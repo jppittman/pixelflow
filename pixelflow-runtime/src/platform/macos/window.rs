@@ -1,6 +1,6 @@
 use crate::api::public::WindowDescriptor;
 use crate::error::RuntimeError;
-use crate::platform::macos::cocoa::{NSPoint, NSRect, NSSize, NSView, NSWindow};
+use crate::platform::macos::cocoa::{NSPoint, NSRect, NSSize, NSView, NSWindow, WindowDeferral};
 use crate::platform::macos::sys::{self, Id, BOOL, YES};
 use std::ffi::c_void;
 
@@ -24,7 +24,7 @@ impl MacWindow {
         // NSBackingStoreBuffered = 2
         let backing = 2;
 
-        let window = NSWindow::alloc().init_with_content_rect(rect, style_mask, backing, false);
+        let window = NSWindow::alloc().init_with_content_rect(rect, style_mask, backing, WindowDeferral::Immediate);
         window.set_title(&desc.title);
 
         let view = NSView::alloc().init_with_frame(rect);
@@ -60,7 +60,7 @@ impl MacWindow {
             sys::send_1::<(), Id>(view.0, sys::sel(b"setLayer:\0"), layer);
 
             // [view setWantsLayer: YES]
-            view.set_wants_layer(true);
+            view.enable_layer();
         }
 
         window.set_content_view(view);
@@ -122,13 +122,13 @@ impl MacWindow {
         }
     }
 
-    pub fn set_visible(&mut self, visible: bool) {
-        if visible {
-            self.window.make_key_and_order_front();
-        } else {
-            unsafe {
-                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
-            }
+    pub fn show(&mut self) {
+        self.window.make_key_and_order_front();
+    }
+
+    pub fn hide(&mut self) {
+        unsafe {
+            sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
         }
     }
 
