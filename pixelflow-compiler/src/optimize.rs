@@ -1597,8 +1597,7 @@ mod tests {
     fn optimize_code_egraph(input: proc_macro2::TokenStream, costs: &CostModel) -> String {
         let kernel = parse(input).unwrap();
         let analyzed = analyze(kernel).unwrap();
-        let mut optimized = analyzed;
-        optimized.def.body = crate::optimize::optimize_via_egraph(&optimized.def.body, costs);
+        let optimized = optimize_with_egraph(analyzed, costs);
         format!("{:?}", optimized.def.body)
     }
 
@@ -1684,7 +1683,7 @@ mod tests {
     fn test_egraph_fma_fusion_with_fma_costs() {
         // a * b + c should become mul_add when FMA is cheap
         let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
-        let debug = optimize_code_egraph(input, &CostModel::load_or_default());
+        let debug = optimize_code_egraph(input, &CostModel::with_fma());
         // With FMA costs, should extract mul_add
         assert!(debug.contains("mul_add"));
     }
@@ -1744,7 +1743,7 @@ mod tests {
         // x / sqrt(y) should become x * rsqrt(y) via algebra:
         // x / sqrt(y) = x * (1/sqrt(y)) = x * rsqrt(y)
         let input = quote! { |x: f32, y: f32| x / y.sqrt() };
-        let debug = optimize_code_egraph(input, &CostModel::load_or_default());
+        let debug = optimize_code_egraph(input, &CostModel::with_fast_rsqrt());
         // Should use rsqrt (real instruction) instead of 1/sqrt
         assert!(debug.contains("rsqrt"), "Expected rsqrt in: {}", debug);
     }
@@ -1811,7 +1810,7 @@ mod tests {
             let product = a * b;
             product + c
         }};
-        let debug = optimize_code_egraph(input, &CostModel::load_or_default());
+        let debug = optimize_code_egraph(input, &CostModel::with_fma());
         // Should fuse into mul_add
         assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
     }
@@ -1826,7 +1825,7 @@ mod tests {
             let r_sq = r * r;
             d_sq - (c_sq - r_sq)
         }};
-        let debug = optimize_code_egraph(input, &CostModel::load_or_default());
+        let debug = optimize_code_egraph(input, &CostModel::fully_optimized());
         eprintln!("Discriminant AST: {}", debug);
 
         // The AST should contain a Neg wrapping the inner subtraction
@@ -1857,7 +1856,7 @@ mod tests {
             let r_sq = r * r;
             d_dot_c * d_dot_c - (c_sq - r_sq)
         }};
-        let debug = optimize_code_egraph(input, &CostModel::load_or_default());
+        let debug = optimize_code_egraph(input, &CostModel::fully_optimized());
         eprintln!("Discriminant with intrinsics AST: {}", debug);
 
         // Check for FMA
