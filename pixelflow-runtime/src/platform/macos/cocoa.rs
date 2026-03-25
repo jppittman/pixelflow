@@ -115,7 +115,21 @@ impl NSRect {
     }
 }
 
+
+// --- Enums ---
+
+pub enum EventDequeue {
+    Dequeue,
+    Peek,
+}
+
+pub enum WindowDeferral {
+    Defer,
+    Immediate,
+}
+
 // --- Wrappers ---
+
 
 /// Wrapper for NSApplication
 #[derive(Copy, Clone)]
@@ -136,10 +150,15 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self) {
         unsafe {
-            let val = if ignore { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), YES);
+        }
+    }
+
+    pub fn activate_normally(&self) {
+        unsafe {
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), NO);
         }
     }
 
@@ -156,9 +175,12 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: EventDequeue) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = match dequeue {
+                EventDequeue::Dequeue => YES,
+                EventDequeue::Peek => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -190,10 +212,13 @@ impl NSWindow {
         rect: NSRect,
         style_mask: u64,
         backing: u64,
-        defer: bool,
+        defer: WindowDeferral,
     ) -> Self {
         unsafe {
-            let d = if defer { YES } else { NO };
+            let d = match defer {
+                WindowDeferral::Defer => YES,
+                WindowDeferral::Immediate => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
@@ -266,10 +291,15 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn enable_layer(&self) {
         unsafe {
-            let val = if wants { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), YES);
+        }
+    }
+
+    pub fn disable_layer(&self) {
+        unsafe {
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), NO);
         }
     }
 
