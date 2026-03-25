@@ -403,7 +403,12 @@ impl Jet3 {
     /// via operator overloads, not call raw SIMD operations directly.
     #[inline(always)]
     pub(crate) fn scale(self, s: Field) -> Jet3 {
-        Jet3::new(self.val * s, self.dx * s, self.dy * s, self.dz * s)
+        Jet3::new(
+            self.val * s,
+            self.dx * s,
+            self.dy * s,
+            self.dz * s,
+        )
     }
 }
 
@@ -860,15 +865,9 @@ impl Numeric for Jet3 {
         let db_coeff = result.raw_mul(half_inv_b);
         Self::new(
             result,
-            self.dx
-                .raw_mul(da_coeff)
-                .raw_sub(other.dx.raw_mul(db_coeff)),
-            self.dy
-                .raw_mul(da_coeff)
-                .raw_sub(other.dy.raw_mul(db_coeff)),
-            self.dz
-                .raw_mul(da_coeff)
-                .raw_sub(other.dz.raw_mul(db_coeff)),
+            self.dx.raw_mul(da_coeff).raw_sub(other.dx.raw_mul(db_coeff)),
+            self.dy.raw_mul(da_coeff).raw_sub(other.dy.raw_mul(db_coeff)),
+            self.dz.raw_mul(da_coeff).raw_sub(other.dz.raw_mul(db_coeff)),
         )
     }
 
@@ -892,12 +891,7 @@ impl Numeric for Jet3 {
             lo.dz,
             Field::select_raw(mask_high, hi.dz, self.dz),
         );
-        Self {
-            val: clamped,
-            dx,
-            dy,
-            dz,
-        }
+        Self { val: clamped, dx, dy, dz }
     }
 
     #[inline(always)]

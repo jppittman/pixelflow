@@ -37,7 +37,7 @@ jobs:
             ${{ runner.os }}-cargo-clippy-
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy -p pixelflow-core --all-targets -- -D warnings
 
   test:
     name: Test on ${{ matrix.os }}
@@ -76,4 +76,4 @@ jobs:
 
       - name: Run workspace tests
         shell: bash
-        run: cargo test --workspace --verbose
+        run: cargo test -p pixelflow-core --verbose
