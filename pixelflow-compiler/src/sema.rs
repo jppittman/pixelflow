@@ -114,7 +114,7 @@ impl SemanticAnalyzer {
         match &param.kind {
             ParamKind::Scalar(ty) => {
                 self.symbols
-                    .register_parameter(param.name.clone(), ty.clone());
+                    .register_parameter(param.name.clone(), *ty.clone());
             }
             ParamKind::Manifold => {
                 self.symbols.register_manifold_param(param.name.clone());

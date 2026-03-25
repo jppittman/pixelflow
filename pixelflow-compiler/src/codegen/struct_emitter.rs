@@ -121,6 +121,7 @@ impl StructEmitter {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_eval_body(
         mut self,
         imports: TokenStream,

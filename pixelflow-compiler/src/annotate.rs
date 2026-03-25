@@ -19,7 +19,7 @@
 //! `Var<N>` references bound via `Let`. The annotation pass assigns each
 //! literal its Var index.
 
-use crate::ast::{BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, BlockExpr, Expr, IdentExpr, Stmt, UnaryOp};
 use proc_macro2::Span;
 use syn::{Ident, Lit, Type};
 
@@ -115,7 +115,7 @@ pub struct AnnotatedBlock {
 
 #[derive(Debug, Clone)]
 pub enum AnnotatedStmt {
-    Let(AnnotatedLet),
+    Let(Box<AnnotatedLet>),
     Expr(AnnotatedExpr),
 }
 
@@ -174,7 +174,6 @@ fn annotate_expr(
             });
             let new_ctx = AnnotationCtx {
                 next_literal: ctx.next_literal + 1,
-                ..ctx
             };
             (
                 AnnotatedExpr::Literal(AnnotatedLiteral {
@@ -322,12 +321,12 @@ fn annotate_stmt(
         Stmt::Let(let_stmt) => {
             let (init, ctx1) = annotate_expr(&let_stmt.init, ctx, literals);
             (
-                AnnotatedStmt::Let(AnnotatedLet {
+                AnnotatedStmt::Let(Box::new(AnnotatedLet {
                     name: let_stmt.name.clone(),
                     ty: let_stmt.ty.clone(),
                     init,
                     span: let_stmt.span,
-                }),
+                })),
                 ctx1,
             )
         }

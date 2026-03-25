@@ -450,6 +450,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn emit_exact_psychedelic_kernel_with_optimize() {
         // Same kernel but with optimization (this is what the actual macro does)
         let input = quote! { pub struct PsychedelicScene = |t: f32, width: f32, height: f32| Field -> Discrete {

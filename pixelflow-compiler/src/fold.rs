@@ -23,7 +23,7 @@
 //! For phases that need state (like sema's symbol table), the trait
 //! methods take `&mut self`.
 
-use crate::ast::{BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LiteralExpr, MethodCallExpr, Stmt, UnaryExpr, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
 use syn::Ident;
 
 /// A fold (catamorphism) over the expression AST.
@@ -127,12 +127,12 @@ pub fn fold_expr<F: ExprFold>(folder: &mut F, expr: &Expr) -> F::Output {
             let stmts: Vec<_> = block
                 .stmts
                 .iter()
-                .filter_map(|stmt| match stmt {
+                .map(|stmt| match stmt {
                     Stmt::Let(let_stmt) => {
                         let init = fold_expr(folder, &let_stmt.init);
-                        Some(folder.fold_let(&let_stmt.name, init))
+                        folder.fold_let(&let_stmt.name, init)
                     }
-                    Stmt::Expr(e) => Some(fold_expr(folder, e)),
+                    Stmt::Expr(e) => fold_expr(folder, e),
                 })
                 .collect();
             let final_expr = block.expr.as_ref().map(|e| fold_expr(folder, e));

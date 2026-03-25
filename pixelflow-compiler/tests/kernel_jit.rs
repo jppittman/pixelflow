@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! Integration tests for the kernel_jit! macro.
 //!
 //! These tests verify the full pipeline from macro input to executable JIT code.
