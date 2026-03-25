@@ -139,7 +139,9 @@ impl SimdOps for ScalarF32 {
 
     #[inline(always)]
     fn gather(slice: &[f32], indices: Self) -> Self {
-        let idx = (libm::floorf(indices.0) as isize).clamp(0, slice.len() as isize - 1) as usize;
+        // Indices are pre-floored by Texture::eval_raw, so truncation is safe and faster.
+        // Even for general use, truncation matches floor for positive indices.
+        let idx = (indices.0 as isize).clamp(0, slice.len() as isize - 1) as usize;
         Self(slice[idx])
     }
 

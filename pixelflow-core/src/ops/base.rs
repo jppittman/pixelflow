@@ -30,8 +30,9 @@
 //! This uses fast rsqrt (~3 cycles) instead of sqrt (~12) + div (~12).
 
 use super::{
-    Abs, Acos, Add, AddMasked, Asin, Atan, Ceil, Cos, Div, Exp, Exp2, Floor, Fract, Ln, Log10,
-    Log2, Max, Min, Mul, MulAdd, MulRecip, MulRsqrt, Neg, Recip, Round, Rsqrt, Sin, Sqrt, Sub, Tan,
+    Abs, Acos, Add, AddMasked, Asin, Atan, Ceil, Cos, Div, Exp, Exp2, Floor, Fract, Ln, Log2,
+    Log10, Max, Min, Mul, MulAdd, MulRecip, MulRsqrt, Neg, Recip, Round, Rsqrt, Sin, Sqrt, Sub,
+    Tan,
 };
 use crate::Field;
 use crate::combinators::Select;
