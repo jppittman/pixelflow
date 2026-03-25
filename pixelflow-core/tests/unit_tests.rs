@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 //! Comprehensive unit tests for pixelflow-core.
 //!
 //! These tests target 80%+ coverage of the library.

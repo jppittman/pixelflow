@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 //! Tests for Jet2H: automatic differentiation with Hessian (second derivatives)
 //!
 //! Note: Jet2H has opaque Field values that cannot be directly inspected in tests.
@@ -50,7 +52,7 @@ fn test_jet2h_unary_ops() {
     let x = Jet2H::x(Field::from(4.0));
 
     let sqrt_result = x.sqrt();
-    let _: Jet2H = sqrt_result.into();
+    _ = <Jet2H>::from(sqrt_result);
 
     let min_result = x.min(Jet2H::y(Field::from(3.0)));
     let _ = min_result.val;

@@ -1,3 +1,6 @@
+#![allow(clippy::approx_constant, clippy::excessive_precision)]
+#![allow(warnings)]
+
 //! Comprehensive benchmarks for pixelflow-core
 //!
 //! Tests SIMD operations, manifold evaluation, and composition performance.

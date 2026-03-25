@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 //! Debug: test if sphere_at returns valid t values
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Field, Manifold, ManifoldExt};

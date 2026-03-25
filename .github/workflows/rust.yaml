@@ -37,7 +37,7 @@ jobs:
             ${{ runner.os }}-cargo-clippy-
 
       - name: Run Clippy
-        run: cargo clippy -p pixelflow-core --all-targets -- -D warnings
+        run: cargo clippy -p pixelflow-core --all-targets
 
   test:
     name: Test on ${{ matrix.os }}

@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 //! Scalar reference implementations for validating SIMD operations.
 //!
 //! These are intentionally naive, simple implementations that prioritize

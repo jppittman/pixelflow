@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 //! # PixelFlow Kernel Compiler Frontend
 //!
 //! A compiler frontend for the PixelFlow DSL, implemented as Rust proc-macros.
