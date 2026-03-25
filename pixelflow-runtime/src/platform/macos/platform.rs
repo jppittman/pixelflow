@@ -102,7 +102,11 @@ impl PlatformOps for MetalOps {
             }
             DisplayControl::SetVisible { id, visible } => {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    if visible { win.show(); } else { win.hide(); }
+                    if visible {
+                        win.show();
+                    } else {
+                        win.hide();
+                    }
                 }
             }
             DisplayControl::RequestRedraw { id } => {

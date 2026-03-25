@@ -24,7 +24,12 @@ impl MacWindow {
         // NSBackingStoreBuffered = 2
         let backing = 2;
 
-        let window = NSWindow::alloc().init_with_content_rect(rect, style_mask, backing, crate::platform::macos::cocoa::WindowDeferral::Immediate);
+        let window = NSWindow::alloc().init_with_content_rect(
+            rect,
+            style_mask,
+            backing,
+            crate::platform::macos::cocoa::WindowDeferral::Immediate,
+        );
         window.set_title(&desc.title);
 
         let view = NSView::alloc().init_with_frame(rect);

@@ -18,7 +18,6 @@ pub enum WindowDeferral {
     Immediate,
 }
 
-
 // --- Helpers ---
 
 /// Convert Rust string to NSString id.
@@ -176,7 +175,10 @@ impl NSApplication {
     // nextEventMatchingMask:untilDate:inMode:dequeue:
     pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: EventDequeue) -> NSEvent {
         unsafe {
-            let d = match dequeue { EventDequeue::Dequeue => YES, EventDequeue::Peek => NO };
+            let d = match dequeue {
+                EventDequeue::Dequeue => YES,
+                EventDequeue::Peek => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -211,7 +213,10 @@ impl NSWindow {
         defer: WindowDeferral,
     ) -> Self {
         unsafe {
-            let d = match defer { WindowDeferral::Defer => YES, WindowDeferral::Immediate => NO };
+            let d = match defer {
+                WindowDeferral::Defer => YES,
+                WindowDeferral::Immediate => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
