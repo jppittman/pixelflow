@@ -1,4 +1,4 @@
-#![cfg(any())]
+#![cfg(all(target_arch = "x86_64", not(target_feature = "avx")))]
 //! Integration tests for the kernel_jit! macro.
 //!
 //! These tests verify the full pipeline from macro input to executable JIT code.

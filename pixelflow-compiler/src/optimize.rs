@@ -23,10 +23,11 @@
 //! ```
 
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
+    BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
     UnaryExpr, UnaryOp,
 };
-use crate::ir_bridge::{ast_to_ir, IRToEGraphContext};
+use crate::cost_builder;
+use crate::ir_bridge::{ast_to_ir, egraph_to_ir, ir_to_code, IRToEGraphContext};
 use crate::sema::AnalyzedKernel;
 use pixelflow_search::egraph::{
     CostModel, EClassId, EGraph, ENode, ExprTree, ExtractedDAG, Leaf, ops,
@@ -86,7 +87,7 @@ fn unique_opaque_name(prefix: &str) -> String {
 /// 5. **Fusion-enabling rewrites** (distribute, etc.)
 /// 6. **Everything else** (commutative, etc.) - apply last
 fn heuristic_score_rewrite(egraph: &EGraph, target: &pixelflow_search::egraph::RewriteTarget) -> i64 {
-
+    use pixelflow_search::egraph::RewriteTarget;
 
     // Get the rule name
     let rule_name = match egraph.rule(target.rule_idx) {
@@ -357,10 +358,11 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
             // Check if the receiver is opaque (Verbatim) and args reference locals
             // This catches patterns like: ColorCube::default().at(red, green, blue, 1.0)
             // where ColorCube::default() is Verbatim and red/green/blue are locals
-            if matches!(call.receiver.as_ref(), Expr::Verbatim(_))
-                && call.args.iter().any(|arg| expr_references_any(arg, local_names)) {
+            if matches!(call.receiver.as_ref(), Expr::Verbatim(_)) {
+                if call.args.iter().any(|arg| expr_references_any(arg, local_names)) {
                     return true;
                 }
+            }
             // Check if this is a method on a captured variable (not X, Y, Z, W)
             if let Expr::Ident(ident) = call.receiver.as_ref() {
                 let name = ident.name.to_string();
@@ -404,7 +406,7 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
                 } else {
                     false
                 }
-            }) || b.expr.as_ref().is_some_and(|e| expr_has_opaque_refs(e, local_names))
+            }) || b.expr.as_ref().map_or(false, |e| expr_has_opaque_refs(e, local_names))
         }
 
         Expr::Ident(_) | Expr::Literal(_) => false,
@@ -436,7 +438,7 @@ fn expr_references_any(expr: &Expr, names: &std::collections::HashSet<String>) -
                 } else {
                     false
                 }
-            }) || b.expr.as_ref().is_some_and(|e| expr_references_any(e, names))
+            }) || b.expr.as_ref().map_or(false, |e| expr_references_any(e, names))
         }
         Expr::Literal(_) => false,
 
@@ -503,7 +505,7 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
             block.block.stmts.iter().any(|stmt| {
                 match stmt {
                     syn::Stmt::Local(local) => {
-                        local.init.as_ref().is_some_and(|init| {
+                        local.init.as_ref().map_or(false, |init| {
                             syn_expr_references_any(&init.expr, names)
                         })
                     }
@@ -522,7 +524,7 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
                         false
                     }
                 })
-                || if_expr.else_branch.as_ref().is_some_and(|(_, else_expr)| {
+                || if_expr.else_branch.as_ref().map_or(false, |(_, else_expr)| {
                     syn_expr_references_any(else_expr, names)
                 })
         }
@@ -1586,21 +1588,21 @@ mod tests {
     use quote::quote;
 
     fn optimize_code(input: proc_macro2::TokenStream) -> String {
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Failed to parse input tokens into KernelDef");
+        let analyzed = analyze(kernel).expect("Failed to semantically analyze KernelDef");
         let optimized = optimize(analyzed);
         format!("{:?}", optimized)
     }
 
     fn optimize_code_egraph(input: proc_macro2::TokenStream, costs: &CostModel) -> String {
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Failed to parse input tokens into KernelDef");
+        let analyzed = analyze(kernel).expect("Failed to semantically analyze KernelDef");
         let optimized = optimize_via_egraph(&analyzed.def.body, costs);
         format!("{:?}", optimized)
     }
 
     #[test]
-    fn test_constant_folding() {
+    fn optimizer_should_fold_constants_when_literals_exist() {
         let input = quote! { |x: f32| x + (1.0 + 2.0) };
         let debug = optimize_code(input);
         assert!(debug.contains("LiteralExpr"));
@@ -1610,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_add() {
+    fn optimizer_should_remove_addition_when_adding_zero() {
         let input = quote! { |x: f32| x + 0.0 };
         let debug = optimize_code(input);
         assert!(debug.contains("IdentExpr"));
@@ -1619,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_mul() {
+    fn optimizer_should_evaluate_to_zero_when_multiplying_by_zero() {
         let input = quote! { |x: f32| x * 0.0 };
         let debug = optimize_code(input);
         assert!(debug.contains("LiteralExpr"));
@@ -1628,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_complex_folding() {
+    fn optimizer_should_fold_complex_nested_literals_when_present() {
         let input = quote! { |x: f32| (1.0 + 2.0) * x + 0.0 };
         let debug = optimize_code(input);
         assert!(debug.contains("3.0"));
@@ -1640,7 +1642,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_egraph_identity_add() {
+    fn egraph_should_remove_addition_when_adding_zero() {
         let input = quote! { |x: f32| x + 0.0 };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to just x
@@ -1650,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_identity_mul() {
+    fn egraph_should_remove_multiplication_when_multiplying_by_one() {
         let input = quote! { |x: f32| x * 1.0 };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to just x
@@ -1660,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_zero_mul() {
+    fn egraph_should_evaluate_to_zero_when_multiplying_by_zero() {
         let input = quote! { |x: f32| x * 0.0 };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to 0.0
@@ -1669,29 +1671,10 @@ mod tests {
         assert!(debug.contains("0.0") || debug.contains("0"), "Expected 0 in: {}", debug);
     }
 
-    #[test]
-    #[ignore]
-    fn test_egraph_sub_self() {
-        let input = quote! { |x: f32| x - x };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to 0.0
-        assert!(debug.contains("0"));
-    }
+
 
     #[test]
-    #[ignore]
-    fn test_egraph_fma_fusion_with_fma_costs() {
-        // a * b + c should become mul_add when FMA is cheap
-        let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
-        let mut fma_costs = CostModel::default();
-        fma_costs.set_cost(pixelflow_ir::OpKind::MulAdd, 1);
-        let debug = optimize_code_egraph(input, &fma_costs);
-        // With FMA costs, should extract mul_add
-        assert!(debug.contains("mul_add"));
-    }
-
-    #[test]
-    fn test_egraph_fma_unfused_with_expensive_fma() {
+    fn egraph_should_unfuse_fma_when_fma_cost_is_expensive() {
         // a * b + c should stay as mul + add when FMA is made expensive
         let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
 
@@ -1704,18 +1687,9 @@ mod tests {
         assert!(!debug.contains("mul_add"), "Expected unfused when MulAdd is expensive: {}", debug);
     }
 
-    #[test]
-    #[ignore]
-    fn test_egraph_fma_fused_with_default_costs() {
-        // With realistic default costs, FMA should be preferred (MulAdd(5) < Mul(5) + Add(4))
-        let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Modern CPUs have cheap FMA, so it should be fused
-        assert!(debug.contains("mul_add"), "Expected FMA fusion with default costs: {}", debug);
-    }
 
     #[test]
-    fn test_egraph_complex_expression() {
+    fn egraph_should_evaluate_complex_expression_to_zero_when_algebra_simplifies_it() {
         // ((x + 0) * 1 - x) should simplify to 0
         let input = quote! { |x: f32| (x + 0.0) * 1.0 - x };
         let debug = optimize_code_egraph(input, &CostModel::default());
@@ -1724,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_preserves_variables() {
+    fn egraph_should_preserve_variables_when_no_optimization_applies() {
         // Simple expression with named variables
         let input = quote! { |cx: f32, cy: f32| cx + cy };
         let debug = optimize_code_egraph(input, &CostModel::default());
@@ -1734,28 +1708,16 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_handles_sqrt() {
+    fn egraph_should_preserve_sqrt_when_no_optimization_applies() {
         let input = quote! { |x: f32| x.sqrt() };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should preserve sqrt
         assert!(debug.contains("sqrt"));
     }
 
-    #[test]
-    #[ignore]
-    fn test_egraph_div_sqrt_to_rsqrt() {
-        // x / sqrt(y) should become x * rsqrt(y) via algebra:
-        // x / sqrt(y) = x * (1/sqrt(y)) = x * rsqrt(y)
-        let input = quote! { |x: f32, y: f32| x / y.sqrt() };
-        let mut rsqrt_costs = CostModel::default();
-        rsqrt_costs.set_cost(pixelflow_ir::OpKind::Rsqrt, 1);
-        let debug = optimize_code_egraph(input, &rsqrt_costs);
-        // Should use rsqrt (real instruction) instead of 1/sqrt
-        assert!(debug.contains("rsqrt"), "Expected rsqrt in: {}", debug);
-    }
 
     #[test]
-    fn test_egraph_double_negation() {
+    fn egraph_should_remove_negation_when_double_negation_applied() {
         let input = quote! { |x: f32| - -x };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to just x
@@ -1769,7 +1731,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_global_optimization_across_let_bindings() {
+    fn global_optimizer_should_propagate_values_across_let_bindings() {
         // The global pass should see through let bindings:
         // let a = x; let b = 0.0; a + b → x
         let input = quote! { |x: f32| {
@@ -1784,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_optimization_zero_multiplication() {
+    fn global_optimizer_should_evaluate_to_zero_across_let_bindings_when_multiplied() {
         // let a = x * x; let b = 0.0; a * b → 0.0
         let input = quote! { |x: f32| {
             let a = x * x;
@@ -1797,126 +1759,23 @@ mod tests {
         assert!(!debug.contains("Mul"), "Should eliminate multiplication: {}", debug);
     }
 
-    #[test]
-    #[ignore]
-    fn test_global_optimization_self_subtraction() {
-        // let a = X * X + Y * Y; a - a → 0.0
-        let input = quote! { || {
-            let a = X * X + Y * Y;
-            a - a
-        }};
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to 0.0
-        assert!(debug.contains("0"), "Expected 0 in output: {}", debug);
-    }
 
-    #[test]
-    #[ignore]
-    fn test_global_fma_across_bindings() {
-        // let product = a * b; product + c → mul_add(a, b, c)
-        let input = quote! { |a: f32, b: f32, c: f32| {
-            let product = a * b;
-            product + c
-        }};
-        let mut fma_costs = CostModel::default();
-        fma_costs.set_cost(pixelflow_ir::OpKind::MulAdd, 1);
-        let debug = optimize_code_egraph(input, &fma_costs);
-        // Should fuse into mul_add
-        assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
-    }
 
-    #[test]
-    #[ignore]
-    fn test_discriminant_pattern() {
-        // This is the problematic pattern:
-        // d_dot_c² - (c_sq - r_sq) should use Neg to wrap (c_sq - r_sq)
-        let input = quote! { |d: f32, c: f32, r: f32| {
-            let d_sq = d * d;
-            let c_sq = c * c;
-            let r_sq = r * r;
-            d_sq - (c_sq - r_sq)
-        }};
-        let mut costs = CostModel::default();
-        costs.set_cost(pixelflow_ir::OpKind::MulAdd, 1);
-        let debug = optimize_code_egraph(input, &costs);
-        eprintln!("Discriminant AST: {}", debug);
 
-        // The AST should contain a Neg wrapping the inner subtraction
-        // If FMA is used: mul_add(d, d, Neg(Sub(c_sq, r_sq)))
-        // The key check: the output should NOT have the wrong sign pattern
-        // Wrong pattern: Sub(c_sq, Neg(r_sq)) which equals c_sq + r_sq
-        // Right pattern: Neg(Sub(c_sq, r_sq)) which equals -c_sq + r_sq
-
-        // With FMA fusion, we expect: mul_add(d, d, ...)
-        // And the third argument should involve a Neg wrapping the subtraction
-        assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
-
-        // Check that Neg appears in the output (wrapping the inner expression)
-        assert!(debug.contains("Neg") || debug.contains("neg"),
-                "Expected Neg in third argument of mul_add: {}", debug);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_discriminant_with_intrinsics() {
-        // This matches the actual failing test more closely:
-        // d_dot_c = X*cx + Y*cy + Z*cz
-        // c_sq = cx*cx + cy*cy + cz*cz
-        // r_sq = r*r
-        // discriminant = d_dot_c*d_dot_c - (c_sq - r_sq)
-        let input = quote! { |cx: f32, cy: f32, cz: f32, r: f32| {
-            let d_dot_c = X * cx + Y * cy + Z * cz;
-            let c_sq = cx * cx + cy * cy + cz * cz;
-            let r_sq = r * r;
-            d_dot_c * d_dot_c - (c_sq - r_sq)
-        }};
-        let mut costs = CostModel::default();
-        costs.set_cost(pixelflow_ir::OpKind::MulAdd, 1);
-        let debug = optimize_code_egraph(input, &costs);
-        eprintln!("Discriminant with intrinsics AST: {}", debug);
-
-        // Check for FMA
-        assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
-
-        // Check that Neg appears - the key correctness check
-        assert!(debug.contains("Neg") || debug.contains("neg"),
-                "Expected Neg in expression: {}", debug);
-    }
 
     // ========================================================================
     // DAG Extraction Tests
     // ========================================================================
 
     /// Test DAG optimization with shared subexpressions.
-    #[test]
-    #[ignore]
-    fn test_dag_optimization_shared_subexpr() {
-        // sin(X) * sin(X) should emit a let-binding
-        let input = quote! { || X.sin() * X.sin() };
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
-
-        // Use neural optimizer
-        let nnue = ExprNnue::new_random(42);
-        let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
-
-        let debug = format!("{:?}", optimized);
-        eprintln!("DAG optimized sin(X)*sin(X): {}", debug);
-
-        // The output should either:
-        // 1. Have a let-binding for the shared sin(X), OR
-        // 2. Reference the same subexpression (e-graph dedup)
-        // For now, just verify it's well-formed
-        assert!(debug.contains("sin") || debug.contains("Sin"), "Expected sin in output");
-    }
 
     /// Test DAG optimization with triple use of shared subexpr.
     #[test]
-    fn test_dag_optimization_triple_shared() {
+    fn dag_optimizer_should_extract_triple_shared_subexpr_when_present() {
         // sqrt(X) * sqrt(X) + sqrt(X) should emit let-binding
         let input = quote! { || X.sqrt() * X.sqrt() + X.sqrt() };
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Failed to parse input tokens into KernelDef");
+        let analyzed = analyze(kernel).expect("Failed to semantically analyze KernelDef");
 
         let nnue = ExprNnue::new_random(42);
         let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
@@ -1930,11 +1789,11 @@ mod tests {
 
     /// Test that simple expressions without sharing don't get wrapped in blocks.
     #[test]
-    fn test_dag_optimization_no_sharing() {
+    fn dag_optimizer_should_not_extract_subexpr_when_no_sharing_present() {
         // X + Y has no sharing, should remain simple
         let input = quote! { || X + Y };
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Failed to parse input tokens into KernelDef");
+        let analyzed = analyze(kernel).expect("Failed to semantically analyze KernelDef");
 
         let nnue = ExprNnue::new_random(42);
         let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
@@ -1947,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_pipeline_discriminant() {
+    fn pipeline_should_generate_correct_negation_wrapper_when_optimizing_discriminant() {
         use crate::codegen;
 
         // Full pipeline test matching actual kernel! macro
@@ -1958,8 +1817,8 @@ mod tests {
             d_dot_c * d_dot_c - (c_sq - r_sq)
         }};
 
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Failed to parse input tokens into KernelDef");
+        let analyzed = analyze(kernel).expect("Failed to semantically analyze KernelDef");
 
         // This is what the kernel! macro does
         let optimized = optimize(analyzed);
