@@ -505,7 +505,7 @@ f 1 2 3 4
 
         // For bilinear fallback, center should be roughly (0.5, 0.5, 0.0)
         // We can't easily check SIMD Field values in tests, so this is a smoke test
-        assert!(patch.is_extraordinary());
+        assert_eq!(patch.is_extraordinary(), true);
     }
 
     #[test]

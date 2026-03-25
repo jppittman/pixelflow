@@ -70,14 +70,14 @@ fn cuj_pty02_real_parser_simple_text() {
 
     // When: Simple text is sent
     let text = b"Hello".to_vec();
-    parser_tx.send(Message::Data(text)).unwrap();
+    parser_tx.send(Message::Data(text)).expect("test failure");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("test failure");
 
     // Then: Should receive Print commands for each character
-    let commands = cmd_rx.try_recv().unwrap();
+    let commands = cmd_rx.try_recv().expect("test failure");
     assert_eq!(commands.len(), 5, "Should have 5 Print commands");
 
     // Verify each character
@@ -115,14 +115,14 @@ fn cuj_pty02_real_parser_escape_sequence() {
     // When: Cursor position escape sequence is sent
     // ESC [ H = cursor to home (1,1)
     let escape_seq = b"\x1b[H".to_vec();
-    parser_tx.send(Message::Data(escape_seq)).unwrap();
+    parser_tx.send(Message::Data(escape_seq)).expect("test failure");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("test failure");
 
     // Then: Should receive a CSI command
-    let commands = cmd_rx.try_recv().unwrap();
+    let commands = cmd_rx.try_recv().expect("test failure");
     assert_eq!(commands.len(), 1, "Should have 1 CSI command");
 
     // Verify it's a cursor position command
@@ -161,14 +161,14 @@ fn cuj_pty02_real_parser_sgr_color() {
     // When: SGR (Set Graphics Rendition) for red foreground is sent
     // ESC [ 31 m = set foreground to red
     let sgr_red = b"\x1b[31m".to_vec();
-    parser_tx.send(Message::Data(sgr_red)).unwrap();
+    parser_tx.send(Message::Data(sgr_red)).expect("test failure");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("test failure");
 
     // Then: Should receive an SGR command
-    let commands = cmd_rx.try_recv().unwrap();
+    let commands = cmd_rx.try_recv().expect("test failure");
     assert_eq!(commands.len(), 1, "Should have 1 SGR command");
 
     match &commands[0] {
@@ -205,14 +205,14 @@ fn cuj_pty02_real_parser_mixed_text_and_escapes() {
     // When: Mixed content is sent
     // "Hi" + cursor home + "!"
     let mixed = b"Hi\x1b[H!".to_vec();
-    parser_tx.send(Message::Data(mixed)).unwrap();
+    parser_tx.send(Message::Data(mixed)).expect("test failure");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("test failure");
 
     // Then: Should receive Print, CSI, Print in order
-    let commands = cmd_rx.try_recv().unwrap();
+    let commands = cmd_rx.try_recv().expect("test failure");
     assert_eq!(commands.len(), 4, "Should have 4 commands (H, i, CSI, !)");
 
     // Verify order
@@ -242,19 +242,19 @@ fn cuj_pty02_real_parser_incremental_escape() {
 
     // When: Escape sequence arrives in pieces (simulating network fragmentation)
     // First just ESC
-    parser_tx.send(Message::Data(vec![0x1b])).unwrap();
+    parser_tx.send(Message::Data(vec![0x1b])).expect("test failure");
     thread::sleep(Duration::from_millis(10));
 
     // Then [
-    parser_tx.send(Message::Data(vec![b'['])).unwrap();
+    parser_tx.send(Message::Data(vec![b'['])).expect("test failure");
     thread::sleep(Duration::from_millis(10));
 
     // Then H
-    parser_tx.send(Message::Data(vec![b'H'])).unwrap();
+    parser_tx.send(Message::Data(vec![b'H'])).expect("test failure");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("test failure");
 
     // Then: Parser should buffer and produce a complete CSI command
     let mut all_commands = Vec::new();
@@ -294,14 +294,14 @@ fn cuj_pty02_real_parser_c0_control() {
     // When: C0 control characters are sent
     // BEL (0x07), LF (0x0A), CR (0x0D)
     let controls = vec![0x07, 0x0A, 0x0D];
-    parser_tx.send(Message::Data(controls)).unwrap();
+    parser_tx.send(Message::Data(controls)).expect("test failure");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("test failure");
 
     // Then: Should receive C0 control commands
-    let commands = cmd_rx.try_recv().unwrap();
+    let commands = cmd_rx.try_recv().expect("test failure");
     assert_eq!(commands.len(), 3, "Should have 3 C0 control commands");
 
     // All should be C0Control variants
@@ -338,12 +338,12 @@ fn cuj_pty02_real_parser_high_throughput() {
 
     for _ in 0..NUM_BATCHES {
         let data: Vec<u8> = (0..BATCH_SIZE).map(|i| b'A' + (i % 26) as u8).collect();
-        parser_tx.send(Message::Data(data)).unwrap();
+        parser_tx.send(Message::Data(data)).expect("test failure");
     }
 
     thread::sleep(Duration::from_millis(200));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("test failure");
 
     // Then: All bytes should be processed
     assert_eq!(
@@ -400,7 +400,7 @@ impl TerminalMessageChain {
         // Spawn app thread (receives commands)
         let app_handle = thread::spawn(move || {
             while let Ok(cmds) = cmd_rx.recv() {
-                commands_clone.lock().unwrap().extend(cmds);
+                commands_clone.lock().expect("test failure").extend(cmds);
             }
         });
 
@@ -413,11 +413,11 @@ impl TerminalMessageChain {
     }
 
     fn send_bytes(&self, data: Vec<u8>) {
-        self.parser_tx.send(Message::Data(data)).unwrap();
+        self.parser_tx.send(Message::Data(data)).expect("test failure");
     }
 
     fn get_commands(&self) -> Vec<AnsiCommand> {
-        self.commands_received.lock().unwrap().clone()
+        self.commands_received.lock().expect("test failure").clone()
     }
 
     fn shutdown(mut self) {
@@ -425,10 +425,10 @@ impl TerminalMessageChain {
         drop(self.parser_tx);
 
         if let Some(h) = self.parser_handle.take() {
-            h.join().unwrap();
+            h.join().expect("test failure");
         }
         if let Some(h) = self.app_handle.take() {
-            h.join().unwrap();
+            h.join().expect("test failure");
         }
     }
 }
