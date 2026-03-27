@@ -652,7 +652,7 @@ impl<M: ManifoldCompat<Jet3, Output = Field>> Manifold<Jet3_4> for Reflect<M> {
         let r_z = d_jet_z - k * n_jet_z;
 
         // Recurse with curved reflected rays
-        self.inner.eval(r_x, r_y, r_z, w)
+        self.inner.eval((r_x, r_y, r_z, w))
     }
 }
 

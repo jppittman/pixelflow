@@ -674,7 +674,7 @@ impl Numeric for Jet3 {
 
     #[inline(always)]
     fn log2(self) -> Self {
-        let log2_e = Field::from(1.4426950408889634);
+        let log2_e = Field::from(core::f32::consts::LOG2_E);
         let inv_val = Field::from(1.0) / self.val;
         let deriv_coeff = inv_val * log2_e;
         Self::new(
@@ -756,7 +756,7 @@ impl Numeric for Jet3 {
     #[inline(always)]
     fn log10(self) -> Self {
         // Chain rule: (log10 f)' = f' / (f * ln(10))
-        let log10_e = Field::from(0.4342944819032518);
+        let log10_e = Field::from(core::f32::consts::LOG10_E);
         let inv_val = Field::from(1.0) / self.val;
         let deriv_coeff = inv_val * log10_e;
         Self::new(
