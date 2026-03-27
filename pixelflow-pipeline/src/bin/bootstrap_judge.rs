@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! Bootstrap the Judge (value head) on a large diverse corpus.
 //!
 //! Generates expressions with BwdGenerator, JIT-benchmarks them,

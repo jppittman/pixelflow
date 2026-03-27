@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! Demo: Algebraic rewrite rules on real graphics patterns.
 //!
 //! Shows how the new categorical trait-based rules transform common

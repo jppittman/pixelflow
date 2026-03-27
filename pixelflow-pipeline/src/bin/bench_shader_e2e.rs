@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! End-to-end benchmark: HCE vs Judge vs Guided on real shader expressions
 //!
 //! Two-step workflow:

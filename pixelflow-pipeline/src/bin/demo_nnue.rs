@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! Demo: NNUE-based cost extraction.
 //!
 //! Shows how the ExprNnue (Judge) works with e-graph extraction.

@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! Evaluate GuidedSearch vs egg baseline.
 //!
 //! This binary compares the Guide-filtered search against egg-style saturation

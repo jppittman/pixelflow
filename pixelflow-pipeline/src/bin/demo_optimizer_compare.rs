@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! Optimizer Comparison Demo
 //!
 //! Compares three optimization strategies on real shader expressions:

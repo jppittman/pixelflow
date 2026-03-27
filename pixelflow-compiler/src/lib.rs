@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! # PixelFlow Kernel Compiler Frontend
 //!
 //! A compiler frontend for the PixelFlow DSL, implemented as Rust proc-macros.

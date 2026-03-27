@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! E2E test for NNUE-guided optimization.
 //!
 //! **All costs are NNUE value head predictions** - no hardcoded lookup tables.

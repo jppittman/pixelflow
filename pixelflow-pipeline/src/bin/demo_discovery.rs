@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! Demo: E-graph discovers non-obvious equivalent forms.
 //!
 //! Shows how equality saturation explores the space of equivalent expressions

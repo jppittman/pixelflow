@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! # Unified Self-Play Training Binary
 //!
 //! Orchestrates the outer training loop:

@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! Fair benchmark: Judge predictions vs actual JIT kernel execution.
 //!
 //! Uses the same `compile_dag` path as training data collection, so predictions

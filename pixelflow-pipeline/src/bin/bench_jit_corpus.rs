@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_variables, unused_imports, clippy::all)]
 //! JIT-benchmark the curated expression corpus.
 //!
 //! Reads `bench_corpus.jsonl` (a JSONL file with `name` and `expression`
