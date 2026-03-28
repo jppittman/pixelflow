@@ -19,7 +19,7 @@
 //! `Var<N>` references bound via `Let`. The annotation pass assigns each
 //! literal its Var index.
 
-use crate::ast::{BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, BlockExpr, Expr, IdentExpr, Stmt, UnaryOp};
 use proc_macro2::Span;
 use syn::{Ident, Lit, Type};
 

@@ -23,7 +23,7 @@
 //! For phases that need state (like sema's symbol table), the trait
 //! methods take `&mut self`.
 
-use crate::ast::{BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LiteralExpr, MethodCallExpr, Stmt, UnaryExpr, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
 use syn::Ident;
 
 /// A fold (catamorphism) over the expression AST.

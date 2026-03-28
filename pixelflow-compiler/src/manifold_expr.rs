@@ -24,7 +24,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{parse_quote, DeriveInput, GenericParam, Generics};
+use syn::DeriveInput;
 
 /// Generate the `ManifoldExpr` impl for a type.
 pub fn derive_manifold_expr(input: DeriveInput) -> TokenStream {

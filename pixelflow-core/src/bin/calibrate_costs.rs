@@ -285,7 +285,7 @@ fn backend_name() -> &'static str {
         not(target_feature = "avx512f")
     ))]
     {
-        return "AVX2";
+        "AVX2"
     }
 
     #[cfg(all(

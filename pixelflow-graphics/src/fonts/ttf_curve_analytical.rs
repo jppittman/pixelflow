@@ -133,11 +133,11 @@ impl Manifold<Field4> for AnalyticalQuad {
         if self.is_linear {
             // Degenerate: quadratic is a line. Solve by*t + (cy - Y) = 0
             let k = kernel!(|ax: f32, bx: f32, cx: f32, by: f32, cy: f32| {
-                let t = (Y - cy) / by;
+                let t = (Y - cy.clone()) / by.clone();
                 let in_t = t.clone().ge(0.0) & t.clone().le(1.0);
 
                 // x-coordinate at intersection
-                let x_int = t.clone() * t.clone() * ax + t.clone() * bx + cx;
+                let x_int = t.clone() * t.clone() * ax.clone() + t.clone() * bx.clone() + cx.clone();
 
                 // Step: 1.0 if crossing is to the left of or at X
                 let crossed = (X >= x_int).select(1.0, 0.0);
@@ -157,15 +157,15 @@ impl Manifold<Field4> for AnalyticalQuad {
 
             // Two roots: t = (-by +/- sqrt(disc)) / (2*ay)
             let t_plus = sqrt_disc.clone() * inv_2a.clone() + neg_b_2a.clone();
-            let t_minus = sqrt_disc * -inv_2a + neg_b_2a;
+            let t_minus = sqrt_disc * -inv_2a.clone() + neg_b_2a.clone();
 
             // X-coordinates at intersection points
             let x_plus = t_plus.clone() * t_plus.clone() * ax.clone() + t_plus.clone() * bx.clone() + cx.clone();
-            let x_minus = t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx;
+            let x_minus = t_minus.clone() * t_minus.clone() * ax.clone() + t_minus.clone() * bx.clone() + cx.clone();
 
             // Tangent dy/dt at each root for winding direction
             let dy_plus = t_plus.clone() * (2.0 * ay.clone()) + by.clone();
-            let dy_minus = t_minus.clone() * (2.0 * ay) + by;
+            let dy_minus = t_minus.clone() * (2.0 * ay.clone()) + by.clone();
 
             // Step: 1.0 if crossing is to the left of or at X
             let crossed_plus = (X >= x_plus).select(1.0, 0.0);

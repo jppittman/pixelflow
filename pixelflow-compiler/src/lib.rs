@@ -1,3 +1,11 @@
+#![allow(dead_code)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::unnecessary_filter_map)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::needless_update)]
+
 //! # PixelFlow Kernel Compiler Frontend
 //!
 //! A compiler frontend for the PixelFlow DSL, implemented as Rust proc-macros.
