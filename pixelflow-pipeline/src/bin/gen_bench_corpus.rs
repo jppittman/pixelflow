@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Generate a diverse expression corpus for JIT benchmarking.
 //!
 //! Generates unique expressions across varied depth/complexity bands,

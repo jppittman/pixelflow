@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Bootstrap the Judge (value head) on a large diverse corpus.
 //!
 //! Generates expressions with BwdGenerator, JIT-benchmarks them,

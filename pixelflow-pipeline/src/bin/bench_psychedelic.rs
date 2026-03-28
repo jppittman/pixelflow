@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Benchmark: Psychedelic shader - Old optimizer vs New (Neural)
 //!
 //! Tests the REAL psychedelic shader expression through both optimization paths,

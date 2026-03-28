@@ -1,3 +1,8 @@
+#![allow(warnings)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::needless_range_loop)]
+
 //! PixelFlow Pipeline: Training and Data Generation.
 //!
 //! This crate provides the training pipeline for the PixelFlow compiler's

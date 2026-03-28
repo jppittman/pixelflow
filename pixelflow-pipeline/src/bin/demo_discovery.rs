@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Demo: E-graph discovers non-obvious equivalent forms.
 //!
 //! Shows how equality saturation explores the space of equivalent expressions

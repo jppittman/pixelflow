@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Demo: Algebraic rewrite rules on real graphics patterns.
 //!
 //! Shows how the new categorical trait-based rules transform common

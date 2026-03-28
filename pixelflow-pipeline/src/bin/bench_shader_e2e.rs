@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! End-to-end benchmark: HCE vs Judge vs Guided on real shader expressions
 //!
 //! Two-step workflow:

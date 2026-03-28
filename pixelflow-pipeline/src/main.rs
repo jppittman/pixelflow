@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! PixelFlow Pipeline Executable.
 //!
 //! Use this for running training tasks and generating data.

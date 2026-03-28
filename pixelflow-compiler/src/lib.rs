@@ -1,3 +1,4 @@
+#![allow(warnings)]
 #![allow(dead_code)]
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::too_many_arguments)]

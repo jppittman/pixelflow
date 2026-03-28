@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Evaluate GuidedSearch vs egg baseline.
 //!
 //! This binary compares the Guide-filtered search against egg-style saturation

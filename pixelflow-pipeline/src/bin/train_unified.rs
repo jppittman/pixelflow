@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! # Unified Self-Play Training Binary
 //!
 //! Orchestrates the outer training loop:

@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Optimizer Comparison Demo
 //!
 //! Compares three optimization strategies on real shader expressions:

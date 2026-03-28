@@ -507,7 +507,7 @@ fn find_at_manifold_params_inner(
             // Determine output type, domain type, and scalar type
             let (output_type, domain_type) = match (&self.analyzed.def.domain_ty, &self.analyzed.def.return_ty) {
                 (Some(domain), Some(output)) => {
-                    let _type_str = quote!{ #domain }.to_string();
+                    let type_str = quote!{ #domain }.to_string();
                     // panic!("DEBUG: domain type is '{}'", type_str);
                     let domain_tokens = if let syn::Type::Tuple(_) = domain {
                         quote! { #domain }
@@ -645,7 +645,7 @@ fn find_at_manifold_params_inner(
         /// These are NOT pre-evaluated - they're accessed via `(&self.field).at(...)` lazily.
         /// `scalar_type` is the type used for scalar/literal conversion (e.g., `Jet3::from` instead of `Field::from`).
         /// This should be the domain's scalar type (from `Spatial::Coord`), not the output type.
-        fn emit_unified_binding(&self, _at_manifold_params: &HashSet<String>, scalar_type: &TokenStream) -> (TokenStream, TokenStream) {
+        fn emit_unified_binding(&self, at_manifold_params: &HashSet<String>, scalar_type: &TokenStream) -> (TokenStream, TokenStream) {
             let params = &self.analyzed.def.params;
 
             if params.is_empty() && self.collected_literals.is_empty() {
@@ -658,7 +658,7 @@ fn find_at_manifold_params_inner(
             // 2. There are scalar params mixed with manifolds
             let manifold_count = self.manifold_indices.len();
             let has_scalar_params = params.iter().any(|p| matches!(p.kind, ParamKind::Scalar(_)));
-            let _needs_pre_eval = manifold_count > 0 &&
+            let needs_pre_eval = manifold_count > 0 &&
                 (manifold_count > 1 || has_scalar_params);
 
             // NOTE: Manifold params are NO LONGER pre-evaluated.

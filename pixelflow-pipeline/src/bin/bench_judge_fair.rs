@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Fair benchmark: Judge predictions vs actual JIT kernel execution.
 //!
 //! Uses the same `compile_dag` path as training data collection, so predictions

@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //! Demo: NNUE-based cost extraction.
 //!
 //! Shows how the ExprNnue (Judge) works with e-graph extraction.
