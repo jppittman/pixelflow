@@ -62,7 +62,7 @@ use pixelflow_core::ops::compare::Lt;
 use pixelflow_core::{Field, Manifold, ManifoldExt, X, Y};
 
 /// Natural logarithm of 2, used for 2^x = exp(x * LN_2).
-const LN_2: f32 = 0.6931471805599453;
+const LN_2: f32 = 0.693_147_2;
 
 // ============================================================================
 // Regular Patch (Valence 4) - Standard B-Spline
@@ -84,6 +84,7 @@ const BSPLINE_BASIS: [[f32; 4]; 4] = [
 ///
 /// Uses X as u ∈ [0,1], Y as v ∈ [0,1].
 #[inline]
+#[must_use]
 pub fn bspline_patch(
     control_points: [[f32; 3]; 16],
 ) -> (
@@ -339,6 +340,7 @@ fn first_tile_patch(coeffs: [[f32; 16]; 3]) -> impl Manifold<Output = Field> {
 ///
 /// For most artistic use cases, this is acceptable. For CAD-quality
 /// precision near extraordinary vertices, eigenvalue weighting is needed.
+#[must_use]
 pub fn eigen_patch(
     control_points: &[[f32; 3]],
     valence: usize,
@@ -395,7 +397,7 @@ pub fn eigen_patch(
 #[inline]
 pub fn validate_eigen_domain(u: f32, v: f32) {
     // Check bounds
-    if u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 {
+    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
         panic!(
             "eigen_patch: (u={}, v={}) outside valid domain [0, 1]²",
             u, v
@@ -420,6 +422,7 @@ pub fn validate_eigen_domain(u: f32, v: f32) {
 /// Returns a manifold type - the polynomial IS the composition,
 /// not a struct that computes it.
 #[inline]
+#[must_use]
 pub fn bicubic(c: [f32; 16]) -> impl Manifold<Output = Field> {
     // Powers of Y (v): Y, Y², Y³
     let v1 = Y;

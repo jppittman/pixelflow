@@ -1,3 +1,12 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::approx_constant)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::type_complexity)]
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_doc_comments)]
+
 
 //! # PixelFlow Graphics
 //!

@@ -127,6 +127,7 @@ impl<P: Pixel> RasterizerSetupHandle<P> {
     /// # Panics
     ///
     /// Panics if the rasterizer thread has died before completing setup.
+    #[must_use]
     pub fn register(self, response_tx: Sender<RenderResponse<P>>) -> RasterizerHandle<P> {
         // Create reply channel for this handshake
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);

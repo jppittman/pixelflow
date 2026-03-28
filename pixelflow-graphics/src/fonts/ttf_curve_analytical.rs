@@ -26,7 +26,7 @@ type Field4 = (Field, Field, Field, Field);
 // 2. Compute x_intersection where the segment crosses y = Y
 // 3. Step: 1 if X >= x_intersection (ray crosses to the left of X), else 0
 // 4. Multiply by winding direction (±1)
-kernel!(
+pixelflow_compiler::kernel_raw!(
     pub struct AnalyticalLine = |x0: f32, y0: f32, dx_over_dy: f32,
                                   dir: f32, y_min: f32, y_max: f32| {
         // Early rejection: only contributes when Y is in segment's vertical range
@@ -44,6 +44,7 @@ kernel!(
 
 impl AnalyticalLine {
     /// Create from two endpoints. Returns None for horizontal/degenerate lines.
+    #[must_use]
     pub fn from_points([x0, y0]: [f32; 2], [x1, y1]: [f32; 2]) -> Option<Self> {
         let dy = y1 - y0;
         if dy.abs() < 1e-6 {
@@ -94,6 +95,7 @@ pub struct AnalyticalQuad {
 
 impl AnalyticalQuad {
     #[inline]
+    #[must_use]
     pub fn new([x0, y0]: [f32; 2], [x1, y1]: [f32; 2], [x2, y2]: [f32; 2]) -> Self {
         let ay = y0 - 2.0 * y1 + y2;
         let by = 2.0 * (y1 - y0);
@@ -132,12 +134,12 @@ impl Manifold<Field4> for AnalyticalQuad {
     fn eval(&self, p: Field4) -> Field {
         if self.is_linear {
             // Degenerate: quadratic is a line. Solve by*t + (cy - Y) = 0
-            let k = kernel!(|ax: f32, bx: f32, cx: f32, by: f32, cy: f32| {
-                let t = (Y - cy.clone()) / by.clone();
+            let k = pixelflow_compiler::kernel_raw!(|ax: f32, bx: f32, cx: f32, by: f32, cy: f32| {
+                let t = (Y - cy) / by;
                 let in_t = t.clone().ge(0.0) & t.clone().le(1.0);
 
                 // x-coordinate at intersection
-                let x_int = t.clone() * t.clone() * ax.clone() + t.clone() * bx.clone() + cx.clone();
+                let x_int = t.clone() * t.clone() * ax + t.clone() * bx + cx;
 
                 // Step: 1.0 if crossing is to the left of or at X
                 let crossed = (X >= x_int).select(1.0, 0.0);
@@ -150,22 +152,22 @@ impl Manifold<Field4> for AnalyticalQuad {
 
         // True quadratic: solve ay*t^2 + by*t + (cy - Y) = 0
         // discriminant = by^2 - 4*ay*(cy - Y) = disc_const + disc_slope*Y
-        let k = kernel!(|ax: f32, bx: f32, cx: f32, ay: f32, by: f32,
+        let k = pixelflow_compiler::kernel_raw!(|ax: f32, bx: f32, cx: f32, ay: f32, by: f32,
                          inv_2a: f32, neg_b_2a: f32, disc_const: f32, disc_slope: f32| {
             let disc = Y * disc_slope + disc_const;
             let sqrt_disc = disc.max(0.0).sqrt();
 
             // Two roots: t = (-by +/- sqrt(disc)) / (2*ay)
             let t_plus = sqrt_disc.clone() * inv_2a.clone() + neg_b_2a.clone();
-            let t_minus = sqrt_disc * -inv_2a.clone() + neg_b_2a.clone();
+            let t_minus = sqrt_disc * (0.0 - inv_2a) + neg_b_2a;
 
             // X-coordinates at intersection points
             let x_plus = t_plus.clone() * t_plus.clone() * ax.clone() + t_plus.clone() * bx.clone() + cx.clone();
-            let x_minus = t_minus.clone() * t_minus.clone() * ax.clone() + t_minus.clone() * bx.clone() + cx.clone();
+            let x_minus = t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx;
 
             // Tangent dy/dt at each root for winding direction
             let dy_plus = t_plus.clone() * (2.0 * ay.clone()) + by.clone();
-            let dy_minus = t_minus.clone() * (2.0 * ay.clone()) + by.clone();
+            let dy_minus = t_minus.clone() * (2.0 * ay) + by;
 
             // Step: 1.0 if crossing is to the left of or at X
             let crossed_plus = (X >= x_plus).select(1.0, 0.0);
