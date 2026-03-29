@@ -118,7 +118,7 @@ fn read_from_pty_with_timeout(pty: &mut NixPty, expected_str: &str) -> Result<St
 }
 
 #[test]
-fn test_pty_spawn_successful() {
+fn pty_spawn_successful_should_succeed_when_tested() {
     // Use sh -c to be more robust across platforms and ensure output flushing
     let config = PtyConfig {
         command_executable: "/bin/sh",
@@ -138,12 +138,7 @@ fn test_pty_spawn_successful() {
             // We should be somewhat flexible with EOL or ensure expected_str matches exactly what PTY outputs.
             let expected_output = "hello pty world\n"; // echo output
             let output =
-                read_from_pty_with_timeout(&mut pty, expected_output).unwrap_or_else(|e| {
-                    panic!(
-                        "pty_spawn_successful: Failed to read from PTY. Error: {}",
-                        e
-                    )
-                });
+                read_from_pty_with_timeout(&mut pty, expected_output).expect("Failed operation");
 
             // Check if the core message is there, trimming whitespace for robustness.
             assert!(output.trim().contains("hello pty world"));
@@ -156,7 +151,7 @@ fn test_pty_spawn_successful() {
 }
 
 #[test]
-fn test_pty_read_write_interaction() {
+fn pty_read_write_interaction_should_succeed_when_tested() {
     let shell_command = "read r_line; echo \"input was: $r_line\"";
     let config = PtyConfig {
         command_executable: "/bin/sh",
@@ -181,12 +176,12 @@ fn test_pty_read_write_interaction() {
 
     let write_data = "hello interactive pty\n"; // \n is important for `read` command in shell
     pty.write_all(write_data.as_bytes())
-        .unwrap_or_else(|e| panic!("Failed to write to PTY: {:?}", e));
+        .expect("Failed operation");
     log::debug!("Successfully wrote to PTY: '{}'", write_data.trim());
 
     let expected_output_fragment = "input was: hello interactive pty";
     let output = read_from_pty_with_timeout(&mut pty, expected_output_fragment)
-        .unwrap_or_else(|err_msg| panic!("Read/write test failed: {}", err_msg));
+        .expect("Failed operation");
 
     assert!(output.contains(expected_output_fragment));
     log::info!(
@@ -197,7 +192,7 @@ fn test_pty_read_write_interaction() {
 }
 
 #[test]
-fn test_pty_resize_successful() {
+fn pty_resize_successful_should_succeed_when_tested() {
     // Use `sleep` from PATH to be cross-platform (macOS has /bin/sleep, Linux /usr/bin/sleep)
     let config = PtyConfig {
         command_executable: "sleep",
@@ -235,7 +230,7 @@ fn test_pty_resize_successful() {
 }
 
 #[test]
-fn test_pty_child_termination_on_drop() {
+fn pty_child_termination_on_drop_should_succeed_when_tested() {
     let config = PtyConfig {
         command_executable: "sleep",
         args: &["2"], // Arg for sleep is just the duration
@@ -295,7 +290,7 @@ fn test_pty_child_termination_on_drop() {
 }
 
 #[test]
-fn test_pty_spawn_invalid_command() {
+fn pty_spawn_invalid_command_should_succeed_when_tested() {
     let non_existent_cmd = "/path/to/absolutely/nonexistent/command_39291az";
     let config = PtyConfig {
         command_executable: non_existent_cmd,
