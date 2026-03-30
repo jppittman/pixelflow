@@ -598,7 +598,10 @@ impl<M: ManifoldCompat<Jet3, Output = Field>> Manifold<Jet3_4> for Reflect<M> {
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        // ⚡ Bolt: Performance optimization & Math fix
+        // Using .rsqrt() directly on the squared length computes x^(-1/2) correctly
+        // and saves an expensive .sqrt() call vs the previous .sqrt().rsqrt() which computed x^(-1/4).
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         // Normal components - evaluate at Jet3 construction boundary
         let nx = (cross_x * inv_n_len.clone()).constant();
@@ -686,7 +689,10 @@ impl<M: ManifoldCompat<Jet3, Output = Discrete>> Manifold<Jet3_4> for ColorRefle
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        // ⚡ Bolt: Performance optimization & Math fix
+        // Using .rsqrt() directly on the squared length computes x^(-1/2) correctly
+        // and saves an expensive .sqrt() call vs the previous .sqrt().rsqrt() which computed x^(-1/4).
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         // Normal components - evaluate at Jet3 construction boundary
         let nx = (cross_x * inv_n_len.clone()).constant();
@@ -793,7 +799,10 @@ where
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        // ⚡ Bolt: Performance optimization & Math fix
+        // Using .rsqrt() directly on the squared length computes x^(-1/2) correctly
+        // and saves an expensive .sqrt() call vs the previous .sqrt().rsqrt() which computed x^(-1/4).
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         let nx = (cross_x * inv_n_len.clone()).constant();
         let ny = (cross_y * inv_n_len.clone()).constant();
@@ -906,7 +915,10 @@ where
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        // ⚡ Bolt: Performance optimization & Math fix
+        // Using .rsqrt() directly on the squared length computes x^(-1/2) correctly
+        // and saves an expensive .sqrt() call vs the previous .sqrt().rsqrt() which computed x^(-1/4).
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         let nx = (cross_x * inv_n_len.clone()).constant();
         let ny = (cross_y * inv_n_len.clone()).constant();
