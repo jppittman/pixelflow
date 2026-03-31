@@ -13,6 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
-## 2024-05-17 - `.sqrt().rsqrt()` is an anti-pattern
-**Learning:** In `pixelflow-graphics`, computing the inverse length using `.sqrt().rsqrt()` on a `Field` type (AST node) incorrectly computes `x^(-1/4)` instead of the intended `x^(-1/2)`. It also introduces redundant AST node evaluation overhead.
-**Action:** Always use `.rsqrt()` directly on the squared value instead of `.sqrt().rsqrt()`.
+## 2026-03-31 - Optimize vector allocation with known capacity
+**Learning:** In the rendering hot path, building the layout tree by repeatedly pushing to a dynamically growing `Vec` causes unnecessary heap reallocations when the exact capacity is already known.
+**Action:** Use `Vec::with_capacity(rows)` and `Vec::with_capacity(cols)` instead of `Vec::new()` to prevent reallocation overhead when iterating over fixed grid dimensions in `terminal_app.rs`.
