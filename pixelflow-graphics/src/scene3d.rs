@@ -511,16 +511,7 @@ where
 
 /// Mask manifold for geometry hit detection.
 kernel!(pub struct GeometryMask = |geometry: kernel| Jet3 -> Field {
-    let t = geometry;
-    let t_max = 1000000.0;
-    let deriv_max = 10000.0;
-
-    // Valid if: t > 0, t < max, derivatives reasonable
-    let valid_t = (V(t) > 0.0) & (V(t) < t_max);
-    let deriv_mag_sq = DX(t) * DX(t) + DY(t) * DY(t) + DZ(t) * DZ(t);
-    let valid_deriv = deriv_mag_sq < (deriv_max * deriv_max);
-
-    valid_t & valid_deriv
+    pixelflow_core::V((V(geometry.clone()) > 0.0) & (V(geometry.clone()) < 1000000.0) & ((DX(geometry.clone()) * DX(geometry.clone()) + DY(geometry.clone()) * DY(geometry.clone()) + DZ(geometry.clone()) * DZ(geometry.clone())) < (10000.0 * 10000.0)))
 });
 
 impl<G, M> Scene for SceneObject<G, M>
@@ -652,7 +643,7 @@ impl<M: ManifoldCompat<Jet3, Output = Field>> Manifold<Jet3_4> for Reflect<M> {
         let r_z = d_jet_z - k * n_jet_z;
 
         // Recurse with curved reflected rays
-        self.inner.eval(r_x, r_y, r_z, w)
+        self.inner.eval((r_x, r_y, r_z, w))
     }
 }
 

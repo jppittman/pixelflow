@@ -265,7 +265,7 @@ impl<'a> LevelBuilder<'a> {
                         SymbolKind::Parameter => {
                             // Look up param kind
                             let param_kind = self.analyzed.def.params.iter()
-                                .find(|p| p.name.to_string() == name)
+                                .find(|p| p.name == name)
                                 .map(|p| p.kind.clone())
                                 .unwrap_or(ParamKind::Scalar(syn::parse_quote!(f32)));
                             // Scalar parameters are Const (captured at kernel creation)
@@ -301,14 +301,14 @@ impl<'a> LevelBuilder<'a> {
             AnnotatedExpr::Unary(unary) => {
                 let operand = self.assign_to_levels(&unary.operand, depths);
                 let operand_deps = self.get_deps(operand);
-                (LeveledNodeKind::Unary { op: unary.op.clone(), operand }, operand_deps)
+                (LeveledNodeKind::Unary { op: unary.op, operand }, operand_deps)
             }
 
             AnnotatedExpr::Binary(binary) => {
                 let left = self.assign_to_levels(&binary.lhs, depths);
                 let right = self.assign_to_levels(&binary.rhs, depths);
                 let deps = self.get_deps(left).join(self.get_deps(right));
-                (LeveledNodeKind::Binary { op: binary.op.clone(), left, right }, deps)
+                (LeveledNodeKind::Binary { op: binary.op, left, right }, deps)
             }
 
             AnnotatedExpr::MethodCall(call) => {
