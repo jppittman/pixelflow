@@ -13,6 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
-## 2025-12-28 - Avoid sqrt before rsqrt
-**Learning:** When computing inverse length or reciprocal square root using `Field` types in `pixelflow-graphics`, using `.sqrt().rsqrt()` incorrectly computes `x^(-1/4)` instead of the intended `x^(-1/2)`, introducing mathematical errors and redundant AST node evaluation overhead.
-**Action:** Use `.rsqrt()` directly instead of `.sqrt().rsqrt()` to save cycles, prevent mathematical bugs, and reduce AST complexity.
+## 2024-05-17 - `.sqrt().rsqrt()` is an anti-pattern
+**Learning:** In `pixelflow-graphics`, computing the inverse length using `.sqrt().rsqrt()` on a `Field` type (AST node) incorrectly computes `x^(-1/4)` instead of the intended `x^(-1/2)`. It also introduces redundant AST node evaluation overhead.
+**Action:** Always use `.rsqrt()` directly on the squared value instead of `.sqrt().rsqrt()`.
