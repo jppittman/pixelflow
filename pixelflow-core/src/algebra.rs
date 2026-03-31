@@ -558,26 +558,26 @@ mod tests {
     }
 
     #[test]
-    fn test_bool_algebra() {
-        assert_eq!(bool::zero(), false);
-        assert_eq!(bool::one(), true);
+    fn bool_algebra_should_evaluate_correctly_when_called() {
+        assert!(!bool::zero(), "bool::zero() should return false");
+        assert!(bool::one(), "bool::one() should return true");
 
         // Boolean ring (OR/AND)
-        assert_eq!(false.add(false), false);
-        assert_eq!(false.add(true), true);
-        assert_eq!(true.add(false), true);
-        assert_eq!(true.add(true), true);
+        assert!(!false.add(false), "false + false should return false");
+        assert!(false.add(true), "false + true should return true");
+        assert!(true.add(false), "true + false should return true");
+        assert!(true.add(true), "true + true should return true");
 
-        assert_eq!(false.mul(false), false);
-        assert_eq!(false.mul(true), false);
-        assert_eq!(true.mul(true), true);
+        assert!(!false.mul(false), "false * false should return false");
+        assert!(!false.mul(true), "false * true should return false");
+        assert!(true.mul(true), "true * true should return true");
 
-        assert_eq!(true.neg(), false);
-        assert_eq!(false.neg(), true);
+        assert!(!true.neg(), "!true should return false");
+        assert!(false.neg(), "!false should return true");
     }
 
     #[test]
-    fn test_u32_algebra() {
+    fn u32_algebra_should_evaluate_correctly_when_called() {
         assert_eq!(u32::zero(), 0);
         assert_eq!(u32::one(), 1);
         assert_eq!(2u32.add(3), 5);
