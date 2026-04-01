@@ -136,10 +136,9 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self) {
         unsafe {
-            let val = if ignore { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), YES);
         }
     }
 
@@ -266,10 +265,9 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn enable_layer(&self) {
         unsafe {
-            let val = if wants { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), YES);
         }
     }
 

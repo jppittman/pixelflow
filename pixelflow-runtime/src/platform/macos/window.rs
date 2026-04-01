@@ -60,7 +60,7 @@ impl MacWindow {
             sys::send_1::<(), Id>(view.0, sys::sel(b"setLayer:\0"), layer);
 
             // [view setWantsLayer: YES]
-            view.set_wants_layer(true);
+            view.enable_layer();
         }
 
         window.set_content_view(view);
@@ -122,13 +122,13 @@ impl MacWindow {
         }
     }
 
-    pub fn set_visible(&mut self, visible: bool) {
-        if visible {
-            self.window.make_key_and_order_front();
-        } else {
-            unsafe {
-                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
-            }
+    pub fn show(&mut self) {
+        self.window.make_key_and_order_front();
+    }
+
+    pub fn hide(&mut self) {
+        unsafe {
+            sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
         }
     }
 
