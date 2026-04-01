@@ -265,8 +265,10 @@ pub fn optimize_with_nnue(mut analyzed: AnalyzedKernel) -> AnalyzedKernel {
 
 /// Optimize a single expression using e-graph saturation and neural extraction.
 fn optimize_expr_with_nnue(expr: Expr, nnue: &ExprNnue) -> Expr {
-    // Treat the entire expression as a unit for global optimization
-    optimize_via_nnue(&expr, nnue)
+    match expr {
+        Expr::Block(block) => optimize_block_preserving_structure(block, nnue),
+        _ => optimize_via_nnue(&expr, nnue),
+    }
 }
 
 /// Optimize an expression via e-graph with neural extraction.
