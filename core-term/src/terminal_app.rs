@@ -740,7 +740,7 @@ pub fn spawn_terminal_app(
             };
             self.handle
                 .lock()
-                .unwrap()
+                .expect("Expected operation to succeed")
                 .send(msg)
                 .map_err(|e| pixelflow_runtime::error::RuntimeError::EventSendError(e.to_string()))
         }
@@ -931,7 +931,7 @@ mod tests {
         // We expect 'a' to be sent to PTY wrapped in PtyCommand::Write
         let received = pty_rx.try_recv();
         assert!(received.is_ok(), "Should receive data on PTY channel");
-        let cmd = received.unwrap();
+        let cmd = received.expect("Expected received command to be present");
         assert_eq!(cmd, PtyCommand::Write(vec![b'a']));
     }
 }

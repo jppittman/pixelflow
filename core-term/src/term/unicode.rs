@@ -26,7 +26,7 @@ impl LocaleInitializer {
             // Try UTF-8 locales in order of preference
             // Start with explicit UTF-8 locales since environment may be unset
             for locale in &["C.utf8", "C.UTF-8", "en_US.UTF-8", "en_US.utf8", ""] {
-                let locale_cstr = CString::new(*locale).unwrap();
+                let locale_cstr = CString::new(*locale).expect("Failed to create CString");
                 if !setlocale(LC_CTYPE, locale_cstr.as_ptr()).is_null() {
                     // Verify it actually works for CJK by testing a known wide char
                     if wcwidth('世' as c_uint) == 2 {
