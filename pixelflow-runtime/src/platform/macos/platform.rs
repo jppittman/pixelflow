@@ -45,7 +45,7 @@ impl MetalOps {
             app.set_activation_policy(NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
 
             app.finish_launching();
-            app.activate_ignoring_other_apps(true);
+            app.activate_ignoring_other_apps();
 
             app
         };
@@ -102,7 +102,11 @@ impl PlatformOps for MetalOps {
             }
             DisplayControl::SetVisible { id, visible } => {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    win.set_visible(visible);
+                    if visible {
+                        win.show();
+                    } else {
+                        win.hide();
+                    }
                 }
             }
             DisplayControl::RequestRedraw { id } => {
@@ -164,7 +168,7 @@ impl PlatformOps for MetalOps {
             }
             DisplayMgmt::Destroy { id } => {
                 if let Some(mut win) = self.windows.remove(&id) {
-                    win.set_visible(false);
+                    win.hide();
                     // Drop closes it implicitly or we call close
                     // win.window.close(); // If we expose it
                     self.window_map.remove(&(win.window.0 as usize));
@@ -217,7 +221,7 @@ impl PlatformOps for MetalOps {
                 u64::MAX,
                 until_date,
                 mode,
-                true, // dequeue
+                cocoa::EventDequeue::Dequeue,
             );
 
             // Release mode string
