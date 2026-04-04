@@ -558,22 +558,22 @@ mod tests {
     }
 
     #[test]
-    fn test_bool_algebra() {
-        assert_eq!(bool::zero(), false);
-        assert_eq!(bool::one(), true);
+    fn bool_algebra_should_return_expected_values_when_operations_applied() {
+        assert!(!bool::zero(), "bool::zero() must be false");
+        assert!(bool::one(), "bool::one() must be true");
 
         // Boolean ring (OR/AND)
-        assert_eq!(false.add(false), false);
-        assert_eq!(false.add(true), true);
-        assert_eq!(true.add(false), true);
-        assert_eq!(true.add(true), true);
+        assert!(!false.add(false), "false OR false must be false");
+        assert!(false.add(true), "false OR true must be true");
+        assert!(true.add(false), "true OR false must be true");
+        assert!(true.add(true), "true OR true must be true");
 
-        assert_eq!(false.mul(false), false);
-        assert_eq!(false.mul(true), false);
-        assert_eq!(true.mul(true), true);
+        assert!(!false.mul(false), "false AND false must be false");
+        assert!(!false.mul(true), "false AND true must be false");
+        assert!(true.mul(true), "true AND true must be true");
 
-        assert_eq!(true.neg(), false);
-        assert_eq!(false.neg(), true);
+        assert!(!true.neg(), "NOT true must be false");
+        assert!(false.neg(), "NOT false must be true");
     }
 
     #[test]
