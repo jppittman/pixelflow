@@ -356,8 +356,8 @@ mod tests {
     #[test]
     fn analyze_simple_kernel() {
         let input = quote! { |r: f32| X * X + Y * Y - r };
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
+        let analyzed = analyze(kernel).expect("Semantic analysis unexpectedly failed on a valid kernel structure");
 
         assert!(analyzed.symbols.is_parameter("r"));
         assert!(analyzed.symbols.is_intrinsic("X"));
@@ -368,11 +368,11 @@ mod tests {
     fn error_on_undefined_symbol() {
         // Named kernels reject undefined symbols (anonymous kernels allow captures)
         let input = quote! { struct Test = |r: f32| X * X + undefined_var };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("Semantic analysis should fail for undefined variables");
         assert!(err.to_string().contains("undefined symbol"));
     }
 
@@ -380,7 +380,7 @@ mod tests {
     fn anonymous_allows_captured_variables() {
         // Anonymous kernels allow captured variables from environment
         let input = quote! { |r: f32| X * X + captured_from_env };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
         assert!(result.is_ok(), "Anonymous kernels should allow captured variables");
     }
@@ -388,11 +388,11 @@ mod tests {
     #[test]
     fn error_on_shadowing_intrinsic() {
         let input = quote! { |X: f32| X * X }; // X shadows the intrinsic
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("Semantic analysis should prevent parameter names from shadowing built-in intrinsic variables");
         assert!(err.to_string().contains("shadows intrinsic"));
     }
 
@@ -404,7 +404,7 @@ mod tests {
                 dx * dx
             }
         };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
         assert!(result.is_ok());
     }
@@ -413,11 +413,11 @@ mod tests {
     fn typo_suggestion_for_intrinsic() {
         // Lowercase "x" should suggest uppercase "X" (named kernel rejects typos)
         let input = quote! { struct Test = || x * x };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
 
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("Semantic analysis expected an error here").to_string();
         assert!(err.contains("undefined symbol"));
         assert!(err.contains("did you mean 'X'"));
     }
@@ -426,11 +426,11 @@ mod tests {
     fn typo_suggestion_for_parameter() {
         // "radiu" should suggest "radius" (named kernel rejects typos)
         let input = quote! { struct Test = |radius: f32| X - radiu };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
 
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("Semantic analysis expected an error here").to_string();
         assert!(err.contains("undefined symbol"));
         // Similar names with 1-2 char difference should be suggested
     }
@@ -438,11 +438,11 @@ mod tests {
     #[test]
     fn error_on_unknown_method() {
         let input = quote! { |r: f32| X.unknownmethod() };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
 
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("Semantic analysis expected an error here").to_string();
         assert!(err.contains("unknown method"));
     }
 
@@ -450,11 +450,11 @@ mod tests {
     fn typo_suggestion_for_method() {
         // "sqrtt" should suggest "sqrt"
         let input = quote! { || X.sqrtt() };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
 
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("Semantic analysis expected an error here").to_string();
         assert!(err.contains("unknown method"));
     }
 
@@ -462,7 +462,7 @@ mod tests {
     fn known_methods_accepted() {
         // All ManifoldExt methods should be accepted
         let input = quote! { || X.sqrt().abs().sin().cos().clone() };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
         assert!(result.is_ok());
     }
@@ -470,11 +470,11 @@ mod tests {
     #[test]
     fn error_on_duplicate_parameter() {
         let input = quote! { |r: f32, r: f32| X - r };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Failed to parse test kernel expression");
         let result = analyze(kernel);
 
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.expect_err("Semantic analysis expected an error here").to_string();
         assert!(err.contains("duplicate parameter"));
     }
 }
