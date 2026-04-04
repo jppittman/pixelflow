@@ -167,7 +167,6 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-
     pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: EventDequeue) -> NSEvent {
         unsafe {
             let d = match dequeue {
@@ -205,8 +204,6 @@ impl NSWindow {
             Self(ptr)
         }
     }
-
-
 
     pub fn init_with_content_rect(
         &self,
