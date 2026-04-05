@@ -1659,74 +1659,50 @@ mod mutation_tests {
     #[test]
     fn csi_cursor_up_no_param_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[A");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]);
     }
 
     #[test]
     fn csi_cursor_up_param_zero_is_coerced_to_1() {
         // param_or_1 applies max(1), so 0 -> 1
         let cmds = process_bytes(b"\x1b[0A");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]);
     }
 
     #[test]
     fn csi_cursor_up_explicit_5() {
         let cmds = process_bytes(b"\x1b[5A");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorUp(5))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(5))]);
     }
 
     #[test]
     fn csi_cursor_down_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[B");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorDown(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorDown(1))]);
     }
 
     #[test]
     fn csi_cursor_forward_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[C");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorForward(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorForward(1))]);
     }
 
     #[test]
     fn csi_cursor_backward_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[D");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorBackward(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorBackward(1))]);
     }
 
     #[test]
     fn csi_cursor_next_line_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[E");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorNextLine(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorNextLine(1))]);
     }
 
     #[test]
     fn csi_cursor_prev_line_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[F");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorPrevLine(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorPrevLine(1))]);
     }
 
     #[test]
@@ -1778,37 +1754,25 @@ mod mutation_tests {
     #[test]
     fn csi_erase_in_display_no_param_defaults_to_0() {
         let cmds = process_bytes(b"\x1b[J");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(0))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(0))]);
     }
 
     #[test]
     fn csi_erase_in_display_explicit_2() {
         let cmds = process_bytes(b"\x1b[2J");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(2))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(2))]);
     }
 
     #[test]
     fn csi_erase_in_line_no_param_defaults_to_0() {
         let cmds = process_bytes(b"\x1b[K");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::EraseInLine(0))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInLine(0))]);
     }
 
     #[test]
     fn csi_erase_in_line_explicit_1() {
         let cmds = process_bytes(b"\x1b[1K");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::EraseInLine(1))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInLine(1))]);
     }
 
     // -----------------------------------------------------------------------
@@ -1887,7 +1851,11 @@ mod mutation_tests {
         if let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() {
             // Checking len kills mutations that reduce MAX_PARAMS below 16.
             assert_eq!(attrs.len(), 16, "all 16 params must be retained");
-            assert_eq!(attrs[0], Attribute::Bold, "first of 16 params should be Bold");
+            assert_eq!(
+                attrs[0],
+                Attribute::Bold,
+                "first of 16 params should be Bold"
+            );
             assert_eq!(
                 attrs[1],
                 Attribute::Faint,
@@ -1903,8 +1871,7 @@ mod mutation_tests {
         // 16 zeros then ;7 (Reverse). The 17th param (7) must be ignored.
         // We send: ESC [ 0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m
         //          that's 16 zeros + 1 extra -> the 7 (Reverse) is the 17th and dropped.
-        let cmds =
-            process_bytes(b"\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m");
+        let cmds = process_bytes(b"\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m");
         if let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() {
             // Every kept attribute should be Reset (0); Reverse (7) must NOT appear.
             assert!(
@@ -2080,28 +2047,19 @@ mod mutation_tests {
     #[test]
     fn csi_ctc_0_is_set_tab_stop() {
         let cmds = process_bytes(b"\x1b[0W");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetTabStop)]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::SetTabStop)]);
     }
 
     #[test]
     fn csi_ctc_2_clears_current_tab_stop() {
         let cmds = process_bytes(b"\x1b[2W");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(0))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(0))]);
     }
 
     #[test]
     fn csi_ctc_5_clears_all_tab_stops() {
         let cmds = process_bytes(b"\x1b[5W");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(3))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(3))]);
     }
 
     // -----------------------------------------------------------------------
@@ -2112,19 +2070,13 @@ mod mutation_tests {
     #[test]
     fn csi_s_uppercase_is_scroll_up() {
         let cmds = process_bytes(b"\x1b[3S");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::ScrollUp(3))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ScrollUp(3))]);
     }
 
     #[test]
     fn csi_t_uppercase_is_scroll_down() {
         let cmds = process_bytes(b"\x1b[3T");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::ScrollDown(3))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ScrollDown(3))]);
     }
 
     // -----------------------------------------------------------------------
@@ -2135,28 +2087,19 @@ mod mutation_tests {
     #[test]
     fn csi_at_is_insert_character() {
         let cmds = process_bytes(b"\x1b[2@");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::InsertCharacter(2))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::InsertCharacter(2))]);
     }
 
     #[test]
     fn csi_p_uppercase_is_delete_character() {
         let cmds = process_bytes(b"\x1b[2P");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::DeleteCharacter(2))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::DeleteCharacter(2))]);
     }
 
     #[test]
     fn csi_x_uppercase_is_erase_character() {
         let cmds = process_bytes(b"\x1b[2X");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::EraseCharacter(2))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseCharacter(2))]);
     }
 
     // -----------------------------------------------------------------------
@@ -2166,19 +2109,13 @@ mod mutation_tests {
     #[test]
     fn csi_l_uppercase_is_insert_line() {
         let cmds = process_bytes(b"\x1b[4L");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::InsertLine(4))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::InsertLine(4))]);
     }
 
     #[test]
     fn csi_m_uppercase_is_delete_line() {
         let cmds = process_bytes(b"\x1b[4M");
-        assert_eq!(
-            cmds,
-            vec![AnsiCommand::Csi(CsiCommand::DeleteLine(4))]
-        );
+        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::DeleteLine(4))]);
     }
 
     // -----------------------------------------------------------------------
