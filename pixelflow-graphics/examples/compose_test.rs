@@ -1,11 +1,16 @@
 //! Testing kernel composition patterns
-use pixelflow_core::{Field, Manifold};
 use pixelflow_compiler::kernel;
+use pixelflow_core::{Field, Manifold};
 
 type Field4 = (Field, Field, Field, Field);
 
 fn field4(x: f32, y: f32) -> Field4 {
-    (Field::from(x), Field::from(y), Field::from(0.0), Field::from(0.0))
+    (
+        Field::from(x),
+        Field::from(y),
+        Field::from(0.0),
+        Field::from(0.0),
+    )
 }
 
 fn main() {
@@ -33,5 +38,8 @@ fn main() {
 
     let c = circle(1.0, 2.0, 0.5);
     let result2 = c.eval(p);
-    println!("circle(center=(1.0, 2.0), r=0.5) at (1.5, 2.0): {:?}", result2);
+    println!(
+        "circle(center=(1.0, 2.0), r=0.5) at (1.5, 2.0): {:?}",
+        result2
+    );
 }

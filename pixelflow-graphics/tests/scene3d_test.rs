@@ -5,10 +5,10 @@
 //! 2. Surface: Warps `P = ray * t` - creates tangent frame via chain rule
 //! 3. Material: Reconstructs normal from derivatives - Reflect, Checker, Sky
 
+use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::combinators::At;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Discrete, Field, Manifold, ManifoldCompat, ManifoldExt};
-use pixelflow_compiler::ManifoldExpr;
 
 type Field4 = (Field, Field, Field, Field);
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);
@@ -16,8 +16,8 @@ use pixelflow_graphics::render::color::{Rgba8, RgbaColorCube};
 use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
 use pixelflow_graphics::scene3d::{
-    Checker, ColorChecker, ColorReflect, ColorScreenToDir, ColorSky, ColorSurface, plane,
-    Reflect, ScreenToDir, sky, Surface,
+    plane, sky, Checker, ColorChecker, ColorReflect, ColorScreenToDir, ColorSky, ColorSurface,
+    Reflect, ScreenToDir, Surface,
 };
 use std::fs::File;
 use std::io::Write;
@@ -120,7 +120,9 @@ fn test_chrome_unit_sphere() {
             center: (0.0, 0.0, 4.0),
             radius: 1.0,
         },
-        material: Reflect { inner: world.clone() },
+        material: Reflect {
+            inner: world.clone(),
+        },
         background: world,
     };
 
@@ -291,7 +293,9 @@ fn test_color_chrome_sphere() {
             center: (0.0, 0.0, 4.0),
             radius: 1.0,
         },
-        material: ColorReflect { inner: world.clone() },
+        material: ColorReflect {
+            inner: world.clone(),
+        },
         background: world,
     };
 
@@ -450,7 +454,9 @@ fn test_mullet_vs_3channel_comparison() {
                         center: (0.0, 0.0, 4.0),
                         radius: 1.0,
                     },
-                    material: Reflect { inner: world.clone() },
+                    material: Reflect {
+                        inner: world.clone(),
+                    },
                     background: world,
                 },
             },
@@ -533,7 +539,9 @@ fn test_mullet_vs_3channel_comparison() {
                     center: (0.0, 0.0, 4.0),
                     radius: 1.0,
                 },
-                material: ColorReflect { inner: world.clone() },
+                material: ColorReflect {
+                    inner: world.clone(),
+                },
                 background: world,
             },
         },
@@ -616,7 +624,9 @@ fn test_work_stealing_benchmark() {
             center: (0.0, 0.0, 4.0),
             radius: 1.0,
         },
-        material: ColorReflect { inner: world.clone() },
+        material: ColorReflect {
+            inner: world.clone(),
+        },
         background: world,
     };
 
