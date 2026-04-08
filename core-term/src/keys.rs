@@ -41,7 +41,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_key_found() {
+    fn map_key_found_should_succeed_when_invoked() {
         let bindings = vec![
             Keybinding {
                 key: KeySymbol::Char('C'),
@@ -69,7 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_key_not_found_symbol_mismatch() {
+    fn map_key_not_found_symbol_mismatch_should_succeed_when_invoked() {
         let bindings = vec![Keybinding {
             key: KeySymbol::Char('C'),
             mods: Modifiers::CONTROL | Modifiers::SHIFT,
@@ -86,7 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_key_not_found_modifier_mismatch() {
+    fn map_key_not_found_modifier_mismatch_should_succeed_when_invoked() {
         let bindings = vec![Keybinding {
             key: KeySymbol::Char('C'),
             mods: Modifiers::CONTROL | Modifiers::SHIFT,
@@ -99,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_key_not_found_empty_bindings() {
+    fn map_key_not_found_empty_bindings_should_succeed_when_invoked() {
         let config = config_with_bindings(vec![]);
         let result = map_key_event_to_action(
             KeySymbol::Char('C'),
@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn test_map_key_multiple_bindings_first_match() {
+    fn map_key_multiple_bindings_first_match_should_succeed_when_invoked() {
         let bindings = vec![
             Keybinding {
                 key: KeySymbol::Char('A'),
