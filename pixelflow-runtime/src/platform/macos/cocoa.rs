@@ -6,6 +6,19 @@
 use super::sys::{self, Id, BOOL, NO, YES};
 use std::ffi::c_void;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EventDequeue {
+    Dequeue,
+    Peek,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WindowDeferral {
+    Defer,
+    Immediate,
+}
+
+
 // --- Helpers ---
 
 /// Convert Rust string to NSString id.
@@ -136,9 +149,9 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = YES;
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -156,9 +169,9 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: EventDequeue) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = if dequeue == EventDequeue::Dequeue { YES } else { NO };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -190,10 +203,10 @@ impl NSWindow {
         rect: NSRect,
         style_mask: u64,
         backing: u64,
-        defer: bool,
+        defer: WindowDeferral,
     ) -> Self {
         unsafe {
-            let d = if defer { YES } else { NO };
+            let d = if defer == WindowDeferral::Defer { YES } else { NO };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
@@ -266,9 +279,9 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn enable_layer(&self) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = YES;
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }
