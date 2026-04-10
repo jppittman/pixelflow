@@ -231,8 +231,8 @@ fn it_should_print_a_single_multibyte_unicode_character() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["世        "], Some((0, 2)));
-    let glyph_1_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-    let glyph_2_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let glyph_1_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present");
+    let glyph_2_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present");
     match glyph_1_wrapper {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
         other => panic!("Expected WidePrimary '世' at (0,0), got {:?}", other),
@@ -256,8 +256,8 @@ fn it_should_print_multiple_multibyte_unicode_characters() {
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["你好      "], Some((0, 4)));
 
-    let char1_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-    let char1_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let char1_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present");
+    let char1_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present");
     match char1_glyph1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '你'),
         _ => panic!("Expected WidePrimary at (0,0)"),
@@ -267,8 +267,8 @@ fn it_should_print_multiple_multibyte_unicode_characters() {
         "Expected WideSpacer at (0,1)"
     );
 
-    let char2_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 2).unwrap();
-    let char2_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 3).unwrap();
+    let char2_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 2).expect("Expected value to be present");
+    let char2_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 3).expect("Expected value to be present");
     match char2_glyph1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '好'),
         _ => panic!("Expected WidePrimary at (0,2)"),
@@ -288,14 +288,14 @@ fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["A世B      "], Some((0, 4)));
 
-    let glyph_a = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    let glyph_a = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present");
     match glyph_a {
         Glyph::Single(cell) => assert_eq!(cell.c, 'A'),
         _ => panic!("Expected Single 'A' at (0,0)"),
     }
 
-    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
-    let glyph_uni_2 = get_glyph_from_snapshot(&snapshot, 0, 2).unwrap();
+    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present");
+    let glyph_uni_2 = get_glyph_from_snapshot(&snapshot, 0, 2).expect("Expected value to be present");
     match glyph_uni_1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
         _ => panic!("Expected WidePrimary '世' at (0,1)"),
@@ -305,7 +305,7 @@ fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
         "Expected WideSpacer at (0,2)"
     );
 
-    let glyph_b = get_glyph_from_snapshot(&snapshot, 0, 3).unwrap();
+    let glyph_b = get_glyph_from_snapshot(&snapshot, 0, 3).expect("Expected value to be present");
     match glyph_b {
         Glyph::Single(cell) => assert_eq!(cell.c, 'B'),
         _ => panic!("Expected Single 'B' at (0,3)"),
@@ -337,13 +337,13 @@ fn it_should_not_print_second_half_of_wide_char_if_at_edge_and_no_wrap_mode_or_s
     // Screen is "世". Cursor logical (0,2), physical (0,1).
     assert_screen_state(&snapshot, &["世"], Some((0, 1))); // assert_screen_state handles wide char checks
 
-    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present");
     match glyph_uni_1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
         _ => panic!("Expected WidePrimary '世' at (0,0)"),
     }
     if snapshot.dimensions.0 > 1 {
-        let glyph_uni_2 = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+        let glyph_uni_2 = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present");
         assert!(
             matches!(glyph_uni_2, Glyph::WideSpacer),
             "Expected WideSpacer at (0,1)"
@@ -362,12 +362,12 @@ fn it_should_overwrite_first_half_of_wide_char_with_ascii() {
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["X    "], Some((0, 1))); // assert_screen_state handles this
 
-    let glyph_x = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    let glyph_x = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present");
     match glyph_x {
         Glyph::Single(cell) => assert_eq!(cell.c, 'X'),
         _ => panic!("Expected Single 'X' at (0,0)"),
     }
-    let glyph_after_x = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let glyph_after_x = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present");
     match glyph_after_x {
         Glyph::Single(cell) => {
             assert_eq!(
@@ -467,10 +467,10 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
     let s4 = term.get_render_snapshot().expect("Snapshot was None");
     // Screen: ["世Z", "X "]. Cursor (0,2) (row 0, col 2)
     // Check s4 screen content directly
-    let glyph_s4_0_0 = get_glyph_from_snapshot(&s4, 0, 0).unwrap();
-    let glyph_s4_0_1 = get_glyph_from_snapshot(&s4, 0, 1).unwrap();
-    let glyph_s4_1_0 = get_glyph_from_snapshot(&s4, 1, 0).unwrap();
-    let glyph_s4_1_1 = get_glyph_from_snapshot(&s4, 1, 1).unwrap();
+    let glyph_s4_0_0 = get_glyph_from_snapshot(&s4, 0, 0).expect("Expected value to be present");
+    let glyph_s4_0_1 = get_glyph_from_snapshot(&s4, 0, 1).expect("Expected value to be present");
+    let glyph_s4_1_0 = get_glyph_from_snapshot(&s4, 1, 0).expect("Expected value to be present");
+    let glyph_s4_1_1 = get_glyph_from_snapshot(&s4, 1, 1).expect("Expected value to be present");
 
     match glyph_s4_0_0 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
@@ -496,7 +496,7 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
         "s4 cursor position mismatch"
     );
 
-    let glyph_at_0_0 = get_glyph_from_snapshot(&s4, 0, 0).unwrap();
+    let glyph_at_0_0 = get_glyph_from_snapshot(&s4, 0, 0).expect("Expected value to be present");
     assert!(
         matches!(glyph_at_0_0, Glyph::WidePrimary(_)),
         "Expected WidePrimary at (0,0)"
@@ -505,7 +505,7 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
         assert_eq!(cell.c, '世');
     }
 
-    let glyph_at_0_1 = get_glyph_from_snapshot(&s4, 0, 1).unwrap();
+    let glyph_at_0_1 = get_glyph_from_snapshot(&s4, 0, 1).expect("Expected value to be present");
     match glyph_at_0_1 {
         Glyph::Single(cell) => assert_eq!(cell.c, 'Z'),
         _ => panic!("Expected Single at (0,1)"),
@@ -1520,7 +1520,7 @@ fn it_should_scroll_up_entire_screen_by_1_line_on_csi_s_with_param_0_or_1() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Expected value to be present")
     .display_char();
     assert_eq!(initial_screen_line0_char0, 'A');
 
@@ -1562,7 +1562,7 @@ fn it_should_scroll_up_within_scrolling_region_on_csi_s() {
         .expect("Snapshot was None")
         .cursor_state
         .map(|cs| (cs.y, cs.x))
-        .unwrap();
+        .expect("Expected value to be present");
     assert_eq!(
         cursor_after_stbm,
         (0, 0),
@@ -1661,7 +1661,7 @@ fn it_should_scroll_down_within_scrolling_region_on_csi_t() {
         .expect("Snapshot was None")
         .cursor_state
         .map(|cs| (cs.y, cs.x))
-        .unwrap();
+        .expect("Expected value to be present");
     assert_eq!(
         cursor_after_stbm,
         (0, 0),
@@ -1912,7 +1912,7 @@ fn it_should_show_and_hide_cursor_on_dectcem() {
     );
     // Ensure shape is restored (assuming Block is default)
     assert_eq!(
-        snapshot_shown.cursor_state.unwrap().shape,
+        snapshot_shown.cursor_state.expect("Expected value to be present").shape,
         CursorShape::Block
     );
 }
@@ -2167,8 +2167,8 @@ fn it_should_reset_all_attributes_on_sgr_0() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Print after reset
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let glyph_a_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-    let glyph_b_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let glyph_a_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present");
+    let glyph_b_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present");
 
     let (attr_a, attr_b) = match (glyph_a_wrapper, glyph_b_wrapper) {
         (Glyph::Single(cell_a), Glyph::Single(cell_b)) => (cell_a.attr, cell_b.attr),
@@ -2208,11 +2208,11 @@ fn it_should_set_bold_on_sgr_1_and_reset_on_sgr_22() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2247,11 +2247,11 @@ fn it_should_set_faint_on_sgr_2_and_reset_on_sgr_22() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2285,11 +2285,11 @@ fn it_should_set_italic_on_sgr_3_and_reset_on_sgr_23() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2319,11 +2319,11 @@ fn it_should_set_underline_on_sgr_4_and_reset_on_sgr_24() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2362,7 +2362,7 @@ fn it_should_set_basic_ansi_foreground_colors_sgr_30_37() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).expect("Expected value to be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2403,7 +2403,7 @@ fn it_should_set_bright_ansi_foreground_colors_sgr_90_97() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in bright_colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).expect("Expected value to be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2431,7 +2431,7 @@ fn it_should_set_indexed_foreground_color_sgr_38_5_n() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Expected value to be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2451,7 +2451,7 @@ fn it_should_set_rgb_foreground_color_sgr_38_2_r_g_b() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Expected value to be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2475,11 +2475,11 @@ fn it_should_reset_foreground_color_on_sgr_39() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Default fg 'B'
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2512,7 +2512,7 @@ fn it_should_set_basic_ansi_background_colors_sgr_40_47() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).expect("Expected value to be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2553,7 +2553,7 @@ fn it_should_set_bright_ansi_background_colors_sgr_100_107() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in bright_colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).expect("Expected value to be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2581,7 +2581,7 @@ fn it_should_set_indexed_background_color_sgr_48_5_n() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Expected value to be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2601,7 +2601,7 @@ fn it_should_set_rgb_background_color_sgr_48_2_r_g_b() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Expected value to be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2625,11 +2625,11 @@ fn it_should_reset_background_color_on_sgr_49() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Default bg 'B'
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2661,11 +2661,11 @@ fn it_should_set_inverse_on_sgr_7_and_reset_on_sgr_27() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Not inverse B: fg=Red, bg=Blue
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Expected value to be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2707,7 +2707,7 @@ fn it_should_set_multiple_attributes_in_one_sgr_sequence() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Expected value to be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
