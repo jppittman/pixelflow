@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Fast Inverse Square Root Optimization and Pre-allocation
+**Learning:** Some graphics routines in `scene3d.rs` were redundantly calculating `x.sqrt().rsqrt()` instead of just `x.rsqrt()` when calculating $1/||n||$ from `n_len_sq`. Also, `Vec::new()` was being used inside a hot loop in `core-term/src/terminal_app.rs` when the capacity (`rows` and `cols`) was already known, causing unnecessary heap allocations.
+**Action:** Replaced `.sqrt().rsqrt()` with `.rsqrt()` for mathematically correct and faster inverse length computation. Replaced `Vec::new()` with `Vec::with_capacity()` in rendering inner loops.
