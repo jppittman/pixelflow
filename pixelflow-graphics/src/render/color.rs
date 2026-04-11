@@ -206,9 +206,21 @@ const fn generate_palette() -> [u32; 256] {
             let r_comp = (cube_idx / (COLOR_CUBE_SIZE * COLOR_CUBE_SIZE)) % COLOR_CUBE_SIZE;
             let g_comp = (cube_idx / COLOR_CUBE_SIZE) % COLOR_CUBE_SIZE;
             let b_comp = cube_idx % COLOR_CUBE_SIZE;
-            let r_val = if r_comp == 0 { 0 } else { r_comp * CUBE_SCALE_FACTOR + CUBE_BASE_OFFSET };
-            let g_val = if g_comp == 0 { 0 } else { g_comp * CUBE_SCALE_FACTOR + CUBE_BASE_OFFSET };
-            let b_val = if b_comp == 0 { 0 } else { b_comp * CUBE_SCALE_FACTOR + CUBE_BASE_OFFSET };
+            let r_val = if r_comp == 0 {
+                0
+            } else {
+                r_comp * CUBE_SCALE_FACTOR + CUBE_BASE_OFFSET
+            };
+            let g_val = if g_comp == 0 {
+                0
+            } else {
+                g_comp * CUBE_SCALE_FACTOR + CUBE_BASE_OFFSET
+            };
+            let b_val = if b_comp == 0 {
+                0
+            } else {
+                b_comp * CUBE_SCALE_FACTOR + CUBE_BASE_OFFSET
+            };
             (r_val, g_val, b_val)
         } else {
             // Grayscale ramp (indices 232-255)
