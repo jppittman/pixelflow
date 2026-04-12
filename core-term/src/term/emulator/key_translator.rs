@@ -162,7 +162,7 @@ mod tests {
     use crate::term::modes::DecPrivateModes;
 
     #[test]
-    fn test_simple_chars() {
+    fn simple_chars_should_succeed_when_called() {
         let modes = DecPrivateModes::default();
         assert_eq!(
             translate_key_input(
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_chars() {
+    fn ctrl_chars_should_succeed_when_called() {
         let modes = DecPrivateModes::default();
         // Test Ctrl+c
         assert_eq!(
@@ -195,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alt_chars() {
+    fn alt_chars_should_succeed_when_called() {
         let modes = DecPrivateModes::default();
         assert_eq!(
             translate_key_input(KeySymbol::Char('a'), Modifiers::ALT, None, &modes),
@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_keys_normal_mode() {
+    fn arrow_keys_normal_mode_should_succeed_when_called() {
         let mut modes = DecPrivateModes::default();
         modes.cursor_keys_app_mode = false;
         assert_eq!(
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_keys_app_mode() {
+    fn arrow_keys_app_mode_should_succeed_when_called() {
         let mut modes = DecPrivateModes::default();
         modes.cursor_keys_app_mode = true;
         assert_eq!(
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_tab() {
+    fn shift_tab_should_succeed_when_called() {
         let modes = DecPrivateModes::default();
         assert_eq!(
             translate_key_input(KeySymbol::Tab, Modifiers::SHIFT, None, &modes),

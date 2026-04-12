@@ -403,7 +403,7 @@ mod tests {
     use pixelflow_ir::OpKind;
 
     #[test]
-    fn test_optimize_identity_add() {
+    fn optimize_identity_add_should_succeed_when_called() {
         // x + 0 should simplify to x
         let expr = Expr::Binary(
             OpKind::Add,
@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_mul_zero() {
+    fn optimize_mul_zero_should_succeed_when_called() {
         // x * 0 should simplify to 0
         let expr = Expr::Binary(
             OpKind::Mul,
@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_complex_expression() {
+    fn optimize_complex_expression_should_succeed_when_called() {
         // (x + 0) * (y * 1) - should simplify to x * y
         let expr = Expr::Binary(
             OpKind::Mul,
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_presets() {
+    fn config_presets_should_succeed_when_called() {
         let fast = OptimizeConfig::fast();
         let thorough = OptimizeConfig::thorough();
 

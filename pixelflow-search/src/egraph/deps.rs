@@ -240,7 +240,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_deps_lattice() {
+    fn deps_lattice_should_succeed_when_called() {
         assert_eq!(Deps::Const.join(Deps::Const), Deps::Const);
         assert_eq!(Deps::Const.join(Deps::Uniform), Deps::Uniform);
         assert_eq!(Deps::Const.join(Deps::Varying), Deps::Varying);
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_var_deps() {
+    fn var_deps_should_succeed_when_called() {
         assert_eq!(var_deps(var::X), Deps::Varying);
         assert_eq!(var_deps(var::Y), Deps::Varying);
         assert_eq!(var_deps(var::Z), Deps::Varying);
@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_const_analysis() {
+    fn const_analysis_should_succeed_when_called() {
         let mut eg = EGraph::new();
         let c = eg.add(ENode::constant(42.0));
 
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uniform_analysis() {
+    fn uniform_analysis_should_succeed_when_called() {
         let mut eg = EGraph::new();
         let w = eg.add(ENode::Var(var::W));
         let two = eg.add(ENode::constant(2.0));
@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_varying_analysis() {
+    fn varying_analysis_should_succeed_when_called() {
         let mut eg = EGraph::new();
         let x = eg.add(ENode::Var(var::X));
         let y = eg.add(ENode::Var(var::Y));
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_deps() {
+    fn mixed_deps_should_succeed_when_called() {
         // (W * 2.0).sin() + X should be Varying
         // but (W * 2.0).sin() should be Uniform (hoistable)
         let mut eg = EGraph::new();

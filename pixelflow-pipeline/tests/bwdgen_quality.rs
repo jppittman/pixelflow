@@ -52,7 +52,7 @@ fn expr_depth(expr: &Expr) -> usize {
 
 #[test]
 #[ignore]
-fn test_bwdgen_quality() {
+fn bwdgen_quality_should_succeed_when_called() {
     let config = BwdGenConfig::default();
     let templates = RuleTemplates::new();
     let mut generator = BwdGenerator::new(42, config, templates);
@@ -115,7 +115,7 @@ fn test_bwdgen_quality() {
     eprintln!("Too high (>1000ns): {too_high}");
 
     if !bench_times.is_empty() {
-        bench_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        bench_times.sort_by(|a, b| a.partial_cmp(b).expect("Expected value but got None/Err"));
         let median = bench_times[bench_times.len() / 2];
         let min = bench_times[0];
         let max = bench_times[bench_times.len() - 1];

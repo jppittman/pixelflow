@@ -216,8 +216,8 @@ mod tests {
         let slot = PodSlot::connected();
         let mut svc = ServiceHandle::new(svc_handle, slot);
 
-        svc.send(Message::Data(42)).unwrap();
-        svc.send(Message::Control(1)).unwrap();
+        svc.send(Message::Data(42)).expect("Expected value but got None/Err");
+        svc.send(Message::Control(1)).expect("Expected value but got None/Err");
 
         drop(svc);
         kill_and_join(kill, pod);
@@ -250,7 +250,7 @@ mod tests {
         assert_eq!(result, Err(ServiceError::Reconnected));
 
         // Endpoint is refreshed; next send succeeds
-        svc.send(Message::Data(100)).unwrap();
+        svc.send(Message::Data(100)).expect("Expected value but got None/Err");
     }
 
     #[test]

@@ -583,7 +583,7 @@ mod debug_tests {
     fn field_debug_should_produce_output() {
         let f = Field::from(42.0);
         let mut s = String::new();
-        write!(s, "{:?}", f).unwrap();
+        write!(s, "{:?}", f).expect("Expected value but got None/Err");
         assert!(!s.is_empty());
     }
 }

@@ -152,19 +152,19 @@ fn vsync_command_start_stop_lifecycle() {
     });
 
     // Test lifecycle
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10));
-    tx.send(Message::Control(VsyncCommand::Stop)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Stop)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10));
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10));
-    tx.send(Message::Control(VsyncCommand::Shutdown)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Shutdown)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(20));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     assert!(log.contains(&"started".to_string()), "Should have started");
     assert!(log.contains(&"stopped".to_string()), "Should have stopped");
     assert!(
@@ -187,17 +187,17 @@ fn vsync_command_update_refresh_rate() {
     });
 
     tx.send(Message::Control(VsyncCommand::UpdateRefreshRate(120.0)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
     tx.send(Message::Control(VsyncCommand::UpdateRefreshRate(144.0)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
     tx.send(Message::Control(VsyncCommand::UpdateRefreshRate(60.0)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     assert!(log.iter().any(|s| s.contains("120.0")));
     assert!(log.iter().any(|s| s.contains("144.0")));
     assert!(log.iter().any(|s| s.contains("60.0")));
@@ -218,13 +218,13 @@ fn vsync_command_request_fps() {
 
     let (fps_tx, fps_rx) = mpsc::channel();
     tx.send(Message::Control(VsyncCommand::RequestCurrentFPS(fps_tx)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
-    let fps = fps_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let fps = fps_rx.recv_timeout(Duration::from_millis(100)).expect("Expected value but got None/Err");
     assert!(fps >= 0.0, "FPS should be non-negative");
 
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 }
 
 // ============================================================================
@@ -245,16 +245,16 @@ fn token_bucket_starts_full() {
     });
 
     // Start and tick 3 times (should consume all tokens)
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     for _ in 0..3 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     let tick_logs: Vec<_> = log.iter().filter(|s| s.starts_with("tick:")).collect();
 
     // Should have 3 ticks (all tokens consumed)
@@ -275,16 +275,16 @@ fn token_bucket_blocks_when_empty() {
     });
 
     // Start and send more ticks than tokens
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     for _ in 0..10 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     let tick_logs: Vec<_> = log.iter().filter(|s| s.starts_with("tick:")).collect();
 
     // Should only process MAX_TOKENS ticks (no rendered responses to replenish)
@@ -310,12 +310,12 @@ fn token_bucket_replenishes_on_rendered_response() {
     });
 
     // Start
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10)); // Wait for start to process
 
     // Consume all tokens
     for _ in 0..3 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
     thread::sleep(Duration::from_millis(10)); // Wait for ticks to process
 
@@ -326,20 +326,20 @@ fn token_bucket_replenishes_on_rendered_response() {
             frame_number: i,
             rendered_at: Instant::now(),
         }))
-        .unwrap();
+        .expect("Expected value but got None/Err");
     }
     thread::sleep(Duration::from_millis(10)); // Wait for replenishment
 
     // Should be able to tick 2 more times (we have 2 tokens from replenishment)
     for _ in 0..5 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     let tick_logs: Vec<_> = log.iter().filter(|s| s.starts_with("tick:")).collect();
 
     // 3 initial + 2 after replenishment = 5
@@ -369,22 +369,22 @@ fn token_bucket_does_not_exceed_max() {
             frame_number: i,
             rendered_at: Instant::now(),
         }))
-        .unwrap();
+        .expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(20));
 
     // Now start and tick many times
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     for _ in 0..20 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     let tick_logs: Vec<_> = log.iter().filter(|s| s.starts_with("tick:")).collect();
 
     // Should still only have MAX_TOKENS worth of ticks
@@ -414,14 +414,14 @@ fn tick_does_nothing_when_not_running() {
 
     // Don't start, just tick
     for _ in 0..5 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     let tick_logs: Vec<_> = log.iter().filter(|s| s.starts_with("tick:")).collect();
 
     assert!(
@@ -444,30 +444,30 @@ fn tick_resumes_after_stop_and_start() {
     });
 
     // Start and tick
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10)); // Wait for start to process
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10)); // Wait for tick to process
 
     // Stop
-    tx.send(Message::Control(VsyncCommand::Stop)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Stop)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10)); // Wait for stop to process
 
     // Tick while stopped (should not count)
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10)); // Wait for ticks to be processed (but ignored)
 
     // Restart and tick
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(10)); // Wait for restart
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     let tick_logs: Vec<_> = log.iter().filter(|s| s.starts_with("tick:")).collect();
 
     // 1 before stop + 1 after restart = 2
@@ -513,16 +513,16 @@ fn set_config_auto_starts_actor() {
         engine_handle,
         self_handle,
     }))
-    .unwrap();
+    .expect("Expected value but got None/Err");
 
     // After SetConfig, should auto-start - ticks should work
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     assert!(
         log.iter().any(|s| s.contains("auto_started")),
         "SetConfig should auto-start the actor"
@@ -635,7 +635,7 @@ fn multiple_senders_to_vsync_actor() {
     });
 
     let s1 = thread::spawn(move || {
-        tx1.send(Message::Control(VsyncCommand::Start)).unwrap();
+        tx1.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
     });
     let s2 = thread::spawn(move || {
         for i in 0..5 {
@@ -643,25 +643,25 @@ fn multiple_senders_to_vsync_actor() {
                 frame_number: i,
                 rendered_at: Instant::now(),
             }))
-            .unwrap();
+            .expect("Expected value but got None/Err");
         }
     });
     let s3 = thread::spawn(move || {
         for _ in 0..5 {
             tx3.send(Message::Management(VsyncManagement::Tick))
-                .unwrap();
+                .expect("Expected value but got None/Err");
         }
     });
 
-    s1.join().unwrap();
-    s2.join().unwrap();
-    s3.join().unwrap();
+    s1.join().expect("Expected value but got None/Err");
+    s2.join().expect("Expected value but got None/Err");
+    s3.join().expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     assert!(!log.is_empty(), "Should have processed some messages");
 }
 
@@ -683,10 +683,10 @@ fn fps_calculation_resets_after_one_second() {
     });
 
     // Start and send some ticks
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
-    tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
+    tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
 
     // Wait for FPS calculation to reset (1 second)
     thread::sleep(Duration::from_millis(1100));
@@ -694,15 +694,15 @@ fn fps_calculation_resets_after_one_second() {
     // Request FPS
     let (fps_tx, fps_rx) = mpsc::channel();
     tx.send(Message::Control(VsyncCommand::RequestCurrentFPS(fps_tx)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
-    let fps = fps_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let fps = fps_rx.recv_timeout(Duration::from_millis(100)).expect("Expected value but got None/Err");
     // Should be approximately 3 FPS (3 frames in ~1 second)
     // But might be slightly different due to timing
     assert!(fps >= 0.0, "FPS should be non-negative after reset");
 
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 }
 
 // ============================================================================
@@ -738,7 +738,7 @@ fn shutdown_stops_processing_immediately() {
     });
 
     // Send shutdown then more messages
-    tx.send(Message::Control(VsyncCommand::Shutdown)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Shutdown)).expect("Expected value but got None/Err");
 
     // These should still be delivered (shutdown is just a control message)
     for i in 0..5 {
@@ -746,12 +746,12 @@ fn shutdown_stops_processing_immediately() {
             frame_number: i,
             rendered_at: Instant::now(),
         }))
-        .unwrap();
+        .expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // All messages should still be processed
     assert_eq!(processed.load(Ordering::SeqCst), 5);
@@ -772,15 +772,15 @@ fn rapid_start_stop_cycles() {
 
     // Rapid start/stop cycles
     for _ in 0..100 {
-        tx.send(Message::Control(VsyncCommand::Start)).unwrap();
-        tx.send(Message::Control(VsyncCommand::Stop)).unwrap();
+        tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
+        tx.send(Message::Control(VsyncCommand::Stop)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     let starts = log.iter().filter(|s| *s == "started").count();
     let stops = log.iter().filter(|s| *s == "stopped").count();
 

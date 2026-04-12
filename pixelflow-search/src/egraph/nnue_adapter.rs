@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_op_to_nnue_roundtrip() {
+    fn op_to_nnue_roundtrip_should_succeed_when_called() {
         let ops_to_test: &[&dyn crate::egraph::ops::Op] = &[
             &ops::Add,
             &ops::Sub,
@@ -608,12 +608,12 @@ mod tests {
             let nnue_op = op_to_nnue(*op);
             let back = nnue_to_op(nnue_op);
             assert!(back.is_some(), "Roundtrip failed for {}", op.name());
-            assert_eq!(back.unwrap().name(), op.name(), "Roundtrip failed for {}", op.name());
+            assert_eq!(back.expect("Expected value but got None/Err").name(), op.name(), "Roundtrip failed for {}", op.name());
         }
     }
 
     #[test]
-    fn test_eclass_to_expr_leaf() {
+    fn eclass_to_expr_leaf_should_succeed_when_called() {
         let mut egraph = EGraph::new();
         let var_class = egraph.add(ENode::Var(0));
         let expr = eclass_to_expr(&egraph, var_class);
@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_simple() {
+    fn roundtrip_simple_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpKind::Add,
             Box::new(Expr::Var(0)),
@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_nested() {
+    fn roundtrip_nested_should_succeed_when_called() {
         // (x * 2.0) + y
         let expr = Expr::Binary(
             OpKind::Add,
@@ -658,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_predict_tree_cost() {
+    fn predict_tree_cost_should_succeed_when_called() {
         let nnue = ExprNnue::new_with_latency_prior(42);
 
         // Simple tree: x + y

@@ -226,13 +226,13 @@ fn directory_allows_cross_actor_messaging() {
 
     // Phase 4: Test cross-actor messaging
     // Send Ping to Alpha -> Alpha sends Pong to Beta -> Beta sends Data to Alpha
-    alpha_h.send(Message::Control(AlphaControl::Ping)).unwrap();
+    alpha_h.send(Message::Control(AlphaControl::Ping)).expect("Expected value but got None/Err");
 
     // Wait for message chain to complete (with timeout)
     let start = std::time::Instant::now();
     loop {
         thread::sleep(Duration::from_millis(10));
-        let log_snapshot = log.lock().unwrap();
+        let log_snapshot = log.lock().expect("Expected value but got None/Err");
         let has_ping = log_snapshot.contains(&"Alpha:Ping".to_string());
         let has_pong = log_snapshot.contains(&"Beta:Pong".to_string());
         let has_response = log_snapshot.contains(&"Alpha:Data:pong-response".to_string());
@@ -349,11 +349,11 @@ fn two_phase_initialization_queues_messages_before_play() {
     exposed
         .alpha
         .send(Message::Data(AlphaData("early-bird".to_string())))
-        .unwrap();
+        .expect("Expected value but got None/Err");
     exposed
         .alpha
         .send(Message::Data(AlphaData("gets-the-worm".to_string())))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     // Verify messages are queued (not processed yet - no threads running)
     // We can't directly check, but the sends should succeed
@@ -430,8 +430,8 @@ fn all_actor_threads_exit_on_channel_close() {
     drop(beta_h);
 
     // Wait for threads
-    alpha_thread.join().unwrap();
-    beta_thread.join().unwrap();
+    alpha_thread.join().expect("Expected value but got None/Err");
+    beta_thread.join().expect("Expected value but got None/Err");
 
     assert!(alpha_exited.load(Ordering::SeqCst));
     assert!(beta_exited.load(Ordering::SeqCst));
@@ -493,13 +493,13 @@ fn actor_thread_panic_isolated() {
     // Trigger alpha panic
     alpha_h
         .send(Message::Data(AlphaData("boom".to_string())))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
 
     // Beta should still work
-    beta_h.send(Message::Data(BetaData(1))).unwrap();
-    beta_h.send(Message::Data(BetaData(2))).unwrap();
+    beta_h.send(Message::Data(BetaData(1))).expect("Expected value but got None/Err");
+    beta_h.send(Message::Data(BetaData(2))).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
 
@@ -507,11 +507,11 @@ fn actor_thread_panic_isolated() {
     drop(beta_h);
 
     let alpha_result = alpha_thread.join();
-    beta_thread.join().unwrap();
+    beta_thread.join().expect("Expected value but got None/Err");
 
     // Alpha should have panicked
     assert!(alpha_result.is_ok()); // Thread itself didn't panic (we caught it)
-    assert!(alpha_result.unwrap().is_err()); // But the closure panicked
+    assert!(alpha_result.expect("Expected value but got None/Err").is_err()); // But the closure panicked
 
     // Beta should have processed messages
     assert_eq!(beta_count.load(Ordering::SeqCst), 2);
@@ -615,7 +615,7 @@ fn circular_messaging_does_not_deadlock() {
     });
 
     // Start the ping-pong
-    alpha_h.send(Message::Control(AlphaControl::Ping)).unwrap();
+    alpha_h.send(Message::Control(AlphaControl::Ping)).expect("Expected value but got None/Err");
 
     // Wait for it to complete (with timeout to detect deadlock)
     let start = std::time::Instant::now();
@@ -674,23 +674,23 @@ fn multiple_producers_work_independently() {
     });
 
     // Send from all producers
-    h1.send(Message::Data(AlphaData("1".to_string()))).unwrap();
-    h2.send(Message::Data(AlphaData("2".to_string()))).unwrap();
-    h3.send(Message::Data(AlphaData("3".to_string()))).unwrap();
+    h1.send(Message::Data(AlphaData("1".to_string()))).expect("Expected value but got None/Err");
+    h2.send(Message::Data(AlphaData("2".to_string()))).expect("Expected value but got None/Err");
+    h3.send(Message::Data(AlphaData("3".to_string()))).expect("Expected value but got None/Err");
 
     // Drop some producers
     drop(h1);
     drop(h2);
 
     // Remaining producers still work
-    h4.send(Message::Data(AlphaData("4".to_string()))).unwrap();
+    h4.send(Message::Data(AlphaData("4".to_string()))).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
 
     // Drop all
     drop(h3);
     drop(h4);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 4);
 }
@@ -774,8 +774,8 @@ fn actors_can_coordinate_startup_with_barrier() {
     drop(alpha_h);
     drop(beta_h);
 
-    alpha_thread.join().unwrap();
-    beta_thread.join().unwrap();
+    alpha_thread.join().expect("Expected value but got None/Err");
+    beta_thread.join().expect("Expected value but got None/Err");
 }
 
 // ============================================================================
@@ -815,10 +815,10 @@ fn shutdown_message_causes_actor_exit() {
     assert!(!exited.load(Ordering::SeqCst));
 
     // Send shutdown
-    alpha_h.send(Message::Shutdown).unwrap();
+    alpha_h.send(Message::Shutdown).expect("Expected value but got None/Err");
 
     // Should exit
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
     assert!(exited.load(Ordering::SeqCst));
 }
 
@@ -881,12 +881,12 @@ fn shutdown_works_with_multiple_actors() {
     assert!(!beta_exited.load(Ordering::SeqCst));
 
     // Shutdown both (simulating directory.shutdown())
-    beta_h.send(Message::Shutdown).unwrap();
-    alpha_h.send(Message::Shutdown).unwrap();
+    beta_h.send(Message::Shutdown).expect("Expected value but got None/Err");
+    alpha_h.send(Message::Shutdown).expect("Expected value but got None/Err");
 
     // Both should exit
-    alpha_thread.join().unwrap();
-    beta_thread.join().unwrap();
+    alpha_thread.join().expect("Expected value but got None/Err");
+    beta_thread.join().expect("Expected value but got None/Err");
 
     assert!(alpha_exited.load(Ordering::SeqCst));
     assert!(beta_exited.load(Ordering::SeqCst));

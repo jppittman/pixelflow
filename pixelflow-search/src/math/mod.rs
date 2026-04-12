@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn test_algebraic_rules_preserve_semantics() {
+    fn algebraic_rules_preserve_semantics_should_succeed_when_called() {
         let pts = standard_test_points();
         let x = Expr::Var(0);
         let y = Expr::Var(1);
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trig_rules_preserve_semantics() {
+    fn trig_rules_preserve_semantics_should_succeed_when_called() {
         let pts = standard_test_points();
         let x = Expr::Var(0);
         let y = Expr::Var(1);
@@ -294,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_left_to_right() {
+    fn associativity_left_to_right_should_succeed_when_called() {
         // (v0 + v1) + v2 should produce v0 + (v1 + v2) in the e-graph
         let v0 = Expr::Var(0);
         let v1 = Expr::Var(1);
@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_right_to_left() {
+    fn associativity_right_to_left_should_succeed_when_called() {
         // v0 + (v1 + v2) should produce (v0 + v1) + v2 in the e-graph
         let v0 = Expr::Var(0);
         let v1 = Expr::Var(1);
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_mul() {
+    fn associativity_mul_should_succeed_when_called() {
         // (v0 * v1) * v2 should produce v0 * (v1 * v2) and vice versa
         let v0 = Expr::Var(0);
         let v1 = Expr::Var(1);
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_min_max() {
+    fn associativity_min_max_should_succeed_when_called() {
         let v0 = Expr::Var(0);
         let v1 = Expr::Var(1);
         let v2 = Expr::Var(2);
@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_templates() {
+    fn associativity_templates_should_succeed_when_called() {
         // Verify all associativity rules have valid lhs/rhs templates
         let assoc_add = Associative::new(&crate::egraph::ops::Add);
         assert!(assoc_add.lhs_template().is_some(), "Associative Add missing lhs_template");
@@ -412,19 +412,19 @@ mod tests {
         assert!(rev_assoc_add.rhs_template().is_some(), "ReverseAssociative Add missing rhs_template");
 
         // Verify template structure: LHS of Associative should be RHS of ReverseAssociative
-        let assoc_lhs = assoc_add.lhs_template().unwrap();
-        let rev_rhs = rev_assoc_add.rhs_template().unwrap();
+        let assoc_lhs = assoc_add.lhs_template().expect("Expected value but got None/Err");
+        let rev_rhs = rev_assoc_add.rhs_template().expect("Expected value but got None/Err");
         assert_eq!(format!("{}", assoc_lhs), format!("{}", rev_rhs),
             "Associative LHS should equal ReverseAssociative RHS (same structural pattern)");
 
-        let assoc_rhs = assoc_add.rhs_template().unwrap();
-        let rev_lhs = rev_assoc_add.lhs_template().unwrap();
+        let assoc_rhs = assoc_add.rhs_template().expect("Expected value but got None/Err");
+        let rev_lhs = rev_assoc_add.lhs_template().expect("Expected value but got None/Err");
         assert_eq!(format!("{}", assoc_rhs), format!("{}", rev_lhs),
             "Associative RHS should equal ReverseAssociative LHS (same structural pattern)");
     }
 
     #[test]
-    fn test_all_rules_count() {
+    fn all_rules_count_should_succeed_when_called() {
         // Verify we have the expected number of rules after removal.
         let rules = all_rules();
         assert_eq!(rules.len(), 61,

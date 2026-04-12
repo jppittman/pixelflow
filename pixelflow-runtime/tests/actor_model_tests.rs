@@ -185,16 +185,16 @@ fn control_messages_processed_before_earlier_data_messages() {
     });
 
     // Send data first, then control
-    tx.send(Message::Data("first".to_string())).unwrap();
-    tx.send(Message::Data("second".to_string())).unwrap();
-    tx.send(Message::Control("priority".to_string())).unwrap();
-    tx.send(Message::Data("third".to_string())).unwrap();
+    tx.send(Message::Data("first".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Data("second".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Control("priority".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Data("third".to_string())).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let messages = log.lock().unwrap();
+    let messages = log.lock().expect("Expected value but got None/Err");
     let ctrl_idx = messages.iter().position(|(s, _)| s.starts_with("C:"));
     let first_data_idx = messages
         .iter()
@@ -203,7 +203,7 @@ fn control_messages_processed_before_earlier_data_messages() {
 
     // Control should be processed before any data that arrived before it
     assert!(
-        ctrl_idx.unwrap() < first_data_idx,
+        ctrl_idx.expect("Expected value but got None/Err") < first_data_idx,
         "Control message should be processed before earlier data messages. Got: {:?}",
         messages.iter().map(|(s, _)| s).collect::<Vec<_>>()
     );
@@ -221,15 +221,15 @@ fn management_messages_processed_before_data_messages() {
     });
 
     // Send data, then management
-    tx.send(Message::Data("data1".to_string())).unwrap();
-    tx.send(Message::Management("mgmt".to_string())).unwrap();
-    tx.send(Message::Data("data2".to_string())).unwrap();
+    tx.send(Message::Data("data1".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Management("mgmt".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Data("data2".to_string())).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let messages = log.lock().unwrap();
+    let messages = log.lock().expect("Expected value but got None/Err");
     let mgmt_idx = messages.iter().position(|(s, _)| s.starts_with("M:"));
     let data1_idx = messages
         .iter()
@@ -237,7 +237,7 @@ fn management_messages_processed_before_data_messages() {
         .unwrap_or(usize::MAX);
 
     assert!(
-        mgmt_idx.unwrap() < data1_idx,
+        mgmt_idx.expect("Expected value but got None/Err") < data1_idx,
         "Management should be processed before earlier data. Got: {:?}",
         messages.iter().map(|(s, _)| s).collect::<Vec<_>>()
     );
@@ -293,12 +293,12 @@ fn control_processed_before_management() {
     });
 
     // Send both control and management rapidly to ensure they're queued before processing
-    tx.send(Message::Management(())).unwrap();
-    tx.send(Message::Control(())).unwrap();
+    tx.send(Message::Management(())).expect("Expected value but got None/Err");
+    tx.send(Message::Control(())).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert!(
         control_first.load(Ordering::SeqCst),
@@ -319,18 +319,18 @@ fn fifo_ordering_within_same_lane() {
 
     // Send multiple data messages
     for i in 0..10 {
-        tx.send(Message::Data(format!("{}", i))).unwrap();
+        tx.send(Message::Data(format!("{}", i))).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let messages = log.lock().unwrap();
+    let messages = log.lock().expect("Expected value but got None/Err");
     let data_msgs: Vec<_> = messages
         .iter()
         .filter(|(s, _)| s.starts_with("D:"))
-        .map(|(s, _)| s.strip_prefix("D:").unwrap().parse::<i32>().unwrap())
+        .map(|(s, _)| s.strip_prefix("D:").expect("Expected value but got None/Err").parse::<i32>().expect("Expected value but got None/Err"))
         .collect();
 
     // Verify FIFO ordering
@@ -385,16 +385,16 @@ fn mixed_priority_messages_all_delivered() {
     // Interleave different priority messages
     for i in 0..100 {
         match i % 3 {
-            0 => tx.send(Message::Data(i)).unwrap(),
-            1 => tx.send(Message::Control(i)).unwrap(),
-            _ => tx.send(Message::Management(i)).unwrap(),
+            0 => tx.send(Message::Data(i)).expect("Expected value but got None/Err"),
+            1 => tx.send(Message::Control(i)).expect("Expected value but got None/Err"),
+            _ => tx.send(Message::Management(i)).expect("Expected value but got None/Err"),
         }
     }
 
     // Small delay to ensure messages start processing
     thread::sleep(Duration::from_millis(10));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // All messages must be delivered (33 or 34 of each type)
     let (data, ctrl, mgmt) = (
@@ -445,16 +445,16 @@ fn no_starvation_with_continuous_high_priority() {
     });
 
     // Send one data message
-    tx.send(Message::Data(())).unwrap();
+    tx.send(Message::Data(())).expect("Expected value but got None/Err");
 
     // Flood with control messages
     for _ in 0..100 {
-        tx.send(Message::Control(())).unwrap();
+        tx.send(Message::Control(())).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Data message must have been processed despite control flood
     assert!(
@@ -501,16 +501,16 @@ fn management_burst_limit_prevents_starvation() {
 
     // Flood management lane
     for i in 0..300 {
-        tx.send(Message::Management(format!("M{}", i))).unwrap();
+        tx.send(Message::Management(format!("M{}", i))).expect("Expected value but got None/Err");
     }
     // Add some control messages
     for i in 0..10 {
-        tx.send(Message::Control(format!("C{}", i))).unwrap();
+        tx.send(Message::Control(format!("C{}", i))).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // All 310 messages should be processed
     assert_eq!(
@@ -549,7 +549,7 @@ fn data_lane_blocks_when_buffer_full() {
     // Sender thread
     let sender = thread::spawn(move || {
         for i in 0..5 {
-            tx_clone.send(Message::Data(format!("{}", i))).unwrap();
+            tx_clone.send(Message::Data(format!("{}", i))).expect("Expected value but got None/Err");
         }
         send_complete_clone.store(true, Ordering::SeqCst);
     });
@@ -558,12 +558,12 @@ fn data_lane_blocks_when_buffer_full() {
     thread::sleep(Duration::from_millis(30));
 
     // Eventually everything completes
-    sender.join().unwrap();
+    sender.join().expect("Expected value but got None/Err");
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert!(send_complete.load(Ordering::SeqCst));
-    assert_eq!(processed.lock().unwrap().len(), 5);
+    assert_eq!(processed.lock().expect("Expected value but got None/Err").len(), 5);
 }
 
 #[test]
@@ -616,19 +616,19 @@ fn multiple_senders_all_messages_delivered() {
             thread::spawn(move || {
                 barrier.wait();
                 for i in 0..msgs_per_sender {
-                    tx.send(Message::Data(i as i32)).unwrap();
+                    tx.send(Message::Data(i as i32)).expect("Expected value but got None/Err");
                 }
             })
         })
         .collect();
 
     for s in senders {
-        s.join().unwrap();
+        s.join().expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         actor.data_count(),
@@ -668,7 +668,7 @@ fn actor_run_exits_when_all_senders_dropped() {
     });
 
     // Ensure actor is running
-    tx.send(Message::Control(())).unwrap();
+    tx.send(Message::Control(())).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(20));
     assert!(
         !exited.load(Ordering::SeqCst),
@@ -677,7 +677,7 @@ fn actor_run_exits_when_all_senders_dropped() {
 
     // Drop sender
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
     assert!(exited.load(Ordering::SeqCst), "Actor should have exited");
 }
 
@@ -712,17 +712,17 @@ fn cloned_handle_works_after_original_dropped() {
     });
 
     // Send from original
-    tx.send(Message::Data(1)).unwrap();
+    tx.send(Message::Data(1)).expect("Expected value but got None/Err");
     // Drop original
     drop(tx);
 
     // Clone should still work
     thread::sleep(Duration::from_millis(20));
-    tx2.send(Message::Data(2)).unwrap();
+    tx2.send(Message::Data(2)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(20));
     drop(tx2);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 2);
 }
@@ -746,13 +746,13 @@ fn park_hint_wait_when_queues_empty() {
     });
 
     // Send one message to wake actor
-    tx.send(Message::Data(())).unwrap();
+    tx.send(Message::Data(())).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let hints = hints.lock().unwrap();
+    let hints = hints.lock().expect("Expected value but got None/Err");
     // After processing the single message, queues are empty -> Idle SystemStatus
     assert!(
         hints.contains(&SystemStatus::Idle),
@@ -778,14 +778,14 @@ fn park_hint_poll_when_burst_limit_hit() {
 
     // Send more than burst limit
     for _ in 0..10 {
-        tx.send(Message::Data(())).unwrap();
+        tx.send(Message::Data(())).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let hints = hints.lock().unwrap();
+    let hints = hints.lock().expect("Expected value but got None/Err");
     // Should have Busy SystemStatus when burst limit is hit (more work available)
     assert!(
         hints.contains(&SystemStatus::Busy),
@@ -808,14 +808,14 @@ fn actor_can_override_park_hint_to_poll() {
         rx.run(&mut actor);
     });
 
-    tx.send(Message::Data(())).unwrap();
+    tx.send(Message::Data(())).expect("Expected value but got None/Err");
 
     // Give it time to loop with Poll
     thread::sleep(Duration::from_millis(30));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let hints = hints.lock().unwrap();
+    let hints = hints.lock().expect("Expected value but got None/Err");
     // Actor returned Poll, so scheduler should keep working
     // This means park() gets called multiple times
     assert!(
@@ -855,15 +855,15 @@ fn different_message_types_per_lane() {
         struct TypedActor(Arc<Mutex<(bool, bool, bool)>>);
         impl Actor<Vec<u8>, HashMap<String, i32>, std::time::Duration> for TypedActor {
             fn handle_data(&mut self, _: Vec<u8>) -> HandlerResult {
-                self.0.lock().unwrap().0 = true;
+                self.0.lock().expect("Expected value but got None/Err").0 = true;
                 Ok(())
             }
             fn handle_control(&mut self, _: HashMap<String, i32>) -> HandlerResult {
-                self.0.lock().unwrap().1 = true;
+                self.0.lock().expect("Expected value but got None/Err").1 = true;
                 Ok(())
             }
             fn handle_management(&mut self, _: std::time::Duration) -> HandlerResult {
-                self.0.lock().unwrap().2 = true;
+                self.0.lock().expect("Expected value but got None/Err").2 = true;
                 Ok(())
             }
             fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
@@ -873,16 +873,16 @@ fn different_message_types_per_lane() {
         rx.run(&mut TypedActor(received_clone));
     });
 
-    tx.send(Message::Data(vec![1, 2, 3])).unwrap();
-    tx.send(Message::Control(HashMap::new())).unwrap();
+    tx.send(Message::Data(vec![1, 2, 3])).expect("Expected value but got None/Err");
+    tx.send(Message::Control(HashMap::new())).expect("Expected value but got None/Err");
     tx.send(Message::Management(Duration::from_secs(1)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let r = received.lock().unwrap();
+    let r = received.lock().expect("Expected value but got None/Err");
     assert!(r.0 && r.1 && r.2, "All three lane types should work");
 }
 
@@ -924,15 +924,15 @@ fn handle_clone_is_independent() {
     });
 
     // Send from all handles
-    tx.send(Message::Data(1)).unwrap();
-    tx2.send(Message::Data(2)).unwrap();
-    tx3.send(Message::Data(3)).unwrap();
+    tx.send(Message::Data(1)).expect("Expected value but got None/Err");
+    tx2.send(Message::Data(2)).expect("Expected value but got None/Err");
+    tx3.send(Message::Data(3)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
     drop(tx2);
     drop(tx3);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 3);
 }
@@ -979,12 +979,12 @@ fn high_throughput_single_sender() {
 
     let num_messages = 50_000;
     for i in 0..num_messages {
-        tx.send(Message::Data(i)).unwrap();
+        tx.send(Message::Data(i)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(200));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -1040,9 +1040,9 @@ fn concurrent_senders_stress_test() {
                 for i in 0..msgs_per_sender {
                     let msg_type = i % 3;
                     match msg_type {
-                        0 => tx.send(Message::Data(sender_id as i32)).unwrap(),
-                        1 => tx.send(Message::Control(sender_id as i32)).unwrap(),
-                        _ => tx.send(Message::Management(sender_id as i32)).unwrap(),
+                        0 => tx.send(Message::Data(sender_id as i32)).expect("Expected value but got None/Err"),
+                        1 => tx.send(Message::Control(sender_id as i32)).expect("Expected value but got None/Err"),
+                        _ => tx.send(Message::Management(sender_id as i32)).expect("Expected value but got None/Err"),
                     }
                 }
             })
@@ -1050,12 +1050,12 @@ fn concurrent_senders_stress_test() {
         .collect();
 
     for s in senders {
-        s.join().unwrap();
+        s.join().expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(200));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -1085,14 +1085,14 @@ fn priority_maintained_when_both_lanes_have_messages() {
         }
         impl Actor<i32, i32, i32> for FirstChecker {
             fn handle_data(&mut self, _: i32) -> HandlerResult {
-                let mut first = self.first.lock().unwrap();
+                let mut first = self.first.lock().expect("Expected value but got None/Err");
                 if first.is_none() {
                     *first = Some("data");
                 }
                 Ok(())
             }
             fn handle_control(&mut self, _: i32) -> HandlerResult {
-                let mut first = self.first.lock().unwrap();
+                let mut first = self.first.lock().expect("Expected value but got None/Err");
                 if first.is_none() {
                     *first = Some("control");
                 }
@@ -1110,15 +1110,15 @@ fn priority_maintained_when_both_lanes_have_messages() {
 
     // Send both control and data before scheduler processes anything
     // by sending them quickly
-    tx.send(Message::Data(1)).unwrap();
-    tx.send(Message::Control(1)).unwrap();
+    tx.send(Message::Data(1)).expect("Expected value but got None/Err");
+    tx.send(Message::Control(1)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Control should be processed first since it has higher priority
-    let first = first_message_type.lock().unwrap();
+    let first = first_message_type.lock().expect("Expected value but got None/Err");
     assert_eq!(
         *first,
         Some("control"),
@@ -1153,13 +1153,13 @@ fn empty_message_types_work() {
         rx.run(&mut UnitActor);
     });
 
-    tx.send(Message::Data(())).unwrap();
-    tx.send(Message::Control(())).unwrap();
-    tx.send(Message::Management(())).unwrap();
+    tx.send(Message::Data(())).expect("Expected value but got None/Err");
+    tx.send(Message::Control(())).expect("Expected value but got None/Err");
+    tx.send(Message::Management(())).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(20));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 }
 
 #[test]
@@ -1194,12 +1194,12 @@ fn zero_size_type_messages() {
     });
 
     for _ in 0..100 {
-        tx.send(Message::Data(ZST)).unwrap();
+        tx.send(Message::Data(ZST)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 100);
 }
@@ -1239,12 +1239,12 @@ fn large_message_type_works() {
 
     for _ in 0..20 {
         tx.send(Message::Data(LargeMessage { data: [0u8; 4096] }))
-            .unwrap();
+            .expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 20);
 }
@@ -1312,12 +1312,12 @@ fn custom_burst_and_buffer_sizes() {
     });
 
     for i in 0..10 {
-        tx.send(Message::Data(i)).unwrap();
+        tx.send(Message::Data(i)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 10);
 }
@@ -1350,12 +1350,12 @@ fn large_burst_and_buffer_sizes() {
 
     // Fill the buffer
     for i in 0..50000 {
-        tx.send(Message::Data(i)).unwrap();
+        tx.send(Message::Data(i)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(200));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 50000);
 }

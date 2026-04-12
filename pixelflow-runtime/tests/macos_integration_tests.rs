@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     #[ignore = "Requires UI interaction or window server"]
-    fn test_metal_ops_lifecycle() {
+    fn metal_ops_lifecycle_should_succeed_when_called() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_clone = events.clone();
 
@@ -79,7 +79,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         // 6. Verify Window Creation Event within MockEngine
-        let captured = events.lock().unwrap();
+        let captured = events.lock().expect("Expected value but got None/Err");
         let found_window_id = captured.iter().find_map(|e| {
             if let pixelflow_runtime::display::messages::DisplayEvent::WindowCreated { window } = e
             {
@@ -95,7 +95,7 @@ mod tests {
         );
 
         // 7. Update Window Title
-        let win_id = found_window_id.unwrap();
+        let win_id = found_window_id.expect("Expected value but got None/Err");
         let _ = ops.handle_control(DisplayControl::SetTitle {
             id: win_id,
             title: "Updated Title".to_string(),

@@ -62,7 +62,7 @@ fn backoff_does_not_overflow_on_large_attempts() {
     thread::sleep(Duration::from_millis(100));
     drop(rx);
 
-    let elapsed = sender.join().unwrap();
+    let elapsed = sender.join().expect("Expected value but got None/Err");
     assert!(
         elapsed < Duration::from_secs(10),
         "Backoff should eventually timeout, not hang. Took: {:?}",
@@ -105,8 +105,8 @@ fn zero_burst_limit_does_not_cause_infinite_loop() {
         rx.run(&mut Counter(processed_clone));
     });
 
-    tx.send(Message::Data(1)).unwrap();
-    tx.send(Message::Data(2)).unwrap();
+    tx.send(Message::Data(1)).expect("Expected value but got None/Err");
+    tx.send(Message::Data(2)).expect("Expected value but got None/Err");
 
     // Wait and check - should not infinite loop
     thread::sleep(Duration::from_millis(100));
@@ -114,7 +114,7 @@ fn zero_burst_limit_does_not_cause_infinite_loop() {
 
     // Use timeout to detect infinite loop
     let join_result = thread::spawn(move || {
-        handle.join().unwrap();
+        handle.join().expect("Expected value but got None/Err");
     });
 
     let timeout = Duration::from_secs(2);
@@ -187,15 +187,15 @@ fn mass_sender_drop_does_not_cause_race() {
         .collect();
 
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("Expected value but got None/Err");
     }
 
     // Original sender still exists
-    tx.send(Message::Data(999)).unwrap();
+    tx.send(Message::Data(999)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Should have processed 100 * 10 + 1 = 1001 messages
     let final_count = count.load(Ordering::SeqCst);
@@ -253,7 +253,7 @@ fn actor_panic_does_not_corrupt_state() {
     thread::sleep(Duration::from_millis(100));
     drop(tx);
 
-    let panicked = handle.join().unwrap();
+    let panicked = handle.join().expect("Expected value but got None/Err");
     assert!(panicked, "Actor should have panicked");
 }
 
@@ -290,17 +290,17 @@ fn continuous_control_eventually_processes_data() {
     });
 
     // Send one data message
-    tx.send(Message::Data("important".to_string())).unwrap();
+    tx.send(Message::Data("important".to_string())).expect("Expected value but got None/Err");
 
     // Then flood with control messages (reduced count for faster test)
     for i in 0..100 {
-        tx.send(Message::Control(format!("{}", i))).unwrap();
+        tx.send(Message::Control(format!("{}", i))).expect("Expected value but got None/Err");
     }
 
     // Wait for processing - quick since no delays
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Note: Due to priority, data may never be processed if control keeps coming
     // This test documents the behavior - it's expected that control has priority
@@ -351,12 +351,12 @@ fn park_poll_does_not_spin_indefinitely() {
     });
 
     // Send one message to trigger the spin
-    tx.send(Message::Data(())).unwrap();
+    tx.send(Message::Data(())).expect("Expected value but got None/Err");
 
     // Wait for the spin to exhaust
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     let final_count = park_count.load(Ordering::SeqCst);
     assert!(
@@ -408,12 +408,12 @@ fn slow_handler_backpressure_works() {
     // Sender thread - will block on backpressure
     let sender = thread::spawn(move || {
         for i in 0..10 {
-            tx_sender.send(Message::Data(i)).unwrap();
+            tx_sender.send(Message::Data(i)).expect("Expected value but got None/Err");
         }
         sender_start.elapsed()
     });
 
-    let send_time = sender.join().unwrap();
+    let send_time = sender.join().expect("Expected value but got None/Err");
 
     // Sending 10 messages through buffer of 2 with 50ms handler
     // Should take at least 400ms (8 messages worth of blocking)
@@ -424,7 +424,7 @@ fn slow_handler_backpressure_works() {
     );
 
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(processed.load(Ordering::SeqCst), 10);
 }
@@ -444,7 +444,7 @@ fn single_sender_fifo_ordering_maintained() {
         struct OrderTracker(Arc<Mutex<Vec<i32>>>);
         impl Actor<i32, i32, i32> for OrderTracker {
             fn handle_data(&mut self, msg: i32) -> HandlerResult {
-                self.0.lock().unwrap().push(msg);
+                self.0.lock().expect("Expected value but got None/Err").push(msg);
                 Ok(())
             }
             fn handle_control(&mut self, _: i32) -> HandlerResult {
@@ -462,14 +462,14 @@ fn single_sender_fifo_ordering_maintained() {
 
     // Send in order from single thread
     for i in 0..1000 {
-        tx.send(Message::Data(i)).unwrap();
+        tx.send(Message::Data(i)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let received = received.lock().unwrap();
+    let received = received.lock().expect("Expected value but got None/Err");
     for (i, &val) in received.iter().enumerate() {
         assert_eq!(
             val, i as i32,
@@ -515,7 +515,7 @@ fn rapid_channel_creation_does_not_leak() {
     // Create and destroy many channels rapidly
     for _ in 0..1000 {
         let (tx, rx) = ActorScheduler::<i32, i32, i32>::new(10, 100);
-        tx.send(Message::Data(1)).unwrap();
+        tx.send(Message::Data(1)).expect("Expected value but got None/Err");
         drop(tx);
         drop(rx);
     }
@@ -570,19 +570,19 @@ fn concurrent_send_during_processing() {
         .map(|sender| {
             thread::spawn(move || {
                 for i in 0..100 {
-                    sender.send(Message::Data(i)).unwrap();
+                    sender.send(Message::Data(i)).expect("Expected value but got None/Err");
                 }
             })
         })
         .collect();
 
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(500));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         total_received.load(Ordering::SeqCst),
@@ -638,19 +638,19 @@ fn doorbell_saturation_does_not_lose_messages() {
             thread::spawn(move || {
                 barrier.wait();
                 for i in 0..100 {
-                    sender.send(Message::Data(i)).unwrap();
+                    sender.send(Message::Data(i)).expect("Expected value but got None/Err");
                 }
             })
         })
         .collect();
 
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(200));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -700,7 +700,7 @@ fn control_lane_timeout_returns_error() {
         // the actual capacity is >= params.control_mgmt_buffer_size.
         let actual_capacity = params.control_mgmt_buffer_size.max(2).next_power_of_two();
         for _ in 0..actual_capacity {
-            tx.send(Message::Control(0)).unwrap();
+            tx.send(Message::Control(0)).expect("Expected value but got None/Err");
         }
 
         // Next send should timeout after MAX_BACKOFF
@@ -768,12 +768,12 @@ fn large_queue_does_not_cause_issues() {
             "message {} with some extra data to use more memory",
             i
         )))
-        .unwrap();
+        .expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(500));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 10000);
 }

@@ -465,7 +465,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_regular_patch() {
+    fn regular_patch_should_succeed_when_called() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -473,8 +473,8 @@ v 1.0 1.0 0.0
 v 0.0 1.0 0.0
 f 1 2 3 4
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
-        let patch = SubdivisionPatch::from_mesh(&mesh, 0).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).expect("Expected value but got None/Err");
+        let patch = SubdivisionPatch::from_mesh(&mesh, 0).expect("Expected value but got None/Err");
 
         // All corners have valence 1 (only one face)
         assert_eq!(patch.corner_valences, [1, 1, 1, 1]);
@@ -482,7 +482,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn test_limit_eval() {
+    fn limit_eval_should_succeed_when_called() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -490,8 +490,8 @@ v 1.0 1.0 0.0
 v 0.0 1.0 0.0
 f 1 2 3 4
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
-        let patch = SubdivisionPatch::from_mesh(&mesh, 0).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).expect("Expected value but got None/Err");
+        let patch = SubdivisionPatch::from_mesh(&mesh, 0).expect("Expected value but got None/Err");
 
         // Evaluate at center (0.5, 0.5) using Jet3
         let u = Jet3::constant(Field::from(0.5));
@@ -505,11 +505,11 @@ f 1 2 3 4
 
         // For bilinear fallback, center should be roughly (0.5, 0.5, 0.0)
         // We can't easily check SIMD Field values in tests, so this is a smoke test
-        assert_eq!(patch.is_extraordinary(), true);
+        assert!(patch.is_extraordinary());
     }
 
     #[test]
-    fn test_surface_stats() {
+    fn surface_stats_should_succeed_when_called() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -520,8 +520,8 @@ v 2.0 1.0 0.0
 f 1 2 3 4
 f 2 5 6 3
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
-        let surface = SubdivisionSurface::from_mesh(mesh).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).expect("Expected value but got None/Err");
+        let surface = SubdivisionSurface::from_mesh(mesh).expect("Expected value but got None/Err");
         let stats = surface.stats();
 
         assert_eq!(stats.total_patches, 2);

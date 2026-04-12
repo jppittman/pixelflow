@@ -304,7 +304,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_eval_expr_scalar_simple() {
+    fn eval_expr_scalar_simple_should_succeed_when_called() {
         // Test: x + y
         let expr = Expr::Binary(
             OpType::Add,
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_expr_scalar_nested() {
+    fn eval_expr_scalar_nested_should_succeed_when_called() {
         // Test: (x * y) + (z - w)
         let expr = Expr::Binary(
             OpType::Add,
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn test_benchmark_runs() {
+    fn benchmark_runs_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpType::Mul,
             Box::new(Expr::Var(0)),
@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_cost() {
+    fn estimate_cost_should_succeed_when_called() {
         // Simple add
         let simple = Expr::Binary(
             OpType::Add,

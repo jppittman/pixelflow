@@ -63,7 +63,7 @@ impl PlatformOps for MockOps {
 }
 
 #[test]
-fn test_platform_actor_delegation() {
+fn platform_actor_delegation_should_succeed_when_called() {
     // 1. Create MockOps
     let ops = MockOps::new();
     let log_ref = ops.log.clone();
@@ -100,7 +100,7 @@ fn test_platform_actor_delegation() {
     let _ = actor.park(SystemStatus::Busy);
 
     // 4. Verify Log
-    let log = log_ref.lock().unwrap();
+    let log = log_ref.lock().expect("Expected value but got None/Err");
     assert_eq!(log.len(), 4);
     assert_eq!(log[0], "Create");
     assert!(log[1].contains("SetTitle WindowId(1) Test Window"));

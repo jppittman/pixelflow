@@ -1602,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_constant_folding() {
+    fn constant_folding_should_succeed_when_called() {
         let input = quote! { |x: f32| x + (1.0 + 2.0) };
         let debug = optimize_code(input);
         assert!(debug.contains("LiteralExpr"));
@@ -1612,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_add() {
+    fn identity_add_should_succeed_when_called() {
         let input = quote! { |x: f32| x + 0.0 };
         let debug = optimize_code(input);
         assert!(debug.contains("IdentExpr"));
@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_mul() {
+    fn zero_mul_should_succeed_when_called() {
         let input = quote! { |x: f32| x * 0.0 };
         let debug = optimize_code(input);
         assert!(debug.contains("LiteralExpr"));
@@ -1630,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_complex_folding() {
+    fn complex_folding_should_succeed_when_called() {
         let input = quote! { |x: f32| (1.0 + 2.0) * x + 0.0 };
         let debug = optimize_code(input);
         assert!(debug.contains("3.0"));
@@ -1642,7 +1642,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_egraph_identity_add() {
+    fn egraph_identity_add_should_succeed_when_called() {
         let input = quote! { |x: f32| x + 0.0 };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to just x
@@ -1652,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_identity_mul() {
+    fn egraph_identity_mul_should_succeed_when_called() {
         let input = quote! { |x: f32| x * 1.0 };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to just x
@@ -1662,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_zero_mul() {
+    fn egraph_zero_mul_should_succeed_when_called() {
         let input = quote! { |x: f32| x * 0.0 };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to 0.0
@@ -1672,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_sub_self() {
+    fn egraph_sub_self_should_succeed_when_called() {
         let input = quote! { |x: f32| x - x };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to 0.0
@@ -1680,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_fma_fusion_with_fma_costs() {
+    fn egraph_fma_fusion_with_fma_costs_should_succeed_when_called() {
         // a * b + c should become mul_add when FMA is cheap
         let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
         let debug = optimize_code_egraph(input, &CostModel::with_fma());
@@ -1689,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_fma_unfused_with_expensive_fma() {
+    fn egraph_fma_unfused_with_expensive_fma_should_succeed_when_called() {
         // a * b + c should stay as mul + add when FMA is made expensive
         let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
 
@@ -1703,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_fma_fused_with_default_costs() {
+    fn egraph_fma_fused_with_default_costs_should_succeed_when_called() {
         // With realistic default costs, FMA should be preferred (MulAdd(5) < Mul(5) + Add(4))
         let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
         let debug = optimize_code_egraph(input, &CostModel::default());
@@ -1712,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_complex_expression() {
+    fn egraph_complex_expression_should_succeed_when_called() {
         // ((x + 0) * 1 - x) should simplify to 0
         let input = quote! { |x: f32| (x + 0.0) * 1.0 - x };
         let debug = optimize_code_egraph(input, &CostModel::default());
@@ -1721,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_preserves_variables() {
+    fn egraph_preserves_variables_should_succeed_when_called() {
         // Simple expression with named variables
         let input = quote! { |cx: f32, cy: f32| cx + cy };
         let debug = optimize_code_egraph(input, &CostModel::default());
@@ -1731,7 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_handles_sqrt() {
+    fn egraph_handles_sqrt_should_succeed_when_called() {
         let input = quote! { |x: f32| x.sqrt() };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should preserve sqrt
@@ -1739,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_div_sqrt_to_rsqrt() {
+    fn egraph_div_sqrt_to_rsqrt_should_succeed_when_called() {
         // x / sqrt(y) should become x * rsqrt(y) via algebra:
         // x / sqrt(y) = x * (1/sqrt(y)) = x * rsqrt(y)
         let input = quote! { |x: f32, y: f32| x / y.sqrt() };
@@ -1749,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_double_negation() {
+    fn egraph_double_negation_should_succeed_when_called() {
         let input = quote! { |x: f32| - -x };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to just x
@@ -1763,7 +1763,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_global_optimization_across_let_bindings() {
+    fn global_optimization_across_let_bindings_should_succeed_when_called() {
         // The global pass should see through let bindings:
         // let a = x; let b = 0.0; a + b → x
         let input = quote! { |x: f32| {
@@ -1778,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_optimization_zero_multiplication() {
+    fn global_optimization_zero_multiplication_should_succeed_when_called() {
         // let a = x * x; let b = 0.0; a * b → 0.0
         let input = quote! { |x: f32| {
             let a = x * x;
@@ -1792,7 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_optimization_self_subtraction() {
+    fn global_optimization_self_subtraction_should_succeed_when_called() {
         // let a = X * X + Y * Y; a - a → 0.0
         let input = quote! { || {
             let a = X * X + Y * Y;
@@ -1804,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_fma_across_bindings() {
+    fn global_fma_across_bindings_should_succeed_when_called() {
         // let product = a * b; product + c → mul_add(a, b, c)
         let input = quote! { |a: f32, b: f32, c: f32| {
             let product = a * b;
@@ -1816,7 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discriminant_pattern() {
+    fn discriminant_pattern_should_succeed_when_called() {
         // This is the problematic pattern:
         // d_dot_c² - (c_sq - r_sq) should use Neg to wrap (c_sq - r_sq)
         let input = quote! { |d: f32, c: f32, r: f32| {
@@ -1844,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discriminant_with_intrinsics() {
+    fn discriminant_with_intrinsics_should_succeed_when_called() {
         // This matches the actual failing test more closely:
         // d_dot_c = X*cx + Y*cy + Z*cz
         // c_sq = cx*cx + cy*cy + cz*cz
@@ -1873,11 +1873,11 @@ mod tests {
 
     /// Test DAG optimization with shared subexpressions.
     #[test]
-    fn test_dag_optimization_shared_subexpr() {
+    fn dag_optimization_shared_subexpr_should_succeed_when_called() {
         // sin(X) * sin(X) should emit a let-binding
         let input = quote! { || X.sin() * X.sin() };
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
+        let analyzed = analyze(kernel).expect("Expected value but got None/Err");
 
         // Use neural optimizer
         let nnue = ExprNnue::new_random(42);
@@ -1895,11 +1895,11 @@ mod tests {
 
     /// Test DAG optimization with triple use of shared subexpr.
     #[test]
-    fn test_dag_optimization_triple_shared() {
+    fn dag_optimization_triple_shared_should_succeed_when_called() {
         // sqrt(X) * sqrt(X) + sqrt(X) should emit let-binding
         let input = quote! { || X.sqrt() * X.sqrt() + X.sqrt() };
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
+        let analyzed = analyze(kernel).expect("Expected value but got None/Err");
 
         let nnue = ExprNnue::new_random(42);
         let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
@@ -1913,11 +1913,11 @@ mod tests {
 
     /// Test that simple expressions without sharing don't get wrapped in blocks.
     #[test]
-    fn test_dag_optimization_no_sharing() {
+    fn dag_optimization_no_sharing_should_succeed_when_called() {
         // X + Y has no sharing, should remain simple
         let input = quote! { || X + Y };
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
+        let analyzed = analyze(kernel).expect("Expected value but got None/Err");
 
         let nnue = ExprNnue::new_random(42);
         let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
@@ -1930,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_pipeline_discriminant() {
+    fn full_pipeline_discriminant_should_succeed_when_called() {
         use crate::codegen;
 
         // Full pipeline test matching actual kernel! macro
@@ -1941,8 +1941,8 @@ mod tests {
             d_dot_c * d_dot_c - (c_sq - r_sq)
         }};
 
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
+        let analyzed = analyze(kernel).expect("Expected value but got None/Err");
 
         // This is what the kernel! macro does
         let optimized = optimize(analyzed);

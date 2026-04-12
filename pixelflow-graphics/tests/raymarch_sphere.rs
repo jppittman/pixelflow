@@ -76,7 +76,7 @@ impl<M: ManifoldCompat<Field, Output = Discrete>> Manifold<Field4> for ColorScre
 }
 
 #[test]
-fn test_sphere_on_floor() {
+fn sphere_on_floor_should_succeed_when_called() {
     const W: usize = 400;
     const H: usize = 300;
 
@@ -109,10 +109,10 @@ fn test_sphere_on_floor() {
 
     // Save PPM
     let path = std::env::temp_dir().join("pixelflow_raymarch_sh.ppm");
-    let mut file = File::create(&path).unwrap();
-    writeln!(file, "P6\n{} {}\n255", W, H).unwrap();
+    let mut file = File::create(&path).expect("Expected value but got None/Err");
+    writeln!(file, "P6\n{} {}\n255", W, H).expect("Expected value but got None/Err");
     for p in &frame.data {
-        file.write_all(&[p.r(), p.g(), p.b()]).unwrap();
+        file.write_all(&[p.r(), p.g(), p.b()]).expect("Expected value but got None/Err");
     }
     println!("Saved: {}", path.display());
 
@@ -127,7 +127,7 @@ fn test_sphere_on_floor() {
 
 /// Test with solid gray material (non-reflective)
 #[test]
-fn test_sphere_on_matte_floor() {
+fn sphere_on_matte_floor_should_succeed_when_called() {
 
 
     const W: usize = 400;
@@ -174,10 +174,10 @@ fn test_sphere_on_matte_floor() {
 
     // Save PPM
     let path = std::env::temp_dir().join("pixelflow_raymarch_matte.ppm");
-    let mut file = File::create(&path).unwrap();
-    writeln!(file, "P6\n{} {}\n255", W, H).unwrap();
+    let mut file = File::create(&path).expect("Expected value but got None/Err");
+    writeln!(file, "P6\n{} {}\n255", W, H).expect("Expected value but got None/Err");
     for p in &frame.data {
-        file.write_all(&[p.r(), p.g(), p.b()]).unwrap();
+        file.write_all(&[p.r(), p.g(), p.b()]).expect("Expected value but got None/Err");
     }
     println!("Saved: {}", path.display());
 
@@ -193,7 +193,7 @@ fn test_sphere_on_matte_floor() {
 
 /// Chrome sphere on checkerboard floor
 #[test]
-fn test_chrome_sphere_on_checkerboard() {
+fn chrome_sphere_on_checkerboard_should_succeed_when_called() {
     const WIDTH: usize = 400;
     const HEIGHT: usize = 300;
 
@@ -225,10 +225,10 @@ fn test_chrome_sphere_on_checkerboard() {
 
     // Save PPM
     let path = std::env::temp_dir().join("pixelflow_chrome_checker.ppm");
-    let mut file = File::create(&path).unwrap();
-    writeln!(file, "P6\n{} {}\n255", WIDTH, HEIGHT).unwrap();
+    let mut file = File::create(&path).expect("Expected value but got None/Err");
+    writeln!(file, "P6\n{} {}\n255", WIDTH, HEIGHT).expect("Expected value but got None/Err");
     for p in &frame.data {
-        file.write_all(&[p.r(), p.g(), p.b()]).unwrap();
+        file.write_all(&[p.r(), p.g(), p.b()]).expect("Expected value but got None/Err");
     }
     println!("Saved: {}", path.display());
 

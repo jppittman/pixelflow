@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_baked_creation() {
+    fn baked_creation_should_succeed_when_called() {
         let color = SolidColor(255, 128, 64, 255);
         let baked: Baked<_, Rgba8> = Baked::new(color, 8, 8);
 
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_baked_eval() {
+    fn baked_eval_should_succeed_when_called() {
         let color = SolidColor(255, 0, 0, 255);
         let baked: Baked<_, Rgba8> = Baked::new(color, 4, 4);
 
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn test_baked_sequential_sampling() {
+    fn baked_sequential_sampling_should_succeed_when_called() {
         // Create a gradient: red increases with x
         struct Gradient;
         impl Manifold<Field4> for Gradient {

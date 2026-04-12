@@ -1285,15 +1285,15 @@ mod tests {
     use libm::fabsf;
 
     #[test]
-    fn test_op_type_roundtrip() {
+    fn op_type_roundtrip_should_succeed_when_called() {
         for i in 0..OpType::COUNT {
-            let op = OpType::from_index(i).unwrap();
+            let op = OpType::from_index(i).expect("Expected value but got None/Err");
             assert_eq!(op.index(), i);
         }
     }
 
     #[test]
-    fn test_feature_roundtrip() {
+    fn feature_roundtrip_should_succeed_when_called() {
         let feature = HalfEPFeature {
             perspective_op: 5,
             descendant_op: 10,
@@ -1306,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_eval() {
+    fn expr_eval_should_succeed_when_called() {
         // x + y
         let expr = Expr::Binary(OpType::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let result = expr.eval(&[3.0, 4.0, 0.0, 0.0]);
@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_generator() {
+    fn expr_generator_should_succeed_when_called() {
         let mut generator = ExprGenerator::new(42, ExprGenConfig::default());
         for _ in 0..10 {
             let expr = generator.generate();
@@ -1324,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn test_feature_extraction() {
+    fn feature_extraction_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpType::Add,
             Box::new(Expr::Var(0)),
@@ -1335,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_add_zero() {
+    fn rewrite_add_zero_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpType::Add,
             Box::new(Expr::Var(0)),
@@ -1343,11 +1343,11 @@ mod tests {
         );
         let rewritten = RewriteRule::AddZero.try_apply(&expr);
         assert!(rewritten.is_some());
-        assert!(matches!(rewritten.unwrap(), Expr::Var(0)));
+        assert!(matches!(rewritten.expect("Expected value but got None/Err"), Expr::Var(0)));
     }
 
     #[test]
-    fn test_rewrite_fuse_muladd() {
+    fn rewrite_fuse_muladd_should_succeed_when_called() {
         // a * b + c
         let expr = Expr::Binary(
             OpType::Add,
@@ -1361,13 +1361,13 @@ mod tests {
         let rewritten = RewriteRule::FuseToMulAdd.try_apply(&expr);
         assert!(rewritten.is_some());
         assert!(matches!(
-            rewritten.unwrap(),
+            rewritten.expect("Expected value but got None/Err"),
             Expr::Ternary(OpType::MulAdd, _, _, _)
         ));
     }
 
     #[test]
-    fn test_find_all_rewrites() {
+    fn find_all_rewrites_should_succeed_when_called() {
         // (x + 0) + y - should find AddZero at path [0]
         let expr = Expr::Binary(
             OpType::Add,
@@ -1390,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_add_remove() {
+    fn accumulator_add_remove_should_succeed_when_called() {
         let nnue = Nnue::with_defaults();
         let mut acc = Accumulator::new(&nnue);
 
@@ -1416,7 +1416,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_unfuse_muladd() {
+    fn unfuse_muladd_should_succeed_when_called() {
         // MulAdd(x, y, z) → x * y + z
         let expr = Expr::Ternary(
             OpType::MulAdd,
@@ -1428,7 +1428,7 @@ mod tests {
         let result = UnfuseRewrite::UnfuseMulAdd.apply(&expr);
         assert!(result.is_some());
 
-        let unoptimized = result.unwrap();
+        let unoptimized = result.expect("Expected value but got None/Err");
         // Should be Add(Mul(x, y), z)
         assert!(matches!(unoptimized, Expr::Binary(OpType::Add, _, _)));
 
@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unfuse_mulrsqrt() {
+    fn unfuse_mulrsqrt_should_succeed_when_called() {
         // MulRsqrt(x, y) → x * rsqrt(y)
         let expr = Expr::Binary(
             OpType::MulRsqrt,
@@ -1451,7 +1451,7 @@ mod tests {
         let result = UnfuseRewrite::UnfuseMulRsqrt.apply(&expr);
         assert!(result.is_some());
 
-        let unoptimized = result.unwrap();
+        let unoptimized = result.expect("Expected value but got None/Err");
         // Should be Mul(x, Rsqrt(y))
         assert!(matches!(unoptimized, Expr::Binary(OpType::Mul, _, _)));
 
@@ -1463,12 +1463,12 @@ mod tests {
     }
 
     #[test]
-    fn test_unfuse_add_identity() {
+    fn unfuse_add_identity_should_succeed_when_called() {
         let expr = Expr::Var(0);
         let result = UnfuseRewrite::AddIdentity.apply(&expr);
         assert!(result.is_some());
 
-        let unoptimized = result.unwrap();
+        let unoptimized = result.expect("Expected value but got None/Err");
         // Should be x + 0
         assert!(matches!(unoptimized, Expr::Binary(OpType::Add, _, _)));
 
@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_produces_valid_pairs() {
+    fn bwd_generator_produces_valid_pairs_should_succeed_when_called() {
         let config = BwdGenConfig::default();
         let mut generator = BwdGenerator::new(42, config);
 
@@ -1513,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_has_fused_ops() {
+    fn bwd_generator_has_fused_ops_should_succeed_when_called() {
         let config = BwdGenConfig {
             fused_op_prob: 0.8, // High probability of fused ops
             max_depth: 4,
@@ -1535,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_fused_ops() {
+    fn count_fused_ops_should_succeed_when_called() {
         // Expression with MulAdd and MulRsqrt
         let expr = Expr::Ternary(
             OpType::MulAdd,

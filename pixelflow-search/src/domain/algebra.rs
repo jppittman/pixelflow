@@ -653,15 +653,15 @@ mod tests {
     use libm::fabsf;
 
     #[test]
-    fn test_op_type_roundtrip() {
+    fn op_type_roundtrip_should_succeed_when_called() {
         for i in 0..OpType::COUNT {
-            let op = OpType::from_index(i).unwrap();
+            let op = OpType::from_index(i).expect("Expected value but got None/Err");
             assert_eq!(op.index(), i);
         }
     }
 
     #[test]
-    fn test_feature_roundtrip() {
+    fn feature_roundtrip_should_succeed_when_called() {
         let feature = HalfEPFeature {
             perspective_op: 5,
             descendant_op: 10,
@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_eval() {
+    fn expr_eval_should_succeed_when_called() {
         // x + y
         let expr = Expr::Binary(
             OpType::Add,
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_generator() {
+    fn expr_generator_should_succeed_when_called() {
         let mut generator = ExprGenerator::new(42, ExprGenConfig::default());
         for _ in 0..10 {
             let expr = generator.generate();
@@ -696,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn test_feature_extraction() {
+    fn feature_extraction_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpType::Add,
             Box::new(Expr::Var(0)),
@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_add_zero() {
+    fn rewrite_add_zero_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpType::Add,
             Box::new(Expr::Var(0)),
@@ -715,11 +715,11 @@ mod tests {
         );
         let rewritten = RewriteRule::AddZero.try_apply(&expr);
         assert!(rewritten.is_some());
-        assert!(matches!(rewritten.unwrap(), Expr::Var(0)));
+        assert!(matches!(rewritten.expect("Expected value but got None/Err"), Expr::Var(0)));
     }
 
     #[test]
-    fn test_rewrite_fuse_muladd() {
+    fn rewrite_fuse_muladd_should_succeed_when_called() {
         // a * b + c
         let expr = Expr::Binary(
             OpType::Add,
@@ -732,11 +732,11 @@ mod tests {
         );
         let rewritten = RewriteRule::FuseToMulAdd.try_apply(&expr);
         assert!(rewritten.is_some());
-        assert!(matches!(rewritten.unwrap(), Expr::Ternary(OpType::MulAdd, _, _, _)));
+        assert!(matches!(rewritten.expect("Expected value but got None/Err"), Expr::Ternary(OpType::MulAdd, _, _, _)));
     }
 
     #[test]
-    fn test_find_all_rewrites() {
+    fn find_all_rewrites_should_succeed_when_called() {
         // (x + 0) + y - should find AddZero at path [0]
         let expr = Expr::Binary(
             OpType::Add,
@@ -759,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_add_remove() {
+    fn accumulator_add_remove_should_succeed_when_called() {
         let nnue = Nnue::with_defaults();
         let mut acc = Accumulator::new(&nnue);
 

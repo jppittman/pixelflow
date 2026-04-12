@@ -416,14 +416,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_expr() {
-        let expr = parse_expr("Add(Var(0), Var(1))").unwrap();
+    fn parse_expr_should_succeed_when_called() {
+        let expr = parse_expr("Add(Var(0), Var(1))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
 
-        let expr = parse_expr("Mul(Add(Var(0), Var(1)), Var(2))").unwrap();
+        let expr = parse_expr("Mul(Add(Var(0), Var(1)), Var(2))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Mul, _, _)));
 
-        let expr = parse_expr("MulAdd(Var(0), Var(1), Var(2))").unwrap();
+        let expr = parse_expr("MulAdd(Var(0), Var(1), Var(2))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Ternary(OpKind::MulAdd, _, _, _)));
     }
 
@@ -432,7 +432,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_parse_kernel_code_variables() {
+    fn parse_kernel_code_variables_should_succeed_when_called() {
         assert!(matches!(parse_kernel_code("X"), Some(Expr::Var(0))));
         assert!(matches!(parse_kernel_code("Y"), Some(Expr::Var(1))));
         assert!(matches!(parse_kernel_code("Z"), Some(Expr::Var(2))));
@@ -440,54 +440,54 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_constants() {
+    fn parse_kernel_code_constants_should_succeed_when_called() {
         assert!(matches!(parse_kernel_code("1.0"), Some(Expr::Const(v)) if (v - 1.0).abs() < 1e-6));
         assert!(matches!(parse_kernel_code("(4.595877)"), Some(Expr::Const(v)) if (v - 4.595877).abs() < 1e-5));
         assert!(matches!(parse_kernel_code("0.0"), Some(Expr::Const(v)) if v.abs() < 1e-6));
     }
 
     #[test]
-    fn test_parse_kernel_code_binary_ops() {
-        let expr = parse_kernel_code("(X + Y)").unwrap();
+    fn parse_kernel_code_binary_ops_should_succeed_when_called() {
+        let expr = parse_kernel_code("(X + Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
 
-        let expr = parse_kernel_code("(X - Y)").unwrap();
+        let expr = parse_kernel_code("(X - Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Sub, _, _)));
 
-        let expr = parse_kernel_code("(X * Y)").unwrap();
+        let expr = parse_kernel_code("(X * Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Mul, _, _)));
 
-        let expr = parse_kernel_code("(X / Y)").unwrap();
+        let expr = parse_kernel_code("(X / Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Div, _, _)));
     }
 
     #[test]
-    fn test_parse_kernel_code_from_benchmark_cache() {
-        let expr = parse_kernel_code("((4.595877) - Z)").unwrap();
+    fn parse_kernel_code_from_benchmark_cache_should_succeed_when_called() {
+        let expr = parse_kernel_code("((4.595877) - Z)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Sub, _, _)));
 
-        let expr = parse_kernel_code("((4.595877) + (-Z))").unwrap();
+        let expr = parse_kernel_code("((4.595877) + (-Z))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
 
-        let expr = parse_kernel_code("((-Z) + (4.595877))").unwrap();
+        let expr = parse_kernel_code("((-Z) + (4.595877))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
     }
 
     #[test]
-    fn test_parse_kernel_code_unary_ops() {
-        let expr = parse_kernel_code("(-X)").unwrap();
+    fn parse_kernel_code_unary_ops_should_succeed_when_called() {
+        let expr = parse_kernel_code("(-X)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Unary(OpKind::Neg, _)));
 
-        let expr = parse_kernel_code("(X).sqrt()").unwrap();
+        let expr = parse_kernel_code("(X).sqrt()").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Unary(OpKind::Sqrt, _)));
 
-        let expr = parse_kernel_code("(X).abs()").unwrap();
+        let expr = parse_kernel_code("(X).abs()").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Unary(OpKind::Abs, _)));
     }
 
     #[test]
-    fn test_parse_kernel_code_nested() {
-        let expr = parse_kernel_code("((X + Y) * Z)").unwrap();
+    fn parse_kernel_code_nested_should_succeed_when_called() {
+        let expr = parse_kernel_code("((X + Y) * Z)").expect("Expected value but got None/Err");
         if let Expr::Binary(OpKind::Mul, left, right) = expr {
             assert!(matches!(*left, Expr::Binary(OpKind::Add, _, _)));
             assert!(matches!(*right, Expr::Var(2)));
@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_method_chains() {
+    fn parse_kernel_code_method_chains_should_succeed_when_called() {
         let expr = parse_kernel_code("(X).sqrt()");
         assert!(expr.is_some(), "Should parse (X).sqrt()");
 
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_complex_expressions() {
+    fn parse_kernel_code_complex_expressions_should_succeed_when_called() {
         let expr = parse_kernel_code("((-0.724020)).rsqrt()");
         assert!(expr.is_some(), "Should parse rsqrt of negative const: {:?}", expr);
 
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_actual_failures() {
+    fn parse_actual_failures_should_succeed_when_called() {
         let expr = parse_kernel_code(
             "((((X).rsqrt()).abs()).abs()).min(((((-0.724020)).rsqrt() * (1.0 / (X).abs()))).min(W))"
         );
@@ -544,7 +544,7 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_expr_to_kernel_code_variables() {
+    fn expr_to_kernel_code_variables_should_succeed_when_called() {
         assert_eq!(expr_to_kernel_code(&Expr::Var(0)), "X");
         assert_eq!(expr_to_kernel_code(&Expr::Var(1)), "Y");
         assert_eq!(expr_to_kernel_code(&Expr::Var(2)), "Z");
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_to_kernel_code_constants() {
+    fn expr_to_kernel_code_constants_should_succeed_when_called() {
         let code = expr_to_kernel_code(&Expr::Const(3.14));
         let reparsed = parse_kernel_code(&code);
         assert!(reparsed.is_some(), "Failed to reparse constant: {}", code);
@@ -567,14 +567,14 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_to_kernel_code_roundtrip_simple() {
+    fn expr_to_kernel_code_roundtrip_simple_should_succeed_when_called() {
         let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let code = expr_to_kernel_code(&expr);
         assert_string_roundtrip(&code);
     }
 
     #[test]
-    fn test_expr_to_kernel_code_roundtrip_unary_methods() {
+    fn expr_to_kernel_code_roundtrip_unary_methods_should_succeed_when_called() {
         for i in 0..OpKind::COUNT {
             let Some(op) = OpKind::from_index(i) else { continue };
             if op.arity() != 1 { continue; }
@@ -585,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_to_kernel_code_roundtrip_binary() {
+    fn expr_to_kernel_code_roundtrip_binary_should_succeed_when_called() {
         for i in 0..OpKind::COUNT {
             let Some(op) = OpKind::from_index(i) else { continue };
             if op.arity() != 2 { continue; }
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_to_kernel_code_roundtrip_ternary() {
+    fn expr_to_kernel_code_roundtrip_ternary_should_succeed_when_called() {
         for i in 0..OpKind::COUNT {
             let Some(op) = OpKind::from_index(i) else { continue };
             if op.arity() != 3 { continue; }
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_to_kernel_code_roundtrip_generated() {
+    fn expr_to_kernel_code_roundtrip_generated_should_succeed_when_called() {
         use pixelflow_search::nnue::{ExprGenConfig, ExprGenerator};
         let config = ExprGenConfig {
             max_depth: 6,

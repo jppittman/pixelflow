@@ -4241,7 +4241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_extraction() {
+    fn edge_extraction_should_succeed_when_called() {
         let expr = make_add_xy();
         let edges = extract_edges(&expr);
 
@@ -4253,7 +4253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fma_edges() {
+    fn fma_edges_should_succeed_when_called() {
         let expr = make_fma_pattern();
         let edges = extract_edges(&expr);
 
@@ -4266,7 +4266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_asymmetric_accumulator() {
+    fn asymmetric_accumulator_should_succeed_when_called() {
         let emb = OpEmbeddings::new_random(42);
 
         // Mul→Add (under Add parent)
@@ -4314,7 +4314,7 @@ mod tests {
     }
 
     #[test]
-    fn test_incremental_update() {
+    fn incremental_update_should_succeed_when_called() {
         let emb = OpEmbeddings::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4341,7 +4341,7 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_pass() {
+    fn forward_pass_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4352,7 +4352,7 @@ mod tests {
     }
 
     #[test]
-    fn test_param_count() {
+    fn param_count_should_succeed_when_called() {
         // Verify parameter count is reasonable and finite
         let count = ExprNnue::param_count();
         assert!(count > 0, "Should have parameters");
@@ -4363,7 +4363,7 @@ mod tests {
     }
 
     #[test]
-    fn test_different_expressions_different_costs() {
+    fn different_expressions_different_costs_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
 
         let simple = Expr::Var(0);
@@ -4389,7 +4389,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_consolidated_param_count() {
+    fn consolidated_param_count_should_succeed_when_called() {
         // Param count should include backbone + all unified heads
         let count = ExprNnue::param_count();
         // Backbone: embeddings + w1 + b1 = ~9,728
@@ -4402,7 +4402,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_head_value_prediction() {
+    fn dual_head_value_prediction_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4421,7 +4421,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_factored_preserves_backbone() {
+    fn from_factored_preserves_backbone_should_succeed_when_called() {
         let original = ExprNnue::new_random(42);
 
         let converted = ExprNnue::from_factored(&original);
@@ -4438,7 +4438,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_head_latency_prior() {
+    fn dual_head_latency_prior_should_succeed_when_called() {
         // Test that latency priors are correctly set in embeddings.
         // Note: Random network weights can overwhelm these priors - this test
         // verifies initialization, not that untrained predictions are correct.
@@ -4475,7 +4475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_policy_scoring() {
+    fn mask_policy_scoring_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4493,7 +4493,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_rule_features_initialization() {
+    fn rule_features_initialization_should_succeed_when_called() {
         let mut rule_features = RuleFeatures::new();
 
         // All features should be zero initially
@@ -4511,7 +4511,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_rule_deterministic() {
+    fn encode_rule_deterministic_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
 
@@ -4534,7 +4534,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_all_rules() {
+    fn encode_all_rules_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let mut rule_features = RuleFeatures::new();
 
@@ -4563,7 +4563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_expr_embed() {
+    fn compute_expr_embed_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4582,7 +4582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_mask_features() {
+    fn compute_mask_features_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4600,7 +4600,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bilinear_score_computation() {
+    fn bilinear_score_computation_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
 
         // Create test vectors
@@ -4631,7 +4631,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_score_all_rules_finite() {
+    fn mask_score_all_rules_finite_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
         let mut rule_features = RuleFeatures::new();
@@ -4652,7 +4652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_rules_unified() {
+    fn filter_rules_unified_should_succeed_when_called() {
         let mut net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
         let mut rule_features = RuleFeatures::new();
@@ -4674,7 +4674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_predict_log_cost() {
+    fn predict_log_cost_should_succeed_when_called() {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4685,7 +4685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_training_step_loss_decreases() {
+    fn mask_training_step_loss_decreases_should_succeed_when_called() {
         let mut net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
         let rule_features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
@@ -4719,7 +4719,7 @@ mod tests {
     }
 
     #[test]
-    fn test_value_mlp_training_step() {
+    fn value_mlp_training_step_should_succeed_when_called() {
         let mut net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
@@ -4751,7 +4751,7 @@ mod tests {
     }
 
     #[test]
-    fn test_randomize_mask_only() {
+    fn randomize_mask_only_should_succeed_when_called() {
         let mut net = ExprNnue::new();
 
         // Set some backbone values that should be preserved
@@ -4788,7 +4788,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "std")]
-    fn test_unified_architecture_serialization_roundtrip() {
+    fn unified_architecture_serialization_roundtrip_should_succeed_when_called() {
         use std::path::PathBuf;
 
         let mut net = ExprNnue::new_random(42);
@@ -4836,7 +4836,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gradients_finite_through_all_paths() {
+    fn gradients_finite_through_all_paths_should_succeed_when_called() {
         let mut net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
         let rule_features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
@@ -4882,7 +4882,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_complex_pe_roundtrip() {
+    fn complex_pe_roundtrip_should_succeed_when_called() {
         // add_edge + remove_edge should return the accumulator to zero.
         let emb = OpEmbeddings::new_random(42);
         let mut acc = EdgeAccumulator::new();
@@ -4909,7 +4909,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sibling_discrimination() {
+    fn sibling_discrimination_should_succeed_when_called() {
         // Add(Sub(A,B), Div(C,D)) vs Add(Div(A,B), Sub(C,D))
         // With child-index encoding, these should produce DIFFERENT accumulators
         // because left child (idx 0) and right child (idx 1) get different PEs.
@@ -4966,7 +4966,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_structural_hash_identical_trees() {
+    fn structural_hash_identical_trees_should_succeed_when_called() {
         // Two separately constructed trees with the same structure must produce
         // the same hash.
         let a = Expr::Binary(
@@ -4987,7 +4987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_structural_hash_different_ops_differ() {
+    fn structural_hash_different_ops_differ_should_succeed_when_called() {
         let add = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let mul = Expr::Binary(OpKind::Mul, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         assert_ne!(
@@ -4998,14 +4998,14 @@ mod tests {
     }
 
     #[test]
-    fn test_structural_hash_different_vars_differ() {
+    fn structural_hash_different_vars_differ_should_succeed_when_called() {
         let v0 = Expr::Var(0);
         let v1 = Expr::Var(1);
         assert_ne!(structural_hash(&v0), structural_hash(&v1));
     }
 
     #[test]
-    fn test_structural_hash_negative_zero_equals_positive_zero() {
+    fn structural_hash_negative_zero_equals_positive_zero_should_succeed_when_called() {
         // -0.0 and 0.0 must hash identically (IEEE 754 quirk).
         let pos = Expr::Const(0.0_f32);
         let neg = Expr::Const(-0.0_f32);
@@ -5017,7 +5017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_expr_dedup_no_shared_subtrees() {
+    fn from_expr_dedup_no_shared_subtrees_should_succeed_when_called() {
         // A tree with no shared subtrees: dedup result must equal plain from_expr.
         let emb = OpEmbeddings::new_random(42);
         let expr = make_fma_pattern(); // (a*b) + c — no CSE
@@ -5040,7 +5040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_expr_dedup_shared_subtree_counted_once() {
+    fn from_expr_dedup_shared_subtree_counted_once_should_succeed_when_called() {
         // Build an expression where the SAME Expr value appears at two
         // positions: Add(neg(x), neg(x)).  The two `neg(x)` subtrees have
         // identical content, so dedup must walk the second one only once and
@@ -5094,7 +5094,7 @@ mod tests {
         }
 
         #[test]
-        fn test_behavior_exploit_scenario_cse_preservation() {
+        fn behavior_exploit_scenario_cse_preservation_should_succeed_when_called() {
             let nnue = ExprNnue::new_random(42);
 
             let shared_x = Box::new(Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0))));
@@ -5118,7 +5118,7 @@ mod tests {
         }
 
         #[test]
-        fn test_behavior_total_collapse() {
+        fn behavior_total_collapse_should_succeed_when_called() {
             let nnue = ExprNnue::new_random(42);
 
             let shared_x = Box::new(Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0))));
@@ -5138,7 +5138,7 @@ mod tests {
         }
 
         #[test]
-        fn test_behavior_sequential_drift() {
+        fn behavior_sequential_drift_should_succeed_when_called() {
             let nnue = ExprNnue::new_random(42);
 
             let mut current_ast = Expr::Binary(

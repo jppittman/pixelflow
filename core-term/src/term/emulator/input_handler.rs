@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn test_paste_text_action_bracketed_on() {
+    fn paste_text_action_bracketed_on_should_succeed_when_called() {
         let mut emu = create_test_emu_for_input();
         // Enable bracketed paste mode via public API (CSI ? 2004 h)
         // This ensures we test the mode setting logic and state representation contract
@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn test_paste_text_action_bracketed_off() {
+    fn paste_text_action_bracketed_off_should_succeed_when_called() {
         let mut emu = create_test_emu_for_input();
         assert!(!emu.dec_modes.bracketed_paste_mode);
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_event_resize_returns_resize_pty_action() {
+    fn control_event_resize_returns_resize_pty_action_should_succeed_when_called() {
         let mut emu = create_test_emu_for_input();
 
         // Default cell size is 10x16 (from config)
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_event_resize_minimum_dimensions() {
+    fn control_event_resize_minimum_dimensions_should_succeed_when_called() {
         let mut emu = create_test_emu_for_input();
 
         // Very small resize (should clamp to MIN_GRID_DIMENSION)
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_event_request_snapshot_returns_none() {
+    fn control_event_request_snapshot_returns_none_should_succeed_when_called() {
         let mut emu = create_test_emu_for_input();
 
         let result = process_control_event(&mut emu, ControlEvent::RequestSnapshot);
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_event_pty_data_ready_returns_none() {
+    fn control_event_pty_data_ready_returns_none_should_succeed_when_called() {
         let mut emu = create_test_emu_for_input();
 
         let result = process_control_event(&mut emu, ControlEvent::PtyDataReady);

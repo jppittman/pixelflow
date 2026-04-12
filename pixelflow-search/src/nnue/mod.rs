@@ -1969,15 +1969,15 @@ mod tests {
     use libm::fabsf;
 
     #[test]
-    fn test_op_type_roundtrip() {
+    fn op_type_roundtrip_should_succeed_when_called() {
         for i in 0..OpKind::COUNT {
-            let op = OpKind::from_index(i).unwrap();
+            let op = OpKind::from_index(i).expect("Expected value but got None/Err");
             assert_eq!(op.index(), i);
         }
     }
 
     #[test]
-    fn test_feature_roundtrip() {
+    fn feature_roundtrip_should_succeed_when_called() {
         let feature = HalfEPFeature {
             perspective_op: 5,
             descendant_op: 10,
@@ -1990,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_generator() {
+    fn expr_generator_should_succeed_when_called() {
         let mut generator = ExprGenerator::new(42, ExprGenConfig::default());
         for _ in 0..10 {
             let expr = generator.generate();
@@ -2000,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn test_feature_extraction() {
+    fn feature_extraction_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpKind::Add,
             Box::new(Expr::Var(0)),
@@ -2011,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_add_zero() {
+    fn rewrite_add_zero_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpKind::Add,
             Box::new(Expr::Var(0)),
@@ -2019,11 +2019,11 @@ mod tests {
         );
         let rewritten = RewriteRule::AddZero.try_apply(&expr);
         assert!(rewritten.is_some());
-        assert!(matches!(rewritten.unwrap(), Expr::Var(0)));
+        assert!(matches!(rewritten.expect("Expected value but got None/Err"), Expr::Var(0)));
     }
 
     #[test]
-    fn test_rewrite_fuse_muladd() {
+    fn rewrite_fuse_muladd_should_succeed_when_called() {
         // a * b + c
         let expr = Expr::Binary(
             OpKind::Add,
@@ -2037,13 +2037,13 @@ mod tests {
         let rewritten = RewriteRule::FuseToMulAdd.try_apply(&expr);
         assert!(rewritten.is_some());
         assert!(matches!(
-            rewritten.unwrap(),
+            rewritten.expect("Expected value but got None/Err"),
             Expr::Ternary(OpKind::MulAdd, _, _, _)
         ));
     }
 
     #[test]
-    fn test_find_all_rewrites() {
+    fn find_all_rewrites_should_succeed_when_called() {
         // (x + 0) + y - should find AddZero at path [0]
         let expr = Expr::Binary(
             OpKind::Add,
@@ -2066,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_add_remove() {
+    fn accumulator_add_remove_should_succeed_when_called() {
         let nnue = Nnue::with_defaults();
         let mut acc = Accumulator::new(&nnue);
 
@@ -2092,28 +2092,28 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_pattern_match_var() {
+    fn pattern_match_var_should_succeed_when_called() {
         // Var(0) matches anything
         let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let template = Expr::Var(0);
-        let bindings = pattern_match(&expr, &template).unwrap();
+        let bindings = pattern_match(&expr, &template).expect("Expected value but got None/Err");
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[&0], expr);
     }
 
     #[test]
-    fn test_pattern_match_structural() {
+    fn pattern_match_structural_should_succeed_when_called() {
         // Match Add(V0, V1) against Add(X, Y)
         let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let template = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
-        let bindings = pattern_match(&expr, &template).unwrap();
+        let bindings = pattern_match(&expr, &template).expect("Expected value but got None/Err");
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[&0], Expr::Var(0));
         assert_eq!(bindings[&1], Expr::Var(1));
     }
 
     #[test]
-    fn test_pattern_match_consistency() {
+    fn pattern_match_consistency_should_succeed_when_called() {
         // V0 appears twice -- must bind to same sub-expr
         let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(0)));
         let template = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(0)));
@@ -2125,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_match_const() {
+    fn pattern_match_const_should_succeed_when_called() {
         let expr = Expr::Const(1.0);
         let template = Expr::Const(1.0);
         assert!(pattern_match(&expr, &template).is_some());
@@ -2135,7 +2135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_substitute_template() {
+    fn substitute_template_should_succeed_when_called() {
         let mut bindings = BTreeMap::new();
         bindings.insert(0, Expr::Var(0)); // X
         bindings.insert(1, Expr::Var(1)); // Y
@@ -2148,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_substitute_template_unbound_var_returns_none() {
+    fn substitute_template_unbound_var_returns_none_should_succeed_when_called() {
         let mut bindings = BTreeMap::new();
         bindings.insert(0, Expr::Var(0)); // Only V0 bound
 
@@ -2159,13 +2159,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_match_then_substitute_roundtrip() {
+    fn pattern_match_then_substitute_roundtrip_should_succeed_when_called() {
         // Match Add(X, Y) against Add(V0, V1), then substitute into Mul(V0, V1)
         let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let lhs = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let rhs = Expr::Binary(OpKind::Mul, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
-        let bindings = pattern_match(&expr, &lhs).unwrap();
+        let bindings = pattern_match(&expr, &lhs).expect("Expected value but got None/Err");
         let result = substitute_template(&rhs, &bindings)
             .expect("substitute_template returned None with complete bindings");
         assert_eq!(result, Expr::Binary(OpKind::Mul, Box::new(Expr::Var(0)), Box::new(Expr::Var(1))));
@@ -2176,7 +2176,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_bwd_generator_produces_valid_pairs() {
+    fn bwd_generator_produces_valid_pairs_should_succeed_when_called() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();
@@ -2196,7 +2196,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_has_fused_ops() {
+    fn bwd_generator_has_fused_ops_should_succeed_when_called() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig {
@@ -2220,7 +2220,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_with_templates() {
+    fn bwd_generator_with_templates_should_succeed_when_called() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();
@@ -2240,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_count_fused_ops() {
+    fn count_fused_ops_should_succeed_when_called() {
         // Expression with MulAdd
         let expr = Expr::Ternary(
             OpKind::MulAdd,
@@ -2261,7 +2261,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_dense_features_simple_add() {
+    fn dense_features_simple_add_should_succeed_when_called() {
         // x + y
         let expr = Expr::Binary(
             OpKind::Add,
@@ -2277,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_features_critical_path_wide_vs_deep() {
+    fn dense_features_critical_path_wide_vs_deep_should_succeed_when_called() {
         // Wide expression: (a + b) + (c + d)
         // Critical path: 4 + 4 = 8 (two adds in sequence, but children parallel)
         let wide = Expr::Binary(
@@ -2327,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_features_max_width() {
+    fn dense_features_max_width_should_succeed_when_called() {
         // Wide expression: (a + b) + (c + d)
         // Max width = 4 (all vars at depth 2)
         let wide = Expr::Binary(
@@ -2349,7 +2349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_features_detect_identity() {
+    fn dense_features_detect_identity_should_succeed_when_called() {
         // x * 1 - has identity
         let expr = Expr::Binary(
             OpKind::Mul,
@@ -2361,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_features_detect_fusable() {
+    fn dense_features_detect_fusable_should_succeed_when_called() {
         // (a * b) + c - fusable pattern
         let expr = Expr::Binary(
             OpKind::Add,
@@ -2377,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_forward_dimensions() {
+    fn hybrid_forward_dimensions_should_succeed_when_called() {
         // Verify the hybrid architecture has correct dimensions
         let nnue = Nnue::with_defaults();
         let acc = Accumulator::new(&nnue);
@@ -2388,7 +2388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_forward_with_features() {
+    fn hybrid_forward_with_features_should_succeed_when_called() {
         let nnue = Nnue::with_defaults();
         let mut acc = Accumulator::new(&nnue);
 
@@ -2412,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nnue_config_combined_size() {
+    fn nnue_config_combined_size_should_succeed_when_called() {
         let config = NnueConfig::default();
         assert_eq!(config.combined_size(), 256 + 32);
     }

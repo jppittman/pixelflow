@@ -315,13 +315,13 @@ mod tests {
     #[test]
     fn send_recv_basic() {
         let (tx, mut rx) = spsc_channel::<u32>(4);
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
-        tx.try_send(3).unwrap();
+        tx.try_send(1).expect("Expected value but got None/Err");
+        tx.try_send(2).expect("Expected value but got None/Err");
+        tx.try_send(3).expect("Expected value but got None/Err");
 
-        assert_eq!(rx.try_recv().unwrap(), 1);
-        assert_eq!(rx.try_recv().unwrap(), 2);
-        assert_eq!(rx.try_recv().unwrap(), 3);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 1);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 2);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 3);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -329,19 +329,19 @@ mod tests {
     fn full_then_drain() {
         let (tx, mut rx) = spsc_channel::<u32>(2);
         // Capacity rounds up to 2
-        tx.try_send(10).unwrap();
-        tx.try_send(20).unwrap();
+        tx.try_send(10).expect("Expected value but got None/Err");
+        tx.try_send(20).expect("Expected value but got None/Err");
 
         // Should be full
         assert!(matches!(tx.try_send(30), Err(TrySendError::Full(30))));
 
         // Drain one
-        assert_eq!(rx.try_recv().unwrap(), 10);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 10);
 
         // Now we can send again
-        tx.try_send(30).unwrap();
-        assert_eq!(rx.try_recv().unwrap(), 20);
-        assert_eq!(rx.try_recv().unwrap(), 30);
+        tx.try_send(30).expect("Expected value but got None/Err");
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 20);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 30);
     }
 
     #[test]
@@ -361,13 +361,13 @@ mod tests {
     #[test]
     fn drain_after_producer_disconnect() {
         let (tx, mut rx) = spsc_channel::<u32>(4);
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
+        tx.try_send(1).expect("Expected value but got None/Err");
+        tx.try_send(2).expect("Expected value but got None/Err");
         drop(tx);
 
         // Should still drain buffered messages
-        assert_eq!(rx.try_recv().unwrap(), 1);
-        assert_eq!(rx.try_recv().unwrap(), 2);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 1);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 2);
         // Then disconnected
         assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     }
@@ -409,8 +409,8 @@ mod tests {
             received
         });
 
-        producer.join().unwrap();
-        let received = consumer.join().unwrap();
+        producer.join().expect("Expected value but got None/Err");
+        let received = consumer.join().expect("Expected value but got None/Err");
         assert_eq!(received, count);
     }
 
@@ -418,16 +418,16 @@ mod tests {
     fn power_of_two_rounding() {
         // Capacity 3 should round up to 4
         let (tx, mut rx) = spsc_channel::<u32>(3);
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
-        tx.try_send(3).unwrap();
-        tx.try_send(4).unwrap();
+        tx.try_send(1).expect("Expected value but got None/Err");
+        tx.try_send(2).expect("Expected value but got None/Err");
+        tx.try_send(3).expect("Expected value but got None/Err");
+        tx.try_send(4).expect("Expected value but got None/Err");
         assert!(matches!(tx.try_send(5), Err(TrySendError::Full(5))));
 
-        assert_eq!(rx.try_recv().unwrap(), 1);
-        assert_eq!(rx.try_recv().unwrap(), 2);
-        assert_eq!(rx.try_recv().unwrap(), 3);
-        assert_eq!(rx.try_recv().unwrap(), 4);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 1);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 2);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 3);
+        assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), 4);
     }
 
     #[test]
@@ -435,8 +435,8 @@ mod tests {
         // Small buffer, many messages — tests index wrapping
         let (tx, mut rx) = spsc_channel::<u32>(2);
         for i in 0..1000 {
-            tx.try_send(i).unwrap();
-            assert_eq!(rx.try_recv().unwrap(), i);
+            tx.try_send(i).expect("Expected value but got None/Err");
+            assert_eq!(rx.try_recv().expect("Expected value but got None/Err"), i);
         }
     }
 
@@ -479,9 +479,9 @@ mod tests {
         let (tx, rx) = spsc_channel::<u32>(8);
         assert_eq!(rx.len(), 0, "Empty buffer has len 0");
 
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
-        tx.try_send(3).unwrap();
+        tx.try_send(1).expect("Expected value but got None/Err");
+        tx.try_send(2).expect("Expected value but got None/Err");
+        tx.try_send(3).expect("Expected value but got None/Err");
         assert_eq!(rx.len(), 3, "Buffer with 3 messages has len 3");
         assert_ne!(rx.len(), 0);
         assert_ne!(rx.len(), 1);
@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn is_empty_false_when_buffer_has_messages() {
         let (tx, rx) = spsc_channel::<u32>(4);
-        tx.try_send(42).unwrap();
+        tx.try_send(42).expect("Expected value but got None/Err");
         assert!(!rx.is_empty(), "Buffer with a message should not be empty");
     }
 
@@ -524,9 +524,9 @@ mod tests {
         DROP_COUNT.store(0, Ordering::Relaxed);
 
         let (tx, rx) = spsc_channel::<Counted>(4);
-        tx.try_send(Counted(1)).unwrap();
-        tx.try_send(Counted(2)).unwrap();
-        tx.try_send(Counted(3)).unwrap();
+        tx.try_send(Counted(1)).expect("Expected value but got None/Err");
+        tx.try_send(Counted(2)).expect("Expected value but got None/Err");
+        tx.try_send(Counted(3)).expect("Expected value but got None/Err");
 
         // Drop both ends without consuming
         drop(tx);

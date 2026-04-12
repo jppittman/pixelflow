@@ -57,38 +57,38 @@ fn eval3(
 // ============================================================================
 
 #[test]
-fn test_jit_macro_return_x() {
+fn jit_macro_return_x_should_succeed_when_called() {
     let m = kernel_jit!(|| X);
     assert_eq!(eval1(&m, 42.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_add_xy() {
+fn jit_macro_add_xy_should_succeed_when_called() {
     let m = kernel_jit!(|| X + Y);
     assert_eq!(eval2(&m, 10.0, 32.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_complex_expr() {
+fn jit_macro_complex_expr_should_succeed_when_called() {
     // (X + Y) * Z
     let m = kernel_jit!(|| (X + Y) * Z);
     assert_eq!(eval3(&m, 2.0, 5.0, 6.0), 42.0); // (2+5)*6 = 42
 }
 
 #[test]
-fn test_jit_macro_subtraction() {
+fn jit_macro_subtraction_should_succeed_when_called() {
     let m = kernel_jit!(|| X - Y);
     assert_eq!(eval2(&m, 100.0, 58.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_division() {
+fn jit_macro_division_should_succeed_when_called() {
     let m = kernel_jit!(|| X / Y);
     assert_eq!(eval2(&m, 84.0, 2.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_negation() {
+fn jit_macro_negation_should_succeed_when_called() {
     let m = kernel_jit!(|| -X);
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
@@ -98,7 +98,7 @@ fn test_jit_macro_negation() {
 // ============================================================================
 
 #[test]
-fn test_jit_macro_sin() {
+fn jit_macro_sin_should_succeed_when_called() {
     // sin(0) = 0
     let m = kernel_jit!(|| X.sin());
     let val = eval1(&m, 0.0);
@@ -106,7 +106,7 @@ fn test_jit_macro_sin() {
 }
 
 #[test]
-fn test_jit_macro_sin_pi_half() {
+fn jit_macro_sin_pi_half_should_succeed_when_called() {
     // sin(π/2) ≈ 1
     let m = kernel_jit!(|| X.sin());
     let val = eval1(&m, core::f32::consts::FRAC_PI_2);
@@ -114,7 +114,7 @@ fn test_jit_macro_sin_pi_half() {
 }
 
 #[test]
-fn test_jit_macro_cos() {
+fn jit_macro_cos_should_succeed_when_called() {
     // cos(0) = 1
     let m = kernel_jit!(|| X.cos());
     let val = eval1(&m, 0.0);
@@ -122,20 +122,20 @@ fn test_jit_macro_cos() {
 }
 
 #[test]
-fn test_jit_macro_sqrt() {
+fn jit_macro_sqrt_should_succeed_when_called() {
     // sqrt(1764) = 42
     let m = kernel_jit!(|| X.sqrt());
     assert_eq!(eval1(&m, 1764.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_abs() {
+fn jit_macro_abs_should_succeed_when_called() {
     let m = kernel_jit!(|| X.abs());
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_min_max() {
+fn jit_macro_min_max_should_succeed_when_called() {
     let m_min = kernel_jit!(|| X.min(Y));
     let m_max = kernel_jit!(|| X.max(Y));
     assert_eq!(eval2(&m_min, 10.0, 42.0), 10.0);
@@ -218,7 +218,7 @@ fn kernel_jit_same_semantics_as_kernel() {
 // ============================================================================
 
 #[test]
-fn test_jit_macro_atan2_basic() {
+fn jit_macro_atan2_basic_should_succeed_when_called() {
     let m = kernel_jit!(|| Y.atan2(X));
     // atan2(1, 1) = π/4 — polynomial has ~0.06 error at t=1 boundary
     let val = eval2(&m, 1.0, 1.0);
@@ -237,7 +237,7 @@ fn test_jit_macro_atan2_basic() {
 }
 
 #[test]
-fn test_jit_macro_atan2_quadrants() {
+fn jit_macro_atan2_quadrants_should_succeed_when_called() {
     let m = kernel_jit!(|| Y.atan2(X));
 
     // Use ratio = 0.5 (well inside polynomial range) for quadrant tests
@@ -275,7 +275,7 @@ fn test_jit_macro_atan2_quadrants() {
 }
 
 #[test]
-fn test_jit_macro_atan() {
+fn jit_macro_atan_should_succeed_when_called() {
     let m = kernel_jit!(|| X.atan());
     // atan(0.5) ≈ 0.4636 — well within polynomial range
     let val = eval1(&m, 0.5);
@@ -293,7 +293,7 @@ fn test_jit_macro_atan() {
 }
 
 #[test]
-fn test_jit_macro_asin() {
+fn jit_macro_asin_should_succeed_when_called() {
     let m = kernel_jit!(|| X.asin());
     // asin(0) = 0
     let val0 = eval1(&m, 0.0);
@@ -311,7 +311,7 @@ fn test_jit_macro_asin() {
 }
 
 #[test]
-fn test_jit_macro_acos() {
+fn jit_macro_acos_should_succeed_when_called() {
     let m = kernel_jit!(|| X.acos());
     // acos(0.5) = π/3 ≈ 1.047 — exercises large-ratio path (ratio ≈ 1.73)
     let val_half = eval1(&m, 0.5);

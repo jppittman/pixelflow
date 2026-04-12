@@ -1578,7 +1578,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_needs_simple() {
+    fn needs_simple_should_succeed_when_called() {
         // X + Y: both leaves need 1, binary needs max(1,1)+1 = 2
         let expr = Expr::Binary(
             OpKind::Add,
@@ -1589,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_unbalanced() {
+    fn needs_unbalanced_should_succeed_when_called() {
         // (X + Y) + Z: left needs 2, right needs 1, total = max(2,1) = 2
         let left = Expr::Binary(
             OpKind::Add,
@@ -1601,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_balanced_deep() {
+    fn needs_balanced_deep_should_succeed_when_called() {
         // (X + Y) + (Z + W): both sides need 2, total = 2+1 = 3
         let left = Expr::Binary(
             OpKind::Add,
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_spill_forced() {
+    fn spill_forced_should_succeed_when_called() {
         // (X + Y) + (Z + W) with max_regs=2 forces spilling via DAG
         let left = Expr::Binary(
             OpKind::Add,
@@ -1654,7 +1654,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_no_spill_with_enough_regs() {
+    fn no_spill_with_enough_regs_should_succeed_when_called() {
         let left = Expr::Binary(
             OpKind::Add,
             Box::new(Expr::Var(0)),
@@ -1675,7 +1675,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_spill_deeply_nested() {
+    fn spill_deeply_nested_should_succeed_when_called() {
         // Chain: ((((X + Y) + Z) + W) + X) with max_regs=1
         let e1 = Expr::Binary(
             OpKind::Add,
@@ -1709,7 +1709,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_simple() {
+    fn dag_simple_should_succeed_when_called() {
         // Simple expression: X + Y (no sharing)
         let expr = Expr::Binary(
             OpKind::Add,
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_with_constant() {
+    fn dag_with_constant_should_succeed_when_called() {
         // X * 2.0 + Y
         let expr = Expr::Binary(
             OpKind::Add,
@@ -1765,7 +1765,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_with_spill() {
+    fn dag_with_spill_should_succeed_when_called() {
         // Complex expression with limited registers
         let left = Expr::Binary(
             OpKind::Add,
@@ -1800,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_linearize_dag() {
+    fn linearize_dag_should_succeed_when_called() {
         // Test the linearization function
         let expr = Expr::Binary(
             OpKind::Add,
@@ -1814,13 +1814,13 @@ mod tests {
         assert_eq!(schedule.len(), 3);
 
         // Root (X+Y) should use both X and Y
-        let root_id = schedule.last().unwrap().0;
+        let root_id = schedule.last().expect("Expected value but got None/Err").0;
         let root_uses = uses_map.get(root_id.0 as usize).expect("root should have uses");
         assert_eq!(root_uses.len(), 2);
     }
 
     #[test]
-    fn test_linearize_dag_structural_dedup() {
+    fn linearize_dag_structural_dedup_should_succeed_when_called() {
         // Verify that cloned subtrees are collapsed by structural hash-consing.
         // Build: (X + Y) + (X + Y) where the two (X+Y) are distinct allocations.
         let make_sum = || Expr::Binary(
@@ -1842,23 +1842,23 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_frame_layout_empty() {
-        let layout = FrameLayout::from_allocation(&[]).unwrap();
+    fn frame_layout_empty_should_succeed_when_called() {
+        let layout = FrameLayout::from_allocation(&[]).expect("Expected value but got None/Err");
         assert_eq!(layout.frame_size, 0);
         assert!(layout.spill_slots.is_empty());
     }
 
     #[test]
-    fn test_frame_layout_one_spill() {
-        let layout = FrameLayout::from_allocation(&[regalloc::ValueId(5)]).unwrap();
+    fn frame_layout_one_spill_should_succeed_when_called() {
+        let layout = FrameLayout::from_allocation(&[regalloc::ValueId(5)]).expect("Expected value but got None/Err");
         assert_eq!(layout.frame_size, 16);
         assert_eq!(layout.spill_slots[&regalloc::ValueId(5)], 0);
     }
 
     #[test]
-    fn test_frame_layout_alignment() {
+    fn frame_layout_alignment_should_succeed_when_called() {
         let spilled = [regalloc::ValueId(1), regalloc::ValueId(2), regalloc::ValueId(3)];
-        let layout = FrameLayout::from_allocation(&spilled).unwrap();
+        let layout = FrameLayout::from_allocation(&spilled).expect("Expected value but got None/Err");
         // 3 * 16 = 48, already aligned
         assert_eq!(layout.frame_size, 48);
         assert_eq!(layout.spill_slots[&regalloc::ValueId(1)], 0);
@@ -1892,14 +1892,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_no_spills() {
+    fn resolve_binary_no_spills_should_succeed_when_called() {
         // left=v4, right=v5, dst=v6 — all in registers
         let (assign, spills, remat) = make_maps(
             &[(0, 4), (1, 5), (2, 6)],
             &[],
         );
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).expect("Expected value but got None/Err");
 
         assert!(plan.reloads.is_empty());
         assert!(plan.store.is_none());
@@ -1909,14 +1909,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_left_spilled() {
+    fn resolve_binary_left_spilled_should_succeed_when_called() {
         // left spilled at offset 0, right in v5
         let (assign, spills, remat) = make_maps(
             &[(1, 5), (2, 6)],
             &[(0, 0)],
         );
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).expect("Expected value but got None/Err");
 
         assert_eq!(plan.reloads.len(), 1);
         assert_eq!(plan.reloads[0], Reload::FromStack { target: RELOAD_REGS[1], offset: 0 });
@@ -1926,14 +1926,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_both_spilled() {
+    fn resolve_binary_both_spilled_should_succeed_when_called() {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let (assign, spills, remat) = make_maps(
             &[(2, 6)],
             &[(0, 0), (1, 16)],
         );
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).expect("Expected value but got None/Err");
 
         assert_eq!(plan.reloads.len(), 2);
         // left → dst (v6), right → tmp_op (v27)
@@ -1945,14 +1945,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dst_spilled_generates_store() {
+    fn resolve_dst_spilled_generates_store_should_succeed_when_called() {
         // dst is spilled → compute into RELOAD_REGS[0], then store
         let (assign, spills, remat) = make_maps(
             &[(0, 4), (1, 5)],
             &[(2, 32)],
         );
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan = resolve_operands(&op, Loc::Spill(32), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Spill(32), &assign, &spills, &remat).expect("Expected value but got None/Err");
 
         // dst should be RELOAD_REGS[0] since result is spilled
         assert_eq!(plan.op, ResolvedOp::Binary {
@@ -1962,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_fmla_path() {
+    fn resolve_muladd_fmla_path_should_succeed_when_called() {
         // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
         let (assign, spills, remat) = make_maps(
             &[(0, 4), (1, 5), (2, 7), (3, 8)],
@@ -1972,7 +1972,7 @@ mod tests {
             OpKind::MulAdd,
             regalloc::ValueId(0), regalloc::ValueId(1), regalloc::ValueId(2),
         );
-        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).expect("Expected value but got None/Err");
 
         assert!(plan.reloads.is_empty());
         // c=v7 ≠ dst=v8, so setup_mov should copy c → dst
@@ -1981,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_both_ab_spilled() {
+    fn resolve_muladd_decomposed_both_ab_spilled_should_succeed_when_called() {
         // a and b both spilled → decomposed FMUL+FADD path
         // c in register
         let (assign, spills, remat) = make_maps(
@@ -1992,7 +1992,7 @@ mod tests {
             OpKind::MulAdd,
             regalloc::ValueId(0), regalloc::ValueId(1), regalloc::ValueId(2),
         );
-        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).expect("Expected value but got None/Err");
 
         // a → dst, b → tmp_op loaded upfront
         assert_eq!(plan.reloads.len(), 2);
@@ -2012,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_all_three_spilled() {
+    fn resolve_muladd_decomposed_all_three_spilled_should_succeed_when_called() {
         // a, b, c all spilled → decomposed with deferred c reload
         let (assign, spills, remat) = make_maps(
             &[(3, 8)],
@@ -2022,7 +2022,7 @@ mod tests {
             OpKind::MulAdd,
             regalloc::ValueId(0), regalloc::ValueId(1), regalloc::ValueId(2),
         );
-        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).expect("Expected value but got None/Err");
 
         // Only a and b reloads upfront — c is deferred
         assert_eq!(plan.reloads.len(), 2);
@@ -2036,20 +2036,20 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_var_is_nop() {
+    fn resolve_var_is_nop_should_succeed_when_called() {
         let (assign, spills, remat) = make_maps(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
-        let plan = resolve_operands(&op, Loc::Reg(Reg(0)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(0)), &assign, &spills, &remat).expect("Expected value but got None/Err");
         assert_eq!(plan.op, ResolvedOp::Nop);
         assert!(plan.reloads.is_empty());
         assert!(plan.store.is_none());
     }
 
     #[test]
-    fn test_resolve_const() {
+    fn resolve_const_should_succeed_when_called() {
         let (assign, spills, remat) = make_maps(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(3.14);
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).expect("Expected value but got None/Err");
         assert_eq!(plan.op, ResolvedOp::LoadConst { dst: Reg(6), val_bits: 3.14f32.to_bits() });
     }
 
@@ -2059,7 +2059,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_lowered_sin() {
+    fn dag_lowered_sin_should_succeed_when_called() {
         // sin(X) through DAG path — triggers spilling from lowered expansion
         let expr = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));
         let result = compile_dag(&expr).expect("DAG compile of sin(X) failed");
@@ -2080,7 +2080,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_deep_chain_with_spills() {
+    fn dag_deep_chain_with_spills_should_succeed_when_called() {
         // Deep chain of ops with limited registers — stresses the spill/reload
         // logic that previously caused SIGSEGV. Uses only primitive ops (no pow)
         // to avoid exponential blowup from lowering.
@@ -2119,7 +2119,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_muladd_spilled() {
+    fn dag_muladd_spilled_should_succeed_when_called() {
         // MulAdd with max_regs=3 — forces spilling of operands
         let expr = Expr::Ternary(
             OpKind::MulAdd,
@@ -2148,7 +2148,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_clamp_basic() {
+    fn dag_clamp_basic_should_succeed_when_called() {
         // clamp(X, 0.0, 1.0) through DAG
         let expr = Expr::Ternary(
             OpKind::Clamp,
@@ -2182,7 +2182,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_compile_via_compile() {
+    fn dag_compile_via_compile_should_succeed_when_called() {
         // Verify compile() delegates to compile_dag() and produces correct results.
         let expr = Expr::Binary(
             OpKind::Mul,
@@ -2216,7 +2216,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_pow_compiles_without_overflow() {
+    fn dag_pow_compiles_without_overflow_should_succeed_when_called() {
         // pow(X, Y) = exp2(Y * log2(X)) — previously caused spill overflow
         // due to lowering blowup. With structural hash-consing, internal clones
         // collapse and the schedule stays manageable.
@@ -2250,7 +2250,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_double_exp() {
+    fn dag_double_exp_should_succeed_when_called() {
         // exp(exp(W)) + Z — expression #7117 that caused bench_jit_corpus to hang.
         //
         // Double exponential: lower_exp chains two exp2 polynomial expansions.
@@ -2290,7 +2290,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_atan2_compiles() {
+    fn dag_atan2_compiles_should_succeed_when_called() {
         // atan2(X, Y) should compile and produce finite result.
         // Verifies the new atan2 JIT builtin works through the DAG pipeline.
         let expr = Expr::Binary(
@@ -2323,7 +2323,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_asin_compiles() {
+    fn dag_asin_compiles_should_succeed_when_called() {
         // asin(X) should compile through the unary transcendental path.
         let expr = Expr::Unary(
             OpKind::Asin,
@@ -2354,7 +2354,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_acos_compiles() {
+    fn dag_acos_compiles_should_succeed_when_called() {
         // acos(X) should compile through the unary transcendental path.
         let expr = Expr::Unary(
             OpKind::Acos,
@@ -2387,7 +2387,7 @@ mod tests {
     /// (which contains a division by zero) must NOT produce NaN in the output.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_select_short_circuit_avoids_div_by_zero() {
+    fn select_short_circuit_avoids_div_by_zero_should_succeed_when_called() {
         // Build: Select(X > 0, Y, Z / 0.0)
         // When X is all-positive (mask all-true), the false arm Z/0.0 should
         // be skipped and the result should be Y, not NaN.
@@ -2436,7 +2436,7 @@ mod tests {
     /// Test Select with all-false mask: should return false arm.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_select_short_circuit_all_false() {
+    fn select_short_circuit_all_false_should_succeed_when_called() {
         // Select(X > 0, Y / 0.0, Z) with X all-negative
         let mask = Expr::Binary(
             OpKind::Gt,
@@ -2483,7 +2483,7 @@ mod tests {
     /// Test Select with mixed mask: BSL path, both arms evaluated.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_select_mixed_mask_uses_bsl() {
+    fn select_mixed_mask_uses_bsl_should_succeed_when_called() {
         // Select(X > 0, Y, Z) with X = [1, -1, 1, -1]
         let mask = Expr::Binary(
             OpKind::Gt,
@@ -2531,7 +2531,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_dag_ne_correctness() {
+    fn dag_ne_correctness_should_succeed_when_called() {
         // Ne(X, Y) should produce all-ones (as float: NaN / -NaN) when X != Y,
         // and all-zeros (0.0) when X == Y.
         let expr = Expr::Binary(

@@ -546,7 +546,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_estimate_cost() {
+    fn estimate_cost_should_succeed_when_called() {
         // Simple add: x + y
         let expr = Expr::Binary(
             OpType::Add,
@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn test_training_sample_dedup() {
+    fn training_sample_dedup_should_succeed_when_called() {
         let features = vec![
             HalfEPFeature {
                 perspective_op: 0,
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_generator() {
+    fn data_generator_should_succeed_when_called() {
         let mut generator = DataGenerator::new(42, DataGenConfig::default());
         let samples = generator.generate_batch(10);
         assert!(!samples.is_empty());
@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dataset_stats() {
+    fn dataset_stats_should_succeed_when_called() {
         let samples = vec![
             TrainingSample {
                 features: vec![1, 2, 3],

@@ -655,7 +655,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_hce_extractor_basic() {
+    fn hce_extractor_basic_should_succeed_when_called() {
         let extractor = HceExtractor::new();
 
         // Simple expression: x + y
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hce_extractor_fma_cheaper() {
+    fn hce_extractor_fma_cheaper_should_succeed_when_called() {
         // Use default extractor (not with_fma) to see raw operation costs
         let extractor = HceExtractor::new();
 
@@ -725,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hce_extractor_better() {
+    fn hce_extractor_better_should_succeed_when_called() {
         let extractor = HceExtractor::new();
 
         let simple = Expr::Var(0);
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hce_extractor_best_rewrite() {
+    fn hce_extractor_best_rewrite_should_succeed_when_called() {
         let extractor = HceExtractor::new();
 
         // x + 0 - has an obvious improvement
@@ -752,7 +752,7 @@ mod tests {
         let result = extractor.best_rewrite(&expr);
         assert!(result.is_some(), "Should find AddZero rewrite");
 
-        let (mv, rewritten, cost) = result.unwrap();
+        let (mv, rewritten, cost) = result.expect("Expected value but got None/Err");
         assert!(
             matches!(mv.rule, RewriteRule::AddZero),
             "Should be AddZero rule"
@@ -770,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hce_extractor_greedy_optimize() {
+    fn hce_extractor_greedy_optimize_should_succeed_when_called() {
         let extractor = HceExtractor::with_fma();
 
         // (x * y + z) + 0 - multiple optimizations possible
@@ -804,7 +804,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_accumulator_initializes_from_expr() {
+    fn accumulator_initializes_from_expr_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpType::Mul,
             Box::new(Expr::Var(0)),
@@ -826,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_delta_update_works() {
+    fn accumulator_delta_update_works_should_succeed_when_called() {
         // Start with: x * 1
         let original = Expr::Binary(
             OpType::Mul,
@@ -859,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_delta_tracks_fma_fusion() {
+    fn accumulator_delta_tracks_fma_fusion_should_succeed_when_called() {
         // Start with: (a * b) + c
         let original = Expr::Binary(
             OpType::Add,
@@ -895,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_verify_consistency() {
+    fn accumulator_verify_consistency_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpType::Add,
             Box::new(Expr::Binary(
@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_multiple_deltas() {
+    fn accumulator_multiple_deltas_should_succeed_when_called() {
         // Start with: ((x * 1) + 0) - should simplify to just x
         let original = Expr::Binary(
             OpType::Add,
@@ -956,7 +956,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_spsa_perturbation_generation() {
+    fn spsa_perturbation_generation_should_succeed_when_called() {
         let config = SpsaConfig {
             max_iters: 10,
             ..Default::default()
@@ -972,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spsa_step_updates_weights() {
+    fn spsa_step_updates_weights_should_succeed_when_called() {
         let config = SpsaConfig {
             max_iters: 10,
             c: 0.5,
@@ -993,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spsa_optimize_reduces_loss() {
+    fn spsa_optimize_reduces_loss_should_succeed_when_called() {
         let config = SpsaConfig {
             max_iters: 50,
             c: 1.0,
@@ -1033,7 +1033,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_ranking_loss_perfect() {
+    fn ranking_loss_perfect_should_succeed_when_called() {
         let samples = vec![
             (Expr::Var(0), 0),
             (
@@ -1058,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ranking_loss_inverted() {
+    fn ranking_loss_inverted_should_succeed_when_called() {
         let samples = vec![
             (Expr::Var(0), 100), // Inverted: simple is "expensive"
             (
@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn test_correlation_loss_bounds() {
+    fn correlation_loss_bounds_should_succeed_when_called() {
         let samples = vec![
             (Expr::Var(0), 0),
             (
@@ -1103,7 +1103,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_hce_extractor_with_accumulator_consistency() {
+    fn hce_extractor_with_accumulator_consistency_should_succeed_when_called() {
         let extractor = HceExtractor::with_fma();
 
         // Build expression

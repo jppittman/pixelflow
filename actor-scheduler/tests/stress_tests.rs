@@ -117,9 +117,9 @@ fn high_contention_all_messages_delivered() {
         let handle = thread::spawn(move || {
             for i in 0..MESSAGES_PER_SENDER {
                 match i % 3 {
-                    0 => tx.send(Message::Data(i as u64)).unwrap(),
-                    1 => tx.send(Message::Control(i as u64)).unwrap(),
-                    _ => tx.send(Message::Management(i as u64)).unwrap(),
+                    0 => tx.send(Message::Data(i as u64)).expect("Expected value but got None/Err"),
+                    1 => tx.send(Message::Control(i as u64)).expect("Expected value but got None/Err"),
+                    _ => tx.send(Message::Management(i as u64)).expect("Expected value but got None/Err"),
                 }
             }
         });
@@ -128,12 +128,12 @@ fn high_contention_all_messages_delivered() {
 
     // Wait for all senders
     for handle in sender_handles {
-        handle.join().unwrap();
+        handle.join().expect("Expected value but got None/Err");
     }
 
     // Give time for processing, then all handles are dropped → scheduler exits
     thread::sleep(Duration::from_millis(100));
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 
     // Verify all messages were delivered
     let total = data_count.load(Ordering::SeqCst)
@@ -173,18 +173,18 @@ fn high_contention_fairness() {
     for tx in senders {
         let handle = thread::spawn(move || {
             for i in 0..MESSAGES_PER_SENDER {
-                tx.send(Message::Control(i as u64)).unwrap();
+                tx.send(Message::Control(i as u64)).expect("Expected value but got None/Err");
             }
         });
         sender_handles.push(handle);
     }
 
     for handle in sender_handles {
-        handle.join().unwrap();
+        handle.join().expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         ctrl_count.load(Ordering::SeqCst),
@@ -245,13 +245,13 @@ fn backpressure_with_slow_consumer() {
     // Send many messages — spin-yield backpressure when buffer full
     let sender_handle = thread::spawn(move || {
         for i in 0..50 {
-            tx.send(Message::Data(i)).unwrap();
+            tx.send(Message::Data(i)).expect("Expected value but got None/Err");
         }
     });
 
-    sender_handle.join().unwrap();
+    sender_handle.join().expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(100));
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         processed.load(Ordering::SeqCst),
@@ -286,7 +286,7 @@ fn custom_wake_handler_is_called() {
     let (tx, _rx) =
         ActorScheduler::<u64, u64, u64>::new_with_wake_handler(10, 100, Some(wake_handler));
 
-    tx.send(Message::Data(42)).unwrap();
+    tx.send(Message::Data(42)).expect("Expected value but got None/Err");
 
     assert!(
         called.load(Ordering::SeqCst),
@@ -338,15 +338,15 @@ fn burst_limit_prevents_data_starvation() {
 
     // Send many data messages and some management
     for i in 0..100 {
-        tx.send(Message::Data(i)).unwrap();
+        tx.send(Message::Data(i)).expect("Expected value but got None/Err");
     }
     for i in 0..10 {
-        tx.send(Message::Management(i)).unwrap();
+        tx.send(Message::Management(i)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 
     // Both should be fully processed
     assert_eq!(data_processed.load(Ordering::SeqCst), 100);
@@ -406,17 +406,17 @@ fn multi_producer_send() {
     for tx in senders {
         handles.push(thread::spawn(move || {
             for i in 0..100 {
-                tx.send(Message::Data(i)).unwrap();
+                tx.send(Message::Data(i)).expect("Expected value but got None/Err");
             }
         }));
     }
 
     for h in handles {
-        h.join().unwrap();
+        h.join().expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(count.load(Ordering::SeqCst), 1000);
 }
@@ -435,14 +435,14 @@ fn empty_message_types_work_under_load() {
     });
 
     for _ in 0..1000 {
-        tx.send(Message::Data(())).unwrap();
-        tx.send(Message::Control(())).unwrap();
-        tx.send(Message::Management(())).unwrap();
+        tx.send(Message::Data(())).expect("Expected value but got None/Err");
+        tx.send(Message::Control(())).expect("Expected value but got None/Err");
+        tx.send(Message::Management(())).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 }
 
 // ============================================================================
@@ -491,12 +491,12 @@ fn large_messages_work() {
 
     for _ in 0..10 {
         tx.send(Message::Data(LargeMessage { data: [42; 4096] }))
-            .unwrap();
+            .expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(received.load(Ordering::SeqCst), 10);
 }

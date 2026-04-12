@@ -195,7 +195,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_parse_simple_quad() {
+    fn parse_simple_quad_should_succeed_when_called() {
         let obj = "
 # Simple cube (partial)
 v 0.0 0.0 0.0
@@ -204,14 +204,14 @@ v 1.0 1.0 0.0
 v 0.0 1.0 0.0
 f 1 2 3 4
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).expect("Expected value but got None/Err");
         assert_eq!(mesh.vertex_count(), 4);
         assert_eq!(mesh.face_count(), 1);
         assert_eq!(mesh.faces[0].vertices, [0, 1, 2, 3]);
     }
 
     #[test]
-    fn test_valence_computation() {
+    fn valence_computation_should_succeed_when_called() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -223,13 +223,13 @@ f 2 3 5 5
 f 3 4 5 5
 f 4 1 5 5
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).expect("Expected value but got None/Err");
         // Vertex 4 (index 4) appears in all 4 faces (degenerate quads here, but still counts)
         assert_eq!(mesh.valence[4], 8); // Each face contributes 2 references
     }
 
     #[test]
-    fn test_reject_triangles() {
+    fn reject_triangles_should_succeed_when_called() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -242,7 +242,7 @@ f 1 2 3
     }
 
     #[test]
-    fn test_texture_coordinates_ignored() {
+    fn texture_coordinates_ignored_should_succeed_when_called() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -254,7 +254,7 @@ vt 1.0 1.0
 vt 0.0 1.0
 f 1/1 2/2 3/3 4/4
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).expect("Expected value but got None/Err");
         assert_eq!(mesh.vertex_count(), 4);
         assert_eq!(mesh.faces[0].vertices, [0, 1, 2, 3]);
     }

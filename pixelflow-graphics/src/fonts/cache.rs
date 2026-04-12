@@ -359,7 +359,7 @@ mod tests {
     const FONT_DATA: &[u8] = include_bytes!("../../assets/NotoSansMono-Regular.ttf");
 
     #[test]
-    fn test_size_bucket() {
+    fn size_bucket_should_succeed_when_called() {
         assert_eq!(size_bucket(8.0), 8);
         assert_eq!(size_bucket(9.0), 12);
         assert_eq!(size_bucket(12.0), 12);
@@ -369,9 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_glyph_creation() {
-        let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
+    fn cached_glyph_creation_should_succeed_when_called() {
+        let font = Font::parse(FONT_DATA).expect("Expected value but got None/Err");
+        let glyph = font.glyph_scaled('A', 32.0).expect("Expected value but got None/Err");
         let cached = CachedGlyph::new(&glyph, 32);
 
         assert_eq!(cached.width(), 32);
@@ -379,8 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn test_glyph_cache_get() {
-        let font = Font::parse(FONT_DATA).unwrap();
+    fn glyph_cache_get_should_succeed_when_called() {
+        let font = Font::parse(FONT_DATA).expect("Expected value but got None/Err");
         let mut cache = GlyphCache::new();
 
         // First access should cache
@@ -400,8 +400,8 @@ mod tests {
     }
 
     #[test]
-    fn test_glyph_cache_warm() {
-        let font = Font::parse(FONT_DATA).unwrap();
+    fn glyph_cache_warm_should_succeed_when_called() {
+        let font = Font::parse(FONT_DATA).expect("Expected value but got None/Err");
         let mut cache = GlyphCache::new();
 
         cache.warm_ascii(&font, 16.0);
@@ -416,11 +416,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_glyph_eval() {
+    fn cached_glyph_eval_should_succeed_when_called() {
         use pixelflow_core::Field;
 
-        let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
+        let font = Font::parse(FONT_DATA).expect("Expected value but got None/Err");
+        let glyph = font.glyph_scaled('A', 32.0).expect("Expected value but got None/Err");
         let cached = CachedGlyph::new(&glyph, 32);
 
         // Evaluate coverage at multiple coordinates - should not panic
@@ -437,10 +437,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_text_creation() {
+    fn cached_text_creation_should_succeed_when_called() {
         use pixelflow_core::Field;
 
-        let font = Font::parse(FONT_DATA).unwrap();
+        let font = Font::parse(FONT_DATA).expect("Expected value but got None/Err");
         let mut cache = GlyphCache::new();
 
         let text = CachedText::new(&font, &mut cache, "Hello", 16.0);
@@ -462,8 +462,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_memory_usage() {
-        let font = Font::parse(FONT_DATA).unwrap();
+    fn cache_memory_usage_should_succeed_when_called() {
+        let font = Font::parse(FONT_DATA).expect("Expected value but got None/Err");
         let mut cache = GlyphCache::new();
 
         cache.get(&font, 'A', 16.0); // 16x16 = 256 pixels * 4 bytes = 1024

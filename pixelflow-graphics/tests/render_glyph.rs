@@ -81,8 +81,8 @@ fn all_printable_ascii_glyphs_exist() {
 fn advance_and_kern() {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
 
-    let advance_a = font.advance_scaled('A', 16.0).unwrap();
-    let advance_w = font.advance_scaled('W', 16.0).unwrap();
+    let advance_a = font.advance_scaled('A', 16.0).expect("Expected value but got None/Err");
+    let advance_w = font.advance_scaled('W', 16.0).expect("Expected value but got None/Err");
 
     assert!(advance_a > 0.0, "Advance for 'A' should be positive");
     assert!(advance_w > 0.0, "Advance for 'W' should be positive");

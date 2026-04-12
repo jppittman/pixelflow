@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bicubic_constant() {
+    fn bicubic_constant_should_succeed_when_called() {
         // Constant polynomial: c00 = 5.0, all others 0
         let mut coeffs = [0.0f32; 16];
         coeffs[0] = 5.0;
@@ -480,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bicubic_linear() {
+    fn bicubic_linear_should_succeed_when_called() {
         // P(u,v) = 1 + 2u + 3v
         let mut coeffs = [0.0f32; 16];
         coeffs[0] = 1.0; // c00 = 1
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_eigen_valence_4() {
+    fn get_eigen_valence_4_should_succeed_when_called() {
         // Regular vertex (valence 4) should have eigenstructure
         let eigen = get_eigen(4).expect("valence 4 should exist");
         assert_eq!(eigen.valence, 4);
@@ -503,10 +503,10 @@ mod tests {
     }
 
     #[test]
-    fn test_eigen_first_eigenvalue_is_one() {
+    fn eigen_first_eigenvalue_is_one_should_succeed_when_called() {
         // First eigenvalue should always be 1.0 (limit surface property)
         for valence in 3..=10 {
-            let eigen = get_eigen(valence).unwrap();
+            let eigen = get_eigen(valence).expect("Expected value but got None/Err");
             assert!(
                 (eigen.eigenvalues[0] - 1.0).abs() < 1e-6,
                 "valence {} first eigenvalue should be 1.0",
@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_patch_flat_plane() {
+    fn bspline_patch_flat_plane_should_succeed_when_called() {
         // Create a flat 4x4 grid of control points at z=0
         // Points span [0,3] x [0,3] in x,y
         let mut control_points = [[0.0f32; 3]; 16];
@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_patch_corners() {
+    fn bspline_patch_corners_should_succeed_when_called() {
         // Flat grid
         let mut control_points = [[0.0f32; 3]; 16];
         for i in 0..4 {
@@ -580,13 +580,13 @@ mod tests {
     }
 
     #[test]
-    fn test_eigen_trivial_case() {
+    fn eigen_trivial_case_should_succeed_when_called() {
         // If all control points are at the SAME location,
         // the surface should evaluate to that location everywhere.
         // This tests affine invariance.
         let control_points = [[1.0f32, 2.0, 3.0]; 16];
 
-        let eigen = get_eigen(4).unwrap();
+        let eigen = get_eigen(4).expect("Expected value but got None/Err");
         println!("K = {}", eigen.k);
 
         // Project to eigenspace
@@ -661,7 +661,7 @@ mod tests {
 
         // Test eigen_patch at (0,0) with constant control points
         let const_points = [[5.0f32, 7.0, 9.0]; 16];
-        let (ex, ey, ez) = eigen_patch(&const_points, 4).unwrap();
+        let (ex, ey, ez) = eigen_patch(&const_points, 4).expect("Expected value but got None/Err");
 
         // At (0,0), the limit position should be the control point value
         let ex0 = eval_scalar(&ex, 0.0, 0.0);
@@ -690,13 +690,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "outside valid domain")]
-    fn test_validate_eigen_domain_panics_for_invalid() {
+    fn validate_eigen_domain_panics_for_invalid_should_succeed_when_called() {
         // This should panic - coordinates outside [0, 1]²
         validate_eigen_domain(1.5, 0.5);
     }
 
     #[test]
-    fn test_validate_eigen_domain_accepts_valid() {
+    fn validate_eigen_domain_accepts_valid_should_succeed_when_called() {
         // Origin is valid (exact limit position)
         validate_eigen_domain(0.0, 0.0);
 
@@ -712,10 +712,10 @@ mod tests {
     }
 
     #[test]
-    fn test_eigen_patch_subpatch_routing() {
+    fn eigen_patch_subpatch_routing_should_succeed_when_called() {
         // Constant control points - surface should be constant everywhere
         let const_points = [[3.0f32, 5.0, 7.0]; 16];
-        let (ex, ey, ez) = eigen_patch(&const_points, 4).unwrap();
+        let (ex, ey, ez) = eigen_patch(&const_points, 4).expect("Expected value but got None/Err");
 
         // Test points in each subpatch region (first tile)
         // Subpatch 0: v < 0.5 → local coords (2u, 2v)
@@ -746,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_symmetry() {
+    fn bspline_symmetry_should_succeed_when_called() {
         // Symmetric grid centered at origin
         let mut control_points = [[0.0f32; 3]; 16];
         for i in 0..4 {
@@ -776,11 +776,11 @@ mod tests {
     }
 
     #[test]
-    fn test_recursive_tiling_constant_surface() {
+    fn recursive_tiling_constant_surface_should_succeed_when_called() {
         // Constant control points - surface should be constant everywhere
         // including at deeper tiles
         let const_points = [[5.0f32, 7.0, 9.0]; 16];
-        let (ex, ey, ez) = eigen_patch(&const_points, 4).unwrap();
+        let (ex, ey, ez) = eigen_patch(&const_points, 4).expect("Expected value but got None/Err");
 
         // Test points at different tile depths
         let test_points = [
@@ -822,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tile_scale_values() {
+    fn tile_scale_values_should_succeed_when_called() {
         // Test that tile_scale computes correct powers of 2
         let scale = tile_scale();
 

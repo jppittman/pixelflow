@@ -408,7 +408,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_expr_tree_to_kernel_body_var() {
+    fn expr_tree_to_kernel_body_var_should_succeed_when_called() {
         assert_eq!(expr_tree_to_kernel_body(&ExprTree::var(0)), "X");
         assert_eq!(expr_tree_to_kernel_body(&ExprTree::var(1)), "Y");
         assert_eq!(expr_tree_to_kernel_body(&ExprTree::var(2)), "Z");
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_tree_to_kernel_body_const() {
+    fn expr_tree_to_kernel_body_const_should_succeed_when_called() {
         assert_eq!(expr_tree_to_kernel_body(&ExprTree::constant(0.0)), "0.0");
         assert_eq!(expr_tree_to_kernel_body(&ExprTree::constant(1.0)), "1.0");
         assert_eq!(expr_tree_to_kernel_body(&ExprTree::constant(-1.0)), "(-1.0)");
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_tree_to_kernel_body_unary() {
+    fn expr_tree_to_kernel_body_unary_should_succeed_when_called() {
         let x = ExprTree::var(0);
         assert_eq!(
             expr_tree_to_kernel_body(&ExprTree::neg(x.clone())),
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_tree_to_kernel_body_binary() {
+    fn expr_tree_to_kernel_body_binary_should_succeed_when_called() {
         let x = ExprTree::var(0);
         let y = ExprTree::var(1);
 
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_tree_to_kernel_body_nested() {
+    fn expr_tree_to_kernel_body_nested_should_succeed_when_called() {
         // (X + Y) * Z
         let tree = ExprTree::mul(
             ExprTree::add(ExprTree::var(0), ExprTree::var(1)),
@@ -471,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_tree_to_kernel_body_mul_add() {
+    fn expr_tree_to_kernel_body_mul_add_should_succeed_when_called() {
         let tree = ExprTree::mul_add(
             ExprTree::var(0),
             ExprTree::var(1),
@@ -481,14 +481,14 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_tree_to_kernel_code() {
+    fn expr_tree_to_kernel_code_should_succeed_when_called() {
         let tree = ExprTree::add(ExprTree::var(0), ExprTree::constant(1.0));
         let code = expr_tree_to_kernel_code(&tree, "my_kernel");
         assert_eq!(code, "let my_kernel = kernel!(|| (X + 1.0));");
     }
 
     #[test]
-    fn test_generate_corpus_jsonl() {
+    fn generate_corpus_jsonl_should_succeed_when_called() {
         let variants = vec![
             ("k0".to_string(), ExprTree::var(0)),
             (
@@ -516,7 +516,7 @@ mod tests {
     use super::super::ops;
 
     #[test]
-    fn test_dag_simple_no_sharing() {
+    fn dag_simple_no_sharing_should_succeed_when_called() {
         // X + Y: no sharing, should produce simple expression
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_shared_var() {
+    fn dag_shared_var_should_succeed_when_called() {
         // X * X: X is shared, but variables don't need let-bindings
         // (they're already O(1) to access)
         let mut egraph = EGraph::new();
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_shared_subexpr() {
+    fn dag_shared_subexpr_should_succeed_when_called() {
         // sqrt(X) * sqrt(X): sqrt(X) is an expensive shared subexpr
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_triple_shared() {
+    fn dag_triple_shared_should_succeed_when_called() {
         // sqrt(X) * sqrt(X) + sqrt(X): sqrt(X) used 3 times
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_nested_sharing() {
+    fn dag_nested_sharing_should_succeed_when_called() {
         // (X + Y) * (X + Y) + (X + Y): (X + Y) used 3 times
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_to_kernel_code() {
+    fn dag_to_kernel_code_should_succeed_when_called() {
         // Test the full kernel code generation
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -657,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_complex_expression() {
+    fn dag_complex_expression_should_succeed_when_called() {
         // Build: (X * Y) + (X * Y) * (Z + W)
         // (X * Y) is shared between two uses
         let mut egraph = EGraph::new();

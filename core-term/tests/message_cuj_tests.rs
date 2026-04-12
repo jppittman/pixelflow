@@ -109,12 +109,12 @@ fn cuj_pty01_single_byte_batch_delivery() {
 
     // When: A single batch of bytes is sent
     let test_data = b"Hello".to_vec();
-    parser_tx.send(Message::Data(test_data.clone())).unwrap();
+    parser_tx.send(Message::Data(test_data.clone())).expect("Expected value but got None/Err");
 
     // Allow processing
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("Expected value but got None/Err");
 
     // Then: All bytes should be received
     assert_eq!(
@@ -124,7 +124,7 @@ fn cuj_pty01_single_byte_batch_delivery() {
     );
 
     // And: Commands should be generated
-    let commands = cmd_rx.try_recv().unwrap();
+    let commands = cmd_rx.try_recv().expect("Expected value but got None/Err");
     assert_eq!(commands.len(), 5, "Should produce 5 Print commands");
 }
 
@@ -148,12 +148,12 @@ fn cuj_pty01_multiple_batches_fifo_order() {
     // When: Multiple batches are sent
     for i in 0..5 {
         let data = format!("batch{}", i).into_bytes();
-        parser_tx.send(Message::Data(data)).unwrap();
+        parser_tx.send(Message::Data(data)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("Expected value but got None/Err");
 
     // Then: All batches should be received in FIFO order
     let mut all_commands = Vec::new();
@@ -197,11 +197,11 @@ fn cuj_pty01_large_batch_handling() {
     // When: A large batch (4KB) is sent
     let large_data: Vec<u8> = (0..4096).map(|i| b'A' + (i % 26) as u8).collect();
     let expected_len = large_data.len();
-    parser_tx.send(Message::Data(large_data)).unwrap();
+    parser_tx.send(Message::Data(large_data)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(100));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("Expected value but got None/Err");
 
     // Then: All bytes should be received
     assert_eq!(
@@ -241,7 +241,7 @@ fn cuj_pty01_channel_closure_propagation() {
     });
 
     // Send some data
-    parser_tx.send(Message::Data(b"test".to_vec())).unwrap();
+    parser_tx.send(Message::Data(b"test".to_vec())).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(20));
 
     // When: Sender is dropped (simulating ReadThread exit)
@@ -270,10 +270,10 @@ fn cuj_pty02_command_batch_delivery() {
         MockAnsiCommand::Print('i'),
         MockAnsiCommand::Newline,
     ];
-    cmd_tx.send(commands.clone()).unwrap();
+    cmd_tx.send(commands.clone()).expect("Expected value but got None/Err");
 
     // Then: App should receive the exact batch
-    let received = cmd_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let received = cmd_rx.recv_timeout(Duration::from_millis(100)).expect("Expected value but got None/Err");
     assert_eq!(received, commands, "App should receive exact command batch");
 }
 
@@ -295,11 +295,11 @@ fn cuj_pty02_empty_input_no_output() {
     });
 
     // When: Empty bytes are sent
-    parser_tx.send(Message::Data(vec![])).unwrap();
+    parser_tx.send(Message::Data(vec![])).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("Expected value but got None/Err");
 
     // Then: No commands should be produced
     let result = cmd_rx.try_recv();
@@ -328,14 +328,14 @@ fn cuj_pty02_mixed_content_batch() {
 
     // When: Mixed content (text + newlines) is sent
     let mixed_data = b"Line1\nLine2\n".to_vec();
-    parser_tx.send(Message::Data(mixed_data)).unwrap();
+    parser_tx.send(Message::Data(mixed_data)).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(parser_tx);
-    parser_handle.join().unwrap();
+    parser_handle.join().expect("Expected value but got None/Err");
 
     // Then: Commands should include both prints and newlines
-    let commands = cmd_rx.try_recv().unwrap();
+    let commands = cmd_rx.try_recv().expect("Expected value but got None/Err");
     let newline_count = commands
         .iter()
         .filter(|c| matches!(c, MockAnsiCommand::Newline))
@@ -354,10 +354,10 @@ fn cuj_pty03_write_command_delivery() {
 
     // When: App sends bytes to write
     let output = b"\x1b[H".to_vec(); // Move cursor home
-    write_tx.send(output.clone()).unwrap();
+    write_tx.send(output.clone()).expect("Expected value but got None/Err");
 
     // Then: Write thread receives the bytes
-    let received = write_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let received = write_rx.recv_timeout(Duration::from_millis(100)).expect("Expected value but got None/Err");
     assert_eq!(received, output, "Write thread should receive exact bytes");
 }
 
@@ -368,12 +368,12 @@ fn cuj_pty03_write_ordering_preserved() {
 
     // When: Multiple write commands are sent
     for i in 0..10 {
-        write_tx.send(vec![b'0' + i]).unwrap();
+        write_tx.send(vec![b'0' + i]).expect("Expected value but got None/Err");
     }
 
     // Then: Order should be preserved
     for i in 0..10 {
-        let received = write_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        let received = write_rx.recv_timeout(Duration::from_millis(100)).expect("Expected value but got None/Err");
         assert_eq!(received, vec![b'0' + i], "Write {} should be in order", i);
     }
 }
@@ -423,14 +423,14 @@ fn cuj_pty04_sender_drop_terminates_receiver() {
     });
 
     // Send some data
-    tx.send(Message::Data(42)).unwrap();
+    tx.send(Message::Data(42)).expect("Expected value but got None/Err");
     thread::sleep(Duration::from_millis(20));
 
     // When: Sender is dropped
     drop(tx);
 
     // Then: Receiver thread should terminate
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
     assert_eq!(
         terminated.load(Ordering::SeqCst),
         1,
@@ -512,14 +512,14 @@ fn cuj_eng01_resize_message_delivery() {
 
     // When: Resize event is sent
     tx.send(Message::Control(MockEngineControl::Resize(1920, 1080)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Then: App should receive resize
-    let events = control_events.lock().unwrap();
+    let events = control_events.lock().expect("Expected value but got None/Err");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], MockEngineControl::Resize(1920, 1080));
 }
@@ -545,14 +545,14 @@ fn cuj_eng02_close_requested_delivery() {
 
     // When: CloseRequested is sent
     tx.send(Message::Control(MockEngineControl::CloseRequested))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Then: App should receive close request
-    let events = control_events.lock().unwrap();
+    let events = control_events.lock().expect("Expected value but got None/Err");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], MockEngineControl::CloseRequested);
 }
@@ -580,18 +580,18 @@ fn cuj_eng04_keydown_delivery() {
     tx.send(Message::Management(MockEngineManagement::KeyDown {
         key: 'a',
     }))
-    .unwrap();
+    .expect("Expected value but got None/Err");
     tx.send(Message::Management(MockEngineManagement::KeyDown {
         key: 'b',
     }))
-    .unwrap();
+    .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Then: App should receive key events in order
-    let events = management_events.lock().unwrap();
+    let events = management_events.lock().expect("Expected value but got None/Err");
     assert_eq!(events.len(), 2);
     assert_eq!(events[0], MockEngineManagement::KeyDown { key: 'a' });
     assert_eq!(events[1], MockEngineManagement::KeyDown { key: 'b' });
@@ -621,14 +621,14 @@ fn cuj_eng08_paste_delivery() {
     tx.send(Message::Management(MockEngineManagement::Paste(
         paste_content.clone(),
     )))
-    .unwrap();
+    .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Then: App should receive paste with content
-    let events = management_events.lock().unwrap();
+    let events = management_events.lock().expect("Expected value but got None/Err");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], MockEngineManagement::Paste(paste_content));
 }
@@ -654,14 +654,14 @@ fn cuj_eng09_frame_request_delivery() {
 
     // When: Frame request is sent
     tx.send(Message::Data(MockEngineData::RequestFrame))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Then: App should receive frame request
-    let events = data_events.lock().unwrap();
+    let events = data_events.lock().expect("Expected value but got None/Err");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], MockEngineData::RequestFrame);
 }
@@ -681,15 +681,15 @@ fn cuj_priority_control_before_management_before_data() {
 
     impl Actor<String, String, String> for OrderRecordingActor {
         fn handle_data(&mut self, msg: String) -> HandlerResult {
-            self.order.lock().unwrap().push(format!("D:{}", msg));
+            self.order.lock().expect("Expected value but got None/Err").push(format!("D:{}", msg));
             Ok(())
         }
         fn handle_control(&mut self, msg: String) -> HandlerResult {
-            self.order.lock().unwrap().push(format!("C:{}", msg));
+            self.order.lock().expect("Expected value but got None/Err").push(format!("C:{}", msg));
             Ok(())
         }
         fn handle_management(&mut self, msg: String) -> HandlerResult {
-            self.order.lock().unwrap().push(format!("M:{}", msg));
+            self.order.lock().expect("Expected value but got None/Err").push(format!("M:{}", msg));
             Ok(())
         }
         fn park(&mut self, _: SystemStatus) -> Result<ActorStatus, HandlerError> {
@@ -706,17 +706,17 @@ fn cuj_priority_control_before_management_before_data() {
     });
 
     // When: Messages are sent in Data, Management, Control order
-    tx.send(Message::Data("data1".to_string())).unwrap();
-    tx.send(Message::Data("data2".to_string())).unwrap();
-    tx.send(Message::Management("mgmt1".to_string())).unwrap();
-    tx.send(Message::Control("ctrl1".to_string())).unwrap();
+    tx.send(Message::Data("data1".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Data("data2".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Management("mgmt1".to_string())).expect("Expected value but got None/Err");
+    tx.send(Message::Control("ctrl1".to_string())).expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     // Then: Control should be processed before earlier Data
-    let order = message_order.lock().unwrap();
+    let order = message_order.lock().expect("Expected value but got None/Err");
     let ctrl_idx = order.iter().position(|s| s.starts_with("C:"));
     let first_data_idx = order.iter().position(|s| s == "D:data1");
 
@@ -725,7 +725,7 @@ fn cuj_priority_control_before_management_before_data() {
         "Both control and data should be processed"
     );
     assert!(
-        ctrl_idx.unwrap() < first_data_idx.unwrap(),
+        ctrl_idx.expect("Expected value but got None/Err") < first_data_idx.expect("Expected value but got None/Err"),
         "Control should be processed before earlier data. Order: {:?}",
         *order
     );
@@ -778,7 +778,7 @@ fn cuj_concurrent_senders_all_messages_delivered() {
     for (sender_id, tx) in sender_handles_vec.drain(..).enumerate() {
         let handle = thread::spawn(move || {
             for msg_id in 0..MESSAGES_PER_SENDER {
-                tx.send(Message::Data(sender_id * 1000 + msg_id)).unwrap();
+                tx.send(Message::Data(sender_id * 1000 + msg_id)).expect("Expected value but got None/Err");
             }
         });
         sender_handles.push(handle);
@@ -786,11 +786,11 @@ fn cuj_concurrent_senders_all_messages_delivered() {
 
     // Wait for all senders
     for h in sender_handles {
-        h.join().unwrap();
+        h.join().expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
-    receiver_handle.join().unwrap();
+    receiver_handle.join().expect("Expected value but got None/Err");
 
     // Verify all messages received
     assert_eq!(

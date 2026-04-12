@@ -380,7 +380,7 @@ mod tests {
     const FONT_DATA: &[u8] = include_bytes!("../../assets/DejaVuSansMono-Fallback.ttf");
 
     #[test]
-    fn test_embedded_source() {
+    fn embedded_source_should_succeed_when_called() {
         let source = EmbeddedSource::new(FONT_DATA);
         assert_eq!(source.as_bytes().len(), FONT_DATA.len());
 
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_source() {
+    fn data_source_should_succeed_when_called() {
         let source = DataSource::new(FONT_DATA.to_vec());
         assert_eq!(source.as_bytes().len(), FONT_DATA.len());
 
@@ -400,19 +400,19 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_font_returns_none() {
+    fn invalid_font_returns_none_should_succeed_when_called() {
         let source = DataSource::new(vec![0, 1, 2, 3]);
         assert!(LoadedFont::new(source).is_none());
     }
 
     #[test]
-    fn test_empty_data_returns_none() {
+    fn empty_data_returns_none_should_succeed_when_called() {
         let source = DataSource::new(vec![]);
         assert!(LoadedFont::new(source).is_none());
     }
 
     #[test]
-    fn test_glyph_access_through_loaded_font() {
+    fn glyph_access_through_loaded_font_should_succeed_when_called() {
         let source = EmbeddedSource::new(FONT_DATA);
         let loaded = LoadedFont::new(source).expect("should parse font");
 
@@ -426,7 +426,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_mmap_source() {
+    fn mmap_source_should_succeed_when_called() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 

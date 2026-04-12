@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_grid_construction() {
+    fn grid_construction_should_succeed_when_called() {
         use pixelflow_graphics::render::rasterizer::rasterize;
 
         let factory = MockFactory {
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cell_channel_blending() {
+    fn cell_channel_blending_should_succeed_when_called() {
         use pixelflow_graphics::render::rasterizer::rasterize;
 
         let cell = Cell::new(
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn test_color_manifold() {
+    fn color_manifold_should_succeed_when_called() {
         use pixelflow_graphics::render::rasterizer::rasterize;
 
         // Color::Rgb from pixelflow-graphics implements Manifold<Output = Discrete>

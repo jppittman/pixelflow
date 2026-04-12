@@ -723,7 +723,7 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn test_expr_features_linear() {
+    fn expr_features_linear_should_succeed_when_called() {
         let mut features = ExprFeatures::default();
         features.add_count = 2;
         features.mul_count = 3;
@@ -737,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fma_incentive() {
+    fn fma_incentive_should_succeed_when_called() {
         // Without FMA: mul + add = 5 + 4 = 9
         let mut without_fma = ExprFeatures::default();
         without_fma.mul_count = 1;
@@ -762,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_div_is_expensive() {
+    fn div_is_expensive_should_succeed_when_called() {
         let mut one_div = ExprFeatures::default();
         one_div.div_count = 1;
 
@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_feature_names_match_count() {
+    fn feature_names_match_count_should_succeed_when_called() {
         assert_eq!(ExprFeatures::NAMES.len(), ExprFeatures::COUNT);
     }
 
@@ -788,7 +788,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_extract_simple_add() {
+    fn extract_simple_add_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // x + y
@@ -802,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_fma_pattern() {
+    fn extract_fma_pattern_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // (a * b) + c - fusable pattern
@@ -823,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_identity_mul_one() {
+    fn extract_identity_mul_one_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // x * 1
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_self_cancel() {
+    fn extract_self_cancel_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // x - x
@@ -856,7 +856,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_critical_path_wide_vs_deep() {
+    fn critical_path_wide_vs_deep_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // Wide expression: (a + b) + (c + d)
@@ -918,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn test_max_width_computation() {
+    fn max_width_computation_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // Wide expression: (a + b) + (c + d)
@@ -979,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ilp_features_affect_cost() {
+    fn ilp_features_affect_cost_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // Wide expression: (a + b) + (c + d)
@@ -1032,7 +1032,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_domain_legal_moves() {
+    fn domain_legal_moves_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // x + 0 - should have AddZero move available
@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_apply_move() {
+    fn domain_apply_move_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // x + 0
@@ -1072,7 +1072,7 @@ mod tests {
         let result = ExprDomain::apply_move(&expr, &mv);
         assert!(result.is_some(), "AddZero should apply");
 
-        let simplified = result.unwrap();
+        let simplified = result.expect("Expected value but got None/Err");
         assert!(
             matches!(simplified, Expr::Var(0)),
             "x + 0 should simplify to x"
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluator_prefers_simpler() {
+    fn evaluator_prefers_simpler_should_succeed_when_called() {
         use alloc::boxed::Box;
 
         // Before: x * 1

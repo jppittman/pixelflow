@@ -513,7 +513,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_f32_algebra() {
+    fn f32_algebra_should_succeed_when_called() {
         // Ring operations
         assert_eq!(f32::zero(), 0.0);
         assert_eq!(f32::one(), 1.0);
@@ -537,7 +537,7 @@ mod tests {
     // Transcendental tests only run on scalar fallback platforms
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
-    fn test_f32_transcendental() {
+    fn f32_transcendental_should_succeed_when_called() {
         let epsilon = 1e-6;
 
         assert!((4.0f32.sqrt() - 2.0).abs() < epsilon);
@@ -558,26 +558,26 @@ mod tests {
     }
 
     #[test]
-    fn test_bool_algebra() {
-        assert_eq!(bool::zero(), false);
-        assert_eq!(bool::one(), true);
+    fn bool_algebra_should_succeed_when_called() {
+        assert!(!(bool::zero()));
+        assert!(bool::one());
 
         // Boolean ring (OR/AND)
-        assert_eq!(false.add(false), false);
-        assert_eq!(false.add(true), true);
-        assert_eq!(true.add(false), true);
-        assert_eq!(true.add(true), true);
+        assert!(!(false.add(false)));
+        assert!(false.add(true));
+        assert!(true.add(false));
+        assert!(true.add(true));
 
-        assert_eq!(false.mul(false), false);
-        assert_eq!(false.mul(true), false);
-        assert_eq!(true.mul(true), true);
+        assert!(!(false.mul(false)));
+        assert!(!(false.mul(true)));
+        assert!(true.mul(true));
 
-        assert_eq!(true.neg(), false);
-        assert_eq!(false.neg(), true);
+        assert!(!(true.neg()));
+        assert!(false.neg());
     }
 
     #[test]
-    fn test_u32_algebra() {
+    fn u32_algebra_should_succeed_when_called() {
         assert_eq!(u32::zero(), 0);
         assert_eq!(u32::one(), 1);
         assert_eq!(2u32.add(3), 5);

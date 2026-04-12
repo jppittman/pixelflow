@@ -31,7 +31,7 @@ mod tests {
     // we will rely on 'cargo check' which we already ran.
 
     #[test]
-    fn test_vsync_command_debug() {
+    fn vsync_command_debug_should_succeed_when_called() {
         let (tx, _rx) = mpsc::channel();
         let cmd = VsyncCommand::RequestCurrentFPS(tx);
         let debug_str = format!("{:?}", cmd);

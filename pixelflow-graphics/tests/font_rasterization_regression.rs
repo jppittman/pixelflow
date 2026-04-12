@@ -30,10 +30,10 @@ fn regression_mask_and_not_multiply() {
     // Create a 400x400 square from (100,100) to (500,500)
     // Use Geometry with lines (which now produce smooth AA coverage)
     let lines: Vec<Line<LineKernel>> = vec![
-        make_line([[100.0, 100.0], [500.0, 100.0]]).unwrap(), // bottom
-        make_line([[500.0, 100.0], [500.0, 500.0]]).unwrap(), // right
-        make_line([[500.0, 500.0], [100.0, 500.0]]).unwrap(), // top
-        make_line([[100.0, 500.0], [100.0, 100.0]]).unwrap(), // left
+        make_line([[100.0, 100.0], [500.0, 100.0]]).expect("Expected value but got None/Err"), // bottom
+        make_line([[500.0, 100.0], [500.0, 500.0]]).expect("Expected value but got None/Err"), // right
+        make_line([[500.0, 500.0], [100.0, 500.0]]).expect("Expected value but got None/Err"), // top
+        make_line([[100.0, 500.0], [100.0, 100.0]]).expect("Expected value but got None/Err"), // left
     ];
     let geo: Geometry<Line<LineKernel>, Quad<QuadKernel>> = Geometry {
         lines: Arc::from(lines),
@@ -97,7 +97,7 @@ fn regression_mask_and_not_multiply() {
 #[test]
 fn regression_line_x_intersection_test() {
     // Vertical line at x=500, going from (500,100) to (500,500)
-    let line = make_line([[500.0, 100.0], [500.0, 500.0]]).unwrap();
+    let line = make_line([[500.0, 100.0], [500.0, 500.0]]).expect("Expected value but got None/Err");
     let geo: Geometry<Line<LineKernel>, Quad<QuadKernel>> = Geometry {
         lines: Arc::from(vec![line]),
         quads: Arc::from(vec![]),
@@ -247,9 +247,9 @@ fn regression_font_metrics() {
 fn regression_monospace_advance() {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
 
-    let advance_a = font.advance_scaled('A', 16.0).unwrap();
-    let advance_m = font.advance_scaled('M', 16.0).unwrap();
-    let advance_i = font.advance_scaled('i', 16.0).unwrap();
+    let advance_a = font.advance_scaled('A', 16.0).expect("Expected value but got None/Err");
+    let advance_m = font.advance_scaled('M', 16.0).expect("Expected value but got None/Err");
+    let advance_i = font.advance_scaled('i', 16.0).expect("Expected value but got None/Err");
 
     // For a monospace font, all advances should be equal
     assert!(

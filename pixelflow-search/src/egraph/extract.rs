@@ -920,7 +920,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_expr_tree_node_count() {
+    fn expr_tree_node_count_should_succeed_when_called() {
         let x = ExprTree::var(0);
         assert_eq!(x.node_count(), 1);
 
@@ -929,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_tree_depth() {
+    fn expr_tree_depth_should_succeed_when_called() {
         let x = ExprTree::var(0);
         assert_eq!(x.depth(), 1);
 
@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_simple() {
+    fn extract_simple_should_succeed_when_called() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
 
@@ -954,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_with_ops() {
+    fn extract_with_ops_should_succeed_when_called() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -975,7 +975,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_extract_dag_simple() {
+    fn extract_dag_simple_should_succeed_when_called() {
         // X + Y: no sharing
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -993,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_shared_subexpr() {
+    fn extract_dag_shared_subexpr_should_succeed_when_called() {
         // X * X: X is used twice
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_triple_use() {
+    fn extract_dag_triple_use_should_succeed_when_called() {
         // sin(X) * sin(X) + sin(X): sin(X) used 3 times
         // We simulate this structure without actual sin
         let mut egraph = EGraph::new();
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_nested_sharing() {
+    fn extract_dag_nested_sharing_should_succeed_when_called() {
         // (X + Y) * (X + Y): (X + Y) is shared
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));

@@ -150,7 +150,7 @@ mod tests {
     use crate::variables::X;
 
     #[test]
-    fn test_computed_basic() {
+    fn computed_basic_should_succeed_when_called() {
         // Use an expression tree (X) that gets evaluated
         let expr = X;
         let computed = Computed::new(move |p: Field4| -> Field { expr.eval(p) });
@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn test_computed_captures() {
+    fn computed_captures_should_succeed_when_called() {
         let scale = 2.0f32;
         // Use expression tree X * scale
         let expr = X * scale;

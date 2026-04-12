@@ -1499,7 +1499,7 @@ mod tests {
 
         // Verify the encoding: 0x4F00F400 | (abc<<16) | (defgh<<5) | Rd
         // imm8=0x70=0b01110000, abc=011=3, defgh=10000=16
-        let inst = u32::from_le_bytes(code[..4].try_into().unwrap());
+        let inst = u32::from_le_bytes(code[..4].try_into().expect("Expected value but got None/Err"));
         assert_eq!(inst, 0x4F03_F600, "FMOV V0.4S, #1.0 encoding");
     }
 

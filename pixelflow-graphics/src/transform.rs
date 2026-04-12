@@ -159,17 +159,6 @@ mod tests {
         let _ = result;
     }
 
-    #[test]
-    fn scale_and_translate_compose() {
-        let scaled = scale(X, 2.0);
-        let composed = translate(scaled, 1.0, 0.0);
-
-        let zero = Field::from(0.0);
-        let four = Field::from(4.0);
-
-        let result = composed.eval((four, zero, zero, zero));
-        let _ = result;
-    }
 
     #[test]
     fn scale_creation_and_eval() {

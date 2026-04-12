@@ -365,7 +365,7 @@ mod tests {
     use crate::nnue::OpKind;
 
     #[test]
-    fn test_sample_creation() {
+    fn sample_creation_should_succeed_when_called() {
         let expr = Expr::Binary(
             OpKind::Add,
             alloc::boxed::Box::new(Expr::Var(0)),
@@ -377,13 +377,13 @@ mod tests {
     }
 
     #[test]
-    fn test_trainer_creation() {
+    fn trainer_creation_should_succeed_when_called() {
         let trainer = NnueTrainer::new();
         assert_eq!(trainer.samples.len(), 0);
     }
 
     #[test]
-    fn test_linear_nnue_predict() {
+    fn linear_nnue_predict_should_succeed_when_called() {
         let mut model = LinearNnue::new();
         model.bias = 1.0;
         model.weights[0] = 0.5;
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_ranks() {
+    fn compute_ranks_should_succeed_when_called() {
         let values = vec![3.0, 1.0, 4.0, 1.5, 2.0];
         let ranks = compute_ranks(&values);
         // Expected: 1.0→1, 1.5→2, 2.0→3, 3.0→4, 4.0→5

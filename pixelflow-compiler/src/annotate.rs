@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn annotate_no_literals() {
         let input = quote! { || X + Y };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         let ctx = AnnotationCtx::new();
         let (_, _, literals) = annotate(&kernel.body, ctx);
         assert!(literals.is_empty());
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn annotate_single_literal() {
         let input = quote! { || X + 1.0 };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         let ctx = AnnotationCtx::new();
         let (annotated, _, literals) = annotate(&kernel.body, ctx);
 
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn annotate_multiple_literals() {
         let input = quote! { || 1.0 / X.sqrt() + 2.0 };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         let ctx = AnnotationCtx::new();
         let (_, _, literals) = annotate(&kernel.body, ctx);
 

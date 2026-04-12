@@ -107,19 +107,19 @@ fn detect_double_tick_rate_if_two_clock_threads() {
     // Simulate ticks at 60 Hz for 100ms
     let tick_interval = Duration::from_secs_f64(1.0 / 60.0);
 
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
 
     for _ in 0..6 {
         // 6 ticks = 100ms at 60Hz
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
         thread::sleep(tick_interval);
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let times = tick_times.lock().unwrap();
+    let times = tick_times.lock().expect("Expected value but got None/Err");
     assert_eq!(times.len(), 6, "Should have exactly 6 ticks");
 
     // Check tick spacing is reasonable (not doubled)
@@ -204,12 +204,12 @@ fn token_bucket_does_not_underflow() {
 
     // Hammer with ticks - should never underflow
     for _ in 0..1000 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert!(
         !underflow.load(Ordering::SeqCst),
@@ -423,20 +423,20 @@ fn shutdown_command_stops_tick_processing() {
 
     // Send some ticks
     for _ in 0..10 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     // Shutdown
-    tx.send(Message::Control(VsyncCommand::Shutdown)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Shutdown)).expect("Expected value but got None/Err");
 
     // More ticks after shutdown - should be ignored
     for _ in 0..10 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
     }
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     let count = tick_count.load(Ordering::SeqCst);
     assert!(
@@ -470,9 +470,9 @@ fn fps_request_handles_dropped_receiver() {
                     VsyncCommand::RequestCurrentFPS(sender) => {
                         let result = sender.send(60.0);
                         if result.is_err() {
-                            self.0.lock().unwrap().push("fps_send_failed".to_string());
+                            self.0.lock().expect("Expected value but got None/Err").push("fps_send_failed".to_string());
                         } else {
-                            self.0.lock().unwrap().push("fps_sent".to_string());
+                            self.0.lock().expect("Expected value but got None/Err").push("fps_sent".to_string());
                         }
                     }
                     _ => {}
@@ -494,13 +494,13 @@ fn fps_request_handles_dropped_receiver() {
     drop(fps_rx);
 
     tx.send(Message::Control(VsyncCommand::RequestCurrentFPS(fps_tx)))
-        .unwrap();
+        .expect("Expected value but got None/Err");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
-    let log = log.lock().unwrap();
+    let log = log.lock().expect("Expected value but got None/Err");
     assert!(
         log.contains(&"fps_send_failed".to_string()),
         "Should handle dropped FPS receiver gracefully"
@@ -579,22 +579,22 @@ fn refresh_rate_update_during_ticks_is_safe() {
         });
     });
 
-    tx.send(Message::Control(VsyncCommand::Start)).unwrap();
+    tx.send(Message::Control(VsyncCommand::Start)).expect("Expected value but got None/Err");
 
     // Interleave ticks and rate updates
     for i in 0..100 {
-        tx.send(Message::Management(VsyncManagement::Tick)).unwrap();
+        tx.send(Message::Management(VsyncManagement::Tick)).expect("Expected value but got None/Err");
         if i % 10 == 0 {
             tx.send(Message::Control(VsyncCommand::UpdateRefreshRate(
                 60.0 + i as f64,
             )))
-            .unwrap();
+            .expect("Expected value but got None/Err");
         }
     }
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected value but got None/Err");
 
     assert_eq!(
         tick_count.load(Ordering::SeqCst),

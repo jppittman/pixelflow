@@ -194,7 +194,7 @@ mod tests {
         slot.publish(new_handle);
 
         assert!(
-            waiter.join().unwrap(),
+            waiter.join().expect("Expected value but got None/Err"),
             "reconnect should succeed after publish"
         );
         assert!(received.load(Ordering::SeqCst));
@@ -220,7 +220,7 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         slot.stop();
 
-        assert_eq!(waiter.join().unwrap().unwrap_err(), PodGone::Stopped);
+        assert_eq!(waiter.join().expect("Expected value but got None/Err").unwrap_err(), PodGone::Stopped);
     }
 
     #[test]

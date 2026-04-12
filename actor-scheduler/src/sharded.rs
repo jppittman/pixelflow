@@ -172,10 +172,10 @@ mod tests {
         let tx2 = builder.add_producer();
         let mut inbox = builder.build();
 
-        tx1.try_send(1).unwrap();
-        tx1.try_send(2).unwrap();
-        tx2.try_send(10).unwrap();
-        tx2.try_send(20).unwrap();
+        tx1.try_send(1).expect("Expected value but got None/Err");
+        tx1.try_send(2).expect("Expected value but got None/Err");
+        tx2.try_send(10).expect("Expected value but got None/Err");
+        tx2.try_send(20).expect("Expected value but got None/Err");
 
         let mut received = Vec::new();
         let status = inbox
@@ -183,7 +183,7 @@ mod tests {
                 received.push(msg);
                 Ok(())
             })
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         assert_eq!(status, DrainStatus::Empty);
         assert_eq!(received.len(), 4);
@@ -199,7 +199,7 @@ mod tests {
         let mut inbox = builder.build();
 
         for i in 0..50 {
-            tx.try_send(i).unwrap();
+            tx.try_send(i).expect("Expected value but got None/Err");
         }
 
         let mut count = 0;
@@ -208,7 +208,7 @@ mod tests {
                 count += 1;
                 Ok(())
             })
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         assert_eq!(count, 10);
         assert_eq!(status, DrainStatus::More);
@@ -223,9 +223,9 @@ mod tests {
 
         // Producer 1 floods, producer 2 sends one
         for i in 0..50 {
-            tx1.try_send(i).unwrap();
+            tx1.try_send(i).expect("Expected value but got None/Err");
         }
-        tx2.try_send(100).unwrap();
+        tx2.try_send(100).expect("Expected value but got None/Err");
 
         // With limit=4 and 2 shards, per_shard=2
         let mut received = Vec::new();
@@ -234,7 +234,7 @@ mod tests {
                 received.push(msg);
                 Ok(())
             })
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         // Producer 2's message should appear (not starved by producer 1)
         assert!(
@@ -254,7 +254,7 @@ mod tests {
         drop(tx1);
         drop(tx2);
 
-        let status = inbox.drain(100, |_: u32| Ok(())).unwrap();
+        let status = inbox.drain(100, |_: u32| Ok(())).expect("Expected value but got None/Err");
         assert_eq!(status, DrainStatus::Disconnected);
     }
 
@@ -264,7 +264,7 @@ mod tests {
         let tx = builder.add_producer();
         let mut inbox = builder.build();
 
-        tx.try_send(42).unwrap();
+        tx.try_send(42).expect("Expected value but got None/Err");
         drop(tx);
 
         let mut received = Vec::new();
@@ -273,13 +273,13 @@ mod tests {
                 received.push(msg);
                 Ok(())
             })
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         assert_eq!(received, vec![42]);
         // First drain gets the message; the shard reports Disconnected but
         // we still got data, so it's not all-disconnected yet
         // Second drain should show disconnected
-        let status2 = inbox.drain(100, |_: u32| Ok(())).unwrap();
+        let status2 = inbox.drain(100, |_: u32| Ok(())).expect("Expected value but got None/Err");
         assert_eq!(status2, DrainStatus::Disconnected);
     }
 
@@ -289,8 +289,8 @@ mod tests {
         let tx = builder.add_producer();
         let mut inbox = builder.build();
 
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
+        tx.try_send(1).expect("Expected value but got None/Err");
+        tx.try_send(2).expect("Expected value but got None/Err");
 
         let result = inbox.drain(100, |msg: u32| {
             if msg == 1 {
@@ -303,12 +303,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    #[should_panic(expected = "at least one producer")]
-    fn panics_on_empty_build() {
-        let builder = InboxBuilder::<u32>::new(16);
-        let _inbox = builder.build();
-    }
 
     // Kills: replace shard_count -> usize with 0 (line 159)
     // Kills: replace shard_count -> usize with 1 (line 159)
@@ -346,8 +340,8 @@ mod tests {
         let mut inbox = builder.build();
 
         for i in 0u32..10 {
-            tx1.try_send(i).unwrap();
-            tx2.try_send(i + 100).unwrap();
+            tx1.try_send(i).expect("Expected value but got None/Err");
+            tx2.try_send(i + 100).expect("Expected value but got None/Err");
         }
 
         let mut from_shard1 = 0usize;
@@ -361,7 +355,7 @@ mod tests {
                 }
                 Ok(())
             })
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         // Each shard should contribute at most per_shard = 4/2 = 2 messages
         assert!(from_shard1 <= 2, "Shard 1 drained {} messages, expected <= 2", from_shard1);

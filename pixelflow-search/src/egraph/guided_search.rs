@@ -979,7 +979,7 @@ mod tests {
     use crate::nnue::ExprNnue;
 
     #[test]
-    fn test_guided_search_basic() {
+    fn guided_search_basic_should_succeed_when_called() {
         // Create simple expression: X + 0
         let expr = ExprTree::Op {
             op: &ops::Add,
@@ -1008,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_training_data() {
+    fn collect_training_data_should_succeed_when_called() {
         // (X + 0) * 1
         let expr = ExprTree::Op {
             op: &ops::Mul,
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rule_stats() {
+    fn rule_stats_should_succeed_when_called() {
         let mut stats = RuleStats::default();
 
         // Initially 0% match rate

@@ -1029,21 +1029,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_expr() {
-        let expr = parse_expr("Add(Var(0), Var(1))").unwrap();
+    fn parse_expr_should_succeed_when_called() {
+        let expr = parse_expr("Add(Var(0), Var(1))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
 
-        let expr = parse_expr("Mul(Add(Var(0), Var(1)), Var(2))").unwrap();
+        let expr = parse_expr("Mul(Add(Var(0), Var(1)), Var(2))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Mul, _, _)));
 
-        let expr = parse_expr("MulAdd(Var(0), Var(1), Var(2))").unwrap();
+        let expr = parse_expr("MulAdd(Var(0), Var(1), Var(2))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Ternary(OpKind::MulAdd, _, _, _)));
     }
 
     #[test]
-    fn test_forward_backward() {
+    fn forward_backward_should_succeed_when_called() {
         let net = FactoredNnue::new_random(42);
-        let expr = parse_expr("Add(Mul(Var(0), Var(1)), Var(2))").unwrap();
+        let expr = parse_expr("Add(Mul(Var(0), Var(1)), Var(2))").expect("Expected value but got None/Err");
         let sample = FactoredSample::new(expr, 100.0, &net.embeddings);
 
         let cache = ForwardCache::forward(&net, &sample.accumulator, &sample.structural);
@@ -1065,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn test_training_reduces_loss() {
+    fn training_reduces_loss_should_succeed_when_called() {
         let config = TrainConfig {
             learning_rate: 0.1,
             epochs: 5,
@@ -1076,10 +1076,10 @@ mod tests {
         let mut trainer = FactoredTrainer::new(config, 42);
 
         // Add some simple samples
-        trainer.add_sample(parse_expr("Var(0)").unwrap(), 10.0);
-        trainer.add_sample(parse_expr("Add(Var(0), Var(1))").unwrap(), 50.0);
-        trainer.add_sample(parse_expr("Mul(Var(0), Var(1))").unwrap(), 60.0);
-        trainer.add_sample(parse_expr("Div(Var(0), Var(1))").unwrap(), 200.0);
+        trainer.add_sample(parse_expr("Var(0)").expect("Expected value but got None/Err"), 10.0);
+        trainer.add_sample(parse_expr("Add(Var(0), Var(1))").expect("Expected value but got None/Err"), 50.0);
+        trainer.add_sample(parse_expr("Mul(Var(0), Var(1))").expect("Expected value but got None/Err"), 60.0);
+        trainer.add_sample(parse_expr("Div(Var(0), Var(1))").expect("Expected value but got None/Err"), 200.0);
 
         let initial_metrics = trainer.evaluate();
         let mut final_loss = 0.0;
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spearman_correlation() {
+    fn spearman_correlation_should_succeed_when_called() {
         // Perfect positive correlation
         let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let b = vec![10.0, 20.0, 30.0, 40.0, 50.0];
@@ -1124,7 +1124,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_parse_kernel_code_variables() {
+    fn parse_kernel_code_variables_should_succeed_when_called() {
         assert!(matches!(parse_kernel_code("X"), Some(Expr::Var(0))));
         assert!(matches!(parse_kernel_code("Y"), Some(Expr::Var(1))));
         assert!(matches!(parse_kernel_code("Z"), Some(Expr::Var(2))));
@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_constants() {
+    fn parse_kernel_code_constants_should_succeed_when_called() {
         assert!(matches!(parse_kernel_code("1.0"), Some(Expr::Const(v)) if (v - 1.0).abs() < 1e-6));
         assert!(
             matches!(parse_kernel_code("(4.595877)"), Some(Expr::Const(v)) if (v - 4.595877).abs() < 1e-5)
@@ -1141,55 +1141,55 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_binary_ops() {
+    fn parse_kernel_code_binary_ops_should_succeed_when_called() {
         // Basic addition
-        let expr = parse_kernel_code("(X + Y)").unwrap();
+        let expr = parse_kernel_code("(X + Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
 
         // Basic subtraction
-        let expr = parse_kernel_code("(X - Y)").unwrap();
+        let expr = parse_kernel_code("(X - Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Sub, _, _)));
 
         // Basic multiplication
-        let expr = parse_kernel_code("(X * Y)").unwrap();
+        let expr = parse_kernel_code("(X * Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Mul, _, _)));
 
         // Basic division
-        let expr = parse_kernel_code("(X / Y)").unwrap();
+        let expr = parse_kernel_code("(X / Y)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Div, _, _)));
     }
 
     #[test]
-    fn test_parse_kernel_code_from_benchmark_cache() {
+    fn parse_kernel_code_from_benchmark_cache_should_succeed_when_called() {
         // Real examples from benchmark_cache.jsonl
-        let expr = parse_kernel_code("((4.595877) - Z)").unwrap();
+        let expr = parse_kernel_code("((4.595877) - Z)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Sub, _, _)));
 
-        let expr = parse_kernel_code("((4.595877) + (-Z))").unwrap();
+        let expr = parse_kernel_code("((4.595877) + (-Z))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
 
-        let expr = parse_kernel_code("((-Z) + (4.595877))").unwrap();
+        let expr = parse_kernel_code("((-Z) + (4.595877))").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
     }
 
     #[test]
-    fn test_parse_kernel_code_unary_ops() {
+    fn parse_kernel_code_unary_ops_should_succeed_when_called() {
         // Negation
-        let expr = parse_kernel_code("(-X)").unwrap();
+        let expr = parse_kernel_code("(-X)").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Unary(OpKind::Neg, _)));
 
         // Method calls on variables
-        let expr = parse_kernel_code("(X).sqrt()").unwrap();
+        let expr = parse_kernel_code("(X).sqrt()").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Unary(OpKind::Sqrt, _)));
 
-        let expr = parse_kernel_code("(X).abs()").unwrap();
+        let expr = parse_kernel_code("(X).abs()").expect("Expected value but got None/Err");
         assert!(matches!(expr, Expr::Unary(OpKind::Abs, _)));
     }
 
     #[test]
-    fn test_parse_kernel_code_nested() {
+    fn parse_kernel_code_nested_should_succeed_when_called() {
         // Nested expression: (X + Y) * Z
-        let expr = parse_kernel_code("((X + Y) * Z)").unwrap();
+        let expr = parse_kernel_code("((X + Y) * Z)").expect("Expected value but got None/Err");
         if let Expr::Binary(OpKind::Mul, left, right) = expr {
             assert!(matches!(*left, Expr::Binary(OpKind::Add, _, _)));
             assert!(matches!(*right, Expr::Var(2)));
@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_method_chains() {
+    fn parse_kernel_code_method_chains_should_succeed_when_called() {
         // Method on parenthesized expression
         let expr = parse_kernel_code("(X).sqrt()");
         assert!(expr.is_some(), "Should parse (X).sqrt()");
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_complex_expressions() {
+    fn parse_kernel_code_complex_expressions_should_succeed_when_called() {
         // Negative number in parens with rsqrt
         let expr = parse_kernel_code("((-0.724020)).rsqrt()");
         assert!(
@@ -1241,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_actual_failures() {
+    fn parse_actual_failures_should_succeed_when_called() {
         // Exact expression from benchmark cache
         let expr = parse_kernel_code(
             "((((X).rsqrt()).abs()).abs()).min(((((-0.724020)).rsqrt() * (1.0 / (X).abs()))).min(W))",

@@ -303,7 +303,7 @@ mod tests {
     use alloc::boxed::Box;
 
     #[test]
-    fn test_linear_vs_interaction_fma() {
+    fn linear_vs_interaction_fma_should_succeed_when_called() {
         // Expression: a * b + c (could be FMA)
         let unfused = Expr::Binary(
             OpKind::Add,
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_critical_path_vs_total() {
+    fn critical_path_vs_total_should_succeed_when_called() {
         // Wide expression: (a + b) + (c + d)
         // Total cost: 4 + 4 + 4 = 12
         // Critical path: 4 + 4 = 8 (parallel adds)
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nonlinearity_size() {
+    fn nonlinearity_size_should_succeed_when_called() {
         // Generate some expressions and measure how much interaction terms change things
         use crate::nnue::{ExprGenConfig, ExprGenerator};
 
@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ranking_correlation() {
+    fn ranking_correlation_should_succeed_when_called() {
         use crate::nnue::{ExprGenConfig, ExprGenerator};
 
         let config = ExprGenConfig {

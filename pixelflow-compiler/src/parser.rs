@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn parse_simple_kernel() {
         let input = quote! { |r: f32| X * X + Y * Y - r };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert_eq!(kernel.params.len(), 1);
         assert_eq!(kernel.params[0].name.to_string(), "r");
     }
@@ -456,21 +456,21 @@ mod tests {
     #[test]
     fn parse_empty_params() {
         let input = quote! { || X * X + Y * Y };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert_eq!(kernel.params.len(), 0);
     }
 
     #[test]
     fn parse_multiple_params() {
         let input = quote! { |cx: f32, cy: f32, r: f32| X - cx };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert_eq!(kernel.params.len(), 3);
     }
 
     #[test]
     fn parse_method_call() {
         let input = quote! { |r: f32| (X * X + Y * Y).sqrt() - r };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         // Should successfully parse the .sqrt() method call
         match kernel.body {
             Expr::Binary(_) => {} // Expected: sqrt() - r
@@ -487,7 +487,7 @@ mod tests {
                 dx * dx + dy * dy
             }
         };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         match kernel.body {
             Expr::Block(block) => {
                 assert_eq!(block.stmts.len(), 2); // two let statements
@@ -500,11 +500,11 @@ mod tests {
     #[test]
     fn parse_return_type() {
         let input = quote! { |cx: f32| -> Jet3 X - cx };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert_eq!(kernel.params.len(), 1);
         assert!(kernel.return_ty.is_some());
         // Verify the return type is "Jet3"
-        let ty = kernel.return_ty.unwrap();
+        let ty = kernel.return_ty.expect("Expected value but got None/Err");
         if let syn::Type::Path(type_path) = ty {
             assert_eq!(type_path.path.segments[0].ident.to_string(), "Jet3");
         } else {
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn parse_no_return_type() {
         let input = quote! { |cx: f32| X - cx };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert!(kernel.return_ty.is_none());
         assert!(kernel.domain_ty.is_none());
     }
@@ -524,7 +524,7 @@ mod tests {
     fn parse_domain_and_output_type() {
         // Field -> Discrete syntax: Field is domain, Discrete is output
         let input = quote! { |cx: f32| Field -> Discrete X - cx };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert_eq!(kernel.params.len(), 1);
 
         // Verify domain type is "Field"
@@ -548,7 +548,7 @@ mod tests {
     fn parse_manifold_param() {
         // `kernel` keyword marks a manifold parameter
         let input = quote! { |inner: kernel, r: f32| inner - r };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert_eq!(kernel.params.len(), 2);
 
         // First param should be Manifold
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn parse_multiple_manifold_params() {
         let input = quote! { |a: kernel, b: kernel| a + b };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
         assert_eq!(kernel.params.len(), 2);
         assert!(matches!(kernel.params[0].kind, ParamKind::Manifold));
         assert!(matches!(kernel.params[1].kind, ParamKind::Manifold));
@@ -584,7 +584,7 @@ mod tests {
                 a
             }
         };
-        let kernel = parse(input).unwrap();
+        let kernel = parse(input).expect("Expected value but got None/Err");
 
         eprintln!("Domain: {:?}", kernel.domain_ty);
         eprintln!("Return: {:?}", kernel.return_ty);

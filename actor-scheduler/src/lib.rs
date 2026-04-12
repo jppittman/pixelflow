@@ -1228,14 +1228,14 @@ mod tests {
 
         // Send from this thread — the 3rd message may spin-yield on backpressure
         let send_thread = thread::spawn(move || {
-            tx.send(Message::Data("1".to_string())).unwrap();
-            tx.send(Message::Data("2".to_string())).unwrap();
-            tx.send(Message::Data("3".to_string())).unwrap();
+            tx.send(Message::Data("1".to_string())).expect("Expected value but got None/Err");
+            tx.send(Message::Data("2".to_string())).expect("Expected value but got None/Err");
+            tx.send(Message::Data("3".to_string())).expect("Expected value but got None/Err");
         });
 
-        send_thread.join().unwrap();
+        send_thread.join().expect("Expected value but got None/Err");
         thread::sleep(Duration::from_millis(100));
-        let messages = log.lock().unwrap();
+        let messages = log.lock().expect("Expected value but got None/Err");
         assert_eq!(messages.len(), 3, "All messages should be processed");
     }
 
@@ -1277,15 +1277,15 @@ mod tests {
             handler
         });
 
-        tx.send(Message::Data(1)).unwrap();
-        tx.send(Message::Data(2)).unwrap();
-        tx.send(Message::Control("test".to_string())).unwrap();
-        tx.send(Message::Management(true)).unwrap();
+        tx.send(Message::Data(1)).expect("Expected value but got None/Err");
+        tx.send(Message::Data(2)).expect("Expected value but got None/Err");
+        tx.send(Message::Control("test".to_string())).expect("Expected value but got None/Err");
+        tx.send(Message::Management(true)).expect("Expected value but got None/Err");
 
         thread::sleep(Duration::from_millis(50));
         drop(tx);
 
-        let actor = handle.join().unwrap();
+        let actor = handle.join().expect("Expected value but got None/Err");
         assert_eq!(actor.data_count, 2);
         assert_eq!(actor.ctrl_count, 1);
         assert_eq!(actor.mgmt_count, 1);
@@ -1325,10 +1325,10 @@ mod tests {
         assert!(!exited.load(Ordering::SeqCst), "should still be running");
 
         // Send shutdown
-        tx.send(Message::Shutdown).unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
 
         // Should exit quickly
-        handle.join().unwrap();
+        handle.join().expect("Expected value but got None/Err");
         assert!(exited.load(Ordering::SeqCst), "should have exited");
     }
 }
@@ -1377,8 +1377,8 @@ mod poll_once_tests {
         let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new(100, 100);
         let mut actor = CountActor { data: 0, ctrl: 0 };
 
-        tx.send(Message::Control(1)).unwrap();
-        tx.send(Message::Data(2)).unwrap();
+        tx.send(Message::Control(1)).expect("Expected value but got None/Err");
+        tx.send(Message::Data(2)).expect("Expected value but got None/Err");
 
         // Give messages time to arrive
         thread::sleep(Duration::from_millis(5));
@@ -1426,7 +1426,7 @@ mod poll_once_tests {
             }
         }
 
-        tx.send(Message::Data(1)).unwrap();
+        tx.send(Message::Data(1)).expect("Expected value but got None/Err");
         thread::sleep(Duration::from_millis(5));
 
         let mut actor = FailOnData;
@@ -1445,7 +1445,7 @@ mod poll_once_tests {
         let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new(10, 100);
         let mut actor = CountActor { data: 0, ctrl: 0 };
 
-        tx.send(Message::Shutdown).unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
         thread::sleep(Duration::from_millis(5));
 
         let phase = loop {
@@ -1525,7 +1525,7 @@ mod backoff_unit_tests {
 
         // Run multiple times to exercise varying hash values
         for _ in 0..20 {
-            let dur = backoff_with_jitter(0, &params).unwrap();
+            let dur = backoff_with_jitter(0, &params).expect("Expected value but got None/Err");
             assert!(
                 dur >= min_expected,
                 "Duration {}us below minimum {}us",
@@ -1545,7 +1545,7 @@ mod backoff_unit_tests {
     #[test]
     fn backoff_duration_nonzero_for_nonzero_backoff() {
         let params = params_with_bounds(1000, 1_000_000);
-        let dur = backoff_with_jitter(0, &params).unwrap();
+        let dur = backoff_with_jitter(0, &params).expect("Expected value but got None/Err");
         assert!(dur.as_micros() >= 500, "Duration should be at least 50% of 1000us");
     }
 
@@ -1576,8 +1576,8 @@ mod backoff_unit_tests {
     fn send_with_backoff_returns_timeout_on_permanently_full_channel() {
         // Channel of capacity 2, fill it. Use minimal backoff so timeout fires on attempt 1.
         let (tx, _rx) = spsc::spsc_channel::<u32>(2);
-        tx.try_send(1u32).unwrap();
-        tx.try_send(2u32).unwrap();
+        tx.try_send(1u32).expect("Expected value but got None/Err");
+        tx.try_send(2u32).expect("Expected value but got None/Err");
 
         let params = SchedulerParams {
             spin_attempts: 0,
@@ -1648,11 +1648,11 @@ mod drain_all_targeted_tests {
         let data_count = Arc::new(AtomicUsize::new(0));
 
         // Queue Shutdown BEFORE starting scheduler thread, so scheduler sees it immediately.
-        tx.send(Message::Shutdown).unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
 
         // Queue 30 data messages into the SPSC buffer (scheduler not running yet).
         for i in 0..30i32 {
-            tx.send(Message::Data(i)).unwrap();
+            tx.send(Message::Data(i)).expect("Expected value but got None/Err");
         }
 
         // Now start the scheduler. It sees Shutdown first → calls drain_all_with_timeout.
@@ -1663,7 +1663,7 @@ mod drain_all_targeted_tests {
             rx.run(&mut actor);
         });
 
-        handle.join().unwrap();
+        handle.join().expect("Expected value but got None/Err");
         assert_eq!(
             data_count.load(Ordering::Relaxed),
             30,
@@ -1686,15 +1686,15 @@ mod drain_all_targeted_tests {
         let data_count = Arc::new(AtomicUsize::new(0));
 
         // Send shutdown first, then queue messages
-        tx.send(Message::Shutdown).unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
         for i in 0..20i32 {
-            tx.send(Message::Data(i)).unwrap();
+            tx.send(Message::Data(i)).expect("Expected value but got None/Err");
         }
         for _ in 0..15 {
-            tx.send(Message::Control(())).unwrap();
+            tx.send(Message::Control(())).expect("Expected value but got None/Err");
         }
         for _ in 0..15 {
-            tx.send(Message::Management(())).unwrap();
+            tx.send(Message::Management(())).expect("Expected value but got None/Err");
         }
 
         let data_clone = data_count.clone();
@@ -1735,7 +1735,7 @@ mod drain_all_targeted_tests {
             rx.run(&mut actor);
         });
 
-        handle.join().unwrap();
+        handle.join().expect("Expected value but got None/Err");
         assert_eq!(data_count.load(Ordering::Relaxed), 20);
         assert_eq!(ctrl_count.load(Ordering::Relaxed), 15);
         assert_eq!(mgmt_count.load(Ordering::Relaxed), 15);
@@ -1753,12 +1753,12 @@ mod drain_all_targeted_tests {
 
         // Queue Shutdown BEFORE scheduler starts, then queue control/mgmt messages.
         // Scheduler will see Shutdown immediately → calls drain_control_and_management.
-        tx.send(Message::Shutdown).unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
         for _ in 0..25 {
-            tx.send(Message::Control(())).unwrap();
+            tx.send(Message::Control(())).expect("Expected value but got None/Err");
         }
         for _ in 0..25 {
-            tx.send(Message::Management(())).unwrap();
+            tx.send(Message::Management(())).expect("Expected value but got None/Err");
         }
 
         let ctrl_count = Arc::new(AtomicUsize::new(0));
@@ -1795,7 +1795,7 @@ mod drain_all_targeted_tests {
             rx.run(&mut actor);
         });
 
-        handle.join().unwrap();
+        handle.join().expect("Expected value but got None/Err");
         assert_eq!(
             ctrl_count.load(Ordering::Relaxed),
             25,
@@ -1936,7 +1936,7 @@ mod troupe_tests {
     /// Test the SPSC-based directory pattern: each actor gets its own Directory
     /// with dedicated SPSC handles to every other actor.
     #[test]
-    fn test_troupe_directory_pattern() {
+    fn troupe_directory_pattern_should_succeed_when_called() {
         // Create builders for each actor
         let mut engine_builder =
             ActorBuilder::<EngineData, EngineControl, EngineManagement>::new(1024, None);
@@ -1961,16 +1961,16 @@ mod troupe_tests {
         test_dir
             .display
             .send(Message::Control(DisplayControl::Render))
-            .unwrap();
+            .expect("Expected value but got None/Err");
         test_dir
             .engine
             .send(Message::Control(EngineControl::Tick))
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         // Multiple handles are independent (each is a separate SPSC channel)
         extra_engine_handle
             .send(Message::Control(EngineControl::Tick))
-            .unwrap();
+            .expect("Expected value but got None/Err");
     }
 
     /// Adversarial test: Malicious control sender trying to starve data lane
@@ -2042,15 +2042,15 @@ mod troupe_tests {
             }
         });
 
-        data_sender.join().unwrap();
+        data_sender.join().expect("Expected value but got None/Err");
         thread::sleep(Duration::from_millis(50));
 
         stop_flooding.store(true, Ordering::Relaxed);
-        let control_sent = control_sender.join().unwrap();
+        let control_sent = control_sender.join().expect("Expected value but got None/Err");
 
         // All handles dropped → scheduler exits
         thread::sleep(Duration::from_millis(50));
-        receiver_handle.join().unwrap();
+        receiver_handle.join().expect("Expected value but got None/Err");
 
         let control_count = control_processed.load(Ordering::Relaxed);
         let data_count = data_processed.load(Ordering::Relaxed);
@@ -2144,17 +2144,17 @@ mod troupe_tests {
             }
         });
 
-        data_sender.join().unwrap();
+        data_sender.join().expect("Expected value but got None/Err");
         thread::sleep(Duration::from_millis(50));
 
         stop_flooding.store(true, Ordering::Relaxed);
         let mut total_control_sent = 0;
         for handle in control_threads {
-            total_control_sent += handle.join().unwrap();
+            total_control_sent += handle.join().expect("Expected value but got None/Err");
         }
 
         thread::sleep(Duration::from_millis(50));
-        receiver_handle.join().unwrap();
+        receiver_handle.join().expect("Expected value but got None/Err");
 
         let control_count = control_processed.load(Ordering::Relaxed);
         let data_count = data_processed.load(Ordering::Relaxed);
@@ -2240,14 +2240,14 @@ mod troupe_tests {
             }
         });
 
-        data_sender.join().unwrap();
+        data_sender.join().expect("Expected value but got None/Err");
         thread::sleep(Duration::from_millis(100));
 
         stop_flooding.store(true, Ordering::Relaxed);
-        let control_sent = control_flooder.join().unwrap();
+        let control_sent = control_flooder.join().expect("Expected value but got None/Err");
 
         thread::sleep(Duration::from_millis(50));
-        receiver_handle.join().unwrap();
+        receiver_handle.join().expect("Expected value but got None/Err");
 
         let control_count = control_processed.load(Ordering::Relaxed);
         let data_count = data_processed.load(Ordering::Relaxed);
@@ -2335,11 +2335,11 @@ mod troupe_tests {
         }
 
         for handle in sender_handles {
-            handle.join().unwrap();
+            handle.join().expect("Expected value but got None/Err");
         }
 
         thread::sleep(Duration::from_millis(1000));
-        receiver_handle.join().unwrap();
+        receiver_handle.join().expect("Expected value but got None/Err");
 
         let control_count = control_processed.load(Ordering::Relaxed);
         let mgmt_count = mgmt_processed.load(Ordering::Relaxed);
@@ -2457,7 +2457,7 @@ mod troupe_nesting_tests {
 
     /// Test the two-phase Troupe pattern: new() → exposed() → play()
     #[test]
-    fn test_troupe_two_phase_pattern() {
+    fn troupe_two_phase_pattern_should_succeed_when_called() {
         // Phase 1: Create child troupe (no threads yet)
         let mut child = WorkerTroupe::new();
 
@@ -2468,18 +2468,18 @@ mod troupe_nesting_tests {
         exposed
             .worker
             .send(Message::Control(WorkerControl::Process))
-            .unwrap();
+            .expect("Expected value but got None/Err");
         exposed
             .worker
             .send(Message::Data(WorkerData("hello".to_string())))
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         // Multiple exposed() calls create independent handles
         let exposed2 = child.exposed();
         exposed2
             .worker
             .send(Message::Control(WorkerControl::Process))
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         // Note: We don't call play() here since that would block.
         // The test verifies the two-phase construction pattern works.
@@ -2487,7 +2487,7 @@ mod troupe_nesting_tests {
 
     /// Test that ExposedHandles can outlive the Troupe struct
     #[test]
-    fn test_exposed_handles_outlive_troupe_struct() {
+    fn exposed_handles_outlive_troupe_struct_should_succeed_when_called() {
         let exposed = {
             let mut child = WorkerTroupe::new();
             child.exposed() // ExposedHandles escapes
@@ -2542,7 +2542,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn test_shutdown_immediate_exits_quickly_under_flood() {
+    fn shutdown_immediate_exits_quickly_under_flood_should_succeed_when_called() {
         let (tx, mut rx) =
             ActorScheduler::new_with_shutdown_mode(100, 100, ShutdownMode::Immediate);
 
@@ -2573,8 +2573,8 @@ mod shutdown_tests {
 
         // Shutdown should return quickly even with backlog
         let shutdown_start = std::time::Instant::now();
-        tx.send(Message::Shutdown).unwrap();
-        actor_handle.join().unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
+        actor_handle.join().expect("Expected value but got None/Err");
         let shutdown_duration = shutdown_start.elapsed();
 
         // Should shutdown within 100ms (fast, not waiting for drain)
@@ -2586,7 +2586,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn test_shutdown_drain_control_processes_control_and_mgmt() {
+    fn shutdown_drain_control_processes_control_and_mgmt_should_succeed_when_called() {
         let (tx, mut rx) =
             ActorScheduler::new_with_shutdown_mode(100, 100, ShutdownMode::DrainControl);
 
@@ -2609,21 +2609,21 @@ mod shutdown_tests {
 
         // Send messages
         for i in 0..50 {
-            tx.send(Message::Data(i)).unwrap();
+            tx.send(Message::Data(i)).expect("Expected value but got None/Err");
         }
         for _ in 0..50 {
-            tx.send(Message::Control(())).unwrap();
+            tx.send(Message::Control(())).expect("Expected value but got None/Err");
         }
         for _ in 0..50 {
-            tx.send(Message::Management(())).unwrap();
+            tx.send(Message::Management(())).expect("Expected value but got None/Err");
         }
 
         // Give time for some to queue
         thread::sleep(Duration::from_millis(10));
 
         // Shutdown - should drain control+mgmt
-        tx.send(Message::Shutdown).unwrap();
-        actor_handle.join().unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
+        actor_handle.join().expect("Expected value but got None/Err");
 
         // All control+mgmt should be processed, data may be dropped
         let control = control_count.load(Ordering::Relaxed);
@@ -2637,7 +2637,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn test_shutdown_drain_all_processes_everything() {
+    fn shutdown_drain_all_processes_everything_should_succeed_when_called() {
         let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
             100,
             100,
@@ -2665,17 +2665,17 @@ mod shutdown_tests {
 
         // Send 100 of each type
         for i in 0..100 {
-            tx.send(Message::Data(i)).unwrap();
-            tx.send(Message::Control(())).unwrap();
-            tx.send(Message::Management(())).unwrap();
+            tx.send(Message::Data(i)).expect("Expected value but got None/Err");
+            tx.send(Message::Control(())).expect("Expected value but got None/Err");
+            tx.send(Message::Management(())).expect("Expected value but got None/Err");
         }
 
         // Give time for messages to queue
         thread::sleep(Duration::from_millis(50));
 
         // Shutdown - should drain all
-        tx.send(Message::Shutdown).unwrap();
-        actor_handle.join().unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
+        actor_handle.join().expect("Expected value but got None/Err");
 
         // All messages should be processed
         assert_eq!(data_count.load(Ordering::Relaxed), 100);
@@ -2684,7 +2684,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn test_shutdown_drain_all_timeout_fallback() {
+    fn shutdown_drain_all_timeout_fallback_should_succeed_when_called() {
         let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
             10,   // Small burst limit to check shutdown frequently
             1000, // Large buffer to avoid blocking sends
@@ -2744,7 +2744,7 @@ mod shutdown_tests {
 
         // Send 200 data messages (would take 200ms to process fully)
         for i in 0..200 {
-            tx.send(Message::Data(i)).unwrap();
+            tx.send(Message::Data(i)).expect("Expected value but got None/Err");
         }
 
         // Give actor time to start processing but not finish
@@ -2752,8 +2752,8 @@ mod shutdown_tests {
 
         // Shutdown with 20ms timeout - should timeout before processing all 200
         let shutdown_start = std::time::Instant::now();
-        tx.send(Message::Shutdown).unwrap();
-        actor_handle.join().unwrap();
+        tx.send(Message::Shutdown).expect("Expected value but got None/Err");
+        actor_handle.join().expect("Expected value but got None/Err");
         let shutdown_duration = shutdown_start.elapsed();
 
         // Shutdown should respect timeout (~50ms + overhead for normal run loop batch)

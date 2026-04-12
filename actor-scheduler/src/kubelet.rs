@@ -575,9 +575,9 @@ mod tests {
         assert_eq!(pod.handles.len(), 1);
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
-        let phase = pod.exit_rx.recv().unwrap();
+        let phase = pod.exit_rx.recv().expect("Expected value but got None/Err");
         assert_eq!(phase, PodPhase::Completed);
     }
 
@@ -595,7 +595,7 @@ mod tests {
         // Send data to trigger the failure in the first pod instance.
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Data(1))
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         let kubelet = KubeletBuilder::new()
             .with_poll_interval(Duration::from_millis(1))
@@ -631,7 +631,7 @@ mod tests {
         // Shutdown the initial pod cleanly.
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         let kubelet = KubeletBuilder::new()
             .with_poll_interval(Duration::from_millis(1))
@@ -665,7 +665,7 @@ mod tests {
         // Shutdown the initial pod so it exits with Completed.
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         let kubelet = KubeletBuilder::new()
             .with_poll_interval(Duration::from_millis(1))
@@ -693,7 +693,7 @@ mod tests {
         // without waiting for actual actor failures.
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         let kubelet = KubeletBuilder::new()
             .with_poll_interval(Duration::from_millis(1))
@@ -722,7 +722,7 @@ mod tests {
         // Shut down the initial pod cleanly.
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         let kubelet = KubeletBuilder::new()
             .with_poll_interval(Duration::from_millis(1))
@@ -753,7 +753,7 @@ mod tests {
 
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         let kubelet = KubeletBuilder::new()
             .with_poll_interval(Duration::from_millis(1))
@@ -789,7 +789,7 @@ mod tests {
         // Shut down initial pod (triggers restart under Always policy).
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
 
         let pod_exit_rx = pod.exit_rx;
         // Wait for initial pod to actually exit before handing to Kubelet.
@@ -821,7 +821,7 @@ mod tests {
         // For now, just verify Noop exits via Shutdown + Never policy.
         pod.handles[0]
             .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
+            .expect("Expected value but got None/Err");
         // exit_rx not used here; verify the kubelet handles the other path.
         drop(exit_rx); // ensure no leak
 
@@ -903,7 +903,7 @@ mod tests {
         assert_eq!(kubelet.pods[0].restart_policy, RestartPolicy::Never);
 
         // Signal exit so stop_fn is called and kubelet terminates.
-        tx.send(PodPhase::Completed).unwrap();
+        tx.send(PodPhase::Completed).expect("Expected value but got None/Err");
         kubelet.run();
 
         assert!(

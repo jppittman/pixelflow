@@ -484,7 +484,7 @@ mod tests {
     use crate::egraph::{Leaf, ops};
 
     #[test]
-    fn test_small_kernel_saturates() {
+    fn small_kernel_saturates_should_succeed_when_called() {
         // x + 0 should simplify to x
         let tree = ExprTree::Op {
             op: &ops::Add,
@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_epsilon_greedy() {
+    fn epsilon_greedy_should_succeed_when_called() {
         let tree = ExprTree::Op {
             op: &ops::Mul,
             children: vec![
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_egraph_is_clone() {
+    fn egraph_is_clone_should_succeed_when_called() {
         // Verify EGraph can be cloned (needed for search branching)
         let mut eg = EGraph::new();
         let x = eg.add_expr(&ExprTree::Leaf(Leaf::Var(0)));

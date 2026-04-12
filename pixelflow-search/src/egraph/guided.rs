@@ -697,7 +697,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_guided_state_creation() {
+    fn guided_state_creation_should_succeed_when_called() {
         // Create a simple tree: X + 0
         let tree = ExprTree::op_add(ExprTree::var(0), ExprTree::constant(0.0));
 
@@ -710,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_available_actions() {
+    fn available_actions_should_succeed_when_called() {
         let tree = ExprTree::op_add(ExprTree::var(0), ExprTree::constant(0.0));
 
         let costs = CostModel::default();
@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_action_improves() {
+    fn apply_action_improves_should_succeed_when_called() {
         // X + 0 should simplify to X
         let tree = ExprTree::op_add(ExprTree::var(0), ExprTree::constant(0.0));
 
@@ -749,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_stats() {
+    fn guided_stats_should_succeed_when_called() {
         let tree = ExprTree::op_mul(ExprTree::var(0), ExprTree::constant(1.0));
 
         let costs = CostModel::default();
@@ -771,7 +771,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_action_stats_ucb1() {
+    fn action_stats_ucb1_should_succeed_when_called() {
         let mut stats = ActionStats::default();
 
         // Unvisited action should have infinite UCB1
@@ -795,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_mcts_creation() {
+    fn guided_mcts_creation_should_succeed_when_called() {
         let tree = ExprTree::op_add(ExprTree::var(0), ExprTree::constant(0.0));
 
         let config = GuidedConfig::default().with_iterations(10);
@@ -806,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_mcts_iterate() {
+    fn guided_mcts_iterate_should_succeed_when_called() {
         let tree = ExprTree::op_add(ExprTree::var(0), ExprTree::constant(0.0));
 
         let config = GuidedConfig::default().with_iterations(100).with_seed(42);
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_mcts_run() {
+    fn guided_mcts_run_should_succeed_when_called() {
         // x * 1 should simplify to x
         let tree = ExprTree::op_mul(ExprTree::var(0), ExprTree::constant(1.0));
 
@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_mcts_complex_expr() {
+    fn guided_mcts_complex_expr_should_succeed_when_called() {
         // (x + 0) * 1 + (y * 0) should simplify to x
         let tree = ExprTree::op_add(
             ExprTree::op_mul(
@@ -861,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_mcts_epsilon_greedy() {
+    fn guided_mcts_epsilon_greedy_should_succeed_when_called() {
         let tree = ExprTree::op_add(ExprTree::var(0), ExprTree::var(1));
 
         // Test with epsilon = 1.0 (pure random)
@@ -881,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_mcts_training_mode() {
+    fn guided_mcts_training_mode_should_succeed_when_called() {
         let tree = ExprTree::op_add(ExprTree::var(0), ExprTree::constant(0.0));
 
         let config = GuidedConfig::default()
@@ -899,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_guided_mcts_timeout() {
+    fn guided_mcts_timeout_should_succeed_when_called() {
         let tree = ExprTree::op_add(
             ExprTree::op_mul(ExprTree::var(0), ExprTree::var(1)),
             ExprTree::var(2),

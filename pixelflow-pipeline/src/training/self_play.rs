@@ -1116,7 +1116,7 @@ mod tests {
         assert_eq!(back.steps.len(), 1);
         assert!(back.steps[0].matched);
         assert!((back.final_cost_ns - 1.0).abs() < 1e-6);
-        assert!((back.initial_cost.unwrap() - 5.0).abs() < 1e-6);
+        assert!((back.initial_cost.expect("Expected value but got None/Err") - 5.0).abs() < 1e-6);
 
         std::fs::remove_file(&tmp)
             .unwrap_or_else(|e| panic!("Failed to remove temp file {}: {e}", tmp.display()));
@@ -1164,7 +1164,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp.display()));
             let mut w = BufWriter::new(file);
             // Write with some empty lines interspersed
-            writeln!(w).unwrap();
+            writeln!(w).expect("Expected value but got None/Err");
             writeln!(
                 w,
                 "{}",
@@ -1172,11 +1172,11 @@ mod tests {
                     trajectory_idx: 0,
                     advantages: vec![1.0],
                 })
-                .unwrap()
+                .expect("Expected value but got None/Err")
             )
-            .unwrap();
-            writeln!(w).unwrap();
-            writeln!(w, "   ").unwrap();
+            .expect("Expected value but got None/Err");
+            writeln!(w).expect("Expected value but got None/Err");
+            writeln!(w, "   ").expect("Expected value but got None/Err");
             writeln!(
                 w,
                 "{}",
@@ -1184,10 +1184,10 @@ mod tests {
                     trajectory_idx: 1,
                     advantages: vec![2.0, 3.0],
                 })
-                .unwrap()
+                .expect("Expected value but got None/Err")
             )
-            .unwrap();
-            w.flush().unwrap();
+            .expect("Expected value but got None/Err");
+            w.flush().expect("Expected value but got None/Err");
         }
 
         let read_back = read_advantages_jsonl(&tmp);
