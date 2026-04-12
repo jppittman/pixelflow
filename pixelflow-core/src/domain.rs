@@ -274,7 +274,7 @@ mod tests {
     use crate::Field;
 
     #[test]
-    fn 2d_spatial_should_succeed_when_called() {
+    fn two_d_spatial_should_succeed_when_called() {
         let domain = (Field::from(3.0), Field::from(4.0));
         let mut buf = [0.0f32; crate::PARALLELISM];
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn 4d_spatial_should_succeed_when_called() {
+    fn four_d_spatial_should_succeed_when_called() {
         let domain = (
             Field::from(1.0),
             Field::from(2.0),
