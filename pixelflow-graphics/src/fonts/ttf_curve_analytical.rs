@@ -134,10 +134,10 @@ impl Manifold<Field4> for AnalyticalQuad {
             // Degenerate: quadratic is a line. Solve by*t + (cy - Y) = 0
             let k = kernel!(|ax: f32, bx: f32, cx: f32, by: f32, cy: f32| {
                 let t = (Y - cy) / by;
-                let in_t = t.clone().ge(0.0) & t.clone().le(1.0);
+                let in_t = V(t).ge(0.0) & V(t).le(1.0);
 
                 // x-coordinate at intersection
-                let x_int = t.clone() * t.clone() * ax + t.clone() * bx + cx;
+                let x_int = V(t) * V(t) * ax + V(t) * bx + cx;
 
                 // Step: 1.0 if crossing is to the left of or at X
                 let crossed = (X >= x_int).select(1.0, 0.0);
@@ -160,20 +160,20 @@ impl Manifold<Field4> for AnalyticalQuad {
             let t_minus = sqrt_disc * -inv_2a + neg_b_2a;
 
             // X-coordinates at intersection points
-            let x_plus = t_plus.clone() * t_plus.clone() * ax.clone() + t_plus.clone() * bx.clone() + cx.clone();
-            let x_minus = t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx;
+            let x_plus = V(t_plus) * V(t_plus) * ax + V(t_plus) * bx + cx;
+            let x_minus = V(t_minus) * V(t_minus) * ax + V(t_minus) * bx + cx;
 
             // Tangent dy/dt at each root for winding direction
-            let dy_plus = t_plus.clone() * (2.0 * ay.clone()) + by.clone();
-            let dy_minus = t_minus.clone() * (2.0 * ay) + by;
+            let dy_plus = V(t_plus) * (2.0 * ay) + by;
+            let dy_minus = V(t_minus) * (2.0 * ay) + by;
 
             // Step: 1.0 if crossing is to the left of or at X
             let crossed_plus = (X >= x_plus).select(1.0, 0.0);
             let crossed_minus = (X >= x_minus).select(1.0, 0.0);
 
             // Validity: only count roots with t in [0, 1]
-            let valid_plus = t_plus.clone().ge(0.0) & t_plus.clone().le(1.0);
-            let valid_minus = t_minus.clone().ge(0.0) & t_minus.clone().le(1.0);
+            let valid_plus = V(t_plus).ge(0.0) & V(t_plus).le(1.0);
+            let valid_minus = V(t_minus).ge(0.0) & V(t_minus).le(1.0);
 
             // Winding sign from tangent direction
             let sign_plus = dy_plus.gt(0.0).select(-1.0, 1.0);
