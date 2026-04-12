@@ -24,9 +24,7 @@ use syn::{Ident, Lit};
 ///
 /// Index is declaration order: first scalar param = 0, second = 1, etc.
 /// Only scalar params are included — manifold params cannot be constant-folded.
-pub fn scalar_param_indices(
-    analyzed: &crate::sema::AnalyzedKernel,
-) -> HashMap<String, u8> {
+pub fn scalar_param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, u8> {
     analyzed
         .def
         .params

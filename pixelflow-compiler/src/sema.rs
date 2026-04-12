@@ -382,7 +382,10 @@ mod tests {
         let input = quote! { |r: f32| X * X + captured_from_env };
         let kernel = parse(input).unwrap();
         let result = analyze(kernel);
-        assert!(result.is_ok(), "Anonymous kernels should allow captured variables");
+        assert!(
+            result.is_ok(),
+            "Anonymous kernels should allow captured variables"
+        );
     }
 
     #[test]

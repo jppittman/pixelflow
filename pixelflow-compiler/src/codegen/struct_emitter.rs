@@ -54,9 +54,7 @@ pub enum DomainConfig {
         trait_bounds: Vec<TokenStream>,
     },
     /// Generic domain: `impl<__P: Spatial> Manifold<__P> for Struct`
-    Generic {
-        output_type: TokenStream,
-    },
+    Generic { output_type: TokenStream },
 }
 
 /// The eval function body.
@@ -217,7 +215,11 @@ impl StructEmitter {
         let binding = &eval_body.binding;
 
         let manifold_impl = match &self.domain_config {
-            DomainConfig::Fixed { domain_type, output_type, trait_bounds } => {
+            DomainConfig::Fixed {
+                domain_type,
+                output_type,
+                trait_bounds,
+            } => {
                 if generics.is_empty() {
                     quote! {
                         impl ::pixelflow_core::Manifold<#domain_type> for #name {
