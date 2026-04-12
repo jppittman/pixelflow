@@ -50,7 +50,9 @@ impl EventMonitor {
         flags: KqueueFlags,
     ) -> Result<()> {
         let fd = source.as_raw_fd();
-        let mut changes = Vec::new();
+        // Optimization: We add at most 2 filters (read and write),
+        // pre-allocate to prevent dynamic reallocation overhead.
+        let mut changes = Vec::with_capacity(2);
 
         // Add read filter if requested
         if flags.contains(KqueueFlags::EPOLLIN) {
@@ -113,7 +115,9 @@ impl EventMonitor {
 
     pub fn delete<S: std::os::unix::io::AsRawFd>(&self, source: &S) -> Result<()> {
         let fd = source.as_raw_fd();
-        let mut changes = Vec::new();
+        // Optimization: We delete exactly 2 filters,
+        // pre-allocate to prevent dynamic reallocation overhead.
+        let mut changes = Vec::with_capacity(2);
 
         // Delete both read and write filters
         for filter in [libc::EVFILT_READ, libc::EVFILT_WRITE] {
