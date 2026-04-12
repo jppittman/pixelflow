@@ -63,7 +63,9 @@ fn should_report(modes: &DecPrivateModes, kind: MouseEventKind) -> bool {
         }
         MouseEventKind::Release => {
             // X10 mode does not report releases
-            modes.mouse_vt200_mode || modes.mouse_button_event_mode || modes.mouse_any_event_mode
+            modes.mouse_vt200_mode
+                || modes.mouse_button_event_mode
+                || modes.mouse_any_event_mode
         }
         MouseEventKind::Motion => {
             // Button-event mode reports motion only while a button is held,
@@ -86,11 +88,7 @@ fn button_base_code(button: MouseButton) -> u8 {
         MouseButton::ScrollDown => 65,
         MouseButton::Other(n) => {
             // Buttons 4+ map to codes 128+
-            if n >= 4 {
-                128 + n - 4
-            } else {
-                n
-            }
+            if n >= 4 { 128 + n - 4 } else { n }
         }
     }
 }
@@ -126,11 +124,7 @@ fn legacy_button_code(button: MouseButton, kind: MouseEventKind) -> u8 {
 /// Format: `ESC [ < Cb ; Cx ; Cy M` for press/motion, `ESC [ < Cb ; Cx ; Cy m` for release.
 /// Coordinates are 1-based.
 fn encode_sgr(button_code: u8, col: usize, row: usize, kind: MouseEventKind) -> Vec<u8> {
-    let suffix = if kind == MouseEventKind::Release {
-        b'm'
-    } else {
-        b'M'
-    };
+    let suffix = if kind == MouseEventKind::Release { b'm' } else { b'M' };
     // SGR uses 1-based coordinates
     let cx = col + 1;
     let cy = row + 1;
@@ -197,31 +191,15 @@ mod tests {
     #[test]
     fn no_mode_returns_none() {
         let modes = DecPrivateModes::default();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 5,
-                row: 10,
-                kind: MouseEventKind::Press,
-            },
-        );
+        let result = encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 5, row: 10, kind: MouseEventKind::Press });
         assert_eq!(result, None);
     }
 
     #[test]
     fn sgr_left_press() {
         let modes = modes_with_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 5,
-                row: 10,
-                kind: MouseEventKind::Press,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 5, row: 10, kind: MouseEventKind::Press }).unwrap();
         // SGR: ESC[<0;6;11M (1-based coords)
         assert_eq!(result, b"\x1b[<0;6;11M");
     }
@@ -229,16 +207,8 @@ mod tests {
     #[test]
     fn sgr_left_release() {
         let modes = modes_with_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 5,
-                row: 10,
-                kind: MouseEventKind::Release,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 5, row: 10, kind: MouseEventKind::Release }).unwrap();
         // SGR release uses lowercase 'm', button code preserved
         assert_eq!(result, b"\x1b[<0;6;11m");
     }
@@ -246,32 +216,16 @@ mod tests {
     #[test]
     fn sgr_right_press() {
         let modes = modes_with_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Right,
-                col: 0,
-                row: 0,
-                kind: MouseEventKind::Press,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Right, col: 0, row: 0, kind: MouseEventKind::Press }).unwrap();
         assert_eq!(result, b"\x1b[<2;1;1M");
     }
 
     #[test]
     fn sgr_right_release() {
         let modes = modes_with_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Right,
-                col: 3,
-                row: 7,
-                kind: MouseEventKind::Release,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Right, col: 3, row: 7, kind: MouseEventKind::Release }).unwrap();
         // SGR preserves button identity on release
         assert_eq!(result, b"\x1b[<2;4;8m");
     }
@@ -279,32 +233,17 @@ mod tests {
     #[test]
     fn sgr_middle_press() {
         let modes = modes_with_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Middle,
-                col: 79,
-                row: 23,
-                kind: MouseEventKind::Press,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Middle, col: 79, row: 23, kind: MouseEventKind::Press })
+                .unwrap();
         assert_eq!(result, b"\x1b[<1;80;24M");
     }
 
     #[test]
     fn sgr_motion_left() {
         let modes = modes_with_any_event_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 10,
-                row: 5,
-                kind: MouseEventKind::Motion,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 10, row: 5, kind: MouseEventKind::Motion }).unwrap();
         // Motion adds 32 to button code: 0 + 32 = 32
         assert_eq!(result, b"\x1b[<32;11;6M");
     }
@@ -312,16 +251,8 @@ mod tests {
     #[test]
     fn sgr_motion_right() {
         let modes = modes_with_button_event_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Right,
-                col: 10,
-                row: 5,
-                kind: MouseEventKind::Motion,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Right, col: 10, row: 5, kind: MouseEventKind::Motion }).unwrap();
         // Motion adds 32 to button code: 2 + 32 = 34
         assert_eq!(result, b"\x1b[<34;11;6M");
     }
@@ -329,48 +260,26 @@ mod tests {
     #[test]
     fn sgr_scroll_up() {
         let modes = modes_with_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::ScrollUp,
-                col: 10,
-                row: 5,
-                kind: MouseEventKind::Press,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::ScrollUp, col: 10, row: 5, kind: MouseEventKind::Press })
+                .unwrap();
         assert_eq!(result, b"\x1b[<64;11;6M");
     }
 
     #[test]
     fn sgr_scroll_down() {
         let modes = modes_with_sgr();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::ScrollDown,
-                col: 10,
-                row: 5,
-                kind: MouseEventKind::Press,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::ScrollDown, col: 10, row: 5, kind: MouseEventKind::Press })
+                .unwrap();
         assert_eq!(result, b"\x1b[<65;11;6M");
     }
 
     #[test]
     fn legacy_left_press() {
         let modes = modes_with_vt200();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 5,
-                row: 10,
-                kind: MouseEventKind::Press,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 5, row: 10, kind: MouseEventKind::Press }).unwrap();
         // Legacy: ESC[M + (0+32) + (5+33) + (10+33)
         assert_eq!(result, vec![0x1b, b'[', b'M', 32, 38, 43]);
     }
@@ -378,16 +287,8 @@ mod tests {
     #[test]
     fn legacy_left_release_uses_code_3() {
         let modes = modes_with_vt200();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 5,
-                row: 10,
-                kind: MouseEventKind::Release,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 5, row: 10, kind: MouseEventKind::Release }).unwrap();
         // Legacy release: button code = 3, so Cb = 3 + 32 = 35
         assert_eq!(result, vec![0x1b, b'[', b'M', 35, 38, 43]);
     }
@@ -395,16 +296,9 @@ mod tests {
     #[test]
     fn legacy_right_release_uses_code_3() {
         let modes = modes_with_vt200();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Right,
-                col: 5,
-                row: 10,
-                kind: MouseEventKind::Release,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Right, col: 5, row: 10, kind: MouseEventKind::Release })
+                .unwrap();
         // Legacy release always uses code 3 regardless of which button was released
         assert_eq!(result, vec![0x1b, b'[', b'M', 35, 38, 43]);
     }
@@ -412,85 +306,32 @@ mod tests {
     #[test]
     fn legacy_coords_overflow_returns_none() {
         let modes = modes_with_vt200();
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 300,
-                row: 10,
-                kind: MouseEventKind::Press,
-            },
-        );
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 300, row: 10, kind: MouseEventKind::Press });
         assert_eq!(result, None);
     }
 
     #[test]
     fn x10_reports_press_only() {
         let modes = modes_with_x10();
-        let press = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 0,
-                row: 0,
-                kind: MouseEventKind::Press,
-            },
-        );
+        let press = encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 0, row: 0, kind: MouseEventKind::Press });
         assert!(press.is_some());
-        let release = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 0,
-                row: 0,
-                kind: MouseEventKind::Release,
-            },
-        );
+        let release =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 0, row: 0, kind: MouseEventKind::Release });
         assert_eq!(release, None);
-        let motion = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 0,
-                row: 0,
-                kind: MouseEventKind::Motion,
-            },
-        );
+        let motion = encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 0, row: 0, kind: MouseEventKind::Motion });
         assert_eq!(motion, None);
     }
 
     #[test]
     fn vt200_reports_press_and_release() {
         let modes = modes_with_vt200();
-        let press = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 0,
-                row: 0,
-                kind: MouseEventKind::Press,
-            },
-        );
+        let press = encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 0, row: 0, kind: MouseEventKind::Press });
         assert!(press.is_some());
-        let release = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 0,
-                row: 0,
-                kind: MouseEventKind::Release,
-            },
-        );
+        let release =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 0, row: 0, kind: MouseEventKind::Release });
         assert!(release.is_some());
-        let motion = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 0,
-                row: 0,
-                kind: MouseEventKind::Motion,
-            },
-        );
+        let motion = encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 0, row: 0, kind: MouseEventKind::Motion });
         assert_eq!(motion, None);
     }
 
@@ -498,16 +339,9 @@ mod tests {
     fn sgr_large_coordinates() {
         let modes = modes_with_sgr();
         // SGR has no coordinate limit
-        let result = encode_mouse_event(
-            &modes,
-            MouseEncodingParams {
-                button: MouseButton::Left,
-                col: 500,
-                row: 300,
-                kind: MouseEventKind::Press,
-            },
-        )
-        .unwrap();
+        let result =
+            encode_mouse_event(&modes, MouseEncodingParams { button: MouseButton::Left, col: 500, row: 300, kind: MouseEventKind::Press })
+                .unwrap();
         assert_eq!(result, b"\x1b[<0;501;301M");
     }
 }
