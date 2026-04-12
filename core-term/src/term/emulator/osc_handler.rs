@@ -12,28 +12,32 @@ impl TerminalEmulator {
         let ps_str: &str;
         let content_str: &str;
 
-        if parts.len() == 1 {
-            // No semicolon found, treat the whole string as Ps, content is empty
-            ps_str = parts[0];
-            content_str = "";
-            // Log a debug message for this case, as it might be an implicit expectation
-            debug!(
-                "OSC sequence without semicolon: '{}'. Interpreting Ps='{}', Pt='{}'",
-                osc_str, ps_str, content_str
-            );
-        } else if parts.len() == 2 {
-            // Semicolon found, standard case
-            ps_str = parts[0];
-            content_str = parts[1];
-        } else {
-            // This case should ideally not be reached with splitn(2, ';')
-            // but handle defensively.
-            warn!(
-                "Malformed OSC sequence (unexpected parts count for {}): {}",
-                parts.len(),
-                osc_str
-            );
-            return None;
+        match parts.len() {
+            1 => {
+                // No semicolon found, treat the whole string as Ps, content is empty
+                ps_str = parts[0];
+                content_str = "";
+                // Log a debug message for this case, as it might be an implicit expectation
+                debug!(
+                    "OSC sequence without semicolon: '{}'. Interpreting Ps='{}', Pt='{}'",
+                    osc_str, ps_str, content_str
+                );
+            }
+            2 => {
+                // Semicolon found, standard case
+                ps_str = parts[0];
+                content_str = parts[1];
+            }
+            _ => {
+                // This case should ideally not be reached with splitn(2, ';')
+                // but handle defensively.
+                warn!(
+                    "Malformed OSC sequence (unexpected parts count for {}): {}",
+                    parts.len(),
+                    osc_str
+                );
+                return None;
+            }
         }
 
         // Attempt to parse Ps, default to 0 if parsing fails (e.g., "Implicit Title")
