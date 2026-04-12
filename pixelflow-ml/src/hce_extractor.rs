@@ -635,7 +635,6 @@ pub fn correlation_loss(weights: &[i32], samples: &[(Expr, u64)]) -> f64 {
     let n_f = n as f64;
     let rho = 1.0 - (6.0 * sum_d2) / (n_f * (n_f * n_f - 1.0));
 
-    // Return 1 - correlation (so lower is better)
     1.0 - rho
 }
 
