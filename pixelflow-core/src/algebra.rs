@@ -559,21 +559,21 @@ mod tests {
 
     #[test]
     fn test_bool_algebra() {
-        assert_eq!(bool::zero(), false);
-        assert_eq!(bool::one(), true);
+        assert!(!bool::zero(), "Expected bool::zero() to be false");
+        assert!(bool::one(), "Expected bool::one() to be true");
 
         // Boolean ring (OR/AND)
-        assert_eq!(false.add(false), false);
-        assert_eq!(false.add(true), true);
-        assert_eq!(true.add(false), true);
-        assert_eq!(true.add(true), true);
+        assert!(!false.add(false), "Expected false.add(false) to be false");
+        assert!(false.add(true), "Expected false.add(true) to be true");
+        assert!(true.add(false), "Expected true.add(false) to be true");
+        assert!(true.add(true), "Expected true.add(true) to be true");
 
-        assert_eq!(false.mul(false), false);
-        assert_eq!(false.mul(true), false);
-        assert_eq!(true.mul(true), true);
+        assert!(!false.mul(false), "Expected false.mul(false) to be false");
+        assert!(!false.mul(true), "Expected false.mul(true) to be false");
+        assert!(true.mul(true), "Expected true.mul(true) to be true");
 
-        assert_eq!(true.neg(), false);
-        assert_eq!(false.neg(), true);
+        assert!(!true.neg(), "Expected true.neg() to be false");
+        assert!(false.neg(), "Expected false.neg() to be true");
     }
 
     #[test]
