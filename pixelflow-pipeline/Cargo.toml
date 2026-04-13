@@ -7,9 +7,10 @@ description = "Training and data generation pipeline for PixelFlow"
 [features]
 default = []
 training = ["pixelflow-search/std"]
+profiling = ["pprof"]
 
 [dependencies]
-pixelflow-ir = { path = "../pixelflow-ir", features = ["alloc"] }
+pixelflow-ir = { path = "../pixelflow-ir" }
 pixelflow-search = { path = "../pixelflow-search", features = ["std", "nnue"] }
 pixelflow-core = { path = "../pixelflow-core" }
 pixelflow-compiler = { path = "../pixelflow-compiler" }
@@ -18,6 +19,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 criterion = "0.5"
+ureq = { version = "2.10", default-features = false, features = ["json"] }
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -29,40 +32,13 @@ harness = false
 
 
 [[bin]]
-name = "eval_search"
-path = "src/bin/eval_search.rs"
-
-[[bin]]
-name = "demo_rewrites"
-path = "src/bin/demo_rewrites.rs"
-
-[[bin]]
-name = "demo_discovery"
-path = "src/bin/demo_discovery.rs"
-
-[[bin]]
-name = "demo_nnue"
-path = "src/bin/demo_nnue.rs"
-
-
-[[bin]]
 name = "bench_jit_corpus"
 path = "src/bin/bench_jit_corpus.rs"
 required-features = ["training"]
 
 [[bin]]
-name = "bench_judge_fair"
-path = "src/bin/bench_judge_fair.rs"
-required-features = ["training"]
-
-[[bin]]
-name = "bench_shader_e2e"
-path = "src/bin/bench_shader_e2e.rs"
-required-features = ["training"]
-
-[[bin]]
-name = "bootstrap_judge"
-path = "src/bin/bootstrap_judge.rs"
+name = "bootstrap_extraction_head"
+path = "src/bin/bootstrap_extraction_head.rs"
 required-features = ["training"]
 
 [[bin]]
@@ -75,3 +51,17 @@ name = "train_unified"
 path = "src/bin/train_unified.rs"
 required-features = ["training"]
 
+[[bin]]
+name = "bench_jit_profile"
+path = "src/bin/bench_jit_profile.rs"
+required-features = ["training"]
+
+[[bin]]
+name = "validate_corpus"
+path = "src/bin/validate_corpus.rs"
+required-features = ["training"]
+
+[[bin]]
+name = "bench_scanline_jit"
+path = "src/bin/bench_scanline_jit.rs"
+required-features = ["training"]

@@ -63,31 +63,20 @@ use crate::egraph::rewrite::Rewrite;
 
 // Re-export key types for convenience
 pub use algebra::{
-    InversePair, AddNeg, MulRecip,
-    Commutative, Identity, Annihilator, Associative, ReverseAssociative,
-    algebra_rules, inverse_pair_rules, basic_algebra_rules,
-};
-pub use parity::{
-    Parity, ParityKind,
-    SinParity, CosParity, TanParity, AsinParity, AtanParity, AbsParity,
-    parity_rules,
-};
-pub use trig::{
-    AngleAddition, Sign, AngleExpansion,
-    SinAngleAddition, CosAngleAddition,
-    trig_rules,
+    AddNeg, Annihilator, Associative, Commutative, Identity, InversePair, MulRecip,
+    ReverseAssociative, algebra_rules, basic_algebra_rules, inverse_pair_rules,
 };
 pub use exp::{
-    FunctionInverse, Homomorphism,
-    ExpLn, Exp2Log2, ExpHomomorphism, LnHomomorphism,
-    exp_rules,
+    Exp2Log2, ExpHomomorphism, ExpLn, FunctionInverse, Homomorphism, LnHomomorphism, exp_rules,
 };
-pub use power::{
-    power_rules,
+pub use fusion::{FmaFusion, RecipSqrt, fusion_rules};
+pub use parity::{
+    AbsParity, AsinParity, AtanParity, CosParity, Parity, ParityKind, SinParity, TanParity,
+    parity_rules,
 };
-pub use fusion::{
-    FmaFusion, RecipSqrt,
-    fusion_rules,
+pub use power::power_rules;
+pub use trig::{
+    AngleAddition, AngleExpansion, CosAngleAddition, Sign, SinAngleAddition, trig_rules,
 };
 
 /// All mathematical rewrite rules.
@@ -148,10 +137,145 @@ pub fn transcendental_rules() -> Vec<Box<dyn Rewrite>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::{Expr, OpKind};
-    use crate::egraph::{EGraph, expr_to_egraph, eclass_to_expr, saturate_with_budget, CostModel};
+    use crate::egraph::{CostModel, EClassId, EGraph, ENode, saturate_with_budget};
+    use crate::egraph::Pattern as Expr;
+    use pixelflow_ir::OpKind;
+    use std::sync::Arc;
 
-    fn b(e: Expr) -> Box<Expr> { Box::new(e) }
+    fn b(e: Expr) -> Arc<Expr> {
+        Arc::new(e)
+    }
+
+    fn expr_to_egraph(expr: &Expr, egraph: &mut EGraph) -> EClassId {
+        enum Task<'a> {
+            Visit(&'a Expr),
+            CompleteOp { kind: OpKind, arity: usize },
+            CompleteTuple { arity: usize },
+        }
+
+        let mut stack = vec![Task::Visit(expr)];
+        let mut result_stack = Vec::new();
+
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Visit(node) => match node {
+                    Expr::Var(idx) => result_stack.push(egraph.add(ENode::Var(*idx))),
+                    Expr::Const(val) => result_stack.push(egraph.add(ENode::Const(val.to_bits()))),
+                    Expr::Param(i) => panic!("Expr::Param({i}) reached math tests"),
+                    Expr::Unary(kind, a) => {
+                        stack.push(Task::CompleteOp {
+                            kind: *kind,
+                            arity: 1,
+                        });
+                        stack.push(Task::Visit(a));
+                    }
+                    Expr::Binary(kind, a, b) => {
+                        stack.push(Task::CompleteOp {
+                            kind: *kind,
+                            arity: 2,
+                        });
+                        stack.push(Task::Visit(b));
+                        stack.push(Task::Visit(a));
+                    }
+                    Expr::Ternary(kind, a, b, c) => {
+                        stack.push(Task::CompleteOp {
+                            kind: *kind,
+                            arity: 3,
+                        });
+                        stack.push(Task::Visit(c));
+                        stack.push(Task::Visit(b));
+                        stack.push(Task::Visit(a));
+                    }
+                    Expr::Nary(kind, children) => match kind {
+                        OpKind::Tuple => {
+                            assert!(!children.is_empty(), "empty tuple in math test");
+                            stack.push(Task::CompleteTuple {
+                                arity: children.len(),
+                            });
+                            for child in children.iter().rev() {
+                                stack.push(Task::Visit(child));
+                            }
+                        }
+                        _ => panic!("unsupported n-ary op in math test: {kind:?}"),
+                    },
+                },
+                Task::CompleteOp { kind, arity } => {
+                    let start = result_stack.len().saturating_sub(arity);
+                    let children: Vec<EClassId> = result_stack.drain(start..).collect();
+                    let op = crate::egraph::ops::op_from_kind(kind)
+                        .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
+                    result_stack.push(egraph.add(ENode::Op { op, children }));
+                }
+                Task::CompleteTuple { arity } => {
+                    let start = result_stack.len().saturating_sub(arity);
+                    let children: Vec<EClassId> = result_stack.drain(start..).collect();
+                    result_stack.push(children[0]);
+                }
+            }
+        }
+
+        result_stack
+            .pop()
+            .expect("expr_to_egraph: empty result stack")
+    }
+
+    fn eclass_to_expr(egraph: &EGraph, class: EClassId) -> Expr {
+        enum Task {
+            Visit(EClassId),
+            Complete { kind: OpKind, arity: usize },
+        }
+
+        let mut stack = vec![Task::Visit(class)];
+        let mut result_stack = Vec::new();
+
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Visit(class_id) => {
+                    let node = &egraph.nodes(class_id)[0];
+                    match node {
+                        ENode::Var(idx) => result_stack.push(Expr::Var(*idx)),
+                        ENode::Const(bits) => result_stack.push(Expr::Const(f32::from_bits(*bits))),
+                        ENode::Op { op, children } => {
+                            let kind = op.kind();
+                            let arity = children.len();
+                            assert!(
+                                (1..=3).contains(&arity),
+                                "unsupported arity in math test: {arity}"
+                            );
+                            stack.push(Task::Complete { kind, arity });
+                            for &child in children.iter().rev() {
+                                stack.push(Task::Visit(child));
+                            }
+                        }
+                    }
+                }
+                Task::Complete { kind, arity } => {
+                    let start = result_stack.len().saturating_sub(arity);
+                    let mut children: Vec<Expr> = result_stack.drain(start..).collect();
+                    let expr = match arity {
+                        1 => Expr::Unary(kind, b(children.remove(0))),
+                        2 => {
+                            let rhs = children.remove(1);
+                            let lhs = children.remove(0);
+                            Expr::Binary(kind, b(lhs), b(rhs))
+                        }
+                        3 => {
+                            let c = children.remove(2);
+                            let rhs = children.remove(1);
+                            let lhs = children.remove(0);
+                            Expr::Ternary(kind, b(lhs), b(rhs), b(c))
+                        }
+                        _ => unreachable!(),
+                    };
+                    result_stack.push(expr);
+                }
+            }
+        }
+
+        result_stack
+            .pop()
+            .expect("eclass_to_expr: empty result stack")
+    }
 
     /// Evaluate an IR Expr at given variable values.
     fn eval_expr(expr: &Expr, vars: &[f32; 4]) -> f32 {
@@ -161,18 +285,21 @@ mod tests {
             Expr::Param(_) => panic!("Param in eval_expr"),
             Expr::Unary(op, a) => {
                 let a = eval_expr(a, vars);
-                op.eval_unary(a).unwrap_or_else(|| panic!("eval_unary failed for {:?}", op))
+                op.eval_unary(a)
+                    .unwrap_or_else(|| panic!("eval_unary failed for {:?}", op))
             }
             Expr::Binary(op, a, b) => {
                 let a = eval_expr(a, vars);
                 let b = eval_expr(b, vars);
-                op.eval_binary(a, b).unwrap_or_else(|| panic!("eval_binary failed for {:?}", op))
+                op.eval_binary(a, b)
+                    .unwrap_or_else(|| panic!("eval_binary failed for {:?}", op))
             }
             Expr::Ternary(op, a, b, c) => {
                 let a = eval_expr(a, vars);
                 let b = eval_expr(b, vars);
                 let c = eval_expr(c, vars);
-                op.eval_ternary(a, b, c).unwrap_or_else(|| panic!("eval_ternary failed for {:?}", op))
+                op.eval_ternary(a, b, c)
+                    .unwrap_or_else(|| panic!("eval_ternary failed for {:?}", op))
             }
             Expr::Nary(_, _) => panic!("Nary in eval_expr"),
         }
@@ -193,8 +320,12 @@ mod tests {
             let opt = eval_expr(&optimized, point);
 
             // Both NaN => OK. Both inf with same sign => OK.
-            if original.is_nan() && opt.is_nan() { continue; }
-            if original.is_infinite() && opt.is_infinite() && original.signum() == opt.signum() { continue; }
+            if original.is_nan() && opt.is_nan() {
+                continue;
+            }
+            if original.is_infinite() && opt.is_infinite() && original.signum() == opt.signum() {
+                continue;
+            }
 
             let diff = (original - opt).abs();
             // Use relative error for large values
@@ -219,15 +350,15 @@ mod tests {
     /// Standard test points including edge cases.
     fn standard_test_points() -> Vec<[f32; 4]> {
         vec![
-            [0.5, 0.7, 1.3, -0.2],      // Normal values
-            [0.0, 0.0, 0.0, 0.0],        // Zeros
-            [1.0, 1.0, 1.0, 1.0],        // Ones
-            [-1.0, -1.0, -1.0, -1.0],    // Negative ones
-            [100.0, 100.0, 100.0, 100.0], // Large values (exp overflow territory)
-            [-100.0, -100.0, 0.01, 0.01], // Mixed large negative / small positive
-            [0.001, 0.001, 0.001, 0.001], // Very small
+            [0.5, 0.7, 1.3, -0.2],             // Normal values
+            [0.0, 0.0, 0.0, 0.0],              // Zeros
+            [1.0, 1.0, 1.0, 1.0],              // Ones
+            [-1.0, -1.0, -1.0, -1.0],          // Negative ones
+            [100.0, 100.0, 100.0, 100.0],      // Large values (exp overflow territory)
+            [-100.0, -100.0, 0.01, 0.01],      // Mixed large negative / small positive
+            [0.001, 0.001, 0.001, 0.001],      // Very small
             [3.14159, 1.5708, 0.7854, 2.3562], // Pi-related (trig)
-            [-0.5, 0.3, -0.8, 0.1],      // Mixed sign small
+            [-0.5, 0.3, -0.8, 0.1],            // Mixed sign small
         ]
     }
 
@@ -250,9 +381,11 @@ mod tests {
         check_optimization_preserves_semantics(&expr, &pts, 1e-6);
 
         // (x + y) - y (triggers cancellation)
-        let expr = Expr::Binary(OpKind::Sub,
+        let expr = Expr::Binary(
+            OpKind::Sub,
             b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))),
-            b(y.clone()));
+            b(y.clone()),
+        );
         check_optimization_preserves_semantics(&expr, &pts, 1e-4);
 
         // x * 0 (triggers annihilator)
@@ -275,13 +408,17 @@ mod tests {
         let y = Expr::Var(1);
 
         // sin(x + y) (triggers angle addition)
-        let expr = Expr::Unary(OpKind::Sin,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))));
+        let expr = Expr::Unary(
+            OpKind::Sin,
+            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))),
+        );
         check_optimization_preserves_semantics(&expr, &pts, 1e-4);
 
         // cos(x + y) (triggers angle addition)
-        let expr = Expr::Unary(OpKind::Cos,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))));
+        let expr = Expr::Unary(
+            OpKind::Cos,
+            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))),
+        );
         check_optimization_preserves_semantics(&expr, &pts, 1e-4);
 
         // sin(neg(x)) (triggers parity: odd)
@@ -316,20 +453,30 @@ mod tests {
         for point in &pts {
             let original = eval_expr(&expr, point);
             let opt = eval_expr(&optimized, point);
-            if original.is_nan() && opt.is_nan() { continue; }
+            if original.is_nan() && opt.is_nan() {
+                continue;
+            }
             let diff = (original - opt).abs();
-            let threshold = if original.abs() > 1.0 { 1e-5 * original.abs() } else { 1e-5 };
-            assert!(diff <= threshold,
-                "Associativity L->R changed semantics at {point:?}: {original} vs {opt}");
+            let threshold = if original.abs() > 1.0 {
+                1e-5 * original.abs()
+            } else {
+                1e-5
+            };
+            assert!(
+                diff <= threshold,
+                "Associativity L->R changed semantics at {point:?}: {original} vs {opt}"
+            );
         }
 
         // Verify the e-graph contains the right-associated form by checking
         // that the root class has grown (new nodes added by associativity)
         let root = eg.find(root);
         let node_count = eg.nodes(root).len();
-        assert!(node_count > 1,
+        assert!(
+            node_count > 1,
             "Expected associativity to add alternative tree shapes, \
-             but root class has only {node_count} node(s)");
+             but root class has only {node_count} node(s)"
+        );
     }
 
     #[test]
@@ -353,19 +500,29 @@ mod tests {
         for point in &pts {
             let original = eval_expr(&expr, point);
             let opt = eval_expr(&optimized, point);
-            if original.is_nan() && opt.is_nan() { continue; }
+            if original.is_nan() && opt.is_nan() {
+                continue;
+            }
             let diff = (original - opt).abs();
-            let threshold = if original.abs() > 1.0 { 1e-5 * original.abs() } else { 1e-5 };
-            assert!(diff <= threshold,
-                "Associativity R->L changed semantics at {point:?}: {original} vs {opt}");
+            let threshold = if original.abs() > 1.0 {
+                1e-5 * original.abs()
+            } else {
+                1e-5
+            };
+            assert!(
+                diff <= threshold,
+                "Associativity R->L changed semantics at {point:?}: {original} vs {opt}"
+            );
         }
 
         // Verify the e-graph grew from reverse associativity
         let root = eg.find(root);
         let node_count = eg.nodes(root).len();
-        assert!(node_count > 1,
+        assert!(
+            node_count > 1,
             "Expected reverse associativity to add alternative tree shapes, \
-             but root class has only {node_count} node(s)");
+             but root class has only {node_count} node(s)"
+        );
     }
 
     #[test]
@@ -404,30 +561,52 @@ mod tests {
     fn test_associativity_templates() {
         // Verify all associativity rules have valid lhs/rhs templates
         let assoc_add = Associative::new(&crate::egraph::ops::Add);
-        assert!(assoc_add.lhs_template().is_some(), "Associative Add missing lhs_template");
-        assert!(assoc_add.rhs_template().is_some(), "Associative Add missing rhs_template");
+        assert!(
+            assoc_add.lhs_template().is_some(),
+            "Associative Add missing lhs_template"
+        );
+        assert!(
+            assoc_add.rhs_template().is_some(),
+            "Associative Add missing rhs_template"
+        );
 
         let rev_assoc_add = ReverseAssociative::new(&crate::egraph::ops::Add);
-        assert!(rev_assoc_add.lhs_template().is_some(), "ReverseAssociative Add missing lhs_template");
-        assert!(rev_assoc_add.rhs_template().is_some(), "ReverseAssociative Add missing rhs_template");
+        assert!(
+            rev_assoc_add.lhs_template().is_some(),
+            "ReverseAssociative Add missing lhs_template"
+        );
+        assert!(
+            rev_assoc_add.rhs_template().is_some(),
+            "ReverseAssociative Add missing rhs_template"
+        );
 
         // Verify template structure: LHS of Associative should be RHS of ReverseAssociative
         let assoc_lhs = assoc_add.lhs_template().unwrap();
         let rev_rhs = rev_assoc_add.rhs_template().unwrap();
-        assert_eq!(format!("{}", assoc_lhs), format!("{}", rev_rhs),
-            "Associative LHS should equal ReverseAssociative RHS (same structural pattern)");
+        assert_eq!(
+            format!("{}", assoc_lhs),
+            format!("{}", rev_rhs),
+            "Associative LHS should equal ReverseAssociative RHS (same structural pattern)"
+        );
 
         let assoc_rhs = assoc_add.rhs_template().unwrap();
         let rev_lhs = rev_assoc_add.lhs_template().unwrap();
-        assert_eq!(format!("{}", assoc_rhs), format!("{}", rev_lhs),
-            "Associative RHS should equal ReverseAssociative LHS (same structural pattern)");
+        assert_eq!(
+            format!("{}", assoc_rhs),
+            format!("{}", rev_lhs),
+            "Associative RHS should equal ReverseAssociative LHS (same structural pattern)"
+        );
     }
 
     #[test]
     fn test_all_rules_count() {
         // Verify we have the expected number of rules after removal.
         let rules = all_rules();
-        assert_eq!(rules.len(), 61,
-            "Expected 61 rules (59 math + 2 fusion), got {}", rules.len());
+        assert_eq!(
+            rules.len(),
+            61,
+            "Expected 61 rules (59 math + 2 fusion), got {}",
+            rules.len()
+        );
     }
 }

@@ -55,8 +55,8 @@
 
 #![allow(dead_code)] // Prototype code
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 use libm::{sqrtf, fabsf};
 
 // Re-export OpKind as OpType for backward compatibility within this module.
@@ -395,45 +395,45 @@ impl ExprGenerator {
                 // Binary operations
                 0 => Expr::Binary(
                     OpType::Add,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 1 => Expr::Binary(
                     OpType::Sub,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 2 => Expr::Binary(
                     OpType::Mul,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 3 => Expr::Binary(
                     OpType::Div,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 4 => Expr::Binary(
                     OpType::Min,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 5 => Expr::Binary(
                     OpType::Max,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 // Unary operations
-                6 => Expr::Unary(OpType::Neg, Box::new(self.generate_recursive(depth + 1))),
-                7 => Expr::Unary(OpType::Sqrt, Box::new(self.generate_recursive(depth + 1))),
-                8 => Expr::Unary(OpType::Rsqrt, Box::new(self.generate_recursive(depth + 1))),
-                9 => Expr::Unary(OpType::Abs, Box::new(self.generate_recursive(depth + 1))),
+                6 => Expr::Unary(OpType::Neg, Arc::new(self.generate_recursive(depth + 1))),
+                7 => Expr::Unary(OpType::Sqrt, Arc::new(self.generate_recursive(depth + 1))),
+                8 => Expr::Unary(OpType::Rsqrt, Arc::new(self.generate_recursive(depth + 1))),
+                9 => Expr::Unary(OpType::Abs, Arc::new(self.generate_recursive(depth + 1))),
                 // Fused operations
                 10 => Expr::Ternary(
                     OpType::MulAdd,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 _ => unreachable!(),
             }
@@ -546,7 +546,7 @@ impl RewriteRule {
                 Expr::Binary(OpType::Add, a, b) if exprs_equal(a, b) => {
                     Some(Expr::Binary(
                         OpType::Mul,
-                        Box::new(Expr::Const(2.0)),
+                        Arc::new(Expr::Const(2.0)),
                         a.clone(),
                     ))
                 }
@@ -567,7 +567,7 @@ impl RewriteRule {
             RewriteRule::UnfuseMulAdd => match expr {
                 Expr::Ternary(OpType::MulAdd, a, b, c) => Some(Expr::Binary(
                     OpType::Add,
-                    Box::new(Expr::Binary(OpType::Mul, a.clone(), b.clone())),
+                    Arc::new(Expr::Binary(OpType::Mul, a.clone(), b.clone())),
                     c.clone(),
                 )),
                 _ => None,
@@ -678,8 +678,8 @@ mod tests {
         // x + y
         let expr = Expr::Binary(
             OpType::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Var(1)),
         );
         let result = expr.eval(&[3.0, 4.0, 0.0, 0.0]);
         assert!(fabsf(result - 7.0) < 1e-6);
@@ -699,8 +699,8 @@ mod tests {
     fn test_feature_extraction() {
         let expr = Expr::Binary(
             OpType::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(1.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(1.0)),
         );
         let features = extract_features(&expr);
         assert!(!features.is_empty());
@@ -710,8 +710,8 @@ mod tests {
     fn test_rewrite_add_zero() {
         let expr = Expr::Binary(
             OpType::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(0.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(0.0)),
         );
         let rewritten = RewriteRule::AddZero.try_apply(&expr);
         assert!(rewritten.is_some());
@@ -723,12 +723,12 @@ mod tests {
         // a * b + c
         let expr = Expr::Binary(
             OpType::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpType::Mul,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Var(2)),
+            Arc::new(Expr::Var(2)),
         );
         let rewritten = RewriteRule::FuseToMulAdd.try_apply(&expr);
         assert!(rewritten.is_some());
@@ -740,12 +740,12 @@ mod tests {
         // (x + 0) + y - should find AddZero at path [0]
         let expr = Expr::Binary(
             OpType::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpType::Add,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Const(0.0)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Const(0.0)),
             )),
-            Box::new(Expr::Var(1)),
+            Arc::new(Expr::Var(1)),
         );
         let rewrites = find_all_rewrites(&expr);
         assert!(!rewrites.is_empty());

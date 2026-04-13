@@ -3,32 +3,29 @@
 //! Runs hill-climbing trajectories with the current mask weights (self-play,
 //! no perturbation) and records per-step payload for the Critic.
 //!
-//! This is the "GENERATE" phase of the unified training loop. Unlike
-//! `collect_guide_data` which uses random Gaussian perturbation of mask
-//! weights, this module uses the model weights as-is (true self-play).
+//! This is the "GENERATE" phase of the unified training loop.
 //!
-//! ## Key differences from `collect_guide_data`
-//!
-//! - No perturbation -- uses model weights directly
-//! - Records `accumulator_state` + `rule_embedding` per step (for Critic)
-//! - JIT benchmarks final expression for ground-truth terminal cost
-//! - Returns [`Trajectory`] struct (defined in `unified.rs`) not `TrajectorySample`
+//! It runs the current saturation policy directly, records per-step payload for
+//! the Critic, benchmarks the final extracted expression for terminal cost, and
+//! returns [`Trajectory`] values for the shared replay/update path.
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
+use pixelflow_ir::{ExprArena, ExprId, ExprNode};
 use pixelflow_search::egraph::{
-    all_rules, expr_tree_to_nnue, extract_neural, predict_tree_cost, EGraph, ENode, Rewrite,
+    EGraph, ENode, Rewrite, all_rules, compute_ref_counts, extract_neural_to_arena,
 };
-use pixelflow_search::nnue::{
-    BwdGenConfig, BwdGenerator, EdgeAccumulator, Expr, ExprNnue, GraphAccumulator, OpKind,
-    RuleTemplates, EMBED_DIM, GRAPH_INPUT_DIM,
-};
-use pixelflow_search::nnue::factored::MAX_ARITY;
 use pixelflow_search::nnue::factored::INPUT_DIM;
+use pixelflow_search::nnue::factored::MAX_ARITY;
+use pixelflow_search::nnue::{
+    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_INPUT_DIM,
+    GraphAccumulator, OpKind, RuleTemplates,
+};
 
-use crate::jit_bench::benchmark_jit;
-use crate::training::factored::parse_kernel_code;
+use crate::jit_bench::benchmark_jit_arena;
+use crate::training::corpus;
+use crate::training::factored::arena_to_kernel_code;
 use crate::training::unified::{Trajectory, TrajectoryAdvantages, TrajectoryStep};
 
 // ============================================================================
@@ -43,23 +40,27 @@ fn sigmoid(x: f32) -> f32 {
 
 /// Convert an [`EdgeAccumulator`] to a flat `INPUT_DIM`-element `Vec<f32>`.
 ///
-/// Layout: `[values (4*K=128 floats), edge_count, node_count]` = 130 floats total.
+/// Layout: `[values (4*K=128 floats), edge_count, node_count, node_budget, epoch_budget]` = 132 floats total.
 pub fn acc_to_vec(acc: &EdgeAccumulator) -> Vec<f32> {
     let mut v = Vec::with_capacity(INPUT_DIM);
     v.extend_from_slice(&acc.values);
     v.push(acc.edge_count as f32);
     v.push(acc.node_count as f32);
+    v.push(acc.node_budget as f32);
+    v.push(acc.epoch_budget as f32);
     v
 }
 
 /// Convert a [`GraphAccumulator`] to a flat `GRAPH_INPUT_DIM`-element `Vec<f32>`.
 ///
-/// Layout: `[values (3*K=96 floats), edge_count, node_count]` = 98 floats total.
+/// Layout: `[values (4*K=128 floats), edge_count, node_count, node_budget, epoch_budget]` = 132 floats total.
 pub fn gacc_to_vec(gacc: &GraphAccumulator) -> Vec<f32> {
     let mut v = Vec::with_capacity(GRAPH_INPUT_DIM);
     v.extend_from_slice(&gacc.values);
     v.push(gacc.edge_count as f32);
     v.push(gacc.node_count as f32);
+    v.push(gacc.node_budget as f32);
+    v.push(gacc.epoch_budget as f32);
     v
 }
 
@@ -69,22 +70,63 @@ pub fn gacc_to_vec(gacc: &GraphAccumulator) -> Vec<f32> {
 /// via union-find, and accumulates VSA-encoded edges. Rebuilt from scratch
 /// each epoch because union-find merges change canonical representatives,
 /// making incremental updates unsound.
-fn build_graph_acc(egraph: &EGraph, emb: &pixelflow_search::nnue::OpEmbeddings) -> GraphAccumulator {
+fn build_graph_acc(
+    egraph: &EGraph,
+    emb: &pixelflow_search::nnue::OpEmbeddings,
+) -> GraphAccumulator {
+    use std::collections::HashMap;
+
     let mut gacc = GraphAccumulator::new();
+
+    // Pass 1: collect 1-hop edges and build a parent map (child_class → parent_op).
+    // For 2-hop: if child class C has parent op P, and P's class has parent op GP,
+    // then (GP, P, child_op) is a 2-hop path.
+    //
+    // parent_ops maps: canonical class id → Vec of OpKind that appear as parents of that class.
+    let mut parent_ops: HashMap<usize, Vec<OpKind>> = HashMap::new();
+
     for class_id in egraph.class_ids() {
         for node in egraph.nodes(class_id) {
             match node {
                 ENode::Var(_) | ENode::Const(_) => gacc.add_leaf(),
                 ENode::Op { op, children } => {
-                    let child_ops: Vec<OpKind> = children
-                        .iter()
-                        .map(|c| egraph.canonical_op(*c))
-                        .collect();
-                    gacc.add_op_node(emb, op.kind(), &child_ops);
+                    let op_kind = op.kind();
+                    let child_ops: Vec<OpKind> =
+                        children.iter().map(|c| egraph.canonical_op(*c)).collect();
+                    gacc.add_op_node(emb, op_kind, &child_ops);
+
+                    // Record this op as a parent of each child class
+                    for c in children {
+                        parent_ops.entry(c.index()).or_default().push(op_kind);
+                    }
                 }
             }
         }
     }
+
+    // Pass 2: 2-hop edges. For each (parent → child) edge, look up grandparents
+    // of the parent's class and emit (grandparent, parent, child) triples.
+    for class_id in egraph.class_ids() {
+        // What ops are parents of this class?
+        let gp_ops = match parent_ops.get(&class_id.index()) {
+            Some(ops) => ops.clone(),
+            None => continue, // root class, no grandparent paths
+        };
+
+        for node in egraph.nodes(class_id) {
+            if let ENode::Op { op, children } = node {
+                let parent_op = op.kind();
+                for child in children {
+                    let child_op = egraph.canonical_op(*child);
+                    // Each grandparent of this class creates a 2-hop path
+                    for &gp_op in &gp_ops {
+                        gacc.add_2hop_edge(emb, gp_op, parent_op, child_op);
+                    }
+                }
+            }
+        }
+    }
+
     gacc
 }
 
@@ -104,177 +146,80 @@ pub fn build_rule_templates(rules: &[Box<dyn Rewrite>]) -> RuleTemplates {
     templates
 }
 
-/// Convert an NNUE [`Expr`] to an [`ExprTree`] for e-graph insertion.
-///
-/// Uses iterative traversal with explicit stack to avoid thread stack overflow
-/// on deeply nested expression trees.
-fn expr_to_tree(
-    expr: &Expr,
-) -> pixelflow_search::egraph::ExprTree {
-    use pixelflow_search::egraph::ExprTree;
-
-    enum Task<'a> {
-        Visit(&'a Expr),
-        Complete {
-            op_ref: &'static dyn pixelflow_search::egraph::ops::Op,
-            arity: usize,
-        },
-    }
-
-    let mut stack: Vec<Task<'_>> = vec![Task::Visit(expr)];
-    let mut result_stack: Vec<ExprTree> = Vec::new();
-
-    while let Some(task) = stack.pop() {
-        match task {
-            Task::Visit(node) => match node {
-                Expr::Var(v) => result_stack.push(ExprTree::var(*v)),
-                Expr::Const(c) => result_stack.push(ExprTree::constant(*c)),
-                Expr::Param(i) => panic!("Expr::Param({i}) in expr_to_tree -- call substitute_params first"),
-                Expr::Unary(op, a) => {
-                    let op_ref = op_kind_to_static(*op);
-                    stack.push(Task::Complete { op_ref, arity: 1 });
-                    stack.push(Task::Visit(a));
-                }
-                Expr::Binary(op, a, b) => {
-                    let op_ref = op_kind_to_static(*op);
-                    stack.push(Task::Complete { op_ref, arity: 2 });
-                    stack.push(Task::Visit(b));
-                    stack.push(Task::Visit(a));
-                }
-                Expr::Ternary(op, a, b, c) => {
-                    let op_ref = op_kind_to_static(*op);
-                    stack.push(Task::Complete { op_ref, arity: 3 });
-                    stack.push(Task::Visit(c));
-                    stack.push(Task::Visit(b));
-                    stack.push(Task::Visit(a));
-                }
-                Expr::Nary(op, children) => {
-                    let op_ref = op_kind_to_static(*op);
-                    stack.push(Task::Complete { op_ref, arity: children.len() });
-                    for child in children.iter().rev() {
-                        stack.push(Task::Visit(child));
-                    }
-                }
-            },
-            Task::Complete { op_ref, arity } => {
-                let start = result_stack.len().saturating_sub(arity);
-                let child_trees: Vec<ExprTree> = result_stack.drain(start..).collect();
-                result_stack.push(ExprTree::Op {
-                    op: op_ref,
-                    children: child_trees,
-                });
-            }
-        }
-    }
-
-    result_stack.pop().unwrap_or_else(|| panic!("expr_to_tree: empty result stack"))
-}
-
-/// Convert [`OpKind`] to a static [`Op`] reference for e-graph construction.
-fn op_kind_to_static(
-    kind: pixelflow_search::nnue::OpKind,
-) -> &'static dyn pixelflow_search::egraph::ops::Op {
-    use pixelflow_search::egraph::ops;
-    use pixelflow_search::nnue::OpKind;
-
-    match kind {
-        OpKind::Add => &ops::Add,
-        OpKind::Sub => &ops::Sub,
-        OpKind::Mul => &ops::Mul,
-        OpKind::Div => &ops::Div,
-        OpKind::Neg => &ops::Neg,
-        OpKind::Recip => &ops::Recip,
-        OpKind::Sqrt => &ops::Sqrt,
-        OpKind::Rsqrt => &ops::Rsqrt,
-        OpKind::Abs => &ops::Abs,
-        OpKind::Min => &ops::Min,
-        OpKind::Max => &ops::Max,
-        OpKind::MulAdd => &ops::MulAdd,
-        OpKind::Floor => &ops::Floor,
-        OpKind::Ceil => &ops::Ceil,
-        OpKind::Round => &ops::Round,
-        OpKind::Fract => &ops::Fract,
-        OpKind::Sin => &ops::Sin,
-        OpKind::Cos => &ops::Cos,
-        OpKind::Tan => &ops::Tan,
-        OpKind::Asin => &ops::Asin,
-        OpKind::Acos => &ops::Acos,
-        OpKind::Atan => &ops::Atan,
-        OpKind::Atan2 => &ops::Atan2,
-        OpKind::Exp => &ops::Exp,
-        OpKind::Exp2 => &ops::Exp2,
-        OpKind::Ln => &ops::Ln,
-        OpKind::Log2 => &ops::Log2,
-        OpKind::Log10 => &ops::Log10,
-        OpKind::Pow => &ops::Pow,
-        OpKind::Hypot => &ops::Hypot,
-        OpKind::Lt => &ops::Lt,
-        OpKind::Le => &ops::Le,
-        OpKind::Gt => &ops::Gt,
-        OpKind::Ge => &ops::Ge,
-        OpKind::Eq => &ops::Eq,
-        OpKind::Ne => &ops::Ne,
-        OpKind::Select => &ops::Select,
-        OpKind::Clamp => &ops::Clamp,
-        OpKind::Tuple => &ops::Tuple,
-        OpKind::Var | OpKind::Const => panic!("Var/Const should not need op conversion"),
-    }
-}
-
 // ============================================================================
 // Edge collection for embedding gradients
 // ============================================================================
 
-/// Collect edges from an expression tree for embedding gradient flow.
-///
-/// Mirrors the traversal in `EdgeAccumulator::from_expr_dedup` but only records
-/// `(parent_op_index, child_op_index, effective_depth)` tuples. Uses dedup via
-/// structural hashing to match what the accumulator actually sees.
-pub fn collect_edges_dedup(expr: &Expr) -> Vec<(u8, u8, u16)> {
+/// Collect edges from an arena expression for embedding gradient flow.
+pub fn collect_edges_dedup_arena(arena: &ExprArena, root: ExprId) -> Vec<(u8, u8, u16)> {
     use std::collections::BTreeSet;
 
     let mut edges = Vec::new();
-    let mut seen = BTreeSet::<u64>::new();
-    let mut stack: Vec<(&Expr, u32)> = vec![(expr, 0)];
+    let mut seen = BTreeSet::<ExprId>::new();
+    let mut stack: Vec<(ExprId, u32)> = vec![(root, 0)];
 
-    while let Some((node, d)) = stack.pop() {
-        let h = pixelflow_search::nnue::factored::structural_hash(node);
-        if !seen.insert(h) {
+    while let Some((id, d)) = stack.pop() {
+        if !seen.insert(id) {
             continue;
         }
 
-        let parent_op = node.op_type();
-
-        match node {
-            Expr::Var(_) | Expr::Const(_) => {}
-            Expr::Param(i) => panic!(
-                "Expr::Param({i}) in collect_edges_dedup — call substitute_params first"
-            ),
-            Expr::Unary(_, child) => {
-                let eff_depth = d * MAX_ARITY as u32;
-                edges.push((parent_op.index() as u8, child.op_type().index() as u8, eff_depth as u16));
-                stack.push((child, d + 1));
+        match arena.node(id) {
+            ExprNode::Var(_) | ExprNode::Const(_) => {}
+            ExprNode::Param(i) => {
+                panic!("ExprNode::Param({i}) reached edge collection — substitute params first")
             }
-            Expr::Binary(_, left, right) => {
-                edges.push((parent_op.index() as u8, left.op_type().index() as u8, (d * MAX_ARITY as u32) as u16));
-                edges.push((parent_op.index() as u8, right.op_type().index() as u8, (d * MAX_ARITY as u32 + 1) as u16));
-                stack.push((right, d + 1));
-                stack.push((left, d + 1));
+            ExprNode::Unary(op, child) => {
+                edges.push((
+                    op.index() as u8,
+                    arena.kind(*child).index() as u8,
+                    (d * MAX_ARITY as u32) as u16,
+                ));
+                stack.push((*child, d + 1));
             }
-            Expr::Ternary(_, a, b, c) => {
-                edges.push((parent_op.index() as u8, a.op_type().index() as u8, (d * MAX_ARITY as u32) as u16));
-                edges.push((parent_op.index() as u8, b.op_type().index() as u8, (d * MAX_ARITY as u32 + 1) as u16));
-                edges.push((parent_op.index() as u8, c.op_type().index() as u8, (d * MAX_ARITY as u32 + 2) as u16));
-                stack.push((c, d + 1));
-                stack.push((b, d + 1));
-                stack.push((a, d + 1));
+            ExprNode::Binary(op, left, right) => {
+                edges.push((
+                    op.index() as u8,
+                    arena.kind(*left).index() as u8,
+                    (d * MAX_ARITY as u32) as u16,
+                ));
+                edges.push((
+                    op.index() as u8,
+                    arena.kind(*right).index() as u8,
+                    (d * MAX_ARITY as u32 + 1) as u16,
+                ));
+                stack.push((*right, d + 1));
+                stack.push((*left, d + 1));
             }
-            Expr::Nary(_, children) => {
-                for (idx, child) in children.iter().enumerate() {
+            ExprNode::Ternary(op, a, b, c) => {
+                edges.push((
+                    op.index() as u8,
+                    arena.kind(*a).index() as u8,
+                    (d * MAX_ARITY as u32) as u16,
+                ));
+                edges.push((
+                    op.index() as u8,
+                    arena.kind(*b).index() as u8,
+                    (d * MAX_ARITY as u32 + 1) as u16,
+                ));
+                edges.push((
+                    op.index() as u8,
+                    arena.kind(*c).index() as u8,
+                    (d * MAX_ARITY as u32 + 2) as u16,
+                ));
+                stack.push((*c, d + 1));
+                stack.push((*b, d + 1));
+                stack.push((*a, d + 1));
+            }
+            ExprNode::Nary(op, _, _) => {
+                for (idx, child) in arena.children(id).enumerate() {
                     let eff_depth = d * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                    edges.push((parent_op.index() as u8, child.op_type().index() as u8, eff_depth as u16));
+                    edges.push((
+                        op.index() as u8,
+                        arena.kind(child).index() as u8,
+                        eff_depth as u16,
+                    ));
                 }
-                for child in children.iter().rev() {
+                for child in arena.children(id) {
                     stack.push((child, d + 1));
                 }
             }
@@ -306,7 +251,8 @@ pub fn collect_edges_dedup(expr: &Expr) -> Vec<(u8, u8, u16)> {
 ///    d. Update best cost if improved.
 /// 3. JIT-benchmark the final expression for ground-truth terminal cost.
 pub fn run_self_play_trajectory(
-    seed_expr: &Expr,
+    seed_arena: &ExprArena,
+    seed_root: ExprId,
     seed_name: &str,
     model: &ExprNnue,
     rule_embeds: &[[f32; EMBED_DIM]],
@@ -316,24 +262,25 @@ pub fn run_self_play_trajectory(
     trajectory_id: String,
 ) -> Option<Trajectory> {
     // Hard wall-clock deadline per trajectory: safety net against runaway extraction.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // 5s is enough for any reasonable expression — pathological ones get skipped.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let traj_start = std::time::Instant::now();
 
     // 1. Convert seed expression to e-graph
-    let expr_tree = expr_to_tree(seed_expr);
     let mut egraph = EGraph::with_rules(all_rules());
-    let root = egraph.add_expr(&expr_tree);
+    let root = egraph.add_arena(seed_arena, seed_root);
+    let t_egraph_build = traj_start.elapsed();
 
     // 2. Score the initial expression
-    let (initial_tree, _initial_extract_cost) = extract_neural(&egraph, root, model);
-    let initial_cost = predict_tree_cost(&initial_tree, model);
+    let (initial_arena, initial_root, initial_cost) = extract_neural_to_arena(&egraph, root, model);
 
     // 2b. JIT benchmark the initial expression for ground-truth initial cost
-    let initial_expr_nnue = expr_tree_to_nnue(&initial_tree);
-    if initial_expr_nnue.has_degenerate() {
+    if initial_arena.has_degenerate(initial_root) {
         eprintln!("Skipping degenerate seed expression in {trajectory_id} (seed={seed_name})");
         return None;
     }
-    let initial_bench = match benchmark_jit(&initial_expr_nnue) {
+    let t_before_initial_jit = traj_start.elapsed();
+    let initial_bench = match benchmark_jit_arena(&initial_arena, initial_root) {
         Ok(b) => b,
         Err(e) => {
             eprintln!(
@@ -342,18 +289,36 @@ pub fn run_self_play_trajectory(
             return None;
         }
     };
+    let t_after_initial_jit = traj_start.elapsed();
+
+    // Domain check: if any SIMD lane is NaN or Inf at the test point, the
+    // expression is undefined there. Rewrite equivalence checks would always
+    // fire false positives (REWRITE BUG) because IEEE 754 NaN/Inf behavior
+    // diverges across mathematically-equivalent forms. Skip early.
+    if initial_bench.output.iter().any(|x| !x.is_finite()) {
+        eprintln!("[SKIP] {seed_name}: initial output contains NaN/Inf, skipping");
+        return None;
+    }
+
     let initial_cost_ns = initial_bench.ns;
 
     // 3. Track best
-    let mut best_cost = initial_cost;
+    let best_cost = initial_cost;
     let mut steps: Vec<TrajectoryStep> = Vec::new();
 
     let num_rules = rules.len();
 
-    // Randomize resource constraints per trajectory for training variety.
-    let traj_hash: usize = trajectory_id.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
-    let node_budget = 500 + (traj_hash % 4501);          // [500, 5000]
-    let epoch_budget = 5 + (traj_hash.wrapping_mul(7) % 26); // [5, 30]
+    // Randomize resource constraints per trajectory, scaled by expression size.
+    // Larger expressions need more budget to explore meaningful rewrites.
+    // Budget = base + multiplier * node_count, with random multiplier.
+    let traj_hash: usize = trajectory_id
+        .bytes()
+        .fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
+    let initial_nodes = initial_arena.node_count_subtree(initial_root);
+    // multiplier in [3, 10] — small exprs get 50-200, large (100-node) get 300-1000
+    let budget_mult = 3 + (traj_hash % 8); // [3, 10]
+    let node_budget = (50 + budget_mult * initial_nodes).min(2000); // floor 50, cap 2000
+    let epoch_budget = 10 + (traj_hash.wrapping_mul(7) % 51); // [10, 60]
     let effective_epochs = max_epochs.min(epoch_budget);
 
     // 4. Epoch loop
@@ -362,21 +327,25 @@ pub fn run_self_play_trajectory(
     // from a single extracted expression. After rules fire and create new
     // e-nodes/equivalences, rebuild the GraphAccumulator and re-score to
     // approve newly-passing rules. The EdgeAccumulator is still built from
-    // the initial expression for the value head (TrajectoryStep.accumulator_state).
+    // the initial expression for the extraction head (TrajectoryStep.accumulator_state).
     //
     // No per-epoch extraction or JIT. The only JIT benchmark is the final one.
     // The transformer critic assigns per-step credit from the single terminal reward.
 
-    // Build EdgeAccumulator from initial expression (for value head training)
-    let acc = EdgeAccumulator::from_expr_dedup(&initial_expr_nnue, &model.embeddings);
+    let mut acc =
+        EdgeAccumulator::from_arena_dedup(&initial_arena, initial_root, &model.embeddings);
+    acc.node_budget = node_budget as u32;
+    acc.epoch_budget = epoch_budget as u32;
     let acc_vec = acc_to_vec(&acc);
-    let edges = collect_edges_dedup(&initial_expr_nnue);
+    let edges = collect_edges_dedup_arena(&initial_arena, initial_root);
     let hidden = model.forward_shared(&acc);
     let expr_embed = model.compute_expr_embed(&hidden);
     let expr_embed_vec: Vec<f32> = expr_embed.to_vec();
 
     // Build GraphAccumulator from initial e-graph state (for mask scoring)
     let mut gacc = build_graph_acc(&egraph, &model.embeddings);
+    gacc.node_budget = node_budget as u32;
+    gacc.epoch_budget = epoch_budget as u32;
     let mut gacc_vec = gacc_to_vec(&gacc);
 
     // Score all rules via graph pathway
@@ -397,14 +366,13 @@ pub fn run_self_play_trajectory(
         steps.push(TrajectoryStep {
             accumulator_state: acc_vec.clone(),
             expression_embedding: expr_embed_vec.clone(),
-            rule_embedding: rule_embeds.get(r).map_or_else(
-                || vec![0.0; EMBED_DIM],
-                |e| e.to_vec(),
-            ),
+            rule_embedding: rule_embeds
+                .get(r)
+                .map_or_else(|| vec![0.0; EMBED_DIM], |e| e.to_vec()),
             budget_remaining: (node_budget as i32) - (egraph.node_count() as i32),
             epochs_remaining: effective_epochs as i32,
             action_probability: prob,
-            matched: false, // Updated during saturation
+            matched: false,        // Updated during saturation
             jit_cost_ns: f64::NAN, // Backfilled with final cost
             edges: edges.clone(),
             graph_accumulator_state: gacc_vec.clone(),
@@ -412,11 +380,13 @@ pub fn run_self_play_trajectory(
     }
 
     // Saturate: apply approved rules, rebuild graph accumulator, re-score
+    let t_before_saturate = traj_start.elapsed();
     for epoch in 0..effective_epochs {
         if std::time::Instant::now() > deadline {
             panic!(
-                "Trajectory {trajectory_id} hit 30s wall-clock deadline at epoch {epoch} \
-                 (node_budget={node_budget}, egraph_nodes={}, epoch_budget={epoch_budget})",
+                "Trajectory {trajectory_id} hit 5s wall-clock deadline at epoch {epoch} \
+                 (node_budget={node_budget}, egraph_nodes={}, epoch_budget={epoch_budget}). \
+                 This means resource budgets are not preventing runaway computation.",
                 egraph.node_count()
             );
         }
@@ -425,22 +395,32 @@ pub fn run_self_play_trajectory(
             break;
         }
 
-        let mut any_changed = false;
-        for (step_idx, &(r, _)) in approved_rules.iter().enumerate() {
-            let result = egraph.apply_rule_at_index(r);
-            if result.changes > 0 {
-                steps[step_idx].matched = true;
-                any_changed = true;
+        // Apply all approved rules in a single batch — one rebuild per epoch.
+        let any_changed = {
+            let mut batch = egraph.batch();
+            let mut changed = false;
+            for (step_idx, &(r, _)) in approved_rules.iter().enumerate() {
+                if batch.node_count() > node_budget {
+                    break;
+                }
+                let result = batch.apply_rule(r, node_budget, Some(deadline));
+                if result.changes > 0 {
+                    steps[step_idx].matched = true;
+                    changed = true;
+                }
             }
-        }
+            changed
+            // rebuild happens here on drop
+        };
 
-        // Fixed point: no rule produced new unions this epoch
         if !any_changed {
             break;
         }
 
         // Rebuild graph accumulator from post-union-find state
         gacc = build_graph_acc(&egraph, &model.embeddings);
+        gacc.node_budget = node_budget as u32;
+        gacc.epoch_budget = epoch_budget as u32;
         gacc_vec = gacc_to_vec(&gacc);
 
         // Re-score with accurate graph state
@@ -449,17 +429,20 @@ pub fn run_self_play_trajectory(
         // Approve newly-passing rules, record new steps with updated gacc
         let epochs_remaining = (effective_epochs as i32) - (epoch as i32) - 1;
         for r in 0..num_rules {
-            let score = if r < new_scores.len() { new_scores[r] } else { 0.0 };
+            let score = if r < new_scores.len() {
+                new_scores[r]
+            } else {
+                0.0
+            };
             let prob = sigmoid(score);
             if prob > threshold && !approved_rules.iter().any(|(idx, _)| *idx == r) {
                 approved_rules.push((r, prob));
                 steps.push(TrajectoryStep {
                     accumulator_state: acc_vec.clone(),
                     expression_embedding: expr_embed_vec.clone(),
-                    rule_embedding: rule_embeds.get(r).map_or_else(
-                        || vec![0.0; EMBED_DIM],
-                        |e| e.to_vec(),
-                    ),
+                    rule_embedding: rule_embeds
+                        .get(r)
+                        .map_or_else(|| vec![0.0; EMBED_DIM], |e| e.to_vec()),
                     budget_remaining: (node_budget as i32) - (egraph.node_count() as i32),
                     epochs_remaining,
                     action_probability: prob,
@@ -473,22 +456,56 @@ pub fn run_self_play_trajectory(
     }
 
     // 5. JIT benchmark the final expression for terminal cost
-    let (final_tree, _) = extract_neural(&egraph, root, model);
-    let final_expr = expr_tree_to_nnue(&final_tree);
-    if final_expr.has_degenerate() {
+    let t_after_saturate = traj_start.elapsed();
+    let post_sat_nodes = egraph.node_count();
+    if post_sat_nodes > 5000 {
+        eprintln!(
+            "Trajectory {trajectory_id} egraph too large ({post_sat_nodes} nodes, budget={node_budget}), skipping"
+        );
+        return None;
+    }
+    if std::time::Instant::now() > deadline {
+        eprintln!(
+            "Trajectory {trajectory_id} hit deadline before extraction (seed={seed_name}, nodes={post_sat_nodes})"
+        );
+        return None;
+    }
+    let extractor = pixelflow_search::egraph::IncrementalExtractor::new(model, 8);
+    let (_final_cost, final_choices) = extractor.extract_choices_only(&egraph, root);
+    let final_ref_counts = compute_ref_counts(&egraph, root, &final_choices);
+    let (final_arena, final_arena_root) =
+        pixelflow_search::egraph::choices_to_arena(&egraph, root, &final_choices);
+
+    // Degenerate check on the arena (NaN/Inf constants, recip/div-by-zero).
+    if final_arena.has_degenerate(final_arena_root) {
         eprintln!("Rewrite produced degenerate expression in {trajectory_id} (seed={seed_name})");
         return None;
     }
-    let final_bench = match benchmark_jit(&final_expr) {
+    let final_bench = match benchmark_jit_arena(&final_arena, final_arena_root) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!(
-                "JIT bench failed for trajectory {trajectory_id} (seed={seed_name}): {e}"
-            );
+            eprintln!("JIT bench failed for trajectory {trajectory_id} (seed={seed_name}): {e}");
             return None;
         }
     };
     let final_cost_ns = final_bench.ns;
+    let t_total = traj_start.elapsed();
+
+    // Log slow trajectories with phase breakdown
+    if t_total.as_millis() > 100 {
+        eprintln!(
+            "[SLOW_TRAJ] {trajectory_id} (seed={seed_name}) total={:.1}ms: \
+             egraph_build={:.1}ms extract+score={:.1}ms initial_jit={:.1}ms \
+             setup={:.1}ms saturate={:.1}ms final={:.1}ms nodes={post_sat_nodes}",
+            t_total.as_secs_f64() * 1000.0,
+            t_egraph_build.as_secs_f64() * 1000.0,
+            (t_before_initial_jit - t_egraph_build).as_secs_f64() * 1000.0,
+            (t_after_initial_jit - t_before_initial_jit).as_secs_f64() * 1000.0,
+            (t_before_saturate - t_after_initial_jit).as_secs_f64() * 1000.0,
+            (t_after_saturate - t_before_saturate).as_secs_f64() * 1000.0,
+            (t_total - t_after_saturate).as_secs_f64() * 1000.0,
+        );
+    }
 
     // Backfill all steps with the final cost. The transformer critic will
     // assign per-step advantages from this single terminal reward.
@@ -506,35 +523,63 @@ pub fn run_self_play_trajectory(
              \x20 initial output: {:?}\n\
              \x20 final   output: {:?}\n\
              \x20 max_diff={max_diff:.6} epsilon={EQUIV_EPSILON}\n\
-             \x20 initial expr: {initial_expr_nnue}\n\
-             \x20 final   expr: {final_expr}\n\
+             \x20 initial expr: {}\n\
+             \x20 final   expr: {}\n\
              \x20 steps: {} ({} matched)",
-            initial_bench.output, final_bench.output,
-            steps.len(), steps.iter().filter(|s| s.matched).count(),
+            initial_bench.output,
+            final_bench.output,
+            arena_to_kernel_code(&initial_arena, initial_root),
+            arena_to_kernel_code(&final_arena, final_arena_root),
+            steps.len(),
+            steps.iter().filter(|s| s.matched).count(),
         );
         return None;
     }
 
-    // 6. Log the rewrite for visibility
-    let speedup = if final_cost_ns > 0.0 { initial_cost_ns / final_cost_ns } else { 0.0 };
+    // 6. Build final EdgeAccumulator for extraction head training.
+    // The extraction head needs: "this expression's structure → this expression's cost."
+    // We provide two paired data points per trajectory:
+    //   (initial_acc, initial_cost_ns) and (final_acc, final_cost_ns).
+    // Build final accumulator using DAG-aware path: shared subexpressions get
+    // (ref_count - 1) var_ref edges instead of duplicated subtree edges.
+    // This matches what the extraction head evaluates during hill climbing.
+    let final_acc = EdgeAccumulator::from_dag_choices(
+        &egraph,
+        root,
+        &final_choices,
+        &final_ref_counts,
+        &model.embeddings,
+    );
+    let final_acc_vec = acc_to_vec(&final_acc);
+    let final_edges = collect_edges_dedup_arena(&final_arena, final_arena_root);
+
+    // 7. Log the rewrite for visibility
+    let speedup = if final_cost_ns > 0.0 {
+        initial_cost_ns / final_cost_ns
+    } else {
+        0.0
+    };
     let matched = steps.iter().filter(|s| s.matched).count();
     eprintln!(
         "[REWRITE] {seed_name}: {speedup:.2}x ({initial_cost_ns:.1}ns -> {final_cost_ns:.1}ns) \
-         [{matched}/{} steps]\n\
-         \x20 before: {initial_expr_nnue}\n\
-         \x20 after:  {final_expr}",
+         [{matched}/{} steps]",
         steps.len(),
     );
 
-    // 7. Return trajectory
+    // 8. Return trajectory
     Some(Trajectory {
         trajectory_id,
-        seed_expr: seed_name.to_string(),
         steps,
         initial_cost_ns,
         final_cost_ns,
         initial_cost: Some(initial_cost),
         final_cost: Some(best_cost),
+        initial_nodes,
+        node_budget,
+        initial_accumulator_state: acc_vec.clone(),
+        initial_edges: edges.clone(),
+        final_accumulator_state: final_acc_vec,
+        final_edges,
     })
 }
 
@@ -607,32 +652,43 @@ pub fn generate_trajectory_batch_parallel(
     let mut generator = BwdGenerator::new(seed, config.clone(), templates.clone());
     let work_items: Vec<_> = (0..count)
         .map(|i| {
-            let pair = generator.generate();
+            let pair = generator.generate_arena();
             let traj_id = format!("seed_{seed}_t{i}");
             let name = format!("expr_{i}");
-            (pair.unoptimized, name, traj_id)
+            (pair.arena, pair.unoptimized, name, traj_id)
         })
         .collect();
 
     if num_workers <= 1 || count <= 1 {
         // Sequential fast path: no thread overhead.
         let mut trajectories = Vec::new();
-        for (expr, name, traj_id) in &work_items {
+        for (arena, root, name, traj_id) in &work_items {
             if let Some(traj) = run_self_play_trajectory(
-                expr, name, model, &rule_embeds, rules, threshold, max_epochs,
+                arena,
+                *root,
+                name,
+                model,
+                &rule_embeds,
+                rules,
+                threshold,
+                max_epochs,
                 traj_id.clone(),
             ) {
                 trajectories.push(traj);
             }
         }
-        eprintln!("Generated {}/{count} trajectories (sequential)", trajectories.len());
+        eprintln!(
+            "Generated {}/{count} trajectories (sequential)",
+            trajectories.len()
+        );
         return trajectories;
     }
 
     // Parallel: partition work items across workers, spawn scoped threads.
     let num_rules = rules.len();
     let chunk_size = (count + num_workers - 1) / num_workers;
-    let chunks: Vec<&[(Expr, String, String)]> = work_items.chunks(chunk_size).collect();
+    let chunks: Vec<&[(ExprArena, ExprId, String, String)]> =
+        work_items.chunks(chunk_size).collect();
     let actual_workers = chunks.len();
 
     eprintln!(
@@ -658,15 +714,17 @@ pub fn generate_trajectory_batch_parallel(
                         // through the hot loop — rules are used by EGraph internally).
                         let worker_rules: Vec<Box<dyn Rewrite>> = all_rules();
                         assert_eq!(
-                            worker_rules.len(), num_rules,
+                            worker_rules.len(),
+                            num_rules,
                             "Worker {worker_id}: rule count mismatch ({} vs {num_rules})",
                             worker_rules.len()
                         );
 
                         let mut results = Vec::with_capacity(chunk.len());
-                        for (expr, name, traj_id) in chunk {
+                        for (arena, root, name, traj_id) in chunk {
                             if let Some(traj) = run_self_play_trajectory(
-                                expr,
+                                arena,
+                                *root,
                                 name,
                                 model_ref,
                                 rule_embeds_ref,
@@ -708,156 +766,304 @@ pub fn generate_trajectory_batch_parallel(
 }
 
 // ============================================================================
-// JSONL I/O helpers
+// Trajectory I/O helpers
 // ============================================================================
 
-/// Write trajectories to a JSONL file (one JSON object per line).
+const TRAJ_MAGIC: &[u8; 8] = b"PFTJ0001";
+const ADV_MAGIC: &[u8; 8] = b"PFAD0001";
+
+fn write_u8<W: Write>(w: &mut W, v: u8) {
+    w.write_all(&[v]).expect("write u8 failed");
+}
+
+fn write_u32<W: Write>(w: &mut W, v: u32) {
+    w.write_all(&v.to_le_bytes()).expect("write u32 failed");
+}
+
+fn write_u64<W: Write>(w: &mut W, v: u64) {
+    w.write_all(&v.to_le_bytes()).expect("write u64 failed");
+}
+
+fn write_i32<W: Write>(w: &mut W, v: i32) {
+    w.write_all(&v.to_le_bytes()).expect("write i32 failed");
+}
+
+fn write_f32<W: Write>(w: &mut W, v: f32) {
+    w.write_all(&v.to_le_bytes()).expect("write f32 failed");
+}
+
+fn write_f64<W: Write>(w: &mut W, v: f64) {
+    w.write_all(&v.to_le_bytes()).expect("write f64 failed");
+}
+
+fn write_string<W: Write>(w: &mut W, s: &str) {
+    write_u32(w, s.len() as u32);
+    w.write_all(s.as_bytes()).expect("write string failed");
+}
+
+fn write_f32_vec<W: Write>(w: &mut W, values: &[f32]) {
+    write_u32(w, values.len() as u32);
+    for &v in values {
+        write_f32(w, v);
+    }
+}
+
+fn write_edges<W: Write>(w: &mut W, edges: &[(u8, u8, u16)]) {
+    write_u32(w, edges.len() as u32);
+    for &(parent, child, depth) in edges {
+        write_u8(w, parent);
+        write_u8(w, child);
+        w.write_all(&depth.to_le_bytes())
+            .expect("write edge depth failed");
+    }
+}
+
+fn read_exact<const N: usize, R: std::io::Read>(r: &mut R) -> [u8; N] {
+    let mut buf = [0u8; N];
+    r.read_exact(&mut buf).expect("binary read failed");
+    buf
+}
+
+fn read_u8<R: std::io::Read>(r: &mut R) -> u8 {
+    read_exact::<1, _>(r)[0]
+}
+
+fn read_u32<R: std::io::Read>(r: &mut R) -> u32 {
+    u32::from_le_bytes(read_exact(r))
+}
+
+fn read_u64<R: std::io::Read>(r: &mut R) -> u64 {
+    u64::from_le_bytes(read_exact(r))
+}
+
+fn read_i32<R: std::io::Read>(r: &mut R) -> i32 {
+    i32::from_le_bytes(read_exact(r))
+}
+
+fn read_f32<R: std::io::Read>(r: &mut R) -> f32 {
+    f32::from_le_bytes(read_exact(r))
+}
+
+fn read_f64<R: std::io::Read>(r: &mut R) -> f64 {
+    f64::from_le_bytes(read_exact(r))
+}
+
+fn read_string<R: std::io::Read>(r: &mut R) -> String {
+    let len = read_u32(r) as usize;
+    let mut bytes = vec![0u8; len];
+    r.read_exact(&mut bytes).expect("read string failed");
+    String::from_utf8(bytes).expect("binary trajectory id is not UTF-8")
+}
+
+fn read_f32_vec<R: std::io::Read>(r: &mut R) -> Vec<f32> {
+    let len = read_u32(r) as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(read_f32(r));
+    }
+    values
+}
+
+fn read_edges<R: std::io::Read>(r: &mut R) -> Vec<(u8, u8, u16)> {
+    let len = read_u32(r) as usize;
+    let mut edges = Vec::with_capacity(len);
+    for _ in 0..len {
+        let parent = read_u8(r);
+        let child = read_u8(r);
+        let depth = u16::from_le_bytes(read_exact(r));
+        edges.push((parent, child, depth));
+    }
+    edges
+}
+
+/// Write trajectories to the compact binary training format.
 ///
-/// Panics on I/O or serialization errors (fail fast, fail loudly).
-pub fn write_trajectories_jsonl(trajectories: &[Trajectory], path: &Path) {
+/// This is the live Rust↔critic IPC format.
+pub fn write_trajectories_binary(trajectories: &[Trajectory], path: &Path) {
     let file = std::fs::File::create(path)
         .unwrap_or_else(|e| panic!("Failed to create {}: {e}", path.display()));
     let mut writer = BufWriter::new(file);
+    writer
+        .write_all(TRAJ_MAGIC)
+        .unwrap_or_else(|e| panic!("Failed to write {}: {e}", path.display()));
+    write_u32(&mut writer, trajectories.len() as u32);
     for traj in trajectories {
-        let json = serde_json::to_string(traj)
-            .unwrap_or_else(|e| panic!("Failed to serialize trajectory: {e}"));
-        writeln!(writer, "{json}")
-            .unwrap_or_else(|e| panic!("Failed to write to {}: {e}", path.display()));
+        write_string(&mut writer, &traj.trajectory_id);
+        write_u32(&mut writer, traj.steps.len() as u32);
+        write_f64(&mut writer, traj.initial_cost_ns);
+        write_f64(&mut writer, traj.final_cost_ns);
+        match traj.initial_cost {
+            Some(v) => {
+                write_u8(&mut writer, 1);
+                write_f32(&mut writer, v);
+            }
+            None => write_u8(&mut writer, 0),
+        }
+        match traj.final_cost {
+            Some(v) => {
+                write_u8(&mut writer, 1);
+                write_f32(&mut writer, v);
+            }
+            None => write_u8(&mut writer, 0),
+        }
+        write_u64(&mut writer, traj.initial_nodes as u64);
+        write_u64(&mut writer, traj.node_budget as u64);
+        write_f32_vec(&mut writer, &traj.initial_accumulator_state);
+        write_edges(&mut writer, &traj.initial_edges);
+        write_f32_vec(&mut writer, &traj.final_accumulator_state);
+        write_edges(&mut writer, &traj.final_edges);
+
+        for step in &traj.steps {
+            write_f32_vec(&mut writer, &step.accumulator_state);
+            write_f32_vec(&mut writer, &step.expression_embedding);
+            write_f32_vec(&mut writer, &step.rule_embedding);
+            write_i32(&mut writer, step.budget_remaining);
+            write_i32(&mut writer, step.epochs_remaining);
+            write_f32(&mut writer, step.action_probability);
+            write_u8(&mut writer, u8::from(step.matched));
+            write_f64(&mut writer, step.jit_cost_ns);
+            write_edges(&mut writer, &step.edges);
+            write_f32_vec(&mut writer, &step.graph_accumulator_state);
+        }
     }
     writer
         .flush()
         .unwrap_or_else(|e| panic!("Failed to flush {}: {e}", path.display()));
 }
 
-/// Read trajectories from a JSONL file.
-///
-/// Each line is a JSON-serialized [`Trajectory`].
-/// Empty lines are skipped. Panics on I/O or parse errors (fail fast, fail loudly).
-pub fn load_trajectories_jsonl(path: &Path) -> Vec<Trajectory> {
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display()));
-    let reader = std::io::BufReader::new(file);
-    let mut trajectories = Vec::new();
-    for (line_num, line) in std::io::BufRead::lines(reader).enumerate() {
-        let line = line.unwrap_or_else(|e| panic!("Failed to read line {} of {}: {e}", line_num + 1, path.display()));
-        if line.trim().is_empty() { continue; }
-        let traj: Trajectory = serde_json::from_str(&line)
-            .unwrap_or_else(|e| panic!("Failed to parse trajectory at {}:{}: {e}", path.display(), line_num + 1));
-        trajectories.push(traj);
+/// Read trajectories from the compact binary training format.
+pub fn load_trajectories_binary(path: &Path) -> Vec<Trajectory> {
+    let mut reader = BufReader::new(
+        std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display())),
+    );
+    let magic = read_exact::<8, _>(&mut reader);
+    assert_eq!(
+        &magic,
+        TRAJ_MAGIC,
+        "Invalid trajectory binary magic in {}",
+        path.display()
+    );
+    let count = read_u32(&mut reader) as usize;
+    let mut trajectories = Vec::with_capacity(count);
+    for _ in 0..count {
+        let trajectory_id = read_string(&mut reader);
+        let step_count = read_u32(&mut reader) as usize;
+        let initial_cost_ns = read_f64(&mut reader);
+        let final_cost_ns = read_f64(&mut reader);
+        let initial_cost = if read_u8(&mut reader) != 0 {
+            Some(read_f32(&mut reader))
+        } else {
+            None
+        };
+        let final_cost = if read_u8(&mut reader) != 0 {
+            Some(read_f32(&mut reader))
+        } else {
+            None
+        };
+        let initial_nodes = read_u64(&mut reader) as usize;
+        let node_budget = read_u64(&mut reader) as usize;
+        let initial_accumulator_state = read_f32_vec(&mut reader);
+        let initial_edges = read_edges(&mut reader);
+        let final_accumulator_state = read_f32_vec(&mut reader);
+        let final_edges = read_edges(&mut reader);
+
+        let mut steps = Vec::with_capacity(step_count);
+        for _ in 0..step_count {
+            steps.push(TrajectoryStep {
+                accumulator_state: read_f32_vec(&mut reader),
+                expression_embedding: read_f32_vec(&mut reader),
+                rule_embedding: read_f32_vec(&mut reader),
+                budget_remaining: read_i32(&mut reader),
+                epochs_remaining: read_i32(&mut reader),
+                action_probability: read_f32(&mut reader),
+                matched: read_u8(&mut reader) != 0,
+                jit_cost_ns: read_f64(&mut reader),
+                edges: read_edges(&mut reader),
+                graph_accumulator_state: read_f32_vec(&mut reader),
+            });
+        }
+        trajectories.push(Trajectory {
+            trajectory_id,
+            steps,
+            initial_cost_ns,
+            final_cost_ns,
+            initial_cost,
+            final_cost,
+            initial_nodes,
+            node_budget,
+            initial_accumulator_state,
+            initial_edges,
+            final_accumulator_state,
+            final_edges,
+        });
     }
     trajectories
 }
 
-/// Read per-trajectory advantage scores from a JSONL file.
-///
-/// Each line is a JSON-serialized [`TrajectoryAdvantages`].
-/// Empty lines are skipped. Panics on I/O or parse errors (fail fast, fail loudly).
-pub fn read_advantages_jsonl(path: &Path) -> Vec<TrajectoryAdvantages> {
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display()));
-    let reader = BufReader::new(file);
-    reader
-        .lines()
-        .enumerate()
-        .filter_map(|(line_num, line)| {
-            let line = line
-                .unwrap_or_else(|e| panic!("Read error at line {line_num}: {e}"));
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            Some(
-                serde_json::from_str(trimmed)
-                    .unwrap_or_else(|e| panic!("JSON parse error at line {line_num}: {e}")),
-            )
-        })
-        .collect()
+/// Read per-trajectory advantage scores from the compact binary format.
+pub fn read_advantages_binary(path: &Path) -> Vec<TrajectoryAdvantages> {
+    let mut reader = BufReader::new(
+        std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("Failed to open {}: {e}", path.display())),
+    );
+    let magic = read_exact::<8, _>(&mut reader);
+    assert_eq!(
+        &magic,
+        ADV_MAGIC,
+        "Invalid advantage binary magic in {}",
+        path.display()
+    );
+    let count = read_u32(&mut reader) as usize;
+    let mut advantages = Vec::with_capacity(count);
+    for _ in 0..count {
+        let trajectory_idx = read_u64(&mut reader) as usize;
+        let values = read_f32_vec(&mut reader);
+        advantages.push(TrajectoryAdvantages {
+            trajectory_idx,
+            advantages: values,
+        });
+    }
+    advantages
 }
 
 // ============================================================================
 // Corpus loading and trajectory generation
 // ============================================================================
 
-/// Load expressions from bench_corpus.jsonl, parse via `parse_kernel_code`.
+/// Load expressions from binary corpus (`bench_corpus.bin`).
 ///
 /// Returns up to `max_count` `(name, Expr)` pairs, sampled uniformly via
-/// LCG shuffle.
+/// LCG shuffle. Expressions with >1000 nodes are filtered out.
 ///
 /// # Panics
 ///
-/// Panics if zero expressions parse successfully from the file.
-pub fn load_corpus_exprs(path: &Path, max_count: usize, seed: u64) -> Vec<(String, Expr)> {
-    let file = std::fs::File::open(path)
-        .unwrap_or_else(|e| panic!("Failed to open corpus file {}: {e}", path.display()));
-    let reader = BufReader::new(file);
+/// Panics if zero expressions load successfully from the file.
+pub fn load_corpus_exprs(
+    path: &Path,
+    max_count: usize,
+    seed: u64,
+) -> Vec<(String, ExprArena, ExprId)> {
+    let raw = corpus::read_corpus(path)
+        .unwrap_or_else(|e| panic!("Failed to read binary corpus {}: {e}", path.display()));
+    let total_entries = raw.len();
 
-    let mut parsed: Vec<(String, Expr)> = Vec::new();
-    let mut total_lines = 0u64;
-    let mut parse_failures = 0u64;
+    let mut parsed: Vec<(String, ExprArena, ExprId)> = Vec::new();
+    let mut skipped_large = 0u64;
 
-    for (line_num, line_result) in reader.lines().enumerate() {
-        let line = line_result
-            .unwrap_or_else(|e| panic!("Read error at line {line_num} in {}: {e}", path.display()));
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for (name, arena, root) in raw {
+        if arena.len() > 1000 {
+            skipped_large += 1;
             continue;
         }
-        total_lines += 1;
-
-        // Parse JSON to extract "name" and "expression" fields
-        let json: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "WARNING: JSON parse error at line {line_num} in {}: {e}",
-                    path.display()
-                );
-                parse_failures += 1;
-                continue;
-            }
-        };
-
-        let name = match json.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n.to_string(),
-            None => {
-                eprintln!(
-                    "WARNING: missing or non-string 'name' at line {line_num} in {}",
-                    path.display()
-                );
-                parse_failures += 1;
-                continue;
-            }
-        };
-
-        let expression = match json.get("expression").and_then(|v| v.as_str()) {
-            Some(e) => e,
-            None => {
-                eprintln!(
-                    "WARNING: missing or non-string 'expression' at line {line_num} in {}",
-                    path.display()
-                );
-                parse_failures += 1;
-                continue;
-            }
-        };
-
-        match parse_kernel_code(expression) {
-            Some(expr) => parsed.push((name, expr)),
-            None => {
-                eprintln!(
-                    "WARNING: parse_kernel_code failed for '{}' (line {line_num}, name='{name}') in {}",
-                    expression,
-                    path.display()
-                );
-                parse_failures += 1;
-            }
-        }
+        parsed.push((name, arena, root));
     }
 
     assert!(
         !parsed.is_empty(),
-        "Zero expressions parsed successfully from {} ({total_lines} lines, {parse_failures} failures)",
-        path.display()
+        "Zero expressions loaded from {} ({} entries, {skipped_large} oversized)",
+        path.display(),
+        total_entries
     );
 
     // LCG-based Fisher-Yates shuffle
@@ -875,9 +1081,10 @@ pub fn load_corpus_exprs(path: &Path, max_count: usize, seed: u64) -> Vec<(Strin
     parsed.truncate(max_count);
 
     eprintln!(
-        "Loaded {} corpus expressions from {} ({total_lines} lines, {parse_failures} parse failures)",
+        "Loaded {} corpus expressions from {} ({} entries, {skipped_large} oversized)",
         parsed.len(),
-        path.display()
+        path.display(),
+        total_entries
     );
 
     parsed
@@ -891,7 +1098,7 @@ pub fn generate_corpus_trajectories(
     model: &ExprNnue,
     templates: &RuleTemplates,
     rules: &[Box<dyn Rewrite>],
-    corpus: &[(String, Expr)],
+    corpus: &[(String, ExprArena, ExprId)],
     count: usize,
     seed: u64,
     threshold: f32,
@@ -913,7 +1120,7 @@ pub fn generate_corpus_trajectories_parallel(
     model: &ExprNnue,
     templates: &RuleTemplates,
     rules: &[Box<dyn Rewrite>],
-    corpus: &[(String, Expr)],
+    corpus: &[(String, ExprArena, ExprId)],
     count: usize,
     seed: u64,
     threshold: f32,
@@ -943,9 +1150,16 @@ pub fn generate_corpus_trajectories_parallel(
         // Sequential fast path.
         let mut trajectories = Vec::new();
         for (idx, traj_id) in &work_items {
-            let (ref name, ref expr) = corpus[*idx];
+            let (ref name, ref arena, root) = corpus[*idx];
             match run_self_play_trajectory(
-                expr, name, model, &rule_embeds, rules, threshold, max_epochs,
+                arena,
+                root,
+                name,
+                model,
+                &rule_embeds,
+                rules,
+                threshold,
+                max_epochs,
                 traj_id.clone(),
             ) {
                 Some(traj) => trajectories.push(traj),
@@ -969,9 +1183,7 @@ pub fn generate_corpus_trajectories_parallel(
     let chunks: Vec<&[(usize, String)]> = work_items.chunks(chunk_size).collect();
     let actual_workers = chunks.len();
 
-    eprintln!(
-        "[PARALLEL] Spawning {actual_workers} workers for {count} corpus trajectories"
-    );
+    eprintln!("[PARALLEL] Spawning {actual_workers} workers for {count} corpus trajectories");
 
     let mut all_trajectories: Vec<Trajectory> = Vec::new();
 
@@ -990,16 +1202,18 @@ pub fn generate_corpus_trajectories_parallel(
                     .spawn_scoped(scope, move || {
                         let worker_rules: Vec<Box<dyn Rewrite>> = all_rules();
                         assert_eq!(
-                            worker_rules.len(), num_rules,
+                            worker_rules.len(),
+                            num_rules,
                             "Worker {worker_id}: rule count mismatch ({} vs {num_rules})",
                             worker_rules.len()
                         );
 
                         let mut results = Vec::with_capacity(chunk.len());
                         for (idx, traj_id) in chunk {
-                            let (ref name, ref expr) = corpus_ref[*idx];
+                            let (ref name, ref arena, root) = corpus_ref[*idx];
                             match run_self_play_trajectory(
-                                expr,
+                                arena,
+                                root,
                                 name,
                                 model_ref,
                                 rule_embeds_ref,
@@ -1019,9 +1233,7 @@ pub fn generate_corpus_trajectories_parallel(
                         }
                         results
                     })
-                    .unwrap_or_else(|e| {
-                        panic!("Failed to spawn corpus worker {worker_id}: {e}")
-                    })
+                    .unwrap_or_else(|e| panic!("Failed to spawn corpus worker {worker_id}: {e}"))
             })
             .collect();
 
@@ -1082,10 +1294,9 @@ mod tests {
     }
 
     #[test]
-    fn trajectory_jsonl_round_trip() {
+    fn trajectory_binary_round_trip() {
         let traj = Trajectory {
             trajectory_id: "test".into(),
-            seed_expr: "X".into(),
             steps: vec![TrajectoryStep {
                 accumulator_state: vec![0.0; 130],
                 expression_embedding: vec![0.0; 32],
@@ -1102,16 +1313,20 @@ mod tests {
             final_cost_ns: 1.0,
             initial_cost: Some(5.0),
             final_cost: Some(1.0),
+            initial_nodes: 1,
+            node_budget: 100,
+            initial_accumulator_state: vec![],
+            initial_edges: vec![],
+            final_accumulator_state: vec![],
+            final_edges: vec![],
         };
 
-        let tmp = std::env::temp_dir().join("test_self_play_traj.jsonl");
-        write_trajectories_jsonl(&[traj], &tmp);
+        let tmp = std::env::temp_dir().join("test_self_play_traj.pftraj");
+        write_trajectories_binary(&[traj], &tmp);
 
-        // Read back and verify
-        let contents = std::fs::read_to_string(&tmp)
-            .unwrap_or_else(|e| panic!("Failed to read {}: {e}", tmp.display()));
-        let back: Trajectory = serde_json::from_str(contents.trim())
-            .unwrap_or_else(|e| panic!("Failed to parse trajectory JSONL: {e}"));
+        let read_back = load_trajectories_binary(&tmp);
+        assert_eq!(read_back.len(), 1);
+        let back = &read_back[0];
         assert_eq!(back.trajectory_id, "test");
         assert_eq!(back.steps.len(), 1);
         assert!(back.steps[0].matched);
@@ -1123,29 +1338,20 @@ mod tests {
     }
 
     #[test]
-    fn advantages_jsonl_round_trip() {
-        let adv = TrajectoryAdvantages {
-            trajectory_idx: 0,
-            advantages: vec![0.1, -0.2, 0.3],
-        };
-
-        let tmp = std::env::temp_dir().join("test_self_play_adv.jsonl");
+    fn advantages_binary_round_trip() {
+        let tmp = std::env::temp_dir().join("test_self_play_adv.pfadv");
         {
             let file = std::fs::File::create(&tmp)
                 .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp.display()));
             let mut w = BufWriter::new(file);
-            writeln!(
-                w,
-                "{}",
-                serde_json::to_string(&adv)
-                    .unwrap_or_else(|e| panic!("Failed to serialize advantages: {e}"))
-            )
-            .unwrap_or_else(|e| panic!("Failed to write: {e}"));
-            w.flush()
-                .unwrap_or_else(|e| panic!("Failed to flush: {e}"));
+            w.write_all(ADV_MAGIC).unwrap();
+            write_u32(&mut w, 1);
+            write_u64(&mut w, 0);
+            write_f32_vec(&mut w, &[0.1, -0.2, 0.3]);
+            w.flush().unwrap_or_else(|e| panic!("Failed to flush: {e}"));
         }
 
-        let read_back = read_advantages_jsonl(&tmp);
+        let read_back = read_advantages_binary(&tmp);
         assert_eq!(read_back.len(), 1);
         assert_eq!(read_back[0].advantages.len(), 3);
         assert!((read_back[0].advantages[0] - 0.1).abs() < 1e-6);
@@ -1157,51 +1363,11 @@ mod tests {
     }
 
     #[test]
-    fn advantages_jsonl_skips_empty_lines() {
-        let tmp = std::env::temp_dir().join("test_self_play_adv_empty.jsonl");
-        {
-            let file = std::fs::File::create(&tmp)
-                .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp.display()));
-            let mut w = BufWriter::new(file);
-            // Write with some empty lines interspersed
-            writeln!(w).unwrap();
-            writeln!(
-                w,
-                "{}",
-                serde_json::to_string(&TrajectoryAdvantages {
-                    trajectory_idx: 0,
-                    advantages: vec![1.0],
-                })
-                .unwrap()
-            )
-            .unwrap();
-            writeln!(w).unwrap();
-            writeln!(w, "   ").unwrap();
-            writeln!(
-                w,
-                "{}",
-                serde_json::to_string(&TrajectoryAdvantages {
-                    trajectory_idx: 1,
-                    advantages: vec![2.0, 3.0],
-                })
-                .unwrap()
-            )
-            .unwrap();
-            w.flush().unwrap();
-        }
-
-        let read_back = read_advantages_jsonl(&tmp);
-        assert_eq!(read_back.len(), 2, "Should have 2 records, skipping empty lines");
-        assert_eq!(read_back[0].trajectory_idx, 0);
-        assert_eq!(read_back[1].trajectory_idx, 1);
-
-        std::fs::remove_file(&tmp)
-            .unwrap_or_else(|e| panic!("Failed to remove temp file {}: {e}", tmp.display()));
-    }
-
-    #[test]
     fn sigmoid_basic_values() {
-        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6, "sigmoid(0) should be 0.5");
+        assert!(
+            (sigmoid(0.0) - 0.5).abs() < 1e-6,
+            "sigmoid(0) should be 0.5"
+        );
         assert!(sigmoid(10.0) > 0.999, "sigmoid(10) should be ~1.0");
         assert!(sigmoid(-10.0) < 0.001, "sigmoid(-10) should be ~0.0");
     }

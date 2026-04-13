@@ -525,8 +525,8 @@ kernel!(pub struct GeometryMask = |geometry: kernel| Jet3 -> Field {
 
 impl<G, M> Scene for SceneObject<G, M>
 where
-    G: ManifoldCompat<Jet3, Output = Jet3> + ManifoldExpr + Clone + Copy,
-    M: ManifoldCompat<Jet3, Output = Discrete> + ManifoldExpr + Clone + Copy,
+    G: ManifoldCompat<Jet3, Output = Jet3> + ManifoldExpr + Clone + Copy + Send + Sync,
+    M: ManifoldCompat<Jet3, Output = Discrete> + ManifoldExpr + Clone + Copy + Send + Sync,
 {
     type Mask = GeometryMask<G>;
     type Color = GeometryColor<G, M>;
@@ -652,7 +652,7 @@ impl<M: ManifoldCompat<Jet3, Output = Field>> Manifold<Jet3_4> for Reflect<M> {
         let r_z = d_jet_z - k * n_jet_z;
 
         // Recurse with curved reflected rays
-        self.inner.eval(r_x, r_y, r_z, w)
+        self.inner.eval_raw(r_x, r_y, r_z, w)
     }
 }
 

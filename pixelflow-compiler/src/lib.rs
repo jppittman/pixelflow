@@ -4,13 +4,10 @@
 //!
 //! ## Architecture
 //!
-//! The compiler follows a traditional pipeline:
+//! The live frontend pipeline is:
 //!
 //! ```text
 //! Source (macro input)
-//!     │
-//!     ▼ Lexer (lexer.rs)
-//! Token Stream
 //!     │
 //!     ▼ Parser (parser.rs)
 //! AST (ast.rs)
@@ -18,31 +15,21 @@
 //!     ▼ Semantic Analysis (sema.rs)
 //! Analyzed AST + Symbol Table
 //!     │
-//!     ▼ Annotation (annotate.rs)
-//! Annotated AST (literals have Var indices)
+//!     ▼ E-graph optimization (optimize.rs)
+//! Optimized AST
 //!     │
-//!     ▼ Code Generation (codegen.rs)
+//!     ▼ Code generation / arena lowering
 //! Rust TokenStream (output)
 //! ```
 //!
-//! ## Symbol Table
-//!
-//! The compiler maintains a symbol table with two classes of symbols:
-//!
-//! 1. **Intrinsic coordinates** (X, Y, Z, W) - bound at evaluation time
-//! 2. **Captured parameters** - bound at kernel construction time
-//!
-//! This mirrors the layered contramap pattern: parameters are fixed when you
-//! call the kernel constructor, coordinates are fixed when `eval_raw` is called.
+//! The compiler still has some older utility modules, but the hot path is
+//! parse -> analyze -> optimize -> emit.
 
 mod annotate;
 mod ast;
 mod codegen;
-mod cost_builder;
 mod element;
-mod fold;
 mod ir_bridge;
-mod lexer;
 mod manifold_expr;
 mod optimize;
 mod parser;
@@ -100,9 +87,9 @@ pub fn derive_element(input: TokenStream) -> TokenStream {
 ///
 /// # Compiler Pipeline
 ///
-/// 1. **Lexer**: Tokenizes the input (delegated to `syn`)
-/// 2. **Parser**: Builds AST from closure syntax
-/// 3. **Semantic Analysis**: Resolves symbols, validates types
+/// 1. **Parser**: Builds AST from closure syntax
+/// 2. **Semantic Analysis**: Resolves symbols, validates types
+/// 3. **Optimization**: E-graph saturation + learned extraction
 /// 4. **Code Generation**: Emits struct + Manifold impl
 #[proc_macro]
 pub fn kernel(input: TokenStream) -> TokenStream {
@@ -213,7 +200,14 @@ pub fn kernel_jit(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
-    // Phase 3: Collect scalar params in declaration order
+    // Phase 3: Optimization (e-graph saturation + NNUE extraction at compile time)
+    // Same optimization pipeline as kernel! — the only difference between
+    // kernel! and kernel_jit! should be the backend (LLVM vs JIT), not the
+    // optimization. This gives us FMA fusion, algebraic simplification,
+    // CSE, rsqrt, etc. before the IR is emitted for runtime JIT compilation.
+    let analyzed = optimize::optimize(analyzed);
+
+    // Phase 4: Collect scalar params in declaration order
     let scalar_params: Vec<_> = analyzed
         .def
         .params
@@ -221,10 +215,10 @@ pub fn kernel_jit(input: TokenStream) -> TokenStream {
         .filter(|p| matches!(p.kind, ast::ParamKind::Scalar(_)))
         .collect();
 
-    // Phase 4: Convert body to IR (params become Expr::Param(i) nodes)
+    // Phase 5: Convert optimized body to arena IR (params become Param(i) nodes)
     let param_map = ir_bridge::scalar_param_indices(&analyzed);
-    let ir = match ir_bridge::ast_to_ir(&analyzed.def.body, &param_map) {
-        Ok(ir) => ir,
+    let arena_code = match ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map) {
+        Ok(code) => code,
         Err(e) => {
             return syn::Error::new(proc_macro2::Span::call_site(), e)
                 .to_compile_error()
@@ -232,15 +226,12 @@ pub fn kernel_jit(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Phase 5: Generate the runtime Expr constructor (Param nodes included)
-    let expr_code = ir_bridge::ir_to_runtime_expr(&ir);
-
     if scalar_params.is_empty() {
         // Zero-param: compile immediately, return JitManifold
         let output = quote! {
             {
-                let __expr = #expr_code;
-                let __code = ::pixelflow_ir::backend::emit::compile_dag(&__expr).map(|r| r.code)
+                let (__arena, __root) = #arena_code;
+                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root).map(|r| r.code)
                     .expect("kernel_jit! JIT compilation failed");
                 let __jit = ::pixelflow_ir::JitManifold::new(__code);
                 // Wrap in a struct that implements Manifold in the user's crate
@@ -292,9 +283,9 @@ pub fn kernel_jit(input: TokenStream) -> TokenStream {
 
         let output = quote! {
             move | #( #param_names : #param_types ),* | {
-                let __expr = #expr_code;
-                let __expr = ::pixelflow_ir::substitute_params(&__expr, #param_slice);
-                let __code = ::pixelflow_ir::backend::emit::compile_dag(&__expr).map(|r| r.code)
+                let (mut __arena, __root) = #arena_code;
+                let __root = __arena.substitute_params(__root, #param_slice);
+                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root).map(|r| r.code)
                     .expect("kernel_jit! JIT compilation failed");
                 let __jit = ::pixelflow_ir::JitManifold::new(__code);
                 struct __JitWrapper(::pixelflow_ir::JitManifold);

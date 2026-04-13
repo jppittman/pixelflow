@@ -1,23 +1,21 @@
 //! Bridge between macro AST and pixelflow-ir.
 //!
 //! This module handles conversions between:
-//! 1. Macro AST → IR (ast_to_ir)
-//! 2. IR → E-graph (ir_to_egraph)
-//! 3. E-graph → IR (egraph_to_ir)
-//! 4. IR → Type-level code (ir_to_code)
+//! 1. Macro AST → arena IR
+//! 2. arena IR → runtime construction code
 //!
 //! The IR becomes the canonical representation, with AST only used during parsing.
 
-use crate::ast::{BinaryExpr, BinaryOp, Expr, LiteralExpr, UnaryOp};
-use pixelflow_ir::{Expr as IR, OpKind};
-use pixelflow_search::egraph::{EClassId, EGraph, ENode, ExprTree, Leaf, ops};
-use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote};
 use std::collections::HashMap;
-use syn::{Ident, Lit};
+use crate::ast::{BinaryOp, Expr, UnaryOp};
+use pixelflow_ir::OpKind;
+use pixelflow_ir::arena::{ExprArena, ExprId};
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::Lit;
 
 // ============================================================================
-// AST → IR Conversion
+// AST → Arena IR Conversion
 // ============================================================================
 
 /// Build a `param_name → index` map from an analyzed kernel.
@@ -39,26 +37,30 @@ pub fn scalar_param_indices(
         .collect()
 }
 
-/// Convert macro AST to IR.
+/// Convert macro AST to an arena-allocated IR.
 ///
-/// This flattens the high-level parsing structure (with source spans, etc.)
-/// into the clean IR representation used for optimization.
+/// Mirrors [`ast_to_ir`] exactly but pushes nodes into `arena` instead of
+/// heap-allocating [`Arc`] wrappers. Children are recursed first so that
+/// parent nodes always reference already-interned [`ExprId`]s.
 ///
 /// `param_indices` maps parameter names to their declaration-order index (0-based).
-/// Parameter identifiers are emitted as [`IR::Param(i)`] for later substitution.
-pub fn ast_to_ir(expr: &Expr, param_indices: &HashMap<String, u8>) -> Result<IR, String> {
+/// Parameter identifiers are emitted as arena `Param(i)` nodes.
+pub fn ast_to_arena(
+    expr: &Expr,
+    param_indices: &HashMap<String, u8>,
+    arena: &mut ExprArena,
+) -> Result<ExprId, String> {
     match expr {
         Expr::Ident(ident) => {
-            // Map coordinate variables to their indices
             let name = ident.name.to_string();
             match name.as_str() {
-                "X" => Ok(IR::Var(0)),
-                "Y" => Ok(IR::Var(1)),
-                "Z" => Ok(IR::Var(2)),
-                "W" => Ok(IR::Var(3)),
+                "X" => Ok(arena.push_var(0)),
+                "Y" => Ok(arena.push_var(1)),
+                "Z" => Ok(arena.push_var(2)),
+                "W" => Ok(arena.push_var(3)),
                 _ => {
                     if let Some(&idx) = param_indices.get(&name) {
-                        Ok(IR::Param(idx))
+                        Ok(arena.push_param(idx))
                     } else {
                         Err(format!("Unknown identifier: {}", name))
                     }
@@ -68,96 +70,179 @@ pub fn ast_to_ir(expr: &Expr, param_indices: &HashMap<String, u8>) -> Result<IR,
 
         Expr::Literal(lit) => {
             if let Some(val) = extract_f64_from_lit(&lit.lit) {
-                Ok(IR::Const(val as f32))
+                Ok(arena.push_const(val as f32))
             } else {
                 Err(format!("Non-numeric literal"))
             }
         }
 
         Expr::Binary(binary) => {
-            let lhs = Box::new(ast_to_ir(&binary.lhs, param_indices)?);
-            let rhs = Box::new(ast_to_ir(&binary.rhs, param_indices)?);
+            let lhs = ast_to_arena(&binary.lhs, param_indices, arena)?;
+            let rhs = ast_to_arena(&binary.rhs, param_indices, arena)?;
 
             let op = match binary.op {
                 BinaryOp::Add => OpKind::Add,
                 BinaryOp::Sub => OpKind::Sub,
                 BinaryOp::Mul => OpKind::Mul,
                 BinaryOp::Div => OpKind::Div,
+                BinaryOp::Lt => OpKind::Lt,
+                BinaryOp::Le => OpKind::Le,
+                BinaryOp::Gt => OpKind::Gt,
+                BinaryOp::Ge => OpKind::Ge,
+                BinaryOp::Eq => OpKind::Eq,
+                BinaryOp::Ne => OpKind::Ne,
                 _ => return Err(format!("Unsupported binary op: {:?}", binary.op)),
             };
 
-            Ok(IR::Binary(op, lhs, rhs))
+            Ok(arena.push_binary(op, lhs, rhs))
         }
 
         Expr::Unary(unary) => {
-            let operand = Box::new(ast_to_ir(&unary.operand, param_indices)?);
+            let operand = ast_to_arena(&unary.operand, param_indices, arena)?;
 
             let op = match unary.op {
                 UnaryOp::Neg => OpKind::Neg,
                 UnaryOp::Not => return Err(format!("Unsupported unary op: Not")),
             };
 
-            Ok(IR::Unary(op, operand))
+            Ok(arena.push_unary(op, operand))
         }
 
         Expr::MethodCall(call) => {
             let method = call.method.to_string();
-            let receiver = Box::new(ast_to_ir(&call.receiver, param_indices)?);
+            let receiver = ast_to_arena(&call.receiver, param_indices, arena)?;
 
             match (method.as_str(), call.args.len()) {
                 // Unary methods - primitives
-                ("sqrt", 0) => Ok(IR::Unary(OpKind::Sqrt, receiver)),
-                ("abs", 0) => Ok(IR::Unary(OpKind::Abs, receiver)),
-                ("neg", 0) => Ok(IR::Unary(OpKind::Neg, receiver)),
-                ("floor", 0) => Ok(IR::Unary(OpKind::Floor, receiver)),
-                ("ceil", 0) => Ok(IR::Unary(OpKind::Ceil, receiver)),
-                ("recip", 0) => Ok(IR::Unary(OpKind::Recip, receiver)),
-                ("rsqrt", 0) => Ok(IR::Unary(OpKind::Rsqrt, receiver)),
+                ("sqrt", 0) => Ok(arena.push_unary(OpKind::Sqrt, receiver)),
+                ("abs", 0) => Ok(arena.push_unary(OpKind::Abs, receiver)),
+                ("neg", 0) => Ok(arena.push_unary(OpKind::Neg, receiver)),
+                ("floor", 0) => Ok(arena.push_unary(OpKind::Floor, receiver)),
+                ("ceil", 0) => Ok(arena.push_unary(OpKind::Ceil, receiver)),
+                ("recip", 0) => Ok(arena.push_unary(OpKind::Recip, receiver)),
+                ("rsqrt", 0) => Ok(arena.push_unary(OpKind::Rsqrt, receiver)),
 
                 // Unary methods - transcendentals (lowered before JIT)
-                ("sin", 0) => Ok(IR::Unary(OpKind::Sin, receiver)),
-                ("cos", 0) => Ok(IR::Unary(OpKind::Cos, receiver)),
-                ("tan", 0) => Ok(IR::Unary(OpKind::Tan, receiver)),
-                ("exp", 0) => Ok(IR::Unary(OpKind::Exp, receiver)),
-                ("exp2", 0) => Ok(IR::Unary(OpKind::Exp2, receiver)),
-                ("ln", 0) => Ok(IR::Unary(OpKind::Ln, receiver)),
-                ("log2", 0) => Ok(IR::Unary(OpKind::Log2, receiver)),
+                ("sin", 0) => Ok(arena.push_unary(OpKind::Sin, receiver)),
+                ("cos", 0) => Ok(arena.push_unary(OpKind::Cos, receiver)),
+                ("tan", 0) => Ok(arena.push_unary(OpKind::Tan, receiver)),
+                ("exp", 0) => Ok(arena.push_unary(OpKind::Exp, receiver)),
+                ("exp2", 0) => Ok(arena.push_unary(OpKind::Exp2, receiver)),
+                ("ln", 0) => Ok(arena.push_unary(OpKind::Ln, receiver)),
+                ("log2", 0) => Ok(arena.push_unary(OpKind::Log2, receiver)),
 
                 // Unary methods - inverse trigonometric
-                ("atan", 0) => Ok(IR::Unary(OpKind::Atan, receiver)),
-                ("asin", 0) => Ok(IR::Unary(OpKind::Asin, receiver)),
-                ("acos", 0) => Ok(IR::Unary(OpKind::Acos, receiver)),
+                ("atan", 0) => Ok(arena.push_unary(OpKind::Atan, receiver)),
+                ("asin", 0) => Ok(arena.push_unary(OpKind::Asin, receiver)),
+                ("acos", 0) => Ok(arena.push_unary(OpKind::Acos, receiver)),
 
                 // Binary methods
                 ("min", 1) => {
-                    let arg = Box::new(ast_to_ir(&call.args[0], param_indices)?);
-                    Ok(IR::Binary(OpKind::Min, receiver, arg))
+                    let arg = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    Ok(arena.push_binary(OpKind::Min, receiver, arg))
                 }
                 ("max", 1) => {
-                    let arg = Box::new(ast_to_ir(&call.args[0], param_indices)?);
-                    Ok(IR::Binary(OpKind::Max, receiver, arg))
+                    let arg = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    Ok(arena.push_binary(OpKind::Max, receiver, arg))
                 }
                 ("atan2", 1) => {
-                    let arg = Box::new(ast_to_ir(&call.args[0], param_indices)?);
-                    Ok(IR::Binary(OpKind::Atan2, receiver, arg))
+                    let arg = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    Ok(arena.push_binary(OpKind::Atan2, receiver, arg))
                 }
 
                 // Ternary methods
                 ("mul_add", 2) => {
-                    let b = Box::new(ast_to_ir(&call.args[0], param_indices)?);
-                    let c = Box::new(ast_to_ir(&call.args[1], param_indices)?);
-                    Ok(IR::Ternary(OpKind::MulAdd, receiver, b, c))
+                    let b = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    let c = ast_to_arena(&call.args[1], param_indices, arena)?;
+                    Ok(arena.push_ternary(OpKind::MulAdd, receiver, b, c))
                 }
+                ("select", 2) => {
+                    let if_true = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    let if_false = ast_to_arena(&call.args[1], param_indices, arena)?;
+                    Ok(arena.push_ternary(OpKind::Select, receiver, if_true, if_false))
+                }
+
+                // Comparison methods (emitted by e-graph extraction)
+                ("lt", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Lt, receiver, a)) }
+                ("le", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Le, receiver, a)) }
+                ("gt", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Gt, receiver, a)) }
+                ("ge", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Ge, receiver, a)) }
+                ("eq", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Eq, receiver, a)) }
+                ("ne", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Ne, receiver, a)) }
 
                 _ => Err(format!("Unsupported method: {}", method)),
             }
         }
 
         // Parentheses are transparent - just recurse into the inner expression
-        Expr::Paren(inner) => ast_to_ir(inner, param_indices),
+        Expr::Paren(inner) => ast_to_arena(inner, param_indices, arena),
 
         _ => Err(format!("Unsupported expression type")),
     }
+}
+
+/// Generate runtime arena-construction code from macro AST.
+pub fn ast_to_runtime_arena(
+    expr: &Expr,
+    param_indices: &HashMap<String, u8>,
+) -> Result<TokenStream, String> {
+    let mut arena = ExprArena::new();
+    let root = ast_to_arena(expr, param_indices, &mut arena)?;
+    let nodes = arena.nodes_raw();
+    let nary_children = arena.nary_children_raw();
+
+    let node_tokens: Vec<TokenStream> = nodes
+        .iter()
+        .map(|node| match node {
+            pixelflow_ir::arena::ExprNode::Var(i) => {
+                quote! { ::pixelflow_ir::arena::ExprNode::Var(#i) }
+            }
+            pixelflow_ir::arena::ExprNode::Const(v) => {
+                quote! { ::pixelflow_ir::arena::ExprNode::Const(#v) }
+            }
+            pixelflow_ir::arena::ExprNode::Param(i) => {
+                quote! { ::pixelflow_ir::arena::ExprNode::Param(#i) }
+            }
+            pixelflow_ir::arena::ExprNode::Unary(op, child) => {
+                let op_code = opkind_to_tokens(*op);
+                let child = child.0;
+                quote! { ::pixelflow_ir::arena::ExprNode::Unary(#op_code, ::pixelflow_ir::arena::ExprId(#child)) }
+            }
+            pixelflow_ir::arena::ExprNode::Binary(op, a, b) => {
+                let op_code = opkind_to_tokens(*op);
+                let a = a.0;
+                let b = b.0;
+                quote! { ::pixelflow_ir::arena::ExprNode::Binary(#op_code, ::pixelflow_ir::arena::ExprId(#a), ::pixelflow_ir::arena::ExprId(#b)) }
+            }
+            pixelflow_ir::arena::ExprNode::Ternary(op, a, b, c) => {
+                let op_code = opkind_to_tokens(*op);
+                let a = a.0;
+                let b = b.0;
+                let c = c.0;
+                quote! { ::pixelflow_ir::arena::ExprNode::Ternary(#op_code, ::pixelflow_ir::arena::ExprId(#a), ::pixelflow_ir::arena::ExprId(#b), ::pixelflow_ir::arena::ExprId(#c)) }
+            }
+            pixelflow_ir::arena::ExprNode::Nary(op, start, len) => {
+                let op_code = opkind_to_tokens(*op);
+                quote! { ::pixelflow_ir::arena::ExprNode::Nary(#op_code, #start, #len) }
+            }
+        })
+        .collect();
+
+    let child_tokens: Vec<TokenStream> = nary_children
+        .iter()
+        .map(|id| {
+            let id = id.0;
+            quote! { ::pixelflow_ir::arena::ExprId(#id) }
+        })
+        .collect();
+
+    let root = root.0;
+    Ok(quote! {{
+        let __nodes = vec![#(#node_tokens),*];
+        let __nary_children = vec![#(#child_tokens),*];
+        let __arena = ::pixelflow_ir::arena::ExprArena::from_raw(__nodes, __nary_children);
+        (__arena, ::pixelflow_ir::arena::ExprId(#root))
+    }})
 }
 
 /// Extract f64 from a syn::Lit.
@@ -166,215 +251,6 @@ fn extract_f64_from_lit(lit: &Lit) -> Option<f64> {
         Lit::Float(f) => f.base10_parse::<f64>().ok(),
         Lit::Int(i) => i.base10_parse::<i64>().ok().map(|v| v as f64),
         _ => None,
-    }
-}
-
-// ============================================================================
-// IR → E-graph Conversion (Flattening)
-// ============================================================================
-
-/// Context for flattening IR trees into E-graph.
-pub struct IRToEGraphContext {
-    pub egraph: EGraph,
-}
-
-impl IRToEGraphContext {
-    pub fn new() -> Self {
-        Self {
-            egraph: EGraph::with_rules(crate::optimize::standard_rules()),
-        }
-    }
-
-    /// Flatten an IR tree into the E-graph, returning the root e-class ID.
-    pub fn ir_to_egraph(&mut self, ir: &IR) -> EClassId {
-        match ir {
-            IR::Var(idx) => self.egraph.add(ENode::Var(*idx)),
-
-            IR::Const(val) => self.egraph.add(ENode::constant(*val)),
-
-            IR::Param(i) => panic!(
-                "Expr::Param({}) reached e-graph optimizer — call substitute_params before optimization",
-                i
-            ),
-
-            IR::Unary(op, child) => {
-                let child_id = self.ir_to_egraph(child);
-                let op_ref = opkind_to_op(*op);
-                self.egraph.add(ENode::Op {
-                    op: op_ref,
-                    children: vec![child_id],
-                })
-            }
-
-            IR::Binary(op, lhs, rhs) => {
-                let lhs_id = self.ir_to_egraph(lhs);
-                let rhs_id = self.ir_to_egraph(rhs);
-                let op_ref = opkind_to_op(*op);
-                self.egraph.add(ENode::Op {
-                    op: op_ref,
-                    children: vec![lhs_id, rhs_id],
-                })
-            }
-
-            IR::Ternary(op, a, b, c) => {
-                let a_id = self.ir_to_egraph(a);
-                let b_id = self.ir_to_egraph(b);
-                let c_id = self.ir_to_egraph(c);
-                let op_ref = opkind_to_op(*op);
-                self.egraph.add(ENode::Op {
-                    op: op_ref,
-                    children: vec![a_id, b_id, c_id],
-                })
-            }
-
-            IR::Nary(op, children) => {
-                let child_ids: Vec<EClassId> = children
-                    .iter()
-                    .map(|child| self.ir_to_egraph(child))
-                    .collect();
-                let op_ref = opkind_to_op(*op);
-                self.egraph.add(ENode::Op {
-                    op: op_ref,
-                    children: child_ids,
-                })
-            }
-        }
-    }
-}
-
-/// Map OpKind to a static Op trait object reference.
-fn opkind_to_op(kind: OpKind) -> &'static dyn ops::Op {
-    match kind {
-        OpKind::Add => &ops::Add,
-        OpKind::Sub => &ops::Sub,
-        OpKind::Mul => &ops::Mul,
-        OpKind::Div => &ops::Div,
-        OpKind::Neg => &ops::Neg,
-        OpKind::Sqrt => &ops::Sqrt,
-        OpKind::Rsqrt => &ops::Rsqrt,
-        OpKind::Recip => &ops::Recip,
-        OpKind::Abs => &ops::Abs,
-        OpKind::Min => &ops::Min,
-        OpKind::Max => &ops::Max,
-        OpKind::MulAdd => &ops::MulAdd,
-        _ => panic!("Unsupported OpKind: {:?}", kind),
-    }
-}
-
-// ============================================================================
-// E-graph → IR Conversion (Extraction)
-// ============================================================================
-
-/// Convert an extracted ExprTree back to IR.
-pub fn egraph_to_ir(tree: &ExprTree) -> IR {
-    match tree {
-        ExprTree::Leaf(Leaf::Var(idx)) => IR::Var(*idx),
-
-        ExprTree::Leaf(Leaf::Const(val)) => IR::Const(*val),
-
-        ExprTree::Op { op, children } => {
-            let name = op.name();
-
-            // Map op name back to OpKind
-            let kind = match name {
-                "add" => OpKind::Add,
-                "sub" => OpKind::Sub,
-                "mul" => OpKind::Mul,
-                "div" => OpKind::Div,
-                "neg" => OpKind::Neg,
-                "sqrt" => OpKind::Sqrt,
-                "rsqrt" => OpKind::Rsqrt,
-                "recip" => OpKind::Recip,
-                "abs" => OpKind::Abs,
-                "min" => OpKind::Min,
-                "max" => OpKind::Max,
-                "mul_add" => OpKind::MulAdd,
-                _ => panic!("Unknown op: {}", name),
-            };
-
-            // Convert children
-            let child_irs: Vec<IR> = children.iter().map(|c| egraph_to_ir(c)).collect();
-
-            match child_irs.len() {
-                1 => IR::Unary(kind, Box::new(child_irs[0].clone())),
-                2 => IR::Binary(
-                    kind,
-                    Box::new(child_irs[0].clone()),
-                    Box::new(child_irs[1].clone()),
-                ),
-                3 => IR::Ternary(
-                    kind,
-                    Box::new(child_irs[0].clone()),
-                    Box::new(child_irs[1].clone()),
-                    Box::new(child_irs[2].clone()),
-                ),
-                _ => IR::Nary(kind, child_irs),
-            }
-        }
-    }
-}
-
-// ============================================================================
-// IR → Type-Level Code Generation
-// ============================================================================
-
-/// Generate runtime Expr constructor code from IR.
-///
-/// This emits Rust code that, when executed, builds the same IR tree at runtime.
-/// Used by kernel_jit! to defer compilation to runtime (JIT).
-pub fn ir_to_runtime_expr(ir: &IR) -> TokenStream {
-    match ir {
-        IR::Var(idx) => {
-            quote! { ::pixelflow_ir::Expr::Var(#idx) }
-        }
-
-        IR::Const(val) => {
-            quote! { ::pixelflow_ir::Expr::Const(#val) }
-        }
-
-        IR::Param(idx) => {
-            quote! { ::pixelflow_ir::Expr::Param(#idx) }
-        }
-
-        IR::Unary(op, child) => {
-            let child_code = ir_to_runtime_expr(child);
-            let op_code = opkind_to_tokens(*op);
-            quote! {
-                ::pixelflow_ir::Expr::Unary(#op_code, Box::new(#child_code))
-            }
-        }
-
-        IR::Binary(op, lhs, rhs) => {
-            let lhs_code = ir_to_runtime_expr(lhs);
-            let rhs_code = ir_to_runtime_expr(rhs);
-            let op_code = opkind_to_tokens(*op);
-            quote! {
-                ::pixelflow_ir::Expr::Binary(#op_code, Box::new(#lhs_code), Box::new(#rhs_code))
-            }
-        }
-
-        IR::Ternary(op, a, b, c) => {
-            let a_code = ir_to_runtime_expr(a);
-            let b_code = ir_to_runtime_expr(b);
-            let c_code = ir_to_runtime_expr(c);
-            let op_code = opkind_to_tokens(*op);
-            quote! {
-                ::pixelflow_ir::Expr::Ternary(
-                    #op_code,
-                    Box::new(#a_code),
-                    Box::new(#b_code),
-                    Box::new(#c_code),
-                )
-            }
-        }
-
-        IR::Nary(op, children) => {
-            let child_codes: Vec<_> = children.iter().map(ir_to_runtime_expr).collect();
-            let op_code = opkind_to_tokens(*op);
-            quote! {
-                ::pixelflow_ir::Expr::Nary(#op_code, vec![#(#child_codes),*])
-            }
-        }
     }
 }
 
@@ -399,80 +275,26 @@ fn opkind_to_tokens(kind: OpKind) -> TokenStream {
         OpKind::Asin => quote! { ::pixelflow_ir::OpKind::Asin },
         OpKind::Acos => quote! { ::pixelflow_ir::OpKind::Acos },
         OpKind::Atan2 => quote! { ::pixelflow_ir::OpKind::Atan2 },
+        OpKind::Tan => quote! { ::pixelflow_ir::OpKind::Tan },
+        OpKind::Exp => quote! { ::pixelflow_ir::OpKind::Exp },
+        OpKind::Exp2 => quote! { ::pixelflow_ir::OpKind::Exp2 },
+        OpKind::Ln => quote! { ::pixelflow_ir::OpKind::Ln },
+        OpKind::Log2 => quote! { ::pixelflow_ir::OpKind::Log2 },
+        OpKind::Log10 => quote! { ::pixelflow_ir::OpKind::Log10 },
+        OpKind::Pow => quote! { ::pixelflow_ir::OpKind::Pow },
+        OpKind::Hypot => quote! { ::pixelflow_ir::OpKind::Hypot },
         OpKind::Floor => quote! { ::pixelflow_ir::OpKind::Floor },
         OpKind::Ceil => quote! { ::pixelflow_ir::OpKind::Ceil },
+        OpKind::Round => quote! { ::pixelflow_ir::OpKind::Round },
+        OpKind::Fract => quote! { ::pixelflow_ir::OpKind::Fract },
+        OpKind::Lt => quote! { ::pixelflow_ir::OpKind::Lt },
+        OpKind::Le => quote! { ::pixelflow_ir::OpKind::Le },
+        OpKind::Gt => quote! { ::pixelflow_ir::OpKind::Gt },
+        OpKind::Ge => quote! { ::pixelflow_ir::OpKind::Ge },
+        OpKind::Eq => quote! { ::pixelflow_ir::OpKind::Eq },
+        OpKind::Ne => quote! { ::pixelflow_ir::OpKind::Ne },
         OpKind::Select => quote! { ::pixelflow_ir::OpKind::Select },
         OpKind::Clamp => quote! { ::pixelflow_ir::OpKind::Clamp },
         _ => panic!("Unsupported OpKind for JIT: {:?}", kind),
-    }
-}
-
-/// Generate type-level code from IR.
-///
-/// This emits the type-level AST that will be monomorphized by rustc.
-pub fn ir_to_code(ir: &IR) -> TokenStream {
-    match ir {
-        IR::Var(idx) => {
-            // Map variable indices to coordinate variables
-            match idx {
-                0 => quote! { X },
-                1 => quote! { Y },
-                2 => quote! { Z },
-                3 => quote! { W },
-                _ => {
-                    let var_name = format_ident!("v{}", idx);
-                    quote! { #var_name }
-                }
-            }
-        }
-
-        IR::Const(val) => {
-            quote! { #val }
-        }
-
-        IR::Param(i) => panic!(
-            "Expr::Param({}) reached type-level codegen — Param nodes are only for kernel_jit!, not kernel!",
-            i
-        ),
-
-        IR::Unary(op, child) => {
-            let child_code = ir_to_code(child);
-            match op {
-                OpKind::Neg => quote! { Neg::new(#child_code) },
-                OpKind::Sqrt => quote! { (#child_code).sqrt() },
-                OpKind::Abs => quote! { (#child_code).abs() },
-                OpKind::Rsqrt => quote! { (#child_code).rsqrt() },
-                OpKind::Recip => quote! { (#child_code).recip() },
-                _ => panic!("Unsupported unary op: {:?}", op),
-            }
-        }
-
-        IR::Binary(op, lhs, rhs) => {
-            let lhs_code = ir_to_code(lhs);
-            let rhs_code = ir_to_code(rhs);
-            match op {
-                OpKind::Add => quote! { (#lhs_code) + (#rhs_code) },
-                OpKind::Sub => quote! { (#lhs_code) - (#rhs_code) },
-                OpKind::Mul => quote! { (#lhs_code) * (#rhs_code) },
-                OpKind::Div => quote! { (#lhs_code) / (#rhs_code) },
-                OpKind::Min => quote! { (#lhs_code).min(#rhs_code) },
-                OpKind::Max => quote! { (#lhs_code).max(#rhs_code) },
-                _ => panic!("Unsupported binary op: {:?}", op),
-            }
-        }
-
-        IR::Ternary(op, a, b, c) => {
-            let a_code = ir_to_code(a);
-            let b_code = ir_to_code(b);
-            let c_code = ir_to_code(c);
-            match op {
-                OpKind::MulAdd => quote! { (#a_code).mul_add(#b_code, #c_code) },
-                _ => panic!("Unsupported ternary op: {:?}", op),
-            }
-        }
-
-        IR::Nary(_, _children) => {
-            panic!("N-ary ops not yet supported in codegen")
-        }
     }
 }

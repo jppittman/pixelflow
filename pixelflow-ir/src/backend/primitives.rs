@@ -11,7 +11,15 @@ use core::ops::{Add, BitAnd, BitOr, Div, Mul, Neg, Not, Sub};
 
 /// Mask operations - predicates for SIMD lanes.
 pub trait MaskPrimitives:
-    Copy + Clone + Debug + Default + Send + Sync + BitAnd<Output = Self> + BitOr<Output = Self> + Not<Output = Self>
+    Copy
+    + Clone
+    + Debug
+    + Default
+    + Send
+    + Sync
+    + BitAnd<Output = Self>
+    + BitOr<Output = Self>
+    + Not<Output = Self>
 {
     /// Any lane true?
     fn any(self) -> bool;

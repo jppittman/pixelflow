@@ -1,18 +1,17 @@
 {
-  "best_trial": 96,
-  "best_value": 1.0801803785421678,
+  "best_trial": 19,
+  "best_value": -1.5,
   "best_params": {
-    "critic_epochs": 80,
-    "critic_lr": 0.00016580397347606962,
-    "critic_dropout": 0.123666793809721,
-    "lr": 0.00817282396158122,
-    "momentum": 0.890841839182543,
-    "weight_decay": 5.34418697378621e-06,
-    "grad_clip": 8.74000762425164,
-    "entropy_coeff": 0.0982580225074376,
-    "value_coeff": 1.175118315100511,
-    "mini_batch_size": 2048,
-    "updates_per_round": 19
-  },
-  "mode": "offline"
+    "lr": 0.0024063972842750707,
+    "momentum": 0.982554506671941,
+    "weight_decay": 6.936427467767516e-07,
+    "grad_clip": 0.9646682314598818,
+    "entropy_coeff": 0.008393372112938328,
+    "value_coeff": 0.16285661534676296,
+    "miss_penalty": 0.21556770049096702,
+    "mini_batch_size": 256,
+    "updates_per_round": 15,
+    "corpus_fraction": 0.5124710699028718,
+    "threshold": 0.5355934495495241
+  }
 }

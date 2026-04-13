@@ -2,8 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::cost::{CostModel, CostFunction};
-use super::extract::ExprTree;
+use super::cost::{CostFunction, CostModel};
 use super::node::{EClassId, ENode};
 use super::ops;
 use super::rewrite::{Rewrite, RewriteAction};
@@ -141,6 +140,14 @@ impl EGraph {
         if let Some(&id) = self.memo.get(&node) {
             return self.find(id);
         }
+        // Hard class limit: never allocate beyond this. Prevents unbounded
+        // memory growth when resource limits are missing from call sites.
+        const HARD_CLASS_LIMIT: usize = 100_000;
+        if self.classes.len() >= HARD_CLASS_LIMIT {
+            // Return a sentinel pointing at class 0. The e-graph is over
+            // budget; further growth would be useless anyway.
+            return EClassId(0);
+        }
         let id = EClassId(self.classes.len() as u32);
         self.classes.push(EClass {
             nodes: vec![node.clone()],
@@ -164,8 +171,62 @@ impl EGraph {
         parent
     }
 
-    fn rebuild(&mut self) {
-        while let Some(id) = self.worklist.pop() {
+    /// Begin a batch of rule applications. Returns a guard that rebuilds
+    /// the e-graph when dropped (RAII). Rules applied through the guard
+    /// skip per-rule rebuilds; the single rebuild on drop amortizes the cost.
+    ///
+    /// ```ignore
+    /// {
+    ///     let mut batch = egraph.batch();
+    ///     batch.apply_rule(0, 500);
+    ///     batch.apply_rule(1, 500);
+    ///     // rebuild happens here on drop
+    /// }
+    /// ```
+    /// Begin a batch of rule applications with interleaved partial rebuild.
+    ///
+    /// `rebuild_chunk`: max worklist items to process after each rule.
+    /// Higher = more deduplication, slower per rule.
+    /// Lower = less deduplication, faster per rule but classes grow.
+    /// Default of 256 balances the two.
+    pub fn batch(&mut self) -> EGraphBatch<'_> {
+        EGraphBatch {
+            graph: self,
+            any_changes: false,
+            rebuild_chunk: 256,
+        }
+    }
+
+    /// Begin a batch with a custom rebuild chunk size.
+    pub fn batch_with_chunk(&mut self, rebuild_chunk: usize) -> EGraphBatch<'_> {
+        EGraphBatch {
+            graph: self,
+            any_changes: false,
+            rebuild_chunk,
+        }
+    }
+
+    /// Rebuild the e-graph completely. Processes the entire worklist.
+    pub fn rebuild(&mut self) {
+        self.rebuild_budgeted(usize::MAX);
+    }
+
+    /// Process up to `budget` worklist items. Each item canonicalizes one
+    /// e-class's nodes and deduplicates via the memo table.
+    ///
+    /// The graph is consistent after each item — partially rebuilt is safe.
+    /// Unprocessed classes may have stale canonical forms (rule matching
+    /// might miss some equivalences) but won't produce wrong results.
+    ///
+    /// Returns the number of worklist items remaining.
+    pub fn rebuild_budgeted(&mut self, budget: usize) -> usize {
+        let mut processed = 0;
+        while processed < budget {
+            let id = match self.worklist.pop() {
+                Some(id) => id,
+                None => break,
+            };
+            processed += 1;
             let id = self.find(id);
             let nodes = std::mem::take(&mut self.classes[id.index()].nodes);
             let mut new_nodes = Vec::new();
@@ -183,6 +244,12 @@ impl EGraph {
             }
             self.classes[id.index()].nodes = new_nodes;
         }
+        self.worklist.len()
+    }
+
+    /// Number of pending worklist items (classes needing rebuild).
+    pub fn pending_rebuilds(&self) -> usize {
+        self.worklist.len()
     }
 
     pub fn nodes(&self, id: EClassId) -> &[ENode] {
@@ -214,6 +281,15 @@ impl EGraph {
                 None
             }
         })
+    }
+
+    /// Collect all canonical e-class IDs into a `Vec`.
+    ///
+    /// Use this instead of `class_ids()` when the caller needs `&mut self`
+    /// (since the iterator borrows `&self`). This is the single source of
+    /// truth for "which classes are canonical" — delegates to `class_ids()`.
+    pub fn canonical_class_ids(&self) -> Vec<EClassId> {
+        self.class_ids().collect()
     }
 
     /// Get the total number of nodes across all e-classes.
@@ -250,27 +326,133 @@ impl EGraph {
         out
     }
 
-    /// Insert an expression tree into the e-graph, returning the root e-class.
-    pub fn add_expr(&mut self, tree: &ExprTree) -> EClassId {
-        use super::extract::Leaf;
+    /// Add an arena-based DAG expression to the e-graph, preserving sharing.
+    ///
+    /// Each `ExprId` in the arena maps to exactly one `EClassId`. Because the
+    /// arena is topologically ordered (children always precede parents), a single
+    /// linear scan suffices — no recursion, no stack overflow.
+    ///
+    /// Returns the `EClassId` of the root node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `root` is not a valid index in `arena`, or if any child
+    /// `ExprId` referenced by an interior node has not been processed yet
+    /// (which would indicate a malformed arena that violates topological order).
+    /// Also panics if an `ExprNode::Param` node is encountered, since Param
+    /// nodes are not valid after kernel compilation.
+    pub fn add_arena(
+        &mut self,
+        arena: &pixelflow_ir::ExprArena,
+        root: pixelflow_ir::ExprId,
+    ) -> EClassId {
+        use pixelflow_ir::arena::ExprNode;
 
-        match tree {
-            ExprTree::Leaf(Leaf::Var(v)) => self.add(ENode::Var(*v)),
-            ExprTree::Leaf(Leaf::Const(c)) => self.add(ENode::constant(*c)),
+        let n = arena.len();
+        assert!(
+            (root.0 as usize) < n,
+            "add_arena: root {:?} out of bounds (arena has {} nodes)",
+            root,
+            n,
+        );
 
-            ExprTree::Op { op, children } => {
-                // Recursively add all children first
-                let child_ids: Vec<_> = children.iter().map(|c| self.add_expr(c)).collect();
+        // Map from arena ExprId index → EClassId. None = not yet processed.
+        let mut id_map: Vec<Option<EClassId>> = vec![None; n];
 
-                // Create ENode::Op with the operation and children
-                let node = ENode::Op {
-                    op: *op,
-                    children: child_ids,
-                };
-
-                self.add(node)
-            }
+        for idx in 0..n {
+            let eid = pixelflow_ir::ExprId(idx as u32);
+            let eclass = match arena.node(eid) {
+                ExprNode::Var(v) => self.add(ENode::Var(*v)),
+                ExprNode::Const(v) => self.add(ENode::constant(*v)),
+                ExprNode::Param(i) => {
+                    panic!("add_arena: ExprNode::Param({i}) not valid after kernel compilation")
+                }
+                ExprNode::Unary(op, child) => {
+                    let child_id = id_map[child.0 as usize].unwrap_or_else(|| {
+                        panic!(
+                            "add_arena: Unary node at idx={idx} references child {:?} which has not been processed (arena not topologically ordered)",
+                            child
+                        )
+                    });
+                    let static_op = ops::op_from_kind(*op)
+                        .unwrap_or_else(|| panic!("add_arena: no static Op for OpKind {:?}", op));
+                    self.add(ENode::Op {
+                        op: static_op,
+                        children: vec![child_id],
+                    })
+                }
+                ExprNode::Binary(op, left, right) => {
+                    let left_id = id_map[left.0 as usize].unwrap_or_else(|| {
+                        panic!(
+                            "add_arena: Binary node at idx={idx} references left child {:?} which has not been processed",
+                            left
+                        )
+                    });
+                    let right_id = id_map[right.0 as usize].unwrap_or_else(|| {
+                        panic!(
+                            "add_arena: Binary node at idx={idx} references right child {:?} which has not been processed",
+                            right
+                        )
+                    });
+                    let static_op = ops::op_from_kind(*op)
+                        .unwrap_or_else(|| panic!("add_arena: no static Op for OpKind {:?}", op));
+                    self.add(ENode::Op {
+                        op: static_op,
+                        children: vec![left_id, right_id],
+                    })
+                }
+                ExprNode::Ternary(op, a, b, c) => {
+                    let a_id = id_map[a.0 as usize].unwrap_or_else(|| {
+                        panic!(
+                            "add_arena: Ternary node at idx={idx} references child a={:?} which has not been processed",
+                            a
+                        )
+                    });
+                    let b_id = id_map[b.0 as usize].unwrap_or_else(|| {
+                        panic!(
+                            "add_arena: Ternary node at idx={idx} references child b={:?} which has not been processed",
+                            b
+                        )
+                    });
+                    let c_id = id_map[c.0 as usize].unwrap_or_else(|| {
+                        panic!(
+                            "add_arena: Ternary node at idx={idx} references child c={:?} which has not been processed",
+                            c
+                        )
+                    });
+                    let static_op = ops::op_from_kind(*op)
+                        .unwrap_or_else(|| panic!("add_arena: no static Op for OpKind {:?}", op));
+                    self.add(ENode::Op {
+                        op: static_op,
+                        children: vec![a_id, b_id, c_id],
+                    })
+                }
+                ExprNode::Nary(op, start, len) => {
+                    let children_slice = arena.nary_children_slice(*start, *len);
+                    let child_ids: Vec<EClassId> = children_slice
+                        .iter()
+                        .enumerate()
+                        .map(|(ci, c)| {
+                            id_map[c.0 as usize].unwrap_or_else(|| {
+                                panic!(
+                                    "add_arena: Nary node at idx={idx} references child[{ci}]={:?} which has not been processed",
+                                    c
+                                )
+                            })
+                        })
+                        .collect();
+                    let static_op = ops::op_from_kind(*op)
+                        .unwrap_or_else(|| panic!("add_arena: no static Op for OpKind {:?}", op));
+                    self.add(ENode::Op {
+                        op: static_op,
+                        children: child_ids,
+                    })
+                }
+            };
+            id_map[idx] = Some(eclass);
         }
+
+        id_map[root.0 as usize].expect("add_arena: root EClassId missing after full traversal")
     }
 
     /// Get a rule by index.
@@ -286,9 +468,7 @@ impl EGraph {
         let mut matches = Vec::new();
 
         for (rule_idx, rule) in self.rules.iter().enumerate() {
-            for class_idx in 0..self.classes.len() {
-                let class_id = EClassId(class_idx as u32);
-                let class_id = self.find(class_id);
+            for class_id in self.class_ids() {
                 let nodes = &self.classes[class_id.index()].nodes;
 
                 for (node_idx, node) in nodes.iter().enumerate() {
@@ -350,13 +530,28 @@ impl EGraph {
                     false
                 }
             }
-            RewriteAction::Distribute { outer, inner, a, b, c } => {
+            RewriteAction::Distribute {
+                outer,
+                inner,
+                a,
+                b,
+                c,
+            } => {
                 // A * (B + C) → A*B + A*C
-                let ab_node = ENode::Op { op: outer, children: vec![a, b] };
+                let ab_node = ENode::Op {
+                    op: outer,
+                    children: vec![a, b],
+                };
                 let ab_id = self.add(ab_node);
-                let ac_node = ENode::Op { op: outer, children: vec![a, c] };
+                let ac_node = ENode::Op {
+                    op: outer,
+                    children: vec![a, c],
+                };
                 let ac_id = self.add(ac_node);
-                let result_node = ENode::Op { op: inner, children: vec![ab_id, ac_id] };
+                let result_node = ENode::Op {
+                    op: inner,
+                    children: vec![ab_id, ac_id],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -365,11 +560,23 @@ impl EGraph {
                     false
                 }
             }
-            RewriteAction::Factor { outer, inner, common, unique_l, unique_r } => {
+            RewriteAction::Factor {
+                outer,
+                inner,
+                common,
+                unique_l,
+                unique_r,
+            } => {
                 // A*B + A*C → A * (B + C)
-                let sum_node = ENode::Op { op: outer, children: vec![unique_l, unique_r] };
+                let sum_node = ENode::Op {
+                    op: outer,
+                    children: vec![unique_l, unique_r],
+                };
                 let sum_id = self.add(sum_node);
-                let result_node = ENode::Op { op: inner, children: vec![common, sum_id] };
+                let result_node = ENode::Op {
+                    op: inner,
+                    children: vec![common, sum_id],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -378,11 +585,22 @@ impl EGraph {
                     false
                 }
             }
-            RewriteAction::Canonicalize { target, inverse, a, b } => {
+            RewriteAction::Canonicalize {
+                target,
+                inverse,
+                a,
+                b,
+            } => {
                 // a - b → a + neg(b)
-                let inv_node = ENode::Op { op: inverse, children: vec![b] };
+                let inv_node = ENode::Op {
+                    op: inverse,
+                    children: vec![b],
+                };
                 let inv_id = self.add(inv_node);
-                let target_node = ENode::Op { op: target, children: vec![a, inv_id] };
+                let target_node = ENode::Op {
+                    op: target,
+                    children: vec![a, inv_id],
+                };
                 let target_id = self.add(target_node);
                 if self.find(class_id) != self.find(target_id) {
                     self.union(class_id, target_id);
@@ -393,9 +611,15 @@ impl EGraph {
             }
             RewriteAction::Associate { op, a, b, c } => {
                 // (a op b) op c → a op (b op c)
-                let bc_node = ENode::Op { op, children: vec![b, c] };
+                let bc_node = ENode::Op {
+                    op,
+                    children: vec![b, c],
+                };
                 let bc_id = self.add(bc_node);
-                let result_node = ENode::Op { op, children: vec![a, bc_id] };
+                let result_node = ENode::Op {
+                    op,
+                    children: vec![a, bc_id],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -406,9 +630,15 @@ impl EGraph {
             }
             RewriteAction::ReverseAssociate { op, a, b, c } => {
                 // a op (b op c) → (a op b) op c
-                let ab_node = ENode::Op { op, children: vec![a, b] };
+                let ab_node = ENode::Op {
+                    op,
+                    children: vec![a, b],
+                };
                 let ab_id = self.add(ab_node);
-                let result_node = ENode::Op { op, children: vec![ab_id, c] };
+                let result_node = ENode::Op {
+                    op,
+                    children: vec![ab_id, c],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -419,9 +649,15 @@ impl EGraph {
             }
             RewriteAction::OddParity { func, inner } => {
                 // For odd functions: Op(neg(x)) → neg(Op(x))
-                let func_node = ENode::Op { op: func, children: vec![inner] };
+                let func_node = ENode::Op {
+                    op: func,
+                    children: vec![inner],
+                };
                 let func_id = self.add(func_node);
-                let neg_node = ENode::Op { op: &ops::Neg, children: vec![func_id] };
+                let neg_node = ENode::Op {
+                    op: &ops::Neg,
+                    children: vec![func_id],
+                };
                 let neg_id = self.add(neg_node);
                 if self.find(class_id) != self.find(neg_id) {
                     self.union(class_id, neg_id);
@@ -430,31 +666,63 @@ impl EGraph {
                     false
                 }
             }
-            RewriteAction::AngleAddition { term1_op1, term1_op2, term2_op1, term2_op2, term2_sign, a, b } => {
+            RewriteAction::AngleAddition {
+                term1_op1,
+                term1_op2,
+                term2_op1,
+                term2_op2,
+                term2_sign,
+                a,
+                b,
+            } => {
                 // sin(a+b) → sin(a)cos(b) + cos(a)sin(b)
                 // cos(a+b) → cos(a)cos(b) - sin(a)sin(b)
-                let t1_left = ENode::Op { op: term1_op1, children: vec![a] };
+                let t1_left = ENode::Op {
+                    op: term1_op1,
+                    children: vec![a],
+                };
                 let t1_left_id = self.add(t1_left);
-                let t1_right = ENode::Op { op: term1_op2, children: vec![b] };
+                let t1_right = ENode::Op {
+                    op: term1_op2,
+                    children: vec![b],
+                };
                 let t1_right_id = self.add(t1_right);
-                let term1 = ENode::Op { op: &ops::Mul, children: vec![t1_left_id, t1_right_id] };
+                let term1 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![t1_left_id, t1_right_id],
+                };
                 let term1_id = self.add(term1);
 
-                let t2_left = ENode::Op { op: term2_op1, children: vec![a] };
+                let t2_left = ENode::Op {
+                    op: term2_op1,
+                    children: vec![a],
+                };
                 let t2_left_id = self.add(t2_left);
-                let t2_right = ENode::Op { op: term2_op2, children: vec![b] };
+                let t2_right = ENode::Op {
+                    op: term2_op2,
+                    children: vec![b],
+                };
                 let t2_right_id = self.add(t2_right);
-                let term2 = ENode::Op { op: &ops::Mul, children: vec![t2_left_id, t2_right_id] };
+                let term2 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![t2_left_id, t2_right_id],
+                };
                 let term2_id = self.add(term2);
 
                 use crate::math::trig::Sign;
                 let result_id = match term2_sign {
                     Sign::Plus => {
-                        let result = ENode::Op { op: &ops::Add, children: vec![term1_id, term2_id] };
+                        let result = ENode::Op {
+                            op: &ops::Add,
+                            children: vec![term1_id, term2_id],
+                        };
                         self.add(result)
                     }
                     Sign::Minus => {
-                        let result = ENode::Op { op: &ops::Sub, children: vec![term1_id, term2_id] };
+                        let result = ENode::Op {
+                            op: &ops::Sub,
+                            children: vec![term1_id, term2_id],
+                        };
                         self.add(result)
                     }
                 };
@@ -465,13 +733,27 @@ impl EGraph {
                     false
                 }
             }
-            RewriteAction::Homomorphism { func, target_op, a, b } => {
+            RewriteAction::Homomorphism {
+                func,
+                target_op,
+                a,
+                b,
+            } => {
                 // f(a ⊕ b) → f(a) ⊗ f(b)
-                let func_a = ENode::Op { op: func, children: vec![a] };
+                let func_a = ENode::Op {
+                    op: func,
+                    children: vec![a],
+                };
                 let func_a_id = self.add(func_a);
-                let func_b = ENode::Op { op: func, children: vec![b] };
+                let func_b = ENode::Op {
+                    op: func,
+                    children: vec![b],
+                };
                 let func_b_id = self.add(func_b);
-                let result = ENode::Op { op: target_op, children: vec![func_a_id, func_b_id] };
+                let result = ENode::Op {
+                    op: target_op,
+                    children: vec![func_a_id, func_b_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -482,9 +764,15 @@ impl EGraph {
             }
             RewriteAction::PowerCombine { base, exp_a, exp_b } => {
                 // x^a * x^b → x^(a+b)
-                let sum = ENode::Op { op: &ops::Add, children: vec![exp_a, exp_b] };
+                let sum = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![exp_a, exp_b],
+                };
                 let sum_id = self.add(sum);
-                let result = ENode::Op { op: &ops::Pow, children: vec![base, sum_id] };
+                let result = ENode::Op {
+                    op: &ops::Pow,
+                    children: vec![base, sum_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -495,9 +783,15 @@ impl EGraph {
             }
             RewriteAction::ReverseAngleAddition { trig_op, a, b } => {
                 // sin(a)cos(b) + cos(a)sin(b) → sin(a + b)
-                let sum = ENode::Op { op: &ops::Add, children: vec![a, b] };
+                let sum = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a, b],
+                };
                 let sum_id = self.add(sum);
-                let result = ENode::Op { op: trig_op, children: vec![sum_id] };
+                let result = ENode::Op {
+                    op: trig_op,
+                    children: vec![sum_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -508,13 +802,22 @@ impl EGraph {
             }
             RewriteAction::HalfAngleProduct { x } => {
                 // sin(x) * cos(x) → sin(x + x) / 2
-                let two_x = ENode::Op { op: &ops::Add, children: vec![x, x] };
+                let two_x = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![x, x],
+                };
                 let two_x_id = self.add(two_x);
-                let sin_2x = ENode::Op { op: &ops::Sin, children: vec![two_x_id] };
+                let sin_2x = ENode::Op {
+                    op: &ops::Sin,
+                    children: vec![two_x_id],
+                };
                 let sin_2x_id = self.add(sin_2x);
                 let two = ENode::Const(2.0_f32.to_bits());
                 let two_id = self.add(two);
-                let result = ENode::Op { op: &ops::Div, children: vec![sin_2x_id, two_id] };
+                let result = ENode::Op {
+                    op: &ops::Div,
+                    children: vec![sin_2x_id, two_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -527,7 +830,10 @@ impl EGraph {
                 // a + a → 2 * a
                 let two = ENode::Const(2.0_f32.to_bits());
                 let two_id = self.add(two);
-                let result = ENode::Op { op: &ops::Mul, children: vec![two_id, a] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![two_id, a],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -538,7 +844,10 @@ impl EGraph {
             }
             RewriteAction::Halving { a } => {
                 // 2 * a → a + a
-                let result = ENode::Op { op: &ops::Add, children: vec![a, a] };
+                let result = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a, a],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -551,9 +860,15 @@ impl EGraph {
                 // pow(x, n) → x * pow(x, n-1)
                 let n_minus_1 = ENode::constant((exponent - 1) as f32);
                 let n_minus_1_id = self.add(n_minus_1);
-                let pow_reduced = ENode::Op { op: &ops::Pow, children: vec![base, n_minus_1_id] };
+                let pow_reduced = ENode::Op {
+                    op: &ops::Pow,
+                    children: vec![base, n_minus_1_id],
+                };
                 let pow_id = self.add(pow_reduced);
-                let result = ENode::Op { op: &ops::Mul, children: vec![base, pow_id] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![base, pow_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -562,11 +877,21 @@ impl EGraph {
                     false
                 }
             }
-            RewriteAction::LogPower { log_op, base, exponent } => {
+            RewriteAction::LogPower {
+                log_op,
+                base,
+                exponent,
+            } => {
                 // log(pow(x, n)) → n * log(x)
-                let log_x = ENode::Op { op: log_op, children: vec![base] };
+                let log_x = ENode::Op {
+                    op: log_op,
+                    children: vec![base],
+                };
                 let log_x_id = self.add(log_x);
-                let result = ENode::Op { op: &ops::Mul, children: vec![exponent, log_x_id] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![exponent, log_x_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -577,19 +902,37 @@ impl EGraph {
             }
             RewriteAction::ExpandSquare { a, b } => {
                 // (a+b)² → a² + 2ab + b²
-                let a2 = ENode::Op { op: &ops::Mul, children: vec![a, a] };
+                let a2 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![a, a],
+                };
                 let a2_id = self.add(a2);
-                let b2 = ENode::Op { op: &ops::Mul, children: vec![b, b] };
+                let b2 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![b, b],
+                };
                 let b2_id = self.add(b2);
-                let ab = ENode::Op { op: &ops::Mul, children: vec![a, b] };
+                let ab = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![a, b],
+                };
                 let ab_id = self.add(ab);
                 let two = ENode::constant(2.0);
                 let two_id = self.add(two);
-                let two_ab = ENode::Op { op: &ops::Mul, children: vec![two_id, ab_id] };
+                let two_ab = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![two_id, ab_id],
+                };
                 let two_ab_id = self.add(two_ab);
-                let sum1 = ENode::Op { op: &ops::Add, children: vec![a2_id, two_ab_id] };
+                let sum1 = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a2_id, two_ab_id],
+                };
                 let sum1_id = self.add(sum1);
-                let result = ENode::Op { op: &ops::Add, children: vec![sum1_id, b2_id] };
+                let result = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![sum1_id, b2_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -600,11 +943,20 @@ impl EGraph {
             }
             RewriteAction::DiffOfSquares { a, b } => {
                 // a² - b² → (a+b)(a-b)
-                let sum = ENode::Op { op: &ops::Add, children: vec![a, b] };
+                let sum = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a, b],
+                };
                 let sum_id = self.add(sum);
-                let diff = ENode::Op { op: &ops::Sub, children: vec![a, b] };
+                let diff = ENode::Op {
+                    op: &ops::Sub,
+                    children: vec![a, b],
+                };
                 let diff_id = self.add(diff);
-                let result = ENode::Op { op: &ops::Mul, children: vec![sum_id, diff_id] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![sum_id, diff_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -635,7 +987,7 @@ impl EGraph {
         self.saturate_with_limits(100, 10_000, std::time::Duration::from_millis(500))
     }
 
-    /// Saturate with just an iteration limit (legacy API).
+    /// Saturate with just an iteration limit (simple compatibility API).
     ///
     /// Warning: This can hang on complex expressions. Prefer `saturate_with_limits`.
     pub fn saturate_with_limit(&mut self, max_iters: usize) {
@@ -656,69 +1008,139 @@ impl EGraph {
         timeout: std::time::Duration,
     ) {
         let start = std::time::Instant::now();
+        let deadline = start + timeout;
 
         for _ in 0..max_iters {
-            // Time limit check
             if start.elapsed() >= timeout {
                 return;
             }
-
-            // Size limit check
             if self.classes.len() > max_classes {
                 return;
             }
 
-            let unions = self.apply_rules();
+            // Apply all rules in a single batch — one rebuild per iteration
+            let unions = {
+                let mut batch = self.batch();
+                let n_rules = batch.graph.rules.len();
+                let mut total = 0;
+                for rule_idx in 0..n_rules {
+                    if batch.node_count() > max_classes {
+                        break;
+                    }
+                    let result = batch.apply_rule(rule_idx, max_classes, Some(deadline));
+                    total += result.changes;
+                }
+                total
+                // rebuild happens here on drop
+            };
             if unions == 0 {
                 return; // Saturated
             }
         }
     }
 
-    /// Apply all rewrite rules once and return the number of changes made.
+    /// Apply all rewrite rules once with a node budget.
     ///
-    /// This is used by best-first search to expand a state by one step.
-    pub fn apply_rules_once(&mut self) -> usize {
-        self.apply_rules()
+    /// Returns the number of changes made. Stops if the graph exceeds
+    /// `max_nodes` classes.
+    pub fn apply_rules_once(&mut self, max_nodes: usize) -> usize {
+        self.apply_rules_budgeted(max_nodes)
     }
 
-    /// Apply a single rule (by index) everywhere it matches.
+    /// Apply a single rule (by index) everywhere it matches, with budget.
     ///
-    /// Returns changes made and evaluations consumed. Each node checked
-    /// against the rule costs one eval regardless of match outcome.
-    /// This is used by guided search to selectively apply rules.
-    pub fn apply_rule_at_index(&mut self, rule_idx: usize) -> ApplyResult {
+    /// Returns changes made and evaluations consumed. Stops scanning
+    /// if the graph exceeds `max_nodes` classes.
+    pub fn apply_rule_at_index(&mut self, rule_idx: usize, max_nodes: usize) -> ApplyResult {
+        self.apply_rule_at_index_budgeted(rule_idx, max_nodes)
+    }
+
+    /// Apply a single rule with a node budget. Stops scanning when the
+    /// e-graph exceeds `max_nodes` classes, preventing runaway growth
+    /// from a single rule application.
+    pub fn apply_rule_at_index_budgeted(
+        &mut self,
+        rule_idx: usize,
+        max_nodes: usize,
+    ) -> ApplyResult {
+        self.apply_rule_at_index_timed(rule_idx, max_nodes, None)
+    }
+
+    /// Apply a single rule with node budget AND optional wall-clock deadline.
+    /// Stops if either budget or deadline is exceeded.
+    pub fn apply_rule_at_index_timed(
+        &mut self,
+        rule_idx: usize,
+        max_nodes: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> ApplyResult {
         if rule_idx >= self.rules.len() {
-            return ApplyResult { changes: 0, evals: 0 };
+            return ApplyResult {
+                changes: 0,
+                evals: 0,
+            };
         }
 
         let mut unions = 0;
         let mut evals = 0usize;
         let mut updates: Vec<(EClassId, RewriteAction)> = Vec::new();
+        let mut estimated_new_nodes: usize = 0;
 
-        let num_classes = self.classes.len();
-        for class_idx in 0..num_classes {
-            let class_id = EClassId(class_idx as u32);
-            let class_id = self.find(class_id);
-            let nodes: Vec<ENode> = self.classes[class_id.index()].nodes.clone();
+        let canonical_ids = self.canonical_class_ids();
+        'scan: for canonical in canonical_ids {
+            // Budget check: current graph + pending creates must stay under limit
+            if self.classes.len() + estimated_new_nodes > max_nodes {
+                break;
+            }
+            // Deadline check
+            if evals & 1023 == 0 {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() > dl {
+                        break;
+                    }
+                }
+            }
+
+            let nodes: Vec<ENode> = self.classes[canonical.index()].nodes.clone();
 
             for node in &nodes {
                 evals += 1;
-                if let Some(action) = self.rules[rule_idx].apply(self, class_id, node) {
-                    updates.push((class_id, action));
-                    *self.match_counts.entry(self.rules[rule_idx].name().to_string()).or_insert(0) += 1;
+                if let Some(action) = self.rules[rule_idx].apply(self, canonical, node) {
+                    // Track how many nodes this action would create
+                    let action_cost = match &action {
+                        RewriteAction::Union(_) => 0,
+                        RewriteAction::Create(_) => 1,
+                        // Multi-node actions: conservative upper bound
+                        _ => 3,
+                    };
+                    estimated_new_nodes += action_cost;
+
+                    // If this action would push us over budget, stop scanning
+                    if self.classes.len() + estimated_new_nodes > max_nodes {
+                        // Don't add this action — discard it and stop
+                        break 'scan;
+                    }
+
+                    updates.push((canonical, action));
+                    *self
+                        .match_counts
+                        .entry(self.rules[rule_idx].name().to_string())
+                        .or_insert(0) += 1;
                 }
             }
         }
 
+        // Commit: all actions in the log are within budget.
+        // Do NOT rebuild here — caller is responsible for calling rebuild()
+        // after all rules for the epoch are applied (lazy/batched rebuild).
         for (class_id, action) in updates {
             unions += self.apply_action(class_id, action);
         }
 
-        if unions > 0 {
-            self.rebuild();
+        ApplyResult {
+            changes: unions,
+            evals,
         }
-        ApplyResult { changes: unions, evals }
     }
 
     /// Apply a rewrite action and return 1 if a union was made, 0 otherwise.
@@ -741,12 +1163,27 @@ impl EGraph {
                     0
                 }
             }
-            RewriteAction::Distribute { outer, inner, a, b, c } => {
-                let ab_node = ENode::Op { op: outer, children: vec![a, b] };
+            RewriteAction::Distribute {
+                outer,
+                inner,
+                a,
+                b,
+                c,
+            } => {
+                let ab_node = ENode::Op {
+                    op: outer,
+                    children: vec![a, b],
+                };
                 let ab_id = self.add(ab_node);
-                let ac_node = ENode::Op { op: outer, children: vec![a, c] };
+                let ac_node = ENode::Op {
+                    op: outer,
+                    children: vec![a, c],
+                };
                 let ac_id = self.add(ac_node);
-                let result_node = ENode::Op { op: inner, children: vec![ab_id, ac_id] };
+                let result_node = ENode::Op {
+                    op: inner,
+                    children: vec![ab_id, ac_id],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -755,10 +1192,22 @@ impl EGraph {
                     0
                 }
             }
-            RewriteAction::Factor { outer, inner, common, unique_l, unique_r } => {
-                let sum_node = ENode::Op { op: outer, children: vec![unique_l, unique_r] };
+            RewriteAction::Factor {
+                outer,
+                inner,
+                common,
+                unique_l,
+                unique_r,
+            } => {
+                let sum_node = ENode::Op {
+                    op: outer,
+                    children: vec![unique_l, unique_r],
+                };
                 let sum_id = self.add(sum_node);
-                let result_node = ENode::Op { op: inner, children: vec![common, sum_id] };
+                let result_node = ENode::Op {
+                    op: inner,
+                    children: vec![common, sum_id],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -767,10 +1216,21 @@ impl EGraph {
                     0
                 }
             }
-            RewriteAction::Canonicalize { target, inverse, a, b } => {
-                let inv_node = ENode::Op { op: inverse, children: vec![b] };
+            RewriteAction::Canonicalize {
+                target,
+                inverse,
+                a,
+                b,
+            } => {
+                let inv_node = ENode::Op {
+                    op: inverse,
+                    children: vec![b],
+                };
                 let inv_id = self.add(inv_node);
-                let target_node = ENode::Op { op: target, children: vec![a, inv_id] };
+                let target_node = ENode::Op {
+                    op: target,
+                    children: vec![a, inv_id],
+                };
                 let target_id = self.add(target_node);
                 if self.find(class_id) != self.find(target_id) {
                     self.union(class_id, target_id);
@@ -780,9 +1240,15 @@ impl EGraph {
                 }
             }
             RewriteAction::Associate { op, a, b, c } => {
-                let bc_node = ENode::Op { op, children: vec![b, c] };
+                let bc_node = ENode::Op {
+                    op,
+                    children: vec![b, c],
+                };
                 let bc_id = self.add(bc_node);
-                let result_node = ENode::Op { op, children: vec![a, bc_id] };
+                let result_node = ENode::Op {
+                    op,
+                    children: vec![a, bc_id],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -793,9 +1259,15 @@ impl EGraph {
             }
             RewriteAction::ReverseAssociate { op, a, b, c } => {
                 // a op (b op c) → (a op b) op c
-                let ab_node = ENode::Op { op, children: vec![a, b] };
+                let ab_node = ENode::Op {
+                    op,
+                    children: vec![a, b],
+                };
                 let ab_id = self.add(ab_node);
-                let result_node = ENode::Op { op, children: vec![ab_id, c] };
+                let result_node = ENode::Op {
+                    op,
+                    children: vec![ab_id, c],
+                };
                 let result_id = self.add(result_node);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -807,9 +1279,15 @@ impl EGraph {
             RewriteAction::OddParity { func, inner } => {
                 // For odd functions: Op(neg(x)) → neg(Op(x))
                 // Create func(inner), then wrap in neg
-                let func_node = ENode::Op { op: func, children: vec![inner] };
+                let func_node = ENode::Op {
+                    op: func,
+                    children: vec![inner],
+                };
                 let func_id = self.add(func_node);
-                let neg_node = ENode::Op { op: &ops::Neg, children: vec![func_id] };
+                let neg_node = ENode::Op {
+                    op: &ops::Neg,
+                    children: vec![func_id],
+                };
                 let neg_id = self.add(neg_node);
                 if self.find(class_id) != self.find(neg_id) {
                     self.union(class_id, neg_id);
@@ -818,45 +1296,77 @@ impl EGraph {
                     0
                 }
             }
-            RewriteAction::AngleAddition { term1_op1, term1_op2, term2_op1, term2_op2, term2_sign, a, b } => {
+            RewriteAction::AngleAddition {
+                term1_op1,
+                term1_op2,
+                term2_op1,
+                term2_op2,
+                term2_sign,
+                a,
+                b,
+            } => {
                 // sin(a+b) → sin(a)cos(b) + cos(a)sin(b)
                 // cos(a+b) → cos(a)cos(b) - sin(a)sin(b)
                 //
                 // Create: term1_op1(a)*term1_op2(b) +/- term2_op1(a)*term2_op2(b)
 
                 // term1_op1(a)
-                let t1_left = ENode::Op { op: term1_op1, children: vec![a] };
+                let t1_left = ENode::Op {
+                    op: term1_op1,
+                    children: vec![a],
+                };
                 let t1_left_id = self.add(t1_left);
 
                 // term1_op2(b)
-                let t1_right = ENode::Op { op: term1_op2, children: vec![b] };
+                let t1_right = ENode::Op {
+                    op: term1_op2,
+                    children: vec![b],
+                };
                 let t1_right_id = self.add(t1_right);
 
                 // term1_op1(a) * term1_op2(b)
-                let term1 = ENode::Op { op: &ops::Mul, children: vec![t1_left_id, t1_right_id] };
+                let term1 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![t1_left_id, t1_right_id],
+                };
                 let term1_id = self.add(term1);
 
                 // term2_op1(a)
-                let t2_left = ENode::Op { op: term2_op1, children: vec![a] };
+                let t2_left = ENode::Op {
+                    op: term2_op1,
+                    children: vec![a],
+                };
                 let t2_left_id = self.add(t2_left);
 
                 // term2_op2(b)
-                let t2_right = ENode::Op { op: term2_op2, children: vec![b] };
+                let t2_right = ENode::Op {
+                    op: term2_op2,
+                    children: vec![b],
+                };
                 let t2_right_id = self.add(t2_right);
 
                 // term2_op1(a) * term2_op2(b)
-                let term2 = ENode::Op { op: &ops::Mul, children: vec![t2_left_id, t2_right_id] };
+                let term2 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![t2_left_id, t2_right_id],
+                };
                 let term2_id = self.add(term2);
 
                 // Combine based on sign
                 use crate::math::trig::Sign;
                 let result_id = match term2_sign {
                     Sign::Plus => {
-                        let result = ENode::Op { op: &ops::Add, children: vec![term1_id, term2_id] };
+                        let result = ENode::Op {
+                            op: &ops::Add,
+                            children: vec![term1_id, term2_id],
+                        };
                         self.add(result)
                     }
                     Sign::Minus => {
-                        let result = ENode::Op { op: &ops::Sub, children: vec![term1_id, term2_id] };
+                        let result = ENode::Op {
+                            op: &ops::Sub,
+                            children: vec![term1_id, term2_id],
+                        };
                         self.add(result)
                     }
                 };
@@ -868,20 +1378,34 @@ impl EGraph {
                     0
                 }
             }
-            RewriteAction::Homomorphism { func, target_op, a, b } => {
+            RewriteAction::Homomorphism {
+                func,
+                target_op,
+                a,
+                b,
+            } => {
                 // f(a ⊕ b) → f(a) ⊗ f(b)
                 // e.g., exp(a + b) → exp(a) * exp(b)
 
                 // func(a)
-                let func_a = ENode::Op { op: func, children: vec![a] };
+                let func_a = ENode::Op {
+                    op: func,
+                    children: vec![a],
+                };
                 let func_a_id = self.add(func_a);
 
                 // func(b)
-                let func_b = ENode::Op { op: func, children: vec![b] };
+                let func_b = ENode::Op {
+                    op: func,
+                    children: vec![b],
+                };
                 let func_b_id = self.add(func_b);
 
                 // target_op(func(a), func(b))
-                let result = ENode::Op { op: target_op, children: vec![func_a_id, func_b_id] };
+                let result = ENode::Op {
+                    op: target_op,
+                    children: vec![func_a_id, func_b_id],
+                };
                 let result_id = self.add(result);
 
                 if self.find(class_id) != self.find(result_id) {
@@ -895,11 +1419,17 @@ impl EGraph {
                 // x^a * x^b → x^(a+b)
 
                 // a + b
-                let sum = ENode::Op { op: &ops::Add, children: vec![exp_a, exp_b] };
+                let sum = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![exp_a, exp_b],
+                };
                 let sum_id = self.add(sum);
 
                 // x^(a+b)
-                let result = ENode::Op { op: &ops::Pow, children: vec![base, sum_id] };
+                let result = ENode::Op {
+                    op: &ops::Pow,
+                    children: vec![base, sum_id],
+                };
                 let result_id = self.add(result);
 
                 if self.find(class_id) != self.find(result_id) {
@@ -914,11 +1444,17 @@ impl EGraph {
                 // (or cos case)
 
                 // a + b
-                let sum = ENode::Op { op: &ops::Add, children: vec![a, b] };
+                let sum = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a, b],
+                };
                 let sum_id = self.add(sum);
 
                 // trig(a + b)
-                let result = ENode::Op { op: trig_op, children: vec![sum_id] };
+                let result = ENode::Op {
+                    op: trig_op,
+                    children: vec![sum_id],
+                };
                 let result_id = self.add(result);
 
                 if self.find(class_id) != self.find(result_id) {
@@ -933,11 +1469,17 @@ impl EGraph {
                 // Derived from: sin(2x) = 2*sin(x)*cos(x)
 
                 // x + x
-                let two_x = ENode::Op { op: &ops::Add, children: vec![x, x] };
+                let two_x = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![x, x],
+                };
                 let two_x_id = self.add(two_x);
 
                 // sin(x + x)
-                let sin_2x = ENode::Op { op: &ops::Sin, children: vec![two_x_id] };
+                let sin_2x = ENode::Op {
+                    op: &ops::Sin,
+                    children: vec![two_x_id],
+                };
                 let sin_2x_id = self.add(sin_2x);
 
                 // constant 2
@@ -945,7 +1487,10 @@ impl EGraph {
                 let two_id = self.add(two);
 
                 // sin(x + x) / 2
-                let result = ENode::Op { op: &ops::Div, children: vec![sin_2x_id, two_id] };
+                let result = ENode::Op {
+                    op: &ops::Div,
+                    children: vec![sin_2x_id, two_id],
+                };
                 let result_id = self.add(result);
 
                 if self.find(class_id) != self.find(result_id) {
@@ -959,7 +1504,10 @@ impl EGraph {
                 // a + a → 2 * a
                 let two = ENode::Const(2.0_f32.to_bits());
                 let two_id = self.add(two);
-                let result = ENode::Op { op: &ops::Mul, children: vec![two_id, a] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![two_id, a],
+                };
                 let result_id = self.add(result);
 
                 if self.find(class_id) != self.find(result_id) {
@@ -971,7 +1519,10 @@ impl EGraph {
             }
             RewriteAction::Halving { a } => {
                 // 2 * a → a + a
-                let result = ENode::Op { op: &ops::Add, children: vec![a, a] };
+                let result = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a, a],
+                };
                 let result_id = self.add(result);
 
                 if self.find(class_id) != self.find(result_id) {
@@ -984,9 +1535,15 @@ impl EGraph {
             RewriteAction::PowerRecurrence { base, exponent } => {
                 let n_minus_1 = ENode::constant((exponent - 1) as f32);
                 let n_minus_1_id = self.add(n_minus_1);
-                let pow_reduced = ENode::Op { op: &ops::Pow, children: vec![base, n_minus_1_id] };
+                let pow_reduced = ENode::Op {
+                    op: &ops::Pow,
+                    children: vec![base, n_minus_1_id],
+                };
                 let pow_id = self.add(pow_reduced);
-                let result = ENode::Op { op: &ops::Mul, children: vec![base, pow_id] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![base, pow_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -995,10 +1552,20 @@ impl EGraph {
                     0
                 }
             }
-            RewriteAction::LogPower { log_op, base, exponent } => {
-                let log_x = ENode::Op { op: log_op, children: vec![base] };
+            RewriteAction::LogPower {
+                log_op,
+                base,
+                exponent,
+            } => {
+                let log_x = ENode::Op {
+                    op: log_op,
+                    children: vec![base],
+                };
                 let log_x_id = self.add(log_x);
-                let result = ENode::Op { op: &ops::Mul, children: vec![exponent, log_x_id] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![exponent, log_x_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -1008,19 +1575,37 @@ impl EGraph {
                 }
             }
             RewriteAction::ExpandSquare { a, b } => {
-                let a2 = ENode::Op { op: &ops::Mul, children: vec![a, a] };
+                let a2 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![a, a],
+                };
                 let a2_id = self.add(a2);
-                let b2 = ENode::Op { op: &ops::Mul, children: vec![b, b] };
+                let b2 = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![b, b],
+                };
                 let b2_id = self.add(b2);
-                let ab = ENode::Op { op: &ops::Mul, children: vec![a, b] };
+                let ab = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![a, b],
+                };
                 let ab_id = self.add(ab);
                 let two = ENode::constant(2.0);
                 let two_id = self.add(two);
-                let two_ab = ENode::Op { op: &ops::Mul, children: vec![two_id, ab_id] };
+                let two_ab = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![two_id, ab_id],
+                };
                 let two_ab_id = self.add(two_ab);
-                let sum1 = ENode::Op { op: &ops::Add, children: vec![a2_id, two_ab_id] };
+                let sum1 = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a2_id, two_ab_id],
+                };
                 let sum1_id = self.add(sum1);
-                let result = ENode::Op { op: &ops::Add, children: vec![sum1_id, b2_id] };
+                let result = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![sum1_id, b2_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -1030,11 +1615,20 @@ impl EGraph {
                 }
             }
             RewriteAction::DiffOfSquares { a, b } => {
-                let sum = ENode::Op { op: &ops::Add, children: vec![a, b] };
+                let sum = ENode::Op {
+                    op: &ops::Add,
+                    children: vec![a, b],
+                };
                 let sum_id = self.add(sum);
-                let diff = ENode::Op { op: &ops::Sub, children: vec![a, b] };
+                let diff = ENode::Op {
+                    op: &ops::Sub,
+                    children: vec![a, b],
+                };
                 let diff_id = self.add(diff);
-                let result = ENode::Op { op: &ops::Mul, children: vec![sum_id, diff_id] };
+                let result = ENode::Op {
+                    op: &ops::Mul,
+                    children: vec![sum_id, diff_id],
+                };
                 let result_id = self.add(result);
                 if self.find(class_id) != self.find(result_id) {
                     self.union(class_id, result_id);
@@ -1046,21 +1640,25 @@ impl EGraph {
         }
     }
 
-    fn apply_rules(&mut self) -> usize {
+    fn apply_rules_budgeted(&mut self, max_nodes: usize) -> usize {
         let mut unions = 0;
         let mut updates: Vec<(EClassId, RewriteAction)> = Vec::new();
 
-        let num_classes = self.classes.len();
-        for class_idx in 0..num_classes {
-            let class_id = EClassId(class_idx as u32);
-            let class_id = self.find(class_id);
-            let nodes: Vec<ENode> = self.classes[class_id.index()].nodes.clone();
+        let canonical_ids = self.canonical_class_ids();
+        for canonical in canonical_ids {
+            if self.classes.len() > max_nodes {
+                break;
+            }
+            let nodes: Vec<ENode> = self.classes[canonical.index()].nodes.clone();
 
             for node in &nodes {
                 for rule in self.rules.iter() {
-                    if let Some(action) = rule.apply(self, class_id, node) {
-                        updates.push((class_id, action));
-                        *self.match_counts.entry(rule.name().to_string()).or_insert(0) += 1;
+                    if let Some(action) = rule.apply(self, canonical, node) {
+                        updates.push((canonical, action));
+                        *self
+                            .match_counts
+                            .entry(rule.name().to_string())
+                            .or_insert(0) += 1;
                     }
                 }
             }
@@ -1068,20 +1666,24 @@ impl EGraph {
 
         for (class_id, action) in updates {
             unions += self.apply_action(class_id, action);
+            if self.classes.len() > max_nodes {
+                break;
+            }
         }
 
-        self.rebuild();
+        // Lazy rebuild: caller should call rebuild() after all rules applied.
+        // saturate_with_limits handles this.
         unions
     }
 
     pub fn extract_with_costs(&self, root: EClassId, costs: &CostModel) -> ENode {
         let root = self.find(root);
         let mut cost_table: HashMap<EClassId, (usize, ENode)> = HashMap::new();
-        for _ in 0..self.classes.len() {
+        let canonical_ids: Vec<EClassId> = self.class_ids().collect();
+        // Fixed-point iteration: at most one pass per canonical class.
+        for _ in 0..canonical_ids.len() {
             let mut changed = false;
-            for idx in 0..self.classes.len() {
-                let id = EClassId(idx as u32);
-                let id = self.find(id);
+            for &id in &canonical_ids {
                 for node in &self.classes[id.index()].nodes {
                     let cost = self.node_cost_with_model(node, &cost_table, costs);
                     let current = cost_table.get(&id).map(|(c, _)| *c).unwrap_or(usize::MAX);
@@ -1091,40 +1693,63 @@ impl EGraph {
                     }
                 }
             }
-            if !changed { break; }
+            if !changed {
+                break;
+            }
         }
-        cost_table.get(&root).map(|(_, node)| node.clone()).unwrap_or(ENode::Const(0))
+        cost_table
+            .get(&root)
+            .map(|(_, node)| node.clone())
+            .unwrap_or(ENode::Const(0))
     }
 
-    fn node_cost_with_model(&self, node: &ENode, cost_table: &HashMap<EClassId, (usize, ENode)>, costs: &CostModel) -> usize {
+    fn node_cost_with_model(
+        &self,
+        node: &ENode,
+        cost_table: &HashMap<EClassId, (usize, ENode)>,
+        costs: &CostModel,
+    ) -> usize {
         let get_child_cost = |id: EClassId| {
             let id = self.find(id);
-            cost_table.get(&id).map(|(c, _)| *c).unwrap_or(usize::MAX / 4)
+            cost_table
+                .get(&id)
+                .map(|(c, _)| *c)
+                .unwrap_or(usize::MAX / 4)
         };
         let op_cost = costs.node_op_cost(node);
-        let child_cost = node.children().iter()
+        let child_cost = node
+            .children()
+            .iter()
             .fold(0usize, |acc, &c| acc.saturating_add(get_child_cost(c)));
         child_cost.saturating_add(op_cost)
     }
 
-    /// Extract the minimum-cost expression tree from an e-class.
-    pub fn extract_tree_with_costs(&self, root: EClassId, costs: &CostModel) -> ExprTree {
-        let (tree, _cost) = super::extract::extract(self, root, costs);
-        tree
+    /// Extract the minimum-cost expression from an e-class.
+    pub fn extract_expr_with_costs(
+        &self,
+        root: EClassId,
+        costs: &CostModel,
+    ) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
+        let (arena, arena_root, _cost) = super::extract::extract(self, root, costs);
+        (arena, arena_root)
     }
 
-    /// Extract the best expression tree and its cost.
+    /// Extract the best expression and its cost.
     ///
     /// The cost function can be any `CostFunction` implementor:
     /// - `CostModel` for hardcoded costs
-    /// - `ExprNnue` via `extract_neural` for learned neural costs
-    pub fn extract_best<C: CostFunction>(&self, root: EClassId, costs: &C) -> (ExprTree, usize) {
+    /// - `ExprNnue` via [`IncrementalExtractor`] for learned neural costs
+    pub fn extract_best<C: CostFunction>(
+        &self,
+        root: EClassId,
+        costs: &C,
+    ) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId, usize) {
         super::extract::extract(self, root, costs)
     }
 
     /// Extract a DAG with sharing information from an e-class.
     ///
-    /// Unlike `extract_tree_with_costs`, this tracks which e-classes are used
+    /// Unlike `extract_expr_with_costs`, this tracks which e-classes are used
     /// multiple times, enabling codegen to emit let-bindings for shared subexprs.
     ///
     /// # Example
@@ -1132,81 +1757,23 @@ impl EGraph {
     /// For `sin(X) * sin(X) + sin(X)`:
     /// - Tree extraction would compute sin(X) three times
     /// - DAG extraction marks sin(X) as shared, enabling: `let __0 = X.sin(); __0 * __0 + __0`
-    pub fn extract_dag_with_costs(&self, root: EClassId, costs: &CostModel) -> super::extract::ExtractedDAG {
+    pub fn extract_dag_with_costs(
+        &self,
+        root: EClassId,
+        costs: &CostModel,
+    ) -> super::extract::ExtractedDAG {
         super::extract::extract_dag(self, root, costs)
-    }
-
-    /// Extract up to N different equivalent expressions from an e-class.
-    ///
-    /// This returns different structural representations of the same value,
-    /// useful for training data generation where we want to benchmark
-    /// multiple equivalent forms.
-    ///
-    /// # Arguments
-    ///
-    /// * `root` - The e-class to extract variants from
-    /// * `n` - Maximum number of variants to extract
-    /// * `costs` - Cost model for building expression trees
-    ///
-    /// # Returns
-    ///
-    /// A vector of distinct ExprTree representations, up to `n` elements.
-    pub fn extract_variants(&self, root: EClassId, n: usize, costs: &CostModel) -> Vec<ExprTree> {
-        let root = self.find(root);
-        let nodes = &self.classes[root.index()].nodes;
-
-        // Use a set to deduplicate by debug string (since ExprTree contains f32 which doesn't impl Eq)
-        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut variants = Vec::with_capacity(n);
-
-        for node in nodes.iter() {
-            if variants.len() >= n {
-                break;
-            }
-
-            // Build tree for this particular node (not the "best" one)
-            let tree = self.node_to_tree_variant(node, costs);
-
-            // Deduplicate by debug representation
-            let key = format!("{:?}", tree);
-            if seen_keys.insert(key) {
-                variants.push(tree);
-            }
-        }
-
-        variants
-    }
-
-    /// Convert a specific ENode to a tree, recursively extracting children.
-    ///
-    /// Unlike extraction, this preserves the specific node structure at this level,
-    /// but uses optimal extraction for children.
-    fn node_to_tree_variant(&self, node: &ENode, costs: &CostModel) -> ExprTree {
-        use super::extract::Leaf;
-
-        match node {
-            ENode::Var(v) => ExprTree::Leaf(Leaf::Var(*v)),
-            ENode::Const(bits) => ExprTree::Leaf(Leaf::Const(f32::from_bits(*bits))),
-            ENode::Op { op, children } => {
-                // Recursively extract optimal children
-                let child_trees = children
-                    .iter()
-                    .map(|&child| self.extract_tree_with_costs(child, costs))
-                    .collect();
-                ExprTree::Op {
-                    op: *op,
-                    children: child_trees,
-                }
-            }
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::algebra::{AddNeg, MulRecip, Canonicalize, Cancellation, InverseAnnihilation, Involution, Annihilator, Commutative, Distributive, Identity};
     use crate::egraph::ops;
+    use crate::math::algebra::{
+        AddNeg, Annihilator, Cancellation, Canonicalize, Commutative, Distributive, Identity,
+        InverseAnnihilation, Involution, MulRecip,
+    };
 
     /// Create an e-graph with standard algebraic rules for testing.
     fn egraph_with_rules() -> EGraph {
@@ -1241,8 +1808,14 @@ mod tests {
     fn test_inverse_add() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
-        let neg_x = eg.add(ENode::Op { op: &ops::Neg, children: vec![x] });
-        let sum = eg.add(ENode::Op { op: &ops::Add, children: vec![x, neg_x] });
+        let neg_x = eg.add(ENode::Op {
+            op: &ops::Neg,
+            children: vec![x],
+        });
+        let sum = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, neg_x],
+        });
         eg.saturate();
         let zero = eg.add(ENode::constant(0.0));
         assert_eq!(eg.find(sum), eg.find(zero));
@@ -1252,8 +1825,14 @@ mod tests {
     fn test_inverse_mul() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
-        let recip_x = eg.add(ENode::Op { op: &ops::Recip, children: vec![x] });
-        let product = eg.add(ENode::Op { op: &ops::Mul, children: vec![x, recip_x] });
+        let recip_x = eg.add(ENode::Op {
+            op: &ops::Recip,
+            children: vec![x],
+        });
+        let product = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![x, recip_x],
+        });
         eg.saturate();
         let one = eg.add(ENode::constant(1.0));
         assert_eq!(eg.find(product), eg.find(one));
@@ -1264,8 +1843,14 @@ mod tests {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let five = eg.add(ENode::constant(5.0));
-        let prod = eg.add(ENode::Op { op: &ops::Mul, children: vec![x, five] });
-        let div = eg.add(ENode::Op { op: &ops::Div, children: vec![prod, x] });
+        let prod = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![x, five],
+        });
+        let div = eg.add(ENode::Op {
+            op: &ops::Div,
+            children: vec![prod, x],
+        });
         eg.saturate();
         assert_eq!(eg.find(div), eg.find(five));
     }
@@ -1275,21 +1860,27 @@ mod tests {
         // a - (b - c) should equal a - b + c
         // Test: 10 - (6 - 2) = 10 - 4 = 6
         let mut eg = egraph_with_rules();
-        let a = eg.add(ENode::constant(10.0));  // a = 10
-        let b = eg.add(ENode::constant(6.0));   // b = 6
-        let c = eg.add(ENode::constant(2.0));   // c = 2
+        let a = eg.add(ENode::constant(10.0)); // a = 10
+        let b = eg.add(ENode::constant(6.0)); // b = 6
+        let c = eg.add(ENode::constant(2.0)); // c = 2
 
         // Build a - (b - c)
-        let b_minus_c = eg.add(ENode::Op { op: &ops::Sub, children: vec![b, c] });   // 6 - 2 = 4
-        let result = eg.add(ENode::Op { op: &ops::Sub, children: vec![a, b_minus_c] });  // 10 - 4 = 6
+        let b_minus_c = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![b, c],
+        }); // 6 - 2 = 4
+        let result = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![a, b_minus_c],
+        }); // 10 - 4 = 6
 
         eg.saturate();
 
         // Extract and verify structure
         let costs = CostModel::default();
-        let tree = eg.extract_tree_with_costs(result, &costs);
-        eprintln!("Extracted tree: {:?}", tree);
-        assert!(tree.node_count() > 0);
+        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Extracted arena: root={:?} len={}", root, arena.len());
+        assert!(arena.node_count_subtree(root) > 0);
     }
 
     #[test]
@@ -1301,16 +1892,25 @@ mod tests {
         let c_sq = eg.add(ENode::constant(16.0));
         let r_sq = eg.add(ENode::constant(1.0));
 
-        let d_sq = eg.add(ENode::Op { op: &ops::Mul, children: vec![d, d] });
-        let inner_sub = eg.add(ENode::Op { op: &ops::Sub, children: vec![c_sq, r_sq] });
-        let result = eg.add(ENode::Op { op: &ops::Sub, children: vec![d_sq, inner_sub] });
+        let d_sq = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![d, d],
+        });
+        let inner_sub = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![c_sq, r_sq],
+        });
+        let result = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![d_sq, inner_sub],
+        });
 
         eg.saturate();
 
         let costs = CostModel::default();
-        let tree = eg.extract_tree_with_costs(result, &costs);
-        eprintln!("Extracted tree: {:?}", tree);
-        assert!(tree.node_count() > 0);
+        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Extracted arena: root={:?} len={}", root, arena.len());
+        assert!(arena.node_count_subtree(root) > 0);
     }
 
     #[test]
@@ -1321,16 +1921,29 @@ mod tests {
         let y = eg.add(ENode::Var(1));
         let z = eg.add(ENode::Var(2));
 
-        let x_sq = eg.add(ENode::Op { op: &ops::Mul, children: vec![x, x] });
-        let inner_sub = eg.add(ENode::Op { op: &ops::Sub, children: vec![y, z] });
-        let result = eg.add(ENode::Op { op: &ops::Sub, children: vec![x_sq, inner_sub] });
+        let x_sq = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![x, x],
+        });
+        let inner_sub = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![y, z],
+        });
+        let result = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![x_sq, inner_sub],
+        });
 
         eg.saturate();
 
         let costs = CostModel::default();
-        let tree = eg.extract_tree_with_costs(result, &costs);
-        eprintln!("Extracted tree with vars: {:?}", tree);
-        assert!(tree.node_count() > 0);
+        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!(
+            "Extracted arena with vars: root={:?} len={}",
+            root,
+            arena.len()
+        );
+        assert!(arena.node_count_subtree(root) > 0);
     }
 
     #[test]
@@ -1341,17 +1954,30 @@ mod tests {
         let y = eg.add(ENode::Var(1));
         let z = eg.add(ENode::Var(2));
 
-        let x_sq = eg.add(ENode::Op { op: &ops::Mul, children: vec![x, x] });
-        let inner_sub = eg.add(ENode::Op { op: &ops::Sub, children: vec![y, z] });
-        let result = eg.add(ENode::Op { op: &ops::Sub, children: vec![x_sq, inner_sub] });
+        let x_sq = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![x, x],
+        });
+        let inner_sub = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![y, z],
+        });
+        let result = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![x_sq, inner_sub],
+        });
 
         eg.saturate();
 
         // Use default costs like the kernel! macro does
         let costs = CostModel::new();
-        let tree = eg.extract_tree_with_costs(result, &costs);
-        eprintln!("Extracted tree with FMA costs: {:?}", tree);
-        assert!(tree.node_count() > 0);
+        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!(
+            "Extracted arena with FMA costs: root={:?} len={}",
+            root,
+            arena.len()
+        );
+        assert!(arena.node_count_subtree(root) > 0);
     }
 
     #[test]
@@ -1364,20 +1990,41 @@ mod tests {
         let b = eg.add(ENode::Var(2));
         let r = eg.add(ENode::Var(3));
 
-        let d_sq = eg.add(ENode::Op { op: &ops::Mul, children: vec![d, d] });
-        let a_sq = eg.add(ENode::Op { op: &ops::Mul, children: vec![a, a] });
-        let b_sq = eg.add(ENode::Op { op: &ops::Mul, children: vec![b, b] });
-        let c_sq = eg.add(ENode::Op { op: &ops::Add, children: vec![a_sq, b_sq] });
-        let r_sq = eg.add(ENode::Op { op: &ops::Mul, children: vec![r, r] });
-        let inner = eg.add(ENode::Op { op: &ops::Sub, children: vec![c_sq, r_sq] });
-        let result = eg.add(ENode::Op { op: &ops::Sub, children: vec![d_sq, inner] });
+        let d_sq = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![d, d],
+        });
+        let a_sq = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![a, a],
+        });
+        let b_sq = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![b, b],
+        });
+        let c_sq = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![a_sq, b_sq],
+        });
+        let r_sq = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![r, r],
+        });
+        let inner = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![c_sq, r_sq],
+        });
+        let result = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![d_sq, inner],
+        });
 
         eg.saturate();
 
         let costs = CostModel::new();
-        let tree = eg.extract_tree_with_costs(result, &costs);
-        eprintln!("Discriminant tree: {:?}", tree);
-        assert!(tree.node_count() > 0);
+        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Discriminant arena: root={:?} len={}", root, arena.len());
+        assert!(arena.node_count_subtree(root) > 0);
     }
 
     #[test]
@@ -1419,68 +2066,102 @@ mod tests {
 
         let mut current = x;
         for _ in 0..10 {
-            current = eg.add(ENode::Op { op: &ops::Add, children: vec![current, one] });
+            current = eg.add(ENode::Op {
+                op: &ops::Add,
+                children: vec![current, one],
+            });
         }
 
         eg.saturate();
 
         // Extract with default costs (high threshold)
         let default_costs = CostModel::default();
-        let tree = eg.extract_tree_with_costs(current, &default_costs);
-        assert!(tree.node_count() > 0);
+        let (arena, root) = eg.extract_expr_with_costs(current, &default_costs);
+        assert!(arena.node_count_subtree(root) > 0);
 
         // Extract with shallow costs (low threshold)
         let mut shallow_costs = CostModel::new();
         shallow_costs.depth_threshold = 3;
         shallow_costs.depth_penalty = 1000;
-        let tree2 = eg.extract_tree_with_costs(current, &shallow_costs);
-        assert!(tree2.node_count() > 0);
+        let (arena2, root2) = eg.extract_expr_with_costs(current, &shallow_costs);
+        assert!(arena2.node_count_subtree(root2) > 0);
+    }
+}
+
+// ============================================================================
+// EGraphBatch — RAII batched rule application with lazy rebuild
+// ============================================================================
+
+/// RAII batch for rule application with budgeted interleaved rebuild.
+///
+/// Applies rules without per-rule rebuilds. After each rule, processes
+/// a chunk of the rebuild worklist to keep classes deduplicated without
+/// doing a full rebuild. On drop, drains the remaining worklist.
+///
+/// The rebuild budget per rule is proportional to the changes made,
+/// keeping total work bounded.
+///
+/// ```ignore
+/// {
+///     let mut batch = egraph.batch();
+///     for rule in approved_rules {
+///         batch.apply_rule(rule, 500, Some(deadline));
+///     }
+/// } // final rebuild on drop
+/// ```
+pub struct EGraphBatch<'a> {
+    graph: &'a mut EGraph,
+    any_changes: bool,
+    /// Max worklist items to process per rule application.
+    /// Keeps class sizes bounded during the batch.
+    rebuild_chunk: usize,
+}
+
+impl<'a> EGraphBatch<'a> {
+    /// Apply a single rule, then process a chunk of pending rebuilds.
+    ///
+    /// The interleaved rebuild keeps classes from ballooning between rules.
+    /// Each rule application is followed by processing up to `rebuild_chunk`
+    /// worklist items, so the graph stays approximately deduplicated.
+    pub fn apply_rule(
+        &mut self,
+        rule_idx: usize,
+        max_nodes: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> ApplyResult {
+        let result = self
+            .graph
+            .apply_rule_at_index_timed(rule_idx, max_nodes, deadline);
+        if result.changes > 0 {
+            self.any_changes = true;
+            // Interleaved partial rebuild: process some worklist items to keep
+            // classes small. The chunk size bounds work per rule.
+            self.graph.rebuild_budgeted(self.rebuild_chunk);
+        }
+        result
     }
 
-    #[test]
-    fn test_extract_variants() {
-        // Build x + 0, which should have multiple equivalent forms after saturation
-        let mut eg = egraph_with_rules();
-        let x = eg.add(ENode::Var(0));
-        let zero = eg.add(ENode::constant(0.0));
-        let sum = eg.add(ENode::Op { op: &ops::Add, children: vec![x, zero] });
-
-        eg.saturate();
-
-        let costs = CostModel::default();
-        let variants = eg.extract_variants(sum, 5, &costs);
-
-        // Should have at least one variant
-        assert!(!variants.is_empty(), "Should extract at least one variant");
-
-        // All variants should have valid structure
-        for tree in &variants {
-            assert!(tree.node_count() > 0);
-        }
+    /// Current number of e-classes.
+    pub fn node_count(&self) -> usize {
+        self.graph.classes.len()
     }
 
-    #[test]
-    fn test_extract_variants_multiple_forms() {
-        // Build x * 1, which should simplify to x
-        let mut eg = egraph_with_rules();
-        let x = eg.add(ENode::Var(0));
-        let one = eg.add(ENode::constant(1.0));
-        let prod = eg.add(ENode::Op { op: &ops::Mul, children: vec![x, one] });
+    /// Whether any rule in this batch produced changes.
+    pub fn has_changes(&self) -> bool {
+        self.any_changes
+    }
 
-        eg.saturate();
+    /// Pending rebuild worklist items.
+    pub fn pending_rebuilds(&self) -> usize {
+        self.graph.pending_rebuilds()
+    }
+}
 
-        let costs = CostModel::default();
-        let variants = eg.extract_variants(prod, 10, &costs);
-
-        // Should have multiple variants (x*1, 1*x, x, etc.)
-        eprintln!("Found {} variants for x*1:", variants.len());
-        for (i, v) in variants.iter().enumerate() {
-            eprintln!("  {}: {:?}", i, v);
-        }
-
-        // All variants should have valid structure
-        for tree in &variants {
-            assert!(tree.node_count() > 0);
+impl Drop for EGraphBatch<'_> {
+    fn drop(&mut self) {
+        // Drain any remaining worklist items
+        if self.any_changes {
+            self.graph.rebuild();
         }
     }
 }

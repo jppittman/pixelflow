@@ -26,9 +26,7 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{
-            mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
-        };
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, mprotect};
 
         if code.is_empty() {
             return Err("empty code buffer");
@@ -38,38 +36,41 @@ impl ExecutableCode {
         let page_size = page_size();
         let capacity = (code.len() + page_size - 1) & !(page_size - 1);
 
-        // 1. Allocate read-write memory
-        let ptr = mmap(
-            ptr::null_mut(),
-            capacity,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANON,
-            -1,
-            0,
-        );
+        // SAFETY: All syscalls below are safe given valid arguments (which we ensure).
+        unsafe {
+            // 1. Allocate read-write memory
+            let ptr = mmap(
+                ptr::null_mut(),
+                capacity,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            );
 
-        if ptr == libc::MAP_FAILED {
-            return Err("mmap failed");
+            if ptr == libc::MAP_FAILED {
+                return Err("mmap failed");
+            }
+
+            let ptr = ptr as *mut u8;
+
+            // 2. Copy code into the buffer
+            ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
+
+            // 3. Flip to read-execute (W^X)
+            let result = mprotect(ptr as *mut libc::c_void, capacity, PROT_READ | PROT_EXEC);
+
+            if result != 0 {
+                libc::munmap(ptr as *mut libc::c_void, capacity);
+                return Err("mprotect failed");
+            }
+
+            Ok(Self {
+                ptr,
+                len: code.len(),
+                capacity,
+            })
         }
-
-        let ptr = ptr as *mut u8;
-
-        // 2. Copy code into the buffer
-        ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
-
-        // 3. Flip to read-execute (W^X)
-        let result = mprotect(ptr as *mut libc::c_void, capacity, PROT_READ | PROT_EXEC);
-
-        if result != 0 {
-            libc::munmap(ptr as *mut libc::c_void, capacity);
-            return Err("mprotect failed");
-        }
-
-        Ok(Self {
-            ptr,
-            len: code.len(),
-            capacity,
-        })
     }
 
     /// Get a function pointer to the compiled code.
@@ -79,7 +80,8 @@ impl ExecutableCode {
     /// and signature for type `F`.
     #[inline]
     pub unsafe fn as_fn<F>(&self) -> F {
-        core::mem::transmute_copy(&self.ptr)
+        // SAFETY: Caller guarantees F matches the compiled code's signature.
+        unsafe { core::mem::transmute_copy(&self.ptr) }
     }
 
     /// Get the code as a byte slice (for debugging).
@@ -122,6 +124,229 @@ fn page_size() -> usize {
 }
 
 // =============================================================================
+// Reusable code buffer — eliminates mmap/munmap per compile
+// =============================================================================
+
+/// A reusable region of executable memory for JIT compilation.
+///
+/// Allocates a single page (or multiple pages) once via `mmap`, then reuses it
+/// across compiles. This eliminates the ~10-20µs mmap/munmap syscall overhead
+/// per compile, replacing it with cheaper mprotect toggles (~2-5µs) or
+/// `pthread_jit_write_protect_np` on Apple Silicon (~0.5µs).
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut buf = CodeBuffer::new(65536).expect("mmap failed");
+/// let func: KernelFn = buf.write_code(&machine_code)?;
+/// // ... call func ...
+/// // Next compile reuses the same memory:
+/// let func2: KernelFn = buf.write_code(&other_code)?;
+/// ```
+///
+/// # Safety
+///
+/// The caller must ensure that no references to previously returned function
+/// pointers are used after a subsequent `write_code` call (the old code is
+/// overwritten).
+pub struct CodeBuffer {
+    ptr: *mut u8,
+    capacity: usize,
+    len: usize,
+}
+
+// SAFETY: The code buffer is owned by a single thread at a time.
+// The caller must ensure no concurrent access to write_code.
+unsafe impl Send for CodeBuffer {}
+
+impl CodeBuffer {
+    /// Allocate a reusable code buffer of at least `capacity` bytes.
+    ///
+    /// The actual capacity is rounded up to the system page size.
+    /// Returns an error if mmap fails.
+    #[cfg(unix)]
+    pub fn new(capacity: usize) -> Result<Self, &'static str> {
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap};
+
+        if capacity == 0 {
+            return Err("CodeBuffer capacity must be > 0");
+        }
+
+        let ps = page_size();
+        let capacity = (capacity + ps - 1) & !(ps - 1);
+
+        // On macOS with JIT support, use MAP_JIT for pthread_jit_write_protect_np.
+        #[cfg(target_os = "macos")]
+        let flags = MAP_PRIVATE | MAP_ANON | libc::MAP_JIT;
+        #[cfg(not(target_os = "macos"))]
+        let flags = MAP_PRIVATE | MAP_ANON;
+
+        let ptr = unsafe {
+            mmap(
+                ptr::null_mut(),
+                capacity,
+                PROT_READ | PROT_WRITE,
+                flags,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Err("CodeBuffer: mmap failed");
+        }
+
+        // Immediately flip to RX so it's in a safe default state.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let rc = unsafe {
+                libc::mprotect(
+                    ptr as *mut libc::c_void,
+                    capacity,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                )
+            };
+            if rc != 0 {
+                unsafe {
+                    libc::munmap(ptr as *mut libc::c_void, capacity);
+                }
+                return Err("CodeBuffer: initial mprotect to RX failed");
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // With MAP_JIT on macOS, the memory starts RW. Toggle to RX.
+            unsafe {
+                toggle_jit_write(false);
+            }
+        }
+
+        Ok(Self {
+            ptr: ptr as *mut u8,
+            capacity,
+            len: 0,
+        })
+    }
+
+    /// Write machine code into the buffer and return a function pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// 1. `code` contains valid machine code for the current architecture.
+    /// 2. No previously returned function pointers are called after this.
+    /// 3. `code.len() <= self.capacity`.
+    #[cfg(unix)]
+    pub unsafe fn write_code<F: Copy>(&mut self, code: &[u8]) -> Result<F, &'static str> {
+        if code.is_empty() {
+            return Err("CodeBuffer: empty code");
+        }
+        if code.len() > self.capacity {
+            return Err("CodeBuffer: code exceeds buffer capacity");
+        }
+
+        // SAFETY: All unsafe operations below are protected by the function's
+        // safety contract: valid machine code, no concurrent access, code fits.
+        unsafe {
+            // Toggle to writable.
+            #[cfg(target_os = "macos")]
+            {
+                toggle_jit_write(true);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let rc = libc::mprotect(
+                    self.ptr as *mut libc::c_void,
+                    self.capacity,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                );
+                if rc != 0 {
+                    return Err("CodeBuffer: mprotect to RW failed");
+                }
+            }
+
+            // Copy code.
+            ptr::copy_nonoverlapping(code.as_ptr(), self.ptr, code.len());
+            self.len = code.len();
+
+            // Toggle to executable.
+            #[cfg(target_os = "macos")]
+            {
+                toggle_jit_write(false);
+                // Instruction cache coherence on Apple Silicon.
+                // sys_icache_invalidate is needed after writing code on ARM.
+                unsafe extern "C" {
+                    fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
+                }
+                sys_icache_invalidate(self.ptr as *mut core::ffi::c_void, code.len());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let rc = libc::mprotect(
+                    self.ptr as *mut libc::c_void,
+                    self.capacity,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                );
+                if rc != 0 {
+                    return Err("CodeBuffer: mprotect to RX failed");
+                }
+            }
+
+            Ok(core::mem::transmute_copy(&self.ptr))
+        }
+    }
+
+    /// Current code length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the buffer contains no code.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Total capacity in bytes.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl Drop for CodeBuffer {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.capacity);
+        }
+    }
+}
+
+/// Toggle JIT write protection on macOS (Apple Silicon).
+///
+/// When `writable` is true, the current thread can write to MAP_JIT memory.
+/// When false, the memory is executable but not writable (W^X).
+///
+/// This is much cheaper than mprotect (~0.5µs vs ~5µs) and is per-thread,
+/// so it doesn't affect other threads' ability to execute the code.
+#[cfg(target_os = "macos")]
+unsafe fn toggle_jit_write(writable: bool) {
+    // pthread_jit_write_protect_np(true) = write-protect (executable)
+    // pthread_jit_write_protect_np(false) = writable (not executable)
+    // Note: the semantics are inverted from what you'd expect!
+    unsafe extern "C" {
+        fn pthread_jit_write_protect_np(enabled: bool);
+    }
+    // writable=true → we want to write → disable write protection
+    // writable=false → we want to execute → enable write protection
+    // SAFETY: pthread_jit_write_protect_np is always safe to call — it only
+    // affects the calling thread's JIT write permission.
+    unsafe {
+        pthread_jit_write_protect_np(!writable);
+    }
+}
+
+// =============================================================================
 // Kernel type aliases for JIT-compiled functions
 // =============================================================================
 
@@ -135,13 +360,47 @@ use core::arch::x86_64::__m128;
 /// Args: X in v0, Y in v1, Z in v2, W in v3
 /// Returns: result in v0
 #[cfg(target_arch = "aarch64")]
-pub type KernelFn = extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
+pub type KernelFn =
+    extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
+
+/// JIT-compiled scanline kernel signature for ARM64.
+///
+/// Processes an entire scanline in a single call with no per-pixel Rust-JIT boundary.
+/// Y/Z/W stay in registers across the entire loop (loop-invariant hoisting by construction).
+///
+/// Args:
+///   x0 = pointer to input X array (128-bit aligned `float32x4_t` values)
+///   v1 = Y (broadcast, loop-invariant)
+///   v2 = Z (broadcast, loop-invariant)
+///   v3 = W (broadcast, loop-invariant)
+///   x1 = pointer to output array (128-bit aligned `float32x4_t` values)
+///   x2 = count (number of SIMD groups to process)
+#[cfg(target_arch = "aarch64")]
+pub type ScanlineKernelFn = extern "C" fn(
+    *const float32x4_t, // x_array
+    float32x4_t,        // y (broadcast)
+    float32x4_t,        // z (broadcast)
+    float32x4_t,        // w (broadcast)
+    *mut float32x4_t,   // output array
+    usize,              // count
+);
 
 /// JIT-compiled kernel signature for x86-64.
 /// Args: X in xmm0, Y in xmm1, Z in xmm2, W in xmm3
 /// Returns: result in xmm0
 #[cfg(target_arch = "x86_64")]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
+
+/// JIT-compiled scanline kernel signature for x86-64 (stub — not yet implemented).
+#[cfg(target_arch = "x86_64")]
+pub type ScanlineKernelFn = extern "C" fn(
+    *const __m128, // x_array
+    __m128,        // y (broadcast)
+    __m128,        // z (broadcast)
+    __m128,        // w (broadcast)
+    *mut __m128,   // output array
+    usize,         // count
+);
 
 // =============================================================================
 // Tests
@@ -150,6 +409,7 @@ pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
 
     #[test]
     #[cfg(target_arch = "aarch64")]
@@ -247,7 +507,7 @@ mod tests {
 
             let result = func(x, y, z, w);
             let val = vgetq_lane_f32(result, 0);
-            assert_eq!(val, 42.0);  // (2 + 5) * 6 = 42
+            assert_eq!(val, 42.0); // (2 + 5) * 6 = 42
         }
     }
 
@@ -258,8 +518,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_return_x() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Simplest: just return X
         let expr = Expr::Var(0);
@@ -282,8 +542,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_return_y() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return Y (needs MOV to v0)
         let expr = Expr::Var(1);
@@ -306,16 +566,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_add_xy() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // X + Y
-        let expr = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         let exec = compile(&expr).expect("compile failed");
 
         unsafe {
@@ -335,19 +591,19 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_complex() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // (X + Y) * Z
         let expr = Expr::Binary(
             OpKind::Mul,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Var(2)),
+            Arc::new(Expr::Var(2)),
         );
         let exec = compile(&expr).expect("compile failed");
 
@@ -361,15 +617,15 @@ mod tests {
             let w = vdupq_n_f32(0.0);
 
             let result = func(x, y, z, w);
-            assert_eq!(vgetq_lane_f32(result, 0), 42.0);  // (2+5)*6 = 42
+            assert_eq!(vgetq_lane_f32(result, 0), 42.0); // (2+5)*6 = 42
         }
     }
 
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return a constant
         let expr = Expr::Const(42.0);
@@ -392,12 +648,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_floor() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // floor(X)
-        let expr = Expr::Unary(OpKind::Floor, Box::new(Expr::Var(0)));
+        let expr = Expr::Unary(OpKind::Floor, Arc::new(Expr::Var(0)));
         let exec = compile(&expr).expect("compile failed");
 
         unsafe {
@@ -417,16 +673,16 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_mul_add() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // X * Y + Z (FMA)
         let expr = Expr::Ternary(
             OpKind::MulAdd,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-            Box::new(Expr::Var(2)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Var(1)),
+            Arc::new(Expr::Var(2)),
         );
         let exec = compile(&expr).expect("compile failed");
 
@@ -436,7 +692,7 @@ mod tests {
             use core::arch::aarch64::*;
             let x = vdupq_n_f32(6.0);
             let y = vdupq_n_f32(7.0);
-            let z = vdupq_n_f32(0.0);  // 6*7 + 0 = 42
+            let z = vdupq_n_f32(0.0); // 6*7 + 0 = 42
             let w = vdupq_n_f32(0.0);
 
             let result = func(x, y, z, w);
@@ -447,8 +703,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const_negative() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return a negative constant
         let expr = Expr::Const(-42.0);
@@ -471,8 +727,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const_pi() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return π (not a simple constant)
         let expr = Expr::Const(core::f32::consts::PI);
@@ -489,7 +745,11 @@ mod tests {
 
             let result = func(x, y, z, w);
             let val = vgetq_lane_f32(result, 0);
-            assert!((val - core::f32::consts::PI).abs() < 0.0001, "PI = {}, expected ~3.14159", val);
+            assert!(
+                (val - core::f32::consts::PI).abs() < 0.0001,
+                "PI = {}, expected ~3.14159",
+                val
+            );
         }
     }
 
@@ -534,15 +794,15 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_x_plus_const() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // X + 0.5
         let expr = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(0.5)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(0.5)),
         );
         let exec = compile(&expr).expect("compile failed");
 
@@ -563,17 +823,17 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_floor_add() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // floor(X + 0.5) - common rounding pattern
         let expr = Expr::Unary(
             OpKind::Floor,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Const(0.5)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Const(0.5)),
             )),
         );
         let exec = compile(&expr).expect("compile failed");
@@ -582,7 +842,7 @@ mod tests {
             let func: KernelFn = exec.as_fn();
 
             use core::arch::aarch64::*;
-            let x = vdupq_n_f32(41.3);  // floor(41.3 + 0.5) = floor(41.8) = 41
+            let x = vdupq_n_f32(41.3); // floor(41.3 + 0.5) = floor(41.8) = 41
             let y = vdupq_n_f32(0.0);
             let z = vdupq_n_f32(0.0);
             let w = vdupq_n_f32(0.0);
@@ -595,17 +855,17 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_horner() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // Simple Horner: c1 * x + c0 with x=0 should give c0=5.0
         // mul_add(c1=2.0, x, c0=5.0) = 2*0 + 5 = 5
         let expr = Expr::Ternary(
             OpKind::MulAdd,
-            Box::new(Expr::Const(2.0)),  // c1
-            Box::new(Expr::Var(0)),       // x
-            Box::new(Expr::Const(5.0)),   // c0
+            Arc::new(Expr::Const(2.0)), // c1
+            Arc::new(Expr::Var(0)),     // x
+            Arc::new(Expr::Const(5.0)), // c0
         );
         let exec = compile(&expr).expect("compile failed");
 
@@ -613,7 +873,7 @@ mod tests {
             let func: KernelFn = exec.as_fn();
 
             use core::arch::aarch64::*;
-            let x = vdupq_n_f32(0.0);  // 2*0 + 5 = 5
+            let x = vdupq_n_f32(0.0); // 2*0 + 5 = 5
             let y = vdupq_n_f32(0.0);
             let z = vdupq_n_f32(0.0);
             let w = vdupq_n_f32(0.0);
@@ -626,16 +886,16 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_horner_with_x() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // c1 * x + c0 with x=3 should give 2*3 + 5 = 11
         let expr = Expr::Ternary(
             OpKind::MulAdd,
-            Box::new(Expr::Const(2.0)),
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(5.0)),
+            Arc::new(Expr::Const(2.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(5.0)),
         );
         let exec = compile(&expr).expect("compile failed");
 
@@ -643,7 +903,7 @@ mod tests {
             let func: KernelFn = exec.as_fn();
 
             use core::arch::aarch64::*;
-            let x = vdupq_n_f32(3.0);  // 2*3 + 5 = 11
+            let x = vdupq_n_f32(3.0); // 2*3 + 5 = 11
             let y = vdupq_n_f32(0.0);
             let z = vdupq_n_f32(0.0);
             let w = vdupq_n_f32(0.0);
@@ -656,12 +916,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_sin_lowered() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // sin(X) - should be lowered to polynomial
-        let expr = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));
+        let expr = Expr::Unary(OpKind::Sin, Arc::new(Expr::Var(0)));
         let exec = compile(&expr).expect("compile failed");
 
         unsafe {

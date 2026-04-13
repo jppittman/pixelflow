@@ -486,10 +486,7 @@ impl SimdOps for F32x4 {
             let one = vdupq_n_f32(1.0);
             let mask_large = vcgtq_f32(r_abs, one);
             let recip_r = vdivq_f32(one, r_abs);
-            let atan_large = vsubq_f32(
-                vdupq_n_f32(PI_2),
-                vmulq_f32(recip_r, atan_approx),
-            );
+            let atan_large = vsubq_f32(vdupq_n_f32(PI_2), vmulq_f32(recip_r, atan_approx));
             let atan_val = vbslq_f32(mask_large, atan_large, atan_approx);
 
             let y_abs = vabsq_f32(y);
@@ -499,7 +496,11 @@ impl SimdOps for F32x4 {
             let zero = vdupq_n_f32(0.0);
             let mask_neg_x = vcltq_f32(x_val, zero);
             let correction = vmulq_f32(vdupq_n_f32(PI), sign_y);
-            Self(vbslq_f32(mask_neg_x, vsubq_f32(atan_signed, correction), atan_signed))
+            Self(vbslq_f32(
+                mask_neg_x,
+                vsubq_f32(atan_signed, correction),
+                atan_signed,
+            ))
         }
     }
 

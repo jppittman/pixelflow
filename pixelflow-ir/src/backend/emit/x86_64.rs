@@ -28,21 +28,14 @@ fn emit_vex_128_0f(code: &mut Vec<u8>, opcode: u8, dst: Reg, src1: Reg, src2: Re
 
     code.push(0xC4);
     code.push(r | x | b | 0x01); // map = 0F
-    code.push(vvvv | 0x00);      // W=0, L=0 (128-bit), pp=00
+    code.push(vvvv | 0x00); // W=0, L=0 (128-bit), pp=00
     code.push(opcode);
     code.push(0xC0 | ((dst.0 & 7) << 3) | (src2.0 & 7)); // ModRM
 }
 
 /// Emit a VEX-encoded 3-operand instruction with an immediate byte.
 /// VEX.128.0F: dst = op(src1, src2, imm8)
-fn emit_vex_128_0f_imm(
-    code: &mut Vec<u8>,
-    opcode: u8,
-    dst: Reg,
-    src1: Reg,
-    src2: Reg,
-    imm8: u8,
-) {
+fn emit_vex_128_0f_imm(code: &mut Vec<u8>, opcode: u8, dst: Reg, src1: Reg, src2: Reg, imm8: u8) {
     emit_vex_128_0f(code, opcode, dst, src1, src2);
     code.push(imm8);
 }
@@ -54,9 +47,7 @@ fn emit_sse_rr(code: &mut Vec<u8>, prefix: Option<u8>, opcode: &[u8], dst: Reg, 
     }
 
     // REX prefix if needed (for xmm8-xmm15)
-    let rex = 0x40
-        | (if dst.0 >= 8 { 0x04 } else { 0 })
-        | (if src.0 >= 8 { 0x01 } else { 0 });
+    let rex = 0x40 | (if dst.0 >= 8 { 0x04 } else { 0 }) | (if src.0 >= 8 { 0x01 } else { 0 });
     if rex != 0x40 {
         code.push(rex);
     }
@@ -235,8 +226,8 @@ pub fn emit_andps(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 // =============================================================================
 
 /// VCMPPS predicates
-const CMP_LT: u8 = 1;   // Less than (ordered, non-signaling)
-const CMP_NLE: u8 = 6;   // Not less-or-equal, i.e. greater than (unordered)
+const CMP_LT: u8 = 1; // Less than (ordered, non-signaling)
+const CMP_NLE: u8 = 6; // Not less-or-equal, i.e. greater than (unordered)
 
 /// VCMPPS dst, src1, src2, imm8 — packed float comparison
 ///
@@ -361,21 +352,21 @@ pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, 
 
     // poly = c7 * t² + c5
     emit_f32_const(code, s1, 0.2_f32);
-    emit_vmulps(code, s3, s3, dst);     // s3 = c7 * t²
-    emit_vaddps(code, s3, s3, s1);      // s3 = c7*t² + c5
+    emit_vmulps(code, s3, s3, dst); // s3 = c7 * t²
+    emit_vaddps(code, s3, s3, s1); // s3 = c7*t² + c5
 
     // poly = (c7*t²+c5) * t² + c3
     emit_f32_const(code, s1, -0.333333333_f32);
-    emit_vmulps(code, s3, s3, dst);     // s3 = prev * t²
-    emit_vaddps(code, s3, s3, s1);      // s3 = prev*t² + c3
+    emit_vmulps(code, s3, s3, dst); // s3 = prev * t²
+    emit_vaddps(code, s3, s3, s1); // s3 = prev*t² + c3
 
     // poly = (...) * t² + c1
     emit_f32_const(code, s1, 0.999999999_f32);
-    emit_vmulps(code, s3, s3, dst);     // s3 = prev * t²
-    emit_vaddps(code, s3, s3, s1);      // s3 = poly = prev*t² + c1
+    emit_vmulps(code, s3, s3, dst); // s3 = prev * t²
+    emit_vaddps(code, s3, s3, s1); // s3 = poly = prev*t² + c1
 
     // atan_approx = poly * r_abs
-    emit_vmulps(code, s3, s3, s2);      // s3 = atan_approx
+    emit_vmulps(code, s3, s3, s2); // s3 = atan_approx
 
     // ---- Phase 3: Handle |r| > 1 case ----
     // atan_large = π/2 - (1/r_abs) * atan_approx
@@ -384,19 +375,19 @@ pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, 
     emit_f32_const(code, s1, 1.0_f32);
 
     // mask_large = r_abs > 1.0  (all-ones where |r| > 1)
-    emit_vcmpps(code, dst, s2, s1, CMP_NLE);  // dst = mask_large
+    emit_vcmpps(code, dst, s2, s1, CMP_NLE); // dst = mask_large
 
     // s1 = 1.0 / r_abs
-    emit_vdivps(code, s1, s1, s2);     // s1 = recip_r = 1/r_abs
+    emit_vdivps(code, s1, s1, s2); // s1 = recip_r = 1/r_abs
 
     // s1 = recip_r * atan_approx
-    emit_vmulps(code, s1, s1, s3);     // s1 = recip_r * atan_approx
+    emit_vmulps(code, s1, s1, s3); // s1 = recip_r * atan_approx
 
     // s2 = π/2
     emit_f32_const(code, s2, core::f32::consts::FRAC_PI_2);
 
     // s1 = π/2 - recip_r * atan_approx = atan_large
-    emit_vsubps(code, s1, s2, s1);     // s1 = atan_large
+    emit_vsubps(code, s1, s2, s1); // s1 = atan_large
 
     // ---- Phase 4: Blend large/small case ----
     // atan_val = mask_large ? atan_large : atan_approx
@@ -404,9 +395,9 @@ pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, 
     //   s2 = dst & s1           (mask & atan_large)
     //   dst = ~dst & s3         (ANDN: ~mask & atan_approx)
     //   s2 = s2 | dst           (combine)
-    emit_vandps(code, s2, dst, s1);     // s2 = mask & atan_large
-    emit_vandnps(code, dst, dst, s3);   // dst = ~mask & atan_approx
-    emit_vorps(code, s2, s2, dst);      // s2 = atan_val (blended result)
+    emit_vandps(code, s2, dst, s1); // s2 = mask & atan_large
+    emit_vandnps(code, dst, dst, s3); // dst = ~mask & atan_approx
+    emit_vorps(code, s2, s2, dst); // s2 = atan_val (blended result)
 
     // ---- Phase 5: Sign correction (multiply by sign of y) ----
     // sign_y = y / |y|  (preserves sign, NaN-safe for zero handled by quadrant)
@@ -416,10 +407,10 @@ pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, 
     // s3 = |y|
     emit_vandps(code, s3, src_y, s1);
     // s3 = sign_y = |y| / y ... actually we want y / |y|
-    emit_vdivps(code, s3, src_y, s3);   // s3 = sign_y = y / |y|
+    emit_vdivps(code, s3, src_y, s3); // s3 = sign_y = y / |y|
 
     // s2 = atan_signed = atan_val * sign_y
-    emit_vmulps(code, s2, s2, s3);      // s2 = atan_signed
+    emit_vmulps(code, s2, s2, s3); // s2 = atan_signed
 
     // ---- Phase 6: Quadrant correction for negative x ----
     // if x < 0: result = atan_signed - π * sign_y
@@ -428,22 +419,22 @@ pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, 
     emit_vxorps(code, dst, dst, dst);
 
     // s1 = mask_neg_x = (x < 0)
-    emit_vcmpps(code, s1, src_x, dst, CMP_LT);  // s1 = mask where x < 0
+    emit_vcmpps(code, s1, src_x, dst, CMP_LT); // s1 = mask where x < 0
 
     // s0 = π * sign_y
     emit_f32_const(code, s0, core::f32::consts::PI);
-    emit_vmulps(code, s0, s0, s3);      // s0 = π * sign_y
+    emit_vmulps(code, s0, s0, s3); // s0 = π * sign_y
 
     // dst = atan_signed - correction = atan_signed - π * sign_y
-    emit_vsubps(code, dst, s2, s0);     // dst = corrected result
+    emit_vsubps(code, dst, s2, s0); // dst = corrected result
 
     // Blend: result = mask_neg_x ? corrected : atan_signed
     //   s0 = s1 & dst           (mask & corrected)
     //   s1 = ~s1 & s2           (ANDN: ~mask & atan_signed)
     //   dst = s0 | s1
-    emit_vandps(code, s0, s1, dst);     // s0 = mask & corrected
-    emit_vandnps(code, s1, s1, s2);     // s1 = ~mask & atan_signed
-    emit_vorps(code, dst, s0, s1);      // dst = final result
+    emit_vandps(code, s0, s1, dst); // s0 = mask & corrected
+    emit_vandnps(code, s1, s1, s2); // s1 = ~mask & atan_signed
+    emit_vorps(code, dst, s0, s1); // dst = final result
 }
 
 /// atan(x) = atan2(x, 1.0)
@@ -550,7 +541,10 @@ pub fn emit_binary_transcendental(
 ) {
     match op {
         OpKind::Atan2 => emit_atan2_builtin(code, dst, src1, src2, scratch),
-        _ => panic!("x86_64 binary transcendental emit not implemented for {:?}", op),
+        _ => panic!(
+            "x86_64 binary transcendental emit not implemented for {:?}",
+            op
+        ),
     }
 }
 

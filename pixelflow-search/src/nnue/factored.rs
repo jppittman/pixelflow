@@ -40,8 +40,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use libm::sqrtf;
 
+use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use crate::egraph::Pattern as Expr;
 pub use pixelflow_ir::OpKind;
-use pixelflow_ir::Expr;
 
 // ============================================================================
 // Constants
@@ -54,18 +55,18 @@ use pixelflow_ir::Expr;
 pub const K: usize = 32;
 
 /// Number of scalar features appended to the dual accumulator.
-/// Just edge_count and node_count — the accumulator handles everything else.
-pub const SCALAR_FEATURE_COUNT: usize = 2;
+/// edge_count, node_count, node_budget, epoch_budget.
+pub const SCALAR_FEATURE_COUNT: usize = 4;
 
 /// Total input dimension to the hidden layer:
-/// 4K (dual accumulator: 2K flat + 2K depth-encoded) + 2 scalars.
+/// 4K (dual accumulator: 2K flat + 2K depth-encoded) + 4 scalars.
 pub const INPUT_DIM: usize = 4 * K + SCALAR_FEATURE_COUNT;
 
-/// Graph accumulator dimension: marginals (2K) + VSA binding (K).
-pub const GRAPH_ACC_DIM: usize = 3 * K;  // 96
+/// Graph accumulator dimension: marginals (2K) + 1-hop VSA binding (K) + 2-hop VSA binding (K).
+pub const GRAPH_ACC_DIM: usize = 4 * K; // 128
 
-/// Graph backbone input: 3K + 2 scalars (edge_count, node_count).
-pub const GRAPH_INPUT_DIM: usize = GRAPH_ACC_DIM + SCALAR_FEATURE_COUNT; // 98
+/// Graph backbone input: 4K + 4 scalars (edge_count, node_count, node_budget, epoch_budget).
+pub const GRAPH_INPUT_DIM: usize = GRAPH_ACC_DIM + SCALAR_FEATURE_COUNT; // 132
 
 /// Maximum arity for child-index encoding.
 /// Effective depth = `depth * MAX_ARITY + child_index`, where child_index ∈ [0, MAX_ARITY).
@@ -79,10 +80,6 @@ pub const MAX_DEPTH: usize = 192;
 
 /// Hidden layer size.
 pub const HIDDEN_DIM: usize = 64;
-
-/// Maximum number of rewrite rules supported (legacy, for backward compat).
-/// See MASK_MAX_RULES for the new unified architecture.
-pub const MAX_RULES: usize = 64;
 
 // ============================================================================
 // Unified Mask Architecture Constants
@@ -196,7 +193,7 @@ impl RuleFeatures {
 
 /// Rule templates: LHS and RHS expressions for each rule.
 ///
-/// These use the SAME expr_embed as value/mask heads, enabling the model
+/// These use the SAME expr_embed as extraction/saturation heads, enabling the model
 /// to learn structural similarity between expressions and rule patterns.
 ///
 /// Each rule has:
@@ -282,6 +279,162 @@ impl RuleTemplates {
     pub fn has_templates(&self, rule_idx: usize) -> bool {
         self.get_lhs(rule_idx).is_some() && self.get_rhs(rule_idx).is_some()
     }
+
+    /// Returns `true` if any template (LHS or RHS) has `op` as its root operation.
+    ///
+    /// Used to skip template matching entirely for nodes whose op cannot match
+    /// any template root, avoiding expensive `to_expr` + `pattern_match` calls.
+    #[must_use]
+    pub fn has_root_op(&self, op: OpKind) -> bool {
+        for rule_idx in 0..self.len() {
+            if let Some(lhs) = self.get_lhs(rule_idx) {
+                // We match against LHS to produce RHS, but we also want
+                // expanding rewrites (RHS->LHS). Check both sides.
+                if !matches!(lhs, Expr::Var(_)) && lhs.kind() == op {
+                    return true;
+                }
+            }
+            if let Some(rhs) = self.get_rhs(rule_idx) {
+                if !matches!(rhs, Expr::Var(_)) && rhs.kind() == op {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Build a precomputed set of root ops that appear in any template.
+    ///
+    /// Returns a fixed-size array indexed by `OpKind::index()`. This turns
+    /// `has_root_op` from O(rules) to O(1) when called repeatedly.
+    #[must_use]
+    pub fn root_op_set(&self) -> [bool; OpKind::COUNT] {
+        let mut set = [false; OpKind::COUNT];
+        for rule_idx in 0..self.len() {
+            if let Some(lhs) = self.get_lhs(rule_idx) {
+                if !matches!(lhs, Expr::Var(_)) {
+                    set[lhs.kind().index()] = true;
+                }
+            }
+            if let Some(rhs) = self.get_rhs(rule_idx) {
+                if !matches!(rhs, Expr::Var(_)) {
+                    set[rhs.kind().index()] = true;
+                }
+            }
+        }
+        set
+    }
+}
+
+// ============================================================================
+// Arena Rule Templates
+// ============================================================================
+
+/// A single rule stored as two subtrees inside one shared [`ExprArena`].
+///
+/// `lhs` and `rhs` are roots inside `arena`. Either may be `None` when the
+/// corresponding pattern was not provided (same semantics as [`RuleTemplates`]).
+pub struct ArenaRuleTemplate {
+    /// Shared arena holding both the LHS and RHS subtrees.
+    pub arena: ExprArena,
+    /// Root of the LHS pattern, or `None`.
+    pub lhs: Option<ExprId>,
+    /// Root of the RHS pattern, or `None`.
+    pub rhs: Option<ExprId>,
+    /// Precomputed: LHS root op kind (if LHS is not a bare Var).
+    pub lhs_op: Option<OpKind>,
+    /// Precomputed: RHS root op kind (if RHS is not a bare Var).
+    pub rhs_op: Option<OpKind>,
+}
+
+impl ArenaRuleTemplate {
+    /// Construct from a pair of optional template patterns.
+    #[must_use]
+    pub fn from_patterns(lhs: Option<&Expr>, rhs: Option<&Expr>) -> Self {
+        let mut arena = ExprArena::with_capacity(16);
+
+        let lhs_id = lhs.map(|e| e.push_into(&mut arena));
+        let rhs_id = rhs.map(|e| e.push_into(&mut arena));
+
+        let lhs_op = lhs_id.and_then(|id| {
+            if matches!(arena.node(id), ExprNode::Var(_)) {
+                None
+            } else {
+                Some(arena.kind(id))
+            }
+        });
+        let rhs_op = rhs_id.and_then(|id| {
+            if matches!(arena.node(id), ExprNode::Var(_)) {
+                None
+            } else {
+                Some(arena.kind(id))
+            }
+        });
+
+        Self {
+            arena,
+            lhs: lhs_id,
+            rhs: rhs_id,
+            lhs_op,
+            rhs_op,
+        }
+    }
+}
+
+/// Arena-backed rule template storage.
+///
+/// Stores every rule as an [`ArenaRuleTemplate`] — tiny arenas of 2-5 nodes
+/// each — so that pattern matching and substitution can operate directly on
+/// arena nodes without the `to_expr` / `push_expr` bridge.
+pub struct ArenaRuleTemplates {
+    /// One arena-backed template per rule, indexed by rule_idx.
+    pub arenas: Vec<ArenaRuleTemplate>,
+    /// Precomputed O(1) op-membership set (same semantics as `root_op_set()`).
+    pub root_op_set: [bool; OpKind::COUNT],
+}
+
+impl ArenaRuleTemplates {
+    /// Convert [`RuleTemplates`] into arena form.
+    ///
+    /// Iterates every rule, converts LHS/RHS patterns to per-rule arenas,
+    /// and precomputes the `root_op_set` membership array.
+    #[must_use]
+    pub fn from_rule_templates(templates: &RuleTemplates) -> Self {
+        let mut arenas = Vec::with_capacity(templates.len());
+        let mut root_op_set = [false; OpKind::COUNT];
+
+        for rule_idx in 0..templates.len() {
+            let lhs = templates.get_lhs(rule_idx);
+            let rhs = templates.get_rhs(rule_idx);
+            let tmpl = ArenaRuleTemplate::from_patterns(lhs, rhs);
+
+            if let Some(op) = tmpl.lhs_op {
+                root_op_set[op.index()] = true;
+            }
+            if let Some(op) = tmpl.rhs_op {
+                root_op_set[op.index()] = true;
+            }
+
+            arenas.push(tmpl);
+        }
+
+        Self {
+            arenas,
+            root_op_set,
+        }
+    }
+
+    /// Number of rules.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.arenas.len()
+    }
+
+    /// `true` if there are no rules.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.arenas.is_empty()
+    }
 }
 
 // ============================================================================
@@ -344,47 +497,47 @@ impl OpEmbeddings {
         // Known latencies (cycles) - these are approximate and can be refined
         // Dimension 0 = latency, normalized to [0, 1] range (divide by max ~20)
         let latencies: [f32; OpKind::COUNT] = [
-            0.0,   // Var - free
-            0.0,   // Const - free
-            0.2,   // Add - 4 cycles
-            0.2,   // Sub - 4 cycles
-            0.25,  // Mul - 5 cycles
-            0.75,  // Div - 15 cycles
-            0.05,  // Neg - 1 cycle
-            0.75,  // Sqrt - 15 cycles
-            0.25,  // Rsqrt - 5 cycles (fast approximation)
-            0.05,  // Abs - 1 cycle
-            0.2,   // Min - 4 cycles
-            0.2,   // Max - 4 cycles
-            0.25,  // MulAdd - 5 cycles (fused)
-            0.5,   // Recip - 10 cycles
-            0.2,   // Floor - 4 cycles
-            0.2,   // Ceil - 4 cycles
-            0.2,   // Round - 4 cycles
-            0.2,   // Fract - 4 cycles
-            0.5,   // Sin - 10 cycles
-            0.5,   // Cos - 10 cycles
-            0.5,   // Tan - 10 cycles
-            0.5,   // Asin - 10 cycles
-            0.5,   // Acos - 10 cycles
-            0.5,   // Atan - 10 cycles
-            0.5,   // Exp - 10 cycles
-            0.5,   // Exp2 - 10 cycles
-            0.5,   // Ln - 10 cycles
-            0.5,   // Log2 - 10 cycles
-            0.5,   // Log10 - 10 cycles
-            0.5,   // Atan2 - 10 cycles
-            0.6,   // Pow - 12 cycles
-            0.4,   // Hypot - 8 cycles
-            0.15,  // Lt - 3 cycles
-            0.15,  // Le - 3 cycles
-            0.15,  // Gt - 3 cycles
-            0.15,  // Ge - 3 cycles
-            0.15,  // Eq - 3 cycles
-            0.15,  // Ne - 3 cycles
-            0.2,   // Select - 4 cycles
-            0.3,   // Clamp - 6 cycles (2x compare + select)
-            0.0,   // Tuple - free (structural)
+            0.0,  // Var - free
+            0.0,  // Const - free
+            0.2,  // Add - 4 cycles
+            0.2,  // Sub - 4 cycles
+            0.25, // Mul - 5 cycles
+            0.75, // Div - 15 cycles
+            0.05, // Neg - 1 cycle
+            0.75, // Sqrt - 15 cycles
+            0.25, // Rsqrt - 5 cycles (fast approximation)
+            0.05, // Abs - 1 cycle
+            0.2,  // Min - 4 cycles
+            0.2,  // Max - 4 cycles
+            0.25, // MulAdd - 5 cycles (fused)
+            0.5,  // Recip - 10 cycles
+            0.2,  // Floor - 4 cycles
+            0.2,  // Ceil - 4 cycles
+            0.2,  // Round - 4 cycles
+            0.2,  // Fract - 4 cycles
+            0.5,  // Sin - 10 cycles
+            0.5,  // Cos - 10 cycles
+            0.5,  // Tan - 10 cycles
+            0.5,  // Asin - 10 cycles
+            0.5,  // Acos - 10 cycles
+            0.5,  // Atan - 10 cycles
+            0.5,  // Exp - 10 cycles
+            0.5,  // Exp2 - 10 cycles
+            0.5,  // Ln - 10 cycles
+            0.5,  // Log2 - 10 cycles
+            0.5,  // Log10 - 10 cycles
+            0.5,  // Atan2 - 10 cycles
+            0.6,  // Pow - 12 cycles
+            0.4,  // Hypot - 8 cycles
+            0.15, // Lt - 3 cycles
+            0.15, // Le - 3 cycles
+            0.15, // Gt - 3 cycles
+            0.15, // Ge - 3 cycles
+            0.15, // Eq - 3 cycles
+            0.15, // Ne - 3 cycles
+            0.2,  // Select - 4 cycles
+            0.3,  // Clamp - 6 cycles (2x compare + select)
+            0.0,  // Tuple - free (structural)
         ];
 
         let mut rng_state = seed.wrapping_add(1);
@@ -396,9 +549,7 @@ impl OpEmbeddings {
 
             // Dimensions 1..K: small random for learning interactions
             for dim in 1..K {
-                rng_state = rng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1);
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let uniform = (rng_state >> 33) as f32 / (1u64 << 31) as f32;
                 self.e[op_idx][dim] = (uniform * 2.0 - 1.0) * small_scale;
             }
@@ -413,9 +564,7 @@ impl OpEmbeddings {
         for op_idx in 0..OpKind::COUNT {
             for dim in 0..K {
                 // LCG for no_std compatibility
-                rng_state = rng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1);
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
 
                 // Convert to [-1, 1] and scale
                 let uniform = (rng_state >> 33) as f32 / (1u64 << 31) as f32;
@@ -508,8 +657,12 @@ const fn const_sin(x: f64) -> f64 {
     let two_pi: f64 = 6.283185307179586;
     let mut r = x;
     // Simple modular reduction (good enough for small positive x)
-    while r > pi { r -= two_pi; }
-    while r < -pi { r += two_pi; }
+    while r > pi {
+        r -= two_pi;
+    }
+    while r < -pi {
+        r += two_pi;
+    }
     // Taylor: sin(r) = r - r^3/6 + r^5/120 - ...
     let mut result: f64 = 0.0;
     let mut term: f64 = r;
@@ -528,8 +681,12 @@ const fn const_cos(x: f64) -> f64 {
     let pi: f64 = 3.141592653589793;
     let two_pi: f64 = 6.283185307179586;
     let mut r = x;
-    while r > pi { r -= two_pi; }
-    while r < -pi { r += two_pi; }
+    while r > pi {
+        r -= two_pi;
+    }
+    while r < -pi {
+        r += two_pi;
+    }
     let mut result: f64 = 0.0;
     let mut term: f64 = 1.0;
     let r2 = r * r;
@@ -549,17 +706,30 @@ pub fn depth_pe(depth: u32) -> &'static [f32; K] {
     &DEPTH_PE[depth.min((MAX_DEPTH - 1) as u32) as usize]
 }
 
+/// Cyclic rotation by `amount % K` positions (generalised VSA permutation).
+///
+/// `shift_by(emb, 0)` is the identity, `shift_by(emb, 1)` is the original
+/// `shift1`, and higher amounts encode hierarchical depth in VSA bindings:
+/// `parent ⊙ shift_by(child, depth)` produces a distinct binding per depth
+/// level, so `Add(Add(X,Y),Z)` and `Add(X,Add(Y,Z))` yield different
+/// accumulators.
+#[inline]
+fn shift_by(emb: &[f32; K], amount: usize) -> [f32; K] {
+    let amount = amount % K;
+    let mut out = [0.0f32; K];
+    for i in 0..K {
+        out[i] = emb[(i + amount) % K];
+    }
+    out
+}
+
 /// Cyclic shift by 1 position (VSA permutation for breaking commutativity).
 ///
 /// Used by `GraphAccumulator` to ensure `parent ⊙ shift₁(child)` produces a
 /// different binding vector than `child ⊙ shift₁(parent)`, i.e. `Mul→Add ≠ Add→Mul`.
 #[inline]
 fn shift1(emb: &[f32; K]) -> [f32; K] {
-    let mut out = [0.0f32; K];
-    for i in 0..K {
-        out[i] = emb[(i + 1) % K];
-    }
-    out
+    shift_by(emb, 1)
 }
 
 // ============================================================================
@@ -601,8 +771,29 @@ pub struct EdgeAccumulator {
     /// Incremented by `from_expr_dedup` each time a subtree that was already
     /// walked is encountered again. The duplicate's edges are NOT re-added to
     /// the accumulator — this field is purely diagnostic and does NOT feed into
-    /// the network (INPUT_DIM stays at 130 to remain compatible with judge.bin).
+    /// the network.
     pub backref_count: u32,
+
+    /// E-graph node budget for this trajectory (how many nodes the saturator may create).
+    /// Serialized into the accumulator vector so the model can condition on its budget.
+    pub node_budget: u32,
+
+    /// Epoch budget for this trajectory (max saturation epochs).
+    /// Serialized into the accumulator vector alongside node_budget.
+    pub epoch_budget: u32,
+
+    // -- Variance features (fed to extraction head) --
+    /// Fraction of nodes that are compile-time constants (variance = {}).
+    pub variance_frac_const: f32,
+
+    /// Fraction of nodes that are frame-uniform (variance ⊆ {Z, W}, no X or Y).
+    pub variance_frac_frame: f32,
+
+    /// Fraction of nodes that are scanline-uniform (have Y but no X).
+    pub variance_frac_scanline: f32,
+
+    /// Fraction of nodes that are pixel-varying (have X).
+    pub variance_frac_pixel: f32,
 }
 
 impl Default for EdgeAccumulator {
@@ -620,10 +811,19 @@ impl EdgeAccumulator {
             edge_count: 0,
             node_count: 0,
             backref_count: 0,
+            node_budget: 0,
+            epoch_budget: 0,
+            variance_frac_const: 0.0,
+            variance_frac_frame: 0.0,
+            variance_frac_scanline: 0.0,
+            variance_frac_pixel: 0.0,
         }
     }
 
     /// Reset to zero state.
+    ///
+    /// Budget fields are intentionally NOT reset — they are trajectory-level
+    /// properties that should persist across epoch rebuilds.
     pub fn reset(&mut self) {
         self.values = [0.0; 4 * K];
         self.edge_count = 0;
@@ -638,14 +838,26 @@ impl EdgeAccumulator {
     /// `(real, imaginary)` for frequency `f`. PE stores `sin` at even, `cos` at
     /// odd indices. Complex: `(emb_re + j·emb_im) × (cos + j·sin)`.
     #[inline]
-    pub fn add_edge(&mut self, emb: &OpEmbeddings, parent_op: OpKind, child_op: OpKind, depth: u32) {
+    pub fn add_edge(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        child_op: OpKind,
+        depth: u32,
+    ) {
         let pe = depth_pe(depth);
         self.add_edge_with_pe(emb, parent_op, child_op, pe);
     }
 
     /// Add a single edge with caller-provided PE (used by InstructionWindow).
     #[inline]
-    pub fn add_edge_with_pe(&mut self, emb: &OpEmbeddings, parent_op: OpKind, child_op: OpKind, pe: &[f32; K]) {
+    pub fn add_edge_with_pe(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        child_op: OpKind,
+        pe: &[f32; K],
+    ) {
         let parent_emb = emb.get(parent_op);
         let child_emb = emb.get(child_op);
 
@@ -678,14 +890,26 @@ impl EdgeAccumulator {
 
     /// Remove a single edge contribution (for incremental updates).
     #[inline]
-    pub fn remove_edge(&mut self, emb: &OpEmbeddings, parent_op: OpKind, child_op: OpKind, depth: u32) {
+    pub fn remove_edge(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        child_op: OpKind,
+        depth: u32,
+    ) {
         let pe = depth_pe(depth);
         self.remove_edge_with_pe(emb, parent_op, child_op, pe);
     }
 
     /// Remove a single edge with caller-provided PE (used by InstructionWindow).
     #[inline]
-    pub fn remove_edge_with_pe(&mut self, emb: &OpEmbeddings, parent_op: OpKind, child_op: OpKind, pe: &[f32; K]) {
+    pub fn remove_edge_with_pe(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        child_op: OpKind,
+        pe: &[f32; K],
+    ) {
         let parent_emb = emb.get(parent_op);
         let child_emb = emb.get(child_op);
 
@@ -713,17 +937,6 @@ impl EdgeAccumulator {
         self.edge_count = self.edge_count.saturating_sub(1);
     }
 
-    /// Build dual accumulator from expression tree.
-    ///
-    /// Does a naive tree walk — safe for trees that have no shared subtrees
-    /// (leaf-only exprs, rule templates). For CSE-containing extracted trees
-    /// use [`from_expr_dedup`](Self::from_expr_dedup).
-    pub fn from_expr(expr: &Expr, emb: &OpEmbeddings) -> Self {
-        let mut acc = Self::new();
-        Self::collect_recursive(expr, emb, &mut acc, 0);
-        acc
-    }
-
     /// Build dual accumulator from expression tree, deduplicating shared subtrees.
     ///
     /// Uses structural (content-based) hashing to detect subtrees that appear
@@ -734,7 +947,7 @@ impl EdgeAccumulator {
     ///
     /// `INPUT_DIM` and the weight layout are unchanged — `backref_count` is a
     /// diagnostic field and does not feed into the forward pass, so this method
-    /// is fully compatible with the trained `judge.bin`.
+    /// is fully compatible with the trained extraction head weights (`judge.bin`).
     pub fn from_expr_dedup(expr: &Expr, emb: &OpEmbeddings) -> Self {
         let mut acc = Self::new();
         let mut seen: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
@@ -765,7 +978,9 @@ impl EdgeAccumulator {
 
             match node {
                 Expr::Var(_) | Expr::Const(_) => {}
-                Expr::Param(i) => panic!("Expr::Param({i}) reached NNUE cost model — call substitute_params before use"),
+                Expr::Param(i) => panic!(
+                    "Expr::Param({i}) reached NNUE cost model — call substitute_params before use"
+                ),
                 Expr::Unary(_, child) => {
                     let eff_depth = d * MAX_ARITY as u32;
                     acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
@@ -799,48 +1014,58 @@ impl EdgeAccumulator {
         }
     }
 
-    fn collect_recursive(expr: &Expr, emb: &OpEmbeddings, acc: &mut Self, depth: u32) {
-        // Iterative traversal with explicit stack to avoid thread stack overflow
-        // on deep expression trees.
-        let mut stack: alloc::vec::Vec<(&Expr, u32)> = alloc::vec![(expr, depth)];
+    /// Build dual accumulator from an arena DAG, counting each shared node once.
+    #[must_use]
+    pub fn from_arena_dedup(arena: &ExprArena, root: ExprId, emb: &OpEmbeddings) -> Self {
+        use alloc::collections::BTreeSet;
 
-        while let Some((node, d)) = stack.pop() {
-            let parent_op = node.op_type();
+        let mut acc = Self::new();
+        let mut seen = BTreeSet::<ExprId>::new();
+        let mut stack: Vec<(ExprId, u32)> = alloc::vec![(root, 0)];
+
+        while let Some((id, depth)) = stack.pop() {
+            if !seen.insert(id) {
+                acc.backref_count += 1;
+                continue;
+            }
+
             acc.node_count += 1;
-
-            match node {
-                Expr::Var(_) | Expr::Const(_) => {}
-                Expr::Param(i) => panic!("Expr::Param({i}) reached NNUE cost model — call substitute_params before use"),
-                Expr::Unary(_, child) => {
-                    let eff_depth = d * MAX_ARITY as u32;
-                    acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
-                    stack.push((child, d + 1));
+            match arena.node(id) {
+                ExprNode::Var(_) | ExprNode::Const(_) => {}
+                ExprNode::Param(i) => {
+                    panic!("ExprNode::Param({i}) reached NNUE cost model — substitute params first")
                 }
-                Expr::Binary(_, left, right) => {
-                    acc.add_edge(emb, parent_op, left.op_type(), d * MAX_ARITY as u32);
-                    acc.add_edge(emb, parent_op, right.op_type(), d * MAX_ARITY as u32 + 1);
-                    stack.push((right, d + 1));
-                    stack.push((left, d + 1));
+                ExprNode::Unary(op, child) => {
+                    acc.add_edge(emb, *op, arena.kind(*child), depth * MAX_ARITY as u32);
+                    stack.push((*child, depth + 1));
                 }
-                Expr::Ternary(_, a, b, c) => {
-                    acc.add_edge(emb, parent_op, a.op_type(), d * MAX_ARITY as u32);
-                    acc.add_edge(emb, parent_op, b.op_type(), d * MAX_ARITY as u32 + 1);
-                    acc.add_edge(emb, parent_op, c.op_type(), d * MAX_ARITY as u32 + 2);
-                    stack.push((c, d + 1));
-                    stack.push((b, d + 1));
-                    stack.push((a, d + 1));
+                ExprNode::Binary(op, left, right) => {
+                    acc.add_edge(emb, *op, arena.kind(*left), depth * MAX_ARITY as u32);
+                    acc.add_edge(emb, *op, arena.kind(*right), depth * MAX_ARITY as u32 + 1);
+                    stack.push((*right, depth + 1));
+                    stack.push((*left, depth + 1));
                 }
-                Expr::Nary(_, children) => {
-                    for (idx, child) in children.iter().enumerate() {
-                        let eff_depth = d * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                        acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
+                ExprNode::Ternary(op, a, b, c) => {
+                    acc.add_edge(emb, *op, arena.kind(*a), depth * MAX_ARITY as u32);
+                    acc.add_edge(emb, *op, arena.kind(*b), depth * MAX_ARITY as u32 + 1);
+                    acc.add_edge(emb, *op, arena.kind(*c), depth * MAX_ARITY as u32 + 2);
+                    stack.push((*c, depth + 1));
+                    stack.push((*b, depth + 1));
+                    stack.push((*a, depth + 1));
+                }
+                ExprNode::Nary(op, _, _) => {
+                    for (idx, child) in arena.children(id).enumerate() {
+                        let eff_depth = depth * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
+                        acc.add_edge(emb, *op, arena.kind(child), eff_depth);
                     }
-                    for child in children.iter().rev() {
-                        stack.push((child, d + 1));
+                    for child in arena.children(id) {
+                        stack.push((child, depth + 1));
                     }
                 }
             }
         }
+
+        acc
     }
 
     /// Remove all edges from an expression subtree.
@@ -858,7 +1083,9 @@ impl EdgeAccumulator {
 
             match node {
                 Expr::Var(_) | Expr::Const(_) => {}
-                Expr::Param(i) => panic!("Expr::Param({i}) reached NNUE cost model — call substitute_params before use"),
+                Expr::Param(i) => panic!(
+                    "Expr::Param({i}) reached NNUE cost model — call substitute_params before use"
+                ),
                 Expr::Unary(_, child) => {
                     let eff_depth = d * MAX_ARITY as u32;
                     acc.remove_edge(emb, parent_op, child.op_type(), eff_depth);
@@ -902,10 +1129,201 @@ impl EdgeAccumulator {
         self.node_count += other.node_count;
         self.backref_count += other.backref_count;
     }
+
+    // ========================================================================
+    // DAG-Aware Accumulator Construction
+    // ========================================================================
+
+    /// Build accumulator from e-graph extraction choices with DAG-aware sharing.
+    ///
+    /// For each reachable e-class:
+    /// - If `ref_count[class] == 1`: add edges normally (unique use).
+    /// - If `ref_count[class] > 1`: add edges once (the computation), plus
+    ///   `(ref_count - 1)` Var->parent edges (register loads for reuse).
+    ///
+    /// This matches what the JIT emits: shared subexpressions become let-bindings,
+    /// and subsequent uses are cheap register loads.
+    pub fn from_dag_choices(
+        egraph: &crate::egraph::EGraph,
+        root: crate::egraph::EClassId,
+        choices: &[Option<usize>],
+        ref_count: &[u32],
+        emb: &OpEmbeddings,
+    ) -> Self {
+        Self::from_dag_choices_with_variance(egraph, root, choices, ref_count, emb, None)
+    }
+
+    /// Build accumulator from DAG choices, optionally incorporating variance analysis.
+    ///
+    /// If `variance_analysis` is provided, the accumulator's variance histogram
+    /// features are populated (fraction of nodes at each variance level).
+    pub fn from_dag_choices_with_variance(
+        egraph: &crate::egraph::EGraph,
+        root: crate::egraph::EClassId,
+        choices: &[Option<usize>],
+        ref_count: &[u32],
+        emb: &OpEmbeddings,
+        variance_analysis: Option<&crate::egraph::deps::DepsAnalysis>,
+    ) -> Self {
+        use crate::egraph::{EClassId, ENode};
+
+        let mut acc = Self::new();
+        let num_classes = egraph.num_classes();
+        let mut expanded = alloc::vec![false; num_classes];
+        // Variance counters
+        let mut n_const: u32 = 0;
+        let mut n_frame: u32 = 0;
+        let mut n_scanline: u32 = 0;
+        let mut n_pixel: u32 = 0;
+        // Stack: (class_id, depth)
+        let mut stack: alloc::vec::Vec<(EClassId, u32)> = alloc::vec![(root, 0)];
+
+        while let Some((class, depth)) = stack.pop() {
+            let canonical = egraph.find(class);
+            let idx = canonical.0 as usize;
+
+            if idx >= num_classes {
+                panic!(
+                    "from_dag_choices: e-class {} out of bounds (num_classes={})",
+                    canonical.0, num_classes
+                );
+            }
+
+            // Always increment node_count on first expansion.
+            // Subsequent visits to a shared node only add var_ref edges.
+            if expanded[idx] {
+                continue;
+            }
+            expanded[idx] = true;
+
+            let node_idx = match choices[idx] {
+                Some(ni) => ni,
+                None => continue, // Unreachable class — skip
+            };
+
+            let nodes = egraph.nodes(canonical);
+            if node_idx >= nodes.len() {
+                panic!(
+                    "from_dag_choices: node_idx {} out of bounds for e-class {} (has {} nodes)",
+                    node_idx,
+                    canonical.0,
+                    nodes.len()
+                );
+            }
+
+            let node = &nodes[node_idx];
+            acc.node_count += 1;
+
+            // Classify this node's variance if analysis is available
+            if let Some(va) = variance_analysis {
+                let v = va.get(egraph, canonical);
+                if v.is_const() {
+                    n_const += 1;
+                } else if v.is_x_invariant() && !v.depends_on_y() {
+                    // Frame-uniform: depends only on Z/W (no X, no Y)
+                    n_frame += 1;
+                } else if v.is_x_invariant() {
+                    // Scanline-uniform: depends on Y (but not X)
+                    n_scanline += 1;
+                } else {
+                    // Pixel-varying: depends on X
+                    n_pixel += 1;
+                }
+            }
+
+            match node {
+                ENode::Var(_) | ENode::Const(_) => {
+                    // Leaf: no edges to add. If shared, ref loads are zero-cost
+                    // (it's just a variable or constant).
+                }
+                ENode::Op { op, children } => {
+                    let parent_op = op.kind();
+
+                    // Add edges for this node's children (the computation edges).
+                    for (child_idx, &child_class) in children.iter().enumerate() {
+                        let child_canonical = egraph.find(child_class);
+                        let child_node_idx = choices[child_canonical.0 as usize].unwrap_or(0);
+                        let child_nodes = egraph.nodes(child_canonical);
+                        let child_op = if child_node_idx < child_nodes.len() {
+                            match &child_nodes[child_node_idx] {
+                                ENode::Var(_) => OpKind::Var,
+                                ENode::Const(_) => OpKind::Const,
+                                ENode::Op { op: cop, .. } => cop.kind(),
+                            }
+                        } else {
+                            OpKind::Var // fallback
+                        };
+
+                        let eff_depth =
+                            depth * MAX_ARITY as u32 + (child_idx.min(MAX_ARITY - 1)) as u32;
+                        acc.add_edge(emb, parent_op, child_op, eff_depth);
+
+                        // Push child for expansion
+                        stack.push((child_class, depth + 1));
+                    }
+
+                    // For shared children: add (ref_count - 1) var_ref edges.
+                    // These represent register loads at subsequent use sites.
+                    for (child_idx, &child_class) in children.iter().enumerate() {
+                        let child_canonical = egraph.find(child_class);
+                        let rc = ref_count
+                            .get(child_canonical.0 as usize)
+                            .copied()
+                            .unwrap_or(1);
+                        if rc > 1 {
+                            let eff_depth =
+                                depth * MAX_ARITY as u32 + (child_idx.min(MAX_ARITY - 1)) as u32;
+                            acc.add_var_ref_edges(emb, parent_op, eff_depth, rc - 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Populate variance histogram fractions
+        if variance_analysis.is_some() && acc.node_count > 0 {
+            let total = acc.node_count as f32;
+            acc.variance_frac_const = n_const as f32 / total;
+            acc.variance_frac_frame = n_frame as f32 / total;
+            acc.variance_frac_scanline = n_scanline as f32 / total;
+            acc.variance_frac_pixel = n_pixel as f32 / total;
+        }
+
+        acc
+    }
+
+    /// Add N var-reference edges (representing register loads of a shared value).
+    ///
+    /// Each var-ref edge is `(Var, parent_op)` at the given depth. This tells the
+    /// extraction head: "this parent loads a let-bound value N times."
+    pub fn add_var_ref_edges(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        depth: u32,
+        count: u32,
+    ) {
+        for _ in 0..count {
+            self.add_edge(emb, parent_op, OpKind::Var, depth);
+        }
+    }
+
+    /// Remove N var-reference edges (inverse of `add_var_ref_edges`).
+    pub fn remove_var_ref_edges(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        depth: u32,
+        count: u32,
+    ) {
+        for _ in 0..count {
+            self.remove_edge(emb, parent_op, OpKind::Var, depth);
+        }
+    }
 }
 
 // ============================================================================
-// Graph Accumulator (VSA encoding of e-graph state for mask head)
+// Graph Accumulator (VSA encoding of e-graph state for saturation head)
 // ============================================================================
 
 /// VSA accumulator for e-graph state (rebuilt each epoch).
@@ -916,25 +1334,38 @@ impl EdgeAccumulator {
 /// |---------|-----|-----------|--------|
 /// | `[0..K]` | K | `Σ E[parent]` | Marginal: which ops appear as parents |
 /// | `[K..2K]` | K | `Σ E[child]` | Marginal: which ops appear as children |
-/// | `[2K..3K]` | K | `Σ E[parent] ⊙ shift₁(E[child])` | **VSA binding**: which ops are connected |
+/// | `[2K..3K]` | K | `Σ E[parent] ⊙ shift₁(E[child])` | **1-hop VSA binding**: which ops are connected |
+/// | `[3K..4K]` | K | `Σ E[gp] ⊙ shift₁(E[par]) ⊙ shift²(E[child])` | **2-hop VSA binding**: 3-node path patterns |
 ///
-/// The binding section uses element-wise Hadamard product with a cyclic shift to
+/// The 1-hop binding section uses element-wise Hadamard product with a cyclic shift to
 /// break commutativity (`Mul→Add ≠ Add→Mul`). This captures the **joint**
 /// distribution of parent-child pairs — strictly more informative than marginals
-/// alone. The downstream backbone learns to decode the bundled representation.
+/// alone.
 ///
-/// Shares `OpEmbeddings` with the value head — same learned op embeddings,
+/// The 2-hop binding section extends this to 3-node paths (grandparent→parent→child),
+/// capturing patterns like "Mul feeding Add feeding Sqrt" which is exactly what
+/// rewrite rules match on. This turns the accumulator from a 0-round GNN into
+/// a 1-round GNN.
+///
+/// The downstream backbone learns to decode the bundled representation.
+///
+/// Shares `OpEmbeddings` with the extraction head — same learned op embeddings,
 /// different downstream pathway.
 #[derive(Clone)]
 pub struct GraphAccumulator {
-    /// `[0..K]`:    marginal parent sum  `Σ E[parent]`
-    /// `[K..2K]`:   marginal child sum   `Σ E[child]`
-    /// `[2K..3K]`:  VSA binding sum      `Σ E[parent] ⊙ shift₁(E[child])`
+    /// `[0..K]`:    marginal parent sum     `Σ E[parent]`
+    /// `[K..2K]`:   marginal child sum      `Σ E[child]`
+    /// `[2K..3K]`:  1-hop VSA binding sum   `Σ E[parent] ⊙ shift_by(E[child], depth)`
+    /// `[3K..4K]`:  2-hop VSA binding sum   `Σ E[gp] ⊙ shift₁(E[par]) ⊙ shift²(E[child])`
     pub values: [f32; GRAPH_ACC_DIM],
     /// Number of edges added to the accumulator.
     pub edge_count: u32,
     /// Number of nodes (ops + leaves) in the graph.
     pub node_count: u32,
+    /// E-graph node budget for this trajectory (how many nodes the saturator may create).
+    pub node_budget: u32,
+    /// Epoch budget for this trajectory (max saturation epochs).
+    pub epoch_budget: u32,
 }
 
 impl Default for GraphAccumulator {
@@ -951,31 +1382,57 @@ impl GraphAccumulator {
             values: [0.0; GRAPH_ACC_DIM],
             edge_count: 0,
             node_count: 0,
+            node_budget: 0,
+            epoch_budget: 0,
         }
     }
 
     /// Reset to zero state.
+    ///
+    /// Budget fields are intentionally NOT reset — they are trajectory-level
+    /// properties that should persist across epoch rebuilds.
     pub fn reset(&mut self) {
         self.values = [0.0; GRAPH_ACC_DIM];
         self.edge_count = 0;
         self.node_count = 0;
     }
 
-    /// Add a single edge with VSA encoding.
+    /// Add a single edge with depth-aware VSA encoding.
     ///
     /// Updates all three sections: marginal parent, marginal child, and
-    /// VSA binding (`E[parent] ⊙ shift₁(E[child])`).
+    /// VSA binding (`E[parent] ⊙ shift_by(E[child], depth % K)`).
+    ///
+    /// At `depth == 0` the shift is the identity (root edges), `depth == 1`
+    /// shifts by 1 (matching the original `shift1` behavior), `depth == 2`
+    /// shifts by 2, etc. This encodes hierarchical position into the binding
+    /// without any extra parameters.
     #[inline]
-    pub fn add_edge(&mut self, emb: &OpEmbeddings, parent_op: OpKind, child_op: OpKind) {
+    pub fn add_edge_at_depth(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        child_op: OpKind,
+        depth: usize,
+    ) {
         let p = emb.get(parent_op);
         let c = emb.get(child_op);
-        let c_shifted = shift1(c);
+        let c_shifted = shift_by(c, depth);
         for i in 0..K {
-            self.values[i] += p[i];                        // marginal parent
-            self.values[K + i] += c[i];                    // marginal child
+            self.values[i] += p[i]; // marginal parent
+            self.values[K + i] += c[i]; // marginal child
             self.values[2 * K + i] += p[i] * c_shifted[i]; // VSA binding
         }
         self.edge_count += 1;
+    }
+
+    /// Add a single edge with VSA encoding (backward-compatible, depth = 1).
+    ///
+    /// Equivalent to `add_edge_at_depth(emb, parent_op, child_op, 1)`.
+    /// Preserves the original `shift1` behavior for callers that do not
+    /// track depth.
+    #[inline]
+    pub fn add_edge(&mut self, emb: &OpEmbeddings, parent_op: OpKind, child_op: OpKind) {
+        self.add_edge_at_depth(emb, parent_op, child_op, 1);
     }
 
     /// Add a leaf node (Var/Const) — no edges, just increment node count.
@@ -983,14 +1440,214 @@ impl GraphAccumulator {
         self.node_count += 1;
     }
 
-    /// Add an Op node and all its edges to children.
+    /// Add an Op node and all its edges to children, with depth-aware VSA.
     ///
-    /// Emits one edge per child and increments `node_count` once.
-    pub fn add_op_node(&mut self, emb: &OpEmbeddings, op: OpKind, child_ops: &[OpKind]) {
+    /// Emits one `add_edge_at_depth` per child and increments `node_count`
+    /// once.  The `depth` parameter is the depth of `op` in the expression
+    /// tree (0 = root).
+    pub fn add_op_node_at_depth(
+        &mut self,
+        emb: &OpEmbeddings,
+        op: OpKind,
+        child_ops: &[OpKind],
+        depth: usize,
+    ) {
         for &child_op in child_ops {
-            self.add_edge(emb, op, child_op);
+            self.add_edge_at_depth(emb, op, child_op, depth);
         }
         self.node_count += 1;
+    }
+
+    /// Add an Op node and all its edges to children (backward-compatible, depth = 1).
+    ///
+    /// Equivalent to `add_op_node_at_depth(emb, op, child_ops, 1)`.
+    pub fn add_op_node(&mut self, emb: &OpEmbeddings, op: OpKind, child_ops: &[OpKind]) {
+        self.add_op_node_at_depth(emb, op, child_ops, 1);
+    }
+
+    // ========== Incremental Removal (inverse of addition) ==========
+
+    /// Remove a single edge with depth-aware VSA encoding — the exact
+    /// inverse of [`add_edge_at_depth`].
+    ///
+    /// Subtracts (instead of adds) the parent, child, and VSA binding
+    /// contributions from each section. Decrements `edge_count` via
+    /// saturating subtraction so underflow clamps to zero rather than
+    /// wrapping.
+    ///
+    /// # Contract
+    ///
+    /// Callers must only remove edges that were previously added at the
+    /// same `depth`. Removing an edge that was never added will corrupt
+    /// the accumulator values (negative contributions) and is a logic
+    /// error.
+    #[inline]
+    pub fn remove_edge_at_depth(
+        &mut self,
+        emb: &OpEmbeddings,
+        parent_op: OpKind,
+        child_op: OpKind,
+        depth: usize,
+    ) {
+        let p = emb.get(parent_op);
+        let c = emb.get(child_op);
+        let c_shifted = shift_by(c, depth);
+        for i in 0..K {
+            self.values[i] -= p[i]; // marginal parent
+            self.values[K + i] -= c[i]; // marginal child
+            self.values[2 * K + i] -= p[i] * c_shifted[i]; // VSA binding
+        }
+        self.edge_count = self.edge_count.saturating_sub(1);
+    }
+
+    /// Remove a single edge (backward-compatible, depth = 1) — the exact
+    /// inverse of [`add_edge`].
+    ///
+    /// Equivalent to `remove_edge_at_depth(emb, parent_op, child_op, 1)`.
+    #[inline]
+    pub fn remove_edge(&mut self, emb: &OpEmbeddings, parent_op: OpKind, child_op: OpKind) {
+        self.remove_edge_at_depth(emb, parent_op, child_op, 1);
+    }
+
+    /// Remove an Op node and all its edges to children with depth-aware
+    /// VSA — the exact inverse of [`add_op_node_at_depth`].
+    ///
+    /// Calls [`remove_edge_at_depth`] for each child and decrements
+    /// `node_count`.
+    pub fn remove_op_node_at_depth(
+        &mut self,
+        emb: &OpEmbeddings,
+        op: OpKind,
+        child_ops: &[OpKind],
+        depth: usize,
+    ) {
+        for &child_op in child_ops {
+            self.remove_edge_at_depth(emb, op, child_op, depth);
+        }
+        self.node_count = self.node_count.saturating_sub(1);
+    }
+
+    /// Remove an Op node and all its edges (backward-compatible, depth = 1)
+    /// — the exact inverse of [`add_op_node`].
+    ///
+    /// Equivalent to `remove_op_node_at_depth(emb, op, child_ops, 1)`.
+    pub fn remove_op_node(&mut self, emb: &OpEmbeddings, op: OpKind, child_ops: &[OpKind]) {
+        self.remove_op_node_at_depth(emb, op, child_ops, 1);
+    }
+
+    /// Remove a leaf node — the exact inverse of [`add_leaf`].
+    ///
+    /// Decrements `node_count` only (leaves contribute no edges).
+    pub fn remove_leaf(&mut self) {
+        self.node_count = self.node_count.saturating_sub(1);
+    }
+
+    // ========== 2-hop Message Passing (1-round GNN) ==========
+
+    /// Add a 2-hop (grandparent→parent→child) binding to the `[3K..4K]` section.
+    ///
+    /// Encodes 3-node path patterns like "Mul feeding Add feeding Sqrt" using
+    /// the VSA triple product `E[grandparent] ⊙ shift₁(E[parent]) ⊙ shift²(E[child])`.
+    /// The shift amounts break commutativity: `A→B→C` produces a different
+    /// binding than any permutation of {A, B, C}.
+    ///
+    /// Does NOT modify the `[0..3K]` sections or `edge_count`/`node_count` —
+    /// those are maintained by `add_edge*` / `add_op_node*`.
+    #[inline]
+    pub fn add_2hop_edge(
+        &mut self,
+        emb: &OpEmbeddings,
+        grandparent_op: OpKind,
+        parent_op: OpKind,
+        child_op: OpKind,
+    ) {
+        let gp = emb.get(grandparent_op);
+        let p = shift1(emb.get(parent_op));
+        let c = shift_by(emb.get(child_op), 2);
+        for i in 0..K {
+            self.values[3 * K + i] += gp[i] * p[i] * c[i];
+        }
+    }
+
+    /// Remove a 2-hop (grandparent→parent→child) binding — the exact inverse
+    /// of [`add_2hop_edge`].
+    ///
+    /// Subtracts the triple-product contribution from the `[3K..4K]` section.
+    ///
+    /// # Contract
+    ///
+    /// Callers must only remove 2-hop edges that were previously added with
+    /// the same (grandparent, parent, child) triple. Removing a path that was
+    /// never added will corrupt the accumulator values and is a logic error.
+    #[inline]
+    pub fn remove_2hop_edge(
+        &mut self,
+        emb: &OpEmbeddings,
+        grandparent_op: OpKind,
+        parent_op: OpKind,
+        child_op: OpKind,
+    ) {
+        let gp = emb.get(grandparent_op);
+        let p = shift1(emb.get(parent_op));
+        let c = shift_by(emb.get(child_op), 2);
+        for i in 0..K {
+            self.values[3 * K + i] -= gp[i] * p[i] * c[i];
+        }
+    }
+
+    /// Return a copy with each of the four sections independently L2-normalized.
+    ///
+    /// Raw sums grow proportionally to edge count, so a 200-edge graph has
+    /// values ~20x larger than a 10-edge graph.  Normalizing makes the
+    /// embedding scale-invariant: small rewrites on large graphs become visible
+    /// instead of being swamped by magnitude.
+    ///
+    /// Each section is normalized independently because they represent different
+    /// quantities with different natural scales:
+    /// - `[0..K]`    marginal parent sums
+    /// - `[K..2K]`   marginal child sums
+    /// - `[2K..3K]`  1-hop VSA binding sums
+    /// - `[3K..4K]`  2-hop VSA binding sums
+    ///
+    /// Scalar fields (`edge_count`, `node_count`, etc.) are copied as-is.
+    ///
+    /// A zero-norm section (no edges accumulated) is left as all-zeros rather
+    /// than producing NaN/Inf.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        let mut out = self.clone();
+        out.normalize_in_place();
+        out
+    }
+
+    /// L2-normalize each of the four sections in place.
+    ///
+    /// See [`normalized`](Self::normalized) for rationale.
+    pub fn normalize_in_place(&mut self) {
+        l2_normalize_section(&mut self.values, 0, K);
+        l2_normalize_section(&mut self.values, K, 2 * K);
+        l2_normalize_section(&mut self.values, 2 * K, 3 * K);
+        l2_normalize_section(&mut self.values, 3 * K, 4 * K);
+    }
+}
+
+/// L2-normalize a contiguous slice `values[start..end]` in place.
+///
+/// If the section norm is zero (or negligibly small), it is left untouched
+/// to avoid division by zero.
+fn l2_normalize_section(values: &mut [f32], start: usize, end: usize) {
+    let mut sum_sq: f32 = 0.0;
+    for i in start..end {
+        sum_sq += values[i] * values[i];
+    }
+    let norm = sqrtf(sum_sq);
+    // Guard: skip normalization for zero/near-zero sections to avoid NaN/Inf.
+    if norm < 1e-12 {
+        return;
+    }
+    let inv_norm = 1.0 / norm;
+    for i in start..end {
+        values[i] *= inv_norm;
     }
 }
 
@@ -1014,7 +1671,7 @@ impl GraphAccumulator {
 #[must_use]
 pub fn structural_hash(expr: &Expr) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64  = 0x0000_0100_0000_01b3;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
     fn mix(mut h: u64, bytes: &[u8]) -> u64 {
         for &b in bytes {
@@ -1098,7 +1755,10 @@ fn extract_edges_recursive(expr: &Expr, edges: &mut Vec<Edge>) {
 
     match expr {
         Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        Expr::Param(i) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
         Expr::Unary(_, child) => {
             edges.push(Edge {
                 parent,
@@ -1151,18 +1811,18 @@ fn extract_edges_recursive(expr: &Expr, edges: &mut Vec<Edge>) {
 // Dual-Head NNUE (AlphaZero-style)
 // ============================================================================
 
-/// ExprNnue: shared backbone with one value head (Value MLP) and one policy head (bilinear mask).
+/// ExprNnue: shared backbone with one extraction head (Value MLP) and one saturation head (bilinear mask).
 ///
 /// ## Architecture
 ///
 /// ```text
 /// expr → OpEmbeddings → EdgeAccumulator → hidden [64] → expr_proj → expr_embed [24]
-///                                                            ├─→ value_mlp → cost (Judge)
-///                                                            └─→ [embed, cost] → mask_mlp → bilinear → policy (Guide)
+///                                                            ├─→ value_mlp → cost (extraction head)
+///                                                            └─→ [embed, cost] → mask_mlp → bilinear → score (saturation head)
 /// ```
 ///
-/// **Value head**: `expr_embed → value_mlp (24→16→1)` predicts log-nanosecond cost.
-/// **Policy head**: `[expr_embed, value_pred] → mask_mlp → bilinear(mask_features, rule_embed)` scores rules.
+/// **Extraction head**: `expr_embed → value_mlp (24→16→1)` predicts log-nanosecond cost.
+/// **Saturation head**: `[expr_embed, value_pred] → mask_mlp → bilinear(mask_features, rule_embed)` scores rules.
 ///
 /// Rule embeddings come from LHS/RHS templates via `rule_proj`, not from learned per-rule embeddings.
 #[derive(Clone)]
@@ -1177,10 +1837,17 @@ pub struct ExprNnue {
     /// Hidden layer biases: [HIDDEN_DIM] (64 params)
     pub b1: [f32; HIDDEN_DIM],
 
+    /// Shared trunk weights: [HIDDEN_DIM][HIDDEN_DIM] (64 x 64 = 4,096 params).
+    /// Both edge tower and graph tower outputs pass through this layer before
+    /// reaching their task-specific projection heads.
+    /// This is the "deep conceptual representation" shared between extraction and saturation.
+    pub trunk_w: [[f32; HIDDEN_DIM]; HIDDEN_DIM],
+    /// Shared trunk biases: [HIDDEN_DIM] (64 params).
+    pub trunk_b: [f32; HIDDEN_DIM],
+
     // ========== UNIFIED MASK ARCHITECTURE ==========
     // These fields support the new bilinear expr-rule interaction model
     // that scales to 1000+ rules.
-
     /// Projects backbone hidden (64) to shared expr embedding (EMBED_DIM=24).
     /// Weights: [HIDDEN_DIM x EMBED_DIM]
     pub expr_proj_w: [[f32; EMBED_DIM]; HIDDEN_DIM],
@@ -1219,10 +1886,9 @@ pub struct ExprNnue {
 
     // ========== RULE TEMPLATE PROJECTION (LHS/RHS embeddings) ==========
     // These fields support encoding rules from their LHS/RHS expression
-    // templates using the SAME expr_embed as value/mask heads.
+    // templates using the SAME expr_embed as extraction/saturation heads.
     //
     // 4-way concat: [z_LHS | z_RHS | z_LHS-z_RHS | z_LHS*z_RHS] (96) → rule_embed (24)
-
     /// Rule projection weights: [RULE_CONCAT_DIM x EMBED_DIM] = [96 x 24] = 2,304 params.
     /// Projects 4-way concatenation to rule embedding.
     pub rule_proj_w: [[f32; EMBED_DIM]; RULE_CONCAT_DIM],
@@ -1235,11 +1901,10 @@ pub struct ExprNnue {
     /// Learned bias projection: produces per-rule bias via dot(mask_bias_proj, rule_embed)
     pub mask_bias_proj: [f32; EMBED_DIM],
 
-    // ========== GRAPH STATE BACKBONE (for mask head) ==========
+    // ========== GRAPH STATE BACKBONE (for saturation head) ==========
     // Separate pathway: GraphAccumulator (VSA e-graph state) → graph_w1 → graph_proj → mask_mlp → bilinear
-    // The value head path (EdgeAccumulator → w1 → expr_proj) is completely unchanged.
-
-    /// Graph backbone weights: [GRAPH_INPUT_DIM][HIDDEN_DIM] (98 × 64 = 6,272 params)
+    // The extraction head path (EdgeAccumulator → w1 → expr_proj) is completely unchanged.
+    /// Graph backbone weights: [GRAPH_INPUT_DIM][HIDDEN_DIM] (132 × 64 = 8,448 params)
     pub graph_w1: [[f32; HIDDEN_DIM]; GRAPH_INPUT_DIM],
     /// Graph backbone biases: [HIDDEN_DIM] (64 params)
     pub graph_b1: [f32; HIDDEN_DIM],
@@ -1265,6 +1930,10 @@ impl ExprNnue {
             w1: [[0.0; HIDDEN_DIM]; INPUT_DIM],
             b1: [0.0; HIDDEN_DIM],
 
+            // Shared trunk (zero-init)
+            trunk_w: [[0.0; HIDDEN_DIM]; HIDDEN_DIM],
+            trunk_b: [0.0; HIDDEN_DIM],
+
             // Unified mask architecture
             expr_proj_w: [[0.0; EMBED_DIM]; HIDDEN_DIM],
             expr_proj_b: [0.0; EMBED_DIM],
@@ -1274,7 +1943,7 @@ impl ExprNnue {
             value_mlp_w2: [0.0; MLP_HIDDEN],
             value_mlp_b2: 5.0, // Start near typical log-cost
 
-            mask_mlp_w1: [[0.0; MLP_HIDDEN]; MASK_INPUT_DIM],  // 24 × 16
+            mask_mlp_w1: [[0.0; MLP_HIDDEN]; MASK_INPUT_DIM], // 24 × 16
             mask_mlp_b1: [0.0; MLP_HIDDEN],
             mask_mlp_w2: [[0.0; EMBED_DIM]; MLP_HIDDEN],
             mask_mlp_b2: [0.0; EMBED_DIM],
@@ -1320,17 +1989,23 @@ impl ExprNnue {
         net
     }
 
-    /// Convert from single-head ExprNnue (reuse trained embeddings).
+    /// Convert an older extraction-first model into the unified architecture.
     ///
-    /// The value head inherits the original output weights.
-    /// Rule embeddings and search head start at zero (need training).
-    /// New unified mask architecture fields are zero-initialized (need training).
+    /// This preserves the edge tower exactly by initializing the shared trunk
+    /// to identity, so pre-trunk hidden activations pass through unchanged.
+    /// Task-specific unified-head weights remain zero-initialized and require
+    /// training.
     #[must_use]
     pub fn from_factored(factored: &ExprNnue) -> Self {
-        Self {
+        let mut net = Self {
             embeddings: factored.embeddings.clone(),
             w1: factored.w1,
             b1: factored.b1,
+
+            // Shared trunk starts as identity so the migrated edge tower
+            // preserves its pre-trunk representation exactly.
+            trunk_w: [[0.0; HIDDEN_DIM]; HIDDEN_DIM],
+            trunk_b: [0.0; HIDDEN_DIM],
 
             // Unified mask architecture - zero-initialized (needs training)
             expr_proj_w: [[0.0; EMBED_DIM]; HIDDEN_DIM],
@@ -1341,7 +2016,7 @@ impl ExprNnue {
             value_mlp_w2: [0.0; MLP_HIDDEN],
             value_mlp_b2: 5.0,
 
-            mask_mlp_w1: [[0.0; MLP_HIDDEN]; MASK_INPUT_DIM],  // 24 × 16
+            mask_mlp_w1: [[0.0; MLP_HIDDEN]; MASK_INPUT_DIM], // 24 × 16
             mask_mlp_b1: [0.0; MLP_HIDDEN],
             mask_mlp_w2: [[0.0; EMBED_DIM]; MLP_HIDDEN],
             mask_mlp_b2: [0.0; EMBED_DIM],
@@ -1363,7 +2038,13 @@ impl ExprNnue {
             graph_b1: [0.0; HIDDEN_DIM],
             graph_proj_w: [[0.0; EMBED_DIM]; HIDDEN_DIM],
             graph_proj_b: [0.0; EMBED_DIM],
+        };
+
+        for i in 0..HIDDEN_DIM {
+            net.trunk_w[i][i] = 1.0;
         }
+
+        net
     }
 
     /// Randomize only network weights, not embeddings.
@@ -1371,9 +2052,7 @@ impl ExprNnue {
         let mut rng_state = seed.wrapping_add(12345);
 
         let mut next_f32 = || {
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (rng_state >> 33) as f32 / (1u64 << 31) as f32 * 2.0 - 1.0
         };
 
@@ -1389,6 +2068,16 @@ impl ExprNnue {
             *b = next_f32().abs() * 0.1;
         }
 
+        // Shared trunk: identity + small noise (near-identity preserves tower signal)
+        for i in 0..HIDDEN_DIM {
+            for j in 0..HIDDEN_DIM {
+                self.trunk_w[i][j] = if i == j { 1.0 } else { 0.0 } + next_f32() * 0.01;
+            }
+        }
+        for b in &mut self.trunk_b {
+            *b = 0.0;
+        }
+
         // Initialize unified mask architecture (full init - includes shared projection + value mlp)
         self.randomize_unified_arch_with_rng(&mut next_f32);
     }
@@ -1396,7 +2085,7 @@ impl ExprNnue {
     /// Internal helper to randomize ALL unified architecture weights.
     ///
     /// ONLY used during full random init (randomize_weights_only).
-    /// Do NOT call this when bootstrapping from judge - use randomize_mask_only instead.
+    /// Do NOT call this when bootstrapping from extraction head weights - use randomize_mask_only instead.
     fn randomize_unified_arch_with_rng<F: FnMut() -> f32>(&mut self, next_f32: &mut F) {
         // He initialization scales
         let scale_proj = sqrtf(2.0 / HIDDEN_DIM as f32);
@@ -1447,7 +2136,7 @@ impl ExprNnue {
             *b = 0.0; // Neutral
         }
 
-        // Rule MLP: RULE_FEATURE_DIM → MLP_HIDDEN → EMBED_DIM (legacy, hand-crafted features)
+        // Rule MLP: RULE_FEATURE_DIM → MLP_HIDDEN → EMBED_DIM (hand-crafted features)
         for i in 0..RULE_FEATURE_DIM {
             for j in 0..MLP_HIDDEN {
                 self.rule_mlp_w1[i][j] = next_f32() * scale_rule_feat;
@@ -1521,14 +2210,14 @@ impl ExprNnue {
 
     /// Create a copy with trained backbone but randomized mask weights.
     ///
-    /// This is the key method for embedding sharing: load a trained judge,
+    /// This is the key method for embedding sharing: load a trained extraction head,
     /// then create a new model that:
     /// - Keeps: embeddings, w1, b1 (trained backbone)
-    /// - Keeps: expr_proj_w, expr_proj_b (shared projection - trained with judge)
-    /// - Keeps: value_mlp_* (value head - trained with judge)
-    /// - Randomizes: mask_mlp, rule_mlp, rule_proj, interaction, mask_bias_proj (mask-specific)
+    /// - Keeps: expr_proj_w, expr_proj_b (shared projection - trained with extraction head)
+    /// - Keeps: value_mlp_* (extraction head weights)
+    /// - Randomizes: mask_mlp, rule_mlp, rule_proj, interaction, mask_bias_proj (saturation head specific)
     ///
-    /// Use this when bootstrapping mask training from a pre-trained judge.
+    /// Use this when bootstrapping saturation head training from a pre-trained extraction head.
     #[must_use]
     pub fn with_randomized_mask_weights(&self, seed: u64) -> Self {
         let mut model = self.clone();
@@ -1544,15 +2233,13 @@ impl ExprNnue {
         let mut rng_state = seed.wrapping_add(54321);
 
         let mut next_f32 = || {
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (rng_state >> 33) as f32 / (1u64 << 31) as f32 * 2.0 - 1.0
         };
 
         // He initialization scales
         let scale_embed = sqrtf(2.0 / EMBED_DIM as f32);
-        let scale_mask_input = sqrtf(2.0 / MASK_INPUT_DIM as f32);  // 24 dims
+        let scale_mask_input = sqrtf(2.0 / MASK_INPUT_DIM as f32); // 24 dims
         let scale_hidden = sqrtf(2.0 / MLP_HIDDEN as f32);
         let scale_rule_feat = sqrtf(2.0 / RULE_FEATURE_DIM as f32);
         let scale_concat = sqrtf(2.0 / RULE_CONCAT_DIM as f32);
@@ -1575,7 +2262,7 @@ impl ExprNnue {
             *b = 0.0;
         }
 
-        // Rule MLP: RULE_FEATURE_DIM → MLP_HIDDEN → EMBED_DIM (legacy)
+        // Rule MLP: RULE_FEATURE_DIM → MLP_HIDDEN → EMBED_DIM (hand-crafted features)
         for i in 0..RULE_FEATURE_DIM {
             for j in 0..MLP_HIDDEN {
                 self.rule_mlp_w1[i][j] = next_f32() * scale_rule_feat;
@@ -1638,11 +2325,30 @@ impl ExprNnue {
         }
     }
 
+    /// Apply shared trunk: HIDDEN_DIM -> HIDDEN_DIM with ReLU.
+    ///
+    /// Both the edge tower and graph tower pass through this layer before
+    /// reaching their task-specific projection heads. Initialized near-identity
+    /// so the trunk preserves tower signal until training pulls it away.
+    #[inline]
+    fn apply_trunk(&self, tower_output: &[f32; HIDDEN_DIM]) -> [f32; HIDDEN_DIM] {
+        let mut out = self.trunk_b;
+        for i in 0..HIDDEN_DIM {
+            for j in 0..HIDDEN_DIM {
+                out[j] += tower_output[i] * self.trunk_w[i][j];
+            }
+        }
+        for h in &mut out {
+            *h = h.max(0.0);
+        }
+        out
+    }
+
     /// Shared forward pass through dual accumulator + hidden layer.
     ///
     /// Input: 128 dual accumulator dims (64 flat + 64 depth-encoded)
-    ///        + 2 scalar features (edge_count, node_count).
-    /// Returns the hidden layer activations after ReLU.
+    ///        + 4 scalar features (edge_count, node_count, node_budget, epoch_budget).
+    /// Returns the hidden layer activations after tower ReLU + shared trunk.
     #[inline]
     pub fn forward_shared(&self, acc: &EdgeAccumulator) -> [f32; HIDDEN_DIM] {
         let mut hidden = self.b1;
@@ -1663,20 +2369,27 @@ impl ExprNnue {
             }
         }
 
-        // Process scalar features (2 dims: edge_count, node_count).
+        // Process scalar features (4 dims: edge_count, node_count, node_budget, epoch_budget).
         // Use log2 to compress the range for large ASTs.
         let base = 4 * K;
         let ec = libm::log2f(1.0 + acc.edge_count as f32);
         let nc = libm::log2f(1.0 + acc.node_count as f32);
+        let nb = libm::log2f(1.0 + acc.node_budget as f32);
+        let eb = libm::log2f(1.0 + acc.epoch_budget as f32);
         for (j, h) in hidden.iter_mut().enumerate() {
             *h += ec * self.w1[base][j];
             *h += nc * self.w1[base + 1][j];
+            *h += nb * self.w1[base + 2][j];
+            *h += eb * self.w1[base + 3][j];
         }
 
         // ReLU activation
         for h in &mut hidden {
             *h = h.max(0.0);
         }
+
+        // Shared trunk
+        let hidden = self.apply_trunk(&hidden);
 
         hidden
     }
@@ -1695,7 +2408,7 @@ impl ExprNnue {
         self.value_mlp_forward(&expr_embed)
     }
 
-    /// Value head: predict cost in nanoseconds (exp of log-cost).
+    /// Extraction head: predict cost in nanoseconds (exp of log-cost).
     ///
     /// Convenience method that applies exp() to log-cost.
     #[must_use]
@@ -1703,17 +2416,73 @@ impl ExprNnue {
         libm::expf(self.predict_log_cost(expr))
     }
 
-    /// Value head with pre-computed accumulator.
+    /// Extraction head with pre-computed accumulator.
     ///
     /// More efficient when you already have the accumulator.
     #[must_use]
-    pub fn predict_log_cost_with_features(
-        &self,
-        acc: &EdgeAccumulator,
-    ) -> f32 {
-        let hidden = self.forward_shared(acc);
+    pub fn predict_log_cost_with_features(&self, acc: &EdgeAccumulator) -> f32 {
+        // Extraction head uses expression structure ONLY — no search resource
+        // scalars (node_budget, epoch_budget, edge_count, node_count).
+        // Those features exist for the saturation head which needs to reason
+        // about search resources. The extraction head predicts execution cost
+        // which depends only on what ops are in the expression, not how many
+        // nodes the e-graph had or what budget was used.
+        let hidden = self.forward_expr_only(acc);
         let expr_embed = self.compute_expr_embed(&hidden);
         self.value_mlp_forward(&expr_embed)
+    }
+
+    /// Forward pass through shared backbone using ONLY expression structure.
+    ///
+    /// Skips the 4 scalar features (edge_count, node_count, node_budget,
+    /// epoch_budget) that are search-state metadata, not expression properties.
+    /// Use this for the extraction head; use `forward_shared` for the saturation head
+    /// which needs resource-awareness.
+    pub fn forward_expr_only(&self, acc: &EdgeAccumulator) -> [f32; HIDDEN_DIM] {
+        let mut hidden = self.b1;
+
+        let scale = if acc.node_count > 0 {
+            1.0 / libm::sqrtf(acc.node_count as f32)
+        } else {
+            1.0
+        };
+
+        // Dual accumulator values (expression structure): dims 0..128
+        for (i, &val) in acc.values.iter().enumerate() {
+            let scaled_val = val * scale;
+            for (j, h) in hidden.iter_mut().enumerate() {
+                *h += scaled_val * self.w1[i][j];
+            }
+        }
+
+        // Variance histogram features: dims 128..132
+        // Uses the w1 slots that forward_shared uses for scalars.
+        // After retraining, the extraction head learns that low-variance
+        // nodes are cheap (hoisted out of inner loops).
+        let variance_features = [
+            acc.variance_frac_const,
+            acc.variance_frac_frame,
+            acc.variance_frac_scanline,
+            acc.variance_frac_pixel,
+        ];
+        for (k, &val) in variance_features.iter().enumerate() {
+            let i = 4 * K + k; // w1 index 128..132
+            if i < INPUT_DIM {
+                for (j, h) in hidden.iter_mut().enumerate() {
+                    *h += val * self.w1[i][j];
+                }
+            }
+        }
+
+        // ReLU (same as forward_shared)
+        for h in &mut hidden {
+            *h = h.max(0.0);
+        }
+
+        // Shared trunk
+        let hidden = self.apply_trunk(&hidden);
+
+        hidden
     }
 
     // ========================================================================
@@ -1755,14 +2524,14 @@ impl ExprNnue {
     // ========================================================================
     // Graph State Backbone Forward Pass
     //
-    // Separate pathway for mask head: GraphAccumulator → graph_w1 → graph_proj
+    // Separate pathway for saturation head: GraphAccumulator → graph_w1 → graph_proj
     // Feeds into the SAME mask_mlp + bilinear scoring as the expr pathway.
     // ========================================================================
 
-    /// Graph state forward pass (for mask head).
+    /// Graph state forward pass (for saturation head).
     ///
     /// Same structure as `forward_shared` but with `graph_w1`/`graph_b1` and
-    /// `GRAPH_INPUT_DIM` input (98 vs 130). Uses `1/sqrt(node_count)` scaling
+    /// `GRAPH_INPUT_DIM` input (132). Uses `1/sqrt(node_count)` scaling
     /// and log2 scalars, matching the `forward_shared` conventions.
     #[inline]
     pub fn forward_graph(&self, gacc: &GraphAccumulator) -> [f32; HIDDEN_DIM] {
@@ -1775,7 +2544,7 @@ impl ExprNnue {
             1.0
         };
 
-        // Process graph accumulator (96 dims: 3K sections)
+        // Process graph accumulator (128 dims: 4K sections)
         for (i, &val) in gacc.values.iter().enumerate() {
             let scaled_val = val * scale;
             for (j, h) in hidden.iter_mut().enumerate() {
@@ -1783,20 +2552,27 @@ impl ExprNnue {
             }
         }
 
-        // Process scalar features (2 dims: edge_count, node_count).
+        // Process scalar features (4 dims: edge_count, node_count, node_budget, epoch_budget).
         // Use log2 to compress the range for large e-graphs.
         let base = GRAPH_ACC_DIM;
         let ec = libm::log2f(1.0 + gacc.edge_count as f32);
         let nc = libm::log2f(1.0 + gacc.node_count as f32);
+        let nb = libm::log2f(1.0 + gacc.node_budget as f32);
+        let eb = libm::log2f(1.0 + gacc.epoch_budget as f32);
         for (j, h) in hidden.iter_mut().enumerate() {
             *h += ec * self.graph_w1[base][j];
             *h += nc * self.graph_w1[base + 1][j];
+            *h += nb * self.graph_w1[base + 2][j];
+            *h += eb * self.graph_w1[base + 3][j];
         }
 
         // ReLU activation
         for h in &mut hidden {
             *h = h.max(0.0);
         }
+
+        // Shared trunk
+        let hidden = self.apply_trunk(&hidden);
 
         hidden
     }
@@ -1843,10 +2619,7 @@ impl ExprNnue {
     /// Input: expr_embed (24 dims) directly — value_pred was removed as redundant.
     /// MLP: EMBED_DIM (24) → MLP_HIDDEN (ReLU) → EMBED_DIM (24)
     #[inline]
-    fn compute_mask_features(
-        &self,
-        expr_embed: &[f32; EMBED_DIM],
-    ) -> [f32; EMBED_DIM] {
+    fn compute_mask_features(&self, expr_embed: &[f32; EMBED_DIM]) -> [f32; EMBED_DIM] {
         // First layer: EMBED_DIM → MLP_HIDDEN
         let mut h = self.mask_mlp_b1;
 
@@ -1932,7 +2705,11 @@ impl ExprNnue {
     /// Returns a Vec of rule embeddings that can be reused across multiple
     /// expressions during saturation.
     #[must_use]
-    pub fn encode_all_rules(&self, rule_features: &RuleFeatures, num_rules: usize) -> Vec<[f32; EMBED_DIM]> {
+    pub fn encode_all_rules(
+        &self,
+        rule_features: &RuleFeatures,
+        num_rules: usize,
+    ) -> Vec<[f32; EMBED_DIM]> {
         (0..num_rules)
             .map(|r| self.encode_rule(&rule_features.features[r]))
             .collect()
@@ -1941,7 +2718,7 @@ impl ExprNnue {
     // =========================================================================
     // Rule Encoding from LHS/RHS Templates
     //
-    // Uses the SAME expr_embed as value/mask heads. 4-way concatenation:
+    // Uses the SAME expr_embed as extraction/saturation heads. 4-way concatenation:
     // [z_LHS | z_RHS | z_LHS-z_RHS | z_LHS*z_RHS] → linear → rule_embed
     //
     // This provides richer semantic features than hand-crafted rule descriptors.
@@ -1977,8 +2754,8 @@ impl ExprNnue {
         // 4-way concatenate: [z_LHS | z_RHS | z_LHS-z_RHS | z_LHS*z_RHS] = 96 dims
         let mut concat = [0.0f32; RULE_CONCAT_DIM];
         for i in 0..EMBED_DIM {
-            concat[i] = z_lhs[i];                           // what it matches
-            concat[EMBED_DIM + i] = z_rhs[i];               // what it produces
+            concat[i] = z_lhs[i]; // what it matches
+            concat[EMBED_DIM + i] = z_rhs[i]; // what it produces
             concat[2 * EMBED_DIM + i] = z_lhs[i] - z_rhs[i]; // the delta
             concat[3 * EMBED_DIM + i] = z_lhs[i] * z_rhs[i]; // shared structure
         }
@@ -1999,7 +2776,10 @@ impl ExprNnue {
     /// Rule embeddings don't change during search - they're computed from
     /// LHS/RHS templates which are static.
     #[must_use]
-    pub fn encode_all_rules_from_templates(&self, templates: &RuleTemplates) -> Vec<[f32; EMBED_DIM]> {
+    pub fn encode_all_rules_from_templates(
+        &self,
+        templates: &RuleTemplates,
+    ) -> Vec<[f32; EMBED_DIM]> {
         (0..templates.len())
             .map(|r| {
                 match (templates.get_lhs(r), templates.get_rhs(r)) {
@@ -2041,11 +2821,7 @@ impl ExprNnue {
     /// Uses pre-cached rule embeddings for efficiency. One forward pass through
     /// backbone + expr_proj + mask_mlp, then O(rules) bilinear scoring.
     #[must_use]
-    pub fn mask_score_all_rules(
-        &self,
-        expr: &Expr,
-        rule_embeds: &[[f32; EMBED_DIM]],
-    ) -> Vec<f32> {
+    pub fn mask_score_all_rules(&self, expr: &Expr, rule_embeds: &[[f32; EMBED_DIM]]) -> Vec<f32> {
         let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
         let hidden = self.forward_shared(&acc);
         let expr_embed = self.compute_expr_embed(&hidden);
@@ -2102,11 +2878,7 @@ impl ExprNnue {
     /// Computes the rule embedding on-the-fly from rule features.
     /// Returns raw score (apply sigmoid for probability).
     #[must_use]
-    pub fn mask_score_single(
-        &self,
-        expr: &Expr,
-        rule_features: &[f32; RULE_FEATURE_DIM],
-    ) -> f32 {
+    pub fn mask_score_single(&self, expr: &Expr, rule_features: &[f32; RULE_FEATURE_DIM]) -> f32 {
         let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
         let hidden = self.forward_shared(&acc);
         let expr_embed = self.compute_expr_embed(&hidden);
@@ -2179,10 +2951,10 @@ impl ExprNnue {
             + EMBED_DIM * EMBED_DIM           // interaction: 24 * 24 = 576
             + EMBED_DIM                        // mask_bias_proj: 32
             // graph state backbone
-            + GRAPH_INPUT_DIM * HIDDEN_DIM    // graph_w1: 98 * 64 = 6,272
+            + GRAPH_INPUT_DIM * HIDDEN_DIM    // graph_w1: 132 * 64 = 8,448
             + HIDDEN_DIM                      // graph_b1: 64
             + HIDDEN_DIM * EMBED_DIM          // graph_proj_w: 64 * 32 = 2,048
-            + EMBED_DIM                       // graph_proj_b: 32
+            + EMBED_DIM // graph_proj_b: 32
     }
 
     /// Memory size in bytes (f32 weights).
@@ -2200,7 +2972,7 @@ impl ExprNnue {
 
     /// Predict cost directly from accumulator (for MCTS evaluation).
     ///
-    /// Skips expr parsing - just forward pass through backbone + value head.
+    /// Skips expr parsing - just forward pass through backbone + extraction head.
     /// Use this for fast MCTS rollout evaluation.
     #[must_use]
     pub fn predict_cost_from_accumulator(&self, acc: &EdgeAccumulator) -> f32 {
@@ -2227,10 +2999,7 @@ impl ExprNnue {
 
     /// Predict cost with pre-computed accumulator (for MCTS).
     #[must_use]
-    pub fn predict_cost_from_features(
-        &self,
-        acc: &EdgeAccumulator,
-    ) -> f32 {
+    pub fn predict_cost_from_features(&self, acc: &EdgeAccumulator) -> f32 {
         let hidden = self.forward_shared(acc);
         let expr_embed = self.compute_expr_embed(&hidden);
 
@@ -2347,15 +3116,15 @@ impl ExprNnue {
 
     /// Save weights to a binary file.
     ///
-    /// Format: magic "TRIB" + all weights as little-endian f32.
-    /// TRIB: EMBED_DIM=32, mask_bias_proj replaces mask_rule_bias.
+    /// Format: magic "TRID" + all weights as little-endian f32.
+    /// TRID: shared trunk layer added between towers and projection heads.
     #[cfg(feature = "std")]
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::File::create(path)?;
+        let mut file = std::io::BufWriter::with_capacity(256 * 1024, std::fs::File::create(path)?);
 
-        // Magic header (TRIB = mask_bias_proj replaces mask_rule_bias — retrain required)
-        file.write_all(b"TRIB")?;
+        // Magic header (TRID = shared trunk added — retrain required for old TRIC/TRIB/etc models)
+        file.write_all(b"TRID")?;
 
         // ===== Backbone =====
         // Embeddings
@@ -2372,6 +3141,16 @@ impl ExprNnue {
             }
         }
         for &val in &self.b1 {
+            file.write_all(&val.to_le_bytes())?;
+        }
+
+        // Shared trunk
+        for row in &self.trunk_w {
+            for &val in row {
+                file.write_all(&val.to_le_bytes())?;
+            }
+        }
+        for &val in &self.trunk_b {
             file.write_all(&val.to_le_bytes())?;
         }
 
@@ -2418,7 +3197,7 @@ impl ExprNnue {
             file.write_all(&val.to_le_bytes())?;
         }
 
-        // Rule MLP (legacy, for hand-crafted features)
+        // Rule MLP for hand-crafted rule features.
         for row in &self.rule_mlp_w1 {
             for &val in row {
                 file.write_all(&val.to_le_bytes())?;
@@ -2479,27 +3258,45 @@ impl ExprNnue {
         Ok(())
     }
 
+    /// Load weights from an in-memory byte slice.
+    ///
+    /// Used by the compiler to load weights embedded via `include_bytes!`.
+    #[cfg(feature = "std")]
+    pub fn from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        Self::load_from_reader(std::io::Cursor::new(bytes))
+    }
+
     /// Load weights from a binary file.
     ///
-    /// Only supports "TRIA" format (EMBED_DIM=32). Old formats (TRI5-TRI9) require retrain.
+    /// Only supports "TRID" format (shared trunk). Old formats (TRIC and earlier) require retrain.
     #[cfg(feature = "std")]
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path)?;
+        let file = std::io::BufReader::with_capacity(256 * 1024, std::fs::File::open(path)?);
+        Self::load_from_reader(file)
+    }
 
+    #[cfg(feature = "std")]
+    fn load_from_reader<R: std::io::Read>(mut file: R) -> std::io::Result<Self> {
         // Check magic
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
 
-        // TRIB: EMBED_DIM=32, mask_bias_proj replaces mask_rule_bias
+        // TRID: shared trunk layer between towers and projection heads
+        // TRIC: incompatible — pre-shared-trunk architecture
+        // TRIB: incompatible — GRAPH_ACC_DIM was 3K (96), GRAPH_INPUT_DIM was 100
         // TRIA: incompatible — had mask_rule_bias[1024] instead of mask_bias_proj[32]
         // TRI5-TRI9: incompatible — EMBED_DIM was 24, all weight shapes differ
-        if &magic != b"TRIB" {
+        if &magic != b"TRID" {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "Incompatible ExprNnue format {:?}. Expected 'TRIB' (mask_bias_proj). Old formats (TRIA, TRI5-TRI9) require retrain.",
-                    std::str::from_utf8(&magic).unwrap_or("????")
+                    "Incompatible ExprNnue format {:?}. Expected 'TRID' (shared trunk). {}",
+                    std::str::from_utf8(&magic).unwrap_or("????"),
+                    if &magic == b"TRIC" {
+                        "Incompatible format 'TRIC' (pre-shared-trunk). Retrain required."
+                    } else {
+                        "Old formats (TRIB, TRIA, TRI5-TRI9) require retrain."
+                    }
                 ),
             ));
         }
@@ -2525,6 +3322,20 @@ impl ExprNnue {
             }
         }
         for val in &mut net.b1 {
+            let mut buf = [0u8; 4];
+            file.read_exact(&mut buf)?;
+            *val = f32::from_le_bytes(buf);
+        }
+
+        // Shared trunk
+        for row in &mut net.trunk_w {
+            for val in row {
+                let mut buf = [0u8; 4];
+                file.read_exact(&mut buf)?;
+                *val = f32::from_le_bytes(buf);
+            }
+        }
+        for val in &mut net.trunk_b {
             let mut buf = [0u8; 4];
             file.read_exact(&mut buf)?;
             *val = f32::from_le_bytes(buf);
@@ -2651,90 +3462,30 @@ impl ExprNnue {
             *val = f32::from_le_bytes(buf);
         }
 
-        // Graph state backbone (backward compat: old models won't have these bytes)
-        let mut has_graph = true;
+        // Graph state backbone (TRID format: mandatory, no backward compat)
         for row in &mut net.graph_w1 {
             for val in row {
                 let mut buf = [0u8; 4];
-                if file.read_exact(&mut buf).is_err() {
-                    has_graph = false;
-                    break;
-                }
+                file.read_exact(&mut buf)?;
                 *val = f32::from_le_bytes(buf);
             }
-            if !has_graph { break; }
         }
-        if has_graph {
-            for val in &mut net.graph_b1 {
+        for val in &mut net.graph_b1 {
+            let mut buf = [0u8; 4];
+            file.read_exact(&mut buf)?;
+            *val = f32::from_le_bytes(buf);
+        }
+        for row in &mut net.graph_proj_w {
+            for val in row {
                 let mut buf = [0u8; 4];
-                if file.read_exact(&mut buf).is_err() {
-                    has_graph = false;
-                    break;
-                }
+                file.read_exact(&mut buf)?;
                 *val = f32::from_le_bytes(buf);
             }
         }
-        if has_graph {
-            for row in &mut net.graph_proj_w {
-                for val in row {
-                    let mut buf = [0u8; 4];
-                    if file.read_exact(&mut buf).is_err() {
-                        has_graph = false;
-                        break;
-                    }
-                    *val = f32::from_le_bytes(buf);
-                }
-                if !has_graph { break; }
-            }
-        }
-        if has_graph {
-            for val in &mut net.graph_proj_b {
-                let mut buf = [0u8; 4];
-                if file.read_exact(&mut buf).is_err() {
-                    has_graph = false;
-                    break;
-                }
-                *val = f32::from_le_bytes(buf);
-            }
-        }
-
-        // If old model (no graph backbone bytes), initialize randomly
-        if !has_graph {
-            #[cfg(feature = "std")]
-            {
-                eprintln!(
-                    "WARN: loaded TRIB model without graph backbone — initializing graph_w1/graph_b1/graph_proj_w/graph_proj_b randomly"
-                );
-            }
-            // Use a deterministic seed derived from existing weights for reproducibility
-            let seed = net.b1[0].to_bits() as u64 ^ 0xDEAD_BEEF_CAFE_BABE;
-            let mut rng_state = seed.wrapping_add(99999);
-            let mut next_f32 = || {
-                rng_state = rng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1);
-                (rng_state >> 33) as f32 / (1u64 << 31) as f32 * 2.0 - 1.0
-            };
-
-            let scale_graph = sqrtf(2.0 / GRAPH_INPUT_DIM as f32);
-            let scale_proj = sqrtf(2.0 / HIDDEN_DIM as f32);
-
-            for row in 0..GRAPH_INPUT_DIM {
-                for col in 0..HIDDEN_DIM {
-                    net.graph_w1[row][col] = next_f32() * scale_graph;
-                }
-            }
-            for b in &mut net.graph_b1 {
-                *b = next_f32().abs() * 0.1;
-            }
-            for j in 0..HIDDEN_DIM {
-                for k in 0..EMBED_DIM {
-                    net.graph_proj_w[j][k] = next_f32() * scale_proj;
-                }
-            }
-            for b in &mut net.graph_proj_b {
-                *b = next_f32().abs() * 0.1;
-            }
+        for val in &mut net.graph_proj_b {
+            let mut buf = [0u8; 4];
+            file.read_exact(&mut buf)?;
+            *val = f32::from_le_bytes(buf);
         }
 
         Ok(net)
@@ -2752,7 +3503,7 @@ impl ExprNnue {
     // Backbone (embeddings, w1, b1) is FROZEN during mask training.
     // =========================================================================
 
-    /// Train mask head on single (expr, rule, fired) sample.
+    /// Train saturation head on single (expr, rule, fired) sample.
     ///
     /// Uses asymmetric BCE loss with higher weight for false negatives
     /// (catching positives is critical - we don't want to skip rules that fire).
@@ -2817,9 +3568,8 @@ impl ExprNnue {
         }
 
         // d_score → interaction, mask_features, rule_embed
-        let (d_mask_features, d_rule_embed) = self.backprop_bilinear(
-            d_score, &mask_features, &rule_embed, &transformed, lr
-        );
+        let (d_mask_features, d_rule_embed) =
+            self.backprop_bilinear(d_score, &mask_features, &rule_embed, &transformed, lr);
 
         // d_mask_features → mask_mlp
         let _d_expr_embed = self.backprop_mask_mlp(&d_mask_features, &expr_embed, &mask_hidden, lr);
@@ -2875,9 +3625,9 @@ impl ExprNnue {
         // - Rejected: ∇log (1 - sigmoid(score)) = -sigmoid(score)
         let prob = sigmoid(score).clamp(1e-6, 1.0 - 1e-6);
         let d_log_prob = if approved {
-            1.0 - prob  // push score up when reinforcing approval
+            1.0 - prob // push score up when reinforcing approval
         } else {
-            -prob  // push score down when reinforcing rejection
+            -prob // push score down when reinforcing rejection
         };
 
         // Clip gradient to prevent explosion
@@ -2893,9 +3643,8 @@ impl ExprNnue {
             self.mask_bias_proj[k] -= lr * d_score * rule_embed[k];
         }
 
-        let (d_mask_features, d_rule_embed) = self.backprop_bilinear(
-            d_score, &mask_features, &rule_embed, &transformed, lr
-        );
+        let (d_mask_features, d_rule_embed) =
+            self.backprop_bilinear(d_score, &mask_features, &rule_embed, &transformed, lr);
 
         let _d_expr_embed = self.backprop_mask_mlp(&d_mask_features, &expr_embed, &mask_hidden, lr);
         self.backprop_rule_mlp(&d_rule_embed, rule_features, &rule_hidden, lr);
@@ -2960,11 +3709,7 @@ impl ExprNnue {
         // - Approved: ∇log sigmoid(score) = 1 - sigmoid(score)
         // - Rejected: ∇log (1 - sigmoid(score)) = -sigmoid(score)
         let prob = sigmoid(score).clamp(1e-6, 1.0 - 1e-6);
-        let d_log_prob = if approved {
-            1.0 - prob
-        } else {
-            -prob
-        };
+        let d_log_prob = if approved { 1.0 - prob } else { -prob };
 
         // Clip gradient to prevent explosion
         let d_score = (advantage * d_log_prob).clamp(-1.0, 1.0);
@@ -2980,9 +3725,8 @@ impl ExprNnue {
             self.mask_bias_proj[k] -= lr * d_score * rule_embed[k];
         }
 
-        let (d_mask_features, _d_rule_embed) = self.backprop_bilinear(
-            d_score, &mask_features, rule_embed, &transformed, lr
-        );
+        let (d_mask_features, _d_rule_embed) =
+            self.backprop_bilinear(d_score, &mask_features, rule_embed, &transformed, lr);
 
         let _d_expr_embed = self.backprop_mask_mlp(&d_mask_features, &expr_embed, &mask_hidden, lr);
         // NOTE: Rule embedding is not updated here - it comes from templates.
@@ -3008,7 +3752,8 @@ impl ExprNnue {
     ) -> f32 {
         let mut total_grad = 0.0f32;
         for (expr, rule_embed, approved) in decisions {
-            total_grad += self.train_mask_reinforce_with_embed(expr, rule_embed, *approved, advantage, lr);
+            total_grad +=
+                self.train_mask_reinforce_with_embed(expr, rule_embed, *approved, advantage, lr);
         }
         total_grad
     }
@@ -3017,12 +3762,7 @@ impl ExprNnue {
     ///
     /// Uses MSE loss. Backprop goes through value_mlp → expr_proj.
     /// Backbone is frozen.
-    pub fn train_value_mlp_step(
-        &mut self,
-        expr: &Expr,
-        true_cost: f32,
-        lr: f32,
-    ) -> f32 {
+    pub fn train_value_mlp_step(&mut self, expr: &Expr, true_cost: f32, lr: f32) -> f32 {
         // Forward
         let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
         let hidden = self.forward_shared(&acc);
@@ -3048,7 +3788,10 @@ impl ExprNnue {
     // =========================================================================
 
     /// Mask MLP forward storing hidden activations.
-    fn mask_mlp_forward_with_hidden(&self, expr_embed: &[f32; EMBED_DIM]) -> ([f32; EMBED_DIM], [f32; MLP_HIDDEN]) {
+    fn mask_mlp_forward_with_hidden(
+        &self,
+        expr_embed: &[f32; EMBED_DIM],
+    ) -> ([f32; EMBED_DIM], [f32; MLP_HIDDEN]) {
         // First layer
         let mut h = self.mask_mlp_b1;
         for i in 0..EMBED_DIM {
@@ -3077,7 +3820,10 @@ impl ExprNnue {
     }
 
     /// Rule MLP forward storing hidden activations.
-    fn rule_mlp_forward_with_hidden(&self, rule_features: &[f32; RULE_FEATURE_DIM]) -> ([f32; EMBED_DIM], [f32; MLP_HIDDEN]) {
+    fn rule_mlp_forward_with_hidden(
+        &self,
+        rule_features: &[f32; RULE_FEATURE_DIM],
+    ) -> ([f32; EMBED_DIM], [f32; MLP_HIDDEN]) {
         // First layer
         let mut h = self.rule_mlp_b1;
         for i in 0..RULE_FEATURE_DIM {
@@ -3105,7 +3851,10 @@ impl ExprNnue {
     }
 
     /// Value MLP forward storing hidden activations.
-    fn value_mlp_forward_with_hidden(&self, expr_embed: &[f32; EMBED_DIM]) -> (f32, [f32; MLP_HIDDEN]) {
+    fn value_mlp_forward_with_hidden(
+        &self,
+        expr_embed: &[f32; EMBED_DIM],
+    ) -> (f32, [f32; MLP_HIDDEN]) {
         // First layer
         let mut h = self.value_mlp_b1;
         for i in 0..EMBED_DIM {
@@ -3398,805 +4147,6 @@ fn softmax_with_temperature(logits: &[f32], temperature: f32) -> Vec<f32> {
 }
 
 // ============================================================================
-// Incremental Judge — refcount-aware rewrite evaluation
-// ============================================================================
-
-/// Build initial reference counts for all unique subtrees in an expression.
-///
-/// Walks the tree depth-first. For each node, increments its structural hash's
-/// refcount. If this was the FIRST encounter (count went from 0 to 1), recurses
-/// into children. If already seen, stops (subtree already fully counted).
-#[must_use]
-pub fn build_refcounts(expr: &Expr) -> alloc::collections::BTreeMap<u64, u32> {
-    let mut refs = alloc::collections::BTreeMap::new();
-    build_refcounts_recursive(expr, &mut refs);
-    refs
-}
-
-fn build_refcounts_recursive(expr: &Expr, refs: &mut alloc::collections::BTreeMap<u64, u32>) {
-    let h = structural_hash(expr);
-    let count = refs.entry(h).or_insert(0);
-    *count += 1;
-    if *count > 1 {
-        // Already counted this subtree's children on a prior encounter.
-        return;
-    }
-    // First encounter: recurse into children.
-    match expr {
-        Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!(
-            "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-        ),
-        Expr::Unary(_, child) => {
-            build_refcounts_recursive(child, refs);
-        }
-        Expr::Binary(_, left, right) => {
-            build_refcounts_recursive(left, refs);
-            build_refcounts_recursive(right, refs);
-        }
-        Expr::Ternary(_, a, b, c) => {
-            build_refcounts_recursive(a, refs);
-            build_refcounts_recursive(b, refs);
-            build_refcounts_recursive(c, refs);
-        }
-        Expr::Nary(_, children) => {
-            for child in children {
-                build_refcounts_recursive(child, refs);
-            }
-        }
-    }
-}
-
-/// Remove edges from the accumulator for subtrees that became fully orphaned.
-///
-/// Compares old refcounts (before LHS decrement) against new refcounts (after
-/// LHS decrement). A node whose refcount dropped from >0 to 0 has been fully
-/// orphaned — its edges must be subtracted from the accumulator.
-///
-/// A `processed` set prevents double-subtraction when a CSE subtree appears
-/// at multiple positions under the LHS being removed.
-fn subtract_orphaned_edges(
-    acc: &mut EdgeAccumulator,
-    emb: &OpEmbeddings,
-    expr: &Expr,
-    old_refs: &alloc::collections::BTreeMap<u64, u32>,
-    new_refs: &alloc::collections::BTreeMap<u64, u32>,
-    depth: u32,
-    processed: &mut alloc::collections::BTreeSet<u64>,
-) {
-    let h = structural_hash(expr);
-    if processed.contains(&h) {
-        return; // Already handled this subtree (CSE dedup).
-    }
-    let old_count = old_refs.get(&h).copied().unwrap_or(0);
-    let new_count = new_refs.get(&h).copied().unwrap_or(0);
-    if old_count == 0 {
-        // Node was never in the accumulator. Nothing to remove.
-        return;
-    }
-    if new_count > 0 {
-        // Node still has references elsewhere. Its edges must stay.
-        return;
-    }
-    // old_count > 0 && new_count == 0: this node is fully orphaned.
-    processed.insert(h);
-    let parent_op = expr.op_type();
-    acc.node_count = acc.node_count.saturating_sub(1);
-
-    match expr {
-        Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!(
-            "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-        ),
-        Expr::Unary(_, child) => {
-            let eff_depth = depth * MAX_ARITY as u32;
-            acc.remove_edge(emb, parent_op, child.op_type(), eff_depth);
-            subtract_orphaned_edges(acc, emb, child, old_refs, new_refs, depth + 1, processed);
-        }
-        Expr::Binary(_, left, right) => {
-            acc.remove_edge(emb, parent_op, left.op_type(), depth * MAX_ARITY as u32);
-            acc.remove_edge(emb, parent_op, right.op_type(), depth * MAX_ARITY as u32 + 1);
-            subtract_orphaned_edges(acc, emb, left, old_refs, new_refs, depth + 1, processed);
-            subtract_orphaned_edges(acc, emb, right, old_refs, new_refs, depth + 1, processed);
-        }
-        Expr::Ternary(_, a, b, c) => {
-            acc.remove_edge(emb, parent_op, a.op_type(), depth * MAX_ARITY as u32);
-            acc.remove_edge(emb, parent_op, b.op_type(), depth * MAX_ARITY as u32 + 1);
-            acc.remove_edge(emb, parent_op, c.op_type(), depth * MAX_ARITY as u32 + 2);
-            subtract_orphaned_edges(acc, emb, a, old_refs, new_refs, depth + 1, processed);
-            subtract_orphaned_edges(acc, emb, b, old_refs, new_refs, depth + 1, processed);
-            subtract_orphaned_edges(acc, emb, c, old_refs, new_refs, depth + 1, processed);
-        }
-        Expr::Nary(_, children) => {
-            for (idx, child) in children.iter().enumerate() {
-                let eff_depth = depth * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                acc.remove_edge(emb, parent_op, child.op_type(), eff_depth);
-                subtract_orphaned_edges(acc, emb, child, old_refs, new_refs, depth + 1, processed);
-            }
-        }
-    }
-}
-
-/// Add edges to the accumulator for subtrees that are brand new.
-///
-/// Compares pre-add refcounts against post-add refcounts. A node whose
-/// refcount went from 0 to >0 is brand new — its edges must be added.
-///
-/// A `processed` set prevents double-addition when a CSE subtree appears
-/// at multiple positions in the RHS.
-fn add_new_edges(
-    acc: &mut EdgeAccumulator,
-    emb: &OpEmbeddings,
-    expr: &Expr,
-    pre_refs: &alloc::collections::BTreeMap<u64, u32>,
-    post_refs: &alloc::collections::BTreeMap<u64, u32>,
-    depth: u32,
-    processed: &mut alloc::collections::BTreeSet<u64>,
-) {
-    let h = structural_hash(expr);
-    if processed.contains(&h) {
-        return; // Already handled this subtree (CSE dedup).
-    }
-    let pre_count = pre_refs.get(&h).copied().unwrap_or(0);
-    let post_count = post_refs.get(&h).copied().unwrap_or(0);
-    if pre_count > 0 {
-        // Already existed before this addition. Its edges are in the accumulator.
-        return;
-    }
-    if post_count == 0 {
-        panic!(
-            "add_new_edges: node hash {h:#x} has post_count==0 — \
-             increment_refs should have made it > 0"
-        );
-    }
-    // pre_count == 0 && post_count > 0: brand new subtree.
-    processed.insert(h);
-    let parent_op = expr.op_type();
-    acc.node_count += 1;
-
-    match expr {
-        Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!(
-            "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-        ),
-        Expr::Unary(_, child) => {
-            let eff_depth = depth * MAX_ARITY as u32;
-            acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
-            add_new_edges(acc, emb, child, pre_refs, post_refs, depth + 1, processed);
-        }
-        Expr::Binary(_, left, right) => {
-            acc.add_edge(emb, parent_op, left.op_type(), depth * MAX_ARITY as u32);
-            acc.add_edge(emb, parent_op, right.op_type(), depth * MAX_ARITY as u32 + 1);
-            add_new_edges(acc, emb, left, pre_refs, post_refs, depth + 1, processed);
-            add_new_edges(acc, emb, right, pre_refs, post_refs, depth + 1, processed);
-        }
-        Expr::Ternary(_, a, b, c) => {
-            acc.add_edge(emb, parent_op, a.op_type(), depth * MAX_ARITY as u32);
-            acc.add_edge(emb, parent_op, b.op_type(), depth * MAX_ARITY as u32 + 1);
-            acc.add_edge(emb, parent_op, c.op_type(), depth * MAX_ARITY as u32 + 2);
-            add_new_edges(acc, emb, a, pre_refs, post_refs, depth + 1, processed);
-            add_new_edges(acc, emb, b, pre_refs, post_refs, depth + 1, processed);
-            add_new_edges(acc, emb, c, pre_refs, post_refs, depth + 1, processed);
-        }
-        Expr::Nary(_, children) => {
-            for (idx, child) in children.iter().enumerate() {
-                let eff_depth = depth * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
-                add_new_edges(acc, emb, child, pre_refs, post_refs, depth + 1, processed);
-            }
-        }
-    }
-}
-
-/// Decrement refcounts for all nodes in an expression subtree.
-///
-/// For each node, decrements its count. Only recurses into children when
-/// the old count was 1 (i.e., this was the last reference, so children
-/// need decrementing too). If old count > 1, the subtree still has other
-/// references and children were counted via those references.
-fn decrement_refs(expr: &Expr, refs: &mut alloc::collections::BTreeMap<u64, u32>) {
-    let h = structural_hash(expr);
-    let count = refs.get(&h).copied().unwrap_or_else(|| {
-        panic!(
-            "decrement_refs: subtree hash {h:#x} not found in refcount map — \
-             expression was never added"
-        )
-    });
-    if count == 0 {
-        panic!(
-            "decrement_refs: subtree hash {h:#x} already at zero — \
-             double-decrement indicates logic error"
-        );
-    }
-    if count == 1 {
-        refs.remove(&h);
-    } else {
-        refs.insert(h, count - 1);
-    }
-    if count == 1 {
-        // This was the last reference. Recurse to decrement children.
-        match expr {
-            Expr::Var(_) | Expr::Const(_) => {}
-            Expr::Param(i) => panic!(
-                "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-            ),
-            Expr::Unary(_, child) => decrement_refs(child, refs),
-            Expr::Binary(_, left, right) => {
-                decrement_refs(left, refs);
-                decrement_refs(right, refs);
-            }
-            Expr::Ternary(_, a, b, c) => {
-                decrement_refs(a, refs);
-                decrement_refs(b, refs);
-                decrement_refs(c, refs);
-            }
-            Expr::Nary(_, children) => {
-                for child in children {
-                    decrement_refs(child, refs);
-                }
-            }
-        }
-    }
-}
-
-/// Increment refcounts for all nodes in an expression subtree.
-///
-/// For each node, increments its count. Only recurses into children when
-/// the old count was 0 (i.e., this is a brand new subtree, so children
-/// need incrementing too). If old count > 0, the subtree already exists
-/// and children were already counted.
-fn increment_refs(expr: &Expr, refs: &mut alloc::collections::BTreeMap<u64, u32>) {
-    let h = structural_hash(expr);
-    let count = refs.entry(h).or_insert(0);
-    let was_zero = *count == 0;
-    *count += 1;
-    if was_zero {
-        // Brand new subtree. Recurse to increment children.
-        match expr {
-            Expr::Var(_) | Expr::Const(_) => {}
-            Expr::Param(i) => panic!(
-                "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-            ),
-            Expr::Unary(_, child) => increment_refs(child, refs),
-            Expr::Binary(_, left, right) => {
-                increment_refs(left, refs);
-                increment_refs(right, refs);
-            }
-            Expr::Ternary(_, a, b, c) => {
-                increment_refs(a, refs);
-                increment_refs(b, refs);
-                increment_refs(c, refs);
-            }
-            Expr::Nary(_, children) => {
-                for child in children {
-                    increment_refs(child, refs);
-                }
-            }
-        }
-    }
-}
-
-/// Replace the first subtree matching `lhs_hash` with `rhs` in the expression.
-///
-/// Returns `true` if a replacement was made. Searches depth-first, replacing
-/// the first match encountered.
-fn replace_subtree(expr: &mut Expr, lhs_hash: u64, rhs: &Expr) -> bool {
-    if structural_hash(expr) == lhs_hash {
-        *expr = rhs.clone();
-        return true;
-    }
-    match expr {
-        Expr::Var(_) | Expr::Const(_) => false,
-        Expr::Param(i) => panic!(
-            "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-        ),
-        Expr::Unary(_, child) => replace_subtree(child, lhs_hash, rhs),
-        Expr::Binary(_, left, right) => {
-            replace_subtree(left, lhs_hash, rhs)
-                || replace_subtree(right, lhs_hash, rhs)
-        }
-        Expr::Ternary(_, a, b, c) => {
-            replace_subtree(a, lhs_hash, rhs)
-                || replace_subtree(b, lhs_hash, rhs)
-                || replace_subtree(c, lhs_hash, rhs)
-        }
-        Expr::Nary(_, children) => {
-            for child in children.iter_mut() {
-                if replace_subtree(child, lhs_hash, rhs) {
-                    return true;
-                }
-            }
-            false
-        }
-    }
-}
-
-/// Parent context for a subtree: the parent's OpKind, which child slot the
-/// target occupies, and the parent's depth in the tree.
-struct ParentContext {
-    parent_op: OpKind,
-    child_index: usize,
-    parent_depth: u32,
-}
-
-/// Search the AST for a child whose structural hash matches `target_hash`.
-///
-/// Returns the parent's context (op, child index, depth) so the caller can
-/// fix up the parent→child edge when the child is replaced.
-///
-/// Returns `None` if `target_hash` matches the root (no parent).
-fn find_parent_context(expr: &Expr, target_hash: u64) -> Option<ParentContext> {
-    fn search(expr: &Expr, target: u64, depth: u32) -> Option<ParentContext> {
-        let parent_op = expr.op_type();
-        match expr {
-            Expr::Var(_) | Expr::Const(_) => None,
-            Expr::Param(i) => panic!(
-                "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-            ),
-            Expr::Unary(_, child) => {
-                if structural_hash(child) == target {
-                    Some(ParentContext { parent_op, child_index: 0, parent_depth: depth })
-                } else {
-                    search(child, target, depth + 1)
-                }
-            }
-            Expr::Binary(_, left, right) => {
-                if structural_hash(left) == target {
-                    return Some(ParentContext { parent_op, child_index: 0, parent_depth: depth });
-                }
-                if structural_hash(right) == target {
-                    return Some(ParentContext { parent_op, child_index: 1, parent_depth: depth });
-                }
-                search(left, target, depth + 1)
-                    .or_else(|| search(right, target, depth + 1))
-            }
-            Expr::Ternary(_, a, b, c) => {
-                if structural_hash(a) == target {
-                    return Some(ParentContext { parent_op, child_index: 0, parent_depth: depth });
-                }
-                if structural_hash(b) == target {
-                    return Some(ParentContext { parent_op, child_index: 1, parent_depth: depth });
-                }
-                if structural_hash(c) == target {
-                    return Some(ParentContext { parent_op, child_index: 2, parent_depth: depth });
-                }
-                search(a, target, depth + 1)
-                    .or_else(|| search(b, target, depth + 1))
-                    .or_else(|| search(c, target, depth + 1))
-            }
-            Expr::Nary(_, children) => {
-                for (idx, child) in children.iter().enumerate() {
-                    if structural_hash(child) == target {
-                        return Some(ParentContext {
-                            parent_op,
-                            child_index: idx.min(MAX_ARITY - 1),
-                            parent_depth: depth,
-                        });
-                    }
-                }
-                for child in children.iter() {
-                    if let Some(ctx) = search(child, target, depth + 1) {
-                        return Some(ctx);
-                    }
-                }
-                None
-            }
-        }
-    }
-
-    // If the root itself matches, there is no parent.
-    if structural_hash(expr) == target_hash {
-        return None;
-    }
-    search(expr, target_hash, 0)
-}
-
-// ============================================================================
-// Delta-buffer helpers for zero-BTreeMap-clone peek_rewrite
-// ============================================================================
-
-/// Simulate `decrement_refs` without mutating the global refcount map.
-///
-/// Walks the LHS subtree exactly as `decrement_refs` does, recording deltas
-/// in a small O(Δ) map instead of mutating `global_refs`.
-fn simulate_decrement(
-    expr: &Expr,
-    global_refs: &alloc::collections::BTreeMap<u64, u32>,
-    delta: &mut alloc::collections::BTreeMap<u64, i32>,
-) {
-    let h = structural_hash(expr);
-    let global_count = global_refs.get(&h).copied().unwrap_or(0);
-    let current_delta = delta.entry(h).or_insert(0);
-    let effective_count = global_count as i32 + *current_delta;
-    if effective_count <= 0 {
-        panic!(
-            "simulate_decrement: subtree hash {h:#x} effective count {effective_count} <= 0 — \
-             double-decrement indicates logic error"
-        );
-    }
-    *current_delta -= 1;
-    if effective_count == 1 {
-        // This was the last reference. Recurse to decrement children.
-        match expr {
-            Expr::Var(_) | Expr::Const(_) => {}
-            Expr::Param(i) => panic!(
-                "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-            ),
-            Expr::Unary(_, child) => simulate_decrement(child, global_refs, delta),
-            Expr::Binary(_, left, right) => {
-                simulate_decrement(left, global_refs, delta);
-                simulate_decrement(right, global_refs, delta);
-            }
-            Expr::Ternary(_, a, b, c) => {
-                simulate_decrement(a, global_refs, delta);
-                simulate_decrement(b, global_refs, delta);
-                simulate_decrement(c, global_refs, delta);
-            }
-            Expr::Nary(_, children) => {
-                for child in children {
-                    simulate_decrement(child, global_refs, delta);
-                }
-            }
-        }
-    }
-}
-
-/// Simulate `increment_refs` without mutating the global refcount map.
-///
-/// Walks the RHS subtree exactly as `increment_refs` does, recording deltas
-/// in the same O(Δ) map.
-fn simulate_increment(
-    expr: &Expr,
-    global_refs: &alloc::collections::BTreeMap<u64, u32>,
-    delta: &mut alloc::collections::BTreeMap<u64, i32>,
-) {
-    let h = structural_hash(expr);
-    let global_count = global_refs.get(&h).copied().unwrap_or(0);
-    let current_delta = delta.entry(h).or_insert(0);
-    let effective_count = global_count as i32 + *current_delta;
-    *current_delta += 1;
-    if effective_count == 0 {
-        // Brand new subtree. Recurse to increment children.
-        match expr {
-            Expr::Var(_) | Expr::Const(_) => {}
-            Expr::Param(i) => panic!(
-                "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-            ),
-            Expr::Unary(_, child) => simulate_increment(child, global_refs, delta),
-            Expr::Binary(_, left, right) => {
-                simulate_increment(left, global_refs, delta);
-                simulate_increment(right, global_refs, delta);
-            }
-            Expr::Ternary(_, a, b, c) => {
-                simulate_increment(a, global_refs, delta);
-                simulate_increment(b, global_refs, delta);
-                simulate_increment(c, global_refs, delta);
-            }
-            Expr::Nary(_, children) => {
-                for child in children {
-                    simulate_increment(child, global_refs, delta);
-                }
-            }
-        }
-    }
-}
-
-/// Subtract edges from the accumulator for subtrees orphaned by a delta.
-///
-/// Mirrors [`subtract_orphaned_edges`] but reads orphan status from
-/// `global_refs` + `delta` instead of comparing two full BTreeMaps.
-///
-/// A node is orphaned when:
-/// - `global_refs[h] > 0` (it existed before)
-/// - `global_refs[h] + delta[h] <= 0` (it no longer exists after the rewrite)
-fn subtract_orphaned_edges_delta(
-    acc: &mut EdgeAccumulator,
-    emb: &OpEmbeddings,
-    expr: &Expr,
-    global_refs: &alloc::collections::BTreeMap<u64, u32>,
-    delta: &alloc::collections::BTreeMap<u64, i32>,
-    depth: u32,
-    processed: &mut alloc::collections::BTreeSet<u64>,
-) {
-    let h = structural_hash(expr);
-    if processed.contains(&h) {
-        return; // Already handled this subtree (CSE dedup).
-    }
-    let old_count = global_refs.get(&h).copied().unwrap_or(0);
-    if old_count == 0 {
-        // Node was never in the accumulator. Nothing to remove.
-        return;
-    }
-    let d = delta.get(&h).copied().unwrap_or(0);
-    let new_count = old_count as i32 + d;
-    if new_count > 0 {
-        // Node still has references elsewhere. Its edges must stay.
-        return;
-    }
-    // old_count > 0 && new_count <= 0: this node is fully orphaned.
-    processed.insert(h);
-    let parent_op = expr.op_type();
-    acc.node_count = acc.node_count.saturating_sub(1);
-
-    match expr {
-        Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!(
-            "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-        ),
-        Expr::Unary(_, child) => {
-            let eff_depth = depth * MAX_ARITY as u32;
-            acc.remove_edge(emb, parent_op, child.op_type(), eff_depth);
-            subtract_orphaned_edges_delta(acc, emb, child, global_refs, delta, depth + 1, processed);
-        }
-        Expr::Binary(_, left, right) => {
-            acc.remove_edge(emb, parent_op, left.op_type(), depth * MAX_ARITY as u32);
-            acc.remove_edge(emb, parent_op, right.op_type(), depth * MAX_ARITY as u32 + 1);
-            subtract_orphaned_edges_delta(acc, emb, left, global_refs, delta, depth + 1, processed);
-            subtract_orphaned_edges_delta(acc, emb, right, global_refs, delta, depth + 1, processed);
-        }
-        Expr::Ternary(_, a, b, c) => {
-            acc.remove_edge(emb, parent_op, a.op_type(), depth * MAX_ARITY as u32);
-            acc.remove_edge(emb, parent_op, b.op_type(), depth * MAX_ARITY as u32 + 1);
-            acc.remove_edge(emb, parent_op, c.op_type(), depth * MAX_ARITY as u32 + 2);
-            subtract_orphaned_edges_delta(acc, emb, a, global_refs, delta, depth + 1, processed);
-            subtract_orphaned_edges_delta(acc, emb, b, global_refs, delta, depth + 1, processed);
-            subtract_orphaned_edges_delta(acc, emb, c, global_refs, delta, depth + 1, processed);
-        }
-        Expr::Nary(_, children) => {
-            for (idx, child) in children.iter().enumerate() {
-                let eff_depth = depth * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                acc.remove_edge(emb, parent_op, child.op_type(), eff_depth);
-                subtract_orphaned_edges_delta(acc, emb, child, global_refs, delta, depth + 1, processed);
-            }
-        }
-    }
-}
-
-/// Add edges to the accumulator for subtrees that are brand new per delta.
-///
-/// Mirrors [`add_new_edges`] but reads new-node status from
-/// `global_refs` + `delta` instead of comparing two full BTreeMaps.
-///
-/// A node is new when:
-/// - `global_refs[h] == 0` (or absent — it did not exist before)
-/// - `global_refs[h] + delta[h] > 0` (it exists after the rewrite)
-fn add_new_edges_delta(
-    acc: &mut EdgeAccumulator,
-    emb: &OpEmbeddings,
-    expr: &Expr,
-    global_refs: &alloc::collections::BTreeMap<u64, u32>,
-    delta: &alloc::collections::BTreeMap<u64, i32>,
-    depth: u32,
-    processed: &mut alloc::collections::BTreeSet<u64>,
-) {
-    let h = structural_hash(expr);
-    if processed.contains(&h) {
-        return; // Already handled this subtree (CSE dedup).
-    }
-    let pre_count = global_refs.get(&h).copied().unwrap_or(0);
-    if pre_count > 0 {
-        // Already existed before this addition. Its edges are in the accumulator.
-        return;
-    }
-    let d = delta.get(&h).copied().unwrap_or(0);
-    let post_count = pre_count as i32 + d;
-    if post_count <= 0 {
-        panic!(
-            "add_new_edges_delta: node hash {h:#x} has post_count {post_count} <= 0 — \
-             simulate_increment should have made it > 0"
-        );
-    }
-    // pre_count == 0 && post_count > 0: brand new subtree.
-    processed.insert(h);
-    let parent_op = expr.op_type();
-    acc.node_count += 1;
-
-    match expr {
-        Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!(
-            "Expr::Param({i}) reached IncrementalJudge — call substitute_params before use"
-        ),
-        Expr::Unary(_, child) => {
-            let eff_depth = depth * MAX_ARITY as u32;
-            acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
-            add_new_edges_delta(acc, emb, child, global_refs, delta, depth + 1, processed);
-        }
-        Expr::Binary(_, left, right) => {
-            acc.add_edge(emb, parent_op, left.op_type(), depth * MAX_ARITY as u32);
-            acc.add_edge(emb, parent_op, right.op_type(), depth * MAX_ARITY as u32 + 1);
-            add_new_edges_delta(acc, emb, left, global_refs, delta, depth + 1, processed);
-            add_new_edges_delta(acc, emb, right, global_refs, delta, depth + 1, processed);
-        }
-        Expr::Ternary(_, a, b, c) => {
-            acc.add_edge(emb, parent_op, a.op_type(), depth * MAX_ARITY as u32);
-            acc.add_edge(emb, parent_op, b.op_type(), depth * MAX_ARITY as u32 + 1);
-            acc.add_edge(emb, parent_op, c.op_type(), depth * MAX_ARITY as u32 + 2);
-            add_new_edges_delta(acc, emb, a, global_refs, delta, depth + 1, processed);
-            add_new_edges_delta(acc, emb, b, global_refs, delta, depth + 1, processed);
-            add_new_edges_delta(acc, emb, c, global_refs, delta, depth + 1, processed);
-        }
-        Expr::Nary(_, children) => {
-            for (idx, child) in children.iter().enumerate() {
-                let eff_depth = depth * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
-                add_new_edges_delta(acc, emb, child, global_refs, delta, depth + 1, processed);
-            }
-        }
-    }
-}
-
-/// Apply an incremental accumulator delta for replacing `lhs` with `rhs`.
-///
-/// Mutates `acc` and `refs` in place. The caller decides whether these are
-/// the real state (commit) or throwaway clones (peek).
-///
-/// Algorithm:
-/// 1. Snapshot old refcounts for comparison
-/// 2. Decrement refcounts for LHS subtree
-/// 3. Increment refcounts for RHS subtree
-/// 4. Parent edge fixup (if LHS is not the root)
-/// 5. Subtract orphaned LHS edges (refcount went >0 → 0)
-/// 6. Add new RHS edges (refcount went 0 → >0)
-fn apply_incremental_delta(
-    acc: &mut EdgeAccumulator,
-    emb: &OpEmbeddings,
-    lhs: &Expr,
-    rhs: &Expr,
-    refs: &mut alloc::collections::BTreeMap<u64, u32>,
-    parent_ctx: Option<&ParentContext>,
-    lhs_depth: u32,
-) {
-    // 1. Snapshot old refcounts before mutation
-    let old_refs = refs.clone();
-
-    // 2–3. Update refcounts: decrement old, increment new
-    decrement_refs(lhs, refs);
-    increment_refs(rhs, refs);
-
-    // 4. Parent edge fixup: the parent's outgoing edge changes type
-    if let Some(ctx) = parent_ctx {
-        let old_root_op = lhs.op_type();
-        let new_root_op = rhs.op_type();
-        let eff_depth = ctx.parent_depth * MAX_ARITY as u32 + ctx.child_index as u32;
-        // Always remove old + add new; if ops are identical the net effect on
-        // the float array is zero (no drift), but we keep it unconditional for
-        // correctness when the ops differ.
-        acc.remove_edge(emb, ctx.parent_op, old_root_op, eff_depth);
-        acc.add_edge(emb, ctx.parent_op, new_root_op, eff_depth);
-    }
-
-    // 5. Remove edges for nodes orphaned by this rewrite
-    let mut processed = alloc::collections::BTreeSet::new();
-    subtract_orphaned_edges(acc, emb, lhs, &old_refs, refs, lhs_depth, &mut processed);
-
-    // 6. Add edges for brand-new nodes introduced by this rewrite
-    processed.clear();
-    add_new_edges(acc, emb, rhs, &old_refs, refs, lhs_depth, &mut processed);
-}
-
-/// Incremental NNUE judge for rewrite-based optimization.
-///
-/// Wraps an [`EdgeAccumulator`], an external refcount map, and the current AST
-/// so that:
-/// - The accumulator remains cheap to clone (stack copy, ~520 bytes)
-/// - CSE (common subexpression elimination) is tracked via structural hashes
-/// - [`peek_rewrite`](Self::peek_rewrite) evaluates a candidate rewrite without mutation
-/// - [`commit_rewrite`](Self::commit_rewrite) permanently applies a rewrite
-///
-/// The refcount map (`BTreeMap<u64, u32>`) lives OUTSIDE the accumulator so
-/// cloning the accumulator for candidate trials is still instant. The AST is
-/// stored for parent-edge bookkeeping: when a subtree is replaced, the parent
-/// node's outgoing edge changes type, which must be reflected in the accumulator.
-pub struct IncrementalJudge<'a> {
-    nnue: &'a ExprNnue,
-    acc: EdgeAccumulator,
-    refs: alloc::collections::BTreeMap<u64, u32>,
-    ast: Expr,
-}
-
-impl<'a> IncrementalJudge<'a> {
-    /// Build an incremental judge from an expression and NNUE network.
-    ///
-    /// Constructs the deduped accumulator, initial refcount map, and stores
-    /// a clone of the AST for parent-edge tracking.
-    #[must_use]
-    pub fn new(ast: &Expr, nnue: &'a ExprNnue) -> Self {
-        let acc = EdgeAccumulator::from_expr_dedup(ast, &nnue.embeddings);
-        let refs = build_refcounts(ast);
-        Self { nnue, acc, refs, ast: ast.clone() }
-    }
-
-    /// Current predicted log-cost from the accumulator.
-    #[must_use]
-    pub fn current_cost(&self) -> f32 {
-        self.nnue.predict_log_cost_with_features(&self.acc)
-    }
-
-    /// Evaluate a candidate rewrite WITHOUT mutating state.
-    ///
-    /// Uses a delta buffer instead of cloning the full refcount BTreeMap.
-    /// Only the flat accumulator (~520 bytes, stack copy) is cloned. The
-    /// delta buffer is O(Δ) — proportional to the rewrite size, not the
-    /// total expression size.
-    ///
-    /// `depth` is the depth of the LHS subtree root in the overall AST.
-    #[must_use]
-    pub fn peek_rewrite(&self, lhs: &Expr, rhs: &Expr, depth: u32) -> f32 {
-        let lhs_hash = structural_hash(lhs);
-        let parent_ctx = find_parent_context(&self.ast, lhs_hash);
-
-        // 1. Build O(Δ) delta buffer by simulating decrement + increment
-        let mut delta = alloc::collections::BTreeMap::<u64, i32>::new();
-        simulate_decrement(lhs, &self.refs, &mut delta);
-        simulate_increment(rhs, &self.refs, &mut delta);
-
-        // 2. Clone only the accumulator (stack copy, ~520 bytes)
-        let mut cand_acc = self.acc.clone();
-
-        // 3. Parent edge fixup
-        if let Some(ctx) = parent_ctx.as_ref() {
-            let old_root_op = lhs.op_type();
-            let new_root_op = rhs.op_type();
-            let eff_depth = ctx.parent_depth * MAX_ARITY as u32 + ctx.child_index as u32;
-            cand_acc.remove_edge(&self.nnue.embeddings, ctx.parent_op, old_root_op, eff_depth);
-            cand_acc.add_edge(&self.nnue.embeddings, ctx.parent_op, new_root_op, eff_depth);
-        }
-
-        // 4. Subtract edges for orphaned nodes (global_refs[h] > 0, effective == 0)
-        let mut processed = alloc::collections::BTreeSet::new();
-        subtract_orphaned_edges_delta(
-            &mut cand_acc,
-            &self.nnue.embeddings,
-            lhs,
-            &self.refs,
-            &delta,
-            depth,
-            &mut processed,
-        );
-
-        // 5. Add edges for brand-new nodes (global_refs[h] == 0, effective > 0)
-        processed.clear();
-        add_new_edges_delta(
-            &mut cand_acc,
-            &self.nnue.embeddings,
-            rhs,
-            &self.refs,
-            &delta,
-            depth,
-            &mut processed,
-        );
-
-        self.nnue.predict_log_cost_with_features(&cand_acc)
-    }
-
-    /// Permanently apply a rewrite, mutating the accumulator, refcount map,
-    /// and stored AST.
-    ///
-    /// `depth` is the depth of the LHS subtree root in the overall AST.
-    pub fn commit_rewrite(&mut self, lhs: &Expr, rhs: &Expr, depth: u32) {
-        let lhs_hash = structural_hash(lhs);
-        let parent_ctx = find_parent_context(&self.ast, lhs_hash);
-
-        apply_incremental_delta(
-            &mut self.acc,
-            &self.nnue.embeddings,
-            lhs,
-            rhs,
-            &mut self.refs,
-            parent_ctx.as_ref(),
-            depth,
-        );
-
-        // Update the AST to reflect the rewrite
-        let replaced = replace_subtree(&mut self.ast, lhs_hash, rhs);
-        assert!(
-            replaced,
-            "commit_rewrite: LHS subtree (hash {lhs_hash:#x}) not found in current AST"
-        );
-    }
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -4207,23 +4157,19 @@ mod tests {
 
     /// Create a simple expression: x + y
     fn make_add_xy() -> Expr {
-        Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        )
+        Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)))
     }
 
     /// Create FMA-eligible expression: a*b + c
     fn make_fma_pattern() -> Expr {
         Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Mul,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Var(2)),
+            Arc::new(Expr::Var(2)),
         )
     }
 
@@ -4231,11 +4177,11 @@ mod tests {
     fn make_add_mul_pattern() -> Expr {
         Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Binary(
                 OpKind::Mul,
-                Box::new(Expr::Var(1)),
-                Box::new(Expr::Var(2)),
+                Arc::new(Expr::Var(1)),
+                Arc::new(Expr::Var(2)),
             )),
         )
     }
@@ -4261,7 +4207,9 @@ mod tests {
         assert_eq!(edges.len(), 4);
 
         // Check that Add→Mul exists (the FMA-critical edge)
-        let has_add_mul = edges.iter().any(|e| e.parent == OpKind::Add && e.child == OpKind::Mul);
+        let has_add_mul = edges
+            .iter()
+            .any(|e| e.parent == OpKind::Add && e.child == OpKind::Mul);
         assert!(has_add_mul, "Should have Add→Mul edge for FMA pattern");
     }
 
@@ -4271,11 +4219,11 @@ mod tests {
 
         // Mul→Add (under Add parent)
         let fma = make_fma_pattern();
-        let acc_fma = EdgeAccumulator::from_expr(&fma, &emb);
+        let acc_fma = EdgeAccumulator::from_expr_dedup(&fma, &emb);
 
         // Add→Mul (Mul under Add, same ops but different structure)
         let add_mul = make_add_mul_pattern();
-        let _acc_add_mul = EdgeAccumulator::from_expr(&add_mul, &emb);
+        let _acc_add_mul = EdgeAccumulator::from_expr_dedup(&add_mul, &emb);
 
         // The accumulators should be different because:
         // - FMA has Add→Mul, Add→Var edges
@@ -4288,15 +4236,15 @@ mod tests {
 
         let mul_add = Expr::Binary(
             OpKind::Mul,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(1)),
-                Box::new(Expr::Var(2)),
+                Arc::new(Expr::Var(1)),
+                Arc::new(Expr::Var(2)),
             )),
         );
 
-        let acc_mul_add = EdgeAccumulator::from_expr(&mul_add, &emb);
+        let acc_mul_add = EdgeAccumulator::from_expr_dedup(&mul_add, &emb);
 
         // These should definitely differ:
         // - FMA (a*b + c): edges are Add→Mul, Add→Var, Mul→Var, Mul→Var
@@ -4310,7 +4258,10 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum();
 
-        assert!(diff > 0.1, "Asymmetric patterns should produce different accumulators");
+        assert!(
+            diff > 0.1,
+            "Asymmetric patterns should produce different accumulators"
+        );
     }
 
     #[test]
@@ -4319,10 +4270,10 @@ mod tests {
         let expr = make_fma_pattern();
 
         // Build accumulator from scratch
-        let acc_full = EdgeAccumulator::from_expr(&expr, &emb);
+        let acc_full = EdgeAccumulator::from_expr_dedup(&expr, &emb);
 
-        // Build via from_expr (same as full)
-        let acc_inc = EdgeAccumulator::from_expr(&expr, &emb);
+        // Build via from_expr_dedup (same as full)
+        let acc_inc = EdgeAccumulator::from_expr_dedup(&expr, &emb);
 
         // Should match
         for i in 0..acc_full.values.len() {
@@ -4336,7 +4287,10 @@ mod tests {
         let mut acc_removed = acc_inc.clone();
         acc_removed.remove_expr_edges(&expr, &emb);
         for &v in &acc_removed.values {
-            assert!(v.abs() < 1e-6, "After removing all edges, accumulator should be zero");
+            assert!(
+                v.abs() < 1e-6,
+                "After removing all edges, accumulator should be zero"
+            );
         }
     }
 
@@ -4358,7 +4312,8 @@ mod tests {
         assert!(count > 0, "Should have parameters");
         assert!(
             ExprNnue::memory_bytes() < 200_000,
-            "NNUE should use < 200KB, got {} bytes", ExprNnue::memory_bytes()
+            "NNUE should use < 200KB, got {} bytes",
+            ExprNnue::memory_bytes()
         );
     }
 
@@ -4369,8 +4324,8 @@ mod tests {
         let simple = Expr::Var(0);
         let complex = Expr::Binary(
             OpKind::Div,
-            Box::new(Expr::Unary(OpKind::Sqrt, Box::new(Expr::Var(0)))),
-            Box::new(Expr::Unary(OpKind::Sqrt, Box::new(Expr::Var(1)))),
+            Arc::new(Expr::Unary(OpKind::Sqrt, Arc::new(Expr::Var(0)))),
+            Arc::new(Expr::Unary(OpKind::Sqrt, Arc::new(Expr::Var(1)))),
         );
 
         let cost_simple = net.predict_cost(&simple);
@@ -4397,7 +4352,8 @@ mod tests {
         assert!(count > 10_000, "Should have >10k params, got {}", count);
         assert!(
             ExprNnue::memory_bytes() < 200_000,
-            "NNUE should use < 200KB, got {} bytes", ExprNnue::memory_bytes()
+            "NNUE should use < 200KB, got {} bytes",
+            ExprNnue::memory_bytes()
         );
     }
 
@@ -4431,10 +4387,24 @@ mod tests {
         assert_eq!(original.w1, converted.w1);
         assert_eq!(original.b1, converted.b1);
 
-        // Value MLP and mask MLP are zero-initialized (need training)
+        // Identity trunk preserves the edge-tower hidden representation.
         let expr = make_fma_pattern();
+        let acc = EdgeAccumulator::from_expr_dedup(&expr, &original.embeddings);
+        let original_hidden = original.forward_shared(&acc);
+        let converted_hidden = converted.forward_shared(&acc);
+        for i in 0..HIDDEN_DIM {
+            assert!(
+                (original_hidden[i] - converted_hidden[i]).abs() < 1e-6,
+                "forward_shared[{i}] changed during migration"
+            );
+        }
+
+        // Unified heads are still zero-initialized and should remain numerically sane.
         let cost = converted.predict_cost(&expr);
-        assert!(cost.is_finite(), "Prediction from converted model should be finite");
+        assert!(
+            cost.is_finite(),
+            "Prediction from converted model should be finite"
+        );
     }
 
     #[test]
@@ -4479,13 +4449,21 @@ mod tests {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
-        // Use mask-based scoring (the only policy head now)
+        // Use mask-based scoring (the only saturation head now)
         let rule_features = RuleFeatures::new();
         let rule_embeds = net.encode_all_rules(&rule_features, 2);
         let scores = net.mask_score_all_rules(&expr, &rule_embeds);
 
-        assert!(scores[0].is_finite(), "Policy score should be finite: {}", scores[0]);
-        assert!(scores[1].is_finite(), "Policy score should be finite: {}", scores[1]);
+        assert!(
+            scores[0].is_finite(),
+            "Policy score should be finite: {}",
+            scores[0]
+        );
+        assert!(
+            scores[1].is_finite(),
+            "Policy score should be finite: {}",
+            scores[1]
+        );
     }
 
     // ========================================================================
@@ -4507,7 +4485,10 @@ mod tests {
         rule_features.set(0, [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0]);
         let features = rule_features.get(0);
         assert!((features[0] - 0.25).abs() < 1e-6, "Category should be set");
-        assert!((features[3] - 1.0).abs() < 1e-6, "Commutative flag should be set");
+        assert!(
+            (features[3] - 1.0).abs() < 1e-6,
+            "Commutative flag should be set"
+        );
     }
 
     #[test]
@@ -4529,7 +4510,11 @@ mod tests {
 
         // Embedding should be finite
         for i in 0..EMBED_DIM {
-            assert!(embed1[i].is_finite(), "Rule embedding should be finite at dim {}", i);
+            assert!(
+                embed1[i].is_finite(),
+                "Rule embedding should be finite at dim {}",
+                i
+            );
         }
     }
 
@@ -4555,11 +4540,25 @@ mod tests {
         }
 
         // Different features should produce different embeddings
-        let diff_01: f32 = embeds[0].iter().zip(embeds[1].iter()).map(|(a, b)| (a - b).abs()).sum();
-        let diff_02: f32 = embeds[0].iter().zip(embeds[2].iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff_01: f32 = embeds[0]
+            .iter()
+            .zip(embeds[1].iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let diff_02: f32 = embeds[0]
+            .iter()
+            .zip(embeds[2].iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
 
-        assert!(diff_01 > 1e-3, "Different rules should have different embeddings");
-        assert!(diff_02 > 1e-3, "Different rules should have different embeddings");
+        assert!(
+            diff_01 > 1e-3,
+            "Different rules should have different embeddings"
+        );
+        assert!(
+            diff_02 > 1e-3,
+            "Different rules should have different embeddings"
+        );
     }
 
     #[test]
@@ -4568,16 +4567,24 @@ mod tests {
         let expr = make_fma_pattern();
 
         // Compute hidden state
-        let acc = EdgeAccumulator::from_expr(&expr, &net.embeddings);
+        let acc = EdgeAccumulator::from_expr_dedup(&expr, &net.embeddings);
         let hidden = net.forward_shared(&acc);
 
         // Compute expr embedding
         let expr_embed = net.compute_expr_embed(&hidden);
 
-        assert_eq!(expr_embed.len(), EMBED_DIM, "Expr embed should have EMBED_DIM dimensions");
+        assert_eq!(
+            expr_embed.len(),
+            EMBED_DIM,
+            "Expr embed should have EMBED_DIM dimensions"
+        );
 
         for (i, &val) in expr_embed.iter().enumerate() {
-            assert!(val.is_finite(), "Expr embedding should be finite at dim {}", i);
+            assert!(
+                val.is_finite(),
+                "Expr embedding should be finite at dim {}",
+                i
+            );
         }
     }
 
@@ -4586,16 +4593,24 @@ mod tests {
         let net = ExprNnue::new_random(42);
         let expr = make_fma_pattern();
 
-        let acc = EdgeAccumulator::from_expr(&expr, &net.embeddings);
+        let acc = EdgeAccumulator::from_expr_dedup(&expr, &net.embeddings);
         let hidden = net.forward_shared(&acc);
         let expr_embed = net.compute_expr_embed(&hidden);
 
         let mask_features = net.compute_mask_features(&expr_embed);
 
-        assert_eq!(mask_features.len(), EMBED_DIM, "Mask features should have EMBED_DIM dimensions");
+        assert_eq!(
+            mask_features.len(),
+            EMBED_DIM,
+            "Mask features should have EMBED_DIM dimensions"
+        );
 
         for (i, &val) in mask_features.iter().enumerate() {
-            assert!(val.is_finite(), "Mask features should be finite at dim {}", i);
+            assert!(
+                val.is_finite(),
+                "Mask features should be finite at dim {}",
+                i
+            );
         }
     }
 
@@ -4681,7 +4696,10 @@ mod tests {
         let cost = net.predict_log_cost(&expr);
 
         assert!(cost.is_finite(), "Unified cost prediction should be finite");
-        assert!(cost > 0.0, "Cost should be positive (exp of value_mlp output)");
+        assert!(
+            cost > 0.0,
+            "Cost should be positive (exp of value_mlp output)"
+        );
     }
 
     #[test]
@@ -4758,24 +4776,39 @@ mod tests {
         net.embeddings.e[0][0] = 1.234;
         net.w1[0][0] = 5.678;
         net.b1[0] = 0.999;
-        net.expr_proj_w[0][0] = 2.345;  // shared projection - should be preserved
+        net.expr_proj_w[0][0] = 2.345; // shared projection - should be preserved
 
         // Initially mask-specific weights should be zero
         let initial_mask_sum: f32 = net.mask_mlp_w1.iter().flatten().map(|x| x.abs()).sum();
-        assert!(initial_mask_sum < 1e-6, "Initial mask weights should be zero");
+        assert!(
+            initial_mask_sum < 1e-6,
+            "Initial mask weights should be zero"
+        );
 
         // Randomize mask-only
         net.randomize_mask_only(42);
 
         // Backbone should be PRESERVED
-        assert!((net.embeddings.e[0][0] - 1.234).abs() < 1e-6, "Embeddings should be preserved");
-        assert!((net.w1[0][0] - 5.678).abs() < 1e-6, "w1 should be preserved");
+        assert!(
+            (net.embeddings.e[0][0] - 1.234).abs() < 1e-6,
+            "Embeddings should be preserved"
+        );
+        assert!(
+            (net.w1[0][0] - 5.678).abs() < 1e-6,
+            "w1 should be preserved"
+        );
         assert!((net.b1[0] - 0.999).abs() < 1e-6, "b1 should be preserved");
-        assert!((net.expr_proj_w[0][0] - 2.345).abs() < 1e-6, "expr_proj should be preserved");
+        assert!(
+            (net.expr_proj_w[0][0] - 2.345).abs() < 1e-6,
+            "expr_proj should be preserved"
+        );
 
         // Mask-specific weights should now be non-zero
         let final_mask_sum: f32 = net.mask_mlp_w1.iter().flatten().map(|x| x.abs()).sum();
-        assert!(final_mask_sum > 1.0, "Randomized mask weights should be non-zero");
+        assert!(
+            final_mask_sum > 1.0,
+            "Randomized mask weights should be non-zero"
+        );
 
         // Interaction matrix should be near identity diagonal
         for i in 0..EMBED_DIM {
@@ -4841,12 +4874,12 @@ mod tests {
         let expr = make_fma_pattern();
         let rule_features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
 
-        // Train mask head
+        // Train saturation head
         let mask_loss = net.train_mask_step(&expr, &rule_features, true, 0.01, 1.0, 10.0);
         assert!(mask_loss.is_finite(), "Mask loss should be finite");
         assert!(!mask_loss.is_nan(), "Mask loss should not be NaN");
 
-        // Train value head
+        // Train extraction head
         let value_loss = net.train_value_mlp_step(&expr, 5.0, 0.01);
         assert!(value_loss.is_finite(), "Value loss should be finite");
         assert!(!value_loss.is_nan(), "Value loss should not be NaN");
@@ -4854,25 +4887,37 @@ mod tests {
         // Verify weights didn't become NaN
         for row in &net.expr_proj_w {
             for &val in row {
-                assert!(!val.is_nan(), "expr_proj_w should not contain NaN after training");
+                assert!(
+                    !val.is_nan(),
+                    "expr_proj_w should not contain NaN after training"
+                );
             }
         }
 
         for row in &net.mask_mlp_w1 {
             for &val in row {
-                assert!(!val.is_nan(), "mask_mlp_w1 should not contain NaN after training");
+                assert!(
+                    !val.is_nan(),
+                    "mask_mlp_w1 should not contain NaN after training"
+                );
             }
         }
 
         for row in &net.rule_mlp_w1 {
             for &val in row {
-                assert!(!val.is_nan(), "rule_mlp_w1 should not contain NaN after training");
+                assert!(
+                    !val.is_nan(),
+                    "rule_mlp_w1 should not contain NaN after training"
+                );
             }
         }
 
         for row in &net.interaction {
             for &val in row {
-                assert!(!val.is_nan(), "interaction should not contain NaN after training");
+                assert!(
+                    !val.is_nan(),
+                    "interaction should not contain NaN after training"
+                );
             }
         }
     }
@@ -4918,35 +4963,35 @@ mod tests {
         // Add(Sub(X,Y), Div(Z,W))
         let expr_a = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Sub,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Div,
-                Box::new(Expr::Var(2)),
-                Box::new(Expr::Var(3)),
+                Arc::new(Expr::Var(2)),
+                Arc::new(Expr::Var(3)),
             )),
         );
 
         // Add(Div(X,Y), Sub(Z,W))
         let expr_b = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Div,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Sub,
-                Box::new(Expr::Var(2)),
-                Box::new(Expr::Var(3)),
+                Arc::new(Expr::Var(2)),
+                Arc::new(Expr::Var(3)),
             )),
         );
 
-        let acc_a = EdgeAccumulator::from_expr(&expr_a, &emb);
-        let acc_b = EdgeAccumulator::from_expr(&expr_b, &emb);
+        let acc_a = EdgeAccumulator::from_expr_dedup(&expr_a, &emb);
+        let acc_b = EdgeAccumulator::from_expr_dedup(&expr_b, &emb);
 
         // Depth-encoded half should differ because siblings get different PEs
         let diff: f32 = acc_a.values[2 * K..4 * K]
@@ -4971,13 +5016,13 @@ mod tests {
         // the same hash.
         let a = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(1.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(1.0)),
         );
         let b = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(1.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(1.0)),
         );
         assert_eq!(
             structural_hash(&a),
@@ -4988,8 +5033,8 @@ mod tests {
 
     #[test]
     fn test_structural_hash_different_ops_differ() {
-        let add = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
-        let mul = Expr::Binary(OpKind::Mul, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let add = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let mul = Expr::Binary(OpKind::Mul, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         assert_ne!(
             structural_hash(&add),
             structural_hash(&mul),
@@ -5018,24 +5063,14 @@ mod tests {
 
     #[test]
     fn test_from_expr_dedup_no_shared_subtrees() {
-        // A tree with no shared subtrees: dedup result must equal plain from_expr.
+        // A tree with no shared subtrees: backref_count must be 0.
         let emb = OpEmbeddings::new_random(42);
         let expr = make_fma_pattern(); // (a*b) + c — no CSE
 
-        let plain = EdgeAccumulator::from_expr(&expr, &emb);
         let dedup = EdgeAccumulator::from_expr_dedup(&expr, &emb);
 
-        // Accumulator values and scalars must match exactly.
-        for i in 0..4 * K {
-            assert!(
-                (plain.values[i] - dedup.values[i]).abs() < 1e-9,
-                "values[{i}] mismatch: plain={} dedup={}",
-                plain.values[i],
-                dedup.values[i]
-            );
-        }
-        assert_eq!(plain.edge_count, dedup.edge_count, "edge_count must match");
-        assert_eq!(plain.node_count, dedup.node_count, "node_count must match");
+        assert!(dedup.edge_count > 0, "must have edges");
+        assert!(dedup.node_count > 0, "must have nodes");
         assert_eq!(0, dedup.backref_count, "no CSE → backref_count must be 0");
     }
 
@@ -5050,122 +5085,334 @@ mod tests {
         // create two structurally equal (but separately allocated) neg(x)
         // subtrees.  structural_hash treats them as identical.
         let emb = OpEmbeddings::new_random(42);
-        let neg_x_a = Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0)));
-        let neg_x_b = Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0)));
-        let shared_sub = Expr::Binary(OpKind::Add, Box::new(neg_x_a), Box::new(neg_x_b));
+        let neg_x_a = Expr::Unary(OpKind::Neg, Arc::new(Expr::Var(0)));
+        let neg_x_b = Expr::Unary(OpKind::Neg, Arc::new(Expr::Var(0)));
+        let shared_sub = Expr::Binary(OpKind::Add, Arc::new(neg_x_a), Arc::new(neg_x_b));
 
-        let plain = EdgeAccumulator::from_expr(&shared_sub, &emb);
         let dedup = EdgeAccumulator::from_expr_dedup(&shared_sub, &emb);
 
         // backref_count must be exactly 1: the second `neg(x)` was skipped.
         assert_eq!(
-            1,
-            dedup.backref_count,
+            1, dedup.backref_count,
             "one shared subtree → backref_count == 1"
         );
 
-        // dedup must have fewer edges/nodes than the naive walk.
-        assert!(
-            dedup.edge_count < plain.edge_count,
-            "dedup should suppress duplicate edges: plain={} dedup={}",
-            plain.edge_count,
-            dedup.edge_count
-        );
-        assert!(
-            dedup.node_count < plain.node_count,
-            "dedup should suppress duplicate nodes: plain={} dedup={}",
-            plain.node_count,
+        // The deduplicated walk must see: Add node + one neg(x) node + one Var node = 3 nodes.
+        // The second neg(x) is skipped.
+        assert_eq!(
+            3, dedup.node_count,
+            "Add + one neg(x) + one Var = 3 unique nodes, got {}",
             dedup.node_count
         );
     }
 
-    #[cfg(test)]
-    mod black_box_behavior_tests {
-        use super::*;
-        use alloc::boxed::Box;
+    // ========================================================================
+    // GraphAccumulator normalization tests
+    // ========================================================================
 
-        fn assert_costs_match(incremental_cost: f32, ground_truth_cost: f32, context: &str) {
-            let diff = (incremental_cost - ground_truth_cost).abs();
-            assert!(
-                diff < 1e-4,
-                "{}: Incremental cost {} diverged from ground truth {}",
-                context, incremental_cost, ground_truth_cost
+    #[test]
+    fn test_graph_acc_normalize_unit_norm_per_section() {
+        let emb = OpEmbeddings::new_random(42);
+        let mut gacc = GraphAccumulator::new();
+        // Build a non-trivial accumulator: several edges
+        gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
+        gacc.add_edge(&emb, OpKind::Mul, OpKind::Var);
+        gacc.add_edge(&emb, OpKind::Mul, OpKind::Var);
+        gacc.add_edge(&emb, OpKind::Add, OpKind::Var);
+
+        let normed = gacc.normalized();
+
+        // Each section should have L2 norm ~1.0
+        let section_norm = |start: usize, end: usize| -> f32 {
+            let sum_sq: f32 = normed.values[start..end].iter().map(|v| v * v).sum();
+            sqrtf(sum_sq)
+        };
+        let eps = 1e-5;
+        assert!(
+            (section_norm(0, K) - 1.0).abs() < eps,
+            "parent section norm should be 1.0"
+        );
+        assert!(
+            (section_norm(K, 2 * K) - 1.0).abs() < eps,
+            "child section norm should be 1.0"
+        );
+        assert!(
+            (section_norm(2 * K, 3 * K) - 1.0).abs() < eps,
+            "1-hop VSA section norm should be 1.0"
+        );
+        // 2-hop section is zero (no 2-hop edges added) — normalization should leave it as zeros.
+        let hop2_norm = section_norm(3 * K, 4 * K);
+        assert!(
+            hop2_norm < eps,
+            "2-hop VSA section should be zero when no 2-hop edges added, got {hop2_norm}"
+        );
+    }
+
+    #[test]
+    fn test_graph_acc_normalize_scalars_preserved() {
+        let emb = OpEmbeddings::new_random(42);
+        let mut gacc = GraphAccumulator::new();
+        gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
+        gacc.add_leaf();
+        gacc.add_leaf();
+        gacc.node_budget = 100;
+        gacc.epoch_budget = 50;
+
+        let normed = gacc.normalized();
+        assert_eq!(
+            normed.edge_count, gacc.edge_count,
+            "edge_count must be preserved"
+        );
+        assert_eq!(
+            normed.node_count, gacc.node_count,
+            "node_count must be preserved"
+        );
+        assert_eq!(
+            normed.node_budget, gacc.node_budget,
+            "node_budget must be preserved"
+        );
+        assert_eq!(
+            normed.epoch_budget, gacc.epoch_budget,
+            "epoch_budget must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_graph_acc_normalize_zero_is_safe() {
+        // A fresh (zero) accumulator should normalize without NaN/Inf.
+        let gacc = GraphAccumulator::new();
+        let normed = gacc.normalized();
+        for (i, &v) in normed.values.iter().enumerate() {
+            assert!(v.is_finite(), "values[{i}] must be finite, got {v}");
+            assert_eq!(
+                v, 0.0,
+                "zero accumulator must stay zero after normalization"
             );
-        }
-
-        #[test]
-        fn test_behavior_exploit_scenario_cse_preservation() {
-            let nnue = ExprNnue::new_random(42);
-
-            let shared_x = Box::new(Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0))));
-            let lhs_target = Expr::Binary(OpKind::Sub, shared_x.clone(), Box::new(Expr::Var(1)));
-            let right_branch = Expr::Binary(OpKind::Mul, shared_x.clone(), Box::new(Expr::Var(2)));
-            let initial_ast = Expr::Binary(OpKind::Add, Box::new(lhs_target.clone()), Box::new(right_branch.clone()));
-
-            let mut judge = IncrementalJudge::new(&initial_ast, &nnue);
-
-            let rhs_candidate = Expr::Unary(OpKind::Abs, Box::new(Expr::Var(3)));
-
-            let predicted_cost = judge.peek_rewrite(&lhs_target, &rhs_candidate, 1);
-
-            let future_ast = Expr::Binary(OpKind::Add, Box::new(rhs_candidate.clone()), Box::new(right_branch.clone()));
-            let truth_judge = IncrementalJudge::new(&future_ast, &nnue);
-
-            assert_costs_match(predicted_cost, truth_judge.current_cost(), "Peek CSE preservation failed");
-
-            judge.commit_rewrite(&lhs_target, &rhs_candidate, 1);
-            assert_costs_match(judge.current_cost(), truth_judge.current_cost(), "Commit CSE preservation failed");
-        }
-
-        #[test]
-        fn test_behavior_total_collapse() {
-            let nnue = ExprNnue::new_random(42);
-
-            let shared_x = Box::new(Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0))));
-            let initial_ast = Expr::Binary(OpKind::Add, shared_x.clone(), shared_x.clone());
-
-            let mut judge = IncrementalJudge::new(&initial_ast, &nnue);
-
-            let rhs_candidate = Expr::Const(0.0);
-            let predicted_cost = judge.peek_rewrite(&initial_ast, &rhs_candidate, 0);
-
-            let truth_judge = IncrementalJudge::new(&rhs_candidate, &nnue);
-
-            assert_costs_match(predicted_cost, truth_judge.current_cost(), "Peek total collapse failed");
-
-            judge.commit_rewrite(&initial_ast, &rhs_candidate, 0);
-            assert_costs_match(judge.current_cost(), truth_judge.current_cost(), "Commit total collapse failed");
-        }
-
-        #[test]
-        fn test_behavior_sequential_drift() {
-            let nnue = ExprNnue::new_random(42);
-
-            let mut current_ast = Expr::Binary(
-                OpKind::Add,
-                Box::new(Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0)))),
-                Box::new(Expr::Unary(OpKind::Abs, Box::new(Expr::Var(1))))
-            );
-            let mut judge = IncrementalJudge::new(&current_ast, &nnue);
-
-            let rewrites: Vec<(Expr, Expr, u32)> = vec![
-                (Expr::Unary(OpKind::Abs, Box::new(Expr::Var(1))), Expr::Var(2), 1),
-                (Expr::Unary(OpKind::Neg, Box::new(Expr::Var(0))), Expr::Const(1.0), 1),
-                (Expr::Var(2), Expr::Const(1.0), 1),
-            ];
-
-            for (lhs, rhs, depth) in rewrites {
-                judge.commit_rewrite(&lhs, &rhs, depth);
-            }
-
-            let final_truth_ast = Expr::Binary(
-                OpKind::Add,
-                Box::new(Expr::Const(1.0)),
-                Box::new(Expr::Const(1.0))
-            );
-            let truth_judge = IncrementalJudge::new(&final_truth_ast, &nnue);
-
-            assert_costs_match(judge.current_cost(), truth_judge.current_cost(), "Sequential drift detected");
         }
     }
+
+    #[test]
+    fn test_graph_acc_normalize_in_place_matches_normalized() {
+        let emb = OpEmbeddings::new_random(42);
+        let mut gacc = GraphAccumulator::new();
+        gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
+        gacc.add_edge(&emb, OpKind::Mul, OpKind::Var);
+
+        let copy_normed = gacc.normalized();
+
+        let mut in_place = gacc.clone();
+        in_place.normalize_in_place();
+
+        for i in 0..GRAPH_ACC_DIM {
+            assert!(
+                (copy_normed.values[i] - in_place.values[i]).abs() < 1e-9,
+                "values[{i}] mismatch: normalized()={} vs normalize_in_place()={}",
+                copy_normed.values[i],
+                in_place.values[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_acc_normalize_scale_invariance() {
+        // Doubling all edges (adding each edge twice) should yield the same
+        // normalized vector, proving scale invariance.
+        let emb = OpEmbeddings::new_random(42);
+
+        let mut small = GraphAccumulator::new();
+        small.add_edge(&emb, OpKind::Add, OpKind::Mul);
+        small.add_edge(&emb, OpKind::Mul, OpKind::Var);
+
+        let mut large = GraphAccumulator::new();
+        for _ in 0..10 {
+            large.add_edge(&emb, OpKind::Add, OpKind::Mul);
+            large.add_edge(&emb, OpKind::Mul, OpKind::Var);
+        }
+
+        let small_n = small.normalized();
+        let large_n = large.normalized();
+
+        for i in 0..GRAPH_ACC_DIM {
+            assert!(
+                (small_n.values[i] - large_n.values[i]).abs() < 1e-5,
+                "normalized vectors should match regardless of scale: values[{i}] small={} large={}",
+                small_n.values[i],
+                large_n.values[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_acc_normalize_idempotent() {
+        // Normalizing twice should produce the same result.
+        let emb = OpEmbeddings::new_random(42);
+        let mut gacc = GraphAccumulator::new();
+        gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
+        gacc.add_edge(&emb, OpKind::Mul, OpKind::Var);
+
+        let once = gacc.normalized();
+        let twice = once.normalized();
+
+        for i in 0..GRAPH_ACC_DIM {
+            assert!(
+                (once.values[i] - twice.values[i]).abs() < 1e-6,
+                "normalization must be idempotent: values[{i}] once={} twice={}",
+                once.values[i],
+                twice.values[i]
+            );
+        }
+    }
+
+    // ========================================================================
+    // GraphAccumulator incremental remove tests
+    // ========================================================================
+
+    /// Helper: walk an expression tree and call `add_op_node` / `add_leaf`
+    /// on a `GraphAccumulator`, using the backward-compatible depth=1 API.
+    fn build_graph_acc_from_expr(expr: &Expr, emb: &OpEmbeddings) -> GraphAccumulator {
+        let mut acc = GraphAccumulator::new();
+        graph_acc_walk_add(expr, emb, &mut acc);
+        acc
+    }
+
+    fn graph_acc_walk_add(expr: &Expr, emb: &OpEmbeddings, acc: &mut GraphAccumulator) {
+        match expr {
+            Expr::Var(_) | Expr::Const(_) => acc.add_leaf(),
+            Expr::Param(i) => panic!("Expr::Param({i}) in graph acc test"),
+            Expr::Unary(op, child) => {
+                acc.add_op_node(emb, *op, &[child.op_type()]);
+                graph_acc_walk_add(child, emb, acc);
+            }
+            Expr::Binary(op, left, right) => {
+                acc.add_op_node(emb, *op, &[left.op_type(), right.op_type()]);
+                graph_acc_walk_add(left, emb, acc);
+                graph_acc_walk_add(right, emb, acc);
+            }
+            Expr::Ternary(op, a, b, c) => {
+                acc.add_op_node(emb, *op, &[a.op_type(), b.op_type(), c.op_type()]);
+                graph_acc_walk_add(a, emb, acc);
+                graph_acc_walk_add(b, emb, acc);
+                graph_acc_walk_add(c, emb, acc);
+            }
+            Expr::Nary(op, children) => {
+                let child_ops: alloc::vec::Vec<OpKind> =
+                    children.iter().map(|c| c.op_type()).collect();
+                acc.add_op_node(emb, *op, &child_ops);
+                for child in children.iter() {
+                    graph_acc_walk_add(child, emb, acc);
+                }
+            }
+        }
+    }
+
+    /// Helper: walk an expression tree and call `remove_op_node` / `remove_leaf`
+    /// on a `GraphAccumulator` to subtract its contribution.
+    fn graph_acc_walk_remove(expr: &Expr, emb: &OpEmbeddings, acc: &mut GraphAccumulator) {
+        match expr {
+            Expr::Var(_) | Expr::Const(_) => acc.remove_leaf(),
+            Expr::Param(i) => panic!("Expr::Param({i}) in graph acc test"),
+            Expr::Unary(op, child) => {
+                acc.remove_op_node(emb, *op, &[child.op_type()]);
+                graph_acc_walk_remove(child, emb, acc);
+            }
+            Expr::Binary(op, left, right) => {
+                acc.remove_op_node(emb, *op, &[left.op_type(), right.op_type()]);
+                graph_acc_walk_remove(left, emb, acc);
+                graph_acc_walk_remove(right, emb, acc);
+            }
+            Expr::Ternary(op, a, b, c) => {
+                acc.remove_op_node(emb, *op, &[a.op_type(), b.op_type(), c.op_type()]);
+                graph_acc_walk_remove(a, emb, acc);
+                graph_acc_walk_remove(b, emb, acc);
+                graph_acc_walk_remove(c, emb, acc);
+            }
+            Expr::Nary(op, children) => {
+                let child_ops: alloc::vec::Vec<OpKind> =
+                    children.iter().map(|c| c.op_type()).collect();
+                acc.remove_op_node(emb, *op, &child_ops);
+                for child in children.iter() {
+                    graph_acc_walk_remove(child, emb, acc);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_graph_acc_remove_edge_inverse_of_add() {
+        let emb = OpEmbeddings::new_random(42);
+
+        // Expression A: x + y
+        let expr_a = make_add_xy();
+        // Expression B: sin(x) * y
+        let expr_b = Expr::Binary(
+            OpKind::Mul,
+            Arc::new(Expr::Unary(OpKind::Sin, Arc::new(Expr::Var(0)))),
+            Arc::new(Expr::Var(1)),
+        );
+
+        // Build accumulator from A, then add B and remove A.
+        let mut incremental = build_graph_acc_from_expr(&expr_a, &emb);
+        graph_acc_walk_add(&expr_b, &emb, &mut incremental);
+        graph_acc_walk_remove(&expr_a, &emb, &mut incremental);
+
+        // Build accumulator from B alone (ground truth).
+        let from_scratch = build_graph_acc_from_expr(&expr_b, &emb);
+
+        assert_eq!(
+            incremental.edge_count, from_scratch.edge_count,
+            "edge_count mismatch: incremental={} vs from_scratch={}",
+            incremental.edge_count, from_scratch.edge_count
+        );
+        assert_eq!(
+            incremental.node_count, from_scratch.node_count,
+            "node_count mismatch: incremental={} vs from_scratch={}",
+            incremental.node_count, from_scratch.node_count
+        );
+        for i in 0..GRAPH_ACC_DIM {
+            let diff = (incremental.values[i] - from_scratch.values[i]).abs();
+            assert!(
+                diff < 1e-6,
+                "values[{i}] mismatch: incremental={} vs from_scratch={} (diff={diff})",
+                incremental.values[i],
+                from_scratch.values[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_acc_add_then_remove_returns_to_zero() {
+        let emb = OpEmbeddings::new_random(99);
+
+        let expr = make_fma_pattern();
+        let mut acc = build_graph_acc_from_expr(&expr, &emb);
+
+        assert!(acc.edge_count > 0, "should have edges after add");
+        assert!(acc.node_count > 0, "should have nodes after add");
+
+        graph_acc_walk_remove(&expr, &emb, &mut acc);
+
+        assert_eq!(
+            acc.edge_count, 0,
+            "edge_count should be 0 after full removal"
+        );
+        assert_eq!(
+            acc.node_count, 0,
+            "node_count should be 0 after full removal"
+        );
+        for i in 0..GRAPH_ACC_DIM {
+            assert!(
+                acc.values[i].abs() < 1e-6,
+                "values[{i}] should be ~0 after full removal, got {}",
+                acc.values[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_acc_remove_leaf_saturates_at_zero() {
+        let mut acc = GraphAccumulator::new();
+        acc.remove_leaf();
+        assert_eq!(acc.node_count, 0, "node_count must not underflow");
+    }
+
 }

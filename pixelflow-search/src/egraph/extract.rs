@@ -1,265 +1,14 @@
-//! Extraction: Pull out a concrete expression tree from an e-graph.
+//! Extraction: materialise a concrete arena expression from an e-graph.
 //!
 //! An e-graph compresses many equivalent expressions. Extraction picks
-//! the "best" one according to a cost model.
+//! the "best" one according to a cost model and materialises it as an
+//! [`pixelflow_ir::ExprArena`].
 
-use alloc::vec::Vec;
 use super::cost::{CostFunction, CostModel};
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
-use super::ops::Op;
-
-/// A concrete expression tree extracted from an e-graph.
-///
-/// Unlike ENode (which uses EClassId children), this has direct child ownership.
-/// This is the output of extraction - a single concrete expression from the e-class.
-#[derive(Clone, Debug)]
-pub enum ExprTree {
-    /// Leaf nodes
-    Leaf(Leaf),
-    /// Operation with child subtrees
-    Op {
-        op: &'static dyn Op,
-        children: Vec<ExprTree>,
-    },
-}
-
-/// Leaf nodes in an expression tree.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Leaf {
-    /// Variable with index (0=X, 1=Y, 2=Z, 3=W, etc.)
-    Var(u8),
-    /// Constant value
-    Const(f32),
-}
-
-impl ExprTree {
-    /// Create a variable.
-    pub fn var(idx: u8) -> Self {
-        Self::Leaf(Leaf::Var(idx))
-    }
-
-    /// Create a constant.
-    pub fn constant(val: f32) -> Self {
-        Self::Leaf(Leaf::Const(val))
-    }
-
-    /// Count total nodes in the tree.
-    ///
-    /// Uses iterative traversal to avoid stack overflow on deep trees.
-    pub fn node_count(&self) -> usize {
-        let mut count = 0usize;
-        let mut stack: Vec<&ExprTree> = vec![self];
-        while let Some(node) = stack.pop() {
-            count += 1;
-            if let Self::Op { children, .. } = node {
-                for child in children {
-                    stack.push(child);
-                }
-            }
-        }
-        count
-    }
-
-    /// Compute depth of the tree.
-    ///
-    /// Uses iterative traversal to avoid stack overflow on deep trees.
-    pub fn depth(&self) -> usize {
-        // Stack stores (node, depth_at_node)
-        let mut stack: Vec<(&ExprTree, usize)> = vec![(self, 1)];
-        let mut max_depth = 0usize;
-        while let Some((node, d)) = stack.pop() {
-            match node {
-                Self::Leaf(_) => {
-                    if d > max_depth {
-                        max_depth = d;
-                    }
-                }
-                Self::Op { children, .. } => {
-                    for child in children {
-                        stack.push((child, d + 1));
-                    }
-                }
-            }
-        }
-        max_depth
-    }
-
-    /// Check if this expression has valid types.
-    ///
-    /// Returns `false` if comparison results are used in invalid contexts
-    /// (e.g., as operands to arithmetic operations).
-    ///
-    /// Type rules:
-    /// - Comparison ops (lt, le, gt, ge, eq, ne) return boolean
-    /// - Select's first arg must be boolean, returns numeric
-    /// - All other ops require numeric operands and return numeric
-    /// - Leaves (Var, Const) are numeric
-    pub fn is_type_valid(&self) -> bool {
-        self.check_type().is_some()
-    }
-
-    /// Returns Some(is_boolean) if valid, None if invalid.
-    ///
-    /// Uses iterative traversal to avoid stack overflow on deep trees.
-    fn check_type(&self) -> Option<bool> {
-        enum Task<'a> {
-            Visit(&'a ExprTree),
-            Complete { name: &'static str, arity: usize },
-        }
-
-        let mut stack: Vec<Task<'_>> = vec![Task::Visit(self)];
-        // result_stack holds Option<bool>: Some(true)=boolean, Some(false)=numeric, None=invalid
-        let mut result_stack: Vec<Option<bool>> = Vec::new();
-
-        while let Some(task) = stack.pop() {
-            match task {
-                Task::Visit(node) => match node {
-                    Self::Leaf(_) => result_stack.push(Some(false)), // Leaves are numeric
-
-                    Self::Op { op, children } => {
-                        let name = op.name();
-                        stack.push(Task::Complete { name, arity: children.len() });
-                        for child in children.iter().rev() {
-                            stack.push(Task::Visit(child));
-                        }
-                    }
-                },
-                Task::Complete { name, arity } => {
-                    let start = result_stack.len().saturating_sub(arity);
-                    let child_types: Vec<Option<bool>> = result_stack.drain(start..).collect();
-
-                    // Comparison ops: require numeric children, return boolean
-                    if matches!(name, "lt" | "le" | "gt" | "ge" | "eq" | "ne") {
-                        let valid = child_types.iter().all(|t| matches!(t, Some(false)));
-                        if valid {
-                            result_stack.push(Some(true)); // Return boolean
-                        } else {
-                            result_stack.push(None); // Invalid
-                        }
-                        continue;
-                    }
-
-                    // Select: first child MUST be boolean, others numeric
-                    if name == "select" && arity == 3 {
-                        let cond_ok = matches!(child_types[0], Some(true));
-                        let branches_ok = child_types[1..].iter().all(|t| matches!(t, Some(false)));
-                        if cond_ok && branches_ok {
-                            result_stack.push(Some(false)); // Return numeric
-                        } else {
-                            result_stack.push(None); // Invalid
-                        }
-                        continue;
-                    }
-
-                    // All other ops: require numeric children, return numeric
-                    let valid = child_types.iter().all(|t| matches!(t, Some(false)));
-                    if valid {
-                        result_stack.push(Some(false)); // Return numeric
-                    } else {
-                        result_stack.push(None); // Invalid
-                    }
-                }
-            }
-        }
-
-        result_stack.pop().unwrap_or_else(|| panic!("check_type: empty result stack"))
-    }
-
-    // Constructor helpers for common operations
-    pub fn add(a: Self, b: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Add,
-            children: alloc::vec![a, b],
-        }
-    }
-
-    pub fn sub(a: Self, b: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Sub,
-            children: alloc::vec![a, b],
-        }
-    }
-
-    pub fn mul(a: Self, b: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Mul,
-            children: alloc::vec![a, b],
-        }
-    }
-
-    pub fn div(a: Self, b: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Div,
-            children: alloc::vec![a, b],
-        }
-    }
-
-    pub fn neg(a: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Neg,
-            children: alloc::vec![a],
-        }
-    }
-
-    pub fn sqrt(a: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Sqrt,
-            children: alloc::vec![a],
-        }
-    }
-
-    pub fn abs(a: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Abs,
-            children: alloc::vec![a],
-        }
-    }
-
-    pub fn min(a: Self, b: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Min,
-            children: alloc::vec![a, b],
-        }
-    }
-
-    pub fn max(a: Self, b: Self) -> Self {
-        Self::Op {
-            op: &super::ops::Max,
-            children: alloc::vec![a, b],
-        }
-    }
-
-    pub fn mul_add(a: Self, b: Self, c: Self) -> Self {
-        Self::Op {
-            op: &super::ops::MulAdd,
-            children: alloc::vec![a, b, c],
-        }
-    }
-
-    /// Compute the cost of this expression tree using the given cost model.
-    ///
-    /// Uses iterative traversal to avoid stack overflow on deep trees.
-    pub fn cost(&self, costs: &CostModel) -> usize {
-        let mut total = 0usize;
-        let mut stack: Vec<&ExprTree> = vec![self];
-        while let Some(node) = stack.pop() {
-            match node {
-                Self::Leaf(_) => {} // Variables and constants are free
-                Self::Op { op, children } => {
-                    total += costs.cost(op.kind());
-                    for child in children {
-                        stack.push(child);
-                    }
-                }
-            }
-        }
-        total
-    }
-
-}
-
-use crate::nnue::{ExprNnue, EdgeAccumulator};
+use crate::nnue::{EdgeAccumulator, ExprNnue};
+use alloc::vec::Vec;
 
 /// Incremental 3-pass neural extractor.
 ///
@@ -288,26 +37,72 @@ impl<'a> IncrementalExtractor<'a> {
         Self { nnue, top_k }
     }
 
-    /// Run the 3-pass extraction and return the best tree with its neural cost.
-    pub fn extract(&self, egraph: &EGraph, root_class: EClassId) -> (ExprTree, f32) {
-        const MAX_PASSES: usize = 3;
+    /// Run the extraction refinement loop and return only `(cost, choices)`.
+    ///
+    /// The `choices` vector maps canonical e-class ID to the chosen node index.
+    /// Call [`choices_to_arena`] to materialise the extracted DAG.
+    pub fn extract_choices_only(
+        &self,
+        egraph: &EGraph,
+        root_class: EClassId,
+    ) -> (f32, Vec<Option<usize>>) {
+        const MAX_PASSES: usize = 10;
 
-        // Pass 1: Bootstrap with shallowest tree (minimum node count)
-        let mut choices = self.extract_shallowest(egraph, root_class);
+        // Pass 1: Bootstrap with the ORIGINAL expression's nodes (index 0 per
+        // e-class = the first node added, which is the original). This ensures
+        // we start from the input expression and only move to alternatives the
+        // NNUE extraction head certifies as cheaper.
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        // Index 0 in each e-class is the original node (first added).
+        // Only set choices for classes reachable from root.
+        {
+            let mut stack = alloc::vec![root_class];
+            let mut visited = alloc::vec![false; num_classes];
+            while let Some(class) = stack.pop() {
+                let canonical = egraph.find(class);
+                let idx = canonical.0 as usize;
+                if idx >= num_classes || visited[idx] {
+                    continue;
+                }
+                visited[idx] = true;
+                choices[idx] = Some(0); // Original node
+                if let Some(node) = egraph.nodes(canonical).first() {
+                    if let ENode::Op { children, .. } = node {
+                        for &child in children {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
 
-        // Build initial tree and its full-tree accumulator
-        let initial_tree = super::nnue_adapter::build_tree_with_choices(
-            egraph, root_class, &choices,
-        );
-        let initial_expr = super::nnue_adapter::expr_tree_to_nnue(&initial_tree);
-        // Use dedup variant: extracted trees may contain CSE (shared subtrees).
-        let mut current_acc = EdgeAccumulator::from_expr_dedup(
-            &initial_expr, &self.nnue.embeddings,
+        // Run variance analysis once — O(n) over e-graph, provides
+        // per-e-class coordinate dependency info to the extraction head.
+        let variance_analysis = super::deps::DepsAnalysis::analyze(egraph);
+
+        // Build initial DAG-aware accumulator using ref counts.
+        // This avoids the tree-bloating problem: shared subexpressions are
+        // counted once (computation) + (ref_count-1) var_ref edges (register loads).
+        let ref_count = compute_ref_counts(egraph, root_class, &choices);
+        let current_acc = EdgeAccumulator::from_dag_choices_with_variance(
+            egraph,
+            root_class,
+            &choices,
+            &ref_count,
+            &self.nnue.embeddings,
+            Some(&variance_analysis),
         );
         let mut current_cost = self.nnue.predict_log_cost_with_features(&current_acc);
 
-        // Passes 2..MAX_PASSES: Refine via O(Δ) swaps
-        for _pass in 1..MAX_PASSES {
+        // Refinement passes: for each e-class, try ALL alternatives (up to top_k),
+        // accept the BEST improvement (not first). Repeat until fixpoint or max passes.
+        //
+        // DAG-aware: each swap may change ref counts (new children may be shared
+        // differently), so we rebuild the accumulator from scratch for each candidate.
+        // This is O(reachable_classes) per candidate, same as the old tree-based path,
+        // but now sharing-aware. True incremental updates can be added later.
+        for _pass in 0..MAX_PASSES {
             let active = self.get_active_classes(egraph, root_class, &choices);
             let mut improved = false;
 
@@ -315,54 +110,74 @@ impl<'a> IncrementalExtractor<'a> {
                 let canonical = egraph.find(class);
                 let nodes = egraph.nodes(canonical);
                 if nodes.len() <= 1 {
-                    continue; // No alternatives
+                    continue;
                 }
 
                 let current_node_idx = choices[canonical.0 as usize].unwrap_or(0);
-
-                // Build old subtree for this e-class
-                let old_subtree = super::nnue_adapter::build_subtree_with_choices(
-                    egraph, canonical, current_node_idx, &choices,
-                );
-                let old_subtree_expr = super::nnue_adapter::expr_tree_to_nnue(
-                    &old_subtree,
-                );
-
                 let candidates_to_try = nodes.len().min(self.top_k);
+
+                // Best-improvement: evaluate ALL candidates, pick the cheapest.
+                let mut best_swap_cost = current_cost;
+                let mut best_swap_idx: Option<usize> = None;
 
                 for node_idx in 0..candidates_to_try {
                     if node_idx == current_node_idx {
                         continue;
                     }
 
-                    // Build candidate subtree (same descendants, different root node)
-                    let cand_subtree = super::nnue_adapter::build_subtree_with_choices(
-                        egraph, canonical, node_idx, &choices,
-                    );
-                    let cand_expr = super::nnue_adapter::expr_tree_to_nnue(
-                        &cand_subtree,
-                    );
+                    // Skip self-referential candidates (would create cycles).
+                    if let ENode::Op { children, .. } = &nodes[node_idx] {
+                        if children.iter().any(|&c| egraph.find(c) == canonical) {
+                            continue;
+                        }
+                    }
 
-                    // O(Δ) accumulator swap: remove old, add new.
-                    // Candidate subtrees are freshly built slices — use dedup to
-                    // guard against any shared subtrees they may contain.
-                    let mut test_acc = current_acc.clone();
-                    test_acc.remove_expr_edges(
-                        &old_subtree_expr, &self.nnue.embeddings,
-                    );
-                    let cand_acc = EdgeAccumulator::from_expr_dedup(
-                        &cand_expr, &self.nnue.embeddings,
-                    );
-                    test_acc.merge(&cand_acc);
+                    // Tentatively apply the swap. First check it doesn't create a cycle.
+                    let old_choice = choices[canonical.0 as usize];
+                    choices[canonical.0 as usize] = Some(node_idx);
+                    if choices_have_cycle_from(egraph, root_class, &choices) {
+                        choices[canonical.0 as usize] = old_choice;
+                        continue;
+                    }
 
+                    let test_refs = compute_ref_counts(egraph, root_class, &choices);
+                    let test_acc = EdgeAccumulator::from_dag_choices_with_variance(
+                        egraph,
+                        root_class,
+                        &choices,
+                        &test_refs,
+                        &self.nnue.embeddings,
+                        Some(&variance_analysis),
+                    );
                     let test_cost = self.nnue.predict_log_cost_with_features(&test_acc);
 
-                    if test_cost < current_cost {
-                        choices[canonical.0 as usize] = Some(node_idx);
-                        current_acc = test_acc;
-                        current_cost = test_cost;
-                        improved = true;
-                        break; // First-improvement: move to next e-class
+                    // Restore original choice.
+                    choices[canonical.0 as usize] = old_choice;
+
+                    if test_cost < best_swap_cost {
+                        best_swap_cost = test_cost;
+                        best_swap_idx = Some(node_idx);
+                    }
+                }
+
+                if let Some(idx) = best_swap_idx {
+                    choices[canonical.0 as usize] = Some(idx);
+                    current_cost = best_swap_cost;
+                    improved = true;
+
+                    // The newly-chosen node may have children in e-classes
+                    // that weren't reachable before (saturation merges can
+                    // introduce new children). Ensure they have a choice so
+                    // downstream codegen doesn't hit a missing entry.
+                    let nodes = egraph.nodes(canonical);
+                    if let Some(ENode::Op { children, .. }) = nodes.get(idx) {
+                        for &child in children {
+                            let cc = egraph.find(child);
+                            let ci = cc.0 as usize;
+                            if ci < choices.len() && choices[ci].is_none() {
+                                choices[ci] = Some(0);
+                            }
+                        }
                     }
                 }
             }
@@ -372,19 +187,11 @@ impl<'a> IncrementalExtractor<'a> {
             }
         }
 
-        // Build final tree from refined choices
-        let tree = super::nnue_adapter::build_tree_with_choices(
-            egraph, root_class, &choices,
-        );
-        (tree, current_cost)
+        (current_cost, choices)
     }
 
     /// Pass 1: Bottom-up DP choosing the node with fewest total AST nodes.
-    fn extract_shallowest(
-        &self,
-        egraph: &EGraph,
-        root: EClassId,
-    ) -> Vec<Option<usize>> {
+    fn extract_shallowest(&self, egraph: &EGraph, root: EClassId) -> Vec<Option<usize>> {
         use alloc::collections::BTreeSet;
 
         const CYCLE_COUNT: usize = 1_000_000;
@@ -437,8 +244,7 @@ impl<'a> IncrementalExtractor<'a> {
                                     .iter()
                                     .map(|&c| {
                                         let cc = egraph.find(c);
-                                        best_count[cc.0 as usize]
-                                            .unwrap_or(CYCLE_COUNT)
+                                        best_count[cc.0 as usize].unwrap_or(CYCLE_COUNT)
                                     })
                                     .sum();
                                 1usize.saturating_add(child_sum)
@@ -456,6 +262,8 @@ impl<'a> IncrementalExtractor<'a> {
                 best_node[canonical.0 as usize] = Some(min_idx);
             }
         }
+
+        break_choice_cycles(egraph, root, &mut best_node);
 
         best_node
     }
@@ -496,7 +304,234 @@ impl<'a> IncrementalExtractor<'a> {
     }
 }
 
-/// Extract the minimum-cost expression tree from an e-class.
+/// Extract directly into an [`pixelflow_ir::ExprArena`].
+#[must_use]
+pub fn extract_neural_to_arena(
+    egraph: &EGraph,
+    root: EClassId,
+    nnue: &ExprNnue,
+) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId, f32) {
+    let extractor = IncrementalExtractor::new(nnue, 8);
+    let (cost, choices) = extractor.extract_choices_only(egraph, root);
+    let (arena, root_id) = choices_to_arena(egraph, root, &choices);
+    (arena, root_id, cost)
+}
+
+/// Check whether the current extraction choices contain a cycle reachable from `root`.
+fn choices_have_cycle_from(egraph: &EGraph, root: EClassId, choices: &[Option<usize>]) -> bool {
+    let num_classes = egraph.num_classes();
+    let mut color: Vec<u8> = alloc::vec![0; num_classes];
+    let mut stack: Vec<(EClassId, bool)> = alloc::vec![(root, false)];
+
+    while let Some((class, children_done)) = stack.pop() {
+        let canonical = egraph.find(class);
+        let idx = canonical.0 as usize;
+        if idx >= num_classes {
+            continue;
+        }
+
+        if children_done {
+            color[idx] = 2;
+            continue;
+        }
+
+        match color[idx] {
+            1 => return true,
+            2 => continue,
+            _ => {}
+        }
+
+        color[idx] = 1;
+        stack.push((canonical, true));
+
+        let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or(0);
+        if let Some(ENode::Op { children, .. }) = egraph.nodes(canonical).get(node_idx) {
+            for &child in children.iter().rev() {
+                stack.push((child, false));
+            }
+        }
+    }
+
+    false
+}
+
+/// Post-pass: detect and break cycles in the choice graph.
+///
+/// After the bottom-up DP, mutual cycles can exist (e.g. class 68 picks
+/// neg(69) and class 69 picks neg(68)). This function performs a DFS from
+/// `root` following the choice graph, detects back-edges via 3-color
+/// marking (white/gray/black), and breaks each cycle by swapping a cycle
+/// member's choice to a leaf or a non-cycle-referencing node.
+///
+/// Restarts from root after each break to handle nested cycles.
+fn break_choice_cycles(egraph: &EGraph, root: EClassId, best_node: &mut Vec<Option<usize>>) {
+    // Restart-DFS approach (like the original) but with dense Vecs instead
+    // of BTreeSet. Each iteration finds one cycle and breaks it, then restarts.
+    // Correctness requires restart because breaking a cycle changes the choice
+    // graph — new cycles may appear or old ones may disappear.
+    //
+    // Complexity: O(cycles × classes). Dense Vecs make each DFS pass O(classes)
+    // instead of O(classes × log classes) with BTreeSet.
+
+    let capacity = best_node.len();
+    let root_can = egraph.find(root).0 as usize;
+    if root_can >= capacity {
+        return;
+    }
+
+    // Reusable buffers (cleared each iteration, not reallocated)
+    let mut color: Vec<u8> = vec![0; capacity]; // 0=white, 1=gray, 2=black
+    let mut stack: Vec<(usize, usize)> = Vec::with_capacity(256);
+
+    loop {
+        // Reset for this DFS pass
+        color.iter_mut().for_each(|c| *c = 0);
+        stack.clear();
+        stack.push((root_can, 0));
+        color[root_can] = 1;
+
+        let mut cycle_found = false;
+
+        'dfs: while !stack.is_empty() {
+            let (cid, ref_ci) = {
+                let top = stack.last().unwrap();
+                (top.0, top.1)
+            };
+
+            let node_idx = best_node[cid].unwrap_or(0);
+            let canonical = egraph.find(EClassId(cid as u32));
+            let nodes = egraph.nodes(canonical);
+
+            let children: Vec<usize> = if node_idx < nodes.len() {
+                if let ENode::Op { children, .. } = &nodes[node_idx] {
+                    children
+                        .iter()
+                        .map(|&c| egraph.find(c).0 as usize)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let mut found_child = false;
+            let mut ci = ref_ci;
+            while ci < children.len() {
+                let child_can = children[ci];
+                ci += 1;
+                if child_can >= capacity {
+                    continue;
+                }
+
+                match color[child_can] {
+                    0 => {
+                        stack.last_mut().unwrap().1 = ci;
+                        color[child_can] = 1;
+                        stack.push((child_can, 0));
+                        found_child = true;
+                        break;
+                    }
+                    1 => {
+                        // Back-edge → cycle. Extract and break it.
+                        let cycle: Vec<usize> = stack
+                            .iter()
+                            .map(|&(s, _)| s)
+                            .skip_while(|&s| s != child_can)
+                            .collect();
+                        break_single_cycle(egraph, &cycle, best_node);
+                        cycle_found = true;
+                        break 'dfs;
+                    }
+                    _ => {} // black, skip
+                }
+            }
+
+            if !found_child {
+                stack.last_mut().unwrap().1 = ci;
+                color[cid] = 2;
+                stack.pop();
+            }
+        }
+
+        if !cycle_found {
+            break; // No cycles remain
+        }
+    }
+}
+
+/// Break a cycle by switching the chosen node for one member to a leaf
+/// or a node whose children are all outside the cycle.
+fn break_single_cycle(egraph: &EGraph, cycle: &[usize], best_node: &mut Vec<Option<usize>>) {
+    if cycle.is_empty() {
+        return;
+    }
+
+    // Build cycle membership set for O(1) lookup
+    let max_id = cycle.iter().copied().max().unwrap_or(0);
+    let mut in_cycle = vec![false; max_id + 1];
+    for &cid in cycle {
+        in_cycle[cid] = true;
+    }
+
+    // Strategy 1: find ANY cycle member with a leaf node
+    for &cid in cycle {
+        let canonical = egraph.find(EClassId(cid as u32));
+        let nodes = egraph.nodes(canonical);
+        for (idx, node) in nodes.iter().enumerate() {
+            if matches!(node, ENode::Var(_) | ENode::Const(_)) {
+                best_node[cid] = Some(idx);
+                return;
+            }
+        }
+    }
+
+    // Strategy 2: find a cycle member with an Op whose children
+    // are ALL outside the cycle
+    for &cid in cycle {
+        let canonical = egraph.find(EClassId(cid as u32));
+        let nodes = egraph.nodes(canonical);
+        for (idx, node) in nodes.iter().enumerate() {
+            if let ENode::Op { children, .. } = node {
+                let all_outside = children.iter().all(|&c| {
+                    let cc = egraph.find(c).0 as usize;
+                    cc >= in_cycle.len() || !in_cycle[cc]
+                });
+                if all_outside {
+                    best_node[cid] = Some(idx);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Strategy 3: pick the first cycle member, choose its node with
+    // fewest children in the cycle (minimize remaining cycle edges)
+    let cid = cycle[0];
+    let canonical = egraph.find(EClassId(cid as u32));
+    let nodes = egraph.nodes(canonical);
+    let mut best_idx = 0;
+    let mut best_in_cycle_count = usize::MAX;
+    for (idx, node) in nodes.iter().enumerate() {
+        let count = match node {
+            ENode::Var(_) | ENode::Const(_) => 0,
+            ENode::Op { children, .. } => children
+                .iter()
+                .filter(|&&c| {
+                    let cc = egraph.find(c).0 as usize;
+                    cc < in_cycle.len() && in_cycle[cc]
+                })
+                .count(),
+        };
+        if count < best_in_cycle_count {
+            best_in_cycle_count = count;
+            best_idx = idx;
+        }
+    }
+    best_node[cid] = Some(best_idx);
+}
+
+/// Extract the minimum-cost arena expression from an e-class.
 ///
 /// Uses dynamic programming: cost(class) = min over all nodes in class.
 ///
@@ -506,7 +541,11 @@ impl<'a> IncrementalExtractor<'a> {
 /// - `CostModel` for hardcoded costs
 /// - Neural cost models (e.g., `ExprNnue` via adapter)
 /// - Custom domain-specific cost functions
-pub fn extract<C: CostFunction>(egraph: &EGraph, root: EClassId, costs: &C) -> (ExprTree, usize) {
+pub fn extract<C: CostFunction>(
+    egraph: &EGraph,
+    root: EClassId,
+    costs: &C,
+) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId, usize) {
     use alloc::collections::BTreeSet;
 
     // Cap for cycle/self-referential costs - high but not astronomical
@@ -591,65 +630,288 @@ pub fn extract<C: CostFunction>(egraph: &EGraph, root: EClassId, costs: &C) -> (
 
     let total_cost = best_cost[egraph.find(root).0 as usize].unwrap_or(usize::MAX);
 
-    // Phase 2: Iterative top-down tree construction
-    // Use a stack of (class, partially_built_tree_slot)
-    enum BuildTask {
-        Visit(EClassId),
-        Complete { canonical: u32, op: &'static dyn super::ops::Op, num_children: usize },
-    }
+    // Break any mutual cycles in the choice graph before building the tree.
+    break_choice_cycles(egraph, root, &mut best_node);
 
-    let mut build_stack: Vec<BuildTask> = vec![BuildTask::Visit(root)];
-    let mut result_stack: Vec<ExprTree> = Vec::new();
-    let mut building: BTreeSet<u32> = BTreeSet::new();
+    let (arena, root_id) = choices_to_arena(egraph, root, &best_node);
+    (arena, root_id, total_cost)
+}
 
-    while let Some(task) = build_stack.pop() {
-        match task {
-            BuildTask::Visit(class) => {
-                let canonical = egraph.find(class);
+// ============================================================================
+// DAG-Aware Reference Counting (for NNUE extraction)
+// ============================================================================
 
-                // Cycle detection
-                if !building.insert(canonical.0) {
-                    result_stack.push(ExprTree::Leaf(Leaf::Const(0.0)));
-                    continue;
-                }
+/// Count how many times each canonical e-class is referenced by the current
+/// extraction choices, walking from `root`.
+///
+/// A class with `ref_count > 1` is referenced by multiple parents and should
+/// be treated as shared (let-bound) in the DAG. The function uses `expanded`
+/// tracking so each e-class is recursed into only once, but its count is
+/// incremented every time it is referenced.
+///
+/// Returns a `Vec<u32>` indexed by canonical e-class ID.
+pub fn compute_ref_counts(egraph: &EGraph, root: EClassId, choices: &[Option<usize>]) -> Vec<u32> {
+    let num_classes = egraph.num_classes();
+    let mut counts: Vec<u32> = alloc::vec![0u32; num_classes];
+    let mut expanded: Vec<bool> = alloc::vec![false; num_classes];
+    let mut stack: Vec<EClassId> = alloc::vec![root];
 
-                let node_idx = best_node[canonical.0 as usize].unwrap_or(0);
-                let node = &egraph.nodes(canonical)[node_idx];
+    while let Some(class) = stack.pop() {
+        let canonical = egraph.find(class);
+        let idx = canonical.0 as usize;
+        if idx >= num_classes {
+            continue;
+        }
 
-                match node {
-                    ENode::Var(idx) => {
-                        building.remove(&canonical.0);
-                        result_stack.push(ExprTree::Leaf(Leaf::Var(*idx)));
-                    }
-                    ENode::Const(bits) => {
-                        building.remove(&canonical.0);
-                        result_stack.push(ExprTree::Leaf(Leaf::Const(f32::from_bits(*bits))));
-                    }
-                    ENode::Op { op, children } => {
-                        // Push completion task, then visit children in reverse order
-                        build_stack.push(BuildTask::Complete {
-                            canonical: canonical.0,
-                            op: *op,
-                            num_children: children.len(),
-                        });
-                        for &child in children.iter().rev() {
-                            build_stack.push(BuildTask::Visit(child));
+        counts[idx] += 1;
+
+        // Only recurse into children on first visit (DAG, not tree).
+        if !expanded[idx] {
+            expanded[idx] = true;
+            if let Some(node_idx) = choices[idx] {
+                let nodes = egraph.nodes(canonical);
+                if node_idx < nodes.len() {
+                    if let ENode::Op { children, .. } = &nodes[node_idx] {
+                        for &child in children {
+                            stack.push(child);
                         }
                     }
                 }
             }
-            BuildTask::Complete { canonical, op, num_children } => {
-                building.remove(&canonical);
-                // Pop children from result stack (they're in correct order now)
-                let start = result_stack.len().saturating_sub(num_children);
-                let child_trees: Vec<ExprTree> = result_stack.drain(start..).collect();
-                result_stack.push(ExprTree::Op { op, children: child_trees });
+        }
+    }
+
+    counts
+}
+
+/// Build an `ExtractedDAG` from NNUE extraction choices + reference counts.
+///
+/// Bridges the NNUE hill-climbing extractor (which produces per-e-class choices)
+/// with DAG codegen (which needs `ExtractedDAG` with sharing info for let-bindings).
+pub fn build_extracted_dag_from_choices(
+    egraph: &EGraph,
+    root: EClassId,
+    choices: &[Option<usize>],
+    ref_counts: &[u32],
+) -> ExtractedDAG {
+    let canonical_root = egraph.find(root);
+
+    // Shared e-classes: ref_count > 1
+    let shared: Vec<(EClassId, usize)> = ref_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c > 1)
+        .map(|(i, c)| (EClassId(i as u32), *c as usize))
+        .collect();
+
+    // Topological schedule: shared classes before their dependents (post-order).
+    let mut schedule = Vec::new();
+    let mut visited = alloc::vec![false; egraph.num_classes()];
+
+    fn topo_walk(
+        egraph: &EGraph,
+        class: EClassId,
+        choices: &[Option<usize>],
+        ref_counts: &[u32],
+        visited: &mut Vec<bool>,
+        schedule: &mut Vec<EClassId>,
+    ) {
+        let canonical = egraph.find(class);
+        let idx = canonical.index();
+        if idx >= visited.len() || visited[idx] {
+            return;
+        }
+        visited[idx] = true;
+
+        if let Some(node_idx) = choices.get(idx).copied().flatten() {
+            if let Some(node) = egraph.nodes(canonical).get(node_idx) {
+                if let ENode::Op { children, .. } = node {
+                    for &child in children {
+                        topo_walk(egraph, child, choices, ref_counts, visited, schedule);
+                    }
+                }
+            }
+        }
+
+        if ref_counts.get(idx).copied().unwrap_or(0) > 1 {
+            schedule.push(canonical);
+        }
+    }
+
+    topo_walk(
+        egraph,
+        root,
+        choices,
+        ref_counts,
+        &mut visited,
+        &mut schedule,
+    );
+
+    ExtractedDAG {
+        root: canonical_root,
+        shared,
+        schedule,
+        choices: choices.to_vec(),
+        total_cost: 0,
+    }
+}
+
+// ============================================================================
+// Arena-Direct Extraction (EGraph → ExprArena)
+// ============================================================================
+
+/// Walk extraction choices and materialise directly into an [`pixelflow_ir::ExprArena`].
+///
+/// Each reachable e-class maps to exactly one [`pixelflow_ir::ExprId`]. Shared
+/// e-classes naturally share `ExprId`s (DAG output — nodes are not duplicated).
+///
+/// ## Algorithm
+///
+/// Iterative post-order traversal with a `Vec<Option<ExprId>>` cache indexed by
+/// canonical e-class id:
+///
+/// - If an e-class already has a cached `ExprId`, reuse it (O(1), `ExprId` is `Copy`).
+/// - Otherwise push children for visiting (in reverse so they are processed
+///   left-to-right), then push a `Complete` task for the current e-class.
+/// - On `Complete`: pop the children `ExprId`s from the result stack, push a new
+///   node into the arena, and record the `ExprId` in the cache.
+///
+/// Post-order guarantees nodes are appended in topological order (children before
+/// parents), which is a requirement of [`pixelflow_ir::ExprArena`].
+pub fn choices_to_arena(
+    egraph: &EGraph,
+    root: EClassId,
+    choices: &[Option<usize>],
+) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
+    use pixelflow_ir::{ExprArena, ExprId};
+
+    enum Task {
+        /// Visit an e-class: push it to the result stack if cached, otherwise
+        /// schedule children + a Complete task.
+        Visit(EClassId),
+        /// All children of this e-class have been processed; pop their ExprIds,
+        /// push a new arena node, and cache the result.
+        Complete { canonical_id: u32, node_idx: usize },
+    }
+
+    let num_classes = egraph.num_classes();
+    let mut arena = ExprArena::with_capacity(num_classes);
+    // Cache: canonical e-class id → ExprId (None = not yet visited).
+    let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; num_classes];
+    let mut result_stack: Vec<ExprId> = Vec::new();
+    let mut task_stack: Vec<Task> = alloc::vec![Task::Visit(root)];
+
+    while let Some(task) = task_stack.pop() {
+        match task {
+            Task::Visit(class) => {
+                let canonical = egraph.find(class);
+                let idx = canonical.0 as usize;
+
+                // Already materialised — reuse without any clone (ExprId is Copy).
+                if let Some(cached_id) = id_map.get(idx).and_then(|o| *o) {
+                    result_stack.push(cached_id);
+                    continue;
+                }
+
+                let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or(0);
+
+                let nodes = egraph.nodes(canonical);
+                assert!(
+                    node_idx < nodes.len(),
+                    "choices_to_arena: node_idx {} out of bounds ({}) for e-class {}",
+                    node_idx,
+                    nodes.len(),
+                    idx
+                );
+                let node = &nodes[node_idx];
+
+                match node {
+                    ENode::Var(var_idx) => {
+                        let expr_id = arena.push_var(*var_idx);
+                        if idx < id_map.len() {
+                            id_map[idx] = Some(expr_id);
+                        }
+                        result_stack.push(expr_id);
+                    }
+                    ENode::Const(bits) => {
+                        let expr_id = arena.push_const(f32::from_bits(*bits));
+                        if idx < id_map.len() {
+                            id_map[idx] = Some(expr_id);
+                        }
+                        result_stack.push(expr_id);
+                    }
+                    ENode::Op { children, .. } => {
+                        // Schedule completion after children are processed.
+                        task_stack.push(Task::Complete {
+                            canonical_id: canonical.0,
+                            node_idx,
+                        });
+                        // Push children in reverse so they are popped left-to-right.
+                        for &child in children.iter().rev() {
+                            task_stack.push(Task::Visit(child));
+                        }
+                    }
+                }
+            }
+
+            Task::Complete {
+                canonical_id,
+                node_idx,
+            } => {
+                let idx = canonical_id as usize;
+
+                // Another branch may have filled the cache between scheduling this
+                // Complete and executing it (diamond sharing). Reuse if so.
+                if let Some(cached_id) = id_map.get(idx).and_then(|o| *o) {
+                    result_stack.push(cached_id);
+                    continue;
+                }
+
+                let canonical = EClassId(canonical_id);
+                let nodes = egraph.nodes(canonical);
+                let node = &nodes[node_idx];
+
+                let ENode::Op { op, children } = node else {
+                    // Leaves are handled in Visit; reaching here would be a bug.
+                    panic!(
+                        "choices_to_arena: Complete task for non-Op node (e-class {})",
+                        canonical_id
+                    );
+                };
+
+                let arity = children.len();
+                let start = result_stack.len().checked_sub(arity).unwrap_or_else(|| {
+                    panic!(
+                        "choices_to_arena: result_stack underflow (arity={}, len={}, e-class={})",
+                        arity,
+                        result_stack.len(),
+                        canonical_id
+                    )
+                });
+                let child_ids: Vec<pixelflow_ir::ExprId> = result_stack.drain(start..).collect();
+
+                let op_kind = op.kind();
+
+                let expr_id = match arity {
+                    0 => arena.push_const(0.0), // Degenerate zero-arity Op — treat as 0.
+                    1 => arena.push_unary(op_kind, child_ids[0]),
+                    2 => arena.push_binary(op_kind, child_ids[0], child_ids[1]),
+                    3 => arena.push_ternary(op_kind, child_ids[0], child_ids[1], child_ids[2]),
+                    _ => arena.push_nary(op_kind, &child_ids),
+                };
+
+                if idx < id_map.len() {
+                    id_map[idx] = Some(expr_id);
+                }
+                result_stack.push(expr_id);
             }
         }
     }
 
-    let tree = result_stack.pop().unwrap_or_else(|| ExprTree::Leaf(Leaf::Const(0.0)));
-    (tree, total_cost)
+    let root_id = result_stack
+        .pop()
+        .unwrap_or_else(|| panic!("choices_to_arena: empty result stack after traversal"));
+    (arena, root_id)
 }
 
 // ============================================================================
@@ -697,7 +959,8 @@ impl ExtractedDAG {
 
     /// Get the use count for an e-class.
     pub fn use_count(&self, class: EClassId) -> usize {
-        self.shared.iter()
+        self.shared
+            .iter()
             .find(|(id, _)| *id == class)
             .map(|(_, count)| *count)
             .unwrap_or(1)
@@ -803,12 +1066,16 @@ pub fn extract_dag<C: CostFunction>(egraph: &EGraph, root: EClassId, costs: &C) 
 
     let total_cost = best_cost[egraph.find(root).0 as usize].unwrap_or(usize::MAX);
 
+    // Break any mutual cycles in the choice graph before counting refs.
+    break_choice_cycles(egraph, root, &mut best_node);
+
     // Phase 2: Count references to each e-class in the extracted DAG
     let mut ref_counts: Vec<usize> = alloc::vec![0; num_classes];
     count_refs_recursive(egraph, root, &best_node, &mut ref_counts);
 
     // Phase 3: Identify shared e-classes (count > 1)
-    let shared: Vec<(EClassId, usize)> = ref_counts.iter()
+    let shared: Vec<(EClassId, usize)> = ref_counts
+        .iter()
         .enumerate()
         .filter(|(_, count)| **count > 1)
         .map(|(idx, count)| (EClassId(idx as u32), *count))
@@ -920,36 +1187,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_expr_tree_node_count() {
-        let x = ExprTree::var(0);
-        assert_eq!(x.node_count(), 1);
-
-        let sum = ExprTree::add(ExprTree::var(0), ExprTree::var(1));
-        assert_eq!(sum.node_count(), 3); // Add + X + Y
-    }
-
-    #[test]
-    fn test_expr_tree_depth() {
-        let x = ExprTree::var(0);
-        assert_eq!(x.depth(), 1);
-
-        let sum = ExprTree::add(ExprTree::var(0), ExprTree::var(1));
-        assert_eq!(sum.depth(), 2);
-
-        // (X + Y) * Z
-        let nested = ExprTree::mul(sum, ExprTree::var(2));
-        assert_eq!(nested.depth(), 3);
-    }
-
-    #[test]
     fn test_extract_simple() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
 
         let costs = CostModel::default();
-        let (tree, cost) = extract(&egraph, x, &costs);
+        let (arena, root, cost) = extract(&egraph, x, &costs);
 
-        assert!(matches!(tree, ExprTree::Leaf(Leaf::Var(0))));
+        assert_eq!(arena.len(), 1);
+        assert_eq!(root.0, 0);
         assert_eq!(cost, 0); // Leaf nodes (Var/Const) have cost 0
     }
 
@@ -964,10 +1210,10 @@ mod tests {
         });
 
         let costs = CostModel::default();
-        let (tree, _cost) = extract(&egraph, sum, &costs);
+        let (arena, root, _cost) = extract(&egraph, sum, &costs);
 
-        assert!(matches!(tree, ExprTree::Op { .. }));
-        assert_eq!(tree.node_count(), 3); // Add + X + Y
+        assert_eq!(arena.len(), 3); // Add + X + Y
+        assert_eq!(root.0, 2);
     }
 
     // ========================================================================
@@ -988,7 +1234,10 @@ mod tests {
         let costs = CostModel::default();
         let dag = extract_dag(&egraph, sum, &costs);
 
-        assert!(dag.shared.is_empty(), "X + Y should have no shared subexprs");
+        assert!(
+            dag.shared.is_empty(),
+            "X + Y should have no shared subexprs"
+        );
         assert_eq!(dag.root, egraph.find(sum));
     }
 
@@ -1035,7 +1284,10 @@ mod tests {
         let dag = extract_dag(&egraph, result, &costs);
 
         // sin_x should be shared (used 3 times: twice in Mul, once in Add)
-        assert!(dag.is_shared(sin_x), "sqrt(X) should be shared (used 3 times)");
+        assert!(
+            dag.is_shared(sin_x),
+            "sqrt(X) should be shared (used 3 times)"
+        );
         assert_eq!(dag.use_count(sin_x), 3);
 
         // Schedule should have sin_x before the operations that use it
@@ -1064,5 +1316,224 @@ mod tests {
         // (X + Y) should be shared
         assert!(dag.is_shared(sum), "(X + Y) should be shared");
         assert_eq!(dag.use_count(sum), 2);
+    }
+
+    // ========================================================================
+    // compute_ref_counts Tests
+    // ========================================================================
+
+    #[test]
+    fn test_compute_ref_counts_no_sharing() {
+        // X + Y: no sharing
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let y = egraph.add(ENode::Var(1));
+        let sum = egraph.add(ENode::Op {
+            op: &super::super::ops::Add,
+            children: alloc::vec![x, y],
+        });
+
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        choices[egraph.find(sum).0 as usize] = Some(0);
+        choices[egraph.find(x).0 as usize] = Some(0);
+        choices[egraph.find(y).0 as usize] = Some(0);
+
+        let rc = compute_ref_counts(&egraph, sum, &choices);
+        assert_eq!(
+            rc[egraph.find(sum).0 as usize],
+            1,
+            "root should have ref_count 1"
+        );
+        assert_eq!(
+            rc[egraph.find(x).0 as usize],
+            1,
+            "X should have ref_count 1"
+        );
+        assert_eq!(
+            rc[egraph.find(y).0 as usize],
+            1,
+            "Y should have ref_count 1"
+        );
+    }
+
+    #[test]
+    fn test_compute_ref_counts_shared() {
+        // X * X: X is used twice
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let x_squared = egraph.add(ENode::Op {
+            op: &super::super::ops::Mul,
+            children: alloc::vec![x, x],
+        });
+
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        choices[egraph.find(x_squared).0 as usize] = Some(0);
+        choices[egraph.find(x).0 as usize] = Some(0);
+
+        let rc = compute_ref_counts(&egraph, x_squared, &choices);
+        assert_eq!(rc[egraph.find(x_squared).0 as usize], 1, "root ref_count");
+        assert_eq!(
+            rc[egraph.find(x).0 as usize],
+            2,
+            "X should have ref_count 2"
+        );
+    }
+
+    #[test]
+    fn test_compute_ref_counts_triple_use() {
+        // sqrt(X) * sqrt(X) + sqrt(X): sqrt(X) referenced 3 times
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let sqrt_x = egraph.add(ENode::Op {
+            op: &super::super::ops::Sqrt,
+            children: alloc::vec![x],
+        });
+        let product = egraph.add(ENode::Op {
+            op: &super::super::ops::Mul,
+            children: alloc::vec![sqrt_x, sqrt_x],
+        });
+        let result = egraph.add(ENode::Op {
+            op: &super::super::ops::Add,
+            children: alloc::vec![product, sqrt_x],
+        });
+
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        choices[egraph.find(result).0 as usize] = Some(0);
+        choices[egraph.find(product).0 as usize] = Some(0);
+        choices[egraph.find(sqrt_x).0 as usize] = Some(0);
+        choices[egraph.find(x).0 as usize] = Some(0);
+
+        let rc = compute_ref_counts(&egraph, result, &choices);
+        assert_eq!(
+            rc[egraph.find(sqrt_x).0 as usize],
+            3,
+            "sqrt(X) should have ref_count 3"
+        );
+        assert_eq!(
+            rc[egraph.find(x).0 as usize],
+            1,
+            "X should have ref_count 1 (only 1 parent)"
+        );
+    }
+
+    #[test]
+    fn test_dag_accumulator_handles_shared_subexpressions() {
+        use crate::nnue::{EdgeAccumulator, ExprNnue};
+
+        // sin(X) * sin(X): tree has 2x sin edges, DAG has 1x sin + 1x var_ref
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let sqrt_x = egraph.add(ENode::Op {
+            op: &super::super::ops::Sqrt,
+            children: alloc::vec![x],
+        });
+        let product = egraph.add(ENode::Op {
+            op: &super::super::ops::Mul,
+            children: alloc::vec![sqrt_x, sqrt_x],
+        });
+
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        choices[egraph.find(product).0 as usize] = Some(0);
+        choices[egraph.find(sqrt_x).0 as usize] = Some(0);
+        choices[egraph.find(x).0 as usize] = Some(0);
+
+        let nnue = ExprNnue::new_with_latency_prior(42);
+
+        // DAG accumulator
+        let ref_counts = compute_ref_counts(&egraph, product, &choices);
+        let dag_acc = EdgeAccumulator::from_dag_choices(
+            &egraph,
+            product,
+            &choices,
+            &ref_counts,
+            &nnue.embeddings,
+        );
+
+        assert_eq!(dag_acc.node_count, 3, "DAG acc should count 3 unique nodes");
+        assert_eq!(
+            dag_acc.edge_count, 3,
+            "shared reuse should contribute a var_ref edge"
+        );
+    }
+
+    // =========================================================================
+    // choices_to_arena tests
+    // =========================================================================
+
+    /// X + Y should produce an arena with exactly 3 nodes: Var(0), Var(1), Add.
+    #[test]
+    fn test_choices_to_arena_simple() {
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let y = egraph.add(ENode::Var(1));
+        let add = egraph.add(ENode::Op {
+            op: &super::super::ops::Add,
+            children: alloc::vec![x, y],
+        });
+
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        choices[egraph.find(add).0 as usize] = Some(0);
+        choices[egraph.find(x).0 as usize] = Some(0);
+        choices[egraph.find(y).0 as usize] = Some(0);
+
+        let (arena, root_id) = choices_to_arena(&egraph, add, &choices);
+
+        assert_eq!(arena.len(), 3, "X + Y should have exactly 3 arena nodes");
+        // Root should be the last node (post-order: X, Y, Add)
+        assert_eq!(root_id.0, 2, "root ExprId should be 2 (the Add node)");
+    }
+
+    /// X * X should produce an arena with exactly 2 nodes: Var(0) and Mul.
+    /// The shared Var(0) e-class must reuse one ExprId rather than being duplicated.
+    #[test]
+    fn test_choices_to_arena_shared() {
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let mul = egraph.add(ENode::Op {
+            op: &super::super::ops::Mul,
+            children: alloc::vec![x, x],
+        });
+
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        choices[egraph.find(mul).0 as usize] = Some(0);
+        choices[egraph.find(x).0 as usize] = Some(0);
+
+        let (arena, root_id) = choices_to_arena(&egraph, mul, &choices);
+
+        assert_eq!(
+            arena.len(),
+            2,
+            "X * X should have exactly 2 arena nodes (X shared)"
+        );
+        assert_eq!(root_id.0, 1, "root ExprId should be 1 (the Mul node)");
+    }
+
+    /// Direct extraction and explicit `choices_to_arena` should agree for tree-shaped inputs.
+    #[test]
+    fn test_extract_matches_choices_to_arena() {
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let y = egraph.add(ENode::Var(1));
+        let add = egraph.add(ENode::Op {
+            op: &super::super::ops::Add,
+            children: alloc::vec![x, y],
+        });
+
+        let num_classes = egraph.num_classes();
+        let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
+        choices[egraph.find(add).0 as usize] = Some(0);
+        choices[egraph.find(x).0 as usize] = Some(0);
+        choices[egraph.find(y).0 as usize] = Some(0);
+
+        let (arena, root_id) = choices_to_arena(&egraph, add, &choices);
+        let (extracted_arena, extracted_root, _cost) = extract(&egraph, add, &CostModel::default());
+        assert_eq!(arena.len(), extracted_arena.len());
+        assert_eq!(root_id, extracted_root);
     }
 }

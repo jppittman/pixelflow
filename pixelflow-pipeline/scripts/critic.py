@@ -8,22 +8,22 @@
 # ///
 """Causal Sequence Transformer Critic for temporal credit assignment.
 
-Reads self-play trajectories (JSONL), trains a value model V_t for each
+Reads self-play trajectories (`.pftraj`), trains a value model V_t for each
 step, exports per-step advantages A_t = R_T - V_t.
 
 Variable-length trajectories are batched with pad_sequence + padding masks
 for efficient GPU matrix multiplication. Device auto-selected: CUDA > MPS > CPU.
 
 Usage:
-    uv run critic.py train --input trajectories.jsonl --output advantages.jsonl
-    uv run critic.py train --input trajectories.jsonl --output advantages.jsonl --checkpoint critic.pt
+    uv run critic.py train --input trajectories.pftraj --output advantages.pfadv
+    uv run critic.py train --input trajectories.pftraj --output advantages.pfadv --checkpoint critic.pt
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
+import struct
 import sys
 from pathlib import Path
 
@@ -37,11 +37,15 @@ from torch.optim import AdamW
 # Constants — must match pixelflow-pipeline/src/training/unified.rs
 # =============================================================================
 
-ACC_DIM = 130        # EdgeAccumulator size (4*K dual sums + edge_count + node_count)
-EXPR_DIM = 32        # EMBED_DIM for expression embeddings (expr_proj output)
-RULE_DIM = 32        # EMBED_DIM for rule embeddings
+GRAPH_ACC_DIM = 132  # GraphAccumulator (saturation/search state — changes per step)
+EXPR_DIM = 32        # expression embedding (expr_proj output)
+RULE_DIM = 32        # rule embedding (action taken)
 RESOURCE_DIM = 2     # budget_remaining, epochs_remaining
-STEP_DIM = ACC_DIM + EXPR_DIM + RULE_DIM + RESOURCE_DIM  # 196 floats per step
+STEP_DIM = GRAPH_ACC_DIM + EXPR_DIM + RULE_DIM + RESOURCE_DIM  # 198 floats per step
+# NOTE: EdgeAccumulator deliberately excluded — it encodes the INITIAL
+# expression (frozen for the whole trajectory), not the search state.
+# Giving it to the critic lets it shortcut credit assignment by just
+# predicting cost directly (val_loss=0.008 = zero-signal advantages).
 
 
 # =============================================================================
@@ -152,71 +156,148 @@ class CriticTransformer(nn.Module):
 # Data loading — fail fast, fail loudly
 # =============================================================================
 
-def load_trajectories(path: Path) -> list[dict]:
-    """Load trajectory JSONL. Crash with a clear error if empty or malformed."""
-    if not path.exists():
-        raise FileNotFoundError(f"Trajectory file not found: {path}")
+TRAJ_MAGIC = b"PFTJ0001"
+ADV_MAGIC = b"PFAD0001"
+
+
+class BinaryReader:
+    def __init__(self, data: bytes, path: Path):
+        self.data = data
+        self.path = path
+        self.off = 0
+
+    def take(self, n: int) -> bytes:
+        end = self.off + n
+        if end > len(self.data):
+            raise ValueError(
+                f"Unexpected EOF in {self.path} at byte {self.off}, wanted {n} bytes"
+            )
+        chunk = self.data[self.off:end]
+        self.off = end
+        return chunk
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u32(self) -> int:
+        return struct.unpack_from("<I", self.take(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack_from("<Q", self.take(8))[0]
+
+    def i32(self) -> int:
+        return struct.unpack_from("<i", self.take(4))[0]
+
+    def f32(self) -> float:
+        return struct.unpack_from("<f", self.take(4))[0]
+
+    def f64(self) -> float:
+        return struct.unpack_from("<d", self.take(8))[0]
+
+    def string(self) -> str:
+        n = self.u32()
+        return self.take(n).decode("utf-8")
+
+    def f32_vec(self) -> list[float]:
+        n = self.u32()
+        if n == 0:
+            return []
+        values = struct.unpack_from(f"<{n}f", self.take(4 * n))
+        return list(values)
+
+    def edges(self) -> list[tuple[int, int, int]]:
+        n = self.u32()
+        out = []
+        for _ in range(n):
+            parent = self.u8()
+            child = self.u8()
+            depth = struct.unpack_from("<H", self.take(2))[0]
+            out.append((parent, child, depth))
+        return out
+
+
+def _load_trajectories_binary(path: Path) -> list[dict]:
+    data = path.read_bytes()
+    r = BinaryReader(data, path)
+    magic = r.take(8)
+    if magic != TRAJ_MAGIC:
+        raise ValueError(f"Invalid trajectory binary magic in {path}: {magic!r}")
 
     trajectories: list[dict] = []
-    with open(path) as f:
-        for line_num, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Malformed JSON at {path}:{line_num}: {e}"
-                ) from e
+    for _ in range(r.u32()):
+        trajectory_id = r.string()
+        step_count = r.u32()
+        initial_cost_ns = r.f64()
+        final_cost_ns = r.f64()
+        initial_cost = r.f32() if r.u8() else None
+        final_cost = r.f32() if r.u8() else None
+        initial_nodes = r.u64()
+        node_budget = r.u64()
+        initial_accumulator_state = r.f32_vec()
+        initial_edges = r.edges()
+        final_accumulator_state = r.f32_vec()
+        final_edges = r.edges()
 
-            # Validate required fields
-            for field in ("trajectory_id", "steps", "final_cost_ns"):
-                if field not in obj:
-                    raise KeyError(
-                        f"Missing required field '{field}' at {path}:{line_num}"
-                    )
-            if not isinstance(obj["steps"], list) or len(obj["steps"]) == 0:
-                raise ValueError(
-                    f"Trajectory at {path}:{line_num} has no steps "
-                    f"(trajectory_id={obj.get('trajectory_id', '???')})"
-                )
-            for step_idx, step in enumerate(obj["steps"]):
-                for sf in ("accumulator_state", "expression_embedding", "rule_embedding"):
-                    if sf not in step:
-                        raise KeyError(
-                            f"Missing '{sf}' in step {step_idx} at "
-                            f"{path}:{line_num}"
-                        )
-                acc_len = len(step["accumulator_state"])
-                if acc_len != ACC_DIM:
-                    raise ValueError(
-                        f"accumulator_state has {acc_len} floats, expected "
-                        f"{ACC_DIM} at {path}:{line_num} step {step_idx}"
-                    )
-                expr_len = len(step["expression_embedding"])
-                if expr_len != EXPR_DIM:
-                    raise ValueError(
-                        f"expression_embedding has {expr_len} floats, expected "
-                        f"{EXPR_DIM} at {path}:{line_num} step {step_idx}"
-                    )
-                rule_len = len(step["rule_embedding"])
-                if rule_len != RULE_DIM:
-                    raise ValueError(
-                        f"rule_embedding has {rule_len} floats, expected "
-                        f"{RULE_DIM} at {path}:{line_num} step {step_idx}"
-                    )
+        steps = []
+        for _step in range(step_count):
+            steps.append({
+                "accumulator_state": r.f32_vec(),
+                "expression_embedding": r.f32_vec(),
+                "rule_embedding": r.f32_vec(),
+                "budget_remaining": r.i32(),
+                "epochs_remaining": r.i32(),
+                "action_probability": r.f32(),
+                "matched": bool(r.u8()),
+                "jit_cost_ns": r.f64(),
+                "edges": r.edges(),
+                "graph_accumulator_state": r.f32_vec(),
+            })
 
-            trajectories.append(obj)
+        trajectories.append({
+            "trajectory_id": trajectory_id,
+            "steps": steps,
+            "initial_cost_ns": initial_cost_ns,
+            "final_cost_ns": final_cost_ns,
+            "initial_cost": initial_cost,
+            "final_cost": final_cost,
+            "initial_nodes": initial_nodes,
+            "node_budget": node_budget,
+            "initial_accumulator_state": initial_accumulator_state,
+            "initial_edges": initial_edges,
+            "final_accumulator_state": final_accumulator_state,
+            "final_edges": final_edges,
+        })
 
+    if r.off != len(data):
+        raise ValueError(f"Trailing bytes in {path}: {len(data) - r.off}")
     if not trajectories:
         raise ValueError(f"No trajectories found in {path} (file is empty)")
-
     print(
-        f"Loaded {len(trajectories)} trajectories from {path}",
+        f"Loaded {len(trajectories)} binary trajectories from {path}",
         file=sys.stderr,
     )
     return trajectories
+
+
+def write_advantages(path: Path, records: list[dict]) -> None:
+    """Write advantages as binary `.pfadv`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(ADV_MAGIC)
+        f.write(struct.pack("<I", len(records)))
+        for record in records:
+            adv = record["advantages"]
+            f.write(struct.pack("<Q", int(record["trajectory_idx"])))
+            f.write(struct.pack("<I", len(adv)))
+            if adv:
+                f.write(struct.pack(f"<{len(adv)}f", *[float(x) for x in adv]))
+
+
+def load_trajectories(path: Path) -> list[dict]:
+    """Load binary trajectories."""
+    if not path.exists():
+        raise FileNotFoundError(f"Trajectory file not found: {path}")
+    return _load_trajectories_binary(path)
 
 
 def trajectories_to_tensors(
@@ -238,23 +319,33 @@ def trajectories_to_tensors(
         step_features = []
         step_matches = []
         for step in steps:
-            # Scale features to match Rust's forward_shared scaling
-            acc_state = step["accumulator_state"].copy()
-            edge_count = acc_state[128]
-            node_count = acc_state[129]
-            
+            # GraphAccumulator: the search state that changes per step.
+            # This is what the policy head saw when deciding which rules to approve.
+            # We deliberately EXCLUDE the EdgeAccumulator — it encodes the initial
+            # expression (frozen for the whole trajectory) and lets the critic
+            # shortcut credit assignment by predicting cost directly.
+            gacc = step.get("graph_accumulator_state", [])
+            if len(gacc) < GRAPH_ACC_DIM:
+                gacc = [0.0] * GRAPH_ACC_DIM
+
+            # Scale VSA sections by 1/sqrt(node_count) to match forward_graph
+            edge_count = gacc[128] if len(gacc) > 128 else 0.0
+            node_count = gacc[129] if len(gacc) > 129 else 1.0
             scale = 1.0 / math.sqrt(max(1.0, node_count))
             for i in range(128):
-                acc_state[i] *= scale
-            
-            acc_state[128] = math.log2(1.0 + edge_count)
-            acc_state[129] = math.log2(1.0 + node_count)
-            
+                gacc[i] *= scale
+            node_budget = gacc[130] if len(gacc) > 130 else 0.0
+            epoch_budget = gacc[131] if len(gacc) > 131 else 0.0
+            gacc[128] = math.log2(1.0 + edge_count)
+            gacc[129] = math.log2(1.0 + node_count)
+            gacc[130] = math.log2(1.0 + node_budget)
+            gacc[131] = math.log2(1.0 + epoch_budget)
+
             resource_features = [
                 float(step["budget_remaining"]),
                 float(step["epochs_remaining"]),
             ]
-            features = acc_state + step["expression_embedding"] + step["rule_embedding"] + resource_features
+            features = gacc[:GRAPH_ACC_DIM] + step["expression_embedding"] + step["rule_embedding"] + resource_features
             if len(features) != STEP_DIM:
                 raise ValueError(
                     f"Step feature length {len(features)} != {STEP_DIM} "
@@ -363,17 +454,12 @@ def train_and_export(args: argparse.Namespace) -> None:
     trajectories = load_trajectories(Path(args.input))
     sequences, rewards, matched_masks = trajectories_to_tensors(trajectories)
 
-    # Build padded batch (all trajectories in one tensor)
-    padded, targets, padding_mask, lengths = build_padded_batch(
-        sequences, rewards, device
-    )
-    B = padded.size(0)
-    T_max = padded.size(1)
+    # Pre-compute sequence lengths for use in the export phase
+    lengths = [seq.size(0) for seq in sequences]
+    n = len(sequences)
     n_real_steps = sum(lengths)
     print(
-        f"Batch: {B} trajectories, T_max={T_max}, "
-        f"{n_real_steps} real steps, "
-        f"{B * T_max - n_real_steps} padding positions",
+        f"Dataset: {n} trajectories, {n_real_steps} real steps",
         file=sys.stderr,
     )
 
@@ -400,70 +486,112 @@ def train_and_export(args: argparse.Namespace) -> None:
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
-    # ---- Training loop (batched) ----
+    # ---- Mini-batch training loop ----
     model.train()
     best_loss = float("inf")
     best_state = None
-    for epoch in range(args.epochs):
-        v_pred = model(padded, src_key_padding_mask=padding_mask)
-        loss = masked_mse_loss(v_pred, targets, padding_mask)
+    mb = args.mini_batch_size
 
-        if not torch.isfinite(loss):
+    for epoch in range(args.epochs):
+        # Shuffle trajectory indices each epoch
+        perm = torch.randperm(n)
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for start in range(0, n, mb):
+            batch_idx = perm[start : start + mb].tolist()
+            batch_seqs = [sequences[i] for i in batch_idx]
+            batch_rewards = [rewards[i] for i in batch_idx]
+
+            b_padded, b_targets, b_padding_mask, _ = build_padded_batch(
+                batch_seqs, batch_rewards, device
+            )
+
+            v_pred = model(b_padded, src_key_padding_mask=b_padding_mask)
+            loss = masked_mse_loss(v_pred, b_targets, b_padding_mask)
+
+            if not torch.isfinite(loss):
+                print(
+                    f"Epoch {epoch + 1}/{args.epochs} mini-batch {n_batches}: "
+                    f"loss=NaN — skipping batch",
+                    file=sys.stderr,
+                )
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        if n_batches == 0:
             print(
-                f"Epoch {epoch + 1}/{args.epochs}  loss=NaN — stopping early, reverting to best checkpoint",
+                f"Epoch {epoch + 1}/{args.epochs}: all batches NaN — reverting to best",
                 file=sys.stderr,
             )
             if best_state is not None:
                 model.load_state_dict(best_state)
             break
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        loss_val = loss.item()
-        if loss_val < best_loss:
-            best_loss = loss_val
+        avg_loss = epoch_loss / n_batches
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
             print(
-                f"Epoch {epoch + 1}/{args.epochs}  loss={loss_val:.6f}",
+                f"Epoch {epoch + 1}/{args.epochs}  loss={avg_loss:.6f}",
                 file=sys.stderr,
             )
 
     # ---- Export advantages ----
     output_path = Path(args.output)
     model.eval()
-    with torch.no_grad():
-        v_pred = model(padded, src_key_padding_mask=padding_mask)  # (B, T_max, 1)
-        v_pred = v_pred.squeeze(-1).cpu()  # (B, T_max)
+    all_value_preds: list[torch.Tensor] = []  # list of (T_i,) tensors, one per trajectory
 
-    with open(output_path, "w") as out_f:
-        for i, length in enumerate(lengths):
-            v_i = v_pred[i, :length]  # (T_i,) — only real positions
-            adv = rewards[i] - v_i    # A_t = R_T - V_t
-            
-            # EXPLICIT PENALTY: Time-wasting rules (fired but didn't match) get a hard negative advantage.
-            # This overrides the temporal credit assignment for that specific step, teaching the policy
-            # to stop predicting high scores for rules that fail structural matching.
-            step_matched = matched_masks[i][:length].to(device=adv.device)
-            adv = torch.where(step_matched, adv, torch.full_like(adv, -0.01))
-            
-            # Replace any NaN/Inf with 0.0 — model diverged, neutral advantage
-            if not torch.all(torch.isfinite(adv)):
-                n_bad = (~torch.isfinite(adv)).sum().item()
-                print(
-                    f"WARNING: trajectory {i} has {n_bad}/{len(adv)} non-finite advantages, zeroing them",
-                    file=sys.stderr,
-                )
-                adv = torch.where(torch.isfinite(adv), adv, torch.zeros_like(adv))
-            record = {
-                "trajectory_idx": i,
-                "advantages": adv.tolist(),
-            }
-            out_f.write(json.dumps(record) + "\n")
+    with torch.no_grad():
+        for start in range(0, n, mb):
+            end = min(start + mb, n)
+            chunk_seqs = sequences[start:end]
+            chunk_rewards = rewards[start:end]
+            c_padded, _, c_padding_mask, c_lengths = build_padded_batch(
+                chunk_seqs, chunk_rewards, device
+            )
+            v_chunk = model(c_padded, src_key_padding_mask=c_padding_mask)  # (B, T, 1)
+            v_chunk = v_chunk.squeeze(-1).cpu()  # (B, T)
+            for j, length in enumerate(c_lengths):
+                all_value_preds.append(v_chunk[j, :length])  # (T_i,)
+
+    if len(all_value_preds) != n:
+        raise RuntimeError(
+            f"Value pred count {len(all_value_preds)} != {n}"
+        )
+
+    records = []
+    for i, length in enumerate(lengths):
+        v_i = all_value_preds[i]          # (T_i,)
+        adv = torch.tensor(rewards[i]) - v_i   # A_t = R_T - V_t
+
+        # EXPLICIT PENALTY: unmatched steps get hard negative advantage
+        step_matched = matched_masks[i][:length].to(device=adv.device)
+        adv = torch.where(step_matched, adv, torch.full_like(adv, -0.01))
+
+        # Replace NaN/Inf with 0.0
+        if not torch.all(torch.isfinite(adv)):
+            n_bad = (~torch.isfinite(adv)).sum().item()
+            print(
+                f"WARNING: trajectory {i} has {n_bad}/{len(adv)} non-finite advantages, zeroing them",
+                file=sys.stderr,
+            )
+            adv = torch.where(torch.isfinite(adv), adv, torch.zeros_like(adv))
+
+        records.append({
+            "trajectory_idx": i,
+            "advantages": adv.tolist(),
+        })
+    write_advantages(output_path, records)
 
     print(
         f"Wrote {len(sequences)} advantage records to {output_path}",
@@ -490,10 +618,10 @@ def main() -> None:
         "train", help="Train critic and export advantages"
     )
     train_parser.add_argument(
-        "--input", required=True, help="Path to trajectory JSONL"
+        "--input", required=True, help="Path to trajectory batch (.pftraj)"
     )
     train_parser.add_argument(
-        "--output", required=True, help="Path to write advantages JSONL"
+        "--output", required=True, help="Path to write advantages batch (.pfadv)"
     )
     train_parser.add_argument(
         "--checkpoint",
@@ -535,6 +663,12 @@ def main() -> None:
         type=float,
         default=0.1,
         help="Dropout rate (default: 0.1)",
+    )
+    train_parser.add_argument(
+        "--mini-batch-size",
+        type=int,
+        default=64,
+        help="Trajectories per mini-batch during training (default: 64)",
     )
 
     args = parser.parse_args()

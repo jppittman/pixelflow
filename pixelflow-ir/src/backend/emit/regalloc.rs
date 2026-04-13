@@ -17,7 +17,7 @@
 //! Expression DAGs from e-graph extraction are always in SSA form.
 
 use alloc::collections::BTreeMap;
-use alloc::collections::BTreeSet;
+use alloc::collections::BinaryHeap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -31,12 +31,19 @@ pub struct ValueId(pub u32);
 ///
 /// Two values interfere if they're both live at the same program point.
 /// The graph is undirected - if A interferes with B, B interferes with A.
+///
+/// Internally uses dense Vecs indexed by `ValueId.0` for O(1) lookup.
 #[derive(Debug, Default)]
 pub struct InterferenceGraph {
-    /// Adjacency list: value → set of interfering values
-    edges: BTreeMap<ValueId, BTreeSet<ValueId>>,
-    /// Pre-colored values (e.g., function arguments in specific registers)
-    precolored: BTreeMap<ValueId, Reg>,
+    /// All values in the graph, in insertion order.
+    values: Vec<ValueId>,
+    /// Adjacency list: `neighbors[vid.0]` = Vec of interfering ValueIds.
+    /// Empty Vec for values with no neighbors.
+    neighbors: Vec<Vec<ValueId>>,
+    /// Pre-colored values: `precolored[vid.0]` = Some(Reg) if pre-colored.
+    precolored: Vec<Option<Reg>>,
+    /// Capacity: `max(ValueId.0) + 1` across all inserted values.
+    capacity: usize,
 }
 
 impl InterferenceGraph {
@@ -45,61 +52,117 @@ impl InterferenceGraph {
         Self::default()
     }
 
+    /// Grow dense Vecs to accommodate a ValueId.
+    fn ensure_capacity(&mut self, v: ValueId) {
+        let idx = v.0 as usize + 1;
+        if idx > self.capacity {
+            self.capacity = idx;
+            self.neighbors.resize_with(idx, Vec::new);
+            self.precolored.resize(idx, None);
+        }
+    }
+
     /// Add a value to the graph (with no interferences yet).
     pub fn add_value(&mut self, v: ValueId) {
-        self.edges.entry(v).or_default();
+        self.ensure_capacity(v);
+        // Only push to the values list if not already present.
+        // The neighbors Vec already has an entry from ensure_capacity.
+        if !self.values.contains(&v) {
+            self.values.push(v);
+        }
     }
 
     /// Add an interference edge between two values.
     pub fn add_edge(&mut self, a: ValueId, b: ValueId) {
-        if a != b {
-            self.edges.entry(a).or_default().insert(b);
-            self.edges.entry(b).or_default().insert(a);
+        if a == b {
+            return;
+        }
+        self.ensure_capacity(a);
+        self.ensure_capacity(b);
+
+        let ai = a.0 as usize;
+        let bi = b.0 as usize;
+
+        // Push unconditionally — dedup happens in finalize().
+        // The old code did .contains() which is O(degree) per insertion,
+        // making the entire build O(n × degree²). With push + sort/dedup
+        // at the end, it's O(edges × log(degree)).
+        self.neighbors[ai].push(b);
+        self.neighbors[bi].push(a);
+
+        // Ensure both appear in the values list.
+        if !self.values.contains(&a) {
+            self.values.push(a);
+        }
+        if !self.values.contains(&b) {
+            self.values.push(b);
         }
     }
 
     /// Mark a value as pre-colored (must use specific register).
     pub fn precolor(&mut self, v: ValueId, reg: Reg) {
         self.add_value(v);
-        self.precolored.insert(v, reg);
+        self.precolored[v.0 as usize] = Some(reg);
     }
 
     /// Get the degree of a value (number of interferences).
     pub fn degree(&self, v: ValueId) -> usize {
-        self.edges.get(&v).map(|s| s.len()).unwrap_or(0)
+        let idx = v.0 as usize;
+        if idx < self.capacity {
+            self.neighbors[idx].len()
+        } else {
+            0
+        }
     }
 
     /// Get all values in the graph.
-    pub fn values(&self) -> impl Iterator<Item = ValueId> + '_ {
-        self.edges.keys().copied()
+    /// Sort and deduplicate all neighbor lists. Must be called after
+    /// all edges are added (add_edge pushes duplicates for speed).
+    pub fn dedup_edges(&mut self) {
+        for neighbors in &mut self.neighbors {
+            neighbors.sort_unstable();
+            neighbors.dedup();
+        }
+    }
+
+    pub fn values(&self) -> &[ValueId] {
+        &self.values
     }
 
     /// Get neighbors of a value.
-    pub fn neighbors(&self, v: ValueId) -> impl Iterator<Item = ValueId> + '_ {
-        self.edges
-            .get(&v)
-            .into_iter()
-            .flat_map(|s| s.iter().copied())
+    pub fn neighbors(&self, v: ValueId) -> &[ValueId] {
+        let idx = v.0 as usize;
+        if idx < self.capacity {
+            &self.neighbors[idx]
+        } else {
+            &[]
+        }
     }
 
     /// Check if a value is pre-colored.
     pub fn is_precolored(&self, v: ValueId) -> bool {
-        self.precolored.contains_key(&v)
+        let idx = v.0 as usize;
+        idx < self.capacity && self.precolored[idx].is_some()
     }
 
     /// Get the pre-assigned register for a value, if any.
     pub fn precolor_of(&self, v: ValueId) -> Option<Reg> {
-        self.precolored.get(&v).copied()
+        let idx = v.0 as usize;
+        if idx < self.capacity {
+            self.precolored[idx]
+        } else {
+            None
+        }
     }
 
     /// Number of values in the graph.
     pub fn len(&self) -> usize {
-        self.edges.len()
+        self.values.len()
     }
 
     /// Check if graph is empty.
     pub fn is_empty(&self) -> bool {
-        self.edges.is_empty()
+        self.values.is_empty()
     }
 }
 
@@ -127,52 +190,75 @@ pub struct RegAllocation {
 /// * `num_regs` - Number of available registers
 /// * `scratch_base` - First scratch register index
 pub fn color_graph(graph: &InterferenceGraph, num_regs: u8, scratch_base: u8) -> RegAllocation {
-    let mut assignment: BTreeMap<ValueId, Reg> = BTreeMap::new();
+    // Dense assignment Vec: assignment[vid.0] = Some(Reg) if colored.
+    let capacity = graph.capacity;
+    let mut assignment_dense: Vec<Option<Reg>> = vec![None; capacity.max(1)];
     let mut spilled: Vec<ValueId> = Vec::new();
 
-    // Copy pre-colored assignments
-    for (&v, &reg) in &graph.precolored {
-        assignment.insert(v, reg);
+    // Copy pre-colored assignments.
+    for &v in graph.values() {
+        if let Some(reg) = graph.precolor_of(v) {
+            assignment_dense[v.0 as usize] = Some(reg);
+        }
     }
 
-    // Build simplicial elimination ordering (reverse order for greedy coloring)
+    // Build simplicial elimination ordering (reverse order for greedy coloring).
     let ordering = simplicial_elimination_order(graph);
 
-    // Greedy coloring in the computed order
+    // Greedy coloring in the computed order.
+    // used_colors[c] = true if color c is taken by a neighbor.
+    let mut used_colors: Vec<bool> = vec![false; (scratch_base as usize) + (num_regs as usize)];
+
     for v in ordering {
-        if assignment.contains_key(&v) {
-            continue; // Already pre-colored
+        if assignment_dense[v.0 as usize].is_some() {
+            continue; // Already pre-colored.
         }
 
-        // Find colors used by neighbors
-        let mut used_colors: BTreeSet<u8> = BTreeSet::new();
-        for neighbor in graph.neighbors(v) {
-            if let Some(&Reg(c)) = assignment.get(&neighbor) {
-                used_colors.insert(c);
+        // Mark colors used by neighbors.
+        let mut marked: Vec<usize> = Vec::new();
+        for &neighbor in graph.neighbors(v) {
+            if let Some(Reg(c)) = assignment_dense[neighbor.0 as usize] {
+                let ci = c as usize;
+                if ci < used_colors.len() && !used_colors[ci] {
+                    used_colors[ci] = true;
+                    marked.push(ci);
+                }
             }
         }
 
-        // Find first available color in scratch range
+        // Find first available color in scratch range.
         let mut color = None;
         for c in scratch_base..(scratch_base + num_regs) {
-            if !used_colors.contains(&c) {
+            if !used_colors[c as usize] {
                 color = Some(c);
                 break;
             }
         }
 
+        // Clear marks for next iteration.
+        for ci in marked {
+            used_colors[ci] = false;
+        }
+
         match color {
             Some(c) => {
-                assignment.insert(v, Reg(c));
+                assignment_dense[v.0 as usize] = Some(Reg(c));
             }
             None => {
-                // No register available - need to spill
                 spilled.push(v);
             }
         }
     }
 
-    // Count registers used
+    // Build the public BTreeMap assignment from the dense Vec.
+    let mut assignment: BTreeMap<ValueId, Reg> = BTreeMap::new();
+    for &v in graph.values() {
+        if let Some(reg) = assignment_dense[v.0 as usize] {
+            assignment.insert(v, reg);
+        }
+    }
+
+    // Count registers used.
     let max_reg = assignment
         .values()
         .filter(|r| r.0 >= scratch_base)
@@ -188,47 +274,60 @@ pub fn color_graph(graph: &InterferenceGraph, num_regs: u8, scratch_base: u8) ->
     }
 }
 
-/// Compute a simplicial elimination ordering.
+/// Compute a simplicial elimination ordering using maximum cardinality search (MCS).
 ///
-/// Uses maximum cardinality search (MCS), which produces a perfect
-/// elimination ordering for chordal graphs.
+/// MCS produces a perfect elimination ordering for chordal graphs, making
+/// subsequent greedy coloring optimal. Uses a max-heap for O(n log n) rather
+/// than the naive O(n²) scan.
 fn simplicial_elimination_order(graph: &InterferenceGraph) -> Vec<ValueId> {
     let n = graph.len();
     if n == 0 {
         return vec![];
     }
 
-    let mut order = Vec::with_capacity(n);
-    let mut weight: BTreeMap<ValueId, usize> = BTreeMap::new();
-    let mut remaining: BTreeSet<ValueId> = BTreeSet::new();
+    let capacity = graph.capacity;
 
-    // Initialize
-    for v in graph.values() {
-        weight.insert(v, 0);
-        remaining.insert(v);
+    // Dense weight and membership arrays indexed by ValueId.0.
+    let mut weight: Vec<usize> = vec![0; capacity];
+    let mut in_remaining: Vec<bool> = vec![false; capacity];
+
+    for &v in graph.values() {
+        in_remaining[v.0 as usize] = true;
     }
 
-    // MCS: repeatedly pick the vertex with maximum weight
-    for _ in 0..n {
-        // Find max-weight unordered vertex
-        let v = remaining
-            .iter()
-            .max_by_key(|&&v| weight.get(&v).unwrap_or(&0))
-            .copied()
-            .expect("remaining should not be empty");
+    // Max-heap of (weight, ValueId). Stale entries (weight mismatch) are skipped.
+    // ValueId derives Ord, so (usize, ValueId) is ordered lexicographically —
+    // weight is the primary key, ValueId is the tiebreaker.
+    let mut heap: BinaryHeap<(usize, ValueId)> =
+        graph.values().iter().map(|&v| (0usize, v)).collect();
 
-        remaining.remove(&v);
+    let mut order = Vec::with_capacity(n);
+
+    for _ in 0..n {
+        // Pop max-weight vertex still in remaining; skip stale heap entries.
+        let v = loop {
+            let (w, v) = heap.pop().expect("heap must be non-empty during MCS");
+            let vi = v.0 as usize;
+            if in_remaining[vi] && w == weight[vi] {
+                break v;
+            }
+            // Stale entry — the real weight is higher; skip.
+        };
+
+        in_remaining[v.0 as usize] = false;
         order.push(v);
 
-        // Increment weight of remaining neighbors
-        for neighbor in graph.neighbors(v) {
-            if remaining.contains(&neighbor) {
-                *weight.entry(neighbor).or_default() += 1;
+        // Increment weights of remaining neighbors and push updated entries.
+        for &neighbor in graph.neighbors(v) {
+            let ni = neighbor.0 as usize;
+            if in_remaining[ni] {
+                weight[ni] += 1;
+                heap.push((weight[ni], neighbor));
             }
         }
     }
 
-    // Return in reverse order for greedy coloring
+    // Reverse so that simplicial vertices (colored last in MCS) are colored first.
     order.reverse();
     order
 }
@@ -241,41 +340,52 @@ fn simplicial_elimination_order(graph: &InterferenceGraph) -> Vec<ValueId> {
 ///
 /// Returns an interference graph where two values interfere if
 /// their live ranges overlap.
-pub fn build_interference_graph<D, F>(
-    schedule: &[(ValueId, D)],
-    uses_of: F,
-) -> InterferenceGraph
+pub fn build_interference_graph<D, F>(schedule: &[(ValueId, D)], uses_of: F) -> InterferenceGraph
 where
     F: Fn(ValueId) -> Vec<ValueId>,
 {
     let mut graph = InterferenceGraph::new();
 
-    // Add all values
+    // Add all values.
     for (v, _) in schedule {
         graph.add_value(*v);
     }
 
-    // Live set tracking
-    let mut live: BTreeSet<ValueId> = BTreeSet::new();
+    // Compute max ValueId for the dense live bitvec.
+    let max_vid = schedule.iter().map(|(v, _)| v.0).max().unwrap_or(0) as usize;
+    let live_capacity = max_vid + 1;
 
-    // Walk schedule in reverse (backward liveness analysis)
+    // Dense live set: live[vid.0] = true if the value is currently live.
+    // live_list tracks which values are live for O(|live|) iteration.
+    let mut live: Vec<bool> = vec![false; live_capacity];
+    let mut live_list: Vec<ValueId> = Vec::new();
+
+    // Walk schedule in reverse (backward liveness analysis).
     for (v, _) in schedule.iter().rev() {
-        // v is defined here, so it's live after this point until its last use
-        // All currently live values interfere with v
-        for &other in &live {
+        let vi = v.0 as usize;
+
+        // All currently live values interfere with v.
+        for &other in &live_list {
             graph.add_edge(*v, other);
         }
 
-        // v is now live (just defined)
-        live.insert(*v);
+        // v is now live (just defined).
+        if vi < live_capacity && !live[vi] {
+            live[vi] = true;
+            live_list.push(*v);
+        }
 
-        // Remove v's uses from live set (they end here if this is their last use)
-        // Actually, we need to add uses TO the live set
+        // Add uses of v to the live set.
         for used in uses_of(*v) {
-            live.insert(used);
+            let ui = used.0 as usize;
+            if ui < live_capacity && !live[ui] {
+                live[ui] = true;
+                live_list.push(used);
+            }
         }
     }
 
+    graph.dedup_edges();
     graph
 }
 
@@ -507,6 +617,7 @@ pub fn linear_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::BTreeSet;
 
     #[test]
     fn test_empty_graph() {

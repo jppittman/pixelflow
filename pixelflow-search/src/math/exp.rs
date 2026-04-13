@@ -21,11 +21,15 @@
 //! the exp Homomorphism IS the trig angle addition rules in the complex plane.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
-use crate::egraph::{EGraph, EClassId, ENode, Op, Rewrite, RewriteAction, ops};
-use pixelflow_ir::{Expr, OpKind};
+use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
+use crate::egraph::Pattern as Expr;
+use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Box<Expr> { Box::new(e) }
+fn b(e: Expr) -> Arc<Expr> {
+    Arc::new(e)
+}
 
 // ============================================================================
 // FunctionInverse Trait
@@ -51,16 +55,24 @@ pub trait FunctionInverse: Send + Sync {
 pub struct ExpLn;
 
 impl FunctionInverse for ExpLn {
-    fn forward() -> &'static dyn Op { &ops::Exp }
-    fn backward() -> &'static dyn Op { &ops::Ln }
+    fn forward() -> &'static dyn Op {
+        &ops::Exp
+    }
+    fn backward() -> &'static dyn Op {
+        &ops::Ln
+    }
 }
 
 /// exp2 and log2 are inverses: 2^(log2(x)) = x, log2(2^x) = x
 pub struct Exp2Log2;
 
 impl FunctionInverse for Exp2Log2 {
-    fn forward() -> &'static dyn Op { &ops::Exp2 }
-    fn backward() -> &'static dyn Op { &ops::Log2 }
+    fn forward() -> &'static dyn Op {
+        &ops::Exp2
+    }
+    fn backward() -> &'static dyn Op {
+        &ops::Log2
+    }
 }
 
 /// sqrt and square (mul self) are partial inverses.
@@ -69,9 +81,13 @@ impl FunctionInverse for Exp2Log2 {
 pub struct SqrtSquare;
 
 impl FunctionInverse for SqrtSquare {
-    fn forward() -> &'static dyn Op { &ops::Sqrt }
+    fn forward() -> &'static dyn Op {
+        &ops::Sqrt
+    }
     // Square isn't a unary op, so we handle this specially
-    fn backward() -> &'static dyn Op { &ops::Mul } // Placeholder
+    fn backward() -> &'static dyn Op {
+        &ops::Mul
+    } // Placeholder
 }
 
 // ============================================================================
@@ -106,15 +122,25 @@ impl<T: FunctionInverse> Rewrite for ForwardBackward<T> {
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: forward(backward(x))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != T::forward().kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != T::forward().kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         // Check if argument is backward(x)
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == T::backward().kind() && arg_children.len() == 1 {
                     let x = arg_children[0];
                     // forward(backward(x)) → x
@@ -127,7 +153,10 @@ impl<T: FunctionInverse> Rewrite for ForwardBackward<T> {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Forward(Backward(V0))
-        Some(Expr::Unary(T::forward().kind(), b(Expr::Unary(T::backward().kind(), b(Expr::Var(0))))))
+        Some(Expr::Unary(
+            T::forward().kind(),
+            b(Expr::Unary(T::backward().kind(), b(Expr::Var(0)))),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -164,15 +193,25 @@ impl<T: FunctionInverse> Rewrite for BackwardForward<T> {
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: backward(forward(x))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != T::backward().kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != T::backward().kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         // Check if argument is forward(x)
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == T::forward().kind() && arg_children.len() == 1 {
                     let x = arg_children[0];
                     // backward(forward(x)) → x
@@ -185,7 +224,10 @@ impl<T: FunctionInverse> Rewrite for BackwardForward<T> {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Backward(Forward(V0))
-        Some(Expr::Unary(T::backward().kind(), b(Expr::Unary(T::forward().kind(), b(Expr::Var(0))))))
+        Some(Expr::Unary(
+            T::backward().kind(),
+            b(Expr::Unary(T::forward().kind(), b(Expr::Var(0)))),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -220,9 +262,15 @@ pub trait Homomorphism: Send + Sync {
 pub struct ExpHomomorphism;
 
 impl Homomorphism for ExpHomomorphism {
-    fn func() -> &'static dyn Op { &ops::Exp }
-    fn source_op() -> &'static dyn Op { &ops::Add }
-    fn target_op() -> &'static dyn Op { &ops::Mul }
+    fn func() -> &'static dyn Op {
+        &ops::Exp
+    }
+    fn source_op() -> &'static dyn Op {
+        &ops::Add
+    }
+    fn target_op() -> &'static dyn Op {
+        &ops::Mul
+    }
 }
 
 /// ln is a homomorphism from (R⁺, ×) to (R, +)
@@ -230,9 +278,15 @@ impl Homomorphism for ExpHomomorphism {
 pub struct LnHomomorphism;
 
 impl Homomorphism for LnHomomorphism {
-    fn func() -> &'static dyn Op { &ops::Ln }
-    fn source_op() -> &'static dyn Op { &ops::Mul }
-    fn target_op() -> &'static dyn Op { &ops::Add }
+    fn func() -> &'static dyn Op {
+        &ops::Ln
+    }
+    fn source_op() -> &'static dyn Op {
+        &ops::Mul
+    }
+    fn target_op() -> &'static dyn Op {
+        &ops::Add
+    }
 }
 
 // ============================================================================
@@ -267,15 +321,25 @@ impl<T: Homomorphism> Rewrite for HomomorphismRule<T> {
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: func(source_op(a, b))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != T::func().kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != T::func().kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         // Check if argument is source_op(a, b)
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == T::source_op().kind() && arg_children.len() == 2 {
                     let a = arg_children[0];
                     let b = arg_children[1];
@@ -296,7 +360,11 @@ impl<T: Homomorphism> Rewrite for HomomorphismRule<T> {
         // Func(SourceOp(V0, V1))
         Some(Expr::Unary(
             T::func().kind(),
-            b(Expr::Binary(T::source_op().kind(), b(Expr::Var(0)), b(Expr::Var(1)))),
+            b(Expr::Binary(
+                T::source_op().kind(),
+                b(Expr::Var(0)),
+                b(Expr::Var(1)),
+            )),
         ))
     }
 
@@ -328,13 +396,21 @@ impl PowerCombine {
 }
 
 impl Rewrite for PowerCombine {
-    fn name(&self) -> &str { "power-combine" }
+    fn name(&self) -> &str {
+        "power-combine"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Mul(Pow(x, a), Pow(y, b)) where x == y
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Mul { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Mul {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let left = children[0];
         let right = children[1];

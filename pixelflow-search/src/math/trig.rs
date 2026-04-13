@@ -17,11 +17,15 @@
 //! are just the real/imaginary parts of e^(i(a+b)) = e^(ia) · e^(ib).
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
-use crate::egraph::{EGraph, EClassId, ENode, Op, Rewrite, RewriteAction, ops};
-use pixelflow_ir::{Expr, OpKind};
+use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
+use crate::egraph::Pattern as Expr;
+use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Box<Expr> { Box::new(e) }
+fn b(e: Expr) -> Arc<Expr> {
+    Arc::new(e)
+}
 
 // ============================================================================
 // AngleAddition Trait
@@ -67,7 +71,9 @@ pub trait AngleAddition: Send + Sync {
 pub struct SinAngleAddition;
 
 impl AngleAddition for SinAngleAddition {
-    fn op() -> &'static dyn Op { &ops::Sin }
+    fn op() -> &'static dyn Op {
+        &ops::Sin
+    }
     fn expansion() -> AngleExpansion {
         AngleExpansion {
             term1_op1: &ops::Sin,
@@ -83,7 +89,9 @@ impl AngleAddition for SinAngleAddition {
 pub struct CosAngleAddition;
 
 impl AngleAddition for CosAngleAddition {
-    fn op() -> &'static dyn Op { &ops::Cos }
+    fn op() -> &'static dyn Op {
+        &ops::Cos
+    }
     fn expansion() -> AngleExpansion {
         AngleExpansion {
             term1_op1: &ops::Cos,
@@ -129,15 +137,25 @@ impl<T: AngleAddition> Rewrite for AngleAdditionRule<T> {
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Op(Add(a, b))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != T::op().kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != T::op().kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         // Check if argument is Add(a, b)
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == OpKind::Add && arg_children.len() == 2 {
                     let a = arg_children[0];
                     let b = arg_children[1];
@@ -208,13 +226,21 @@ impl Pythagorean {
 }
 
 impl Rewrite for Pythagorean {
-    fn name(&self) -> &str { "pythagorean" }
+    fn name(&self) -> &str {
+        "pythagorean"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Add(A, B) where A = sin²(x), B = cos²(y), x == y
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Add { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Add {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let left = children[0];
         let right = children[1];
@@ -253,7 +279,12 @@ impl Rewrite for Pythagorean {
 impl Pythagorean {
     /// Check if left = sin²(x) and right = cos²(x) for same x.
     /// Returns Some(x) if pattern matches.
-    fn match_pythagorean_pair(&self, egraph: &EGraph, left: EClassId, right: EClassId) -> Option<EClassId> {
+    fn match_pythagorean_pair(
+        &self,
+        egraph: &EGraph,
+        left: EClassId,
+        right: EClassId,
+    ) -> Option<EClassId> {
         // Check left for sin²(x) pattern: Mul(Sin(x), Sin(x)) or Pow(Sin(x), 2)
         let sin_x = self.extract_squared_trig(egraph, left, OpKind::Sin)?;
 
@@ -269,7 +300,12 @@ impl Pythagorean {
     }
 
     /// Extract x from trig(x)² pattern (either Mul(trig(x), trig(x)) or Pow(trig(x), 2))
-    fn extract_squared_trig(&self, egraph: &EGraph, class: EClassId, trig_op: OpKind) -> Option<EClassId> {
+    fn extract_squared_trig(
+        &self,
+        egraph: &EGraph,
+        class: EClassId,
+        trig_op: OpKind,
+    ) -> Option<EClassId> {
         for node in egraph.nodes(class) {
             if let ENode::Op { op, children } = node {
                 // Pattern 1: Mul(trig(x), trig(x))
@@ -292,7 +328,12 @@ impl Pythagorean {
     }
 
     /// Extract x from trig(x)
-    fn extract_trig_arg(&self, egraph: &EGraph, class: EClassId, trig_op: OpKind) -> Option<EClassId> {
+    fn extract_trig_arg(
+        &self,
+        egraph: &EGraph,
+        class: EClassId,
+        trig_op: OpKind,
+    ) -> Option<EClassId> {
         for node in egraph.nodes(class) {
             if let ENode::Op { op, children } = node {
                 if op.kind() == trig_op && children.len() == 1 {
@@ -324,14 +365,22 @@ impl ReverseAngleAddition {
 }
 
 impl Rewrite for ReverseAngleAddition {
-    fn name(&self) -> &str { "reverse-angle-addition" }
+    fn name(&self) -> &str {
+        "reverse-angle-addition"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Add(Mul(sin(a), cos(b)), Mul(cos(a), sin(b)))
         // → sin(a + b)
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Add { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Add {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let left = children[0];
         let right = children[1];
@@ -381,7 +430,12 @@ impl Rewrite for ReverseAngleAddition {
 
 impl ReverseAngleAddition {
     /// Match pattern: Mul(sin(a), cos(b)) in one class, Mul(cos(a), sin(b)) in other
-    fn match_sin_angle_sum(&self, egraph: &EGraph, left: EClassId, right: EClassId) -> Option<(EClassId, EClassId)> {
+    fn match_sin_angle_sum(
+        &self,
+        egraph: &EGraph,
+        left: EClassId,
+        right: EClassId,
+    ) -> Option<(EClassId, EClassId)> {
         // Check left = sin(a) * cos(b)
         let (sin_arg_l, cos_arg_l) = self.extract_sin_cos_mul(egraph, left)?;
         // Check right = cos(a) * sin(b)
@@ -399,7 +453,11 @@ impl ReverseAngleAddition {
     }
 
     /// Extract (sin_arg, cos_arg) from Mul(sin(x), cos(y)) or Mul(cos(y), sin(x))
-    fn extract_sin_cos_mul(&self, egraph: &EGraph, class: EClassId) -> Option<(EClassId, EClassId)> {
+    fn extract_sin_cos_mul(
+        &self,
+        egraph: &EGraph,
+        class: EClassId,
+    ) -> Option<(EClassId, EClassId)> {
         for node in egraph.nodes(class) {
             if let ENode::Op { op, children } = node {
                 if op.kind() != OpKind::Mul || children.len() != 2 {
@@ -429,7 +487,11 @@ impl ReverseAngleAddition {
     }
 
     /// Extract (cos_arg, sin_arg) from Mul(cos(x), sin(y)) or Mul(sin(y), cos(x))
-    fn extract_cos_sin_mul(&self, egraph: &EGraph, class: EClassId) -> Option<(EClassId, EClassId)> {
+    fn extract_cos_sin_mul(
+        &self,
+        egraph: &EGraph,
+        class: EClassId,
+    ) -> Option<(EClassId, EClassId)> {
         for node in egraph.nodes(class) {
             if let ENode::Op { op, children } = node {
                 if op.kind() != OpKind::Mul || children.len() != 2 {
@@ -458,7 +520,12 @@ impl ReverseAngleAddition {
         None
     }
 
-    fn extract_trig_arg(&self, egraph: &EGraph, class: EClassId, trig_op: OpKind) -> Option<EClassId> {
+    fn extract_trig_arg(
+        &self,
+        egraph: &EGraph,
+        class: EClassId,
+        trig_op: OpKind,
+    ) -> Option<EClassId> {
         for node in egraph.nodes(class) {
             if let ENode::Op { op, children } = node {
                 if op.kind() == trig_op && children.len() == 1 {
@@ -492,13 +559,21 @@ impl HalfAngleProduct {
 }
 
 impl Rewrite for HalfAngleProduct {
-    fn name(&self) -> &str { "half-angle-product" }
+    fn name(&self) -> &str {
+        "half-angle-product"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Mul(sin(x), cos(y)) or Mul(cos(x), sin(y)) where x == y
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Mul { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Mul {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let left = children[0];
         let right = children[1];
@@ -542,7 +617,12 @@ impl Rewrite for HalfAngleProduct {
 
 impl HalfAngleProduct {
     /// Check if we have sin(x) and cos(x) with same argument
-    fn match_sin_cos_same_arg(&self, egraph: &EGraph, sin_class: EClassId, cos_class: EClassId) -> Option<EClassId> {
+    fn match_sin_cos_same_arg(
+        &self,
+        egraph: &EGraph,
+        sin_class: EClassId,
+        cos_class: EClassId,
+    ) -> Option<EClassId> {
         let sin_arg = self.extract_trig_arg(egraph, sin_class, OpKind::Sin)?;
         let cos_arg = self.extract_trig_arg(egraph, cos_class, OpKind::Cos)?;
 
@@ -553,7 +633,12 @@ impl HalfAngleProduct {
         }
     }
 
-    fn extract_trig_arg(&self, egraph: &EGraph, class: EClassId, trig_op: OpKind) -> Option<EClassId> {
+    fn extract_trig_arg(
+        &self,
+        egraph: &EGraph,
+        class: EClassId,
+        trig_op: OpKind,
+    ) -> Option<EClassId> {
         for node in egraph.nodes(class) {
             if let ENode::Op { op, children } = node {
                 if op.kind() == trig_op && children.len() == 1 {

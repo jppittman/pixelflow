@@ -30,13 +30,13 @@ const _: () = assert!(RECORD_SIZE == 640);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReplayRecord {
-    pub acc: [f32; ACC_DIM],       // 130 × 4 = 520
+    pub acc: [f32; ACC_DIM],          // 130 × 4 = 520
     pub rule_embed: [f32; EMBED_DIM], // 24 × 4 = 96
-    pub rule_idx: u32,             // 4
-    pub matched: u32,              // bool as u32 for alignment, 4
-    pub jit_cost_ns: f64,          // 8
-    pub advantage: f32,            // 4
-    pub _pad: f32,                 // 4  → total 640
+    pub rule_idx: u32,                // 4
+    pub matched: u32,                 // bool as u32 for alignment, 4
+    pub jit_cost_ns: f64,             // 8
+    pub advantage: f32,               // 4
+    pub _pad: f32,                    // 4  → total 640
 }
 
 /// Persistent replay buffer backed by a flat binary file.
@@ -213,11 +213,13 @@ fn bytes_as_records(bytes: &[u8]) -> &[ReplayRecord] {
         bytes.len(),
     );
     assert!(
-        bytes.as_ptr() as usize % std::mem::align_of::<ReplayRecord>() == 0
-            || bytes.is_empty(),
+        bytes.as_ptr() as usize % std::mem::align_of::<ReplayRecord>() == 0 || bytes.is_empty(),
         "[REPLAY] Byte buffer is not aligned to ReplayRecord alignment",
     );
     unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr() as *const ReplayRecord, bytes.len() / RECORD_SIZE)
+        std::slice::from_raw_parts(
+            bytes.as_ptr() as *const ReplayRecord,
+            bytes.len() / RECORD_SIZE,
+        )
     }
 }

@@ -13,18 +13,18 @@
 //! - **Compounds** (`compounds.rs`): Higher-level operations (sin, cos, exp, log)
 //!   built from primitives. These have a blanket impl over all `Primitives`.
 //!
-//! The legacy `SimdOps` trait is preserved for backward compatibility but new
+//! The existing `SimdOps` trait is preserved for backward compatibility but new
 //! code should use `Primitives` + `Compounds`.
 
 use core::fmt::Debug;
 use core::ops::{Add, BitAnd, BitOr, Div, Mul, Neg, Not, Shl, Shr, Sub};
 
 // New layered architecture
-pub mod primitives;
 pub mod compounds;
+pub mod primitives;
 
-pub use primitives::{MaskPrimitives, Primitives};
 pub use compounds::Compounds;
+pub use primitives::{MaskPrimitives, Primitives};
 
 // JIT code emission
 pub mod emit;

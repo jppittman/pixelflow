@@ -25,12 +25,12 @@ fn add_self(x: f32) -> f32 {
 
 #[inline(never)]
 fn distributed(a: f32, b: f32, c: f32) -> f32 {
-    a * b + a * c  // 2 muls, 1 add
+    a * b + a * c // 2 muls, 1 add
 }
 
 #[inline(never)]
 fn factored(a: f32, b: f32, c: f32) -> f32 {
-    a * (b + c)  // 1 mul, 1 add
+    a * (b + c) // 1 mul, 1 add
 }
 
 // ============================================================================
@@ -91,12 +91,13 @@ fn fast_rsqrt(x: f32) -> f32 {
     // This is what rsqrt instructions do internally
     let half_x = 0.5 * x;
     let mut y = f32::from_bits(0x5f3759df - (x.to_bits() >> 1));
-    y = y * (1.5 - half_x * y * y);  // One Newton-Raphson iteration
+    y = y * (1.5 - half_x * y * y); // One Newton-Raphson iteration
     y
 }
 
 fn benchmark<F>(name: &str, iterations: u64, mut f: F) -> (f64, f32)
-where F: FnMut() -> f32
+where
+    F: FnMut() -> f32,
 {
     // Warmup
     let mut sink = 0.0f32;
@@ -120,8 +121,14 @@ where F: FnMut() -> f32
 
 fn compare(name: &str, iterations: u64, opt_a: (&str, f64, f32), opt_b: (&str, f64, f32)) {
     println!("{}", name);
-    println!("  {}: {:.2} ns/iter (result: {:.6})", opt_a.0, opt_a.1, opt_a.2);
-    println!("  {}: {:.2} ns/iter (result: {:.6})", opt_b.0, opt_b.1, opt_b.2);
+    println!(
+        "  {}: {:.2} ns/iter (result: {:.6})",
+        opt_a.0, opt_a.1, opt_a.2
+    );
+    println!(
+        "  {}: {:.2} ns/iter (result: {:.6})",
+        opt_b.0, opt_b.1, opt_b.2
+    );
 
     let speedup = (opt_a.1 - opt_b.1) / opt_a.1 * 100.0;
     let winner = if opt_b.1 < opt_a.1 { opt_b.0 } else { opt_a.0 };
@@ -145,36 +152,62 @@ fn main() {
     // Choice 1
     let r1 = benchmark("x*2", iterations, || mul_by_2(x));
     let r2 = benchmark("x+x", iterations, || add_self(x));
-    compare("Choice 1: x*2 vs x+x", iterations, ("x*2", r1.0, r1.1), ("x+x", r2.0, r2.1));
+    compare(
+        "Choice 1: x*2 vs x+x",
+        iterations,
+        ("x*2", r1.0, r1.1),
+        ("x+x", r2.0, r2.1),
+    );
 
     // Choice 2
     let r1 = benchmark("a*b + a*c", iterations, || distributed(a, b, c));
     let r2 = benchmark("a*(b+c)", iterations, || factored(a, b, c));
-    compare("Choice 2: Distributive a*b+a*c vs a*(b+c)", iterations,
-        ("a*b + a*c", r1.0, r1.1), ("a*(b+c)", r2.0, r2.1));
+    compare(
+        "Choice 2: Distributive a*b+a*c vs a*(b+c)",
+        iterations,
+        ("a*b + a*c", r1.0, r1.1),
+        ("a*(b+c)", r2.0, r2.1),
+    );
 
     // Choice 3
     let r1 = benchmark("x/y", iterations, || div_direct(x, y));
     let r2 = benchmark("x*(1/y)", iterations, || mul_recip(x, y));
-    compare("Choice 3: x/y vs x*(1/y)", iterations, ("x/y", r1.0, r1.1), ("x*(1/y)", r2.0, r2.1));
+    compare(
+        "Choice 3: x/y vs x*(1/y)",
+        iterations,
+        ("x/y", r1.0, r1.1),
+        ("x*(1/y)", r2.0, r2.1),
+    );
 
     // Choice 4
     let r1 = benchmark("sqrt(x)*sqrt(x)", iterations, || sqrt_squared(x.abs()));
     let r2 = benchmark("x", iterations, || identity(x.abs()));
-    compare("Choice 4: sqrt(x)*sqrt(x) vs x", iterations,
-        ("sqrt*sqrt", r1.0, r1.1), ("identity", r2.0, r2.1));
+    compare(
+        "Choice 4: sqrt(x)*sqrt(x) vs x",
+        iterations,
+        ("sqrt*sqrt", r1.0, r1.1),
+        ("identity", r2.0, r2.1),
+    );
 
     // Choice 5
     let r1 = benchmark("a*b + c", iterations, || mul_then_add(a, b, c));
     let r2 = benchmark("fma(a,b,c)", iterations, || fma_op(a, b, c));
-    compare("Choice 5: a*b+c vs fma(a,b,c)", iterations,
-        ("mul+add", r1.0, r1.1), ("fma", r2.0, r2.1));
+    compare(
+        "Choice 5: a*b+c vs fma(a,b,c)",
+        iterations,
+        ("mul+add", r1.0, r1.1),
+        ("fma", r2.0, r2.1),
+    );
 
     // Choice 6
     let r1 = benchmark("1/sqrt(x)", iterations / 10, || div_sqrt(x.abs()));
     let r2 = benchmark("fast_rsqrt", iterations / 10, || fast_rsqrt(x.abs()));
-    compare("Choice 6: 1/sqrt(x) vs fast_rsqrt", iterations / 10,
-        ("1/sqrt", r1.0, r1.1), ("fast_rsqrt", r2.0, r2.1));
+    compare(
+        "Choice 6: 1/sqrt(x) vs fast_rsqrt",
+        iterations / 10,
+        ("1/sqrt", r1.0, r1.1),
+        ("fast_rsqrt", r2.0, r2.1),
+    );
 
     println!("=== Summary ===");
     println!("These benchmarks show what an HCE-guided e-graph should prefer.");
