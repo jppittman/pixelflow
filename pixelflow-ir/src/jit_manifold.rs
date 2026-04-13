@@ -36,7 +36,9 @@ impl JitManifold {
         z: core::arch::aarch64::float32x4_t,
         w: core::arch::aarch64::float32x4_t,
     ) -> core::arch::aarch64::float32x4_t {
-        let func: KernelFn = self.code.as_fn();
+        // SAFETY: The ExecutableCode was produced by our JIT compiler which
+        // emits code matching the KernelFn signature.
+        let func: KernelFn = unsafe { self.code.as_fn() };
         func(x, y, z, w)
     }
 }
@@ -57,7 +59,9 @@ impl JitManifold {
         z: core::arch::x86_64::__m128,
         w: core::arch::x86_64::__m128,
     ) -> core::arch::x86_64::__m128 {
-        let func: KernelFn = self.code.as_fn();
+        // SAFETY: The ExecutableCode was produced by our JIT compiler which
+        // emits code matching the KernelFn signature.
+        let func: KernelFn = unsafe { self.code.as_fn() };
         func(x, y, z, w)
     }
 }
@@ -65,3 +69,93 @@ impl JitManifold {
 // SAFETY: ExecutableCode is read-only mapped memory with no interior mutability.
 unsafe impl Send for JitManifold {}
 unsafe impl Sync for JitManifold {}
+
+// =============================================================================
+// Scanline JIT kernel — eliminates per-pixel function pointer overhead
+// =============================================================================
+
+use crate::backend::emit::executable::ScanlineKernelFn;
+
+/// A JIT-compiled scanline kernel that processes multiple pixels in a single call.
+///
+/// Unlike [`JitManifold`] which calls through an `extern "C"` function pointer
+/// per pixel, `ScanlineJitManifold` contains its own loop in the emitted code.
+/// Y/Z/W stay in NEON registers for the entire scanline (loop-invariant by
+/// construction), eliminating the ~2.2x overhead of the Rust-JIT boundary.
+pub struct ScanlineJitManifold {
+    code: ExecutableCode,
+}
+
+impl ScanlineJitManifold {
+    /// Wrap compiled scanline executable code.
+    pub fn new(code: ExecutableCode) -> Self {
+        Self { code }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl ScanlineJitManifold {
+    /// Evaluate the kernel across a scanline of pixels.
+    ///
+    /// The JIT'd code contains its own loop — Y/Z/W are loaded once and stay in
+    /// NEON registers for all pixels. Only X varies per pixel (loaded from `xs`).
+    ///
+    /// # Safety
+    ///
+    /// - `xs` and `output` must be properly aligned for `float32x4_t` (16 bytes).
+    /// - `output.len()` must be >= `xs.len()`.
+    /// - The code must have been compiled by [`compile_arena_dag_scanline`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `output.len() < xs.len()`.
+    #[inline(always)]
+    pub unsafe fn eval_scanline(
+        &self,
+        xs: &[core::arch::aarch64::float32x4_t],
+        y: core::arch::aarch64::float32x4_t,
+        z: core::arch::aarch64::float32x4_t,
+        w: core::arch::aarch64::float32x4_t,
+        output: &mut [core::arch::aarch64::float32x4_t],
+    ) {
+        assert!(
+            output.len() >= xs.len(),
+            "ScanlineJitManifold::eval_scanline: output buffer too small \
+             (have {}, need {})",
+            output.len(),
+            xs.len()
+        );
+        if xs.is_empty() {
+            return;
+        }
+        let func: ScanlineKernelFn = unsafe { self.code.as_fn() };
+        func(xs.as_ptr(), y, z, w, output.as_mut_ptr(), xs.len());
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ScanlineJitManifold {
+    /// Evaluate the kernel across a scanline of pixels (x86-64 stub).
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as the ARM64 version.
+    ///
+    /// # Panics
+    ///
+    /// Panics unconditionally — x86-64 scanline JIT is not yet implemented.
+    pub unsafe fn eval_scanline(
+        &self,
+        _xs: &[core::arch::x86_64::__m128],
+        _y: core::arch::x86_64::__m128,
+        _z: core::arch::x86_64::__m128,
+        _w: core::arch::x86_64::__m128,
+        _output: &mut [core::arch::x86_64::__m128],
+    ) {
+        panic!("ScanlineJitManifold::eval_scanline not implemented for x86-64");
+    }
+}
+
+// SAFETY: ExecutableCode is read-only mapped memory with no interior mutability.
+unsafe impl Send for ScanlineJitManifold {}
+unsafe impl Sync for ScanlineJitManifold {}

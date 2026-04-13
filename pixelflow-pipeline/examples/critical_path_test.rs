@@ -77,7 +77,8 @@ fn expr_sequential(a: f32, b: f32, c: f32, d: f32, e: f32, _f: f32) -> f32 {
 }
 
 fn benchmark<F>(name: &str, mut f: F) -> f64
-where F: FnMut() -> f32
+where
+    F: FnMut() -> f32,
 {
     // Warmup
     let mut sink = 0.0f32;
@@ -117,9 +118,15 @@ fn main() {
     let actual_improvement = (deep_ns - wide_ns) / deep_ns * 100.0;
     println!("  wide: {:.2} ns/iter", wide_ns);
     println!("  deep: {:.2} ns/iter", deep_ns);
-    println!("  Actual: wide is {:.1}% {}\n",
+    println!(
+        "  Actual: wide is {:.1}% {}\n",
         actual_improvement.abs(),
-        if actual_improvement > 0.0 { "faster (CONFIRMED)" } else { "slower (WRONG!)" });
+        if actual_improvement > 0.0 {
+            "faster (CONFIRMED)"
+        } else {
+            "slower (WRONG!)"
+        }
+    );
 
     // Test 2: div
     println!("Test 2: Wide vs Deep with div");
@@ -129,9 +136,15 @@ fn main() {
     let actual_improvement = (deep_ns - wide_ns) / deep_ns * 100.0;
     println!("  wide: {:.2} ns/iter", wide_ns);
     println!("  deep: {:.2} ns/iter", deep_ns);
-    println!("  Actual: wide is {:.1}% {}\n",
+    println!(
+        "  Actual: wide is {:.1}% {}\n",
         actual_improvement.abs(),
-        if actual_improvement > 0.0 { "faster (CONFIRMED)" } else { "slower (WRONG!)" });
+        if actual_improvement > 0.0 {
+            "faster (CONFIRMED)"
+        } else {
+            "slower (WRONG!)"
+        }
+    );
 
     // Test 3: realistic
     println!("Test 3: Realistic expression");
@@ -140,9 +153,15 @@ fn main() {
     let actual_improvement = (seq_ns - wide_ns) / seq_ns * 100.0;
     println!("  wide: {:.2} ns/iter", wide_ns);
     println!("  sequential: {:.2} ns/iter", seq_ns);
-    println!("  Actual: wide is {:.1}% {}\n",
+    println!(
+        "  Actual: wide is {:.1}% {}\n",
         actual_improvement.abs(),
-        if actual_improvement > 0.0 { "faster (CONFIRMED)" } else { "slower (WRONG!)" });
+        if actual_improvement > 0.0 {
+            "faster (CONFIRMED)"
+        } else {
+            "slower (WRONG!)"
+        }
+    );
 
     println!("=== Summary ===");
     println!("Critical path analysis IS valuable when:");

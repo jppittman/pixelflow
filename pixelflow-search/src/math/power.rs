@@ -28,10 +28,15 @@
 //! - x/x → Canonicalize(MulRecip) → x * recip(x) → InverseAnnihilation → 1
 //! - x-x → Canonicalize(AddNeg) → x + neg(x) → InverseAnnihilation → 0
 
-use crate::egraph::{EGraph, EClassId, ENode, Op, Rewrite, RewriteAction, ops};
-use pixelflow_ir::{Expr, OpKind};
+use std::sync::Arc;
 
-fn b(e: Expr) -> Box<Expr> { Box::new(e) }
+use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
+use crate::egraph::Pattern as Expr;
+use pixelflow_ir::OpKind;
+
+fn b(e: Expr) -> Arc<Expr> {
+    Arc::new(e)
+}
 
 const EPSILON: f32 = 1e-6;
 
@@ -76,39 +81,47 @@ struct PowSpecialValue {
 }
 
 impl Rewrite for PowSpecialValue {
-    fn name(&self) -> &str { self.name }
+    fn name(&self) -> &str {
+        self.name
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Pow { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Pow {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let exp_val = eclass_const(egraph, children[1])?;
-        if !const_eq(exp_val, self.target_exponent) { return None; }
+        if !const_eq(exp_val, self.target_exponent) {
+            return None;
+        }
 
         let base = children[0];
         match &self.result {
-            PowResult::Constant(c) => {
-                Some(RewriteAction::Create(ENode::constant(*c)))
-            }
-            PowResult::Identity => {
-                Some(RewriteAction::Union(base))
-            }
-            PowResult::UnaryOp(op) => {
-                Some(RewriteAction::Create(
-                    ENode::Op { op: *op, children: vec![base] }
-                ))
-            }
-            PowResult::SelfMul => {
-                Some(RewriteAction::Create(
-                    ENode::Op { op: &ops::Mul, children: vec![base, base] }
-                ))
-            }
+            PowResult::Constant(c) => Some(RewriteAction::Create(ENode::constant(*c))),
+            PowResult::Identity => Some(RewriteAction::Union(base)),
+            PowResult::UnaryOp(op) => Some(RewriteAction::Create(ENode::Op {
+                op: *op,
+                children: vec![base],
+            })),
+            PowResult::SelfMul => Some(RewriteAction::Create(ENode::Op {
+                op: &ops::Mul,
+                children: vec![base, base],
+            })),
         }
     }
 
     fn lhs_template(&self) -> Option<Expr> {
-        Some(Expr::Binary(OpKind::Pow, b(Expr::Var(0)), b(Expr::Const(self.target_exponent))))
+        Some(Expr::Binary(
+            OpKind::Pow,
+            b(Expr::Var(0)),
+            b(Expr::Const(self.target_exponent)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -179,22 +192,36 @@ fn pow_special_value_rules() -> Vec<Box<dyn Rewrite>> {
 pub struct PowerRecurrence;
 
 impl PowerRecurrence {
-    pub fn new() -> Box<Self> { Box::new(Self) }
+    pub fn new() -> Box<Self> {
+        Box::new(Self)
+    }
 }
 
 impl Rewrite for PowerRecurrence {
-    fn name(&self) -> &str { "power-recurrence" }
+    fn name(&self) -> &str {
+        "power-recurrence"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Pow { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Pow {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let n = eclass_const(egraph, children[1])?;
         // Only for integer n ≥ 3 (n=2 handled by PowSpecialValue, n=1 likewise)
-        if n < 2.5 || (n - n.round()).abs() > EPSILON { return None; }
+        if n < 2.5 || (n - n.round()).abs() > EPSILON {
+            return None;
+        }
         let n_int = n.round() as i32;
-        if n_int > 8 { return None; } // Don't explode large powers
+        if n_int > 8 {
+            return None;
+        } // Don't explode large powers
 
         let x = children[0];
         Some(RewriteAction::PowerRecurrence {
@@ -227,8 +254,12 @@ pub struct LogPower {
 }
 
 impl LogPower {
-    pub fn ln() -> Box<Self> { Box::new(Self { log_op: &ops::Ln }) }
-    pub fn log2() -> Box<Self> { Box::new(Self { log_op: &ops::Log2 }) }
+    pub fn ln() -> Box<Self> {
+        Box::new(Self { log_op: &ops::Ln })
+    }
+    pub fn log2() -> Box<Self> {
+        Box::new(Self { log_op: &ops::Log2 })
+    }
 }
 
 impl Rewrite for LogPower {
@@ -242,14 +273,24 @@ impl Rewrite for LogPower {
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: log(pow(x, n))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != self.log_op.kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != self.log_op.kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == OpKind::Pow && arg_children.len() == 2 {
                     let x = arg_children[0];
                     let n = arg_children[1];
@@ -267,12 +308,19 @@ impl Rewrite for LogPower {
 
     fn lhs_template(&self) -> Option<Expr> {
         let lk = self.log_op.kind();
-        Some(Expr::Unary(lk, b(Expr::Binary(OpKind::Pow, b(Expr::Var(0)), b(Expr::Var(1))))))
+        Some(Expr::Unary(
+            lk,
+            b(Expr::Binary(OpKind::Pow, b(Expr::Var(0)), b(Expr::Var(1)))),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
         let lk = self.log_op.kind();
-        Some(Expr::Binary(OpKind::Mul, b(Expr::Var(1)), b(Expr::Unary(lk, b(Expr::Var(0))))))
+        Some(Expr::Binary(
+            OpKind::Mul,
+            b(Expr::Var(1)),
+            b(Expr::Unary(lk, b(Expr::Var(0)))),
+        ))
     }
 }
 
@@ -288,24 +336,40 @@ impl Rewrite for LogPower {
 pub struct ExpandSquare;
 
 impl ExpandSquare {
-    pub fn new() -> Box<Self> { Box::new(Self) }
+    pub fn new() -> Box<Self> {
+        Box::new(Self)
+    }
 }
 
 impl Rewrite for ExpandSquare {
-    fn name(&self) -> &str { "expand-square" }
+    fn name(&self) -> &str {
+        "expand-square"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Pow(sum, 2) where sum = Add(a, b)
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Pow { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Pow {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let exp_val = eclass_const(egraph, children[1])?;
-        if !const_eq(exp_val, 2.0) { return None; }
+        if !const_eq(exp_val, 2.0) {
+            return None;
+        }
 
         let sum_id = children[0];
         for sum_node in egraph.nodes(sum_id) {
-            if let ENode::Op { op: sum_op, children: sum_children } = sum_node {
+            if let ENode::Op {
+                op: sum_op,
+                children: sum_children,
+            } = sum_node
+            {
                 if sum_op.kind() == OpKind::Add && sum_children.len() == 2 {
                     let a = sum_children[0];
                     let b = sum_children[1];
@@ -330,7 +394,11 @@ impl Rewrite for ExpandSquare {
         let b2 = Expr::Binary(OpKind::Mul, b(Expr::Var(1)), b(Expr::Var(1)));
         let ab = Expr::Binary(OpKind::Mul, b(Expr::Var(0)), b(Expr::Var(1)));
         let two_ab = Expr::Binary(OpKind::Mul, b(Expr::Const(2.0)), b(ab));
-        let sum = Expr::Binary(OpKind::Add, b(a2), b(Expr::Binary(OpKind::Add, b(two_ab), b(b2))));
+        let sum = Expr::Binary(
+            OpKind::Add,
+            b(a2),
+            b(Expr::Binary(OpKind::Add, b(two_ab), b(b2))),
+        );
         Some(sum)
     }
 }
@@ -346,17 +414,27 @@ impl Rewrite for ExpandSquare {
 pub struct DiffOfSquares;
 
 impl DiffOfSquares {
-    pub fn new() -> Box<Self> { Box::new(Self) }
+    pub fn new() -> Box<Self> {
+        Box::new(Self)
+    }
 }
 
 impl Rewrite for DiffOfSquares {
-    fn name(&self) -> &str { "diff-of-squares" }
+    fn name(&self) -> &str {
+        "diff-of-squares"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Sub(X, Y) where X contains Mul(a,a) and Y contains Mul(b,b)
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Sub { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Sub {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let a = self.extract_self_mul(egraph, children[0])?;
         let b = self.extract_self_mul(egraph, children[1])?;
@@ -388,7 +466,8 @@ impl DiffOfSquares {
     fn extract_self_mul(&self, egraph: &EGraph, id: EClassId) -> Option<EClassId> {
         for node in egraph.nodes(id) {
             if let ENode::Op { op, children } = node {
-                if op.kind() == OpKind::Mul && children.len() == 2
+                if op.kind() == OpKind::Mul
+                    && children.len() == 2
                     && egraph.find(children[0]) == egraph.find(children[1])
                 {
                     return Some(children[0]);

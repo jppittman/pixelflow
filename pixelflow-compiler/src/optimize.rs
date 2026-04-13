@@ -26,12 +26,10 @@ use crate::ast::{
     BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
     UnaryExpr, UnaryOp,
 };
-use crate::cost_builder;
-use crate::ir_bridge::{ast_to_ir, egraph_to_ir, ir_to_code, IRToEGraphContext};
 use crate::sema::AnalyzedKernel;
 use pixelflow_search::egraph::{
-    CostModel, EClassId, EGraph, ENode, ExprTree, ExtractedDAG, Leaf, ops,
-    Rewrite, extract_neural,
+    EClassId, EGraph, ENode, ExtractedDAG, IncrementalExtractor, Rewrite, ops,
+    compute_ref_counts, build_extracted_dag_from_choices,
 };
 use pixelflow_search::nnue::ExprNnue;
 use pixelflow_search::math::all_rules as search_all_rules;
@@ -57,15 +55,28 @@ pub fn standard_rules() -> Vec<Box<dyn Rewrite>> {
 /// Counter for generating unique opaque variable names.
 static OPAQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// NNUE model for AOT optimization, loaded from trained weights.
-static NNUE_MODEL: OnceLock<ExprNnue> = OnceLock::new();
+/// Optimization model for AOT extraction, loaded from trained weights.
+static OPTIMIZATION_MODEL: OnceLock<ExprNnue> = OnceLock::new();
 
-/// Get the neural cost model, initializing it from scratch (random) or loaded weights.
-fn get_nnue_model() -> &'static ExprNnue {
-    NNUE_MODEL.get_or_init(|| {
-        // PixelflowZero: Start from total ignorance.
-        // In production, this would load from a .bin file.
-        ExprNnue::new_random(42)
+/// Get the neural cost model, loaded from trained weights embedded at compile time.
+///
+/// Weights are trained via the pixelflow-pipeline training loop:
+///   1. Self-play generates trajectories (e-graph saturation + JIT benchmarking)
+///   2. Decision Transformer critic assigns temporal credit (advantages)
+///   3. Joint backprop trains the extraction head (expression → cost)
+///      and saturation head (which rules to apply)
+///   4. Extraction head uses DAG-aware accumulator (shared nodes counted once)
+///   5. JIT benchmarks use eval100! unrolled loop (no loop counter bias)
+///
+/// The extraction head evaluates expressions during e-graph extraction to
+/// pick the cheapest equivalent form. It uses `forward_expr_only()` which
+/// sees only expression structure (op types + edge depths), not search
+/// metadata (node counts, budgets).
+fn get_optimization_model() -> &'static ExprNnue {
+    OPTIMIZATION_MODEL.get_or_init(|| {
+        static WEIGHTS: &[u8] = include_bytes!("../weights/expr_nnue.bin");
+        ExprNnue::from_bytes(WEIGHTS)
+            .unwrap_or_else(|e| panic!("Failed to load optimization model weights: {e}"))
     })
 }
 
@@ -75,47 +86,6 @@ fn unique_opaque_name(prefix: &str) -> String {
     format!("__{}{}", prefix, id)
 }
 
-/// Heuristic score for rewrite priority.
-///
-/// Higher scores = apply sooner (more promising rewrites).
-///
-/// Priority order:
-/// 1. **Identity/Annihilator** (x+0, x*1, x*0) - eliminate operations (highest)
-/// 2. **FMA fusion** (a*b+c) - enable SIMD instructions
-/// 3. **RecipSqrt** (1/sqrt(x)) - special instruction
-/// 4. **Canonicalization** (normalize forms) - enables other matches
-/// 5. **Fusion-enabling rewrites** (distribute, etc.)
-/// 6. **Everything else** (commutative, etc.) - apply last
-fn heuristic_score_rewrite(egraph: &EGraph, target: &pixelflow_search::egraph::RewriteTarget) -> i64 {
-    use pixelflow_search::egraph::RewriteTarget;
-
-    // Get the rule name
-    let rule_name = match egraph.rule(target.rule_idx) {
-        Some(rule) => rule.name(),
-        None => return 0,
-    };
-
-    // Priority scoring based on rule type
-    match rule_name {
-        // Tier 1: Eliminate operations (identity, annihilator)
-        "identity" | "annihilator" => 1000,
-
-        // Tier 2: Enable SIMD (FMA fusion)
-        "fma_fusion" => 800,
-
-        // Tier 3: Special instructions
-        "recip_sqrt" => 700,
-
-        // Tier 4: Canonicalization (enables other matches)
-        "canonicalize" => 600,
-
-        // Tier 5: Fusion-enabling
-        "distribute" | "factor" | "involution" | "cancellation" => 500,
-
-        // Tier 6: Everything else (commutativity, etc.)
-        _ => 100,
-    }
-}
 
 /// Time-controlled saturation configuration.
 ///
@@ -193,7 +163,7 @@ fn saturate_with_time_control(
         }
 
         // Apply one round of rewrites (all matching rules)
-        let changes = egraph.apply_rules_once();
+        let changes = egraph.apply_rules_once(10_000);
 
         // Saturated if no changes
         if changes == 0 {
@@ -253,53 +223,66 @@ pub fn optimize(mut analyzed: AnalyzedKernel) -> AnalyzedKernel {
 
     // 2. E-Graph optimization (global rewriting & fusion)
     // Uses neural cost model for structural extraction
-    optimize_with_nnue(analyzed)
+    optimize_with_model(analyzed)
 }
 
-/// Optimize an analyzed kernel using neural cost extraction.
-pub fn optimize_with_nnue(mut analyzed: AnalyzedKernel) -> AnalyzedKernel {
-    let nnue = get_nnue_model();
-    analyzed.def.body = optimize_expr_with_nnue(analyzed.def.body, nnue);
+/// Optimize an analyzed kernel using learned extraction.
+pub fn optimize_with_model(mut analyzed: AnalyzedKernel) -> AnalyzedKernel {
+    let model = get_optimization_model();
+    analyzed.def.body = optimize_expr_with_model(analyzed.def.body, model);
     analyzed
 }
 
 /// Optimize a single expression using e-graph saturation and neural extraction.
-fn optimize_expr_with_nnue(expr: Expr, nnue: &ExprNnue) -> Expr {
-    // Treat the entire expression as a unit for global optimization
-    optimize_via_nnue(&expr, nnue)
+fn optimize_expr_with_model(expr: Expr, model: &ExprNnue) -> Expr {
+    // Blocks: pass directly to optimize_via_model. The e-graph's expr_to_egraph
+    // already handles Block by adding each let-binding to var_to_eclass, so
+    // references share e-classes. Let-bindings are CSE hints. The e-graph sees
+    // the whole expression as one DAG.
+    //
+    // Blocks with opaque references (method calls on captured manifolds) must
+    // preserve structure. Pure arithmetic blocks go through the e-graph whole.
+    if let Expr::Block(block) = expr {
+        if block_has_opaque_with_locals(&block) {
+            return optimize_block_preserving_structure(block, model);
+        }
+        return optimize_via_model(&Expr::Block(block), model);
+    }
+
+    // For non-block expressions, treat as a unit for global optimization.
+    optimize_via_model(&expr, model)
 }
 
-/// Optimize an expression via e-graph with neural extraction.
-fn optimize_via_nnue(expr: &Expr, nnue: &ExprNnue) -> Expr {
-    // Try to convert AST → IR
-    let ir = match ast_to_ir(expr, &std::collections::HashMap::new()) {
-        Ok(ir) => ir,
-        Err(_) => {
-            // Fallback to legacy AST-based if IR fails
-            let mut ctx = EGraphContext::new();
-            let root = ctx.expr_to_egraph(expr);
-            let node_count = count_ast_nodes(expr);
-            saturate_with_time_control(&mut ctx.egraph, &config_for_node_count(node_count));
-            
-            // PixelflowZero: Pick the best structural form via NNUE
-            let (tree, _) = extract_neural(&ctx.egraph, root, nnue);
-            return ctx.tree_to_expr(&tree);
-        }
-    };
-
-    // Flatten IR → E-graph
-    let mut ctx = IRToEGraphContext::new();
-    let root = ctx.ir_to_egraph(&ir);
+/// Optimize an expression via e-graph with neural extraction + DAG CSE.
+///
+/// Uses the NNUE extraction head to pick the cheapest equivalent form
+/// via DAG-aware hill climbing, then emits let-bindings for shared
+/// subexpressions. This avoids tree-bloating where shared e-classes
+/// get duplicated, and produces code with CSE.
+///
+/// Always uses the DAG codegen path. `dag_to_expr` handles non-shared
+/// expressions correctly (returns the expression without a block wrapper),
+/// so the old "no sharing — simple tree" fallback is unnecessary and
+/// removed. CSE is always preserved.
+fn optimize_via_model(expr: &Expr, model: &ExprNnue) -> Expr {
+    let mut ctx = EGraphContext::new();
+    let root = ctx.expr_to_egraph(expr);
 
     let node_count = count_ast_nodes(expr);
     saturate_with_time_control(&mut ctx.egraph, &config_for_node_count(node_count));
 
-    // Extract optimized E-graph → ExprTree using NNUE
-    let (tree, _) = extract_neural(&ctx.egraph, root, nnue);
+    // Extract via arena path (CSE-preserving) then convert choices → DAG.
+    let extractor = IncrementalExtractor::new(model, 8);
+    let (_cost, choices) = extractor.extract_choices_only(&ctx.egraph, root);
 
-    // Convert ExprTree → AST
-    let legacy_ctx = EGraphContext::new();
-    legacy_ctx.tree_to_expr(&tree)
+    // Build ExtractedDAG: ref_counts drive let-binding placement.
+    // dag_to_expr emits let-bindings for shared subexpressions and returns
+    // a plain expression when there is no sharing — no separate tree path needed.
+    let ref_counts = compute_ref_counts(&ctx.egraph, root, &choices);
+    let dag = build_extracted_dag_from_choices(
+        &ctx.egraph, root, &choices, &ref_counts,
+    );
+    ctx.dag_to_expr(&dag)
 }
 
 /// Check if a block must preserve its structure during optimization.
@@ -543,117 +526,106 @@ fn is_coordinate_intrinsic(name: &str) -> bool {
     matches!(name, "X" | "Y" | "Z" | "W")
 }
 
+/// Inline all let-bindings in a block, producing a single expression.
+///
+/// Each local variable reference is replaced with its definition. The result
+/// is one expression with no let-bindings — the e-graph sees the whole DAG
+/// and can optimize across what were separate bindings.
+///
+/// CSE is recovered by the DAG extraction: shared subexpressions get
+/// ref_count > 1, and `dag_to_expr` emits new let-bindings for them.
+fn inline_block(block: BlockExpr) -> Expr {
+    let mut bindings: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
+
+    for stmt in &block.stmts {
+        if let Stmt::Let(let_stmt) = stmt {
+            // Substitute already-known bindings into this init
+            let inlined_init = substitute_locals(&let_stmt.init, &bindings);
+            bindings.insert(let_stmt.name.to_string(), inlined_init);
+        }
+    }
+
+    match &block.expr {
+        Some(final_expr) => substitute_locals(final_expr, &bindings),
+        None => make_literal(0.0, Span::call_site()),
+    }
+}
+
+/// Recursively substitute local variable references with their definitions.
+fn substitute_locals(
+    expr: &Expr,
+    bindings: &std::collections::HashMap<String, Expr>,
+) -> Expr {
+    match expr {
+        Expr::Ident(ident) => {
+            let name = ident.name.to_string();
+            if let Some(replacement) = bindings.get(&name) {
+                replacement.clone()
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::Literal(_) => expr.clone(),
+        Expr::Unary(u) => Expr::Unary(UnaryExpr {
+            op: u.op,
+            operand: Box::new(substitute_locals(&u.operand, bindings)),
+            span: u.span,
+        }),
+        Expr::Binary(b) => Expr::Binary(BinaryExpr {
+            op: b.op,
+            lhs: Box::new(substitute_locals(&b.lhs, bindings)),
+            rhs: Box::new(substitute_locals(&b.rhs, bindings)),
+            span: b.span,
+        }),
+        Expr::Call(c) => Expr::Call(CallExpr {
+            func: c.func.clone(),
+            args: c.args.iter().map(|a| substitute_locals(a, bindings)).collect(),
+            span: c.span,
+        }),
+        Expr::MethodCall(m) => Expr::MethodCall(MethodCallExpr {
+            receiver: Box::new(substitute_locals(&m.receiver, bindings)),
+            method: m.method.clone(),
+            args: m.args.iter().map(|a| substitute_locals(a, bindings)).collect(),
+            span: m.span,
+        }),
+        Expr::Block(inner) => {
+            // Nested block: inline it too
+            let mut inner_bindings = bindings.clone();
+            for stmt in &inner.stmts {
+                if let Stmt::Let(let_stmt) = stmt {
+                    let inlined = substitute_locals(&let_stmt.init, &inner_bindings);
+                    inner_bindings.insert(let_stmt.name.to_string(), inlined);
+                }
+            }
+            match &inner.expr {
+                Some(e) => substitute_locals(e, &inner_bindings),
+                None => make_literal(0.0, Span::call_site()),
+            }
+        }
+        // Verbatim/other: pass through unchanged
+        _ => expr.clone(),
+    }
+}
+
 /// Optimize a block while preserving its structure.
 ///
 /// Each let binding and the final expression are optimized independently.
-fn optimize_block_preserving_structure(mut block: BlockExpr, nnue: &ExprNnue) -> Expr {
+fn optimize_block_preserving_structure(mut block: BlockExpr, model: &ExprNnue) -> Expr {
     for stmt in &mut block.stmts {
         if let Stmt::Let(let_stmt) = stmt {
             let init = std::mem::replace(
                 &mut let_stmt.init,
                 make_literal(0.0, Span::call_site()),
             );
-            let_stmt.init = optimize_expr_with_nnue(init, nnue);
+            let_stmt.init = optimize_expr_with_model(init, model);
         }
     }
     if let Some(final_expr) = block.expr.take() {
-        block.expr = Some(Box::new(optimize_expr_with_nnue(*final_expr, nnue)));
+        block.expr = Some(Box::new(optimize_expr_with_model(*final_expr, model)));
     }
     Expr::Block(block)
 }
 
-/// Optimize an expression via the e-graph (AST-based, legacy).
-///
-/// Uses chess-style time control to prevent hanging on complex expressions.
-fn optimize_via_egraph(expr: &Expr, costs: &CostModel) -> Expr {
-    let mut ctx = EGraphContext::new();
-    let root = ctx.expr_to_egraph(expr);
-
-    // Select time budget based on expression complexity
-    let node_count = count_ast_nodes(expr);
-    let config = config_for_node_count(node_count);
-
-    // Time-controlled saturation (replaces fixed budget)
-    saturate_with_time_control(&mut ctx.egraph, &config);
-
-    let tree = ctx.egraph.extract_tree_with_costs(root, costs);
-    ctx.tree_to_expr(&tree)
-}
-
-/// Optimize an expression via e-graph with DAG-aware extraction.
-///
-/// Unlike `optimize_via_egraph`, this tracks shared subexpressions and emits
-/// let-bindings for e-classes used more than once. This enables Common
-/// Subexpression Elimination (CSE) in the generated code.
-///
-/// # Example
-///
-/// For `sin(X) * sin(X) + sin(X)`:
-/// - Tree extraction: `X.sin() * X.sin() + X.sin()` (3 sin calls)
-/// - DAG extraction: `{ let __0 = X.sin(); __0 * __0 + __0 }` (1 sin call)
-#[allow(dead_code)] // Will be used in future integration
-fn optimize_via_egraph_dag(expr: &Expr, costs: &CostModel) -> Expr {
-    let mut ctx = EGraphContext::new();
-    let root = ctx.expr_to_egraph(expr);
-
-    // Select time budget based on expression complexity
-    let node_count = count_ast_nodes(expr);
-    let config = config_for_node_count(node_count);
-
-    // Time-controlled saturation (replaces fixed budget)
-    saturate_with_time_control(&mut ctx.egraph, &config);
-
-    // Use DAG extraction to capture sharing
-    let dag = ctx.egraph.extract_dag_with_costs(root, costs);
-
-    // Only use DAG-to-expr if there are actually shared subexpressions
-    // This avoids unnecessary block wrapping for simple expressions
-    if dag.shared.iter().any(|(id, _)| ctx.egraph.find(*id) != dag.root) {
-        ctx.dag_to_expr(&dag)
-    } else {
-        // No sharing - use simpler tree extraction
-        let tree = ctx.egraph.extract_tree_with_costs(root, costs);
-        ctx.tree_to_expr(&tree)
-    }
-}
-
-/// Optimize an expression via the IR pipeline (NEW).
-///
-/// This uses the unified IR representation:
-/// AST → IR → E-graph → ExprTree → AST
-///
-/// Uses chess-style time control to prevent hanging on complex expressions.
-/// Falls back to AST-based optimization if IR conversion fails.
-fn optimize_via_ir(expr: &Expr, costs: &CostModel) -> Expr {
-    // Try to convert AST → IR
-    let ir = match ast_to_ir(expr, &std::collections::HashMap::new()) {
-        Ok(ir) => ir,
-        Err(_) => {
-            // IR conversion failed (unsupported constructs like blocks, captured variables)
-            // Fall back to legacy AST-based optimization
-            return optimize_via_egraph(expr, costs);
-        }
-    };
-
-    // Flatten IR → E-graph
-    let mut ctx = IRToEGraphContext::new();
-    let root = ctx.ir_to_egraph(&ir);
-
-    // Select time budget based on expression complexity
-    let node_count = count_ast_nodes(expr);
-    let config = config_for_node_count(node_count);
-
-    // Time-controlled saturation (replaces fixed budget)
-    saturate_with_time_control(&mut ctx.egraph, &config);
-
-    // Extract optimized E-graph → ExprTree
-    let tree = ctx.egraph.extract_tree_with_costs(root, costs);
-
-    // Convert ExprTree → AST using existing infrastructure
-    // We reuse the AST generation since it already knows how to emit method calls, etc.
-    let legacy_ctx = EGraphContext::new();
-    legacy_ctx.tree_to_expr(&tree)
-}
 
 // ============================================================================
 // E-Graph Integration (Legacy AST-based)
@@ -1005,9 +977,11 @@ impl EGraphContext {
             });
         }
 
-        // Get the best node for this e-class
-        let node_idx = dag.best_node_idx(canonical)
-            .unwrap_or_else(|| panic!("No best node for e-class {} in DAG", canonical.index()));
+        // Get the best node for this e-class.
+        // Default to node 0 (the original expression's node) when no choice
+        // was recorded — this happens when saturation merges introduce
+        // children that weren't in the initial reachable set.
+        let node_idx = dag.best_node_idx(canonical).unwrap_or(0);
         let node = &self.egraph.nodes(canonical)[node_idx];
 
         match node {
@@ -1185,181 +1159,6 @@ impl EGraphContext {
         })
     }
 
-    /// Convert an extracted expression tree back to an AST expression.
-    fn tree_to_expr(&self, tree: &ExprTree) -> Expr {
-        let span = Span::call_site();
-
-        match tree {
-            ExprTree::Leaf(Leaf::Var(idx)) => {
-                // First, try to get the name from our variable mapping
-                let name = self
-                    .idx_to_name
-                    .get(*idx as usize)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        // Fallback: recognize intrinsic coordinate variable indices
-                        // The IR bridge uses 0=X, 1=Y, 2=Z, 3=W convention
-                        match idx {
-                            0 => "X".to_string(),
-                            1 => "Y".to_string(),
-                            2 => "Z".to_string(),
-                            3 => "W".to_string(),
-                            _ => format!("__var{}", idx),
-                        }
-                    });
-
-                // Check if this is an opaque variable - restore original expression
-                if let Some(original) = self.opaque_exprs.get(&name) {
-                    return original.clone();
-                }
-
-                Expr::Ident(IdentExpr {
-                    name: Ident::new(&name, span),
-                    span,
-                })
-            }
-
-            ExprTree::Leaf(Leaf::Const(val)) => make_literal(*val as f64, span),
-
-            ExprTree::Op { op, children } => {
-                let name = op.name();
-                match (name, children.as_slice()) {
-                    // Binary arithmetic
-                    ("add", [a, b]) => Expr::Binary(BinaryExpr {
-                        op: BinaryOp::Add,
-                        lhs: Box::new(self.tree_to_expr(a)),
-                        rhs: Box::new(self.tree_to_expr(b)),
-                        span,
-                    }),
-                    ("sub", [a, b]) => Expr::Binary(BinaryExpr {
-                        op: BinaryOp::Sub,
-                        lhs: Box::new(self.tree_to_expr(a)),
-                        rhs: Box::new(self.tree_to_expr(b)),
-                        span,
-                    }),
-                    ("mul", [a, b]) => Expr::Binary(BinaryExpr {
-                        op: BinaryOp::Mul,
-                        lhs: Box::new(self.tree_to_expr(a)),
-                        rhs: Box::new(self.tree_to_expr(b)),
-                        span,
-                    }),
-                    ("div", [a, b]) => Expr::Binary(BinaryExpr {
-                        op: BinaryOp::Div,
-                        lhs: Box::new(self.tree_to_expr(a)),
-                        rhs: Box::new(self.tree_to_expr(b)),
-                        span,
-                    }),
-
-                    // Unary
-                    ("neg", [a]) => Expr::Unary(UnaryExpr {
-                        op: UnaryOp::Neg,
-                        operand: Box::new(self.tree_to_expr(a)),
-                        span,
-                    }),
-                    ("sqrt", [a]) => self.unary_method(a, "sqrt", span),
-                    ("rsqrt", [a]) => self.unary_method(a, "rsqrt", span),
-                    ("recip", [a]) => {
-                        // recip(x) = 1.0 / x - emit as division
-                        Expr::Binary(BinaryExpr {
-                            op: BinaryOp::Div,
-                            lhs: Box::new(make_literal(1.0, span)),
-                            rhs: Box::new(self.tree_to_expr(a)),
-                            span,
-                        })
-                    }
-                    ("abs", [a]) => self.unary_method(a, "abs", span),
-                    ("floor", [a]) => self.unary_method(a, "floor", span),
-                    ("ceil", [a]) => self.unary_method(a, "ceil", span),
-                    ("round", [a]) => self.unary_method(a, "round", span),
-                    ("fract", [a]) => self.unary_method(a, "fract", span),
-                    ("sin", [a]) => self.unary_method(a, "sin", span),
-                    ("cos", [a]) => self.unary_method(a, "cos", span),
-                    ("tan", [a]) => self.unary_method(a, "tan", span),
-                    ("asin", [a]) => self.unary_method(a, "asin", span),
-                    ("acos", [a]) => self.unary_method(a, "acos", span),
-                    ("atan", [a]) => self.unary_method(a, "atan", span),
-                    ("exp", [a]) => self.unary_method(a, "exp", span),
-                    ("exp2", [a]) => self.unary_method(a, "exp2", span),
-                    ("ln", [a]) => self.unary_method(a, "ln", span),
-                    ("log2", [a]) => self.unary_method(a, "log2", span),
-                    ("log10", [a]) => self.unary_method(a, "log10", span),
-
-                    // Binary methods
-                    ("min", [a, b]) => self.binary_method(a, b, "min", span),
-                    ("max", [a, b]) => self.binary_method(a, b, "max", span),
-                    ("atan2", [a, b]) => self.binary_method(a, b, "atan2", span),
-                    ("pow", [a, b]) => self.binary_method(a, b, "pow", span),
-                    ("hypot", [a, b]) => self.binary_method(a, b, "hypot", span),
-
-                    // Comparisons
-                    ("lt", [a, b]) => self.binary_op(a, b, BinaryOp::Lt, span),
-                    ("le", [a, b]) => self.binary_op(a, b, BinaryOp::Le, span),
-                    ("gt", [a, b]) => self.binary_op(a, b, BinaryOp::Gt, span),
-                    ("ge", [a, b]) => self.binary_op(a, b, BinaryOp::Ge, span),
-                    ("eq", [a, b]) => self.binary_op(a, b, BinaryOp::Eq, span),
-                    ("ne", [a, b]) => self.binary_op(a, b, BinaryOp::Ne, span),
-
-                    // Ternary
-                    ("mul_add", [a, b, c]) => Expr::MethodCall(MethodCallExpr {
-                        receiver: Box::new(self.tree_to_expr(a)),
-                        method: Ident::new("mul_add", span),
-                        args: vec![self.tree_to_expr(b), self.tree_to_expr(c)],
-                        span,
-                    }),
-                    ("select", [a, b, c]) => Expr::MethodCall(MethodCallExpr {
-                        receiver: Box::new(self.tree_to_expr(a)),
-                        method: Ident::new("select", span),
-                        args: vec![self.tree_to_expr(b), self.tree_to_expr(c)],
-                        span,
-                    }),
-                    ("clamp", [a, b, c]) => Expr::MethodCall(MethodCallExpr {
-                        receiver: Box::new(self.tree_to_expr(a)),
-                        method: Ident::new("clamp", span),
-                        args: vec![self.tree_to_expr(b), self.tree_to_expr(c)],
-                        span,
-                    }),
-
-                    // Tuple
-                    ("tuple", elems) => Expr::Tuple(crate::ast::TupleExpr {
-                        elems: elems.iter().map(|e| self.tree_to_expr(e)).collect(),
-                        span,
-                    }),
-
-                    // Unknown operation - emit as method call if possible
-                    (op_name, [a]) => self.unary_method(a, op_name, span),
-                    (op_name, [a, b]) => self.binary_method(a, b, op_name, span),
-                    _ => panic!("Unknown operation {} with {} children", name, children.len()),
-                }
-            }
-        }
-    }
-
-    fn unary_method(&self, a: &ExprTree, name: &str, span: Span) -> Expr {
-        Expr::MethodCall(MethodCallExpr {
-            receiver: Box::new(self.tree_to_expr(a)),
-            method: Ident::new(name, span),
-            args: vec![],
-            span,
-        })
-    }
-
-    fn binary_method(&self, a: &ExprTree, b: &ExprTree, name: &str, span: Span) -> Expr {
-        Expr::MethodCall(MethodCallExpr {
-            receiver: Box::new(self.tree_to_expr(a)),
-            method: Ident::new(name, span),
-            args: vec![self.tree_to_expr(b)],
-            span,
-        })
-    }
-
-    fn binary_op(&self, a: &ExprTree, b: &ExprTree, op: BinaryOp, span: Span) -> Expr {
-        Expr::Binary(BinaryExpr {
-            op,
-            lhs: Box::new(self.tree_to_expr(a)),
-            rhs: Box::new(self.tree_to_expr(b)),
-            span,
-        })
-    }
 }
 
 /// Extract f64 from a syn::Lit.
@@ -1594,278 +1393,6 @@ mod tests {
         format!("{:?}", optimized.def.body)
     }
 
-    fn optimize_code_egraph(input: proc_macro2::TokenStream, costs: &CostModel) -> String {
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
-        let optimized = optimize_with_egraph(analyzed, costs);
-        format!("{:?}", optimized.def.body)
-    }
-
-    #[test]
-    fn test_constant_folding() {
-        let input = quote! { |x: f32| x + (1.0 + 2.0) };
-        let debug = optimize_code(input);
-        assert!(debug.contains("LiteralExpr"));
-        assert!(debug.contains("3.0"));
-        assert!(!debug.contains("1.0"));
-        assert!(!debug.contains("2.0"));
-    }
-
-    #[test]
-    fn test_identity_add() {
-        let input = quote! { |x: f32| x + 0.0 };
-        let debug = optimize_code(input);
-        assert!(debug.contains("IdentExpr"));
-        assert!(debug.contains("x"));
-        assert!(!debug.contains("BinaryExpr"));
-    }
-
-    #[test]
-    fn test_zero_mul() {
-        let input = quote! { |x: f32| x * 0.0 };
-        let debug = optimize_code(input);
-        assert!(debug.contains("LiteralExpr"));
-        assert!(debug.contains("0.0"));
-        assert!(!debug.contains("IdentExpr"));
-    }
-
-    #[test]
-    fn test_complex_folding() {
-        let input = quote! { |x: f32| (1.0 + 2.0) * x + 0.0 };
-        let debug = optimize_code(input);
-        assert!(debug.contains("3.0"));
-        assert!(debug.contains("x"));
-    }
-
-    // ========================================================================
-    // E-Graph Integration Tests
-    // ========================================================================
-
-    #[test]
-    fn test_egraph_identity_add() {
-        let input = quote! { |x: f32| x + 0.0 };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to just x
-        assert!(debug.contains("IdentExpr"));
-        assert!(debug.contains("x"));
-        assert!(!debug.contains("Add"));
-    }
-
-    #[test]
-    fn test_egraph_identity_mul() {
-        let input = quote! { |x: f32| x * 1.0 };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to just x
-        assert!(debug.contains("IdentExpr"));
-        assert!(debug.contains("x"));
-        assert!(!debug.contains("Mul"));
-    }
-
-    #[test]
-    fn test_egraph_zero_mul() {
-        let input = quote! { |x: f32| x * 0.0 };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to 0.0
-        eprintln!("test_egraph_zero_mul output: {}", debug);
-        assert!(debug.contains("LiteralExpr"), "Expected LiteralExpr in: {}", debug);
-        assert!(debug.contains("0.0") || debug.contains("0"), "Expected 0 in: {}", debug);
-    }
-
-    #[test]
-    fn test_egraph_sub_self() {
-        let input = quote! { |x: f32| x - x };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to 0.0
-        assert!(debug.contains("0"));
-    }
-
-    #[test]
-    fn test_egraph_fma_fusion_with_fma_costs() {
-        // a * b + c should become mul_add when FMA is cheap
-        let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
-        let debug = optimize_code_egraph(input, &CostModel::with_fma());
-        // With FMA costs, should extract mul_add
-        assert!(debug.contains("mul_add"));
-    }
-
-    #[test]
-    fn test_egraph_fma_unfused_with_expensive_fma() {
-        // a * b + c should stay as mul + add when FMA is made expensive
-        let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
-
-        // Create a cost model where MulAdd is artificially expensive
-        let mut expensive_fma = CostModel::default();
-        expensive_fma.set_cost(pixelflow_ir::OpKind::MulAdd, 20); // More than mul(5) + add(4) = 9
-
-        let debug = optimize_code_egraph(input, &expensive_fma);
-        // With expensive FMA, should prefer unfused (mul(5) + add(4) = 9 < mul_add(20))
-        assert!(!debug.contains("mul_add"), "Expected unfused when MulAdd is expensive: {}", debug);
-    }
-
-    #[test]
-    fn test_egraph_fma_fused_with_default_costs() {
-        // With realistic default costs, FMA should be preferred (MulAdd(5) < Mul(5) + Add(4))
-        let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Modern CPUs have cheap FMA, so it should be fused
-        assert!(debug.contains("mul_add"), "Expected FMA fusion with default costs: {}", debug);
-    }
-
-    #[test]
-    fn test_egraph_complex_expression() {
-        // ((x + 0) * 1 - x) should simplify to 0
-        let input = quote! { |x: f32| (x + 0.0) * 1.0 - x };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to 0.0
-        assert!(debug.contains("0"));
-    }
-
-    #[test]
-    fn test_egraph_preserves_variables() {
-        // Simple expression with named variables
-        let input = quote! { |cx: f32, cy: f32| cx + cy };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should preserve variable names
-        assert!(debug.contains("cx"));
-        assert!(debug.contains("cy"));
-    }
-
-    #[test]
-    fn test_egraph_handles_sqrt() {
-        let input = quote! { |x: f32| x.sqrt() };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should preserve sqrt
-        assert!(debug.contains("sqrt"));
-    }
-
-    #[test]
-    fn test_egraph_div_sqrt_to_rsqrt() {
-        // x / sqrt(y) should become x * rsqrt(y) via algebra:
-        // x / sqrt(y) = x * (1/sqrt(y)) = x * rsqrt(y)
-        let input = quote! { |x: f32, y: f32| x / y.sqrt() };
-        let debug = optimize_code_egraph(input, &CostModel::with_fast_rsqrt());
-        // Should use rsqrt (real instruction) instead of 1/sqrt
-        assert!(debug.contains("rsqrt"), "Expected rsqrt in: {}", debug);
-    }
-
-    #[test]
-    fn test_egraph_double_negation() {
-        let input = quote! { |x: f32| - -x };
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to just x
-        assert!(debug.contains("IdentExpr"));
-        assert!(debug.contains("x"));
-        assert!(!debug.contains("Neg"));
-    }
-
-    // ========================================================================
-    // Cross-Binding Optimization Tests (Global Pass)
-    // ========================================================================
-
-    #[test]
-    fn test_global_optimization_across_let_bindings() {
-        // The global pass should see through let bindings:
-        // let a = x; let b = 0.0; a + b → x
-        let input = quote! { |x: f32| {
-            let a = x;
-            let b = 0.0;
-            a + b
-        }};
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to just x (no Add, no 0.0 literal in result)
-        assert!(debug.contains("x"), "Expected x in output: {}", debug);
-        assert!(!debug.contains("Add"), "Should eliminate addition with zero: {}", debug);
-    }
-
-    #[test]
-    fn test_global_optimization_zero_multiplication() {
-        // let a = x * x; let b = 0.0; a * b → 0.0
-        let input = quote! { |x: f32| {
-            let a = x * x;
-            let b = 0.0;
-            a * b
-        }};
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to 0.0
-        assert!(debug.contains("0"), "Expected 0 in output: {}", debug);
-        assert!(!debug.contains("Mul"), "Should eliminate multiplication: {}", debug);
-    }
-
-    #[test]
-    fn test_global_optimization_self_subtraction() {
-        // let a = X * X + Y * Y; a - a → 0.0
-        let input = quote! { || {
-            let a = X * X + Y * Y;
-            a - a
-        }};
-        let debug = optimize_code_egraph(input, &CostModel::default());
-        // Should simplify to 0.0
-        assert!(debug.contains("0"), "Expected 0 in output: {}", debug);
-    }
-
-    #[test]
-    fn test_global_fma_across_bindings() {
-        // let product = a * b; product + c → mul_add(a, b, c)
-        let input = quote! { |a: f32, b: f32, c: f32| {
-            let product = a * b;
-            product + c
-        }};
-        let debug = optimize_code_egraph(input, &CostModel::with_fma());
-        // Should fuse into mul_add
-        assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
-    }
-
-    #[test]
-    fn test_discriminant_pattern() {
-        // This is the problematic pattern:
-        // d_dot_c² - (c_sq - r_sq) should use Neg to wrap (c_sq - r_sq)
-        let input = quote! { |d: f32, c: f32, r: f32| {
-            let d_sq = d * d;
-            let c_sq = c * c;
-            let r_sq = r * r;
-            d_sq - (c_sq - r_sq)
-        }};
-        let debug = optimize_code_egraph(input, &CostModel::fully_optimized());
-        eprintln!("Discriminant AST: {}", debug);
-
-        // The AST should contain a Neg wrapping the inner subtraction
-        // If FMA is used: mul_add(d, d, Neg(Sub(c_sq, r_sq)))
-        // The key check: the output should NOT have the wrong sign pattern
-        // Wrong pattern: Sub(c_sq, Neg(r_sq)) which equals c_sq + r_sq
-        // Right pattern: Neg(Sub(c_sq, r_sq)) which equals -c_sq + r_sq
-
-        // With FMA fusion, we expect: mul_add(d, d, ...)
-        // And the third argument should involve a Neg wrapping the subtraction
-        assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
-
-        // Check that Neg appears in the output (wrapping the inner expression)
-        assert!(debug.contains("Neg") || debug.contains("neg"),
-                "Expected Neg in third argument of mul_add: {}", debug);
-    }
-
-    #[test]
-    fn test_discriminant_with_intrinsics() {
-        // This matches the actual failing test more closely:
-        // d_dot_c = X*cx + Y*cy + Z*cz
-        // c_sq = cx*cx + cy*cy + cz*cz
-        // r_sq = r*r
-        // discriminant = d_dot_c*d_dot_c - (c_sq - r_sq)
-        let input = quote! { |cx: f32, cy: f32, cz: f32, r: f32| {
-            let d_dot_c = X * cx + Y * cy + Z * cz;
-            let c_sq = cx * cx + cy * cy + cz * cz;
-            let r_sq = r * r;
-            d_dot_c * d_dot_c - (c_sq - r_sq)
-        }};
-        let debug = optimize_code_egraph(input, &CostModel::fully_optimized());
-        eprintln!("Discriminant with intrinsics AST: {}", debug);
-
-        // Check for FMA
-        assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
-
-        // Check that Neg appears - the key correctness check
-        assert!(debug.contains("Neg") || debug.contains("neg"),
-                "Expected Neg in expression: {}", debug);
-    }
 
     // ========================================================================
     // DAG Extraction Tests
@@ -1880,8 +1407,8 @@ mod tests {
         let analyzed = analyze(kernel).unwrap();
 
         // Use neural optimizer
-        let nnue = ExprNnue::new_random(42);
-        let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
+        let model = ExprNnue::new_random(42);
+        let optimized = optimize_expr_with_model(analyzed.def.body.clone(), &model);
 
         let debug = format!("{:?}", optimized);
         eprintln!("DAG optimized sin(X)*sin(X): {}", debug);
@@ -1901,8 +1428,8 @@ mod tests {
         let kernel = parse(input).unwrap();
         let analyzed = analyze(kernel).unwrap();
 
-        let nnue = ExprNnue::new_random(42);
-        let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
+        let model = ExprNnue::new_random(42);
+        let optimized = optimize_expr_with_model(analyzed.def.body.clone(), &model);
 
         let debug = format!("{:?}", optimized);
         eprintln!("DAG optimized sqrt(X)*sqrt(X)+sqrt(X): {}", debug);
@@ -1919,8 +1446,8 @@ mod tests {
         let kernel = parse(input).unwrap();
         let analyzed = analyze(kernel).unwrap();
 
-        let nnue = ExprNnue::new_random(42);
-        let optimized = optimize_expr_with_nnue(analyzed.def.body.clone(), &nnue);
+        let model = ExprNnue::new_random(42);
+        let optimized = optimize_expr_with_model(analyzed.def.body.clone(), &model);
 
         let debug = format!("{:?}", optimized);
         eprintln!("DAG optimized X+Y: {}", debug);

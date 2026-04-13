@@ -1,24 +1,138 @@
 //! Shared JIT benchmarking infrastructure.
 //!
-//! Provides `benchmark_jit()` for timing JIT-compiled expressions.
-//! Used by `bench_jit_corpus` and `train_online`.
+//! Shared helpers for timing arena-native JIT kernels.
 
 use std::fmt;
 
-use pixelflow_ir::Expr;
-use pixelflow_ir::backend::emit::compile_dag;
+use pixelflow_ir::backend::emit::compile_arena_dag;
+use pixelflow_ir::{ExprArena, ExprId};
 
 /// Number of timed samples per expression. Take the median.
-const TIMED_RUNS: usize = 5;
+/// 20 samples × 100 inner iters = 2000 evals. Enough to resolve
+/// sub-nanosecond differences on small expressions.
+const TIMED_RUNS: usize = 20;
 
 /// Warmup iterations before timed runs. Warms icache, branch predictor,
 /// and microarchitectural state so every benchmark_jit() call measures
 /// hot performance — not cold-start overhead.
 const WARMUP_ITERS: usize = 64;
 
-/// Inner iterations per timed sample. Keep low — we care about relative
-/// cost differences for training, not sub-nanosecond precision.
-const INNER_ITERS: usize = 4;
+/// Inner iterations per timed sample. Must be large enough that the total
+/// time exceeds clock resolution (~1ns on Apple Silicon). The inner loop
+/// is manually unrolled 10x to eliminate loop counter overhead — a constant
+/// ~0.3ns/iter bias that corrupts the additive cost model the NNUE is
+/// learning (small expressions appear proportionally more expensive).
+const INNER_ITERS: usize = 100;
+
+/// Fully unrolled inner loop — 100 evals, zero loop counter overhead.
+/// At INNER_ITERS=100 this means exactly 1 outer iteration with no loop
+/// branch at all. Eliminates the ~0.3ns/iter constant bias that corrupts
+/// the additive cost model for small expressions.
+macro_rules! eval100 {
+    ($func:expr, $x:expr, $y:expr, $z:expr, $w:expr) => {{
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+        std::hint::black_box($func($x, $y, $z, $w));
+    }};
+}
 
 /// Maximum plausible single-eval time: 1 second.
 /// Anything above this is a timing artifact (e.g., u64 underflow in
@@ -40,7 +154,9 @@ impl fmt::Display for BenchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BenchError::CompileFailed(msg) => write!(f, "compile failed: {}", msg),
-            BenchError::UnsupportedArch => write!(f, "unsupported architecture for JIT benchmarking"),
+            BenchError::UnsupportedArch => {
+                write!(f, "unsupported architecture for JIT benchmarking")
+            }
             BenchError::InvalidMeasurement(v) => write!(f, "invalid measurement: {}ns", v),
         }
     }
@@ -61,8 +177,13 @@ fn nanos_now() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn nanos_now() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts); }
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts);
+    }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -125,8 +246,9 @@ impl BenchResult {
     }
 }
 
-pub fn benchmark_jit(expr: &Expr) -> Result<BenchResult, BenchError> {
-    let result = compile_dag(expr).map_err(BenchError::CompileFailed)?;
+/// JIT-compile and benchmark an arena expression. No `Expr` conversion.
+pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResult, BenchError> {
+    let result = compile_arena_dag(arena, root).map_err(BenchError::CompileFailed)?;
     let exec_code = result.code;
 
     #[cfg(target_arch = "aarch64")]
@@ -141,12 +263,10 @@ pub fn benchmark_jit(expr: &Expr) -> Result<BenchResult, BenchError> {
             let z = vdupq_n_f32(1.3);
             let w = vdupq_n_f32(-0.2);
 
-            // Warmup: fill icache, train branch predictor, stabilize μarch.
             for _ in 0..WARMUP_ITERS {
                 std::hint::black_box(func(x, y, z, w));
             }
 
-            // Grab output for correctness check (post-warmup).
             let out = func(x, y, z, w);
             let mut output = [0.0f32; 4];
             vst1q_f32(output.as_mut_ptr(), out);
@@ -154,14 +274,15 @@ pub fn benchmark_jit(expr: &Expr) -> Result<BenchResult, BenchError> {
             let mut times = [0u64; TIMED_RUNS];
             for t in &mut times {
                 let start = nanos_now();
-                for _ in 0..INNER_ITERS {
-                    std::hint::black_box(func(x, y, z, w));
-                }
+                eval100!(func, x, y, z, w);
                 *t = nanos_now() - start;
             }
+
             times.sort_unstable();
-            let median = times[TIMED_RUNS / 2] as f64 / INNER_ITERS as f64;
-            validate_median(median).map(|ns| BenchResult { ns, output })
+            let median_total = times[TIMED_RUNS / 2];
+            let ns = median_total as f64 / INNER_ITERS as f64;
+
+            return validate_median(ns).map(|ns| BenchResult { ns, output });
         }
     }
 
@@ -177,7 +298,6 @@ pub fn benchmark_jit(expr: &Expr) -> Result<BenchResult, BenchError> {
             let z = _mm_set1_ps(1.3);
             let w = _mm_set1_ps(-0.2);
 
-            // Warmup: fill icache, train branch predictor, stabilize μarch.
             for _ in 0..WARMUP_ITERS {
                 std::hint::black_box(func(x, y, z, w));
             }
@@ -189,14 +309,15 @@ pub fn benchmark_jit(expr: &Expr) -> Result<BenchResult, BenchError> {
             let mut times = [0u64; TIMED_RUNS];
             for t in &mut times {
                 let start = nanos_now();
-                for _ in 0..INNER_ITERS {
-                    std::hint::black_box(func(x, y, z, w));
-                }
+                eval100!(func, x, y, z, w);
                 *t = nanos_now() - start;
             }
+
             times.sort_unstable();
-            let median = times[TIMED_RUNS / 2] as f64 / INNER_ITERS as f64;
-            validate_median(median).map(|ns| BenchResult { ns, output })
+            let median_total = times[TIMED_RUNS / 2];
+            let ns = median_total as f64 / INNER_ITERS as f64;
+
+            return validate_median(ns).map(|ns| BenchResult { ns, output });
         }
     }
 
@@ -210,12 +331,14 @@ pub fn benchmark_jit(expr: &Expr) -> Result<BenchResult, BenchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::Expr;
+    use pixelflow_ir::ExprArena;
 
     #[test]
     fn constant_expr_benchmarks_successfully() {
-        let expr = Expr::Const(3.14);
-        let result = benchmark_jit(&expr).expect("constant expression must JIT-compile and benchmark");
+        let mut arena = ExprArena::new();
+        let root = arena.push_const(3.14);
+        let result = benchmark_jit_arena(&arena, root)
+            .expect("constant expression must JIT-compile and benchmark");
         for lane in &result.output {
             assert!(
                 (*lane - 3.14).abs() < 1e-5,
@@ -223,6 +346,10 @@ mod tests {
                 lane
             );
         }
-        assert!(result.ns >= 0.0, "timing must be non-negative, got {}", result.ns);
+        assert!(
+            result.ns >= 0.0,
+            "timing must be non-negative, got {}",
+            result.ns
+        );
     }
 }

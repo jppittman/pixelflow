@@ -159,7 +159,7 @@ pub trait Compounds: Primitives {
     /// Tangent.
     #[inline(always)]
     fn tan(self) -> Self {
-        self.sin() * self.cos().recip_approx()
+        self.sin() / self.cos()
     }
 
     /// Four-quadrant arctangent: atan2(y, x).

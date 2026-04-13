@@ -61,7 +61,8 @@ fn deep_sqrt(a: f32, b: f32, c: f32, d: f32) -> f32 {
 }
 
 fn benchmark<F>(name: &str, iterations: u64, mut f: F) -> f64
-where F: FnMut() -> f32
+where
+    F: FnMut() -> f32,
 {
     // Warmup
     let mut sink = 0.0f32;
@@ -104,9 +105,11 @@ fn main() {
     let wide_time = benchmark("wide (a+b)+(c+d)", iterations, || wide_expr(a, b, c, d));
     let deep_time = benchmark("deep ((a+b)+c)+d", iterations, || deep_expr(a, b, c, d));
     let speedup = (deep_time - wide_time) / deep_time * 100.0;
-    println!("  Actual: wide is {:.1}% {} than deep\n",
+    println!(
+        "  Actual: wide is {:.1}% {} than deep\n",
         speedup.abs(),
-        if speedup > 0.0 { "FASTER" } else { "SLOWER" });
+        if speedup > 0.0 { "FASTER" } else { "SLOWER" }
+    );
 
     // Test 2: 8-value addition
     println!("Test 2: 8-value addition (7 adds)");
@@ -114,29 +117,49 @@ fn main() {
     let wide8_time = benchmark("wide balanced tree", iterations, || wide_8(&vals8));
     let deep8_time = benchmark("deep linear chain", iterations, || deep_8(&vals8));
     let speedup8 = (deep8_time - wide8_time) / deep8_time * 100.0;
-    println!("  Actual: wide is {:.1}% {} than deep\n",
+    println!(
+        "  Actual: wide is {:.1}% {} than deep\n",
         speedup8.abs(),
-        if speedup8 > 0.0 { "FASTER" } else { "SLOWER" });
+        if speedup8 > 0.0 { "FASTER" } else { "SLOWER" }
+    );
 
     // Test 3: With expensive operations (sqrt)
     println!("Test 3: With sqrt operations");
     println!("  Wide: sqrt(a)*sqrt(b) + sqrt(c)*sqrt(d) - 4 sqrts in parallel");
     println!("  Deep: nested sqrts in chain - 3 sqrts sequential");
-    let wide_sqrt_time = benchmark("wide parallel sqrts", iterations / 10, || wide_sqrt(a, b, c, d));
-    let deep_sqrt_time = benchmark("deep sequential sqrts", iterations / 10, || deep_sqrt(a, b, c, d));
+    let wide_sqrt_time = benchmark("wide parallel sqrts", iterations / 10, || {
+        wide_sqrt(a, b, c, d)
+    });
+    let deep_sqrt_time = benchmark("deep sequential sqrts", iterations / 10, || {
+        deep_sqrt(a, b, c, d)
+    });
     let speedup_sqrt = (deep_sqrt_time - wide_sqrt_time) / deep_sqrt_time * 100.0;
-    println!("  Actual: wide is {:.1}% {} than deep\n",
+    println!(
+        "  Actual: wide is {:.1}% {} than deep\n",
         speedup_sqrt.abs(),
-        if speedup_sqrt > 0.0 { "FASTER" } else { "SLOWER" });
+        if speedup_sqrt > 0.0 {
+            "FASTER"
+        } else {
+            "SLOWER"
+        }
+    );
 
     // Summary
     println!("=== Summary ===");
-    println!("The ILP hypothesis (wide is faster due to parallelism) is {}",
-        if speedup > 0.0 && speedup8 > 0.0 { "CONFIRMED" } else { "NOT CONFIRMED" });
+    println!(
+        "The ILP hypothesis (wide is faster due to parallelism) is {}",
+        if speedup > 0.0 && speedup8 > 0.0 {
+            "CONFIRMED"
+        } else {
+            "NOT CONFIRMED"
+        }
+    );
 
     if speedup > 0.0 {
         println!("\nHCE predicted 8% improvement, actual was {:.1}%", speedup);
-        println!("Prediction accuracy: {:.0}%",
-            100.0 - ((speedup - 8.0).abs() / 8.0 * 100.0).min(100.0));
+        println!(
+            "Prediction accuracy: {:.0}%",
+            100.0 - ((speedup - 8.0).abs() / 8.0 * 100.0).min(100.0)
+        );
     }
 }

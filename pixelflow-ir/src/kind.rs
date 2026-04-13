@@ -89,17 +89,42 @@ impl OpKind {
         match self {
             Self::Var | Self::Const | Self::Tuple => 0,
 
-            Self::Neg | Self::Sqrt | Self::Rsqrt | Self::Abs |
-            Self::Recip | Self::Floor | Self::Ceil | Self::Round |
-            Self::Fract | Self::Sin | Self::Cos | Self::Tan |
-            Self::Asin | Self::Acos | Self::Atan | Self::Exp |
-            Self::Exp2 | Self::Ln | Self::Log2 | Self::Log10 => 1,
+            Self::Neg
+            | Self::Sqrt
+            | Self::Rsqrt
+            | Self::Abs
+            | Self::Recip
+            | Self::Floor
+            | Self::Ceil
+            | Self::Round
+            | Self::Fract
+            | Self::Sin
+            | Self::Cos
+            | Self::Tan
+            | Self::Asin
+            | Self::Acos
+            | Self::Atan
+            | Self::Exp
+            | Self::Exp2
+            | Self::Ln
+            | Self::Log2
+            | Self::Log10 => 1,
 
-            Self::Add | Self::Sub | Self::Mul | Self::Div |
-            Self::Min | Self::Max |
-            Self::Atan2 | Self::Pow | Self::Hypot |
-            Self::Lt | Self::Le | Self::Gt | Self::Ge |
-            Self::Eq | Self::Ne => 2,
+            Self::Add
+            | Self::Sub
+            | Self::Mul
+            | Self::Div
+            | Self::Min
+            | Self::Max
+            | Self::Atan2
+            | Self::Pow
+            | Self::Hypot
+            | Self::Lt
+            | Self::Le
+            | Self::Gt
+            | Self::Ge
+            | Self::Eq
+            | Self::Ne => 2,
 
             Self::MulAdd | Self::Select | Self::Clamp => 3,
         }
@@ -204,22 +229,45 @@ impl OpKind {
     pub const fn default_cost(self) -> usize {
         match self {
             Self::Var | Self::Const | Self::Tuple => 0,
-            Self::Neg | Self::Abs | Self::Floor | Self::Ceil |
-            Self::Round | Self::Fract => 1,
-            Self::Add | Self::Sub | Self::Min | Self::Max |
-            Self::Lt | Self::Le | Self::Gt | Self::Ge |
-            Self::Eq | Self::Ne | Self::Select | Self::Clamp => 4,
+            Self::Neg | Self::Abs | Self::Floor | Self::Ceil | Self::Round | Self::Fract => 1,
+            Self::Add
+            | Self::Sub
+            | Self::Min
+            | Self::Max
+            | Self::Lt
+            | Self::Le
+            | Self::Gt
+            | Self::Ge
+            | Self::Eq
+            | Self::Ne
+            | Self::Select
+            | Self::Clamp => 4,
             Self::Mul | Self::MulAdd | Self::Recip | Self::Rsqrt => 5,
-            Self::Div | Self::Sqrt | Self::Sin | Self::Cos | Self::Tan |
-            Self::Asin | Self::Acos | Self::Atan | Self::Atan2 |
-            Self::Exp | Self::Exp2 | Self::Ln | Self::Log2 | Self::Log10 |
-            Self::Pow | Self::Hypot => 15,
+            Self::Div
+            | Self::Sqrt
+            | Self::Sin
+            | Self::Cos
+            | Self::Tan
+            | Self::Asin
+            | Self::Acos
+            | Self::Atan
+            | Self::Atan2
+            | Self::Exp
+            | Self::Exp2
+            | Self::Ln
+            | Self::Log2
+            | Self::Log10
+            | Self::Pow
+            | Self::Hypot => 15,
         }
     }
 
     /// Returns true if the operation is commutative (a op b == b op a).
     pub const fn is_commutative(self) -> bool {
-        matches!(self, Self::Add | Self::Mul | Self::Min | Self::Max | Self::Eq | Self::Ne)
+        matches!(
+            self,
+            Self::Add | Self::Mul | Self::Min | Self::Max | Self::Eq | Self::Ne
+        )
     }
 
     /// Returns true if the operation is associative ((a op b) op c == a op (b op c)).
@@ -255,7 +303,7 @@ impl OpKind {
     /// - Var/Const (leaves, not ops)
     /// - Tuple (structural, not computational)
     /// - MulAdd (fused — should only arise from rewrite rules)
- /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
+    /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
     /// - Select (needs mask input — only valid composed with a comparison)
     /// Returns true if this op can appear in randomly generated seed expressions
     /// fed to the JIT training pipeline.
@@ -269,11 +317,19 @@ impl OpKind {
     /// Excluded because they are fused ops that only appear via rewrites:
     ///   MulAdd
     pub const fn is_seed_op(self) -> bool {
-        !matches!(self,
-            Self::Var | Self::Const | Self::Tuple |
-            Self::MulAdd |
-            Self::Lt | Self::Le | Self::Gt | Self::Ge | Self::Eq | Self::Ne |
-            Self::Select
+        !matches!(
+            self,
+            Self::Var
+                | Self::Const
+                | Self::Tuple
+                | Self::MulAdd
+                | Self::Lt
+                | Self::Le
+                | Self::Gt
+                | Self::Ge
+                | Self::Eq
+                | Self::Ne
+                | Self::Select
         )
     }
 
@@ -287,10 +343,25 @@ impl OpKind {
             Self::Neg => EmitStyle::UnaryPrefix,
 
             // Unary method: (a).sqrt()
-            Self::Sqrt | Self::Rsqrt | Self::Abs | Self::Recip |
-            Self::Floor | Self::Ceil | Self::Round | Self::Fract |
-            Self::Sin | Self::Cos | Self::Tan | Self::Asin | Self::Acos | Self::Atan |
-            Self::Exp | Self::Exp2 | Self::Ln | Self::Log2 | Self::Log10 => EmitStyle::UnaryMethod,
+            Self::Sqrt
+            | Self::Rsqrt
+            | Self::Abs
+            | Self::Recip
+            | Self::Floor
+            | Self::Ceil
+            | Self::Round
+            | Self::Fract
+            | Self::Sin
+            | Self::Cos
+            | Self::Tan
+            | Self::Asin
+            | Self::Acos
+            | Self::Atan
+            | Self::Exp
+            | Self::Exp2
+            | Self::Ln
+            | Self::Log2
+            | Self::Log10 => EmitStyle::UnaryMethod,
 
             // Binary infix: (a + b)
             Self::Add => EmitStyle::BinaryInfix("+"),
@@ -299,8 +370,17 @@ impl OpKind {
             Self::Div => EmitStyle::BinaryInfix("/"),
 
             // Binary method: (a).min(b)
-            Self::Min | Self::Max | Self::Atan2 | Self::Hypot | Self::Pow |
-            Self::Lt | Self::Le | Self::Gt | Self::Ge | Self::Eq | Self::Ne => EmitStyle::BinaryMethod,
+            Self::Min
+            | Self::Max
+            | Self::Atan2
+            | Self::Hypot
+            | Self::Pow
+            | Self::Lt
+            | Self::Le
+            | Self::Gt
+            | Self::Ge
+            | Self::Eq
+            | Self::Ne => EmitStyle::BinaryMethod,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select | Self::Clamp => EmitStyle::TernaryMethod,
@@ -357,8 +437,16 @@ impl OpKind {
             Self::Le => Some(if x <= y { 1.0 } else { 0.0 }),
             Self::Gt => Some(if x > y { 1.0 } else { 0.0 }),
             Self::Ge => Some(if x >= y { 1.0 } else { 0.0 }),
-            Self::Eq => Some(if (x - y).abs() < f32::EPSILON { 1.0 } else { 0.0 }),
-            Self::Ne => Some(if (x - y).abs() >= f32::EPSILON { 1.0 } else { 0.0 }),
+            Self::Eq => Some(if (x - y).abs() < f32::EPSILON {
+                1.0
+            } else {
+                0.0
+            }),
+            Self::Ne => Some(if (x - y).abs() >= f32::EPSILON {
+                1.0
+            } else {
+                0.0
+            }),
             _ => None,
         }
     }

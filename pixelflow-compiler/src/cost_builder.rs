@@ -22,7 +22,7 @@ static LEARNED_WEIGHTS_TOML: &str = include_str!("../data/learned_cost_model.tom
 /// Build a cost model from learned weights embedded at compile time.
 ///
 /// Falls back to sensible defaults if parsing fails.
-pub fn build_cost_model_with_hce() -> CostModel {
+pub fn build_learned_cost_model() -> CostModel {
     parse_cost_model_toml(LEARNED_WEIGHTS_TOML)
 }
 
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_load_learned_weights() {
-        let model = build_cost_model_with_hce();
+        let model = build_learned_cost_model();
 
         // Sanity checks: expensive ops should cost more than cheap ones
         assert!(

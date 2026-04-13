@@ -89,7 +89,12 @@ impl SaturationResult {
 /// assert!(result.saturated || result.iterations <= 100);
 /// ```
 pub fn saturate_with_budget(egraph: &mut EGraph, max_iterations: usize) -> SaturationResult {
-    saturate_with_full_budget(egraph, max_iterations, 10_000, std::time::Duration::from_secs(5))
+    saturate_with_full_budget(
+        egraph,
+        max_iterations,
+        10_000,
+        std::time::Duration::from_secs(5),
+    )
 }
 
 /// Run saturation with budget, class, and time limits.
@@ -191,8 +196,7 @@ pub fn achievable_cost_within_budget(
     let result = saturate_with_budget(egraph, budget);
 
     // Extract best cost
-    let tree = egraph.extract_tree_with_costs(root, costs);
-    let cost = tree.cost(costs);
+    let (_arena, _arena_root, cost) = egraph.extract_best(root, costs);
 
     (cost, result)
 }
@@ -200,8 +204,11 @@ pub fn achievable_cost_within_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egraph::{ENode, CostModel, ops, Rewrite};
-    use crate::math::algebra::{AddNeg, MulRecip, Canonicalize, Cancellation, InverseAnnihilation, Involution, Annihilator, Commutative, Identity};
+    use crate::egraph::{ops, CostModel, ENode, Rewrite};
+    use crate::math::algebra::{
+        AddNeg, Annihilator, Cancellation, Canonicalize, Commutative, Identity,
+        InverseAnnihilation, Involution, MulRecip,
+    };
 
     /// Create an e-graph with standard algebraic rules for testing.
     fn egraph_with_rules() -> EGraph {
@@ -228,7 +235,10 @@ mod tests {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let zero = eg.add(ENode::constant(0.0));
-        let _sum = eg.add(ENode::Op { op: &ops::Add, children: vec![x, zero] });
+        let _sum = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, zero],
+        });
 
         let result = saturate_with_budget(&mut eg, 10);
 
@@ -243,9 +253,18 @@ mod tests {
         // Create a moderately complex expression
         let x = eg.add(ENode::Var(0));
         let y = eg.add(ENode::Var(1));
-        let mul = eg.add(ENode::Op { op: &ops::Mul, children: vec![x, y] });
-        let add = eg.add(ENode::Op { op: &ops::Add, children: vec![mul, x] });
-        let _sub = eg.add(ENode::Op { op: &ops::Sub, children: vec![add, y] });
+        let mul = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![x, y],
+        });
+        let add = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![mul, x],
+        });
+        let _sub = eg.add(ENode::Op {
+            op: &ops::Sub,
+            children: vec![add, y],
+        });
 
         // Very small budget - may not saturate
         let result = saturate_with_budget(&mut eg, 1);
@@ -259,7 +278,10 @@ mod tests {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let zero = eg.add(ENode::constant(0.0));
-        let sum = eg.add(ENode::Op { op: &ops::Add, children: vec![x, zero] });
+        let sum = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, zero],
+        });
 
         let costs = CostModel::new();
         let (cost, result) = achievable_cost_within_budget(&mut eg, sum, 10, &costs);

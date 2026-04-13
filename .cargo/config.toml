@@ -7,6 +7,5 @@ bake-eigen = "run --package xtask --release -- bake-eigen"
 [build]
 # Relaxed FP math for faster SIMD - allows FMA contraction and unsafe FP opts
 rustflags = [
-    "-C", "target-cpu=native",
     "-C", "llvm-args=-fp-contract=fast",
 ]

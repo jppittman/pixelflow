@@ -1,5 +1,5 @@
 [workspace]
-members = ["core-term", "pixelflow-core", "pixelflow-graphics", "pixelflow-compiler", "xtask", "pixelflow-runtime", "actor-scheduler", "actor-scheduler-macros", "pixelflow-search", "pixelflow-pipeline", "pixelflow-ml", "code-index"]
+members = ["core-term", "pixelflow-core", "pixelflow-graphics", "pixelflow-compiler", "xtask", "pixelflow-runtime", "actor-scheduler", "actor-scheduler-macros", "pixelflow-search", "pixelflow-pipeline", "pixelflow-ml", "pixelflow-ir"]
 exclude = ["pixelflow-core/fuzz"]
 resolver = "2"
 

@@ -177,6 +177,9 @@ pub mod combinators;
 /// Fluent API extensions.
 pub mod ext;
 
+/// Lattice: representable functor for manifold evaluation.
+pub mod lattice;
+
 // ============================================================================
 // Re-exports (The "Prelude")
 // ============================================================================
@@ -228,6 +231,12 @@ pub use zst::Zst;
 
 // Differentiable trait for manifolds with analytical gradients
 pub use manifold::Differentiable;
+
+// Lattice types for manifold evaluation over finite domains
+pub use lattice::{
+    DiscreteManifold, FrameLattice, IndexLattice1D, IndexLattice2D, Lattice, LatticeDomain,
+    PointLattice, ReduceOp, ScanlineLattice,
+};
 
 // ============================================================================
 // Field: The ONLY User-Facing SIMD Type

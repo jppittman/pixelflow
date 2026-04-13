@@ -8,8 +8,8 @@
 //! The results can be processed to create NNUE training data.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use pixelflow_core::{Field, Manifold, ManifoldExt, X, Y, Z, W};
 use pixelflow_compiler::kernel_raw;
+use pixelflow_core::{Field, Manifold, ManifoldExt, W, X, Y, Z};
 
 // ============================================================================
 // Benchmark Categories
@@ -82,13 +82,17 @@ fn bench_basic_arithmetic(c: &mut Criterion) {
     {
         let m = X + Y + Z + W;
         group.bench_function("chain4_add", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
     {
         let m = X * Y * Z * W;
         group.bench_function("chain4_mul", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -96,19 +100,25 @@ fn bench_basic_arithmetic(c: &mut Criterion) {
     {
         let m = (X + Y) + (Z + W);
         group.bench_function("wide2_add", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
     {
         let m = X * Y + Z * W;
         group.bench_function("wide2_mul", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
     {
         let m = (X + Y) * (Z + W);
         group.bench_function("wide2_mix", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -154,7 +164,9 @@ fn bench_expensive_ops(c: &mut Criterion) {
     {
         let m = X.sqrt() + Y.sqrt() + Z.sqrt() + W.sqrt();
         group.bench_function("sqrt4_wide", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -176,7 +188,9 @@ fn bench_expensive_ops(c: &mut Criterion) {
     {
         let m = X / Y + Z / W;
         group.bench_function("div2_wide", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -190,7 +204,9 @@ fn bench_expensive_ops(c: &mut Criterion) {
     {
         let m = X / Y / Z / W;
         group.bench_function("div3_deep", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -240,7 +256,9 @@ fn bench_distance_functions(c: &mut Criterion) {
     {
         let m = (X * X + Y * Y + Z * Z + W * W).sqrt();
         group.bench_function("dist4d", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -390,7 +408,9 @@ fn bench_depth_vs_width(c: &mut Criterion) {
     {
         let m = (X + Y) + (Z + W);
         group.bench_function("d2w4", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -398,13 +418,17 @@ fn bench_depth_vs_width(c: &mut Criterion) {
     {
         let m = ((X + Y) + Z) + W;
         group.bench_function("d3w2_left", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
     {
         let m = X + (Y + (Z + W));
         group.bench_function("d3w2_right", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -420,7 +444,9 @@ fn bench_depth_vs_width(c: &mut Criterion) {
     {
         let m = (X.sqrt() + Y.sqrt()) + (Z.sqrt() + W.sqrt());
         group.bench_function("wide_sqrt4", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -436,7 +462,9 @@ fn bench_depth_vs_width(c: &mut Criterion) {
     {
         let m = X / Y + Z / W;
         group.bench_function("wide_div2", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -444,7 +472,9 @@ fn bench_depth_vs_width(c: &mut Criterion) {
     {
         let m = ((X / Y) / Z) / W;
         group.bench_function("deep_div3", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -538,7 +568,9 @@ fn bench_kernel_raw_comparison(c: &mut Criterion) {
         let k = kernel_raw!(|| X + Y);
         let m = k();
         group.bench_function("add_kernel_raw", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -554,23 +586,30 @@ fn bench_kernel_raw_comparison(c: &mut Criterion) {
         let k = kernel_raw!(|| (X * X + Y * Y).sqrt());
         let m = k();
         group.bench_function("dist2d_kernel_raw", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
     // Complex expression - manual
     {
-        let m = ((X * X + Y * Y).sqrt() - 1.0f32).min(((X - 3.0f32) * (X - 3.0f32) + Y * Y).sqrt() - 1.0f32);
+        let m = ((X * X + Y * Y).sqrt() - 1.0f32)
+            .min(((X - 3.0f32) * (X - 3.0f32) + Y * Y).sqrt() - 1.0f32);
         group.bench_function("sdf_union_manual", |b| {
             b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), zf, wf))))
         });
     }
     // Complex expression - kernel_raw
     {
-        let k = kernel_raw!(|| ((X * X + Y * Y).sqrt() - 1.0).min(((X - 3.0) * (X - 3.0) + Y * Y).sqrt() - 1.0));
+        let k = kernel_raw!(
+            || ((X * X + Y * Y).sqrt() - 1.0).min(((X - 3.0) * (X - 3.0) + Y * Y).sqrt() - 1.0)
+        );
         let m = k();
         group.bench_function("sdf_union_kernel_raw", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 
@@ -586,7 +625,9 @@ fn bench_kernel_raw_comparison(c: &mut Criterion) {
         let k = kernel_raw!(|| X * Y + Z);
         let m = k();
         group.bench_function("fma_kernel_raw", |b| {
-            b.iter(|| black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf)))))
+            b.iter(|| {
+                black_box(m.eval((black_box(xf), black_box(yf), black_box(zf), black_box(wf))))
+            })
         });
     }
 

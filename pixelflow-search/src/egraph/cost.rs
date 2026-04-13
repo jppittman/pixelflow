@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use pixelflow_ir::OpKind;
 use super::node::ENode;
+use pixelflow_ir::OpKind;
 
 // ============================================================================
 // Cost Function Trait
@@ -263,8 +263,7 @@ impl CostModel {
 
         // Try user config directory
         if let Some(home) = std::env::var_os("HOME") {
-            let config_path = Path::new(&home)
-                .join(".config/pixelflow/cost_model.toml");
+            let config_path = Path::new(&home).join(".config/pixelflow/cost_model.toml");
             if let Ok(model) = Self::load_toml(&config_path) {
                 return model;
             }

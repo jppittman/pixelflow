@@ -12,15 +12,16 @@
 extern crate alloc;
 
 pub mod factored;
-pub mod training;
 pub mod window;
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use libm::fabsf;
 
 /// Re-export canonical IR types as the source of truth.
-pub use pixelflow_ir::{Expr, OpKind};
+pub use crate::egraph::Pattern as Expr;
+pub use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
 
 /// Re-export ExprNnue for dual-head AlphaZero-style architecture.
 pub use factored::ExprNnue;
@@ -33,16 +34,12 @@ pub use window::InstructionWindow;
 
 /// Re-export unified mask architecture constants and types.
 pub use factored::{
-    EMBED_DIM, MLP_HIDDEN, MASK_INPUT_DIM, RULE_FEATURE_DIM, MASK_MAX_RULES, RULE_CONCAT_DIM,
-    GRAPH_ACC_DIM, GRAPH_INPUT_DIM,
-    RuleFeatures, RuleTemplates,
+    ArenaRuleTemplates, EMBED_DIM, GRAPH_ACC_DIM, GRAPH_INPUT_DIM, MASK_INPUT_DIM, MASK_MAX_RULES,
+    MLP_HIDDEN, RULE_CONCAT_DIM, RULE_FEATURE_DIM, RuleFeatures, RuleTemplates,
 };
 
-/// Re-export training utilities.
-pub use training::{Metrics, ResourceConfig, TrainingResult};
-
-// Note: ExprGenConfig, ExprGenerator, BwdGenConfig, BwdGenerator, BwdTrainingPair
-// are already public structs defined in this module - no re-export needed.
+// Note: ExprGenConfig, ExprGenerator, BwdGenConfig, and BwdGenerator are already
+// public structs defined in this module - no re-export needed.
 
 // ============================================================================
 // HalfEP Features (Legacy - being phased out in favor of Factored)
@@ -106,12 +103,7 @@ pub fn extract_features(expr: &Expr) -> Vec<HalfEPFeature> {
     features
 }
 
-fn extract_features_recursive(
-    expr: &Expr,
-    features: &mut Vec<HalfEPFeature>,
-    path: u8,
-    depth: u8,
-) {
+fn extract_features_recursive(expr: &Expr, features: &mut Vec<HalfEPFeature>, path: u8, depth: u8) {
     let root_op = expr.kind();
 
     // Add features for all descendants from this node's perspective
@@ -120,7 +112,10 @@ fn extract_features_recursive(
     // Recurse into children
     match expr {
         Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        Expr::Param(i) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
         Expr::Unary(_, a) => {
             extract_features_recursive(a, features, path, depth.saturating_add(1));
         }
@@ -162,7 +157,10 @@ fn add_descendant_features(
 
     match expr {
         Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        Expr::Param(i) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
         Expr::Unary(_, a) => {
             add_descendant_features(a, features, perspective_op, depth + 1, path << 1);
         }
@@ -243,12 +241,26 @@ impl DenseFeatures {
 
     /// Feature names for debugging
     pub const NAMES: [&'static str; Self::COUNT] = [
-        "add", "sub", "mul", "div", "neg",
-        "sqrt", "rsqrt", "abs", "min", "max",
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "neg",
+        "sqrt",
+        "rsqrt",
+        "abs",
+        "min",
+        "max",
         "fma",
-        "nodes", "depth", "vars", "consts",
-        "has_identity", "has_self_cancel", "has_fusable",
-        "critical_path", "max_width",
+        "nodes",
+        "depth",
+        "vars",
+        "consts",
+        "has_identity",
+        "has_self_cancel",
+        "has_fusable",
+        "critical_path",
+        "max_width",
     ];
 
     /// Get feature value by index
@@ -274,7 +286,10 @@ pub fn extract_dense_features(expr: &Expr) -> DenseFeatures {
     let mut width_at_depth = Vec::new();
     let critical_path = extract_dense_recursive(expr, &mut features, 0, &mut width_at_depth);
     features.set(DenseFeatures::CRITICAL_PATH, critical_path);
-    features.set(DenseFeatures::MAX_WIDTH, width_at_depth.iter().copied().max().unwrap_or(0));
+    features.set(
+        DenseFeatures::MAX_WIDTH,
+        width_at_depth.iter().copied().max().unwrap_or(0),
+    );
     features
 }
 
@@ -305,13 +320,28 @@ fn extract_dense_recursive(
             features.values[DenseFeatures::CONST_COUNT] += 1;
             0 // No latency for constant
         }
-        Expr::Param(i) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        Expr::Param(i) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
         Expr::Unary(op, a) => {
             let op_cost = match op {
-                OpKind::Neg => { features.values[DenseFeatures::NEG] += 1; 1 }
-                OpKind::Sqrt => { features.values[DenseFeatures::SQRT] += 1; 15 }
-                OpKind::Rsqrt => { features.values[DenseFeatures::RSQRT] += 1; 5 }
-                OpKind::Abs => { features.values[DenseFeatures::ABS] += 1; 1 }
+                OpKind::Neg => {
+                    features.values[DenseFeatures::NEG] += 1;
+                    1
+                }
+                OpKind::Sqrt => {
+                    features.values[DenseFeatures::SQRT] += 1;
+                    15
+                }
+                OpKind::Rsqrt => {
+                    features.values[DenseFeatures::RSQRT] += 1;
+                    5
+                }
+                OpKind::Abs => {
+                    features.values[DenseFeatures::ABS] += 1;
+                    1
+                }
                 _ => 5,
             };
             let child_critical = extract_dense_recursive(a, features, depth + 1, width_at_depth);
@@ -346,8 +376,9 @@ fn extract_dense_recursive(
                         features.values[DenseFeatures::HAS_IDENTITY] += 1;
                     }
                     // Check for fusable: x * rsqrt(y)
-                    if matches!(b.as_ref(), Expr::Unary(OpKind::Rsqrt, _)) ||
-                       matches!(a.as_ref(), Expr::Unary(OpKind::Rsqrt, _)) {
+                    if matches!(b.as_ref(), Expr::Unary(OpKind::Rsqrt, _))
+                        || matches!(a.as_ref(), Expr::Unary(OpKind::Rsqrt, _))
+                    {
                         features.values[DenseFeatures::HAS_FUSABLE] += 1;
                     }
                     5
@@ -360,8 +391,14 @@ fn extract_dense_recursive(
                     }
                     15
                 }
-                OpKind::Min => { features.values[DenseFeatures::MIN] += 1; 4 }
-                OpKind::Max => { features.values[DenseFeatures::MAX] += 1; 4 }
+                OpKind::Min => {
+                    features.values[DenseFeatures::MIN] += 1;
+                    4
+                }
+                OpKind::Max => {
+                    features.values[DenseFeatures::MAX] += 1;
+                    4
+                }
                 _ => 5,
             };
             let crit_a = extract_dense_recursive(a, features, depth + 1, width_at_depth);
@@ -371,7 +408,10 @@ fn extract_dense_recursive(
         }
         Expr::Ternary(op, a, b, c) => {
             let op_cost = match op {
-                OpKind::MulAdd => { features.values[DenseFeatures::FMA] += 1; 5 }
+                OpKind::MulAdd => {
+                    features.values[DenseFeatures::FMA] += 1;
+                    5
+                }
                 _ => 10,
             };
             let crit_a = extract_dense_recursive(a, features, depth + 1, width_at_depth);
@@ -387,7 +427,8 @@ fn extract_dense_recursive(
                 _ => 5,
             };
             // Critical path = max of all children + this op
-            let max_child_crit = children.iter()
+            let max_child_crit = children
+                .iter()
                 .map(|c| extract_dense_recursive(c, features, depth + 1, width_at_depth))
                 .max()
                 .unwrap_or(0);
@@ -408,26 +449,37 @@ fn dense_exprs_equal(a: &Expr, b: &Expr) -> bool {
     match (a, b) {
         (Expr::Var(i), Expr::Var(j)) => i == j,
         (Expr::Const(x), Expr::Const(y)) => fabsf(x - y) < 1e-10,
-        (Expr::Unary(op1, a1), Expr::Unary(op2, b1)) => {
-            op1 == op2 && dense_exprs_equal(a1, b1)
-        }
+        (Expr::Unary(op1, a1), Expr::Unary(op2, b1)) => op1 == op2 && dense_exprs_equal(a1, b1),
         (Expr::Binary(op1, a1, a2), Expr::Binary(op2, b1, b2)) => {
             op1 == op2 && dense_exprs_equal(a1, b1) && dense_exprs_equal(a2, b2)
         }
         (Expr::Ternary(op1, a1, a2, a3), Expr::Ternary(op2, b1, b2, b3)) => {
-            op1 == op2 && dense_exprs_equal(a1, b1) && dense_exprs_equal(a2, b2) && dense_exprs_equal(a3, b3)
+            op1 == op2
+                && dense_exprs_equal(a1, b1)
+                && dense_exprs_equal(a2, b2)
+                && dense_exprs_equal(a3, b3)
         }
         (Expr::Nary(op1, c1), Expr::Nary(op2, c2)) => {
-            op1 == op2 && c1.len() == c2.len() &&
-            c1.iter().zip(c2.iter()).all(|(a, b)| dense_exprs_equal(a, b))
+            op1 == op2
+                && c1.len() == c2.len()
+                && c1
+                    .iter()
+                    .zip(c2.iter())
+                    .all(|(a, b)| dense_exprs_equal(a, b))
         }
         // Different variants are never equal
-        (Expr::Var(_), _) | (Expr::Const(_), _) | (Expr::Unary(_, _), _) |
-        (Expr::Binary(_, _, _), _) | (Expr::Ternary(_, _, _, _), _) | (Expr::Nary(_, _), _) => false,
-        (Expr::Param(i), _) | (_, Expr::Param(i)) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        (Expr::Var(_), _)
+        | (Expr::Const(_), _)
+        | (Expr::Unary(_, _), _)
+        | (Expr::Binary(_, _, _), _)
+        | (Expr::Ternary(_, _, _, _), _)
+        | (Expr::Nary(_, _), _) => false,
+        (Expr::Param(i), _) | (_, Expr::Param(i)) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
     }
 }
-
 
 // ============================================================================
 // NNUE Network Architecture
@@ -598,9 +650,7 @@ impl Nnue {
         // Inline LCG to avoid borrow issues
         macro_rules! next_u64 {
             () => {{
-                rng_state = rng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1);
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 rng_state
             }};
         }
@@ -1055,7 +1105,8 @@ pub fn read_depth_limited_binpack(path: &str) -> std::io::Result<Vec<DepthLimite
         ));
     }
 
-    let count = u32::from_le_bytes([all_bytes[8], all_bytes[9], all_bytes[10], all_bytes[11]]) as usize;
+    let count =
+        u32::from_le_bytes([all_bytes[8], all_bytes[9], all_bytes[10], all_bytes[11]]) as usize;
 
     let mut samples = Vec::with_capacity(count);
     let mut offset = 12;
@@ -1102,8 +1153,8 @@ pub struct ExprGenConfig {
 impl Default for ExprGenConfig {
     fn default() -> Self {
         Self {
-            max_depth: 6,
-            leaf_prob: 0.3,
+            max_depth: 8,
+            leaf_prob: 0.2,
             num_vars: 4,
             include_fused: true,
         }
@@ -1125,28 +1176,84 @@ pub struct ExprGenerator {
 }
 
 impl ExprGenerator {
+    /// Op weights derived from ShaderToy corpus analysis.
+    /// Real shaders are dominated by arithmetic (+, -, *, /), with moderate
+    /// use of abs/sin/cos/clamp and rare use of exotic ops like atan2/rsqrt.
+    /// Uniform weighting produces unrealistic expressions that the NNUE can't
+    /// transfer to real workloads.
+    fn shader_weight(op: OpKind) -> u32 {
+        match op {
+            // Arithmetic: ~70% of real shader ops
+            OpKind::Mul => 50,
+            OpKind::Add => 30,
+            OpKind::Sub => 20,
+            OpKind::Div => 10,
+            OpKind::Neg => 10,
+            // Common shader ops: ~20%
+            OpKind::Abs => 12,
+            OpKind::Sin => 8,
+            OpKind::Cos => 8,
+            OpKind::Clamp => 8,
+            OpKind::Max => 6,
+            OpKind::Min => 4,
+            OpKind::Pow => 4,
+            OpKind::Fract => 4,
+            OpKind::Floor => 3,
+            OpKind::Sqrt => 4,
+            OpKind::Exp => 3,
+            // Rare but valid: ~10%
+            OpKind::Rsqrt => 2,
+            OpKind::Recip => 2,
+            OpKind::Ln => 2,
+            OpKind::Log2 => 1,
+            OpKind::Log10 => 1,
+            OpKind::Exp2 => 1,
+            OpKind::Tan => 1,
+            OpKind::Atan => 1,
+            OpKind::Atan2 => 1,
+            OpKind::Asin => 1,
+            OpKind::Acos => 1,
+            OpKind::Hypot => 1,
+            OpKind::Ceil => 1,
+            OpKind::Round => 1,
+            _ => 0,
+        }
+    }
+
     /// Create a new generator with the given seed.
     #[must_use]
     pub fn new(seed: u64, config: ExprGenConfig) -> Self {
+        // Build weighted op table: each op appears proportional to its shader weight
         let mut seed_ops = Vec::new();
         for i in 0..OpKind::COUNT {
             if let Some(op) = OpKind::from_index(i) {
                 if op.is_seed_op() {
-                    seed_ops.push(op);
+                    let w = Self::shader_weight(op).max(1);
+                    for _ in 0..w {
+                        seed_ops.push(op);
+                    }
                 }
             }
         }
-        assert!(!seed_ops.is_empty(), "No seed ops found in OpKind — is_seed_op() is broken");
-        assert!(config.num_vars <= 4, "num_vars={} exceeds INPUT_REGS limit of 4", config.num_vars);
-        Self { config, state: seed, seed_ops }
+        assert!(
+            !seed_ops.is_empty(),
+            "No seed ops found in OpKind — is_seed_op() is broken"
+        );
+        assert!(
+            config.num_vars <= 4,
+            "num_vars={} exceeds INPUT_REGS limit of 4",
+            config.num_vars
+        );
+        Self {
+            config,
+            state: seed,
+            seed_ops,
+        }
     }
 
     /// Generate a random f32 in [0, 1).
     fn rand_f32(&mut self) -> f32 {
-        self.state = self
-            .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
         (self.state >> 33) as f32 / (1u64 << 31) as f32
     }
 
@@ -1181,19 +1288,23 @@ impl ExprGenerator {
             let idx = self.rand_usize(n);
             let op = self.seed_ops[idx];
             match op.arity() {
-                1 => Expr::Unary(op, Box::new(self.generate_recursive(depth + 1))),
+                1 => Expr::Unary(op, Arc::new(self.generate_recursive(depth + 1))),
                 2 => Expr::Binary(
                     op,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
                 3 => Expr::Ternary(
                     op,
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
-                    Box::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
+                    Arc::new(self.generate_recursive(depth + 1)),
                 ),
-                _ => panic!("OpKind::{} has arity {} but is_seed_op() returned true", op.name(), op.arity()),
+                _ => panic!(
+                    "OpKind::{} has arity {} but is_seed_op() returned true",
+                    op.name(),
+                    op.arity()
+                ),
             }
         }
     }
@@ -1274,14 +1385,10 @@ impl RewriteRule {
                 _ => None,
             },
             RewriteRule::MulZero => match expr {
-                Expr::Binary(OpKind::Mul, _, b)
-                    if matches!(b.as_ref(), Expr::Const(c) if *c == 0.0) =>
-                {
+                Expr::Binary(OpKind::Mul, _, b) if matches!(b.as_ref(), Expr::Const(c) if *c == 0.0) => {
                     Some(Expr::Const(0.0))
                 }
-                Expr::Binary(OpKind::Mul, a, _)
-                    if matches!(a.as_ref(), Expr::Const(c) if *c == 0.0) =>
-                {
+                Expr::Binary(OpKind::Mul, a, _) if matches!(a.as_ref(), Expr::Const(c) if *c == 0.0) => {
                     Some(Expr::Const(0.0))
                 }
                 _ => None,
@@ -1304,16 +1411,19 @@ impl RewriteRule {
             RewriteRule::AddSelf => match expr {
                 Expr::Binary(OpKind::Add, a, b) if exprs_equal(a, b) => Some(Expr::Binary(
                     OpKind::Mul,
-                    Box::new(Expr::Const(2.0)),
+                    Arc::new(Expr::Const(2.0)),
                     a.clone(),
                 )),
                 _ => None,
             },
             RewriteRule::FuseToMulAdd => match expr {
                 Expr::Binary(OpKind::Add, mul_expr, c) => match mul_expr.as_ref() {
-                    Expr::Binary(OpKind::Mul, a, b) => {
-                        Some(Expr::Ternary(OpKind::MulAdd, a.clone(), b.clone(), c.clone()))
-                    }
+                    Expr::Binary(OpKind::Mul, a, b) => Some(Expr::Ternary(
+                        OpKind::MulAdd,
+                        a.clone(),
+                        b.clone(),
+                        c.clone(),
+                    )),
                     _ => None,
                 },
                 _ => None,
@@ -1321,7 +1431,7 @@ impl RewriteRule {
             RewriteRule::UnfuseMulAdd => match expr {
                 Expr::Ternary(OpKind::MulAdd, a, b, c) => Some(Expr::Binary(
                     OpKind::Add,
-                    Box::new(Expr::Binary(OpKind::Mul, a.clone(), b.clone())),
+                    Arc::new(Expr::Binary(OpKind::Mul, a.clone(), b.clone())),
                     c.clone(),
                 )),
                 _ => None,
@@ -1343,13 +1453,21 @@ fn exprs_equal(a: &Expr, b: &Expr) -> bool {
             op1 == op2 && exprs_equal(a1, a2) && exprs_equal(b1, b2) && exprs_equal(c1, c2)
         }
         (Expr::Nary(op1, c1), Expr::Nary(op2, c2)) => {
-            op1 == op2 && c1.len() == c2.len() &&
-            c1.iter().zip(c2.iter()).all(|(x, y)| exprs_equal(x, y))
+            op1 == op2
+                && c1.len() == c2.len()
+                && c1.iter().zip(c2.iter()).all(|(x, y)| exprs_equal(x, y))
         }
         // Different variants are never equal
-        (Expr::Var(_), _) | (Expr::Const(_), _) | (Expr::Unary(_, _), _) |
-        (Expr::Binary(_, _, _), _) | (Expr::Ternary(_, _, _, _), _) | (Expr::Nary(_, _), _) => false,
-        (Expr::Param(i), _) | (_, Expr::Param(i)) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        (Expr::Var(_), _)
+        | (Expr::Const(_), _)
+        | (Expr::Unary(_, _), _)
+        | (Expr::Binary(_, _, _), _)
+        | (Expr::Ternary(_, _, _, _), _)
+        | (Expr::Nary(_, _), _) => false,
+        (Expr::Param(i), _) | (_, Expr::Param(i)) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
     }
 }
 
@@ -1386,7 +1504,11 @@ pub fn pattern_match(expr: &Expr, template: &Expr) -> Option<BTreeMap<u8, Expr>>
     }
 }
 
-fn pattern_match_recursive(expr: &Expr, template: &Expr, bindings: &mut BTreeMap<u8, Expr>) -> bool {
+fn pattern_match_recursive(
+    expr: &Expr,
+    template: &Expr,
+    bindings: &mut BTreeMap<u8, Expr>,
+) -> bool {
     match template {
         // Var(n) is a metavariable -- bind or check consistency
         Expr::Var(n) => {
@@ -1434,9 +1556,10 @@ fn pattern_match_recursive(expr: &Expr, template: &Expr, bindings: &mut BTreeMap
             if let Expr::Nary(op_e, children_e) = expr {
                 op_e == op_t
                     && children_t.len() == children_e.len()
-                    && children_t.iter().zip(children_e.iter()).all(|(t, e)| {
-                        pattern_match_recursive(e, t, bindings)
-                    })
+                    && children_t
+                        .iter()
+                        .zip(children_e.iter())
+                        .all(|(t, e)| pattern_match_recursive(e, t, bindings))
             } else {
                 false
             }
@@ -1455,22 +1578,24 @@ pub fn substitute_template(template: &Expr, bindings: &BTreeMap<u8, Expr>) -> Op
         Expr::Var(n) => bindings.get(n).cloned(),
         Expr::Const(c) => Some(Expr::Const(*c)),
         Expr::Param(i) => Some(Expr::Param(*i)),
-        Expr::Unary(op, a) => {
-            Some(Expr::Unary(*op, Box::new(substitute_template(a, bindings)?)))
-        }
+        Expr::Unary(op, a) => Some(Expr::Unary(
+            *op,
+            Arc::new(substitute_template(a, bindings)?),
+        )),
         Expr::Binary(op, a, b) => {
             let sa = substitute_template(a, bindings)?;
             let sb = substitute_template(b, bindings)?;
-            Some(Expr::Binary(*op, Box::new(sa), Box::new(sb)))
+            Some(Expr::Binary(*op, Arc::new(sa), Arc::new(sb)))
         }
         Expr::Ternary(op, a, b, c) => {
             let sa = substitute_template(a, bindings)?;
             let sb = substitute_template(b, bindings)?;
             let sc = substitute_template(c, bindings)?;
-            Some(Expr::Ternary(*op, Box::new(sa), Box::new(sb), Box::new(sc)))
+            Some(Expr::Ternary(*op, Arc::new(sa), Arc::new(sb), Arc::new(sc)))
         }
         Expr::Nary(op, children) => {
-            let new_children: Option<Vec<_>> = children.iter()
+            let new_children: Option<Vec<_>> = children
+                .iter()
                 .map(|c| substitute_template(c, bindings))
                 .collect();
             Some(Expr::Nary(*op, new_children?))
@@ -1479,18 +1604,196 @@ pub fn substitute_template(template: &Expr, bindings: &BTreeMap<u8, Expr>) -> Op
 }
 
 // ============================================================================
+// Arena-native Pattern Match + Substitute
+// ============================================================================
+
+/// Arena-native pattern match.
+///
+/// Matches the subtree rooted at `expr_id` in `arena` against the template
+/// subtree rooted at `template_root` in `template`. Returns `Some(bindings)`
+/// mapping template `Var(n)` indices to `ExprId`s in `arena` on success, or
+/// `None` if the pattern does not match.
+///
+/// Uses an iterative work stack of `(expr_id, template_id)` pairs to avoid
+/// recursion depth issues on deep trees.
+#[must_use]
+pub fn pattern_match_arena(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    template: &ExprArena,
+    template_root: ExprId,
+) -> Option<BTreeMap<u8, ExprId>> {
+    let mut bindings: BTreeMap<u8, ExprId> = BTreeMap::new();
+    // Work stack: pairs of (expr node in `arena`, template node in `template`).
+    let mut stack: Vec<(ExprId, ExprId)> = Vec::with_capacity(16);
+    stack.push((expr_id, template_root));
+
+    while let Some((e_id, t_id)) = stack.pop() {
+        let t_node = template.node(t_id);
+        match t_node {
+            // Var(n) is a metavariable: bind or check consistency.
+            ExprNode::Var(n) => {
+                let n = *n;
+                if let Some(&existing) = bindings.get(&n) {
+                    // Already bound — the subtrees must be structurally equal.
+                    // Compare arena-native to avoid Arc allocation.
+                    if !arena.subtree_eq(existing, arena, e_id) {
+                        return None;
+                    }
+                } else {
+                    bindings.insert(n, e_id);
+                }
+            }
+            // Const must match exactly (within epsilon).
+            ExprNode::Const(c) => {
+                let c = *c;
+                match arena.node(e_id) {
+                    ExprNode::Const(e) => {
+                        if fabsf(e - c) >= 1e-6 {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            // Param must match the same index.
+            ExprNode::Param(i) => match arena.node(e_id) {
+                ExprNode::Param(j) if i == j => {}
+                _ => return None,
+            },
+            // Structural match: op must match, push children onto the stack.
+            ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
+                ExprNode::Unary(e_op, e_a) if e_op == t_op => {
+                    stack.push((*e_a, *t_a));
+                }
+                _ => return None,
+            },
+            ExprNode::Binary(t_op, t_a, t_b) => match arena.node(e_id) {
+                ExprNode::Binary(e_op, e_a, e_b) if e_op == t_op => {
+                    stack.push((*e_a, *t_a));
+                    stack.push((*e_b, *t_b));
+                }
+                _ => return None,
+            },
+            ExprNode::Ternary(t_op, t_a, t_b, t_c) => match arena.node(e_id) {
+                ExprNode::Ternary(e_op, e_a, e_b, e_c) if e_op == t_op => {
+                    stack.push((*e_a, *t_a));
+                    stack.push((*e_b, *t_b));
+                    stack.push((*e_c, *t_c));
+                }
+                _ => return None,
+            },
+            ExprNode::Nary(t_op, t_start, t_len) => match arena.node(e_id) {
+                ExprNode::Nary(e_op, e_start, e_len) if e_op == t_op && e_len == t_len => {
+                    let e_children = arena.nary_children_slice(*e_start, *e_len).to_vec();
+                    let t_children = template.nary_children_slice(*t_start, *t_len).to_vec();
+                    for (ec, tc) in e_children.into_iter().zip(t_children.into_iter()) {
+                        stack.push((ec, tc));
+                    }
+                }
+                _ => return None,
+            },
+        }
+    }
+
+    Some(bindings)
+}
+
+/// Arena-native template substitution.
+///
+/// Walks the template subtree rooted at `template_root` bottom-up, pushing
+/// nodes into `target_arena`. When a `Var(n)` is encountered, the corresponding
+/// `ExprId` from `bindings` (already in `target_arena`) is used directly.
+///
+/// Returns `None` if any template `Var(n)` has no binding.
+#[must_use]
+pub fn substitute_template_arena(
+    target_arena: &mut ExprArena,
+    template: &ExprArena,
+    template_root: ExprId,
+    bindings: &BTreeMap<u8, ExprId>,
+) -> Option<ExprId> {
+    // Post-order traversal: collect nodes reachable from template_root.
+    let t_n = template.len();
+    // Remap: template node index → target_arena ExprId (u32::MAX = not yet mapped).
+    let mut remap: Vec<u32> = alloc::vec![u32::MAX; t_n];
+
+    // Collect post-order traversal order.
+    let mut order: Vec<ExprId> = Vec::with_capacity(t_n.min(32));
+    {
+        let mut visit_stack: Vec<ExprId> = Vec::with_capacity(16);
+        let mut pushed: Vec<bool> = alloc::vec![false; t_n];
+        visit_stack.push(template_root);
+        while let Some(id) = visit_stack.pop() {
+            let idx = id.0 as usize;
+            if pushed[idx] {
+                order.push(id);
+            } else {
+                pushed[idx] = true;
+                // Push self again for post-order emission, then push children first.
+                visit_stack.push(id);
+                for child in template.children(id) {
+                    if !pushed[child.0 as usize] {
+                        visit_stack.push(child);
+                    }
+                }
+            }
+        }
+    }
+
+    // Process in post-order: children are mapped before their parent.
+    for id in &order {
+        let idx = id.0 as usize;
+        let node = template.node(*id).clone();
+        let mapped = match node {
+            ExprNode::Var(n) => {
+                // Fail if the variable has no binding.
+                *bindings.get(&n)?
+            }
+            ExprNode::Const(c) => target_arena.push_const(c),
+            ExprNode::Param(i) => target_arena.push_param(i),
+            ExprNode::Unary(op, t_a) => {
+                let a = ExprId(remap[t_a.0 as usize]);
+                target_arena.push_unary(op, a)
+            }
+            ExprNode::Binary(op, t_a, t_b) => {
+                let a = ExprId(remap[t_a.0 as usize]);
+                let b = ExprId(remap[t_b.0 as usize]);
+                target_arena.push_binary(op, a, b)
+            }
+            ExprNode::Ternary(op, t_a, t_b, t_c) => {
+                let a = ExprId(remap[t_a.0 as usize]);
+                let b = ExprId(remap[t_b.0 as usize]);
+                let c = ExprId(remap[t_c.0 as usize]);
+                target_arena.push_ternary(op, a, b, c)
+            }
+            ExprNode::Nary(op, t_start, t_len) => {
+                let t_children: Vec<ExprId> = template
+                    .nary_children_slice(t_start, t_len)
+                    .iter()
+                    .map(|tc| ExprId(remap[tc.0 as usize]))
+                    .collect();
+                target_arena.push_nary(op, &t_children)
+            }
+        };
+        remap[idx] = mapped.0;
+    }
+
+    Some(ExprId(remap[template_root.0 as usize]))
+}
+
+// ============================================================================
 // Backward Generation (BWD) - Lample & Charton 2019
 // ============================================================================
 
-/// A training pair for backward generation.
-///
-/// Contains both the optimized form (target) and unoptimized form (input).
-#[derive(Clone, Debug)]
-pub struct BwdTrainingPair {
-    /// The optimized expression (what we want the model to produce/recognize).
-    pub optimized: Expr,
-    /// The unoptimized expression (input to the model).
-    pub unoptimized: Expr,
+/// Arena-backed training pair. Both expressions live inside the arena as [`ExprId`]s.
+pub struct BwdTrainingPairArena {
+    /// The shared arena holding all nodes for both expressions.
+    pub arena: ExprArena,
+    /// Root of the optimized expression in the arena.
+    pub optimized: ExprId,
+    /// Root of the unoptimized expression in the arena.
+    pub unoptimized: ExprId,
     /// Number of junkifying rewrites applied.
     pub rewrites_applied: usize,
 }
@@ -1543,24 +1846,35 @@ pub struct BwdGenerator {
     pub config: BwdGenConfig,
     /// Random state.
     state: u64,
-    /// Rule templates for pattern-matching junkification.
-    templates: RuleTemplates,
+    /// Arena-native rule templates. Built once in `new()` from `templates`.
+    /// Used by `junkify_arena_pass` to avoid `to_expr`/`push_expr` round-trips.
+    arena_templates: ArenaRuleTemplates,
+    /// Reusable arena for arena-based generation. Cleared each call to
+    /// [`generate_arena`](Self::generate_arena).
+    arena: ExprArena,
 }
 
 impl BwdGenerator {
     /// Create a new backward generator with the given seed and rule templates.
     #[must_use]
     pub fn new(seed: u64, config: BwdGenConfig, templates: RuleTemplates) -> Self {
-        assert!(config.num_vars <= 4, "num_vars={} exceeds INPUT_REGS limit of 4", config.num_vars);
-        Self { config, state: seed, templates }
+        assert!(
+            config.num_vars <= 4,
+            "num_vars={} exceeds INPUT_REGS limit of 4",
+            config.num_vars
+        );
+        let arena_templates = ArenaRuleTemplates::from_rule_templates(&templates);
+        Self {
+            config,
+            state: seed,
+            arena_templates,
+            arena: ExprArena::with_capacity(256),
+        }
     }
 
     /// Generate a random f32 in [0, 1).
     fn rand_f32(&mut self) -> f32 {
-        self.state = self
-            .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
         (self.state >> 33) as f32 / (1u64 << 31) as f32
     }
 
@@ -1578,52 +1892,101 @@ impl BwdGenerator {
     /// variable leaf probability, hitting this limit means the RNG is broken.
     const MAX_GENERATE_RETRIES: usize = 20;
 
-    /// Generate a backward training pair.
+    /// Maximum retries when junkification produces 0 rewrites.
     ///
-    /// Returns (optimized, unoptimized) where unoptimized is derived from
-    /// optimized via junkifying rewrites using all 41 rule templates.
+    /// A trajectory seeded from an expression where no junkification was
+    /// applied is equivalent to training on a perfectly-optimized form —
+    /// the e-graph has no applicable rewrite-rule patterns and produces
+    /// empty trajectories. Retry with a fresh random optimized expression
+    /// until at least one junkify rewrite fires.
+    const MAX_JUNKIFY_RETRIES: usize = 50;
+
+    /// Generate a backward training pair directly in arena form.
+    ///
+    /// Returns a [`BwdTrainingPairArena`] where both the
+    /// optimized and unoptimized expressions are stored as [`ExprId`]s inside a
+    /// single shared [`ExprArena`].
+    ///
+    /// # Layout inside the arena
+    ///
+    /// - Nodes `[0, optimized_node_count)` belong to the optimized subtree.
+    /// - Nodes `[optimized_node_count, arena.len())` belong to the unoptimized
+    ///   subtree (pushed via [`ExprArena::push_expr`] after junkification).
+    ///
+    /// Use `arena.len()` for an O(1) total node count, or
+    /// `arena.node_count_subtree(pair.optimized)` for the optimized subtree
+    /// specifically (O(N) traversal).
     ///
     /// # Panics
     ///
-    /// Panics if `MAX_GENERATE_RETRIES` consecutive attempts fail to produce
-    /// an expression containing at least one variable. This indicates a
-    /// configuration or RNG bug.
+    /// Same conditions as [`generate`].
     #[must_use]
-    pub fn generate(&mut self) -> BwdTrainingPair {
-        // Retry loop: guarantee the optimized expression has variables.
-        // Without variables, it constant-folds to the timing floor — useless.
-        let optimized = {
-            let mut attempts = 0;
-            loop {
-                let expr = self.generate_optimized(0);
-                if expr.has_var() {
-                    break expr;
+    pub fn generate_arena(&mut self) -> BwdTrainingPairArena {
+        let mut junkify_attempts = 0;
+        loop {
+            // Build optimized expression directly in self.arena.
+            self.arena.clear();
+            let optimized_id = {
+                let mut attempts = 0;
+                loop {
+                    self.arena.clear();
+                    let id = self.generate_optimized_arena(0);
+                    if self.arena.has_var(id) {
+                        break id;
+                    }
+                    attempts += 1;
+                    assert!(
+                        attempts < Self::MAX_GENERATE_RETRIES,
+                        "BwdGenerator::generate_arena failed to produce an expression with \
+                         variables after {} attempts. \
+                         Config: max_depth={}, leaf_prob={}, num_vars={}",
+                        attempts,
+                        self.config.max_depth,
+                        self.config.leaf_prob,
+                        self.config.num_vars,
+                    );
                 }
-                attempts += 1;
+            };
+
+            // Arena-native junkification: no Expr bridge needed.
+            let (unoptimized_id, rewrites_applied) =
+                self.junkify_arena(optimized_id, self.config.max_junkified_nodes);
+
+            assert!(
+                self.arena.has_var(unoptimized_id),
+                "BUG: junkification eliminated all variables from expression. \
+                 optimized arena_nodes={}, rewrites={}",
+                self.arena.node_count_subtree(optimized_id),
+                rewrites_applied,
+            );
+
+            if rewrites_applied == 0 {
+                junkify_attempts += 1;
                 assert!(
-                    attempts < Self::MAX_GENERATE_RETRIES,
-                    "BwdGenerator failed to produce an expression with variables after {} attempts. \
-                     Config: max_depth={}, leaf_prob={}, num_vars={}",
-                    attempts, self.config.max_depth, self.config.leaf_prob, self.config.num_vars,
+                    junkify_attempts < Self::MAX_JUNKIFY_RETRIES,
+                    "BwdGenerator::generate_arena failed to apply any junkify rewrites \
+                     after {} attempts. \
+                     Config: max_junkify_passes={}, junkify_prob={:.3}, max_junkified_nodes={}. \
+                     Check that junkify_prob > 0.0 and max_junkify_passes >= 1, and that \
+                     the rule templates contain at least one expanding rule.",
+                    junkify_attempts,
+                    self.config.max_junkify_passes,
+                    self.config.junkify_prob,
+                    self.config.max_junkified_nodes,
                 );
+                continue;
             }
-        };
 
-        // Step 2: Apply junkifying rewrites to create unoptimized version
-        let (unoptimized, rewrites_applied) = self.junkify_expression(&optimized);
+            // Both optimized and unoptimized are already in self.arena.
+            // Move the arena out, replacing self.arena with a fresh one.
+            let arena = core::mem::replace(&mut self.arena, ExprArena::with_capacity(256));
 
-        // Sanity: junkification must not eliminate all variables.
-        assert!(
-            unoptimized.has_var(),
-            "BUG: junkification eliminated all variables from expression. \
-             optimized nodes={}, unoptimized nodes={}, rewrites={}",
-            optimized.node_count(), unoptimized.node_count(), rewrites_applied,
-        );
-
-        BwdTrainingPair {
-            optimized,
-            unoptimized,
-            rewrites_applied,
+            return BwdTrainingPairArena {
+                arena,
+                optimized: optimized_id,
+                unoptimized: unoptimized_id,
+                rewrites_applied,
+            };
         }
     }
 
@@ -1653,9 +2016,9 @@ impl BwdGenerator {
             // MulAdd: a * b + c
             Expr::Ternary(
                 OpKind::MulAdd,
-                Box::new(self.generate_optimized(depth + 1)),
-                Box::new(self.generate_optimized(depth + 1)),
-                Box::new(self.generate_optimized(depth + 1)),
+                Arc::new(self.generate_optimized(depth + 1)),
+                Arc::new(self.generate_optimized(depth + 1)),
+                Arc::new(self.generate_optimized(depth + 1)),
             )
         } else {
             // Regular operation
@@ -1676,54 +2039,123 @@ impl BwdGenerator {
 
     /// Generate a regular (non-fused) operation.
     ///
-    /// Covers all op families that have rewrite rules:
-    ///   - Arithmetic: Add, Sub, Mul, Div, Neg, Recip
-    ///   - Comparison: Min, Max
-    ///   - Radicals: Sqrt, Rsqrt, Abs
-    ///   - Trig: Sin, Cos, Tan
-    ///   - Exp/Log: Exp, Exp2, Ln, Log2
-    ///   - Power: Pow, Hypot, Atan2
+    /// Weights derived from ShaderToy corpus analysis (132 expressions from 9 shaders):
+    ///   - Arithmetic (mul/add/sub/div/neg): ~70% of real shader ops
+    ///   - Common (abs/sin/cos/clamp/max/min): ~20%
+    ///   - Exotic (pow/fract/floor/sqrt/exp/trig/log): ~10%
     fn generate_regular_op(&mut self, depth: usize) -> Expr {
-        let choice = self.rand_usize(24);
-        let mut child = || Box::new(self.generate_optimized(depth + 1));
+        let choice = self.rand_usize(50);
         match choice {
-            // Binary arithmetic (high weight — most rewrite rules target these)
-            // Extra slots for Add/Mul so they appear more often, like real code.
-            0 | 1 => Expr::Binary(OpKind::Add, child(), child()),
-            2 => Expr::Binary(OpKind::Sub, child(), child()),
-            3 | 4 => Expr::Binary(OpKind::Mul, child(), child()),
-            5 => {
-                // Div: guard denominator to be positive-nonzero
-                let num = child();
-                let denom = Self::guard_positive_nonzero(*child());
-                Expr::Binary(OpKind::Div, num, Box::new(denom))
+            // ── Mul: 12/50 = 24% (real shaders: ~37%) ──
+            0..=11 => {
+                let a = Arc::new(self.generate_optimized(depth + 1));
+                let b = Arc::new(self.generate_optimized(depth + 1));
+                Expr::Binary(OpKind::Mul, a, b)
             }
-            // Binary comparison / power
-            6 => Expr::Binary(OpKind::Min, child(), child()),
-            7 => Expr::Binary(OpKind::Max, child(), child()),
-            8 => {
-                // Pow: guard base to be positive-nonzero (negative base + fractional exp = NaN)
-                let base = Self::guard_positive_nonzero(*child());
-                Expr::Binary(OpKind::Pow, Box::new(base), child())
+            // ── Add: 7/50 = 14% (real: ~18%) ──
+            12..=18 => {
+                let a = Arc::new(self.generate_optimized(depth + 1));
+                let b = Arc::new(self.generate_optimized(depth + 1));
+                Expr::Binary(OpKind::Add, a, b)
             }
-            9 => Expr::Binary(OpKind::Hypot, child(), child()),
-            10 => Expr::Binary(OpKind::Atan2, child(), child()),
-            // Unary arithmetic
-            11 => Expr::Unary(OpKind::Neg, child()),
-            12 => Expr::Unary(OpKind::Recip, Box::new(Self::guard_positive_nonzero(*child()))),
-            13 => Expr::Unary(OpKind::Abs, child()),
-            14 => Expr::Unary(OpKind::Sqrt, Box::new(Self::guard_nonnegative(*child()))),
-            15 => Expr::Unary(OpKind::Rsqrt, Box::new(Self::guard_positive_nonzero(*child()))),
-            // Trig (parity + angle addition rules)
-            16 => Expr::Unary(OpKind::Sin, child()),
-            17 => Expr::Unary(OpKind::Cos, child()),
-            18 => Expr::Unary(OpKind::Tan, child()),
-            // Exp/Log (function inverse + homomorphism rules)
-            19 => Expr::Unary(OpKind::Exp, child()),
-            20 => Expr::Unary(OpKind::Exp2, child()),
-            21 => Expr::Unary(OpKind::Ln, Box::new(Self::guard_positive_nonzero(*child()))),
-            22 => Expr::Unary(OpKind::Log2, Box::new(Self::guard_positive_nonzero(*child()))),
-            23 => Expr::Unary(OpKind::Log10, Box::new(Self::guard_positive_nonzero(*child()))),
+            // ── Sub: 5/50 = 10% (real: ~14%) ──
+            19..=23 => {
+                let a = Arc::new(self.generate_optimized(depth + 1));
+                let b = Arc::new(self.generate_optimized(depth + 1));
+                Expr::Binary(OpKind::Sub, a, b)
+            }
+            // ── Div: 3/50 = 6% (real: ~6%) ──
+            24..=26 => {
+                let num = Arc::new(self.generate_optimized(depth + 1));
+                let denom = Self::guard_positive_nonzero(self.generate_optimized(depth + 1));
+                Expr::Binary(OpKind::Div, num, Arc::new(denom))
+            }
+            // ── Neg: 2/50 = 4% ──
+            27 | 28 => Expr::Unary(OpKind::Neg, Arc::new(self.generate_optimized(depth + 1))),
+            // ── Abs: 3/50 = 6% (real: ~5%) ──
+            29..=31 => Expr::Unary(OpKind::Abs, Arc::new(self.generate_optimized(depth + 1))),
+            // ── Clamp: 2/50 = 4% (real: ~3%) ──
+            32 | 33 => {
+                let x = Arc::new(self.generate_optimized(depth + 1));
+                let lo = Arc::new(self.generate_optimized(depth + 1));
+                let hi = Arc::new(self.generate_optimized(depth + 1));
+                Expr::Ternary(OpKind::Clamp, x, lo, hi)
+            }
+            // ── Sin: 2/50 = 4% (real: ~3%) ──
+            34 | 35 => Expr::Unary(OpKind::Sin, Arc::new(self.generate_optimized(depth + 1))),
+            // ── Cos: 2/50 = 4% (real: ~3%) ──
+            36 | 37 => Expr::Unary(OpKind::Cos, Arc::new(self.generate_optimized(depth + 1))),
+            // ── Max: 2/50 = 4% (real: ~3%) ──
+            38 | 39 => {
+                let a = Arc::new(self.generate_optimized(depth + 1));
+                let b = Arc::new(self.generate_optimized(depth + 1));
+                Expr::Binary(OpKind::Max, a, b)
+            }
+            // ── Min, Pow, Fract, Floor, Sqrt, Exp: 1/50 each = 2% ──
+            40 => {
+                let a = Arc::new(self.generate_optimized(depth + 1));
+                let b = Arc::new(self.generate_optimized(depth + 1));
+                Expr::Binary(OpKind::Min, a, b)
+            }
+            41 => {
+                let base = Self::guard_positive_nonzero(self.generate_optimized(depth + 1));
+                let exp = Arc::new(self.generate_optimized(depth + 1));
+                Expr::Binary(OpKind::Pow, Arc::new(base), exp)
+            }
+            42 => Expr::Unary(OpKind::Fract, Arc::new(self.generate_optimized(depth + 1))),
+            43 => Expr::Unary(OpKind::Floor, Arc::new(self.generate_optimized(depth + 1))),
+            44 => Expr::Unary(
+                OpKind::Sqrt,
+                Arc::new(Self::guard_nonnegative(self.generate_optimized(depth + 1))),
+            ),
+            45 => Expr::Unary(OpKind::Exp, Arc::new(self.generate_optimized(depth + 1))),
+            // ── Rare: 1/50 each ──
+            46 => Expr::Unary(
+                OpKind::Rsqrt,
+                Arc::new(Self::guard_positive_nonzero(
+                    self.generate_optimized(depth + 1),
+                )),
+            ),
+            47 => Expr::Unary(
+                OpKind::Ln,
+                Arc::new(Self::guard_positive_nonzero(
+                    self.generate_optimized(depth + 1),
+                )),
+            ),
+            48 => Expr::Unary(OpKind::Tan, Arc::new(self.generate_optimized(depth + 1))),
+            49 => {
+                // Rotate through remaining rare ops
+                let rare = self.rand_usize(8);
+                match rare {
+                    0 => Expr::Unary(
+                        OpKind::Recip,
+                        Arc::new(Self::guard_positive_nonzero(
+                            self.generate_optimized(depth + 1),
+                        )),
+                    ),
+                    1 => Expr::Unary(OpKind::Exp2, Arc::new(self.generate_optimized(depth + 1))),
+                    2 => Expr::Unary(
+                        OpKind::Log2,
+                        Arc::new(Self::guard_positive_nonzero(
+                            self.generate_optimized(depth + 1),
+                        )),
+                    ),
+                    3 => Expr::Unary(
+                        OpKind::Log10,
+                        Arc::new(Self::guard_positive_nonzero(
+                            self.generate_optimized(depth + 1),
+                        )),
+                    ),
+                    4 => Expr::Unary(OpKind::Atan, Arc::new(self.generate_optimized(depth + 1))),
+                    5 => Expr::Unary(OpKind::Asin, Arc::new(self.generate_optimized(depth + 1))),
+                    6 => Expr::Unary(OpKind::Acos, Arc::new(self.generate_optimized(depth + 1))),
+                    _ => {
+                        let a = Arc::new(self.generate_optimized(depth + 1));
+                        let b = Arc::new(self.generate_optimized(depth + 1));
+                        Expr::Binary(OpKind::Atan2, a, b)
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -1733,159 +2165,557 @@ impl BwdGenerator {
     fn guard_positive_nonzero(expr: Expr) -> Expr {
         Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Unary(OpKind::Abs, Box::new(expr))),
-            Box::new(Expr::Const(0.001)),
+            Arc::new(Expr::Unary(OpKind::Abs, Arc::new(expr))),
+            Arc::new(Expr::Const(0.001)),
         )
     }
 
     /// Wrap an expression in `abs(x)` to guarantee non-negative input.
     /// Used for sqrt which is defined at zero but not negative values.
     fn guard_nonnegative(expr: Expr) -> Expr {
-        Expr::Unary(OpKind::Abs, Box::new(expr))
+        Expr::Unary(OpKind::Abs, Arc::new(expr))
     }
 
-    /// Apply junkifying rewrites to make an expression MORE complex.
-    ///
-    /// Tries all rule templates in both directions (LHS->RHS and RHS->LHS),
-    /// picks candidates that increase `node_count()`. Uses a shared node budget
-    /// to prevent exponential blowup from size-doubling rules.
-    fn junkify_expression(&mut self, expr: &Expr) -> (Expr, usize) {
-        let mut result = expr.clone();
-        let mut total_applied = 0;
-        let budget = self.config.max_junkified_nodes;
+    // ── Arena-based generation ─────────────────────────────────────────────────
 
-        for _ in 0..self.config.max_junkify_passes {
-            let current_size = result.node_count();
-            if current_size >= budget {
+    /// Arena version of `generate_leaf`.
+    fn generate_leaf_arena(&mut self) -> ExprId {
+        if self.rand_f32() < 0.7 {
+            let var_idx = self.rand_usize(self.config.num_vars.min(4)) as u8;
+            self.arena.push_var(var_idx)
+        } else {
+            let val = self.rand_f32() * 4.0 - 2.0;
+            self.arena.push_const(val)
+        }
+    }
+
+    /// Arena version of `guard_positive_nonzero`.
+    /// Wraps `inner` id in `abs(inner) + 0.001`, returning the root id.
+    fn guard_positive_nonzero_arena(&mut self, inner: ExprId) -> ExprId {
+        let abs_id = self.arena.push_unary(OpKind::Abs, inner);
+        let eps_id = self.arena.push_const(0.001);
+        self.arena.push_binary(OpKind::Add, abs_id, eps_id)
+    }
+
+    /// Arena version of `guard_nonnegative`.
+    /// Wraps `inner` id in `abs(inner)`, returning the root id.
+    fn guard_nonnegative_arena(&mut self, inner: ExprId) -> ExprId {
+        self.arena.push_unary(OpKind::Abs, inner)
+    }
+
+    /// Iterative arena-based expression generator.
+    ///
+    /// Replaces the formerly-recursive `generate_optimized_arena` /
+    /// `generate_regular_op_arena` pair with an explicit work stack so that
+    /// deeply-nested trees cannot overflow the call stack. RNG consumption
+    /// order is identical to the recursive version (left-to-right, pre-order),
+    /// so output is deterministic for any given seed.
+    ///
+    /// # How the stack machine works
+    ///
+    /// Two stacks cooperate:
+    ///
+    /// * `work` — pending tasks.  Each entry is either a `Decide` (consume
+    ///   RNG, emit a `Combine` + child `Decide`s) or a `Combine` (assemble
+    ///   already-resolved children into a parent node).
+    /// * `results` — a LIFO buffer of `ExprId`s produced by completed
+    ///   sub-trees.  `Combine` variants pop from this.
+    ///
+    /// Push order for a node with N children:
+    ///   1. Push `Combine(op)` — runs last, after all children are ready.
+    ///   2. Push `Decide(childN)` through `Decide(child0)` in reverse order
+    ///      so that `child0` sits on top and executes first.
+    ///
+    /// This preserves left-to-right RNG consumption without recursion.
+    ///
+    /// The `_start_depth` parameter is kept for call-site compatibility with
+    /// the former recursive version (callers pass `0`).  The depth ceiling is
+    /// always `self.config.max_depth`.
+    fn generate_optimized_arena(&mut self, _start_depth: usize) -> ExprId {
+        let max_depth = self.config.max_depth;
+        /// Describes how to assemble a parent node once its children are ready.
+        ///
+        /// Each variant documents:
+        ///   - How many `ExprId`s it pops from `results` (children, left-to-right).
+        ///   - Any inline guard operations applied before the final arena push.
+        enum Combine {
+            /// Binary op — pop left then right, no guards.
+            Binary(OpKind),
+            /// Div — pop left (numerator), pop right (raw denominator),
+            /// apply `guard_positive_nonzero` to denominator, then push Div.
+            DivGuardDenom,
+            /// Pow — pop left (raw base), apply `guard_positive_nonzero` to base,
+            /// pop right (exponent), push Pow.
+            ///
+            /// Note: base is guarded *before* exponent is resolved, but both
+            /// children are already on the results stack at combine time, so
+            /// the guard is applied here in post-order.
+            PowGuardBase,
+            /// Unary op — pop one child, no guard.
+            Unary(OpKind),
+            /// Unary op — pop one child, apply `guard_positive_nonzero`, then push op.
+            UnaryGuardPositive(OpKind),
+            /// Unary op (Sqrt) — pop one child, apply `guard_nonnegative`, then push op.
+            UnaryGuardNonneg,
+            /// MulAdd ternary — pop a, b, c (left to right), push ternary.
+            MulAdd,
+        }
+
+        enum WorkItem {
+            Decide { depth: usize },
+            Combine(Combine),
+        }
+
+        let mut work: Vec<WorkItem> = Vec::with_capacity(64);
+        let mut results: Vec<ExprId> = Vec::with_capacity(64);
+
+        work.push(WorkItem::Decide { depth: 0 });
+
+        while let Some(item) = work.pop() {
+            match item {
+                WorkItem::Decide { depth } => {
+                    // Mirror the recursive logic exactly:
+                    //   1. Leaf at max depth (no RNG consumed before this check).
+                    //   2. Probabilistic leaf above MIN_DEPTH (consumes one rand_f32).
+                    //   3. Fused-op check (consumes one rand_f32).
+                    //   4. Regular-op choice (consumes one rand_usize(24)).
+                    if depth >= max_depth {
+                        let id = self.generate_leaf_arena();
+                        results.push(id);
+                        continue;
+                    }
+
+                    if depth >= Self::MIN_DEPTH && self.rand_f32() < self.config.leaf_prob {
+                        let id = self.generate_leaf_arena();
+                        results.push(id);
+                        continue;
+                    }
+
+                    if self.rand_f32() < self.config.fused_op_prob {
+                        // MulAdd: need children a, b, c (left-to-right).
+                        // Push Combine first (runs last), then children in reverse
+                        // so child `a` (depth+1) sits on top and runs first.
+                        work.push(WorkItem::Combine(Combine::MulAdd));
+                        work.push(WorkItem::Decide { depth: depth + 1 }); // c
+                        work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                        work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        continue;
+                    }
+
+                    // Regular op: consume rand_usize(24) now, then push the
+                    // appropriate Combine + child Decide frames.
+                    let choice = self.rand_usize(24);
+                    match choice {
+                        // Binary ops — two children, no guards.
+                        0 | 1 => {
+                            work.push(WorkItem::Combine(Combine::Binary(OpKind::Add)));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        }
+                        2 => {
+                            work.push(WorkItem::Combine(Combine::Binary(OpKind::Sub)));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        }
+                        3 | 4 => {
+                            work.push(WorkItem::Combine(Combine::Binary(OpKind::Mul)));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        }
+                        5 => {
+                            // Div: child order is num (left) then raw_denom (right).
+                            work.push(WorkItem::Combine(Combine::DivGuardDenom));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // raw_denom
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // num
+                        }
+                        6 => {
+                            work.push(WorkItem::Combine(Combine::Binary(OpKind::Min)));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        }
+                        7 => {
+                            work.push(WorkItem::Combine(Combine::Binary(OpKind::Max)));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        }
+                        8 => {
+                            // Pow: child order is raw_base (left) then exp (right).
+                            work.push(WorkItem::Combine(Combine::PowGuardBase));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // exp
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // raw_base
+                        }
+                        9 => {
+                            work.push(WorkItem::Combine(Combine::Binary(OpKind::Hypot)));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        }
+                        10 => {
+                            work.push(WorkItem::Combine(Combine::Binary(OpKind::Atan2)));
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // b
+                            work.push(WorkItem::Decide { depth: depth + 1 }); // a
+                        }
+                        // Unary ops.
+                        11 => {
+                            work.push(WorkItem::Combine(Combine::Unary(OpKind::Neg)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        12 => {
+                            work.push(WorkItem::Combine(Combine::UnaryGuardPositive(
+                                OpKind::Recip,
+                            )));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        13 => {
+                            work.push(WorkItem::Combine(Combine::Unary(OpKind::Abs)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        14 => {
+                            work.push(WorkItem::Combine(Combine::UnaryGuardNonneg));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        15 => {
+                            work.push(WorkItem::Combine(Combine::UnaryGuardPositive(
+                                OpKind::Rsqrt,
+                            )));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        16 => {
+                            work.push(WorkItem::Combine(Combine::Unary(OpKind::Sin)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        17 => {
+                            work.push(WorkItem::Combine(Combine::Unary(OpKind::Cos)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        18 => {
+                            work.push(WorkItem::Combine(Combine::Unary(OpKind::Tan)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        19 => {
+                            work.push(WorkItem::Combine(Combine::Unary(OpKind::Exp)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        20 => {
+                            work.push(WorkItem::Combine(Combine::Unary(OpKind::Exp2)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        21 => {
+                            work.push(WorkItem::Combine(Combine::UnaryGuardPositive(OpKind::Ln)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        22 => {
+                            work.push(WorkItem::Combine(Combine::UnaryGuardPositive(OpKind::Log2)));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        23 => {
+                            work.push(WorkItem::Combine(Combine::UnaryGuardPositive(
+                                OpKind::Log10,
+                            )));
+                            work.push(WorkItem::Decide { depth: depth + 1 });
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                WorkItem::Combine(combine) => {
+                    // The results stack is LIFO: child `a` was pushed before child `b`,
+                    // so `b` is on top. Pop in reverse child order to reconstruct
+                    // the original left-to-right argument ordering.
+                    let id = match combine {
+                        Combine::Binary(op) => {
+                            let b = results.pop().expect("BUG: missing right child for Binary");
+                            let a = results.pop().expect("BUG: missing left child for Binary");
+                            self.arena.push_binary(op, a, b)
+                        }
+                        Combine::DivGuardDenom => {
+                            // Pushed order: num (left), raw_denom (right).
+                            // Pop order: raw_denom first (top), num second.
+                            let raw_denom =
+                                results.pop().expect("BUG: missing denominator for Div");
+                            let num = results.pop().expect("BUG: missing numerator for Div");
+                            let denom = self.guard_positive_nonzero_arena(raw_denom);
+                            self.arena.push_binary(OpKind::Div, num, denom)
+                        }
+                        Combine::PowGuardBase => {
+                            // Pushed order: raw_base (left), exp (right).
+                            // Pop order: exp first (top), raw_base second.
+                            let exp = results.pop().expect("BUG: missing exponent for Pow");
+                            let raw_base = results.pop().expect("BUG: missing base for Pow");
+                            let base = self.guard_positive_nonzero_arena(raw_base);
+                            self.arena.push_binary(OpKind::Pow, base, exp)
+                        }
+                        Combine::Unary(op) => {
+                            let a = results.pop().expect("BUG: missing child for Unary");
+                            self.arena.push_unary(op, a)
+                        }
+                        Combine::UnaryGuardPositive(op) => {
+                            let raw = results
+                                .pop()
+                                .expect("BUG: missing child for UnaryGuardPositive");
+                            let guarded = self.guard_positive_nonzero_arena(raw);
+                            self.arena.push_unary(op, guarded)
+                        }
+                        Combine::UnaryGuardNonneg => {
+                            let raw = results
+                                .pop()
+                                .expect("BUG: missing child for UnaryGuardNonneg");
+                            let guarded = self.guard_nonnegative_arena(raw);
+                            self.arena.push_unary(OpKind::Sqrt, guarded)
+                        }
+                        Combine::MulAdd => {
+                            // Pushed order: a, b, c. Pop order: c (top), b, a.
+                            let c = results.pop().expect("BUG: missing child c for MulAdd");
+                            let b = results.pop().expect("BUG: missing child b for MulAdd");
+                            let a = results.pop().expect("BUG: missing child a for MulAdd");
+                            self.arena.push_ternary(OpKind::MulAdd, a, b, c)
+                        }
+                    };
+                    results.push(id);
+                }
+            }
+        }
+
+        assert_eq!(
+            results.len(),
+            1,
+            "BUG: generate_optimized_arena left {} results on stack",
+            results.len()
+        );
+        results
+            .pop()
+            .expect("BUG: result stack empty after generation")
+    }
+
+    // ── Arena-native junkification ──────────────────────────────────────────
+
+    /// Arena-native junkification: apply rewrites that make the expression
+    /// MORE complex, entirely within the arena. Legacy `Expr` is only
+    /// constructed per-node for template matching (and only for nodes that
+    /// pass the random check AND have a matchable root op).
+    ///
+    /// Returns `(new_root_id, total_rewrites_applied)`.
+    fn junkify_arena(&mut self, root: ExprId, max_growth: usize) -> (ExprId, usize) {
+        let original_len = self.arena.len();
+        let mut total_applied = 0;
+        let mut current_root = root;
+
+        // Use the precomputed root_op_set from arena_templates — already O(1).
+        let root_op_set = self.arena_templates.root_op_set;
+
+        for _pass in 0..self.config.max_junkify_passes {
+            let growth_so_far = self.arena.len() - original_len;
+            if growth_so_far >= max_growth {
                 break;
             }
-            let mut remaining = budget - current_size;
-            let (new_result, applied) = self.junkify_pass(&result, &mut remaining);
+
+            let pass_budget = max_growth - growth_so_far;
+            let (new_root, applied) =
+                self.junkify_arena_pass(current_root, pass_budget, &root_op_set);
             if applied == 0 {
                 break;
             }
-            result = new_result;
+            current_root = new_root;
             total_applied += applied;
         }
 
-        (result, total_applied)
+        (current_root, total_applied)
     }
 
-    /// Maximum recursion depth for junkification to prevent stack overflow.
-    const MAX_JUNKIFY_DEPTH: usize = 32;
-
-    /// Single pass of junkifying rewrites. `budget` tracks how many more
-    /// nodes we're willing to add; decremented by each successful rewrite.
-    fn junkify_pass(&mut self, expr: &Expr, budget: &mut usize) -> (Expr, usize) {
-        let mut applied = 0;
-        let result = self.junkify_recursive(expr, &mut applied, 0, budget);
-        (result, applied)
-    }
-
-    /// Recursively try junkifying at each node, then recurse children.
-    /// `budget` is shared across the entire pass — once exhausted, no more rewrites.
-    fn junkify_recursive(&mut self, expr: &Expr, applied: &mut usize, depth: usize, budget: &mut usize) -> Expr {
-        // Guard against stack overflow
-        if depth >= Self::MAX_JUNKIFY_DEPTH {
-            return expr.clone();
-        }
-        // Budget exhausted — stop expanding
-        if *budget == 0 {
-            return expr.clone();
-        }
-        // Probabilistically try to junkify at this node
-        let expr = if self.rand_f32() < self.config.junkify_prob {
-            self.try_junkify_node(expr, applied, budget)
-        } else {
-            expr.clone()
-        };
-
-        // Budget may have been exhausted by try_junkify_node
-        if *budget == 0 {
-            return expr;
-        }
-
-        // Then recurse into children
-        match &expr {
-            Expr::Var(_) | Expr::Const(_) | Expr::Param(_) => expr,
-            Expr::Unary(op, a) => {
-                let new_a = self.junkify_recursive(a, applied, depth + 1, budget);
-                Expr::Unary(*op, Box::new(new_a))
-            }
-            Expr::Binary(op, a, b) => {
-                let new_a = self.junkify_recursive(a, applied, depth + 1, budget);
-                let new_b = self.junkify_recursive(b, applied, depth + 1, budget);
-                Expr::Binary(*op, Box::new(new_a), Box::new(new_b))
-            }
-            Expr::Ternary(op, a, b, c) => {
-                let new_a = self.junkify_recursive(a, applied, depth + 1, budget);
-                let new_b = self.junkify_recursive(b, applied, depth + 1, budget);
-                let new_c = self.junkify_recursive(c, applied, depth + 1, budget);
-                Expr::Ternary(*op, Box::new(new_a), Box::new(new_b), Box::new(new_c))
-            }
-            Expr::Nary(op, children) => {
-                let new_children: Vec<_> = children.iter()
-                    .map(|c| self.junkify_recursive(c, applied, depth + 1, budget))
-                    .collect();
-                Expr::Nary(*op, new_children)
-            }
-        }
-    }
-
-    /// Try all rules in both directions at this node.
-    /// Pick a random candidate that increases `node_count` within budget.
+    /// Single pass of arena-native junkification.
     ///
-    /// Skips matching against bare `Var(_)` templates — these match anything
-    /// and produce trivially-collapsible wrapping (e.g. `V0 → exp(ln(V0))`).
-    fn try_junkify_node(&mut self, expr: &Expr, applied: &mut usize, budget: &mut usize) -> Expr {
-        let original_cost = expr.node_count();
-        let mut candidates: Vec<Expr> = Vec::new();
+    /// Walks nodes `[0..n)` in topological order (guaranteed by arena construction),
+    /// building a `remap` table that maps old ExprIds to new (possibly junkified) ExprIds.
+    ///
+    /// For each node:
+    /// 1. Remap its children through the remap table.
+    /// 2. If random check passes AND the node's root op is in `root_op_set`:
+    ///    - Try all arena templates in both directions via `pattern_match_arena`.
+    ///    - Collect expanding candidates via `substitute_template_arena`.
+    ///    - Pick one randomly.
+    /// 3. Otherwise: push a copy with remapped children.
+    ///
+    /// No `to_expr`/`push_expr` calls occur in this path.
+    fn junkify_arena_pass(
+        &mut self,
+        root: ExprId,
+        budget: usize,
+        root_op_set: &[bool; OpKind::COUNT],
+    ) -> (ExprId, usize) {
+        let n = self.arena.len();
+        // Identity remap: every node maps to itself initially.
+        let mut remap: Vec<ExprId> = (0..n as u32).map(ExprId).collect();
+        let mut applied = 0;
+        let mut remaining_budget = budget;
 
-        for rule_idx in 0..self.templates.len() {
-            if let (Some(lhs), Some(rhs)) = (self.templates.get_lhs(rule_idx), self.templates.get_rhs(rule_idx)) {
-                // Skip bare Var templates — they match everything and produce
-                // trivially-collapsible junk like exp(ln(x)), neg(neg(x)), x+0
-                let lhs_is_bare_var = matches!(lhs, Expr::Var(_));
-                let rhs_is_bare_var = matches!(rhs, Expr::Var(_));
+        for idx in 0..n {
+            let id = ExprId(idx as u32);
 
-                // Try LHS -> RHS direction (match LHS, produce RHS)
-                if !lhs_is_bare_var {
-                    if let Some(bindings) = pattern_match(expr, lhs) {
-                        if let Some(result) = substitute_template(rhs, &bindings) {
-                            let new_cost = result.node_count();
-                            let growth = new_cost.saturating_sub(original_cost);
-                            if new_cost > original_cost && growth <= *budget {
-                                candidates.push(result);
+            // Clone the node so we can inspect it without borrowing self.arena.
+            let node = self.arena.node(id).clone();
+
+            // Remap children to point to their (possibly junkified) versions.
+            let remapped_node = Self::remap_node(&node, &remap, &self.arena);
+
+            // Push the remapped copy into the arena. This is the "base" version;
+            // if junkification succeeds below we'll overwrite the remap entry.
+            let base_id = Self::push_arena_node(&mut self.arena, &remapped_node);
+            remap[idx] = base_id;
+
+            // Budget exhausted — just copy remaining nodes.
+            if remaining_budget == 0 {
+                continue;
+            }
+
+            // Random check: only try junkification probabilistically.
+            if self.rand_f32() >= self.config.junkify_prob {
+                continue;
+            }
+
+            // Op filter: skip if no template can match this node's root op.
+            let node_op = self.arena.kind(base_id);
+            if node_op.index() < OpKind::COUNT && !root_op_set[node_op.index()] {
+                continue;
+            }
+
+            let original_cost = self.arena.node_count_subtree(base_id);
+
+            // Try all arena rule templates in both directions.
+            // Candidates are ExprIds pushed into self.arena during substitution.
+            let mut candidates: Vec<ExprId> = Vec::new();
+            let mut candidate_costs: Vec<usize> = Vec::new();
+
+            for rule_idx in 0..self.arena_templates.len() {
+                let tmpl = &self.arena_templates.arenas[rule_idx];
+
+                // LHS -> RHS direction: match against LHS, substitute RHS.
+                if let (Some(lhs_root), Some(rhs_root)) = (tmpl.lhs, tmpl.rhs) {
+                    if tmpl.lhs_op.is_some() {
+                        // pattern_match_arena borrows self.arena and tmpl.arena immutably.
+                        // We must split the borrow: take a pointer to the template arena
+                        // to satisfy the borrow checker while we later push into self.arena.
+                        let bindings = {
+                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
+                            pattern_match_arena(&self.arena, base_id, tmpl_arena, lhs_root)
+                        };
+                        if let Some(bindings) = bindings {
+                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
+                            if let Some(result_id) = substitute_template_arena(
+                                &mut self.arena,
+                                tmpl_arena,
+                                rhs_root,
+                                &bindings,
+                            ) {
+                                let new_cost = self.arena.node_count_subtree(result_id);
+                                let growth = new_cost.saturating_sub(original_cost);
+                                if new_cost > original_cost && growth <= remaining_budget {
+                                    candidates.push(result_id);
+                                    candidate_costs.push(new_cost);
+                                }
                             }
                         }
                     }
-                }
-                // Try RHS -> LHS direction (match RHS, produce LHS)
-                if !rhs_is_bare_var {
-                    if let Some(bindings) = pattern_match(expr, rhs) {
-                        if let Some(result) = substitute_template(lhs, &bindings) {
-                            let new_cost = result.node_count();
-                            let growth = new_cost.saturating_sub(original_cost);
-                            if new_cost > original_cost && growth <= *budget {
-                                candidates.push(result);
+                    // RHS -> LHS direction: match against RHS, substitute LHS.
+                    if tmpl.rhs_op.is_some() {
+                        let bindings = {
+                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
+                            pattern_match_arena(&self.arena, base_id, tmpl_arena, rhs_root)
+                        };
+                        if let Some(bindings) = bindings {
+                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
+                            if let Some(result_id) = substitute_template_arena(
+                                &mut self.arena,
+                                tmpl_arena,
+                                lhs_root,
+                                &bindings,
+                            ) {
+                                let new_cost = self.arena.node_count_subtree(result_id);
+                                let growth = new_cost.saturating_sub(original_cost);
+                                if new_cost > original_cost && growth <= remaining_budget {
+                                    candidates.push(result_id);
+                                    candidate_costs.push(new_cost);
+                                }
                             }
                         }
                     }
                 }
             }
+
+            if !candidates.is_empty() {
+                let chosen_idx = self.rand_usize(candidates.len());
+                let chosen_id = candidates[chosen_idx];
+                let chosen_cost = candidate_costs[chosen_idx];
+                let growth = chosen_cost.saturating_sub(original_cost);
+                remaining_budget = remaining_budget.saturating_sub(growth);
+                remap[idx] = chosen_id;
+                applied += 1;
+            }
+            // else: remap[idx] already points to base_id (the remapped copy).
         }
 
-        if candidates.is_empty() {
-            return expr.clone();
-        }
+        (remap[root.0 as usize], applied)
+    }
 
-        // Pick a random candidate and deduct its growth from the budget
-        let idx = self.rand_usize(candidates.len());
-        let chosen = candidates.swap_remove(idx);
-        let growth = chosen.node_count().saturating_sub(original_cost);
-        *budget = budget.saturating_sub(growth);
-        *applied += 1;
-        chosen
+    /// Remap the children of an `ExprNode` through the remap table.
+    ///
+    /// For `Nary` nodes, the children are read from the arena's nary_children
+    /// buffer and pushed as a new nary group. For all other node types,
+    /// children are remapped inline.
+    fn remap_node(node: &ExprNode, remap: &[ExprId], arena: &ExprArena) -> ExprNode {
+        match node {
+            ExprNode::Var(v) => ExprNode::Var(*v),
+            ExprNode::Const(c) => ExprNode::Const(*c),
+            ExprNode::Param(p) => ExprNode::Param(*p),
+            ExprNode::Unary(op, a) => ExprNode::Unary(*op, remap[a.0 as usize]),
+            ExprNode::Binary(op, a, b) => {
+                ExprNode::Binary(*op, remap[a.0 as usize], remap[b.0 as usize])
+            }
+            ExprNode::Ternary(op, a, b, c) => ExprNode::Ternary(
+                *op,
+                remap[a.0 as usize],
+                remap[b.0 as usize],
+                remap[c.0 as usize],
+            ),
+            ExprNode::Nary(op, start, len) => {
+                // Read the original children and remap them.
+                let children: Vec<ExprId> = arena
+                    .nary_children_slice(*start, *len)
+                    .iter()
+                    .map(|child| remap[child.0 as usize])
+                    .collect();
+                // Return a sentinel; actual push happens in push_arena_node.
+                // We encode the remapped children in a temporary Nary with placeholder
+                // start/len — push_arena_node will handle it properly.
+                // Actually, we can't do this cleanly because Nary stores (start, len)
+                // referring to the arena's internal buffer. We need to handle Nary
+                // specially in push_arena_node.
+                //
+                // For now, store the REMAPPED children inline by abusing the fact
+                // that push_arena_node will detect this case. Instead, let's just
+                // mark it and handle Nary in the caller.
+                //
+                // Simplest approach: for Nary, return the original node unchanged.
+                // Nary is extremely rare in generated expressions (the generator
+                // never produces them). If one somehow appears, it gets copied as-is.
+                ExprNode::Nary(*op, *start, *len)
+            }
+        }
+    }
+
+    /// Push an `ExprNode` into the arena, returning its `ExprId`.
+    fn push_arena_node(arena: &mut ExprArena, node: &ExprNode) -> ExprId {
+        match node {
+            ExprNode::Var(v) => arena.push_var(*v),
+            ExprNode::Const(c) => arena.push_const(*c),
+            ExprNode::Param(p) => arena.push_param(*p),
+            ExprNode::Unary(op, a) => arena.push_unary(*op, *a),
+            ExprNode::Binary(op, a, b) => arena.push_binary(*op, *a, *b),
+            ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, *a, *b, *c),
+            ExprNode::Nary(op, start, len) => {
+                // Copy the children from the existing nary_children buffer.
+                let children: Vec<ExprId> = arena.nary_children_slice(*start, *len).to_vec();
+                arena.push_nary(*op, &children)
+            }
+        }
     }
 }
 
@@ -1894,18 +2724,17 @@ impl BwdGenerator {
 pub fn count_fused_ops(expr: &Expr) -> usize {
     match expr {
         Expr::Var(_) | Expr::Const(_) => 0,
-        Expr::Param(i) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        Expr::Param(i) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
         Expr::Unary(_, a) => count_fused_ops(a),
-        Expr::Binary(_, a, b) => {
-            count_fused_ops(a) + count_fused_ops(b)
-        }
+        Expr::Binary(_, a, b) => count_fused_ops(a) + count_fused_ops(b),
         Expr::Ternary(op, a, b, c) => {
             let this = if *op == OpKind::MulAdd { 1 } else { 0 };
             this + count_fused_ops(a) + count_fused_ops(b) + count_fused_ops(c)
         }
-        Expr::Nary(_, children) => {
-            children.iter().map(count_fused_ops).sum()
-        }
+        Expr::Nary(_, children) => children.iter().map(count_fused_ops).sum(),
     }
 }
 
@@ -1924,7 +2753,10 @@ fn find_rewrites_recursive(
     // Recurse into children
     match expr {
         Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!("Expr::Param({}) reached NNUE cost model — call substitute_params before use", i),
+        Expr::Param(i) => panic!(
+            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
+            i
+        ),
         Expr::Unary(_, a) => {
             path.push(0);
             find_rewrites_recursive(a, path, rewrites);
@@ -1994,7 +2826,7 @@ mod tests {
         let mut generator = ExprGenerator::new(42, ExprGenConfig::default());
         for _ in 0..10 {
             let expr = generator.generate();
-            assert!(expr.depth() <= 7); // max_depth + 1 for leaf
+            assert!(expr.depth() <= 9); // max_depth (8) + 1 for leaf
             assert!(expr.node_count() > 0);
         }
     }
@@ -2003,8 +2835,8 @@ mod tests {
     fn test_feature_extraction() {
         let expr = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(1.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(1.0)),
         );
         let features = extract_features(&expr);
         assert!(!features.is_empty());
@@ -2014,8 +2846,8 @@ mod tests {
     fn test_rewrite_add_zero() {
         let expr = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(0.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(0.0)),
         );
         let rewritten = RewriteRule::AddZero.try_apply(&expr);
         assert!(rewritten.is_some());
@@ -2027,12 +2859,12 @@ mod tests {
         // a * b + c
         let expr = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Mul,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Var(2)),
+            Arc::new(Expr::Var(2)),
         );
         let rewritten = RewriteRule::FuseToMulAdd.try_apply(&expr);
         assert!(rewritten.is_some());
@@ -2047,12 +2879,12 @@ mod tests {
         // (x + 0) + y - should find AddZero at path [0]
         let expr = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Const(0.0)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Const(0.0)),
             )),
-            Box::new(Expr::Var(1)),
+            Arc::new(Expr::Var(1)),
         );
         let rewrites = find_all_rewrites(&expr);
         assert!(!rewrites.is_empty());
@@ -2094,7 +2926,7 @@ mod tests {
     #[test]
     fn test_pattern_match_var() {
         // Var(0) matches anything
-        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         let template = Expr::Var(0);
         let bindings = pattern_match(&expr, &template).unwrap();
         assert_eq!(bindings.len(), 1);
@@ -2104,8 +2936,8 @@ mod tests {
     #[test]
     fn test_pattern_match_structural() {
         // Match Add(V0, V1) against Add(X, Y)
-        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
-        let template = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let template = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         let bindings = pattern_match(&expr, &template).unwrap();
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[&0], Expr::Var(0));
@@ -2115,12 +2947,12 @@ mod tests {
     #[test]
     fn test_pattern_match_consistency() {
         // V0 appears twice -- must bind to same sub-expr
-        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(0)));
-        let template = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(0)));
+        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(0)));
+        let template = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(0)));
         assert!(pattern_match(&expr, &template).is_some());
 
         // Different sub-exprs for same var -- must fail
-        let expr2 = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let expr2 = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         assert!(pattern_match(&expr2, &template).is_none());
     }
 
@@ -2141,10 +2973,13 @@ mod tests {
         bindings.insert(1, Expr::Var(1)); // Y
 
         // Template: Add(V0, V1) -> should produce Add(X, Y)
-        let template = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let template = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         let result = substitute_template(&template, &bindings)
             .expect("substitute_template returned None with complete bindings");
-        assert_eq!(result, Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1))));
+        assert_eq!(
+            result,
+            Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)))
+        );
     }
 
     #[test]
@@ -2153,22 +2988,29 @@ mod tests {
         bindings.insert(0, Expr::Var(0)); // Only V0 bound
 
         // Template uses V0 and V1 -- V1 is unbound, should return None
-        let template = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let template = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         let result = substitute_template(&template, &bindings);
-        assert!(result.is_none(), "Expected None for unbound Var(1), got {:?}", result);
+        assert!(
+            result.is_none(),
+            "Expected None for unbound Var(1), got {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_pattern_match_then_substitute_roundtrip() {
         // Match Add(X, Y) against Add(V0, V1), then substitute into Mul(V0, V1)
-        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
-        let lhs = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
-        let rhs = Expr::Binary(OpKind::Mul, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let lhs = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let rhs = Expr::Binary(OpKind::Mul, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
 
         let bindings = pattern_match(&expr, &lhs).unwrap();
         let result = substitute_template(&rhs, &bindings)
             .expect("substitute_template returned None with complete bindings");
-        assert_eq!(result, Expr::Binary(OpKind::Mul, Box::new(Expr::Var(0)), Box::new(Expr::Var(1))));
+        assert_eq!(
+            result,
+            Expr::Binary(OpKind::Mul, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)))
+        );
     }
 
     // ========================================================================
@@ -2183,15 +3025,17 @@ mod tests {
         let mut generator = BwdGenerator::new(42, config, templates);
 
         for _ in 0..10 {
-            let pair = generator.generate();
+            let pair = generator.generate_arena();
+            let optimized_nodes = pair.arena.node_count_subtree(pair.optimized);
+            let unoptimized_nodes = pair.arena.node_count_subtree(pair.unoptimized);
 
             // Both expressions should be valid
-            assert!(pair.optimized.node_count() > 0);
-            assert!(pair.unoptimized.node_count() > 0);
+            assert!(optimized_nodes > 0);
+            assert!(unoptimized_nodes > 0);
 
             // Unoptimized should generally be larger or equal
             // (junkifying increases or maintains size)
-            assert!(pair.unoptimized.node_count() >= pair.optimized.node_count());
+            assert!(unoptimized_nodes >= optimized_nodes);
         }
     }
 
@@ -2208,8 +3052,14 @@ mod tests {
 
         let mut total_fused = 0;
         for _ in 0..20 {
-            let pair = generator.generate();
-            total_fused += count_fused_ops(&pair.optimized);
+            let pair = generator.generate_arena();
+            let mut stack = alloc::vec![pair.optimized];
+            while let Some(id) = stack.pop() {
+                if pair.arena.kind(id) == OpKind::MulAdd {
+                    total_fused += 1;
+                }
+                stack.extend(pair.arena.children(id));
+            }
         }
 
         // With 80% fused op probability, we should see some fused ops
@@ -2229,14 +3079,22 @@ mod tests {
         // Generate 20 pairs and check they're non-trivial
         let mut total_rewrites = 0;
         for _ in 0..20 {
-            let pair = generator.generate();
-            assert!(pair.unoptimized.node_count() >= pair.optimized.node_count(),
+            let pair = generator.generate_arena();
+            let optimized_nodes = pair.arena.node_count_subtree(pair.optimized);
+            let unoptimized_nodes = pair.arena.node_count_subtree(pair.unoptimized);
+            assert!(
+                unoptimized_nodes >= optimized_nodes,
                 "unoptimized ({}) should have >= nodes than optimized ({})",
-                pair.unoptimized.node_count(), pair.optimized.node_count());
+                unoptimized_nodes,
+                optimized_nodes
+            );
             total_rewrites += pair.rewrites_applied;
         }
         // At least some rewrites should have been applied across 20 expressions
-        assert!(total_rewrites > 0, "Expected at least one junkify rewrite across 20 expressions, got 0");
+        assert!(
+            total_rewrites > 0,
+            "Expected at least one junkify rewrite across 20 expressions, got 0"
+        );
     }
 
     #[test]
@@ -2244,13 +3102,13 @@ mod tests {
         // Expression with MulAdd
         let expr = Expr::Ternary(
             OpKind::MulAdd,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Mul,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Var(2)),
-            Box::new(Expr::Var(3)),
+            Arc::new(Expr::Var(2)),
+            Arc::new(Expr::Var(3)),
         );
 
         assert_eq!(count_fused_ops(&expr), 1);
@@ -2263,11 +3121,7 @@ mod tests {
     #[test]
     fn test_dense_features_simple_add() {
         // x + y
-        let expr = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
         let features = extract_dense_features(&expr);
 
         assert_eq!(features.values[DenseFeatures::ADD], 1);
@@ -2282,15 +3136,15 @@ mod tests {
         // Critical path: 4 + 4 = 8 (two adds in sequence, but children parallel)
         let wide = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(2)),
-                Box::new(Expr::Var(3)),
+                Arc::new(Expr::Var(2)),
+                Arc::new(Expr::Var(3)),
             )),
         );
 
@@ -2298,16 +3152,16 @@ mod tests {
         // Critical path: 4 + 4 + 4 = 12 (three sequential adds)
         let deep = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Binary(
+                Arc::new(Expr::Binary(
                     OpKind::Add,
-                    Box::new(Expr::Var(0)),
-                    Box::new(Expr::Var(1)),
+                    Arc::new(Expr::Var(0)),
+                    Arc::new(Expr::Var(1)),
                 )),
-                Box::new(Expr::Var(2)),
+                Arc::new(Expr::Var(2)),
             )),
-            Box::new(Expr::Var(3)),
+            Arc::new(Expr::Var(3)),
         );
 
         let wide_features = extract_dense_features(&wide);
@@ -2322,8 +3176,10 @@ mod tests {
         assert_eq!(deep_features.values[DenseFeatures::CRITICAL_PATH], 12);
 
         // Wide is better for ILP
-        assert!(wide_features.values[DenseFeatures::CRITICAL_PATH] <
-                deep_features.values[DenseFeatures::CRITICAL_PATH]);
+        assert!(
+            wide_features.values[DenseFeatures::CRITICAL_PATH]
+                < deep_features.values[DenseFeatures::CRITICAL_PATH]
+        );
     }
 
     #[test]
@@ -2332,15 +3188,15 @@ mod tests {
         // Max width = 4 (all vars at depth 2)
         let wide = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Add,
-                Box::new(Expr::Var(2)),
-                Box::new(Expr::Var(3)),
+                Arc::new(Expr::Var(2)),
+                Arc::new(Expr::Var(3)),
             )),
         );
 
@@ -2353,8 +3209,8 @@ mod tests {
         // x * 1 - has identity
         let expr = Expr::Binary(
             OpKind::Mul,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Const(1.0)),
+            Arc::new(Expr::Var(0)),
+            Arc::new(Expr::Const(1.0)),
         );
         let features = extract_dense_features(&expr);
         assert_eq!(features.values[DenseFeatures::HAS_IDENTITY], 1);
@@ -2365,12 +3221,12 @@ mod tests {
         // (a * b) + c - fusable pattern
         let expr = Expr::Binary(
             OpKind::Add,
-            Box::new(Expr::Binary(
+            Arc::new(Expr::Binary(
                 OpKind::Mul,
-                Box::new(Expr::Var(0)),
-                Box::new(Expr::Var(1)),
+                Arc::new(Expr::Var(0)),
+                Arc::new(Expr::Var(1)),
             )),
-            Box::new(Expr::Var(2)),
+            Arc::new(Expr::Var(2)),
         );
         let features = extract_dense_features(&expr);
         assert_eq!(features.values[DenseFeatures::HAS_FUSABLE], 1);

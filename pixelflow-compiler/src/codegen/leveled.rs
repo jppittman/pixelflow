@@ -48,31 +48,59 @@ use crate::ast::{BinaryOp, UnaryOp, ParamKind};
 use crate::sema::AnalyzedKernel;
 use crate::symbol::SymbolKind;
 
+use pixelflow_ir::Variance;
+
 /// Dependency classification for uniform hoisting.
 ///
-/// Forms a lattice: Const < Uniform < Varying
-/// Operations propagate upward: `Uniform + Varying = Varying`
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Deps {
-    /// No dependencies - literal constant
-    Const,
-    /// Depends only on W (time) - compute once per frame
-    Uniform,
-    /// Depends on X, Y, or Z - compute per pixel
-    Varying,
-}
+/// Wraps `pixelflow_ir::Variance` (4-bit bitset) with the older three-level view.
+/// The three historical levels map to:
+/// - `Deps::Const`   → `Variance::CONST` (0b0000)
+/// - `Deps::Uniform`  → `Variance::W` (0b1000) or any frame-uniform
+/// - `Deps::Varying`  → any spatially varying (X, Y, or Z bits set)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Deps(pub Variance);
 
 impl Deps {
-    /// Join two dependencies (least upper bound in lattice)
+    /// No dependencies — compile-time constant.
+    pub const Const: Self = Self(Variance::CONST);
+    /// Depends only on W (time) — frame-uniform.
+    pub const Uniform: Self = Self(Variance::W);
+    /// Depends on spatial coordinates — per-pixel. Uses {X,Y,Z} as the
+    /// conservative "varying" marker.
+    pub const Varying: Self = Self(Variance::SPATIAL);
+
+    /// Join two dependencies (union of variance bitsets).
     #[inline]
+    #[must_use]
     pub fn join(self, other: Self) -> Self {
-        self.max(other)
+        Self(self.0.union(other.0))
     }
 
-    /// Is this uniform (can be hoisted)?
+    /// Is this uniform (can be hoisted out of the pixel loop)?
     #[inline]
+    #[must_use]
     pub fn is_uniform(&self) -> bool {
-        matches!(self, Deps::Const | Deps::Uniform)
+        self.0.is_frame_uniform()
+    }
+
+    /// Get the underlying Variance.
+    #[inline]
+    #[must_use]
+    pub fn variance(self) -> Variance {
+        self.0
+    }
+}
+
+impl PartialOrd for Deps {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Deps {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.0.popcount().cmp(&other.0.popcount())
+            .then(self.0.bits().cmp(&other.0.bits()))
     }
 }
 
@@ -403,10 +431,12 @@ pub fn analyze_deps(
 
     for level in &builder.levels {
         for node in level {
-            match node.deps {
-                Deps::Const => stats.const_nodes += 1,
-                Deps::Uniform => stats.uniform_nodes += 1,
-                Deps::Varying => stats.varying_nodes += 1,
+            if node.deps.0.is_const() {
+                stats.const_nodes += 1;
+            } else if node.deps.is_uniform() {
+                stats.uniform_nodes += 1;
+            } else {
+                stats.varying_nodes += 1;
             }
         }
     }
