@@ -10,7 +10,8 @@ const ITERATIONS: u64 = 100_000;
 
 /// Measure latency of an operation by chaining it
 fn measure_chain<F>(name: &str, init: f32, mut op: F) -> f64
-where F: FnMut(f32) -> f32
+where
+    F: FnMut(f32) -> f32,
 {
     // Warmup
     let mut x = init;
@@ -35,7 +36,10 @@ where F: FnMut(f32) -> f32
 
     // Estimate cycles at 3 GHz
     let cycles = ns_per_op * 3.0;
-    println!("  {:<15}: {:.2} ns/op (~{:.1} cycles)", name, ns_per_op, cycles);
+    println!(
+        "  {:<15}: {:.2} ns/op (~{:.1} cycles)",
+        name, ns_per_op, cycles
+    );
     ns_per_op
 }
 

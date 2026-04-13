@@ -12,20 +12,15 @@
 //! - [`graph`]: The EGraph itself
 //! - [`deps`]: Dependency analysis for uniform hoisting
 //! - [`codegen`]: Code generation from extracted expressions (tree & DAG)
-//! - [`nnue_adapter`]: NNUE integration for learned cost prediction
-//! - [`guided_search`]: Guided search with learned rule filtering
 //!
 //! Mathematical rewrite rules are now in the [`crate::math`] module.
 
 pub mod codegen;
 mod cost;
-mod deps;
-mod extract;
+pub mod deps;
+pub(crate) mod extract;
 mod graph;
-pub mod guided_search;  // Guided search with learned rule filtering
 mod node;
-pub mod nnue_adapter;
-pub mod nnue_optimize;  // NNUE-guided expression optimization
 pub mod ops;
 pub mod rewrite;
 pub mod saturate;
@@ -33,42 +28,51 @@ pub mod saturate;
 // Re-export public API
 pub use cost::{CostFunction, CostModel};
 pub use deps::{Deps, DepsAnalysis};
-pub use extract::{ExprTree, ExtractedDAG, IncrementalExtractor, Leaf, extract_dag};
-pub use graph::{ApplyResult, EGraph, RewriteTarget};
+pub use extract::{
+    ExtractedDAG, IncrementalExtractor, build_extracted_dag_from_choices, choices_to_arena,
+    compute_ref_counts, extract_dag, extract_neural_to_arena,
+};
+pub use graph::{ApplyResult, EGraph, EGraphBatch, RewriteTarget};
 pub use node::{EClassId, ENode};
 pub use ops::Op;
-pub use rewrite::{Rewrite, RewriteAction};
-pub use saturate::{SaturationResult, saturate_with_budget, achievable_cost_within_budget};
-pub use guided_search::{
-    GuidedSearch, GuidedSearchResult, RuleStats, EpochRecord, RuleRecord,
-    UnifiedMaskSearchResult, UnifiedMaskEpochRecord, UnifiedPairRecord,
-};
-pub use nnue_optimize::{NnueOptimizer, OptimizeConfig, OptimizeResult};
-
-// Re-export NNUE adapter types
-pub use nnue_adapter::predict_tree_cost;
-pub use nnue_adapter::{expr_tree_to_nnue, expr_to_egraph, eclass_to_expr};
-pub use nnue_adapter::{extract_neural, extract_beam};
+pub use rewrite::{Pattern, Rewrite, RewriteAction};
+pub use saturate::{SaturationResult, achievable_cost_within_budget, saturate_with_budget};
 
 // Re-export rule types from math module for backward compatibility
 pub use crate::math::{
-    // Algebra
-    InversePair, AddNeg, MulRecip,
-    Commutative, Identity, Annihilator, Associative,
-    algebra_rules, inverse_pair_rules, basic_algebra_rules,
-    // Parity
-    Parity, ParityKind,
-    parity_rules,
+    AddNeg,
     // Trig
-    AngleAddition, Sign,
-    trig_rules,
-    // Exp
-    FunctionInverse, Homomorphism, ExpLn, Exp2Log2,
-    exp_rules,
+    AngleAddition,
+    Annihilator,
+    Associative,
+    Commutative,
+    Exp2Log2,
+    ExpLn,
     // Fusion
-    FmaFusion, RecipSqrt, fusion_rules,
+    FmaFusion,
+    // Exp
+    FunctionInverse,
+    Homomorphism,
+    Identity,
+    // Algebra
+    InversePair,
+    MulRecip,
+    // Parity
+    Parity,
+    ParityKind,
+    RecipSqrt,
+    Sign,
+    algebra_rules,
     // Rule collections
-    all_math_rules, core_rules, transcendental_rules,
+    all_math_rules,
+    basic_algebra_rules,
+    core_rules,
+    exp_rules,
+    fusion_rules,
+    inverse_pair_rules,
+    parity_rules,
+    transcendental_rules,
+    trig_rules,
 };
 
 /// All rewrite rules: 40 math + 2 fusion = 42 total.
@@ -89,7 +93,10 @@ pub fn all_rules() -> Vec<Box<dyn Rewrite>> {
 #[must_use]
 pub fn collect_rule_templates() -> crate::nnue::RuleTemplates {
     let rules = all_rules();
-    assert!(!rules.is_empty(), "collect_rule_templates: all_rules() returned 0 rules");
+    assert!(
+        !rules.is_empty(),
+        "collect_rule_templates: all_rules() returned 0 rules"
+    );
 
     let mut templates = crate::nnue::RuleTemplates::with_capacity(rules.len());
 

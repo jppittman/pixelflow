@@ -9,11 +9,15 @@
 //! - EvenNegation: Op(neg(x)) → Op(x)
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
-use crate::egraph::{EGraph, EClassId, ENode, Op, Rewrite, RewriteAction, ops};
-use pixelflow_ir::{Expr, OpKind};
+use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
+use crate::egraph::Pattern as Expr;
+use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Box<Expr> { Box::new(e) }
+fn b(e: Expr) -> Arc<Expr> {
+    Arc::new(e)
+}
 
 // ============================================================================
 // Parity Trait
@@ -47,43 +51,67 @@ pub trait Parity: Send + Sync {
 /// Sin is odd: sin(-x) = -sin(x)
 pub struct SinParity;
 impl Parity for SinParity {
-    fn op() -> &'static dyn Op { &ops::Sin }
-    fn parity() -> ParityKind { ParityKind::Odd }
+    fn op() -> &'static dyn Op {
+        &ops::Sin
+    }
+    fn parity() -> ParityKind {
+        ParityKind::Odd
+    }
 }
 
 /// Cos is even: cos(-x) = cos(x)
 pub struct CosParity;
 impl Parity for CosParity {
-    fn op() -> &'static dyn Op { &ops::Cos }
-    fn parity() -> ParityKind { ParityKind::Even }
+    fn op() -> &'static dyn Op {
+        &ops::Cos
+    }
+    fn parity() -> ParityKind {
+        ParityKind::Even
+    }
 }
 
 /// Tan is odd: tan(-x) = -tan(x)
 pub struct TanParity;
 impl Parity for TanParity {
-    fn op() -> &'static dyn Op { &ops::Tan }
-    fn parity() -> ParityKind { ParityKind::Odd }
+    fn op() -> &'static dyn Op {
+        &ops::Tan
+    }
+    fn parity() -> ParityKind {
+        ParityKind::Odd
+    }
 }
 
 /// Asin is odd: asin(-x) = -asin(x)
 pub struct AsinParity;
 impl Parity for AsinParity {
-    fn op() -> &'static dyn Op { &ops::Asin }
-    fn parity() -> ParityKind { ParityKind::Odd }
+    fn op() -> &'static dyn Op {
+        &ops::Asin
+    }
+    fn parity() -> ParityKind {
+        ParityKind::Odd
+    }
 }
 
 /// Atan is odd: atan(-x) = -atan(x)
 pub struct AtanParity;
 impl Parity for AtanParity {
-    fn op() -> &'static dyn Op { &ops::Atan }
-    fn parity() -> ParityKind { ParityKind::Odd }
+    fn op() -> &'static dyn Op {
+        &ops::Atan
+    }
+    fn parity() -> ParityKind {
+        ParityKind::Odd
+    }
 }
 
 /// Abs is even: abs(-x) = abs(x)
 pub struct AbsParity;
 impl Parity for AbsParity {
-    fn op() -> &'static dyn Op { &ops::Abs }
-    fn parity() -> ParityKind { ParityKind::Even }
+    fn op() -> &'static dyn Op {
+        &ops::Abs
+    }
+    fn parity() -> ParityKind {
+        ParityKind::Even
+    }
 }
 
 // ============================================================================
@@ -108,7 +136,9 @@ impl<T: Parity> Default for OddNegation<T> {
 }
 
 impl<T: Parity> Rewrite for OddNegation<T> {
-    fn name(&self) -> &str { "odd-negation" }
+    fn name(&self) -> &str {
+        "odd-negation"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Must be odd function
@@ -117,15 +147,25 @@ impl<T: Parity> Rewrite for OddNegation<T> {
         }
 
         // Match: Op(neg(x))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != T::op().kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != T::op().kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         // Check if argument is neg(x)
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == OpKind::Neg && arg_children.len() == 1 {
                     let x = arg_children[0];
                     // Op(neg(x)) → neg(Op(x))
@@ -170,7 +210,9 @@ impl<T: Parity> Default for EvenNegation<T> {
 }
 
 impl<T: Parity> Rewrite for EvenNegation<T> {
-    fn name(&self) -> &str { "even-negation" }
+    fn name(&self) -> &str {
+        "even-negation"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Must be even function
@@ -179,15 +221,25 @@ impl<T: Parity> Rewrite for EvenNegation<T> {
         }
 
         // Match: Op(neg(x))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != T::op().kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != T::op().kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         // Check if argument is neg(x)
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == OpKind::Neg && arg_children.len() == 1 {
                     let x = arg_children[0];
                     // Op(neg(x)) → Op(x)
@@ -231,15 +283,25 @@ impl<T: Parity> Rewrite for ParityNegation<T> {
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Op(neg(x))
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != T::op().kind() { return None; }
-        if children.len() != 1 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != T::op().kind() {
+            return None;
+        }
+        if children.len() != 1 {
+            return None;
+        }
 
         let arg = children[0];
 
         // Check if argument is neg(x)
         for arg_node in egraph.nodes(arg) {
-            if let ENode::Op { op: arg_op, children: arg_children } = arg_node {
+            if let ENode::Op {
+                op: arg_op,
+                children: arg_children,
+            } = arg_node
+            {
                 if arg_op.kind() == OpKind::Neg && arg_children.len() == 1 {
                     let x = arg_children[0];
 
@@ -279,14 +341,20 @@ impl<T: Parity> Rewrite for ParityNegation<T> {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Op(Neg(V0))
-        Some(Expr::Unary(T::op().kind(), b(Expr::Unary(OpKind::Neg, b(Expr::Var(0))))))
+        Some(Expr::Unary(
+            T::op().kind(),
+            b(Expr::Unary(OpKind::Neg, b(Expr::Var(0)))),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
         match T::parity() {
             ParityKind::Odd => {
                 // Neg(Op(V0))
-                Some(Expr::Unary(OpKind::Neg, b(Expr::Unary(T::op().kind(), b(Expr::Var(0))))))
+                Some(Expr::Unary(
+                    OpKind::Neg,
+                    b(Expr::Unary(T::op().kind(), b(Expr::Var(0)))),
+                ))
             }
             ParityKind::Even => {
                 // Op(V0)

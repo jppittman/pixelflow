@@ -8,9 +8,6 @@
 
 pub mod fusion;
 pub mod jit_bench;
-pub mod layer;
-pub mod nnue;
-pub mod train;
 
 // Training infrastructure (requires std feature)
 #[cfg(feature = "training")]

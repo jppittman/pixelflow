@@ -12,8 +12,8 @@
 //! - **Reciprocal Square Root**: `1 / sqrt(x)` → `rsqrt(x)`
 
 use pixelflow_ir::OpKind;
-use pixelflow_search::egraph::{EGraph, EClassId, ENode, ops};
 use pixelflow_search::egraph::rewrite::{Rewrite, RewriteAction};
+use pixelflow_search::egraph::{EClassId, EGraph, ENode, ops};
 
 // ============================================================================
 // FMA Fusion
@@ -35,12 +35,20 @@ impl Default for FmaFusion {
 }
 
 impl Rewrite for FmaFusion {
-    fn name(&self) -> &str { "fma-fusion" }
+    fn name(&self) -> &str {
+        "fma-fusion"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Add { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Add {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let left = children[0];
         let right = children[1];
@@ -83,10 +91,14 @@ impl Default for RecipSqrt {
 }
 
 impl Rewrite for RecipSqrt {
-    fn name(&self) -> &str { "recip-sqrt" }
+    fn name(&self) -> &str {
+        "recip-sqrt"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        let ENode::Op { op, children } = node else { return None };
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
 
         match op.kind() {
             OpKind::Div if children.len() == 2 => {
@@ -163,8 +175,5 @@ fn extract_sqrt(egraph: &EGraph, class: EClassId) -> Option<EClassId> {
 
 /// CPU instruction fusion rules for training.
 pub fn fusion_rules() -> Vec<Box<dyn Rewrite>> {
-    vec![
-        FmaFusion::new(),
-        RecipSqrt::new(),
-    ]
+    vec![FmaFusion::new(), RecipSqrt::new()]
 }

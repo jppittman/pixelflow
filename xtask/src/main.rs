@@ -10,8 +10,6 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-mod codegen;
-
 /// Entry point for xtask.
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -21,7 +19,6 @@ fn main() {
         eprintln!("Commands:");
         eprintln!("  bundle-run    Build and run the bundled macOS app");
         eprintln!("  bake-eigen    Parse Stam's eigenstructure binary → Rust consts");
-        eprintln!("  codegen       Generate optimized kernels using pixelflow-search");
         std::process::exit(1);
     }
 
@@ -33,10 +30,6 @@ fn main() {
         }
         "bake-eigen" => {
             bake_eigen();
-        }
-        "codegen" => {
-            let workspace_root = find_workspace_root();
-            codegen::generate_kernels(&workspace_root);
         }
         _ => {
             eprintln!("Unknown command: {}", args[1]);

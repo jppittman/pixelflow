@@ -19,7 +19,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use super::factored::{EdgeAccumulator, ExprNnue, OpEmbeddings, K};
+use super::factored::{EdgeAccumulator, ExprNnue, K, OpEmbeddings};
 use pixelflow_ir::OpKind;
 
 // ============================================================================
@@ -177,11 +177,14 @@ impl InstructionWindow {
 
     /// Evict the oldest instruction from the window.
     fn evict_oldest(&mut self, emb: &OpEmbeddings) {
-        let entry = self.buffer.pop_front()
+        let entry = self
+            .buffer
+            .pop_front()
             .expect("evict_oldest called on empty window — push logic is broken");
 
         for &child_op in &entry.children {
-            self.acc.remove_edge_with_pe(emb, entry.op, child_op, &entry.pe);
+            self.acc
+                .remove_edge_with_pe(emb, entry.op, child_op, &entry.pe);
         }
         self.acc.node_count = self.acc.node_count.saturating_sub(1);
     }

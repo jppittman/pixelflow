@@ -7,7 +7,7 @@ description = "A generic graph search framework for algebraic optimization and s
 [dependencies]
 libm = "0.2.15"
 rand = "0.8"
-pixelflow-ir = { path = "../pixelflow-ir", default-features = false, features = ["alloc", "std"] }
+pixelflow-ir = { path = "../pixelflow-ir", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 

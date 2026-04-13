@@ -6,11 +6,15 @@
 //! - Distributivity and factoring
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
-use crate::egraph::{EGraph, EClassId, ENode, Op, Rewrite, RewriteAction, ops};
-use pixelflow_ir::{Expr, OpKind};
+use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
+use crate::egraph::Pattern as Expr;
+use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Box<Expr> { Box::new(e) }
+fn b(e: Expr) -> Arc<Expr> {
+    Arc::new(e)
+}
 
 // ============================================================================
 // InversePair: The Core Algebraic Relationship
@@ -47,10 +51,18 @@ pub trait InversePair: Send + Sync {
 /// - (x + a) - a = x
 pub struct AddNeg;
 impl InversePair for AddNeg {
-    fn base() -> &'static dyn Op { &ops::Add }
-    fn inverse() -> &'static dyn Op { &ops::Neg }
-    fn derived() -> &'static dyn Op { &ops::Sub }
-    fn identity() -> f32 { 0.0 }
+    fn base() -> &'static dyn Op {
+        &ops::Add
+    }
+    fn inverse() -> &'static dyn Op {
+        &ops::Neg
+    }
+    fn derived() -> &'static dyn Op {
+        &ops::Sub
+    }
+    fn identity() -> f32 {
+        0.0
+    }
 }
 
 /// Multiplication and Reciprocal are inverses.
@@ -60,10 +72,18 @@ impl InversePair for AddNeg {
 /// - (x * a) / a = x
 pub struct MulRecip;
 impl InversePair for MulRecip {
-    fn base() -> &'static dyn Op { &ops::Mul }
-    fn inverse() -> &'static dyn Op { &ops::Recip }
-    fn derived() -> &'static dyn Op { &ops::Div }
-    fn identity() -> f32 { 1.0 }
+    fn base() -> &'static dyn Op {
+        &ops::Mul
+    }
+    fn inverse() -> &'static dyn Op {
+        &ops::Recip
+    }
+    fn derived() -> &'static dyn Op {
+        &ops::Div
+    }
+    fn identity() -> f32 {
+        1.0
+    }
 }
 
 // ============================================================================
@@ -101,10 +121,14 @@ impl<T: InversePair> Default for Canonicalize<T> {
 }
 
 impl<T: InversePair> Rewrite for Canonicalize<T> {
-    fn name(&self) -> &str { "canonicalize" }
+    fn name(&self) -> &str {
+        "canonicalize"
+    }
 
     fn apply(&self, _egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        if !node_matches_op(node, T::derived()) { return None; }
+        if !node_matches_op(node, T::derived()) {
+            return None;
+        }
         let (a, b) = node.binary_operands()?;
 
         Some(RewriteAction::Canonicalize {
@@ -117,7 +141,11 @@ impl<T: InversePair> Rewrite for Canonicalize<T> {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Derived(V0, V1)
-        Some(Expr::Binary(T::derived().kind(), b(Expr::Var(0)), b(Expr::Var(1))))
+        Some(Expr::Binary(
+            T::derived().kind(),
+            b(Expr::Var(0)),
+            b(Expr::Var(1)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -150,13 +178,22 @@ impl<T: InversePair> Default for Involution<T> {
 }
 
 impl<T: InversePair> Rewrite for Involution<T> {
-    fn name(&self) -> &str { "involution" }
+    fn name(&self) -> &str {
+        "involution"
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        if !node_matches_op(node, T::inverse()) { return None; }
+        if !node_matches_op(node, T::inverse()) {
+            return None;
+        }
 
         let children = node.children();
-        if children.len() != 1 { return None; }
+        if children.len() != 1 {
+            return None;
+        }
         let inner_id = children[0];
 
         for inner_node in egraph.nodes(inner_id) {
@@ -202,10 +239,17 @@ impl<T: InversePair> Default for Cancellation<T> {
 }
 
 impl<T: InversePair> Rewrite for Cancellation<T> {
-    fn name(&self) -> &str { "cancellation" }
+    fn name(&self) -> &str {
+        "cancellation"
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        if !node_matches_op(node, T::derived()) { return None; }
+        if !node_matches_op(node, T::derived()) {
+            return None;
+        }
         let (numerator, canceller) = node.binary_operands()?;
 
         for inner_node in egraph.nodes(numerator) {
@@ -229,7 +273,11 @@ impl<T: InversePair> Rewrite for Cancellation<T> {
         // Derived(Base(V0, V1), V1)
         Some(Expr::Binary(
             T::derived().kind(),
-            b(Expr::Binary(T::base().kind(), b(Expr::Var(0)), b(Expr::Var(1)))),
+            b(Expr::Binary(
+                T::base().kind(),
+                b(Expr::Var(0)),
+                b(Expr::Var(1)),
+            )),
             b(Expr::Var(1)),
         ))
     }
@@ -260,10 +308,14 @@ impl<T: InversePair> Default for InverseAnnihilation<T> {
 }
 
 impl<T: InversePair> Rewrite for InverseAnnihilation<T> {
-    fn name(&self) -> &str { "inverse-annihilation" }
+    fn name(&self) -> &str {
+        "inverse-annihilation"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        if !node_matches_op(node, T::base()) { return None; }
+        if !node_matches_op(node, T::base()) {
+            return None;
+        }
         let (a, b) = node.binary_operands()?;
 
         // x ⊕ inv(x) → identity
@@ -322,11 +374,15 @@ impl Associative {
 }
 
 impl Rewrite for Associative {
-    fn name(&self) -> &str { "associative" }
+    fn name(&self) -> &str {
+        "associative"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.op.kind() { return None; }
+        if node_op.kind() != self.op.kind() {
+            return None;
+        }
 
         let (left, right) = node.binary_operands()?;
 
@@ -350,13 +406,21 @@ impl Rewrite for Associative {
     fn lhs_template(&self) -> Option<Expr> {
         // Op(Op(V0, V1), V2)
         let k = self.op.kind();
-        Some(Expr::Binary(k, b(Expr::Binary(k, b(Expr::Var(0)), b(Expr::Var(1)))), b(Expr::Var(2))))
+        Some(Expr::Binary(
+            k,
+            b(Expr::Binary(k, b(Expr::Var(0)), b(Expr::Var(1)))),
+            b(Expr::Var(2)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
         // Op(V0, Op(V1, V2))
         let k = self.op.kind();
-        Some(Expr::Binary(k, b(Expr::Var(0)), b(Expr::Binary(k, b(Expr::Var(1)), b(Expr::Var(2))))))
+        Some(Expr::Binary(
+            k,
+            b(Expr::Var(0)),
+            b(Expr::Binary(k, b(Expr::Var(1)), b(Expr::Var(2)))),
+        ))
     }
 }
 
@@ -372,11 +436,15 @@ impl ReverseAssociative {
 }
 
 impl Rewrite for ReverseAssociative {
-    fn name(&self) -> &str { "reverse-associative" }
+    fn name(&self) -> &str {
+        "reverse-associative"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.op.kind() { return None; }
+        if node_op.kind() != self.op.kind() {
+            return None;
+        }
 
         let (left, right) = node.binary_operands()?;
 
@@ -401,13 +469,21 @@ impl Rewrite for ReverseAssociative {
     fn lhs_template(&self) -> Option<Expr> {
         // Op(V0, Op(V1, V2))
         let k = self.op.kind();
-        Some(Expr::Binary(k, b(Expr::Var(0)), b(Expr::Binary(k, b(Expr::Var(1)), b(Expr::Var(2))))))
+        Some(Expr::Binary(
+            k,
+            b(Expr::Var(0)),
+            b(Expr::Binary(k, b(Expr::Var(1)), b(Expr::Var(2)))),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
         // Op(Op(V0, V1), V2)
         let k = self.op.kind();
-        Some(Expr::Binary(k, b(Expr::Binary(k, b(Expr::Var(0)), b(Expr::Var(1)))), b(Expr::Var(2))))
+        Some(Expr::Binary(
+            k,
+            b(Expr::Binary(k, b(Expr::Var(0)), b(Expr::Var(1)))),
+            b(Expr::Var(2)),
+        ))
     }
 }
 
@@ -423,14 +499,20 @@ impl Commutative {
 }
 
 impl Rewrite for Commutative {
-    fn name(&self) -> &str { "commutative" }
+    fn name(&self) -> &str {
+        "commutative"
+    }
 
     fn apply(&self, _egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.op.kind() { return None; }
+        if node_op.kind() != self.op.kind() {
+            return None;
+        }
 
         let (a, b) = node.binary_operands()?;
-        if a == b { return None; }
+        if a == b {
+            return None;
+        }
 
         let swapped = ENode::Op {
             op: self.op,
@@ -441,12 +523,20 @@ impl Rewrite for Commutative {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Op(V0, V1)
-        Some(Expr::Binary(self.op.kind(), b(Expr::Var(0)), b(Expr::Var(1))))
+        Some(Expr::Binary(
+            self.op.kind(),
+            b(Expr::Var(0)),
+            b(Expr::Var(1)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
         // Op(V1, V0)
-        Some(Expr::Binary(self.op.kind(), b(Expr::Var(1)), b(Expr::Var(0))))
+        Some(Expr::Binary(
+            self.op.kind(),
+            b(Expr::Var(1)),
+            b(Expr::Var(0)),
+        ))
     }
 }
 
@@ -463,11 +553,15 @@ impl Distributive {
 }
 
 impl Rewrite for Distributive {
-    fn name(&self) -> &str { "distribute" }
+    fn name(&self) -> &str {
+        "distribute"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.outer.kind() { return None; }
+        if node_op.kind() != self.outer.kind() {
+            return None;
+        }
 
         let (a, other) = node.binary_operands()?;
 
@@ -494,7 +588,11 @@ impl Rewrite for Distributive {
         Some(Expr::Binary(
             self.outer.kind(),
             b(Expr::Var(0)),
-            b(Expr::Binary(self.inner.kind(), b(Expr::Var(1)), b(Expr::Var(2)))),
+            b(Expr::Binary(
+                self.inner.kind(),
+                b(Expr::Var(1)),
+                b(Expr::Var(2)),
+            )),
         ))
     }
 
@@ -523,22 +621,30 @@ impl Factor {
 }
 
 impl Rewrite for Factor {
-    fn name(&self) -> &str { "factor" }
+    fn name(&self) -> &str {
+        "factor"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.outer.kind() { return None; }
+        if node_op.kind() != self.outer.kind() {
+            return None;
+        }
 
         let (left, right) = node.binary_operands()?;
 
         for l_node in egraph.nodes(left) {
             let l_op = l_node.op()?;
-            if l_op.kind() != self.inner.kind() { continue; }
+            if l_op.kind() != self.inner.kind() {
+                continue;
+            }
             let (la, lb) = l_node.binary_operands()?;
 
             for r_node in egraph.nodes(right) {
                 let r_op = r_node.op()?;
-                if r_op.kind() != self.inner.kind() { continue; }
+                if r_op.kind() != self.inner.kind() {
+                    continue;
+                }
                 let (ra, rb) = r_node.binary_operands()?;
 
                 let (common, unique_l, unique_r) = if egraph.find(la) == egraph.find(ra) {
@@ -581,7 +687,11 @@ impl Rewrite for Factor {
         Some(Expr::Binary(
             self.inner.kind(),
             b(Expr::Var(0)),
-            b(Expr::Binary(self.outer.kind(), b(Expr::Var(1)), b(Expr::Var(2)))),
+            b(Expr::Binary(
+                self.outer.kind(),
+                b(Expr::Var(1)),
+                b(Expr::Var(2)),
+            )),
         ))
     }
 }
@@ -598,11 +708,18 @@ impl Identity {
 }
 
 impl Rewrite for Identity {
-    fn name(&self) -> &str { "identity" }
+    fn name(&self) -> &str {
+        "identity"
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.op.kind() { return None; }
+        if node_op.kind() != self.op.kind() {
+            return None;
+        }
 
         let id_val = self.op.identity()?;
         let (a, b) = node.binary_operands()?;
@@ -619,7 +736,11 @@ impl Rewrite for Identity {
     fn lhs_template(&self) -> Option<Expr> {
         // Op(V0, Const(identity))
         let id_val = self.op.identity()?;
-        Some(Expr::Binary(self.op.kind(), b(Expr::Var(0)), b(Expr::Const(id_val))))
+        Some(Expr::Binary(
+            self.op.kind(),
+            b(Expr::Var(0)),
+            b(Expr::Const(id_val)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -640,11 +761,18 @@ impl Annihilator {
 }
 
 impl Rewrite for Annihilator {
-    fn name(&self) -> &str { "annihilator" }
+    fn name(&self) -> &str {
+        "annihilator"
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.op.kind() { return None; }
+        if node_op.kind() != self.op.kind() {
+            return None;
+        }
 
         let zero_val = self.op.annihilator()?;
         let (a, b) = node.binary_operands()?;
@@ -658,7 +786,11 @@ impl Rewrite for Annihilator {
     fn lhs_template(&self) -> Option<Expr> {
         // Op(V0, Const(annihilator))
         let ann = self.op.annihilator()?;
-        Some(Expr::Binary(self.op.kind(), b(Expr::Var(0)), b(Expr::Const(ann))))
+        Some(Expr::Binary(
+            self.op.kind(),
+            b(Expr::Var(0)),
+            b(Expr::Const(ann)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -680,12 +812,18 @@ impl Idempotent {
 }
 
 impl Rewrite for Idempotent {
-    fn name(&self) -> &str { "idempotent" }
+    fn name(&self) -> &str {
+        "idempotent"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let node_op = node.op()?;
-        if node_op.kind() != self.op.kind() { return None; }
-        if !self.op.is_idempotent() { return None; }
+        if node_op.kind() != self.op.kind() {
+            return None;
+        }
+        if !self.op.is_idempotent() {
+            return None;
+        }
 
         let (a, b) = node.binary_operands()?;
 
@@ -697,7 +835,11 @@ impl Rewrite for Idempotent {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Op(V0, V0)
-        Some(Expr::Binary(self.op.kind(), b(Expr::Var(0)), b(Expr::Var(0))))
+        Some(Expr::Binary(
+            self.op.kind(),
+            b(Expr::Var(0)),
+            b(Expr::Var(0)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -727,13 +869,21 @@ impl Doubling {
 }
 
 impl Rewrite for Doubling {
-    fn name(&self) -> &str { "doubling" }
+    fn name(&self) -> &str {
+        "doubling"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Add(a, b) where a == b
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != ops::Add.kind() { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != ops::Add.kind() {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let a = children[0];
         let b = children[1];
@@ -754,7 +904,11 @@ impl Rewrite for Doubling {
 
     fn rhs_template(&self) -> Option<Expr> {
         // Mul(Const(2.0), V0)
-        Some(Expr::Binary(OpKind::Mul, b(Expr::Const(2.0)), b(Expr::Var(0))))
+        Some(Expr::Binary(
+            OpKind::Mul,
+            b(Expr::Const(2.0)),
+            b(Expr::Var(0)),
+        ))
     }
 }
 
@@ -770,13 +924,21 @@ impl Halving {
 }
 
 impl Rewrite for Halving {
-    fn name(&self) -> &str { "halving" }
+    fn name(&self) -> &str {
+        "halving"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Mul(2, a) or Mul(a, 2)
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != ops::Mul.kind() { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != ops::Mul.kind() {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let left = children[0];
         let right = children[1];
@@ -795,7 +957,11 @@ impl Rewrite for Halving {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Mul(Const(2.0), V0)
-        Some(Expr::Binary(OpKind::Mul, b(Expr::Const(2.0)), b(Expr::Var(0))))
+        Some(Expr::Binary(
+            OpKind::Mul,
+            b(Expr::Const(2.0)),
+            b(Expr::Var(0)),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -822,10 +988,17 @@ impl ConstantFold {
 }
 
 impl Rewrite for ConstantFold {
-    fn name(&self) -> &str { "constant-fold" }
+    fn name(&self) -> &str {
+        "constant-fold"
+    }
+    fn is_destructive(&self) -> bool {
+        true
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        let ENode::Op { op, children } = node else { return None };
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
 
         let kind = op.kind();
 

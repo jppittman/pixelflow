@@ -3,9 +3,13 @@ CoreTerm.app
 .DS_Store
 /vendor
 
-
 .gemini*/
 gha-creds-*.json
 *.ppm
 *.log
 *.db
+*.pyc
+.code-index/
+
+# Training artifacts (regenerated, large)
+pixelflow-pipeline/data/*

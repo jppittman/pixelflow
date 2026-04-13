@@ -11,10 +11,15 @@
 //! `1 / sqrt(x)` → `rsqrt(x)` — fast approximate on x86 (rsqrtps/vrsqrtps)
 //!
 
-use pixelflow_ir::{Expr, OpKind};
-use crate::egraph::{EGraph, EClassId, ENode, Rewrite, RewriteAction, ops};
+use std::sync::Arc;
 
-fn b(e: Expr) -> Box<Expr> { Box::new(e) }
+use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, ops};
+use crate::egraph::Pattern as Expr;
+use pixelflow_ir::OpKind;
+
+fn b(e: Expr) -> Arc<Expr> {
+    Arc::new(e)
+}
 
 // ============================================================================
 // FMA Fusion
@@ -39,13 +44,21 @@ impl Default for FmaFusion {
 }
 
 impl Rewrite for FmaFusion {
-    fn name(&self) -> &str { "fma-fusion" }
+    fn name(&self) -> &str {
+        "fma-fusion"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Add(Mul(a, b), c)
-        let ENode::Op { op, children } = node else { return None };
-        if op.kind() != OpKind::Add { return None; }
-        if children.len() != 2 { return None; }
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
+        if op.kind() != OpKind::Add {
+            return None;
+        }
+        if children.len() != 2 {
+            return None;
+        }
 
         let left = children[0];
         let right = children[1];
@@ -112,11 +125,15 @@ impl Default for RecipSqrt {
 }
 
 impl Rewrite for RecipSqrt {
-    fn name(&self) -> &str { "recip-sqrt" }
+    fn name(&self) -> &str {
+        "recip-sqrt"
+    }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         // Match: Div(1, Sqrt(x)) or Recip(Sqrt(x))
-        let ENode::Op { op, children } = node else { return None };
+        let ENode::Op { op, children } = node else {
+            return None;
+        };
 
         match op.kind() {
             OpKind::Div if children.len() == 2 => {
@@ -153,7 +170,10 @@ impl Rewrite for RecipSqrt {
 
     fn lhs_template(&self) -> Option<Expr> {
         // Recip(Sqrt(V0))
-        Some(Expr::Unary(OpKind::Recip, b(Expr::Unary(OpKind::Sqrt, b(Expr::Var(0))))))
+        Some(Expr::Unary(
+            OpKind::Recip,
+            b(Expr::Unary(OpKind::Sqrt, b(Expr::Var(0)))),
+        ))
     }
 
     fn rhs_template(&self) -> Option<Expr> {
@@ -210,8 +230,5 @@ fn extract_sqrt(egraph: &EGraph, class: EClassId) -> Option<EClassId> {
 /// - FMA: `a * b + c` → `muladd(a, b, c)` (FmaFusion)
 /// - Rsqrt: `1/sqrt(x)` → `rsqrt(x)` (RecipSqrt)
 pub fn fusion_rules() -> Vec<Box<dyn Rewrite>> {
-    vec![
-        FmaFusion::new(),
-        RecipSqrt::new(),
-    ]
+    vec![FmaFusion::new(), RecipSqrt::new()]
 }

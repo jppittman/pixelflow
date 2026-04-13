@@ -17,7 +17,7 @@
 
 use pixelflow_search::nnue::{BwdGenConfig, BwdGenerator, ExprNnue, RuleTemplates};
 
-use crate::jit_bench::benchmark_jit;
+use crate::jit_bench::benchmark_jit_arena;
 
 /// Number of parameters in the ES search space.
 const ES_DIM: usize = 6;
@@ -136,7 +136,10 @@ impl GenEs {
             .collect();
 
         if valid.is_empty() {
-            eprintln!("[gen_es] ALL {} candidates failed JIT; skipping update", self.population);
+            eprintln!(
+                "[gen_es] ALL {} candidates failed JIT; skipping update",
+                self.population
+            );
             return denormalize(&self.mu);
         }
 
@@ -181,7 +184,12 @@ impl GenEs {
                 grad[d].is_finite(),
                 "NaN/Inf in grad[{d}]={}, scale={scale}, n={n}, sigma={}, mu={:?}, \
                  epsilons={:?}, normalized={:?}, fitnesses={:?}",
-                grad[d], self.sigma, self.mu, epsilons, normalized, fitnesses
+                grad[d],
+                self.sigma,
+                self.mu,
+                epsilons,
+                normalized,
+                fitnesses
             );
         }
 
@@ -206,9 +214,15 @@ impl GenEs {
 
     /// Evaluate a single candidate config with a pre-determined seed.
     ///
-    /// Generates `samples_per_candidate` expressions, benchmarks each via JIT,
-    /// and returns the mean |predict_log_cost - log_ns(benchmark)| across
-    /// successful benchmarks. Returns None if ALL JIT evaluations fail.
+    /// Returns a composite fitness score combining:
+    /// - Judge prediction error: `|predict_log_cost(expr) - log_ns(jit)|`
+    ///   (higher = judge blind spot = more valuable training signal)
+    /// - Rewrite richness penalty: configs that produce `rewrites_applied == 0`
+    ///   generate trajectories where `unoptimized == optimized`, giving the
+    ///   e-graph nothing to simplify and producing empty trajectories.
+    ///   Such configs are penalized by subtracting from their score.
+    ///
+    /// Returns None if ALL JIT evaluations fail.
     fn evaluate_candidate_with_seed(
         &self,
         config: &BwdGenConfig,
@@ -219,17 +233,40 @@ impl GenEs {
 
         let mut error_sum = 0.0f32;
         let mut count = 0u32;
+        let mut zero_rewrite_count = 0u32;
 
         for _ in 0..self.samples_per_candidate {
-            let pair = bwd_gen.generate();
-            // Benchmark the optimized expression (the one the judge should predict well).
-            let expr = &pair.optimized;
+            let pair = bwd_gen.generate_arena();
 
-            match benchmark_jit(expr) {
+            // Track how often junkification fails to produce any rewrites.
+            // Configs that regularly produce rewrites_applied==0 generate
+            // unoptimized==optimized seeds which produce empty trajectories.
+            if pair.rewrites_applied == 0 {
+                zero_rewrite_count += 1;
+            }
+
+            // Skip oversized expressions: the AArch64 JIT uses 12-bit LDR offsets
+            // (max 4095 entries), so expressions with too many nodes overflow the
+            // constant pool. 150 nodes is a safe ceiling that matches self_play.rs.
+            //
+            // Use arena.node_count_subtree for the optimized subtree node count
+            // (O(N) traversal, but avoids materializing the full Expr just
+            // to count nodes before the size check).
+            if pair.arena.node_count_subtree(pair.optimized) > 150 {
+                continue;
+            }
+
+            // Benchmark and evaluate directly from the arena.
+            match benchmark_jit_arena(&pair.arena, pair.optimized) {
                 Ok(b) => {
                     let ns = b.ns;
                     let actual = log_ns(ns);
-                    let predicted = judge.predict_log_cost(expr);
+                    let acc = pixelflow_search::nnue::EdgeAccumulator::from_arena_dedup(
+                        &pair.arena,
+                        pair.optimized,
+                        &judge.embeddings,
+                    );
+                    let predicted = judge.predict_log_cost_with_features(&acc);
                     let err = libm::fabsf(predicted - actual);
                     if !err.is_finite() {
                         eprintln!(
@@ -247,10 +284,20 @@ impl GenEs {
         }
 
         if count == 0 {
-            None
-        } else {
-            Some(error_sum / count as f32)
+            return None;
         }
+
+        let mean_error = error_sum / count as f32;
+
+        // Penalize configs that frequently produce zero-rewrite pairs.
+        // The penalty scales linearly with the fraction of zero-rewrite samples:
+        //   penalty = mean_error * zero_rewrite_fraction
+        // This subtracts from the fitness, steering ES away from configs
+        // that can't junkify and would produce empty trajectories.
+        let zero_rewrite_fraction = zero_rewrite_count as f32 / self.samples_per_candidate as f32;
+        let richness_penalty = mean_error * zero_rewrite_fraction;
+
+        Some(mean_error - richness_penalty)
     }
 
     // ---- PRNG (LCG, same pattern as rest of codebase) ----
@@ -281,23 +328,28 @@ impl GenEs {
 
 /// Normalize a `BwdGenConfig` into [0,1]^6.
 ///
-/// | Param              | Range     | Formula               |
-/// |--------------------|-----------|-----------------------|
-/// | max_depth          | [15, 60]  | (v - 15) / 45        |
-/// | leaf_prob          | [0.05, 0.8] | (v - 0.05) / 0.75 |
-/// | num_vars           | [1, 4]    | (v - 1) / 3          |
-/// | fused_op_prob      | [0.0, 0.8]| v / 0.8              |
-/// | max_junkify_passes | [0, 10]   | v / 10               |
-/// | junkify_prob       | [0.0, 1.0]| v                     |
+/// | Param              | Range      | Formula                  |
+/// |--------------------|------------|--------------------------|
+/// | max_depth          | [5, 20]    | (v - 5) / 15             |
+/// | leaf_prob          | [0.05, 0.8]| (v - 0.05) / 0.75        |
+/// | num_vars           | [1, 4]     | (v - 1) / 3              |
+/// | fused_op_prob      | [0.0, 0.8] | v / 0.8                  |
+/// | max_junkify_passes | [1, 10]    | (v - 1) / 9              |
+/// | junkify_prob       | [0.1, 1.0] | (v - 0.1) / 0.9          |
+///
+/// `max_junkify_passes` minimum is 1: configs with 0 passes can never apply
+/// any junkify rewrites, producing `unoptimized == optimized` and empty
+/// trajectories. Similarly `junkify_prob` minimum is 0.1 to ensure nodes
+/// are visited with non-negligible probability.
 #[must_use]
 pub fn normalize(config: &BwdGenConfig) -> [f32; ES_DIM] {
     [
-        (config.max_depth as f32 - 15.0) / 45.0,
+        (config.max_depth as f32 - 5.0) / 15.0,
         (config.leaf_prob - 0.05) / 0.75,
         (config.num_vars as f32 - 1.0) / 3.0,
         config.fused_op_prob / 0.8,
-        config.max_junkify_passes as f32 / 10.0,
-        config.junkify_prob,
+        (config.max_junkify_passes as f32 - 1.0) / 9.0,
+        (config.junkify_prob - 0.1) / 0.9,
     ]
 }
 
@@ -315,21 +367,27 @@ pub fn denormalize(params: &[f32; ES_DIM]) -> BwdGenConfig {
         clamp01(params[5]),
     ];
 
-    let max_depth_f = p[0] * 45.0 + 15.0;
+    let max_depth_f = p[0] * 15.0 + 5.0;
     let leaf_prob = p[1] * 0.75 + 0.05;
     let num_vars_f = p[2] * 3.0 + 1.0;
     let fused_op_prob = p[3] * 0.8;
-    let max_junkify_f = p[4] * 10.0;
-    let junkify_prob = p[5];
+    // ES range for max_junkify_passes is [1, 10]: lower bound is 1, not 0.
+    // A config with max_junkify_passes=0 can never apply any junkify rewrites,
+    // so unoptimized == optimized and the e-graph produces empty trajectories.
+    let max_junkify_f = p[4] * 9.0 + 1.0;
+    // junkify_prob must stay above a floor so at least some nodes are visited.
+    // ES range [0.1, 1.0] prevents the degenerate case of prob≈0 where
+    // every node is skipped and rewrites_applied stays at 0.
+    let junkify_prob = p[5] * 0.9 + 0.1;
 
     BwdGenConfig {
         max_depth: libm::roundf(max_depth_f) as usize,
         leaf_prob,
         num_vars: (libm::roundf(num_vars_f) as usize).min(4),
         fused_op_prob,
-        max_junkify_passes: libm::roundf(max_junkify_f) as usize,
+        max_junkify_passes: (libm::roundf(max_junkify_f) as usize).max(1),
         junkify_prob,
-        max_junkified_nodes: 500, // Safety cap — not ES-tunable
+        max_junkified_nodes: 80, // Max *additional* nodes from junkification (relative growth cap)
     }
 }
 
@@ -339,7 +397,13 @@ pub fn denormalize(params: &[f32; ES_DIM]) -> BwdGenConfig {
 #[must_use]
 pub fn log_ns(ns: f64) -> f32 {
     assert!(!ns.is_nan(), "log_ns called with NaN");
-    let clamped = if ns < 1e-3 { 1e-3 } else if ns > 1e9 { 1e9 } else { ns };
+    let clamped = if ns < 1e-3 {
+        1e-3
+    } else if ns > 1e9 {
+        1e9
+    } else {
+        ns
+    };
     libm::logf(clamped as f32)
 }
 
@@ -365,7 +429,7 @@ mod tests {
     #[test]
     fn test_normalize_denormalize_roundtrip() {
         let original = BwdGenConfig {
-            max_depth: 30, // Within ES range [15, 60]
+            max_depth: 10, // Within ES range [5, 20]
             ..BwdGenConfig::default()
         };
         let normed = normalize(&original);
@@ -421,39 +485,57 @@ mod tests {
         // All below minimum → should clamp to range minimums.
         let below = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0];
         let config = denormalize(&below);
-        assert_eq!(config.max_depth, 15, "max_depth should clamp to 15, got {}", config.max_depth);
+        assert_eq!(
+            config.max_depth, 5,
+            "max_depth should clamp to 5, got {}",
+            config.max_depth
+        );
         assert!(
             libm::fabsf(config.leaf_prob - 0.05) < 0.01,
             "leaf_prob should clamp to 0.05, got {}",
             config.leaf_prob
         );
-        assert_eq!(config.num_vars, 1, "num_vars should clamp to 1, got {}", config.num_vars);
+        assert_eq!(
+            config.num_vars, 1,
+            "num_vars should clamp to 1, got {}",
+            config.num_vars
+        );
         assert!(
             libm::fabsf(config.fused_op_prob) < 0.01,
             "fused_op_prob should clamp to 0.0, got {}",
             config.fused_op_prob
         );
+        // min is 1 (not 0) — configs with 0 passes can never junkify
         assert_eq!(
-            config.max_junkify_passes, 0,
-            "max_junkify_passes should clamp to 0, got {}",
+            config.max_junkify_passes, 1,
+            "max_junkify_passes should clamp to 1, got {}",
             config.max_junkify_passes
         );
+        // min is 0.1 (not 0.0) — prob=0 means no nodes are ever visited
         assert!(
-            libm::fabsf(config.junkify_prob) < 0.01,
-            "junkify_prob should clamp to 0.0, got {}",
+            libm::fabsf(config.junkify_prob - 0.1) < 0.01,
+            "junkify_prob should clamp to 0.1, got {}",
             config.junkify_prob
         );
 
         // All above maximum → should clamp to range maximums.
         let above = [2.0, 2.0, 2.0, 2.0, 2.0, 2.0];
         let config = denormalize(&above);
-        assert_eq!(config.max_depth, 60, "max_depth should clamp to 60, got {}", config.max_depth);
+        assert_eq!(
+            config.max_depth, 20,
+            "max_depth should clamp to 20, got {}",
+            config.max_depth
+        );
         assert!(
             libm::fabsf(config.leaf_prob - 0.80) < 0.01,
             "leaf_prob should clamp to 0.80, got {}",
             config.leaf_prob
         );
-        assert_eq!(config.num_vars, 4, "num_vars should clamp to 4, got {}", config.num_vars);
+        assert_eq!(
+            config.num_vars, 4,
+            "num_vars should clamp to 4, got {}",
+            config.num_vars
+        );
         assert!(
             libm::fabsf(config.fused_op_prob - 0.80) < 0.01,
             "fused_op_prob should clamp to 0.80, got {}",

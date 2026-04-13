@@ -414,10 +414,7 @@ impl SimdOps for F32x4 {
         let one = f32x4_splat(1.0);
         let mask_large = f32x4_gt(r_abs, one);
         let recip_r = f32x4_div(one, r_abs);
-        let atan_large = f32x4_sub(
-            f32x4_splat(PI_2),
-            f32x4_mul(recip_r, atan_approx),
-        );
+        let atan_large = f32x4_sub(f32x4_splat(PI_2), f32x4_mul(recip_r, atan_approx));
         let atan_val = v128_bitselect(atan_large, atan_approx, mask_large);
 
         let y_abs = f32x4_abs(y);
@@ -427,7 +424,11 @@ impl SimdOps for F32x4 {
         let zero = f32x4_splat(0.0);
         let mask_neg_x = f32x4_lt(x_val, zero);
         let correction = f32x4_mul(f32x4_splat(PI), sign_y);
-        Self(v128_bitselect(f32x4_sub(atan_signed, correction), atan_signed, mask_neg_x))
+        Self(v128_bitselect(
+            f32x4_sub(atan_signed, correction),
+            atan_signed,
+            mask_neg_x,
+        ))
     }
 
     #[inline(always)]
