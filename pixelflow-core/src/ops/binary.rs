@@ -17,9 +17,9 @@
 //! let auto = x / Sqrt(y);            // Becomes Mul<X, Rsqrt<Y>> at compile time!
 //! ```
 
+use crate::Field;
 use crate::Manifold;
 use crate::jet::Jet3;
-use crate::Field;
 use pixelflow_compiler::Element;
 
 /// Addition: L + R

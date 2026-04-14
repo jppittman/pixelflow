@@ -20,9 +20,9 @@
 //! - No finite differences, no extra evaluations
 
 use crate::mesh::{Point3, QuadMesh};
+use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Field, Manifold, ManifoldExt};
-use pixelflow_compiler::ManifoldExpr;
 
 /// The 4D Jet3 domain type for 3D ray tracing autodiff.
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);
@@ -465,7 +465,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_regular_patch() {
+    fn patch_should_be_extraordinary_when_valences_are_one() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -473,16 +473,25 @@ v 1.0 1.0 0.0
 v 0.0 1.0 0.0
 f 1 2 3 4
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
-        let patch = SubdivisionPatch::from_mesh(&mesh, 0).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj)))
+            .expect("Failed to parse QuadMesh from obj string");
+        let patch = SubdivisionPatch::from_mesh(&mesh, 0)
+            .expect("Failed to create SubdivisionPatch from mesh");
 
         // All corners have valence 1 (only one face)
-        assert_eq!(patch.corner_valences, [1, 1, 1, 1]);
-        assert!(patch.is_extraordinary()); // Valence 1 is extraordinary
+        assert_eq!(
+            patch.corner_valences,
+            [1, 1, 1, 1],
+            "Corner valences must be all 1s"
+        );
+        assert!(
+            patch.is_extraordinary(),
+            "Valence 1 must be considered extraordinary"
+        ); // Valence 1 is extraordinary
     }
 
     #[test]
-    fn test_limit_eval() {
+    fn limit_eval_should_fallback_when_extraordinary() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -490,8 +499,10 @@ v 1.0 1.0 0.0
 v 0.0 1.0 0.0
 f 1 2 3 4
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
-        let patch = SubdivisionPatch::from_mesh(&mesh, 0).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj)))
+            .expect("Failed to parse QuadMesh from obj string");
+        let patch = SubdivisionPatch::from_mesh(&mesh, 0)
+            .expect("Failed to create SubdivisionPatch from mesh");
 
         // Evaluate at center (0.5, 0.5) using Jet3
         let u = Jet3::constant(Field::from(0.5));
@@ -505,11 +516,14 @@ f 1 2 3 4
 
         // For bilinear fallback, center should be roughly (0.5, 0.5, 0.0)
         // We can't easily check SIMD Field values in tests, so this is a smoke test
-        assert_eq!(patch.is_extraordinary(), true);
+        assert!(
+            patch.is_extraordinary(),
+            "Bilinear fallback patch must be extraordinary"
+        );
     }
 
     #[test]
-    fn test_surface_stats() {
+    fn stats_should_count_patches_when_surface_created() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -520,10 +534,15 @@ v 2.0 1.0 0.0
 f 1 2 3 4
 f 2 5 6 3
 ";
-        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj))).unwrap();
-        let surface = SubdivisionSurface::from_mesh(mesh).unwrap();
+        let mesh = QuadMesh::from_obj(BufReader::new(Cursor::new(obj)))
+            .expect("Failed to parse QuadMesh from obj string");
+        let surface = SubdivisionSurface::from_mesh(mesh)
+            .expect("Failed to create SubdivisionSurface from mesh");
         let stats = surface.stats();
 
-        assert_eq!(stats.total_patches, 2);
+        assert_eq!(
+            stats.total_patches, 2,
+            "Surface must contain exactly 2 patches"
+        );
     }
 }
