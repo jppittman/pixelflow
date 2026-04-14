@@ -1100,7 +1100,7 @@ fn analyze_select_guards(
 ) -> Vec<SelectGuard> {
     use alloc::collections::BTreeSet;
 
-    let mut guards = Vec::new();
+    let mut guards = Vec::with_capacity(schedule.len() / 4); // Heuristic capacity for guards
 
     // Build index: ValueId → schedule position
     let mut vid_to_idx = alloc::collections::BTreeMap::new();
