@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-01-01 - Avoid heap reallocation in loop vectors
+**Learning:** Initializing dynamically growing vectors within inner loops (e.g., `Vec::new()` in terminal_app.rs when building raster grids) causes excessive and unnecessary heap reallocation, dragging down rendering throughput.
+**Action:** When a loop generates a vector whose final length is known (e.g., number of columns/rows), always initialize it with `Vec::with_capacity(size)` instead of `Vec::new()` to pre-allocate memory and eliminate reallocation overhead.
