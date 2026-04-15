@@ -19,7 +19,7 @@ pub mod snapshot; // Add this line to declare the module
 // Re-export items for easier use by other modules and within this module
 pub use action::{ControlEvent, EmulatorAction, UserInputAction};
 pub use charset::{map_to_dec_line_drawing, CharacterSet};
-pub use emulator::mouse::{MouseEncodingParams, MouseEventKind};
+pub use emulator::mouse::{MouseEventKind, MouseEncodingParams};
 pub use emulator::TerminalEmulator;
 pub use layout::Layout;
 pub use snapshot::{
