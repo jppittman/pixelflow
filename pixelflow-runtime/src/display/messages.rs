@@ -81,12 +81,6 @@ pub enum DisplayData {
 /// - **Queueing**: Burst-limited (subject to flow control, may queue)
 ///
 /// # Control Message Types
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WindowVisibility {
-    Visible,
-    Hidden,
-}
-
 #[derive(Debug, Clone)]
 pub enum DisplayControl {
     /// Set the window title.
@@ -174,7 +168,7 @@ pub enum DisplayControl {
     ///
     /// - `id`: Window identifier
     /// - `visible`: `true` to show, `false` to hide
-    SetVisible { id: WindowId, visibility: WindowVisibility },
+    SetVisible { id: WindowId, visible: bool },
 
     /// Request an immediate redraw.
     ///
