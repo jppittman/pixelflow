@@ -7,34 +7,24 @@
 //!   binary advantage batches back.
 //! - Rust reads advantages to apply policy gradient updates to the mask head.
 
-/// A single step in a self-play trajectory.
+/// A single epoch-granular step in a self-play trajectory.
+///
+/// One step per epoch: the mask is a multi-dimensional action (all rules decided
+/// simultaneously), applied via clean batch, then one full rebuild.
 #[derive(Debug, Clone)]
 pub struct TrajectoryStep {
-    /// EdgeAccumulator state at time t: 4*K dual sums + edge_count + node_count = 130 floats.
-    pub accumulator_state: Vec<f32>,
-    /// Expression embedding at decision time (EMBED_DIM floats).
-    /// This is one side of the bilinear product: score = expr_embed^T @ M @ rule_embed.
-    pub expression_embedding: Vec<f32>,
-    /// Rule embedding for the selected rule (EMBED_DIM floats).
-    pub rule_embedding: Vec<f32>,
+    /// E-graph VSA state at epoch start (GRAPH_INPUT_DIM floats).
+    pub graph_accumulator_state: Vec<f32>,
+    /// Full mask decision: (rule_idx, action_prob, approved) for EVERY rule.
+    pub mask: Vec<(usize, f32, bool)>,
+    /// Per-rule union counts for approved rules that were attempted: (rule_idx, unions).
+    pub rule_outcomes: Vec<(usize, u32)>,
     /// Remaining node budget: node_budget - egraph.node_count(). Markov state.
     pub budget_remaining: i32,
-    /// Remaining epoch budget: epoch_budget - current_epoch. Markov state.
+    /// Remaining epoch budget: effective_epochs - current_epoch - 1. Markov state.
     pub epochs_remaining: i32,
-    /// sigmoid(bilinear_score) — the Actor's confidence in this rule.
-    pub action_probability: f32,
-    /// Whether the rule actually matched and was applied.
-    pub matched: bool,
-    /// JIT-benchmarked cost of the expression at this epoch (nanoseconds).
-    /// All steps within the same epoch share this value.
+    /// Terminal JIT cost backfilled at trajectory end (nanoseconds).
     pub jit_cost_ns: f64,
-    /// Edge list for embedding gradient flow: (parent_op, child_op, depth).
-    /// Compact representation of the expression structure at decision time.
-    /// Each tuple is (parent OpKind index as u8, child OpKind index as u8, effective depth as u16).
-    pub edges: Vec<(u8, u8, u16)>,
-    /// Graph accumulator state (VSA encoding) at decision time (GRAPH_INPUT_DIM floats).
-    /// Used by the graph backbone for mask scoring (separate from expression EdgeAccumulator).
-    pub graph_accumulator_state: Vec<f32>,
 }
 
 /// A complete self-play trajectory with terminal cost.
@@ -42,7 +32,7 @@ pub struct TrajectoryStep {
 pub struct Trajectory {
     /// Unique identifier for this trajectory.
     pub trajectory_id: String,
-    /// Sequence of steps taken during hill-climbing.
+    /// Sequence of epoch-granular steps taken during hill-climbing.
     pub steps: Vec<TrajectoryStep>,
     /// JIT-benchmarked initial cost before any rewrites (nanoseconds).
     pub initial_cost_ns: f64,
@@ -66,6 +56,9 @@ pub struct Trajectory {
     pub final_accumulator_state: Vec<f32>,
     /// Edge list of the final expression (for embedding gradient flow).
     pub final_edges: Vec<(u8, u8, u16)>,
+    /// Intermediate expression samples collected during saturation (p ≈ 0.1 per epoch).
+    /// Each entry is (acc_state, edges, jit_cost_ns) for a mid-trajectory extraction.
+    pub intermediate_pairs: Vec<(Vec<f32>, Vec<(u8, u8, u16)>, f64)>,
 }
 
 /// Per-trajectory advantage scores produced by the Python Critic.

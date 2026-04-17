@@ -302,6 +302,7 @@ pub fn run_self_play_trajectory(
     // 3. Track best
     let best_cost = initial_cost;
     let mut steps: Vec<TrajectoryStep> = Vec::new();
+    let mut intermediate_pairs: Vec<(Vec<f32>, Vec<(u8, u8, u16)>, f64)> = Vec::new();
 
     let num_rules = rules.len();
 
@@ -318,137 +319,107 @@ pub fn run_self_play_trajectory(
     let epoch_budget = 10 + (traj_hash.wrapping_mul(7) % 51); // [10, 60]
     let effective_epochs = max_epochs.min(epoch_budget);
 
-    // 4. Epoch loop
-    //
-    // KEY DESIGN: Score rules from the e-graph state (GraphAccumulator), not
-    // from a single extracted expression. After rules fire and create new
-    // e-nodes/equivalences, rebuild the GraphAccumulator and re-score to
-    // approve newly-passing rules. The EdgeAccumulator is still built from
-    // the initial expression for the extraction head (TrajectoryStep.accumulator_state).
-    //
-    // No per-epoch extraction or JIT. The only JIT benchmark is the final one.
-    // The transformer critic assigns per-step credit from the single terminal reward.
-
-    let mut acc =
+    // Build initial EdgeAccumulator and edges for initial_accumulator_state.
+    // These are built from the initial expression (before any rewrites) and
+    // are used by the extraction head training path. The epoch loop uses a
+    // fresh GraphAccumulator per epoch for the saturation head.
+    let mut acc_initial =
         EdgeAccumulator::from_arena_dedup(&initial_arena, initial_root, &model.embeddings);
-    acc.node_budget = node_budget as u32;
-    acc.epoch_budget = epoch_budget as u32;
-    let acc_vec = acc_to_vec(&acc);
+    acc_initial.node_budget = node_budget as u32;
+    acc_initial.epoch_budget = epoch_budget as u32;
+    let acc_vec = acc_to_vec(&acc_initial);
     let edges = collect_edges_dedup_arena(&initial_arena, initial_root);
-    let hidden = model.forward_shared(&acc);
-    let expr_embed = model.compute_expr_embed(&hidden);
-    let expr_embed_vec: Vec<f32> = expr_embed.to_vec();
 
-    // Build GraphAccumulator from initial e-graph state (for mask scoring)
-    let mut gacc = build_graph_acc(&egraph, &model.embeddings);
-    gacc.node_budget = node_budget as u32;
-    gacc.epoch_budget = epoch_budget as u32;
-    let mut gacc_vec = gacc_to_vec(&gacc);
+    // 4. Epoch loop: one epoch = one causal step.
+    //
+    // KEY DESIGN: The mask is a multi-dimensional action (all rules decided
+    // simultaneously). Rules are applied via clean batch (no interleaved rebuild),
+    // then a single full rebuild fires. Across epochs, steps form a genuine
+    // causal sequence with meaningful positional encoding.
+    //
+    // No per-epoch JIT benchmark. The only JIT benchmarks are initial and final.
+    // The transformer critic assigns per-step advantages from the single terminal reward.
 
-    // Score all rules via graph pathway
-    let scores = model.mask_score_all_rules_graph(&gacc, rule_embeds);
+    // LCG state for probabilistic intermediate sampling (p ≈ 0.1 per epoch)
+    let mut lcg_state = traj_hash as u64;
 
-    // Determine which rules are approved
-    let mut approved_rules: Vec<(usize, f32)> = Vec::new();
-    for r in 0..num_rules {
-        let score = if r < scores.len() { scores[r] } else { 0.0 };
-        let prob = sigmoid(score);
-        if prob > threshold {
-            approved_rules.push((r, prob));
-        }
-    }
-
-    // Record one step per approved rule (decisions made, not yet applied)
-    for &(r, prob) in &approved_rules {
-        steps.push(TrajectoryStep {
-            accumulator_state: acc_vec.clone(),
-            expression_embedding: expr_embed_vec.clone(),
-            rule_embedding: rule_embeds
-                .get(r)
-                .map_or_else(|| vec![0.0; EMBED_DIM], |e| e.to_vec()),
-            budget_remaining: (node_budget as i32) - (egraph.node_count() as i32),
-            epochs_remaining: effective_epochs as i32,
-            action_probability: prob,
-            matched: false,        // Updated during saturation
-            jit_cost_ns: f64::NAN, // Backfilled with final cost
-            edges: edges.clone(),
-            graph_accumulator_state: gacc_vec.clone(),
-        });
-    }
-
-    // Saturate: apply approved rules, rebuild graph accumulator, re-score
     let t_before_saturate = traj_start.elapsed();
     for epoch in 0..effective_epochs {
         if std::time::Instant::now() > deadline {
-            panic!(
-                "Trajectory {trajectory_id} hit 5s wall-clock deadline at epoch {epoch} \
-                 (node_budget={node_budget}, egraph_nodes={}, epoch_budget={epoch_budget}). \
-                 This means resource budgets are not preventing runaway computation.",
-                egraph.node_count()
+            eprintln!(
+                "Trajectory {trajectory_id} hit 5s deadline at epoch {epoch}"
             );
+            break;
         }
-
         if egraph.node_count() > node_budget {
             break;
         }
 
-        // Apply all approved rules in a single batch — one rebuild per epoch.
-        let any_changed = {
-            let mut batch = egraph.batch();
-            let mut changed = false;
-            for (step_idx, &(r, _)) in approved_rules.iter().enumerate() {
+        // 1. Build GraphAccumulator from current e-graph state
+        let mut gacc = build_graph_acc(&egraph, &model.embeddings);
+        gacc.node_budget = node_budget as u32;
+        gacc.epoch_budget = epoch_budget as u32;
+        let gacc_vec = gacc_to_vec(&gacc);
+
+        // 2. Score ALL rules via graph pathway
+        let scores = model.mask_score_all_rules_graph(&gacc, rule_embeds);
+
+        // 3. Build full mask: every rule gets a decision
+        let mask: Vec<(usize, f32, bool)> = (0..num_rules)
+            .map(|r| {
+                let score = scores.get(r).copied().unwrap_or(0.0);
+                let prob = sigmoid(score);
+                (r, prob, prob > threshold)
+            })
+            .collect();
+
+        // 4. Apply approved rules via clean batch (single rebuild at drop)
+        let mut rule_outcomes: Vec<(usize, u32)> = Vec::new();
+        {
+            let mut batch = egraph.batch_clean();
+            for &(r, _, approved) in &mask {
+                if !approved {
+                    continue;
+                }
                 if batch.node_count() > node_budget {
                     break;
                 }
                 let result = batch.apply_rule(r, node_budget, Some(deadline));
-                if result.changes > 0 {
-                    steps[step_idx].matched = true;
-                    changed = true;
-                }
+                rule_outcomes.push((r, result.changes as u32));
             }
-            changed
-            // rebuild happens here on drop
-        };
-
-        if !any_changed {
-            break;
+            // single full rebuild on drop
         }
 
-        // Rebuild graph accumulator from post-union-find state
-        gacc = build_graph_acc(&egraph, &model.embeddings);
-        gacc.node_budget = node_budget as u32;
-        gacc.epoch_budget = epoch_budget as u32;
-        gacc_vec = gacc_to_vec(&gacc);
+        // 5. Record ONE step for this epoch
+        steps.push(TrajectoryStep {
+            graph_accumulator_state: gacc_vec,
+            mask,
+            rule_outcomes: rule_outcomes.clone(),
+            budget_remaining: (node_budget as i32) - (egraph.node_count() as i32),
+            epochs_remaining: (effective_epochs as i32) - (epoch as i32) - 1,
+            jit_cost_ns: f64::NAN, // backfilled with terminal cost at end
+        });
 
-        // Re-score with accurate graph state
-        let new_scores = model.mask_score_all_rules_graph(&gacc, rule_embeds);
-
-        // Approve newly-passing rules, record new steps with updated gacc
-        let epochs_remaining = (effective_epochs as i32) - (epoch as i32) - 1;
-        for r in 0..num_rules {
-            let score = if r < new_scores.len() {
-                new_scores[r]
-            } else {
-                0.0
-            };
-            let prob = sigmoid(score);
-            if prob > threshold && !approved_rules.iter().any(|(idx, _)| *idx == r) {
-                approved_rules.push((r, prob));
-                steps.push(TrajectoryStep {
-                    accumulator_state: acc_vec.clone(),
-                    expression_embedding: expr_embed_vec.clone(),
-                    rule_embedding: rule_embeds
-                        .get(r)
-                        .map_or_else(|| vec![0.0; EMBED_DIM], |e| e.to_vec()),
-                    budget_remaining: (node_budget as i32) - (egraph.node_count() as i32),
-                    epochs_remaining,
-                    action_probability: prob,
-                    matched: false,
-                    jit_cost_ns: f64::NAN,
-                    edges: edges.clone(),
-                    graph_accumulator_state: gacc_vec.clone(),
-                });
+        // 6. Intermediate extraction-head sample (p ≈ 0.1)
+        lcg_state = lcg_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        if (lcg_state >> 33) % 10 == 0 {
+            let (mid_arena, mid_root, _) = extract_neural_to_arena(&egraph, root, model);
+            if !mid_arena.has_degenerate(mid_root) {
+                if let Ok(bench) = benchmark_jit_arena(&mid_arena, mid_root) {
+                    let mid_acc = EdgeAccumulator::from_arena_dedup(
+                        &mid_arena, mid_root, &model.embeddings,
+                    );
+                    let mid_edges = collect_edges_dedup_arena(&mid_arena, mid_root);
+                    intermediate_pairs.push((acc_to_vec(&mid_acc), mid_edges, bench.ns));
+                }
             }
+        }
+
+        // 7. Check convergence: stop if no approved rule produced any unions
+        if rule_outcomes.iter().all(|(_, u)| *u == 0) {
+            break;
         }
     }
 
@@ -522,13 +493,12 @@ pub fn run_self_play_trajectory(
              \x20 max_diff={max_diff:.6} epsilon={EQUIV_EPSILON}\n\
              \x20 initial expr: {}\n\
              \x20 final   expr: {}\n\
-             \x20 steps: {} ({} matched)",
+             \x20 steps: {}",
             initial_bench.output,
             final_bench.output,
             arena_to_kernel_code(&initial_arena, initial_root),
             arena_to_kernel_code(&final_arena, final_arena_root),
             steps.len(),
-            steps.iter().filter(|s| s.matched).count(),
         );
         return None;
     }
@@ -556,10 +526,15 @@ pub fn run_self_play_trajectory(
     } else {
         0.0
     };
-    let matched = steps.iter().filter(|s| s.matched).count();
+    // Count approved rules that produced unions across all steps
+    let total_matched = steps
+        .iter()
+        .flat_map(|s| s.rule_outcomes.iter())
+        .filter(|(_, u)| *u > 0)
+        .count();
     eprintln!(
         "[REWRITE] {seed_name}: {speedup:.2}x ({initial_cost_ns:.1}ns -> {final_cost_ns:.1}ns) \
-         [{matched}/{} steps]",
+         [{} epochs, {total_matched} rule-matches]",
         steps.len(),
     );
 
@@ -573,10 +548,11 @@ pub fn run_self_play_trajectory(
         final_cost: Some(best_cost),
         initial_nodes,
         node_budget,
-        initial_accumulator_state: acc_vec.clone(),
-        initial_edges: edges.clone(),
+        initial_accumulator_state: acc_vec,
+        initial_edges: edges,
         final_accumulator_state: final_acc_vec,
         final_edges,
+        intermediate_pairs,
     })
 }
 
@@ -766,7 +742,7 @@ pub fn generate_trajectory_batch_parallel(
 // Trajectory I/O helpers
 // ============================================================================
 
-const TRAJ_MAGIC: &[u8; 8] = b"PFTJ0001";
+const TRAJ_MAGIC: &[u8; 8] = b"PFTJ0002";
 const ADV_MAGIC: &[u8; 8] = b"PFAD0001";
 
 fn write_u8<W: Write>(w: &mut W, v: u8) {
@@ -910,17 +886,30 @@ pub fn write_trajectories_binary(trajectories: &[Trajectory], path: &Path) {
         write_f32_vec(&mut writer, &traj.final_accumulator_state);
         write_edges(&mut writer, &traj.final_edges);
 
+        // Intermediate extraction-head pairs
+        write_u32(&mut writer, traj.intermediate_pairs.len() as u32);
+        for (acc, edges, cost_ns) in &traj.intermediate_pairs {
+            write_f32_vec(&mut writer, acc);
+            write_edges(&mut writer, edges);
+            write_f64(&mut writer, *cost_ns);
+        }
+
         for step in &traj.steps {
-            write_f32_vec(&mut writer, &step.accumulator_state);
-            write_f32_vec(&mut writer, &step.expression_embedding);
-            write_f32_vec(&mut writer, &step.rule_embedding);
+            write_f32_vec(&mut writer, &step.graph_accumulator_state);
+            write_u32(&mut writer, step.mask.len() as u32);
+            for &(rule_idx, action_prob, approved) in &step.mask {
+                write_u32(&mut writer, rule_idx as u32);
+                write_f32(&mut writer, action_prob);
+                write_u8(&mut writer, u8::from(approved));
+            }
+            write_u32(&mut writer, step.rule_outcomes.len() as u32);
+            for &(rule_idx, unions) in &step.rule_outcomes {
+                write_u32(&mut writer, rule_idx as u32);
+                write_u32(&mut writer, unions);
+            }
             write_i32(&mut writer, step.budget_remaining);
             write_i32(&mut writer, step.epochs_remaining);
-            write_f32(&mut writer, step.action_probability);
-            write_u8(&mut writer, u8::from(step.matched));
             write_f64(&mut writer, step.jit_cost_ns);
-            write_edges(&mut writer, &step.edges);
-            write_f32_vec(&mut writer, &step.graph_accumulator_state);
         }
     }
     writer
@@ -965,19 +954,44 @@ pub fn load_trajectories_binary(path: &Path) -> Vec<Trajectory> {
         let final_accumulator_state = read_f32_vec(&mut reader);
         let final_edges = read_edges(&mut reader);
 
+        // Intermediate extraction-head pairs
+        let n_intermediate = read_u32(&mut reader) as usize;
+        let mut intermediate_pairs = Vec::with_capacity(n_intermediate);
+        for _ in 0..n_intermediate {
+            let acc = read_f32_vec(&mut reader);
+            let edges = read_edges(&mut reader);
+            let cost_ns = read_f64(&mut reader);
+            intermediate_pairs.push((acc, edges, cost_ns));
+        }
+
         let mut steps = Vec::with_capacity(step_count);
         for _ in 0..step_count {
+            let gacc = read_f32_vec(&mut reader);
+            let mask_len = read_u32(&mut reader) as usize;
+            let mut mask = Vec::with_capacity(mask_len);
+            for _ in 0..mask_len {
+                let rule_idx = read_u32(&mut reader) as usize;
+                let action_prob = read_f32(&mut reader);
+                let approved = read_u8(&mut reader) != 0;
+                mask.push((rule_idx, action_prob, approved));
+            }
+            let outcomes_len = read_u32(&mut reader) as usize;
+            let mut rule_outcomes = Vec::with_capacity(outcomes_len);
+            for _ in 0..outcomes_len {
+                let rule_idx = read_u32(&mut reader) as usize;
+                let unions = read_u32(&mut reader);
+                rule_outcomes.push((rule_idx, unions));
+            }
+            let budget_remaining = read_i32(&mut reader);
+            let epochs_remaining = read_i32(&mut reader);
+            let jit_cost_ns = read_f64(&mut reader);
             steps.push(TrajectoryStep {
-                accumulator_state: read_f32_vec(&mut reader),
-                expression_embedding: read_f32_vec(&mut reader),
-                rule_embedding: read_f32_vec(&mut reader),
-                budget_remaining: read_i32(&mut reader),
-                epochs_remaining: read_i32(&mut reader),
-                action_probability: read_f32(&mut reader),
-                matched: read_u8(&mut reader) != 0,
-                jit_cost_ns: read_f64(&mut reader),
-                edges: read_edges(&mut reader),
-                graph_accumulator_state: read_f32_vec(&mut reader),
+                graph_accumulator_state: gacc,
+                mask,
+                rule_outcomes,
+                budget_remaining,
+                epochs_remaining,
+                jit_cost_ns,
             });
         }
         trajectories.push(Trajectory {
@@ -993,6 +1007,7 @@ pub fn load_trajectories_binary(path: &Path) -> Vec<Trajectory> {
             initial_edges,
             final_accumulator_state,
             final_edges,
+            intermediate_pairs,
         });
     }
     trajectories
@@ -1295,16 +1310,12 @@ mod tests {
         let traj = Trajectory {
             trajectory_id: "test".into(),
             steps: vec![TrajectoryStep {
-                accumulator_state: vec![0.0; 130],
-                expression_embedding: vec![0.0; 32],
-                rule_embedding: vec![0.0; 32],
+                graph_accumulator_state: vec![0.0; GRAPH_INPUT_DIM],
+                mask: vec![(0usize, 0.7f32, true), (1usize, 0.3f32, false)],
+                rule_outcomes: vec![(0usize, 2u32)],
                 budget_remaining: 1000,
                 epochs_remaining: 10,
-                action_probability: 0.5,
-                matched: true,
                 jit_cost_ns: 5.0,
-                edges: vec![(2, 3, 0)],
-                graph_accumulator_state: vec![0.0; GRAPH_INPUT_DIM],
             }],
             initial_cost_ns: 5.0,
             final_cost_ns: 1.0,
@@ -1316,9 +1327,10 @@ mod tests {
             initial_edges: vec![],
             final_accumulator_state: vec![],
             final_edges: vec![],
+            intermediate_pairs: vec![],
         };
 
-        let tmp = std::env::temp_dir().join("test_self_play_traj.pftraj");
+        let tmp = std::env::temp_dir().join("test_self_play_traj_v2.pftraj");
         write_trajectories_binary(&[traj], &tmp);
 
         let read_back = load_trajectories_binary(&tmp);
@@ -1326,9 +1338,15 @@ mod tests {
         let back = &read_back[0];
         assert_eq!(back.trajectory_id, "test");
         assert_eq!(back.steps.len(), 1);
-        assert!(back.steps[0].matched);
+        assert_eq!(back.steps[0].mask.len(), 2);
+        assert_eq!(back.steps[0].mask[0].0, 0);
+        assert!(back.steps[0].mask[0].2, "rule 0 should be approved");
+        assert!(!back.steps[0].mask[1].2, "rule 1 should not be approved");
+        assert_eq!(back.steps[0].rule_outcomes.len(), 1);
+        assert_eq!(back.steps[0].rule_outcomes[0].1, 2, "rule 0 should have 2 unions");
         assert!((back.final_cost_ns - 1.0).abs() < 1e-6);
         assert!((back.initial_cost.unwrap() - 5.0).abs() < 1e-6);
+        assert!(back.intermediate_pairs.is_empty());
 
         std::fs::remove_file(&tmp)
             .unwrap_or_else(|e| panic!("Failed to remove temp file {}: {e}", tmp.display()));

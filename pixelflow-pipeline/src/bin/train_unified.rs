@@ -542,23 +542,30 @@ fn acc_from_vec(v: &[f32]) -> EdgeAccumulator {
     acc
 }
 
-fn acc_from_step(step: &TrajectoryStep) -> EdgeAccumulator {
-    assert_eq!(
-        step.accumulator_state.len(),
-        INPUT_DIM,
-        "Expected {} accumulator values, got {}",
-        INPUT_DIM,
-        step.accumulator_state.len()
-    );
-
-    let mut acc = EdgeAccumulator::default();
-    acc.values.copy_from_slice(&step.accumulator_state[..4 * K]);
-    acc.edge_count = step.accumulator_state[4 * K] as u32;
-    acc.node_count = step.accumulator_state[4 * K + 1] as u32;
-    acc.node_budget = step.accumulator_state[4 * K + 2] as u32;
-    acc.epoch_budget = step.accumulator_state[4 * K + 3] as u32;
-    acc
+/// Reconstruct [`GraphAccumulator`] from a raw float vector (graph_accumulator_state field).
+///
+/// Normalizes VSA values to unit L2 to handle embedding scale drift over training rounds.
+fn gacc_from_vec(v: &[f32]) -> GraphAccumulator {
+    let mut gacc = GraphAccumulator::new();
+    if v.len() < GRAPH_INPUT_DIM {
+        return gacc;
+    }
+    let l2: f32 = v[..GRAPH_ACC_DIM]
+        .iter()
+        .map(|x| x * x)
+        .sum::<f32>()
+        .sqrt()
+        .max(1e-8);
+    for i in 0..GRAPH_ACC_DIM {
+        gacc.values[i] = v[i] / l2;
+    }
+    gacc.edge_count = v[GRAPH_ACC_DIM] as u32;
+    gacc.node_count = v[GRAPH_ACC_DIM + 1] as u32;
+    gacc.node_budget = v[GRAPH_ACC_DIM + 2] as u32;
+    gacc.epoch_budget = v[GRAPH_ACC_DIM + 3] as u32;
+    gacc
 }
+
 
 fn final_model_path(args: &Args) -> PathBuf {
     args.final_model
@@ -566,91 +573,30 @@ fn final_model_path(args: &Args) -> PathBuf {
         .unwrap_or_else(|| args.output_dir.join("final_model.bin"))
 }
 
-/// Reconstruct [`EdgeAccumulator`] from a [`ReplayStep`], with VSA values normalized to unit L2.
+/// Reconstruct [`GraphAccumulator`] from a [`ReplayStep`]'s graph_acc field.
 ///
-/// EdgeAccumulator VSA values grow in scale over training rounds for the same
-/// reason as rule_embed and graph_acc (they encode op embeddings). Normalizing
-/// keeps value-head backbone gradients bounded regardless of replay step age.
-fn acc_from_replay(step: &ReplayStep) -> EdgeAccumulator {
-    assert_eq!(
-        step.acc.len(),
-        INPUT_DIM,
-        "Expected {} accumulator values in replay step, got {}",
-        INPUT_DIM,
-        step.acc.len()
-    );
-    let l2: f32 = step.acc[..4 * K]
-        .iter()
-        .map(|x| x * x)
-        .sum::<f32>()
-        .sqrt()
-        .max(1e-8);
-    let mut acc = EdgeAccumulator::default();
-    for i in 0..4 * K {
-        acc.values[i] = step.acc[i] / l2;
-    }
-    acc.edge_count = step.acc[4 * K] as u32;
-    acc.node_count = step.acc[4 * K + 1] as u32;
-    acc.node_budget = step.acc[4 * K + 2] as u32;
-    acc.epoch_budget = step.acc[4 * K + 3] as u32;
-    acc
+/// Normalizes VSA values to unit L2 to handle embedding scale drift over training rounds.
+fn gacc_from_replay(step: &ReplayStep) -> GraphAccumulator {
+    gacc_from_vec(&step.graph_acc)
 }
 
-/// Extract rule embedding from a [`ReplayStep`], normalized to unit L2.
+/// Get the current rule embedding for a replay step, normalized to unit L2.
 ///
-/// Op embeddings grow in scale over many training rounds (L2 can reach 100+
-/// by round 299). Normalizing at load time ensures both the forward pass
-/// (score computation) and the backward pass (gradient chain rule) use the
-/// same unit-norm vector, keeping the policy gradient magnitude bounded.
-fn embed_from_replay(step: &ReplayStep) -> [f32; EMBED_DIM] {
-    assert_eq!(
-        step.rule_embed.len(),
-        EMBED_DIM,
-        "Expected {} rule embedding dims in replay step, got {}",
-        EMBED_DIM,
-        step.rule_embed.len()
-    );
-    let l2: f32 = step
-        .rule_embed
-        .iter()
-        .map(|x| x * x)
-        .sum::<f32>()
-        .sqrt()
-        .max(1e-8);
+/// The rule embedding is re-derived from the current model each backward pass
+/// (not stored in the replay buffer). This avoids stale embeddings from when
+/// the trajectory was collected, and keeps the policy gradient in sync with
+/// the current model parameters.
+fn embed_for_replay(
+    step: &ReplayStep,
+    rule_embeds: &[[f32; EMBED_DIM]],
+) -> [f32; EMBED_DIM] {
+    let raw = rule_embeds.get(step.rule_idx).copied().unwrap_or([0.0f32; EMBED_DIM]);
+    let l2: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
     let mut embed = [0.0f32; EMBED_DIM];
     for i in 0..EMBED_DIM {
-        embed[i] = step.rule_embed[i] / l2;
+        embed[i] = raw[i] / l2;
     }
     embed
-}
-
-/// Reconstruct [`GraphAccumulator`] from a [`ReplayStep`].
-fn gacc_from_replay(step: &ReplayStep) -> GraphAccumulator {
-    let mut gacc = GraphAccumulator::new();
-    if step.graph_acc.len() == GRAPH_INPUT_DIM {
-        // The VSA values stored in replay were computed with op embeddings from
-        // the self-play model, which can drift to large L2 norms over many rounds
-        // (same root cause as rule_embed scale inflation). Normalize to unit L2
-        // so the graph_input fed into graph_w1 has bounded magnitude regardless
-        // of when the trajectory was collected.
-        let l2: f32 = step.graph_acc[..GRAPH_ACC_DIM]
-            .iter()
-            .map(|x| x * x)
-            .sum::<f32>()
-            .sqrt()
-            .max(1e-8);
-        for i in 0..GRAPH_ACC_DIM {
-            gacc.values[i] = step.graph_acc[i] / l2;
-        }
-        gacc.edge_count = step.graph_acc[GRAPH_ACC_DIM] as u32;
-        gacc.node_count = step.graph_acc[GRAPH_ACC_DIM + 1] as u32;
-        gacc.node_budget = step.graph_acc[GRAPH_ACC_DIM + 2] as u32;
-        gacc.epoch_budget = step.graph_acc[GRAPH_ACC_DIM + 3] as u32;
-    }
-    // If graph_acc is empty (old replay data), return zeroed accumulator.
-    // The graph backbone will produce a zero-centered embedding, which is fine
-    // for backward compat — the mask gradient will be small but non-zero.
-    gacc
 }
 
 // ============================================================================
@@ -658,13 +604,10 @@ fn gacc_from_replay(step: &ReplayStep) -> GraphAccumulator {
 // ============================================================================
 
 struct ReplayStep {
-    acc: Vec<f32>,             // 132 floats (INPUT_DIM)
-    graph_acc: Vec<f32>,       // GRAPH_INPUT_DIM floats — VSA graph state
-    expr_embed: Vec<f32>,      // 32 floats (EMBED_DIM) — expr_proj output at decision time
-    rule_embed: Vec<f32>,      // 32 floats (EMBED_DIM)
-    edges: Vec<(u8, u8, u16)>, // Edge list for embedding gradient flow
-    matched: bool,
-    jit_cost_ns: f64,
+    graph_acc: Vec<f32>,       // GRAPH_INPUT_DIM floats — VSA graph state at epoch start
+    rule_idx: usize,           // Which rule this entry corresponds to
+    matched: bool,             // Whether the rule produced any unions
+    jit_cost_ns: f64,          // Terminal JIT cost (backfilled at trajectory end)
     advantage: f32,
 }
 
@@ -681,7 +624,11 @@ impl ReplayBuffer {
         }
     }
 
-    /// Flatten trajectory steps + advantages into ReplaySteps and append.
+    /// Flatten trajectory epoch-steps + advantages into per-approved-rule ReplaySteps.
+    ///
+    /// Each epoch step covers all rules via its mask. We expand approved rules into
+    /// individual ReplaySteps, one per approved rule. The epoch-level advantage is
+    /// broadcast to all rules in that epoch (the critic assigned per-epoch credit).
     fn push_round(&mut self, trajectories: &[Trajectory], advantages: &[TrajectoryAdvantages]) {
         for (traj, adv) in trajectories.iter().zip(advantages.iter()) {
             assert_eq!(
@@ -693,16 +640,22 @@ impl ReplayBuffer {
                 adv.advantages.len()
             );
             for (step, &advantage) in traj.steps.iter().zip(adv.advantages.iter()) {
-                self.steps.push(ReplayStep {
-                    acc: step.accumulator_state.clone(),
-                    graph_acc: step.graph_accumulator_state.clone(),
-                    expr_embed: step.expression_embedding.clone(),
-                    rule_embed: step.rule_embedding.clone(),
-                    edges: step.edges.clone(),
-                    matched: step.matched,
-                    jit_cost_ns: step.jit_cost_ns,
-                    advantage,
-                });
+                // Expand epoch step into one ReplayStep per approved rule.
+                // Only approved rules participated in the policy gradient.
+                for &(rule_idx, _action_prob, approved) in &step.mask {
+                    if !approved {
+                        continue;
+                    }
+                    let matched = step.rule_outcomes.iter()
+                        .any(|&(r, u)| r == rule_idx && u > 0);
+                    self.steps.push(ReplayStep {
+                        graph_acc: step.graph_accumulator_state.clone(),
+                        rule_idx,
+                        matched,
+                        jit_cost_ns: step.jit_cost_ns,
+                        advantage,
+                    });
+                }
             }
         }
         self.prune();
@@ -1184,6 +1137,11 @@ fn real_main() {
         let mut total_value_steps = 0usize;
         let nan_cost_count = 0usize; // Always zero — NaN costs replaced with penalty upstream
 
+        // Pre-compute current rule embeddings for the policy gradient.
+        // These are re-derived from the current model each round (not stored in replay),
+        // so the policy gradient stays in sync with the current parameters.
+        let round_rule_embeds = model.encode_all_rules_from_templates(&templates);
+
         // Accumulate per-step log lines, flush once after the loop
         let mut update_log = String::with_capacity(256 * args.updates_per_round);
 
@@ -1213,10 +1171,12 @@ fn real_main() {
                     step.jit_cost_ns,
                 );
 
-                let acc = acc_from_replay(step);
                 let gacc = gacc_from_replay(step);
-                let rule_embed = embed_from_replay(step);
-                let cache = forward_cached(&model, &acc, &gacc, &rule_embed);
+                let rule_embed = embed_for_replay(step, &round_rule_embeds);
+                // Dummy acc for the extraction head path (extraction is trained
+                // separately on trajectory-level pairs, not per replay step).
+                let dummy_acc = EdgeAccumulator::default();
+                let cache = forward_cached(&model, &dummy_acc, &gacc, &rule_embed);
 
                 backward_policy(
                     &model,
@@ -1229,17 +1189,13 @@ fn real_main() {
                     &mut grads,
                 );
                 batch_policy += 1;
-
-                // NOTE: extraction head (value) is trained separately below on
-                // trajectory-level paired data (initial_acc→initial_cost,
-                // final_acc→final_cost). NOT here — per-step accumulator_state
-                // is the initial expression, but jit_cost_ns is the final cost.
-                // Training here would teach "initial structure → final cost"
-                // which is wrong for extraction.
                 batch_value += 1;
 
-                // Extraction head embedding gradients are computed in the
-                // trajectory-level extraction training loop below, not here.
+                // Extraction head (value backward) is trained separately below
+                // on trajectory-level paired data: (acc, jit_cost) pairs where
+                // both acc and cost describe the SAME expression.
+                // Per-step backward_value is intentionally removed — value backward
+                // now ONLY comes from initial/final/intermediate trajectory pairs.
             }
 
             let batch_size = batch_policy.max(1) as f32;
@@ -1346,6 +1302,31 @@ fn real_main() {
                         backward_through_accumulator(
                             &d_acc,
                             &traj.final_edges,
+                            acc.node_count,
+                            &mut ext_grads,
+                        );
+                    }
+                    ext_count += 1;
+                }
+
+                // Intermediate expression pairs (sampled at p≈0.1 per epoch)
+                for (acc_state, edges, cost_ns) in &traj.intermediate_pairs {
+                    if acc_state.is_empty() || !cost_ns.is_finite() || *cost_ns <= 0.0 {
+                        continue;
+                    }
+                    let acc = acc_from_vec(acc_state);
+                    let gacc = GraphAccumulator::new();
+                    let rule_embed = [0.0f32; EMBED_DIM];
+                    let cache = forward_cached(&model, &acc, &gacc, &rule_embed);
+                    let target = log_ns(*cost_ns);
+                    backward_value(&model, &cache, target, args.value_coeff, &mut ext_grads);
+
+                    if !edges.is_empty() {
+                        let d_acc =
+                            compute_d_acc_input_value(&model, &cache, target, args.value_coeff);
+                        backward_through_accumulator(
+                            &d_acc,
+                            edges,
                             acc.node_count,
                             &mut ext_grads,
                         );
@@ -1589,6 +1570,10 @@ fn real_main() {
 /// 4. Do N rounds of pure SGD
 /// 5. Save model + per-round metrics
 fn run_offline(args: &Args, model: &mut ExprNnue) {
+    // Build rule templates for computing current rule embeddings in the backward pass.
+    let offline_rules: Vec<Box<dyn Rewrite>> = all_rules();
+    let offline_templates = build_rule_templates(&offline_rules);
+
     let traj_dir = args.trajectory_dir.as_ref().unwrap_or(&args.output_dir);
 
     logln!("[OFFLINE] Loading trajectories from {:?}...", traj_dir);
@@ -1708,6 +1693,9 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
         let mut total_policy_steps = 0usize;
         let mut total_value_steps = 0usize;
 
+        // Re-derive rule embeddings from the current model each round.
+        let round_rule_embeds = model.encode_all_rules_from_templates(&offline_templates);
+
         for update_idx in 0..args.updates_per_round {
             let batch_indices = replay_buffer.sample_batch(
                 args.mini_batch_size,
@@ -1732,10 +1720,10 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
                     step.jit_cost_ns,
                 );
 
-                let acc = acc_from_replay(step);
                 let gacc = gacc_from_replay(step);
-                let rule_embed = embed_from_replay(step);
-                let cache = forward_cached(model, &acc, &gacc, &rule_embed);
+                let rule_embed = embed_for_replay(step, &round_rule_embeds);
+                let dummy_acc = EdgeAccumulator::default();
+                let cache = forward_cached(model, &dummy_acc, &gacc, &rule_embed);
 
                 backward_policy(
                     model,
@@ -1748,19 +1736,8 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
                     &mut grads,
                 );
                 batch_policy += 1;
-
-                let target = log_ns(step.jit_cost_ns);
-                backward_value(model, &cache, target, args.value_coeff, &mut grads);
                 batch_value += 1;
-
-                // Embedding gradients: value loss flows through expr backbone → acc_input.
-                // Policy loss flows through graph backbone → graph_input (handled by
-                // backward_policy → graph_w1). Only value path needs acc_input gradient.
-                if !step.edges.is_empty() {
-                    let d_acc_v =
-                        compute_d_acc_input_value(model, &cache, target, args.value_coeff);
-                    backward_through_accumulator(&d_acc_v, &step.edges, acc.node_count, &mut grads);
-                }
+                // Value backward is handled by trajectory-level pairs in extraction loop.
             }
 
             let batch_size = batch_policy.max(1) as f32;
@@ -1812,10 +1789,10 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
         let mut saturation_loss_sum = 0.0f64;
         for &idx in &eval_indices {
             let step = &replay_buffer.steps[idx];
-            let acc = acc_from_replay(step);
             let gacc = gacc_from_replay(step);
-            let rule_embed = embed_from_replay(step);
-            let cache = forward_cached(model, &acc, &gacc, &rule_embed);
+            let rule_embed = embed_for_replay(step, &round_rule_embeds);
+            let dummy_acc = EdgeAccumulator::default();
+            let cache = forward_cached(model, &dummy_acc, &gacc, &rule_embed);
 
             let target = log_ns(step.jit_cost_ns);
             let extraction_err = cache.value_pred - target;
@@ -2464,6 +2441,9 @@ fn run_trial(
         let mut total_policy_steps = 0usize;
         let mut total_value_steps = 0usize;
 
+        // Re-derive rule embeddings from current model each round.
+        let round_rule_embeds = model.encode_all_rules_from_templates(templates);
+
         for update_idx in 0..config.updates_per_round {
             let batch_indices = replay_buffer.sample_batch(
                 config.mini_batch_size,
@@ -2488,10 +2468,10 @@ fn run_trial(
                     step.jit_cost_ns,
                 );
 
-                let acc = acc_from_replay(step);
                 let gacc = gacc_from_replay(step);
-                let rule_embed = embed_from_replay(step);
-                let cache = forward_cached(&model, &acc, &gacc, &rule_embed);
+                let rule_embed = embed_for_replay(step, &round_rule_embeds);
+                let dummy_acc = EdgeAccumulator::default();
+                let cache = forward_cached(&model, &dummy_acc, &gacc, &rule_embed);
 
                 backward_policy(
                     &model,
@@ -2504,16 +2484,8 @@ fn run_trial(
                     &mut grads,
                 );
                 batch_policy += 1;
-
-                let target = log_ns(step.jit_cost_ns);
-                backward_value(&model, &cache, target, config.value_coeff, &mut grads);
                 batch_value += 1;
-
-                if !step.edges.is_empty() {
-                    let d_acc_v =
-                        compute_d_acc_input_value(&model, &cache, target, config.value_coeff);
-                    backward_through_accumulator(&d_acc_v, &step.edges, acc.node_count, &mut grads);
-                }
+                // Value backward handled by trajectory-level extraction loop.
             }
 
             let batch_size = batch_policy.max(1) as f32;
@@ -2549,10 +2521,10 @@ fn run_trial(
         let mut saturation_loss_sum = 0.0f64;
         for &idx in &eval_indices {
             let step = &replay_buffer.steps[idx];
-            let acc = acc_from_replay(step);
             let gacc = gacc_from_replay(step);
-            let rule_embed = embed_from_replay(step);
-            let cache = forward_cached(&model, &acc, &gacc, &rule_embed);
+            let rule_embed = embed_for_replay(step, &round_rule_embeds);
+            let dummy_acc = EdgeAccumulator::default();
+            let cache = forward_cached(&model, &dummy_acc, &gacc, &rule_embed);
 
             let target = log_ns(step.jit_cost_ns);
             let extraction_err = cache.value_pred - target;
