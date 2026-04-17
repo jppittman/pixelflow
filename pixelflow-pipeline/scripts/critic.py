@@ -356,17 +356,20 @@ def trajectories_to_tensors(
             # expression (frozen for the whole trajectory) and lets the critic
             # shortcut credit assignment by predicting cost directly.
             gacc = list(step["graph_accumulator_state"])
-            if len(gacc) < GRAPH_ACC_DIM:
-                gacc = gacc + [0.0] * (GRAPH_ACC_DIM - len(gacc))
+            if len(gacc) != GRAPH_ACC_DIM:
+                raise ValueError(
+                    f"graph_accumulator_state has {len(gacc)} floats, expected "
+                    f"{GRAPH_ACC_DIM} (trajectory_id={traj.get('trajectory_id', '<unknown>')})"
+                )
 
             # Normalize VSA sections [0..128] by 1/sqrt(node_count)
-            edge_count = gacc[128] if len(gacc) > 128 else 0.0
-            node_count = gacc[129] if len(gacc) > 129 else 1.0
+            edge_count = gacc[128]
+            node_count = gacc[129]
             scale = 1.0 / math.sqrt(max(1.0, node_count))
             for i in range(128):
                 gacc[i] *= scale
-            node_budget = gacc[130] if len(gacc) > 130 else 0.0
-            epoch_budget = gacc[131] if len(gacc) > 131 else 0.0
+            node_budget = gacc[130]
+            epoch_budget = gacc[131]
             gacc[128] = math.log2(1.0 + edge_count)
             gacc[129] = math.log2(1.0 + node_count)
             gacc[130] = math.log2(1.0 + node_budget)
@@ -381,7 +384,8 @@ def trajectories_to_tensors(
             total_unions = sum(unions for _, unions in rule_outcomes)
 
             frac_approved = n_approved / n_rules if n_rules > 0 else 0.0
-            frac_matched = n_matched / n_approved if n_approved > 0 else 0.0
+            n_ran = len(rule_outcomes)
+            frac_matched = n_matched / n_ran if n_ran > 0 else 0.0
             log1p_unions = math.log1p(total_unions)
             mean_prob = sum(p for _, p, _ in mask) / n_rules if n_rules > 0 else 0.0
             budget_norm = float(step["budget_remaining"]) / 1000.0   # rough normalization
@@ -400,6 +404,12 @@ def trajectories_to_tensors(
             # A step is "matched" if any rule produced at least one union
             step_matched = any(unions > 0 for _, unions in rule_outcomes)
             step_matches.append(step_matched)
+
+        if not step_features:
+            raise ValueError(
+                f"Trajectory {traj.get('trajectory_id', '<unknown>')!r} has zero steps — "
+                "binary data may be corrupt"
+            )
 
         seq = torch.tensor(step_features, dtype=torch.float32)
         sequences.append(seq)
