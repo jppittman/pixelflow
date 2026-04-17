@@ -38,10 +38,10 @@ from torch.optim import AdamW
 # =============================================================================
 
 GRAPH_ACC_DIM = 132  # GraphAccumulator (saturation/search state — changes per step)
-EXPR_DIM = 32        # expression embedding (expr_proj output)
-RULE_DIM = 32        # rule embedding (action taken)
-RESOURCE_DIM = 2     # budget_remaining, epochs_remaining
-STEP_DIM = GRAPH_ACC_DIM + EXPR_DIM + RULE_DIM + RESOURCE_DIM  # 198 floats per step
+MASK_STATS_DIM = 6   # frac_approved, frac_matched, log1p_unions, mean_prob, budget_norm, epochs_norm
+STEP_DIM = GRAPH_ACC_DIM + MASK_STATS_DIM  # 138 floats per step
+# TODO: add RULE_DIM=32 (mean approved rule_embed) when rule embedding table is added;
+# that will bring STEP_DIM from 138 to 170.
 # NOTE: EdgeAccumulator deliberately excluded — it encodes the INITIAL
 # expression (frozen for the whole trajectory), not the search state.
 # Giving it to the critic lets it shortcut credit assignment by just
@@ -156,7 +156,7 @@ class CriticTransformer(nn.Module):
 # Data loading — fail fast, fail loudly
 # =============================================================================
 
-TRAJ_MAGIC = b"PFTJ0001"
+TRAJ_MAGIC = b"PFTJ0002"
 ADV_MAGIC = b"PFAD0001"
 
 
@@ -221,7 +221,10 @@ def _load_trajectories_binary(path: Path) -> list[dict]:
     r = BinaryReader(data, path)
     magic = r.take(8)
     if magic != TRAJ_MAGIC:
-        raise ValueError(f"Invalid trajectory binary magic in {path}: {magic!r}")
+        raise ValueError(
+            f"Invalid trajectory binary magic in {path}: {magic!r} "
+            f"(expected {TRAJ_MAGIC!r}; PFTJ0001 files are no longer supported)"
+        )
 
     trajectories: list[dict] = []
     for _ in range(r.u32()):
@@ -238,19 +241,46 @@ def _load_trajectories_binary(path: Path) -> list[dict]:
         final_accumulator_state = r.f32_vec()
         final_edges = r.edges()
 
+        # PFTJ0002: intermediate extraction-head pairs
+        n_intermediate_pairs = r.u32()
+        intermediate_pairs: list[tuple[list[float], list[tuple], float]] = []
+        for _ in range(n_intermediate_pairs):
+            acc_state = r.f32_vec()
+            pair_edges = r.edges()
+            cost_ns = r.f64()
+            intermediate_pairs.append((acc_state, pair_edges, cost_ns))
+
+        # PFTJ0002: epoch-granular steps (one step = one mask decision epoch)
         steps = []
         for _step in range(step_count):
+            graph_accumulator_state = r.f32_vec()
+
+            mask_len = r.u32()
+            mask: list[tuple[int, float, bool]] = []
+            for _ in range(mask_len):
+                rule_idx = r.u32()
+                action_prob = r.f32()
+                approved = bool(r.u8())
+                mask.append((rule_idx, action_prob, approved))
+
+            rule_outcomes_len = r.u32()
+            rule_outcomes: list[tuple[int, int]] = []
+            for _ in range(rule_outcomes_len):
+                outcome_rule_idx = r.u32()
+                unions_produced = r.u32()
+                rule_outcomes.append((outcome_rule_idx, unions_produced))
+
+            budget_remaining = r.i32()
+            epochs_remaining = r.i32()
+            jit_cost_ns = r.f64()
+
             steps.append({
-                "accumulator_state": r.f32_vec(),
-                "expression_embedding": r.f32_vec(),
-                "rule_embedding": r.f32_vec(),
-                "budget_remaining": r.i32(),
-                "epochs_remaining": r.i32(),
-                "action_probability": r.f32(),
-                "matched": bool(r.u8()),
-                "jit_cost_ns": r.f64(),
-                "edges": r.edges(),
-                "graph_accumulator_state": r.f32_vec(),
+                "graph_accumulator_state": graph_accumulator_state,
+                "mask": mask,
+                "rule_outcomes": rule_outcomes,
+                "budget_remaining": budget_remaining,
+                "epochs_remaining": epochs_remaining,
+                "jit_cost_ns": jit_cost_ns,
             })
 
         trajectories.append({
@@ -266,6 +296,7 @@ def _load_trajectories_binary(path: Path) -> list[dict]:
             "initial_edges": initial_edges,
             "final_accumulator_state": final_accumulator_state,
             "final_edges": final_edges,
+            "intermediate_pairs": intermediate_pairs,
         })
 
     if r.off != len(data):
@@ -319,16 +350,16 @@ def trajectories_to_tensors(
         step_features = []
         step_matches = []
         for step in steps:
-            # GraphAccumulator: the search state that changes per step.
+            # GraphAccumulator: the search state that changes per epoch-step.
             # This is what the policy head saw when deciding which rules to approve.
             # We deliberately EXCLUDE the EdgeAccumulator — it encodes the initial
             # expression (frozen for the whole trajectory) and lets the critic
             # shortcut credit assignment by predicting cost directly.
-            gacc = step.get("graph_accumulator_state", [])
+            gacc = list(step["graph_accumulator_state"])
             if len(gacc) < GRAPH_ACC_DIM:
-                gacc = [0.0] * GRAPH_ACC_DIM
+                gacc = gacc + [0.0] * (GRAPH_ACC_DIM - len(gacc))
 
-            # Scale VSA sections by 1/sqrt(node_count) to match forward_graph
+            # Normalize VSA sections [0..128] by 1/sqrt(node_count)
             edge_count = gacc[128] if len(gacc) > 128 else 0.0
             node_count = gacc[129] if len(gacc) > 129 else 1.0
             scale = 1.0 / math.sqrt(max(1.0, node_count))
@@ -341,18 +372,34 @@ def trajectories_to_tensors(
             gacc[130] = math.log2(1.0 + node_budget)
             gacc[131] = math.log2(1.0 + epoch_budget)
 
-            resource_features = [
-                float(step["budget_remaining"]),
-                float(step["epochs_remaining"]),
-            ]
-            features = gacc[:GRAPH_ACC_DIM] + step["expression_embedding"] + step["rule_embedding"] + resource_features
+            # Mask summary stats (6 floats)
+            mask = step["mask"]
+            rule_outcomes = step["rule_outcomes"]
+            n_rules = len(mask)
+            n_approved = sum(1 for _, _, approved in mask if approved)
+            n_matched = sum(1 for _, unions in rule_outcomes if unions > 0)
+            total_unions = sum(unions for _, unions in rule_outcomes)
+
+            frac_approved = n_approved / n_rules if n_rules > 0 else 0.0
+            frac_matched = n_matched / n_approved if n_approved > 0 else 0.0
+            log1p_unions = math.log1p(total_unions)
+            mean_prob = sum(p for _, p, _ in mask) / n_rules if n_rules > 0 else 0.0
+            budget_norm = float(step["budget_remaining"]) / 1000.0   # rough normalization
+            epochs_norm = float(step["epochs_remaining"]) / 20.0    # rough normalization
+
+            mask_stats = [frac_approved, frac_matched, log1p_unions, mean_prob, budget_norm, epochs_norm]
+
+            features = gacc[:GRAPH_ACC_DIM] + mask_stats
             if len(features) != STEP_DIM:
                 raise ValueError(
                     f"Step feature length {len(features)} != {STEP_DIM} "
                     f"(trajectory_id={traj['trajectory_id']})"
                 )
             step_features.append(features)
-            step_matches.append(step["matched"])
+
+            # A step is "matched" if any rule produced at least one union
+            step_matched = any(unions > 0 for _, unions in rule_outcomes)
+            step_matches.append(step_matched)
 
         seq = torch.tensor(step_features, dtype=torch.float32)
         sequences.append(seq)
