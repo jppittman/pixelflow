@@ -246,10 +246,11 @@ impl BenchResult {
     }
 }
 
-/// JIT-compile and benchmark an arena expression. No `Expr` conversion.
-pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResult, BenchError> {
-    let result = compile_arena_dag(arena, root).map_err(BenchError::CompileFailed)?;
-    let exec_code = result.code;
+fn benchmark_exec_code(
+    exec_code: pixelflow_ir::backend::emit::executable::ExecutableCode,
+    repeat_batches: usize,
+) -> Result<BenchResult, BenchError> {
+    let repeat_batches = repeat_batches.max(1);
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -274,13 +275,15 @@ pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResul
             let mut times = [0u64; TIMED_RUNS];
             for t in &mut times {
                 let start = nanos_now();
-                eval100!(func, x, y, z, w);
+                for _ in 0..repeat_batches {
+                    eval100!(func, x, y, z, w);
+                }
                 *t = nanos_now() - start;
             }
 
             times.sort_unstable();
             let median_total = times[TIMED_RUNS / 2];
-            let ns = median_total as f64 / INNER_ITERS as f64;
+            let ns = median_total as f64 / (INNER_ITERS * repeat_batches) as f64;
 
             return validate_median(ns).map(|ns| BenchResult { ns, output });
         }
@@ -309,13 +312,15 @@ pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResul
             let mut times = [0u64; TIMED_RUNS];
             for t in &mut times {
                 let start = nanos_now();
-                eval100!(func, x, y, z, w);
+                for _ in 0..repeat_batches {
+                    eval100!(func, x, y, z, w);
+                }
                 *t = nanos_now() - start;
             }
 
             times.sort_unstable();
             let median_total = times[TIMED_RUNS / 2];
-            let ns = median_total as f64 / INNER_ITERS as f64;
+            let ns = median_total as f64 / (INNER_ITERS * repeat_batches) as f64;
 
             return validate_median(ns).map(|ns| BenchResult { ns, output });
         }
@@ -326,6 +331,26 @@ pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResul
         let _ = exec_code;
         Err(BenchError::UnsupportedArch)
     }
+}
+
+/// JIT-compile and benchmark an arena expression. No `Expr` conversion.
+pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResult, BenchError> {
+    benchmark_jit_arena_repeated(arena, root, 1)
+}
+
+/// Validation-only heavier benchmark path.
+///
+/// `repeat_batches=100` means each timed sample performs 10_000 evals
+/// (100 batches × 100 unrolled inner iterations), which is enough to lift
+/// tiny held-out shader expressions above timer noise without slowing the
+/// regular training path.
+pub fn benchmark_jit_arena_repeated(
+    arena: &ExprArena,
+    root: ExprId,
+    repeat_batches: usize,
+) -> Result<BenchResult, BenchError> {
+    let result = compile_arena_dag(arena, root).map_err(BenchError::CompileFailed)?;
+    benchmark_exec_code(result.code, repeat_batches)
 }
 
 #[cfg(test)]

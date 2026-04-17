@@ -32,8 +32,8 @@
 
 use pixelflow_ir::OpKind;
 use pixelflow_search::nnue::factored::{
-    depth_pe, EdgeAccumulator, ExprNnue, GraphAccumulator, EMBED_DIM, GRAPH_ACC_DIM,
-    GRAPH_INPUT_DIM, HIDDEN_DIM, INPUT_DIM, K, MLP_HIDDEN,
+    EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_ACC_DIM, GRAPH_INPUT_DIM, GraphAccumulator,
+    HIDDEN_DIM, INPUT_DIM, K, MLP_HIDDEN, depth_pe,
 };
 
 // ============================================================================
