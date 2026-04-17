@@ -1,17 +1,17 @@
 {
-  "best_trial": 19,
-  "best_value": -1.5,
+  "best_trial": 0,
+  "best_value": Infinity,
   "best_params": {
-    "lr": 0.0024063972842750707,
-    "momentum": 0.982554506671941,
-    "weight_decay": 6.936427467767516e-07,
-    "grad_clip": 0.9646682314598818,
-    "entropy_coeff": 0.008393372112938328,
-    "value_coeff": 0.16285661534676296,
-    "miss_penalty": 0.21556770049096702,
-    "mini_batch_size": 256,
-    "updates_per_round": 15,
-    "corpus_fraction": 0.5124710699028718,
-    "threshold": 0.5355934495495241
+    "lr": 0.0012,
+    "momentum": 0.49,
+    "weight_decay": 0.00018,
+    "grad_clip": 0.15,
+    "entropy_coeff": 0.0011,
+    "entropy_floor_ratio": 0.2727272727,
+    "value_coeff": 0.19,
+    "miss_penalty": 0.74,
+    "mini_batch_size": 2048,
+    "updates_per_round": 7,
+    "replay_capacity": 50000
   }
 }

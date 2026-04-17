@@ -44,13 +44,13 @@ macro_rules! logln {
 }
 
 use clap::Parser;
-use pixelflow_pipeline::jit_bench::benchmark_jit_arena;
+use pixelflow_pipeline::jit_bench::benchmark_jit_arena_repeated;
 use pixelflow_pipeline::training::factored::parse_kernel_code_arena;
-use pixelflow_search::egraph::{all_rules, extract_neural_to_arena, EGraph, Rewrite};
+use pixelflow_search::egraph::{EGraph, Rewrite, all_rules, extract_neural_to_arena};
 use pixelflow_search::math::all_math_rules;
 use pixelflow_search::nnue::factored::{
-    EdgeAccumulator, ExprNnue, GraphAccumulator, RuleTemplates, EMBED_DIM, GRAPH_ACC_DIM,
-    GRAPH_INPUT_DIM, INPUT_DIM, K,
+    EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_ACC_DIM, GRAPH_INPUT_DIM, GraphAccumulator,
+    INPUT_DIM, K, RuleTemplates,
 };
 
 use pixelflow_pipeline::training::gen_es::log_ns;
@@ -61,8 +61,8 @@ use pixelflow_pipeline::training::self_play::{
 };
 use pixelflow_pipeline::training::unified::{Trajectory, TrajectoryAdvantages, TrajectoryStep};
 use pixelflow_pipeline::training::unified_backward::{
-    apply_unified_sgd, backward_policy, backward_through_accumulator, backward_value,
-    compute_d_acc_input_value, forward_cached, UnifiedGradients,
+    UnifiedGradients, apply_unified_sgd, backward_policy, backward_through_accumulator,
+    backward_value, compute_d_acc_input_value, forward_cached,
 };
 use pixelflow_search::nnue::BwdGenConfig;
 
@@ -239,8 +239,27 @@ fn retrain_critic(
 ///
 /// Returns `Some(Child)` if we spawned the server (caller must kill on exit),
 /// or `None` if it was already running.
-fn ensure_critic_server(critic_url: &str, critic_checkpoint: &str) -> Option<std::process::Child> {
+fn critic_port_from_url(critic_url: &str) -> u16 {
+    let without_scheme = critic_url.split("://").nth(1).unwrap_or(critic_url);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let (_, port_str) = host_port.rsplit_once(':').unwrap_or_else(|| {
+        panic!(
+            "[CRITIC] critic_url must include an explicit port, got `{critic_url}`"
+        )
+    });
+    port_str.parse::<u16>().unwrap_or_else(|e| {
+        panic!("[CRITIC] Failed to parse port from critic_url `{critic_url}`: {e}")
+    })
+}
+
+fn ensure_critic_server(
+    critic_url: &str,
+    critic_checkpoint: &str,
+    critic_lr: f64,
+    critic_dropout: f64,
+) -> Option<std::process::Child> {
     let health_url = format!("{critic_url}/health");
+    let port = critic_port_from_url(critic_url);
 
     // Check if server is already running
     if ureq::get(&health_url).call().is_ok() {
@@ -253,7 +272,10 @@ fn ensure_critic_server(critic_url: &str, critic_checkpoint: &str) -> Option<std
     let script_path = "pixelflow-pipeline/scripts/critic_server.py";
     let mut cmd = std::process::Command::new("uv");
     cmd.args(["run", script_path]);
+    cmd.args(["--port", &port.to_string()]);
     cmd.args(["--checkpoint", critic_checkpoint]);
+    cmd.args(["--lr", &critic_lr.to_string()]);
+    cmd.args(["--dropout", &critic_dropout.to_string()]);
     // Drop server logs instead of piping them into an unread buffer, which can
     // eventually block the child process.
     cmd.stdout(std::process::Stdio::null());
@@ -793,7 +815,12 @@ fn real_main() {
         logln!("[CRITIC] Skipped (--skip-critic).");
         None
     } else {
-        ensure_critic_server(&args.critic_url, critic_ckpt_str)
+        ensure_critic_server(
+            &args.critic_url,
+            critic_ckpt_str,
+            args.critic_lr,
+            args.critic_dropout,
+        )
     };
 
     // Load model or initialize fresh
@@ -1439,23 +1466,23 @@ fn real_main() {
         };
 
         // Extraction head MAE: mean |predict_log_cost - log_ns(jit_cost)| across all steps
-        let mut judge_error_sum = 0.0f64;
-        let mut judge_error_count = 0u64;
+        let mut extraction_error_sum = 0.0f64;
+        let mut extraction_error_count = 0u64;
         for traj in &trajectories {
             for step in &traj.steps {
                 if step.jit_cost_ns.is_finite() && step.jit_cost_ns >= 0.5 {
                     let acc = acc_from_step(step);
                     let predicted = model.predict_log_cost_with_features(&acc);
                     let actual = log_ns(step.jit_cost_ns);
-                    judge_error_sum += libm::fabs((predicted - actual) as f64);
-                    judge_error_count += 1;
+                    extraction_error_sum += libm::fabs((predicted - actual) as f64);
+                    extraction_error_count += 1;
                 }
             }
         }
-        let judge_mae = if judge_error_count == 0 {
+        let extraction_mae = if extraction_error_count == 0 {
             f64::NAN
         } else {
-            judge_error_sum / judge_error_count as f64
+            extraction_error_sum / extraction_error_count as f64
         };
 
         // Log metrics as JSONL
@@ -1467,7 +1494,7 @@ fn real_main() {
             "speedup_median": speedup_median,
             "avg_initial_ns": avg_initial_ns,
             "avg_final_ns": avg_final_ns,
-            "judge_mae": judge_mae,
+            "extraction_mae": extraction_mae,
             "es_depth": gen_config.max_depth,
             "es_leaf_prob": gen_config.leaf_prob,
             "gen_depth": gen_config.max_depth,
@@ -1512,7 +1539,7 @@ fn real_main() {
             let _ = writeln!(
                 w,
                 "[{hms}] [METRICS] speedup={speedup_median:.3}x init={avg_initial_ns:.1}ns final={avg_final_ns:.1}ns \
-                 judge_mae={judge_mae:.3} depth={} steps={avg_steps:.1} \
+                 extraction_mae={extraction_mae:.3} depth={} steps={avg_steps:.1} \
                  grad_raw={avg_grad_norm:.2} grad_clip={avg_clipped_grad_norm:.2} buf={} time={:.1}s",
                 gen_config.max_depth,
                 replay_buffer.len(),
@@ -1778,13 +1805,13 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
         let avg_grad_norm = round_grad_norm / args.updates_per_round as f32;
         let avg_clipped_grad_norm = round_clipped_grad_norm / args.updates_per_round as f32;
 
-        // Compute value loss on a sample for metrics
+        // Compute extraction/saturation losses on a replay sample for metrics
         let eval_indices = replay_buffer.sample_batch(
             args.mini_batch_size.min(replay_buffer.len()),
             round_seed.wrapping_add(0xE7A1),
         );
-        let mut value_loss_sum = 0.0f64;
-        let mut policy_loss_sum = 0.0f64;
+        let mut extraction_loss_sum = 0.0f64;
+        let mut saturation_loss_sum = 0.0f64;
         for &idx in &eval_indices {
             let step = &replay_buffer.steps[idx];
             let acc = acc_from_replay(step);
@@ -1793,15 +1820,15 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
             let cache = forward_cached(model, &acc, &gacc, &rule_embed);
 
             let target = log_ns(step.jit_cost_ns);
-            let value_err = cache.value_pred - target;
-            value_loss_sum += (value_err * value_err) as f64;
+            let extraction_err = cache.value_pred - target;
+            extraction_loss_sum += (extraction_err * extraction_err) as f64;
 
-            // Policy loss: -log(prob) if matched, -log(1-prob) if not
+            // Saturation loss proxy: negative log-probability for the sampled matched rewrite.
             let p = (cache.prob as f64).clamp(1e-7, 1.0 - 1e-7);
-            policy_loss_sum += -libm::log(p);
+            saturation_loss_sum += -libm::log(p);
         }
-        let avg_value_loss = value_loss_sum / eval_indices.len().max(1) as f64;
-        let avg_policy_loss = policy_loss_sum / eval_indices.len().max(1) as f64;
+        let avg_extraction_loss = extraction_loss_sum / eval_indices.len().max(1) as f64;
+        let avg_saturation_loss = saturation_loss_sum / eval_indices.len().max(1) as f64;
 
         // Checkpoint
         let ckpt_path = args.output_dir.join(format!("model_r{round}.bin"));
@@ -1816,8 +1843,8 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
             "mode": "offline",
             "policy_steps": total_policy_steps,
             "value_steps": total_value_steps,
-            "avg_value_loss": avg_value_loss,
-            "avg_policy_loss": avg_policy_loss,
+            "avg_extraction_loss": avg_extraction_loss,
+            "avg_saturation_loss": avg_saturation_loss,
             "entropy_coeff": annealed_entropy,
             "grad_norm": avg_grad_norm,
             "grad_norm_raw": avg_grad_norm,
@@ -1841,11 +1868,11 @@ fn run_offline(args: &Args, model: &mut ExprNnue) {
             .unwrap_or_else(|e| panic!("Failed to flush metrics: {e}"));
 
         logln!(
-            "[OFFLINE] round {}/{}: val_loss={:.4} pol_loss={:.4} grad_raw={:.4} grad_clip={:.4} time={:.2}s",
+            "[OFFLINE] round {}/{}: extraction_loss={:.4} saturation_loss={:.4} grad_raw={:.4} grad_clip={:.4} time={:.2}s",
             round + 1,
             args.rounds,
-            avg_value_loss,
-            avg_policy_loss,
+            avg_extraction_loss,
+            avg_saturation_loss,
             avg_grad_norm,
             avg_clipped_grad_norm,
             round_elapsed.as_secs_f64()
@@ -1907,6 +1934,20 @@ struct TrialConfig {
     seed: u64,
     #[serde(default = "default_replay_capacity")]
     replay_capacity: usize,
+    #[serde(default = "default_offline")]
+    offline: bool,
+    #[serde(default)]
+    trajectory_dir: Option<PathBuf>,
+    #[serde(default = "default_max_trajectory_files")]
+    max_trajectory_files: usize,
+    #[serde(default)]
+    critic_epochs: Option<usize>,
+    #[serde(default)]
+    critic_lr: Option<f64>,
+    #[serde(default)]
+    critic_dropout: Option<f64>,
+    #[serde(default)]
+    critic_mini_batch_size: Option<usize>,
 }
 
 fn default_rounds() -> usize {
@@ -1960,16 +2001,22 @@ fn default_seed() -> u64 {
 fn default_replay_capacity() -> usize {
     200000
 }
+fn default_offline() -> bool {
+    false
+}
+fn default_max_trajectory_files() -> usize {
+    0
+}
 
 // ============================================================================
 // Validation on held-out real shader expressions
 // ============================================================================
 
-/// Build the 7 canonical validation expressions in arena form.
+/// Build the held-out validation expressions in arena form.
 ///
-/// These are the same expressions used in `bench_shader_e2e` — real GPU shader
-/// kernels that the training corpus must NOT contain. They serve as a clean
-/// held-out set to detect generalization vs. in-sample metric gaming.
+/// These are real ShaderToy-style expressions that the training corpus must
+/// not contain. Keep this set fixed so Optuna trials compare on the same
+/// out-of-sample workload instead of chasing synthetic easy cases.
 fn build_validation_exprs() -> Vec<(&'static str, pixelflow_ir::ExprArena, pixelflow_ir::ExprId)> {
     let sources = [
         ("val_radial", "(((X * X) + (Y * Y)) - 0.7).abs()"),
@@ -1986,7 +2033,19 @@ fn build_validation_exprs() -> Vec<(&'static str, pixelflow_ir::ExprArena, pixel
         ),
         (
             "val_psychred",
-            "((((((((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)).sin()) + 1.0) * (((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)) - ((Y * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + ((Z * 0.5) * 0.7))).abs())) * 0.2) + 0.001)) / ((((Y + ((Z * 0.3).sin() * 0.2)).exp()) * (((((((X * X) + (Y * Y)) - 0.7).abs()) * -4.0) * (1.0 + ((Z * 2.0).sin() * 0.1))).exp())) / (((((((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)).sin()) + 1.0) * (((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)) - ((Y * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + ((Z * 0.5) * 0.7))).abs())) * 0.2) + 0.001)).abs()) + 1.0)) + 1.0) * 0.5)",
+            "((((((((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)).sin()) + 1.0) * (((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)) - ((Y * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + ((Z * 0.5) * 0.7))).abs())) * 0.2) + 0.001)) / ((((Y + ((Z * 0.3).sin() * 0.2)).exp()) * (((((((X * X) + (Y * Y)) - 0.7).abs()) * -4.0) * (1.0 + ((Z * 2.0).sin() * 0.1))).exp())) / (((((((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)).sin()) + 1.0) * (((((X * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + (Z * 0.5)) - ((Y * ((1.0 - ((((X * X) + (Y * Y)) - 0.7).abs())) * 5.0)) + ((Z * 0.5) * 0.7))).abs())) * 0.2) + 0.001)).abs()) + 1.0)) + 1.0) * 0.5))",
+        ),
+        (
+            "val_shadertoy_warp_x",
+            "((X) + (((X - 0.5) * 1.7777777) / ((((X - 0.5) * 1.7777777) * ((X - 0.5) * 1.7777777) + ((Y - 0.5) * (Y - 0.5))).sqrt())) * (((Z + 0.07).sin()) + 1.0) * (((((((X - 0.5) * 1.7777777) * ((X - 0.5) * 1.7777777) + ((Y - 0.5) * (Y - 0.5))).sqrt()) * 9.0) - (Z + 0.07) - (Z + 0.07)).sin()).abs())",
+        ),
+        (
+            "val_shadertoy_fuji_sun",
+            "(((((0.3) - (((X * X) + (Y * Y)).sqrt())) / (0.3 - 0.29)).clamp(0.0, 1.0)) * ((3.0 * ((((Y) + (Z * 0.2 * 1.02)) * 100.0).sin()) + (((Y) * 14.0) + 1.0).clamp((-(6.0)), 6.0)).clamp(0.0, 1.0))).clamp(0.0, 1.0) + ((0.7 - (((X * X) + (Y * Y)).sqrt())) / 0.7).clamp(0.0, 1.0) * 0.6",
+        ),
+        (
+            "val_shadertoy_smooth_union",
+            "((Y + ((X - Y) * (0.5 + (0.5 * ((Y - X) / Z))).clamp(0.0, 1.0))) - (Z * (0.5 + (0.5 * ((Y - X) / Z))).clamp(0.0, 1.0) * (1.0 - (0.5 + (0.5 * ((Y - X) / Z))).clamp(0.0, 1.0))))",
         ),
     ];
 
@@ -2004,6 +2063,9 @@ fn build_validation_exprs() -> Vec<(&'static str, pixelflow_ir::ExprArena, pixel
 const VAL_SAT_NODE_BUDGET: usize = 2_000;
 /// Validation saturation epochs — matches bench_shader_e2e.
 const VAL_SAT_MAX_EPOCHS: usize = 30;
+/// Repeat the microbenchmark enough times that held-out validation timings are
+/// not dominated by timer quantization.
+const VAL_BENCH_REPEAT_BATCHES: usize = 100;
 
 /// Evaluate the current model on held-out validation shader expressions.
 ///
@@ -2021,13 +2083,14 @@ fn validate_on_shaders(model: &ExprNnue) -> f64 {
 
     for (name, arena, arena_root) in &validation_exprs {
         // Benchmark the original expression
-        let original_ns = match benchmark_jit_arena(arena, *arena_root) {
-            Ok(r) => r.ns,
-            Err(e) => {
-                logln!("[VAL] {name}: original JIT failed: {e}");
-                continue;
-            }
-        };
+        let original_ns =
+            match benchmark_jit_arena_repeated(arena, *arena_root, VAL_BENCH_REPEAT_BATCHES) {
+                Ok(r) => r.ns,
+                Err(e) => {
+                    logln!("[VAL] {name}: original JIT failed: {e}");
+                    continue;
+                }
+            };
 
         // Saturate with a small budget (fast, prevents e-graph explosion)
         let mut egraph = EGraph::with_rules(all_math_rules());
@@ -2056,7 +2119,11 @@ fn validate_on_shaders(model: &ExprNnue) -> f64 {
             extract_neural_to_arena(&egraph, root, model);
 
         // Benchmark the extracted expression
-        let extracted_ns = match benchmark_jit_arena(&extracted_arena, extracted_root) {
+        let extracted_ns = match benchmark_jit_arena_repeated(
+            &extracted_arena,
+            extracted_root,
+            VAL_BENCH_REPEAT_BATCHES,
+        ) {
             Ok(r) => r.ns,
             Err(e) => {
                 logln!("[VAL] {name}: extracted JIT failed: {e}");
@@ -2071,13 +2138,13 @@ fn validate_on_shaders(model: &ExprNnue) -> f64 {
             || extracted_ns <= 0.0
         {
             logln!(
-                "[VAL] {name}: degenerate timing original={original_ns:.1}ns extracted={extracted_ns:.1}ns"
+                "[VAL] {name}: degenerate timing original={original_ns:.3}ns extracted={extracted_ns:.3}ns"
             );
             continue;
         }
 
         let speedup = original_ns / extracted_ns;
-        logln!("[VAL] {name}: {original_ns:.1}ns -> {extracted_ns:.1}ns = {speedup:.3}x");
+        logln!("[VAL] {name}: {original_ns:.3}ns -> {extracted_ns:.3}ns = {speedup:.3}x");
         speedups.push(speedup);
     }
 
@@ -2114,6 +2181,10 @@ fn run_trial(
     critic_url: &str,
     output_dir: &Path,
     workers: Option<usize>,
+    default_critic_epochs: usize,
+    default_critic_lr: f64,
+    default_critic_dropout: f64,
+    default_critic_mini_batch_size: usize,
 ) -> serde_json::Value {
     let trial_dir = output_dir.join(format!("trial_{trial_id}"));
     std::fs::create_dir_all(&trial_dir)
@@ -2137,6 +2208,87 @@ fn run_trial(
 
     let mut round_metrics = Vec::with_capacity(config.rounds);
     let mut best_score = f64::INFINITY;
+    let critic_epochs = config.critic_epochs.unwrap_or(default_critic_epochs);
+    let critic_lr = config.critic_lr.unwrap_or(default_critic_lr);
+    let critic_dropout = config.critic_dropout.unwrap_or(default_critic_dropout);
+    let critic_mini_batch_size = config
+        .critic_mini_batch_size
+        .unwrap_or(default_critic_mini_batch_size);
+
+    if config.offline {
+        let traj_dir = config.trajectory_dir.as_deref().unwrap_or(output_dir);
+        logln!(
+            "[SERVER] Trial {trial_id}: offline replay from {:?} (max_files={})",
+            traj_dir,
+            config.max_trajectory_files,
+        );
+
+        let mut traj_files: Vec<PathBuf> = std::fs::read_dir(traj_dir)
+            .unwrap_or_else(|e| {
+                panic!("[SERVER] Failed to read trajectory dir {:?}: {e}", traj_dir)
+            })
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("trajectories_r") && name.ends_with(".pftraj") {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        traj_files.sort();
+
+        if traj_files.is_empty() {
+            panic!("[SERVER] No trajectory files found in {:?}", traj_dir);
+        }
+
+        if config.max_trajectory_files > 0 && traj_files.len() > config.max_trajectory_files {
+            let drop = traj_files.len() - config.max_trajectory_files;
+            traj_files.drain(..drop);
+        }
+
+        let mut all_trajs = Vec::new();
+        for path in &traj_files {
+            all_trajs.extend(load_trajectories_binary(path));
+        }
+
+        let combined_path = trial_dir.join("_offline_trajectories.pftraj");
+        write_trajectories_binary(&all_trajs, &combined_path);
+        let adv_path = trial_dir.join("_offline_advantages.pfadv");
+
+        run_critic(
+            critic_url,
+            combined_path
+                .to_str()
+                .unwrap_or_else(|| panic!("[SERVER] Invalid UTF-8 in trajectory path")),
+            adv_path
+                .to_str()
+                .unwrap_or_else(|| panic!("[SERVER] Invalid UTF-8 in advantage path")),
+            critic_epochs,
+            critic_lr,
+            critic_dropout,
+            critic_mini_batch_size,
+        );
+
+        let all_advs = read_advantages_binary(&adv_path);
+        assert_eq!(
+            all_trajs.len(),
+            all_advs.len(),
+            "[SERVER] Trial {trial_id}: trajectory/advantage count mismatch: {} vs {}",
+            all_trajs.len(),
+            all_advs.len()
+        );
+
+        replay_buffer.push_round(&all_trajs, &all_advs);
+        let _ = std::fs::remove_file(&combined_path);
+        let _ = std::fs::remove_file(&adv_path);
+        logln!(
+            "[SERVER] Trial {trial_id}: offline replay buffer contains {} steps from {} trajectories",
+            replay_buffer.len(),
+            all_trajs.len(),
+        );
+    }
 
     for round in 0..config.rounds {
         let round_start = std::time::Instant::now();
@@ -2148,129 +2300,165 @@ fn run_trial(
             config.rounds,
         );
 
-        // ── PHASE 1: GENERATE ─────────────────────────────────────────
-        let mut rs = round_seed;
-        let mut rf = || -> f32 {
-            rs = rs.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (rs >> 33) as f32 / (1u64 << 31) as f32
-        };
-        let gen_config = BwdGenConfig {
-            max_depth: 5 + (rf() * 6.0) as usize,
-            leaf_prob: 0.10 + rf() * 0.20,
-            num_vars: 4,
-            fused_op_prob: 0.05 + rf() * 0.15,
-            max_junkify_passes: 2 + (rf() * 4.0) as usize,
-            junkify_prob: 0.5 + rf() * 0.3,
-            max_junkified_nodes: 300 + (rf() * 400.0) as usize,
-        };
+        let mut speedup_median = f64::NAN;
+        let mut total_steps = 0usize;
+        let mut gen_elapsed_s = 0.0f64;
+        let mut trajectory_count = 0usize;
 
-        let corpus_count = (config.trajectories_per_round as f32 * config.corpus_fraction) as usize;
-        let es_count = config.trajectories_per_round - corpus_count;
+        if !config.offline {
+            // ── PHASE 1: GENERATE ─────────────────────────────────────────
+            let mut rs = round_seed;
+            let mut rf = || -> f32 {
+                rs = rs.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (rs >> 33) as f32 / (1u64 << 31) as f32
+            };
+            let gen_config = BwdGenConfig {
+                max_depth: 5 + (rf() * 6.0) as usize,
+                leaf_prob: 0.10 + rf() * 0.20,
+                num_vars: 4,
+                fused_op_prob: 0.05 + rf() * 0.15,
+                max_junkify_passes: 2 + (rf() * 4.0) as usize,
+                junkify_prob: 0.5 + rf() * 0.3,
+                max_junkified_nodes: 300 + (rf() * 400.0) as usize,
+            };
 
-        let gen_start = std::time::Instant::now();
+            let corpus_count =
+                (config.trajectories_per_round as f32 * config.corpus_fraction) as usize;
+            let es_count = config.trajectories_per_round - corpus_count;
 
-        let mut trajectories = generate_trajectory_batch_parallel(
-            &model,
-            templates,
-            rules,
-            es_count,
-            round_seed,
-            config.threshold,
-            config.max_steps,
-            &gen_config,
-            Some(effective_workers),
-        );
+            let gen_start = std::time::Instant::now();
 
-        if corpus_count > 0 && !corpus_exprs.is_empty() {
-            trajectories.extend(generate_corpus_trajectories_parallel(
+            let mut trajectories = generate_trajectory_batch_parallel(
                 &model,
                 templates,
                 rules,
-                corpus_exprs,
-                corpus_count,
-                round_seed.wrapping_add(0xC0),
+                es_count,
+                round_seed,
                 config.threshold,
                 config.max_steps,
+                &gen_config,
                 Some(effective_workers),
-            ));
-        }
-        let gen_elapsed = gen_start.elapsed();
-
-        // Filter empty trajectories
-        let mut trajectories: Vec<_> = trajectories
-            .into_iter()
-            .filter(|t| !t.steps.is_empty())
-            .collect();
-
-        if trajectories.is_empty() {
-            logln!(
-                "[SERVER] Trial {trial_id} round {}: no valid trajectories, skipping",
-                round + 1
             );
-            round_metrics.push(serde_json::json!({
-                "round": round,
-                "skipped": true,
-            }));
-            continue;
-        }
 
-        // Replace NaN/non-finite jit_cost_ns with penalty
-        let max_cost_ns = trajectories
-            .iter()
-            .flat_map(|t| t.steps.iter())
-            .filter_map(|s| {
-                if s.jit_cost_ns.is_finite() {
-                    Some(s.jit_cost_ns)
-                } else {
-                    None
-                }
-            })
-            .fold(0.0f64, f64::max);
-        let penalty_cost_ns = (max_cost_ns * 2.0).max(100.0);
+            if corpus_count > 0 && !corpus_exprs.is_empty() {
+                trajectories.extend(generate_corpus_trajectories_parallel(
+                    &model,
+                    templates,
+                    rules,
+                    corpus_exprs,
+                    corpus_count,
+                    round_seed.wrapping_add(0xC0),
+                    config.threshold,
+                    config.max_steps,
+                    Some(effective_workers),
+                ));
+            }
+            gen_elapsed_s = gen_start.elapsed().as_secs_f64();
 
-        for traj in &mut trajectories {
-            for step in &mut traj.steps {
-                if !step.jit_cost_ns.is_finite() || step.jit_cost_ns < 0.0 {
-                    step.jit_cost_ns = penalty_cost_ns;
+            // Filter empty trajectories
+            let mut trajectories: Vec<_> = trajectories
+                .into_iter()
+                .filter(|t| !t.steps.is_empty())
+                .collect();
+
+            if trajectories.is_empty() {
+                logln!(
+                    "[SERVER] Trial {trial_id} round {}: no valid trajectories, skipping",
+                    round + 1
+                );
+                round_metrics.push(serde_json::json!({
+                    "round": round,
+                    "skipped": true,
+                    "mode": "online",
+                }));
+                continue;
+            }
+
+            // Replace NaN/non-finite jit_cost_ns with penalty
+            let max_cost_ns = trajectories
+                .iter()
+                .flat_map(|t| t.steps.iter())
+                .filter_map(|s| {
+                    if s.jit_cost_ns.is_finite() {
+                        Some(s.jit_cost_ns)
+                    } else {
+                        None
+                    }
+                })
+                .fold(0.0f64, f64::max);
+            let penalty_cost_ns = (max_cost_ns * 2.0).max(100.0);
+
+            for traj in &mut trajectories {
+                for step in &mut traj.steps {
+                    if !step.jit_cost_ns.is_finite() || step.jit_cost_ns < 0.0 {
+                        step.jit_cost_ns = penalty_cost_ns;
+                    }
                 }
             }
-        }
 
-        let total_steps: usize = trajectories.iter().map(|t| t.steps.len()).sum();
+            total_steps = trajectories.iter().map(|t| t.steps.len()).sum();
+            trajectory_count = trajectories.len();
 
-        // ── PHASE 2: EXPORT ───────────────────────────────────────────
-        let traj_path = trial_dir.join(format!("trajectories_r{round}.pftraj"));
-        write_trajectories_binary(&trajectories, &traj_path);
+            // ── PHASE 2: EXPORT ───────────────────────────────────────────
+            let traj_path = trial_dir.join(format!("trajectories_r{round}.pftraj"));
+            write_trajectories_binary(&trajectories, &traj_path);
 
-        // ── PHASE 3: CRITIQUE ─────────────────────────────────────────
-        let adv_path = trial_dir.join(format!("advantages_r{round}.pfadv"));
-        let _ = std::fs::remove_file(&adv_path);
+            // ── PHASE 3: CRITIQUE ─────────────────────────────────────────
+            let adv_path = trial_dir.join(format!("advantages_r{round}.pfadv"));
+            let _ = std::fs::remove_file(&adv_path);
 
-        let traj_path_str = traj_path
-            .to_str()
-            .unwrap_or_else(|| panic!("[SERVER] Invalid UTF-8 in traj path"));
-        let adv_path_str = adv_path
-            .to_str()
-            .unwrap_or_else(|| panic!("[SERVER] Invalid UTF-8 in adv path"));
+            let traj_path_str = traj_path
+                .to_str()
+                .unwrap_or_else(|| panic!("[SERVER] Invalid UTF-8 in traj path"));
+            let adv_path_str = adv_path
+                .to_str()
+                .unwrap_or_else(|| panic!("[SERVER] Invalid UTF-8 in adv path"));
 
-        step_critic(critic_url, traj_path_str, adv_path_str);
+            step_critic(critic_url, traj_path_str, adv_path_str);
 
-        // ── PHASE 4: UPDATE ──────────────────────────────────────────
-        let advantages = read_advantages_binary(&adv_path);
+            // ── PHASE 4: UPDATE ──────────────────────────────────────────
+            let advantages = read_advantages_binary(&adv_path);
 
-        if advantages.len() != trajectories.len() {
-            panic!(
-                "[SERVER] Trial {trial_id} round {}: trajectory/advantage count mismatch: {} vs {}",
-                round,
-                trajectories.len(),
-                advantages.len(),
-            );
+            if advantages.len() != trajectories.len() {
+                panic!(
+                    "[SERVER] Trial {trial_id} round {}: trajectory/advantage count mismatch: {} vs {}",
+                    round,
+                    trajectories.len(),
+                    advantages.len(),
+                );
+            }
+
+            replay_buffer.push_round(&trajectories, &advantages);
+
+            const MAX_REASONABLE_NS: f64 = 1_000_000_000.0;
+            let mut speedups: Vec<f64> = trajectories
+                .iter()
+                .filter(|t| {
+                    t.initial_cost_ns.is_finite()
+                        && t.initial_cost_ns > 0.0
+                        && t.initial_cost_ns < MAX_REASONABLE_NS
+                        && t.final_cost_ns.is_finite()
+                        && t.final_cost_ns > 0.0
+                        && t.final_cost_ns < MAX_REASONABLE_NS
+                })
+                .map(|t| t.initial_cost_ns / t.final_cost_ns)
+                .collect();
+            speedups
+                .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+            speedup_median = if speedups.is_empty() {
+                f64::NAN
+            } else {
+                let mid = speedups.len() / 2;
+                if speedups.len() % 2 == 0 {
+                    (speedups[mid - 1] + speedups[mid]) / 2.0
+                } else {
+                    speedups[mid]
+                }
+            };
         }
 
         let annealed_entropy = (config.entropy_coeff * (1.0 - round as f32 / config.rounds as f32))
             .max(config.entropy_floor);
-
-        replay_buffer.push_round(&trajectories, &advantages);
 
         // Mini-batch gradient steps from replay buffer
         let mut round_grad_norm = 0.0f32;
@@ -2359,8 +2547,8 @@ fn run_trial(
             config.mini_batch_size.min(replay_buffer.len()),
             round_seed.wrapping_add(0xE7A1),
         );
-        let mut value_loss_sum = 0.0f64;
-        let mut policy_loss_sum = 0.0f64;
+        let mut extraction_loss_sum = 0.0f64;
+        let mut saturation_loss_sum = 0.0f64;
         for &idx in &eval_indices {
             let step = &replay_buffer.steps[idx];
             let acc = acc_from_replay(step);
@@ -2369,55 +2557,30 @@ fn run_trial(
             let cache = forward_cached(&model, &acc, &gacc, &rule_embed);
 
             let target = log_ns(step.jit_cost_ns);
-            let value_err = cache.value_pred - target;
-            value_loss_sum += (value_err * value_err) as f64;
+            let extraction_err = cache.value_pred - target;
+            extraction_loss_sum += (extraction_err * extraction_err) as f64;
 
             let p = (cache.prob as f64).clamp(1e-7, 1.0 - 1e-7);
-            policy_loss_sum += -libm::log(p);
+            saturation_loss_sum += -libm::log(p);
         }
-        let avg_value_loss = value_loss_sum / eval_indices.len().max(1) as f64;
-        let avg_policy_loss = policy_loss_sum / eval_indices.len().max(1) as f64;
+        let avg_extraction_loss = extraction_loss_sum / eval_indices.len().max(1) as f64;
+        let avg_saturation_loss = saturation_loss_sum / eval_indices.len().max(1) as f64;
 
-        // Speedup metric (median)
-        const MAX_REASONABLE_NS: f64 = 1_000_000_000.0;
-        let mut speedups: Vec<f64> = trajectories
-            .iter()
-            .filter(|t| {
-                t.initial_cost_ns.is_finite()
-                    && t.initial_cost_ns > 0.0
-                    && t.initial_cost_ns < MAX_REASONABLE_NS
-                    && t.final_cost_ns.is_finite()
-                    && t.final_cost_ns > 0.0
-                    && t.final_cost_ns < MAX_REASONABLE_NS
-            })
-            .map(|t| t.initial_cost_ns / t.final_cost_ns)
-            .collect();
-        speedups.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-        let speedup_median = if speedups.is_empty() {
-            f64::NAN
-        } else {
-            let mid = speedups.len() / 2;
-            if speedups.len() % 2 == 0 {
-                (speedups[mid - 1] + speedups[mid]) / 2.0
-            } else {
-                speedups[mid]
-            }
-        };
-
-        // Track best score (lowest value loss)
-        if avg_value_loss < best_score {
-            best_score = avg_value_loss;
+        // Track best score (lowest extraction loss)
+        if avg_extraction_loss < best_score {
+            best_score = avg_extraction_loss;
         }
 
         let round_elapsed = round_start.elapsed();
 
         let metrics = serde_json::json!({
             "round": round,
-            "trajectories": trajectories.len(),
+            "mode": if config.offline { "offline" } else { "online" },
+            "trajectories": trajectory_count,
             "total_steps": total_steps,
             "speedup_median": speedup_median,
-            "avg_value_loss": avg_value_loss,
-            "avg_policy_loss": avg_policy_loss,
+            "avg_extraction_loss": avg_extraction_loss,
+            "avg_saturation_loss": avg_saturation_loss,
             "entropy_coeff": annealed_entropy,
             "grad_norm": avg_grad_norm,
             "grad_norm_raw": avg_grad_norm,
@@ -2426,7 +2589,7 @@ fn run_trial(
             "buffer_size": replay_buffer.len(),
             "policy_steps": total_policy_steps,
             "value_steps": total_value_steps,
-            "gen_elapsed_s": gen_elapsed.as_secs_f64(),
+            "gen_elapsed_s": gen_elapsed_s,
             "rss_mb": rss_mb(),
             "elapsed_s": round_elapsed.as_secs_f64(),
         });
@@ -2441,15 +2604,16 @@ fn run_trial(
         let hms = &hms;
 
         logln!(
-            "[{hms}] [SERVER] Trial {trial_id} round {}/{}: val_loss={:.4} pol_loss={:.4} \
-             speedup={:.2}x grad={:.4} time={:.1}s",
+            "[{hms}] [SERVER] Trial {trial_id} round {}/{}: extraction_loss={:.4} saturation_loss={:.4} \
+             speedup={:.2}x grad={:.4} time={:.1}s mode={}",
             round + 1,
             config.rounds,
-            avg_value_loss,
-            avg_policy_loss,
+            avg_extraction_loss,
+            avg_saturation_loss,
             speedup_median,
             avg_grad_norm,
             round_elapsed.as_secs_f64(),
+            if config.offline { "offline" } else { "online" },
         );
     }
 
@@ -2516,7 +2680,12 @@ fn run_server(args: &Args, socket_path: &Path) {
             args.critic_checkpoint
         )
     });
-    let mut critic_child = ensure_critic_server(&args.critic_url, critic_ckpt_str);
+    let mut critic_child = ensure_critic_server(
+        &args.critic_url,
+        critic_ckpt_str,
+        args.critic_lr,
+        args.critic_dropout,
+    );
 
     // Create output directory
     std::fs::create_dir_all(&args.output_dir).unwrap_or_else(|e| {
@@ -2587,7 +2756,7 @@ fn run_server(args: &Args, socket_path: &Path) {
 
         logln!(
             "[SERVER] Trial {trial_id}: rounds={} traj={} lr={:.2e} momentum={:.3} \
-             wd={:.2e} ent={:.3} seed={}",
+             wd={:.2e} ent={:.3} seed={} offline={} max_files={} critic_ep={} critic_lr={:.2e} critic_do={:.3} critic_bs={}",
             config.rounds,
             config.trajectories_per_round,
             config.lr,
@@ -2595,6 +2764,14 @@ fn run_server(args: &Args, socket_path: &Path) {
             config.weight_decay,
             config.entropy_coeff,
             config.seed,
+            config.offline,
+            config.max_trajectory_files,
+            config.critic_epochs.unwrap_or(args.critic_epochs),
+            config.critic_lr.unwrap_or(args.critic_lr),
+            config.critic_dropout.unwrap_or(args.critic_dropout),
+            config
+                .critic_mini_batch_size
+                .unwrap_or(args.critic_mini_batch_size),
         );
 
         let trial_start = std::time::Instant::now();
@@ -2610,6 +2787,10 @@ fn run_server(args: &Args, socket_path: &Path) {
                 &args.critic_url,
                 &args.output_dir,
                 args.workers,
+                args.critic_epochs,
+                args.critic_lr,
+                args.critic_dropout,
+                args.critic_mini_batch_size,
             )
         }));
 
