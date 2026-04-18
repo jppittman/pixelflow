@@ -59,7 +59,7 @@ use pixelflow_pipeline::training::self_play::{
     generate_trajectory_batch_parallel, load_corpus_exprs, load_trajectories_binary,
     read_advantages_binary, write_trajectories_binary,
 };
-use pixelflow_pipeline::training::unified::{Trajectory, TrajectoryAdvantages, TrajectoryStep};
+use pixelflow_pipeline::training::unified::{Trajectory, TrajectoryAdvantages};
 use pixelflow_pipeline::training::unified_backward::{
     UnifiedGradients, apply_unified_sgd, backward_policy, backward_through_accumulator,
     backward_value, compute_d_acc_input_value, forward_cached,
@@ -1444,18 +1444,42 @@ fn real_main() {
                 / valid_jit_trajs.len() as f64
         };
 
-        // Extraction head MAE: mean |predict_log_cost - log_ns(jit_cost)| across all steps
+        // Extraction head MAE: mean |predict_log_cost - log_ns(jit_cost)| on initial/final/intermediate pairs
         let mut extraction_error_sum = 0.0f64;
         let mut extraction_error_count = 0u64;
         for traj in &trajectories {
-            for step in &traj.steps {
-                if step.jit_cost_ns.is_finite() && step.jit_cost_ns >= 0.5 {
-                    let acc = acc_from_step(step);
-                    let predicted = model.predict_log_cost_with_features(&acc);
-                    let actual = log_ns(step.jit_cost_ns);
-                    extraction_error_sum += libm::fabs((predicted - actual) as f64);
-                    extraction_error_count += 1;
+            // initial pair
+            if !traj.initial_accumulator_state.is_empty()
+                && traj.initial_cost_ns.is_finite()
+                && traj.initial_cost_ns >= 0.5
+            {
+                let acc = acc_from_vec(&traj.initial_accumulator_state);
+                let predicted = model.predict_log_cost_with_features(&acc);
+                let actual = log_ns(traj.initial_cost_ns);
+                extraction_error_sum += libm::fabs((predicted - actual) as f64);
+                extraction_error_count += 1;
+            }
+            // final pair
+            if !traj.final_accumulator_state.is_empty()
+                && traj.final_cost_ns.is_finite()
+                && traj.final_cost_ns >= 0.5
+            {
+                let acc = acc_from_vec(&traj.final_accumulator_state);
+                let predicted = model.predict_log_cost_with_features(&acc);
+                let actual = log_ns(traj.final_cost_ns);
+                extraction_error_sum += libm::fabs((predicted - actual) as f64);
+                extraction_error_count += 1;
+            }
+            // intermediate pairs
+            for (acc_state, _edges, cost_ns) in &traj.intermediate_pairs {
+                if acc_state.is_empty() || !cost_ns.is_finite() || *cost_ns < 0.5 {
+                    continue;
                 }
+                let acc = acc_from_vec(acc_state);
+                let predicted = model.predict_log_cost_with_features(&acc);
+                let actual = log_ns(*cost_ns);
+                extraction_error_sum += libm::fabs((predicted - actual) as f64);
+                extraction_error_count += 1;
             }
         }
         let extraction_mae = if extraction_error_count == 0 {
@@ -1463,6 +1487,82 @@ fn real_main() {
         } else {
             extraction_error_sum / extraction_error_count as f64
         };
+
+        // Policy entropy: mean per-rule Bernoulli entropy across all steps
+        let mut entropy_sum = 0.0f64;
+        let mut entropy_count = 0u64;
+        for traj in &trajectories {
+            for step in &traj.steps {
+                for &(_rule_idx, prob, _approved) in &step.mask {
+                    let p = prob as f64;
+                    let eps = 1e-7;
+                    let p = p.clamp(eps, 1.0 - eps);
+                    let h = -p * p.ln() - (1.0 - p) * (1.0 - p).ln();
+                    entropy_sum += h;
+                    entropy_count += 1;
+                }
+            }
+        }
+        let mean_policy_entropy = if entropy_count == 0 {
+            f64::NAN
+        } else {
+            entropy_sum / entropy_count as f64
+        };
+
+        // Approval and match rates
+        let mut total_mask_entries = 0u64;
+        let mut total_approved = 0u64;
+        let mut total_matched = 0u64; // approved rules that produced unions > 0
+        for traj in &trajectories {
+            for step in &traj.steps {
+                for &(rule_idx, _prob, approved) in &step.mask {
+                    total_mask_entries += 1;
+                    if approved {
+                        total_approved += 1;
+                        let fired = step.rule_outcomes.iter().any(|&(r, u)| r == rule_idx && u > 0);
+                        if fired {
+                            total_matched += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let approval_rate = if total_mask_entries == 0 {
+            f64::NAN
+        } else {
+            total_approved as f64 / total_mask_entries as f64
+        };
+        let match_rate = if total_approved == 0 {
+            f64::NAN
+        } else {
+            total_matched as f64 / total_approved as f64
+        };
+
+        // Terminal reward distribution: reward = -log_ns(final_cost_ns)
+        let rewards: Vec<f64> = trajectories
+            .iter()
+            .filter(|t| t.final_cost_ns.is_finite() && t.final_cost_ns >= 0.5)
+            .map(|t| -(log_ns(t.final_cost_ns) as f64))
+            .collect();
+        let reward_mean = if rewards.is_empty() {
+            f64::NAN
+        } else {
+            rewards.iter().sum::<f64>() / rewards.len() as f64
+        };
+        let reward_std = if rewards.len() < 2 {
+            f64::NAN
+        } else {
+            let var = rewards
+                .iter()
+                .map(|r| (r - reward_mean).powi(2))
+                .sum::<f64>()
+                / rewards.len() as f64;
+            var.sqrt()
+        };
+
+        // Intermediate pairs count
+        let total_intermediate_pairs: usize =
+            trajectories.iter().map(|t| t.intermediate_pairs.len()).sum();
 
         // Log metrics as JSONL
         let metrics = serde_json::json!({
@@ -1474,6 +1574,12 @@ fn real_main() {
             "avg_initial_ns": avg_initial_ns,
             "avg_final_ns": avg_final_ns,
             "extraction_mae": extraction_mae,
+            "mean_policy_entropy": mean_policy_entropy,
+            "approval_rate": approval_rate,
+            "match_rate": match_rate,
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "intermediate_pairs": total_intermediate_pairs,
             "es_depth": gen_config.max_depth,
             "es_leaf_prob": gen_config.leaf_prob,
             "gen_depth": gen_config.max_depth,
@@ -1519,7 +1625,8 @@ fn real_main() {
                 w,
                 "[{hms}] [METRICS] speedup={speedup_median:.3}x init={avg_initial_ns:.1}ns final={avg_final_ns:.1}ns \
                  extraction_mae={extraction_mae:.3} depth={} steps={avg_steps:.1} \
-                 grad_raw={avg_grad_norm:.2} grad_clip={avg_clipped_grad_norm:.2} buf={} time={:.1}s",
+                 grad_raw={avg_grad_norm:.2} grad_clip={avg_clipped_grad_norm:.2} buf={} time={:.1}s \
+                 appr={approval_rate:.2} match={match_rate:.2} entropy={mean_policy_entropy:.3} reward_mean={reward_mean:.3}",
                 gen_config.max_depth,
                 replay_buffer.len(),
                 round_elapsed.as_secs_f64()
