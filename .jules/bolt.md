@@ -13,3 +13,11 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Redundant Math Operations in Normalization
+**Learning:** In mathematical expressions calculating inverse lengths (like vector normalization),  was being used, which incorrectly applies the root twice (calculating 1/(x^(1/4))) and adds a computationally expensive, redundant operation.
+**Action:** Replaced  with . Always ensure standard math identities are correctly implemented to avoid compounded operation costs.
+
+## 2025-12-28 - Redundant Math Operations in Normalization
+**Learning:** In mathematical expressions calculating inverse lengths (like vector normalization), `.sqrt().rsqrt()` was being used, which incorrectly applies the root twice (calculating 1/(x^(1/4))) and adds a computationally expensive, redundant operation.
+**Action:** Replaced `.sqrt().rsqrt()` with `.rsqrt()`. Always ensure standard math identities are correctly implemented to avoid compounded operation costs.
