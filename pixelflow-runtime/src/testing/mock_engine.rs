@@ -58,7 +58,7 @@ impl MockEngine {
     }
 
     pub fn messages(&self) -> std::sync::MutexGuard<'_, Vec<ReceivedMessage>> {
-        self.messages.lock().unwrap()
+        self.messages.lock().expect("Failed to lock messages mutex")
     }
 }
 
@@ -71,7 +71,7 @@ impl Actor<EngineData, EngineControl, AppManagement> for MessageCollector {
     fn handle_data(&mut self, msg: EngineData) -> HandlerResult {
         self.messages
             .lock()
-            .unwrap()
+            .expect("Failed to lock messages mutex")
             .push(ReceivedMessage::Data(msg));
         Ok(())
     }
@@ -79,7 +79,7 @@ impl Actor<EngineData, EngineControl, AppManagement> for MessageCollector {
     fn handle_control(&mut self, msg: EngineControl) -> HandlerResult {
         self.messages
             .lock()
-            .unwrap()
+            .expect("Failed to lock messages mutex")
             .push(ReceivedMessage::Control(msg));
         Ok(())
     }
@@ -87,7 +87,7 @@ impl Actor<EngineData, EngineControl, AppManagement> for MessageCollector {
     fn handle_management(&mut self, msg: AppManagement) -> HandlerResult {
         self.messages
             .lock()
-            .unwrap()
+            .expect("Failed to lock messages mutex")
             .push(ReceivedMessage::Management(msg));
         Ok(())
     }
