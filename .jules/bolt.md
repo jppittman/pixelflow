@@ -13,3 +13,5 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+* Renamed tests in `pixelflow-core/src/algebra.rs` to conform to the STYLE.md conventions (`[behavior]_should_[expected]`). Used `git restore` on unmodified files to ensure `cargo fmt` noise did not leak into unrelated files, preserving scope.
