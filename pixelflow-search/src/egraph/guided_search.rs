@@ -482,17 +482,22 @@ impl GuidedSearch {
         loop {
             // Termination checks
             if self.epoch >= self.max_epochs {
-                return self.finish_unified_mask(
-                    StopReason::MaxEpochs, pairs_tried, pairs_skipped, trajectory
-                );
+                return self.finish_unified_mask(UnifiedMaskFinishParams {
+                    stop_reason: StopReason::MaxEpochs,
+                    pairs_tried: pairs_tried,
+                    pairs_skipped: pairs_skipped,
+                    trajectory: trajectory,
+                });
             }
 
             let num_classes = self.egraph.num_classes();
             if num_classes >= max_classes {
-                return self.finish_unified_mask(
-                    StopReason::MaxEpochs, // TODO: add OutOfSpace reason
-                    pairs_tried, pairs_skipped, trajectory
-                );
+                return self.finish_unified_mask(UnifiedMaskFinishParams {
+                    stop_reason: StopReason::MaxEpochs, // TODO: add OutOfSpace reason
+                    pairs_tried: pairs_tried,
+                    pairs_skipped: pairs_skipped,
+                    trajectory: trajectory,
+                });
             }
 
             let cost_before = self.best_cost;
@@ -573,9 +578,12 @@ impl GuidedSearch {
             });
 
             if total_changes == 0 {
-                return self.finish_unified_mask(
-                    StopReason::Saturated, pairs_tried, pairs_skipped, trajectory
-                );
+                return self.finish_unified_mask(UnifiedMaskFinishParams {
+                    stop_reason: StopReason::Saturated,
+                    pairs_tried: pairs_tried,
+                    pairs_skipped: pairs_skipped,
+                    trajectory: trajectory,
+                });
             }
 
             self.epoch += 1;
@@ -642,17 +650,22 @@ impl GuidedSearch {
         loop {
             // Termination checks
             if self.epoch >= self.max_epochs {
-                return self.finish_unified_mask(
-                    StopReason::MaxEpochs, pairs_tried, pairs_skipped, trajectory
-                );
+                return self.finish_unified_mask(UnifiedMaskFinishParams {
+                    stop_reason: StopReason::MaxEpochs,
+                    pairs_tried: pairs_tried,
+                    pairs_skipped: pairs_skipped,
+                    trajectory: trajectory,
+                });
             }
 
             let num_classes = self.egraph.num_classes();
             if num_classes >= max_classes {
-                return self.finish_unified_mask(
-                    StopReason::MaxEpochs, // Resource limit (maps to MaxEpochs for now)
-                    pairs_tried, pairs_skipped, trajectory
-                );
+                return self.finish_unified_mask(UnifiedMaskFinishParams {
+                    stop_reason: StopReason::MaxEpochs, // Resource limit (maps to MaxEpochs for now)
+                    pairs_tried: pairs_tried,
+                    pairs_skipped: pairs_skipped,
+                    trajectory: trajectory,
+                });
             }
 
             let cost_before = self.best_cost;
@@ -730,9 +743,12 @@ impl GuidedSearch {
             });
 
             if total_changes == 0 {
-                return self.finish_unified_mask(
-                    StopReason::Saturated, pairs_tried, pairs_skipped, trajectory
-                );
+                return self.finish_unified_mask(UnifiedMaskFinishParams {
+                    stop_reason: StopReason::Saturated,
+                    pairs_tried: pairs_tried,
+                    pairs_skipped: pairs_skipped,
+                    trajectory: trajectory,
+                });
             }
 
             self.epoch += 1;
@@ -741,19 +757,16 @@ impl GuidedSearch {
 
     fn finish_unified_mask(
         &self,
-        stop_reason: StopReason,
-        pairs_tried: usize,
-        pairs_skipped: usize,
-        trajectory: Vec<UnifiedMaskEpochRecord>,
+        params: UnifiedMaskFinishParams,
     ) -> UnifiedMaskSearchResult {
         UnifiedMaskSearchResult {
             best_tree: self.best_tree.clone().expect("best_tree should be set"),
             best_cost: self.best_cost,
             epochs_used: self.epoch,
-            pairs_tried,
-            pairs_skipped,
-            trajectory,
-            stop_reason,
+            pairs_tried: params.pairs_tried,
+            pairs_skipped: params.pairs_skipped,
+            trajectory: params.trajectory,
+            stop_reason: params.stop_reason,
         }
     }
 
@@ -840,6 +853,13 @@ pub struct UnifiedMaskEpochRecord {
 }
 
 /// Result of unified dual-mask guided search.
+pub struct UnifiedMaskFinishParams {
+    pub stop_reason: StopReason,
+    pub pairs_tried: usize,
+    pub pairs_skipped: usize,
+    pub trajectory: Vec<UnifiedMaskEpochRecord>,
+}
+
 pub struct UnifiedMaskSearchResult {
     /// Best expression tree found
     pub best_tree: ExprTree,
