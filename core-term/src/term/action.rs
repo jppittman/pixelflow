@@ -78,7 +78,7 @@ pub enum UserInputAction {
     KeyInput {
         symbol: KeySymbol,
         modifiers: Modifiers,
-        text: Option<std::borrow::Cow<'static, str>>>,
+        text: Option<std::borrow::Cow<'static, str>>,
     },
 
     /// Initiate copy of selected text.
