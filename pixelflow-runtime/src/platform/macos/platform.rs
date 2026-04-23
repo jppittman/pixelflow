@@ -5,7 +5,7 @@ use crate::error::RuntimeError;
 use crate::platform::macos::cocoa::{self, event_type, NSApplication, NSPasteboard};
 use crate::platform::macos::events;
 use crate::platform::macos::sys;
-use crate::platform::macos::window::MacWindow;
+use crate::platform::macos::window::{MacWindow, WindowVisibility};
 use crate::platform::PlatformPixel;
 use actor_scheduler::{ActorStatus, HandlerError, HandlerResult, Message, SystemStatus};
 use pixelflow_graphics::render::Frame;
@@ -102,7 +102,12 @@ impl PlatformOps for MetalOps {
             }
             DisplayControl::SetVisible { id, visible } => {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    win.set_visible(visible);
+                    let visibility = if visible {
+                        WindowVisibility::Visible
+                    } else {
+                        WindowVisibility::Hidden
+                    };
+                    win.set_visible(visibility);
                 }
             }
             DisplayControl::RequestRedraw { id } => {
@@ -164,7 +169,7 @@ impl PlatformOps for MetalOps {
             }
             DisplayMgmt::Destroy { id } => {
                 if let Some(mut win) = self.windows.remove(&id) {
-                    win.set_visible(false);
+                    win.set_visible(WindowVisibility::Hidden);
                     // Drop closes it implicitly or we call close
                     // win.window.close(); // If we expose it
                     self.window_map.remove(&(win.window.0 as usize));
