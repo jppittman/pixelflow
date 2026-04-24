@@ -117,6 +117,12 @@ impl NSRect {
 
 // --- Wrappers ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoreOtherApps {
+    Yes,
+    No,
+}
+
 /// Wrapper for NSApplication
 #[derive(Copy, Clone)]
 pub struct NSApplication(pub Id);
@@ -136,9 +142,12 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self, ignore: IgnoreOtherApps) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = match ignore {
+                IgnoreOtherApps::Yes => YES,
+                IgnoreOtherApps::No => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -247,6 +256,12 @@ impl NSWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRequirement {
+    WantsLayer,
+    NoLayer,
+}
+
 /// Wrapper for NSView
 #[derive(Copy, Clone)]
 pub struct NSView(pub Id);
@@ -266,9 +281,12 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self, wants: LayerRequirement) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = match wants {
+                LayerRequirement::WantsLayer => YES,
+                LayerRequirement::NoLayer => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }

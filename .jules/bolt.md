@@ -13,3 +13,8 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+### Refactoring boolean arguments to enums
+When refactoring boolean arguments to enums to enforce style rules, always add standard derivations (e.g., `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`) to the new enum. This ensures the enum mimics the fundamental usability of a boolean and prevents downstream compilation errors in structs or comparisons that originally relied on boolean trait implementations.
+
+Also, be sure to clean up any temporary scripts created during exploration or fixing.
