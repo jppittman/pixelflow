@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-04-25 - Incorrect Vector Normalization
+**Learning:** The previous calculation for inverse normal length used `n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt()`, which mathematically incorrectly calculates `1/sqrt(sqrt(n_len_sq))` (i.e. the inverse fourth root instead of inverse square root). In addition to being wrong, chaining `.sqrt()` with `.rsqrt()` executes redundant and expensive operations.
+**Action:** When computing an inverse vector length from a squared length (`n_len_sq`), directly use `.rsqrt()`. This both correctly normalizes the vector and provides a fast computational path by avoiding an explicit `sqrt` call before the inverse square root.

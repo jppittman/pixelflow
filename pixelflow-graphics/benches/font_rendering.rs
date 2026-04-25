@@ -65,13 +65,17 @@ fn bench_pixelflow_threading(c: &mut Criterion) {
     let colored = Grayscale(glyph);
 
     for threads in [1, 2, 4, 8] {
-        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
-            let mut frame = Frame::<Rgba8>::new(360, 24);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |b, &threads| {
+                let mut frame = Frame::<Rgba8>::new(360, 24);
 
-            b.iter(|| {
-                rasterize(black_box(&colored), black_box(&mut frame), threads);
-            });
-        });
+                b.iter(|| {
+                    rasterize(black_box(&colored), black_box(&mut frame), threads);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -132,7 +136,8 @@ fn bench_freetype_single_char(c: &mut Criterion) {
             face.set_char_size(0, 32 * 64, 96, 96).unwrap();
 
             b.iter(|| {
-                face.load_char(ch as usize, ft::face::LoadFlag::RENDER).unwrap();
+                face.load_char(ch as usize, ft::face::LoadFlag::RENDER)
+                    .unwrap();
                 let glyph = face.glyph();
                 black_box(glyph.bitmap());
             });
@@ -157,7 +162,8 @@ fn bench_freetype_text(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
             b.iter(|| {
                 for ch in text_str.chars() {
-                    face.load_char(ch as usize, ft::face::LoadFlag::RENDER).unwrap();
+                    face.load_char(ch as usize, ft::face::LoadFlag::RENDER)
+                        .unwrap();
                     let glyph = face.glyph();
                     black_box(glyph.bitmap());
                 }
