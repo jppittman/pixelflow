@@ -47,7 +47,7 @@ fn test_multiple_characters() {
     ]);
 
     // VERIFY: Grid has "Hello"
-    let snapshot = harness.get_snapshot().unwrap();
+    let snapshot = harness.get_snapshot().expect("Expected snapshot to be returned successfully");
 
     let text: String = snapshot.lines[0]
         .cells
@@ -71,7 +71,7 @@ fn test_newline_advances_row() {
     ]);
 
     // VERIFY: 'A' on row 0, 'B' on row 1
-    let snapshot = harness.get_snapshot().unwrap();
+    let snapshot = harness.get_snapshot().expect("Expected snapshot to be returned successfully");
 
     assert_eq!(snapshot.lines[0].cells[0].display_char(), 'A');
     assert_eq!(snapshot.lines[1].cells[0].display_char(), 'B');
@@ -88,7 +88,7 @@ fn test_cursor_position_command() {
     ]);
 
     // VERIFY: 'X' at position (9, 4) [0-indexed]
-    let snapshot = harness.get_snapshot().unwrap();
+    let snapshot = harness.get_snapshot().expect("Expected snapshot to be returned successfully");
 
     // CursorPosition is 1-indexed, grid is 0-indexed
     assert_eq!(snapshot.lines[4].cells[9].display_char(), 'X');
@@ -110,7 +110,7 @@ fn test_multiline_text() {
     }
 
     // VERIFY: Three lines of text
-    let snapshot = harness.get_snapshot().unwrap();
+    let snapshot = harness.get_snapshot().expect("Expected snapshot to be returned successfully");
 
     let line1: String = snapshot.lines[0]
         .cells

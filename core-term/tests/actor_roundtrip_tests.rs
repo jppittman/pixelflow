@@ -92,16 +92,16 @@ fn parser_roundtrip_simple_text() {
 
     // Roundtrip: send bytes → expect parsed commands
     let input = b"Hello".to_vec();
-    tx.send(Message::Data(input)).unwrap();
+    tx.send(Message::Data(input)).expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     // Verify roundtrip
     assert_eq!(bytes_processed.load(Ordering::SeqCst), 5);
 
-    let commands = output_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let commands = output_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
     assert_eq!(commands.len(), 5);
     assert_eq!(commands[0], TestAnsiCommand::Print('H'));
     assert_eq!(commands[1], TestAnsiCommand::Print('e'));
@@ -128,13 +128,13 @@ fn parser_roundtrip_ansi_escape_sequence() {
 
     // Roundtrip: send ANSI escape sequence → expect parsed CSI command
     let input = b"\x1b[A".to_vec(); // Cursor Up
-    tx.send(Message::Data(input)).unwrap();
+    tx.send(Message::Data(input)).expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
-    let commands = output_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let commands = output_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0], TestAnsiCommand::CsiCursorUp(1));
 }
@@ -157,13 +157,13 @@ fn parser_roundtrip_mixed_content() {
 
     // Roundtrip: mixed text and control characters
     let input = b"Hi\nWorld\r".to_vec();
-    tx.send(Message::Data(input)).unwrap();
+    tx.send(Message::Data(input)).expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
-    let commands = output_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let commands = output_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
     assert_eq!(commands.len(), 9);
     assert_eq!(commands[0], TestAnsiCommand::Print('H'));
     assert_eq!(commands[1], TestAnsiCommand::Print('i'));
@@ -193,13 +193,13 @@ fn parser_roundtrip_multiple_batches_preserve_order() {
     });
 
     // Send multiple batches
-    tx.send(Message::Data(b"First".to_vec())).unwrap();
-    tx.send(Message::Data(b"Second".to_vec())).unwrap();
-    tx.send(Message::Data(b"Third".to_vec())).unwrap();
+    tx.send(Message::Data(b"First".to_vec())).expect("Expected operation to succeed without errors");
+    tx.send(Message::Data(b"Second".to_vec())).expect("Expected operation to succeed without errors");
+    tx.send(Message::Data(b"Third".to_vec())).expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     // Collect all commands in order
     let mut all_commands = Vec::new();
@@ -236,11 +236,11 @@ fn parser_roundtrip_empty_input_no_output() {
     });
 
     // Roundtrip: empty input → no output
-    tx.send(Message::Data(vec![])).unwrap();
+    tx.send(Message::Data(vec![])).expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     // Verify no commands produced
     assert!(output_rx.try_recv().is_err());
@@ -356,19 +356,19 @@ fn terminal_app_roundtrip_key_input() {
 
     // Roundtrip: send key press → expect PTY output
     tx.send(Message::Management(TestEngineManagement::KeyPress('a')))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
     tx.send(Message::Management(TestEngineManagement::KeyPress('b')))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     // Verify roundtrip
     assert_eq!(keypress_count.load(Ordering::SeqCst), 2);
 
-    let output1 = pty_rx.recv_timeout(Duration::from_millis(100)).unwrap();
-    let output2 = pty_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let output1 = pty_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
+    let output2 = pty_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
 
     assert_eq!(output1, vec![b'a']);
     assert_eq!(output2, vec![b'b']);
@@ -402,15 +402,15 @@ fn terminal_app_roundtrip_special_key() {
     tx.send(Message::Management(TestEngineManagement::SpecialKey(
         "Up".to_string(),
     )))
-    .unwrap();
+    .expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     assert_eq!(keypress_count.load(Ordering::SeqCst), 1);
 
-    let output = pty_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let output = pty_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
     assert_eq!(output, b"\x1b[A");
 }
 
@@ -440,15 +440,15 @@ fn terminal_app_roundtrip_resize_control() {
 
     // Roundtrip: send resize control → expect notification
     tx.send(Message::Control(TestEngineControl::Resize(1920, 1080)))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     assert_eq!(resize_count.load(Ordering::SeqCst), 1);
 
-    let output = pty_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let output = pty_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
     assert_eq!(output, b"RESIZE:1920x1080");
 }
 
@@ -478,15 +478,15 @@ fn terminal_app_roundtrip_frame_request() {
 
     // Roundtrip: send frame requests
     tx.send(Message::Data(TestEngineData::FrameRequest))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
     tx.send(Message::Data(TestEngineData::FrameRequest))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
     tx.send(Message::Data(TestEngineData::FrameRequest))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(50));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     assert_eq!(frame_count.load(Ordering::SeqCst), 3);
 }
@@ -517,15 +517,15 @@ fn terminal_app_roundtrip_priority_ordering() {
 
     // Send in reverse priority order
     tx.send(Message::Data(TestEngineData::FrameRequest))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
     tx.send(Message::Management(TestEngineManagement::KeyPress('x')))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
     tx.send(Message::Control(TestEngineControl::Resize(800, 600)))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(100));
     drop(tx);
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     // Verify all processed
     assert_eq!(resize_count.load(Ordering::SeqCst), 1);
@@ -533,11 +533,11 @@ fn terminal_app_roundtrip_priority_ordering() {
     assert_eq!(frame_count.load(Ordering::SeqCst), 1);
 
     // Control should be processed first (resize)
-    let first = pty_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let first = pty_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
     assert_eq!(first, b"RESIZE:800x600");
 
     // Then management (keypress)
-    let second = pty_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let second = pty_rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
     assert_eq!(second, vec![b'x']);
 }
 
@@ -613,24 +613,24 @@ fn multi_actor_chain_roundtrip() {
     });
 
     // Roundtrip: raw bytes → parser → app → final output
-    parser_tx.send(Message::Data(b"Hello".to_vec())).unwrap();
-    parser_tx.send(Message::Data(b" World".to_vec())).unwrap();
+    parser_tx.send(Message::Data(b"Hello".to_vec())).expect("Expected operation to succeed without errors");
+    parser_tx.send(Message::Data(b" World".to_vec())).expect("Expected operation to succeed without errors");
 
     thread::sleep(Duration::from_millis(100));
     drop(parser_tx);
 
-    parser_handle.join().unwrap();
-    bridge_handle.join().unwrap();
+    parser_handle.join().expect("Expected operation to succeed without errors");
+    bridge_handle.join().expect("Expected operation to succeed without errors");
 
     // Verify complete chain
     assert_eq!(bytes_processed.load(Ordering::SeqCst), 11); // "Hello World"
 
     let output1 = app_output_rx
         .recv_timeout(Duration::from_millis(100))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
     let output2 = app_output_rx
         .recv_timeout(Duration::from_millis(100))
-        .unwrap();
+        .expect("Expected operation to succeed without errors");
 
     assert_eq!(output1, "Hello");
     assert_eq!(output2, " World");
@@ -732,7 +732,7 @@ fn roundtrip_sender_dropped_during_processing() {
     });
 
     // Send message
-    tx.send(Message::Data(1)).unwrap();
+    tx.send(Message::Data(1)).expect("Expected operation to succeed without errors");
 
     // Wait for processing to start
     while !started.load(Ordering::SeqCst) {
@@ -742,7 +742,7 @@ fn roundtrip_sender_dropped_during_processing() {
     // Drop sender while actor is processing
     drop(tx);
 
-    handle.join().unwrap();
+    handle.join().expect("Expected operation to succeed without errors");
 
     // Actor should finish processing current message
     assert_eq!(processed.load(Ordering::SeqCst), 1);
@@ -768,7 +768,7 @@ fn pty_command_resize_delivery_at_actor_boundary() {
     .expect("Should send resize command");
 
     // Simulate receiving in WriteThread
-    let cmd = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let cmd = rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors");
 
     assert_eq!(
         cmd,
@@ -789,32 +789,32 @@ fn pty_command_resize_ordering_preserved() {
         cols: 80,
         rows: 24,
     }))
-    .unwrap();
+    .expect("Expected operation to succeed without errors");
     tx.send(PtyCommand::Resize(core_term::io::Resize {
         cols: 120,
         rows: 40,
     }))
-    .unwrap();
+    .expect("Expected operation to succeed without errors");
     tx.send(PtyCommand::Resize(core_term::io::Resize {
         cols: 200,
         rows: 60,
     }))
-    .unwrap();
+    .expect("Expected operation to succeed without errors");
 
     // Verify FIFO order
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Resize(core_term::io::Resize { cols: 80, rows: 24 })
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Resize(core_term::io::Resize {
             cols: 120,
             rows: 40
         })
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Resize(core_term::io::Resize {
             cols: 200,
             rows: 60
@@ -828,28 +828,28 @@ fn pty_command_write_and_resize_interleaved() {
     let (tx, rx) = std::sync::mpsc::sync_channel::<PtyCommand>(16);
 
     // Interleave write and resize commands
-    tx.send(PtyCommand::Write(b"hello".to_vec())).unwrap();
+    tx.send(PtyCommand::Write(b"hello".to_vec())).expect("Expected operation to succeed without errors");
     tx.send(PtyCommand::Resize(core_term::io::Resize {
         cols: 100,
         rows: 50,
     }))
-    .unwrap();
-    tx.send(PtyCommand::Write(b"world".to_vec())).unwrap();
+    .expect("Expected operation to succeed without errors");
+    tx.send(PtyCommand::Write(b"world".to_vec())).expect("Expected operation to succeed without errors");
 
     // Verify interleaved order
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Write(b"hello".to_vec())
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Resize(core_term::io::Resize {
             cols: 100,
             rows: 50
         })
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Write(b"world".to_vec())
     );
 }
@@ -863,7 +863,7 @@ fn pty_command_channel_closure_on_sender_drop() {
         cols: 80,
         rows: 24,
     }))
-    .unwrap();
+    .expect("Expected operation to succeed without errors");
 
     drop(tx);
 
@@ -884,21 +884,21 @@ fn pty_command_resize_boundary_values() {
         cols: 1,
         rows: 1,
     }))
-    .unwrap();
+    .expect("Expected operation to succeed without errors");
 
     // Maximum u16 values
     tx.send(PtyCommand::Resize(core_term::io::Resize {
         cols: u16::MAX,
         rows: u16::MAX,
     }))
-    .unwrap();
+    .expect("Expected operation to succeed without errors");
 
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Resize(core_term::io::Resize { cols: 1, rows: 1 })
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
+        rx.recv_timeout(Duration::from_millis(100)).expect("Expected operation to succeed without errors"),
         PtyCommand::Resize(core_term::io::Resize {
             cols: u16::MAX,
             rows: u16::MAX
@@ -920,19 +920,19 @@ fn pty_command_resize_from_multiple_senders() {
                 cols: 100 + i,
                 rows: 50,
             }))
-            .unwrap();
+            .expect("Expected operation to succeed without errors");
         }
     });
 
     let h2 = thread::spawn(move || {
         for i in 0..5 {
             tx2.send(PtyCommand::Write(format!("msg{}", i).into_bytes()))
-                .unwrap();
+                .expect("Expected operation to succeed without errors");
         }
     });
 
-    h1.join().unwrap();
-    h2.join().unwrap();
+    h1.join().expect("Expected operation to succeed without errors");
+    h2.join().expect("Expected operation to succeed without errors");
     drop(tx); // Drop original sender
 
     // Count received commands
