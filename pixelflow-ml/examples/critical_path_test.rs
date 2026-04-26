@@ -76,7 +76,7 @@ fn expr_sequential(a: f32, b: f32, c: f32, d: f32, e: f32, _f: f32) -> f32 {
     t2 + t4
 }
 
-fn benchmark<F>(name: &str, mut f: F) -> f64
+fn benchmark<F>(_name: &str, mut f: F) -> f64
 where
     F: FnMut() -> f32,
 {

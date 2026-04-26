@@ -10,6 +10,14 @@
 //! well with SIMD execution since all operations scale similarly.
 
 use crate::nnue::{Expr, OpType};
+
+pub struct EvalContext {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
 use alloc::vec::Vec;
 
 #[cfg(feature = "std")]
@@ -57,17 +65,17 @@ impl Default for BenchmarkConfig {
 /// This is the core evaluation function used for benchmarking.
 /// It uses standard f32 operations which correlate well with SIMD
 /// performance for relative cost ranking.
-pub fn eval_expr_scalar(expr: &Expr, x: f32, y: f32, z: f32, w: f32) -> f32 {
+pub fn eval_expr_scalar(expr: &Expr, ctx: &EvalContext) -> f32 {
     match expr {
-        Expr::Var(0) => x,
-        Expr::Var(1) => y,
-        Expr::Var(2) => z,
-        Expr::Var(3) => w,
+        Expr::Var(0) => ctx.x,
+        Expr::Var(1) => ctx.y,
+        Expr::Var(2) => ctx.z,
+        Expr::Var(3) => ctx.w,
         Expr::Var(_) => 0.0,
         Expr::Const(c) => *c,
         Expr::Binary(op, lhs, rhs) => {
-            let l = eval_expr_scalar(lhs, x, y, z, w);
-            let r = eval_expr_scalar(rhs, x, y, z, w);
+            let l = eval_expr_scalar(lhs, ctx);
+            let r = eval_expr_scalar(rhs, ctx);
             match op {
                 OpType::Add => l + r,
                 OpType::Sub => l - r,
@@ -79,7 +87,7 @@ pub fn eval_expr_scalar(expr: &Expr, x: f32, y: f32, z: f32, w: f32) -> f32 {
             }
         }
         Expr::Unary(op, arg) => {
-            let a = eval_expr_scalar(arg, x, y, z, w);
+            let a = eval_expr_scalar(arg, ctx);
             match op {
                 OpType::Neg => -a,
                 OpType::Sqrt => libm::sqrtf(a),
@@ -89,9 +97,9 @@ pub fn eval_expr_scalar(expr: &Expr, x: f32, y: f32, z: f32, w: f32) -> f32 {
             }
         }
         Expr::Ternary(op, a, b, c) => {
-            let va = eval_expr_scalar(a, x, y, z, w);
-            let vb = eval_expr_scalar(b, x, y, z, w);
-            let vc = eval_expr_scalar(c, x, y, z, w);
+            let va = eval_expr_scalar(a, ctx);
+            let vb = eval_expr_scalar(b, ctx);
+            let vc = eval_expr_scalar(c, ctx);
             match op {
                 OpType::MulAdd => libm::fmaf(va, vb, vc),
                 OpType::MulRsqrt => va / libm::sqrtf(vb),
@@ -152,9 +160,10 @@ pub fn benchmark_expr(expr: &Expr, config: &BenchmarkConfig) -> BenchmarkResult 
     // Warmup
     for _ in 0..config.warmup_iterations {
         for _ in 0..config.evals_per_iteration {
+            let ctx = EvalContext { x, y, z, w };
             let _ = std::hint::black_box(eval_expr_scalar(
                 std::hint::black_box(expr),
-                x, y, z, w,
+                &ctx,
             ));
         }
     }
@@ -165,9 +174,10 @@ pub fn benchmark_expr(expr: &Expr, config: &BenchmarkConfig) -> BenchmarkResult 
     for _ in 0..config.measure_iterations {
         let start = Instant::now();
         for _ in 0..config.evals_per_iteration {
+            let ctx = EvalContext { x, y, z, w };
             let _ = std::hint::black_box(eval_expr_scalar(
                 std::hint::black_box(expr),
-                x, y, z, w,
+                &ctx,
             ));
         }
         let elapsed = start.elapsed();
@@ -312,7 +322,8 @@ mod tests {
             Box::new(Expr::Var(1)),
         );
 
-        let result = eval_expr_scalar(&expr, 3.0, 4.0, 0.0, 0.0);
+        let ctx = EvalContext { x: 3.0, y: 4.0, z: 0.0, w: 0.0 };
+        let result = eval_expr_scalar(&expr, &ctx);
         assert!((result - 7.0).abs() < 1e-6);
     }
 
@@ -334,7 +345,8 @@ mod tests {
         );
 
         // (3 * 4) + (5 - 2) = 12 + 3 = 15
-        let result = eval_expr_scalar(&expr, 3.0, 4.0, 5.0, 2.0);
+        let ctx = EvalContext { x: 3.0, y: 4.0, z: 5.0, w: 2.0 };
+        let result = eval_expr_scalar(&expr, &ctx);
         assert!((result - 15.0).abs() < 1e-6);
     }
 
