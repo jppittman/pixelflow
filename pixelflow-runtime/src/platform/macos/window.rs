@@ -12,6 +12,12 @@ pub struct MacWindow {
     pub(crate) current_height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowVisibility {
+    Visible,
+    Hidden,
+}
+
 impl MacWindow {
     pub fn new(desc: WindowDescriptor) -> Result<Self, RuntimeError> {
         let rect = NSRect::new(
@@ -60,7 +66,7 @@ impl MacWindow {
             sys::send_1::<(), Id>(view.0, sys::sel(b"setLayer:\0"), layer);
 
             // [view setWantsLayer: YES]
-            view.set_wants_layer(true);
+            view.set_wants_layer(crate::platform::macos::cocoa::LayerVisibility::WantsLayer);
         }
 
         window.set_content_view(view);
@@ -122,13 +128,14 @@ impl MacWindow {
         }
     }
 
-    pub fn set_visible(&mut self, visible: bool) {
-        if visible {
-            self.window.make_key_and_order_front();
-        } else {
-            unsafe {
-                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
+    pub fn set_visible(&mut self, visibility: WindowVisibility) {
+        match visibility {
+            WindowVisibility::Visible => {
+                self.window.make_key_and_order_front();
             }
+            WindowVisibility::Hidden => unsafe {
+                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
+            },
         }
     }
 

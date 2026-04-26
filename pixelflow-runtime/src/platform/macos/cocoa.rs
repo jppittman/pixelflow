@@ -117,6 +117,18 @@ impl NSRect {
 
 // --- Wrappers ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    IgnoreOtherApps,
+    RespectOtherApps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventDequeuePolicy {
+    Dequeue,
+    Peek,
+}
+
 /// Wrapper for NSApplication
 #[derive(Copy, Clone)]
 pub struct NSApplication(pub Id);
@@ -136,9 +148,12 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self, policy: ActivationPolicy) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = match policy {
+                ActivationPolicy::IgnoreOtherApps => YES,
+                ActivationPolicy::RespectOtherApps => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -156,9 +171,18 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event(
+        &self,
+        mask: u64,
+        date: Id,
+        mode: Id,
+        dequeue: EventDequeuePolicy,
+    ) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = match dequeue {
+                EventDequeuePolicy::Dequeue => YES,
+                EventDequeuePolicy::Peek => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -247,6 +271,12 @@ impl NSWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerVisibility {
+    WantsLayer,
+    NoLayer,
+}
+
 /// Wrapper for NSView
 #[derive(Copy, Clone)]
 pub struct NSView(pub Id);
@@ -266,9 +296,12 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self, wants: LayerVisibility) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = match wants {
+                LayerVisibility::WantsLayer => YES,
+                LayerVisibility::NoLayer => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }
