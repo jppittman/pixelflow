@@ -36,6 +36,18 @@ pub fn nsstring_to_string(ns_str: Id) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    RespectOtherApps,
+    IgnoreOtherApps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerSupport {
+    WantsLayer,
+    DoesNotWantLayer,
+}
+
 // --- Structs ---
 
 /// Wrapper for NSPasteboard
@@ -136,9 +148,12 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self, policy: ActivationPolicy) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = match policy {
+                ActivationPolicy::IgnoreOtherApps => YES,
+                ActivationPolicy::RespectOtherApps => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -266,9 +281,12 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self, support: LayerSupport) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = match support {
+                LayerSupport::WantsLayer => YES,
+                LayerSupport::DoesNotWantLayer => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }

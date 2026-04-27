@@ -45,7 +45,9 @@ impl MetalOps {
             app.set_activation_policy(NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
 
             app.finish_launching();
-            app.activate_ignoring_other_apps(true);
+            app.activate_ignoring_other_apps(
+                crate::platform::macos::cocoa::ActivationPolicy::IgnoreOtherApps,
+            );
 
             app
         };
@@ -102,7 +104,11 @@ impl PlatformOps for MetalOps {
             }
             DisplayControl::SetVisible { id, visible } => {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    win.set_visible(visible);
+                    win.set_visible(if visible {
+                        crate::platform::macos::window::WindowVisibility::Visible
+                    } else {
+                        crate::platform::macos::window::WindowVisibility::Hidden
+                    });
                 }
             }
             DisplayControl::RequestRedraw { id } => {
@@ -164,7 +170,7 @@ impl PlatformOps for MetalOps {
             }
             DisplayMgmt::Destroy { id } => {
                 if let Some(mut win) = self.windows.remove(&id) {
-                    win.set_visible(false);
+                    win.set_visible(crate::platform::macos::window::WindowVisibility::Hidden);
                     // Drop closes it implicitly or we call close
                     // win.window.close(); // If we expose it
                     self.window_map.remove(&(win.window.0 as usize));

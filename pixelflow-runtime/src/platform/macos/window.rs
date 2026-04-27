@@ -4,6 +4,12 @@ use crate::platform::macos::cocoa::{NSPoint, NSRect, NSSize, NSView, NSWindow};
 use crate::platform::macos::sys::{self, Id, BOOL, YES};
 use std::ffi::c_void;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowVisibility {
+    Hidden,
+    Visible,
+}
+
 pub struct MacWindow {
     pub(crate) window: NSWindow,
     pub(crate) view: NSView,
@@ -60,7 +66,7 @@ impl MacWindow {
             sys::send_1::<(), Id>(view.0, sys::sel(b"setLayer:\0"), layer);
 
             // [view setWantsLayer: YES]
-            view.set_wants_layer(true);
+            view.set_wants_layer(crate::platform::macos::cocoa::LayerSupport::WantsLayer);
         }
 
         window.set_content_view(view);
@@ -122,13 +128,14 @@ impl MacWindow {
         }
     }
 
-    pub fn set_visible(&mut self, visible: bool) {
-        if visible {
-            self.window.make_key_and_order_front();
-        } else {
-            unsafe {
-                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
+    pub fn set_visible(&mut self, visibility: WindowVisibility) {
+        match visibility {
+            WindowVisibility::Visible => {
+                self.window.make_key_and_order_front();
             }
+            WindowVisibility::Hidden => unsafe {
+                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
+            },
         }
     }
 
