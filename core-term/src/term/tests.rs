@@ -301,7 +301,8 @@ fn test_csi_sgr_fg_color() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let glyph_a_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    let glyph_a_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0)
+        .expect("Test failed: expected value to be present");
 
     match glyph_a_wrapper {
         Glyph::Single(cell) | Glyph::WidePrimary(cell) => {
@@ -325,7 +326,8 @@ fn test_csi_sgr_fg_color() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
     let snapshot_b = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_b, &["AB   "], Some((0, 2))); // A is red, B is default
-    let glyph_b_wrapper = get_glyph_from_snapshot(&snapshot_b, 0, 1).unwrap();
+    let glyph_b_wrapper = get_glyph_from_snapshot(&snapshot_b, 0, 1)
+        .expect("Test failed: expected value to be present");
     match glyph_b_wrapper {
         Glyph::Single(cell) | Glyph::WidePrimary(cell) => {
             assert_eq!(
@@ -825,7 +827,10 @@ fn test_snapshot_with_selection() {
     };
 
     assert!(snapshot_with_selection.selection.range.is_some());
-    let sel_range = snapshot_with_selection.selection.range.unwrap();
+    let sel_range = snapshot_with_selection
+        .selection
+        .range
+        .expect("Test failed: expected value to be present");
     assert_eq!(sel_range.start, Point { x: 1, y: 0 });
     assert_eq!(sel_range.end, Point { x: 3, y: 1 });
     assert_eq!(snapshot_with_selection.selection.mode, SelectionMode::Cell);
@@ -850,7 +855,11 @@ fn test_mode_show_cursor_dectcem() {
         snap_default.cursor_state.is_some(),
         "Cursor should be visible by default"
     );
-    let initial_shape = snap_default.cursor_state.as_ref().unwrap().shape;
+    let initial_shape = snap_default
+        .cursor_state
+        .as_ref()
+        .expect("Test failed: expected value to be present")
+        .shape;
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::ResetModePrivate(DecModeConstant::TextCursorEnable as u16),
@@ -870,7 +879,11 @@ fn test_mode_show_cursor_dectcem() {
         "Cursor should be visible again after DECSET ?25h"
     );
     assert_eq!(
-        snap_shown.cursor_state.as_ref().unwrap().shape,
+        snap_shown
+            .cursor_state
+            .as_ref()
+            .expect("Test failed: expected value to be present")
+            .shape,
         initial_shape,
         "Cursor should revert to its initial non-hidden shape"
     );
@@ -1083,11 +1096,16 @@ fn test_ps1_multiline_with_sgr_at_bottom_scrolls() {
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["P1   ", "$    "], Some((1, 2)));
 
-    let glyph_p_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-    let glyph_1_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
-    let glyph_dollar_wrapper = get_glyph_from_snapshot(&snapshot, 1, 0).unwrap();
-    let glyph_space_after_dollar_wrapper = get_glyph_from_snapshot(&snapshot, 1, 1).unwrap();
-    let glyph_final_cursor_cell_wrapper = get_glyph_from_snapshot(&snapshot, 1, 2).unwrap();
+    let glyph_p_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0)
+        .expect("Test failed: expected value to be present");
+    let glyph_1_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1)
+        .expect("Test failed: expected value to be present");
+    let glyph_dollar_wrapper = get_glyph_from_snapshot(&snapshot, 1, 0)
+        .expect("Test failed: expected value to be present");
+    let glyph_space_after_dollar_wrapper = get_glyph_from_snapshot(&snapshot, 1, 1)
+        .expect("Test failed: expected value to be present");
+    let glyph_final_cursor_cell_wrapper = get_glyph_from_snapshot(&snapshot, 1, 2)
+        .expect("Test failed: expected value to be present");
 
     match glyph_p_wrapper {
         Glyph::Single(cell) | Glyph::WidePrimary(cell) => {

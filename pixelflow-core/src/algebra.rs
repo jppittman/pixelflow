@@ -267,7 +267,11 @@ impl Algebra for f32 {
 
     #[inline(always)]
     fn select(mask: bool, if_true: Self, if_false: Self) -> Self {
-        if mask { if_true } else { if_false }
+        if mask {
+            if_true
+        } else {
+            if_false
+        }
     }
 
     #[inline(always)]
@@ -352,12 +356,20 @@ impl Transcendental for f32 {
 
     #[inline(always)]
     fn min(self, rhs: Self) -> Self {
-        if self < rhs { self } else { rhs }
+        if self < rhs {
+            self
+        } else {
+            rhs
+        }
     }
 
     #[inline(always)]
     fn max(self, rhs: Self) -> Self {
-        if self > rhs { self } else { rhs }
+        if self > rhs {
+            self
+        } else {
+            rhs
+        }
     }
 
     #[inline(always)]
@@ -431,7 +443,11 @@ impl Algebra for bool {
 
     #[inline(always)]
     fn select(mask: bool, if_true: Self, if_false: Self) -> Self {
-        if mask { if_true } else { if_false }
+        if mask {
+            if_true
+        } else {
+            if_false
+        }
     }
 }
 
@@ -500,7 +516,11 @@ impl Algebra for u32 {
 
     #[inline(always)]
     fn select(mask: bool, if_true: Self, if_false: Self) -> Self {
-        if mask { if_true } else { if_false }
+        if mask {
+            if_true
+        } else {
+            if_false
+        }
     }
 }
 
@@ -559,21 +579,21 @@ mod tests {
 
     #[test]
     fn test_bool_algebra() {
-        assert_eq!(bool::zero(), false);
-        assert_eq!(bool::one(), true);
+        assert!(!bool::zero(), "expected false");
+        assert!(bool::one(), "expected true");
 
         // Boolean ring (OR/AND)
-        assert_eq!(false.add(false), false);
-        assert_eq!(false.add(true), true);
-        assert_eq!(true.add(false), true);
-        assert_eq!(true.add(true), true);
+        assert!(!false.add(false), "expected false");
+        assert!(false.add(true), "expected true");
+        assert!(true.add(false), "expected true");
+        assert!(true.add(true), "expected true");
 
-        assert_eq!(false.mul(false), false);
-        assert_eq!(false.mul(true), false);
-        assert_eq!(true.mul(true), true);
+        assert!(!false.mul(false), "expected false");
+        assert!(!false.mul(true), "expected false");
+        assert!(true.mul(true), "expected true");
 
-        assert_eq!(true.neg(), false);
-        assert_eq!(false.neg(), true);
+        assert!(!true.neg(), "expected false");
+        assert!(false.neg(), "expected true");
     }
 
     #[test]

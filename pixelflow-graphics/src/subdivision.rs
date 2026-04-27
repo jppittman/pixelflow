@@ -20,9 +20,9 @@
 //! - No finite differences, no extra evaluations
 
 use crate::mesh::{Point3, QuadMesh};
+use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Field, Manifold, ManifoldExt};
-use pixelflow_compiler::ManifoldExpr;
 
 /// The 4D Jet3 domain type for 3D ray tracing autodiff.
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);
@@ -505,7 +505,7 @@ f 1 2 3 4
 
         // For bilinear fallback, center should be roughly (0.5, 0.5, 0.0)
         // We can't easily check SIMD Field values in tests, so this is a smoke test
-        assert_eq!(patch.is_extraordinary(), true);
+        assert!(patch.is_extraordinary(), "expected true");
     }
 
     #[test]

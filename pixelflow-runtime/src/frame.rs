@@ -160,9 +160,13 @@ mod tests {
         let surface = TestSurface { color: 1.0 };
         let packet = FramePacket::new(surface, recycle_tx);
 
-        handle.submit_frame(packet).unwrap();
+        handle
+            .submit_frame(packet)
+            .expect("Failed to submit frame packet");
 
-        let received = rx.recv().unwrap();
+        let received = rx
+            .recv()
+            .expect("Failed to receive frame packet from channel");
         assert_eq!(received.surface.color, 1.0);
     }
 
@@ -174,17 +178,23 @@ mod tests {
         // Create and submit a packet
         let surface = TestSurface { color: 1.0 };
         let packet = FramePacket::new(surface, Arc::clone(&recycle_tx));
-        handle.submit_frame(packet).unwrap();
+        handle
+            .submit_frame(packet)
+            .expect("Failed to submit frame packet");
 
         // Receive and "render" it
-        let received = rx.recv().unwrap();
+        let received = rx
+            .recv()
+            .expect("Failed to receive frame packet from channel");
         assert_eq!(received.surface.color, 1.0);
 
         // Recycle using the method (clean API)
         received.recycle();
 
         // Logic thread receives the recycled packet
-        let recycled = recycle_rx.recv().unwrap();
+        let recycled = recycle_rx
+            .recv()
+            .expect("Failed to receive recycled packet from channel");
         assert_eq!(recycled.surface.color, 1.0);
     }
 }
