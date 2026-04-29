@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-29 - Vector Normalization Redundant Sqrt
+**Learning:** In `scene3d.rs`, vector normalization was erroneously calculating `inv_n_len` using `.sqrt().rsqrt()`. This applies the root twice (calculating $x^{-0.25}$ instead of $x^{-0.5}$) and forces two expensive operations. Replacing it with just `.rsqrt()` fixes the math and removes a heavy instruction from the core rendering path.
+**Action:** When auditing vector math, always check for redundant or conflicting inverse square root operations stacked together.
