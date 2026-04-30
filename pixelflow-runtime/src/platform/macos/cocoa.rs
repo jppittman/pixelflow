@@ -117,6 +117,12 @@ impl NSRect {
 
 // --- Wrappers ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequeueEvent {
+    Yes,
+    No,
+}
+
 /// Wrapper for NSApplication
 #[derive(Copy, Clone)]
 pub struct NSApplication(pub Id);
@@ -156,9 +162,12 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: DequeueEvent) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = match dequeue {
+                DequeueEvent::Yes => YES,
+                DequeueEvent::No => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),

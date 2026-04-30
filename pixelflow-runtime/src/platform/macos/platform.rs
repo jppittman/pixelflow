@@ -2,7 +2,7 @@ use crate::api::private::{EngineActorHandle, EngineData, WindowId};
 use crate::display::messages::{DisplayControl, DisplayData, DisplayEvent, DisplayMgmt, Window};
 use crate::display::ops::PlatformOps;
 use crate::error::RuntimeError;
-use crate::platform::macos::cocoa::{self, event_type, NSApplication, NSPasteboard};
+use crate::platform::macos::cocoa::{self, event_type, DequeueEvent, NSApplication, NSPasteboard};
 use crate::platform::macos::events;
 use crate::platform::macos::sys;
 use crate::platform::macos::window::MacWindow;
@@ -217,7 +217,7 @@ impl PlatformOps for MetalOps {
                 u64::MAX,
                 until_date,
                 mode,
-                true, // dequeue
+                DequeueEvent::Yes, // dequeue
             );
 
             // Release mode string
