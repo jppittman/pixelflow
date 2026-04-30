@@ -12,11 +12,7 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansMono-Regular.ttf");
 
 /// Measure the horizontal extent of rendered pixels at a given Y row.
 /// Returns (leftmost_x, rightmost_x) of pixels above the threshold, or None if row is empty.
-fn measure_row_extent(
-    frame: &Frame<Rgba8>,
-    y: usize,
-    threshold: u8,
-) -> Option<(usize, usize)> {
+fn measure_row_extent(frame: &Frame<Rgba8>, y: usize, threshold: u8) -> Option<(usize, usize)> {
     let width = frame.width;
     let row_start = y * width;
     let row = &frame.data[row_start..row_start + width];
