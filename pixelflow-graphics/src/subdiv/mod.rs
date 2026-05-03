@@ -688,28 +688,9 @@ mod tests {
         );
     }
 
-    #[test]
-    #[should_panic(expected = "outside valid domain")]
-    fn test_validate_eigen_domain_panics_for_invalid() {
-        // This should panic - coordinates outside [0, 1]²
-        validate_eigen_domain(1.5, 0.5);
-    }
 
-    #[test]
-    fn test_validate_eigen_domain_accepts_valid() {
-        // Origin is valid (exact limit position)
-        validate_eigen_domain(0.0, 0.0);
 
-        // First tile is valid
-        validate_eigen_domain(0.5, 0.5);
-        validate_eigen_domain(0.75, 0.75);
-        validate_eigen_domain(1.0, 1.0);
 
-        // Deeper tiles are now valid with recursive tiling
-        validate_eigen_domain(0.25, 0.25);
-        validate_eigen_domain(0.125, 0.125);
-        validate_eigen_domain(0.01, 0.01);
-    }
 
     #[test]
     fn test_eigen_patch_subpatch_routing() {

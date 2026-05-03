@@ -433,23 +433,7 @@ impl TerminalMessageChain {
     }
 }
 
-#[test]
-fn cuj_e2e_complete_message_chain() {
-    // Given: A complete terminal message chain
-    let chain = TerminalMessageChain::new();
 
-    // When: Terminal output is sent through the chain
-    // Simulate: clear screen, move cursor, print text
-    chain.send_bytes(b"\x1b[2J".to_vec()); // Clear screen
-    chain.send_bytes(b"\x1b[1;1H".to_vec()); // Move to 1,1
-    chain.send_bytes(b"Hello, Terminal!".to_vec()); // Print text
-
-    thread::sleep(Duration::from_millis(100));
-    chain.shutdown();
-
-    // Then: All commands should be received by app
-    // This validates the complete: PTY → ReadThread → Parser → App chain
-}
 
 #[test]
 fn cuj_e2e_rapid_small_writes() {

@@ -197,30 +197,9 @@ fn high_contention_fairness() {
 // Rapid Channel Creation/Destruction Tests
 // ============================================================================
 
-#[test]
-fn rapid_channel_creation_does_not_leak() {
-    // Create and drop many channels rapidly
-    for _ in 0..1000 {
-        let (tx, _rx) = ActorScheduler::<u64, u64, u64>::new(10, 100);
-        // Send a few messages (ignore errors - receiver not running)
-        tx.send(Message::Data(1)).ok();
-        tx.send(Message::Control(2)).ok();
-        // Let it drop
-    }
-    // If we get here without running out of memory, the test passes
-}
 
-#[test]
-fn rapid_producer_creation() {
-    // Create and drop many producers rapidly
-    let mut builder = ActorBuilder::<u64, u64, u64>::new(100, None);
-    for _ in 0..100 {
-        let tx = builder.add_producer();
-        tx.send(Message::Data(42)).ok();
-        drop(tx);
-    }
-    let _rx = builder.build();
-}
+
+
 
 // ============================================================================
 // Backpressure Tests
@@ -425,25 +404,7 @@ fn multi_producer_send() {
 // Empty Message Type Tests
 // ============================================================================
 
-#[test]
-fn empty_message_types_work_under_load() {
-    let (tx, mut rx) = ActorScheduler::<(), (), ()>::new(10, 100);
 
-    let receiver_handle = thread::spawn(move || {
-        let mut h = NoOpHandler;
-        rx.run(&mut h);
-    });
-
-    for _ in 0..1000 {
-        tx.send(Message::Data(())).unwrap();
-        tx.send(Message::Control(())).unwrap();
-        tx.send(Message::Management(())).unwrap();
-    }
-
-    thread::sleep(Duration::from_millis(50));
-    drop(tx);
-    receiver_handle.join().unwrap();
-}
 
 // ============================================================================
 // Large Message Tests

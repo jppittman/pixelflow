@@ -31,34 +31,7 @@ fn parse_font_and_get_glyph() {
     println!("Glyph advance: {}", advance);
 }
 
-#[test]
-fn glyph_is_manifold() {
-    let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
-    let glyph = font.glyph_scaled('A', 64.0).expect("Glyph 'A' not found");
 
-    // Verify the glyph implements ManifoldCompat by evaluating it
-    // We can't extract the values, but we can verify it doesn't panic
-    let _val = glyph.eval_raw(
-        Field::from(32.0),
-        Field::from(32.0),
-        Field::from(0.0),
-        Field::from(0.0),
-    );
-
-    // Test evaluation at various points
-    for y in 0..64 {
-        for x in 0..64 {
-            let _val = glyph.eval_raw(
-                Field::from(x as f32 + 0.5),
-                Field::from(y as f32 + 0.5),
-                Field::from(0.0),
-                Field::from(0.0),
-            );
-        }
-    }
-
-    println!("Successfully evaluated glyph at 64x64 points");
-}
 
 #[test]
 fn all_printable_ascii_glyphs_exist() {

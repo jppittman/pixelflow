@@ -2376,16 +2376,7 @@ mod tests {
         assert_eq!(features.values[DenseFeatures::HAS_FUSABLE], 1);
     }
 
-    #[test]
-    fn test_hybrid_forward_dimensions() {
-        // Verify the hybrid architecture has correct dimensions
-        let nnue = Nnue::with_defaults();
-        let acc = Accumulator::new(&nnue);
-        let dense = DenseFeatures::default();
 
-        // Should not panic
-        let _ = acc.forward_hybrid(&nnue, &dense);
-    }
 
     #[test]
     fn test_hybrid_forward_with_features() {

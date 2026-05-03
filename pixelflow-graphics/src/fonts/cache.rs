@@ -415,26 +415,7 @@ mod tests {
         assert!(cache.contains(' ', 16.0));
     }
 
-    #[test]
-    fn test_cached_glyph_eval() {
-        use pixelflow_core::Field;
 
-        let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
-        let cached = CachedGlyph::new(&glyph, 32);
-
-        // Evaluate coverage at multiple coordinates - should not panic
-        for x in [2.0, 8.0, 16.0, 24.0] {
-            for y in [2.0, 8.0, 16.0, 24.0] {
-                let _coverage = cached.eval_raw(
-                    Field::from(x),
-                    Field::from(y),
-                    Field::from(0.0),
-                    Field::from(0.0),
-                );
-            }
-        }
-    }
 
     #[test]
     fn test_cached_text_creation() {

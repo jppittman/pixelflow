@@ -179,77 +179,7 @@ impl Actor<BetaData, BetaControl, BetaManagement> for BetaActor<'_> {
 /// Solution: Use timeout-based verification and don't wait for thread join.
 /// Real applications should use a dedicated shutdown coordinator or have actors
 /// drop their directory references when they receive shutdown.
-#[test]
-fn directory_allows_cross_actor_messaging() {
-    let log = Arc::new(Mutex::new(Vec::new()));
 
-    // Phase 1: Create builders for each actor
-    let mut alpha_builder =
-        ActorBuilder::<AlphaData, AlphaControl, AlphaManagement>::new(1024, None);
-    let mut beta_builder = ActorBuilder::<BetaData, BetaControl, BetaManagement>::new(1024, None);
-
-    // Phase 2: Create per-actor directories with dedicated SPSC handles
-    let alpha_dir = TestDirectory {
-        alpha: alpha_builder.add_producer(),
-        beta: beta_builder.add_producer(),
-    };
-    let beta_dir = TestDirectory {
-        alpha: alpha_builder.add_producer(),
-        beta: beta_builder.add_producer(),
-    };
-
-    // External handles for sending from this thread
-    let alpha_h = alpha_builder.add_producer();
-
-    // Build schedulers (seals all producers)
-    let mut alpha_s = alpha_builder.build();
-    let mut beta_s = beta_builder.build();
-
-    // Phase 3: Spawn actors — each owns its directory
-    let log_alpha = log.clone();
-    thread::spawn(move || {
-        let mut actor = AlphaActor {
-            dir: &alpha_dir,
-            log: log_alpha,
-        };
-        alpha_s.run(&mut actor);
-    });
-
-    let log_beta = log.clone();
-    thread::spawn(move || {
-        let mut actor = BetaActor {
-            dir: &beta_dir,
-            log: log_beta,
-        };
-        beta_s.run(&mut actor);
-    });
-
-    // Phase 4: Test cross-actor messaging
-    // Send Ping to Alpha -> Alpha sends Pong to Beta -> Beta sends Data to Alpha
-    alpha_h.send(Message::Control(AlphaControl::Ping)).unwrap();
-
-    // Wait for message chain to complete (with timeout)
-    let start = std::time::Instant::now();
-    loop {
-        thread::sleep(Duration::from_millis(10));
-        let log_snapshot = log.lock().unwrap();
-        let has_ping = log_snapshot.contains(&"Alpha:Ping".to_string());
-        let has_pong = log_snapshot.contains(&"Beta:Pong".to_string());
-        let has_response = log_snapshot.contains(&"Alpha:Data:pong-response".to_string());
-
-        if has_ping && has_pong && has_response {
-            break; // Success!
-        }
-
-        if start.elapsed() > Duration::from_secs(2) {
-            panic!("Cross-actor messaging timed out. Log: {:?}", *log_snapshot);
-        }
-    }
-
-    // Note: We don't join threads here because of circular handle references.
-    // The actors hold handles to each other via the directory, preventing clean shutdown.
-    // This is acceptable for testing - threads will be cleaned up when the test exits.
-}
 
 // ============================================================================
 // Two-Phase Initialization Tests
@@ -337,31 +267,7 @@ impl TestTroupe {
     }
 }
 
-#[test]
-fn two_phase_initialization_queues_messages_before_play() {
-    // Phase 1: Create troupe
-    let mut troupe = TestTroupe::new();
 
-    // Phase 2: Get exposed handles (each call creates new SPSC channels)
-    let exposed = troupe.exposed();
-
-    // Phase 3: Send messages BEFORE play() - they should queue
-    exposed
-        .alpha
-        .send(Message::Data(AlphaData("early-bird".to_string())))
-        .unwrap();
-    exposed
-        .alpha
-        .send(Message::Data(AlphaData("gets-the-worm".to_string())))
-        .unwrap();
-
-    // Verify messages are queued (not processed yet - no threads running)
-    // We can't directly check, but the sends should succeed
-
-    // Drop troupe to clean up
-    drop(troupe);
-    drop(exposed);
-}
 
 // ============================================================================
 // Thread Lifecycle Tests

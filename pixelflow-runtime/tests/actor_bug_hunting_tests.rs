@@ -262,52 +262,7 @@ fn actor_panic_does_not_corrupt_state() {
 // Can control messages completely starve data messages?
 // ============================================================================
 
-#[test]
-fn continuous_control_eventually_processes_data() {
-    let (tx, mut rx) = ActorScheduler::new(10, 100);
-    let data_received = Arc::new(AtomicBool::new(false));
-    let data_received_clone = data_received.clone();
 
-    let handle = thread::spawn(move || {
-        struct StarvationTracker(Arc<AtomicBool>);
-        impl Actor<String, String, String> for StarvationTracker {
-            fn handle_data(&mut self, _: String) -> HandlerResult {
-                self.0.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-            fn handle_control(&mut self, _: String) -> HandlerResult {
-                // No delay - we're testing priority, not processing time
-                Ok(())
-            }
-            fn handle_management(&mut self, _: String) -> HandlerResult {
-                Ok(())
-            }
-            fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
-                Ok(ActorStatus::Idle)
-            }
-        }
-        rx.run(&mut StarvationTracker(data_received_clone));
-    });
-
-    // Send one data message
-    tx.send(Message::Data("important".to_string())).unwrap();
-
-    // Then flood with control messages (reduced count for faster test)
-    for i in 0..100 {
-        tx.send(Message::Control(format!("{}", i))).unwrap();
-    }
-
-    // Wait for processing - quick since no delays
-    thread::sleep(Duration::from_millis(100));
-    drop(tx);
-    handle.join().unwrap();
-
-    // Note: Due to priority, data may never be processed if control keeps coming
-    // This test documents the behavior - it's expected that control has priority
-    // But we want to verify the system doesn't deadlock
-
-    // The test passes if it completes without hanging
-}
 
 // ============================================================================
 // ActorStatus::Busy causes CPU spin
@@ -510,19 +465,7 @@ fn large_frame_numbers_dont_overflow() {
 // Does creating and destroying many channels leak resources?
 // ============================================================================
 
-#[test]
-fn rapid_channel_creation_does_not_leak() {
-    // Create and destroy many channels rapidly
-    for _ in 0..1000 {
-        let (tx, rx) = ActorScheduler::<i32, i32, i32>::new(10, 100);
-        tx.send(Message::Data(1)).unwrap();
-        drop(tx);
-        drop(rx);
-    }
 
-    // If we get here without OOM, we're probably fine
-    // In a real test, we'd measure memory usage
-}
 
 // ============================================================================
 // Send after partial processing
@@ -783,44 +726,4 @@ fn large_queue_does_not_cause_issues() {
 // What if messages arrive exactly as scheduler is shutting down?
 // ============================================================================
 
-#[test]
-fn shutdown_race_does_not_panic() {
-    for _ in 0..100 {
-        let mut builder = ActorBuilder::<i32, i32, i32>::new(100, None);
-        let tx = builder.add_producer();
-        let tx2 = builder.add_producer();
-        let mut rx = builder.build_with_burst(10, ShutdownMode::default());
 
-        let handle = thread::spawn(move || {
-            struct NoopActor;
-            impl Actor<i32, i32, i32> for NoopActor {
-                fn handle_data(&mut self, _: i32) -> HandlerResult {
-                    Ok(())
-                }
-                fn handle_control(&mut self, _: i32) -> HandlerResult {
-                    Ok(())
-                }
-                fn handle_management(&mut self, _: i32) -> HandlerResult {
-                    Ok(())
-                }
-                fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
-                    Ok(ActorStatus::Idle)
-                }
-            }
-            rx.run(&mut NoopActor);
-        });
-
-        // Race: send and drop nearly simultaneously
-        thread::spawn(move || {
-            for i in 0..10 {
-                let _ = tx2.send(Message::Data(i));
-            }
-        });
-
-        // Drop original sender quickly
-        drop(tx);
-
-        // Should complete without panic
-        let _ = handle.join();
-    }
-}

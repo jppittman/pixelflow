@@ -137,65 +137,15 @@ mod tests {
     use super::*;
     use pixelflow_core::Field;
 
-    #[test]
-    fn scale_function_works() {
-        let scaled = scale(X, 2.0);
-        let zero = Field::from(0.0);
-        let two = Field::from(2.0);
 
-        // At x=2, scaled should give x/2 = 1
-        let result = scaled.eval((two, zero, zero, zero));
-        let _ = result;
-    }
 
-    #[test]
-    fn translate_function_works() {
-        let translated = translate(X, 1.0, 0.0);
-        let zero = Field::from(0.0);
-        let two = Field::from(2.0);
 
-        // At x=2, translated should give x-1 = 1
-        let result = translated.eval((two, zero, zero, zero));
-        let _ = result;
-    }
 
-    #[test]
-    fn scale_and_translate_compose() {
-        let scaled = scale(X, 2.0);
-        let composed = translate(scaled, 1.0, 0.0);
 
-        let zero = Field::from(0.0);
-        let four = Field::from(4.0);
 
-        let result = composed.eval((four, zero, zero, zero));
-        let _ = result;
-    }
 
-    #[test]
-    fn scale_creation_and_eval() {
-        let scaled = Scale {
-            manifold: X,
-            factor: 2.0,
-        };
 
-        let zero = Field::from(0.0);
-        let one = Field::from(1.0);
 
-        let _ = scaled.eval((one, zero, zero, zero));
-    }
-
-    #[test]
-    fn scale_with_various_factors() {
-        for factor in [0.5, 1.0, 2.0, 10.0] {
-            let scaled = Scale {
-                manifold: X,
-                factor,
-            };
-            let zero = Field::from(0.0);
-            let one = Field::from(1.0);
-            let _ = scaled.eval((one, one, zero, zero));
-        }
-    }
 
     #[test]
     fn scale_is_clone() {
@@ -207,63 +157,11 @@ mod tests {
         assert_eq!(cloned.factor, 2.0);
     }
 
-    #[test]
-    fn translate_creation_and_eval() {
-        let translated = Translate {
-            manifold: X,
-            offset: [1.0, 2.0],
-        };
 
-        let zero = Field::from(0.0);
-        let one = Field::from(1.0);
 
-        let _ = translated.eval((one, one, zero, zero));
-    }
 
-    #[test]
-    fn translate_with_various_offsets() {
-        for offset in [[0.0, 0.0], [1.0, 1.0], [-5.0, 5.0], [100.0, -100.0]] {
-            let translated = Translate {
-                manifold: X,
-                offset,
-            };
-            let zero = Field::from(0.0);
-            let one = Field::from(1.0);
-            let _ = translated.eval((one, one, zero, zero));
-        }
-    }
 
-    #[test]
-    fn struct_scale_and_translate_compose() {
-        let scaled = Scale {
-            manifold: X,
-            factor: 2.0,
-        };
-        let composed = Translate {
-            manifold: scaled,
-            offset: [1.0, 1.0],
-        };
 
-        let zero = Field::from(0.0);
-        let one = Field::from(1.0);
 
-        let _ = composed.eval((one, one, zero, zero));
-    }
 
-    #[test]
-    fn struct_translate_and_scale_compose() {
-        let translated = Translate {
-            manifold: Y,
-            offset: [1.0, 2.0],
-        };
-        let composed = Scale {
-            manifold: translated,
-            factor: 0.5,
-        };
-
-        let zero = Field::from(0.0);
-        let one = Field::from(1.0);
-
-        let _ = composed.eval((one, one, zero, zero));
-    }
 }

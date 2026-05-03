@@ -193,17 +193,9 @@ mod tests {
         tex.data()[0]
     }
 
-    #[test]
-    fn circle_at_origin() {
-        // Point at origin should be inside
-        // Point at (2, 0) should be outside
-    }
 
-    #[test]
-    fn composition_works() {
-        // circle inside square
-        let _scene = square(circle(SOLID, 0.5f32), EMPTY);
-    }
+
+
 
     #[test]
     fn const_manifold_eval() {

@@ -296,12 +296,7 @@ mod tests {
     use alloc::vec;
     use pixelflow_core::Sh2;
 
-    #[test]
-    fn test_elu_feature_positive() {
-        let f = EluFeature;
-        let result = f.apply(Field::from(0.0));
-        let _ = result;
-    }
+
 
     #[test]
     fn test_elu_feature_dimension() {

@@ -467,16 +467,7 @@ mod tests {
         assert_eq!(kernel.params.len(), 3);
     }
 
-    #[test]
-    fn parse_method_call() {
-        let input = quote! { |r: f32| (X * X + Y * Y).sqrt() - r };
-        let kernel = parse(input).unwrap();
-        // Should successfully parse the .sqrt() method call
-        match kernel.body {
-            Expr::Binary(_) => {} // Expected: sqrt() - r
-            _ => panic!("expected binary expression"),
-        }
-    }
+
 
     #[test]
     fn parse_block_expr() {

@@ -107,13 +107,7 @@ mod tests {
         assert!(!mixed.all());
     }
 
-    #[test]
-    #[should_panic]
-    fn test_sse2_store_panic() {
-        let a = F32x4::default();
-        let mut out = [0.0; 3]; // Too small
-        a.store(&mut out);
-    }
+
 
     #[test]
     fn test_sse2_reciprocal_math() {

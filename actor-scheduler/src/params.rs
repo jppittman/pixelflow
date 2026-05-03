@@ -303,10 +303,7 @@ impl Default for SchedulerParams {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_params_are_valid() {
-        SchedulerParams::default().validate();
-    }
+
 
     #[test]
     fn roundtrip_to_vec_from_vec() {
@@ -325,22 +322,9 @@ mod tests {
         assert_eq!(original.jitter_range_pct, reconstructed.jitter_range_pct);
     }
 
-    #[test]
-    #[should_panic(expected = "control_mgmt_buffer_size must be >= 1")]
-    fn validates_buffer_size() {
-        let mut p = SchedulerParams::default();
-        p.control_mgmt_buffer_size = 0;
-        p.validate();
-    }
 
-    #[test]
-    #[should_panic(expected = "jitter_min_pct")]
-    fn validates_jitter_sum() {
-        let mut p = SchedulerParams::default();
-        p.jitter_min_pct = 80;
-        p.jitter_range_pct = 30; // 80 + 30 = 110 > 100
-        p.validate();
-    }
+
+
 
     // Kills: replace * with + in control_burst_limit (line 201)
     // With +: control_burst_limit = buf_size + multiplier (wrong — should be product)

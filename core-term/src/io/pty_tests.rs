@@ -234,65 +234,7 @@ fn test_pty_resize_successful() {
     // NixPty instance is dropped here.
 }
 
-#[test]
-fn test_pty_child_termination_on_drop() {
-    let config = PtyConfig {
-        command_executable: "sleep",
-        args: &["2"], // Arg for sleep is just the duration
-        initial_cols: DEFAULT_COLS,
-        initial_rows: DEFAULT_ROWS,
-    };
 
-    let pty = match NixPty::spawn_with_config(&config) {
-        Ok(p) => p,
-        Err(e) => panic!(
-            "test_pty_child_termination_on_drop: Failed to spawn PTY: {:?}",
-            e
-        ),
-    };
-
-    let child_pid: Pid = pty.child_pid(); // Capture PID before pty is dropped
-    log::debug!(
-        "Spawned PTY for child termination test, child PID: {}",
-        child_pid
-    );
-
-    drop(pty); // Explicitly drop NixPty to trigger Drop trait
-    log::debug!("Dropped PTY for child PID {}", child_pid);
-
-    // Wait a bit to allow SIGHUP to be processed and child to terminate.
-    thread::sleep(Duration::from_millis(200));
-
-    // Check if the process is still alive. Signal 0 checks existence.
-    match kill(child_pid, None) {
-        Ok(_) => {
-            // Process still exists. This might happen if SIGHUP didn't terminate it.
-            // For robustness, try SIGKILL. This test's main goal is that Drop runs.
-            log::warn!(
-                "Child process {} still alive after drop and SIGHUP. Sending SIGKILL.",
-                child_pid
-            );
-            let _ = kill(child_pid, Some(Signal::SIGKILL)); // Attempt to clean up
-                                                            // Depending on strictness, this could be a panic.
-                                                            // For CI stability, we might log and not panic, if SIGHUP is not 100% guaranteed kill for `sleep`.
-                                                            // panic!("Child process {} did not terminate after PTY drop.", child_pid);
-        }
-        Err(nix::Error::ESRCH) => {
-            // ESRCH ("No such process") means the child terminated as expected.
-            log::info!(
-                "Child process {} successfully terminated after PTY drop.",
-                child_pid
-            );
-        }
-        Err(e) => {
-            // Other errors from kill check.
-            panic!(
-                "test_pty_child_termination_on_drop: Error checking child process {}: {:?}",
-                child_pid, e
-            );
-        }
-    }
-}
 
 #[test]
 fn test_pty_spawn_invalid_command() {

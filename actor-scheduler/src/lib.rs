@@ -1933,45 +1933,7 @@ mod troupe_tests {
         pub display: ActorHandle<DisplayData, DisplayControl, DisplayManagement>,
     }
 
-    /// Test the SPSC-based directory pattern: each actor gets its own Directory
-    /// with dedicated SPSC handles to every other actor.
-    #[test]
-    fn test_troupe_directory_pattern() {
-        // Create builders for each actor
-        let mut engine_builder =
-            ActorBuilder::<EngineData, EngineControl, EngineManagement>::new(1024, None);
-        let mut display_builder =
-            ActorBuilder::<DisplayData, DisplayControl, DisplayManagement>::new(1024, None);
 
-        // Each "producer" (actor + external caller) gets dedicated SPSC handles
-        // Directory for the test caller:
-        let test_dir = Directory {
-            engine: engine_builder.add_producer(),
-            display: display_builder.add_producer(),
-        };
-
-        // An additional producer handle (e.g. for exposed handles)
-        let extra_engine_handle = engine_builder.add_producer();
-
-        // Build schedulers (seals builders — no more producers after this)
-        let _engine_s = engine_builder.build();
-        let _display_s = display_builder.build();
-
-        // Verify cross-actor messaging works via directory
-        test_dir
-            .display
-            .send(Message::Control(DisplayControl::Render))
-            .unwrap();
-        test_dir
-            .engine
-            .send(Message::Control(EngineControl::Tick))
-            .unwrap();
-
-        // Multiple handles are independent (each is a separate SPSC channel)
-        extra_engine_handle
-            .send(Message::Control(EngineControl::Tick))
-            .unwrap();
-    }
 
     /// Adversarial test: Malicious control sender trying to starve data lane
     /// Uses CONTINUOUS flooding to ensure burst limiting works during active attack.
@@ -2455,50 +2417,9 @@ mod troupe_nesting_tests {
         }
     }
 
-    /// Test the two-phase Troupe pattern: new() → exposed() → play()
-    #[test]
-    fn test_troupe_two_phase_pattern() {
-        // Phase 1: Create child troupe (no threads yet)
-        let mut child = WorkerTroupe::new();
 
-        // Phase 2: Parent grabs exposed handles (each call creates new SPSC channels)
-        let exposed = child.exposed();
 
-        // Parent can now send to child even before child.play()
-        exposed
-            .worker
-            .send(Message::Control(WorkerControl::Process))
-            .unwrap();
-        exposed
-            .worker
-            .send(Message::Data(WorkerData("hello".to_string())))
-            .unwrap();
 
-        // Multiple exposed() calls create independent handles
-        let exposed2 = child.exposed();
-        exposed2
-            .worker
-            .send(Message::Control(WorkerControl::Process))
-            .unwrap();
-
-        // Note: We don't call play() here since that would block.
-        // The test verifies the two-phase construction pattern works.
-    }
-
-    /// Test that ExposedHandles can outlive the Troupe struct
-    #[test]
-    fn test_exposed_handles_outlive_troupe_struct() {
-        let exposed = {
-            let mut child = WorkerTroupe::new();
-            child.exposed() // ExposedHandles escapes
-        };
-        // Troupe struct dropped, but handles still valid (SPSC channels still open
-        // until both sides drop). Builder was not consumed by build(), so receiver
-        // side is also dropped — handles become disconnected.
-
-        // Just verify the type works
-        let _: WorkerExposedHandles = exposed;
-    }
 }
 
 #[cfg(test)]

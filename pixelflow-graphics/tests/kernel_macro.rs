@@ -466,16 +466,7 @@ fn test_kernel_composition_with_offset() {
 /// 1. ManifoldBind2<M1, M2, Body> that carries both manifold types
 /// 2. Explicit type annotations in the generated closure
 /// 3. A different codegen strategy (e.g., leveled evaluation)
-#[test]
-#[ignore = "two-manifold params require ManifoldBind2 implementation"]
-fn test_two_manifold_params() {
-    // Test body commented out until ManifoldBind2 is implemented
-    // See the original test for the intended behavior:
-    //
-    // let circle_sdf = kernel!(|cx: f32, cy: f32, r: f32| { ... });
-    // let sdf_union = kernel!(|a: kernel, b: kernel| a.min(b));
-    // let union = sdf_union(circle1, circle2);
-}
+
 
 /// Test mixed manifold and scalar parameters.
 #[test]

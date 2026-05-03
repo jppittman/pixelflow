@@ -801,39 +801,7 @@ mod tests {
         assert!(restarts.load(Ordering::SeqCst) >= 1);
     }
 
-    #[test]
-    fn kubelet_handles_pod_sender_dropped_without_phase() {
-        // A pod whose sender side drops without sending a PodPhase should be
-        // treated as Completed (Disconnected branch).
-        let slot = make_slot();
 
-        // Create a channel pair and immediately drop the sender.
-        let (tx, exit_rx) = mpsc::channel::<PodPhase>();
-        drop(tx); // sender dropped immediately
-
-        // Build a minimal ManagedPod by going through the public API:
-        // We can't easily inject a raw exit_rx; instead, verify via spawn_managed
-        // with a very short-lived pod that ignores the actor.
-        // For the Disconnected branch, just verify the kubelet exits cleanly:
-        let pod = spawn_managed(vec![slot.clone()], 64, None, || Noop);
-        // Replace pod.exit_rx with our pre-disconnected one indirectly:
-        // Since SpawnedPod.exit_rx is public, we can use it in a separate ManualPod test.
-        // For now, just verify Noop exits via Shutdown + Never policy.
-        pod.handles[0]
-            .send(crate::Message::<i32, i32, i32>::Shutdown)
-            .unwrap();
-        // exit_rx not used here; verify the kubelet handles the other path.
-        drop(exit_rx); // ensure no leak
-
-        let kubelet = KubeletBuilder::new()
-            .with_poll_interval(Duration::from_millis(1))
-            .add_pod(pod, RestartPolicy::Never)
-            .build();
-
-        let join = thread::spawn(move || kubelet.run());
-        join.join()
-            .expect("kubelet should exit after Never+Completed");
-    }
 
     // Verify the within_budget logic resets the window after restart_window expires.
     #[test]

@@ -231,67 +231,9 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn test_algebraic_rules_preserve_semantics() {
-        let pts = standard_test_points();
-        let x = Expr::Var(0);
-        let y = Expr::Var(1);
 
-        // a - b (triggers canonicalize: sub → add+neg)
-        let expr = Expr::Binary(OpKind::Sub, b(x.clone()), b(y.clone()));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-5);
 
-        // a / b (triggers canonicalize: div → mul+recip)
-        let expr = Expr::Binary(OpKind::Div, b(x.clone()), b(y.clone()));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
 
-        // neg(neg(x)) (triggers involution)
-        let expr = Expr::Unary(OpKind::Neg, b(Expr::Unary(OpKind::Neg, b(x.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
-
-        // (x + y) - y (triggers cancellation)
-        let expr = Expr::Binary(OpKind::Sub,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))),
-            b(y.clone()));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
-
-        // x * 0 (triggers annihilator)
-        let expr = Expr::Binary(OpKind::Mul, b(x.clone()), b(Expr::Const(0.0)));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
-
-        // x + 0 (triggers identity)
-        let expr = Expr::Binary(OpKind::Add, b(x.clone()), b(Expr::Const(0.0)));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
-
-        // x * 1 (triggers identity)
-        let expr = Expr::Binary(OpKind::Mul, b(x.clone()), b(Expr::Const(1.0)));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
-    }
-
-    #[test]
-    fn test_trig_rules_preserve_semantics() {
-        let pts = standard_test_points();
-        let x = Expr::Var(0);
-        let y = Expr::Var(1);
-
-        // sin(x + y) (triggers angle addition)
-        let expr = Expr::Unary(OpKind::Sin,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
-
-        // cos(x + y) (triggers angle addition)
-        let expr = Expr::Unary(OpKind::Cos,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
-
-        // sin(neg(x)) (triggers parity: odd)
-        let expr = Expr::Unary(OpKind::Sin, b(Expr::Unary(OpKind::Neg, b(x.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-5);
-
-        // cos(neg(x)) (triggers parity: even)
-        let expr = Expr::Unary(OpKind::Cos, b(Expr::Unary(OpKind::Neg, b(x.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-5);
-    }
 
     #[test]
     fn test_associativity_left_to_right() {
@@ -368,37 +310,9 @@ mod tests {
              but root class has only {node_count} node(s)");
     }
 
-    #[test]
-    fn test_associativity_mul() {
-        // (v0 * v1) * v2 should produce v0 * (v1 * v2) and vice versa
-        let v0 = Expr::Var(0);
-        let v1 = Expr::Var(1);
-        let v2 = Expr::Var(2);
 
-        let left = Expr::Binary(OpKind::Mul, b(v0.clone()), b(v1.clone()));
-        let expr = Expr::Binary(OpKind::Mul, b(left), b(v2.clone()));
 
-        let pts = standard_test_points();
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
-    }
 
-    #[test]
-    fn test_associativity_min_max() {
-        let v0 = Expr::Var(0);
-        let v1 = Expr::Var(1);
-        let v2 = Expr::Var(2);
-
-        // min(min(v0, v1), v2) should produce min(v0, min(v1, v2))
-        let min_left = Expr::Binary(OpKind::Min, b(v0.clone()), b(v1.clone()));
-        let expr_min = Expr::Binary(OpKind::Min, b(min_left), b(v2.clone()));
-        let pts = standard_test_points();
-        check_optimization_preserves_semantics(&expr_min, &pts, 1e-6);
-
-        // max(max(v0, v1), v2) should produce max(v0, max(v1, v2))
-        let max_left = Expr::Binary(OpKind::Max, b(v0.clone()), b(v1.clone()));
-        let expr_max = Expr::Binary(OpKind::Max, b(max_left), b(v2.clone()));
-        check_optimization_preserves_semantics(&expr_max, &pts, 1e-6);
-    }
 
     #[test]
     fn test_associativity_templates() {

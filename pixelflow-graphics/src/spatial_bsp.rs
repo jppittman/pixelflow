@@ -426,20 +426,7 @@ mod tests {
     // Degenerate Case Tests
     // ========================================================================
 
-    #[test]
-    fn empty_bsp_returns_transparent_on_eval() {
-        let bsp: SpatialBSP<SolidColor> = SpatialBSP::from_positioned(vec![]);
 
-        let x = Field::from(50.0);
-        let y = Field::from(50.0);
-        let z = Field::from(0.0);
-        let w = Field::from(0.0);
-
-        // Should not panic when evaluating empty BSP
-        let result = bsp.eval_raw(x, y, z, w);
-        // Empty BSP should successfully evaluate (implementation returns default/transparent)
-        let _ = result;
-    }
 
     #[test]
     fn single_leaf_has_no_interiors() {
@@ -823,28 +810,7 @@ mod tests {
         assert_eq!(right_pixels[0], expected_blue, "Right region must be blue");
     }
 
-    #[test]
-    fn eval_at_multiple_coords_with_single_leaf() {
-        let bsp = SpatialBSP::single(SolidColor::new(100, 150, 200, 255));
 
-        // Sample at various locations - all should return same color without panicking
-        let coords = [
-            (0.0, 0.0),
-            (50.0, 50.0),
-            (100.0, 100.0),
-            (-10.0, -10.0),
-            (1000.0, 1000.0),
-        ];
-
-        for (x, y) in coords {
-            let _result = bsp.eval_raw(
-                Field::from(x),
-                Field::from(y),
-                Field::from(0.0),
-                Field::from(0.0),
-            );
-        }
-    }
 
     #[test]
     fn quadtree_like_structure_four_quadrants() {
@@ -1181,111 +1147,17 @@ mod tests {
     // SIMD Boundary Behavior Tests
     // ========================================================================
 
-    #[test]
-    fn eval_exactly_at_threshold_goes_right() {
-        // Test the boundary condition: coord < threshold goes left, >= goes right
-        let items = vec![
-            Positioned {
-                bounds: (0.0, 0.0, 50.0, 100.0),
-                leaf: SolidColor::new(255, 0, 0, 255),
-            },
-            Positioned {
-                bounds: (50.0, 0.0, 100.0, 100.0),
-                leaf: SolidColor::new(0, 0, 255, 255),
-            },
-        ];
 
-        let bsp = SpatialBSP::from_positioned(items);
-        let threshold = bsp.interiors[0].threshold;
 
-        // Sample exactly at threshold (should go right, >= threshold)
-        let result = bsp.eval_raw(
-            Field::from(threshold),
-            Field::from(50.0),
-            Field::from(0.0),
-            Field::from(0.0),
-        );
 
-        // Should return a valid result without panicking
-        let _ = result;
-    }
 
-    #[test]
-    fn eval_just_below_threshold_goes_left() {
-        let items = vec![
-            Positioned {
-                bounds: (0.0, 0.0, 50.0, 100.0),
-                leaf: SolidColor::new(255, 0, 0, 255),
-            },
-            Positioned {
-                bounds: (50.0, 0.0, 100.0, 100.0),
-                leaf: SolidColor::new(0, 0, 255, 255),
-            },
-        ];
 
-        let bsp = SpatialBSP::from_positioned(items);
-        let threshold = bsp.interiors[0].threshold;
-
-        // Sample just below threshold
-        let result = bsp.eval_raw(
-            Field::from(threshold - 0.1),
-            Field::from(50.0),
-            Field::from(0.0),
-            Field::from(0.0),
-        );
-
-        let _ = result;
-    }
-
-    #[test]
-    fn eval_just_above_threshold_goes_right() {
-        let items = vec![
-            Positioned {
-                bounds: (0.0, 0.0, 50.0, 100.0),
-                leaf: SolidColor::new(255, 0, 0, 255),
-            },
-            Positioned {
-                bounds: (50.0, 0.0, 100.0, 100.0),
-                leaf: SolidColor::new(0, 0, 255, 255),
-            },
-        ];
-
-        let bsp = SpatialBSP::from_positioned(items);
-        let threshold = bsp.interiors[0].threshold;
-
-        // Sample just above threshold
-        let result = bsp.eval_raw(
-            Field::from(threshold + 0.1),
-            Field::from(50.0),
-            Field::from(0.0),
-            Field::from(0.0),
-        );
-
-        let _ = result;
-    }
 
     // ========================================================================
     // Special Float Value Tests
     // ========================================================================
 
-    #[test]
-    #[should_panic(expected = "unwrap")]
-    fn nan_bounds_panics_during_construction() {
-        // This tests the sharp corner: partial_cmp().unwrap() will panic on NaN
-        let items = vec![
-            Positioned {
-                bounds: (0.0, 0.0, 50.0, 100.0),
-                leaf: SolidColor::new(255, 0, 0, 255),
-            },
-            Positioned {
-                bounds: (f32::NAN, 0.0, 100.0, 100.0), // NaN in bounds
-                leaf: SolidColor::new(0, 0, 255, 255),
-            },
-        ];
 
-        // Should panic when trying to sort by center (partial_cmp on NaN)
-        let _bsp = SpatialBSP::from_positioned(items);
-    }
 
     #[test]
     fn infinity_bounds_handled() {

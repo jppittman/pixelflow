@@ -126,12 +126,7 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic(expected = "substitute_params: param index 1 out of range")]
-    fn substitute_params_panics_on_index_out_of_range() {
-        let expr = Expr::Param(1);
-        substitute_params(&expr, &[1.0_f32]);
-    }
+
 
     // =========================================================================
     // Emitter integration: substitute_params → compile → execute

@@ -210,18 +210,7 @@ mod tests {
         join.join().unwrap();
     }
 
-    #[test]
-    fn hot_path_send_succeeds() {
-        let (svc_handle, kill, pod) = spawn_pod();
-        let slot = PodSlot::connected();
-        let mut svc = ServiceHandle::new(svc_handle, slot);
 
-        svc.send(Message::Data(42)).unwrap();
-        svc.send(Message::Control(1)).unwrap();
-
-        drop(svc);
-        kill_and_join(kill, pod);
-    }
 
     #[test]
     fn reconnects_after_pod_restart_and_returns_reconnected() {

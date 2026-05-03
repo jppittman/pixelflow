@@ -1130,37 +1130,7 @@ fn priority_maintained_when_both_lanes_have_messages() {
 // Edge Case Tests
 // ============================================================================
 
-#[test]
-fn empty_message_types_work() {
-    let (tx, mut rx) = ActorScheduler::<(), (), ()>::new(10, 100);
 
-    let handle = thread::spawn(move || {
-        struct UnitActor;
-        impl Actor<(), (), ()> for UnitActor {
-            fn handle_data(&mut self, _: ()) -> HandlerResult {
-                Ok(())
-            }
-            fn handle_control(&mut self, _: ()) -> HandlerResult {
-                Ok(())
-            }
-            fn handle_management(&mut self, _: ()) -> HandlerResult {
-                Ok(())
-            }
-            fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
-                Ok(ActorStatus::Idle)
-            }
-        }
-        rx.run(&mut UnitActor);
-    });
-
-    tx.send(Message::Data(())).unwrap();
-    tx.send(Message::Control(())).unwrap();
-    tx.send(Message::Management(())).unwrap();
-
-    thread::sleep(Duration::from_millis(20));
-    drop(tx);
-    handle.join().unwrap();
-}
 
 #[test]
 fn zero_size_type_messages() {

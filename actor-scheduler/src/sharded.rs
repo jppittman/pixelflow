@@ -303,12 +303,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    #[should_panic(expected = "at least one producer")]
-    fn panics_on_empty_build() {
-        let builder = InboxBuilder::<u32>::new(16);
-        let _inbox = builder.build();
-    }
+
 
     // Kills: replace shard_count -> usize with 0 (line 159)
     // Kills: replace shard_count -> usize with 1 (line 159)

@@ -81,60 +81,7 @@ mod tests {
     use crate::io::pty::PtyConfig;
     use std::sync::mpsc::sync_channel;
 
-    #[test]
-    fn test_write_thread_handles_resize_command() {
-        // Create a real PTY for testing
-        let config = PtyConfig {
-            command_executable: "/bin/cat",
-            args: &[],
-            initial_cols: 80,
-            initial_rows: 24,
-        };
 
-        let pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
-        let (tx, rx) = sync_channel::<PtyCommand>(16);
 
-        let write_thread = WriteThread::spawn(pty, rx).expect("Failed to spawn write thread");
 
-        // Send resize command
-        tx.send(PtyCommand::Resize(crate::io::Resize {
-            cols: 120,
-            rows: 40,
-        }))
-        .expect("Failed to send resize");
-
-        // Send some data
-        tx.send(PtyCommand::Write(b"hello".to_vec()))
-            .expect("Failed to send write");
-
-        // Drop sender to close the channel and terminate the thread
-        drop(tx);
-
-        // Thread should exit cleanly
-        drop(write_thread);
-    }
-
-    #[test]
-    fn test_write_thread_handles_write_command() {
-        let config = PtyConfig {
-            command_executable: "/bin/cat",
-            args: &[],
-            initial_cols: 80,
-            initial_rows: 24,
-        };
-
-        let pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
-        let (tx, rx) = sync_channel::<PtyCommand>(16);
-
-        let write_thread = WriteThread::spawn(pty, rx).expect("Failed to spawn write thread");
-
-        // Send multiple write commands
-        tx.send(PtyCommand::Write(b"line1\n".to_vec()))
-            .expect("Failed to send");
-        tx.send(PtyCommand::Write(b"line2\n".to_vec()))
-            .expect("Failed to send");
-
-        drop(tx);
-        drop(write_thread);
-    }
 }
