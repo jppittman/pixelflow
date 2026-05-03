@@ -174,10 +174,7 @@ pub enum DisplayControl {
     ///
     /// - `id`: Window identifier
     /// - `visible`: `true` to show, `false` to hide
-    SetVisible {
-        id: WindowId,
-        visibility: Visibility,
-    },
+    SetVisible { id: WindowId, visibility: Visibility },
 
     /// Request an immediate redraw.
     ///

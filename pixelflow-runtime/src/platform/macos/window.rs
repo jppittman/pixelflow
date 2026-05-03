@@ -127,9 +127,11 @@ impl MacWindow {
             crate::display::messages::Visibility::Visible => {
                 self.window.make_key_and_order_front();
             }
-            crate::display::messages::Visibility::Hidden => unsafe {
-                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
-            },
+            crate::display::messages::Visibility::Hidden => {
+                unsafe {
+                    sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
+                }
+            }
         }
     }
 
