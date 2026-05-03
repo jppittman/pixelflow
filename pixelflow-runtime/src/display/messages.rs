@@ -67,6 +67,12 @@ pub enum DisplayData {
     Present { window: Window },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Visible,
+    Hidden,
+}
+
 /// Control messages for the display driver (configuration and lifecycle).
 ///
 /// Control messages are for state changes and non-rendering operations.
@@ -168,7 +174,10 @@ pub enum DisplayControl {
     ///
     /// - `id`: Window identifier
     /// - `visible`: `true` to show, `false` to hide
-    SetVisible { id: WindowId, visible: bool },
+    SetVisible {
+        id: WindowId,
+        visibility: Visibility,
+    },
 
     /// Request an immediate redraw.
     ///
