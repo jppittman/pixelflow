@@ -13,9 +13,9 @@
 //!
 //! No iteration. Nesting is occlusion.
 
+use pixelflow_compiler::{kernel, ManifoldExpr};
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::*;
-use pixelflow_compiler::{kernel, ManifoldExpr};
 
 /// The standard 4D Field domain type.
 type Field4 = (Field, Field, Field, Field);
@@ -598,7 +598,7 @@ impl<M: ManifoldCompat<Jet3, Output = Field>> Manifold<Jet3_4> for Reflect<M> {
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         // Normal components - evaluate at Jet3 construction boundary
         let nx = (cross_x * inv_n_len.clone()).constant();
@@ -686,7 +686,7 @@ impl<M: ManifoldCompat<Jet3, Output = Discrete>> Manifold<Jet3_4> for ColorRefle
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         // Normal components - evaluate at Jet3 construction boundary
         let nx = (cross_x * inv_n_len.clone()).constant();
@@ -793,7 +793,7 @@ where
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         let nx = (cross_x * inv_n_len.clone()).constant();
         let ny = (cross_y * inv_n_len.clone()).constant();
@@ -906,7 +906,7 @@ where
         let n_len_sq = cross_x.clone() * cross_x.clone()
             + cross_y.clone() * cross_y.clone()
             + cross_z.clone() * cross_z.clone();
-        let inv_n_len = n_len_sq.max(Field::from(1e-10)).sqrt().rsqrt();
+        let inv_n_len = n_len_sq.max(Field::from(1e-10)).rsqrt();
 
         let nx = (cross_x * inv_n_len.clone()).constant();
         let ny = (cross_y * inv_n_len.clone()).constant();
@@ -1136,7 +1136,10 @@ impl<C: ManifoldCompat<Field, Output = Discrete>> Manifold<Jet3_4> for ColorChec
         // Coverage: how much of the pixel is in this cell vs neighbor
         let zero = Field::from(0.0);
         let one = Field::from(1.0);
-        let coverage = (dist_to_edge / pixel_size).min(one.clone()).max(zero).constant();
+        let coverage = (dist_to_edge / pixel_size)
+            .min(one.clone())
+            .max(zero)
+            .constant();
 
         // Select and blend colors
         let r_base = is_even.clone().select(ra.clone(), rb.clone());
