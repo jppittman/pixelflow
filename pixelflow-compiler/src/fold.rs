@@ -23,7 +23,7 @@
 //! For phases that need state (like sema's symbol table), the trait
 //! methods take `&mut self`.
 
-use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
+use crate::ast::{BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LiteralExpr, MethodCallExpr, Stmt, UnaryExpr, UnaryOp};
 use syn::Ident;
 
 /// A fold (catamorphism) over the expression AST.
@@ -82,11 +82,7 @@ pub trait ExprFold {
     }
 
     /// Transform a block expression.
-    fn fold_block(
-        &mut self,
-        stmts: Vec<Self::Output>,
-        final_expr: Option<Self::Output>,
-    ) -> Self::Output;
+    fn fold_block(&mut self, stmts: Vec<Self::Output>, final_expr: Option<Self::Output>) -> Self::Output;
 
     /// Transform a tuple expression.
     fn fold_tuple(&mut self, elems: Vec<Self::Output>) -> Self::Output;

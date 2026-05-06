@@ -45,9 +45,7 @@ impl MetalOps {
             app.set_activation_policy(NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
 
             app.finish_launching();
-            app.activate_ignoring_other_apps(
-                crate::platform::macos::cocoa::ActivationPolicy::IgnoreOtherApps,
-            );
+            app.activate_ignoring_other_apps(true);
 
             app
         };
@@ -219,7 +217,7 @@ impl PlatformOps for MetalOps {
                 u64::MAX,
                 until_date,
                 mode,
-                crate::platform::macos::cocoa::DequeueBehavior::Dequeue, // dequeue
+                true, // dequeue
             );
 
             // Release mode string

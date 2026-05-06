@@ -24,12 +24,7 @@ impl MacWindow {
         // NSBackingStoreBuffered = 2
         let backing = 2;
 
-        let window = NSWindow::alloc().init_with_content_rect(
-            rect,
-            style_mask,
-            backing,
-            crate::platform::macos::cocoa::DeferCreation::Immediate,
-        );
+        let window = NSWindow::alloc().init_with_content_rect(rect, style_mask, backing, false);
         window.set_title(&desc.title);
 
         let view = NSView::alloc().init_with_frame(rect);
@@ -65,7 +60,7 @@ impl MacWindow {
             sys::send_1::<(), Id>(view.0, sys::sel(b"setLayer:\0"), layer);
 
             // [view setWantsLayer: YES]
-            view.set_wants_layer(crate::platform::macos::cocoa::LayerRequest::WantsLayer);
+            view.set_wants_layer(true);
         }
 
         window.set_content_view(view);

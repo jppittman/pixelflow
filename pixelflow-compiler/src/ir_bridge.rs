@@ -8,13 +8,13 @@
 //!
 //! The IR becomes the canonical representation, with AST only used during parsing.
 
-use crate::ast::{BinaryOp, Expr, UnaryOp};
+use crate::ast::{BinaryExpr, BinaryOp, Expr, LiteralExpr, UnaryOp};
 use pixelflow_ir::{Expr as IR, OpKind};
 use pixelflow_search::egraph::{EClassId, EGraph, ENode, ExprTree, Leaf, ops};
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use std::collections::HashMap;
-use syn::Lit;
+use syn::{Ident, Lit};
 
 // ============================================================================
 // AST → IR Conversion
@@ -24,7 +24,9 @@ use syn::Lit;
 ///
 /// Index is declaration order: first scalar param = 0, second = 1, etc.
 /// Only scalar params are included — manifold params cannot be constant-folded.
-pub fn scalar_param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, u8> {
+pub fn scalar_param_indices(
+    analyzed: &crate::sema::AnalyzedKernel,
+) -> HashMap<String, u8> {
     analyzed
         .def
         .params

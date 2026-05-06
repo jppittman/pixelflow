@@ -25,7 +25,11 @@ fn eval1(m: &impl Manifold<(Field, Field, Field, Field), Output = Field>, x: f32
     )))
 }
 
-fn eval2(m: &impl Manifold<(Field, Field, Field, Field), Output = Field>, x: f32, y: f32) -> f32 {
+fn eval2(
+    m: &impl Manifold<(Field, Field, Field, Field), Output = Field>,
+    x: f32,
+    y: f32,
+) -> f32 {
     field_extract(m.eval((
         Field::from(x),
         Field::from(y),
@@ -220,8 +224,7 @@ fn test_jit_macro_atan2_basic() {
     let val = eval2(&m, 1.0, 1.0);
     assert!(
         (val - std::f32::consts::FRAC_PI_4).abs() < 0.07,
-        "atan2(1, 1) = {val}, expected ~{}",
-        std::f32::consts::FRAC_PI_4
+        "atan2(1, 1) = {val}, expected ~{}", std::f32::consts::FRAC_PI_4
     );
 
     // atan2(1, 2) = atan(0.5) ≈ 0.4636 — well inside polynomial range
@@ -283,7 +286,10 @@ fn test_jit_macro_atan() {
     );
     // atan(0) = 0
     let val0 = eval1(&m, 0.0);
-    assert!(val0.abs() < 0.01, "atan(0) = {val0}, expected ~0");
+    assert!(
+        val0.abs() < 0.01,
+        "atan(0) = {val0}, expected ~0"
+    );
 }
 
 #[test]
@@ -291,7 +297,10 @@ fn test_jit_macro_asin() {
     let m = kernel_jit!(|| X.asin());
     // asin(0) = 0
     let val0 = eval1(&m, 0.0);
-    assert!(val0.abs() < 0.01, "asin(0) = {val0}, expected ~0");
+    assert!(
+        val0.abs() < 0.01,
+        "asin(0) = {val0}, expected ~0"
+    );
     // asin(0.5) = π/6 ≈ 0.5236 — ratio < 1, polynomial is accurate
     let val_half = eval1(&m, 0.5);
     let expected = 0.5_f32.asin();

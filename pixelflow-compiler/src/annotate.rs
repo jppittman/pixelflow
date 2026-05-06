@@ -19,7 +19,7 @@
 //! `Var<N>` references bound via `Let`. The annotation pass assigns each
 //! literal its Var index.
 
-use crate::ast::{BinaryOp, BlockExpr, Expr, IdentExpr, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, Stmt, UnaryOp};
 use proc_macro2::Span;
 use syn::{Ident, Lit, Type};
 
@@ -143,10 +143,7 @@ pub struct AnnotationResult {
 /// Annotate an expression tree, resolving literal Var indices.
 ///
 /// This is a pure function - context flows through return values.
-pub fn annotate(
-    expr: &Expr,
-    ctx: AnnotationCtx,
-) -> (AnnotatedExpr, AnnotationCtx, Vec<CollectedLiteral>) {
+pub fn annotate(expr: &Expr, ctx: AnnotationCtx) -> (AnnotatedExpr, AnnotationCtx, Vec<CollectedLiteral>) {
     let mut literals = Vec::new();
     let (annotated, final_ctx) = annotate_expr(expr, ctx, &mut literals);
     (annotated, final_ctx, literals)

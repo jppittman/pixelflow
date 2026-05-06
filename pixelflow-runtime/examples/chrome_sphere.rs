@@ -3,10 +3,10 @@
 //! Compares single-threaded vs parallel rasterization of the 3D chrome sphere scene.
 //! Uses the mullet architecture: geometry once, colors as packed Discrete.
 
-use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::combinators::At;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Discrete, Field, Manifold, ManifoldCompat};
+use pixelflow_compiler::ManifoldExpr;
 
 type Field4 = (Field, Field, Field, Field);
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);

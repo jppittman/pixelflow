@@ -23,21 +23,22 @@
 //! ```
 
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LetStmt, LiteralExpr,
-    MethodCallExpr, Stmt, UnaryExpr, UnaryOp,
+    BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
+    UnaryExpr, UnaryOp,
 };
 use crate::cost_builder;
-use crate::ir_bridge::{IRToEGraphContext, ast_to_ir, egraph_to_ir, ir_to_code};
+use crate::ir_bridge::{ast_to_ir, egraph_to_ir, ir_to_code, IRToEGraphContext};
 use crate::sema::AnalyzedKernel;
 use pixelflow_search::egraph::{
-    CostModel, EClassId, EGraph, ENode, ExprTree, ExtractedDAG, Leaf, Rewrite, extract_neural, ops,
+    CostModel, EClassId, EGraph, ENode, ExprTree, ExtractedDAG, Leaf, ops,
+    Rewrite, extract_neural,
 };
-use pixelflow_search::math::all_rules as search_all_rules;
 use pixelflow_search::nnue::ExprNnue;
+use pixelflow_search::math::all_rules as search_all_rules;
 use proc_macro2::Span;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use syn::{Ident, Lit};
 
@@ -85,10 +86,7 @@ fn unique_opaque_name(prefix: &str) -> String {
 /// 4. **Canonicalization** (normalize forms) - enables other matches
 /// 5. **Fusion-enabling rewrites** (distribute, etc.)
 /// 6. **Everything else** (commutative, etc.) - apply last
-fn heuristic_score_rewrite(
-    egraph: &EGraph,
-    target: &pixelflow_search::egraph::RewriteTarget,
-) -> i64 {
+fn heuristic_score_rewrite(egraph: &EGraph, target: &pixelflow_search::egraph::RewriteTarget) -> i64 {
     use pixelflow_search::egraph::RewriteTarget;
 
     // Get the rule name
@@ -174,7 +172,10 @@ impl SaturationConfig {
 /// never hangs, even on expressions that cause exponential e-graph growth.
 ///
 /// Returns true if saturated (optimal), false if limit hit (best-effort).
-fn saturate_with_time_control(egraph: &mut EGraph, config: &SaturationConfig) -> bool {
+fn saturate_with_time_control(
+    egraph: &mut EGraph,
+    config: &SaturationConfig,
+) -> bool {
     let start = Instant::now();
 
     // Iterative saturation with time and size checks
@@ -225,19 +226,18 @@ fn count_ast_nodes(expr: &Expr) -> usize {
         Expr::Binary(b) => 1 + count_ast_nodes(&b.lhs) + count_ast_nodes(&b.rhs),
         Expr::Unary(u) => 1 + count_ast_nodes(&u.operand),
         Expr::MethodCall(c) => {
-            1 + count_ast_nodes(&c.receiver) + c.args.iter().map(count_ast_nodes).sum::<usize>()
+            1 + count_ast_nodes(&c.receiver)
+                + c.args.iter().map(count_ast_nodes).sum::<usize>()
         }
         Expr::Call(c) => 1 + c.args.iter().map(count_ast_nodes).sum::<usize>(),
         Expr::Paren(p) => count_ast_nodes(p),
         Expr::Block(b) => {
-            let stmt_nodes: usize = b
-                .stmts
-                .iter()
-                .map(|s| match s {
+            let stmt_nodes: usize = b.stmts.iter().map(|s| {
+                match s {
                     Stmt::Let(l) => 1 + count_ast_nodes(&l.init),
                     Stmt::Expr(e) => count_ast_nodes(e),
-                })
-                .sum();
+                }
+            }).sum();
             let expr_nodes = b.expr.as_ref().map(|e| count_ast_nodes(e)).unwrap_or(0);
             stmt_nodes + expr_nodes
         }
@@ -359,11 +359,7 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
             // This catches patterns like: ColorCube::default().at(red, green, blue, 1.0)
             // where ColorCube::default() is Verbatim and red/green/blue are locals
             if matches!(call.receiver.as_ref(), Expr::Verbatim(_)) {
-                if call
-                    .args
-                    .iter()
-                    .any(|arg| expr_references_any(arg, local_names))
-                {
+                if call.args.iter().any(|arg| expr_references_any(arg, local_names)) {
                     return true;
                 }
             }
@@ -374,21 +370,14 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
                 // and args contain locals, this is problematic
                 if !is_coordinate_intrinsic(&name) {
                     // Check if any arg references a local
-                    if call
-                        .args
-                        .iter()
-                        .any(|arg| expr_references_any(arg, local_names))
-                    {
+                    if call.args.iter().any(|arg| expr_references_any(arg, local_names)) {
                         return true;
                     }
                 }
             }
             // Recurse into receiver and args
             expr_has_opaque_refs(&call.receiver, local_names)
-                || call
-                    .args
-                    .iter()
-                    .any(|a| expr_has_opaque_refs(a, local_names))
+                || call.args.iter().any(|a| expr_has_opaque_refs(a, local_names))
         }
 
         // Function calls are treated as opaque because expr_to_egraph doesn't
@@ -396,17 +385,11 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
         // Therefore, if any arg references a local, we must preserve structure.
         Expr::Call(call) => {
             // Calls are opaque. If args reference locals, the call itself is an opaque ref.
-            if call
-                .args
-                .iter()
-                .any(|a| expr_references_any(a, local_names))
-            {
+            if call.args.iter().any(|a| expr_references_any(a, local_names)) {
                 return true;
             }
             // Recurse to check for nested opaque refs
-            call.args
-                .iter()
-                .any(|a| expr_has_opaque_refs(a, local_names))
+            call.args.iter().any(|a| expr_has_opaque_refs(a, local_names))
         }
 
         // Recurse into other expression types
@@ -423,10 +406,7 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
                 } else {
                     false
                 }
-            }) || b
-                .expr
-                .as_ref()
-                .map_or(false, |e| expr_has_opaque_refs(e, local_names))
+            }) || b.expr.as_ref().map_or(false, |e| expr_has_opaque_refs(e, local_names))
         }
 
         Expr::Ident(_) | Expr::Literal(_) => false,
@@ -440,7 +420,9 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
 fn expr_references_any(expr: &Expr, names: &std::collections::HashSet<String>) -> bool {
     match expr {
         Expr::Ident(i) => names.contains(&i.name.to_string()),
-        Expr::Binary(b) => expr_references_any(&b.lhs, names) || expr_references_any(&b.rhs, names),
+        Expr::Binary(b) => {
+            expr_references_any(&b.lhs, names) || expr_references_any(&b.rhs, names)
+        }
         Expr::Unary(u) => expr_references_any(&u.operand, names),
         Expr::MethodCall(c) => {
             expr_references_any(&c.receiver, names)
@@ -456,10 +438,7 @@ fn expr_references_any(expr: &Expr, names: &std::collections::HashSet<String>) -
                 } else {
                     false
                 }
-            }) || b
-                .expr
-                .as_ref()
-                .map_or(false, |e| expr_references_any(e, names))
+            }) || b.expr.as_ref().map_or(false, |e| expr_references_any(e, names))
         }
         Expr::Literal(_) => false,
 
@@ -482,33 +461,25 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
                 names.contains(&ident.to_string())
             } else {
                 // Qualified path like `Discrete::pack` - check segments
-                path.path
-                    .segments
-                    .iter()
-                    .any(|seg| names.contains(&seg.ident.to_string()))
+                path.path.segments.iter().any(|seg| names.contains(&seg.ident.to_string()))
             }
         }
 
         SynExpr::MethodCall(call) => {
             // Recursively check receiver and arguments
             syn_expr_references_any(&call.receiver, names)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| syn_expr_references_any(arg, names))
+                || call.args.iter().any(|arg| syn_expr_references_any(arg, names))
         }
 
         SynExpr::Call(call) => {
             // Check function and arguments
             syn_expr_references_any(&call.func, names)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| syn_expr_references_any(arg, names))
+                || call.args.iter().any(|arg| syn_expr_references_any(arg, names))
         }
 
         SynExpr::Binary(bin) => {
-            syn_expr_references_any(&bin.left, names) || syn_expr_references_any(&bin.right, names)
+            syn_expr_references_any(&bin.left, names)
+                || syn_expr_references_any(&bin.right, names)
         }
 
         SynExpr::Unary(un) => syn_expr_references_any(&un.expr, names),
@@ -526,24 +497,23 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
 
         SynExpr::Reference(reference) => syn_expr_references_any(&reference.expr, names),
 
-        SynExpr::Tuple(tuple) => tuple
-            .elems
-            .iter()
-            .any(|e| syn_expr_references_any(e, names)),
+        SynExpr::Tuple(tuple) => tuple.elems.iter().any(|e| syn_expr_references_any(e, names)),
 
-        SynExpr::Array(array) => array
-            .elems
-            .iter()
-            .any(|e| syn_expr_references_any(e, names)),
+        SynExpr::Array(array) => array.elems.iter().any(|e| syn_expr_references_any(e, names)),
 
-        SynExpr::Block(block) => block.block.stmts.iter().any(|stmt| match stmt {
-            syn::Stmt::Local(local) => local
-                .init
-                .as_ref()
-                .map_or(false, |init| syn_expr_references_any(&init.expr, names)),
-            syn::Stmt::Expr(expr, _) => syn_expr_references_any(expr, names),
-            _ => false,
-        }),
+        SynExpr::Block(block) => {
+            block.block.stmts.iter().any(|stmt| {
+                match stmt {
+                    syn::Stmt::Local(local) => {
+                        local.init.as_ref().map_or(false, |init| {
+                            syn_expr_references_any(&init.expr, names)
+                        })
+                    }
+                    syn::Stmt::Expr(expr, _) => syn_expr_references_any(expr, names),
+                    _ => false,
+                }
+            })
+        }
 
         SynExpr::If(if_expr) => {
             syn_expr_references_any(&if_expr.cond, names)
@@ -554,12 +524,9 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
                         false
                     }
                 })
-                || if_expr
-                    .else_branch
-                    .as_ref()
-                    .map_or(false, |(_, else_expr)| {
-                        syn_expr_references_any(else_expr, names)
-                    })
+                || if_expr.else_branch.as_ref().map_or(false, |(_, else_expr)| {
+                    syn_expr_references_any(else_expr, names)
+                })
         }
 
         // Literals don't reference variables
@@ -582,7 +549,10 @@ fn is_coordinate_intrinsic(name: &str) -> bool {
 fn optimize_block_preserving_structure(mut block: BlockExpr, nnue: &ExprNnue) -> Expr {
     for stmt in &mut block.stmts {
         if let Stmt::Let(let_stmt) = stmt {
-            let init = std::mem::replace(&mut let_stmt.init, make_literal(0.0, Span::call_site()));
+            let init = std::mem::replace(
+                &mut let_stmt.init,
+                make_literal(0.0, Span::call_site()),
+            );
             let_stmt.init = optimize_expr_with_nnue(init, nnue);
         }
     }
@@ -638,11 +608,7 @@ fn optimize_via_egraph_dag(expr: &Expr, costs: &CostModel) -> Expr {
 
     // Only use DAG-to-expr if there are actually shared subexpressions
     // This avoids unnecessary block wrapping for simple expressions
-    if dag
-        .shared
-        .iter()
-        .any(|(id, _)| ctx.egraph.find(*id) != dag.root)
-    {
+    if dag.shared.iter().any(|(id, _)| ctx.egraph.find(*id) != dag.root) {
         ctx.dag_to_expr(&dag)
     } else {
         // No sharing - use simpler tree extraction
@@ -743,14 +709,14 @@ impl EGraphContext {
     fn is_known_method(method: &str, arg_count: usize) -> bool {
         match method {
             // Unary methods (0 args)
-            "sqrt" | "rsqrt" | "recip" | "abs" | "neg" | "floor" | "ceil" | "round" | "fract"
-            | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp" | "exp2" | "ln" | "log2"
-            | "log10" => arg_count == 0,
+            "sqrt" | "rsqrt" | "recip" | "abs" | "neg"
+            | "floor" | "ceil" | "round" | "fract"
+            | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+            | "exp" | "exp2" | "ln" | "log2" | "log10" => arg_count == 0,
 
             // Binary methods (1 arg)
-            "min" | "max" | "atan2" | "pow" | "hypot" | "lt" | "le" | "gt" | "ge" | "eq" | "ne" => {
-                arg_count == 1
-            }
+            "min" | "max" | "atan2" | "pow" | "hypot"
+            | "lt" | "le" | "gt" | "ge" | "eq" | "ne" => arg_count == 1,
 
             // Ternary methods (2 args)
             "mul_add" | "select" | "clamp" => arg_count == 2,
@@ -777,16 +743,9 @@ impl EGraphContext {
                 // Check if this is a supported binary op BEFORE converting children
                 // Unsupported ops are preserved as opaque expressions
                 match binary.op {
-                    BinaryOp::Add
-                    | BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Lt
-                    | BinaryOp::Le
-                    | BinaryOp::Gt
-                    | BinaryOp::Ge
-                    | BinaryOp::Eq
-                    | BinaryOp::Ne => {
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                    | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+                    | BinaryOp::Eq | BinaryOp::Ne => {
                         // Supported - convert children
                         let lhs = self.expr_to_egraph(&binary.lhs);
                         let rhs = self.expr_to_egraph(&binary.rhs);
@@ -804,10 +763,7 @@ impl EGraphContext {
                             BinaryOp::Ne => &ops::Ne,
                             _ => unreachable!(),
                         };
-                        self.egraph.add(ENode::Op {
-                            op,
-                            children: vec![lhs, rhs],
-                        })
+                        self.egraph.add(ENode::Op { op, children: vec![lhs, rhs] })
                     }
                     // For other ops (Rem, BitXor, Shl, Shr)
                     // preserve as opaque expression with original structure
@@ -819,19 +775,13 @@ impl EGraphContext {
                 match unary.op {
                     UnaryOp::Neg => {
                         let operand = self.expr_to_egraph(&unary.operand);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Neg,
-                            children: vec![operand],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Neg, children: vec![operand] })
                     }
                     UnaryOp::Not => {
                         // Map Not(x) to 1.0 - x (assuming boolean 0.0/1.0 logic)
                         let operand = self.expr_to_egraph(&unary.operand);
                         let one = self.egraph.add(ENode::constant(1.0));
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Sub,
-                            children: vec![one, operand],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Sub, children: vec![one, operand] })
                     }
                 }
             }
@@ -849,199 +799,94 @@ impl EGraphContext {
 
                 match method.as_str() {
                     // === Unary methods ===
-                    "sqrt" => self.egraph.add(ENode::Op {
-                        op: &ops::Sqrt,
-                        children: vec![receiver],
-                    }),
-                    "rsqrt" => self.egraph.add(ENode::Op {
-                        op: &ops::Rsqrt,
-                        children: vec![receiver],
-                    }),
-                    "recip" => self.egraph.add(ENode::Op {
-                        op: &ops::Recip,
-                        children: vec![receiver],
-                    }),
-                    "abs" => self.egraph.add(ENode::Op {
-                        op: &ops::Abs,
-                        children: vec![receiver],
-                    }),
-                    "neg" => self.egraph.add(ENode::Op {
-                        op: &ops::Neg,
-                        children: vec![receiver],
-                    }),
-                    "floor" => self.egraph.add(ENode::Op {
-                        op: &ops::Floor,
-                        children: vec![receiver],
-                    }),
-                    "ceil" => self.egraph.add(ENode::Op {
-                        op: &ops::Ceil,
-                        children: vec![receiver],
-                    }),
-                    "round" => self.egraph.add(ENode::Op {
-                        op: &ops::Round,
-                        children: vec![receiver],
-                    }),
-                    "fract" => self.egraph.add(ENode::Op {
-                        op: &ops::Fract,
-                        children: vec![receiver],
-                    }),
-                    "sin" => self.egraph.add(ENode::Op {
-                        op: &ops::Sin,
-                        children: vec![receiver],
-                    }),
-                    "cos" => self.egraph.add(ENode::Op {
-                        op: &ops::Cos,
-                        children: vec![receiver],
-                    }),
-                    "tan" => self.egraph.add(ENode::Op {
-                        op: &ops::Tan,
-                        children: vec![receiver],
-                    }),
-                    "asin" => self.egraph.add(ENode::Op {
-                        op: &ops::Asin,
-                        children: vec![receiver],
-                    }),
-                    "acos" => self.egraph.add(ENode::Op {
-                        op: &ops::Acos,
-                        children: vec![receiver],
-                    }),
-                    "atan" => self.egraph.add(ENode::Op {
-                        op: &ops::Atan,
-                        children: vec![receiver],
-                    }),
-                    "exp" => self.egraph.add(ENode::Op {
-                        op: &ops::Exp,
-                        children: vec![receiver],
-                    }),
-                    "exp2" => self.egraph.add(ENode::Op {
-                        op: &ops::Exp2,
-                        children: vec![receiver],
-                    }),
-                    "ln" => self.egraph.add(ENode::Op {
-                        op: &ops::Ln,
-                        children: vec![receiver],
-                    }),
-                    "log2" => self.egraph.add(ENode::Op {
-                        op: &ops::Log2,
-                        children: vec![receiver],
-                    }),
-                    "log10" => self.egraph.add(ENode::Op {
-                        op: &ops::Log10,
-                        children: vec![receiver],
-                    }),
+                    "sqrt" => self.egraph.add(ENode::Op { op: &ops::Sqrt, children: vec![receiver] }),
+                    "rsqrt" => self.egraph.add(ENode::Op { op: &ops::Rsqrt, children: vec![receiver] }),
+                    "recip" => self.egraph.add(ENode::Op { op: &ops::Recip, children: vec![receiver] }),
+                    "abs" => self.egraph.add(ENode::Op { op: &ops::Abs, children: vec![receiver] }),
+                    "neg" => self.egraph.add(ENode::Op { op: &ops::Neg, children: vec![receiver] }),
+                    "floor" => self.egraph.add(ENode::Op { op: &ops::Floor, children: vec![receiver] }),
+                    "ceil" => self.egraph.add(ENode::Op { op: &ops::Ceil, children: vec![receiver] }),
+                    "round" => self.egraph.add(ENode::Op { op: &ops::Round, children: vec![receiver] }),
+                    "fract" => self.egraph.add(ENode::Op { op: &ops::Fract, children: vec![receiver] }),
+                    "sin" => self.egraph.add(ENode::Op { op: &ops::Sin, children: vec![receiver] }),
+                    "cos" => self.egraph.add(ENode::Op { op: &ops::Cos, children: vec![receiver] }),
+                    "tan" => self.egraph.add(ENode::Op { op: &ops::Tan, children: vec![receiver] }),
+                    "asin" => self.egraph.add(ENode::Op { op: &ops::Asin, children: vec![receiver] }),
+                    "acos" => self.egraph.add(ENode::Op { op: &ops::Acos, children: vec![receiver] }),
+                    "atan" => self.egraph.add(ENode::Op { op: &ops::Atan, children: vec![receiver] }),
+                    "exp" => self.egraph.add(ENode::Op { op: &ops::Exp, children: vec![receiver] }),
+                    "exp2" => self.egraph.add(ENode::Op { op: &ops::Exp2, children: vec![receiver] }),
+                    "ln" => self.egraph.add(ENode::Op { op: &ops::Ln, children: vec![receiver] }),
+                    "log2" => self.egraph.add(ENode::Op { op: &ops::Log2, children: vec![receiver] }),
+                    "log10" => self.egraph.add(ENode::Op { op: &ops::Log10, children: vec![receiver] }),
 
                     // === Binary methods ===
                     "min" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Min,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Min, children: vec![receiver, arg] })
                     }
                     "max" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Max,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Max, children: vec![receiver, arg] })
                     }
                     "atan2" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Atan2,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Atan2, children: vec![receiver, arg] })
                     }
                     "pow" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Pow,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Pow, children: vec![receiver, arg] })
                     }
                     "hypot" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Hypot,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Hypot, children: vec![receiver, arg] })
                     }
 
                     // === Comparison methods ===
                     "lt" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Lt,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Lt, children: vec![receiver, arg] })
                     }
                     "le" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Le,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Le, children: vec![receiver, arg] })
                     }
                     "gt" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Gt,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Gt, children: vec![receiver, arg] })
                     }
                     "ge" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Ge,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Ge, children: vec![receiver, arg] })
                     }
                     "eq" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Eq,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Eq, children: vec![receiver, arg] })
                     }
                     "ne" => {
                         let arg = self.expr_to_egraph(&call.args[0]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Ne,
-                            children: vec![receiver, arg],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Ne, children: vec![receiver, arg] })
                     }
 
                     // === Ternary methods ===
                     "mul_add" => {
                         let b = self.expr_to_egraph(&call.args[0]);
                         let c = self.expr_to_egraph(&call.args[1]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::MulAdd,
-                            children: vec![receiver, b, c],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::MulAdd, children: vec![receiver, b, c] })
                     }
                     "select" => {
                         let if_true = self.expr_to_egraph(&call.args[0]);
                         let if_false = self.expr_to_egraph(&call.args[1]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Select,
-                            children: vec![receiver, if_true, if_false],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Select, children: vec![receiver, if_true, if_false] })
                     }
                     "clamp" => {
                         let min_val = self.expr_to_egraph(&call.args[0]);
                         let max_val = self.expr_to_egraph(&call.args[1]);
-                        self.egraph.add(ENode::Op {
-                            op: &ops::Clamp,
-                            children: vec![receiver, min_val, max_val],
-                        })
+                        self.egraph.add(ENode::Op { op: &ops::Clamp, children: vec![receiver, min_val, max_val] })
                     }
 
                     // Should not reach here due to is_known_method check
-                    _ => unreachable!(
-                        "Unknown method {} should have been handled as opaque",
-                        method
-                    ),
+                    _ => unreachable!("Unknown method {} should have been handled as opaque", method),
                 }
             }
 
@@ -1068,16 +913,17 @@ impl EGraphContext {
 
             // For Call and Verbatim, treat as opaque and store original expression
             // so it can be restored during extraction
-            Expr::Call(call) => self.create_opaque_var(&format!("call_{}_", call.func), expr),
+            Expr::Call(call) => {
+                self.create_opaque_var(&format!("call_{}_", call.func), expr)
+            }
 
-            Expr::Verbatim(_) => self.create_opaque_var("verbatim_", expr),
+            Expr::Verbatim(_) => {
+                self.create_opaque_var("verbatim_", expr)
+            }
 
             Expr::Tuple(tuple) => {
                 let elems: Vec<_> = tuple.elems.iter().map(|e| self.expr_to_egraph(e)).collect();
-                self.egraph.add(ENode::Op {
-                    op: &ops::Tuple,
-                    children: elems,
-                })
+                self.egraph.add(ENode::Op { op: &ops::Tuple, children: elems })
             }
         }
     }
@@ -1160,25 +1006,23 @@ impl EGraphContext {
         }
 
         // Get the best node for this e-class
-        let node_idx = dag
-            .best_node_idx(canonical)
+        let node_idx = dag.best_node_idx(canonical)
             .unwrap_or_else(|| panic!("No best node for e-class {} in DAG", canonical.index()));
         let node = &self.egraph.nodes(canonical)[node_idx];
 
         match node {
             ENode::Var(idx) => {
                 // Try to get the variable name from our mapping
-                let name =
-                    self.idx_to_name
-                        .get(*idx as usize)
-                        .cloned()
-                        .unwrap_or_else(|| match idx {
-                            0 => "X".to_string(),
-                            1 => "Y".to_string(),
-                            2 => "Z".to_string(),
-                            3 => "W".to_string(),
-                            _ => format!("__var{}", idx),
-                        });
+                let name = self.idx_to_name
+                    .get(*idx as usize)
+                    .cloned()
+                    .unwrap_or_else(|| match idx {
+                        0 => "X".to_string(),
+                        1 => "Y".to_string(),
+                        2 => "Z".to_string(),
+                        3 => "W".to_string(),
+                        _ => format!("__var{}", idx),
+                    });
 
                 // Check if this is an opaque variable - restore original expression
                 if let Some(original) = self.opaque_exprs.get(&name) {
@@ -1195,8 +1039,7 @@ impl EGraphContext {
 
             ENode::Op { op, children } => {
                 let name = op.name();
-                let child_exprs: Vec<Expr> = children
-                    .iter()
+                let child_exprs: Vec<Expr> = children.iter()
                     .map(|&c| self.eclass_to_expr(c, dag, binding_names))
                     .collect();
 
@@ -1311,11 +1154,7 @@ impl EGraphContext {
             // Unknown - try as unary or binary method
             (name, [a]) => self.unary_method_expr(a, name, span),
             (name, [a, b]) => self.binary_method_expr(a, b, name, span),
-            (name, _) => panic!(
-                "Unknown operation {} with {} children",
-                name,
-                children.len()
-            ),
+            (name, _) => panic!("Unknown operation {} with {} children", name, children.len()),
         }
     }
 
@@ -1489,11 +1328,7 @@ impl EGraphContext {
                     // Unknown operation - emit as method call if possible
                     (op_name, [a]) => self.unary_method(a, op_name, span),
                     (op_name, [a, b]) => self.binary_method(a, b, op_name, span),
-                    _ => panic!(
-                        "Unknown operation {} with {} children",
-                        name,
-                        children.len()
-                    ),
+                    _ => panic!("Unknown operation {} with {} children", name, children.len()),
                 }
             }
         }
@@ -1756,14 +1591,14 @@ mod tests {
         let kernel = parse(input).unwrap();
         let analyzed = analyze(kernel).unwrap();
         let optimized = optimize(analyzed);
-        format!("{:?}", optimized.def.body)
+        format!("{:?}", optimized)
     }
 
     fn optimize_code_egraph(input: proc_macro2::TokenStream, costs: &CostModel) -> String {
         let kernel = parse(input).unwrap();
         let analyzed = analyze(kernel).unwrap();
-        let optimized = optimize_with_egraph(analyzed, costs);
-        format!("{:?}", optimized.def.body)
+        let optimized = optimize_via_egraph(&analyzed.def.body, costs);
+        format!("{:?}", optimized)
     }
 
     #[test]
@@ -1832,16 +1667,8 @@ mod tests {
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to 0.0
         eprintln!("test_egraph_zero_mul output: {}", debug);
-        assert!(
-            debug.contains("LiteralExpr"),
-            "Expected LiteralExpr in: {}",
-            debug
-        );
-        assert!(
-            debug.contains("0.0") || debug.contains("0"),
-            "Expected 0 in: {}",
-            debug
-        );
+        assert!(debug.contains("LiteralExpr"), "Expected LiteralExpr in: {}", debug);
+        assert!(debug.contains("0.0") || debug.contains("0"), "Expected 0 in: {}", debug);
     }
 
     #[test]
@@ -1856,7 +1683,7 @@ mod tests {
     fn test_egraph_fma_fusion_with_fma_costs() {
         // a * b + c should become mul_add when FMA is cheap
         let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
-        let debug = optimize_code_egraph(input, &CostModel::with_fma());
+        let debug = optimize_code_egraph(input, &CostModel::new());
         // With FMA costs, should extract mul_add
         assert!(debug.contains("mul_add"));
     }
@@ -1872,11 +1699,7 @@ mod tests {
 
         let debug = optimize_code_egraph(input, &expensive_fma);
         // With expensive FMA, should prefer unfused (mul(5) + add(4) = 9 < mul_add(20))
-        assert!(
-            !debug.contains("mul_add"),
-            "Expected unfused when MulAdd is expensive: {}",
-            debug
-        );
+        assert!(!debug.contains("mul_add"), "Expected unfused when MulAdd is expensive: {}", debug);
     }
 
     #[test]
@@ -1885,11 +1708,7 @@ mod tests {
         let input = quote! { |a: f32, b: f32, c: f32| a * b + c };
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Modern CPUs have cheap FMA, so it should be fused
-        assert!(
-            debug.contains("mul_add"),
-            "Expected FMA fusion with default costs: {}",
-            debug
-        );
+        assert!(debug.contains("mul_add"), "Expected FMA fusion with default costs: {}", debug);
     }
 
     #[test]
@@ -1924,7 +1743,7 @@ mod tests {
         // x / sqrt(y) should become x * rsqrt(y) via algebra:
         // x / sqrt(y) = x * (1/sqrt(y)) = x * rsqrt(y)
         let input = quote! { |x: f32, y: f32| x / y.sqrt() };
-        let debug = optimize_code_egraph(input, &CostModel::with_fast_rsqrt());
+        let debug = optimize_code_egraph(input, &CostModel::new());
         // Should use rsqrt (real instruction) instead of 1/sqrt
         assert!(debug.contains("rsqrt"), "Expected rsqrt in: {}", debug);
     }
@@ -1955,11 +1774,7 @@ mod tests {
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to just x (no Add, no 0.0 literal in result)
         assert!(debug.contains("x"), "Expected x in output: {}", debug);
-        assert!(
-            !debug.contains("Add"),
-            "Should eliminate addition with zero: {}",
-            debug
-        );
+        assert!(!debug.contains("Add"), "Should eliminate addition with zero: {}", debug);
     }
 
     #[test]
@@ -1973,11 +1788,7 @@ mod tests {
         let debug = optimize_code_egraph(input, &CostModel::default());
         // Should simplify to 0.0
         assert!(debug.contains("0"), "Expected 0 in output: {}", debug);
-        assert!(
-            !debug.contains("Mul"),
-            "Should eliminate multiplication: {}",
-            debug
-        );
+        assert!(!debug.contains("Mul"), "Should eliminate multiplication: {}", debug);
     }
 
     #[test]
@@ -1999,7 +1810,7 @@ mod tests {
             let product = a * b;
             product + c
         }};
-        let debug = optimize_code_egraph(input, &CostModel::with_fma());
+        let debug = optimize_code_egraph(input, &CostModel::new());
         // Should fuse into mul_add
         assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
     }
@@ -2014,7 +1825,7 @@ mod tests {
             let r_sq = r * r;
             d_sq - (c_sq - r_sq)
         }};
-        let debug = optimize_code_egraph(input, &CostModel::fully_optimized());
+        let debug = optimize_code_egraph(input, &CostModel::new());
         eprintln!("Discriminant AST: {}", debug);
 
         // The AST should contain a Neg wrapping the inner subtraction
@@ -2028,11 +1839,8 @@ mod tests {
         assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
 
         // Check that Neg appears in the output (wrapping the inner expression)
-        assert!(
-            debug.contains("Neg") || debug.contains("neg"),
-            "Expected Neg in third argument of mul_add: {}",
-            debug
-        );
+        assert!(debug.contains("Neg") || debug.contains("neg"),
+                "Expected Neg in third argument of mul_add: {}", debug);
     }
 
     #[test]
@@ -2048,18 +1856,15 @@ mod tests {
             let r_sq = r * r;
             d_dot_c * d_dot_c - (c_sq - r_sq)
         }};
-        let debug = optimize_code_egraph(input, &CostModel::fully_optimized());
+        let debug = optimize_code_egraph(input, &CostModel::new());
         eprintln!("Discriminant with intrinsics AST: {}", debug);
 
         // Check for FMA
         assert!(debug.contains("mul_add"), "Expected FMA fusion: {}", debug);
 
         // Check that Neg appears - the key correctness check
-        assert!(
-            debug.contains("Neg") || debug.contains("neg"),
-            "Expected Neg in expression: {}",
-            debug
-        );
+        assert!(debug.contains("Neg") || debug.contains("neg"),
+                "Expected Neg in expression: {}", debug);
     }
 
     // ========================================================================
@@ -2085,10 +1890,7 @@ mod tests {
         // 1. Have a let-binding for the shared sin(X), OR
         // 2. Reference the same subexpression (e-graph dedup)
         // For now, just verify it's well-formed
-        assert!(
-            debug.contains("sin") || debug.contains("Sin"),
-            "Expected sin in output"
-        );
+        assert!(debug.contains("sin") || debug.contains("Sin"), "Expected sin in output");
     }
 
     /// Test DAG optimization with triple use of shared subexpr.
@@ -2124,10 +1926,7 @@ mod tests {
         eprintln!("DAG optimized X+Y: {}", debug);
 
         // Should NOT be wrapped in a block
-        assert!(
-            !debug.starts_with("Block"),
-            "Simple expression should not be wrapped in block"
-        );
+        assert!(!debug.starts_with("Block"), "Simple expression should not be wrapped in block");
     }
 
     #[test]
@@ -2160,12 +1959,7 @@ mod tests {
         // YES: (c_sq - r_sq).neg() (which is -c_sq + r²)
 
         // Check for the WRONG pattern (the bug)
-        let has_wrong_pattern =
-            output_str.contains("r . neg ( )") && !output_str.contains(") . neg ( )");
-        assert!(
-            !has_wrong_pattern,
-            "Found wrong pattern (r.neg() without wrapping): {}",
-            output_str
-        );
+        let has_wrong_pattern = output_str.contains("r . neg ( )") && !output_str.contains(") . neg ( )");
+        assert!(!has_wrong_pattern, "Found wrong pattern (r.neg() without wrapping): {}", output_str);
     }
 }

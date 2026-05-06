@@ -22,7 +22,7 @@
 //! The macro detects if it's running inside `pixelflow-core` or an external crate
 //! to generate the correct paths (`crate::ops::...` vs `::pixelflow_core::ops::...`).
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{TokenStream, Span};
 use quote::quote;
 use syn::{DeriveInput, Ident};
 

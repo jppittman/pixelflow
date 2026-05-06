@@ -71,9 +71,9 @@ pub fn emit(analyzed: AnalyzedKernel) -> TokenStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimize::optimize;
     use crate::parser::parse;
     use crate::sema::analyze;
+    use crate::optimize::optimize;
     use quote::quote;
 
     fn compile(input: TokenStream) -> TokenStream {
@@ -222,13 +222,11 @@ mod tests {
         // inner → ContextFree(inner), r → CtxVar::<A0, 0usize>
         assert!(
             output_str.contains("ContextFree (inner)"),
-            "Expected ContextFree for inner, got: {}",
-            output_str
+            "Expected ContextFree for inner, got: {}", output_str
         );
         assert!(
             output_str.contains("CtxVar :: < A0 , 0usize >"),
-            "Expected CtxVar::<A0, 0usize> for r, got: {}",
-            output_str
+            "Expected CtxVar::<A0, 0usize> for r, got: {}", output_str
         );
 
         // Should use WithContext
@@ -256,8 +254,7 @@ mod tests {
         // a, b -> ContextFree(a), ContextFree(b)
         assert!(
             output_str.contains("ContextFree (a)") && output_str.contains("ContextFree (b)"),
-            "Expected ContextFree for a and b, got: {}",
-            output_str
+            "Expected ContextFree for a and b, got: {}", output_str
         );
 
         // Should use WithContext with tuple
@@ -374,10 +371,7 @@ mod tests {
 
         // Should preserve all let bindings
         assert!(output_str.contains("let scale"), "Expected let scale");
-        assert!(
-            output_str.contains("let half_width"),
-            "Expected let half_width"
-        );
+        assert!(output_str.contains("let half_width"), "Expected let half_width");
         assert!(output_str.contains("let x"), "Expected let x");
         assert!(output_str.contains("let y"), "Expected let y");
         assert!(output_str.contains("let r_sq"), "Expected let r_sq");
