@@ -106,6 +106,8 @@ pub enum StopReason {
     MaxEpochs,
     /// No rules in the e-graph
     NoRules,
+    /// E-graph reached the configured maximum class count
+    OutOfSpace,
 }
 
 /// Match threshold for rule application.
@@ -490,7 +492,7 @@ impl GuidedSearch {
             let num_classes = self.egraph.num_classes();
             if num_classes >= max_classes {
                 return self.finish_unified_mask(
-                    StopReason::MaxEpochs, // TODO: add OutOfSpace reason
+                    StopReason::OutOfSpace,
                     pairs_tried, pairs_skipped, trajectory
                 );
             }
@@ -650,7 +652,7 @@ impl GuidedSearch {
             let num_classes = self.egraph.num_classes();
             if num_classes >= max_classes {
                 return self.finish_unified_mask(
-                    StopReason::MaxEpochs, // Resource limit (maps to MaxEpochs for now)
+                    StopReason::OutOfSpace,
                     pairs_tried, pairs_skipped, trajectory
                 );
             }
