@@ -23,11 +23,10 @@
 //! ```
 
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
+    BinaryExpr, BinaryOp, BlockExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
     UnaryExpr, UnaryOp,
 };
-use crate::cost_builder;
-use crate::ir_bridge::{ast_to_ir, egraph_to_ir, ir_to_code, IRToEGraphContext};
+use crate::ir_bridge::{ast_to_ir, IRToEGraphContext};
 use crate::sema::AnalyzedKernel;
 use pixelflow_search::egraph::{
     CostModel, EClassId, EGraph, ENode, ExprTree, ExtractedDAG, Leaf, ops,
@@ -87,7 +86,7 @@ fn unique_opaque_name(prefix: &str) -> String {
 /// 5. **Fusion-enabling rewrites** (distribute, etc.)
 /// 6. **Everything else** (commutative, etc.) - apply last
 fn heuristic_score_rewrite(egraph: &EGraph, target: &pixelflow_search::egraph::RewriteTarget) -> i64 {
-    use pixelflow_search::egraph::RewriteTarget;
+
 
     // Get the rule name
     let rule_name = match egraph.rule(target.rule_idx) {

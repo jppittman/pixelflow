@@ -397,7 +397,7 @@ pub fn analyze_deps(
 ) -> DepsStats {
     let mut builder = LevelBuilder::new(analyzed);
     let root = builder.build(annotated);
-    let root_deps = builder.get_deps(root);
+    let _root_deps = builder.get_deps(root);
 
     let mut stats = DepsStats::default();
 

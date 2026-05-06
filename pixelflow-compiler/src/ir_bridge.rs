@@ -8,13 +8,13 @@
 //!
 //! The IR becomes the canonical representation, with AST only used during parsing.
 
-use crate::ast::{BinaryExpr, BinaryOp, Expr, LiteralExpr, UnaryOp};
+use crate::ast::{BinaryOp, Expr, UnaryOp};
 use pixelflow_ir::{Expr as IR, OpKind};
 use pixelflow_search::egraph::{EClassId, EGraph, ENode, ExprTree, Leaf, ops};
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::HashMap;
-use syn::{Ident, Lit};
+use syn::Lit;
 
 // ============================================================================
 // AST → IR Conversion
