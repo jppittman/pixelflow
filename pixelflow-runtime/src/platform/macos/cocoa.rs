@@ -6,6 +6,27 @@
 use super::sys::{self, Id, BOOL, NO, YES};
 use std::ffi::c_void;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    Observe,
+    IgnoreOtherApps,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequeueBehavior {
+    Peek,
+    Dequeue,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferCreation {
+    Immediate,
+    Deferred,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRequest {
+    WantsLayer,
+    NoLayer,
+}
+
 // --- Helpers ---
 
 /// Convert Rust string to NSString id.
@@ -136,9 +157,12 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self, policy: ActivationPolicy) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = match policy {
+                ActivationPolicy::IgnoreOtherApps => YES,
+                ActivationPolicy::Observe => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -156,9 +180,12 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, behavior: DequeueBehavior) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = match behavior {
+                DequeueBehavior::Dequeue => YES,
+                DequeueBehavior::Peek => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -190,10 +217,13 @@ impl NSWindow {
         rect: NSRect,
         style_mask: u64,
         backing: u64,
-        defer: bool,
+        defer: DeferCreation,
     ) -> Self {
         unsafe {
-            let d = if defer { YES } else { NO };
+            let d = match defer {
+                DeferCreation::Deferred => YES,
+                DeferCreation::Immediate => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
@@ -266,9 +296,12 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self, request: LayerRequest) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = match request {
+                LayerRequest::WantsLayer => YES,
+                LayerRequest::NoLayer => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }
