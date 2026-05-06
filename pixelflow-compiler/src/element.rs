@@ -22,7 +22,7 @@
 //! The macro detects if it's running inside `pixelflow-core` or an external crate
 //! to generate the correct paths (`crate::ops::...` vs `::pixelflow_core::ops::...`).
 
-use proc_macro2::{TokenStream, Span};
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{DeriveInput, Ident};
 
@@ -48,7 +48,7 @@ pub fn derive_element(input: DeriveInput) -> TokenStream {
     };
 
     let ops_mod = quote! { #root::ops };
-    
+
     // Helper to generate binary op impl
     let binary_op = |trait_name: &str, method: &str, node_name: &str, node_mod: &TokenStream| {
         let trait_ident = Ident::new(trait_name, Span::call_site());

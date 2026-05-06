@@ -82,7 +82,11 @@ pub trait ExprFold {
     }
 
     /// Transform a block expression.
-    fn fold_block(&mut self, stmts: Vec<Self::Output>, final_expr: Option<Self::Output>) -> Self::Output;
+    fn fold_block(
+        &mut self,
+        stmts: Vec<Self::Output>,
+        final_expr: Option<Self::Output>,
+    ) -> Self::Output;
 
     /// Transform a tuple expression.
     fn fold_tuple(&mut self, elems: Vec<Self::Output>) -> Self::Output;

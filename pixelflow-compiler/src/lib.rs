@@ -52,7 +52,7 @@ mod symbol;
 use proc_macro::TokenStream;
 use quote::format_ident;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, LitInt};
+use syn::{LitInt, parse_macro_input};
 
 /// Derive macro for the `Element` trait.
 ///
@@ -228,7 +228,7 @@ pub fn kernel_jit(input: TokenStream) -> TokenStream {
         Err(e) => {
             return syn::Error::new(proc_macro2::Span::call_site(), e)
                 .to_compile_error()
-                .into()
+                .into();
         }
     };
 
@@ -279,14 +279,10 @@ pub fn kernel_jit(input: TokenStream) -> TokenStream {
         output.into()
     } else {
         // N-param: emit a builder closure
-        let param_names: Vec<proc_macro2::Ident> = scalar_params
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
-        let param_types: Vec<proc_macro2::TokenStream> = scalar_params
-            .iter()
-            .map(|_| quote! { f32 })
-            .collect();
+        let param_names: Vec<proc_macro2::Ident> =
+            scalar_params.iter().map(|p| p.name.clone()).collect();
+        let param_types: Vec<proc_macro2::TokenStream> =
+            scalar_params.iter().map(|_| quote! { f32 }).collect();
         // params slice in declaration order: first param = index 0
         let param_slice = quote! { &[ #( #param_names as f32 ),* ] };
 

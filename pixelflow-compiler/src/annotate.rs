@@ -143,7 +143,10 @@ pub struct AnnotationResult {
 /// Annotate an expression tree, resolving literal Var indices.
 ///
 /// This is a pure function - context flows through return values.
-pub fn annotate(expr: &Expr, ctx: AnnotationCtx) -> (AnnotatedExpr, AnnotationCtx, Vec<CollectedLiteral>) {
+pub fn annotate(
+    expr: &Expr,
+    ctx: AnnotationCtx,
+) -> (AnnotatedExpr, AnnotationCtx, Vec<CollectedLiteral>) {
     let mut literals = Vec::new();
     let (annotated, final_ctx) = annotate_expr(expr, ctx, &mut literals);
     (annotated, final_ctx, literals)
