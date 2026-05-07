@@ -14,10 +14,7 @@ use crate::kind::OpKind;
 /// Format: Vd.4S, Vn.4S, Vm.4S
 #[inline]
 fn encode_3same(opcode: u32, dst: Reg, src1: Reg, src2: Reg) -> u32 {
-    opcode
-        | (dst.0 as u32 & 0x1F)
-        | ((src1.0 as u32 & 0x1F) << 5)
-        | ((src2.0 as u32 & 0x1F) << 16)
+    opcode | (dst.0 as u32 & 0x1F) | ((src1.0 as u32 & 0x1F) << 5) | ((src2.0 as u32 & 0x1F) << 16)
 }
 
 /// Encode a NEON 2-reg misc instruction (unary vector ops).
@@ -60,7 +57,10 @@ pub fn emit_str_voff(code: &mut Vec<u8>, src: Reg, offset: u16) {
 /// immediate addressing. Large offsets use X16 (IP0) as scratch to compute
 /// the address, then load from [X16].
 pub fn emit_ldr_sp(code: &mut Vec<u8>, dst: Reg, offset: u32) {
-    assert!(offset % 16 == 0, "emit_ldr_sp: offset {offset} not 16-byte aligned");
+    assert!(
+        offset % 16 == 0,
+        "emit_ldr_sp: offset {offset} not 16-byte aligned"
+    );
     let imm12 = offset / 16;
     if imm12 <= 4095 {
         // LDR Qt, [SP, #imm12*16]
@@ -79,7 +79,10 @@ pub fn emit_ldr_sp(code: &mut Vec<u8>, dst: Reg, offset: u32) {
 ///
 /// Small offsets use scaled immediate. Large offsets use X16 scratch.
 pub fn emit_str_sp(code: &mut Vec<u8>, src: Reg, offset: u32) {
-    assert!(offset % 16 == 0, "emit_str_sp: offset {offset} not 16-byte aligned");
+    assert!(
+        offset % 16 == 0,
+        "emit_str_sp: offset {offset} not 16-byte aligned"
+    );
     let imm12 = offset / 16;
     if imm12 <= 4095 {
         // STR Qt, [SP, #imm12*16]
@@ -293,7 +296,10 @@ pub fn emit_fmov_imm(code: &mut Vec<u8>, dst: Reg, val: f32, _scratch: [Reg; 4])
         let abc = ((imm8 as u32) >> 5) & 0x7;
         let defgh = (imm8 as u32) & 0x1F;
         // FMOV Vd.4S, #imm8: 0x4F00F400 | abc<<16 | defgh<<5 | Rd
-        emit32(code, 0x4F00_F400 | (abc << 16) | (defgh << 5) | (dst.0 as u32));
+        emit32(
+            code,
+            0x4F00_F400 | (abc << 16) | (defgh << 5) | (dst.0 as u32),
+        );
         return;
     }
 
@@ -383,57 +389,66 @@ pub fn emit_adr_x17_placeholder(code: &mut Vec<u8>) -> usize {
     pos
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdrMode {
+    Adr,
+    Adrp,
+}
+
 /// Patch a previously emitted `ADR X17` placeholder at `adr_pos` to point to `target_pos`.
-/// If `is_adrp` is true, assumes 8 bytes are reserved and patches `ADRP X17` + `ADD X17`.
-pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_adrp: bool) {
-    if is_adrp {
-        assert!(
-            adr_pos + 8 <= code.len(),
-            "patch_adr_or_adrp: adr_pos {} + 8 exceeds code length {}",
-            adr_pos,
-            code.len()
-        );
+/// If `mode` is `AdrMode::Adrp`, assumes 8 bytes are reserved and patches `ADRP X17` + `ADD X17`.
+pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, mode: AdrMode) {
+    match mode {
+        AdrMode::Adrp => {
+            assert!(
+                adr_pos + 8 <= code.len(),
+                "patch_adr_or_adrp: adr_pos {} + 8 exceeds code length {}",
+                adr_pos,
+                code.len()
+            );
 
-        let pc_page = (adr_pos as i64) & !0xFFF;
-        let target_page = (target_pos as i64) & !0xFFF;
-        let page_offset = (target_page - pc_page) >> 12;
+            let pc_page = (adr_pos as i64) & !0xFFF;
+            let target_page = (target_pos as i64) & !0xFFF;
+            let page_offset = (target_page - pc_page) >> 12;
 
-        assert!(
-            page_offset >= -(1 << 20) && page_offset < (1 << 20),
-            "ADRP page offset {} out of range (±4GB)",
-            page_offset
-        );
+            assert!(
+                page_offset >= -(1 << 20) && page_offset < (1 << 20),
+                "ADRP page offset {} out of range (±4GB)",
+                page_offset
+            );
 
-        // 1. Patch ADRP
-        let imm_bits = (page_offset as u32) & 0x1F_FFFF;
-        let immlo = imm_bits & 0x3;
-        let immhi = (imm_bits >> 2) & 0x7FFFF;
-        let adrp_inst = 0x90000011 | (immlo << 29) | (immhi << 5);
-        code[adr_pos..adr_pos + 4].copy_from_slice(&adrp_inst.to_le_bytes());
+            // 1. Patch ADRP
+            let imm_bits = (page_offset as u32) & 0x1F_FFFF;
+            let immlo = imm_bits & 0x3;
+            let immhi = (imm_bits >> 2) & 0x7FFFF;
+            let adrp_inst = 0x90000011 | (immlo << 29) | (immhi << 5);
+            code[adr_pos..adr_pos + 4].copy_from_slice(&adrp_inst.to_le_bytes());
 
-        // 2. Patch ADD (immediate)
-        // ADD X17, X17, #target_pos_within_page
-        let page_inner_offset = (target_pos as u32) & 0xFFF;
-        let add_inst = 0x91000231 | (page_inner_offset << 10);
-        code[adr_pos + 4..adr_pos + 8].copy_from_slice(&add_inst.to_le_bytes());
-    } else {
-        assert!(
-            adr_pos + 4 <= code.len(),
-            "patch_adr_or_adrp: adr_pos {} + 4 exceeds code length {}",
-            adr_pos,
-            code.len()
-        );
-        let offset = (target_pos as i64) - (adr_pos as i64);
-        assert!(
-            offset >= -(1 << 20) && offset < (1 << 20),
-            "ADR offset {} out of range (±1MB)",
-            offset
-        );
-        let offset_bits = (offset as u32) & 0x1F_FFFF;
-        let immlo = offset_bits & 0x3;
-        let immhi = (offset_bits >> 2) & 0x7FFFF;
-        let inst = 0x10000011 | (immlo << 29) | (immhi << 5);
-        code[adr_pos..adr_pos + 4].copy_from_slice(&inst.to_le_bytes());
+            // 2. Patch ADD (immediate)
+            // ADD X17, X17, #target_pos_within_page
+            let page_inner_offset = (target_pos as u32) & 0xFFF;
+            let add_inst = 0x91000231 | (page_inner_offset << 10);
+            code[adr_pos + 4..adr_pos + 8].copy_from_slice(&add_inst.to_le_bytes());
+        }
+        AdrMode::Adr => {
+            assert!(
+                adr_pos + 4 <= code.len(),
+                "patch_adr_or_adrp: adr_pos {} + 4 exceeds code length {}",
+                adr_pos,
+                code.len()
+            );
+            let offset = (target_pos as i64) - (adr_pos as i64);
+            assert!(
+                offset >= -(1 << 20) && offset < (1 << 20),
+                "ADR offset {} out of range (±1MB)",
+                offset
+            );
+            let offset_bits = (offset as u32) & 0x1F_FFFF;
+            let immlo = offset_bits & 0x3;
+            let immhi = (offset_bits >> 2) & 0x7FFFF;
+            let inst = 0x10000011 | (immlo << 29) | (immhi << 5);
+            code[adr_pos..adr_pos + 4].copy_from_slice(&inst.to_le_bytes());
+        }
     }
 }
 
@@ -442,10 +457,17 @@ pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_
 /// Encoding: `0x3DC00000 | (imm12 << 10) | (Rn << 5) | Rt`
 /// where imm12 = byte_offset / 16, Rn = 17 (X17).
 pub fn emit_ldr_q_x17(code: &mut Vec<u8>, dst: Reg, byte_offset: u16) {
-    assert!(byte_offset % 16 == 0, "constant pool offset {} not 16-byte aligned", byte_offset);
+    assert!(
+        byte_offset % 16 == 0,
+        "constant pool offset {} not 16-byte aligned",
+        byte_offset
+    );
     let imm12 = (byte_offset / 16) as u32;
     assert!(imm12 < 4096, "constant pool offset too large");
-    emit32(code, 0x3DC00000 | (imm12 << 10) | (17 << 5) | (dst.0 as u32));
+    emit32(
+        code,
+        0x3DC00000 | (imm12 << 10) | (17 << 5) | (dst.0 as u32),
+    );
 }
 
 /// Emit a constant pool entry: 16 bytes = f32 value splatted 4x (fills a 128-bit NEON register).
@@ -465,10 +487,7 @@ fn emit_ushr(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
     // Encoding: 0x6F200400 | ((32 - shift) << 16) as immh:immb
     // For .4S: immh = 001x, so (32-shift) in bits [19:16]
     let immhb = (64 - shift as u32) & 0x3F; // USHR uses (immh:immb) = (size*2 - shift)
-    let inst = 0x6F200400
-        | (dst.0 as u32)
-        | ((src.0 as u32) << 5)
-        | (immhb << 16);
+    let inst = 0x6F200400 | (dst.0 as u32) | ((src.0 as u32) << 5) | (immhb << 16);
     emit32(code, inst);
 }
 
@@ -476,10 +495,7 @@ fn emit_ushr(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
 fn emit_shl(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
     // For .4S: immh:immb = shift + 32
     let immhb = (shift as u32) + 32;
-    let inst = 0x4F005400
-        | (dst.0 as u32)
-        | ((src.0 as u32) << 5)
-        | (immhb << 16);
+    let inst = 0x4F005400 | (dst.0 as u32) | ((src.0 as u32) << 5) | (immhb << 16);
     emit32(code, inst);
 }
 
@@ -547,7 +563,6 @@ fn emit_u32_const(code: &mut Vec<u8>, dst: Reg, bits: u32) {
     emit32(code, 0x4E040C00 | (dst.0 as u32) | (16 << 5));
 }
 
-
 // =============================================================================
 // Transcendental Builtins — inline polynomial sequences
 // =============================================================================
@@ -601,11 +616,11 @@ pub(crate) fn emit_log2_builtin(
     let sqrt2 = pool.push_f32(1.4142135624)?;
     emit_ldr_q_x17(code, s2, sqrt2);
     emit_fcmge(code, s2, s1, s2); // s2 = mask (all-ones where f >= √2)
-    // adjust = 1.0 & mask
+                                  // adjust = 1.0 & mask
     let one = pool.push_f32(1.0)?;
     emit_ldr_q_x17(code, s0, one);
     emit_and(code, s0, s0, s2); // s0 = adjust (1.0 where f >= √2, 0 elsewhere)
-    // n += adjust
+                                // n += adjust
     emit_fadd(code, dst, dst, s0);
     // If f >= √2: multiply by 0.5 (divide by 2).
     // Use BSL: s1 = mask ? f*0.5 : f
@@ -613,8 +628,8 @@ pub(crate) fn emit_log2_builtin(
     let half = pool.push_f32(0.5)?;
     emit_ldr_q_x17(code, s0, half);
     emit_fmul(code, s0, s1, s0); // s0 = f * 0.5
-    emit_bsl(code, s2, s0, s1);  // s2 = mask ? f*0.5 : f
-    emit_mov(code, s1, s2);      // s1 = adjusted f
+    emit_bsl(code, s2, s0, s1); // s2 = mask ? f*0.5 : f
+    emit_mov(code, s1, s2); // s1 = adjusted f
 
     // Phase 4: Polynomial log2(f) on [√2/2, √2]
     // Subtract 1 so argument is centered at 0 for the polynomial
@@ -630,25 +645,25 @@ pub(crate) fn emit_log2_builtin(
     emit_ldr_q_x17(code, s2, c4);
     let c3 = pool.push_f32(1.7974969154_f32)?;
     emit_ldr_q_x17(code, s0, c3);
-    emit_fmla(code, s0, s2, s1);                   // s0 = c3 + c4*f
+    emit_fmla(code, s0, s2, s1); // s0 = c3 + c4*f
 
     // p = p*f + c2
     let c2 = pool.push_f32(-4.1988046176_f32)?;
     emit_ldr_q_x17(code, s2, c2);
-    emit_fmla(code, s2, s0, s1);                   // s2 = c2 + p*f
+    emit_fmla(code, s2, s0, s1); // s2 = c2 + p*f
 
     // p = p*f + c1
     let c1 = pool.push_f32(5.7270231695_f32)?;
     emit_ldr_q_x17(code, s0, c1);
-    emit_fmla(code, s0, s2, s1);                   // s0 = c1 + p*f
+    emit_fmla(code, s0, s2, s1); // s0 = c1 + p*f
 
     // p = p*f + c0
     let c0 = pool.push_f32(-3.0056146714_f32)?;
     emit_ldr_q_x17(code, s2, c0);
-    emit_fmla(code, s2, s0, s1);                   // s2 = c0 + p*f
+    emit_fmla(code, s2, s0, s1); // s2 = c0 + p*f
 
     // result = n + poly
-    emit_fadd(code, dst, dst, s2);                  // dst = n + poly
+    emit_fadd(code, dst, dst, s2); // dst = n + poly
 
     Ok(())
 }
@@ -684,33 +699,33 @@ pub(crate) fn emit_exp2_builtin(
     emit_ldr_q_x17(code, s2, c4);
     let c3 = pool.push_f32(0.0520323_f32)?;
     emit_ldr_q_x17(code, dst, c3);
-    emit_fmla(code, dst, s2, s1);              // dst = c3 + c4*f
+    emit_fmla(code, dst, s2, s1); // dst = c3 + c4*f
 
     // p = p*f + c2
     let c2 = pool.push_f32(0.2413793_f32)?;
     emit_ldr_q_x17(code, s2, c2);
-    emit_fmla(code, s2, dst, s1);              // s2 = c2 + p*f
+    emit_fmla(code, s2, dst, s1); // s2 = c2 + p*f
 
     // p = p*f + c1
     let c1 = pool.push_f32(0.6931472_f32)?;
     emit_ldr_q_x17(code, dst, c1);
-    emit_fmla(code, dst, s2, s1);              // dst = c1 + p*f
+    emit_fmla(code, dst, s2, s1); // dst = c1 + p*f
 
     // p = p*f + c0 — 1.0 is FMOV-encodable but pool dedup is harmless
     let c0 = pool.push_f32(1.0_f32)?;
     emit_ldr_q_x17(code, s2, c0);
-    emit_fmla(code, s2, dst, s1);              // s2 = c0 + p*f
-    // Polynomial result now in s2.
+    emit_fmla(code, s2, dst, s1); // s2 = c0 + p*f
+                                  // Polynomial result now in s2.
 
     // Phase 3: Compute 2^n via bit manipulation
     // 2^n = reinterpret_f32((int(n) + 127) << 23)
-    emit_fcvtzs(code, s1, s0);                 // s1 = int(n) (s1 was f, no longer needed)
-    emit_u32_const(code, dst, 127);            // dst = 127 (as integer)
-    emit_add_i32(code, s1, s1, dst);           // s1 = int(n) + 127
-    emit_shl(code, s1, s1, 23);               // s1 = (int(n) + 127) << 23 = 2^n as IEEE bits
+    emit_fcvtzs(code, s1, s0); // s1 = int(n) (s1 was f, no longer needed)
+    emit_u32_const(code, dst, 127); // dst = 127 (as integer)
+    emit_add_i32(code, s1, s1, dst); // s1 = int(n) + 127
+    emit_shl(code, s1, s1, 23); // s1 = (int(n) + 127) << 23 = 2^n as IEEE bits
 
     // Phase 4: result = poly * 2^n
-    emit_fmul(code, dst, s2, s1);              // dst = poly * scale = 2^x
+    emit_fmul(code, dst, s2, s1); // dst = poly * scale = 2^x
 
     Ok(())
 }
@@ -734,46 +749,46 @@ fn emit_sin_body(
     // k = floor(x * (1/TAU) + 0.5)
     let inv_tau = pool.push_f32(1.0 / core::f32::consts::TAU)?;
     emit_ldr_q_x17(code, s0, inv_tau);
-    emit_fmul(code, s0, src, s0);              // s0 = x * (1/TAU)
+    emit_fmul(code, s0, src, s0); // s0 = x * (1/TAU)
 
     let half = pool.push_f32(0.5)?;
     emit_ldr_q_x17(code, s2, half);
-    emit_fadd(code, s0, s0, s2);               // s0 = x*(1/TAU) + 0.5
-    emit_frintm(code, s0, s0);                 // s0 = k = floor(...)
+    emit_fadd(code, s0, s0, s2); // s0 = x*(1/TAU) + 0.5
+    emit_frintm(code, s0, s0); // s0 = k = floor(...)
 
     // x_reduced = x - k * TAU
     let tau = pool.push_f32(core::f32::consts::TAU)?;
     emit_ldr_q_x17(code, s2, tau);
-    emit_fmul(code, s2, s0, s2);               // s2 = k * TAU
-    emit_fsub(code, s0, src, s2);              // s0 = x_reduced = x - k*TAU
+    emit_fmul(code, s2, s0, s2); // s2 = k * TAU
+    emit_fsub(code, s0, src, s2); // s0 = x_reduced = x - k*TAU
 
     // Phase 2: Normalize to [-1, 1]
     // t = x_reduced / PI
     let inv_pi = pool.push_f32(1.0 / core::f32::consts::PI)?;
     emit_ldr_q_x17(code, s2, inv_pi);
-    emit_fmul(code, s0, s0, s2);               // s0 = t
+    emit_fmul(code, s0, s0, s2); // s0 = t
 
     // Phase 3: Polynomial sin(π*t) ≈ t * (c1 + t²*(c3 + t²*(c5 + t²*c7)))
     // t² for Horner variable
-    emit_fmul(code, s1, s0, s0);               // s1 = t² (alive through Horner)
+    emit_fmul(code, s1, s0, s0); // s1 = t² (alive through Horner)
 
     // Horner: p = c7*t² + c5, then p*t² + c3, then p*t² + c1
     let c7 = pool.push_f32(-0.599264528932149_f32)?;
     emit_ldr_q_x17(code, s2, c7);
     let c5 = pool.push_f32(2.55016403987734_f32)?;
     emit_ldr_q_x17(code, dst, c5);
-    emit_fmla(code, dst, s2, s1);                       // dst = c5 + c7*t²
+    emit_fmla(code, dst, s2, s1); // dst = c5 + c7*t²
 
     let c3 = pool.push_f32(-5.16771278004997_f32)?;
     emit_ldr_q_x17(code, s2, c3);
-    emit_fmla(code, s2, dst, s1);                       // s2 = c3 + p*t²
+    emit_fmla(code, s2, dst, s1); // s2 = c3 + p*t²
 
     let c1 = pool.push_f32(3.14159265358979_f32)?;
     emit_ldr_q_x17(code, dst, c1);
-    emit_fmla(code, dst, s2, s1);                       // dst = c1 + p*t²
+    emit_fmla(code, dst, s2, s1); // dst = c1 + p*t²
 
     // Phase 4: result = t * p
-    emit_fmul(code, dst, s0, dst);              // dst = t * p = sin(x)
+    emit_fmul(code, dst, s0, dst); // dst = t * p = sin(x)
 
     Ok(())
 }
@@ -802,7 +817,7 @@ pub(crate) fn emit_cos_builtin(
     let s3 = scratch[3];
     let frac_pi_2 = pool.push_f32(core::f32::consts::FRAC_PI_2)?;
     emit_ldr_q_x17(code, s3, frac_pi_2);
-    emit_fadd(code, s3, src, s3);               // s3 = x + π/2
+    emit_fadd(code, s3, src, s3); // s3 = x + π/2
     emit_sin_body(code, pool, dst, s3, scratch[0], scratch[1], scratch[2])
 }
 
@@ -958,8 +973,8 @@ pub(crate) fn emit_atan2_builtin(
     code: &mut Vec<u8>,
     pool: &mut super::ConstPool,
     dst: Reg,
-    src1: Reg,   // y
-    src2: Reg,   // x
+    src1: Reg, // y
+    src2: Reg, // x
     scratch: [Reg; 4],
 ) -> Result<(), &'static str> {
     let s0 = scratch[0];
@@ -981,29 +996,29 @@ pub(crate) fn emit_atan2_builtin(
     // mask_neg_x: "x < 0" via reversed fcmgt → s2 (LIVE until Phase 5)
     // Zero is FMOV-encodable, so use MOVI directly (no pool needed)
     emit_fmov_imm(code, s0, 0.0_f32, [Reg(28), Reg(29), Reg(30), Reg(31)]);
-    emit_fcmgt(code, s2, s0, src2);              // s2 = mask(0 > x) = mask(x < 0)
+    emit_fcmgt(code, s2, s0, src2); // s2 = mask(0 > x) = mask(x < 0)
 
     // r = y / x → dst
-    emit_fdiv(code, dst, src1, src2);            // dst = r = y / x
+    emit_fdiv(code, dst, src1, src2); // dst = r = y / x
 
     // ---- src1, src2 DEAD ----
 
     // sign_r: +1.0 where r >= 0, -1.0 where r < 0.
     emit_fmov_imm(code, s0, 0.0_f32, [Reg(28), Reg(29), Reg(30), Reg(31)]);
-    emit_fcmge(code, s0, dst, s0);               // s0 = mask(r >= 0)
+    emit_fcmge(code, s0, dst, s0); // s0 = mask(r >= 0)
     let one = pool.push_f32(1.0_f32)?;
     emit_ldr_q_x17(code, s3, one);
-    emit_fneg(code, s1, s3);                     // s1 = -1.0
-    emit_bsl(code, s0, s3, s1);                  // s0 = r>=0 ? 1.0 : -1.0
-    emit_str_sp(code, s0, 0);                    // [SP, #0] = sign_r (spilled)
-    // s0, s1, s3 now FREE
+    emit_fneg(code, s1, s3); // s1 = -1.0
+    emit_bsl(code, s0, s3, s1); // s0 = r>=0 ? 1.0 : -1.0
+    emit_str_sp(code, s0, 0); // [SP, #0] = sign_r (spilled)
+                              // s0, s1, s3 now FREE
 
     // r_abs = |r| → s3
-    emit_fabs(code, s3, dst);                    // s3 = r_abs = |r|
+    emit_fabs(code, s3, dst); // s3 = r_abs = |r|
 
     // mask_large = r_abs > 1.0 → s1 (LIVE until Phase 3)
-    emit_ldr_q_x17(code, s0, one);               // s0 = 1.0 (reuse pool offset)
-    emit_fcmgt(code, s1, s3, s0);                // s1 = mask(r_abs > 1.0)
+    emit_ldr_q_x17(code, s0, one); // s0 = 1.0 (reuse pool offset)
+    emit_fcmgt(code, s1, s3, s0); // s1 = mask(r_abs > 1.0)
 
     // State: s0 = free, s1 = mask_large, s2 = mask_neg_x, s3 = r_abs, dst = free.
     // sign_r spilled to [SP, #0].
@@ -1020,20 +1035,20 @@ pub(crate) fn emit_atan2_builtin(
     // =========================================================================
 
     // Compute 1/r_abs → s0
-    emit_ldr_q_x17(code, s0, one);               // s0 = 1.0
-    emit_fdiv(code, s0, s0, s3);                 // s0 = 1.0 / r_abs
+    emit_ldr_q_x17(code, s0, one); // s0 = 1.0
+    emit_fdiv(code, s0, s0, s3); // s0 = 1.0 / r_abs
 
     // Select t: mask_large ? (1/r_abs) : r_abs
     // We need mask in a register we can clobber. Copy mask_large into dst.
-    emit_mov(code, dst, s1);                     // dst = copy of mask_large
-    emit_bsl(code, dst, s0, s3);                 // dst = t = mask ? (1/r_abs) : r_abs
-    // s3 = r_abs and s0 = 1/r_abs are now free.
+    emit_mov(code, dst, s1); // dst = copy of mask_large
+    emit_bsl(code, dst, s0, s3); // dst = t = mask ? (1/r_abs) : r_abs
+                                 // s3 = r_abs and s0 = 1/r_abs are now free.
 
     // t^2 → s0
-    emit_fmul(code, s0, dst, dst);               // s0 = t^2
+    emit_fmul(code, s0, dst, dst); // s0 = t^2
 
     // Save t in s3 for the final multiply (poly * t)
-    emit_mov(code, s3, dst);                     // s3 = t (saved)
+    emit_mov(code, s3, dst); // s3 = t (saved)
 
     // Horner chain: poly = ((c7*t^2 + c5)*t^2 + c3)*t^2 + c1
     // Accumulator alternates between dst and s3. s0 = t^2.
@@ -1045,24 +1060,24 @@ pub(crate) fn emit_atan2_builtin(
     let atan_c5 = pool.push_f32(0.2_f32)?;
     emit_ldr_q_x17(code, dst, atan_c5);
     let atan_c7 = pool.push_f32(-0.142857143_f32)?;
-    emit_ldr_q_x17(code, s3, atan_c7);          // s3 = c7 (clobbers t)
-    emit_fmla(code, dst, s3, s0);                // dst = c5 + c7*t^2
+    emit_ldr_q_x17(code, s3, atan_c7); // s3 = c7 (clobbers t)
+    emit_fmla(code, dst, s3, s0); // dst = c5 + c7*t^2
 
     // Horner step 2: s3 = c3 + dst * t^2
     let atan_c3 = pool.push_f32(-0.333333333_f32)?;
     emit_ldr_q_x17(code, s3, atan_c3);
-    emit_fmla(code, s3, dst, s0);                // s3 = c3 + poly*t^2
+    emit_fmla(code, s3, dst, s0); // s3 = c3 + poly*t^2
 
     // Horner step 3: dst = c1 + s3 * t^2
     let atan_c1 = pool.push_f32(0.999999999_f32)?;
     emit_ldr_q_x17(code, dst, atan_c1);
-    emit_fmla(code, dst, s3, s0);                // dst = poly
+    emit_fmla(code, dst, s3, s0); // dst = poly
 
     // Recover t = sqrt(t^2) → s3
-    emit_fsqrt(code, s3, s0);                    // s3 = t (recovered from t^2)
+    emit_fsqrt(code, s3, s0); // s3 = t (recovered from t^2)
 
     // atan_small = poly * t → dst (always in [0, ~π/4] since t in [0, 1])
-    emit_fmul(code, dst, dst, s3);               // dst = atan_small
+    emit_fmul(code, dst, dst, s3); // dst = atan_small
 
     // State: dst = atan_small, s0 = t^2 (free), s1 = mask_large, s2 = mask_neg_x, s3 = free.
 
@@ -1076,11 +1091,11 @@ pub(crate) fn emit_atan2_builtin(
     // atan_large = π/2 - atan_small → s3
     let frac_pi_2 = pool.push_f32(core::f32::consts::FRAC_PI_2)?;
     emit_ldr_q_x17(code, s3, frac_pi_2);
-    emit_fsub(code, s3, s3, dst);                // s3 = π/2 - atan_small
+    emit_fsub(code, s3, s3, dst); // s3 = π/2 - atan_small
 
     // BSL: s1 = mask_large ? s3 (atan_large) : dst (atan_small)
-    emit_bsl(code, s1, s3, dst);                 // s1 = atan_val (unsigned)
-    emit_mov(code, dst, s1);                     // dst = atan_val
+    emit_bsl(code, s1, s3, dst); // s1 = atan_val (unsigned)
+    emit_mov(code, dst, s1); // dst = atan_val
 
     // State: dst = atan_val (unsigned, positive). s0-s3 free. s2 = mask_neg_x.
 
@@ -1089,8 +1104,8 @@ pub(crate) fn emit_atan2_builtin(
     // Reload sign_r from stack, multiply to get signed atan(r).
     // =========================================================================
 
-    emit_ldr_sp(code, s0, 0);                    // s0 = sign_r (from stack)
-    emit_fmul(code, dst, dst, s0);               // dst = atan_signed = sign(r) * atan(|r|)
+    emit_ldr_sp(code, s0, 0); // s0 = sign_r (from stack)
+    emit_fmul(code, dst, dst, s0); // dst = atan_signed = sign(r) * atan(|r|)
 
     // =========================================================================
     // Phase 5: Quadrant correction for negative x.
@@ -1103,21 +1118,21 @@ pub(crate) fn emit_atan2_builtin(
     // =========================================================================
 
     // Compute sign_y = mask_neg_x ? -sign_r : sign_r
-    emit_fneg(code, s3, s0);                           // s3 = -sign_r
-    emit_mov(code, s1, s2);                            // s1 = copy of mask_neg_x (BSL is destructive)
-    emit_bsl(code, s1, s3, s0);                        // s1 = sign_y
+    emit_fneg(code, s3, s0); // s3 = -sign_r
+    emit_mov(code, s1, s2); // s1 = copy of mask_neg_x (BSL is destructive)
+    emit_bsl(code, s1, s3, s0); // s1 = sign_y
 
     // correction = π * sign_y → s3
     let pi = pool.push_f32(core::f32::consts::PI)?;
     emit_ldr_q_x17(code, s3, pi);
-    emit_fmul(code, s3, s3, s1);                       // s3 = π * sign_y
+    emit_fmul(code, s3, s3, s1); // s3 = π * sign_y
 
     // corrected = atan_signed + π*sign_y → s0
-    emit_fadd(code, s0, dst, s3);                      // s0 = atan_signed + π*sign_y
+    emit_fadd(code, s0, dst, s3); // s0 = atan_signed + π*sign_y
 
     // BSL: s2 = mask_neg_x ? s0 (corrected) : dst (atan_signed)
-    emit_bsl(code, s2, s0, dst);                       // s2 = result
-    emit_mov(code, dst, s2);                           // dst = final result
+    emit_bsl(code, s2, s0, dst); // s2 = result
+    emit_mov(code, dst, s2); // dst = final result
 
     // Deallocate stack frame.
     emit_add_sp(code, 16);
@@ -1155,9 +1170,9 @@ pub(crate) fn emit_asin_builtin(
     // s3 = 1.0 - src*src
     let one = pool.push_f32(1.0_f32)?;
     emit_ldr_q_x17(code, s3, one);
-    emit_fmul(code, dst, src, src);           // dst = src*src (temporary)
-    emit_fsub(code, s3, s3, dst);             // s3 = 1 - src*src
-    emit_fsqrt(code, s3, s3);                 // s3 = sqrt(1 - src*src)
+    emit_fmul(code, dst, src, src); // dst = src*src (temporary)
+    emit_fsub(code, s3, s3, dst); // s3 = 1 - src*src
+    emit_fsqrt(code, s3, s3); // s3 = sqrt(1 - src*src)
     emit_atan2_builtin(code, pool, dst, src, s3, scratch)
 }
 
@@ -1175,10 +1190,10 @@ pub(crate) fn emit_acos_builtin(
     // s3 = 1.0 - src*src
     let one = pool.push_f32(1.0_f32)?;
     emit_ldr_q_x17(code, s3, one);
-    emit_fmul(code, dst, src, src);           // dst = src*src (temporary)
-    emit_fsub(code, s3, s3, dst);             // s3 = 1 - src*src
-    emit_fsqrt(code, s3, s3);                 // s3 = sqrt(1 - src*src)
-    // atan2(sqrt(1-x^2), x) — note: y=s3, x=src
+    emit_fmul(code, dst, src, src); // dst = src*src (temporary)
+    emit_fsub(code, s3, s3, dst); // s3 = 1 - src*src
+    emit_fsqrt(code, s3, s3); // s3 = sqrt(1 - src*src)
+                              // atan2(sqrt(1-x^2), x) — note: y=s3, x=src
     emit_atan2_builtin(code, pool, dst, s3, src, scratch)
 }
 
@@ -1264,7 +1279,10 @@ pub(crate) fn emit_binary_transcendental(
 ) -> Result<(), &'static str> {
     match op {
         OpKind::Pow => emit_pow_builtin(code, pool, dst, src1, src2, scratch),
-        OpKind::Hypot => { emit_hypot_builtin(code, dst, src1, src2); Ok(()) }
+        OpKind::Hypot => {
+            emit_hypot_builtin(code, dst, src1, src2);
+            Ok(())
+        }
         OpKind::Atan2 => emit_atan2_builtin(code, pool, dst, src1, src2, scratch),
         _ => Err("binary transcendental emit not implemented for this op"),
     }
@@ -1288,7 +1306,10 @@ pub fn emit_ternary(code: &mut Vec<u8>, op: OpKind, dst: Reg, a: Reg, b: Reg, c:
                 // Safe to use FMLA
                 if dst.0 != c.0 {
                     // MOV dst, c first
-                    emit32(code, 0x4EA01C00 | (dst.0 as u32) | ((c.0 as u32) << 5) | ((c.0 as u32) << 16));
+                    emit32(
+                        code,
+                        0x4EA01C00 | (dst.0 as u32) | ((c.0 as u32) << 5) | ((c.0 as u32) << 16),
+                    );
                 }
                 emit_fmla(code, dst, a, b);
             }
@@ -1298,21 +1319,23 @@ pub fn emit_ternary(code: &mut Vec<u8>, op: OpKind, dst: Reg, a: Reg, b: Reg, c:
             // dst = a ? b : c (a is mask)
             // Need to move mask to dst first for BSL
             if dst.0 != a.0 {
-                emit32(code, 0x4EA01C00 | (dst.0 as u32) | ((a.0 as u32) << 5) | ((a.0 as u32) << 16));
+                emit32(
+                    code,
+                    0x4EA01C00 | (dst.0 as u32) | ((a.0 as u32) << 5) | ((a.0 as u32) << 16),
+                );
             }
             emit_bsl(code, dst, b, c);
         }
 
         OpKind::Clamp => {
             // dst = clamp(a, b, c) = max(min(a, c), b)
-            emit_fmin(code, dst, a, c);  // dst = min(a, hi)
+            emit_fmin(code, dst, a, c); // dst = min(a, hi)
             emit_fmax(code, dst, dst, b); // dst = max(dst, lo)
         }
 
         _ => panic!("ternary emit not implemented for {:?}", op),
     }
 }
-
 
 // =============================================================================
 // Select Short-Circuit Helpers
@@ -1378,12 +1401,15 @@ pub fn patch_cbz_cbnz(code: &mut [u8], patch_pos: usize, target_pos: usize) {
     let offset = (target_pos as i64 - patch_pos as i64) / 4;
     assert!(
         offset >= -(1 << 18) && offset < (1 << 18),
-        "CBZ/CBNZ branch offset {} out of range (±1MB)", offset
+        "CBZ/CBNZ branch offset {} out of range (±1MB)",
+        offset
     );
     let imm19 = (offset as u32) & 0x7FFFF;
     let existing = u32::from_le_bytes([
-        code[patch_pos], code[patch_pos + 1],
-        code[patch_pos + 2], code[patch_pos + 3],
+        code[patch_pos],
+        code[patch_pos + 1],
+        code[patch_pos + 2],
+        code[patch_pos + 3],
     ]);
     let patched = (existing & 0xFF00001F) | (imm19 << 5);
     code[patch_pos..patch_pos + 4].copy_from_slice(&patched.to_le_bytes());
@@ -1394,12 +1420,15 @@ pub fn patch_b(code: &mut [u8], patch_pos: usize, target_pos: usize) {
     let offset = (target_pos as i64 - patch_pos as i64) / 4;
     assert!(
         offset >= -(1 << 25) && offset < (1 << 25),
-        "B branch offset {} out of range (±128MB)", offset
+        "B branch offset {} out of range (±128MB)",
+        offset
     );
     let imm26 = (offset as u32) & 0x3FFFFFF;
     let existing = u32::from_le_bytes([
-        code[patch_pos], code[patch_pos + 1],
-        code[patch_pos + 2], code[patch_pos + 3],
+        code[patch_pos],
+        code[patch_pos + 1],
+        code[patch_pos + 2],
+        code[patch_pos + 3],
     ]);
     let patched = (existing & 0xFC000000) | imm26;
     code[patch_pos..patch_pos + 4].copy_from_slice(&patched.to_le_bytes());
@@ -1421,7 +1450,10 @@ pub fn emit_epilogue(code: &mut Vec<u8>, result: Reg) {
     // Move result to V0 if not already there
     if result.0 != 0 {
         // MOV V0, Vresult (ORR Vd.16B, Vn.16B, Vn.16B)
-        emit32(code, 0x4EA01C00 | ((result.0 as u32) << 5) | ((result.0 as u32) << 16));
+        emit32(
+            code,
+            0x4EA01C00 | ((result.0 as u32) << 5) | ((result.0 as u32) << 16),
+        );
     }
     // RET
     emit32(code, 0xD65F03C0);
@@ -1436,18 +1468,18 @@ mod tests {
         // Encodable values — imm8 derived from ARM ARM bit layout:
         //   f32 = [a][NOT(b)][bbbbb][cdefgh][19 zeros]
         //   imm8 = a:b:c:d:e:f:g:h
-        assert_eq!(try_encode_fmov_imm8(2.0), Some(0x00));   // 0x40000000
-        assert_eq!(try_encode_fmov_imm8(0.5), Some(0x60));   // 0x3F000000
-        assert_eq!(try_encode_fmov_imm8(1.0), Some(0x70));   // 0x3F800000
-        assert_eq!(try_encode_fmov_imm8(1.5), Some(0x78));   // 0x3FC00000
-        assert_eq!(try_encode_fmov_imm8(-1.0), Some(0xF0));  // 0xBF800000
-        assert_eq!(try_encode_fmov_imm8(-0.5), Some(0xE0));  // 0xBF000000
-        assert_eq!(try_encode_fmov_imm8(-2.0), Some(0x80));  // 0xC0000000
-        assert_eq!(try_encode_fmov_imm8(4.0), Some(0x10));   // 0x40800000
+        assert_eq!(try_encode_fmov_imm8(2.0), Some(0x00)); // 0x40000000
+        assert_eq!(try_encode_fmov_imm8(0.5), Some(0x60)); // 0x3F000000
+        assert_eq!(try_encode_fmov_imm8(1.0), Some(0x70)); // 0x3F800000
+        assert_eq!(try_encode_fmov_imm8(1.5), Some(0x78)); // 0x3FC00000
+        assert_eq!(try_encode_fmov_imm8(-1.0), Some(0xF0)); // 0xBF800000
+        assert_eq!(try_encode_fmov_imm8(-0.5), Some(0xE0)); // 0xBF000000
+        assert_eq!(try_encode_fmov_imm8(-2.0), Some(0x80)); // 0xC0000000
+        assert_eq!(try_encode_fmov_imm8(4.0), Some(0x10)); // 0x40800000
 
         // More encodable values
-        assert_eq!(try_encode_fmov_imm8(3.0), Some(0x08));   // 0x40400000
-        assert_eq!(try_encode_fmov_imm8(0.25), Some(0x50));  // 0x3E800000
+        assert_eq!(try_encode_fmov_imm8(3.0), Some(0x08)); // 0x40400000
+        assert_eq!(try_encode_fmov_imm8(0.25), Some(0x50)); // 0x3E800000
         assert_eq!(try_encode_fmov_imm8(0.125), Some(0x40)); // 0x3E000000
 
         // Non-encodable values
@@ -1495,7 +1527,11 @@ mod tests {
 
         // 1.0 is FMOV-encodable → should emit exactly 1 instruction (4 bytes)
         emit_fmov_imm(&mut code, dst, 1.0, scratch);
-        assert_eq!(code.len(), 4, "FMOV-encodable value should emit 1 instruction");
+        assert_eq!(
+            code.len(),
+            4,
+            "FMOV-encodable value should emit 1 instruction"
+        );
 
         // Verify the encoding: 0x4F00F400 | (abc<<16) | (defgh<<5) | Rd
         // imm8=0x70=0b01110000, abc=011=3, defgh=10000=16
@@ -1513,7 +1549,16 @@ mod tests {
     #[test]
     fn emit_fmov_imm_fallback_for_non_encodable() {
         let mut code = Vec::new();
-        emit_fmov_imm(&mut code, Reg(0), 3.14, [Reg(16), Reg(17), Reg(18), Reg(19)]);
-        assert_eq!(code.len(), 12, "non-encodable should emit 3 instructions (MOVZ+MOVK+DUP)");
+        emit_fmov_imm(
+            &mut code,
+            Reg(0),
+            3.14,
+            [Reg(16), Reg(17), Reg(18), Reg(19)],
+        );
+        assert_eq!(
+            code.len(),
+            12,
+            "non-encodable should emit 3 instructions (MOVZ+MOVK+DUP)"
+        );
     }
 }

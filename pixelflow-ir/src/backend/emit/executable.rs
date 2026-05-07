@@ -26,9 +26,7 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{
-            mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
-        };
+        use libc::{mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
         if code.is_empty() {
             return Err("empty code buffer");
@@ -135,7 +133,8 @@ use core::arch::x86_64::__m128;
 /// Args: X in v0, Y in v1, Z in v2, W in v3
 /// Returns: result in v0
 #[cfg(target_arch = "aarch64")]
-pub type KernelFn = extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
+pub type KernelFn =
+    extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
 
 /// JIT-compiled kernel signature for x86-64.
 /// Args: X in xmm0, Y in xmm1, Z in xmm2, W in xmm3
@@ -247,7 +246,7 @@ mod tests {
 
             let result = func(x, y, z, w);
             let val = vgetq_lane_f32(result, 0);
-            assert_eq!(val, 42.0);  // (2 + 5) * 6 = 42
+            assert_eq!(val, 42.0); // (2 + 5) * 6 = 42
         }
     }
 
@@ -258,8 +257,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_return_x() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Simplest: just return X
         let expr = Expr::Var(0);
@@ -282,8 +281,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_return_y() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return Y (needs MOV to v0)
         let expr = Expr::Var(1);
@@ -306,16 +305,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_add_xy() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // X + Y
-        let expr = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let exec = compile(&expr).expect("compile failed");
 
         unsafe {
@@ -335,9 +330,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_complex() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // (X + Y) * Z
         let expr = Expr::Binary(
@@ -361,15 +356,15 @@ mod tests {
             let w = vdupq_n_f32(0.0);
 
             let result = func(x, y, z, w);
-            assert_eq!(vgetq_lane_f32(result, 0), 42.0);  // (2+5)*6 = 42
+            assert_eq!(vgetq_lane_f32(result, 0), 42.0); // (2+5)*6 = 42
         }
     }
 
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return a constant
         let expr = Expr::Const(42.0);
@@ -392,9 +387,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_floor() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // floor(X)
         let expr = Expr::Unary(OpKind::Floor, Box::new(Expr::Var(0)));
@@ -417,9 +412,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_mul_add() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // X * Y + Z (FMA)
         let expr = Expr::Ternary(
@@ -436,7 +431,7 @@ mod tests {
             use core::arch::aarch64::*;
             let x = vdupq_n_f32(6.0);
             let y = vdupq_n_f32(7.0);
-            let z = vdupq_n_f32(0.0);  // 6*7 + 0 = 42
+            let z = vdupq_n_f32(0.0); // 6*7 + 0 = 42
             let w = vdupq_n_f32(0.0);
 
             let result = func(x, y, z, w);
@@ -447,8 +442,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const_negative() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return a negative constant
         let expr = Expr::Const(-42.0);
@@ -471,8 +466,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const_pi() {
-        use crate::expr::Expr;
         use crate::backend::emit::compile;
+        use crate::expr::Expr;
 
         // Return π (not a simple constant)
         let expr = Expr::Const(core::f32::consts::PI);
@@ -489,7 +484,11 @@ mod tests {
 
             let result = func(x, y, z, w);
             let val = vgetq_lane_f32(result, 0);
-            assert!((val - core::f32::consts::PI).abs() < 0.0001, "PI = {}, expected ~3.14159", val);
+            assert!(
+                (val - core::f32::consts::PI).abs() < 0.0001,
+                "PI = {}, expected ~3.14159",
+                val
+            );
         }
     }
 
@@ -534,9 +533,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_x_plus_const() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // X + 0.5
         let expr = Expr::Binary(
@@ -563,9 +562,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_floor_add() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // floor(X + 0.5) - common rounding pattern
         let expr = Expr::Unary(
@@ -582,7 +581,7 @@ mod tests {
             let func: KernelFn = exec.as_fn();
 
             use core::arch::aarch64::*;
-            let x = vdupq_n_f32(41.3);  // floor(41.3 + 0.5) = floor(41.8) = 41
+            let x = vdupq_n_f32(41.3); // floor(41.3 + 0.5) = floor(41.8) = 41
             let y = vdupq_n_f32(0.0);
             let z = vdupq_n_f32(0.0);
             let w = vdupq_n_f32(0.0);
@@ -595,17 +594,17 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_horner() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // Simple Horner: c1 * x + c0 with x=0 should give c0=5.0
         // mul_add(c1=2.0, x, c0=5.0) = 2*0 + 5 = 5
         let expr = Expr::Ternary(
             OpKind::MulAdd,
-            Box::new(Expr::Const(2.0)),  // c1
-            Box::new(Expr::Var(0)),       // x
-            Box::new(Expr::Const(5.0)),   // c0
+            Box::new(Expr::Const(2.0)), // c1
+            Box::new(Expr::Var(0)),     // x
+            Box::new(Expr::Const(5.0)), // c0
         );
         let exec = compile(&expr).expect("compile failed");
 
@@ -613,7 +612,7 @@ mod tests {
             let func: KernelFn = exec.as_fn();
 
             use core::arch::aarch64::*;
-            let x = vdupq_n_f32(0.0);  // 2*0 + 5 = 5
+            let x = vdupq_n_f32(0.0); // 2*0 + 5 = 5
             let y = vdupq_n_f32(0.0);
             let z = vdupq_n_f32(0.0);
             let w = vdupq_n_f32(0.0);
@@ -626,9 +625,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_horner_with_x() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // c1 * x + c0 with x=3 should give 2*3 + 5 = 11
         let expr = Expr::Ternary(
@@ -643,7 +642,7 @@ mod tests {
             let func: KernelFn = exec.as_fn();
 
             use core::arch::aarch64::*;
-            let x = vdupq_n_f32(3.0);  // 2*3 + 5 = 11
+            let x = vdupq_n_f32(3.0); // 2*3 + 5 = 11
             let y = vdupq_n_f32(0.0);
             let z = vdupq_n_f32(0.0);
             let w = vdupq_n_f32(0.0);
@@ -656,9 +655,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_sin_lowered() {
+        use crate::backend::emit::compile;
         use crate::expr::Expr;
         use crate::kind::OpKind;
-        use crate::backend::emit::compile;
 
         // sin(X) - should be lowered to polynomial
         let expr = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));

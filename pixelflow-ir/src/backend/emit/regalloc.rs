@@ -241,10 +241,7 @@ fn simplicial_elimination_order(graph: &InterferenceGraph) -> Vec<ValueId> {
 ///
 /// Returns an interference graph where two values interfere if
 /// their live ranges overlap.
-pub fn build_interference_graph<D, F>(
-    schedule: &[(ValueId, D)],
-    uses_of: F,
-) -> InterferenceGraph
+pub fn build_interference_graph<D, F>(schedule: &[(ValueId, D)], uses_of: F) -> InterferenceGraph
 where
     F: Fn(ValueId) -> Vec<ValueId>,
 {

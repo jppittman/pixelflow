@@ -93,7 +93,9 @@ impl ConstPool {
         }
         let idx = self.entries.len();
         if idx >= 4096 {
-            return Err("constant pool overflow: exceeded 12-bit LDR offset limit (max 4095 entries)");
+            return Err(
+                "constant pool overflow: exceeded 12-bit LDR offset limit (max 4095 entries)",
+            );
         }
         self.entries.push(bits);
         self.index.insert(bits, idx as u16);
@@ -179,7 +181,10 @@ impl FrameLayout {
             offset += 16; // 128-bit vector
         }
         let aligned = (offset + 15) & !15;
-        Ok(Self { spill_slots, frame_size: aligned })
+        Ok(Self {
+            spill_slots,
+            frame_size: aligned,
+        })
     }
 }
 
@@ -195,19 +200,40 @@ pub enum ResolvedOp {
     /// Unary: dst = op(src).
     Unary { op: OpKind, dst: Reg, src: Reg },
     /// Binary: dst = op(left, right).
-    Binary { op: OpKind, dst: Reg, left: Reg, right: Reg },
+    Binary {
+        op: OpKind,
+        dst: Reg,
+        left: Reg,
+        right: Reg,
+    },
     /// Fused multiply-add via FMLA: dst = c + a*b.
     /// Requires dst to hold c before FMLA.
     FusedMulAdd { dst: Reg, a: Reg, b: Reg },
     /// Decomposed multiply-add: FMUL(dst, a, b) then reload c, then FADD(dst, dst, c).
     /// Used when a and b are both spilled (can't load both + c simultaneously).
     /// `c_deferred`: if Some, c must be reloaded *after* FMUL.
-    DecomposedMulAdd { dst: Reg, a: Reg, b: Reg, c: Reg, c_deferred: Option<DeferredReload> },
+    DecomposedMulAdd {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        c: Reg,
+        c_deferred: Option<DeferredReload>,
+    },
     /// BSL select: dst = mask ? if_true : if_false (mask pre-loaded into dst).
-    Select { dst: Reg, if_true: Reg, if_false: Reg },
+    Select {
+        dst: Reg,
+        if_true: Reg,
+        if_false: Reg,
+    },
     /// Clamp: FMIN(dst, val, hi), then reload lo, then FMAX(dst, dst, lo).
     /// `lo_deferred`: if Some, lo must be reloaded *after* FMIN.
-    Clamp { dst: Reg, val: Reg, lo: Reg, hi: Reg, lo_deferred: Option<DeferredReload> },
+    Clamp {
+        dst: Reg,
+        val: Reg,
+        lo: Reg,
+        hi: Reg,
+        lo_deferred: Option<DeferredReload>,
+    },
 }
 
 /// A deferred reload: value loaded mid-instruction (after a partial computation).
@@ -554,13 +580,21 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
         } else {
             // Must spill — use linear scan for optimal eviction decisions.
             regalloc::linear_scan(
-                &schedule, &uses_map, &precolored, ctx.max_regs, SCRATCH_BASE,
+                &schedule,
+                &uses_map,
+                &precolored,
+                ctx.max_regs,
+                SCRATCH_BASE,
             )
         }
     } else {
         // Expression too large for graph coloring — linear scan only.
         regalloc::linear_scan(
-            &schedule, &uses_map, &precolored, ctx.max_regs, SCRATCH_BASE,
+            &schedule,
+            &uses_map,
+            &precolored,
+            ctx.max_regs,
+            SCRATCH_BASE,
         )
     };
 
@@ -594,15 +628,23 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
 
     for (gi, guard) in select_guards.iter().enumerate() {
         if guard.true_range.0 != guard.true_range.1 {
-            branch_starts.entry(guard.true_range.0).or_default().push(
-                PendingBranch { guard_idx: gi, arm: 0 }
-            );
+            branch_starts
+                .entry(guard.true_range.0)
+                .or_default()
+                .push(PendingBranch {
+                    guard_idx: gi,
+                    arm: 0,
+                });
             branch_ends.entry(guard.true_range.1).or_default().push(gi);
         }
         if guard.false_range.0 != guard.false_range.1 {
-            branch_starts.entry(guard.false_range.0).or_default().push(
-                PendingBranch { guard_idx: gi, arm: 1 }
-            );
+            branch_starts
+                .entry(guard.false_range.0)
+                .or_default()
+                .push(PendingBranch {
+                    guard_idx: gi,
+                    arm: 1,
+                });
             branch_ends.entry(guard.false_range.1).or_default().push(gi);
         }
     }
@@ -645,8 +687,13 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
                 let guard = &select_guards[pb.guard_idx];
                 // Resolve mask register
                 let mask_reg = emit_resolve(
-                    &mut code, guard.mask_vid, RELOAD_REG,
-                    &allocation.assignment, &layout.spill_slots, &allocation.rematerialize, &pool,
+                    &mut code,
+                    guard.mask_vid,
+                    RELOAD_REG,
+                    &allocation.assignment,
+                    &layout.spill_slots,
+                    &allocation.rematerialize,
+                    &pool,
                 );
 
                 match pb.arm {
@@ -701,8 +748,19 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
         }
 
         // Emit the instruction itself
-        let dst_loc = resolve_dst_loc(*vid, &allocation.assignment, &layout.spill_slots, &allocation.rematerialize);
-        let plan = resolve_operands(sched_op, dst_loc, &allocation.assignment, &layout.spill_slots, &allocation.rematerialize)?;
+        let dst_loc = resolve_dst_loc(
+            *vid,
+            &allocation.assignment,
+            &layout.spill_slots,
+            &allocation.rematerialize,
+        );
+        let plan = resolve_operands(
+            sched_op,
+            dst_loc,
+            &allocation.assignment,
+            &layout.spill_slots,
+            &allocation.rematerialize,
+        )?;
 
         // For Select nodes that have guards, emit a short-circuit wrapper:
         // If mask is uniform, just MOV the correct arm to dst (BSL not needed).
@@ -715,8 +773,13 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
                 if has_true_guard || has_false_guard {
                     // Resolve mask register for the all-lanes check
                     let mask_reg = emit_resolve(
-                        &mut code, *mask_vid, RELOAD_REG,
-                        &allocation.assignment, &layout.spill_slots, &allocation.rematerialize, &pool,
+                        &mut code,
+                        *mask_vid,
+                        RELOAD_REG,
+                        &allocation.assignment,
+                        &layout.spill_slots,
+                        &allocation.rematerialize,
+                        &pool,
                     );
 
                     let dst = match dst_loc {
@@ -750,8 +813,13 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
                         emit_mov_reg(&mut code, dst, freg);
                     } else {
                         emit_resolve(
-                            &mut code, *false_vid, dst,
-                            &allocation.assignment, &layout.spill_slots, &allocation.rematerialize, &pool,
+                            &mut code,
+                            *false_vid,
+                            dst,
+                            &allocation.assignment,
+                            &layout.spill_slots,
+                            &allocation.rematerialize,
+                            &pool,
                         );
                     }
                     let skip_to_end2 = aarch64::emit_b(&mut code);
@@ -762,8 +830,13 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
                         emit_mov_reg(&mut code, dst, treg);
                     } else {
                         emit_resolve(
-                            &mut code, *true_vid, dst,
-                            &allocation.assignment, &layout.spill_slots, &allocation.rematerialize, &pool,
+                            &mut code,
+                            *true_vid,
+                            dst,
+                            &allocation.assignment,
+                            &layout.spill_slots,
+                            &allocation.rematerialize,
+                            &pool,
                         );
                     }
 
@@ -800,8 +873,13 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
     // Epilogue: move result to v0, restore SP, RET
     let root = schedule.last().map(|(v, _)| *v).expect("empty schedule");
     let result_reg = emit_resolve(
-        &mut code, root, RELOAD_REG,
-        &allocation.assignment, &layout.spill_slots, &allocation.rematerialize, &pool,
+        &mut code,
+        root,
+        RELOAD_REG,
+        &allocation.assignment,
+        &layout.spill_slots,
+        &allocation.rematerialize,
+        &pool,
     );
 
     if result_reg.0 != 0 {
@@ -841,7 +919,12 @@ pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, 
         for &bits in &pool.entries {
             aarch64::emit_pool_entry(&mut code, bits);
         }
-        aarch64::patch_adr_or_adrp(&mut code, adr_pos, pool_start, needs_adrp);
+        let mode = if needs_adrp {
+            aarch64::AdrMode::Adrp
+        } else {
+            aarch64::AdrMode::Adr
+        };
+        aarch64::patch_adr_or_adrp(&mut code, adr_pos, pool_start, mode);
     }
 
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
@@ -867,7 +950,12 @@ pub enum ScheduledOp {
     /// Binary op with input values
     Binary(OpKind, regalloc::ValueId, regalloc::ValueId),
     /// Ternary op with input values
-    Ternary(OpKind, regalloc::ValueId, regalloc::ValueId, regalloc::ValueId),
+    Ternary(
+        OpKind,
+        regalloc::ValueId,
+        regalloc::ValueId,
+        regalloc::ValueId,
+    ),
 }
 
 /// Structural key for hash-consing during linearization.
@@ -882,7 +970,12 @@ enum StructuralKey {
     Const(u32), // f32::to_bits()
     Unary(OpKind, regalloc::ValueId),
     Binary(OpKind, regalloc::ValueId, regalloc::ValueId),
-    Ternary(OpKind, regalloc::ValueId, regalloc::ValueId, regalloc::ValueId),
+    Ternary(
+        OpKind,
+        regalloc::ValueId,
+        regalloc::ValueId,
+        regalloc::ValueId,
+    ),
 }
 
 /// Linearize a DAG into a schedule with value IDs (iterative post-order).
@@ -1019,8 +1112,11 @@ fn linearize_dag(
                 next_id += 1;
 
                 // Grow the dense uses_map to cover my_id.
-                assert_eq!(my_id.0 as usize, uses_map.len(),
-                    "ValueId should be sequential");
+                assert_eq!(
+                    my_id.0 as usize,
+                    uses_map.len(),
+                    "ValueId should be sequential"
+                );
                 uses_map.push(child_ids);
 
                 schedule.push((my_id, sched_op));
@@ -1075,9 +1171,18 @@ fn transitive_deps(
             if *sv == v {
                 match sop {
                     ScheduledOp::Var(_) | ScheduledOp::Const(_) => {}
-                    ScheduledOp::Unary(_, c) => { worklist.push(*c); }
-                    ScheduledOp::Binary(_, l, r) => { worklist.push(*l); worklist.push(*r); }
-                    ScheduledOp::Ternary(_, a, b, c) => { worklist.push(*a); worklist.push(*b); worklist.push(*c); }
+                    ScheduledOp::Unary(_, c) => {
+                        worklist.push(*c);
+                    }
+                    ScheduledOp::Binary(_, l, r) => {
+                        worklist.push(*l);
+                        worklist.push(*r);
+                    }
+                    ScheduledOp::Ternary(_, a, b, c) => {
+                        worklist.push(*a);
+                        worklist.push(*b);
+                        worklist.push(*c);
+                    }
                 }
                 break;
             }
@@ -1095,9 +1200,7 @@ fn transitive_deps(
 ///
 /// Returns guards sorted by select_idx (ascending).
 #[cfg(feature = "alloc")]
-fn analyze_select_guards(
-    schedule: &[(regalloc::ValueId, ScheduledOp)],
-) -> Vec<SelectGuard> {
+fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<SelectGuard> {
     use alloc::collections::BTreeSet;
 
     let mut guards = Vec::new();
@@ -1147,8 +1250,15 @@ fn analyze_select_guards(
             let true_range = if true_indices.is_empty() {
                 (i, i) // empty range
             } else {
-                let start = *true_indices.iter().next().expect("non-empty set has first element");
-                let end = *true_indices.iter().next_back().expect("non-empty set has last element") + 1;
+                let start = *true_indices
+                    .iter()
+                    .next()
+                    .expect("non-empty set has first element");
+                let end = *true_indices
+                    .iter()
+                    .next_back()
+                    .expect("non-empty set has last element")
+                    + 1;
                 // Verify contiguity: all indices in [start, end) should be either
                 // true_exclusive or shared. If there are false_exclusive nodes
                 // interleaved, we can't use a simple branch guard.
@@ -1163,8 +1273,15 @@ fn analyze_select_guards(
             let false_range = if false_indices.is_empty() {
                 (i, i)
             } else {
-                let start = *false_indices.iter().next().expect("non-empty set has first element");
-                let end = *false_indices.iter().next_back().expect("non-empty set has last element") + 1;
+                let start = *false_indices
+                    .iter()
+                    .next()
+                    .expect("non-empty set has first element");
+                let end = *false_indices
+                    .iter()
+                    .next_back()
+                    .expect("non-empty set has last element")
+                    + 1;
                 let has_true_in_range = (start..end).any(|idx| true_indices.contains(&idx));
                 if has_true_in_range {
                     (i, i)
@@ -1193,10 +1310,7 @@ fn analyze_select_guards(
 fn emit_mov_reg(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 != src.0 {
         // ORR Vd.16B, Vn.16B, Vn.16B
-        let inst = 0x4EA01C00u32
-            | (dst.0 as u32)
-            | ((src.0 as u32) << 5)
-            | ((src.0 as u32) << 16);
+        let inst = 0x4EA01C00u32 | (dst.0 as u32) | ((src.0 as u32) << 5) | ((src.0 as u32) << 16);
         code.extend_from_slice(&inst.to_le_bytes());
     }
 }
@@ -1220,7 +1334,10 @@ fn resolve_dst_loc(
         // Use Reg(0) as a dummy — won't be written.
         Loc::Reg(RELOAD_REGS[0])
     } else {
-        panic!("value {:?} has no assignment, spill slot, or rematerialize entry", vid);
+        panic!(
+            "value {:?} has no assignment, spill slot, or rematerialize entry",
+            vid
+        );
     }
 }
 
@@ -1262,13 +1379,19 @@ pub fn resolve_operands(
         if let Some(&reg) = assignment.get(&v) {
             reg
         } else if let Some(&bits) = rematerialize.get(&v) {
-            reloads.push(Reload::Const { target, val_bits: bits });
+            reloads.push(Reload::Const {
+                target,
+                val_bits: bits,
+            });
             target
         } else if let Some(&offset) = spill_slots.get(&v) {
             reloads.push(Reload::FromStack { target, offset });
             target
         } else {
-            panic!("value {:?} not found in assignment, spill slots, or rematerialize", v);
+            panic!(
+                "value {:?} not found in assignment, spill slots, or rematerialize",
+                v
+            );
         }
     };
 
@@ -1277,21 +1400,24 @@ pub fn resolve_operands(
             // Precolored to input register — no code needed.
             ResolvedOp::Nop
         }
-        ScheduledOp::Const(val) => {
-            ResolvedOp::LoadConst { dst, val_bits: val.to_bits() }
-        }
+        ScheduledOp::Const(val) => ResolvedOp::LoadConst {
+            dst,
+            val_bits: val.to_bits(),
+        },
         ScheduledOp::Unary(op_kind, child) => {
             let src = resolve(*child, tmp_op, &mut reloads);
-            ResolvedOp::Unary { op: *op_kind, dst, src }
+            ResolvedOp::Unary {
+                op: *op_kind,
+                dst,
+                src,
+            }
         }
         ScheduledOp::Binary(op_kind, left, right) => {
             let l_spilled = !assignment.contains_key(left);
             let r_spilled = !assignment.contains_key(right);
 
             let (l_reg, r_reg) = match (l_spilled, r_spilled) {
-                (false, false) => {
-                    (assignment[left], assignment[right])
-                }
+                (false, false) => (assignment[left], assignment[right]),
                 (true, false) => {
                     let l = resolve(*left, tmp_op, &mut reloads);
                     (l, assignment[right])
@@ -1307,7 +1433,12 @@ pub fn resolve_operands(
                     (l, r)
                 }
             };
-            ResolvedOp::Binary { op: *op_kind, dst, left: l_reg, right: r_reg }
+            ResolvedOp::Binary {
+                op: *op_kind,
+                dst,
+                left: l_reg,
+                right: r_reg,
+            }
         }
         ScheduledOp::Ternary(op_kind, a, b, c) => {
             let a_spilled = !assignment.contains_key(a);
@@ -1330,9 +1461,18 @@ pub fn resolve_operands(
                         } else if let Some(&offset) = spill_slots.get(c) {
                             (tmp_op, Some(DeferredReload::FromStack(offset)))
                         } else {
-                            panic!("value {:?} not found in assignment, spill slots, or rematerialize", c);
+                            panic!(
+                                "value {:?} not found in assignment, spill slots, or rematerialize",
+                                c
+                            );
                         };
-                        ResolvedOp::DecomposedMulAdd { dst, a: a_reg, b: b_reg, c: c_reg, c_deferred }
+                        ResolvedOp::DecomposedMulAdd {
+                            dst,
+                            a: a_reg,
+                            b: b_reg,
+                            c: c_reg,
+                            c_deferred,
+                        }
                     } else {
                         // FMLA path: dst += a * b, so dst must hold c first.
                         // At most 1 of {a, b} is spilled → tmp_op handles it.
@@ -1342,7 +1482,11 @@ pub fn resolve_operands(
                         }
                         let a_reg = resolve(*a, tmp_op, &mut reloads);
                         let b_reg = resolve(*b, tmp_op, &mut reloads);
-                        ResolvedOp::FusedMulAdd { dst, a: a_reg, b: b_reg }
+                        ResolvedOp::FusedMulAdd {
+                            dst,
+                            a: a_reg,
+                            b: b_reg,
+                        }
                     }
                 }
                 OpKind::Select => {
@@ -1357,7 +1501,11 @@ pub fn resolve_operands(
                     }
                     let b_reg = resolve(*b, tmp_op, &mut reloads);
                     let c_reg = resolve(*c, tmp_op, &mut reloads);
-                    ResolvedOp::Select { dst, if_true: b_reg, if_false: c_reg }
+                    ResolvedOp::Select {
+                        dst,
+                        if_true: b_reg,
+                        if_false: c_reg,
+                    }
                 }
                 OpKind::Clamp => {
                     // clamp(a, lo=b, hi=c) = max(lo, min(a, c))
@@ -1383,9 +1531,18 @@ pub fn resolve_operands(
                     } else if let Some(&offset) = spill_slots.get(b) {
                         (tmp_op, Some(DeferredReload::FromStack(offset)))
                     } else {
-                        panic!("value {:?} not found in assignment, spill slots, or rematerialize", b);
+                        panic!(
+                            "value {:?} not found in assignment, spill slots, or rematerialize",
+                            b
+                        );
                     };
-                    ResolvedOp::Clamp { dst, val: val_reg, lo: lo_reg, hi: hi_reg, lo_deferred }
+                    ResolvedOp::Clamp {
+                        dst,
+                        val: val_reg,
+                        lo: lo_reg,
+                        hi: hi_reg,
+                        lo_deferred,
+                    }
                 }
                 _ => return Err("unsupported ternary op in DAG compilation"),
             }
@@ -1413,7 +1570,11 @@ pub fn resolve_operands(
 /// instructions. No decisions are made here — all decisions were
 /// made by resolve_operands.
 #[cfg(all(feature = "alloc", target_arch = "aarch64"))]
-fn emit_instruction_plan(code: &mut Vec<u8>, plan: &InstructionPlan, pool: &mut ConstPool) -> Result<(), &'static str> {
+fn emit_instruction_plan(
+    code: &mut Vec<u8>,
+    plan: &InstructionPlan,
+    pool: &mut ConstPool,
+) -> Result<(), &'static str> {
     use aarch64::*;
 
     // 1. Emit reloads (from stack or rematerialized constants)
@@ -1443,20 +1604,29 @@ fn emit_instruction_plan(code: &mut Vec<u8>, plan: &InstructionPlan, pool: &mut 
             let scratch = [Reg(28), Reg(29), Reg(30), Reg(31)];
             emit_unary(code, pool, *op, *dst, *src, scratch)?;
         }
-        ResolvedOp::Binary { op, dst, left, right } => {
-            match op {
-                OpKind::Pow | OpKind::Hypot | OpKind::Atan2 => {
-                    let scratch = [Reg(28), Reg(29), Reg(30), Reg(31)];
-                    aarch64::emit_binary_transcendental(code, pool, *op, *dst, *left, *right, scratch)?;
-                }
-                _ => emit_binary(code, *op, *dst, *left, *right),
+        ResolvedOp::Binary {
+            op,
+            dst,
+            left,
+            right,
+        } => match op {
+            OpKind::Pow | OpKind::Hypot | OpKind::Atan2 => {
+                let scratch = [Reg(28), Reg(29), Reg(30), Reg(31)];
+                aarch64::emit_binary_transcendental(code, pool, *op, *dst, *left, *right, scratch)?;
             }
-        }
+            _ => emit_binary(code, *op, *dst, *left, *right),
+        },
         ResolvedOp::FusedMulAdd { dst, a, b } => {
             // setup_mov already placed c into dst
             emit_fmla(code, *dst, *a, *b);
         }
-        ResolvedOp::DecomposedMulAdd { dst, a, b, c, c_deferred } => {
+        ResolvedOp::DecomposedMulAdd {
+            dst,
+            a,
+            b,
+            c,
+            c_deferred,
+        } => {
             // FMUL(dst, a, b) — consumes a and b (loaded upfront).
             emit_fmul(code, *dst, *a, *b);
             // Reload c after FMUL (c may reuse tmp_op which held b).
@@ -1464,11 +1634,21 @@ fn emit_instruction_plan(code: &mut Vec<u8>, plan: &InstructionPlan, pool: &mut 
             // FADD(dst, dst, c)
             emit_fadd(code, *dst, *dst, *c);
         }
-        ResolvedOp::Select { dst, if_true, if_false } => {
+        ResolvedOp::Select {
+            dst,
+            if_true,
+            if_false,
+        } => {
             // setup_mov already placed mask into dst
             emit_bsl(code, *dst, *if_true, *if_false);
         }
-        ResolvedOp::Clamp { dst, val, lo, hi, lo_deferred } => {
+        ResolvedOp::Clamp {
+            dst,
+            val,
+            lo,
+            hi,
+            lo_deferred,
+        } => {
             // FMIN(dst, val, hi) — consumes val and hi (loaded upfront).
             emit_fmin(code, *dst, *val, *hi);
             // Reload lo after FMIN (lo may reuse tmp_op which held val or hi).
@@ -1509,13 +1689,21 @@ fn emit_resolve(
         aarch64::emit_ldr_sp(code, target, offset);
         target
     } else {
-        panic!("value {:?} has no register, spill slot, or rematerialize entry", vid);
+        panic!(
+            "value {:?} has no register, spill slot, or rematerialize entry",
+            vid
+        );
     }
 }
 
 /// Emit a deferred reload: either from stack or rematerialized constant.
 #[cfg(feature = "alloc")]
-fn emit_deferred(code: &mut Vec<u8>, target: Reg, deferred: Option<&DeferredReload>, pool: &ConstPool) {
+fn emit_deferred(
+    code: &mut Vec<u8>,
+    target: Reg,
+    deferred: Option<&DeferredReload>,
+    pool: &ConstPool,
+) {
     match deferred {
         Some(DeferredReload::FromStack(offset)) => {
             aarch64::emit_ldr_sp(code, target, *offset);
@@ -1580,22 +1768,14 @@ mod tests {
     #[test]
     fn test_needs_simple() {
         // X + Y: both leaves need 1, binary needs max(1,1)+1 = 2
-        let expr = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         assert_eq!(needs(&expr), 2);
     }
 
     #[test]
     fn test_needs_unbalanced() {
         // (X + Y) + Z: left needs 2, right needs 1, total = max(2,1) = 2
-        let left = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(Expr::Var(2)));
         assert_eq!(needs(&expr), 2);
     }
@@ -1603,16 +1783,8 @@ mod tests {
     #[test]
     fn test_needs_balanced_deep() {
         // (X + Y) + (Z + W): both sides need 2, total = 2+1 = 3
-        let left = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
-        let right = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(2)),
-            Box::new(Expr::Var(3)),
-        );
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
         let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
         assert_eq!(needs(&expr), 3);
     }
@@ -1621,16 +1793,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_spill_forced() {
         // (X + Y) + (Z + W) with max_regs=2 forces spilling via DAG
-        let left = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
-        let right = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(2)),
-            Box::new(Expr::Var(3)),
-        );
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
         let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
 
         let ctx = EmitCtx::with_max_regs(2);
@@ -1655,16 +1819,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_no_spill_with_enough_regs() {
-        let left = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
-        let right = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(2)),
-            Box::new(Expr::Var(3)),
-        );
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
         let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
 
         let ctx = EmitCtx::default();
@@ -1677,11 +1833,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_spill_deeply_nested() {
         // Chain: ((((X + Y) + Z) + W) + X) with max_regs=1
-        let e1 = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let e1 = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let e2 = Expr::Binary(OpKind::Add, Box::new(e1), Box::new(Expr::Var(2)));
         let e3 = Expr::Binary(OpKind::Add, Box::new(e2), Box::new(Expr::Var(3)));
         let expr = Expr::Binary(OpKind::Add, Box::new(e3), Box::new(Expr::Var(0)));
@@ -1711,11 +1863,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_simple() {
         // Simple expression: X + Y (no sharing)
-        let expr = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let result = compile_dag(&expr).expect("DAG compile failed");
         assert_eq!(result.spill_count, 0);
@@ -1767,16 +1915,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_with_spill() {
         // Complex expression with limited registers
-        let left = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
-        let right = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(2)),
-            Box::new(Expr::Var(3)),
-        );
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
         let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
 
         // Compile with only 2 registers - should require spilling
@@ -1802,11 +1942,7 @@ mod tests {
     #[test]
     fn test_linearize_dag() {
         // Test the linearization function
-        let expr = Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let (schedule, _structural_cache, uses_map) = linearize_dag(&expr);
 
@@ -1815,7 +1951,9 @@ mod tests {
 
         // Root (X+Y) should use both X and Y
         let root_id = schedule.last().unwrap().0;
-        let root_uses = uses_map.get(root_id.0 as usize).expect("root should have uses");
+        let root_uses = uses_map
+            .get(root_id.0 as usize)
+            .expect("root should have uses");
         assert_eq!(root_uses.len(), 2);
     }
 
@@ -1823,18 +1961,18 @@ mod tests {
     fn test_linearize_dag_structural_dedup() {
         // Verify that cloned subtrees are collapsed by structural hash-consing.
         // Build: (X + Y) + (X + Y) where the two (X+Y) are distinct allocations.
-        let make_sum = || Expr::Binary(
-            OpKind::Add,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let make_sum = || Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let expr = Expr::Binary(OpKind::Add, Box::new(make_sum()), Box::new(make_sum()));
 
         let (schedule, _structural_cache, _uses_map) = linearize_dag(&expr);
 
         // Without dedup: X, Y, X+Y, X', Y', X'+Y', (X+Y)+(X'+Y') = 7 nodes
         // With dedup: X, Y, X+Y, (X+Y)+(X+Y) = 4 nodes
-        assert_eq!(schedule.len(), 4, "structural dedup should collapse cloned (X+Y)");
+        assert_eq!(
+            schedule.len(),
+            4,
+            "structural dedup should collapse cloned (X+Y)"
+        );
     }
 
     // =========================================================================
@@ -1857,7 +1995,11 @@ mod tests {
 
     #[test]
     fn test_frame_layout_alignment() {
-        let spilled = [regalloc::ValueId(1), regalloc::ValueId(2), regalloc::ValueId(3)];
+        let spilled = [
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
+            regalloc::ValueId(3),
+        ];
         let layout = FrameLayout::from_allocation(&spilled).unwrap();
         // 3 * 16 = 48, already aligned
         assert_eq!(layout.frame_size, 48);
@@ -1894,113 +2036,172 @@ mod tests {
     #[test]
     fn test_resolve_binary_no_spills() {
         // left=v4, right=v5, dst=v6 — all in registers
-        let (assign, spills, remat) = make_maps(
-            &[(0, 4), (1, 5), (2, 6)],
-            &[],
-        );
+        let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
 
         assert!(plan.reloads.is_empty());
         assert!(plan.store.is_none());
-        assert_eq!(plan.op, ResolvedOp::Binary {
-            op: OpKind::Add, dst: Reg(6), left: Reg(4), right: Reg(5)
-        });
+        assert_eq!(
+            plan.op,
+            ResolvedOp::Binary {
+                op: OpKind::Add,
+                dst: Reg(6),
+                left: Reg(4),
+                right: Reg(5)
+            }
+        );
     }
 
     #[test]
     fn test_resolve_binary_left_spilled() {
         // left spilled at offset 0, right in v5
-        let (assign, spills, remat) = make_maps(
-            &[(1, 5), (2, 6)],
-            &[(0, 0)],
-        );
+        let (assign, spills, remat) = make_maps(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
 
         assert_eq!(plan.reloads.len(), 1);
-        assert_eq!(plan.reloads[0], Reload::FromStack { target: RELOAD_REGS[1], offset: 0 });
-        assert_eq!(plan.op, ResolvedOp::Binary {
-            op: OpKind::Add, dst: Reg(6), left: RELOAD_REGS[1], right: Reg(5)
-        });
+        assert_eq!(
+            plan.reloads[0],
+            Reload::FromStack {
+                target: RELOAD_REGS[1],
+                offset: 0
+            }
+        );
+        assert_eq!(
+            plan.op,
+            ResolvedOp::Binary {
+                op: OpKind::Add,
+                dst: Reg(6),
+                left: RELOAD_REGS[1],
+                right: Reg(5)
+            }
+        );
     }
 
     #[test]
     fn test_resolve_binary_both_spilled() {
         // Both spilled: left → dst (temp trick), right → tmp_op
-        let (assign, spills, remat) = make_maps(
-            &[(2, 6)],
-            &[(0, 0), (1, 16)],
-        );
+        let (assign, spills, remat) = make_maps(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
 
         assert_eq!(plan.reloads.len(), 2);
         // left → dst (v6), right → tmp_op (v27)
-        assert_eq!(plan.reloads[0], Reload::FromStack { target: Reg(6), offset: 0 });
-        assert_eq!(plan.reloads[1], Reload::FromStack { target: RELOAD_REGS[1], offset: 16 });
-        assert_eq!(plan.op, ResolvedOp::Binary {
-            op: OpKind::Mul, dst: Reg(6), left: Reg(6), right: RELOAD_REGS[1]
-        });
+        assert_eq!(
+            plan.reloads[0],
+            Reload::FromStack {
+                target: Reg(6),
+                offset: 0
+            }
+        );
+        assert_eq!(
+            plan.reloads[1],
+            Reload::FromStack {
+                target: RELOAD_REGS[1],
+                offset: 16
+            }
+        );
+        assert_eq!(
+            plan.op,
+            ResolvedOp::Binary {
+                op: OpKind::Mul,
+                dst: Reg(6),
+                left: Reg(6),
+                right: RELOAD_REGS[1]
+            }
+        );
     }
 
     #[test]
     fn test_resolve_dst_spilled_generates_store() {
         // dst is spilled → compute into RELOAD_REGS[0], then store
-        let (assign, spills, remat) = make_maps(
-            &[(0, 4), (1, 5)],
-            &[(2, 32)],
-        );
+        let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5)], &[(2, 32)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
         let plan = resolve_operands(&op, Loc::Spill(32), &assign, &spills, &remat).unwrap();
 
         // dst should be RELOAD_REGS[0] since result is spilled
-        assert_eq!(plan.op, ResolvedOp::Binary {
-            op: OpKind::Add, dst: RELOAD_REGS[0], left: Reg(4), right: Reg(5)
-        });
-        assert_eq!(plan.store, Some(Store { src: RELOAD_REGS[0], offset: 32 }));
+        assert_eq!(
+            plan.op,
+            ResolvedOp::Binary {
+                op: OpKind::Add,
+                dst: RELOAD_REGS[0],
+                left: Reg(4),
+                right: Reg(5)
+            }
+        );
+        assert_eq!(
+            plan.store,
+            Some(Store {
+                src: RELOAD_REGS[0],
+                offset: 32
+            })
+        );
     }
 
     #[test]
     fn test_resolve_muladd_fmla_path() {
         // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
-        let (assign, spills, remat) = make_maps(
-            &[(0, 4), (1, 5), (2, 7), (3, 8)],
-            &[],
-        );
+        let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 7), (3, 8)], &[]);
         let op = ScheduledOp::Ternary(
             OpKind::MulAdd,
-            regalloc::ValueId(0), regalloc::ValueId(1), regalloc::ValueId(2),
+            regalloc::ValueId(0),
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
         );
         let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).unwrap();
 
         assert!(plan.reloads.is_empty());
         // c=v7 ≠ dst=v8, so setup_mov should copy c → dst
         assert_eq!(plan.setup_mov, Some((Reg(8), Reg(7))));
-        assert_eq!(plan.op, ResolvedOp::FusedMulAdd { dst: Reg(8), a: Reg(4), b: Reg(5) });
+        assert_eq!(
+            plan.op,
+            ResolvedOp::FusedMulAdd {
+                dst: Reg(8),
+                a: Reg(4),
+                b: Reg(5)
+            }
+        );
     }
 
     #[test]
     fn test_resolve_muladd_decomposed_both_ab_spilled() {
         // a and b both spilled → decomposed FMUL+FADD path
         // c in register
-        let (assign, spills, remat) = make_maps(
-            &[(2, 7), (3, 8)],
-            &[(0, 0), (1, 16)],
-        );
+        let (assign, spills, remat) = make_maps(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Ternary(
             OpKind::MulAdd,
-            regalloc::ValueId(0), regalloc::ValueId(1), regalloc::ValueId(2),
+            regalloc::ValueId(0),
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
         );
         let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).unwrap();
 
         // a → dst, b → tmp_op loaded upfront
         assert_eq!(plan.reloads.len(), 2);
-        assert_eq!(plan.reloads[0], Reload::FromStack { target: Reg(8), offset: 0 });
-        assert_eq!(plan.reloads[1], Reload::FromStack { target: RELOAD_REGS[1], offset: 16 });
+        assert_eq!(
+            plan.reloads[0],
+            Reload::FromStack {
+                target: Reg(8),
+                offset: 0
+            }
+        );
+        assert_eq!(
+            plan.reloads[1],
+            Reload::FromStack {
+                target: RELOAD_REGS[1],
+                offset: 16
+            }
+        );
         // c is in a register, no deferred reload needed
         match &plan.op {
-            ResolvedOp::DecomposedMulAdd { dst, a, b, c, c_deferred } => {
+            ResolvedOp::DecomposedMulAdd {
+                dst,
+                a,
+                b,
+                c,
+                c_deferred,
+            } => {
                 assert_eq!(*dst, Reg(8));
                 assert_eq!(*a, Reg(8));
                 assert_eq!(*b, RELOAD_REGS[1]);
@@ -2014,13 +2215,12 @@ mod tests {
     #[test]
     fn test_resolve_muladd_decomposed_all_three_spilled() {
         // a, b, c all spilled → decomposed with deferred c reload
-        let (assign, spills, remat) = make_maps(
-            &[(3, 8)],
-            &[(0, 0), (1, 16), (2, 32)],
-        );
+        let (assign, spills, remat) = make_maps(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
         let op = ScheduledOp::Ternary(
             OpKind::MulAdd,
-            regalloc::ValueId(0), regalloc::ValueId(1), regalloc::ValueId(2),
+            regalloc::ValueId(0),
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
         );
         let plan = resolve_operands(&op, Loc::Reg(Reg(8)), &assign, &spills, &remat).unwrap();
 
@@ -2050,7 +2250,13 @@ mod tests {
         let (assign, spills, remat) = make_maps(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(3.14);
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
-        assert_eq!(plan.op, ResolvedOp::LoadConst { dst: Reg(6), val_bits: 3.14f32.to_bits() });
+        assert_eq!(
+            plan.op,
+            ResolvedOp::LoadConst {
+                dst: Reg(6),
+                val_bits: 3.14f32.to_bits()
+            }
+        );
     }
 
     // =========================================================================
@@ -2092,21 +2298,26 @@ mod tests {
         let cos_y = Expr::Unary(OpKind::Cos, Box::new(Expr::Var(1)));
         let floor_zw = Expr::Unary(
             OpKind::Floor,
-            Box::new(Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)))),
+            Box::new(Expr::Binary(
+                OpKind::Add,
+                Box::new(Expr::Var(2)),
+                Box::new(Expr::Var(3)),
+            )),
         );
         let cos_times_floor = Expr::Binary(OpKind::Mul, Box::new(cos_y), Box::new(floor_zw));
         let expr = Expr::Binary(OpKind::Add, Box::new(sin_x), Box::new(cos_times_floor));
 
         let ctx = EmitCtx::with_max_regs(4);
-        let result = compile_dag_with_ctx(&expr, ctx).expect("DAG compile with heavy spills failed");
+        let result =
+            compile_dag_with_ctx(&expr, ctx).expect("DAG compile with heavy spills failed");
         // Linear scan may or may not spill — correctness is what matters.
 
         unsafe {
             use core::arch::aarch64::*;
-            let x = vdupq_n_f32(0.0);  // sin(0) = 0
-            let y = vdupq_n_f32(0.0);  // cos(0) = 1
+            let x = vdupq_n_f32(0.0); // sin(0) = 0
+            let y = vdupq_n_f32(0.0); // cos(0) = 1
             let z = vdupq_n_f32(2.3);
-            let w = vdupq_n_f32(0.5);  // floor(2.3+0.5) = floor(2.8) = 2
+            let w = vdupq_n_f32(0.5); // floor(2.3+0.5) = floor(2.8) = 2
 
             let func: executable::KernelFn = result.code.as_fn();
             let out = func(x, y, z, w);
@@ -2123,9 +2334,21 @@ mod tests {
         // MulAdd with max_regs=3 — forces spilling of operands
         let expr = Expr::Ternary(
             OpKind::MulAdd,
-            Box::new(Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)))),
-            Box::new(Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)))),
-            Box::new(Expr::Binary(OpKind::Mul, Box::new(Expr::Var(0)), Box::new(Expr::Const(2.0)))),
+            Box::new(Expr::Binary(
+                OpKind::Add,
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Var(1)),
+            )),
+            Box::new(Expr::Binary(
+                OpKind::Add,
+                Box::new(Expr::Var(2)),
+                Box::new(Expr::Var(3)),
+            )),
+            Box::new(Expr::Binary(
+                OpKind::Mul,
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(2.0)),
+            )),
         );
 
         let ctx = EmitCtx::with_max_regs(3);
@@ -2224,11 +2447,7 @@ mod tests {
         // Note: we don't test numerical accuracy here — the polynomial
         // approximations for exp2/log2 have limited range. The point is that
         // compile_dag doesn't panic or overflow.
-        let expr = Expr::Binary(
-            OpKind::Pow,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Pow, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let result = compile_dag(&expr).expect("DAG compile of pow(X, Y) failed");
 
@@ -2244,7 +2463,11 @@ mod tests {
             let out = func(x, y, z, w);
             let val = vgetq_lane_f32(out, 0);
             // pow(1.5, 1.0) should be ~1.5 — identity exponent
-            assert!(val.is_finite(), "pow(1.5, 1.0) produced non-finite: {}", val);
+            assert!(
+                val.is_finite(),
+                "pow(1.5, 1.0) produced non-finite: {}",
+                val
+            );
         }
     }
 
@@ -2284,7 +2507,11 @@ mod tests {
             let val = vgetq_lane_f32(out, 0);
             // exp(exp(0)) + 1.0 ≈ 2.718 + 1.0 = 3.718
             // Polynomial approximation may be off, but result must be finite.
-            assert!(val.is_finite(), "exp(exp(0))+1 produced non-finite: {}", val);
+            assert!(
+                val.is_finite(),
+                "exp(exp(0))+1 produced non-finite: {}",
+                val
+            );
         }
     }
 
@@ -2316,7 +2543,9 @@ mod tests {
             assert!(val.is_finite(), "atan2(1, 1) produced non-finite: {}", val);
             assert!(
                 (val - core::f32::consts::FRAC_PI_4).abs() < 0.07,
-                "atan2(1, 1) = {}, expected ~{}", val, core::f32::consts::FRAC_PI_4
+                "atan2(1, 1) = {}, expected ~{}",
+                val,
+                core::f32::consts::FRAC_PI_4
             );
         }
     }
@@ -2325,10 +2554,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_asin_compiles() {
         // asin(X) should compile through the unary transcendental path.
-        let expr = Expr::Unary(
-            OpKind::Asin,
-            Box::new(Expr::Var(0)),
-        );
+        let expr = Expr::Unary(OpKind::Asin, Box::new(Expr::Var(0)));
 
         let result = compile_dag(&expr).expect("DAG compile of asin(X) failed");
 
@@ -2347,7 +2573,9 @@ mod tests {
             assert!(val.is_finite(), "asin(0.5) produced non-finite: {}", val);
             assert!(
                 (val - expected).abs() < 0.02,
-                "asin(0.5) = {}, expected ~{}", val, expected
+                "asin(0.5) = {}, expected ~{}",
+                val,
+                expected
             );
         }
     }
@@ -2356,10 +2584,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_acos_compiles() {
         // acos(X) should compile through the unary transcendental path.
-        let expr = Expr::Unary(
-            OpKind::Acos,
-            Box::new(Expr::Var(0)),
-        );
+        let expr = Expr::Unary(OpKind::Acos, Box::new(Expr::Var(0)));
 
         let result = compile_dag(&expr).expect("DAG compile of acos(X) failed");
 
@@ -2378,7 +2603,9 @@ mod tests {
             assert!(val.is_finite(), "acos(0.5) produced non-finite: {}", val);
             assert!(
                 (val - expected).abs() < 0.02,
-                "acos(0.5) = {}, expected ~{}", val, expected
+                "acos(0.5) = {}, expected ~{}",
+                val,
+                expected
             );
         }
     }
@@ -2399,7 +2626,7 @@ mod tests {
         let true_arm = Expr::Var(1); // Y
         let false_arm = Expr::Binary(
             OpKind::Div,
-            Box::new(Expr::Var(2)), // Z
+            Box::new(Expr::Var(2)),     // Z
             Box::new(Expr::Const(0.0)), // divide by zero!
         );
         let expr = Expr::Ternary(
@@ -2428,7 +2655,8 @@ mod tests {
             );
             assert!(
                 (val - 42.0).abs() < 1e-6,
-                "Select short-circuit: got {}, expected 42.0", val
+                "Select short-circuit: got {}, expected 42.0",
+                val
             );
         }
     }
@@ -2471,11 +2699,13 @@ mod tests {
             let val = vgetq_lane_f32(out, 0);
             assert!(
                 val.is_finite(),
-                "Select short-circuit (all-false) failed: got {} (expected 99.0)", val
+                "Select short-circuit (all-false) failed: got {} (expected 99.0)",
+                val
             );
             assert!(
                 (val - 99.0).abs() < 1e-6,
-                "Select short-circuit (all-false): got {}, expected 99.0", val
+                "Select short-circuit (all-false): got {}, expected 99.0",
+                val
             );
         }
     }
@@ -2515,17 +2745,29 @@ mod tests {
             let out = func(x, y, z, w);
 
             // Lane 0: mask true → Y = 10
-            assert!((vgetq_lane_f32(out, 0) - 10.0).abs() < 1e-6,
-                "lane 0: expected 10.0, got {}", vgetq_lane_f32(out, 0));
+            assert!(
+                (vgetq_lane_f32(out, 0) - 10.0).abs() < 1e-6,
+                "lane 0: expected 10.0, got {}",
+                vgetq_lane_f32(out, 0)
+            );
             // Lane 1: mask false → Z = 20
-            assert!((vgetq_lane_f32(out, 1) - 20.0).abs() < 1e-6,
-                "lane 1: expected 20.0, got {}", vgetq_lane_f32(out, 1));
+            assert!(
+                (vgetq_lane_f32(out, 1) - 20.0).abs() < 1e-6,
+                "lane 1: expected 20.0, got {}",
+                vgetq_lane_f32(out, 1)
+            );
             // Lane 2: mask true → Y = 10
-            assert!((vgetq_lane_f32(out, 2) - 10.0).abs() < 1e-6,
-                "lane 2: expected 10.0, got {}", vgetq_lane_f32(out, 2));
+            assert!(
+                (vgetq_lane_f32(out, 2) - 10.0).abs() < 1e-6,
+                "lane 2: expected 10.0, got {}",
+                vgetq_lane_f32(out, 2)
+            );
             // Lane 3: mask false → Z = 20
-            assert!((vgetq_lane_f32(out, 3) - 20.0).abs() < 1e-6,
-                "lane 3: expected 20.0, got {}", vgetq_lane_f32(out, 3));
+            assert!(
+                (vgetq_lane_f32(out, 3) - 20.0).abs() < 1e-6,
+                "lane 3: expected 20.0, got {}",
+                vgetq_lane_f32(out, 3)
+            );
         }
     }
 
@@ -2534,11 +2776,7 @@ mod tests {
     fn test_dag_ne_correctness() {
         // Ne(X, Y) should produce all-ones (as float: NaN / -NaN) when X != Y,
         // and all-zeros (0.0) when X == Y.
-        let expr = Expr::Binary(
-            OpKind::Ne,
-            Box::new(Expr::Var(0)),
-            Box::new(Expr::Var(1)),
-        );
+        let expr = Expr::Binary(OpKind::Ne, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let result = compile_dag(&expr).expect("DAG compile of Ne failed");
 
@@ -2555,16 +2793,22 @@ mod tests {
             let out = func(x, y, z, w);
             // All-ones mask reinterpreted as f32 is NaN; check bits are 0xFFFFFFFF
             let bits: u32 = vgetq_lane_f32(out, 0).to_bits();
-            assert_eq!(bits, 0xFFFF_FFFF,
-                "Ne(3.0, 4.0) should be all-ones mask, got 0x{:08X}", bits);
+            assert_eq!(
+                bits, 0xFFFF_FFFF,
+                "Ne(3.0, 4.0) should be all-ones mask, got 0x{:08X}",
+                bits
+            );
 
             // Test 2: X == Y → should produce all-zeros (0.0)
             let x_eq = vdupq_n_f32(5.0);
             let y_eq = vdupq_n_f32(5.0);
             let out_eq = func(x_eq, y_eq, z, w);
             let bits_eq: u32 = vgetq_lane_f32(out_eq, 0).to_bits();
-            assert_eq!(bits_eq, 0x0000_0000,
-                "Ne(5.0, 5.0) should be all-zeros, got 0x{:08X}", bits_eq);
+            assert_eq!(
+                bits_eq, 0x0000_0000,
+                "Ne(5.0, 5.0) should be all-zeros, got 0x{:08X}",
+                bits_eq
+            );
         }
     }
 }
