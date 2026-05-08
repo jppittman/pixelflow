@@ -696,7 +696,7 @@ mod unicode_wide_tests {
         if AnsiCommand::from_esc('A').is_none() {
             expected_commands.push(AnsiCommand::Print('A'));
         } else {
-            expected_commands.push(AnsiCommand::from_esc('A').unwrap());
+            expected_commands.push(AnsiCommand::from_esc('A').expect("Should be present"));
         }
         expected_commands.extend(vec![
             AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For interrupted 0xF0, 0x9F
