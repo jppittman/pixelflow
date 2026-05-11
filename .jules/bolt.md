@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2024-05-14 - Refactor boolean argument in MacWindow::set_visible
+**Learning:** Found an egregious violation of `STYLE.md`'s rule against boolean arguments in `MacWindow::set_visible(visible: bool)`. The rule explicitly recommends "splitting the function into two separate functions" as an alternative to enums.
+**Action:** Refactored `set_visible` into `show()` and `hide()` methods. This is often safer and cleaner than introducing a new enum when the boolean simply toggles two completely separate branches of execution, as it was doing here with `make_key_and_order_front` vs `orderOut`.
