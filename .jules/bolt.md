@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Avoid inverse normal length chained computation
+**Learning:** Found an anti-pattern in `pixelflow-graphics/src/scene3d.rs` where `.sqrt().rsqrt()` was chained on `n_len_sq`. This inadvertently calculates 1/sqrt(sqrt(x)) instead of 1/sqrt(x) and introduces a redundant operation.
+**Action:** Always compute reciprocal square roots directly on the squared value using `.rsqrt()` instead of chaining `.sqrt().rsqrt()`.
