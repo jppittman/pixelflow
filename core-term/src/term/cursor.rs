@@ -238,13 +238,16 @@ impl CursorController {
         self.cursor.attributes
     }
 
-    /// Sets the visibility of the cursor.
-    pub fn set_visible(&mut self, visibility: CursorVisibility) {
-        trace!("Cursor visibility set to: {:?}", visibility);
-        self.cursor.visible = match visibility {
-            CursorVisibility::Visible => true,
-            CursorVisibility::Hidden => false,
-        };
+    /// Shows the cursor.
+    pub fn show(&mut self) {
+        trace!("Cursor visibility set to: Visible");
+        self.cursor.visible = true;
+    }
+
+    /// Hides the cursor.
+    pub fn hide(&mut self) {
+        trace!("Cursor visibility set to: Hidden");
+        self.cursor.visible = false;
     }
 
     /// Returns `true` if the cursor is currently set to be visible.
@@ -398,7 +401,7 @@ impl CursorController {
     }
     pub fn reset(&mut self) {
         self.set_attributes(Attributes::default());
-        self.set_visible(CursorVisibility::Visible);
+        self.show();
         self.cursor = Cursor::default();
     }
 }
