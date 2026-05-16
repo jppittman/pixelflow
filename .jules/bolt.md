@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2024-05-24 - StyleEnforcer: Refactoring Boolean Arguments to Enums
+**Learning:** Found that `STYLE.md` recommends refactoring boolean arguments into descriptive enums or separate methods (e.g. `set_visible(bool)` to `show()` and `hide()`). When performing this refactor on a message enum like `DisplayControl::SetVisible`, it requires tracking down all usages across different platform implementations (`macos`, `linux`) and updating matching logic and underlying platform window methods to ensure the refactor is complete. Pre-existing compilation errors in `pixelflow-graphics` may mask new errors in dependent crates like `pixelflow-runtime` if running a workspace-wide `cargo check`.
+**Action:** Always run a crate-specific check (e.g., `cargo check -p pixelflow-runtime`) to isolate your changes from known failures in other workspace crates.
