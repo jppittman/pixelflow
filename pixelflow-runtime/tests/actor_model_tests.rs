@@ -830,7 +830,7 @@ fn actor_can_override_park_hint_to_poll() {
 // ============================================================================
 
 #[test]
-fn message_enum_variants_distinguishable() {
+fn actor_message_variants_should_be_distinguishable() {
     let data: Message<i32, String, bool> = Message::Data(42);
     let ctrl: Message<i32, String, bool> = Message::Control("test".to_string());
     let mgmt: Message<i32, String, bool> = Message::Management(true);

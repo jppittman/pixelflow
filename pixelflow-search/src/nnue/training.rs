@@ -28,8 +28,8 @@ impl ResourceConfig {
         Self {
             max_classes: 500,
             max_epochs: 20,
-            threshold: 0.3,  // permissive
-            epsilon: 0.0,    // no exploration - oracle is the teacher
+            threshold: 0.3, // permissive
+            epsilon: 0.0,   // no exploration - oracle is the teacher
         }
     }
 
@@ -39,8 +39,8 @@ impl ResourceConfig {
         Self {
             max_classes: 50,
             max_epochs: 5,
-            threshold: 0.5,  // balanced
-            epsilon: 0.3,    // exploration during training
+            threshold: 0.5, // balanced
+            epsilon: 0.3,   // exploration during training
         }
     }
 
@@ -51,7 +51,7 @@ impl ResourceConfig {
             max_classes: 50,
             max_epochs: 5,
             threshold: 0.5,
-            epsilon: 0.0,  // no exploration for fair eval
+            epsilon: 0.0, // no exploration for fair eval
         }
     }
 }
@@ -81,13 +81,21 @@ impl Metrics {
     /// Compute accuracy (correct / total).
     #[must_use]
     pub fn accuracy(&self) -> f32 {
-        if self.total == 0 { 1.0 } else { self.correct as f32 / self.total as f32 }
+        if self.total == 0 {
+            1.0
+        } else {
+            self.correct as f32 / self.total as f32
+        }
     }
 
     /// Compute average loss.
     #[must_use]
     pub fn avg_loss(&self) -> f32 {
-        if self.total == 0 { 0.0 } else { self.loss_sum / self.total as f32 }
+        if self.total == 0 {
+            0.0
+        } else {
+            self.loss_sum / self.total as f32
+        }
     }
 
     /// Record a prediction result.
@@ -177,7 +185,11 @@ impl EpisodeResult {
     /// Reward for this episode (1 if matched, 0 otherwise).
     #[must_use]
     pub fn reward(&self) -> f32 {
-        if self.matched { 1.0 } else { 0.0 }
+        if self.matched {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// Ratio of oracle_cost to student_cost (higher = student did better).
@@ -216,7 +228,11 @@ impl RewardBaseline {
     /// Create new baseline with specified decay.
     #[must_use]
     pub fn new(decay: f32) -> Self {
-        Self { mean: 0.5, decay, count: 0 }
+        Self {
+            mean: 0.5,
+            decay,
+            count: 0,
+        }
     }
 
     /// Update baseline with new reward, return advantage.
@@ -233,14 +249,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_metrics() {
+    fn classification_metrics_initializes_with_correct_values() {
         let mut metrics = Metrics::new();
 
         // Record some results
-        metrics.record(true, true, 0.1);   // correct
+        metrics.record(true, true, 0.1); // correct
         metrics.record(false, false, 0.2); // correct
-        metrics.record(true, false, 0.5);  // false positive
-        metrics.record(false, true, 0.8);  // false negative
+        metrics.record(true, false, 0.5); // false positive
+        metrics.record(false, true, 0.8); // false negative
 
         assert_eq!(metrics.total, 4);
         assert_eq!(metrics.correct, 2);
@@ -251,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_configs() {
+    fn resource_config_returns_correct_hardware_defaults() {
         let oracle = ResourceConfig::oracle();
         let constrained = ResourceConfig::constrained();
         let eval = ResourceConfig::evaluation();
@@ -266,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_training_result() {
+    fn training_result_formats_metadata_correctly() {
         let result = TrainingResult {
             oracle_cost: 100,
             initial_guided_cost: 150,

@@ -20,9 +20,9 @@
 //! - No finite differences, no extra evaluations
 
 use crate::mesh::{Point3, QuadMesh};
+use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Field, Manifold, ManifoldExt};
-use pixelflow_compiler::ManifoldExpr;
 
 /// The 4D Jet3 domain type for 3D ray tracing autodiff.
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);
@@ -465,7 +465,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_regular_patch() {
+    fn regular_patch_evaluates_to_non_extraordinary() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -482,7 +482,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn test_limit_eval() {
+    fn patch_is_extraordinary_for_limit_eval() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -505,11 +505,11 @@ f 1 2 3 4
 
         // For bilinear fallback, center should be roughly (0.5, 0.5, 0.0)
         // We can't easily check SIMD Field values in tests, so this is a smoke test
-        assert_eq!(patch.is_extraordinary(), true);
+        assert!(patch.is_extraordinary(), "Patch must be extraordinary");
     }
 
     #[test]
-    fn test_surface_stats() {
+    fn surface_stats_reports_correct_patch_count() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0

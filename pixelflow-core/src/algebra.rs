@@ -267,7 +267,11 @@ impl Algebra for f32 {
 
     #[inline(always)]
     fn select(mask: bool, if_true: Self, if_false: Self) -> Self {
-        if mask { if_true } else { if_false }
+        if mask {
+            if_true
+        } else {
+            if_false
+        }
     }
 
     #[inline(always)]
@@ -352,12 +356,20 @@ impl Transcendental for f32 {
 
     #[inline(always)]
     fn min(self, rhs: Self) -> Self {
-        if self < rhs { self } else { rhs }
+        if self < rhs {
+            self
+        } else {
+            rhs
+        }
     }
 
     #[inline(always)]
     fn max(self, rhs: Self) -> Self {
-        if self > rhs { self } else { rhs }
+        if self > rhs {
+            self
+        } else {
+            rhs
+        }
     }
 
     #[inline(always)]
@@ -431,7 +443,11 @@ impl Algebra for bool {
 
     #[inline(always)]
     fn select(mask: bool, if_true: Self, if_false: Self) -> Self {
-        if mask { if_true } else { if_false }
+        if mask {
+            if_true
+        } else {
+            if_false
+        }
     }
 }
 
@@ -500,7 +516,11 @@ impl Algebra for u32 {
 
     #[inline(always)]
     fn select(mask: bool, if_true: Self, if_false: Self) -> Self {
-        if mask { if_true } else { if_false }
+        if mask {
+            if_true
+        } else {
+            if_false
+        }
     }
 }
 
@@ -513,7 +533,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_f32_algebra() {
+    fn f32_algebra_operations_compute_correct_values() {
         // Ring operations
         assert_eq!(f32::zero(), 0.0);
         assert_eq!(f32::one(), 1.0);
@@ -537,7 +557,7 @@ mod tests {
     // Transcendental tests only run on scalar fallback platforms
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
-    fn test_f32_transcendental() {
+    fn f32_transcendental_functions_evaluate_correctly() {
         let epsilon = 1e-6;
 
         assert!((4.0f32.sqrt() - 2.0).abs() < epsilon);
@@ -558,26 +578,26 @@ mod tests {
     }
 
     #[test]
-    fn test_bool_algebra() {
-        assert_eq!(bool::zero(), false);
-        assert_eq!(bool::one(), true);
+    fn boolean_algebra_operations_evaluate_correctly() {
+        assert!(!bool::zero(), "bool::zero must be false");
+        assert!(bool::one(), "bool::one must be true");
 
         // Boolean ring (OR/AND)
-        assert_eq!(false.add(false), false);
-        assert_eq!(false.add(true), true);
-        assert_eq!(true.add(false), true);
-        assert_eq!(true.add(true), true);
+        assert!(!false.add(false), "false + false must be false");
+        assert!(false.add(true), "false + true must be true");
+        assert!(true.add(false), "true + false must be true");
+        assert!(true.add(true), "true + true must be true");
 
-        assert_eq!(false.mul(false), false);
-        assert_eq!(false.mul(true), false);
-        assert_eq!(true.mul(true), true);
+        assert!(!false.mul(false), "false * false must be false");
+        assert!(!false.mul(true), "false * true must be false");
+        assert!(true.mul(true), "true * true must be true");
 
-        assert_eq!(true.neg(), false);
-        assert_eq!(false.neg(), true);
+        assert!(!true.neg(), "true.neg must be false");
+        assert!(false.neg(), "false.neg must be true");
     }
 
     #[test]
-    fn test_u32_algebra() {
+    fn u32_algebra_operations_compute_correct_values() {
         assert_eq!(u32::zero(), 0);
         assert_eq!(u32::one(), 1);
         assert_eq!(2u32.add(3), 5);
