@@ -125,11 +125,10 @@ impl Rewrite for RecipSqrt {
 
 fn extract_mul(egraph: &EGraph, class: EClassId) -> Option<(EClassId, EClassId)> {
     for node in egraph.nodes(class) {
-        if let ENode::Op { op, children } = node {
-            if op.kind() == OpKind::Mul && children.len() == 2 {
+        if let ENode::Op { op, children } = node
+            && op.kind() == OpKind::Mul && children.len() == 2 {
                 return Some((children[0], children[1]));
             }
-        }
     }
     None
 }
@@ -148,11 +147,10 @@ fn is_one(egraph: &EGraph, class: EClassId) -> bool {
 
 fn extract_sqrt(egraph: &EGraph, class: EClassId) -> Option<EClassId> {
     for node in egraph.nodes(class) {
-        if let ENode::Op { op, children } = node {
-            if op.kind() == OpKind::Sqrt && children.len() == 1 {
+        if let ENode::Op { op, children } = node
+            && op.kind() == OpKind::Sqrt && children.len() == 1 {
                 return Some(children[0]);
             }
-        }
     }
     None
 }

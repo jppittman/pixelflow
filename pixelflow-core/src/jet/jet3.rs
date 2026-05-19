@@ -31,6 +31,7 @@ pub struct Jet3 {
 impl Jet3 {
     /// Create a jet seeded for the X variable (∂x/∂x = 1, others = 0)
     #[inline(always)]
+    #[must_use]
     pub fn x(val: Field) -> Self {
         Self {
             val,
@@ -42,6 +43,7 @@ impl Jet3 {
 
     /// Create a jet seeded for the Y variable (∂y/∂y = 1, others = 0)
     #[inline(always)]
+    #[must_use]
     pub fn y(val: Field) -> Self {
         Self {
             val,
@@ -53,6 +55,7 @@ impl Jet3 {
 
     /// Create a jet seeded for the Z variable (∂z/∂z = 1, others = 0)
     #[inline(always)]
+    #[must_use]
     pub fn z(val: Field) -> Self {
         Self {
             val,
@@ -64,6 +67,7 @@ impl Jet3 {
 
     /// Create a constant jet (no derivatives)
     #[inline(always)]
+    #[must_use]
     pub fn constant(val: Field) -> Self {
         Self {
             val,
@@ -99,6 +103,7 @@ impl Jet3 {
     /// Returns manifold expressions for the unit normal components.
     /// Use `Jet3::new(nx, ny, nz)` to collapse if needed.
     #[inline(always)]
+    #[must_use]
     pub fn normal(
         &self,
     ) -> (
@@ -109,14 +114,15 @@ impl Jet3 {
         let len_sq = self.dx * self.dx + self.dy * self.dy + self.dz * self.dz;
         let inv_len = len_sq.rsqrt();
         (
-            self.dx.clone() * inv_len.clone(),
-            self.dy.clone() * inv_len.clone(),
-            self.dz.clone() * inv_len,
+            self.dx * inv_len.clone(),
+            self.dy * inv_len.clone(),
+            self.dz * inv_len,
         )
     }
 
     /// Get the raw gradient without normalization.
     #[inline(always)]
+    #[must_use]
     pub fn gradient(&self) -> (Field, Field, Field) {
         (self.dx, self.dy, self.dz)
     }
@@ -138,24 +144,28 @@ impl Jet3 {
 
     /// Less than comparison (returns mask jet).
     #[inline(always)]
+    #[must_use]
     pub fn lt(self, rhs: Self) -> Self {
         Self::constant(self.val.lt(rhs.val))
     }
 
     /// Less than or equal (returns mask jet).
     #[inline(always)]
+    #[must_use]
     pub fn le(self, rhs: Self) -> Self {
         Self::constant(self.val.le(rhs.val))
     }
 
     /// Greater than comparison (returns mask jet).
     #[inline(always)]
+    #[must_use]
     pub fn gt(self, rhs: Self) -> Self {
         Self::constant(self.val.gt(rhs.val))
     }
 
     /// Greater than or equal (returns mask jet).
     #[inline(always)]
+    #[must_use]
     pub fn ge(self, rhs: Self) -> Self {
         Self::constant(self.val.ge(rhs.val))
     }
@@ -165,12 +175,14 @@ impl Jet3 {
     /// Returns `Jet3Sqrt` which enables automatic rsqrt fusion when divided.
     /// Example: `a / b.sqrt()` computes `a * rsqrt(b)` (faster than `a / sqrt(b)`).
     #[inline(always)]
+    #[must_use]
     pub fn sqrt(self) -> Jet3Sqrt {
         Jet3Sqrt(self)
     }
 
     /// Absolute value with derivative.
     #[inline(always)]
+    #[must_use]
     pub fn abs(self) -> Self {
         // |f|' = f' * sign(f)
         let sign = self.val / self.val.abs();
@@ -184,6 +196,7 @@ impl Jet3 {
 
     /// Element-wise minimum with derivative.
     #[inline(always)]
+    #[must_use]
     pub fn min(self, rhs: Self) -> Self {
         let mask = self.val.lt(rhs.val);
         Self {
@@ -196,6 +209,7 @@ impl Jet3 {
 
     /// Element-wise maximum with derivative.
     #[inline(always)]
+    #[must_use]
     pub fn max(self, rhs: Self) -> Self {
         let mask = self.val.gt(rhs.val);
         Self {
@@ -208,18 +222,21 @@ impl Jet3 {
 
     /// Check if any lane of the value is non-zero.
     #[inline(always)]
+    #[must_use]
     pub fn any(&self) -> bool {
         self.val.any()
     }
 
     /// Check if all lanes of the value are non-zero.
     #[inline(always)]
+    #[must_use]
     pub fn all(&self) -> bool {
         self.val.all()
     }
 
     /// Conditional select with early-exit optimization.
     #[inline(always)]
+    #[must_use]
     pub fn select(mask: Self, if_true: Self, if_false: Self) -> Self {
         if mask.all() {
             return if_true;
@@ -248,6 +265,7 @@ pub struct Jet3Sqrt(Jet3);
 impl Jet3Sqrt {
     /// Evaluate to get the actual sqrt result as Jet3.
     #[inline(always)]
+    #[must_use]
     pub fn eval(self) -> Jet3 {
         // Chain rule: (√f)' = f' / (2√f) = f' * rsqrt(f) / 2
         let rsqrt_val = self.0.val.rsqrt();
@@ -419,12 +437,12 @@ impl core::ops::Div for Jet3 {
         // Quotient rule: (f / g)' = (f' * g - f * g') / g²
         let g_sq = rhs.val * rhs.val;
         let inv_g_sq = Field::from(1.0) / g_sq;
-        let scale = rhs.val.clone() * inv_g_sq.clone();
+        let scale = rhs.val * inv_g_sq.clone();
         Self::new(
             self.val / rhs.val,
-            self.dx * scale.clone() - self.val * rhs.dx.clone() * inv_g_sq.clone(),
-            self.dy * scale.clone() - self.val * rhs.dy.clone() * inv_g_sq.clone(),
-            self.dz * scale - self.val * rhs.dz.clone() * inv_g_sq,
+            self.dx * scale.clone() - self.val * rhs.dx * inv_g_sq.clone(),
+            self.dy * scale.clone() - self.val * rhs.dy * inv_g_sq.clone(),
+            self.dz * scale - self.val * rhs.dz * inv_g_sq,
         )
     }
 }
@@ -636,8 +654,8 @@ impl Numeric for Jet3 {
     fn atan2(self, x: Self) -> Self {
         let r_sq = self.val * self.val + x.val * x.val;
         let inv_r_sq = Field::from(1.0) / r_sq;
-        let dy_darg = x.val.clone() * inv_r_sq.clone();
-        let dx_darg = (-self.val).clone() * inv_r_sq;
+        let dy_darg = x.val * inv_r_sq.clone();
+        let dx_darg = (-self.val) * inv_r_sq;
         Self::new(
             self.val.atan2(x.val),
             self.dx * dy_darg.clone() + x.dx * dx_darg.clone(),
@@ -655,8 +673,8 @@ impl Numeric for Jet3 {
         let coeff = exp.val.raw_mul(inv_self);
         Self::new(
             val,
-            val * (exp.dx * ln_base + coeff.clone() * self.dx),
-            val * (exp.dy * ln_base + coeff.clone() * self.dy),
+            val * (exp.dx * ln_base + coeff * self.dx),
+            val * (exp.dy * ln_base + coeff * self.dy),
             val * (exp.dz * ln_base + coeff * self.dz),
         )
     }
@@ -674,7 +692,7 @@ impl Numeric for Jet3 {
 
     #[inline(always)]
     fn log2(self) -> Self {
-        let log2_e = Field::from(1.4426950408889634);
+        let log2_e = Field::from(1.442_695);
         let inv_val = Field::from(1.0) / self.val;
         let deriv_coeff = inv_val * log2_e;
         Self::new(
@@ -689,7 +707,7 @@ impl Numeric for Jet3 {
     fn exp2(self) -> Self {
         // Chain rule: (2^f)' = f' * 2^f * ln(2)
         // ln(2) ≈ 0.6931471805599453
-        let ln_2 = Field::from(0.6931471805599453);
+        let ln_2 = Field::from(0.693_147_2);
         let exp2_val = self.val.exp2();
         let deriv_coeff = exp2_val * ln_2;
         Self::new(
@@ -719,7 +737,7 @@ impl Numeric for Jet3 {
     #[inline(always)]
     fn recip(self) -> Self {
         let inv = self.val.recip();
-        let neg_inv_sq = Field::from(0.0) - inv.clone() * inv;
+        let neg_inv_sq = Field::from(0.0) - inv * inv;
         Self::new(
             inv,
             self.dx * neg_inv_sq.clone(),
@@ -756,7 +774,7 @@ impl Numeric for Jet3 {
     #[inline(always)]
     fn log10(self) -> Self {
         // Chain rule: (log10 f)' = f' / (f * ln(10))
-        let log10_e = Field::from(0.4342944819032518);
+        let log10_e = Field::from(0.434_294_5);
         let inv_val = Field::from(1.0) / self.val;
         let deriv_coeff = inv_val * log10_e;
         Self::new(
