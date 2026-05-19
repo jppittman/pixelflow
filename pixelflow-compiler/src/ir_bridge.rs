@@ -8,13 +8,13 @@
 //!
 //! The IR becomes the canonical representation, with AST only used during parsing.
 
-use crate::ast::{BinaryOp, Expr, UnaryOp};
+use crate::ast::{BinaryExpr, BinaryOp, Expr, LiteralExpr, UnaryOp};
 use pixelflow_ir::{Expr as IR, OpKind};
 use pixelflow_search::egraph::{EClassId, EGraph, ENode, ExprTree, Leaf, ops};
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use std::collections::HashMap;
-use syn::Lit;
+use syn::{Ident, Lit};
 
 // ============================================================================
 // AST → IR Conversion
@@ -70,7 +70,7 @@ pub fn ast_to_ir(expr: &Expr, param_indices: &HashMap<String, u8>) -> Result<IR,
             if let Some(val) = extract_f64_from_lit(&lit.lit) {
                 Ok(IR::Const(val as f32))
             } else {
-                Err("Non-numeric literal".to_string())
+                Err(format!("Non-numeric literal"))
             }
         }
 
@@ -94,7 +94,7 @@ pub fn ast_to_ir(expr: &Expr, param_indices: &HashMap<String, u8>) -> Result<IR,
 
             let op = match unary.op {
                 UnaryOp::Neg => OpKind::Neg,
-                UnaryOp::Not => return Err("Unsupported unary op: Not".to_string()),
+                UnaryOp::Not => return Err(format!("Unsupported unary op: Not")),
             };
 
             Ok(IR::Unary(op, operand))
@@ -156,7 +156,7 @@ pub fn ast_to_ir(expr: &Expr, param_indices: &HashMap<String, u8>) -> Result<IR,
         // Parentheses are transparent - just recurse into the inner expression
         Expr::Paren(inner) => ast_to_ir(inner, param_indices),
 
-        _ => Err("Unsupported expression type".to_string()),
+        _ => Err(format!("Unsupported expression type")),
     }
 }
 
@@ -293,7 +293,7 @@ pub fn egraph_to_ir(tree: &ExprTree) -> IR {
             };
 
             // Convert children
-            let child_irs: Vec<IR> = children.iter().map(egraph_to_ir).collect();
+            let child_irs: Vec<IR> = children.iter().map(|c| egraph_to_ir(c)).collect();
 
             match child_irs.len() {
                 1 => IR::Unary(kind, Box::new(child_irs[0].clone())),
