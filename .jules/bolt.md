@@ -13,6 +13,3 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
-## 2024-05-18 - DisplayControl::SetVisible Refactoring
-**Learning:** The `DisplayControl::SetVisible` variant in `pixelflow-runtime` currently has no senders/instantiations anywhere in the workspace codebase. When refactoring it to use an enum instead of a boolean, only the definition and the pattern-matching receivers in the platform backends needed to be updated.
-**Action:** Always comprehensively search for both definitions and usages when refactoring, but be aware that some API surface area may be unused or only used externally.

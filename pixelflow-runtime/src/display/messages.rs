@@ -80,15 +80,6 @@ pub enum DisplayData {
 /// - **Postcondition**: Window state is updated; operation may not be visible until next frame
 /// - **Queueing**: Burst-limited (subject to flow control, may queue)
 ///
-/// Defines the visibility state of a window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WindowVisibility {
-    /// The window is visible.
-    Show,
-    /// The window is hidden.
-    Hide,
-}
-
 /// # Control Message Types
 #[derive(Debug, Clone)]
 pub enum DisplayControl {
@@ -176,11 +167,8 @@ pub enum DisplayControl {
     /// # Arguments
     ///
     /// - `id`: Window identifier
-    /// - `visibility`: The intended visibility state
-    SetVisible {
-        id: WindowId,
-        visibility: WindowVisibility,
-    },
+    /// - `visible`: `true` to show, `false` to hide
+    SetVisible { id: WindowId, visible: bool },
 
     /// Request an immediate redraw.
     ///
