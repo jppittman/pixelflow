@@ -13,9 +13,9 @@
 //!
 //! No iteration. Nesting is occlusion.
 
-use pixelflow_compiler::{kernel, ManifoldExpr};
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::*;
+use pixelflow_compiler::{kernel, ManifoldExpr};
 
 /// The standard 4D Field domain type.
 type Field4 = (Field, Field, Field, Field);
@@ -365,7 +365,7 @@ kernel!(pub struct Surface = |geometry: kernel, material: kernel, background: ke
     let valid_t = (V(t) > 0.0) & (V(t) < t_max);
     let deriv_mag_sq = DX(t) * DX(t) + DY(t) * DY(t) + DZ(t) * DZ(t);
     let valid_deriv = deriv_mag_sq < (deriv_max * deriv_max);
-    let mask = valid_t & valid_deriv;
+    let mask = (valid_t & valid_deriv).constant();
 
     // 3. Hit point: P = ray * t (always computed; Select short-circuits if mask is all-false)
     let hx = X * t;
@@ -391,7 +391,7 @@ kernel!(pub struct ColorSurface = |geometry: kernel, material: kernel, backgroun
     let valid_t = (V(t) > 0.0) & (V(t) < t_max);
     let deriv_mag_sq = DX(t) * DX(t) + DY(t) * DY(t) + DZ(t) * DZ(t);
     let valid_deriv = deriv_mag_sq < (deriv_max * deriv_max);
-    let mask = valid_t & valid_deriv;
+    let mask = (valid_t & valid_deriv).constant();
 
     // 3. Hit point: P = ray * t (always computed; Select short-circuits if mask is all-false)
     let hx = X * t;
@@ -1136,10 +1136,7 @@ impl<C: ManifoldCompat<Field, Output = Discrete>> Manifold<Jet3_4> for ColorChec
         // Coverage: how much of the pixel is in this cell vs neighbor
         let zero = Field::from(0.0);
         let one = Field::from(1.0);
-        let coverage = (dist_to_edge / pixel_size)
-            .min(one.clone())
-            .max(zero)
-            .constant();
+        let coverage = (dist_to_edge / pixel_size).min(one.clone()).max(zero).constant();
 
         // Select and blend colors
         let r_base = is_even.clone().select(ra.clone(), rb.clone());
