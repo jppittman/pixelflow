@@ -360,7 +360,7 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
             if matches!(call.receiver.as_ref(), Expr::Verbatim(_))
                 && call.args.iter().any(|arg| expr_references_any(arg, local_names)) {
                     return true;
-                }
+            }
             // Check if this is a method on a captured variable (not X, Y, Z, W)
             if let Expr::Ident(ident) = call.receiver.as_ref() {
                 let name = ident.name.to_string();
@@ -1530,12 +1530,8 @@ fn simplify_algebraic(binary: &BinaryExpr) -> Option<Expr> {
                 return Some(*binary.rhs.clone());
             }
         }
-        BinaryOp::Sub => {
-            // x - 0 = x
-            if is_zero(rhs_val) {
-                return Some(*binary.lhs.clone());
-            }
-        }
+        BinaryOp::Sub if is_zero(rhs_val) => return Some(*binary.lhs.clone()),
+        BinaryOp::Sub => {}
         BinaryOp::Mul => {
             // x * 1 = x
             if is_one(rhs_val) {
