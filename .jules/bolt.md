@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2024-05-18 - Refactoring SetVisible boolean flag to ShowWindow and HideWindow
+
+**Learning:** When refactoring a boolean argument into an enum to reveal caller intent, it's essential to locate and update all dispatch paths (e.g. `handle_control` matching) and implementation sites (e.g. macOS and Linux platform logic) to use the new variants.
+**Action:** Always search the codebase for the exact enum name (e.g., `DisplayControl::SetVisible`) to identify all consumers and update them.
