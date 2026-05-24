@@ -161,11 +161,11 @@ impl Manifold<Field4> for AnalyticalQuad {
 
             // X-coordinates at intersection points
             let x_plus = t_plus.clone() * t_plus.clone() * ax.clone() + t_plus.clone() * bx.clone() + cx.clone();
-            let x_minus = t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx;
+            let x_minus = t_minus.clone() * t_minus.clone() * ax.clone() + t_minus.clone() * bx.clone() + cx.clone();
 
             // Tangent dy/dt at each root for winding direction
             let dy_plus = t_plus.clone() * (2.0 * ay.clone()) + by.clone();
-            let dy_minus = t_minus.clone() * (2.0 * ay) + by;
+            let dy_minus = t_minus.clone() * (2.0 * ay.clone()) + by.clone();
 
             // Step: 1.0 if crossing is to the left of or at X
             let crossed_plus = (X >= x_plus).select(1.0, 0.0);
