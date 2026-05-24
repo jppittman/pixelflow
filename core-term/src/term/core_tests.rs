@@ -175,7 +175,7 @@ fn assert_screen_state(
 }
 
 #[test]
-fn it_should_print_a_single_ascii_character() {
+fn method_should_print_a_single_ascii_character() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
@@ -183,7 +183,7 @@ fn it_should_print_a_single_ascii_character() {
 }
 
 #[test]
-fn it_should_print_multiple_ascii_characters_on_one_line() {
+fn method_should_print_multiple_ascii_characters_on_one_line() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('H')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('e')));
@@ -195,7 +195,7 @@ fn it_should_print_multiple_ascii_characters_on_one_line() {
 }
 
 #[test]
-fn it_should_wrap_character_to_next_line_when_end_of_line_is_reached() {
+fn method_should_wrap_character_to_next_line_when_end_of_line_is_reached() {
     let mut term = create_test_emulator(5, 2);
     for char_code in '1'..='5' {
         // Prints "12345"
@@ -212,7 +212,7 @@ fn it_should_wrap_character_to_next_line_when_end_of_line_is_reached() {
 }
 
 #[test]
-fn it_should_overwrite_existing_characters() {
+fn method_should_overwrite_existing_characters() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Y')));
@@ -226,13 +226,15 @@ fn it_should_overwrite_existing_characters() {
 }
 
 #[test]
-fn it_should_print_a_single_multibyte_unicode_character() {
+fn method_should_print_a_single_multibyte_unicode_character() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["世        "], Some((0, 2)));
-    let glyph_1_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-    let glyph_2_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let glyph_1_wrapper =
+        get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present");
+    let glyph_2_wrapper =
+        get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present");
     match glyph_1_wrapper {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
         other => panic!("Expected WidePrimary '世' at (0,0), got {:?}", other),
@@ -249,15 +251,15 @@ fn it_should_print_a_single_multibyte_unicode_character() {
 }
 
 #[test]
-fn it_should_print_multiple_multibyte_unicode_characters() {
+fn method_should_print_multiple_multibyte_unicode_characters() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('你')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('好')));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["你好      "], Some((0, 4)));
 
-    let char1_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-    let char1_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let char1_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present");
+    let char1_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present");
     match char1_glyph1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '你'),
         _ => panic!("Expected WidePrimary at (0,0)"),
@@ -267,8 +269,8 @@ fn it_should_print_multiple_multibyte_unicode_characters() {
         "Expected WideSpacer at (0,1)"
     );
 
-    let char2_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 2).unwrap();
-    let char2_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 3).unwrap();
+    let char2_glyph1 = get_glyph_from_snapshot(&snapshot, 0, 2).expect("Value should be present");
+    let char2_glyph2 = get_glyph_from_snapshot(&snapshot, 0, 3).expect("Value should be present");
     match char2_glyph1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '好'),
         _ => panic!("Expected WidePrimary at (0,2)"),
@@ -280,7 +282,7 @@ fn it_should_print_multiple_multibyte_unicode_characters() {
 }
 
 #[test]
-fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
+fn method_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
@@ -288,14 +290,14 @@ fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["A世B      "], Some((0, 4)));
 
-    let glyph_a = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    let glyph_a = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present");
     match glyph_a {
         Glyph::Single(cell) => assert_eq!(cell.c, 'A'),
         _ => panic!("Expected Single 'A' at (0,0)"),
     }
 
-    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
-    let glyph_uni_2 = get_glyph_from_snapshot(&snapshot, 0, 2).unwrap();
+    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present");
+    let glyph_uni_2 = get_glyph_from_snapshot(&snapshot, 0, 2).expect("Value should be present");
     match glyph_uni_1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
         _ => panic!("Expected WidePrimary '世' at (0,1)"),
@@ -305,7 +307,7 @@ fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
         "Expected WideSpacer at (0,2)"
     );
 
-    let glyph_b = get_glyph_from_snapshot(&snapshot, 0, 3).unwrap();
+    let glyph_b = get_glyph_from_snapshot(&snapshot, 0, 3).expect("Value should be present");
     match glyph_b {
         Glyph::Single(cell) => assert_eq!(cell.c, 'B'),
         _ => panic!("Expected Single 'B' at (0,3)"),
@@ -313,7 +315,7 @@ fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
 }
 
 #[test]
-fn it_should_wrap_wide_character_correctly() {
+fn method_should_wrap_wide_character_correctly() {
     let mut term = create_test_emulator(3, 2);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
@@ -328,7 +330,7 @@ fn it_should_wrap_wide_character_correctly() {
 }
 
 #[test]
-fn it_should_not_print_second_half_of_wide_char_if_at_edge_and_no_wrap_mode_or_similar_logic() {
+fn method_should_not_print_second_half_of_wide_char_if_at_edge_and_no_wrap_mode_or_similar_logic() {
     let mut term = create_test_emulator(2, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
@@ -337,13 +339,14 @@ fn it_should_not_print_second_half_of_wide_char_if_at_edge_and_no_wrap_mode_or_s
     // Screen is "世". Cursor logical (0,2), physical (0,1).
     assert_screen_state(&snapshot, &["世"], Some((0, 1))); // assert_screen_state handles wide char checks
 
-    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    let glyph_uni_1 = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present");
     match glyph_uni_1 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
         _ => panic!("Expected WidePrimary '世' at (0,0)"),
     }
     if snapshot.dimensions.0 > 1 {
-        let glyph_uni_2 = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+        let glyph_uni_2 =
+            get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present");
         assert!(
             matches!(glyph_uni_2, Glyph::WideSpacer),
             "Expected WideSpacer at (0,1)"
@@ -352,7 +355,7 @@ fn it_should_not_print_second_half_of_wide_char_if_at_edge_and_no_wrap_mode_or_s
 }
 
 #[test]
-fn it_should_overwrite_first_half_of_wide_char_with_ascii() {
+fn method_should_overwrite_first_half_of_wide_char_with_ascii() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -362,12 +365,12 @@ fn it_should_overwrite_first_half_of_wide_char_with_ascii() {
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["X    "], Some((0, 1))); // assert_screen_state handles this
 
-    let glyph_x = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    let glyph_x = get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present");
     match glyph_x {
         Glyph::Single(cell) => assert_eq!(cell.c, 'X'),
         _ => panic!("Expected Single 'X' at (0,0)"),
     }
-    let glyph_after_x = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let glyph_after_x = get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present");
     match glyph_after_x {
         Glyph::Single(cell) => {
             assert_eq!(
@@ -384,7 +387,7 @@ fn it_should_overwrite_first_half_of_wide_char_with_ascii() {
 }
 
 #[test]
-fn it_should_overwrite_second_half_of_wide_char_with_ascii() {
+fn method_should_overwrite_second_half_of_wide_char_with_ascii() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -437,7 +440,7 @@ fn it_should_overwrite_second_half_of_wide_char_with_ascii() {
 }
 
 #[test]
-fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
+fn method_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
     let mut term = create_test_emulator(2, 2);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
@@ -467,10 +470,10 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
     let s4 = term.get_render_snapshot().expect("Snapshot was None");
     // Screen: ["世Z", "X "]. Cursor (0,2) (row 0, col 2)
     // Check s4 screen content directly
-    let glyph_s4_0_0 = get_glyph_from_snapshot(&s4, 0, 0).unwrap();
-    let glyph_s4_0_1 = get_glyph_from_snapshot(&s4, 0, 1).unwrap();
-    let glyph_s4_1_0 = get_glyph_from_snapshot(&s4, 1, 0).unwrap();
-    let glyph_s4_1_1 = get_glyph_from_snapshot(&s4, 1, 1).unwrap();
+    let glyph_s4_0_0 = get_glyph_from_snapshot(&s4, 0, 0).expect("Value should be present");
+    let glyph_s4_0_1 = get_glyph_from_snapshot(&s4, 0, 1).expect("Value should be present");
+    let glyph_s4_1_0 = get_glyph_from_snapshot(&s4, 1, 0).expect("Value should be present");
+    let glyph_s4_1_1 = get_glyph_from_snapshot(&s4, 1, 1).expect("Value should be present");
 
     match glyph_s4_0_0 {
         Glyph::WidePrimary(cell) => assert_eq!(cell.c, '世'),
@@ -496,7 +499,7 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
         "s4 cursor position mismatch"
     );
 
-    let glyph_at_0_0 = get_glyph_from_snapshot(&s4, 0, 0).unwrap();
+    let glyph_at_0_0 = get_glyph_from_snapshot(&s4, 0, 0).expect("Value should be present");
     assert!(
         matches!(glyph_at_0_0, Glyph::WidePrimary(_)),
         "Expected WidePrimary at (0,0)"
@@ -505,7 +508,7 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
         assert_eq!(cell.c, '世');
     }
 
-    let glyph_at_0_1 = get_glyph_from_snapshot(&s4, 0, 1).unwrap();
+    let glyph_at_0_1 = get_glyph_from_snapshot(&s4, 0, 1).expect("Value should be present");
     match glyph_at_0_1 {
         Glyph::Single(cell) => assert_eq!(cell.c, 'Z'),
         _ => panic!("Expected Single at (0,1)"),
@@ -515,7 +518,7 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
 
 // --- Line Feed (LF) Tests ---
 #[test]
-fn it_should_move_cursor_down_keeping_column_on_line_feed_if_lnm_is_off() {
+fn method_should_move_cursor_down_keeping_column_on_line_feed_if_lnm_is_off() {
     let mut term = create_test_emulator(10, 3); // LNM is off by default
                                                 // Explicitly disable Linefeed/Newline Mode - testing that LF doesn't do CR
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -553,7 +556,8 @@ fn it_should_move_cursor_down_keeping_column_on_line_feed_if_lnm_is_off() {
 }
 
 #[test]
-fn it_should_scroll_up_and_move_cursor_down_keeping_column_on_line_feed_at_bottom_if_lnm_is_off() {
+fn method_should_scroll_up_and_move_cursor_down_keeping_column_on_line_feed_at_bottom_if_lnm_is_off(
+) {
     let mut term = create_test_emulator(5, 2); // LNM is off by default
                                                // Explicitly disable Linefeed/Newline Mode - testing that LF doesn't do CR
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -582,7 +586,7 @@ fn it_should_scroll_up_and_move_cursor_down_keeping_column_on_line_feed_at_botto
 }
 
 #[test]
-fn it_should_move_cursor_down_and_to_col_0_on_line_feed_if_lnm_is_on() {
+fn method_should_move_cursor_down_and_to_col_0_on_line_feed_if_lnm_is_on() {
     let mut term = create_test_emulator(10, 3);
     // Enable Linefeed/Newline Mode - testing that LF does CR+LF
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(CsiCommand::SetMode(
@@ -620,7 +624,7 @@ fn it_should_move_cursor_down_and_to_col_0_on_line_feed_if_lnm_is_on() {
 }
 
 #[test]
-fn it_should_scroll_and_move_to_col_0_on_line_feed_at_bottom_if_lnm_is_on() {
+fn method_should_scroll_and_move_to_col_0_on_line_feed_at_bottom_if_lnm_is_on() {
     let mut term = create_test_emulator(5, 2);
     // Enable Linefeed/Newline Mode - testing that LF does CR+LF
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(CsiCommand::SetMode(
@@ -651,7 +655,7 @@ fn it_should_scroll_and_move_to_col_0_on_line_feed_at_bottom_if_lnm_is_on() {
 
 // --- Carriage Return (CR) Test ---
 #[test]
-fn it_should_move_cursor_to_col_0_on_carriage_return() {
+fn method_should_move_cursor_to_col_0_on_carriage_return() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
@@ -668,7 +672,7 @@ fn it_should_move_cursor_to_col_0_on_carriage_return() {
 
 // --- Backspace (BS) Tests ---
 #[test]
-fn it_should_move_cursor_left_on_backspace() {
+fn method_should_move_cursor_left_on_backspace() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
@@ -683,7 +687,7 @@ fn it_should_move_cursor_left_on_backspace() {
 }
 
 #[test]
-fn it_should_not_wrap_cursor_on_backspace_at_start_of_line() {
+fn method_should_not_wrap_cursor_on_backspace_at_start_of_line() {
     let mut term = create_test_emulator(10, 2);
     // Explicitly disable Linefeed/Newline Mode - testing that LF doesn't do CR
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -710,7 +714,7 @@ fn it_should_not_wrap_cursor_on_backspace_at_start_of_line() {
 
 // --- Horizontal Tab (HT) Tests ---
 #[test]
-fn it_should_move_cursor_to_next_tab_stop_on_horizontal_tab() {
+fn method_should_move_cursor_to_next_tab_stop_on_horizontal_tab() {
     let mut term = create_test_emulator(20, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
 
@@ -728,7 +732,7 @@ fn it_should_move_cursor_to_next_tab_stop_on_horizontal_tab() {
 }
 
 #[test]
-fn it_should_move_cursor_to_last_column_on_horizontal_tab_if_no_more_tab_stops() {
+fn method_should_move_cursor_to_last_column_on_horizontal_tab_if_no_more_tab_stops() {
     let mut term = create_test_emulator(10, 1);
     for i in 0..9 {
         term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(
@@ -745,7 +749,7 @@ fn it_should_move_cursor_to_last_column_on_horizontal_tab_if_no_more_tab_stops()
 
 // --- Escape (ESC) Test ---
 #[test]
-fn it_should_do_nothing_visible_on_escape_character() {
+fn method_should_do_nothing_visible_on_escape_character() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     let snapshot_before = term.get_render_snapshot().expect("Snapshot was None");
@@ -758,7 +762,7 @@ fn it_should_do_nothing_visible_on_escape_character() {
 
 // --- Cursor Up (CUU) ---
 #[test]
-fn it_should_move_cursor_up_by_n_lines_on_csi_cuu() {
+fn method_should_move_cursor_up_by_n_lines_on_csi_cuu() {
     let mut term = create_test_emulator(5, 3);
     // CUP is 1-based. Target row 3 (idx 2), col 3 (idx 2).
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -778,7 +782,7 @@ fn it_should_move_cursor_up_by_n_lines_on_csi_cuu() {
 }
 
 #[test]
-fn it_should_move_cursor_up_by_1_line_on_csi_cuu_with_param_0_or_1() {
+fn method_should_move_cursor_up_by_1_line_on_csi_cuu_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 1),
@@ -807,7 +811,7 @@ fn it_should_move_cursor_up_by_1_line_on_csi_cuu_with_param_0_or_1() {
 }
 
 #[test]
-fn it_should_clamp_cursor_at_top_line_on_csi_cuu_if_move_is_too_far() {
+fn method_should_clamp_cursor_at_top_line_on_csi_cuu_if_move_is_too_far() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 1),
@@ -825,7 +829,7 @@ fn it_should_clamp_cursor_at_top_line_on_csi_cuu_if_move_is_too_far() {
 
 // --- Cursor Down (CUD) ---
 #[test]
-fn it_should_move_cursor_down_by_n_lines_on_csi_cud() {
+fn method_should_move_cursor_down_by_n_lines_on_csi_cud() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 3),
@@ -842,7 +846,7 @@ fn it_should_move_cursor_down_by_n_lines_on_csi_cud() {
 }
 
 #[test]
-fn it_should_move_cursor_down_by_1_line_on_csi_cud_with_param_0_or_1() {
+fn method_should_move_cursor_down_by_1_line_on_csi_cud_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 1),
@@ -871,7 +875,7 @@ fn it_should_move_cursor_down_by_1_line_on_csi_cud_with_param_0_or_1() {
 }
 
 #[test]
-fn it_should_clamp_cursor_at_bottom_line_on_csi_cud_if_move_is_too_far() {
+fn method_should_clamp_cursor_at_bottom_line_on_csi_cud_if_move_is_too_far() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(3, 1),
@@ -889,7 +893,7 @@ fn it_should_clamp_cursor_at_bottom_line_on_csi_cud_if_move_is_too_far() {
 
 // --- Cursor Forward (CUF) ---
 #[test]
-fn it_should_move_cursor_forward_by_n_cols_on_csi_cuf() {
+fn method_should_move_cursor_forward_by_n_cols_on_csi_cuf() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 1),
@@ -906,7 +910,7 @@ fn it_should_move_cursor_forward_by_n_cols_on_csi_cuf() {
 }
 
 #[test]
-fn it_should_move_cursor_forward_by_1_col_on_csi_cuf_with_param_0_or_1() {
+fn method_should_move_cursor_forward_by_1_col_on_csi_cuf_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 1),
@@ -935,7 +939,7 @@ fn it_should_move_cursor_forward_by_1_col_on_csi_cuf_with_param_0_or_1() {
 }
 
 #[test]
-fn it_should_clamp_cursor_at_last_col_on_csi_cuf_if_move_is_too_far() {
+fn method_should_clamp_cursor_at_last_col_on_csi_cuf_if_move_is_too_far() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 4),
@@ -953,7 +957,7 @@ fn it_should_clamp_cursor_at_last_col_on_csi_cuf_if_move_is_too_far() {
 
 // --- Cursor Back (CUB) ---
 #[test]
-fn it_should_move_cursor_back_by_n_cols_on_csi_cub() {
+fn method_should_move_cursor_back_by_n_cols_on_csi_cub() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 3),
@@ -970,7 +974,7 @@ fn it_should_move_cursor_back_by_n_cols_on_csi_cub() {
 }
 
 #[test]
-fn it_should_move_cursor_back_by_1_col_on_csi_cub_with_param_0_or_1() {
+fn method_should_move_cursor_back_by_1_col_on_csi_cub_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 2),
@@ -999,7 +1003,7 @@ fn it_should_move_cursor_back_by_1_col_on_csi_cub_with_param_0_or_1() {
 }
 
 #[test]
-fn it_should_clamp_cursor_at_first_col_on_csi_cub_if_move_is_too_far() {
+fn method_should_clamp_cursor_at_first_col_on_csi_cub_if_move_is_too_far() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 1),
@@ -1017,7 +1021,7 @@ fn it_should_clamp_cursor_at_first_col_on_csi_cub_if_move_is_too_far() {
 
 // --- Cursor Next Line (CNL) ---
 #[test]
-fn it_should_move_cursor_to_start_of_next_n_lines_on_csi_cnl() {
+fn method_should_move_cursor_to_start_of_next_n_lines_on_csi_cnl() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 3),
@@ -1034,7 +1038,7 @@ fn it_should_move_cursor_to_start_of_next_n_lines_on_csi_cnl() {
 }
 
 #[test]
-fn it_should_move_cursor_to_start_of_next_1_line_on_csi_cnl_with_param_0_or_1() {
+fn method_should_move_cursor_to_start_of_next_1_line_on_csi_cnl_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 3),
@@ -1063,7 +1067,7 @@ fn it_should_move_cursor_to_start_of_next_1_line_on_csi_cnl_with_param_0_or_1() 
 }
 
 #[test]
-fn it_should_clamp_cursor_at_start_of_last_line_on_csi_cnl_if_move_is_too_far() {
+fn method_should_clamp_cursor_at_start_of_last_line_on_csi_cnl_if_move_is_too_far() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 3),
@@ -1081,7 +1085,7 @@ fn it_should_clamp_cursor_at_start_of_last_line_on_csi_cnl_if_move_is_too_far() 
 
 // --- Cursor Previous Line (CPL) ---
 #[test]
-fn it_should_move_cursor_to_start_of_previous_n_lines_on_csi_cpl() {
+fn method_should_move_cursor_to_start_of_previous_n_lines_on_csi_cpl() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(3, 3),
@@ -1098,7 +1102,7 @@ fn it_should_move_cursor_to_start_of_previous_n_lines_on_csi_cpl() {
 }
 
 #[test]
-fn it_should_move_cursor_to_start_of_previous_1_line_on_csi_cpl_with_param_0_or_1() {
+fn method_should_move_cursor_to_start_of_previous_1_line_on_csi_cpl_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 3),
@@ -1127,7 +1131,7 @@ fn it_should_move_cursor_to_start_of_previous_1_line_on_csi_cpl_with_param_0_or_
 }
 
 #[test]
-fn it_should_clamp_cursor_at_start_of_first_line_on_csi_cpl_if_move_is_too_far() {
+fn method_should_clamp_cursor_at_start_of_first_line_on_csi_cpl_if_move_is_too_far() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 3),
@@ -1145,7 +1149,7 @@ fn it_should_clamp_cursor_at_start_of_first_line_on_csi_cpl_if_move_is_too_far()
 
 // --- Cursor Horizontal Absolute (CHA) ---
 #[test]
-fn it_should_move_cursor_to_col_n_on_csi_cha() {
+fn method_should_move_cursor_to_col_n_on_csi_cha() {
     let mut term = create_test_emulator(10, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 1),
@@ -1162,7 +1166,7 @@ fn it_should_move_cursor_to_col_n_on_csi_cha() {
 }
 
 #[test]
-fn it_should_move_cursor_to_col_1_on_csi_cha_with_param_0_or_1() {
+fn method_should_move_cursor_to_col_1_on_csi_cha_with_param_0_or_1() {
     let mut term = create_test_emulator(10, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 5),
@@ -1191,7 +1195,7 @@ fn it_should_move_cursor_to_col_1_on_csi_cha_with_param_0_or_1() {
 }
 
 #[test]
-fn it_should_clamp_cursor_at_last_col_on_csi_cha_if_move_is_too_far() {
+fn method_should_clamp_cursor_at_last_col_on_csi_cha_if_move_is_too_far() {
     let mut term = create_test_emulator(5, 3);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 1),
@@ -1209,7 +1213,7 @@ fn it_should_clamp_cursor_at_last_col_on_csi_cha_if_move_is_too_far() {
 
 // --- Cursor Position (CUP) ---
 #[test]
-fn it_should_move_cursor_to_row_n_col_m_on_csi_cup() {
+fn method_should_move_cursor_to_row_n_col_m_on_csi_cup() {
     let mut term = create_test_emulator(10, 5);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(3, 4),
@@ -1228,7 +1232,7 @@ fn it_should_move_cursor_to_row_n_col_m_on_csi_cup() {
 }
 
 #[test]
-fn it_should_move_cursor_to_origin_on_csi_cup_with_params_0_0_or_1_1_or_missing() {
+fn method_should_move_cursor_to_origin_on_csi_cup_with_params_0_0_or_1_1_or_missing() {
     let mut term = create_test_emulator(10, 5);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(3, 4),
@@ -1291,7 +1295,7 @@ fn setup_ed_el_screen(term: &mut TerminalEmulator, width: usize, height: usize) 
 }
 
 #[test]
-fn it_should_erase_from_cursor_to_end_of_screen_on_csi_0j_or_csi_j() {
+fn method_should_erase_from_cursor_to_end_of_screen_on_csi_0j_or_csi_j() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor at (1,2) (0-indexed) after setup
 
@@ -1315,7 +1319,7 @@ fn it_should_erase_from_cursor_to_end_of_screen_on_csi_0j_or_csi_j() {
 }
 
 #[test]
-fn it_should_erase_from_cursor_to_beginning_of_screen_on_csi_1j() {
+fn method_should_erase_from_cursor_to_beginning_of_screen_on_csi_1j() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor at (1,2)
 
@@ -1327,7 +1331,7 @@ fn it_should_erase_from_cursor_to_beginning_of_screen_on_csi_1j() {
 }
 
 #[test]
-fn it_should_erase_entire_screen_on_csi_2j() {
+fn method_should_erase_entire_screen_on_csi_2j() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor at (1,2)
 
@@ -1340,7 +1344,7 @@ fn it_should_erase_entire_screen_on_csi_2j() {
 
 // --- Erase in Line (EL) ---
 #[test]
-fn it_should_erase_from_cursor_to_end_of_line_on_csi_0k_or_csi_k() {
+fn method_should_erase_from_cursor_to_end_of_line_on_csi_0k_or_csi_k() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor (1,2)
 
@@ -1363,7 +1367,7 @@ fn it_should_erase_from_cursor_to_end_of_line_on_csi_0k_or_csi_k() {
 }
 
 #[test]
-fn it_should_erase_from_cursor_to_beginning_of_line_on_csi_1k() {
+fn method_should_erase_from_cursor_to_beginning_of_line_on_csi_1k() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor (1,2)
 
@@ -1375,7 +1379,7 @@ fn it_should_erase_from_cursor_to_beginning_of_line_on_csi_1k() {
 }
 
 #[test]
-fn it_should_erase_entire_line_on_csi_2k() {
+fn method_should_erase_entire_line_on_csi_2k() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor (1,2)
 
@@ -1387,7 +1391,7 @@ fn it_should_erase_entire_line_on_csi_2k() {
 }
 
 #[test]
-fn it_should_not_change_cursor_position_after_ed_or_el() {
+fn method_should_not_change_cursor_position_after_ed_or_el() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3);
     let initial_cursor_state_tuple = term
@@ -1489,7 +1493,7 @@ fn it_should_not_change_cursor_position_after_ed_or_el() {
 
 // --- Scroll Up (SU) ---
 #[test]
-fn it_should_scroll_up_entire_screen_by_n_lines_on_csi_s() {
+fn method_should_scroll_up_entire_screen_by_n_lines_on_csi_s() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor at (1,2)
                                          // Screen: L0:ABCAB, L1:BCDBC, L2:CDECD
@@ -1512,7 +1516,7 @@ fn it_should_scroll_up_entire_screen_by_n_lines_on_csi_s() {
 }
 
 #[test]
-fn it_should_scroll_up_entire_screen_by_1_line_on_csi_s_with_param_0_or_1() {
+fn method_should_scroll_up_entire_screen_by_1_line_on_csi_s_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor at (1,2)
     let initial_screen_line0_char0 = get_glyph_from_snapshot(
@@ -1520,7 +1524,7 @@ fn it_should_scroll_up_entire_screen_by_1_line_on_csi_s_with_param_0_or_1() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Value should be present")
     .display_char();
     assert_eq!(initial_screen_line0_char0, 'A');
 
@@ -1547,7 +1551,7 @@ fn it_should_scroll_up_entire_screen_by_1_line_on_csi_s_with_param_0_or_1() {
 }
 
 #[test]
-fn it_should_scroll_up_within_scrolling_region_on_csi_s() {
+fn method_should_scroll_up_within_scrolling_region_on_csi_s() {
     let mut term = create_test_emulator(5, 4); // L0, L1, L2, L3
     setup_ed_el_screen(&mut term, 5, 4); // Cursor at (1,2) (0-idx for row 1)
                                          // Screen: L0:ABCAB, L1:BCDBC, L2:CDECD, L3:DEFDE
@@ -1562,7 +1566,7 @@ fn it_should_scroll_up_within_scrolling_region_on_csi_s() {
         .expect("Snapshot was None")
         .cursor_state
         .map(|cs| (cs.y, cs.x))
-        .unwrap();
+        .expect("Value should be present");
     assert_eq!(
         cursor_after_stbm,
         (0, 0),
@@ -1597,7 +1601,7 @@ fn it_should_scroll_up_within_scrolling_region_on_csi_s() {
 
 // --- Scroll Down (SD) ---
 #[test]
-fn it_should_scroll_down_entire_screen_by_n_lines_on_csi_t() {
+fn method_should_scroll_down_entire_screen_by_n_lines_on_csi_t() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor at (1,2)
                                          // Screen: L0:ABCAB, L1:BCDBC, L2:CDECD
@@ -1620,7 +1624,7 @@ fn it_should_scroll_down_entire_screen_by_n_lines_on_csi_t() {
 }
 
 #[test]
-fn it_should_scroll_down_entire_screen_by_1_line_on_csi_t_with_param_0_or_1() {
+fn method_should_scroll_down_entire_screen_by_1_line_on_csi_t_with_param_0_or_1() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor at (1,2)
 
@@ -1647,7 +1651,7 @@ fn it_should_scroll_down_entire_screen_by_1_line_on_csi_t_with_param_0_or_1() {
 }
 
 #[test]
-fn it_should_scroll_down_within_scrolling_region_on_csi_t() {
+fn method_should_scroll_down_within_scrolling_region_on_csi_t() {
     let mut term = create_test_emulator(5, 4);
     setup_ed_el_screen(&mut term, 5, 4); // Cursor at (1,2)
                                          // Screen: L0:ABCAB, L1:BCDBC, L2:CDECD, L3:DEFDE
@@ -1661,7 +1665,7 @@ fn it_should_scroll_down_within_scrolling_region_on_csi_t() {
         .expect("Snapshot was None")
         .cursor_state
         .map(|cs| (cs.y, cs.x))
-        .unwrap();
+        .expect("Value should be present");
     assert_eq!(
         cursor_after_stbm,
         (0, 0),
@@ -1695,7 +1699,7 @@ fn it_should_scroll_down_within_scrolling_region_on_csi_t() {
 }
 
 #[test]
-fn it_should_not_change_cursor_position_on_csi_s_or_csi_t() {
+fn method_should_not_change_cursor_position_on_csi_s_or_csi_t() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // Cursor (1,2)
     let initial_cursor_state_tuple = term
@@ -1745,7 +1749,7 @@ fn it_should_not_change_cursor_position_on_csi_s_or_csi_t() {
 // --- Resize Event Tests ---
 
 #[test]
-fn it_should_resize_to_larger_dimensions_preserving_content_and_cursor() {
+fn method_should_resize_to_larger_dimensions_preserving_content_and_cursor() {
     let mut term = create_test_emulator(5, 2);
     setup_ed_el_screen(&mut term, 5, 2); // L0:ABCAB, L1:BCDBC. Cursor set to (1,2) by setup_ed_el_screen for 5x2.
                                          // Initial state check
@@ -1779,7 +1783,7 @@ fn it_should_resize_to_larger_dimensions_preserving_content_and_cursor() {
 }
 
 #[test]
-fn it_should_resize_to_smaller_dimensions_truncating_content_and_clamping_cursor() {
+fn method_should_resize_to_smaller_dimensions_truncating_content_and_clamping_cursor() {
     let mut term = create_test_emulator(5, 3);
     setup_ed_el_screen(&mut term, 5, 3); // L0:ABCAB, L1:BCDBC, L2:CDECD, Cursor (1,2)
                                          // Initial state check
@@ -1806,7 +1810,7 @@ fn it_should_resize_to_smaller_dimensions_truncating_content_and_clamping_cursor
 }
 
 #[test]
-fn it_should_clamp_cursor_to_new_bottom_right_if_cursor_was_beyond_after_shrink() {
+fn method_should_clamp_cursor_to_new_bottom_right_if_cursor_was_beyond_after_shrink() {
     let mut term = create_test_emulator(5, 3);
     // Place cursor at bottom right (2,4)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -1831,7 +1835,7 @@ fn it_should_clamp_cursor_to_new_bottom_right_if_cursor_was_beyond_after_shrink(
 }
 
 #[test]
-fn it_should_handle_resize_with_content_and_cursor_at_edges() {
+fn method_should_handle_resize_with_content_and_cursor_at_edges() {
     let mut term = create_test_emulator(3, 2);
     // Fill screen and place cursor at bottom right (1,2)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
@@ -1877,7 +1881,7 @@ fn it_should_handle_resize_with_content_and_cursor_at_edges() {
 
 // DECTCEM - Text Cursor Enable Mode (CSI ? 25 h/l)
 #[test]
-fn it_should_show_and_hide_cursor_on_dectcem() {
+fn method_should_show_and_hide_cursor_on_dectcem() {
     let mut term = create_test_emulator(5, 3);
 
     // Cursor should be visible by default (DECTCEM is typically on by default)
@@ -1912,7 +1916,10 @@ fn it_should_show_and_hide_cursor_on_dectcem() {
     );
     // Ensure shape is restored (assuming Block is default)
     assert_eq!(
-        snapshot_shown.cursor_state.unwrap().shape,
+        snapshot_shown
+            .cursor_state
+            .expect("Value should be present")
+            .shape,
         CursorShape::Block
     );
 }
@@ -1923,7 +1930,7 @@ fn it_should_show_and_hide_cursor_on_dectcem() {
 // DecModeConstant::AltScreenBuffer (47)
 // Let's test 1049 as it's more common for full save/restore/clear behavior.
 #[test]
-fn it_should_switch_to_alternate_screen_buffer_and_back_on_csi_1049() {
+fn method_should_switch_to_alternate_screen_buffer_and_back_on_csi_1049() {
     let mut term = create_test_emulator(5, 2);
     setup_ed_el_screen(&mut term, 5, 2); // L0: ABCAB, L1: BCDBC, Cursor (0,2)
     let original_snapshot = term.get_render_snapshot().expect("Snapshot was None");
@@ -1969,7 +1976,7 @@ fn it_should_switch_to_alternate_screen_buffer_and_back_on_csi_1049() {
 
 // Auto Wrap Mode (DECAWM) (CSI ? 7 h/l)
 #[test]
-fn it_should_enable_and_disable_autowrap_mode_on_decawm() {
+fn method_should_enable_and_disable_autowrap_mode_on_decawm() {
     let mut term = create_test_emulator(3, 2); // Small width to test wrap easily
 
     // DECAWM is on by default in emulator
@@ -2031,7 +2038,7 @@ fn it_should_enable_and_disable_autowrap_mode_on_decawm() {
 // --- OSC (Operating System Command) Tests ---
 
 #[test]
-fn it_should_set_window_title_on_osc_0_sequence() {
+fn method_should_set_window_title_on_osc_0_sequence() {
     let mut term = create_test_emulator(10, 1);
     let title = "My Window Title via OSC 0";
     let osc_command_bytes = format!("0;{}", title).into_bytes(); // OSC P s ; P t ST -> P s = 0, P t = title
@@ -2046,7 +2053,7 @@ fn it_should_set_window_title_on_osc_0_sequence() {
 }
 
 #[test]
-fn it_should_set_window_title_on_osc_2_sequence() {
+fn method_should_set_window_title_on_osc_2_sequence() {
     let mut term = create_test_emulator(10, 1);
     let title = "Another Title via OSC 2";
     let osc_command_bytes = format!("2;{}", title).into_bytes(); // OSC P s ; P t ST -> P s = 2, P t = title
@@ -2061,7 +2068,7 @@ fn it_should_set_window_title_on_osc_2_sequence() {
 }
 
 #[test]
-fn it_should_handle_empty_title_string_in_osc_sequence() {
+fn method_should_handle_empty_title_string_in_osc_sequence() {
     let mut term = create_test_emulator(10, 1);
     let title = "";
     let osc_command_bytes = format!("2;{}", title).into_bytes();
@@ -2076,7 +2083,7 @@ fn it_should_handle_empty_title_string_in_osc_sequence() {
 }
 
 #[test]
-fn it_should_handle_osc_sequence_without_semicolon_for_title_setting_if_supported() {
+fn method_should_handle_osc_sequence_without_semicolon_for_title_setting_if_supported() {
     // Some terminals might interpret "OSC 0;title" and "OSC 0:title" or even "OSC 0 title"
     // The current OSC handler in osc_handler.rs specifically looks for ';'.
     // This test checks the documented behavior (parsing up to ';').
@@ -2123,7 +2130,7 @@ fn it_should_handle_osc_sequence_without_semicolon_for_title_setting_if_supporte
 }
 
 #[test]
-fn it_should_ignore_osc_sequences_for_unsupported_ps_codes_for_title() {
+fn method_should_ignore_osc_sequences_for_unsupported_ps_codes_for_title() {
     let mut term = create_test_emulator(10, 1);
     let title = "A Title";
     // Using Ps = 3, which is not standard for window title.
@@ -2148,7 +2155,7 @@ fn it_should_ignore_osc_sequences_for_unsupported_ps_codes_for_title() {
 // --- SGR (Select Graphic Rendition) Tests ---
 
 #[test]
-fn it_should_reset_all_attributes_on_sgr_0() {
+fn method_should_reset_all_attributes_on_sgr_0() {
     let mut term = create_test_emulator(10, 1);
     // Set some attributes first
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -2167,8 +2174,10 @@ fn it_should_reset_all_attributes_on_sgr_0() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Print after reset
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let glyph_a_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-    let glyph_b_wrapper = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    let glyph_a_wrapper =
+        get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present");
+    let glyph_b_wrapper =
+        get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present");
 
     let (attr_a, attr_b) = match (glyph_a_wrapper, glyph_b_wrapper) {
         (Glyph::Single(cell_a), Glyph::Single(cell_b)) => (cell_a.attr, cell_b.attr),
@@ -2194,7 +2203,7 @@ fn it_should_reset_all_attributes_on_sgr_0() {
 
 // --- Intensity ---
 #[test]
-fn it_should_set_bold_on_sgr_1_and_reset_on_sgr_22() {
+fn method_should_set_bold_on_sgr_1_and_reset_on_sgr_22() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Bold]),
@@ -2208,11 +2217,11 @@ fn it_should_set_bold_on_sgr_1_and_reset_on_sgr_22() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2233,7 +2242,7 @@ fn it_should_set_bold_on_sgr_1_and_reset_on_sgr_22() {
 }
 
 #[test]
-fn it_should_set_faint_on_sgr_2_and_reset_on_sgr_22() {
+fn method_should_set_faint_on_sgr_2_and_reset_on_sgr_22() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Faint]),
@@ -2247,11 +2256,11 @@ fn it_should_set_faint_on_sgr_2_and_reset_on_sgr_22() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2272,7 +2281,7 @@ fn it_should_set_faint_on_sgr_2_and_reset_on_sgr_22() {
 
 // --- Italic ---
 #[test]
-fn it_should_set_italic_on_sgr_3_and_reset_on_sgr_23() {
+fn method_should_set_italic_on_sgr_3_and_reset_on_sgr_23() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Italic]),
@@ -2285,11 +2294,11 @@ fn it_should_set_italic_on_sgr_3_and_reset_on_sgr_23() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2306,7 +2315,7 @@ fn it_should_set_italic_on_sgr_3_and_reset_on_sgr_23() {
 
 // --- Underline ---
 #[test]
-fn it_should_set_underline_on_sgr_4_and_reset_on_sgr_24() {
+fn method_should_set_underline_on_sgr_4_and_reset_on_sgr_24() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Underline]),
@@ -2319,11 +2328,11 @@ fn it_should_set_underline_on_sgr_4_and_reset_on_sgr_24() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2340,7 +2349,7 @@ fn it_should_set_underline_on_sgr_4_and_reset_on_sgr_24() {
 
 // --- Foreground Colors ---
 #[test]
-fn it_should_set_basic_ansi_foreground_colors_sgr_30_37() {
+fn method_should_set_basic_ansi_foreground_colors_sgr_30_37() {
     let mut term = create_test_emulator(8, 1);
     let colors = vec![
         NamedColor::Black,
@@ -2362,7 +2371,8 @@ fn it_should_set_basic_ansi_foreground_colors_sgr_30_37() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper =
+            get_glyph_from_snapshot(&snapshot, 0, i).expect("Value should be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2379,7 +2389,7 @@ fn it_should_set_basic_ansi_foreground_colors_sgr_30_37() {
 }
 
 #[test]
-fn it_should_set_bright_ansi_foreground_colors_sgr_90_97() {
+fn method_should_set_bright_ansi_foreground_colors_sgr_90_97() {
     let mut term = create_test_emulator(8, 1);
     let bright_colors = vec![
         NamedColor::BrightBlack,
@@ -2403,7 +2413,8 @@ fn it_should_set_bright_ansi_foreground_colors_sgr_90_97() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in bright_colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper =
+            get_glyph_from_snapshot(&snapshot, 0, i).expect("Value should be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2420,7 +2431,7 @@ fn it_should_set_bright_ansi_foreground_colors_sgr_90_97() {
 }
 
 #[test]
-fn it_should_set_indexed_foreground_color_sgr_38_5_n() {
+fn method_should_set_indexed_foreground_color_sgr_38_5_n() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Foreground(Color::Indexed(123))]),
@@ -2431,7 +2442,7 @@ fn it_should_set_indexed_foreground_color_sgr_38_5_n() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Value should be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2440,7 +2451,7 @@ fn it_should_set_indexed_foreground_color_sgr_38_5_n() {
 }
 
 #[test]
-fn it_should_set_rgb_foreground_color_sgr_38_2_r_g_b() {
+fn method_should_set_rgb_foreground_color_sgr_38_2_r_g_b() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Foreground(Color::Rgb(10, 20, 30))]),
@@ -2451,7 +2462,7 @@ fn it_should_set_rgb_foreground_color_sgr_38_2_r_g_b() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Value should be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2460,7 +2471,7 @@ fn it_should_set_rgb_foreground_color_sgr_38_2_r_g_b() {
 }
 
 #[test]
-fn it_should_reset_foreground_color_on_sgr_39() {
+fn method_should_reset_foreground_color_on_sgr_39() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Foreground(Color::Named(
@@ -2475,11 +2486,11 @@ fn it_should_reset_foreground_color_on_sgr_39() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Default fg 'B'
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2490,7 +2501,7 @@ fn it_should_reset_foreground_color_on_sgr_39() {
 
 // --- Background Colors ---
 #[test]
-fn it_should_set_basic_ansi_background_colors_sgr_40_47() {
+fn method_should_set_basic_ansi_background_colors_sgr_40_47() {
     let mut term = create_test_emulator(8, 1);
     let colors = vec![
         NamedColor::Black,
@@ -2512,7 +2523,8 @@ fn it_should_set_basic_ansi_background_colors_sgr_40_47() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper =
+            get_glyph_from_snapshot(&snapshot, 0, i).expect("Value should be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2529,7 +2541,7 @@ fn it_should_set_basic_ansi_background_colors_sgr_40_47() {
 }
 
 #[test]
-fn it_should_set_bright_ansi_background_colors_sgr_100_107() {
+fn method_should_set_bright_ansi_background_colors_sgr_100_107() {
     let mut term = create_test_emulator(8, 1);
     let bright_colors = vec![
         NamedColor::BrightBlack,
@@ -2553,7 +2565,8 @@ fn it_should_set_bright_ansi_background_colors_sgr_100_107() {
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in bright_colors.iter().enumerate() {
-        let glyph_wrapper = get_glyph_from_snapshot(&snapshot, 0, i).unwrap();
+        let glyph_wrapper =
+            get_glyph_from_snapshot(&snapshot, 0, i).expect("Value should be present");
         match glyph_wrapper {
             Glyph::Single(cell) => {
                 assert_eq!(cell.c, ('A' as u8 + i as u8) as char);
@@ -2570,7 +2583,7 @@ fn it_should_set_bright_ansi_background_colors_sgr_100_107() {
 }
 
 #[test]
-fn it_should_set_indexed_background_color_sgr_48_5_n() {
+fn method_should_set_indexed_background_color_sgr_48_5_n() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Background(Color::Indexed(201))]),
@@ -2581,7 +2594,7 @@ fn it_should_set_indexed_background_color_sgr_48_5_n() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Value should be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2590,7 +2603,7 @@ fn it_should_set_indexed_background_color_sgr_48_5_n() {
 }
 
 #[test]
-fn it_should_set_rgb_background_color_sgr_48_2_r_g_b() {
+fn method_should_set_rgb_background_color_sgr_48_2_r_g_b() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Background(Color::Rgb(40, 50, 60))]),
@@ -2601,7 +2614,7 @@ fn it_should_set_rgb_background_color_sgr_48_2_r_g_b() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Value should be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2610,7 +2623,7 @@ fn it_should_set_rgb_background_color_sgr_48_2_r_g_b() {
 }
 
 #[test]
-fn it_should_reset_background_color_on_sgr_49() {
+fn method_should_reset_background_color_on_sgr_49() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Background(Color::Named(
@@ -2625,11 +2638,11 @@ fn it_should_reset_background_color_on_sgr_49() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Default bg 'B'
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2640,7 +2653,7 @@ fn it_should_reset_background_color_on_sgr_49() {
 
 // --- Inverse ---
 #[test]
-fn it_should_set_inverse_on_sgr_7_and_reset_on_sgr_27() {
+fn method_should_set_inverse_on_sgr_7_and_reset_on_sgr_27() {
     let mut term = create_test_emulator(5, 1);
     // Set specific fg/bg to see inversion clearly
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -2661,11 +2674,11 @@ fn it_should_set_inverse_on_sgr_7_and_reset_on_sgr_27() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Not inverse B: fg=Red, bg=Blue
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+    let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
-    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).unwrap() {
+    let attr_b = match get_glyph_from_snapshot(&snapshot, 0, 1).expect("Value should be present") {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
     };
@@ -2690,7 +2703,7 @@ fn it_should_set_inverse_on_sgr_7_and_reset_on_sgr_27() {
 
 // --- Multiple Attributes ---
 #[test]
-fn it_should_set_multiple_attributes_in_one_sgr_sequence() {
+fn method_should_set_multiple_attributes_in_one_sgr_sequence() {
     let mut term = create_test_emulator(5, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![
@@ -2707,7 +2720,7 @@ fn it_should_set_multiple_attributes_in_one_sgr_sequence() {
         0,
         0,
     )
-    .unwrap()
+    .expect("Value should be present")
     {
         Glyph::Single(c) => c.attr,
         _ => panic!("Expected Single"),
@@ -2720,7 +2733,7 @@ fn it_should_set_multiple_attributes_in_one_sgr_sequence() {
 }
 
 #[test]
-fn it_should_clamp_cursor_on_csi_cup_if_params_are_out_of_bounds() {
+fn method_should_clamp_cursor_on_csi_cup_if_params_are_out_of_bounds() {
     let mut term = create_test_emulator(5, 3);
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -2752,7 +2765,7 @@ fn it_should_clamp_cursor_on_csi_cup_if_params_are_out_of_bounds() {
 }
 
 #[test]
-fn it_should_handle_csi_cup_with_origin_mode_decom() {
+fn method_should_handle_csi_cup_with_origin_mode_decom() {
     let mut term = create_test_emulator(10, 5);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetScrollingRegion { top: 2, bottom: 4 },
