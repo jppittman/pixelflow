@@ -118,7 +118,7 @@ fn read_from_pty_with_timeout(pty: &mut NixPty, expected_str: &str) -> Result<St
 }
 
 #[test]
-fn method_should_succeed_when_pty_spawn_successful() {
+fn test_pty_spawn_successful() {
     // Use sh -c to be more robust across platforms and ensure output flushing
     let config = PtyConfig {
         command_executable: "/bin/sh",
@@ -156,7 +156,7 @@ fn method_should_succeed_when_pty_spawn_successful() {
 }
 
 #[test]
-fn method_should_succeed_when_pty_read_write_interaction() {
+fn test_pty_read_write_interaction() {
     let shell_command = "read r_line; echo \"input was: $r_line\"";
     let config = PtyConfig {
         command_executable: "/bin/sh",
@@ -197,7 +197,7 @@ fn method_should_succeed_when_pty_read_write_interaction() {
 }
 
 #[test]
-fn method_should_succeed_when_pty_resize_successful() {
+fn test_pty_resize_successful() {
     // Use `sleep` from PATH to be cross-platform (macOS has /bin/sleep, Linux /usr/bin/sleep)
     let config = PtyConfig {
         command_executable: "sleep",
@@ -235,7 +235,7 @@ fn method_should_succeed_when_pty_resize_successful() {
 }
 
 #[test]
-fn method_should_succeed_when_pty_child_termination_on_drop() {
+fn test_pty_child_termination_on_drop() {
     let config = PtyConfig {
         command_executable: "sleep",
         args: &["2"], // Arg for sleep is just the duration
@@ -295,7 +295,7 @@ fn method_should_succeed_when_pty_child_termination_on_drop() {
 }
 
 #[test]
-fn method_should_succeed_when_pty_spawn_invalid_command() {
+fn test_pty_spawn_invalid_command() {
     let non_existent_cmd = "/path/to/absolutely/nonexistent/command_39291az";
     let config = PtyConfig {
         command_executable: non_existent_cmd,

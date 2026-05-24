@@ -18,7 +18,7 @@ fn process_bytes(bytes: &[u8]) -> Vec<AnsiCommand> {
 }
 
 #[test]
-fn method_should_process_a_simple_printable_string() {
+fn it_should_process_a_simple_printable_string() {
     let bytes = b"Hello, world!";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -42,14 +42,14 @@ fn method_should_process_a_simple_printable_string() {
 }
 
 #[test]
-fn method_should_process_c0_bel() {
+fn it_should_process_c0_bel() {
     let bytes = b"\x07"; // BEL
     let commands = process_bytes(bytes);
     assert_eq!(commands, vec![AnsiCommand::C0Control(C0Control::BEL)]);
 }
 
 #[test]
-fn method_should_process_csi_h_as_cup_1_1() {
+fn it_should_process_csi_h_as_cup_1_1() {
     let bytes = b"\x1B[H"; // CSI H -> CUP (1, 1)
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -59,7 +59,7 @@ fn method_should_process_csi_h_as_cup_1_1() {
 }
 
 #[test]
-fn method_should_process_csi_sgr_reset() {
+fn it_should_process_csi_sgr_reset() {
     let bytes = b"\x1B[0m";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -71,7 +71,7 @@ fn method_should_process_csi_sgr_reset() {
 }
 
 #[test]
-fn method_should_process_csi_sgr_set_foreground() {
+fn it_should_process_csi_sgr_set_foreground() {
     let bytes = b"\x1B[34m";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -83,7 +83,7 @@ fn method_should_process_csi_sgr_set_foreground() {
 }
 
 #[test]
-fn method_should_process_dec_private_mode_reset_12_att610_cursor_blink() {
+fn it_should_process_dec_private_mode_reset_12_att610_cursor_blink() {
     let bytes = b"\x1b[?12l";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -94,7 +94,7 @@ fn method_should_process_dec_private_mode_reset_12_att610_cursor_blink() {
 }
 
 #[test]
-fn method_should_process_dec_private_mode_set_25_text_cursor_enable() {
+fn it_should_process_dec_private_mode_set_25_text_cursor_enable() {
     let bytes = b"\x1b[?25h";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -105,7 +105,7 @@ fn method_should_process_dec_private_mode_set_25_text_cursor_enable() {
 }
 
 #[test]
-fn method_should_process_dec_private_mode_reset_25_text_cursor_enable() {
+fn it_should_process_dec_private_mode_reset_25_text_cursor_enable() {
     let bytes = b"\x1b[?25l";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -116,7 +116,7 @@ fn method_should_process_dec_private_mode_reset_25_text_cursor_enable() {
 }
 
 #[test]
-fn method_should_process_various_dec_private_mouse_modes() {
+fn it_should_process_various_dec_private_mouse_modes() {
     let modes_to_test = vec![
         (1000, b"\x1b[?1000h", b"\x1b[?1000l", "XTERM_MOUSE_CLICK"),
         (
@@ -155,7 +155,7 @@ fn method_should_process_various_dec_private_mouse_modes() {
 }
 
 #[test]
-fn method_should_process_dec_private_mode_bracketed_paste_2004() {
+fn it_should_process_dec_private_mode_bracketed_paste_2004() {
     let bytes_set = b"\x1b[?2004h";
     let commands_set = process_bytes(bytes_set);
     assert_eq!(
@@ -174,7 +174,7 @@ fn method_should_process_dec_private_mode_bracketed_paste_2004() {
 }
 
 #[test]
-fn method_should_process_dec_private_mode_focus_event_1004() {
+fn it_should_process_dec_private_mode_focus_event_1004() {
     let bytes_set = b"\x1b[?1004h";
     let commands_set = process_bytes(bytes_set);
     assert_eq!(
@@ -193,7 +193,7 @@ fn method_should_process_dec_private_mode_focus_event_1004() {
 }
 
 #[test]
-fn method_should_process_dec_private_mode_uncommon_7727() {
+fn it_should_process_dec_private_mode_uncommon_7727() {
     let bytes = b"\x1b[?7727l";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -204,7 +204,7 @@ fn method_should_process_dec_private_mode_uncommon_7727() {
 }
 
 #[test]
-fn method_should_process_csi_set_cursor_style_decscusr() {
+fn it_should_process_csi_set_cursor_style_decscusr() {
     let bytes_steady_block = b"\x1b[2 q";
     let commands_steady_block = process_bytes(bytes_steady_block);
     assert_eq!(
@@ -231,7 +231,7 @@ fn method_should_process_csi_set_cursor_style_decscusr() {
 }
 
 #[test]
-fn method_should_process_csi_window_manipulation_t() {
+fn it_should_process_csi_window_manipulation_t() {
     let bytes_23_0_0_t = b"\x1b[23;0;0t";
     let commands_23_0_0_t = process_bytes(bytes_23_0_0_t);
     assert_eq!(
@@ -270,7 +270,7 @@ fn method_should_process_csi_window_manipulation_t() {
 }
 
 #[test]
-fn method_should_process_csi_sequence_fragmented_across_param_bytes() {
+fn it_should_process_csi_sequence_fragmented_across_param_bytes() {
     let mut processor = AnsiProcessor::new();
     let commands_frag1 = processor.process_bytes(b"\x1B[1");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ 1)");
@@ -283,7 +283,7 @@ fn method_should_process_csi_sequence_fragmented_across_param_bytes() {
 }
 
 #[test]
-fn method_should_process_csi_sequence_fragmented_across_intermediate_bytes() {
+fn it_should_process_csi_sequence_fragmented_across_intermediate_bytes() {
     let mut processor = AnsiProcessor::new();
     let commands_frag1 = processor.process_bytes(b"\x1B[?");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ ?)");
@@ -296,7 +296,7 @@ fn method_should_process_csi_sequence_fragmented_across_intermediate_bytes() {
 }
 
 #[test]
-fn method_should_process_csi_sequence_fragmented_after_esc() {
+fn it_should_process_csi_sequence_fragmented_after_esc() {
     let mut processor = AnsiProcessor::new();
     let commands_frag1 = processor.process_bytes(b"\x1B");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC)");
@@ -309,7 +309,7 @@ fn method_should_process_csi_sequence_fragmented_after_esc() {
 }
 
 #[test]
-fn method_should_process_string_interspersed_with_fragmented_csi() {
+fn it_should_process_string_interspersed_with_fragmented_csi() {
     let mut processor = AnsiProcessor::new();
     let commands_frag1 = processor.process_bytes(b"Hello ");
     assert_eq!(
@@ -345,7 +345,7 @@ fn method_should_process_string_interspersed_with_fragmented_csi() {
 }
 
 #[test]
-fn method_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
+fn it_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
     // This test demonstrates how AnsiProcessor (which calls lexer.finalize()
     // within its process_bytes) handles UTF-8 fragments delivered in separate calls.
     let mut processor_refined = AnsiProcessor::new();
@@ -388,7 +388,7 @@ fn method_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
 }
 
 #[test]
-fn method_should_complete_csi_if_final_byte_arrives_after_params() {
+fn it_should_complete_csi_if_final_byte_arrives_after_params() {
     let mut processor = AnsiProcessor::new();
     let commands_frag1 = processor.process_bytes(b"\x1B[31");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ 31)");
@@ -407,7 +407,7 @@ fn method_should_complete_csi_if_final_byte_arrives_after_params() {
 }
 
 #[test]
-fn method_should_complete_osc_if_terminator_arrives_after_string_fragment() {
+fn it_should_complete_osc_if_terminator_arrives_after_string_fragment() {
     let mut processor = AnsiProcessor::new();
     let commands_frag1 = processor.process_bytes(b"\x1B]0;Ti");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC ] 0 ; Ti)");
@@ -420,7 +420,7 @@ fn method_should_complete_osc_if_terminator_arrives_after_string_fragment() {
 }
 
 #[test]
-fn method_should_complete_dcs_if_terminator_arrives_after_string_fragment() {
+fn it_should_complete_dcs_if_terminator_arrives_after_string_fragment() {
     let mut processor = AnsiProcessor::new();
     let commands_frag1 = processor.process_bytes(b"\x1BPSt");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC P St)");
@@ -435,14 +435,14 @@ fn method_should_complete_dcs_if_terminator_arrives_after_string_fragment() {
 // --- String Sequence Tests ---
 
 #[test]
-fn method_should_process_osc_string_terminated_by_bel() {
+fn it_should_process_osc_string_terminated_by_bel() {
     let bytes = b"\x1B]0;Set Title\x07";
     let commands = process_bytes(bytes);
     assert_eq!(commands, vec![AnsiCommand::Osc(b"0;Set Title".to_vec())]);
 }
 
 #[test]
-fn method_should_process_osc_string_terminated_by_st() {
+fn it_should_process_osc_string_terminated_by_st() {
     let bytes = b"\x1B]2;Another Title\x1B\\";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -452,21 +452,21 @@ fn method_should_process_osc_string_terminated_by_st() {
 }
 
 #[test]
-fn method_should_process_dcs_string_terminated_by_st() {
+fn it_should_process_dcs_string_terminated_by_st() {
     let bytes = b"\x1BP1;1$rText\x1B\\";
     let commands = process_bytes(bytes);
     assert_eq!(commands, vec![AnsiCommand::Dcs(b"1;1$rText".to_vec())]);
 }
 
 #[test]
-fn method_should_process_pm_string_terminated_by_st() {
+fn it_should_process_pm_string_terminated_by_st() {
     let bytes = b"\x1B^Privacy Message\x1B\\";
     let commands = process_bytes(bytes);
     assert_eq!(commands, vec![AnsiCommand::Pm(b"Privacy Message".to_vec())]);
 }
 
 #[test]
-fn method_should_process_apc_string_terminated_by_st() {
+fn it_should_process_apc_string_terminated_by_st() {
     let bytes = b"\x1B_Application Command\x1B\\";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -478,14 +478,14 @@ fn method_should_process_apc_string_terminated_by_st() {
 // --- Edge Case / Error Tests ---
 
 #[test]
-fn method_should_process_empty_input_as_no_commands() {
+fn it_should_process_empty_input_as_no_commands() {
     let bytes = b"";
     let commands = process_bytes(bytes);
     assert!(commands.is_empty());
 }
 
 #[test]
-fn method_should_buffer_incomplete_csi_sequence() {
+fn it_should_buffer_incomplete_csi_sequence() {
     let bytes = b"\x1B[1;2"; // Incomplete CSI
     let commands = process_bytes(bytes);
     // AnsiProcessor calls finalize, which might clear incomplete CSI state
@@ -498,14 +498,14 @@ fn method_should_buffer_incomplete_csi_sequence() {
 }
 
 #[test]
-fn method_should_process_csi_with_invalid_final_byte_as_error() {
+fn it_should_process_csi_with_invalid_final_byte_as_error() {
     let bytes = b"\x1B[31a"; // 'a' is not a valid CSI final byte
     let commands = process_bytes(bytes);
     assert_eq!(commands, vec![AnsiCommand::Error(b'a')]);
 }
 
 #[test]
-fn method_should_buffer_incomplete_osc_sequence() {
+fn it_should_buffer_incomplete_osc_sequence() {
     let bytes = b"\x1B]0;Title"; // Incomplete OSC
     let commands = process_bytes(bytes);
     assert!(
@@ -515,7 +515,7 @@ fn method_should_buffer_incomplete_osc_sequence() {
 }
 
 #[test]
-fn method_should_buffer_incomplete_dcs_sequence() {
+fn it_should_buffer_incomplete_dcs_sequence() {
     let bytes = b"\x1BPStuff"; // Incomplete DCS
     let commands = process_bytes(bytes);
     assert!(
@@ -525,7 +525,7 @@ fn method_should_buffer_incomplete_dcs_sequence() {
 }
 
 #[test]
-fn method_should_terminate_osc_on_bel_and_process_subsequent_chars() {
+fn it_should_terminate_osc_on_bel_and_process_subsequent_chars() {
     let bytes = b"\x1B]0;String\x08with\x07BEL"; // BEL (0x07) terminates OSC
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -540,7 +540,7 @@ fn method_should_terminate_osc_on_bel_and_process_subsequent_chars() {
 }
 
 #[test]
-fn method_should_abort_osc_on_esc_and_process_subsequent_commands() {
+fn it_should_abort_osc_on_esc_and_process_subsequent_commands() {
     let bytes = b"\x1B]0;String\x1B\x07BEL"; // ESC (0x1B) aborts OSC
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -556,7 +556,7 @@ fn method_should_abort_osc_on_esc_and_process_subsequent_commands() {
 }
 
 #[test]
-fn method_should_include_c0_controls_within_dcs_data() {
+fn it_should_include_c0_controls_within_dcs_data() {
     let bytes = b"\x1BPString\x08with\x0BC0\x1B\\"; // C0 controls are part of DCS data
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -566,7 +566,7 @@ fn method_should_include_c0_controls_within_dcs_data() {
 }
 
 #[test]
-fn method_should_abort_dcs_on_esc_and_process_subsequent_st() {
+fn it_should_abort_dcs_on_esc_and_process_subsequent_st() {
     let bytes = b"\x1BPString\x1B\x1B\\"; // First ESC aborts DCS, second ESC + \ is ST
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -579,7 +579,7 @@ fn method_should_abort_dcs_on_esc_and_process_subsequent_st() {
 }
 
 #[test]
-fn method_should_not_process_st_in_ground_state() {
+fn it_should_not_process_st_in_ground_state() {
     let bytes_esc_st = b"\x1B\\"; // ST (ESC \)
     let commands_esc_st = process_bytes(bytes_esc_st);
     assert_eq!(commands_esc_st, vec![AnsiCommand::StringTerminator]);
@@ -594,7 +594,7 @@ fn method_should_not_process_st_in_ground_state() {
 }
 
 #[test]
-fn method_should_abort_csi_on_esc_and_process_subsequent_csi() {
+fn it_should_abort_csi_on_esc_and_process_subsequent_csi() {
     let bytes = b"\x1B[1;2\x1B[3m"; // ESC aborts first CSI, second CSI is processed
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -634,7 +634,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_esc_c_ris_after_interrupted_utf8() {
+    fn it_should_handle_esc_c_ris_after_interrupted_utf8() {
         let bytes = &[0xE2, ESC, CHAR_C_BYTE]; // Incomplete '€', then ESC c
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -648,7 +648,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_c0_bel_and_char_after_interrupted_utf8() {
+    fn it_should_handle_c0_bel_and_char_after_interrupted_utf8() {
         let bytes = &[0xF0, BEL_BYTE, CHAR_A_BYTE]; // Incomplete '😀', then BEL, then 'A'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -663,7 +663,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_decode_valid_utf8_containing_c1_byte_value_for_ind_and_then_char() {
+    fn it_should_decode_valid_utf8_containing_c1_byte_value_for_ind_and_then_char() {
         let bytes = &[0xE2, 0x82, IND_C1_BYTE, CHAR_B_BYTE]; // E2 82 84 is '₄' (U+2084)
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -674,7 +674,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_complex_interruptions_and_valid_chars_in_sequence() {
+    fn it_should_handle_complex_interruptions_and_valid_chars_in_sequence() {
         let bytes = &[
             0xE2,        // Start of '€'
             ESC,         // ESC (interrupts '€')
@@ -696,7 +696,7 @@ mod unicode_wide_tests {
         if AnsiCommand::from_esc('A').is_none() {
             expected_commands.push(AnsiCommand::Print('A'));
         } else {
-            expected_commands.push(AnsiCommand::from_esc('A').expect("Value should be present"));
+            expected_commands.push(AnsiCommand::from_esc('A').unwrap());
         }
         expected_commands.extend(vec![
             AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For interrupted 0xF0, 0x9F
@@ -708,14 +708,14 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_process_bel_correctly() {
+    fn it_should_process_bel_correctly() {
         let bytes = &[BEL_BYTE];
         let commands = process_bytes_unicode(bytes);
         assert_eq!(commands, vec![AnsiCommand::C0Control(C0Control::BEL)]);
     }
 
     #[test]
-    fn method_should_process_esc_c_ris_correctly() {
+    fn it_should_process_esc_c_ris_correctly() {
         let bytes = &[ESC, CHAR_C_BYTE];
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -725,7 +725,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_c0_nul_and_print_after_interrupted_utf8() {
+    fn it_should_handle_c0_nul_and_print_after_interrupted_utf8() {
         let bytes = &[0xE2, 0x82, NUL, CHAR_A_BYTE]; // Partial '€', NUL, 'A'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -739,7 +739,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_c0_etx_and_esc_sequence_after_interrupted_utf8() {
+    fn it_should_handle_c0_etx_and_esc_sequence_after_interrupted_utf8() {
         let bytes = &[0xF0, 0x9F, ETX, ESC, b'D']; // Partial '😀', ETX, ESC D (IND)
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -753,7 +753,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_decode_valid_utf8_containing_c1_byte_value_for_pad_and_then_char() {
+    fn it_should_decode_valid_utf8_containing_c1_byte_value_for_pad_and_then_char() {
         let bytes = &[0xC2, C1_PAD_BYTE, CHAR_A_BYTE]; // C2 80 is U+0080 (PAD control char)
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -766,7 +766,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_c1_st_and_char_after_interrupted_4_byte_utf8() {
+    fn it_should_handle_c1_st_and_char_after_interrupted_4_byte_utf8() {
         let bytes = &[0xF0, 0x9F, ST_C1_BYTE, CHAR_A_BYTE]; // Partial '😀', C1 ST (0x9C), 'A'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -782,7 +782,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_esc_ris_after_3_byte_utf8_interrupted_at_2nd_byte() {
+    fn it_should_handle_esc_ris_after_3_byte_utf8_interrupted_at_2nd_byte() {
         let bytes = &[0xE2, 0x82, ESC, CHAR_C_BYTE]; // Partial '€', ESC c
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -795,7 +795,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_esc_ris_after_4_byte_utf8_interrupted_at_1st_byte() {
+    fn it_should_handle_esc_ris_after_4_byte_utf8_interrupted_at_1st_byte() {
         let bytes = &[0xF0, ESC, CHAR_C_BYTE]; // Partial '😀', ESC c
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -808,7 +808,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_esc_ris_after_4_byte_utf8_interrupted_at_3rd_byte() {
+    fn it_should_handle_esc_ris_after_4_byte_utf8_interrupted_at_3rd_byte() {
         let bytes = &[0xF0, 0x9F, 0x98, ESC, CHAR_C_BYTE]; // Partial '😀', ESC c
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -821,7 +821,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_double_utf8_interruption_by_esc_then_c0() {
+    fn it_should_handle_double_utf8_interruption_by_esc_then_c0() {
         let bytes = &[0xE2, ESC, b'M', 0xF0, 0x9F, BEL_BYTE]; // Partial '€', ESC M (RI), Partial '😀', BEL
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -836,7 +836,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_invalid_utf8_continuation_followed_by_chars() {
+    fn it_should_handle_invalid_utf8_continuation_followed_by_chars() {
         let bytes = &[0xE2, 0x41, 0x42]; // 0xE2 (start €), 'A' (invalid cont.), 'B'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -850,7 +850,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_overlong_utf8_sequence_c1_af_as_replacement_chars() {
+    fn it_should_handle_overlong_utf8_sequence_c1_af_as_replacement_chars() {
         let bytes = &[0xC1, 0xAF]; // 0xC1 is invalid start, 0xAF is invalid start
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -863,7 +863,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_replace_incomplete_3_of_4_byte_utf8_at_stream_end() {
+    fn it_should_replace_incomplete_3_of_4_byte_utf8_at_stream_end() {
         let bytes = &[0xF0, 0x9F, 0x98]; // Incomplete '😀'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -873,7 +873,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_del_interrupting_utf8_then_char() {
+    fn it_should_handle_del_interrupting_utf8_then_char() {
         let bytes = &[0xE2, 0x7F, CHAR_A_BYTE]; // Partial '€', DEL (0x7F), 'A'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -887,7 +887,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_standalone_c1_nel_between_chars_as_replacement() {
+    fn it_should_handle_standalone_c1_nel_between_chars_as_replacement() {
         let bytes = &[0x41, 0x84, 0x42]; // A, NEL (C1), B
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -902,7 +902,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_c1_like_byte_as_part_of_invalid_utf8_sequence() {
+    fn it_should_handle_c1_like_byte_as_part_of_invalid_utf8_sequence() {
         let bytes = &[0xE2, 0x84, 0x41]; // Partial UTF-8 'E2', then 0x84 (C1 NEL), then 'A'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -917,7 +917,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_handle_c1_like_byte_in_invalid_4_byte_utf8_sequence() {
+    fn it_should_handle_c1_like_byte_in_invalid_4_byte_utf8_sequence() {
         let bytes = &[0xF0, 0x9F, 0x84, 0x41]; // Partial UTF-8, 0x84 (C1 NEL), 'A'
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -931,7 +931,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_correctly_decode_euro_sign_followed_by_char() {
+    fn it_should_correctly_decode_euro_sign_followed_by_char() {
         let bytes = &[0xE2, 0x82, 0xAC, 0x41]; // € then A
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -942,7 +942,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_replace_standalone_c1_ind_after_valid_utf8() {
+    fn it_should_replace_standalone_c1_ind_after_valid_utf8() {
         let bytes = &[0xE2, 0x82, 0xAC, 0x85, 0x41]; // € , IND (C1), A
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -957,7 +957,7 @@ mod unicode_wide_tests {
     }
 
     #[test]
-    fn method_should_ignore_sequence_of_standalone_c1_controls() {
+    fn it_should_ignore_sequence_of_standalone_c1_controls() {
         let bytes = &[0x41, 0x84, 0x85, 0x42]; // A, NEL (C1), IND (C1), B
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
@@ -974,7 +974,7 @@ mod unicode_wide_tests {
 }
 
 #[test]
-fn method_should_handle_esc_k_screen_title_sequence() {
+fn it_should_handle_esc_k_screen_title_sequence() {
     let bytes = b"\x1Bkls\x1B\\";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -985,7 +985,7 @@ fn method_should_handle_esc_k_screen_title_sequence() {
 }
 
 #[test]
-fn method_should_handle_esc_k_with_empty_title() {
+fn it_should_handle_esc_k_with_empty_title() {
     let bytes = b"\x1Bk\x1B\\";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -996,7 +996,7 @@ fn method_should_handle_esc_k_with_empty_title() {
 }
 
 #[test]
-fn method_should_handle_esc_k_with_longer_title() {
+fn it_should_handle_esc_k_with_longer_title() {
     let bytes = b"\x1Bkvim ~/.bashrc\x1B\\";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -1007,7 +1007,7 @@ fn method_should_handle_esc_k_with_longer_title() {
 }
 
 #[test]
-fn method_should_handle_text_before_and_after_esc_k_sequence() {
+fn it_should_handle_text_before_and_after_esc_k_sequence() {
     let bytes = b"Before\x1Bkls\x1B\\After";
     let commands = process_bytes(bytes);
     assert_eq!(
@@ -1033,7 +1033,7 @@ fn method_should_handle_text_before_and_after_esc_k_sequence() {
 // --- Character Set Designation Tests (ESC ( ) * + with final byte) ---
 
 #[test]
-fn method_should_process_esc_open_paren_b_usascii_charset() {
+fn it_should_process_esc_open_paren_b_usascii_charset() {
     // ESC ( B - Select US ASCII as G0 character set
     let bytes = b"\x1B(B";
     let commands = process_bytes(bytes);
@@ -1045,7 +1045,7 @@ fn method_should_process_esc_open_paren_b_usascii_charset() {
 }
 
 #[test]
-fn method_should_process_esc_open_paren_0_dec_graphics_charset() {
+fn it_should_process_esc_open_paren_0_dec_graphics_charset() {
     // ESC ( 0 - Select DEC Special Character and Line Drawing Set as G0
     let bytes = b"\x1B(0";
     let commands = process_bytes(bytes);
@@ -1057,7 +1057,7 @@ fn method_should_process_esc_open_paren_0_dec_graphics_charset() {
 }
 
 #[test]
-fn method_should_process_esc_close_paren_a_uk_charset() {
+fn it_should_process_esc_close_paren_a_uk_charset() {
     // ESC ) A - Select UK as G1 character set
     let bytes = b"\x1B)A";
     let commands = process_bytes(bytes);
@@ -1069,7 +1069,7 @@ fn method_should_process_esc_close_paren_a_uk_charset() {
 }
 
 #[test]
-fn method_should_process_esc_star_with_dec_supplemental() {
+fn it_should_process_esc_star_with_dec_supplemental() {
     // ESC * < - Select DEC Supplemental as G2
     let bytes = b"\x1B*<";
     let commands = process_bytes(bytes);
@@ -1081,7 +1081,7 @@ fn method_should_process_esc_star_with_dec_supplemental() {
 }
 
 #[test]
-fn method_should_process_esc_plus_with_dec_technical() {
+fn it_should_process_esc_plus_with_dec_technical() {
     // ESC + > - Select DEC Technical as G3
     let bytes = b"\x1B+>";
     let commands = process_bytes(bytes);
@@ -1093,7 +1093,7 @@ fn method_should_process_esc_plus_with_dec_technical() {
 }
 
 #[test]
-fn method_should_process_charset_designator_boundary_low() {
+fn it_should_process_charset_designator_boundary_low() {
     // ESC ( 0 - '0' is 0x30, the lowest valid charset designator
     let bytes = b"\x1B(0";
     let commands = process_bytes(bytes);
@@ -1105,7 +1105,7 @@ fn method_should_process_charset_designator_boundary_low() {
 }
 
 #[test]
-fn method_should_process_charset_designator_boundary_high() {
+fn it_should_process_charset_designator_boundary_high() {
     // ESC ( ~ - '~' is 0x7E, the highest valid charset designator
     let bytes = b"\x1B(~";
     let commands = process_bytes(bytes);
@@ -1117,7 +1117,7 @@ fn method_should_process_charset_designator_boundary_high() {
 }
 
 #[test]
-fn method_should_process_charset_special_designators() {
+fn it_should_process_charset_special_designators() {
     // Test special characters that are valid charset designators
     let test_cases = [
         (':', "colon"),
@@ -1151,7 +1151,7 @@ fn method_should_process_charset_special_designators() {
 }
 
 #[test]
-fn method_should_reject_charset_designator_below_valid_range() {
+fn it_should_reject_charset_designator_below_valid_range() {
     // ESC ( / - '/' is 0x2F, below the valid range (0x30-0x7E)
     let bytes = b"\x1B(/";
     let commands = process_bytes(bytes);
@@ -1165,7 +1165,7 @@ fn method_should_reject_charset_designator_below_valid_range() {
 }
 
 #[test]
-fn method_should_reject_charset_designator_above_valid_range() {
+fn it_should_reject_charset_designator_above_valid_range() {
     // ESC ( DEL - DEL is 0x7F, above the valid range (0x30-0x7E)
     let bytes = b"\x1B(\x7F";
     let commands = process_bytes(bytes);
@@ -1179,7 +1179,7 @@ fn method_should_reject_charset_designator_above_valid_range() {
 }
 
 #[test]
-fn method_should_reject_space_as_charset_designator() {
+fn it_should_reject_space_as_charset_designator() {
     // ESC ( SP - Space is 0x20, below the valid range
     let bytes = b"\x1B( ";
     let commands = process_bytes(bytes);
@@ -1659,50 +1659,74 @@ mod mutation_tests {
     #[test]
     fn csi_cursor_up_no_param_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[A");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]
+        );
     }
 
     #[test]
     fn csi_cursor_up_param_zero_is_coerced_to_1() {
         // param_or_1 applies max(1), so 0 -> 1
         let cmds = process_bytes(b"\x1b[0A");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]
+        );
     }
 
     #[test]
     fn csi_cursor_up_explicit_5() {
         let cmds = process_bytes(b"\x1b[5A");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(5))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorUp(5))]
+        );
     }
 
     #[test]
     fn csi_cursor_down_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[B");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorDown(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorDown(1))]
+        );
     }
 
     #[test]
     fn csi_cursor_forward_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[C");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorForward(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorForward(1))]
+        );
     }
 
     #[test]
     fn csi_cursor_backward_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[D");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorBackward(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorBackward(1))]
+        );
     }
 
     #[test]
     fn csi_cursor_next_line_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[E");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorNextLine(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorNextLine(1))]
+        );
     }
 
     #[test]
     fn csi_cursor_prev_line_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[F");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorPrevLine(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::CursorPrevLine(1))]
+        );
     }
 
     #[test]
@@ -1754,25 +1778,37 @@ mod mutation_tests {
     #[test]
     fn csi_erase_in_display_no_param_defaults_to_0() {
         let cmds = process_bytes(b"\x1b[J");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(0))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(0))]
+        );
     }
 
     #[test]
     fn csi_erase_in_display_explicit_2() {
         let cmds = process_bytes(b"\x1b[2J");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(2))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(2))]
+        );
     }
 
     #[test]
     fn csi_erase_in_line_no_param_defaults_to_0() {
         let cmds = process_bytes(b"\x1b[K");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInLine(0))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::EraseInLine(0))]
+        );
     }
 
     #[test]
     fn csi_erase_in_line_explicit_1() {
         let cmds = process_bytes(b"\x1b[1K");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInLine(1))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::EraseInLine(1))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1851,11 +1887,7 @@ mod mutation_tests {
         if let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() {
             // Checking len kills mutations that reduce MAX_PARAMS below 16.
             assert_eq!(attrs.len(), 16, "all 16 params must be retained");
-            assert_eq!(
-                attrs[0],
-                Attribute::Bold,
-                "first of 16 params should be Bold"
-            );
+            assert_eq!(attrs[0], Attribute::Bold, "first of 16 params should be Bold");
             assert_eq!(
                 attrs[1],
                 Attribute::Faint,
@@ -1871,7 +1903,8 @@ mod mutation_tests {
         // 16 zeros then ;7 (Reverse). The 17th param (7) must be ignored.
         // We send: ESC [ 0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m
         //          that's 16 zeros + 1 extra -> the 7 (Reverse) is the 17th and dropped.
-        let cmds = process_bytes(b"\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m");
+        let cmds =
+            process_bytes(b"\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m");
         if let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() {
             // Every kept attribute should be Reset (0); Reverse (7) must NOT appear.
             assert!(
@@ -2047,19 +2080,28 @@ mod mutation_tests {
     #[test]
     fn csi_ctc_0_is_set_tab_stop() {
         let cmds = process_bytes(b"\x1b[0W");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::SetTabStop)]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::SetTabStop)]
+        );
     }
 
     #[test]
     fn csi_ctc_2_clears_current_tab_stop() {
         let cmds = process_bytes(b"\x1b[2W");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(0))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(0))]
+        );
     }
 
     #[test]
     fn csi_ctc_5_clears_all_tab_stops() {
         let cmds = process_bytes(b"\x1b[5W");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(3))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(3))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2070,13 +2112,19 @@ mod mutation_tests {
     #[test]
     fn csi_s_uppercase_is_scroll_up() {
         let cmds = process_bytes(b"\x1b[3S");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ScrollUp(3))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::ScrollUp(3))]
+        );
     }
 
     #[test]
     fn csi_t_uppercase_is_scroll_down() {
         let cmds = process_bytes(b"\x1b[3T");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ScrollDown(3))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::ScrollDown(3))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2087,19 +2135,28 @@ mod mutation_tests {
     #[test]
     fn csi_at_is_insert_character() {
         let cmds = process_bytes(b"\x1b[2@");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::InsertCharacter(2))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::InsertCharacter(2))]
+        );
     }
 
     #[test]
     fn csi_p_uppercase_is_delete_character() {
         let cmds = process_bytes(b"\x1b[2P");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::DeleteCharacter(2))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::DeleteCharacter(2))]
+        );
     }
 
     #[test]
     fn csi_x_uppercase_is_erase_character() {
         let cmds = process_bytes(b"\x1b[2X");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseCharacter(2))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::EraseCharacter(2))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2109,13 +2166,19 @@ mod mutation_tests {
     #[test]
     fn csi_l_uppercase_is_insert_line() {
         let cmds = process_bytes(b"\x1b[4L");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::InsertLine(4))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::InsertLine(4))]
+        );
     }
 
     #[test]
     fn csi_m_uppercase_is_delete_line() {
         let cmds = process_bytes(b"\x1b[4M");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::DeleteLine(4))]);
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::DeleteLine(4))]
+        );
     }
 
     // -----------------------------------------------------------------------
