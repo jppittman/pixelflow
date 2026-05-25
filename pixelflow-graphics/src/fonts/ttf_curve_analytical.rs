@@ -133,11 +133,11 @@ impl Manifold<Field4> for AnalyticalQuad {
         if self.is_linear {
             // Degenerate: quadratic is a line. Solve by*t + (cy - Y) = 0
             let k = kernel!(|ax: f32, bx: f32, cx: f32, by: f32, cy: f32| {
-                let t = (Y - cy) / by;
-                let in_t = t.clone().ge(0.0) & t.clone().le(1.0);
+                let t_val = (Y - cy) / by;
+                let in_t = t_val.clone().ge(0.0) & t_val.clone().le(1.0);
 
                 // x-coordinate at intersection
-                let x_int = t.clone() * t.clone() * ax + t.clone() * bx + cx;
+                let x_int = t_val.clone() * t_val.clone() * ax + t_val.clone() * bx + cx;
 
                 // Step: 1.0 if crossing is to the left of or at X
                 let crossed = (X >= x_int).select(1.0, 0.0);
@@ -156,24 +156,24 @@ impl Manifold<Field4> for AnalyticalQuad {
             let sqrt_disc = disc.max(0.0).sqrt();
 
             // Two roots: t = (-by +/- sqrt(disc)) / (2*ay)
-            let t_plus = sqrt_disc.clone() * inv_2a.clone() + neg_b_2a.clone();
-            let t_minus = sqrt_disc * -inv_2a + neg_b_2a;
+            let t_p = sqrt_disc.clone() * inv_2a.clone() + neg_b_2a.clone();
+            let t_m = sqrt_disc * -inv_2a + neg_b_2a;
 
             // X-coordinates at intersection points
-            let x_plus = t_plus.clone() * t_plus.clone() * ax.clone() + t_plus.clone() * bx.clone() + cx.clone();
-            let x_minus = t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx;
+            let x_plus = t_p.clone() * t_p.clone() * ax.clone() + t_p.clone() * bx.clone() + cx.clone();
+            let x_minus = t_m.clone() * t_m.clone() * ax + t_m.clone() * bx + cx;
 
             // Tangent dy/dt at each root for winding direction
-            let dy_plus = t_plus.clone() * (2.0 * ay.clone()) + by.clone();
-            let dy_minus = t_minus.clone() * (2.0 * ay) + by;
+            let dy_plus = t_p.clone() * (2.0 * ay.clone()) + by.clone();
+            let dy_minus = t_m.clone() * (2.0 * ay) + by;
 
             // Step: 1.0 if crossing is to the left of or at X
             let crossed_plus = (X >= x_plus).select(1.0, 0.0);
             let crossed_minus = (X >= x_minus).select(1.0, 0.0);
 
             // Validity: only count roots with t in [0, 1]
-            let valid_plus = t_plus.clone().ge(0.0) & t_plus.clone().le(1.0);
-            let valid_minus = t_minus.clone().ge(0.0) & t_minus.clone().le(1.0);
+            let valid_plus = t_p.clone().ge(0.0) & t_p.clone().le(1.0);
+            let valid_minus = t_m.clone().ge(0.0) & t_m.clone().le(1.0);
 
             // Winding sign from tangent direction
             let sign_plus = dy_plus.gt(0.0).select(-1.0, 1.0);
