@@ -147,13 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_channels() {
-        let (_handle, _rx) = create_frame_channel::<TestSurface>();
-        let (_recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
-    }
-
-    #[test]
-    fn test_submit_and_receive() {
+    fn submit_frame_should_receive_packet_when_submitted() {
         let (handle, rx) = create_frame_channel::<TestSurface>();
         let (recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
 
@@ -167,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recycle_loop() {
+    fn recycle_should_send_packet_when_called() {
         let (handle, rx) = create_frame_channel::<TestSurface>();
         let (recycle_tx, recycle_rx) = create_recycle_channel::<TestSurface>();
 
