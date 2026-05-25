@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! # Expression Annotation Pass
 //!
 //! Transforms the raw AST into an annotated form where literals have their

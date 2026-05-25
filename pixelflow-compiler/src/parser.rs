@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! # Parser
 //!
 //! Parses the kernel DSL from token stream to AST.

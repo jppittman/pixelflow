@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! # Symbol Table
 //!
 //! The symbol table tracks all identifiers in scope during compilation.

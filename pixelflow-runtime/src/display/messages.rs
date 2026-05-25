@@ -156,31 +156,19 @@ pub enum DisplayControl {
     /// - `cursor`: Cursor icon (arrow, text, etc.)
     SetCursor { id: WindowId, cursor: CursorIcon },
 
-    /// Show the window.
+    /// Show or hide the window.
     ///
     /// # Contract
     ///
-    /// **Sender**: Requests to make the window visible.
+    /// **Sender**: Specifies visibility state.
     ///
-    /// **Receiver**: Shows the window.
+    /// **Receiver**: Shows or hides the window. Window remains in the taskbar/app switcher.
     ///
     /// # Arguments
     ///
     /// - `id`: Window identifier
-    ShowWindow { id: WindowId },
-
-    /// Hide the window.
-    ///
-    /// # Contract
-    ///
-    /// **Sender**: Requests to hide the window.
-    ///
-    /// **Receiver**: Hides the window. Window remains in the taskbar/app switcher.
-    ///
-    /// # Arguments
-    ///
-    /// - `id`: Window identifier
-    HideWindow { id: WindowId },
+    /// - `visible`: `true` to show, `false` to hide
+    SetVisible { id: WindowId, visible: bool },
 
     /// Request an immediate redraw.
     ///

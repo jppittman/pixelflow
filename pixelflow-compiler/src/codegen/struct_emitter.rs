@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! Builder pattern for generating struct definitions with Manifold impls.
 
 use proc_macro2::TokenStream;

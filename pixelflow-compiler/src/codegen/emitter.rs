@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! Core code emission logic for kernel compilation.
 
 use std::collections::{HashMap, HashSet};

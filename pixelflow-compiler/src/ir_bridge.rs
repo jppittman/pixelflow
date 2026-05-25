@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! Bridge between macro AST and pixelflow-ir.
 //!
 //! This module handles conversions between:

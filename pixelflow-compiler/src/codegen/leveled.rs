@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! # Leveled (BFS) Code Generation
 //!
 //! Emits code by evaluating expression trees level-by-level (breadth-first).

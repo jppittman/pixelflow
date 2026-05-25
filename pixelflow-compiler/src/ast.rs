@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! # Abstract Syntax Tree
 //!
 //! The AST represents the structure of a kernel expression after parsing.

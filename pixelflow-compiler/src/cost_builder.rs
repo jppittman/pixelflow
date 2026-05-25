@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(clippy::all)]
 //! Cost model builder using learned weights.
 //!
 //! Loads learned operation costs from `pixelflow-ml/data/learned_cost_model.toml`,
