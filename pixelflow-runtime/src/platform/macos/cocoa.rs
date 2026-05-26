@@ -265,10 +265,15 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn enable_layer(&self) {
         unsafe {
-            let val = if wants { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), YES);
+        }
+    }
+
+    pub fn disable_layer(&self) {
+        unsafe {
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), NO);
         }
     }
 
