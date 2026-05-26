@@ -16,8 +16,8 @@
 //! enabling CSE (common subexpression elimination) across the entire expression.
 
 use actor_scheduler::Message;
-use pixelflow_core::{Discrete, Field, Manifold};
 use pixelflow_compiler::kernel;
+use pixelflow_core::{Discrete, Field, Manifold};
 use pixelflow_runtime::api::private::EngineData;
 use pixelflow_runtime::api::public::{AppData, EngineEvent, EngineEventControl, EngineEventData};
 use pixelflow_runtime::platform::ColorCube;

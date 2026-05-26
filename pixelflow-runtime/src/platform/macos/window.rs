@@ -122,13 +122,14 @@ impl MacWindow {
         }
     }
 
-    pub fn set_visible(&mut self, visible: bool) {
-        if visible {
-            self.window.make_key_and_order_front();
-        } else {
-            unsafe {
-                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
+    pub fn set_visible(&mut self, state: crate::display::messages::ShowWindow) {
+        match state {
+            crate::display::messages::ShowWindow::Show => {
+                self.window.make_key_and_order_front();
             }
+            crate::display::messages::ShowWindow::Hide => unsafe {
+                sys::send::<()>(self.window.0, sys::sel(b"orderOut:\0"));
+            },
         }
     }
 

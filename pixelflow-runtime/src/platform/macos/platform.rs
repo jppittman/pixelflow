@@ -100,9 +100,9 @@ impl PlatformOps for MetalOps {
                     win.set_cursor(cursor);
                 }
             }
-            DisplayControl::SetVisible { id, visible } => {
+            DisplayControl::SetVisible { id, state } => {
                 if let Some(win) = self.windows.get_mut(&id) {
-                    win.set_visible(visible);
+                    win.set_visible(state);
                 }
             }
             DisplayControl::RequestRedraw { id } => {
@@ -164,7 +164,7 @@ impl PlatformOps for MetalOps {
             }
             DisplayMgmt::Destroy { id } => {
                 if let Some(mut win) = self.windows.remove(&id) {
-                    win.set_visible(false);
+                    win.set_visible(crate::display::messages::ShowWindow::Hide);
                     // Drop closes it implicitly or we call close
                     // win.window.close(); // If we expose it
                     self.window_map.remove(&(win.window.0 as usize));
