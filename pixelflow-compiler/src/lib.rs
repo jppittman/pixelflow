@@ -30,6 +30,7 @@ mod ast;
 mod codegen;
 mod element;
 mod ir_bridge;
+mod jit_backend;
 mod manifold_expr;
 mod optimize;
 mod parser;
@@ -111,7 +112,20 @@ pub fn kernel(input: TokenStream) -> TokenStream {
     // Phase 4: Optimization
     let optimized = optimize::optimize(analyzed);
 
-    // Phase 5: Code generation
+    // Phase 5: Code generation.
+    //
+    // NOTE: `kernel!` stays on the combinator backend. We cannot transparently
+    // route the "scalar `Field`" subset to the JIT, because combinator kernels
+    // are polymorphic over the *evaluation domain*: a kernel declared `-> Field`
+    // is still routinely evaluated over `Jet2`/`Jet3` domains for antialiasing
+    // and 3D surfaces (see `pixelflow-core/tests/test_sphere_debug.rs`). The JIT
+    // wrapper is monomorphic to `Manifold<(Field, Field, Field, Field)>`, so
+    // swapping it in drops that polymorphism. Making the swap transparent
+    // requires a dual-backend wrapper (JIT for the `Field` fast path, combinator
+    // for the jet paths); until then the JIT is reached only via `kernel_jit!`.
+    //
+    // The eligibility gate and shared codegen live in `jit_backend` and are
+    // exercised by `kernel_jit!`.
     codegen::emit(optimized).into()
 }
 
@@ -185,8 +199,6 @@ pub fn kernel_raw(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn kernel_jit(input: TokenStream) -> TokenStream {
-    use quote::quote;
-
     // Phase 1: Parse
     let tokens = proc_macro2::TokenStream::from(input);
     let kernel_ast = match parser::parse(tokens) {
@@ -202,121 +214,20 @@ pub fn kernel_jit(input: TokenStream) -> TokenStream {
 
     // Phase 3: Optimization (e-graph saturation + NNUE extraction at compile time)
     // Same optimization pipeline as kernel! — the only difference between
-    // kernel! and kernel_jit! should be the backend (LLVM vs JIT), not the
+    // kernel! and kernel_jit! is the backend (LLVM vs JIT), not the
     // optimization. This gives us FMA fusion, algebraic simplification,
     // CSE, rsqrt, etc. before the IR is emitted for runtime JIT compilation.
     let analyzed = optimize::optimize(analyzed);
 
-    // Phase 4: Collect scalar params in declaration order
-    let scalar_params: Vec<_> = analyzed
-        .def
-        .params
-        .iter()
-        .filter(|p| matches!(p.kind, ast::ParamKind::Scalar(_)))
-        .collect();
-
-    // Phase 5: Convert optimized body to arena IR (params become Param(i) nodes)
-    let param_map = ir_bridge::scalar_param_indices(&analyzed);
-    let arena_code = match ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map) {
-        Ok(code) => code,
-        Err(e) => {
-            return syn::Error::new(proc_macro2::Span::call_site(), e)
-                .to_compile_error()
-                .into();
-        }
-    };
-
-    if scalar_params.is_empty() {
-        // Zero-param: compile immediately, return JitManifold
-        let output = quote! {
-            {
-                let (__arena, __root) = #arena_code;
-                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root).map(|r| r.code)
-                    .expect("kernel_jit! JIT compilation failed");
-                let __jit = ::pixelflow_ir::JitManifold::new(__code);
-                // Wrap in a struct that implements Manifold in the user's crate
-                struct __JitWrapper(::pixelflow_ir::JitManifold);
-                impl ::pixelflow_core::Manifold<(
-                    ::pixelflow_core::Field,
-                    ::pixelflow_core::Field,
-                    ::pixelflow_core::Field,
-                    ::pixelflow_core::Field,
-                )> for __JitWrapper {
-                    type Output = ::pixelflow_core::Field;
-                    #[inline(always)]
-                    fn eval(&self, (x, y, z, w): (
-                        ::pixelflow_core::Field,
-                        ::pixelflow_core::Field,
-                        ::pixelflow_core::Field,
-                        ::pixelflow_core::Field,
-                    )) -> ::pixelflow_core::Field {
-                        unsafe {
-                            ::core::mem::transmute(
-                                self.0.call(
-                                    ::core::mem::transmute(x),
-                                    ::core::mem::transmute(y),
-                                    ::core::mem::transmute(z),
-                                    ::core::mem::transmute(w),
-                                )
-                            )
-                        }
-                    }
-                }
-                unsafe impl Send for __JitWrapper {}
-                unsafe impl Sync for __JitWrapper {}
-                __JitWrapper(__jit)
-            }
-        };
-        output.into()
-    } else {
-        // N-param: emit a builder closure
-        let param_names: Vec<proc_macro2::Ident> =
-            scalar_params.iter().map(|p| p.name.clone()).collect();
-        let param_types: Vec<proc_macro2::TokenStream> =
-            scalar_params.iter().map(|_| quote! { f32 }).collect();
-        // params slice in declaration order: first param = index 0
-        let param_slice = quote! { &[ #( #param_names as f32 ),* ] };
-
-        let output = quote! {
-            move | #( #param_names : #param_types ),* | {
-                let (mut __arena, __root) = #arena_code;
-                let __root = __arena.substitute_params(__root, #param_slice);
-                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root).map(|r| r.code)
-                    .expect("kernel_jit! JIT compilation failed");
-                let __jit = ::pixelflow_ir::JitManifold::new(__code);
-                struct __JitWrapper(::pixelflow_ir::JitManifold);
-                impl ::pixelflow_core::Manifold<(
-                    ::pixelflow_core::Field,
-                    ::pixelflow_core::Field,
-                    ::pixelflow_core::Field,
-                    ::pixelflow_core::Field,
-                )> for __JitWrapper {
-                    type Output = ::pixelflow_core::Field;
-                    #[inline(always)]
-                    fn eval(&self, (x, y, z, w): (
-                        ::pixelflow_core::Field,
-                        ::pixelflow_core::Field,
-                        ::pixelflow_core::Field,
-                        ::pixelflow_core::Field,
-                    )) -> ::pixelflow_core::Field {
-                        unsafe {
-                            ::core::mem::transmute(
-                                self.0.call(
-                                    ::core::mem::transmute(x),
-                                    ::core::mem::transmute(y),
-                                    ::core::mem::transmute(z),
-                                    ::core::mem::transmute(w),
-                                )
-                            )
-                        }
-                    }
-                }
-                unsafe impl Send for __JitWrapper {}
-                unsafe impl Sync for __JitWrapper {}
-                __JitWrapper(__jit)
-            }
-        };
-        output.into()
+    // Phase 4: JIT backend (shared with the eligible subset of `kernel!`).
+    // `kernel_jit!` returns the zero-param manifold value directly, and unlike
+    // `kernel!` it does not fall back — a lowering failure is a hard error,
+    // since the caller explicitly asked for the JIT.
+    match jit_backend::emit_jit(&analyzed, jit_backend::ZeroParam::Value) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => syn::Error::new(proc_macro2::Span::call_site(), e)
+            .to_compile_error()
+            .into(),
     }
 }
 

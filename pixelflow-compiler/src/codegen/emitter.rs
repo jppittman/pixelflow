@@ -417,9 +417,16 @@ impl<'a> CodeEmitter<'a> {
                     #std_imports
                     #peano_imports
 
+                    // The body embeds the manifold by value (`ContextFree`), and
+                    // `ManifoldBind` needs it too. Clone for the bind so both uses
+                    // are valid for non-`Copy` (JIT-backed) inner manifolds;
+                    // combinator manifolds are ZSTs, so the clone is free. UFCS
+                    // (not `.clone()`) so it type-checks against the still-
+                    // unresolved closure-parameter type.
+                    let __manifold_bind = ::core::clone::Clone::clone(&#manifold_name);
                     let __expr = { #body };
                     let __inner_body = WithContext::new(#context_tuple, __expr);
-                    ManifoldBind::new(#manifold_name, __inner_body)
+                    ManifoldBind::new(__manifold_bind, __inner_body)
                 }
             }
         } else if use_computed_fallback {
