@@ -1,8 +1,8 @@
 [package]
 name = "pixelflow-ir"
 version = "0.1.0"
-edition = "2024"
 description = "Unified Intermediate Representation and SIMD Backends for PixelFlow"
+edition = "2024"
 
 [lints]
 workspace = true
@@ -15,8 +15,5 @@ libm = "0.2.15"
 libc = "0.2"
 
 [features]
-default = ["std", "alloc"]
-std = ["alloc"]
-# The crate always links `alloc` (see `extern crate alloc`). This feature gates
-# the owned `Expr` tree API used by the x86-64 JIT emitter and arena bridge.
-alloc = []
+default = ["std"]
+std = []

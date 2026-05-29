@@ -5,7 +5,11 @@ bundle-run = "run --package xtask --release -- bundle-run"
 bake-eigen = "run --package xtask --release -- bake-eigen"
 
 [build]
-# Relaxed FP math for faster SIMD - allows FMA contraction and unsafe FP opts
+# Relaxed FP math for faster SIMD - allows FMA contraction and unsafe FP opts.
+# target-cpu=native enables the AVX-512/AVX2 backends the engine is designed
+# around (see pixelflow-core/src/lib.rs backend selection); without it the build
+# falls back to the lower-fidelity SSE2 path and numeric tests drift.
 rustflags = [
+    "-C", "target-cpu=native",
     "-C", "llvm-args=-fp-contract=fast",
 ]

@@ -36,9 +36,6 @@ pub mod x86_64;
 
 use crate::kind::OpKind;
 
-#[cfg(target_arch = "x86_64")]
-use crate::expr::Expr;
-
 use alloc::vec::Vec;
 
 /// Constant pool: maps f32 bit patterns to pool indices.
@@ -344,33 +341,33 @@ pub const RELOAD_REG: Reg = Reg(12);
 pub const RELOAD_REGS: [Reg; 2] = [Reg(11), Reg(12)];
 
 /// Sethi-Ullman label: minimum registers needed to evaluate this subtree.
-/// This is a catamorphism (fold) over the expression tree.
+/// This is a catamorphism (fold) over the arena DAG (read as a tree).
 #[cfg(target_arch = "x86_64")]
-pub fn needs(expr: &Expr) -> usize {
-    match expr {
+pub fn needs(arena: &crate::arena::ExprArena, id: crate::arena::ExprId) -> usize {
+    use crate::arena::ExprNode;
+    match *arena.node(id) {
         // Leaves need 1 register to hold their value
-        Expr::Var(_) => 1,
-        Expr::Const(_) => 1,
-        Expr::Param(i) => panic!(
-            "Expr::Param({}) reached the JIT emitter — call substitute_params before compile()",
+        ExprNode::Var(_) | ExprNode::Const(_) => 1,
+        ExprNode::Param(i) => panic!(
+            "Param({}) reached the JIT emitter — call substitute_params before compile()",
             i
         ),
 
         // Unary: same as child (result overwrites input)
-        Expr::Unary(_, child) => needs(child),
+        ExprNode::Unary(_, child) => needs(arena, child),
 
         // Binary: Sethi-Ullman magic
-        Expr::Binary(_, left, right) => {
-            let l = needs(left);
-            let r = needs(right);
+        ExprNode::Binary(_, left, right) => {
+            let l = needs(arena, left);
+            let r = needs(arena, right);
             if l == r { l + 1 } else { l.max(r) }
         }
 
         // Ternary: need to hold all three, then combine
-        Expr::Ternary(_, a, b, c) => {
-            let na = needs(a);
-            let nb = needs(b);
-            let nc = needs(c);
+        ExprNode::Ternary(_, a, b, c) => {
+            let na = needs(arena, a);
+            let nb = needs(arena, b);
+            let nc = needs(arena, c);
             // Conservative: max + ties
             let max = na.max(nb).max(nc);
             if (na == nb) || (nb == nc) || (na == nc) {
@@ -380,8 +377,9 @@ pub fn needs(expr: &Expr) -> usize {
             }
         }
 
-        Expr::Nary(_, children) => {
-            children.iter().map(needs).max().unwrap_or(0) + children.len() - 1
+        ExprNode::Nary(_, start, len) => {
+            let children = arena.nary_children_slice(start, len);
+            children.iter().map(|&c| needs(arena, c)).max().unwrap_or(0) + children.len() - 1
         }
     }
 }
@@ -391,78 +389,83 @@ pub fn needs(expr: &Expr) -> usize {
 // =============================================================================
 
 #[cfg(target_arch = "x86_64")]
-pub fn emit(expr: &Expr, depth: u8) -> Result<(Vec<u8>, Reg), &'static str> {
+pub fn emit(
+    arena: &crate::arena::ExprArena,
+    id: crate::arena::ExprId,
+    depth: u8,
+) -> Result<(Vec<u8>, Reg), &'static str> {
+    use crate::arena::ExprNode;
     use x86_64::*;
 
-    match expr {
-        Expr::Var(i) => {
-            if *i as usize >= INPUT_REGS.len() {
+    match *arena.node(id) {
+        ExprNode::Var(i) => {
+            if i as usize >= INPUT_REGS.len() {
                 return Err("variable index out of range");
             }
-            Ok((vec![], INPUT_REGS[*i as usize]))
+            Ok((vec![], INPUT_REGS[i as usize]))
         }
 
-        Expr::Const(val) => {
+        ExprNode::Const(val) => {
             let dst = Reg(SCRATCH_BASE + depth);
             let mut code = Vec::new();
             let scratch = [Reg(13), Reg(14), Reg(15), Reg(15)];
-            emit_const(&mut code, dst, *val, scratch);
+            emit_const(&mut code, dst, val, scratch);
             Ok((code, dst))
         }
 
-        Expr::Unary(op, child) => {
-            let (mut code, src) = emit(child, depth)?;
+        ExprNode::Unary(op, child) => {
+            let (mut code, src) = emit(arena, child, depth)?;
             let dst = Reg(SCRATCH_BASE + depth);
             let scratch = [Reg(13), Reg(14), Reg(15), Reg(15)];
-            emit_unary(&mut code, *op, dst, src, scratch);
+            emit_unary(&mut code, op, dst, src, scratch);
             Ok((code, dst))
         }
 
-        Expr::Binary(op, left, right) => {
-            let n_l = needs(left);
-            let n_r = needs(right);
+        ExprNode::Binary(op, left, right) => {
+            let n_l = needs(arena, left);
+            let n_r = needs(arena, right);
             let dst = Reg(SCRATCH_BASE + depth);
 
             if n_l >= n_r {
-                let (mut code, l_reg) = emit(left, depth)?;
-                let (r_code, r_reg) = emit(right, depth + 1)?;
+                let (mut code, l_reg) = emit(arena, left, depth)?;
+                let (r_code, r_reg) = emit(arena, right, depth + 1)?;
                 code.extend(r_code);
                 match op {
                     OpKind::Atan2 => {
                         let scratch = [Reg(13), Reg(14), Reg(15), Reg(15)];
                         x86_64::emit_binary_transcendental(
-                            &mut code, *op, dst, l_reg, r_reg, scratch,
+                            &mut code, op, dst, l_reg, r_reg, scratch,
                         );
                     }
-                    _ => emit_binary(&mut code, *op, dst, l_reg, r_reg),
+                    _ => emit_binary(&mut code, op, dst, l_reg, r_reg),
                 }
                 Ok((code, dst))
             } else {
-                let (mut code, r_reg) = emit(right, depth)?;
-                let (l_code, l_reg) = emit(left, depth + 1)?;
+                let (mut code, r_reg) = emit(arena, right, depth)?;
+                let (l_code, l_reg) = emit(arena, left, depth + 1)?;
                 code.extend(l_code);
                 match op {
                     OpKind::Atan2 => {
                         let scratch = [Reg(13), Reg(14), Reg(15), Reg(15)];
                         x86_64::emit_binary_transcendental(
-                            &mut code, *op, dst, l_reg, r_reg, scratch,
+                            &mut code, op, dst, l_reg, r_reg, scratch,
                         );
                     }
-                    _ => emit_binary(&mut code, *op, dst, l_reg, r_reg),
+                    _ => emit_binary(&mut code, op, dst, l_reg, r_reg),
                 }
                 Ok((code, dst))
             }
         }
 
-        Expr::Ternary(op, a, b, c) => {
+        ExprNode::Ternary(op, a, b, c) => {
             let dst = Reg(SCRATCH_BASE + depth);
 
             match op {
                 OpKind::MulAdd => {
                     // x86 doesn't have FMLA, use FMUL + FADD
-                    let (mut code, a_reg) = emit(a, depth)?;
-                    let (b_code, b_reg) = emit(b, depth + 1)?;
-                    let (c_code, c_reg) = emit(c, depth + 2)?;
+                    let (mut code, a_reg) = emit(arena, a, depth)?;
+                    let (b_code, b_reg) = emit(arena, b, depth + 1)?;
+                    let (c_code, c_reg) = emit(arena, c, depth + 2)?;
 
                     code.extend(b_code);
                     code.extend(c_code);
@@ -478,8 +481,8 @@ pub fn emit(expr: &Expr, depth: u8) -> Result<(Vec<u8>, Reg), &'static str> {
             }
         }
 
-        Expr::Nary(_, _) => Err("Nary not supported in JIT"),
-        Expr::Param(_) => Err("Param not supported directly here"),
+        ExprNode::Nary(..) => Err("Nary not supported in JIT"),
+        ExprNode::Param(_) => Err("Param not supported directly here"),
     }
 }
 
@@ -3123,20 +3126,22 @@ fn emit_resolve_dense(
     }
 }
 
-/// Compile a DAG to executable code (x86-64).
+/// Compile an [`ExprArena`] DAG to executable code (x86-64).
 ///
-/// Alias for `compile` on x86-64; graph coloring is not yet implemented for
-/// this target. Expressions generated by ExprGenerator are trees (no sharing),
-/// so the Sethi-Ullman emitter is correct and sufficient.
+/// Graph coloring is not yet implemented for this target; the arena is read as
+/// a tree by the Sethi-Ullman emitter (shared nodes are re-emitted). This is
+/// correct and sufficient for the expressions the compiler produces.
 #[cfg(target_arch = "x86_64")]
-pub fn compile_dag(expr: &Expr) -> Result<CompileResult, &'static str> {
+pub fn compile_dag(
+    arena: &crate::arena::ExprArena,
+    root: crate::arena::ExprId,
+) -> Result<CompileResult, &'static str> {
     const MAX_DEPTH: usize = 64;
-    let depth = expr.depth();
-    if depth > MAX_DEPTH {
+    if arena.depth(root) > MAX_DEPTH {
         return Err("expression too deep");
     }
 
-    let code = compile(expr)?;
+    let code = compile(arena, root)?;
     Ok(CompileResult {
         code,
         spill_count: 0,
@@ -3145,13 +3150,13 @@ pub fn compile_dag(expr: &Expr) -> Result<CompileResult, &'static str> {
     })
 }
 
-/// Compile an expression to executable code (x86-64).
+/// Compile an arena expression to executable code (x86-64).
 #[cfg(target_arch = "x86_64")]
-pub fn compile(expr: &Expr) -> Result<executable::ExecutableCode, &'static str> {
-    // Lower compound ops to primitives
-    // let lowered = lower::lower(expr);
-
-    let (mut code, result_reg) = emit(expr, 0)?;
+pub fn compile(
+    arena: &crate::arena::ExprArena,
+    root: crate::arena::ExprId,
+) -> Result<executable::ExecutableCode, &'static str> {
+    let (mut code, result_reg) = emit(arena, root, 0)?;
 
     // Move result to xmm0 if not already there
     if result_reg.0 != 0 {
@@ -3165,9 +3170,6 @@ pub fn compile(expr: &Expr) -> Result<executable::ExecutableCode, &'static str> 
 }
 
 /// Compile an [`ExprArena`] DAG to executable code (x86-64).
-///
-/// x86-64 DAG compilation is not yet implemented. This converts the arena
-/// to an [`Expr`] tree and delegates to the Sethi-Ullman emitter.
 #[cfg(target_arch = "x86_64")]
 pub fn compile_arena(
     arena: &crate::arena::ExprArena,
@@ -3177,20 +3179,16 @@ pub fn compile_arena(
 }
 
 /// Compile an [`ExprArena`] DAG using graph coloring (x86-64 stub).
-///
-/// Converts the arena to an [`Expr`] tree and delegates to [`compile_dag`].
 #[cfg(target_arch = "x86_64")]
 pub fn compile_arena_dag(
     arena: &crate::arena::ExprArena,
     root: crate::arena::ExprId,
 ) -> Result<CompileResult, &'static str> {
-    let expr = arena.to_expr(root);
-    compile_dag(&expr)
+    compile_dag(arena, root)
 }
 
 /// Compile an [`ExprArena`] DAG with explicit register budget (x86-64 stub).
 ///
-/// Converts the arena to an [`Expr`] tree and delegates to [`compile_dag`].
 /// The `ctx` parameter is currently ignored on x86-64 (register budget not
 /// yet supported).
 #[cfg(target_arch = "x86_64")]
@@ -3199,8 +3197,7 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     _ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    let expr = arena.to_expr(root);
-    compile_dag(&expr)
+    compile_dag(arena, root)
 }
 
 // =============================================================================
@@ -3216,7 +3213,7 @@ mod tests {
     fn test_needs_simple() {
         // X + Y: both leaves need 1, binary needs max(1,1)+1 = 2
         let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
-        assert_eq!(needs(&expr), 2);
+        assert_eq!(needs_e(&expr), 2);
     }
 
     #[test]
@@ -3224,7 +3221,7 @@ mod tests {
         // (X + Y) + Z: left needs 2, right needs 1, total = max(2,1) = 2
         let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(Expr::Var(2)));
-        assert_eq!(needs(&expr), 2);
+        assert_eq!(needs_e(&expr), 2);
     }
 
     #[test]
@@ -3233,7 +3230,7 @@ mod tests {
         let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
         let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
-        assert_eq!(needs(&expr), 3);
+        assert_eq!(needs_e(&expr), 3);
     }
 
     #[test]
@@ -3312,7 +3309,7 @@ mod tests {
         // Simple expression: X + Y (no sharing)
         let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
-        let result = compile_dag(&expr).expect("DAG compile failed");
+        let result = compile_dag_e(&expr).expect("DAG compile failed");
         assert_eq!(result.spill_count, 0);
 
         unsafe {
@@ -3342,7 +3339,7 @@ mod tests {
             Box::new(Expr::Var(1)),
         );
 
-        let result = compile_dag(&expr).expect("DAG compile failed");
+        let result = compile_dag_e(&expr).expect("DAG compile failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -3715,7 +3712,7 @@ mod tests {
     fn test_dag_lowered_sin() {
         // sin(X) through DAG path — triggers spilling from lowered expansion
         let expr = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));
-        let result = compile_dag(&expr).expect("DAG compile of sin(X) failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of sin(X) failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -3827,7 +3824,7 @@ mod tests {
             Box::new(Expr::Const(1.0)),
         );
 
-        let result = compile_dag(&expr).expect("DAG clamp failed");
+        let result = compile_dag_e(&expr).expect("DAG clamp failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -3868,7 +3865,7 @@ mod tests {
             )),
         );
 
-        let code = compile(&expr).expect("compile failed");
+        let code = compile_e(&expr).expect("compile failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -3896,7 +3893,7 @@ mod tests {
         // compile_dag doesn't panic or overflow.
         let expr = Expr::Binary(OpKind::Pow, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
-        let result = compile_dag(&expr).expect("DAG compile of pow(X, Y) failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of pow(X, Y) failed");
 
         // Verify it compiled and produced executable code — no spill overflow.
         unsafe {
@@ -3940,7 +3937,7 @@ mod tests {
             Box::new(Expr::Var(2)),
         );
 
-        let result = compile_dag(&expr).expect("DAG compile of exp(exp(W))+Z failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of exp(exp(W))+Z failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -3970,7 +3967,7 @@ mod tests {
         // current large mismatch, not just generic approximation noise.
         let expr = Expr::Unary(OpKind::Tan, Box::new(Expr::Var(0)));
 
-        let result = compile_dag(&expr).expect("DAG compile of tan(X) failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of tan(X) failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4005,8 +4002,8 @@ mod tests {
         let sin_expr = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));
         let cos_expr = Expr::Unary(OpKind::Cos, Box::new(Expr::Var(0)));
 
-        let sin_result = compile_dag(&sin_expr).expect("DAG compile of sin(X) failed");
-        let cos_result = compile_dag(&cos_expr).expect("DAG compile of cos(X) failed");
+        let sin_result = compile_dag_e(&sin_expr).expect("DAG compile of sin(X) failed");
+        let cos_result = compile_dag_e(&cos_expr).expect("DAG compile of cos(X) failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4049,7 +4046,7 @@ mod tests {
             Box::new(Expr::Var(1)),
         );
 
-        let result = compile_dag(&expr).expect("DAG compile of atan2(X, Y) failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of atan2(X, Y) failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4079,7 +4076,7 @@ mod tests {
         // asin(X) should compile through the unary transcendental path.
         let expr = Expr::Unary(OpKind::Asin, Box::new(Expr::Var(0)));
 
-        let result = compile_dag(&expr).expect("DAG compile of asin(X) failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of asin(X) failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4109,7 +4106,7 @@ mod tests {
         // acos(X) should compile through the unary transcendental path.
         let expr = Expr::Unary(OpKind::Acos, Box::new(Expr::Var(0)));
 
-        let result = compile_dag(&expr).expect("DAG compile of acos(X) failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of acos(X) failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4159,7 +4156,7 @@ mod tests {
             Box::new(false_arm),
         );
 
-        let result = compile_dag(&expr).expect("DAG compile of Select failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of Select failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4209,7 +4206,7 @@ mod tests {
             Box::new(false_arm),
         );
 
-        let result = compile_dag(&expr).expect("DAG compile of Select failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of Select failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4254,7 +4251,7 @@ mod tests {
             Box::new(false_arm),
         );
 
-        let result = compile_dag(&expr).expect("DAG compile of Select failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of Select failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4302,7 +4299,7 @@ mod tests {
         // and all-zeros (0.0) when X == Y.
         let expr = Expr::Binary(OpKind::Ne, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
-        let result = compile_dag(&expr).expect("DAG compile of Ne failed");
+        let result = compile_dag_e(&expr).expect("DAG compile of Ne failed");
 
         unsafe {
             use core::arch::aarch64::*;
@@ -4521,7 +4518,7 @@ mod tests {
 
         let (arena, root) = ExprArena::from_expr(&expr);
 
-        let expr_result = compile_dag(&expr).expect("Expr compile failed");
+        let expr_result = compile_dag_e(&expr).expect("Expr compile failed");
         let arena_result = compile_arena_dag(&arena, root).expect("arena compile failed");
 
         unsafe {

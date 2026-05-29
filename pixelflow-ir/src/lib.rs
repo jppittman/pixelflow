@@ -23,10 +23,6 @@ pub use variance::{compute_arena_variance, find_hoistable_arena_nodes};
 pub mod arena;
 pub use arena::{ExprArena, ExprId, ExprNode};
 
-pub mod expr;
-#[cfg(feature = "alloc")]
-pub use expr::Expr;
-
 pub mod jit_manifold;
 pub use jit_manifold::{JitManifold, ScanlineJitManifold};
 
