@@ -6,10 +6,13 @@ bake-eigen = "run --package xtask --release -- bake-eigen"
 
 [build]
 # Relaxed FP math for faster SIMD - allows FMA contraction and unsafe FP opts.
-# target-cpu=native enables the AVX-512/AVX2 backends the engine is designed
-# around (see pixelflow-core/src/lib.rs backend selection); without it the build
-# falls back to the lower-fidelity SSE2 path and numeric tests drift.
+#
+# NOTE: do NOT add `-C target-cpu=native` here. It enables the AVX-512 backend,
+# which widens `Field` to 512 bits — but the x86-64 JIT (`KernelFn`) is fixed at
+# 128-bit `__m128`, so the JIT output can no longer interoperate with the Field
+# pipeline (e.g. pixelflow-pipeline's scanline bins fail to compile). The
+# engine's x86-64 path is 128-bit/SSE2 by construction; native must be opted
+# into per-build only when the JIT is not used.
 rustflags = [
-    "-C", "target-cpu=native",
     "-C", "llvm-args=-fp-contract=fast",
 ]
