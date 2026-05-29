@@ -11,15 +11,12 @@
 //! `1 / sqrt(x)` → `rsqrt(x)` — fast approximate on x86 (rsqrtps/vrsqrtps)
 //!
 
-use std::sync::Arc;
 
-use crate::egraph::Pattern as Expr;
+use crate::arena_pat;
+use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Arc<Expr> {
-    Arc::new(e)
-}
 
 // ============================================================================
 // FMA Fusion
@@ -82,23 +79,12 @@ impl Rewrite for FmaFusion {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Add(Mul(V0, V1), V2)
-        Some(Expr::Binary(
-            OpKind::Add,
-            b(Expr::Binary(OpKind::Mul, b(Expr::Var(0)), b(Expr::Var(1)))),
-            b(Expr::Var(2)),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Add, (bin OpKind::Mul, (var 0), (var 1)), (var 2)))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // MulAdd(V0, V1, V2)
-        Some(Expr::Ternary(
-            OpKind::MulAdd,
-            b(Expr::Var(0)),
-            b(Expr::Var(1)),
-            b(Expr::Var(2)),
-        ))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, tern OpKind::MulAdd, (var 0), (var 1), (var 2)))
     }
 }
 
@@ -168,17 +154,12 @@ impl Rewrite for RecipSqrt {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Recip(Sqrt(V0))
-        Some(Expr::Unary(
-            OpKind::Recip,
-            b(Expr::Unary(OpKind::Sqrt, b(Expr::Var(0)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un OpKind::Recip, (un OpKind::Sqrt, (var 0))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // Rsqrt(V0)
-        Some(Expr::Unary(OpKind::Rsqrt, b(Expr::Var(0))))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un OpKind::Rsqrt, (var 0)))
     }
 }
 

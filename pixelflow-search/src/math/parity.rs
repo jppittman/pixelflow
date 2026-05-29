@@ -9,15 +9,12 @@
 //! - EvenNegation: Op(neg(x)) → Op(x)
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::egraph::Pattern as Expr;
+use crate::arena_pat;
+use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Arc<Expr> {
-    Arc::new(e)
-}
 
 // ============================================================================
 // Parity Trait
@@ -339,27 +336,16 @@ impl<T: Parity> Rewrite for ParityNegation<T> {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Op(Neg(V0))
-        Some(Expr::Unary(
-            T::op().kind(),
-            b(Expr::Unary(OpKind::Neg, b(Expr::Var(0)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un T::op().kind(), (un OpKind::Neg, (var 0))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         match T::parity() {
-            ParityKind::Odd => {
-                // Neg(Op(V0))
-                Some(Expr::Unary(
-                    OpKind::Neg,
-                    b(Expr::Unary(T::op().kind(), b(Expr::Var(0)))),
-                ))
-            }
-            ParityKind::Even => {
-                // Op(V0)
-                Some(Expr::Unary(T::op().kind(), b(Expr::Var(0))))
-            }
+            // Neg(Op(V0))
+            ParityKind::Odd => Some(arena_pat!(__a, un OpKind::Neg, (un T::op().kind(), (var 0)))),
+            // Op(V0)
+            ParityKind::Even => Some(arena_pat!(__a, un T::op().kind(), (var 0))),
         }
     }
 }

@@ -21,15 +21,12 @@
 //! the exp Homomorphism IS the trig angle addition rules in the complex plane.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::egraph::Pattern as Expr;
+use crate::arena_pat;
+use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Arc<Expr> {
-    Arc::new(e)
-}
 
 // ============================================================================
 // FunctionInverse Trait
@@ -151,17 +148,12 @@ impl<T: FunctionInverse> Rewrite for ForwardBackward<T> {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Forward(Backward(V0))
-        Some(Expr::Unary(
-            T::forward().kind(),
-            b(Expr::Unary(T::backward().kind(), b(Expr::Var(0)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un T::forward().kind(), (un T::backward().kind(), (var 0))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // V0
-        Some(Expr::Var(0))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, var 0))
     }
 }
 
@@ -222,17 +214,12 @@ impl<T: FunctionInverse> Rewrite for BackwardForward<T> {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Backward(Forward(V0))
-        Some(Expr::Unary(
-            T::backward().kind(),
-            b(Expr::Unary(T::forward().kind(), b(Expr::Var(0)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un T::backward().kind(), (un T::forward().kind(), (var 0))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // V0
-        Some(Expr::Var(0))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, var 0))
     }
 }
 
@@ -356,26 +343,15 @@ impl<T: Homomorphism> Rewrite for HomomorphismRule<T> {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Func(SourceOp(V0, V1))
-        Some(Expr::Unary(
-            T::func().kind(),
-            b(Expr::Binary(
-                T::source_op().kind(),
-                b(Expr::Var(0)),
-                b(Expr::Var(1)),
-            )),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un T::func().kind(), (bin T::source_op().kind(), (var 0), (var 1))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+
         // TargetOp(Func(V0), Func(V1))
         let fk = T::func().kind();
-        Some(Expr::Binary(
-            T::target_op().kind(),
-            b(Expr::Unary(fk, b(Expr::Var(0)))),
-            b(Expr::Unary(fk, b(Expr::Var(1)))),
-        ))
+        Some(arena_pat!(__a, bin T::target_op().kind(), (un fk, (var 0)), (un fk, (var 1))))
     }
 }
 
@@ -432,22 +408,12 @@ impl Rewrite for PowerCombine {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Mul(Pow(V0, V1), Pow(V0, V2))
-        Some(Expr::Binary(
-            OpKind::Mul,
-            b(Expr::Binary(OpKind::Pow, b(Expr::Var(0)), b(Expr::Var(1)))),
-            b(Expr::Binary(OpKind::Pow, b(Expr::Var(0)), b(Expr::Var(2)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Pow, (var 0), (var 1)), (bin OpKind::Pow, (var 0), (var 2))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // Pow(V0, Add(V1, V2))
-        Some(Expr::Binary(
-            OpKind::Pow,
-            b(Expr::Var(0)),
-            b(Expr::Binary(OpKind::Add, b(Expr::Var(1)), b(Expr::Var(2)))),
-        ))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Pow, (var 0), (bin OpKind::Add, (var 1), (var 2))))
     }
 }
 

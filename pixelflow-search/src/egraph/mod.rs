@@ -35,7 +35,7 @@ pub use extract::{
 pub use graph::{ApplyResult, EGraph, EGraphBatch, RewriteTarget};
 pub use node::{EClassId, ENode};
 pub use ops::Op;
-pub use rewrite::{Pattern, Rewrite, RewriteAction};
+pub use rewrite::{Rewrite, RewriteAction};
 pub use saturate::{SaturationResult, achievable_cost_within_budget, saturate_with_budget};
 
 // Re-export rule types from math module for backward compatibility
@@ -101,10 +101,7 @@ pub fn collect_rule_templates() -> crate::nnue::RuleTemplates {
     let mut templates = crate::nnue::RuleTemplates::with_capacity(rules.len());
 
     for (idx, rule) in rules.iter().enumerate() {
-        if let (Some(lhs), Some(rhs)) = (rule.lhs_template(), rule.rhs_template()) {
-            templates.set(idx, lhs, rhs);
-        }
-        // Rules without templates get None slots (handled by RuleTemplates)
+        templates.build(idx, rule.as_ref());
     }
 
     templates
