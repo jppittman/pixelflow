@@ -321,8 +321,7 @@ impl Lattice for FrameLattice {
             while x + PARALLELISM <= self.width {
                 let result = manifold.eval((x_field, y_field, z_field, w_field));
                 result.store(&mut packed);
-                buffer[row_offset + x..row_offset + x + PARALLELISM]
-                    .copy_from_slice(&packed);
+                buffer[row_offset + x..row_offset + x + PARALLELISM].copy_from_slice(&packed);
 
                 x += PARALLELISM;
                 x_field = x_field.raw_add(step);

@@ -513,8 +513,8 @@ impl Kubelet {
 mod tests {
     use super::*;
     use crate::{ActorStatus, HandlerError, HandlerResult, SystemStatus};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     // ── Minimal actor for testing ───────────────────────────────────────────
 
@@ -869,9 +869,7 @@ mod tests {
     #[test]
     fn with_poll_interval_sets_the_interval() {
         let custom = Duration::from_millis(42);
-        let kubelet = KubeletBuilder::new()
-            .with_poll_interval(custom)
-            .build();
+        let kubelet = KubeletBuilder::new().with_poll_interval(custom).build();
         assert_eq!(
             kubelet.poll_interval, custom,
             "with_poll_interval must store the given interval, not the default"
@@ -897,7 +895,11 @@ mod tests {
             .build();
 
         // Kubelet should have exactly 1 pod registered.
-        assert_eq!(kubelet.pods.len(), 1, "add_manual_pod must register one pod");
+        assert_eq!(
+            kubelet.pods.len(),
+            1,
+            "add_manual_pod must register one pod"
+        );
 
         // Verify the pod is a manual pod (RestartPolicy::Never).
         assert_eq!(kubelet.pods[0].restart_policy, RestartPolicy::Never);
@@ -911,5 +913,4 @@ mod tests {
             "stop_fn should be called when manual pod exits"
         );
     }
-
 }

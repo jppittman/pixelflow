@@ -374,10 +374,7 @@ impl TerminalEmulator {
     ///
     /// Coordinates `col` and `row` are 0-based cell positions.
     #[must_use]
-    pub fn encode_mouse_event(
-        &self,
-        params: mouse::MouseEncodingParams,
-    ) -> Option<Vec<u8>> {
+    pub fn encode_mouse_event(&self, params: mouse::MouseEncodingParams) -> Option<Vec<u8>> {
         mouse::encode_mouse_event(&self.dec_modes, params)
     }
 

@@ -1,9 +1,9 @@
 //! Test: 3D scene rendering with sphere + floor using the scene3d architecture
 
+use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::combinators::At;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Discrete, Field, Manifold, ManifoldCompat};
-use pixelflow_compiler::ManifoldExpr;
 
 type Field4 = (Field, Field, Field, Field);
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);
@@ -11,7 +11,7 @@ use pixelflow_graphics::render::color::{Rgba8, RgbaColorCube};
 use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
 use pixelflow_graphics::scene3d::{
-    ColorChecker, ColorReflect, ColorScreenToDir, ColorSky, ColorSurface, plane,
+    plane, ColorChecker, ColorReflect, ColorScreenToDir, ColorSky, ColorSurface,
 };
 
 /// Sphere at given center with radius (local to this test).
@@ -93,7 +93,9 @@ fn test_sphere_on_floor() {
             center: (0.0, 0.5, 4.0),
             radius: 1.0,
         },
-        material: ColorReflect { inner: world.clone() },
+        material: ColorReflect {
+            inner: world.clone(),
+        },
         background: world,
     };
 
@@ -128,8 +130,6 @@ fn test_sphere_on_floor() {
 /// Test with solid gray material (non-reflective)
 #[test]
 fn test_sphere_on_matte_floor() {
-
-
     const W: usize = 400;
     const H: usize = 300;
 
@@ -210,7 +210,9 @@ fn test_chrome_sphere_on_checkerboard() {
             center: (0.0, 0.5, 4.0),
             radius: 1.0,
         },
-        material: ColorReflect { inner: world.clone() },
+        material: ColorReflect {
+            inner: world.clone(),
+        },
         background: world,
     };
 

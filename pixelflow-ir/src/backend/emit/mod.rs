@@ -499,36 +499,6 @@ pub struct CompileResult {
     pub max_regs: u8,
 }
 
-/// Compile an expression to executable code.
-#[cfg(target_arch = "x86_64")]
-pub fn compile(expr: &Expr) -> Result<executable::ExecutableCode, &'static str> {
-    compile_dag(expr).map(|r| r.code)
-}
-
-/// Compile a DAG (from e-graph extraction) using graph coloring.
-///
-/// Unlike `compile`, this handles shared subexpressions properly.
-/// Each unique subexpression is evaluated exactly once and its result
-/// is kept in a register (or spilled) for all uses.
-#[cfg(target_arch = "x86_64")]
-pub fn compile_dag(expr: &Expr) -> Result<CompileResult, &'static str> {
-    compile_dag_with_ctx(expr, EmitCtx::default())
-}
-
-/// Compile DAG with explicit register budget.
-///
-/// Pipeline as composition of pure morphisms:
-/// ```text
-/// Expr →[lower]→ Expr(primitive) →[linearize]→ Schedule →[analyze]→ Graph
-///   →[color]→ Allocation →[layout]→ FrameLayout →[resolve]→ InstructionPlan
-///   →[emit]→ MachineCode
-/// ```
-#[cfg(target_arch = "x86_64")]
-pub fn compile_dag_with_ctx(expr: &Expr, ctx: EmitCtx) -> Result<CompileResult, &'static str> {
-    let (schedule, _structural_cache, uses_map) = linearize_dag(expr);
-    compile_from_schedule(schedule, uses_map, ctx)
-}
-
 /// Compile an [`ExprArena`] DAG to executable code.
 ///
 /// This is the arena counterpart of [`compile`]. The arena's topological node
@@ -3240,29 +3210,29 @@ pub fn compile_arena_dag_with_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
+    use alloc::boxed::Box;
 
     #[test]
     fn test_needs_simple() {
         // X + Y: both leaves need 1, binary needs max(1,1)+1 = 2
-        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
         assert_eq!(needs(&expr), 2);
     }
 
     #[test]
     fn test_needs_unbalanced() {
         // (X + Y) + Z: left needs 2, right needs 1, total = max(2,1) = 2
-        let left = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(left), Arc::new(Expr::Var(2)));
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(Expr::Var(2)));
         assert_eq!(needs(&expr), 2);
     }
 
     #[test]
     fn test_needs_balanced_deep() {
         // (X + Y) + (Z + W): both sides need 2, total = 2+1 = 3
-        let left = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let right = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(2)), Arc::new(Expr::Var(3)));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(left), Arc::new(right));
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
         assert_eq!(needs(&expr), 3);
     }
 
@@ -3270,9 +3240,9 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_spill_forced() {
         // (X + Y) + (Z + W) with max_regs=2 forces spilling via DAG
-        let left = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let right = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(2)), Arc::new(Expr::Var(3)));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(left), Arc::new(right));
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
 
         let ctx = EmitCtx::with_max_regs(2);
         let result = compile_dag_with_ctx(&expr, ctx).expect("compile failed");
@@ -3296,9 +3266,9 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_no_spill_with_enough_regs() {
-        let left = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let right = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(2)), Arc::new(Expr::Var(3)));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(left), Arc::new(right));
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
 
         let ctx = EmitCtx::default();
         let result = compile_dag_with_ctx(&expr, ctx).expect("compile failed");
@@ -3310,10 +3280,10 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_spill_deeply_nested() {
         // Chain: ((((X + Y) + Z) + W) + X) with max_regs=1
-        let e1 = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let e2 = Expr::Binary(OpKind::Add, Arc::new(e1), Arc::new(Expr::Var(2)));
-        let e3 = Expr::Binary(OpKind::Add, Arc::new(e2), Arc::new(Expr::Var(3)));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(e3), Arc::new(Expr::Var(0)));
+        let e1 = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let e2 = Expr::Binary(OpKind::Add, Box::new(e1), Box::new(Expr::Var(2)));
+        let e3 = Expr::Binary(OpKind::Add, Box::new(e2), Box::new(Expr::Var(3)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(e3), Box::new(Expr::Var(0)));
 
         let ctx = EmitCtx::with_max_regs(1);
         let result = compile_dag_with_ctx(&expr, ctx).expect("compile failed");
@@ -3340,7 +3310,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_simple() {
         // Simple expression: X + Y (no sharing)
-        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let result = compile_dag(&expr).expect("DAG compile failed");
         assert_eq!(result.spill_count, 0);
@@ -3364,12 +3334,12 @@ mod tests {
         // X * 2.0 + Y
         let expr = Expr::Binary(
             OpKind::Add,
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Mul,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Const(2.0)),
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(2.0)),
             )),
-            Arc::new(Expr::Var(1)),
+            Box::new(Expr::Var(1)),
         );
 
         let result = compile_dag(&expr).expect("DAG compile failed");
@@ -3392,9 +3362,9 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_with_spill() {
         // Complex expression with limited registers
-        let left = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let right = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(2)), Arc::new(Expr::Var(3)));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(left), Arc::new(right));
+        let left = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let right = Expr::Binary(OpKind::Add, Box::new(Expr::Var(2)), Box::new(Expr::Var(3)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(left), Box::new(right));
 
         // Compile with only 2 registers - should require spilling
         let ctx = EmitCtx::with_max_regs(2);
@@ -3419,7 +3389,7 @@ mod tests {
     #[test]
     fn test_linearize_dag() {
         // Test the linearization function
-        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let (schedule, _structural_cache, uses_map) = linearize_dag(&expr);
 
@@ -3438,8 +3408,8 @@ mod tests {
     fn test_linearize_dag_structural_dedup() {
         // Verify that cloned subtrees are collapsed by structural hash-consing.
         // Build: (X + Y) + (X + Y) where the two (X+Y) are distinct allocations.
-        let make_sum = || Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(make_sum()), Arc::new(make_sum()));
+        let make_sum = || Expr::Binary(OpKind::Add, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Add, Box::new(make_sum()), Box::new(make_sum()));
 
         let (schedule, _structural_cache, _uses_map) = linearize_dag(&expr);
 
@@ -3744,7 +3714,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_lowered_sin() {
         // sin(X) through DAG path — triggers spilling from lowered expansion
-        let expr = Expr::Unary(OpKind::Sin, Arc::new(Expr::Var(0)));
+        let expr = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));
         let result = compile_dag(&expr).expect("DAG compile of sin(X) failed");
 
         unsafe {
@@ -3771,18 +3741,18 @@ mod tests {
         // expr = sin(X) + cos(Y) * floor(Z + W)
         // After lowering, sin and cos expand to Horner polynomials with ~20 nodes each.
         // With max_regs=4, nearly everything must spill.
-        let sin_x = Expr::Unary(OpKind::Sin, Arc::new(Expr::Var(0)));
-        let cos_y = Expr::Unary(OpKind::Cos, Arc::new(Expr::Var(1)));
+        let sin_x = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));
+        let cos_y = Expr::Unary(OpKind::Cos, Box::new(Expr::Var(1)));
         let floor_zw = Expr::Unary(
             OpKind::Floor,
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Add,
-                Arc::new(Expr::Var(2)),
-                Arc::new(Expr::Var(3)),
+                Box::new(Expr::Var(2)),
+                Box::new(Expr::Var(3)),
             )),
         );
-        let cos_times_floor = Expr::Binary(OpKind::Mul, Arc::new(cos_y), Arc::new(floor_zw));
-        let expr = Expr::Binary(OpKind::Add, Arc::new(sin_x), Arc::new(cos_times_floor));
+        let cos_times_floor = Expr::Binary(OpKind::Mul, Box::new(cos_y), Box::new(floor_zw));
+        let expr = Expr::Binary(OpKind::Add, Box::new(sin_x), Box::new(cos_times_floor));
 
         let ctx = EmitCtx::with_max_regs(4);
         let result =
@@ -3811,20 +3781,20 @@ mod tests {
         // MulAdd with max_regs=3 — forces spilling of operands
         let expr = Expr::Ternary(
             OpKind::MulAdd,
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Add,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Var(1)),
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Var(1)),
             )),
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Add,
-                Arc::new(Expr::Var(2)),
-                Arc::new(Expr::Var(3)),
+                Box::new(Expr::Var(2)),
+                Box::new(Expr::Var(3)),
             )),
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Mul,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Const(2.0)),
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(2.0)),
             )),
         );
 
@@ -3852,9 +3822,9 @@ mod tests {
         // clamp(X, 0.0, 1.0) through DAG
         let expr = Expr::Ternary(
             OpKind::Clamp,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Const(0.0)),
-            Arc::new(Expr::Const(1.0)),
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Const(0.0)),
+            Box::new(Expr::Const(1.0)),
         );
 
         let result = compile_dag(&expr).expect("DAG clamp failed");
@@ -3886,15 +3856,15 @@ mod tests {
         // Verify compile() delegates to compile_dag() and produces correct results.
         let expr = Expr::Binary(
             OpKind::Mul,
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Add,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Const(1.5)),
+                Box::new(Expr::Var(0)),
+                Box::new(Expr::Const(1.5)),
             )),
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Sub,
-                Arc::new(Expr::Var(1)),
-                Arc::new(Expr::Var(2)),
+                Box::new(Expr::Var(1)),
+                Box::new(Expr::Var(2)),
             )),
         );
 
@@ -3924,7 +3894,7 @@ mod tests {
         // Note: we don't test numerical accuracy here — the polynomial
         // approximations for exp2/log2 have limited range. The point is that
         // compile_dag doesn't panic or overflow.
-        let expr = Expr::Binary(OpKind::Pow, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Pow, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let result = compile_dag(&expr).expect("DAG compile of pow(X, Y) failed");
 
@@ -3963,11 +3933,11 @@ mod tests {
         // 3. The result is finite
         let expr = Expr::Binary(
             OpKind::Add,
-            Arc::new(Expr::Unary(
+            Box::new(Expr::Unary(
                 OpKind::Exp,
-                Arc::new(Expr::Unary(OpKind::Exp, Arc::new(Expr::Var(3)))),
+                Box::new(Expr::Unary(OpKind::Exp, Box::new(Expr::Var(3)))),
             )),
-            Arc::new(Expr::Var(2)),
+            Box::new(Expr::Var(2)),
         );
 
         let result = compile_dag(&expr).expect("DAG compile of exp(exp(W))+Z failed");
@@ -3998,7 +3968,7 @@ mod tests {
         // This value came directly from a rewrite-bug localization pass.
         // The tolerance here is intentionally tight enough to catch the
         // current large mismatch, not just generic approximation noise.
-        let expr = Expr::Unary(OpKind::Tan, Arc::new(Expr::Var(0)));
+        let expr = Expr::Unary(OpKind::Tan, Box::new(Expr::Var(0)));
 
         let result = compile_dag(&expr).expect("DAG compile of tan(X) failed");
 
@@ -4013,7 +3983,11 @@ mod tests {
             let out = func(x, y, z, w);
             let val = vgetq_lane_f32(out, 0);
             let expected = (-1.6860065_f32).tan();
-            assert!(val.is_finite(), "tan(-1.6860065) produced non-finite: {}", val);
+            assert!(
+                val.is_finite(),
+                "tan(-1.6860065) produced non-finite: {}",
+                val
+            );
             assert!(
                 (val - expected).abs() < 0.25,
                 "tan(-1.6860065) = {}, expected ~{}",
@@ -4028,8 +4002,8 @@ mod tests {
     fn test_dag_sin_cos_specific_tan_repro_input() {
         // Same input as the tan repro, but testing sin/cos individually tells
         // us whether tan is broken directly or just amplifying smaller errors.
-        let sin_expr = Expr::Unary(OpKind::Sin, Arc::new(Expr::Var(0)));
-        let cos_expr = Expr::Unary(OpKind::Cos, Arc::new(Expr::Var(0)));
+        let sin_expr = Expr::Unary(OpKind::Sin, Box::new(Expr::Var(0)));
+        let cos_expr = Expr::Unary(OpKind::Cos, Box::new(Expr::Var(0)));
 
         let sin_result = compile_dag(&sin_expr).expect("DAG compile of sin(X) failed");
         let cos_result = compile_dag(&cos_expr).expect("DAG compile of cos(X) failed");
@@ -4071,8 +4045,8 @@ mod tests {
         // Verifies the new atan2 JIT builtin works through the DAG pipeline.
         let expr = Expr::Binary(
             OpKind::Atan2,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Var(1)),
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Var(1)),
         );
 
         let result = compile_dag(&expr).expect("DAG compile of atan2(X, Y) failed");
@@ -4103,7 +4077,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_asin_compiles() {
         // asin(X) should compile through the unary transcendental path.
-        let expr = Expr::Unary(OpKind::Asin, Arc::new(Expr::Var(0)));
+        let expr = Expr::Unary(OpKind::Asin, Box::new(Expr::Var(0)));
 
         let result = compile_dag(&expr).expect("DAG compile of asin(X) failed");
 
@@ -4133,7 +4107,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_dag_acos_compiles() {
         // acos(X) should compile through the unary transcendental path.
-        let expr = Expr::Unary(OpKind::Acos, Arc::new(Expr::Var(0)));
+        let expr = Expr::Unary(OpKind::Acos, Box::new(Expr::Var(0)));
 
         let result = compile_dag(&expr).expect("DAG compile of acos(X) failed");
 
@@ -4169,20 +4143,20 @@ mod tests {
         // be skipped and the result should be Y, not NaN.
         let mask = Expr::Binary(
             OpKind::Gt,
-            Arc::new(Expr::Var(0)), // X
-            Arc::new(Expr::Const(0.0)),
+            Box::new(Expr::Var(0)), // X
+            Box::new(Expr::Const(0.0)),
         );
         let true_arm = Expr::Var(1); // Y
         let false_arm = Expr::Binary(
             OpKind::Div,
-            Arc::new(Expr::Var(2)),     // Z
-            Arc::new(Expr::Const(0.0)), // divide by zero!
+            Box::new(Expr::Var(2)),     // Z
+            Box::new(Expr::Const(0.0)), // divide by zero!
         );
         let expr = Expr::Ternary(
             OpKind::Select,
-            Arc::new(mask),
-            Arc::new(true_arm),
-            Arc::new(false_arm),
+            Box::new(mask),
+            Box::new(true_arm),
+            Box::new(false_arm),
         );
 
         let result = compile_dag(&expr).expect("DAG compile of Select failed");
@@ -4218,21 +4192,21 @@ mod tests {
         // Select(X > 0, Y / 0.0, Z) with X all-negative
         let mask = Expr::Binary(
             OpKind::Gt,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Const(0.0)),
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Const(0.0)),
         );
         let true_arm = Expr::Binary(
             OpKind::Div,
-            Arc::new(Expr::Var(1)),
-            Arc::new(Expr::Const(0.0)), // div by zero in true arm
+            Box::new(Expr::Var(1)),
+            Box::new(Expr::Const(0.0)), // div by zero in true arm
         );
         let false_arm = Expr::Var(2); // Z
 
         let expr = Expr::Ternary(
             OpKind::Select,
-            Arc::new(mask),
-            Arc::new(true_arm),
-            Arc::new(false_arm),
+            Box::new(mask),
+            Box::new(true_arm),
+            Box::new(false_arm),
         );
 
         let result = compile_dag(&expr).expect("DAG compile of Select failed");
@@ -4267,17 +4241,17 @@ mod tests {
         // Select(X > 0, Y, Z) with X = [1, -1, 1, -1]
         let mask = Expr::Binary(
             OpKind::Gt,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Const(0.0)),
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Const(0.0)),
         );
         let true_arm = Expr::Var(1);
         let false_arm = Expr::Var(2);
 
         let expr = Expr::Ternary(
             OpKind::Select,
-            Arc::new(mask),
-            Arc::new(true_arm),
-            Arc::new(false_arm),
+            Box::new(mask),
+            Box::new(true_arm),
+            Box::new(false_arm),
         );
 
         let result = compile_dag(&expr).expect("DAG compile of Select failed");
@@ -4326,7 +4300,7 @@ mod tests {
     fn test_dag_ne_correctness() {
         // Ne(X, Y) should produce all-ones (as float: NaN / -NaN) when X != Y,
         // and all-zeros (0.0) when X == Y.
-        let expr = Expr::Binary(OpKind::Ne, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
+        let expr = Expr::Binary(OpKind::Ne, Box::new(Expr::Var(0)), Box::new(Expr::Var(1)));
 
         let result = compile_dag(&expr).expect("DAG compile of Ne failed");
 
@@ -4529,19 +4503,19 @@ mod tests {
         // Build expression both ways: (X * 2.0 + Y) * (Z - W)
         let expr = Expr::Binary(
             OpKind::Mul,
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Add,
-                Arc::new(Expr::Binary(
+                Box::new(Expr::Binary(
                     OpKind::Mul,
-                    Arc::new(Expr::Var(0)),
-                    Arc::new(Expr::Const(2.0)),
+                    Box::new(Expr::Var(0)),
+                    Box::new(Expr::Const(2.0)),
                 )),
-                Arc::new(Expr::Var(1)),
+                Box::new(Expr::Var(1)),
             )),
-            Arc::new(Expr::Binary(
+            Box::new(Expr::Binary(
                 OpKind::Sub,
-                Arc::new(Expr::Var(2)),
-                Arc::new(Expr::Var(3)),
+                Box::new(Expr::Var(2)),
+                Box::new(Expr::Var(3)),
             )),
         );
 

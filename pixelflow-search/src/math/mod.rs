@@ -137,8 +137,8 @@ pub fn transcendental_rules() -> Vec<Box<dyn Rewrite>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egraph::{CostModel, EClassId, EGraph, ENode, saturate_with_budget};
     use crate::egraph::Pattern as Expr;
+    use crate::egraph::{CostModel, EClassId, EGraph, ENode, saturate_with_budget};
     use pixelflow_ir::OpKind;
     use std::sync::Arc;
 

@@ -1,7 +1,7 @@
 //! Debug: test if sphere_at returns valid t values
+use pixelflow_compiler::kernel;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Field, Manifold, ManifoldExt};
-use pixelflow_compiler::kernel;
 
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);
 
@@ -19,16 +19,12 @@ fn sphere_at(cx: f32, cy: f32, cz: f32, r: f32) -> impl Manifold<Jet3_4, Output 
 
 // Simple test: just return a parameter
 fn simple_return_param(val: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
-    kernel!(|val: f32| -> Jet3 {
-        val
-    })(val)
+    kernel!(|val: f32| -> Jet3 { val })(val)
 }
 
 // Test: X + param
 fn x_plus_param(val: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
-    kernel!(|val: f32| -> Jet3 {
-        X + val
-    })(val)
+    kernel!(|val: f32| -> Jet3 { X + val })(val)
 }
 
 #[test]
@@ -45,7 +41,10 @@ fn test_simple_param() {
     let low = Field::from(41.9);
     let high = Field::from(42.1);
     let in_range = result.val.gt(low) & result.val.lt(high);
-    assert!(in_range.all(), "simple_return_param(42.0) should return ~42.0");
+    assert!(
+        in_range.all(),
+        "simple_return_param(42.0) should return ~42.0"
+    );
 }
 
 #[test]
@@ -63,36 +62,38 @@ fn test_x_plus_param() {
     let low = Field::from(14.9);
     let high = Field::from(15.1);
     let in_range = result.val.gt(low) & result.val.lt(high);
-    assert!(in_range.all(), "x_plus_param(10) with X=5 should return ~15.0");
+    assert!(
+        in_range.all(),
+        "x_plus_param(10) with X=5 should return ~15.0"
+    );
 }
 
 // Test d_dot_c = X * cx + Y * cy + Z * cz
 // For ray (0, 0, 1) and center (0, 0, 4): d_dot_c = 0*0 + 0*0 + 1*4 = 4
 fn test_d_dot_c(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
-    kernel!(|cx: f32, cy: f32, cz: f32| -> Jet3 {
-        X * cx + Y * cy + Z * cz
-    })(cx, cy, cz)
+    kernel!(|cx: f32, cy: f32, cz: f32| -> Jet3 { X * cx + Y * cy + Z * cz })(cx, cy, cz)
 }
 
 // Test c_sq = cx*cx + cy*cy + cz*cz (should be 16 for center at (0,0,4))
 // Returns Field since this only computes with scalar params
 fn test_c_sq(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Field> + Clone {
-    kernel!(|cx: f32, cy: f32, cz: f32| -> Field {
-        cx * cx + cy * cy + cz * cz
-    })(cx, cy, cz)
+    kernel!(|cx: f32, cy: f32, cz: f32| -> Field { cx * cx + cy * cy + cz * cz })(cx, cy, cz)
 }
 
 // Test: just r*r (should be 1 for r=1)
 // Returns Field since this only computes with scalar params
 fn test_r_sq(r: f32) -> impl Manifold<Jet3_4, Output = Field> + Clone {
-    kernel!(|r: f32| -> Field {
-        r * r
-    })(r)
+    kernel!(|r: f32| -> Field { r * r })(r)
 }
 
 // Test: c_sq - r_sq (should be 15 for c_sq=16, r_sq=1)
 // Returns Field since this only computes with scalar params
-fn test_c_sq_minus_r_sq(cx: f32, cy: f32, cz: f32, r: f32) -> impl Manifold<Jet3_4, Output = Field> + Clone {
+fn test_c_sq_minus_r_sq(
+    cx: f32,
+    cy: f32,
+    cz: f32,
+    r: f32,
+) -> impl Manifold<Jet3_4, Output = Field> + Clone {
     kernel!(|cx: f32, cy: f32, cz: f32, r: f32| -> Field {
         let c_sq = cx * cx + cy * cy + cz * cz;
         let r_sq = r * r;
@@ -110,7 +111,12 @@ fn test_d_dot_c_sq(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = 
 
 // Test discriminant = d_dot_c² - (c_sq - r_sq)
 // = 4*4 - (16 - 1) = 16 - 15 = 1
-fn test_discriminant(cx: f32, cy: f32, cz: f32, r: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
+fn test_discriminant(
+    cx: f32,
+    cy: f32,
+    cz: f32,
+    r: f32,
+) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
     kernel!(|cx: f32, cy: f32, cz: f32, r: f32| -> Jet3 {
         let d_dot_c = X * cx + Y * cy + Z * cz;
         let c_sq = cx * cx + cy * cy + cz * cz;
@@ -252,5 +258,8 @@ fn test_sphere_hit() {
 
     // t > 2 and t < 4 (should be ~3.0)
     let in_range = t.val.gt(two) & t.val.lt(four);
-    assert!(in_range.all(), "t should be between 2 and 4 (expected ~3.0)");
+    assert!(
+        in_range.all(),
+        "t should be between 2 and 4 (expected ~3.0)"
+    );
 }

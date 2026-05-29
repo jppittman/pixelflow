@@ -4154,6 +4154,7 @@ fn softmax_with_temperature(logits: &[f32], temperature: f32) -> Vec<f32> {
 mod tests {
     use super::*;
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
 
     /// Create a simple expression: x + y
     fn make_add_xy() -> Expr {

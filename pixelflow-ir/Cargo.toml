@@ -15,5 +15,8 @@ libm = "0.2.15"
 libc = "0.2"
 
 [features]
-default = ["std"]
-std = []
+default = ["std", "alloc"]
+std = ["alloc"]
+# The crate always links `alloc` (see `extern crate alloc`). This feature gates
+# the owned `Expr` tree API used by the x86-64 JIT emitter and arena bridge.
+alloc = []

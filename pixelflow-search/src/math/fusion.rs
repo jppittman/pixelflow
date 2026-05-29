@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, ops};
 use crate::egraph::Pattern as Expr;
+use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
 
 fn b(e: Expr) -> Arc<Expr> {

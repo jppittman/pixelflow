@@ -320,7 +320,11 @@ mod tests {
         let _tx3 = builder.add_producer();
         let inbox = builder.build();
 
-        assert_eq!(inbox.shard_count(), 3, "Should have 3 shards for 3 producers");
+        assert_eq!(
+            inbox.shard_count(),
+            3,
+            "Should have 3 shards for 3 producers"
+        );
         assert_ne!(inbox.shard_count(), 0);
         assert_ne!(inbox.shard_count(), 1);
     }
@@ -364,9 +368,20 @@ mod tests {
             .unwrap();
 
         // Each shard should contribute at most per_shard = 4/2 = 2 messages
-        assert!(from_shard1 <= 2, "Shard 1 drained {} messages, expected <= 2", from_shard1);
-        assert!(from_shard2 <= 2, "Shard 2 drained {} messages, expected <= 2", from_shard2);
-        assert_eq!(from_shard1 + from_shard2, 4, "Total should equal limit of 4");
+        assert!(
+            from_shard1 <= 2,
+            "Shard 1 drained {} messages, expected <= 2",
+            from_shard1
+        );
+        assert!(
+            from_shard2 <= 2,
+            "Shard 2 drained {} messages, expected <= 2",
+            from_shard2
+        );
+        assert_eq!(
+            from_shard1 + from_shard2,
+            4,
+            "Total should equal limit of 4"
+        );
     }
-
 }

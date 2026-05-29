@@ -446,14 +446,20 @@ mod tests {
     #[test]
     fn sender_is_disconnected_false_while_receiver_alive() {
         let (tx, _rx) = spsc_channel::<u32>(4);
-        assert!(!tx.is_disconnected(), "Sender should NOT be disconnected while receiver lives");
+        assert!(
+            !tx.is_disconnected(),
+            "Sender should NOT be disconnected while receiver lives"
+        );
     }
 
     #[test]
     fn sender_is_disconnected_true_after_receiver_dropped() {
         let (tx, rx) = spsc_channel::<u32>(4);
         drop(rx);
-        assert!(tx.is_disconnected(), "Sender should be disconnected after receiver drops");
+        assert!(
+            tx.is_disconnected(),
+            "Sender should be disconnected after receiver drops"
+        );
     }
 
     // Kills: replace is_disconnected -> bool with true (line 277)
@@ -462,14 +468,20 @@ mod tests {
     #[test]
     fn receiver_is_disconnected_false_while_sender_alive() {
         let (_tx, rx) = spsc_channel::<u32>(4);
-        assert!(!rx.is_disconnected(), "Receiver should NOT be disconnected while sender lives");
+        assert!(
+            !rx.is_disconnected(),
+            "Receiver should NOT be disconnected while sender lives"
+        );
     }
 
     #[test]
     fn receiver_is_disconnected_true_after_sender_dropped() {
         let (tx, rx) = spsc_channel::<u32>(4);
         drop(tx);
-        assert!(rx.is_disconnected(), "Receiver should be disconnected after sender drops");
+        assert!(
+            rx.is_disconnected(),
+            "Receiver should be disconnected after sender drops"
+        );
     }
 
     // Kills: replace len -> usize with 0 (line 285)
