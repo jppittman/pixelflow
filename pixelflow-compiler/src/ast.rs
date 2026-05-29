@@ -133,6 +133,13 @@ pub struct IdentExpr {
 pub struct LiteralExpr {
     pub lit: syn::Lit,
     pub span: Span,
+    /// Binding index assigned by the [`annotate`](crate::annotate::annotate) pass.
+    ///
+    /// `None` at parse time. After annotation, `Some(idx)` means this literal is
+    /// emitted as `Var::<N{idx}>::new()` (bound via `Let`); `None` literals are
+    /// emitted directly. Carrying this on the single `Expr` AST removes the need
+    /// for a parallel annotated tree.
+    pub var_index: Option<usize>,
 }
 
 /// Binary operators we recognize.

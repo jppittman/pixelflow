@@ -7,8 +7,8 @@
 //! All compiler phases perform the same structural recursion over Expr:
 //! - **sema**: Expr → () (validate, build symbol table)
 //! - **optimize**: Expr → Expr (algebraic simplification)
-//! - **annotate**: Expr → AnnotatedExpr (assign binding indices)
-//! - **codegen**: AnnotatedExpr → TokenStream (emit code)
+//! - **annotate**: fills `var_index` on `Expr` literals (binding indices)
+//! - **codegen**: Expr → TokenStream (emit code)
 //!
 //! This is the classic "catamorphism" pattern from category theory.
 //! Each phase defines how to handle each node type, and the traversal

@@ -5,8 +5,11 @@ use std::collections::{HashMap, HashSet};
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote};
 
-use crate::annotate::{AnnotatedExpr, AnnotatedStmt, AnnotationCtx, annotate};
-use crate::ast::{BinaryOp, ParamKind, UnaryOp};
+use crate::annotate::{AnnotationCtx, annotate};
+use crate::ast::{
+    BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, LiteralExpr, MethodCallExpr, ParamKind,
+    Stmt, TupleExpr, UnaryExpr, UnaryOp,
+};
 use crate::sema::AnalyzedKernel;
 use crate::symbol::SymbolKind;
 
@@ -16,7 +19,7 @@ use super::util::{build_array, sort_by_index, standard_imports};
 /// Scan an annotated expression to find manifold params used with `.at()`.
 /// Returns the set of manifold param names that need ManifoldExt trait bound.
 fn find_at_manifold_params(
-    expr: &AnnotatedExpr,
+    expr: &Expr,
     symbols: &crate::symbol::SymbolTable,
 ) -> HashSet<String> {
     let mut result = HashSet::new();
@@ -30,7 +33,7 @@ fn find_at_manifold_params(
 /// Derivative operations: DX(), DY(), DZ(), V() when applied to a manifold param or local
 /// that binds to a manifold param.
 fn find_derivative_manifold_params(
-    expr: &AnnotatedExpr,
+    expr: &Expr,
     symbols: &crate::symbol::SymbolTable,
 ) -> HashSet<String> {
     let mut result = HashSet::new();
@@ -40,19 +43,19 @@ fn find_derivative_manifold_params(
 }
 
 fn find_derivative_params_inner(
-    expr: &AnnotatedExpr,
+    expr: &Expr,
     symbols: &crate::symbol::SymbolTable,
     result: &mut HashSet<String>,
     locals_to_manifolds: &mut HashMap<String, String>,
 ) {
     match expr {
-        AnnotatedExpr::Call(call) => {
+        Expr::Call(call) => {
             let func_str = call.func.to_string();
             // Check for derivative operations: DX, DY, DZ, V
             if matches!(func_str.as_str(), "DX" | "DY" | "DZ" | "V") {
                 if let Some(arg) = call.args.first() {
                     // Check if the argument is a manifold param or a local bound to one
-                    if let AnnotatedExpr::Ident(ident_expr) = arg {
+                    if let Expr::Ident(ident_expr) = arg {
                         let name_str = ident_expr.name.to_string();
                         // Local bound to manifold param (e.g., `let t = geometry;`)
                         if let Some(manifold_name) = locals_to_manifolds.get(&name_str) {
@@ -71,25 +74,25 @@ fn find_derivative_params_inner(
                 find_derivative_params_inner(arg, symbols, result, locals_to_manifolds);
             }
         }
-        AnnotatedExpr::MethodCall(call) => {
+        Expr::MethodCall(call) => {
             find_derivative_params_inner(&call.receiver, symbols, result, locals_to_manifolds);
             for arg in &call.args {
                 find_derivative_params_inner(arg, symbols, result, locals_to_manifolds);
             }
         }
-        AnnotatedExpr::Binary(binary) => {
+        Expr::Binary(binary) => {
             find_derivative_params_inner(&binary.lhs, symbols, result, locals_to_manifolds);
             find_derivative_params_inner(&binary.rhs, symbols, result, locals_to_manifolds);
         }
-        AnnotatedExpr::Unary(unary) => {
+        Expr::Unary(unary) => {
             find_derivative_params_inner(&unary.operand, symbols, result, locals_to_manifolds);
         }
-        AnnotatedExpr::Block(block) => {
+        Expr::Block(block) => {
             for stmt in &block.stmts {
                 match stmt {
-                    AnnotatedStmt::Let(let_stmt) => {
+                    Stmt::Let(let_stmt) => {
                         // Track local bindings to manifold params: `let t = geometry;`
-                        if let AnnotatedExpr::Ident(ident_expr) = &let_stmt.init {
+                        if let Expr::Ident(ident_expr) = &let_stmt.init {
                             let init_name = ident_expr.name.to_string();
                             if let Some(symbol) = symbols.lookup(&init_name) {
                                 if matches!(symbol.kind, SymbolKind::ManifoldParam) {
@@ -105,7 +108,7 @@ fn find_derivative_params_inner(
                             locals_to_manifolds,
                         );
                     }
-                    AnnotatedStmt::Expr(expr) => {
+                    Stmt::Expr(expr) => {
                         find_derivative_params_inner(expr, symbols, result, locals_to_manifolds);
                     }
                 }
@@ -114,29 +117,29 @@ fn find_derivative_params_inner(
                 find_derivative_params_inner(expr, symbols, result, locals_to_manifolds);
             }
         }
-        AnnotatedExpr::Paren(inner) => {
+        Expr::Paren(inner) => {
             find_derivative_params_inner(inner, symbols, result, locals_to_manifolds);
         }
-        AnnotatedExpr::Tuple(tuple) => {
+        Expr::Tuple(tuple) => {
             for elem in &tuple.elems {
                 find_derivative_params_inner(elem, symbols, result, locals_to_manifolds);
             }
         }
-        AnnotatedExpr::Ident(_) | AnnotatedExpr::Literal(_) | AnnotatedExpr::Verbatim(_) => {}
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Verbatim(_) => {}
     }
 }
 
 fn find_at_manifold_params_inner(
-    expr: &AnnotatedExpr,
+    expr: &Expr,
     symbols: &crate::symbol::SymbolTable,
     result: &mut HashSet<String>,
 ) {
     match expr {
-        AnnotatedExpr::MethodCall(call) => {
+        Expr::MethodCall(call) => {
             let method_str = call.method.to_string();
             // Check if this is a `.at()` call on a manifold param
             if method_str == "at" {
-                if let AnnotatedExpr::Ident(ident_expr) = &*call.receiver {
+                if let Expr::Ident(ident_expr) = &*call.receiver {
                     let name_str = ident_expr.name.to_string();
                     if let Some(symbol) = symbols.lookup(&name_str) {
                         if matches!(symbol.kind, SymbolKind::ManifoldParam) {
@@ -151,25 +154,25 @@ fn find_at_manifold_params_inner(
                 find_at_manifold_params_inner(arg, symbols, result);
             }
         }
-        AnnotatedExpr::Binary(binary) => {
+        Expr::Binary(binary) => {
             find_at_manifold_params_inner(&binary.lhs, symbols, result);
             find_at_manifold_params_inner(&binary.rhs, symbols, result);
         }
-        AnnotatedExpr::Unary(unary) => {
+        Expr::Unary(unary) => {
             find_at_manifold_params_inner(&unary.operand, symbols, result);
         }
-        AnnotatedExpr::Call(call) => {
+        Expr::Call(call) => {
             for arg in &call.args {
                 find_at_manifold_params_inner(arg, symbols, result);
             }
         }
-        AnnotatedExpr::Block(block) => {
+        Expr::Block(block) => {
             for stmt in &block.stmts {
                 match stmt {
-                    AnnotatedStmt::Let(let_stmt) => {
+                    Stmt::Let(let_stmt) => {
                         find_at_manifold_params_inner(&let_stmt.init, symbols, result);
                     }
-                    AnnotatedStmt::Expr(expr) => {
+                    Stmt::Expr(expr) => {
                         find_at_manifold_params_inner(expr, symbols, result);
                     }
                 }
@@ -178,16 +181,16 @@ fn find_at_manifold_params_inner(
                 find_at_manifold_params_inner(expr, symbols, result);
             }
         }
-        AnnotatedExpr::Paren(inner) => {
+        Expr::Paren(inner) => {
             find_at_manifold_params_inner(inner, symbols, result);
         }
-        AnnotatedExpr::Tuple(tuple) => {
+        Expr::Tuple(tuple) => {
             for elem in &tuple.elems {
                 find_at_manifold_params_inner(elem, symbols, result);
             }
         }
         // Leaf nodes - no recursion needed
-        AnnotatedExpr::Ident(_) | AnnotatedExpr::Literal(_) | AnnotatedExpr::Verbatim(_) => {}
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Verbatim(_) => {}
     }
 }
 
@@ -783,9 +786,9 @@ impl<'a> CodeEmitter<'a> {
     ///
     /// Literals with var_index become Var<N> references.
     /// This is the clean functional version that works with the annotation pass.
-    pub fn emit_annotated_expr(&self, expr: &AnnotatedExpr) -> TokenStream {
+    pub fn emit_annotated_expr(&self, expr: &Expr) -> TokenStream {
         match expr {
-            AnnotatedExpr::Ident(ident_expr) => {
+            Expr::Ident(ident_expr) => {
                 let name = &ident_expr.name;
                 let name_str = name.to_string();
 
@@ -845,7 +848,7 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
 
-            AnnotatedExpr::Literal(lit) => {
+            Expr::Literal(lit) => {
                 // Always emit literals as CtxVar references for ZST preservation
                 // This ensures expression trees remain Copy (composed of ZST nodes)
                 if let Some(var_idx) = lit.var_index {
@@ -860,7 +863,7 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
 
-            AnnotatedExpr::Binary(binary) => {
+            Expr::Binary(binary) => {
                 let lhs = self.emit_annotated_expr(&binary.lhs);
                 let rhs = self.emit_annotated_expr(&binary.rhs);
 
@@ -884,7 +887,7 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
 
-            AnnotatedExpr::Unary(unary) => {
+            Expr::Unary(unary) => {
                 let operand = self.emit_annotated_expr(&unary.operand);
                 match unary.op {
                     // Parentheses are required because method call binds tighter than binary operators.
@@ -894,7 +897,7 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
 
-            AnnotatedExpr::MethodCall(call) => {
+            Expr::MethodCall(call) => {
                 let method = &call.method;
                 let method_str = method.to_string();
 
@@ -907,7 +910,7 @@ impl<'a> CodeEmitter<'a> {
                 //    Field/Jet3 coords all convert to Field via Into<Field>
                 let is_named_kernel = self.analyzed.def.struct_decl.is_some();
                 if is_named_kernel && method_str == "at" {
-                    if let AnnotatedExpr::Ident(ident_expr) = &*call.receiver {
+                    if let Expr::Ident(ident_expr) = &*call.receiver {
                         let name = &ident_expr.name;
                         let name_str = name.to_string();
                         if let Some(symbol) = self.analyzed.symbols.lookup(&name_str) {
@@ -939,7 +942,7 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
 
-            AnnotatedExpr::Call(call) => {
+            Expr::Call(call) => {
                 // Free function call: V(m), DX(expr), etc.
                 // Emit with transformed arguments (manifold params become Var<N>)
                 let func = &call.func;
@@ -956,7 +959,7 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
 
-            AnnotatedExpr::Block(block) => {
+            Expr::Block(block) => {
                 let stmts: Vec<TokenStream> = block
                     .stmts
                     .iter()
@@ -980,12 +983,12 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
 
-            AnnotatedExpr::Paren(inner) => {
+            Expr::Paren(inner) => {
                 let inner_code = self.emit_annotated_expr(inner);
                 quote! { (#inner_code) }
             }
 
-            AnnotatedExpr::Tuple(tuple) => {
+            Expr::Tuple(tuple) => {
                 let elems: Vec<TokenStream> = tuple
                     .elems
                     .iter()
@@ -994,13 +997,13 @@ impl<'a> CodeEmitter<'a> {
                 quote! { (#(#elems),*) }
             }
 
-            AnnotatedExpr::Verbatim(syn_expr) => syn_expr.to_token_stream(),
+            Expr::Verbatim(syn_expr) => syn_expr.to_token_stream(),
         }
     }
 
-    fn emit_annotated_stmt(&self, stmt: &AnnotatedStmt) -> TokenStream {
+    fn emit_annotated_stmt(&self, stmt: &Stmt) -> TokenStream {
         match stmt {
-            AnnotatedStmt::Let(let_stmt) => {
+            Stmt::Let(let_stmt) => {
                 let name = &let_stmt.name;
                 let init = self.emit_annotated_expr(&let_stmt.init);
 
@@ -1009,7 +1012,7 @@ impl<'a> CodeEmitter<'a> {
                     None => quote! { let #name = #init; },
                 }
             }
-            AnnotatedStmt::Expr(expr) => {
+            Stmt::Expr(expr) => {
                 let code = self.emit_annotated_expr(expr);
                 quote! { #code; }
             }
@@ -1022,9 +1025,9 @@ impl<'a> CodeEmitter<'a> {
     /// f32 implements Manifold<P, Output = Field>, and ContextFree lifts that to
     /// Manifold<(Ctx, P)> by ignoring the context.
     /// For other expressions, use normal emission.
-    fn emit_at_coord_arg(&self, expr: &AnnotatedExpr) -> TokenStream {
+    fn emit_at_coord_arg(&self, expr: &Expr) -> TokenStream {
         match expr {
-            AnnotatedExpr::Literal(lit_expr) => {
+            Expr::Literal(lit_expr) => {
                 // Wrap literal in ContextFree so it works with context-extended domains
                 // f32: Manifold<P, Output = Field> for P: Send + Sync
                 // ContextFree<f32>: Manifold<(Ctx, P)> by ignoring context

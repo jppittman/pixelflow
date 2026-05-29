@@ -209,6 +209,7 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
         syn::Expr::Lit(expr_lit) => Ok(Expr::Literal(LiteralExpr {
             span: expr_lit.lit.span(),
             lit: expr_lit.lit,
+            var_index: None,
         })),
 
         syn::Expr::Binary(expr_binary) => {
