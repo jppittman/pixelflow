@@ -1272,7 +1272,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failure on x86 Expr bridge path: compile_arena_dag -> to_expr -> compile_dag"]
     fn test_seed_42_t1_initial_jit_matches_scalar() {
         let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
@@ -1290,7 +1289,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failure on x86 Expr bridge path: compile_arena_dag -> to_expr -> compile_dag"]
     fn test_seed_42_t1_final_jit_matches_scalar() {
         let final_ = "log2(add(Const(0.001), abs(atan2(pow(add(abs(neg(pow(add(abs(Const(-0.9631642)), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(mul(min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))), exp(pow(add(abs(atan2(Const(0.1167655), Var(1))), Const(0.001)), Const(-1)))), exp(add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001))))))))))";
         assert_scalar_and_jit_close(final_, 1e-3);
@@ -1310,7 +1308,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failure on x86 Expr bridge path: compile_arena_dag -> to_expr -> compile_dag"]
     fn test_seed_24042_t52_initial_jit_matches_scalar() {
         let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
@@ -1328,7 +1325,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failure on x86 Expr bridge path: compile_arena_dag -> to_expr -> compile_dag"]
     fn test_seed_24042_t52_final_jit_matches_scalar() {
         let final_ = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(Const(0.12621832), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(Const(0.20414245), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(Const(0.093906365), Var(2)), mul(Const(0.093906365), Var(3))), max(Const(-1.3763785), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(Const(8.641348), recip(add(Const(1.7208018), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(Const(1.1988422), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(Const(1.670574), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         assert_scalar_and_jit_close(final_, 1e-3);
