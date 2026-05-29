@@ -1025,7 +1025,14 @@ impl Numeric for Jet2H {
 
     #[inline(always)]
     fn fract(self) -> Self {
-        Self::new(self.val.fract(), self.dx, self.dy, self.dxx, self.dxy, self.dyy)
+        Self::new(
+            self.val.fract(),
+            self.dx,
+            self.dy,
+            self.dxx,
+            self.dxy,
+            self.dyy,
+        )
     }
 
     #[inline(always)]
@@ -1058,11 +1065,31 @@ impl Numeric for Jet2H {
         let clamped = self.val.clamp(lo.val, hi.val);
         Self {
             val: clamped,
-            dx: Field::select_raw(mask_low, lo.dx, Field::select_raw(mask_high, hi.dx, self.dx)),
-            dy: Field::select_raw(mask_low, lo.dy, Field::select_raw(mask_high, hi.dy, self.dy)),
-            dxx: Field::select_raw(mask_low, lo.dxx, Field::select_raw(mask_high, hi.dxx, self.dxx)),
-            dxy: Field::select_raw(mask_low, lo.dxy, Field::select_raw(mask_high, hi.dxy, self.dxy)),
-            dyy: Field::select_raw(mask_low, lo.dyy, Field::select_raw(mask_high, hi.dyy, self.dyy)),
+            dx: Field::select_raw(
+                mask_low,
+                lo.dx,
+                Field::select_raw(mask_high, hi.dx, self.dx),
+            ),
+            dy: Field::select_raw(
+                mask_low,
+                lo.dy,
+                Field::select_raw(mask_high, hi.dy, self.dy),
+            ),
+            dxx: Field::select_raw(
+                mask_low,
+                lo.dxx,
+                Field::select_raw(mask_high, hi.dxx, self.dxx),
+            ),
+            dxy: Field::select_raw(
+                mask_low,
+                lo.dxy,
+                Field::select_raw(mask_high, hi.dxy, self.dxy),
+            ),
+            dyy: Field::select_raw(
+                mask_low,
+                lo.dyy,
+                Field::select_raw(mask_high, hi.dyy, self.dyy),
+            ),
         }
     }
 
@@ -1110,7 +1137,9 @@ impl Numeric for Jet2H {
 
     #[inline(always)]
     fn raw_neg(self) -> Self {
-        Self::new(-self.val, -self.dx, -self.dy, -self.dxx, -self.dxy, -self.dyy)
+        Self::new(
+            -self.val, -self.dx, -self.dy, -self.dxx, -self.dxy, -self.dyy,
+        )
     }
 }
 

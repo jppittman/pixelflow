@@ -1,4 +1,3 @@
-
 //! # PixelFlow Graphics
 //!
 //! Turns **algebraic manifolds into pixels** through three composable tiers: colors, fonts, and materialization.

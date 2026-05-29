@@ -61,7 +61,7 @@ use crate::Manifold;
 use crate::combinators::{At, ClosureMap, Map, Select};
 use crate::ops::{
     Abs, Acos, Add, Asin, Atan, Atan2, Ceil, Clamp, Cos, Div, Eq, Exp, Exp2, Floor, Fract, Ge, Gt,
-    Hypot, Le, Ln, Log10, Log2, Lt, Max, Min, Mul, MulAdd, MulRsqrt, Ne, Neg, Pow, Recip, Round,
+    Hypot, Le, Ln, Log2, Log10, Lt, Max, Min, Mul, MulAdd, MulRsqrt, Ne, Neg, Pow, Recip, Round,
     Rsqrt, Sin, Sqrt, Sub, Tan,
 };
 

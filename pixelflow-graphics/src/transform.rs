@@ -3,7 +3,7 @@
 //! Provides composable coordinate warping using the `At` combinator.
 
 use pixelflow_core::ops::{Div, Sub};
-use pixelflow_core::{At, Field, Manifold, X, Y, Z, W};
+use pixelflow_core::{At, Field, Manifold, W, X, Y, Z};
 
 /// The standard 4D Field domain type.
 type Field4 = (Field, Field, Field, Field);

@@ -2,17 +2,23 @@
 //!
 //! cargo run --release -p pixelflow-runtime --example bench_psychedelic
 
+use pixelflow_compiler::{kernel, kernel_jit, kernel_raw};
 use pixelflow_core::{Field, Manifold, PARALLELISM};
-use pixelflow_compiler::{kernel, kernel_raw, kernel_jit};
 
 #[cfg(target_os = "macos")]
-unsafe extern "C" { fn mach_absolute_time() -> u64; }
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+}
 
 fn nanos_now() -> u64 {
     #[cfg(target_os = "macos")]
-    unsafe { mach_absolute_time() }
+    unsafe {
+        mach_absolute_time()
+    }
     #[cfg(not(target_os = "macos"))]
-    { std::time::Instant::now().elapsed().as_nanos() as u64 }
+    {
+        std::time::Instant::now().elapsed().as_nanos() as u64
+    }
 }
 
 // LLVM only — no e-graph optimization
@@ -127,7 +133,8 @@ fn main() {
         let phase = time * 0.5;
         let sin_w03 = (time * 0.3).sin();
         let sin_w20 = (time * 2.0).sin();
-        let swirl = ((vx + phase).sin() + 1.0) * ((vx + phase) - (vy + phase * 0.7)).abs() * 0.2 + 0.001;
+        let swirl =
+            ((vx + phase).sin() + 1.0) * ((vx + phase) - (vy + phase * 0.7)).abs() * 0.2 + 0.001;
         let pulse = 1.0 + sin_w20 * 0.1;
         let radial_factor = (radial * -4.0 * pulse).exp();
         let y_factor_r = (y + sin_w03 * 0.2).exp();
@@ -142,7 +149,10 @@ fn main() {
         red + green + blue
     });
 
-    println!("=== Psychedelic Shader (3ch, 1920px scanline, {} SIMD lanes) ===\n", PARALLELISM);
+    println!(
+        "=== Psychedelic Shader (3ch, 1920px scanline, {} SIMD lanes) ===\n",
+        PARALLELISM
+    );
 
     let raw_ns = bench_scanline(&raw);
     let opt_ns = bench_scanline(&opt);
@@ -152,6 +162,12 @@ fn main() {
     println!("  NNUE + LLVM (kernel!):    {:.3}ns/pixel", opt_ns);
     println!("  JIT (kernel_jit!):        {:.3}ns/pixel", jit_ns);
     println!();
-    println!("  NNUE+LLVM vs LLVM: {:.1}%", (opt_ns / raw_ns - 1.0) * 100.0);
-    println!("  JIT vs LLVM:       {:.1}%", (jit_ns / raw_ns - 1.0) * 100.0);
+    println!(
+        "  NNUE+LLVM vs LLVM: {:.1}%",
+        (opt_ns / raw_ns - 1.0) * 100.0
+    );
+    println!(
+        "  JIT vs LLVM:       {:.1}%",
+        (jit_ns / raw_ns - 1.0) * 100.0
+    );
 }

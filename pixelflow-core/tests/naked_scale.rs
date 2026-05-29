@@ -12,12 +12,13 @@ fn get_jit_mul_kernel() -> usize {
         0x4E21D800, // fmul v0.4s, v0.4s, v1.4s
         0xD65F03C0, // ret
     ];
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len() * 4)
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len() * 4) };
+
+    let exec = unsafe {
+        pixelflow_ir::backend::emit::executable::ExecutableCode::from_code(bytes).unwrap()
     };
 
-    let exec = unsafe { pixelflow_ir::backend::emit::executable::ExecutableCode::from_code(bytes).unwrap() };
-    
     // Leak the executable so it lives forever (it's just a test)
     let ptr = unsafe { exec.as_fn::<extern "C" fn()>() as usize };
     std::mem::forget(exec);
@@ -66,7 +67,7 @@ fn test_naked_abi_multithreaded_scale() {
                 let successes = &total_successes;
                 s.spawn(move || {
                     let mut local_successes = 0;
-                    
+
                     let x = [1.0f32, 2.0, 3.0, 4.0];
                     let y = [2.0f32, 2.0, 2.0, 2.0];
                     let zero = [0.0f32; 4];
@@ -77,10 +78,10 @@ fn test_naked_abi_multithreaded_scale() {
                             let vy: float32x4_t = std::mem::transmute(y);
                             let vz: float32x4_t = std::mem::transmute(zero);
                             let vw: float32x4_t = std::mem::transmute(zero);
-                            
+
                             let res = invoke_naked_kernel(kernel_ptr, vx, vy, vz, vw);
                             let out: [f32; 4] = std::mem::transmute(res);
-                            
+
                             // 1*2=2, 2*2=4, 3*2=6, 4*2=8
                             if out == [2.0, 4.0, 6.0, 8.0] {
                                 local_successes += 1;
@@ -92,8 +93,14 @@ fn test_naked_abi_multithreaded_scale() {
             }
         });
 
-        assert_eq!(total_successes.load(Ordering::SeqCst), num_threads * ops_per_thread);
-        println!("Successfully executed {} Naked ABI calls across {} threads without crashing.", 
-            num_threads * ops_per_thread, num_threads);
+        assert_eq!(
+            total_successes.load(Ordering::SeqCst),
+            num_threads * ops_per_thread
+        );
+        println!(
+            "Successfully executed {} Naked ABI calls across {} threads without crashing.",
+            num_threads * ops_per_thread,
+            num_threads
+        );
     }
 }

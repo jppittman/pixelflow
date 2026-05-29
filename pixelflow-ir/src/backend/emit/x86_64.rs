@@ -270,10 +270,12 @@ fn emit_f32_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
         code.extend_from_slice(&bits.to_le_bytes());
     }
 
-    // MOVAPS dst, [RIP + disp32]
+    // MOVUPS dst, [RIP + disp32]
     // The displacement is relative to the end of this instruction.
-    // This instruction is 4 bytes (REX? + 0F 28 ModRM + disp32) or 3+4=7.
-    // Actually: opcode 0F 28, ModRM = 0x05 | (dst.0 << 3), then disp32.
+    // MOVUPS (unaligned load) is required here: the constant is embedded inline
+    // in the code stream at an arbitrary byte offset, so its address is not
+    // guaranteed 16-byte aligned. MOVAPS would #GP-fault on a misaligned load.
+    // Opcode 0F 10, ModRM = 0x05 | (dst.0 << 3), then disp32.
     // Total instruction length = (optional REX) + 2(opcode) + 1(ModRM) + 4(disp32) = 7 or 8 bytes.
     // RIP points to end of instruction, so disp32 = -(16 + instruction_length).
 
@@ -285,7 +287,7 @@ fn emit_f32_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
         code.push(0x44); // REX.R
     }
     code.push(0x0F);
-    code.push(0x28);
+    code.push(0x10);
     code.push(0x05 | ((dst.0 & 7) << 3)); // ModRM: mod=00, rm=101 (RIP-relative)
     code.extend_from_slice(&disp.to_le_bytes());
 }
@@ -501,6 +503,20 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, scratch: [
             // TODO: Newton-Raphson refinement
         }
         OpKind::Recip => emit_rcpps(code, dst, src),
+
+        // Negation: flip the sign bit (dst = src XOR 0x80000000).
+        OpKind::Neg => {
+            let mask = scratch[0];
+            emit_f32_const(code, mask, f32::from_bits(0x8000_0000));
+            emit_vxorps(code, dst, src, mask);
+        }
+
+        // Absolute value: clear the sign bit (dst = src AND 0x7FFFFFFF).
+        OpKind::Abs => {
+            let mask = scratch[0];
+            emit_f32_const(code, mask, f32::from_bits(0x7FFF_FFFF));
+            emit_vandps(code, dst, src, mask);
+        }
 
         // Inverse trigonometric builtins
         OpKind::Atan => emit_atan_builtin(code, dst, src, scratch),

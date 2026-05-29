@@ -283,7 +283,12 @@ where
         let right_val = self.eval_child(node.right, x, y, z, w);
 
         // Blend using Select combinator
-        Select { cond: mask, if_true: left_val, if_false: right_val }.eval((x, y, z, w))
+        Select {
+            cond: mask,
+            if_true: left_val,
+            if_false: right_val,
+        }
+        .eval((x, y, z, w))
     }
 
     /// Evaluate a child node (either interior or leaf).

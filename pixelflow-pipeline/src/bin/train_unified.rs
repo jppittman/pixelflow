@@ -243,9 +243,7 @@ fn critic_port_from_url(critic_url: &str) -> u16 {
     let without_scheme = critic_url.split("://").nth(1).unwrap_or(critic_url);
     let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
     let (_, port_str) = host_port.rsplit_once(':').unwrap_or_else(|| {
-        panic!(
-            "[CRITIC] critic_url must include an explicit port, got `{critic_url}`"
-        )
+        panic!("[CRITIC] critic_url must include an explicit port, got `{critic_url}`")
     });
     port_str.parse::<u16>().unwrap_or_else(|e| {
         panic!("[CRITIC] Failed to parse port from critic_url `{critic_url}`: {e}")

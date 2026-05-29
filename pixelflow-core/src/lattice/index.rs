@@ -1,7 +1,7 @@
+use super::{DiscreteManifold, Lattice, LatticeDomain, ReduceOp};
 use crate::numeric::Numeric;
 use crate::{Field, Manifold, PARALLELISM};
 use alloc::vec;
-use super::{DiscreteManifold, Lattice, LatticeDomain, ReduceOp};
 
 // ============================================================================
 // IndexLattice1D: 1D index domain (feature/tensor indexing, not pixel space)
@@ -217,7 +217,8 @@ impl Lattice for IndexLattice2D {
                 let result = manifold.eval((x_field, y_field, z_field, w_field));
                 result.store(&mut packed);
                 let tail_len = self.width - x;
-                buffer[row_offset + x..row_offset + self.width].copy_from_slice(&packed[..tail_len]);
+                buffer[row_offset + x..row_offset + self.width]
+                    .copy_from_slice(&packed[..tail_len]);
             }
         }
 
@@ -440,7 +441,11 @@ mod tests {
         result.store(&mut packed);
         // collapse_with must horizontal-reduce all SIMD lanes to a single scalar,
         // so all lanes should equal 6.0.
-        assert!((packed[0] - 6.0).abs() < 1e-5, "expected 6.0, got {}", packed[0]);
+        assert!(
+            (packed[0] - 6.0).abs() < 1e-5,
+            "expected 6.0, got {}",
+            packed[0]
+        );
     }
 
     #[test]
@@ -485,8 +490,8 @@ mod tests {
 
     #[test]
     fn collapse_axis0_dot_product() {
-        use crate::{Field, Manifold};
         use crate::lattice::DiscreteManifold;
+        use crate::{Field, Manifold};
 
         // W = column-major layout for matmul:
         // W(input_i=X, output_j=Y): W(0,0)=1, W(1,0)=3, W(0,1)=2, W(1,1)=4
@@ -519,7 +524,11 @@ mod tests {
         assert_eq!(result.height(), 1);
         let buf = result.buffer();
         assert!((buf[0] - 7.0).abs() < 1e-4, "expected 7.0, got {}", buf[0]);
-        assert!((buf[1] - 10.0).abs() < 1e-4, "expected 10.0, got {}", buf[1]);
+        assert!(
+            (buf[1] - 10.0).abs() < 1e-4,
+            "expected 10.0, got {}",
+            buf[1]
+        );
     }
 
     #[test]

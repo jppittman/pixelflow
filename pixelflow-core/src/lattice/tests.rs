@@ -151,11 +151,7 @@ fn discrete_manifold_round_trip() {
     ));
     let mut out = [0.0f32; PARALLELISM];
     result.store(&mut out);
-    assert!(
-        (out[0] - 3.0).abs() < 1e-5,
-        "expected 3.0, got {}",
-        out[0],
-    );
+    assert!((out[0] - 3.0).abs() < 1e-5, "expected 3.0, got {}", out[0],);
 }
 
 // ---- collapse_with Add on constant = value * count ----

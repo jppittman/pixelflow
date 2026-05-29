@@ -561,6 +561,45 @@ impl ExprArena {
         id_map[root.0 as usize].expect("substitute_params: root was never mapped")
     }
 
+    /// Materialize the subtree rooted at `root` as an owned [`Expr`] tree.
+    ///
+    /// The arena is the canonical representation. Some backends (the x86-64 JIT
+    /// emitter) still operate on the recursive [`Expr`] tree; this bridges them
+    /// by expanding the arena into an owned, pointer-light `Box` tree. Shared
+    /// subexpressions are duplicated — acceptable because the x86-64 path treats
+    /// expressions as trees (no DAG sharing).
+    #[cfg(feature = "alloc")]
+    #[must_use]
+    pub fn to_expr(&self, root: ExprId) -> crate::expr::Expr {
+        use crate::expr::Expr;
+        use alloc::boxed::Box;
+
+        match self.nodes[root.0 as usize] {
+            ExprNode::Var(i) => Expr::Var(i),
+            ExprNode::Const(v) => Expr::Const(v),
+            ExprNode::Param(i) => Expr::Param(i),
+            ExprNode::Unary(op, a) => Expr::Unary(op, Box::new(self.to_expr(a))),
+            ExprNode::Binary(op, a, b) => {
+                Expr::Binary(op, Box::new(self.to_expr(a)), Box::new(self.to_expr(b)))
+            }
+            ExprNode::Ternary(op, a, b, c) => Expr::Ternary(
+                op,
+                Box::new(self.to_expr(a)),
+                Box::new(self.to_expr(b)),
+                Box::new(self.to_expr(c)),
+            ),
+            ExprNode::Nary(op, start, len) => {
+                let s = start as usize;
+                let l = len as usize;
+                let children = self.nary_children[s..s + l]
+                    .iter()
+                    .map(|child| self.to_expr(*child))
+                    .collect();
+                Expr::Nary(op, children)
+            }
+        }
+    }
+
     // ───────────────────── display ───────────────────────────
 
     /// Format the subtree rooted at `root` as an S-expression, matching the

@@ -753,8 +753,12 @@ impl Numeric for Jet2 {
         let db_coeff = result.raw_mul(half_inv_b);
         Self::new(
             result,
-            self.dx.raw_mul(da_coeff).raw_sub(other.dx.raw_mul(db_coeff)),
-            self.dy.raw_mul(da_coeff).raw_sub(other.dy.raw_mul(db_coeff)),
+            self.dx
+                .raw_mul(da_coeff)
+                .raw_sub(other.dx.raw_mul(db_coeff)),
+            self.dy
+                .raw_mul(da_coeff)
+                .raw_sub(other.dy.raw_mul(db_coeff)),
         )
     }
 
@@ -776,7 +780,11 @@ impl Numeric for Jet2 {
             lo.dy,
             Field::select_raw(mask_high, hi.dy, self.dy),
         );
-        Self { val: clamped, dx, dy }
+        Self {
+            val: clamped,
+            dx,
+            dy,
+        }
     }
 
     #[inline(always)]

@@ -23,9 +23,13 @@ pub use variance::{compute_arena_variance, find_hoistable_arena_nodes};
 pub mod arena;
 pub use arena::{ExprArena, ExprId, ExprNode};
 
+pub mod expr;
+#[cfg(feature = "alloc")]
+pub use expr::Expr;
+
 pub mod jit_manifold;
 pub use jit_manifold::{JitManifold, ScanlineJitManifold};
 
+pub use kind::OpKind;
 pub use ops::{ALL_OPS, OP_COUNT, known_method_names, op_by_index, op_by_name};
 pub use traits::{EmitStyle, Op, OpMeta};
-pub use kind::OpKind;

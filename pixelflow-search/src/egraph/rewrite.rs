@@ -7,8 +7,8 @@ use core::fmt;
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use super::ops::Op;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::OpKind;
+use pixelflow_ir::arena::{ExprArena, ExprId};
 
 /// Structural rewrite template expression.
 #[derive(Clone, Debug, PartialEq)]

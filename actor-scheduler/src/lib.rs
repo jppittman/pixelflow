@@ -1546,7 +1546,10 @@ mod backoff_unit_tests {
     fn backoff_duration_nonzero_for_nonzero_backoff() {
         let params = params_with_bounds(1000, 1_000_000);
         let dur = backoff_with_jitter(0, &params).unwrap();
-        assert!(dur.as_micros() >= 500, "Duration should be at least 50% of 1000us");
+        assert!(
+            dur.as_micros() >= 500,
+            "Duration should be at least 50% of 1000us"
+        );
     }
 
     // Kills: send_with_backoff arithmetic/comparison mutations via observable behavior
@@ -1563,7 +1566,10 @@ mod backoff_unit_tests {
         drop(rx);
         let params = SchedulerParams::DEFAULT;
         assert!(
-            matches!(send_with_backoff(&tx, 42, &params), Err(SendError::Disconnected)),
+            matches!(
+                send_with_backoff(&tx, 42, &params),
+                Err(SendError::Disconnected)
+            ),
             "Should return Disconnected when receiver has dropped"
         );
     }
@@ -1595,7 +1601,6 @@ mod backoff_unit_tests {
             "Should return Timeout when channel permanently full"
         );
     }
-
 }
 
 // Tests targeting missed mutations in drain_all_with_timeout.
@@ -1745,11 +1750,8 @@ mod drain_all_targeted_tests {
     // With body replaced: control/mgmt messages queued at shutdown time are dropped.
     #[test]
     fn drain_control_processes_queued_control_and_mgmt_on_shutdown() {
-        let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
-            100,
-            1000,
-            ShutdownMode::DrainControl,
-        );
+        let (tx, mut rx) =
+            ActorScheduler::new_with_shutdown_mode(100, 1000, ShutdownMode::DrainControl);
 
         // Queue Shutdown BEFORE scheduler starts, then queue control/mgmt messages.
         // Scheduler will see Shutdown immediately → calls drain_control_and_management.

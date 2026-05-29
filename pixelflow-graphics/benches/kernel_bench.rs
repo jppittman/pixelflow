@@ -3,8 +3,8 @@
 //! Tests the effectiveness of the e-graph optimizer on complex algebraic expressions.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use pixelflow_core::{Field, ManifoldCompat, ManifoldExt, PARALLELISM, X, Y};
 use pixelflow_compiler::kernel;
+use pixelflow_core::{Field, ManifoldCompat, ManifoldExt, PARALLELISM, X, Y};
 
 /// Complex polynomial: f(x, y) = x³ + 2x²y + 3xy² + y³
 /// Manual construction (no automatic fusion anymore)
@@ -17,9 +17,7 @@ pub fn manual_poly(x: Field, y: Field) -> Field {
 /// Same polynomial using kernel! (optimized by e-graph)
 #[inline(never)]
 pub fn kernel_poly(x: Field, y: Field) -> Field {
-    let k = kernel!(|| {
-        X * X * X + X * X * Y * 2.0 + X * Y * Y * 3.0 + Y * Y * Y
-    });
+    let k = kernel!(|| { X * X * X + X * X * Y * 2.0 + X * Y * Y * 3.0 + Y * Y * Y });
     k().eval_raw(x, y, Field::from(0.0), Field::from(0.0))
 }
 

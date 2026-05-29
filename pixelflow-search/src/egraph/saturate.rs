@@ -204,7 +204,7 @@ pub fn achievable_cost_within_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egraph::{ops, CostModel, ENode, Rewrite};
+    use crate::egraph::{CostModel, ENode, Rewrite, ops};
     use crate::math::algebra::{
         AddNeg, Annihilator, Cancellation, Canonicalize, Commutative, Identity,
         InverseAnnihilation, Involution, MulRecip,

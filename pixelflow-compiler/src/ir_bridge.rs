@@ -6,12 +6,12 @@
 //!
 //! The IR becomes the canonical representation, with AST only used during parsing.
 
-use std::collections::HashMap;
 use crate::ast::{BinaryOp, Expr, UnaryOp};
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 use proc_macro2::TokenStream;
 use quote::quote;
+use std::collections::HashMap;
 use syn::Lit;
 
 // ============================================================================
@@ -22,9 +22,7 @@ use syn::Lit;
 ///
 /// Index is declaration order: first scalar param = 0, second = 1, etc.
 /// Only scalar params are included — manifold params cannot be constant-folded.
-pub fn scalar_param_indices(
-    analyzed: &crate::sema::AnalyzedKernel,
-) -> HashMap<String, u8> {
+pub fn scalar_param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, u8> {
     analyzed
         .def
         .params
@@ -50,6 +48,21 @@ pub fn ast_to_arena(
     param_indices: &HashMap<String, u8>,
     arena: &mut ExprArena,
 ) -> Result<ExprId, String> {
+    let mut locals: HashMap<String, ExprId> = HashMap::new();
+    ast_to_arena_inner(expr, param_indices, &mut locals, arena)
+}
+
+/// Translate an AST node into the arena, resolving `let`-bound locals via
+/// `locals`. The optimizer emits `let`-bindings (a [`Expr::Block`]) for shared
+/// subexpressions; each binding maps to a single [`ExprId`], so the arena
+/// faithfully preserves the discovered CSE as a DAG rather than duplicating
+/// subtrees.
+fn ast_to_arena_inner(
+    expr: &Expr,
+    param_indices: &HashMap<String, u8>,
+    locals: &mut HashMap<String, ExprId>,
+    arena: &mut ExprArena,
+) -> Result<ExprId, String> {
     match expr {
         Expr::Ident(ident) => {
             let name = ident.name.to_string();
@@ -59,7 +72,9 @@ pub fn ast_to_arena(
                 "Z" => Ok(arena.push_var(2)),
                 "W" => Ok(arena.push_var(3)),
                 _ => {
-                    if let Some(&idx) = param_indices.get(&name) {
+                    if let Some(&id) = locals.get(&name) {
+                        Ok(id)
+                    } else if let Some(&idx) = param_indices.get(&name) {
                         Ok(arena.push_param(idx))
                     } else {
                         Err(format!("Unknown identifier: {}", name))
@@ -77,8 +92,8 @@ pub fn ast_to_arena(
         }
 
         Expr::Binary(binary) => {
-            let lhs = ast_to_arena(&binary.lhs, param_indices, arena)?;
-            let rhs = ast_to_arena(&binary.rhs, param_indices, arena)?;
+            let lhs = ast_to_arena_inner(&binary.lhs, param_indices, locals, arena)?;
+            let rhs = ast_to_arena_inner(&binary.rhs, param_indices, locals, arena)?;
 
             let op = match binary.op {
                 BinaryOp::Add => OpKind::Add,
@@ -98,7 +113,7 @@ pub fn ast_to_arena(
         }
 
         Expr::Unary(unary) => {
-            let operand = ast_to_arena(&unary.operand, param_indices, arena)?;
+            let operand = ast_to_arena_inner(&unary.operand, param_indices, locals, arena)?;
 
             let op = match unary.op {
                 UnaryOp::Neg => OpKind::Neg,
@@ -110,7 +125,7 @@ pub fn ast_to_arena(
 
         Expr::MethodCall(call) => {
             let method = call.method.to_string();
-            let receiver = ast_to_arena(&call.receiver, param_indices, arena)?;
+            let receiver = ast_to_arena_inner(&call.receiver, param_indices, locals, arena)?;
 
             match (method.as_str(), call.args.len()) {
                 // Unary methods - primitives
@@ -138,44 +153,93 @@ pub fn ast_to_arena(
 
                 // Binary methods
                 ("min", 1) => {
-                    let arg = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    let arg = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Min, receiver, arg))
                 }
                 ("max", 1) => {
-                    let arg = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    let arg = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Max, receiver, arg))
                 }
                 ("atan2", 1) => {
-                    let arg = ast_to_arena(&call.args[0], param_indices, arena)?;
+                    let arg = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Atan2, receiver, arg))
                 }
 
                 // Ternary methods
                 ("mul_add", 2) => {
-                    let b = ast_to_arena(&call.args[0], param_indices, arena)?;
-                    let c = ast_to_arena(&call.args[1], param_indices, arena)?;
+                    let b = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let c = ast_to_arena_inner(&call.args[1], param_indices, locals, arena)?;
                     Ok(arena.push_ternary(OpKind::MulAdd, receiver, b, c))
                 }
                 ("select", 2) => {
-                    let if_true = ast_to_arena(&call.args[0], param_indices, arena)?;
-                    let if_false = ast_to_arena(&call.args[1], param_indices, arena)?;
+                    let if_true = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let if_false = ast_to_arena_inner(&call.args[1], param_indices, locals, arena)?;
                     Ok(arena.push_ternary(OpKind::Select, receiver, if_true, if_false))
+                }
+                ("clamp", 2) => {
+                    let lo = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let hi = ast_to_arena_inner(&call.args[1], param_indices, locals, arena)?;
+                    Ok(arena.push_ternary(OpKind::Clamp, receiver, lo, hi))
                 }
 
                 // Comparison methods (emitted by e-graph extraction)
-                ("lt", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Lt, receiver, a)) }
-                ("le", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Le, receiver, a)) }
-                ("gt", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Gt, receiver, a)) }
-                ("ge", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Ge, receiver, a)) }
-                ("eq", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Eq, receiver, a)) }
-                ("ne", 1) => { let a = ast_to_arena(&call.args[0], param_indices, arena)?; Ok(arena.push_binary(OpKind::Ne, receiver, a)) }
+                ("lt", 1) => {
+                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    Ok(arena.push_binary(OpKind::Lt, receiver, a))
+                }
+                ("le", 1) => {
+                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    Ok(arena.push_binary(OpKind::Le, receiver, a))
+                }
+                ("gt", 1) => {
+                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    Ok(arena.push_binary(OpKind::Gt, receiver, a))
+                }
+                ("ge", 1) => {
+                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    Ok(arena.push_binary(OpKind::Ge, receiver, a))
+                }
+                ("eq", 1) => {
+                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    Ok(arena.push_binary(OpKind::Eq, receiver, a))
+                }
+                ("ne", 1) => {
+                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    Ok(arena.push_binary(OpKind::Ne, receiver, a))
+                }
 
                 _ => Err(format!("Unsupported method: {}", method)),
             }
         }
 
         // Parentheses are transparent - just recurse into the inner expression
-        Expr::Paren(inner) => ast_to_arena(inner, param_indices, arena),
+        Expr::Paren(inner) => ast_to_arena_inner(inner, param_indices, locals, arena),
+
+        // Blocks carry the optimizer's CSE: each `let __n = <expr>;` binds a
+        // shared subexpression to a single arena node, and the final expression
+        // references those bindings by name.
+        Expr::Block(block) => {
+            for stmt in &block.stmts {
+                match stmt {
+                    crate::ast::Stmt::Let(let_stmt) => {
+                        let id =
+                            ast_to_arena_inner(&let_stmt.init, param_indices, locals, arena)?;
+                        locals.insert(let_stmt.name.to_string(), id);
+                    }
+                    // A non-binding statement has no value to thread; evaluate
+                    // it so any nested error surfaces, then discard the id.
+                    crate::ast::Stmt::Expr(e) => {
+                        let _ = ast_to_arena_inner(e, param_indices, locals, arena)?;
+                    }
+                }
+            }
+            match &block.expr {
+                Some(final_expr) => {
+                    ast_to_arena_inner(final_expr, param_indices, locals, arena)
+                }
+                None => Err(format!("Block has no final expression")),
+            }
+        }
 
         _ => Err(format!("Unsupported expression type")),
     }
