@@ -1460,6 +1460,7 @@ fn make_literal(val: f64, span: Span) -> Expr {
     Expr::Literal(LiteralExpr {
         lit: Lit::Float(lit),
         span,
+        var_index: None,
     })
 }
 

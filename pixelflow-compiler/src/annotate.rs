@@ -1,27 +1,30 @@
 //! # Expression Annotation Pass
 //!
-//! Transforms the raw AST into an annotated form where literals have their
-//! Var binding indices resolved. This is a pure functional pass.
+//! Walks the AST and resolves each literal's `Var` binding index, writing it
+//! into the literal's `var_index` field. This is a pure functional pass over the
+//! single [`Expr`] representation — there is no separate annotated tree.
 //!
 //! ## Design
 //!
 //! The annotation pass threads context through return values (functional state):
 //! ```text
-//! annotate(expr, ctx) -> (AnnotatedExpr, ctx')
+//! annotate(expr, ctx) -> (Expr, ctx')
 //! ```
 //!
-//! This avoids mutation while still tracking state (literal counter).
+//! This avoids mutation while still tracking state (the literal counter).
 //!
 //! ## Why Annotate?
 //!
 //! In Jet domains (Jet3, Jet2), literals cannot be inlined as actual Jet values
 //! because they'd break the ZST expression tree. Instead, literals become
-//! `Var<N>` references bound via `Let`. The annotation pass assigns each
-//! literal its Var index.
+//! `Var<N>` references bound via `Let`. The annotation pass assigns each literal
+//! its Var index (stored in [`LiteralExpr::var_index`]).
 
-use crate::ast::{BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, Stmt, UnaryOp};
-use proc_macro2::Span;
-use syn::{Ident, Lit, Type};
+use crate::ast::{
+    BinaryExpr, BlockExpr, CallExpr, Expr, LetStmt, LiteralExpr, MethodCallExpr, Stmt, TupleExpr,
+    UnaryExpr,
+};
+use syn::Lit;
 
 /// Context threaded through the annotation pass.
 #[derive(Clone)]
@@ -42,91 +45,6 @@ impl AnnotationCtx {
     }
 }
 
-/// Annotated expression tree.
-///
-/// Mirrors `Expr` but literals carry their resolved Var index.
-#[derive(Debug, Clone)]
-pub enum AnnotatedExpr {
-    Ident(IdentExpr),
-    Literal(AnnotatedLiteral),
-    Binary(AnnotatedBinary),
-    Unary(AnnotatedUnary),
-    MethodCall(AnnotatedMethodCall),
-    Call(AnnotatedCall),
-    Block(AnnotatedBlock),
-    Tuple(AnnotatedTuple),
-    Paren(Box<AnnotatedExpr>),
-    Verbatim(syn::Expr),
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnotatedTuple {
-    pub elems: Vec<AnnotatedExpr>,
-    pub span: Span,
-}
-
-/// A literal with its binding information.
-#[derive(Debug, Clone)]
-pub struct AnnotatedLiteral {
-    pub lit: Lit,
-    pub span: Span,
-    /// If Some(idx), this literal should be emitted as `Var::<N{idx}>::new()`.
-    /// If None, emit the literal directly.
-    pub var_index: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnotatedBinary {
-    pub op: BinaryOp,
-    pub lhs: Box<AnnotatedExpr>,
-    pub rhs: Box<AnnotatedExpr>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnotatedUnary {
-    pub op: UnaryOp,
-    pub operand: Box<AnnotatedExpr>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnotatedMethodCall {
-    pub receiver: Box<AnnotatedExpr>,
-    pub method: Ident,
-    pub args: Vec<AnnotatedExpr>,
-    pub span: Span,
-}
-
-/// A free function call (V(m), DX(expr), etc.).
-#[derive(Debug, Clone)]
-pub struct AnnotatedCall {
-    pub func: Ident,
-    pub args: Vec<AnnotatedExpr>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnotatedBlock {
-    pub stmts: Vec<AnnotatedStmt>,
-    pub expr: Option<Box<AnnotatedExpr>>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub enum AnnotatedStmt {
-    Let(AnnotatedLet),
-    Expr(AnnotatedExpr),
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnotatedLet {
-    pub name: Ident,
-    pub ty: Option<Type>,
-    pub init: AnnotatedExpr,
-    pub span: Span,
-}
-
 /// Collected literal for Let binding generation.
 #[derive(Debug, Clone)]
 pub struct CollectedLiteral {
@@ -136,17 +54,15 @@ pub struct CollectedLiteral {
 
 /// Result of annotation: the annotated tree plus collected literals.
 pub struct AnnotationResult {
-    pub expr: AnnotatedExpr,
+    pub expr: Expr,
     pub literals: Vec<CollectedLiteral>,
 }
 
-/// Annotate an expression tree, resolving literal Var indices.
+/// Annotate an expression tree, resolving literal Var indices in place.
 ///
-/// This is a pure function - context flows through return values.
-pub fn annotate(
-    expr: &Expr,
-    ctx: AnnotationCtx,
-) -> (AnnotatedExpr, AnnotationCtx, Vec<CollectedLiteral>) {
+/// This is a pure function — context flows through return values, and the input
+/// is cloned (the returned [`Expr`] has `var_index` populated on its literals).
+pub fn annotate(expr: &Expr, ctx: AnnotationCtx) -> (Expr, AnnotationCtx, Vec<CollectedLiteral>) {
     let mut literals = Vec::new();
     let (annotated, final_ctx) = annotate_expr(expr, ctx, &mut literals);
     (annotated, final_ctx, literals)
@@ -156,9 +72,9 @@ fn annotate_expr(
     expr: &Expr,
     ctx: AnnotationCtx,
     literals: &mut Vec<CollectedLiteral>,
-) -> (AnnotatedExpr, AnnotationCtx) {
+) -> (Expr, AnnotationCtx) {
     match expr {
-        Expr::Ident(ident) => (AnnotatedExpr::Ident(ident.clone()), ctx),
+        Expr::Ident(ident) => (Expr::Ident(ident.clone()), ctx),
 
         Expr::Literal(lit_expr) => {
             // Always assign a collection-order index to literals.
@@ -177,10 +93,9 @@ fn annotate_expr(
             });
             let new_ctx = AnnotationCtx {
                 next_literal: ctx.next_literal + 1,
-                ..ctx
             };
             (
-                AnnotatedExpr::Literal(AnnotatedLiteral {
+                Expr::Literal(LiteralExpr {
                     lit: lit_expr.lit.clone(),
                     span: lit_expr.span,
                     var_index: Some(collection_index),
@@ -193,7 +108,7 @@ fn annotate_expr(
             let (lhs, ctx1) = annotate_expr(&binary.lhs, ctx, literals);
             let (rhs, ctx2) = annotate_expr(&binary.rhs, ctx1, literals);
             (
-                AnnotatedExpr::Binary(AnnotatedBinary {
+                Expr::Binary(BinaryExpr {
                     op: binary.op,
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
@@ -206,7 +121,7 @@ fn annotate_expr(
         Expr::Unary(unary) => {
             let (operand, ctx1) = annotate_expr(&unary.operand, ctx, literals);
             (
-                AnnotatedExpr::Unary(AnnotatedUnary {
+                Expr::Unary(UnaryExpr {
                     op: unary.op,
                     operand: Box::new(operand),
                     span: unary.span,
@@ -224,7 +139,7 @@ fn annotate_expr(
                 ctx1 = new_ctx;
             }
             (
-                AnnotatedExpr::MethodCall(AnnotatedMethodCall {
+                Expr::MethodCall(MethodCallExpr {
                     receiver: Box::new(receiver),
                     method: call.method.clone(),
                     args,
@@ -243,7 +158,7 @@ fn annotate_expr(
                 ctx1 = new_ctx;
             }
             (
-                AnnotatedExpr::Tuple(AnnotatedTuple {
+                Expr::Tuple(TupleExpr {
                     elems,
                     span: tuple.span,
                 }),
@@ -253,12 +168,12 @@ fn annotate_expr(
 
         Expr::Block(block) => {
             let (annotated_block, ctx1) = annotate_block(block, ctx, literals);
-            (AnnotatedExpr::Block(annotated_block), ctx1)
+            (Expr::Block(annotated_block), ctx1)
         }
 
         Expr::Paren(inner) => {
             let (annotated, ctx1) = annotate_expr(inner, ctx, literals);
-            (AnnotatedExpr::Paren(Box::new(annotated)), ctx1)
+            (Expr::Paren(Box::new(annotated)), ctx1)
         }
 
         Expr::Call(call) => {
@@ -271,7 +186,7 @@ fn annotate_expr(
                 ctx1 = new_ctx;
             }
             (
-                AnnotatedExpr::Call(AnnotatedCall {
+                Expr::Call(CallExpr {
                     func: call.func.clone(),
                     args,
                     span: call.span,
@@ -280,7 +195,7 @@ fn annotate_expr(
             )
         }
 
-        Expr::Verbatim(syn_expr) => (AnnotatedExpr::Verbatim(syn_expr.clone()), ctx),
+        Expr::Verbatim(syn_expr) => (Expr::Verbatim(syn_expr.clone()), ctx),
     }
 }
 
@@ -288,7 +203,7 @@ fn annotate_block(
     block: &BlockExpr,
     ctx: AnnotationCtx,
     literals: &mut Vec<CollectedLiteral>,
-) -> (AnnotatedBlock, AnnotationCtx) {
+) -> (BlockExpr, AnnotationCtx) {
     let mut current_ctx = ctx;
     let mut stmts = Vec::with_capacity(block.stmts.len());
 
@@ -307,7 +222,7 @@ fn annotate_block(
     };
 
     (
-        AnnotatedBlock {
+        BlockExpr {
             stmts,
             expr: final_expr,
             span: block.span,
@@ -320,12 +235,12 @@ fn annotate_stmt(
     stmt: &Stmt,
     ctx: AnnotationCtx,
     literals: &mut Vec<CollectedLiteral>,
-) -> (AnnotatedStmt, AnnotationCtx) {
+) -> (Stmt, AnnotationCtx) {
     match stmt {
         Stmt::Let(let_stmt) => {
             let (init, ctx1) = annotate_expr(&let_stmt.init, ctx, literals);
             (
-                AnnotatedStmt::Let(AnnotatedLet {
+                Stmt::Let(LetStmt {
                     name: let_stmt.name.clone(),
                     ty: let_stmt.ty.clone(),
                     init,
@@ -336,7 +251,7 @@ fn annotate_stmt(
         }
         Stmt::Expr(expr) => {
             let (annotated, ctx1) = annotate_expr(expr, ctx, literals);
-            (AnnotatedStmt::Expr(annotated), ctx1)
+            (Stmt::Expr(annotated), ctx1)
         }
     }
 }
@@ -368,8 +283,8 @@ mod tests {
         assert_eq!(literals[0].index, 0); // collection order index
 
         // Check the annotated tree has the var_index
-        if let AnnotatedExpr::Binary(binary) = annotated {
-            if let AnnotatedExpr::Literal(lit) = &*binary.rhs {
+        if let Expr::Binary(binary) = annotated {
+            if let Expr::Literal(lit) = &*binary.rhs {
                 assert_eq!(lit.var_index, Some(0));
             } else {
                 panic!("expected literal");
