@@ -300,194 +300,440 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, _scratch: [Reg; 4]) {
 }
 
 // =============================================================================
+// VEX integer / convert / round primitives
+// =============================================================================
+//
+// The transcendental builtins below are faithful ports of the aarch64 (NEON)
+// implementations in `aarch64.rs` — same algorithms and coefficients — emitted
+// with AVX (VEX.128) encodings. AVX gives us `vroundps` plus 128-bit integer
+// ops (`vcvttps2dq`, `vpslld`, `vpaddd`, ...) needed for exp/log bit twiddling.
+
+/// General 3-byte VEX encoder for 128-bit ops.
+///
+/// `pp`: 0=none, 1=0x66, 2=0xF3, 3=0xF2. `mmmmm`: 1=0F, 2=0F38, 3=0F3A.
+/// `reg` is the ModRM.reg operand (a register, or a `/digit` opcode extension
+/// passed as `Reg(digit)`); `vvvv` is the inverted extra source (pass `Reg(0)`
+/// when unused — that encodes the required `1111`); `rm` is the ModRM.rm reg.
+fn emit_vex(code: &mut Vec<u8>, pp: u8, mmmmm: u8, w: u8, reg: Reg, vvvv: Reg, rm: Reg, opcode: u8) {
+    let rbit = if reg.0 >= 8 { 0x00 } else { 0x80 };
+    let xbit = 0x40;
+    let bbit = if rm.0 >= 8 { 0x00 } else { 0x20 };
+    code.push(0xC4);
+    code.push(rbit | xbit | bbit | mmmmm);
+    code.push((w << 7) | ((!vvvv.0 & 0xF) << 3) | pp);
+    code.push(opcode);
+    code.push(0xC0 | ((reg.0 & 7) << 3) | (rm.0 & 7));
+}
+
+/// VROUNDPS dst, src, imm8 — round packed f32 (imm: 0=nearest, 1=floor, 2=ceil, 3=trunc).
+fn emit_vroundps(code: &mut Vec<u8>, dst: Reg, src: Reg, imm: u8) {
+    emit_vex(code, 1, 3, 0, dst, Reg(0), src, 0x08); // VEX.128.66.0F3A.WIG 08 /r ib
+    code.push(imm);
+}
+
+/// VCVTTPS2DQ dst, src — convert packed f32 → i32 with truncation.
+fn emit_vcvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+    emit_vex(code, 2, 1, 0, dst, Reg(0), src, 0x5B); // VEX.128.F3.0F.WIG 5B /r
+}
+
+/// VCVTDQ2PS dst, src — convert packed i32 → f32.
+fn emit_vcvtdq2ps(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+    emit_vex(code, 0, 1, 0, dst, Reg(0), src, 0x5B); // VEX.128.0F.WIG 5B /r
+}
+
+/// VPADDD dst, src1, src2 — packed i32 add.
+fn emit_vpaddd(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
+    emit_vex(code, 1, 1, 0, dst, src1, src2, 0xFE); // VEX.128.66.0F.WIG FE /r
+}
+
+/// VPSUBD dst, src1, src2 — packed i32 subtract.
+fn emit_vpsubd(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
+    emit_vex(code, 1, 1, 0, dst, src1, src2, 0xFA); // VEX.128.66.0F.WIG FA /r
+}
+
+/// VPSLLD dst, src, imm8 — packed i32 shift-left-logical by immediate.
+fn emit_vpslld_imm(code: &mut Vec<u8>, dst: Reg, src: Reg, imm: u8) {
+    // VEX.128.66.0F.WIG 72 /6 ib ; dst = vvvv, src = rm, /6 in ModRM.reg.
+    emit_vex(code, 1, 1, 0, Reg(6), dst, src, 0x72);
+    code.push(imm);
+}
+
+/// VPSRLD dst, src, imm8 — packed i32 shift-right-logical by immediate.
+fn emit_vpsrld_imm(code: &mut Vec<u8>, dst: Reg, src: Reg, imm: u8) {
+    // VEX.128.66.0F.WIG 72 /2 ib.
+    emit_vex(code, 1, 1, 0, Reg(2), dst, src, 0x72);
+    code.push(imm);
+}
+
+/// Bit-select (NEON BSL analogue): `dst = (mask & if_true) | (~mask & if_false)`.
+///
+/// `tmp` must differ from `dst`, `mask`, `if_true`, and `if_false`.
+fn emit_blend(code: &mut Vec<u8>, dst: Reg, mask: Reg, if_true: Reg, if_false: Reg, tmp: Reg) {
+    emit_vandps(code, tmp, mask, if_true); // tmp = mask & if_true
+    emit_vandnps(code, dst, mask, if_false); // dst = ~mask & if_false
+    emit_vorps(code, dst, tmp, dst); // dst = blended
+}
+
+// VCMPPS ordered predicates (subset).
+const CMP_EQ: u8 = 0; // EQ_OQ
+const CMP_LE: u8 = 2; // LE_OS
+const CMP_NEQ: u8 = 4; // NEQ_UQ
+const CMP_GE: u8 = 5; // NLT_US (>=)
+
+const SIGN_MASK: u32 = 0x8000_0000;
+const ABS_MASK: u32 = 0x7FFF_FFFF;
+
+// =============================================================================
 // Transcendental Builtins — inline polynomial sequences
 // =============================================================================
 //
-// Each builtin translates the pixelflow-core SSE2 implementation into direct
-// machine code emission. Same coefficients, same algorithms as x86.rs.
+// Faithful ports of the aarch64 builtins (same algorithms / coefficients).
 //
 // Register contract:
 //   dst  — output register
-//   src  — input register (read-only, never clobbered)
-//   s0-s2 — scratch registers from scratch[0..2] (clobbered)
-//   s3    — scratch[3], used by composition builtins
-//
-// All operations use VEX encoding (3-operand, non-destructive) to minimize
-// register pressure in long polynomial sequences.
+//   src  — input register (read-only; never clobbered)
+//   scratch[0..4] — clobbered scratch (4 distinct registers)
 
-/// atan2(y, x) — Chebyshev polynomial approximation.
+/// log2(x) core — exponent extraction + mantissa reduction + 5-term Horner.
+fn emit_log2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: Reg) {
+    // Phase 1: n = float(exponent_bits - 127)
+    emit_vpsrld_imm(code, s0, src, 23); // s0 = bits >> 23
+    emit_f32_const(code, s2, f32::from_bits(127)); // s2 = 127 (int splat)
+    emit_vpsubd(code, s0, s0, s2); // s0 = exp - 127
+    emit_vcvtdq2ps(code, dst, s0); // dst = n
+
+    // Phase 2: f = mantissa in [1, 2)
+    emit_f32_const(code, s2, f32::from_bits(0x007F_FFFF));
+    emit_vandps(code, s1, src, s2); // s1 = mantissa bits
+    emit_f32_const(code, s2, f32::from_bits(0x3F80_0000));
+    emit_vorps(code, s1, s1, s2); // s1 = f
+
+    // Phase 3: branchless reduction to [√2/2, √2]
+    // mask = (f >= √2); adjust = 1.0 & mask; n += adjust; f *= (1 - 0.5*adjust)
+    emit_f32_const(code, s2, 1.414_213_56_f32);
+    emit_vcmpps(code, s2, s1, s2, CMP_GE); // s2 = mask(f >= √2)
+    emit_f32_const(code, s0, 1.0);
+    emit_vandps(code, s0, s0, s2); // s0 = adjust (1.0 or 0.0)
+    emit_vaddps(code, dst, dst, s0); // n += adjust
+    emit_f32_const(code, s2, 0.5);
+    emit_vmulps(code, s2, s0, s2); // s2 = 0.5*adjust
+    emit_f32_const(code, s0, 1.0);
+    emit_vsubps(code, s2, s0, s2); // s2 = 1 - 0.5*adjust = factor
+    emit_vmulps(code, s1, s1, s2); // f *= factor   (s1 = reduced f)
+
+    // Phase 4: poly = ((((c4*f + c3)*f + c2)*f + c1)*f + c0); result = n + poly
+    emit_f32_const(code, s0, -0.320_043_52_f32);
+    emit_f32_const(code, s2, 1.797_496_9_f32);
+    emit_vmulps(code, s0, s0, s1);
+    emit_vaddps(code, s0, s0, s2);
+    emit_f32_const(code, s2, -4.198_804_6_f32);
+    emit_vmulps(code, s0, s0, s1);
+    emit_vaddps(code, s0, s0, s2);
+    emit_f32_const(code, s2, 5.727_023_f32);
+    emit_vmulps(code, s0, s0, s1);
+    emit_vaddps(code, s0, s0, s2);
+    emit_f32_const(code, s2, -3.005_614_7_f32);
+    emit_vmulps(code, s0, s0, s1);
+    emit_vaddps(code, s0, s0, s2);
+    emit_vaddps(code, dst, dst, s0); // n + poly
+}
+
+/// exp2(x) core — floor/frac split + 5-term Horner + 2^n bit scaling.
+fn emit_exp2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: Reg) {
+    emit_vroundps(code, s0, src, 1); // s0 = n = floor(x)
+    emit_vsubps(code, s1, src, s0); // s1 = f = x - n
+
+    // poly (accumulator s2): ((((c4*f + c3)*f + c2)*f + c1)*f + c0)
+    emit_f32_const(code, s2, 0.013_555_7_f32);
+    emit_f32_const(code, dst, 0.052_032_3_f32);
+    emit_vmulps(code, s2, s2, s1);
+    emit_vaddps(code, s2, s2, dst);
+    emit_f32_const(code, dst, 0.241_379_3_f32);
+    emit_vmulps(code, s2, s2, s1);
+    emit_vaddps(code, s2, s2, dst);
+    emit_f32_const(code, dst, 0.693_147_2_f32);
+    emit_vmulps(code, s2, s2, s1);
+    emit_vaddps(code, s2, s2, dst);
+    emit_f32_const(code, dst, 1.0_f32);
+    emit_vmulps(code, s2, s2, s1);
+    emit_vaddps(code, s2, s2, dst); // s2 = poly(2^f)
+
+    // 2^n = reinterpret((int(n) + 127) << 23)
+    emit_vcvttps2dq(code, s1, s0); // s1 = int(n)
+    emit_f32_const(code, dst, f32::from_bits(127)); // 127 (int splat)
+    emit_vpaddd(code, s1, s1, dst);
+    emit_vpslld_imm(code, s1, s1, 23); // s1 = 2^n bits
+    emit_vmulps(code, dst, s2, s1); // dst = poly * 2^n
+}
+
+/// sin(x) core — TAU range reduction + odd Chebyshev polynomial.
+fn emit_sin_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: Reg) {
+    use core::f32::consts::{PI, TAU};
+    // k = floor(x/TAU + 0.5); x_reduced = x - k*TAU
+    emit_f32_const(code, s0, 1.0 / TAU);
+    emit_vmulps(code, s0, src, s0);
+    emit_f32_const(code, s2, 0.5);
+    emit_vaddps(code, s0, s0, s2);
+    emit_vroundps(code, s0, s0, 1); // s0 = k
+    emit_f32_const(code, s2, TAU);
+    emit_vmulps(code, s2, s0, s2); // s2 = k*TAU
+    emit_vsubps(code, s0, src, s2); // s0 = x_reduced
+    // t = x_reduced / PI
+    emit_f32_const(code, s2, 1.0 / PI);
+    emit_vmulps(code, s0, s0, s2); // s0 = t
+    // t² in s1
+    emit_vmulps(code, s1, s0, s0);
+    // poly = ((c7*t² + c5)*t² + c3)*t² + c1   (accumulator dst)
+    emit_f32_const(code, s2, -0.599_264_5_f32);
+    emit_f32_const(code, dst, 2.550_164_f32);
+    emit_vmulps(code, s2, s2, s1);
+    emit_vaddps(code, dst, s2, dst);
+    emit_f32_const(code, s2, -5.167_712_8_f32);
+    emit_vmulps(code, dst, dst, s1);
+    emit_vaddps(code, dst, dst, s2);
+    emit_f32_const(code, s2, core::f32::consts::PI);
+    emit_vmulps(code, dst, dst, s1);
+    emit_vaddps(code, dst, dst, s2);
+    // result = t * poly
+    emit_vmulps(code, dst, s0, dst);
+}
+
+/// MOVUPS [rsp+disp8], xmm — red-zone spill store (unaligned, leaf-safe).
+fn emit_movups_store_rsp(code: &mut Vec<u8>, src: Reg, disp: i8) {
+    if src.0 >= 8 {
+        code.push(0x44); // REX.R
+    }
+    code.push(0x0F);
+    code.push(0x11);
+    code.push(0x44 | ((src.0 & 7) << 3)); // mod=01, reg=src, rm=100 (SIB)
+    code.push(0x24); // SIB: base=rsp, no index
+    code.push(disp as u8);
+}
+
+/// MOVUPS xmm, [rsp+disp8] — red-zone reload (unaligned, leaf-safe).
+fn emit_movups_load_rsp(code: &mut Vec<u8>, dst: Reg, disp: i8) {
+    if dst.0 >= 8 {
+        code.push(0x44);
+    }
+    code.push(0x0F);
+    code.push(0x10);
+    code.push(0x44 | ((dst.0 & 7) << 3));
+    code.push(0x24);
+    code.push(disp as u8);
+}
+
+/// atan2(y, x) core.
 ///
-/// Translated from pixelflow-ir backend/x86.rs F32x4::atan2().
-/// Algorithm:
-///   1. r = y / x, r_abs = |r|
-///   2. Horner polynomial: poly = ((c7*t² + c5)*t² + c3)*t² + c1
-///   3. atan_approx = poly * r_abs
-///   4. Large-angle correction: if |r| > 1, atan = π/2 - atan(1/r)
-///   5. Sign correction: multiply by sign(y)
-///   6. Quadrant correction: subtract π*sign(y) if x < 0
-pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, scratch: [Reg; 4]) {
-    let s0 = scratch[0];
-    let s1 = scratch[1];
-    let s2 = scratch[2];
-    let s3 = scratch[3];
+/// Reduce |y/x| into [0,1] before the polynomial, then apply the ratio sign and
+/// a quadrant correction for x<0. Spills sign_r / sign_y / mask_neg_x into the
+/// 16-byte-aligned red zone (`[rsp-24/-40/-56]`), mirroring the aarch64 port.
+fn emit_atan2_core(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    y: Reg,
+    x: Reg,
+    s0: Reg,
+    s1: Reg,
+    s2: Reg,
+    s3: Reg,
+) {
+    // mask_neg_x = (x < 0) → spill
+    emit_vxorps(code, s0, s0, s0);
+    emit_vcmpps(code, s2, x, s0, CMP_LT);
+    emit_movups_store_rsp(code, s2, -24);
 
-    // ---- Phase 1: Compute r = y / x, r_abs = |r| ----
+    // r = y / x → dst
+    emit_vdivps(code, dst, y, x);
+    // ---- y, x dead ----
 
-    // s0 = y / x
-    emit_vdivps(code, s0, src_y, src_x);
+    // sign_r = copysign(1, r) → spill
+    emit_f32_const(code, s0, f32::from_bits(SIGN_MASK));
+    emit_vandps(code, s0, dst, s0);
+    emit_f32_const(code, s1, 1.0);
+    emit_vorps(code, s0, s0, s1);
+    emit_movups_store_rsp(code, s0, -40);
 
-    // s1 = abs_mask = 0x7FFFFFFF (splat)
-    emit_f32_const(code, s1, f32::from_bits(0x7FFFFFFF));
+    // sign_y = copysign(1, y) → spill
+    emit_f32_const(code, s0, f32::from_bits(SIGN_MASK));
+    emit_vandps(code, s0, y, s0);
+    emit_f32_const(code, s1, 1.0);
+    emit_vorps(code, s0, s0, s1);
+    emit_movups_store_rsp(code, s0, -56);
 
-    // s2 = r_abs = |r| = r & abs_mask
-    emit_vandps(code, s2, s0, s1);
+    // r_abs = |r| → s3
+    emit_f32_const(code, s0, f32::from_bits(ABS_MASK));
+    emit_vandps(code, s3, dst, s0);
 
-    // ---- Phase 2: Horner polynomial atan(t) ≈ t * ((c7*t²+c5)*t²+c3)*t²+c1) ----
-    // where t = r_abs
+    // mask_large = r_abs > 1 → s1
+    emit_f32_const(code, s0, 1.0);
+    emit_vcmpps(code, s1, s3, s0, CMP_NLE);
 
-    // dst = t² = r_abs * r_abs
-    emit_vmulps(code, dst, s2, s2);
+    // t = mask_large ? 1/r_abs : r_abs → dst
+    emit_f32_const(code, s0, 1.0);
+    emit_vdivps(code, s0, s0, s3); // s0 = 1/r_abs
+    emit_blend(code, dst, s1, s0, s3, s2); // dst = t (tmp = s2)
 
-    // Load Chebyshev coefficients and evaluate Horner chain
-    // poly = c7
-    emit_f32_const(code, s3, -0.142857143_f32);
+    // t² → s0 ; t saved → s3
+    emit_vmulps(code, s0, dst, dst);
+    emit_movaps(code, s3, dst); // s3 = t
 
-    // poly = c7 * t² + c5
-    emit_f32_const(code, s1, 0.2_f32);
-    emit_vmulps(code, s3, s3, dst); // s3 = c7 * t²
-    emit_vaddps(code, s3, s3, s1); // s3 = c7*t² + c5
+    // poly = ((c7*t² + c5)*t² + c3)*t² + c1   (accumulator dst, s2 = const scratch)
+    emit_f32_const(code, s2, -0.142_857_14_f32);
+    emit_f32_const(code, dst, 0.2_f32);
+    emit_vmulps(code, s2, s2, s0);
+    emit_vaddps(code, dst, s2, dst);
+    emit_f32_const(code, s2, -0.333_333_34_f32);
+    emit_vmulps(code, dst, dst, s0);
+    emit_vaddps(code, dst, dst, s2);
+    emit_f32_const(code, s2, 0.999_999_9_f32);
+    emit_vmulps(code, dst, dst, s0);
+    emit_vaddps(code, dst, dst, s2);
 
-    // poly = (c7*t²+c5) * t² + c3
-    emit_f32_const(code, s1, -0.333333333_f32);
-    emit_vmulps(code, s3, s3, dst); // s3 = prev * t²
-    emit_vaddps(code, s3, s3, s1); // s3 = prev*t² + c3
+    // atan_small = poly * t
+    emit_vmulps(code, dst, dst, s3); // dst = atan_small ; s3 free
 
-    // poly = (...) * t² + c1
-    emit_f32_const(code, s1, 0.999999999_f32);
-    emit_vmulps(code, s3, s3, dst); // s3 = prev * t²
-    emit_vaddps(code, s3, s3, s1); // s3 = poly = prev*t² + c1
-
-    // atan_approx = poly * r_abs
-    emit_vmulps(code, s3, s3, s2); // s3 = atan_approx
-
-    // ---- Phase 3: Handle |r| > 1 case ----
-    // atan_large = π/2 - (1/r_abs) * atan_approx
-
-    // s1 = 1.0
-    emit_f32_const(code, s1, 1.0_f32);
-
-    // mask_large = r_abs > 1.0  (all-ones where |r| > 1)
-    emit_vcmpps(code, dst, s2, s1, CMP_NLE); // dst = mask_large
-
-    // s1 = 1.0 / r_abs
-    emit_vdivps(code, s1, s1, s2); // s1 = recip_r = 1/r_abs
-
-    // s1 = recip_r * atan_approx
-    emit_vmulps(code, s1, s1, s3); // s1 = recip_r * atan_approx
-
-    // s2 = π/2
+    // atan_large = π/2 - atan_small → s2
     emit_f32_const(code, s2, core::f32::consts::FRAC_PI_2);
+    emit_vsubps(code, s2, s2, dst);
 
-    // s1 = π/2 - recip_r * atan_approx = atan_large
-    emit_vsubps(code, s1, s2, s1); // s1 = atan_large
+    // atan_val = mask_large ? atan_large : atan_small → dst (tmp = s3)
+    emit_blend(code, dst, s1, s2, dst, s3);
 
-    // ---- Phase 4: Blend large/small case ----
-    // atan_val = mask_large ? atan_large : atan_approx
-    // Using AND/ANDN/OR pattern:
-    //   s2 = dst & s1           (mask & atan_large)
-    //   dst = ~dst & s3         (ANDN: ~mask & atan_approx)
-    //   s2 = s2 | dst           (combine)
-    emit_vandps(code, s2, dst, s1); // s2 = mask & atan_large
-    emit_vandnps(code, dst, dst, s3); // dst = ~mask & atan_approx
-    emit_vorps(code, s2, s2, dst); // s2 = atan_val (blended result)
+    // atan_signed = atan_val * sign_r
+    emit_movups_load_rsp(code, s0, -40);
+    emit_vmulps(code, dst, dst, s0);
 
-    // ---- Phase 5: Sign correction (multiply by sign of y) ----
-    // sign_y = y / |y|  (preserves sign, NaN-safe for zero handled by quadrant)
+    // correction = π * sign_y
+    emit_movups_load_rsp(code, s0, -56);
+    emit_f32_const(code, s1, core::f32::consts::PI);
+    emit_vmulps(code, s1, s1, s0);
 
-    // s1 = abs_mask
-    emit_f32_const(code, s1, f32::from_bits(0x7FFFFFFF));
-    // s3 = |y|
-    emit_vandps(code, s3, src_y, s1);
-    // s3 = sign_y = |y| / y ... actually we want y / |y|
-    emit_vdivps(code, s3, src_y, s3); // s3 = sign_y = y / |y|
+    // corrected = atan_signed + π*sign_y → s2
+    emit_vaddps(code, s2, dst, s1);
 
-    // s2 = atan_signed = atan_val * sign_y
-    emit_vmulps(code, s2, s2, s3); // s2 = atan_signed
-
-    // ---- Phase 6: Quadrant correction for negative x ----
-    // if x < 0: result = atan_signed - π * sign_y
-
-    // dst = 0.0
-    emit_vxorps(code, dst, dst, dst);
-
-    // s1 = mask_neg_x = (x < 0)
-    emit_vcmpps(code, s1, src_x, dst, CMP_LT); // s1 = mask where x < 0
-
-    // s0 = π * sign_y
-    emit_f32_const(code, s0, core::f32::consts::PI);
-    emit_vmulps(code, s0, s0, s3); // s0 = π * sign_y
-
-    // dst = atan_signed - correction = atan_signed - π * sign_y
-    emit_vsubps(code, dst, s2, s0); // dst = corrected result
-
-    // Blend: result = mask_neg_x ? corrected : atan_signed
-    //   s0 = s1 & dst           (mask & corrected)
-    //   s1 = ~s1 & s2           (ANDN: ~mask & atan_signed)
-    //   dst = s0 | s1
-    emit_vandps(code, s0, s1, dst); // s0 = mask & corrected
-    emit_vandnps(code, s1, s1, s2); // s1 = ~mask & atan_signed
-    emit_vorps(code, dst, s0, s1); // dst = final result
+    // result = mask_neg_x ? corrected : atan_signed → dst (tmp = s1)
+    emit_movups_load_rsp(code, s0, -24);
+    emit_blend(code, dst, s0, s2, dst, s1);
 }
 
-/// atan(x) = atan2(x, 1.0)
-pub fn emit_atan_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, scratch: [Reg; 4]) {
-    let s3 = scratch[3];
-    // Load 1.0 into s3
-    emit_f32_const(code, s3, 1.0_f32);
-    // atan(x) = atan2(x, 1.0)
-    emit_atan2_builtin(code, dst, src, s3, scratch);
+// ---------------------------------------------------------------------------
+// Public unary builtin entry points
+// ---------------------------------------------------------------------------
+
+pub fn emit_log2_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    emit_log2_body(code, dst, src, sc[0], sc[1], sc[2]);
 }
 
-/// asin(x) = atan2(x, sqrt(1 - x²))
-pub fn emit_asin_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, scratch: [Reg; 4]) {
-    let s0 = scratch[0];
-    let s1 = scratch[1];
-
-    // s0 = x²
-    emit_vmulps(code, s0, src, src);
-
-    // s1 = 1.0
-    emit_f32_const(code, s1, 1.0_f32);
-
-    // s0 = 1.0 - x²
-    emit_vsubps(code, s0, s1, s0);
-
-    // s0 = sqrt(1 - x²)
-    emit_vsqrtps(code, s0, s0);
-
-    // atan2(x, sqrt(1 - x²))
-    emit_atan2_builtin(code, dst, src, s0, scratch);
+pub fn emit_ln_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    emit_log2_body(code, dst, src, sc[0], sc[1], sc[2]);
+    emit_f32_const(code, sc[0], core::f32::consts::LN_2);
+    emit_vmulps(code, dst, dst, sc[0]);
 }
 
-/// acos(x) = atan2(sqrt(1 - x²), x)
-pub fn emit_acos_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, scratch: [Reg; 4]) {
-    let s0 = scratch[0];
-    let s1 = scratch[1];
+pub fn emit_log10_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    emit_log2_body(code, dst, src, sc[0], sc[1], sc[2]);
+    emit_f32_const(code, sc[0], core::f32::consts::LOG10_2);
+    emit_vmulps(code, dst, dst, sc[0]);
+}
 
-    // s0 = x²
-    emit_vmulps(code, s0, src, src);
+pub fn emit_exp2_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    emit_exp2_body(code, dst, src, sc[0], sc[1], sc[2]);
+}
 
-    // s1 = 1.0
-    emit_f32_const(code, s1, 1.0_f32);
+pub fn emit_exp_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    // exp(x) = exp2(x * log2(e)); compute the product in sc[3] so the body
+    // still gets three free scratch (sc[0..2]).
+    emit_f32_const(code, sc[3], core::f32::consts::LOG2_E);
+    emit_vmulps(code, sc[3], src, sc[3]);
+    emit_exp2_body(code, dst, sc[3], sc[0], sc[1], sc[2]);
+}
 
-    // s0 = 1.0 - x²
-    emit_vsubps(code, s0, s1, s0);
+pub fn emit_sin_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    emit_sin_body(code, dst, src, sc[0], sc[1], sc[2]);
+}
 
-    // s0 = sqrt(1 - x²)
-    emit_vsqrtps(code, s0, s0);
+pub fn emit_cos_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    // cos(x) = sin(x + π/2); compute argument in sc[3].
+    emit_f32_const(code, sc[3], core::f32::consts::FRAC_PI_2);
+    emit_vaddps(code, sc[3], src, sc[3]);
+    emit_sin_body(code, dst, sc[3], sc[0], sc[1], sc[2]);
+}
 
-    // atan2(sqrt(1 - x²), x)
-    emit_atan2_builtin(code, dst, s0, src, scratch);
+pub fn emit_tan_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    // tan = sin/cos. sin → dst, cos → sc[3], divide. src untouched by sin_body.
+    emit_sin_body(code, dst, src, sc[0], sc[1], sc[2]);
+    emit_f32_const(code, sc[3], core::f32::consts::FRAC_PI_2);
+    emit_vaddps(code, sc[3], src, sc[3]);
+    // cos(x): sin_body needs 3 scratch + its src(sc[3]); use sc[0..2], result → sc[3].
+    let cos = sc[3];
+    emit_sin_body(code, cos, sc[3], sc[0], sc[1], sc[2]); // overwrites sc[3] in place via dst==src? no
+    emit_vdivps(code, dst, dst, sc[3]);
+}
+
+pub fn emit_floor_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+    emit_vroundps(code, dst, src, 1);
+}
+
+pub fn emit_ceil_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+    emit_vroundps(code, dst, src, 2);
+}
+
+pub fn emit_round_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+    emit_vroundps(code, dst, src, 0); // round to nearest (even)
+}
+
+pub fn emit_fract_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    emit_vroundps(code, sc[0], src, 1); // floor
+    emit_vsubps(code, dst, src, sc[0]); // x - floor(x)
+}
+
+pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, sc: [Reg; 4]) {
+    emit_atan2_core(code, dst, src_y, src_x, sc[0], sc[1], sc[2], sc[3]);
+}
+
+pub fn emit_atan_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    emit_f32_const(code, sc[3], 1.0);
+    emit_atan2_core(code, dst, src, sc[3], sc[0], sc[1], sc[2], sc[3]);
+}
+
+pub fn emit_asin_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    // asin(x) = atan2(x, sqrt(1 - x²)); denom → sc[3].
+    emit_vmulps(code, sc[3], src, src);
+    emit_f32_const(code, sc[0], 1.0);
+    emit_vsubps(code, sc[3], sc[0], sc[3]);
+    emit_vsqrtps(code, sc[3], sc[3]);
+    emit_atan2_core(code, dst, src, sc[3], sc[0], sc[1], sc[2], sc[3]);
+}
+
+pub fn emit_acos_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
+    // acos(x) = atan2(sqrt(1 - x²), x); numerator → sc[3].
+    emit_vmulps(code, sc[3], src, src);
+    emit_f32_const(code, sc[0], 1.0);
+    emit_vsubps(code, sc[3], sc[0], sc[3]);
+    emit_vsqrtps(code, sc[3], sc[3]);
+    emit_atan2_core(code, dst, sc[3], src, sc[0], sc[1], sc[2], sc[3]);
+}
+
+/// pow(x, y) = exp2(y * log2(x)).
+pub fn emit_pow_builtin(code: &mut Vec<u8>, dst: Reg, base: Reg, exp: Reg, sc: [Reg; 4]) {
+    emit_log2_body(code, sc[3], base, sc[0], sc[1], sc[2]); // sc[3] = log2(x)
+    emit_vmulps(code, sc[3], sc[3], exp); // sc[3] = y * log2(x)
+    emit_exp2_body(code, dst, sc[3], sc[0], sc[1], sc[2]); // dst = 2^(...)
+}
+
+/// hypot(x, y) = sqrt(x² + y²).
+pub fn emit_hypot_builtin(code: &mut Vec<u8>, dst: Reg, x: Reg, y: Reg, sc: [Reg; 4]) {
+    emit_vmulps(code, sc[0], x, x);
+    emit_vmulps(code, dst, y, y);
+    emit_vaddps(code, dst, dst, sc[0]);
+    emit_vsqrtps(code, dst, dst);
+}
+
+/// select(cond, if_true, if_false) — bit blend (`cond` is an all-ones/zeros mask).
+///
+/// `tmp` must differ from `cond`, `if_true`, and `if_false`.
+pub fn emit_select(code: &mut Vec<u8>, dst: Reg, cond: Reg, if_true: Reg, if_false: Reg, tmp: Reg) {
+    emit_blend(code, dst, cond, if_true, if_false, tmp);
 }
 
 // =============================================================================
@@ -518,6 +764,24 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, scratch: [
             emit_vandps(code, dst, src, mask);
         }
 
+        // Rounding (AVX vroundps)
+        OpKind::Floor => emit_floor_builtin(code, dst, src),
+        OpKind::Ceil => emit_ceil_builtin(code, dst, src),
+        OpKind::Round => emit_round_builtin(code, dst, src),
+        OpKind::Fract => emit_fract_builtin(code, dst, src, scratch),
+
+        // Exp / log family
+        OpKind::Exp => emit_exp_builtin(code, dst, src, scratch),
+        OpKind::Exp2 => emit_exp2_builtin(code, dst, src, scratch),
+        OpKind::Ln => emit_ln_builtin(code, dst, src, scratch),
+        OpKind::Log2 => emit_log2_builtin(code, dst, src, scratch),
+        OpKind::Log10 => emit_log10_builtin(code, dst, src, scratch),
+
+        // Trig
+        OpKind::Sin => emit_sin_builtin(code, dst, src, scratch),
+        OpKind::Cos => emit_cos_builtin(code, dst, src, scratch),
+        OpKind::Tan => emit_tan_builtin(code, dst, src, scratch),
+
         // Inverse trigonometric builtins
         OpKind::Atan => emit_atan_builtin(code, dst, src, scratch),
         OpKind::Asin => emit_asin_builtin(code, dst, src, scratch),
@@ -542,8 +806,30 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
         OpKind::Min => emit_minps(code, dst, src2),
         OpKind::Max => emit_maxps(code, dst, src2),
 
+        // Comparisons → all-ones / all-zeros mask (ordered predicates).
+        // `dst` already holds src1 (moved above), so compare in place.
+        OpKind::Eq => emit_cmp_tail(code, dst, src2, CMP_EQ),
+        OpKind::Ne => emit_cmp_tail(code, dst, src2, CMP_NEQ),
+        OpKind::Lt => emit_cmp_tail(code, dst, src2, CMP_LT),
+        OpKind::Le => emit_cmp_tail(code, dst, src2, CMP_LE),
+        OpKind::Gt => emit_cmp_tail(code, dst, src2, CMP_NLE),
+        OpKind::Ge => emit_cmp_tail(code, dst, src2, CMP_GE),
+
         _ => panic!("x86_64 binary emit not implemented for {:?}", op),
     }
+}
+
+/// Emit the trailing `CMPPS dst, src2, imm8` of an in-place compare (dst already
+/// holds src1). Produces an all-ones / all-zeros mask.
+fn emit_cmp_tail(code: &mut Vec<u8>, dst: Reg, src2: Reg, pred: u8) {
+    let rex = 0x40 | (if dst.0 >= 8 { 0x04 } else { 0 }) | (if src2.0 >= 8 { 0x01 } else { 0 });
+    if rex != 0x40 {
+        code.push(rex);
+    }
+    code.push(0x0F);
+    code.push(0xC2);
+    code.push(0xC0 | ((dst.0 & 7) << 3) | (src2.0 & 7));
+    code.push(pred);
 }
 
 /// Emit binary transcendental operation (needs scratch registers).
@@ -557,6 +843,8 @@ pub fn emit_binary_transcendental(
 ) {
     match op {
         OpKind::Atan2 => emit_atan2_builtin(code, dst, src1, src2, scratch),
+        OpKind::Pow => emit_pow_builtin(code, dst, src1, src2, scratch),
+        OpKind::Hypot => emit_hypot_builtin(code, dst, src1, src2, scratch),
         _ => panic!(
             "x86_64 binary transcendental emit not implemented for {:?}",
             op
