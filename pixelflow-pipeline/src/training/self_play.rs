@@ -137,10 +137,7 @@ pub fn build_rule_templates(rules: &[Box<dyn Rewrite>]) -> RuleTemplates {
     let mut templates = RuleTemplates::with_capacity(rules.len());
 
     for (idx, rule) in rules.iter().enumerate() {
-        if let (Some(lhs), Some(rhs)) = (rule.lhs_template(), rule.rhs_template()) {
-            templates.set(idx, lhs, rhs);
-        }
-        // Rules without templates get zero embedding (handled by RuleTemplates)
+        templates.build(idx, rule.as_ref());
     }
 
     templates

@@ -17,15 +17,12 @@
 //! are just the real/imaginary parts of e^(i(a+b)) = e^(ia) · e^(ib).
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::egraph::Pattern as Expr;
+use crate::arena_pat;
+use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Arc<Expr> {
-    Arc::new(e)
-}
 
 // ============================================================================
 // AngleAddition Trait
@@ -178,34 +175,32 @@ impl<T: AngleAddition> Rewrite for AngleAdditionRule<T> {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Op(Add(V0, V1))
-        Some(Expr::Unary(
-            T::op().kind(),
-            b(Expr::Binary(OpKind::Add, b(Expr::Var(0)), b(Expr::Var(1)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un T::op().kind(), (bin OpKind::Add, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         let exp = T::expansion();
         // term1: Mul(term1_op1(V0), term1_op2(V1))
-        let term1 = Expr::Binary(
-            OpKind::Mul,
-            b(Expr::Unary(exp.term1_op1.kind(), b(Expr::Var(0)))),
-            b(Expr::Unary(exp.term1_op2.kind(), b(Expr::Var(1)))),
+        let term1 = arena_pat!(
+            __a,
+            bin OpKind::Mul,
+            (un exp.term1_op1.kind(), (var 0)),
+            (un exp.term1_op2.kind(), (var 1))
         );
         // term2: Mul(term2_op1(V0), term2_op2(V1))
-        let term2 = Expr::Binary(
-            OpKind::Mul,
-            b(Expr::Unary(exp.term2_op1.kind(), b(Expr::Var(0)))),
-            b(Expr::Unary(exp.term2_op2.kind(), b(Expr::Var(1)))),
+        let term2 = arena_pat!(
+            __a,
+            bin OpKind::Mul,
+            (un exp.term2_op1.kind(), (var 0)),
+            (un exp.term2_op2.kind(), (var 1))
         );
         // Combine: Plus -> Add(term1, term2), Minus -> Sub(term1, term2)
         let combiner = match exp.term2_sign {
             Sign::Plus => OpKind::Add,
             Sign::Minus => OpKind::Sub,
         };
-        Some(Expr::Binary(combiner, b(term1), b(term2)))
+        Some(__a.push_binary(combiner, term1, term2))
     }
 }
 
@@ -259,20 +254,19 @@ impl Rewrite for Pythagorean {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         // Add(Mul(Sin(V0), Sin(V0)), Mul(Cos(V0), Cos(V0)))
-        let sin_v0 = Expr::Unary(OpKind::Sin, b(Expr::Var(0)));
-        let cos_v0 = Expr::Unary(OpKind::Cos, b(Expr::Var(0)));
-        Some(Expr::Binary(
-            OpKind::Add,
-            b(Expr::Binary(OpKind::Mul, b(sin_v0.clone()), b(sin_v0))),
-            b(Expr::Binary(OpKind::Mul, b(cos_v0.clone()), b(cos_v0))),
-        ))
+        let sin_l = arena_pat!(__a, un OpKind::Sin, (var 0));
+        let sin_r = arena_pat!(__a, un OpKind::Sin, (var 0));
+        let sin_sq = __a.push_binary(OpKind::Mul, sin_l, sin_r);
+        let cos_l = arena_pat!(__a, un OpKind::Cos, (var 0));
+        let cos_r = arena_pat!(__a, un OpKind::Cos, (var 0));
+        let cos_sq = __a.push_binary(OpKind::Mul, cos_l, cos_r);
+        Some(__a.push_binary(OpKind::Add, sin_sq, cos_sq))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // Const(1.0)
-        Some(Expr::Const(1.0))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, cst 1.0))
     }
 }
 
@@ -402,29 +396,12 @@ impl Rewrite for ReverseAngleAddition {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Add(Mul(Sin(V0), Cos(V1)), Mul(Cos(V0), Sin(V1)))
-        Some(Expr::Binary(
-            OpKind::Add,
-            b(Expr::Binary(
-                OpKind::Mul,
-                b(Expr::Unary(OpKind::Sin, b(Expr::Var(0)))),
-                b(Expr::Unary(OpKind::Cos, b(Expr::Var(1)))),
-            )),
-            b(Expr::Binary(
-                OpKind::Mul,
-                b(Expr::Unary(OpKind::Cos, b(Expr::Var(0)))),
-                b(Expr::Unary(OpKind::Sin, b(Expr::Var(1)))),
-            )),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Add, (bin OpKind::Mul, (un OpKind::Sin, (var 0)), (un OpKind::Cos, (var 1))), (bin OpKind::Mul, (un OpKind::Cos, (var 0)), (un OpKind::Sin, (var 1)))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // Sin(Add(V0, V1))
-        Some(Expr::Unary(
-            OpKind::Sin,
-            b(Expr::Binary(OpKind::Add, b(Expr::Var(0)), b(Expr::Var(1)))),
-        ))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, un OpKind::Sin, (bin OpKind::Add, (var 0), (var 1))))
     }
 }
 
@@ -592,26 +569,12 @@ impl Rewrite for HalfAngleProduct {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Mul(Sin(V0), Cos(V0))
-        Some(Expr::Binary(
-            OpKind::Mul,
-            b(Expr::Unary(OpKind::Sin, b(Expr::Var(0)))),
-            b(Expr::Unary(OpKind::Cos, b(Expr::Var(0)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Mul, (un OpKind::Sin, (var 0)), (un OpKind::Cos, (var 0))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // Div(Sin(Add(V0, V0)), Const(2.0))
-        // Matches what the e-graph action actually produces
-        Some(Expr::Binary(
-            OpKind::Div,
-            b(Expr::Unary(
-                OpKind::Sin,
-                b(Expr::Binary(OpKind::Add, b(Expr::Var(0)), b(Expr::Var(0)))),
-            )),
-            b(Expr::Const(2.0)),
-        ))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Div, (un OpKind::Sin, (bin OpKind::Add, (var 0), (var 0))), (cst 2.0)))
     }
 }
 

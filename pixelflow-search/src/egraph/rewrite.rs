@@ -1,120 +1,34 @@
 //! Rewrite rule infrastructure.
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
-use core::fmt;
-
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use super::ops::Op;
-use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 
-/// Structural rewrite template expression.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Pattern {
-    Var(u8),
-    Const(f32),
-    Param(u8),
-    Unary(OpKind, Arc<Pattern>),
-    Binary(OpKind, Arc<Pattern>, Arc<Pattern>),
-    Ternary(OpKind, Arc<Pattern>, Arc<Pattern>, Arc<Pattern>),
-    Nary(OpKind, Vec<Pattern>),
-}
-
-impl Pattern {
-    #[must_use]
-    pub fn kind(&self) -> OpKind {
-        match self {
-            Self::Var(_) => OpKind::Var,
-            Self::Const(_) | Self::Param(_) => OpKind::Const,
-            Self::Unary(op, _) => *op,
-            Self::Binary(op, _, _) => *op,
-            Self::Ternary(op, _, _, _) => *op,
-            Self::Nary(op, _) => *op,
-        }
-    }
-
-    #[must_use]
-    pub fn op_type(&self) -> OpKind {
-        self.kind()
-    }
-
-    #[must_use]
-    pub fn node_count(&self) -> usize {
-        match self {
-            Self::Var(_) | Self::Const(_) | Self::Param(_) => 1,
-            Self::Unary(_, a) => 1 + a.node_count(),
-            Self::Binary(_, a, b) => 1 + a.node_count() + b.node_count(),
-            Self::Ternary(_, a, b, c) => 1 + a.node_count() + b.node_count() + c.node_count(),
-            Self::Nary(_, children) => 1 + children.iter().map(Self::node_count).sum::<usize>(),
-        }
-    }
-
-    #[must_use]
-    pub fn depth(&self) -> usize {
-        match self {
-            Self::Var(_) | Self::Const(_) | Self::Param(_) => 1,
-            Self::Unary(_, a) => 1 + a.depth(),
-            Self::Binary(_, a, b) => 1 + a.depth().max(b.depth()),
-            Self::Ternary(_, a, b, c) => 1 + a.depth().max(b.depth()).max(c.depth()),
-            Self::Nary(_, children) => 1 + children.iter().map(Self::depth).max().unwrap_or(0),
-        }
-    }
-
-    pub fn push_into(&self, arena: &mut ExprArena) -> ExprId {
-        match self {
-            Self::Var(i) => arena.push_var(*i),
-            Self::Const(v) => arena.push_const(*v),
-            Self::Param(i) => arena.push_param(*i),
-            Self::Unary(op, a) => {
-                let a = a.push_into(arena);
-                arena.push_unary(*op, a)
-            }
-            Self::Binary(op, a, b) => {
-                let a = a.push_into(arena);
-                let b = b.push_into(arena);
-                arena.push_binary(*op, a, b)
-            }
-            Self::Ternary(op, a, b, c) => {
-                let a = a.push_into(arena);
-                let b = b.push_into(arena);
-                let c = c.push_into(arena);
-                arena.push_ternary(*op, a, b, c)
-            }
-            Self::Nary(op, children) => {
-                let mut child_ids = Vec::with_capacity(children.len());
-                for child in children {
-                    child_ids.push(child.push_into(arena));
-                }
-                arena.push_nary(*op, &child_ids)
-            }
-        }
-    }
-}
-
-impl fmt::Display for Pattern {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Var(0) => write!(f, "X"),
-            Self::Var(1) => write!(f, "Y"),
-            Self::Var(2) => write!(f, "Z"),
-            Self::Var(3) => write!(f, "W"),
-            Self::Var(i) => write!(f, "v{i}"),
-            Self::Const(v) => write!(f, "{v}"),
-            Self::Param(i) => write!(f, "p{i}"),
-            Self::Unary(op, a) => write!(f, "({} {})", op.name(), a),
-            Self::Binary(op, a, b) => write!(f, "({} {} {})", op.name(), a, b),
-            Self::Ternary(op, a, b, c) => write!(f, "({} {} {} {})", op.name(), a, b, c),
-            Self::Nary(op, children) => {
-                write!(f, "({}", op.name())?;
-                for child in children {
-                    write!(f, " {}", child)?;
-                }
-                write!(f, ")")
-            }
-        }
-    }
+/// Build a rewrite-rule template directly into an [`ExprArena`], returning the
+/// root [`ExprId`]. The DSL mirrors the structural pattern: `var N` / `cst V` /
+/// `par N` leaves, and `un OP, (..)` / `bin OP, (..), (..)` / `tern OP, (..),
+/// (..), (..)` nodes. Metavariables are encoded as `var N` (Var(0) = A, etc.).
+#[macro_export]
+macro_rules! arena_pat {
+    ($a:expr, var $i:expr) => { $a.push_var($i) };
+    ($a:expr, cst $v:expr) => { $a.push_const($v) };
+    ($a:expr, par $i:expr) => { $a.push_param($i) };
+    ($a:expr, un $op:expr, ($($c:tt)+)) => {{
+        let __c = $crate::arena_pat!($a, $($c)+);
+        $a.push_unary($op, __c)
+    }};
+    ($a:expr, bin $op:expr, ($($l:tt)+), ($($r:tt)+)) => {{
+        let __l = $crate::arena_pat!($a, $($l)+);
+        let __r = $crate::arena_pat!($a, $($r)+);
+        $a.push_binary($op, __l, __r)
+    }};
+    ($a:expr, tern $op:expr, ($($x:tt)+), ($($y:tt)+), ($($z:tt)+)) => {{
+        let __x = $crate::arena_pat!($a, $($x)+);
+        let __y = $crate::arena_pat!($a, $($y)+);
+        let __z = $crate::arena_pat!($a, $($z)+);
+        $a.push_ternary($op, __x, __y, __z)
+    }};
 }
 
 /// Actions that a rewrite rule can produce.
@@ -257,7 +171,7 @@ pub trait Rewrite: Send + Sync {
     ///
     /// Returns `None` if the rule doesn't have a defined template.
     /// Rules can opt-in by overriding this method.
-    fn lhs_template(&self) -> Option<Pattern> {
+    fn lhs_template(&self, _arena: &mut ExprArena) -> Option<ExprId> {
         None
     }
 
@@ -273,7 +187,7 @@ pub trait Rewrite: Send + Sync {
     /// ```
     ///
     /// Returns `None` if the rule doesn't have a defined template.
-    fn rhs_template(&self) -> Option<Pattern> {
+    fn rhs_template(&self, _arena: &mut ExprArena) -> Option<ExprId> {
         None
     }
 }

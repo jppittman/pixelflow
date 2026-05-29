@@ -137,189 +137,113 @@ pub fn transcendental_rules() -> Vec<Box<dyn Rewrite>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egraph::Pattern as Expr;
-    use crate::egraph::{CostModel, EClassId, EGraph, ENode, saturate_with_budget};
+    use crate::arena_pat;
+    use crate::egraph::{EClassId, EGraph, ENode, saturate_with_budget};
     use pixelflow_ir::OpKind;
-    use std::sync::Arc;
+    use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
-    fn b(e: Expr) -> Arc<Expr> {
-        Arc::new(e)
+    /// Insert an arena subtree into an e-graph, returning its e-class.
+    fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> EClassId {
+        match *arena.node(id) {
+            ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
+            ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
+            ExprNode::Param(i) => panic!("Param({i}) reached math tests"),
+            ExprNode::Unary(kind, a) => {
+                let ca = expr_to_egraph(arena, a, egraph);
+                let op = crate::egraph::ops::op_from_kind(kind)
+                    .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
+                egraph.add(ENode::Op { op, children: vec![ca] })
+            }
+            ExprNode::Binary(kind, a, b) => {
+                let ca = expr_to_egraph(arena, a, egraph);
+                let cb = expr_to_egraph(arena, b, egraph);
+                let op = crate::egraph::ops::op_from_kind(kind)
+                    .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
+                egraph.add(ENode::Op { op, children: vec![ca, cb] })
+            }
+            ExprNode::Ternary(kind, a, b, c) => {
+                let ca = expr_to_egraph(arena, a, egraph);
+                let cb = expr_to_egraph(arena, b, egraph);
+                let cc = expr_to_egraph(arena, c, egraph);
+                let op = crate::egraph::ops::op_from_kind(kind)
+                    .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
+                egraph.add(ENode::Op { op, children: vec![ca, cb, cc] })
+            }
+            ExprNode::Nary(kind, _, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
+        }
     }
 
-    fn expr_to_egraph(expr: &Expr, egraph: &mut EGraph) -> EClassId {
-        enum Task<'a> {
-            Visit(&'a Expr),
-            CompleteOp { kind: OpKind, arity: usize },
-            CompleteTuple { arity: usize },
-        }
-
-        let mut stack = vec![Task::Visit(expr)];
-        let mut result_stack = Vec::new();
-
-        while let Some(task) = stack.pop() {
-            match task {
-                Task::Visit(node) => match node {
-                    Expr::Var(idx) => result_stack.push(egraph.add(ENode::Var(*idx))),
-                    Expr::Const(val) => result_stack.push(egraph.add(ENode::Const(val.to_bits()))),
-                    Expr::Param(i) => panic!("Expr::Param({i}) reached math tests"),
-                    Expr::Unary(kind, a) => {
-                        stack.push(Task::CompleteOp {
-                            kind: *kind,
-                            arity: 1,
-                        });
-                        stack.push(Task::Visit(a));
-                    }
-                    Expr::Binary(kind, a, b) => {
-                        stack.push(Task::CompleteOp {
-                            kind: *kind,
-                            arity: 2,
-                        });
-                        stack.push(Task::Visit(b));
-                        stack.push(Task::Visit(a));
-                    }
-                    Expr::Ternary(kind, a, b, c) => {
-                        stack.push(Task::CompleteOp {
-                            kind: *kind,
-                            arity: 3,
-                        });
-                        stack.push(Task::Visit(c));
-                        stack.push(Task::Visit(b));
-                        stack.push(Task::Visit(a));
-                    }
-                    Expr::Nary(kind, children) => match kind {
-                        OpKind::Tuple => {
-                            assert!(!children.is_empty(), "empty tuple in math test");
-                            stack.push(Task::CompleteTuple {
-                                arity: children.len(),
-                            });
-                            for child in children.iter().rev() {
-                                stack.push(Task::Visit(child));
-                            }
-                        }
-                        _ => panic!("unsupported n-ary op in math test: {kind:?}"),
-                    },
-                },
-                Task::CompleteOp { kind, arity } => {
-                    let start = result_stack.len().saturating_sub(arity);
-                    let children: Vec<EClassId> = result_stack.drain(start..).collect();
-                    let op = crate::egraph::ops::op_from_kind(kind)
-                        .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
-                    result_stack.push(egraph.add(ENode::Op { op, children }));
-                }
-                Task::CompleteTuple { arity } => {
-                    let start = result_stack.len().saturating_sub(arity);
-                    let children: Vec<EClassId> = result_stack.drain(start..).collect();
-                    result_stack.push(children[0]);
+    /// Materialise the cheapest representative of an e-class into `arena`.
+    fn eclass_to_arena(egraph: &EGraph, class: EClassId, arena: &mut ExprArena) -> ExprId {
+        // Snapshot the chosen node so the egraph borrow is released before we
+        // recurse (which borrows egraph again) and push into the arena.
+        let node = egraph.nodes(class)[0].clone();
+        match node {
+            ENode::Var(idx) => arena.push_var(idx),
+            ENode::Const(bits) => arena.push_const(f32::from_bits(bits)),
+            ENode::Op { op, children } => {
+                let kind = op.kind();
+                let child_ids: Vec<ExprId> = children
+                    .iter()
+                    .map(|&c| eclass_to_arena(egraph, c, arena))
+                    .collect();
+                match child_ids.len() {
+                    1 => arena.push_unary(kind, child_ids[0]),
+                    2 => arena.push_binary(kind, child_ids[0], child_ids[1]),
+                    3 => arena.push_ternary(kind, child_ids[0], child_ids[1], child_ids[2]),
+                    n => panic!("unsupported arity in math test: {n}"),
                 }
             }
         }
-
-        result_stack
-            .pop()
-            .expect("expr_to_egraph: empty result stack")
     }
 
-    fn eclass_to_expr(egraph: &EGraph, class: EClassId) -> Expr {
-        enum Task {
-            Visit(EClassId),
-            Complete { kind: OpKind, arity: usize },
-        }
-
-        let mut stack = vec![Task::Visit(class)];
-        let mut result_stack = Vec::new();
-
-        while let Some(task) = stack.pop() {
-            match task {
-                Task::Visit(class_id) => {
-                    let node = &egraph.nodes(class_id)[0];
-                    match node {
-                        ENode::Var(idx) => result_stack.push(Expr::Var(*idx)),
-                        ENode::Const(bits) => result_stack.push(Expr::Const(f32::from_bits(*bits))),
-                        ENode::Op { op, children } => {
-                            let kind = op.kind();
-                            let arity = children.len();
-                            assert!(
-                                (1..=3).contains(&arity),
-                                "unsupported arity in math test: {arity}"
-                            );
-                            stack.push(Task::Complete { kind, arity });
-                            for &child in children.iter().rev() {
-                                stack.push(Task::Visit(child));
-                            }
-                        }
-                    }
-                }
-                Task::Complete { kind, arity } => {
-                    let start = result_stack.len().saturating_sub(arity);
-                    let mut children: Vec<Expr> = result_stack.drain(start..).collect();
-                    let expr = match arity {
-                        1 => Expr::Unary(kind, b(children.remove(0))),
-                        2 => {
-                            let rhs = children.remove(1);
-                            let lhs = children.remove(0);
-                            Expr::Binary(kind, b(lhs), b(rhs))
-                        }
-                        3 => {
-                            let c = children.remove(2);
-                            let rhs = children.remove(1);
-                            let lhs = children.remove(0);
-                            Expr::Ternary(kind, b(lhs), b(rhs), b(c))
-                        }
-                        _ => unreachable!(),
-                    };
-                    result_stack.push(expr);
-                }
-            }
-        }
-
-        result_stack
-            .pop()
-            .expect("eclass_to_expr: empty result stack")
-    }
-
-    /// Evaluate an IR Expr at given variable values.
-    fn eval_expr(expr: &Expr, vars: &[f32; 4]) -> f32 {
-        match expr {
-            Expr::Var(i) => vars[*i as usize],
-            Expr::Const(c) => *c,
-            Expr::Param(_) => panic!("Param in eval_expr"),
-            Expr::Unary(op, a) => {
-                let a = eval_expr(a, vars);
+    /// Evaluate an arena subtree at the given variable values.
+    fn eval_arena(arena: &ExprArena, id: ExprId, vars: &[f32; 4]) -> f32 {
+        match *arena.node(id) {
+            ExprNode::Var(i) => vars[i as usize],
+            ExprNode::Const(c) => c,
+            ExprNode::Param(_) => panic!("Param in eval_arena"),
+            ExprNode::Unary(op, a) => {
+                let a = eval_arena(arena, a, vars);
                 op.eval_unary(a)
-                    .unwrap_or_else(|| panic!("eval_unary failed for {:?}", op))
+                    .unwrap_or_else(|| panic!("eval_unary failed for {op:?}"))
             }
-            Expr::Binary(op, a, b) => {
-                let a = eval_expr(a, vars);
-                let b = eval_expr(b, vars);
+            ExprNode::Binary(op, a, b) => {
+                let a = eval_arena(arena, a, vars);
+                let b = eval_arena(arena, b, vars);
                 op.eval_binary(a, b)
-                    .unwrap_or_else(|| panic!("eval_binary failed for {:?}", op))
+                    .unwrap_or_else(|| panic!("eval_binary failed for {op:?}"))
             }
-            Expr::Ternary(op, a, b, c) => {
-                let a = eval_expr(a, vars);
-                let b = eval_expr(b, vars);
-                let c = eval_expr(c, vars);
+            ExprNode::Ternary(op, a, b, c) => {
+                let a = eval_arena(arena, a, vars);
+                let b = eval_arena(arena, b, vars);
+                let c = eval_arena(arena, c, vars);
                 op.eval_ternary(a, b, c)
-                    .unwrap_or_else(|| panic!("eval_ternary failed for {:?}", op))
+                    .unwrap_or_else(|| panic!("eval_ternary failed for {op:?}"))
             }
-            Expr::Nary(_, _) => panic!("Nary in eval_expr"),
+            ExprNode::Nary(..) => panic!("Nary in eval_arena"),
         }
     }
 
     /// Run an expression through the egraph optimizer and check that the
     /// optimized result produces the same output at all test points.
-    fn check_optimization_preserves_semantics(expr: &Expr, test_points: &[[f32; 4]], epsilon: f32) {
+    fn check_optimization_preserves_semantics(
+        arena: &ExprArena,
+        root: ExprId,
+        test_points: &[[f32; 4]],
+        epsilon: f32,
+    ) {
         let mut eg = EGraph::new();
-        let root = expr_to_egraph(expr, &mut eg);
+        let root_class = expr_to_egraph(arena, root, &mut eg);
         let _result = saturate_with_budget(&mut eg, 200);
 
-        // Extract optimized expression
-        let optimized = eclass_to_expr(&eg, root);
+        let mut opt_arena = ExprArena::new();
+        let opt_root = eclass_to_arena(&eg, root_class, &mut opt_arena);
 
         for point in test_points {
-            let original = eval_expr(expr, point);
-            let opt = eval_expr(&optimized, point);
+            let original = eval_arena(arena, root, point);
+            let opt = eval_arena(&opt_arena, opt_root, point);
 
-            // Both NaN => OK. Both inf with same sign => OK.
             if original.is_nan() && opt.is_nan() {
                 continue;
             }
@@ -328,7 +252,6 @@ mod tests {
             }
 
             let diff = (original - opt).abs();
-            // Use relative error for large values
             let threshold = if original.abs() > 1.0 {
                 epsilon * original.abs()
             } else {
@@ -337,12 +260,14 @@ mod tests {
             assert!(
                 diff <= threshold,
                 "Optimization changed semantics!\n\
-                 Expression: {expr}\n\
-                 Optimized:  {optimized}\n\
+                 Expression: {}\n\
+                 Optimized:  {}\n\
                  Point: {point:?}\n\
                  Original: {original}\n\
                  Optimized: {opt}\n\
-                 Diff: {diff} > threshold {threshold}"
+                 Diff: {diff} > threshold {threshold}",
+                arena.display(root),
+                opt_arena.display(opt_root),
             );
         }
     }
@@ -350,250 +275,161 @@ mod tests {
     /// Standard test points including edge cases.
     fn standard_test_points() -> Vec<[f32; 4]> {
         vec![
-            [0.5, 0.7, 1.3, -0.2],             // Normal values
-            [0.0, 0.0, 0.0, 0.0],              // Zeros
-            [1.0, 1.0, 1.0, 1.0],              // Ones
-            [-1.0, -1.0, -1.0, -1.0],          // Negative ones
-            [100.0, 100.0, 100.0, 100.0],      // Large values (exp overflow territory)
-            [-100.0, -100.0, 0.01, 0.01],      // Mixed large negative / small positive
-            [0.001, 0.001, 0.001, 0.001],      // Very small
-            [3.14159, 1.5708, 0.7854, 2.3562], // Pi-related (trig)
-            [-0.5, 0.3, -0.8, 0.1],            // Mixed sign small
+            [0.5, 0.7, 1.3, -0.2],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [-1.0, -1.0, -1.0, -1.0],
+            [100.0, 100.0, 100.0, 100.0],
+            [-100.0, -100.0, 0.01, 0.01],
+            [0.001, 0.001, 0.001, 0.001],
+            [3.14159, 1.5708, 0.7854, 2.3562],
+            [-0.5, 0.3, -0.8, 0.1],
         ]
+    }
+
+    /// Assert two e-graph root classes are semantically equal at all points,
+    /// and that associativity added alternative tree shapes to the root class.
+    fn check_assoc(arena: &ExprArena, root: ExprId) {
+        let mut eg = EGraph::with_rules(all_rules());
+        let root_class = expr_to_egraph(arena, root, &mut eg);
+        // Budget 5: associativity fires on the first iteration. Higher budgets
+        // cause combinatorial explosion with commutativity.
+        let _result = saturate_with_budget(&mut eg, 5);
+
+        let mut opt_arena = ExprArena::new();
+        let opt_root = eclass_to_arena(&eg, root_class, &mut opt_arena);
+        for point in &standard_test_points() {
+            let original = eval_arena(arena, root, point);
+            let opt = eval_arena(&opt_arena, opt_root, point);
+            if original.is_nan() && opt.is_nan() {
+                continue;
+            }
+            let diff = (original - opt).abs();
+            let threshold = if original.abs() > 1.0 { 1e-5 * original.abs() } else { 1e-5 };
+            assert!(diff <= threshold, "associativity changed semantics at {point:?}: {original} vs {opt}");
+        }
+
+        let canon = eg.find(root_class);
+        let node_count = eg.nodes(canon).len();
+        assert!(
+            node_count > 1,
+            "expected associativity to add alternative tree shapes, but root class has {node_count} node(s)"
+        );
     }
 
     #[test]
     fn test_algebraic_rules_preserve_semantics() {
         let pts = standard_test_points();
-        let x = Expr::Var(0);
-        let y = Expr::Var(1);
+        let mut a = ExprArena::new();
 
-        // a - b (triggers canonicalize: sub → add+neg)
-        let expr = Expr::Binary(OpKind::Sub, b(x.clone()), b(y.clone()));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-5);
+        // a - b (canonicalize: sub -> add+neg)
+        let e = arena_pat!(&mut a, bin OpKind::Sub, (var 0), (var 1));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
 
-        // a / b (triggers canonicalize: div → mul+recip)
-        let expr = Expr::Binary(OpKind::Div, b(x.clone()), b(y.clone()));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
+        // a / b (canonicalize: div -> mul+recip)
+        let e = arena_pat!(&mut a, bin OpKind::Div, (var 0), (var 1));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
 
-        // neg(neg(x)) (triggers involution)
-        let expr = Expr::Unary(OpKind::Neg, b(Expr::Unary(OpKind::Neg, b(x.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
+        // neg(neg(x)) (involution)
+        let e = arena_pat!(&mut a, un OpKind::Neg, (un OpKind::Neg, (var 0)));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
 
-        // (x + y) - y (triggers cancellation)
-        let expr = Expr::Binary(
-            OpKind::Sub,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))),
-            b(y.clone()),
-        );
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
+        // (x + y) - y (cancellation)
+        let e = arena_pat!(&mut a, bin OpKind::Sub, (bin OpKind::Add, (var 0), (var 1)), (var 1));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
 
-        // x * 0 (triggers annihilator)
-        let expr = Expr::Binary(OpKind::Mul, b(x.clone()), b(Expr::Const(0.0)));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
+        // x * 0 (annihilator)
+        let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (cst 0.0));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
 
-        // x + 0 (triggers identity)
-        let expr = Expr::Binary(OpKind::Add, b(x.clone()), b(Expr::Const(0.0)));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
+        // x + 0 (identity)
+        let e = arena_pat!(&mut a, bin OpKind::Add, (var 0), (cst 0.0));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
 
-        // x * 1 (triggers identity)
-        let expr = Expr::Binary(OpKind::Mul, b(x.clone()), b(Expr::Const(1.0)));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-6);
+        // x * 1 (identity)
+        let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (cst 1.0));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
     }
 
     #[test]
     fn test_trig_rules_preserve_semantics() {
         let pts = standard_test_points();
-        let x = Expr::Var(0);
-        let y = Expr::Var(1);
+        let mut a = ExprArena::new();
 
-        // sin(x + y) (triggers angle addition)
-        let expr = Expr::Unary(
-            OpKind::Sin,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))),
-        );
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
+        // sin(x + y) (angle addition)
+        let e = arena_pat!(&mut a, un OpKind::Sin, (bin OpKind::Add, (var 0), (var 1)));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
 
-        // cos(x + y) (triggers angle addition)
-        let expr = Expr::Unary(
-            OpKind::Cos,
-            b(Expr::Binary(OpKind::Add, b(x.clone()), b(y.clone()))),
-        );
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
+        // cos(x + y) (angle addition)
+        let e = arena_pat!(&mut a, un OpKind::Cos, (bin OpKind::Add, (var 0), (var 1)));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
 
-        // sin(neg(x)) (triggers parity: odd)
-        let expr = Expr::Unary(OpKind::Sin, b(Expr::Unary(OpKind::Neg, b(x.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-5);
+        // sin(neg(x)) (parity: odd)
+        let e = arena_pat!(&mut a, un OpKind::Sin, (un OpKind::Neg, (var 0)));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
 
-        // cos(neg(x)) (triggers parity: even)
-        let expr = Expr::Unary(OpKind::Cos, b(Expr::Unary(OpKind::Neg, b(x.clone()))));
-        check_optimization_preserves_semantics(&expr, &pts, 1e-5);
+        // cos(neg(x)) (parity: even)
+        let e = arena_pat!(&mut a, un OpKind::Cos, (un OpKind::Neg, (var 0)));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
     }
 
     #[test]
     fn test_associativity_left_to_right() {
         // (v0 + v1) + v2 should produce v0 + (v1 + v2) in the e-graph
-        let v0 = Expr::Var(0);
-        let v1 = Expr::Var(1);
-        let v2 = Expr::Var(2);
-
-        // Build (v0 + v1) + v2
-        let left = Expr::Binary(OpKind::Add, b(v0.clone()), b(v1.clone()));
-        let expr = Expr::Binary(OpKind::Add, b(left), b(v2.clone()));
-
-        let mut eg = EGraph::with_rules(all_rules());
-        let root = expr_to_egraph(&expr, &mut eg);
-        // Budget 5 is sufficient — associativity fires on the first iteration.
-        // Higher budgets cause combinatorial explosion with commutativity.
-        let _result = saturate_with_budget(&mut eg, 5);
-
-        // Verify semantic equivalence
-        let optimized = eclass_to_expr(&eg, root);
-        let pts = standard_test_points();
-        for point in &pts {
-            let original = eval_expr(&expr, point);
-            let opt = eval_expr(&optimized, point);
-            if original.is_nan() && opt.is_nan() {
-                continue;
-            }
-            let diff = (original - opt).abs();
-            let threshold = if original.abs() > 1.0 {
-                1e-5 * original.abs()
-            } else {
-                1e-5
-            };
-            assert!(
-                diff <= threshold,
-                "Associativity L->R changed semantics at {point:?}: {original} vs {opt}"
-            );
-        }
-
-        // Verify the e-graph contains the right-associated form by checking
-        // that the root class has grown (new nodes added by associativity)
-        let root = eg.find(root);
-        let node_count = eg.nodes(root).len();
-        assert!(
-            node_count > 1,
-            "Expected associativity to add alternative tree shapes, \
-             but root class has only {node_count} node(s)"
-        );
+        let mut a = ExprArena::new();
+        let e = arena_pat!(&mut a, bin OpKind::Add, (bin OpKind::Add, (var 0), (var 1)), (var 2));
+        check_assoc(&a, e);
     }
 
     #[test]
     fn test_associativity_right_to_left() {
         // v0 + (v1 + v2) should produce (v0 + v1) + v2 in the e-graph
-        let v0 = Expr::Var(0);
-        let v1 = Expr::Var(1);
-        let v2 = Expr::Var(2);
-
-        // Build v0 + (v1 + v2)
-        let right = Expr::Binary(OpKind::Add, b(v1.clone()), b(v2.clone()));
-        let expr = Expr::Binary(OpKind::Add, b(v0.clone()), b(right));
-
-        let mut eg = EGraph::with_rules(all_rules());
-        let root = expr_to_egraph(&expr, &mut eg);
-        let _result = saturate_with_budget(&mut eg, 5);
-
-        // Verify semantic equivalence
-        let optimized = eclass_to_expr(&eg, root);
-        let pts = standard_test_points();
-        for point in &pts {
-            let original = eval_expr(&expr, point);
-            let opt = eval_expr(&optimized, point);
-            if original.is_nan() && opt.is_nan() {
-                continue;
-            }
-            let diff = (original - opt).abs();
-            let threshold = if original.abs() > 1.0 {
-                1e-5 * original.abs()
-            } else {
-                1e-5
-            };
-            assert!(
-                diff <= threshold,
-                "Associativity R->L changed semantics at {point:?}: {original} vs {opt}"
-            );
-        }
-
-        // Verify the e-graph grew from reverse associativity
-        let root = eg.find(root);
-        let node_count = eg.nodes(root).len();
-        assert!(
-            node_count > 1,
-            "Expected reverse associativity to add alternative tree shapes, \
-             but root class has only {node_count} node(s)"
-        );
+        let mut a = ExprArena::new();
+        let e = arena_pat!(&mut a, bin OpKind::Add, (var 0), (bin OpKind::Add, (var 1), (var 2)));
+        check_assoc(&a, e);
     }
 
     #[test]
     fn test_associativity_mul() {
         // (v0 * v1) * v2 should produce v0 * (v1 * v2) and vice versa
-        let v0 = Expr::Var(0);
-        let v1 = Expr::Var(1);
-        let v2 = Expr::Var(2);
-
-        let left = Expr::Binary(OpKind::Mul, b(v0.clone()), b(v1.clone()));
-        let expr = Expr::Binary(OpKind::Mul, b(left), b(v2.clone()));
-
-        let pts = standard_test_points();
-        check_optimization_preserves_semantics(&expr, &pts, 1e-4);
+        let mut a = ExprArena::new();
+        let e = arena_pat!(&mut a, bin OpKind::Mul, (bin OpKind::Mul, (var 0), (var 1)), (var 2));
+        check_optimization_preserves_semantics(&a, e, &standard_test_points(), 1e-4);
     }
 
     #[test]
     fn test_associativity_min_max() {
-        let v0 = Expr::Var(0);
-        let v1 = Expr::Var(1);
-        let v2 = Expr::Var(2);
+        let pts = standard_test_points();
+        let mut a = ExprArena::new();
 
         // min(min(v0, v1), v2) should produce min(v0, min(v1, v2))
-        let min_left = Expr::Binary(OpKind::Min, b(v0.clone()), b(v1.clone()));
-        let expr_min = Expr::Binary(OpKind::Min, b(min_left), b(v2.clone()));
-        let pts = standard_test_points();
-        check_optimization_preserves_semantics(&expr_min, &pts, 1e-6);
+        let e = arena_pat!(&mut a, bin OpKind::Min, (bin OpKind::Min, (var 0), (var 1)), (var 2));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
 
         // max(max(v0, v1), v2) should produce max(v0, max(v1, v2))
-        let max_left = Expr::Binary(OpKind::Max, b(v0.clone()), b(v1.clone()));
-        let expr_max = Expr::Binary(OpKind::Max, b(max_left), b(v2.clone()));
-        check_optimization_preserves_semantics(&expr_max, &pts, 1e-6);
+        let e = arena_pat!(&mut a, bin OpKind::Max, (bin OpKind::Max, (var 0), (var 1)), (var 2));
+        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
     }
 
     #[test]
     fn test_associativity_templates() {
-        // Verify all associativity rules have valid lhs/rhs templates
-        let assoc_add = Associative::new(&crate::egraph::ops::Add);
-        assert!(
-            assoc_add.lhs_template().is_some(),
-            "Associative Add missing lhs_template"
-        );
-        assert!(
-            assoc_add.rhs_template().is_some(),
-            "Associative Add missing rhs_template"
-        );
+        // Verify all associativity rules have valid lhs/rhs templates and that
+        // Associative LHS == ReverseAssociative RHS (and vice versa) structurally.
+        let assoc = Associative::new(&crate::egraph::ops::Add);
+        let rev = ReverseAssociative::new(&crate::egraph::ops::Add);
 
-        let rev_assoc_add = ReverseAssociative::new(&crate::egraph::ops::Add);
-        assert!(
-            rev_assoc_add.lhs_template().is_some(),
-            "ReverseAssociative Add missing lhs_template"
-        );
-        assert!(
-            rev_assoc_add.rhs_template().is_some(),
-            "ReverseAssociative Add missing rhs_template"
-        );
+        let mut a = ExprArena::new();
+        let assoc_lhs = assoc.lhs_template(&mut a).expect("Associative Add missing lhs_template");
+        let assoc_rhs = assoc.rhs_template(&mut a).expect("Associative Add missing rhs_template");
+        let rev_lhs = rev.lhs_template(&mut a).expect("ReverseAssociative Add missing lhs_template");
+        let rev_rhs = rev.rhs_template(&mut a).expect("ReverseAssociative Add missing rhs_template");
 
-        // Verify template structure: LHS of Associative should be RHS of ReverseAssociative
-        let assoc_lhs = assoc_add.lhs_template().unwrap();
-        let rev_rhs = rev_assoc_add.rhs_template().unwrap();
-        assert_eq!(
-            format!("{}", assoc_lhs),
-            format!("{}", rev_rhs),
+        assert!(
+            a.subtree_eq(assoc_lhs, &a, rev_rhs),
             "Associative LHS should equal ReverseAssociative RHS (same structural pattern)"
         );
-
-        let assoc_rhs = assoc_add.rhs_template().unwrap();
-        let rev_lhs = rev_assoc_add.lhs_template().unwrap();
-        assert_eq!(
-            format!("{}", assoc_rhs),
-            format!("{}", rev_lhs),
+        assert!(
+            a.subtree_eq(assoc_rhs, &a, rev_lhs),
             "Associative RHS should equal ReverseAssociative LHS (same structural pattern)"
         );
     }

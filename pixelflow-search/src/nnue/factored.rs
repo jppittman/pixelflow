@@ -41,7 +41,7 @@ use alloc::vec::Vec;
 use libm::sqrtf;
 
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
-use crate::egraph::Pattern as Expr;
+use crate::egraph::Rewrite;
 pub use pixelflow_ir::OpKind;
 
 // ============================================================================
@@ -205,121 +205,89 @@ impl RuleFeatures {
 /// - `z_RHS`: what it PRODUCES (production prediction)
 /// - `z_LHS - z_RHS`: what CHANGED (the delta)
 /// - `z_LHS * z_RHS`: what's SHARED (preserved structure)
-#[derive(Clone)]
+/// Arena-backed rule templates: one [`ArenaRuleTemplate`] per rule index.
+///
+/// `None` slots are rules that define no structural template (or only one
+/// side). Built from the [`Rewrite`] trait via [`RuleTemplates::build`], which
+/// reads each rule's LHS/RHS directly into a per-rule [`ExprArena`].
+#[derive(Clone, Default)]
 pub struct RuleTemplates {
-    /// LHS pattern for each rule (what it matches).
-    /// Uses Expr::Var(0), Expr::Var(1), etc. as metavariables.
-    pub lhs: Vec<Option<Expr>>,
-    /// RHS pattern for each rule (what it produces).
-    pub rhs: Vec<Option<Expr>>,
-}
-
-impl Default for RuleTemplates {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// One optional arena-backed template per rule, indexed by rule_idx.
+    pub rules: Vec<Option<ArenaRuleTemplate>>,
 }
 
 impl RuleTemplates {
     /// Create empty templates.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            lhs: Vec::new(),
-            rhs: Vec::new(),
-        }
+        Self { rules: Vec::new() }
     }
 
-    /// Create templates for a given number of rules (all None initially).
+    /// Create templates for a given number of rules (all `None` initially).
     #[must_use]
     pub fn with_capacity(num_rules: usize) -> Self {
         Self {
-            lhs: vec![None; num_rules],
-            rhs: vec![None; num_rules],
+            rules: (0..num_rules).map(|_| None).collect(),
         }
     }
 
-    /// Set templates for a specific rule.
-    pub fn set(&mut self, rule_idx: usize, lhs: Expr, rhs: Expr) {
-        // Ensure we have enough capacity
-        if rule_idx >= self.lhs.len() {
-            self.lhs.resize(rule_idx + 1, None);
-            self.rhs.resize(rule_idx + 1, None);
+    /// Build and store the LHS/RHS template for `rule` at `rule_idx`, reading
+    /// them directly from the [`Rewrite`] trait into a per-rule arena.
+    ///
+    /// Only stored when the rule defines BOTH sides (legacy semantics).
+    pub fn build(&mut self, rule_idx: usize, rule: &dyn Rewrite) {
+        if rule_idx >= self.rules.len() {
+            self.rules.resize_with(rule_idx + 1, || None);
         }
-        self.lhs[rule_idx] = Some(lhs);
-        self.rhs[rule_idx] = Some(rhs);
+        let tmpl = ArenaRuleTemplate::from_rule(rule);
+        if tmpl.lhs.is_some() && tmpl.rhs.is_some() {
+            self.rules[rule_idx] = Some(tmpl);
+        }
     }
 
-    /// Get LHS template for a rule.
+    /// Get the arena-backed template for a rule, if defined.
     #[must_use]
-    pub fn get_lhs(&self, rule_idx: usize) -> Option<&Expr> {
-        self.lhs.get(rule_idx).and_then(|opt| opt.as_ref())
+    pub fn get(&self, rule_idx: usize) -> Option<&ArenaRuleTemplate> {
+        self.rules.get(rule_idx).and_then(|o| o.as_ref())
     }
 
-    /// Get RHS template for a rule.
-    #[must_use]
-    pub fn get_rhs(&self, rule_idx: usize) -> Option<&Expr> {
-        self.rhs.get(rule_idx).and_then(|opt| opt.as_ref())
-    }
-
-    /// Number of rules with templates.
+    /// Number of rule slots.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lhs.len()
+        self.rules.len()
     }
 
     /// Check if empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lhs.is_empty()
+        self.rules.is_empty()
     }
 
-    /// Check if a rule has templates defined.
+    /// Check if a rule has a template defined.
     #[must_use]
     pub fn has_templates(&self, rule_idx: usize) -> bool {
-        self.get_lhs(rule_idx).is_some() && self.get_rhs(rule_idx).is_some()
+        self.get(rule_idx).is_some()
     }
 
-    /// Returns `true` if any template (LHS or RHS) has `op` as its root operation.
-    ///
-    /// Used to skip template matching entirely for nodes whose op cannot match
-    /// any template root, avoiding expensive `to_expr` + `pattern_match` calls.
+    /// Returns `true` if any template (LHS or RHS) has `op` as its root op.
     #[must_use]
     pub fn has_root_op(&self, op: OpKind) -> bool {
-        for rule_idx in 0..self.len() {
-            if let Some(lhs) = self.get_lhs(rule_idx) {
-                // We match against LHS to produce RHS, but we also want
-                // expanding rewrites (RHS->LHS). Check both sides.
-                if !matches!(lhs, Expr::Var(_)) && lhs.kind() == op {
-                    return true;
-                }
-            }
-            if let Some(rhs) = self.get_rhs(rule_idx) {
-                if !matches!(rhs, Expr::Var(_)) && rhs.kind() == op {
-                    return true;
-                }
-            }
-        }
-        false
+        self.rules
+            .iter()
+            .flatten()
+            .any(|t| t.lhs_op == Some(op) || t.rhs_op == Some(op))
     }
 
-    /// Build a precomputed set of root ops that appear in any template.
-    ///
-    /// Returns a fixed-size array indexed by `OpKind::index()`. This turns
-    /// `has_root_op` from O(rules) to O(1) when called repeatedly.
+    /// Build a precomputed O(1) set of root ops appearing in any template.
     #[must_use]
     pub fn root_op_set(&self) -> [bool; OpKind::COUNT] {
         let mut set = [false; OpKind::COUNT];
-        for rule_idx in 0..self.len() {
-            if let Some(lhs) = self.get_lhs(rule_idx) {
-                if !matches!(lhs, Expr::Var(_)) {
-                    set[lhs.kind().index()] = true;
-                }
+        for t in self.rules.iter().flatten() {
+            if let Some(op) = t.lhs_op {
+                set[op.index()] = true;
             }
-            if let Some(rhs) = self.get_rhs(rule_idx) {
-                if !matches!(rhs, Expr::Var(_)) {
-                    set[rhs.kind().index()] = true;
-                }
+            if let Some(op) = t.rhs_op {
+                set[op.index()] = true;
             }
         }
         set
@@ -333,7 +301,8 @@ impl RuleTemplates {
 /// A single rule stored as two subtrees inside one shared [`ExprArena`].
 ///
 /// `lhs` and `rhs` are roots inside `arena`. Either may be `None` when the
-/// corresponding pattern was not provided (same semantics as [`RuleTemplates`]).
+/// corresponding side was not provided by the rule.
+#[derive(Clone)]
 pub struct ArenaRuleTemplate {
     /// Shared arena holding both the LHS and RHS subtrees.
     pub arena: ExprArena,
@@ -348,22 +317,21 @@ pub struct ArenaRuleTemplate {
 }
 
 impl ArenaRuleTemplate {
-    /// Construct from a pair of optional template patterns.
+    /// Build the LHS/RHS templates of `rule` directly into a fresh arena.
     #[must_use]
-    pub fn from_patterns(lhs: Option<&Expr>, rhs: Option<&Expr>) -> Self {
+    pub fn from_rule(rule: &dyn Rewrite) -> Self {
         let mut arena = ExprArena::with_capacity(16);
+        let lhs = rule.lhs_template(&mut arena);
+        let rhs = rule.rhs_template(&mut arena);
 
-        let lhs_id = lhs.map(|e| e.push_into(&mut arena));
-        let rhs_id = rhs.map(|e| e.push_into(&mut arena));
-
-        let lhs_op = lhs_id.and_then(|id| {
+        let lhs_op = lhs.and_then(|id| {
             if matches!(arena.node(id), ExprNode::Var(_)) {
                 None
             } else {
                 Some(arena.kind(id))
             }
         });
-        let rhs_op = rhs_id.and_then(|id| {
+        let rhs_op = rhs.and_then(|id| {
             if matches!(arena.node(id), ExprNode::Var(_)) {
                 None
             } else {
@@ -373,19 +341,15 @@ impl ArenaRuleTemplate {
 
         Self {
             arena,
-            lhs: lhs_id,
-            rhs: rhs_id,
+            lhs,
+            rhs,
             lhs_op,
             rhs_op,
         }
     }
 }
 
-/// Arena-backed rule template storage.
-///
-/// Stores every rule as an [`ArenaRuleTemplate`] — tiny arenas of 2-5 nodes
-/// each — so that pattern matching and substitution can operate directly on
-/// arena nodes without the `to_expr` / `push_expr` bridge.
+/// Arena-backed rule template storage for the mask head.
 pub struct ArenaRuleTemplates {
     /// One arena-backed template per rule, indexed by rule_idx.
     pub arenas: Vec<ArenaRuleTemplate>,
@@ -394,34 +358,33 @@ pub struct ArenaRuleTemplates {
 }
 
 impl ArenaRuleTemplates {
-    /// Convert [`RuleTemplates`] into arena form.
-    ///
-    /// Iterates every rule, converts LHS/RHS patterns to per-rule arenas,
-    /// and precomputes the `root_op_set` membership array.
+    /// Convert [`RuleTemplates`] into dense arena form (one entry per rule).
     #[must_use]
     pub fn from_rule_templates(templates: &RuleTemplates) -> Self {
         let mut arenas = Vec::with_capacity(templates.len());
         let mut root_op_set = [false; OpKind::COUNT];
 
-        for rule_idx in 0..templates.len() {
-            let lhs = templates.get_lhs(rule_idx);
-            let rhs = templates.get_rhs(rule_idx);
-            let tmpl = ArenaRuleTemplate::from_patterns(lhs, rhs);
-
+        for slot in &templates.rules {
+            let tmpl = match slot {
+                Some(t) => t.clone(),
+                None => ArenaRuleTemplate {
+                    arena: ExprArena::new(),
+                    lhs: None,
+                    rhs: None,
+                    lhs_op: None,
+                    rhs_op: None,
+                },
+            };
             if let Some(op) = tmpl.lhs_op {
                 root_op_set[op.index()] = true;
             }
             if let Some(op) = tmpl.rhs_op {
                 root_op_set[op.index()] = true;
             }
-
             arenas.push(tmpl);
         }
 
-        Self {
-            arenas,
-            root_op_set,
-        }
+        Self { arenas, root_op_set }
     }
 
     /// Number of rules.
@@ -937,83 +900,6 @@ impl EdgeAccumulator {
         self.edge_count = self.edge_count.saturating_sub(1);
     }
 
-    /// Build dual accumulator from expression tree, deduplicating shared subtrees.
-    ///
-    /// Uses structural (content-based) hashing to detect subtrees that appear
-    /// more than once in the expression DAG. When a subtree is encountered a
-    /// second time, a `BACKREF_FEATURE` token is emitted: `backref_count` is
-    /// incremented and the subtree's edges are NOT re-added. This prevents
-    /// double-counting of CSE nodes at the network input layer.
-    ///
-    /// `INPUT_DIM` and the weight layout are unchanged — `backref_count` is a
-    /// diagnostic field and does not feed into the forward pass, so this method
-    /// is fully compatible with the trained extraction head weights (`judge.bin`).
-    pub fn from_expr_dedup(expr: &Expr, emb: &OpEmbeddings) -> Self {
-        let mut acc = Self::new();
-        let mut seen: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
-        Self::collect_recursive_dedup(expr, emb, &mut acc, 0, &mut seen);
-        acc
-    }
-
-    fn collect_recursive_dedup(
-        expr: &Expr,
-        emb: &OpEmbeddings,
-        acc: &mut Self,
-        depth: u32,
-        seen: &mut alloc::collections::BTreeSet<u64>,
-    ) {
-        // Iterative traversal with explicit stack to avoid thread stack overflow
-        // on deep expression trees.
-        let mut stack: alloc::vec::Vec<(&Expr, u32)> = alloc::vec![(expr, depth)];
-
-        while let Some((node, d)) = stack.pop() {
-            let h = structural_hash(node);
-            if !seen.insert(h) {
-                acc.backref_count += 1;
-                continue;
-            }
-
-            let parent_op = node.op_type();
-            acc.node_count += 1;
-
-            match node {
-                Expr::Var(_) | Expr::Const(_) => {}
-                Expr::Param(i) => panic!(
-                    "Expr::Param({i}) reached NNUE cost model — call substitute_params before use"
-                ),
-                Expr::Unary(_, child) => {
-                    let eff_depth = d * MAX_ARITY as u32;
-                    acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
-                    stack.push((child, d + 1));
-                }
-                Expr::Binary(_, left, right) => {
-                    acc.add_edge(emb, parent_op, left.op_type(), d * MAX_ARITY as u32);
-                    acc.add_edge(emb, parent_op, right.op_type(), d * MAX_ARITY as u32 + 1);
-                    // Push right first so left is processed first (stack is LIFO)
-                    stack.push((right, d + 1));
-                    stack.push((left, d + 1));
-                }
-                Expr::Ternary(_, a, b, c) => {
-                    acc.add_edge(emb, parent_op, a.op_type(), d * MAX_ARITY as u32);
-                    acc.add_edge(emb, parent_op, b.op_type(), d * MAX_ARITY as u32 + 1);
-                    acc.add_edge(emb, parent_op, c.op_type(), d * MAX_ARITY as u32 + 2);
-                    stack.push((c, d + 1));
-                    stack.push((b, d + 1));
-                    stack.push((a, d + 1));
-                }
-                Expr::Nary(_, children) => {
-                    for (idx, child) in children.iter().enumerate() {
-                        let eff_depth = d * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                        acc.add_edge(emb, parent_op, child.op_type(), eff_depth);
-                    }
-                    for child in children.iter().rev() {
-                        stack.push((child, d + 1));
-                    }
-                }
-            }
-        }
-    }
-
     /// Build dual accumulator from an arena DAG, counting each shared node once.
     #[must_use]
     pub fn from_arena_dedup(arena: &ExprArena, root: ExprId, emb: &OpEmbeddings) -> Self {
@@ -1066,56 +952,6 @@ impl EdgeAccumulator {
         }
 
         acc
-    }
-
-    /// Remove all edges from an expression subtree.
-    pub fn remove_expr_edges(&mut self, expr: &Expr, emb: &OpEmbeddings) {
-        Self::remove_recursive(expr, emb, self, 0);
-    }
-
-    fn remove_recursive(expr: &Expr, emb: &OpEmbeddings, acc: &mut Self, depth: u32) {
-        // Iterative traversal with explicit stack to avoid thread stack overflow.
-        let mut stack: alloc::vec::Vec<(&Expr, u32)> = alloc::vec![(expr, depth)];
-
-        while let Some((node, d)) = stack.pop() {
-            let parent_op = node.op_type();
-            acc.node_count = acc.node_count.saturating_sub(1);
-
-            match node {
-                Expr::Var(_) | Expr::Const(_) => {}
-                Expr::Param(i) => panic!(
-                    "Expr::Param({i}) reached NNUE cost model — call substitute_params before use"
-                ),
-                Expr::Unary(_, child) => {
-                    let eff_depth = d * MAX_ARITY as u32;
-                    acc.remove_edge(emb, parent_op, child.op_type(), eff_depth);
-                    stack.push((child, d + 1));
-                }
-                Expr::Binary(_, left, right) => {
-                    acc.remove_edge(emb, parent_op, left.op_type(), d * MAX_ARITY as u32);
-                    acc.remove_edge(emb, parent_op, right.op_type(), d * MAX_ARITY as u32 + 1);
-                    stack.push((right, d + 1));
-                    stack.push((left, d + 1));
-                }
-                Expr::Ternary(_, a, b, c) => {
-                    acc.remove_edge(emb, parent_op, a.op_type(), d * MAX_ARITY as u32);
-                    acc.remove_edge(emb, parent_op, b.op_type(), d * MAX_ARITY as u32 + 1);
-                    acc.remove_edge(emb, parent_op, c.op_type(), d * MAX_ARITY as u32 + 2);
-                    stack.push((c, d + 1));
-                    stack.push((b, d + 1));
-                    stack.push((a, d + 1));
-                }
-                Expr::Nary(_, children) => {
-                    for (idx, child) in children.iter().enumerate() {
-                        let eff_depth = d * MAX_ARITY as u32 + (idx.min(MAX_ARITY - 1)) as u32;
-                        acc.remove_edge(emb, parent_op, child.op_type(), eff_depth);
-                    }
-                    for child in children.iter().rev() {
-                        stack.push((child, d + 1));
-                    }
-                }
-            }
-        }
     }
 
     /// Merge another accumulator into this one (vector addition).
@@ -1655,80 +1491,6 @@ fn l2_normalize_section(values: &mut [f32], start: usize, end: usize) {
 // Structural Hashing
 // ============================================================================
 
-/// Compute a structural (content-based) hash of an `Expr` tree.
-///
-/// Uses FNV-1a as the mixing function: fast, no external deps, and produces
-/// a well-distributed 64-bit fingerprint suitable for CSE deduplication.
-/// The hash is purely structural — pointer identity is not considered.
-///
-/// # Collision risk
-///
-/// FNV-1a on 64-bit is sufficient for expression trees found in practice
-/// (thousands of nodes). Collisions would cause two distinct subtrees to be
-/// treated as identical (false CSE), producing a slightly compressed
-/// accumulator rather than a corrupt one. Fail-loudly: if you suspect
-/// collisions add a debug assertion in `collect_recursive_dedup`.
-#[must_use]
-pub fn structural_hash(expr: &Expr) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    fn mix(mut h: u64, bytes: &[u8]) -> u64 {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        h
-    }
-
-    fn hash_rec(expr: &Expr, h: u64) -> u64 {
-        // Encode the discriminant so that Var(0) != Const(0.0) != Param(0).
-        let h = match expr {
-            Expr::Var(idx) => {
-                let h = mix(h, &[0x01]);
-                mix(h, &[*idx])
-            }
-            Expr::Const(v) => {
-                let h = mix(h, &[0x02]);
-                // Normalise -0.0 → 0.0 before hashing so they compare equal.
-                let bits = if *v == 0.0 { 0u32 } else { v.to_bits() };
-                mix(h, &bits.to_le_bytes())
-            }
-            Expr::Param(idx) => {
-                let h = mix(h, &[0x03]);
-                mix(h, &[*idx])
-            }
-            Expr::Unary(op, child) => {
-                let h = mix(h, &[0x04]);
-                let h = mix(h, &(*op as u8).to_le_bytes());
-                hash_rec(child, h)
-            }
-            Expr::Binary(op, left, right) => {
-                let h = mix(h, &[0x05]);
-                let h = mix(h, &(*op as u8).to_le_bytes());
-                let h = hash_rec(left, h);
-                hash_rec(right, h)
-            }
-            Expr::Ternary(op, a, b, c) => {
-                let h = mix(h, &[0x06]);
-                let h = mix(h, &(*op as u8).to_le_bytes());
-                let h = hash_rec(a, h);
-                let h = hash_rec(b, h);
-                hash_rec(c, h)
-            }
-            Expr::Nary(op, children) => {
-                let h = mix(h, &[0x07]);
-                let h = mix(h, &(*op as u8).to_le_bytes());
-                let h = mix(h, &(children.len() as u32).to_le_bytes());
-                children.iter().fold(h, |h, child| hash_rec(child, h))
-            }
-        };
-        h
-    }
-
-    hash_rec(expr, FNV_OFFSET)
-}
-
 // ============================================================================
 // Edge Extraction Utilities
 // ============================================================================
@@ -1740,71 +1502,6 @@ pub struct Edge {
     pub parent: OpKind,
     /// The child operation type.
     pub child: OpKind,
-}
-
-/// Extract all parent→child edges from an expression tree.
-#[must_use]
-pub fn extract_edges(expr: &Expr) -> Vec<Edge> {
-    let mut edges = Vec::new();
-    extract_edges_recursive(expr, &mut edges);
-    edges
-}
-
-fn extract_edges_recursive(expr: &Expr, edges: &mut Vec<Edge>) {
-    let parent = expr.op_type();
-
-    match expr {
-        Expr::Var(_) | Expr::Const(_) => {}
-        Expr::Param(i) => panic!(
-            "Expr::Param({}) reached NNUE cost model — call substitute_params before use",
-            i
-        ),
-        Expr::Unary(_, child) => {
-            edges.push(Edge {
-                parent,
-                child: child.op_type(),
-            });
-            extract_edges_recursive(child, edges);
-        }
-        Expr::Binary(_, left, right) => {
-            edges.push(Edge {
-                parent,
-                child: left.op_type(),
-            });
-            edges.push(Edge {
-                parent,
-                child: right.op_type(),
-            });
-            extract_edges_recursive(left, edges);
-            extract_edges_recursive(right, edges);
-        }
-        Expr::Ternary(_, a, b, c) => {
-            edges.push(Edge {
-                parent,
-                child: a.op_type(),
-            });
-            edges.push(Edge {
-                parent,
-                child: b.op_type(),
-            });
-            edges.push(Edge {
-                parent,
-                child: c.op_type(),
-            });
-            extract_edges_recursive(a, edges);
-            extract_edges_recursive(b, edges);
-            extract_edges_recursive(c, edges);
-        }
-        Expr::Nary(_, children) => {
-            for child in children {
-                edges.push(Edge {
-                    parent,
-                    child: child.op_type(),
-                });
-                extract_edges_recursive(child, edges);
-            }
-        }
-    }
 }
 
 // ============================================================================
@@ -2394,28 +2091,6 @@ impl ExprNnue {
         hidden
     }
 
-    /// Value head: predict cost in log-nanoseconds.
-    ///
-    /// Used for **extraction**: pick the lowest-cost expression from an e-class.
-    /// Apply exp() to get actual nanoseconds.
-    ///
-    /// Uses `from_expr_dedup` to avoid double-counting shared subtrees (CSE).
-    #[must_use]
-    pub fn predict_log_cost(&self, expr: &Expr) -> f32 {
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-        self.value_mlp_forward(&expr_embed)
-    }
-
-    /// Extraction head: predict cost in nanoseconds (exp of log-cost).
-    ///
-    /// Convenience method that applies exp() to log-cost.
-    #[must_use]
-    pub fn predict_cost(&self, expr: &Expr) -> f32 {
-        libm::expf(self.predict_log_cost(expr))
-    }
-
     /// Extraction head with pre-computed accumulator.
     ///
     /// More efficient when you already have the accumulator.
@@ -2724,52 +2399,6 @@ impl ExprNnue {
     // This provides richer semantic features than hand-crafted rule descriptors.
     // =========================================================================
 
-    /// Encode a rule from its LHS and RHS expression templates.
-    ///
-    /// Uses the shared backbone to embed both LHS and RHS, then concatenates
-    /// four views: [z_LHS, z_RHS, z_LHS-z_RHS, z_LHS*z_RHS] and projects to
-    /// EMBED_DIM.
-    ///
-    /// # Arguments
-    /// * `lhs` - LHS pattern (what the rule matches), e.g., `A * (B + C)`
-    /// * `rhs` - RHS pattern (what it produces), e.g., `A*B + A*C`
-    ///
-    /// # Semantic interpretation
-    /// - `z_LHS`: What the rule MATCHES (pattern recognition)
-    /// - `z_RHS`: What it PRODUCES (production prediction)
-    /// - `z_LHS - z_RHS`: What CHANGED (the delta) - inverse rules have opposite signs
-    /// - `z_LHS * z_RHS`: What's SHARED (preserved structure)
-    #[must_use]
-    pub fn encode_rule_from_templates(&self, lhs: &Expr, rhs: &Expr) -> [f32; EMBED_DIM] {
-        // Embed LHS using shared backbone + expr_proj
-        let lhs_acc = EdgeAccumulator::from_expr_dedup(lhs, &self.embeddings);
-        let lhs_hidden = self.forward_shared(&lhs_acc);
-        let z_lhs = self.compute_expr_embed(&lhs_hidden);
-
-        // Embed RHS using shared backbone + expr_proj
-        let rhs_acc = EdgeAccumulator::from_expr_dedup(rhs, &self.embeddings);
-        let rhs_hidden = self.forward_shared(&rhs_acc);
-        let z_rhs = self.compute_expr_embed(&rhs_hidden);
-
-        // 4-way concatenate: [z_LHS | z_RHS | z_LHS-z_RHS | z_LHS*z_RHS] = 96 dims
-        let mut concat = [0.0f32; RULE_CONCAT_DIM];
-        for i in 0..EMBED_DIM {
-            concat[i] = z_lhs[i]; // what it matches
-            concat[EMBED_DIM + i] = z_rhs[i]; // what it produces
-            concat[2 * EMBED_DIM + i] = z_lhs[i] - z_rhs[i]; // the delta
-            concat[3 * EMBED_DIM + i] = z_lhs[i] * z_rhs[i]; // shared structure
-        }
-
-        // Linear projection: 96 → 24 (no MLP, rich features already)
-        let mut out = self.rule_proj_b;
-        for i in 0..RULE_CONCAT_DIM {
-            for k in 0..EMBED_DIM {
-                out[k] += concat[i] * self.rule_proj_w[i][k];
-            }
-        }
-        out
-    }
-
     /// Pre-encode all rules from templates (call once at init, cache results).
     ///
     /// Rules without templates fall back to zero embedding.
@@ -2781,13 +2410,50 @@ impl ExprNnue {
         templates: &RuleTemplates,
     ) -> Vec<[f32; EMBED_DIM]> {
         (0..templates.len())
-            .map(|r| {
-                match (templates.get_lhs(r), templates.get_rhs(r)) {
-                    (Some(lhs), Some(rhs)) => self.encode_rule_from_templates(lhs, rhs),
-                    _ => [0.0f32; EMBED_DIM], // No template - zero embedding
-                }
+            .map(|r| match templates.get(r) {
+                Some(t) => match (t.lhs, t.rhs) {
+                    (Some(lhs), Some(rhs)) => self.encode_rule_from_arena(&t.arena, lhs, rhs),
+                    _ => [0.0f32; EMBED_DIM],
+                },
+                None => [0.0f32; EMBED_DIM], // No template - zero embedding
             })
             .collect()
+    }
+
+    /// Encode a single rule's LHS/RHS arena subtrees into a rule embedding.
+    ///
+    /// 4-way concatenation `[z_LHS | z_RHS | z_LHS-z_RHS | z_LHS*z_RHS]` projected
+    /// to `EMBED_DIM`, using the same shared backbone as the extraction head.
+    #[must_use]
+    pub fn encode_rule_from_arena(
+        &self,
+        arena: &ExprArena,
+        lhs: ExprId,
+        rhs: ExprId,
+    ) -> [f32; EMBED_DIM] {
+        let lhs_acc = EdgeAccumulator::from_arena_dedup(arena, lhs, &self.embeddings);
+        let lhs_hidden = self.forward_shared(&lhs_acc);
+        let z_lhs = self.compute_expr_embed(&lhs_hidden);
+
+        let rhs_acc = EdgeAccumulator::from_arena_dedup(arena, rhs, &self.embeddings);
+        let rhs_hidden = self.forward_shared(&rhs_acc);
+        let z_rhs = self.compute_expr_embed(&rhs_hidden);
+
+        let mut concat = [0.0f32; RULE_CONCAT_DIM];
+        for i in 0..EMBED_DIM {
+            concat[i] = z_lhs[i];
+            concat[EMBED_DIM + i] = z_rhs[i];
+            concat[2 * EMBED_DIM + i] = z_lhs[i] - z_rhs[i];
+            concat[3 * EMBED_DIM + i] = z_lhs[i] * z_rhs[i];
+        }
+
+        let mut out = self.rule_proj_b;
+        for i in 0..RULE_CONCAT_DIM {
+            for k in 0..EMBED_DIM {
+                out[k] += concat[i] * self.rule_proj_w[i][k];
+            }
+        }
+        out
     }
 
     /// Bilinear score: mask_features @ interaction @ rule_embed + bias.
@@ -2816,24 +2482,6 @@ impl ExprNnue {
         score
     }
 
-    /// Score all rules for an expression using unified mask architecture.
-    ///
-    /// Uses pre-cached rule embeddings for efficiency. One forward pass through
-    /// backbone + expr_proj + mask_mlp, then O(rules) bilinear scoring.
-    #[must_use]
-    pub fn mask_score_all_rules(&self, expr: &Expr, rule_embeds: &[[f32; EMBED_DIM]]) -> Vec<f32> {
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        let mask_features = self.compute_mask_features(&expr_embed);
-
-        rule_embeds
-            .iter()
-            .map(|rule_embed| self.bilinear_score(&mask_features, rule_embed))
-            .collect()
-    }
-
     /// Score all rules with pre-computed backbone hidden state.
     ///
     /// More efficient when you have multiple expressions sharing the same
@@ -2852,72 +2500,6 @@ impl ExprNnue {
             .iter()
             .map(|rule_embed| self.bilinear_score(&mask_features, rule_embed))
             .collect()
-    }
-
-    /// Filter rules by mask threshold using unified architecture.
-    ///
-    /// Returns indices of rules with sigmoid(score) > threshold.
-    #[must_use]
-    pub fn filter_rules_unified(
-        &self,
-        expr: &Expr,
-        rule_embeds: &[[f32; EMBED_DIM]],
-        threshold: f32,
-    ) -> Vec<usize> {
-        let scores = self.mask_score_all_rules(expr, rule_embeds);
-        scores
-            .iter()
-            .enumerate()
-            .filter(|(_, score)| sigmoid(**score) > threshold)
-            .map(|(idx, _)| idx)
-            .collect()
-    }
-
-    /// Score a single (expression, rule) pair for mask prediction.
-    ///
-    /// Computes the rule embedding on-the-fly from rule features.
-    /// Returns raw score (apply sigmoid for probability).
-    #[must_use]
-    pub fn mask_score_single(&self, expr: &Expr, rule_features: &[f32; RULE_FEATURE_DIM]) -> f32 {
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        let mask_features = self.compute_mask_features(&expr_embed);
-
-        // Compute rule embedding from features
-        let rule_embed = self.encode_rule(rule_features);
-
-        // Bilinear scoring
-        self.bilinear_score(&mask_features, &rule_embed)
-    }
-
-    /// Compute full NNUE metadata for an expression.
-    ///
-    /// Returns (expr_embed, value_pred, mask_features) tuple.
-    /// Precompute embeddings, value prediction, and mask features for an expression.
-    ///
-    /// The data flow is:
-    /// ```text
-    /// expr → backbone → expr_embed (24) → value_mlp → value_pred (1)
-    ///                         ↓
-    ///                     mask_mlp
-    ///                         ↓
-    ///                  mask_features (24)
-    /// ```
-    #[must_use]
-    pub fn compute_metadata(&self, expr: &Expr) -> ([f32; EMBED_DIM], f32, [f32; EMBED_DIM]) {
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        // Compute value prediction (independent of mask)
-        let value_pred = self.value_mlp_forward(&expr_embed);
-
-        // Compute mask features directly from expr_embed
-        let mask_features = self.compute_mask_features(&expr_embed);
-
-        (expr_embed, value_pred, mask_features)
     }
 
     /// Total parameter count.
@@ -3503,286 +3085,6 @@ impl ExprNnue {
     // Backbone (embeddings, w1, b1) is FROZEN during mask training.
     // =========================================================================
 
-    /// Train saturation head on single (expr, rule, fired) sample.
-    ///
-    /// Uses asymmetric BCE loss with higher weight for false negatives
-    /// (catching positives is critical - we don't want to skip rules that fire).
-    ///
-    /// # Arguments
-    /// * `expr` - The expression being evaluated
-    /// * `rule_features` - Hand-crafted features for this rule
-    /// * `fired` - Whether the rule actually fired on this expr
-    /// * `fired` - Whether the rule actually fired (ground truth)
-    /// * `lr` - Learning rate
-    /// * `fp_weight` - Weight for false positives (typically ~1.0)
-    /// * `fn_weight` - Weight for false negatives (typically ~100.0)
-    ///
-    /// # Returns
-    /// The (weighted) loss for this sample
-    pub fn train_mask_step(
-        &mut self,
-        expr: &Expr,
-        rule_features: &[f32; RULE_FEATURE_DIM],
-        fired: bool,
-        lr: f32,
-        fp_weight: f32,
-        fn_weight: f32,
-    ) -> f32 {
-        // ===== Forward pass with stored intermediates =====
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        // Mask MLP forward (store hidden for backprop)
-        let (mask_features, mask_hidden) = self.mask_mlp_forward_with_hidden(&expr_embed);
-
-        // Rule MLP forward (store hidden for backprop)
-        let (rule_embed, rule_hidden) = self.rule_mlp_forward_with_hidden(rule_features);
-
-        // Bilinear: mask_features @ interaction @ rule_embed
-        let (score, transformed) = self.bilinear_forward_with_hidden(&mask_features, &rule_embed);
-
-        // ===== Loss computation =====
-        let pred = sigmoid(score);
-        let target = if fired { 1.0 } else { 0.0 };
-
-        let p = pred.clamp(1e-7, 1.0 - 1e-7);
-        let loss = -(target * libm::logf(p) + (1.0 - target) * libm::logf(1.0 - p));
-
-        // Asymmetric weighting (catch positives!)
-        let weight = if pred > 0.5 && !fired {
-            fp_weight
-        } else if pred <= 0.5 && fired {
-            fn_weight
-        } else {
-            1.0
-        };
-
-        let d_score = (weight * (pred - target)).clamp(-10.0, 10.0);
-
-        // ===== Backprop =====
-        // d_score → bias projection: ∂score/∂bias_proj_k = rule_embed[k]
-        for k in 0..EMBED_DIM {
-            self.mask_bias_proj[k] -= lr * d_score * rule_embed[k];
-        }
-
-        // d_score → interaction, mask_features, rule_embed
-        let (d_mask_features, d_rule_embed) =
-            self.backprop_bilinear(d_score, &mask_features, &rule_embed, &transformed, lr);
-
-        // d_mask_features → mask_mlp
-        let _d_expr_embed = self.backprop_mask_mlp(&d_mask_features, &expr_embed, &mask_hidden, lr);
-
-        // d_rule_embed → rule_mlp
-        self.backprop_rule_mlp(&d_rule_embed, rule_features, &rule_hidden, lr);
-
-        // NOTE: We freeze the backbone (expr_proj, w1, b1, embeddings)
-        // If you want to fine-tune, uncomment:
-        // self.backprop_expr_proj(&d_expr_embed, &hidden, lr);
-
-        loss * weight
-    }
-
-    /// REINFORCE update for a single mask decision.
-    ///
-    /// The reward comes from FINAL extraction quality, not per-rule outcomes.
-    ///
-    /// For APPROVED decision: ∇log P(approve) = 1 - sigmoid(score)
-    /// For REJECTED decision: ∇log P(reject) = -sigmoid(score)
-    ///
-    /// Positive advantage → reinforce the decision that was made
-    /// Negative advantage → discourage the decision that was made
-    ///
-    /// # Arguments
-    /// * `expr` - Expression that was scored
-    /// * `rule_features` - Features of the rule
-    /// * `approved` - Was this rule approved (tried) or rejected (skipped)?
-    /// * `advantage` - reward - baseline (from final extraction cost comparison)
-    /// * `lr` - Learning rate
-    ///
-    /// # Returns
-    /// The gradient magnitude applied.
-    pub fn train_mask_reinforce(
-        &mut self,
-        expr: &Expr,
-        rule_features: &[f32; RULE_FEATURE_DIM],
-        approved: bool,
-        advantage: f32,
-        lr: f32,
-    ) -> f32 {
-        // Forward pass to get intermediates
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-
-        let expr_embed = self.compute_expr_embed(&hidden);
-        let (mask_features, mask_hidden) = self.mask_mlp_forward_with_hidden(&expr_embed);
-        let (rule_embed, rule_hidden) = self.rule_mlp_forward_with_hidden(rule_features);
-        let (score, transformed) = self.bilinear_forward_with_hidden(&mask_features, &rule_embed);
-
-        // REINFORCE gradient depends on the action taken:
-        // - Approved: ∇log sigmoid(score) = 1 - sigmoid(score)
-        // - Rejected: ∇log (1 - sigmoid(score)) = -sigmoid(score)
-        let prob = sigmoid(score).clamp(1e-6, 1.0 - 1e-6);
-        let d_log_prob = if approved {
-            1.0 - prob // push score up when reinforcing approval
-        } else {
-            -prob // push score down when reinforcing rejection
-        };
-
-        // Clip gradient to prevent explosion
-        let d_score = (advantage * d_log_prob).clamp(-1.0, 1.0);
-
-        // Skip update if gradient would be NaN or too small
-        if !d_score.is_finite() || d_score.abs() < 1e-8 {
-            return 0.0;
-        }
-
-        // Backprop: ∂score/∂bias_proj_k = rule_embed[k]
-        for k in 0..EMBED_DIM {
-            self.mask_bias_proj[k] -= lr * d_score * rule_embed[k];
-        }
-
-        let (d_mask_features, d_rule_embed) =
-            self.backprop_bilinear(d_score, &mask_features, &rule_embed, &transformed, lr);
-
-        let _d_expr_embed = self.backprop_mask_mlp(&d_mask_features, &expr_embed, &mask_hidden, lr);
-        self.backprop_rule_mlp(&d_rule_embed, rule_features, &rule_hidden, lr);
-
-        d_score.abs()
-    }
-
-    /// Batch REINFORCE update for decisions from a search episode.
-    ///
-    /// # Arguments
-    /// * `decisions` - Vec of (expr, rule_features, approved)
-    /// * `advantage` - reward - baseline (from final cost comparison)
-    /// * `lr` - Learning rate
-    ///
-    /// # Returns
-    /// Total gradient norm applied.
-    pub fn train_mask_reinforce_batch(
-        &mut self,
-        decisions: &[(Expr, [f32; RULE_FEATURE_DIM], bool)],
-        advantage: f32,
-        lr: f32,
-    ) -> f32 {
-        let mut total_grad = 0.0f32;
-        for (expr, rule_features, approved) in decisions {
-            total_grad += self.train_mask_reinforce(expr, rule_features, *approved, advantage, lr);
-        }
-        total_grad
-    }
-
-    /// REINFORCE training using pre-computed rule embeddings.
-    ///
-    /// This is the preferred method when using LHS/RHS template embeddings.
-    /// Rule embeddings are computed once via `encode_all_rules_from_templates()`
-    /// and reused across training.
-    ///
-    /// # Arguments
-    /// * `expr` - The expression being evaluated
-    /// * `rule_embed` - Pre-computed rule embedding (from templates)
-    /// * `approved` - Whether this rule was approved by the mask
-    /// * `advantage` - reward - baseline
-    /// * `lr` - Learning rate
-    ///
-    /// # Returns
-    /// The gradient magnitude applied.
-    pub fn train_mask_reinforce_with_embed(
-        &mut self,
-        expr: &Expr,
-        rule_embed: &[f32; EMBED_DIM],
-        approved: bool,
-        advantage: f32,
-        lr: f32,
-    ) -> f32 {
-        // Forward pass to get intermediates
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-
-        let expr_embed = self.compute_expr_embed(&hidden);
-        let (mask_features, mask_hidden) = self.mask_mlp_forward_with_hidden(&expr_embed);
-        let (score, transformed) = self.bilinear_forward_with_hidden(&mask_features, rule_embed);
-
-        // REINFORCE gradient:
-        // - Approved: ∇log sigmoid(score) = 1 - sigmoid(score)
-        // - Rejected: ∇log (1 - sigmoid(score)) = -sigmoid(score)
-        let prob = sigmoid(score).clamp(1e-6, 1.0 - 1e-6);
-        let d_log_prob = if approved { 1.0 - prob } else { -prob };
-
-        // Clip gradient to prevent explosion
-        let d_score = (advantage * d_log_prob).clamp(-1.0, 1.0);
-
-        // Skip update if gradient would be NaN or too small
-        if !d_score.is_finite() || d_score.abs() < 1e-8 {
-            return 0.0;
-        }
-
-        // Backprop (rule embedding is frozen - computed from templates)
-        // ∂score/∂bias_proj_k = rule_embed[k]
-        for k in 0..EMBED_DIM {
-            self.mask_bias_proj[k] -= lr * d_score * rule_embed[k];
-        }
-
-        let (d_mask_features, _d_rule_embed) =
-            self.backprop_bilinear(d_score, &mask_features, rule_embed, &transformed, lr);
-
-        let _d_expr_embed = self.backprop_mask_mlp(&d_mask_features, &expr_embed, &mask_hidden, lr);
-        // NOTE: Rule embedding is not updated here - it comes from templates.
-        // The rule_proj weights that created it are updated only during supervised pretraining.
-
-        d_score.abs()
-    }
-
-    /// Batch REINFORCE update using pre-computed rule embeddings.
-    ///
-    /// # Arguments
-    /// * `decisions` - Vec of (expr, rule_embed, approved)
-    /// * `advantage` - reward - baseline (from final cost comparison)
-    /// * `lr` - Learning rate
-    ///
-    /// # Returns
-    /// Total gradient norm applied.
-    pub fn train_mask_reinforce_batch_with_embeds(
-        &mut self,
-        decisions: &[(Expr, [f32; EMBED_DIM], bool)],
-        advantage: f32,
-        lr: f32,
-    ) -> f32 {
-        let mut total_grad = 0.0f32;
-        for (expr, rule_embed, approved) in decisions {
-            total_grad +=
-                self.train_mask_reinforce_with_embed(expr, rule_embed, *approved, advantage, lr);
-        }
-        total_grad
-    }
-
-    /// Train value MLP on (expr, true_cost) sample.
-    ///
-    /// Uses MSE loss. Backprop goes through value_mlp → expr_proj.
-    /// Backbone is frozen.
-    pub fn train_value_mlp_step(&mut self, expr: &Expr, true_cost: f32, lr: f32) -> f32 {
-        // Forward
-        let acc = EdgeAccumulator::from_expr_dedup(expr, &self.embeddings);
-        let hidden = self.forward_shared(&acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-        let (pred_cost, value_hidden) = self.value_mlp_forward_with_hidden(&expr_embed);
-
-        // MSE loss
-        let diff = pred_cost - true_cost;
-        let loss = diff * diff;
-        let d_cost = 2.0 * diff;
-
-        // Backprop through value_mlp
-        let _d_expr_embed = self.backprop_value_mlp(d_cost, &expr_embed, &value_hidden, lr);
-
-        // NOTE: Backbone frozen - if you want to fine-tune:
-        // self.backprop_expr_proj(&d_expr_embed, &hidden, lr);
-
-        loss
-    }
-
     // =========================================================================
     // Forward with Hidden (for backprop)
     // =========================================================================
@@ -4156,156 +3458,6 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::sync::Arc;
 
-    /// Create a simple expression: x + y
-    fn make_add_xy() -> Expr {
-        Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)))
-    }
-
-    /// Create FMA-eligible expression: a*b + c
-    fn make_fma_pattern() -> Expr {
-        Expr::Binary(
-            OpKind::Add,
-            Arc::new(Expr::Binary(
-                OpKind::Mul,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Var(1)),
-            )),
-            Arc::new(Expr::Var(2)),
-        )
-    }
-
-    /// Create non-FMA pattern: a + b*c (Mul under Add, but on right side)
-    fn make_add_mul_pattern() -> Expr {
-        Expr::Binary(
-            OpKind::Add,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Binary(
-                OpKind::Mul,
-                Arc::new(Expr::Var(1)),
-                Arc::new(Expr::Var(2)),
-            )),
-        )
-    }
-
-    #[test]
-    fn test_edge_extraction() {
-        let expr = make_add_xy();
-        let edges = extract_edges(&expr);
-
-        assert_eq!(edges.len(), 2);
-        assert_eq!(edges[0].parent, OpKind::Add);
-        assert_eq!(edges[0].child, OpKind::Var);
-        assert_eq!(edges[1].parent, OpKind::Add);
-        assert_eq!(edges[1].child, OpKind::Var);
-    }
-
-    #[test]
-    fn test_fma_edges() {
-        let expr = make_fma_pattern();
-        let edges = extract_edges(&expr);
-
-        // Should have: Add→Mul, Add→Var, Mul→Var, Mul→Var
-        assert_eq!(edges.len(), 4);
-
-        // Check that Add→Mul exists (the FMA-critical edge)
-        let has_add_mul = edges
-            .iter()
-            .any(|e| e.parent == OpKind::Add && e.child == OpKind::Mul);
-        assert!(has_add_mul, "Should have Add→Mul edge for FMA pattern");
-    }
-
-    #[test]
-    fn test_asymmetric_accumulator() {
-        let emb = OpEmbeddings::new_random(42);
-
-        // Mul→Add (under Add parent)
-        let fma = make_fma_pattern();
-        let acc_fma = EdgeAccumulator::from_expr_dedup(&fma, &emb);
-
-        // Add→Mul (Mul under Add, same ops but different structure)
-        let add_mul = make_add_mul_pattern();
-        let _acc_add_mul = EdgeAccumulator::from_expr_dedup(&add_mul, &emb);
-
-        // The accumulators should be different because:
-        // - FMA has Add→Mul, Add→Var edges
-        // - ADD_MUL has Add→Var, Add→Mul edges
-        // Wait, these are actually the same edges just in different order!
-        // The key difference is in the CHILD subexpressions.
-
-        // Actually, let's compare with a truly different pattern:
-        // x * (y + z) vs (x * y) + z
-
-        let mul_add = Expr::Binary(
-            OpKind::Mul,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Binary(
-                OpKind::Add,
-                Arc::new(Expr::Var(1)),
-                Arc::new(Expr::Var(2)),
-            )),
-        );
-
-        let acc_mul_add = EdgeAccumulator::from_expr_dedup(&mul_add, &emb);
-
-        // These should definitely differ:
-        // - FMA (a*b + c): edges are Add→Mul, Add→Var, Mul→Var, Mul→Var
-        // - mul_add (a * (b+c)): edges are Mul→Var, Mul→Add, Add→Var, Add→Var
-
-        // They have different edge sets, so accumulators should differ
-        let diff: f32 = acc_fma
-            .values
-            .iter()
-            .zip(acc_mul_add.values.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-
-        assert!(
-            diff > 0.1,
-            "Asymmetric patterns should produce different accumulators"
-        );
-    }
-
-    #[test]
-    fn test_incremental_update() {
-        let emb = OpEmbeddings::new_random(42);
-        let expr = make_fma_pattern();
-
-        // Build accumulator from scratch
-        let acc_full = EdgeAccumulator::from_expr_dedup(&expr, &emb);
-
-        // Build via from_expr_dedup (same as full)
-        let acc_inc = EdgeAccumulator::from_expr_dedup(&expr, &emb);
-
-        // Should match
-        for i in 0..acc_full.values.len() {
-            assert!(
-                (acc_full.values[i] - acc_inc.values[i]).abs() < 1e-6,
-                "Incremental build should match full build"
-            );
-        }
-
-        // Remove and verify we get back to zero
-        let mut acc_removed = acc_inc.clone();
-        acc_removed.remove_expr_edges(&expr, &emb);
-        for &v in &acc_removed.values {
-            assert!(
-                v.abs() < 1e-6,
-                "After removing all edges, accumulator should be zero"
-            );
-        }
-    }
-
-    #[test]
-    fn test_forward_pass() {
-        let net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-
-        let cost = net.predict_cost(&expr);
-
-        // Should be a reasonable value (not NaN, not infinity)
-        assert!(cost.is_finite(), "Cost should be finite");
-    }
-
     #[test]
     fn test_param_count() {
         // Verify parameter count is reasonable and finite
@@ -4315,28 +3467,6 @@ mod tests {
             ExprNnue::memory_bytes() < 200_000,
             "NNUE should use < 200KB, got {} bytes",
             ExprNnue::memory_bytes()
-        );
-    }
-
-    #[test]
-    fn test_different_expressions_different_costs() {
-        let net = ExprNnue::new_random(42);
-
-        let simple = Expr::Var(0);
-        let complex = Expr::Binary(
-            OpKind::Div,
-            Arc::new(Expr::Unary(OpKind::Sqrt, Arc::new(Expr::Var(0)))),
-            Arc::new(Expr::Unary(OpKind::Sqrt, Arc::new(Expr::Var(1)))),
-        );
-
-        let cost_simple = net.predict_cost(&simple);
-        let cost_complex = net.predict_cost(&complex);
-
-        // Complex expression should generally have higher predicted cost
-        // (though with random weights this isn't guaranteed, just check they differ)
-        assert!(
-            (cost_simple - cost_complex).abs() > 1e-6,
-            "Different expressions should produce different costs"
         );
     }
 
@@ -4355,115 +3485,6 @@ mod tests {
             ExprNnue::memory_bytes() < 200_000,
             "NNUE should use < 200KB, got {} bytes",
             ExprNnue::memory_bytes()
-        );
-    }
-
-    #[test]
-    fn test_dual_head_value_prediction() {
-        let net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-
-        let log_cost = net.predict_log_cost(&expr);
-        let cost = net.predict_cost(&expr);
-
-        // Log cost should be finite
-        assert!(log_cost.is_finite(), "Log cost should be finite");
-
-        // Cost should be exp(log_cost)
-        let expected = libm::expf(log_cost);
-        assert!(
-            (cost - expected).abs() < 1e-4,
-            "predict_cost should be exp(predict_log_cost)"
-        );
-    }
-
-    #[test]
-    fn test_from_factored_preserves_backbone() {
-        let original = ExprNnue::new_random(42);
-
-        let converted = ExprNnue::from_factored(&original);
-
-        // Backbone (embeddings, w1, b1) must be preserved
-        assert_eq!(original.embeddings.e, converted.embeddings.e);
-        assert_eq!(original.w1, converted.w1);
-        assert_eq!(original.b1, converted.b1);
-
-        // Identity trunk preserves the edge-tower hidden representation.
-        let expr = make_fma_pattern();
-        let acc = EdgeAccumulator::from_expr_dedup(&expr, &original.embeddings);
-        let original_hidden = original.forward_shared(&acc);
-        let converted_hidden = converted.forward_shared(&acc);
-        for i in 0..HIDDEN_DIM {
-            assert!(
-                (original_hidden[i] - converted_hidden[i]).abs() < 1e-6,
-                "forward_shared[{i}] changed during migration"
-            );
-        }
-
-        // Unified heads are still zero-initialized and should remain numerically sane.
-        let cost = converted.predict_cost(&expr);
-        assert!(
-            cost.is_finite(),
-            "Prediction from converted model should be finite"
-        );
-    }
-
-    #[test]
-    fn test_dual_head_latency_prior() {
-        // Test that latency priors are correctly set in embeddings.
-        // Note: Random network weights can overwhelm these priors - this test
-        // verifies initialization, not that untrained predictions are correct.
-        let net = ExprNnue::new_with_latency_prior(42);
-
-        // Check that expensive ops have higher latency values in dim 0
-        let var_latency = net.embeddings.get(OpKind::Var)[0];
-        let div_latency = net.embeddings.get(OpKind::Div)[0];
-        let sqrt_latency = net.embeddings.get(OpKind::Sqrt)[0];
-
-        // Var should be cheap (0.0 latency)
-        assert!(
-            var_latency < 0.1,
-            "Var latency should be near zero: {}",
-            var_latency
-        );
-
-        // Div and Sqrt should be expensive (0.75 latency)
-        assert!(
-            div_latency > 0.5,
-            "Div latency should be high: {}",
-            div_latency
-        );
-        assert!(
-            sqrt_latency > 0.5,
-            "Sqrt latency should be high: {}",
-            sqrt_latency
-        );
-
-        // Verify the network can make predictions (no NaN/infinity)
-        let expr = Expr::Var(0);
-        let cost = net.predict_cost(&expr);
-        assert!(cost.is_finite(), "Prediction should be finite");
-    }
-
-    #[test]
-    fn test_mask_policy_scoring() {
-        let net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-
-        // Use mask-based scoring (the only saturation head now)
-        let rule_features = RuleFeatures::new();
-        let rule_embeds = net.encode_all_rules(&rule_features, 2);
-        let scores = net.mask_score_all_rules(&expr, &rule_embeds);
-
-        assert!(
-            scores[0].is_finite(),
-            "Policy score should be finite: {}",
-            scores[0]
-        );
-        assert!(
-            scores[1].is_finite(),
-            "Policy score should be finite: {}",
-            scores[1]
         );
     }
 
@@ -4563,59 +3584,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_expr_embed() {
-        let net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-
-        // Compute hidden state
-        let acc = EdgeAccumulator::from_expr_dedup(&expr, &net.embeddings);
-        let hidden = net.forward_shared(&acc);
-
-        // Compute expr embedding
-        let expr_embed = net.compute_expr_embed(&hidden);
-
-        assert_eq!(
-            expr_embed.len(),
-            EMBED_DIM,
-            "Expr embed should have EMBED_DIM dimensions"
-        );
-
-        for (i, &val) in expr_embed.iter().enumerate() {
-            assert!(
-                val.is_finite(),
-                "Expr embedding should be finite at dim {}",
-                i
-            );
-        }
-    }
-
-    #[test]
-    fn test_compute_mask_features() {
-        let net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-
-        let acc = EdgeAccumulator::from_expr_dedup(&expr, &net.embeddings);
-        let hidden = net.forward_shared(&acc);
-        let expr_embed = net.compute_expr_embed(&hidden);
-
-        let mask_features = net.compute_mask_features(&expr_embed);
-
-        assert_eq!(
-            mask_features.len(),
-            EMBED_DIM,
-            "Mask features should have EMBED_DIM dimensions"
-        );
-
-        for (i, &val) in mask_features.iter().enumerate() {
-            assert!(
-                val.is_finite(),
-                "Mask features should be finite at dim {}",
-                i
-            );
-        }
-    }
-
-    #[test]
     fn test_bilinear_score_computation() {
         let net = ExprNnue::new_random(42);
 
@@ -4643,129 +3611,6 @@ mod tests {
             "Bilinear computation mismatch: got {}, expected {}",
             score,
             expected
-        );
-    }
-
-    #[test]
-    fn test_mask_score_all_rules_finite() {
-        let net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-        let mut rule_features = RuleFeatures::new();
-
-        // Set up 5 rules
-        for r in 0..5 {
-            rule_features.set(r, [r as f32 * 0.2, 0.3, 0.0, 1.0, 0.0, 0.0, 0.1, 0.0]);
-        }
-
-        let rule_embeds = net.encode_all_rules(&rule_features, 5);
-        let scores = net.mask_score_all_rules(&expr, &rule_embeds);
-
-        assert_eq!(scores.len(), 5, "Should score all 5 rules");
-
-        for (r, &score) in scores.iter().enumerate() {
-            assert!(score.is_finite(), "Score for rule {} should be finite", r);
-        }
-    }
-
-    #[test]
-    fn test_filter_rules_unified() {
-        let mut net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-        let mut rule_features = RuleFeatures::new();
-
-        // Set up 10 rules
-        for r in 0..10 {
-            rule_features.set(r, [r as f32 * 0.1, 0.3, 0.0, 1.0, 0.0, 0.0, 0.1, 0.0]);
-        }
-
-        let rule_embeds = net.encode_all_rules(&rule_features, 10);
-        let passing = net.filter_rules_unified(&expr, &rule_embeds, 0.5);
-
-        // With random weights, the filtering logic should produce some results
-        // (not necessarily all or none). Verify the output is well-formed.
-        assert!(passing.len() <= 10, "Cannot pass more rules than exist");
-        for &idx in &passing {
-            assert!(idx < 10, "Rule index {} out of bounds", idx);
-        }
-    }
-
-    #[test]
-    fn test_predict_log_cost() {
-        let net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-
-        let cost = net.predict_log_cost(&expr);
-
-        assert!(cost.is_finite(), "Unified cost prediction should be finite");
-        assert!(
-            cost > 0.0,
-            "Cost should be positive (exp of value_mlp output)"
-        );
-    }
-
-    #[test]
-    fn test_mask_training_step_loss_decreases() {
-        let mut net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-        let rule_features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
-
-        // Compute initial loss for a positive sample
-        let rule_embeds = net.encode_all_rules(&RuleFeatures::new(), 1);
-        let initial_scores = net.mask_score_all_rules(&expr, &rule_embeds);
-        let initial_pred = 1.0 / (1.0 + (-initial_scores[0]).exp()); // sigmoid
-
-        // Train on positive sample (rule fired)
-        let mut total_loss = 0.0;
-        for _ in 0..50 {
-            let loss = net.train_mask_step(&expr, &rule_features, true, 0.01, 1.0, 10.0);
-            total_loss += loss;
-            assert!(loss.is_finite(), "Training loss should be finite");
-        }
-
-        // Compute final prediction
-        let rule_embeds = net.encode_all_rules(&RuleFeatures::new(), 1);
-        let final_scores = net.mask_score_all_rules(&expr, &rule_embeds);
-        let final_pred = 1.0 / (1.0 + (-final_scores[0]).exp()); // sigmoid
-
-        // After training on positive samples, prediction should increase
-        // (network learns to predict 1 for this expr-rule pair)
-        assert!(
-            final_pred > initial_pred || (final_pred - initial_pred).abs() < 0.1,
-            "Training on positive should increase prediction: {} -> {}",
-            initial_pred,
-            final_pred
-        );
-    }
-
-    #[test]
-    fn test_value_mlp_training_step() {
-        let mut net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-
-        let target_cost = 100.0f32; // Target nanoseconds
-        let target_log = target_cost.ln();
-
-        // Compute initial prediction
-        let initial_pred = net.predict_log_cost(&expr);
-
-        // Train for several steps
-        for _ in 0..100 {
-            let loss = net.train_value_mlp_step(&expr, target_log, 0.01);
-            assert!(loss.is_finite(), "Value training loss should be finite");
-        }
-
-        // Final prediction should be closer to target
-        let final_pred = net.predict_log_cost(&expr);
-        let initial_error = (initial_pred.ln() - target_log).abs();
-        let final_error = (final_pred.ln() - target_log).abs();
-
-        // Allow for stochastic behavior, but generally should improve
-        // (or at least not get catastrophically worse)
-        assert!(
-            final_error < initial_error * 2.0 || final_error < 1.0,
-            "Value MLP should learn toward target: initial_err={}, final_err={}",
-            initial_error,
-            final_error
         );
     }
 
@@ -4820,109 +3665,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg(feature = "std")]
-    fn test_unified_architecture_serialization_roundtrip() {
-        use std::path::PathBuf;
-
-        let mut net = ExprNnue::new_random(42);
-        net.randomize_mask_only(123);
-
-        // Set some specific values we can verify
-        net.interaction[0][0] = 1.234;
-        net.mask_bias_proj[5] = -0.567;
-        net.value_mlp_b2 = 3.14;
-
-        // Create temp file path
-        let temp_path = PathBuf::from("/tmp/test_dual_head_unified_serialization.bin");
-
-        // Serialize
-        net.save(&temp_path).expect("Save should succeed");
-
-        // Deserialize
-        let loaded = ExprNnue::load(&temp_path).expect("Load should succeed");
-
-        // Cleanup temp file
-        let _ = std::fs::remove_file(&temp_path);
-
-        // Verify specific values
-        assert!(
-            (loaded.interaction[0][0] - 1.234).abs() < 1e-6,
-            "Interaction should be preserved"
-        );
-        assert!(
-            (loaded.mask_bias_proj[5] - (-0.567)).abs() < 1e-6,
-            "Bias projection should be preserved"
-        );
-        assert!(
-            (loaded.value_mlp_b2 - 3.14).abs() < 1e-6,
-            "Value MLP bias should be preserved"
-        );
-
-        // Verify predictions match
-        let expr = make_fma_pattern();
-        let original_cost = net.predict_log_cost(&expr);
-        let loaded_cost = loaded.predict_log_cost(&expr);
-        assert!(
-            (original_cost - loaded_cost).abs() < 1e-5,
-            "Loaded network should produce same predictions"
-        );
-    }
-
-    #[test]
-    fn test_gradients_finite_through_all_paths() {
-        let mut net = ExprNnue::new_random(42);
-        let expr = make_fma_pattern();
-        let rule_features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
-
-        // Train saturation head
-        let mask_loss = net.train_mask_step(&expr, &rule_features, true, 0.01, 1.0, 10.0);
-        assert!(mask_loss.is_finite(), "Mask loss should be finite");
-        assert!(!mask_loss.is_nan(), "Mask loss should not be NaN");
-
-        // Train extraction head
-        let value_loss = net.train_value_mlp_step(&expr, 5.0, 0.01);
-        assert!(value_loss.is_finite(), "Value loss should be finite");
-        assert!(!value_loss.is_nan(), "Value loss should not be NaN");
-
-        // Verify weights didn't become NaN
-        for row in &net.expr_proj_w {
-            for &val in row {
-                assert!(
-                    !val.is_nan(),
-                    "expr_proj_w should not contain NaN after training"
-                );
-            }
-        }
-
-        for row in &net.mask_mlp_w1 {
-            for &val in row {
-                assert!(
-                    !val.is_nan(),
-                    "mask_mlp_w1 should not contain NaN after training"
-                );
-            }
-        }
-
-        for row in &net.rule_mlp_w1 {
-            for &val in row {
-                assert!(
-                    !val.is_nan(),
-                    "rule_mlp_w1 should not contain NaN after training"
-                );
-            }
-        }
-
-        for row in &net.interaction {
-            for &val in row {
-                assert!(
-                    !val.is_nan(),
-                    "interaction should not contain NaN after training"
-                );
-            }
-        }
-    }
-
     // ========================================================================
     // Complex PE + Child-Index Encoding Tests
     // ========================================================================
@@ -4954,158 +3696,9 @@ mod tests {
         assert_eq!(acc.edge_count, 0);
     }
 
-    #[test]
-    fn test_sibling_discrimination() {
-        // Add(Sub(A,B), Div(C,D)) vs Add(Div(A,B), Sub(C,D))
-        // With child-index encoding, these should produce DIFFERENT accumulators
-        // because left child (idx 0) and right child (idx 1) get different PEs.
-        let emb = OpEmbeddings::new_random(42);
-
-        // Add(Sub(X,Y), Div(Z,W))
-        let expr_a = Expr::Binary(
-            OpKind::Add,
-            Arc::new(Expr::Binary(
-                OpKind::Sub,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Var(1)),
-            )),
-            Arc::new(Expr::Binary(
-                OpKind::Div,
-                Arc::new(Expr::Var(2)),
-                Arc::new(Expr::Var(3)),
-            )),
-        );
-
-        // Add(Div(X,Y), Sub(Z,W))
-        let expr_b = Expr::Binary(
-            OpKind::Add,
-            Arc::new(Expr::Binary(
-                OpKind::Div,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Var(1)),
-            )),
-            Arc::new(Expr::Binary(
-                OpKind::Sub,
-                Arc::new(Expr::Var(2)),
-                Arc::new(Expr::Var(3)),
-            )),
-        );
-
-        let acc_a = EdgeAccumulator::from_expr_dedup(&expr_a, &emb);
-        let acc_b = EdgeAccumulator::from_expr_dedup(&expr_b, &emb);
-
-        // Depth-encoded half should differ because siblings get different PEs
-        let diff: f32 = acc_a.values[2 * K..4 * K]
-            .iter()
-            .zip(acc_b.values[2 * K..4 * K].iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-
-        assert!(
-            diff > 0.01,
-            "Sibling-swapped expressions should produce different depth-encoded accumulators, diff={diff}"
-        );
-    }
-
     // ========================================================================
     // structural_hash and from_expr_dedup tests
     // ========================================================================
-
-    #[test]
-    fn test_structural_hash_identical_trees() {
-        // Two separately constructed trees with the same structure must produce
-        // the same hash.
-        let a = Expr::Binary(
-            OpKind::Add,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Const(1.0)),
-        );
-        let b = Expr::Binary(
-            OpKind::Add,
-            Arc::new(Expr::Var(0)),
-            Arc::new(Expr::Const(1.0)),
-        );
-        assert_eq!(
-            structural_hash(&a),
-            structural_hash(&b),
-            "Identical trees must hash equally"
-        );
-    }
-
-    #[test]
-    fn test_structural_hash_different_ops_differ() {
-        let add = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let mul = Expr::Binary(OpKind::Mul, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        assert_ne!(
-            structural_hash(&add),
-            structural_hash(&mul),
-            "Trees with different root ops must hash differently"
-        );
-    }
-
-    #[test]
-    fn test_structural_hash_different_vars_differ() {
-        let v0 = Expr::Var(0);
-        let v1 = Expr::Var(1);
-        assert_ne!(structural_hash(&v0), structural_hash(&v1));
-    }
-
-    #[test]
-    fn test_structural_hash_negative_zero_equals_positive_zero() {
-        // -0.0 and 0.0 must hash identically (IEEE 754 quirk).
-        let pos = Expr::Const(0.0_f32);
-        let neg = Expr::Const(-0.0_f32);
-        assert_eq!(
-            structural_hash(&pos),
-            structural_hash(&neg),
-            "-0.0 and 0.0 should hash to the same value"
-        );
-    }
-
-    #[test]
-    fn test_from_expr_dedup_no_shared_subtrees() {
-        // A tree with no shared subtrees: backref_count must be 0.
-        let emb = OpEmbeddings::new_random(42);
-        let expr = make_fma_pattern(); // (a*b) + c — no CSE
-
-        let dedup = EdgeAccumulator::from_expr_dedup(&expr, &emb);
-
-        assert!(dedup.edge_count > 0, "must have edges");
-        assert!(dedup.node_count > 0, "must have nodes");
-        assert_eq!(0, dedup.backref_count, "no CSE → backref_count must be 0");
-    }
-
-    #[test]
-    fn test_from_expr_dedup_shared_subtree_counted_once() {
-        // Build an expression where the SAME Expr value appears at two
-        // positions: Add(neg(x), neg(x)).  The two `neg(x)` subtrees have
-        // identical content, so dedup must walk the second one only once and
-        // increment backref_count.
-        //
-        // Note: Expr is tree-shaped in Rust (each Box owns its node), so we
-        // create two structurally equal (but separately allocated) neg(x)
-        // subtrees.  structural_hash treats them as identical.
-        let emb = OpEmbeddings::new_random(42);
-        let neg_x_a = Expr::Unary(OpKind::Neg, Arc::new(Expr::Var(0)));
-        let neg_x_b = Expr::Unary(OpKind::Neg, Arc::new(Expr::Var(0)));
-        let shared_sub = Expr::Binary(OpKind::Add, Arc::new(neg_x_a), Arc::new(neg_x_b));
-
-        let dedup = EdgeAccumulator::from_expr_dedup(&shared_sub, &emb);
-
-        // backref_count must be exactly 1: the second `neg(x)` was skipped.
-        assert_eq!(
-            1, dedup.backref_count,
-            "one shared subtree → backref_count == 1"
-        );
-
-        // The deduplicated walk must see: Add node + one neg(x) node + one Var node = 3 nodes.
-        // The second neg(x) is skipped.
-        assert_eq!(
-            3, dedup.node_count,
-            "Add + one neg(x) + one Var = 3 unique nodes, got {}",
-            dedup.node_count
-        );
-    }
 
     // ========================================================================
     // GraphAccumulator normalization tests
@@ -5267,147 +3860,6 @@ mod tests {
     // ========================================================================
     // GraphAccumulator incremental remove tests
     // ========================================================================
-
-    /// Helper: walk an expression tree and call `add_op_node` / `add_leaf`
-    /// on a `GraphAccumulator`, using the backward-compatible depth=1 API.
-    fn build_graph_acc_from_expr(expr: &Expr, emb: &OpEmbeddings) -> GraphAccumulator {
-        let mut acc = GraphAccumulator::new();
-        graph_acc_walk_add(expr, emb, &mut acc);
-        acc
-    }
-
-    fn graph_acc_walk_add(expr: &Expr, emb: &OpEmbeddings, acc: &mut GraphAccumulator) {
-        match expr {
-            Expr::Var(_) | Expr::Const(_) => acc.add_leaf(),
-            Expr::Param(i) => panic!("Expr::Param({i}) in graph acc test"),
-            Expr::Unary(op, child) => {
-                acc.add_op_node(emb, *op, &[child.op_type()]);
-                graph_acc_walk_add(child, emb, acc);
-            }
-            Expr::Binary(op, left, right) => {
-                acc.add_op_node(emb, *op, &[left.op_type(), right.op_type()]);
-                graph_acc_walk_add(left, emb, acc);
-                graph_acc_walk_add(right, emb, acc);
-            }
-            Expr::Ternary(op, a, b, c) => {
-                acc.add_op_node(emb, *op, &[a.op_type(), b.op_type(), c.op_type()]);
-                graph_acc_walk_add(a, emb, acc);
-                graph_acc_walk_add(b, emb, acc);
-                graph_acc_walk_add(c, emb, acc);
-            }
-            Expr::Nary(op, children) => {
-                let child_ops: alloc::vec::Vec<OpKind> =
-                    children.iter().map(|c| c.op_type()).collect();
-                acc.add_op_node(emb, *op, &child_ops);
-                for child in children.iter() {
-                    graph_acc_walk_add(child, emb, acc);
-                }
-            }
-        }
-    }
-
-    /// Helper: walk an expression tree and call `remove_op_node` / `remove_leaf`
-    /// on a `GraphAccumulator` to subtract its contribution.
-    fn graph_acc_walk_remove(expr: &Expr, emb: &OpEmbeddings, acc: &mut GraphAccumulator) {
-        match expr {
-            Expr::Var(_) | Expr::Const(_) => acc.remove_leaf(),
-            Expr::Param(i) => panic!("Expr::Param({i}) in graph acc test"),
-            Expr::Unary(op, child) => {
-                acc.remove_op_node(emb, *op, &[child.op_type()]);
-                graph_acc_walk_remove(child, emb, acc);
-            }
-            Expr::Binary(op, left, right) => {
-                acc.remove_op_node(emb, *op, &[left.op_type(), right.op_type()]);
-                graph_acc_walk_remove(left, emb, acc);
-                graph_acc_walk_remove(right, emb, acc);
-            }
-            Expr::Ternary(op, a, b, c) => {
-                acc.remove_op_node(emb, *op, &[a.op_type(), b.op_type(), c.op_type()]);
-                graph_acc_walk_remove(a, emb, acc);
-                graph_acc_walk_remove(b, emb, acc);
-                graph_acc_walk_remove(c, emb, acc);
-            }
-            Expr::Nary(op, children) => {
-                let child_ops: alloc::vec::Vec<OpKind> =
-                    children.iter().map(|c| c.op_type()).collect();
-                acc.remove_op_node(emb, *op, &child_ops);
-                for child in children.iter() {
-                    graph_acc_walk_remove(child, emb, acc);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_graph_acc_remove_edge_inverse_of_add() {
-        let emb = OpEmbeddings::new_random(42);
-
-        // Expression A: x + y
-        let expr_a = make_add_xy();
-        // Expression B: sin(x) * y
-        let expr_b = Expr::Binary(
-            OpKind::Mul,
-            Arc::new(Expr::Unary(OpKind::Sin, Arc::new(Expr::Var(0)))),
-            Arc::new(Expr::Var(1)),
-        );
-
-        // Build accumulator from A, then add B and remove A.
-        let mut incremental = build_graph_acc_from_expr(&expr_a, &emb);
-        graph_acc_walk_add(&expr_b, &emb, &mut incremental);
-        graph_acc_walk_remove(&expr_a, &emb, &mut incremental);
-
-        // Build accumulator from B alone (ground truth).
-        let from_scratch = build_graph_acc_from_expr(&expr_b, &emb);
-
-        assert_eq!(
-            incremental.edge_count, from_scratch.edge_count,
-            "edge_count mismatch: incremental={} vs from_scratch={}",
-            incremental.edge_count, from_scratch.edge_count
-        );
-        assert_eq!(
-            incremental.node_count, from_scratch.node_count,
-            "node_count mismatch: incremental={} vs from_scratch={}",
-            incremental.node_count, from_scratch.node_count
-        );
-        for i in 0..GRAPH_ACC_DIM {
-            let diff = (incremental.values[i] - from_scratch.values[i]).abs();
-            assert!(
-                diff < 1e-6,
-                "values[{i}] mismatch: incremental={} vs from_scratch={} (diff={diff})",
-                incremental.values[i],
-                from_scratch.values[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_graph_acc_add_then_remove_returns_to_zero() {
-        let emb = OpEmbeddings::new_random(99);
-
-        let expr = make_fma_pattern();
-        let mut acc = build_graph_acc_from_expr(&expr, &emb);
-
-        assert!(acc.edge_count > 0, "should have edges after add");
-        assert!(acc.node_count > 0, "should have nodes after add");
-
-        graph_acc_walk_remove(&expr, &emb, &mut acc);
-
-        assert_eq!(
-            acc.edge_count, 0,
-            "edge_count should be 0 after full removal"
-        );
-        assert_eq!(
-            acc.node_count, 0,
-            "node_count should be 0 after full removal"
-        );
-        for i in 0..GRAPH_ACC_DIM {
-            assert!(
-                acc.values[i].abs() < 1e-6,
-                "values[{i}] should be ~0 after full removal, got {}",
-                acc.values[i]
-            );
-        }
-    }
 
     #[test]
     fn test_graph_acc_remove_leaf_saturates_at_zero() {

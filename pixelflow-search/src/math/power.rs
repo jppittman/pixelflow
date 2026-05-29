@@ -28,15 +28,12 @@
 //! - x/x → Canonicalize(MulRecip) → x * recip(x) → InverseAnnihilation → 1
 //! - x-x → Canonicalize(AddNeg) → x + neg(x) → InverseAnnihilation → 0
 
-use std::sync::Arc;
 
-use crate::egraph::Pattern as Expr;
+use crate::arena_pat;
+use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
 
-fn b(e: Expr) -> Arc<Expr> {
-    Arc::new(e)
-}
 
 const EPSILON: f32 = 1e-6;
 
@@ -116,20 +113,16 @@ impl Rewrite for PowSpecialValue {
         }
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        Some(Expr::Binary(
-            OpKind::Pow,
-            b(Expr::Var(0)),
-            b(Expr::Const(self.target_exponent)),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Pow, (var 0), (cst self.target_exponent)))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         match &self.result {
-            PowResult::Constant(c) => Some(Expr::Const(*c)),
-            PowResult::Identity => Some(Expr::Var(0)),
-            PowResult::UnaryOp(op) => Some(Expr::Unary(op.kind(), b(Expr::Var(0)))),
-            PowResult::SelfMul => Some(Expr::Binary(OpKind::Mul, b(Expr::Var(0)), b(Expr::Var(0)))),
+            PowResult::Constant(c) => Some(arena_pat!(__a, cst *c)),
+            PowResult::Identity => Some(arena_pat!(__a, var 0)),
+            PowResult::UnaryOp(op) => Some(arena_pat!(__a, un op.kind(), (var 0))),
+            PowResult::SelfMul => Some(arena_pat!(__a, bin OpKind::Mul, (var 0), (var 0))),
         }
     }
 }
@@ -230,13 +223,11 @@ impl Rewrite for PowerRecurrence {
         })
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // pow(V0, N) — generic pattern, N is any integer
-        Some(Expr::Binary(OpKind::Pow, b(Expr::Var(0)), b(Expr::Var(1))))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Pow, (var 0), (var 1)))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // V0 * pow(V0, N-1) — can't express N-1 in template, so None
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         None
     }
 }
@@ -306,21 +297,16 @@ impl Rewrite for LogPower {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+
         let lk = self.log_op.kind();
-        Some(Expr::Unary(
-            lk,
-            b(Expr::Binary(OpKind::Pow, b(Expr::Var(0)), b(Expr::Var(1)))),
-        ))
+        Some(arena_pat!(__a, un lk, (bin OpKind::Pow, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+
         let lk = self.log_op.kind();
-        Some(Expr::Binary(
-            OpKind::Mul,
-            b(Expr::Var(1)),
-            b(Expr::Unary(lk, b(Expr::Var(0)))),
-        ))
+        Some(arena_pat!(__a, bin OpKind::Mul, (var 1), (un lk, (var 0))))
     }
 }
 
@@ -380,26 +366,19 @@ impl Rewrite for ExpandSquare {
         None
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        Some(Expr::Binary(
-            OpKind::Pow,
-            b(Expr::Binary(OpKind::Add, b(Expr::Var(0)), b(Expr::Var(1)))),
-            b(Expr::Const(2.0)),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Pow, (bin OpKind::Add, (var 0), (var 1)), (cst 2.0)))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         // a² + 2ab + b²
-        let a2 = Expr::Binary(OpKind::Mul, b(Expr::Var(0)), b(Expr::Var(0)));
-        let b2 = Expr::Binary(OpKind::Mul, b(Expr::Var(1)), b(Expr::Var(1)));
-        let ab = Expr::Binary(OpKind::Mul, b(Expr::Var(0)), b(Expr::Var(1)));
-        let two_ab = Expr::Binary(OpKind::Mul, b(Expr::Const(2.0)), b(ab));
-        let sum = Expr::Binary(
-            OpKind::Add,
-            b(a2),
-            b(Expr::Binary(OpKind::Add, b(two_ab), b(b2))),
-        );
-        Some(sum)
+        let a2 = arena_pat!(__a, bin OpKind::Mul, (var 0), (var 0));
+        let b2 = arena_pat!(__a, bin OpKind::Mul, (var 1), (var 1));
+        let ab = arena_pat!(__a, bin OpKind::Mul, (var 0), (var 1));
+        let two = __a.push_const(2.0);
+        let two_ab = __a.push_binary(OpKind::Mul, two, ab);
+        let two_ab_plus_b2 = __a.push_binary(OpKind::Add, two_ab, b2);
+        Some(__a.push_binary(OpKind::Add, a2, two_ab_plus_b2))
     }
 }
 
@@ -442,22 +421,12 @@ impl Rewrite for DiffOfSquares {
         Some(RewriteAction::DiffOfSquares { a, b })
     }
 
-    fn lhs_template(&self) -> Option<Expr> {
-        // Sub(Mul(V0, V0), Mul(V1, V1))
-        Some(Expr::Binary(
-            OpKind::Sub,
-            b(Expr::Binary(OpKind::Mul, b(Expr::Var(0)), b(Expr::Var(0)))),
-            b(Expr::Binary(OpKind::Mul, b(Expr::Var(1)), b(Expr::Var(1)))),
-        ))
+    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Sub, (bin OpKind::Mul, (var 0), (var 0)), (bin OpKind::Mul, (var 1), (var 1))))
     }
 
-    fn rhs_template(&self) -> Option<Expr> {
-        // Mul(Add(V0, V1), Sub(V0, V1))
-        Some(Expr::Binary(
-            OpKind::Mul,
-            b(Expr::Binary(OpKind::Add, b(Expr::Var(0)), b(Expr::Var(1)))),
-            b(Expr::Binary(OpKind::Sub, b(Expr::Var(0)), b(Expr::Var(1)))),
-        ))
+    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+        Some(arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Add, (var 0), (var 1)), (bin OpKind::Sub, (var 0), (var 1))))
     }
 }
 

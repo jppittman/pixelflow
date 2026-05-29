@@ -104,6 +104,7 @@ impl ExactSizeIterator for ExprChildren<'_> {}
 // ───────────────────────────────────── ExprArena ─────────────────────────────
 
 /// Arena-allocated expression storage. Append-only, O(1) drop.
+#[derive(Clone)]
 pub struct ExprArena {
     nodes: Vec<ExprNode>,
     nary_children: Vec<ExprId>,
