@@ -939,7 +939,11 @@ mod tests {
         let v1 = arena.push_var(1);
         let c2 = arena.push_const(2.0);
         let root = arena.push_ternary(OpKind::MulAdd, v0, v1, c2);
-        assert_eq!(format!("{}", arena.display(root)), "(mul_add X Y 2)");
+        // `display` matches the canonical `Expr` S-expression format.
+        assert_eq!(
+            format!("{}", arena.display(root)),
+            "mul_add(Var(0), Var(1), Const(2))"
+        );
     }
 
     #[test]
