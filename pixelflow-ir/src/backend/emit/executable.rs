@@ -518,9 +518,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_return_x() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
+
         // Simplest: just return X
         let expr = Expr::Var(0);
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -539,9 +542,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_return_y() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
+
         // Return Y (needs MOV to v0)
         let expr = Expr::Var(1);
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -560,11 +566,13 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_add_xy() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // X + Y
         let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -583,6 +591,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_complex() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // (X + Y) * Z
@@ -595,7 +605,7 @@ mod tests {
             )),
             Arc::new(Expr::Var(2)),
         );
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -614,9 +624,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
+
         // Return a constant
         let expr = Expr::Const(42.0);
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -635,11 +648,13 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_floor() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // floor(X)
         let expr = Expr::Unary(OpKind::Floor, Arc::new(Expr::Var(0)));
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -658,6 +673,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_mul_add() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // X * Y + Z (FMA)
@@ -667,7 +684,7 @@ mod tests {
             Arc::new(Expr::Var(1)),
             Arc::new(Expr::Var(2)),
         );
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -686,9 +703,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const_negative() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
+
         // Return a negative constant
         let expr = Expr::Const(-42.0);
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -707,9 +727,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_const_pi() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
+
         // Return π (not a simple constant)
         let expr = Expr::Const(core::f32::consts::PI);
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -771,6 +794,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_x_plus_const() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // X + 0.5
@@ -779,7 +804,7 @@ mod tests {
             Arc::new(Expr::Var(0)),
             Arc::new(Expr::Const(0.5)),
         );
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -798,6 +823,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_floor_add() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // floor(X + 0.5) - common rounding pattern
@@ -809,7 +836,7 @@ mod tests {
                 Arc::new(Expr::Const(0.5)),
             )),
         );
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -828,6 +855,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_horner() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // Simple Horner: c1 * x + c0 with x=0 should give c0=5.0
@@ -838,7 +867,7 @@ mod tests {
             Arc::new(Expr::Var(0)),     // x
             Arc::new(Expr::Const(5.0)), // c0
         );
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -857,6 +886,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_horner_with_x() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // c1 * x + c0 with x=3 should give 2*3 + 5 = 11
@@ -866,7 +897,7 @@ mod tests {
             Arc::new(Expr::Var(0)),
             Arc::new(Expr::Const(5.0)),
         );
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();
@@ -885,11 +916,13 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn test_compile_sin_lowered() {
+        use crate::backend::emit::compile;
+        use crate::expr::Expr;
         use crate::kind::OpKind;
 
         // sin(X) - should be lowered to polynomial
         let expr = Expr::Unary(OpKind::Sin, Arc::new(Expr::Var(0)));
-        let exec = compile_e(&expr).expect("compile failed");
+        let exec = compile(&expr).expect("compile failed");
 
         unsafe {
             let func: KernelFn = exec.as_fn();

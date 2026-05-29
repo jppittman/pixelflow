@@ -222,7 +222,8 @@ fn ast_to_arena_inner(
             for stmt in &block.stmts {
                 match stmt {
                     crate::ast::Stmt::Let(let_stmt) => {
-                        let id = ast_to_arena_inner(&let_stmt.init, param_indices, locals, arena)?;
+                        let id =
+                            ast_to_arena_inner(&let_stmt.init, param_indices, locals, arena)?;
                         locals.insert(let_stmt.name.to_string(), id);
                     }
                     // A non-binding statement has no value to thread; evaluate
@@ -233,7 +234,9 @@ fn ast_to_arena_inner(
                 }
             }
             match &block.expr {
-                Some(final_expr) => ast_to_arena_inner(final_expr, param_indices, locals, arena),
+                Some(final_expr) => {
+                    ast_to_arena_inner(final_expr, param_indices, locals, arena)
+                }
                 None => Err(format!("Block has no final expression")),
             }
         }

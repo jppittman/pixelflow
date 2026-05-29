@@ -40,9 +40,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use libm::sqrtf;
 
+use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 use crate::egraph::Pattern as Expr;
 pub use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
 // ============================================================================
 // Constants
@@ -5415,4 +5415,5 @@ mod tests {
         acc.remove_leaf();
         assert_eq!(acc.node_count, 0, "node_count must not underflow");
     }
+
 }
