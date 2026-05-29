@@ -135,24 +135,43 @@ impl ScanlineJitManifold {
 
 #[cfg(target_arch = "x86_64")]
 impl ScanlineJitManifold {
-    /// Evaluate the kernel across a scanline of pixels (x86-64 stub).
+    /// Evaluate the kernel across a scanline of pixels.
+    ///
+    /// The JIT'd code contains its own loop — Y/Z/W are loaded once and stay in
+    /// SSE registers for all pixels. Only X varies per pixel (loaded from `xs`).
     ///
     /// # Safety
     ///
-    /// Same requirements as the ARM64 version.
+    /// - `xs` and `output` must be properly aligned for `__m128` (16 bytes).
+    /// - `output.len()` must be >= `xs.len()`.
+    /// - The code must have been compiled by [`compile_arena_dag_scanline`].
     ///
     /// # Panics
     ///
-    /// Panics unconditionally — x86-64 scanline JIT is not yet implemented.
+    /// Panics if `output.len() < xs.len()`.
+    ///
+    /// [`compile_arena_dag_scanline`]: crate::backend::emit::compile_arena_dag_scanline
+    #[inline(always)]
     pub unsafe fn eval_scanline(
         &self,
-        _xs: &[core::arch::x86_64::__m128],
-        _y: core::arch::x86_64::__m128,
-        _z: core::arch::x86_64::__m128,
-        _w: core::arch::x86_64::__m128,
-        _output: &mut [core::arch::x86_64::__m128],
+        xs: &[core::arch::x86_64::__m128],
+        y: core::arch::x86_64::__m128,
+        z: core::arch::x86_64::__m128,
+        w: core::arch::x86_64::__m128,
+        output: &mut [core::arch::x86_64::__m128],
     ) {
-        panic!("ScanlineJitManifold::eval_scanline not implemented for x86-64");
+        assert!(
+            output.len() >= xs.len(),
+            "ScanlineJitManifold::eval_scanline: output buffer too small \
+             (have {}, need {})",
+            output.len(),
+            xs.len()
+        );
+        if xs.is_empty() {
+            return;
+        }
+        let func: ScanlineKernelFn = unsafe { self.code.as_fn() };
+        func(xs.as_ptr(), y, z, w, output.as_mut_ptr(), xs.len());
     }
 }
 

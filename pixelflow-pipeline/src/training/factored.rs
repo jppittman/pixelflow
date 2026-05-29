@@ -6,13 +6,9 @@
 //!   `parse_kernel_code_arena`/`arena_to_kernel_code`)
 
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::Arc;
 
 use pixelflow_ir::arena::ExprNode;
 use pixelflow_ir::{EmitStyle, ExprArena, ExprId, OpKind};
-#[cfg(test)]
-use pixelflow_search::egraph::Pattern as Expr;
 
 // ============================================================================
 // Expression Parsing (for loading training data)
@@ -23,57 +19,46 @@ use pixelflow_search::egraph::Pattern as Expr;
 /// Test-only helper for older logged repros in `OpName(child1, child2, ...)`
 /// form such as `Add(Mul(Var(0), Var(1)), Var(2))`.
 #[cfg(test)]
-pub fn parse_expr(s: &str) -> Option<Expr> {
+pub fn parse_expr(s: &str) -> Option<(ExprArena, ExprId)> {
+    let mut arena = ExprArena::new();
+    let root = parse_expr_into(s, &mut arena)?;
+    Some((arena, root))
+}
+
+/// Recursive S-expression parser that builds directly into an [`ExprArena`].
+#[cfg(test)]
+fn parse_expr_into(s: &str, arena: &mut ExprArena) -> Option<ExprId> {
     let s = s.trim();
 
-    // Try parsing as Var
-    if s.starts_with("Var(") && s.ends_with(')') {
-        let inner = &s[4..s.len() - 1];
-        let idx: u8 = inner.parse().ok()?;
-        return Some(Expr::Var(idx));
+    if let Some(inner) = s.strip_prefix("Var(").and_then(|r| r.strip_suffix(')')) {
+        let idx: u8 = inner.trim().parse().ok()?;
+        return Some(arena.push_var(idx));
+    }
+    if let Some(inner) = s.strip_prefix("Const(").and_then(|r| r.strip_suffix(')')) {
+        let val: f32 = inner.trim().parse().ok()?;
+        return Some(arena.push_const(val));
     }
 
-    // Try parsing as Const
-    if s.starts_with("Const(") && s.ends_with(')') {
-        let inner = &s[6..s.len() - 1];
-        let val: f32 = inner.parse().ok()?;
-        return Some(Expr::Const(val));
-    }
-
-    // Parse as operation
     let paren_pos = s.find('(')?;
-    let op_name = &s[..paren_pos];
-    let op = parse_op_kind(op_name)?;
-
-    // Find matching closing paren
+    let op = parse_op_kind(&s[..paren_pos])?;
     let inner = &s[paren_pos + 1..s.len() - 1];
     let children = split_args(inner);
 
-    match op.arity() {
-        0 => None, // Should have been caught above
-        1 => {
-            if children.len() != 1 {
-                return None;
-            }
-            let a = parse_expr(children[0])?;
-            Some(Expr::Unary(op, Arc::new(a)))
+    match (op.arity(), children.len()) {
+        (1, 1) => {
+            let a = parse_expr_into(children[0], arena)?;
+            Some(arena.push_unary(op, a))
         }
-        2 => {
-            if children.len() != 2 {
-                return None;
-            }
-            let a = parse_expr(children[0])?;
-            let b = parse_expr(children[1])?;
-            Some(Expr::Binary(op, Arc::new(a), Arc::new(b)))
+        (2, 2) => {
+            let a = parse_expr_into(children[0], arena)?;
+            let b = parse_expr_into(children[1], arena)?;
+            Some(arena.push_binary(op, a, b))
         }
-        3 => {
-            if children.len() != 3 {
-                return None;
-            }
-            let a = parse_expr(children[0])?;
-            let b = parse_expr(children[1])?;
-            let c = parse_expr(children[2])?;
-            Some(Expr::Ternary(op, Arc::new(a), Arc::new(b), Arc::new(c)))
+        (3, 3) => {
+            let a = parse_expr_into(children[0], arena)?;
+            let b = parse_expr_into(children[1], arena)?;
+            let c = parse_expr_into(children[2], arena)?;
+            Some(arena.push_ternary(op, a, b, c))
         }
         _ => None,
     }
@@ -523,14 +508,6 @@ impl<'a> ArenaKernelParser<'a> {
 }
 
 /// Parser result: (parsed value, remaining input)
-#[cfg(test)]
-type ParseResult<'a, T> = Option<(T, &'a str)>;
-
-/// Parse kernel code syntax like "(X + Y)" into Expr.
-#[cfg(test)]
-pub fn parse_kernel_code(s: &str) -> Option<Expr> {
-    kc_expr(s.trim()).and_then(|(expr, rest)| rest.is_empty().then_some(expr))
-}
 
 /// Parse kernel code directly into an [`ExprArena`] (DAG) with structural sharing.
 ///
@@ -542,170 +519,6 @@ pub fn parse_kernel_code(s: &str) -> Option<Expr> {
 /// Returns `None` if the input fails to parse.
 pub fn parse_kernel_code_arena(s: &str) -> Option<(ExprArena, ExprId)> {
     ArenaKernelParser::new(s.trim()).parse()
-}
-
-/// Top-level: parse a complete expression
-#[cfg(test)]
-fn kc_expr(input: &str) -> ParseResult<'_, Expr> {
-    parse_additive(input.trim())
-}
-
-/// Parse additive: left-associative chain of +/-
-#[cfg(test)]
-fn parse_additive(input: &str) -> ParseResult<'_, Expr> {
-    let (mut acc, mut rest) = parse_multiplicative(input)?;
-
-    while let Some((op, remaining)) = parse_additive_op(rest.trim_start()) {
-        let (rhs, remaining) = parse_multiplicative(remaining.trim_start())?;
-        acc = Expr::Binary(op, Arc::new(acc), Arc::new(rhs));
-        rest = remaining;
-    }
-
-    Some((acc, rest))
-}
-
-#[cfg(test)]
-fn parse_additive_op(input: &str) -> ParseResult<'_, OpKind> {
-    match input.chars().next()? {
-        '+' => Some((OpKind::Add, &input[1..])),
-        '-' => Some((OpKind::Sub, &input[1..])),
-        _ => None,
-    }
-}
-
-/// Parse multiplicative: left-associative chain of * /
-#[cfg(test)]
-fn parse_multiplicative(input: &str) -> ParseResult<'_, Expr> {
-    let (mut acc, mut rest) = parse_postfix(input)?;
-
-    while let Some((op, remaining)) = parse_multiplicative_op(rest.trim_start()) {
-        let (rhs, remaining) = parse_postfix(remaining.trim_start())?;
-        acc = Expr::Binary(op, Arc::new(acc), Arc::new(rhs));
-        rest = remaining;
-    }
-
-    Some((acc, rest))
-}
-
-#[cfg(test)]
-fn parse_multiplicative_op(input: &str) -> ParseResult<'_, OpKind> {
-    match input.chars().next()? {
-        '*' => Some((OpKind::Mul, &input[1..])),
-        '/' => Some((OpKind::Div, &input[1..])),
-        _ => None,
-    }
-}
-
-/// Parse postfix: primary followed by method chains
-#[cfg(test)]
-fn parse_postfix(input: &str) -> ParseResult<'_, Expr> {
-    let (mut acc, mut rest) = parse_primary(input)?;
-
-    while let Some((expr, remaining)) = parse_method_call(rest.trim_start(), acc.clone()) {
-        acc = expr;
-        rest = remaining;
-    }
-
-    Some((acc, rest))
-}
-
-/// Parse a method call: .method() or .method(arg) or .method(arg1, arg2)
-///
-/// Dispatches through `OpKind::from_name()` + `arity()` — no hand-maintained
-/// op enumeration. Adding a new OpKind automatically makes it parseable here.
-#[cfg(test)]
-fn parse_method_call<'a>(input: &'a str, base: Expr) -> ParseResult<'a, Expr> {
-    let input = input.strip_prefix('.')?;
-    let (method_name, rest) = parse_ident(input)?;
-    let rest = rest.strip_prefix('(')?;
-
-    // Unary method: .method()
-    if let Some(rest) = rest.trim_start().strip_prefix(')') {
-        let op = OpKind::from_name(method_name)?;
-        if op.arity() != 1 {
-            return None;
-        }
-        return Some((Expr::Unary(op, Arc::new(base)), rest));
-    }
-
-    // Parse first argument
-    let (arg1, rest) = kc_expr(rest.trim_start())?;
-    let rest = rest.trim_start();
-
-    // Ternary method: .method(arg1, arg2)
-    if let Some(rest) = rest.strip_prefix(',') {
-        let (arg2, rest) = kc_expr(rest.trim_start())?;
-        let rest = rest.trim_start().strip_prefix(')')?;
-        let op = OpKind::from_name(method_name)?;
-        if op.arity() != 3 {
-            return None;
-        }
-        return Some((
-            Expr::Ternary(op, Arc::new(base), Arc::new(arg1), Arc::new(arg2)),
-            rest,
-        ));
-    }
-
-    // Binary method: .method(arg)
-    let rest = rest.strip_prefix(')')?;
-    let op = OpKind::from_name(method_name)?;
-    if op.arity() != 2 {
-        return None;
-    }
-    Some((Expr::Binary(op, Arc::new(base), Arc::new(arg1)), rest))
-}
-
-/// Parse primary: parens, negation, variable, or number
-#[cfg(test)]
-fn parse_primary(input: &str) -> ParseResult<'_, Expr> {
-    let input = input.trim_start();
-
-    // Parenthesized expression
-    if let Some(rest) = input.strip_prefix('(') {
-        let (expr, rest) = kc_expr(rest)?;
-        let rest = rest.trim_start().strip_prefix(')')?;
-        return Some((expr, rest));
-    }
-
-    // Unary negation
-    if let Some(rest) = input.strip_prefix('-') {
-        let (expr, rest) = parse_postfix(rest.trim_start())?;
-        return Some((Expr::Unary(OpKind::Neg, Arc::new(expr)), rest));
-    }
-
-    // Variable or number
-    parse_variable(input).or_else(|| parse_number(input))
-}
-
-/// Parse a variable: X, Y, Z, W
-#[cfg(test)]
-fn parse_variable(input: &str) -> ParseResult<'_, Expr> {
-    let (c, rest) = input.split_at(1.min(input.len()));
-    match c {
-        "X" => Some((Expr::Var(0), rest)),
-        "Y" => Some((Expr::Var(1), rest)),
-        "Z" => Some((Expr::Var(2), rest)),
-        "W" => Some((Expr::Var(3), rest)),
-        _ => None,
-    }
-}
-
-/// Parse a numeric literal
-#[cfg(test)]
-fn parse_number(input: &str) -> ParseResult<'_, Expr> {
-    let end = input
-        .char_indices()
-        .find(|(_, c)| !matches!(c, '0'..='9' | '.' | '-' | 'e' | 'E' | '+'))
-        .map(|(i, _)| i)
-        .unwrap_or(input.len());
-
-    if end == 0 {
-        return None;
-    }
-
-    let num_str = &input[..end];
-    let val: f32 = num_str.parse().ok()?;
-    Some((Expr::Const(val), &input[end..]))
 }
 
 /// Parse an identifier (method name). Accepts `[a-zA-Z_][a-zA-Z0-9_]*`
@@ -727,55 +540,8 @@ fn parse_ident(input: &str) -> Option<(&str, &str)> {
 }
 
 // ============================================================================
-// Expr → Kernel Code Serialization
+// Arena → Kernel Code Serialization
 // ============================================================================
-
-/// Convert an `Expr` to kernel code syntax (inverse of [`parse_kernel_code`]).
-///
-/// Dispatches formatting through [`OpKind::emit_style()`] — no op enumeration.
-/// The output string, when passed to `parse_kernel_code()`, yields a semantically
-/// equivalent expression.
-///
-/// # Panics
-///
-/// Panics on `Expr::Param` (must be substituted first) or `Expr::Nary`.
-#[cfg(test)]
-pub fn expr_to_kernel_code(expr: &Expr) -> String {
-    match expr {
-        Expr::Var(0) => "X".into(),
-        Expr::Var(1) => "Y".into(),
-        Expr::Var(2) => "Z".into(),
-        Expr::Var(3) => "W".into(),
-        Expr::Var(i) => panic!(
-            "expr_to_kernel_code: variable index {} exceeds X/Y/Z/W range",
-            i
-        ),
-        Expr::Const(v) => format_const_kc(*v),
-        Expr::Param(i) => panic!(
-            "Expr::Param({}) reached expr_to_kernel_code — call substitute_params first",
-            i
-        ),
-        Expr::Unary(op, a) => {
-            let a_s = expr_to_kernel_code(a);
-            emit_op_kc(*op, &[a_s])
-        }
-        Expr::Binary(op, a, b) => {
-            let a_s = expr_to_kernel_code(a);
-            let b_s = expr_to_kernel_code(b);
-            emit_op_kc(*op, &[a_s, b_s])
-        }
-        Expr::Ternary(op, a, b, c) => {
-            let a_s = expr_to_kernel_code(a);
-            let b_s = expr_to_kernel_code(b);
-            let c_s = expr_to_kernel_code(c);
-            emit_op_kc(*op, &[a_s, b_s, c_s])
-        }
-        Expr::Nary(op, _) => panic!(
-            "expr_to_kernel_code: Nary({}) not representable in kernel code syntax",
-            op.name()
-        ),
-    }
-}
 
 /// Convert an [`ExprArena`] subtree into kernel code syntax.
 pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
@@ -859,16 +625,13 @@ fn emit_op_kc(op: OpKind, args: &[String]) -> String {
 /// Format a constant for kernel code syntax.
 fn format_const_kc(v: f32) -> String {
     if !v.is_finite() {
-        panic!(
-            "expr_to_kernel_code: non-finite constant {} cannot be represented",
-            v
-        );
+        panic!("arena_to_kernel_code: non-finite constant {v} cannot be represented");
     }
     if v.is_sign_negative() && v != 0.0 {
         return format!("(-{})", format_const_kc(-v));
     }
-    // Rust's Display for f32 produces shortest round-trip representation
-    format!("{}", v)
+    // Rust's Display for f32 produces the shortest round-trip representation.
+    format!("{v}")
 }
 
 // ============================================================================
@@ -882,54 +645,52 @@ mod tests {
 
     const REWRITE_BUG_INPUTS: [f32; 4] = [0.5, 0.7, 1.3, -0.2];
 
-    fn eval_expr_scalar(expr: &Expr, vars: &[f32; 4]) -> f32 {
-        match expr {
-            Expr::Var(i) => vars[*i as usize],
-            Expr::Const(c) => *c,
-            Expr::Param(i) => panic!("Param in eval_expr_scalar: {i}"),
-            Expr::Unary(op, a) => {
-                let a = eval_expr_scalar(a, vars);
+    fn eval_arena_scalar(arena: &ExprArena, id: ExprId, vars: &[f32; 4]) -> f32 {
+        match *arena.node(id) {
+            ExprNode::Var(i) => vars[i as usize],
+            ExprNode::Const(c) => c,
+            ExprNode::Param(i) => panic!("Param in eval_arena_scalar: {i}"),
+            ExprNode::Unary(op, a) => {
+                let a = eval_arena_scalar(arena, a, vars);
                 op.eval_unary(a)
-                    .unwrap_or_else(|| panic!("eval_unary failed for {:?}", op))
+                    .unwrap_or_else(|| panic!("eval_unary failed for {op:?}"))
             }
-            Expr::Binary(op, a, b) => {
-                let a = eval_expr_scalar(a, vars);
-                let b = eval_expr_scalar(b, vars);
+            ExprNode::Binary(op, a, b) => {
+                let a = eval_arena_scalar(arena, a, vars);
+                let b = eval_arena_scalar(arena, b, vars);
                 op.eval_binary(a, b)
-                    .unwrap_or_else(|| panic!("eval_binary failed for {:?}", op))
+                    .unwrap_or_else(|| panic!("eval_binary failed for {op:?}"))
             }
-            Expr::Ternary(op, a, b, c) => {
-                let a = eval_expr_scalar(a, vars);
-                let b = eval_expr_scalar(b, vars);
-                let c = eval_expr_scalar(c, vars);
+            ExprNode::Ternary(op, a, b, c) => {
+                let a = eval_arena_scalar(arena, a, vars);
+                let b = eval_arena_scalar(arena, b, vars);
+                let c = eval_arena_scalar(arena, c, vars);
                 op.eval_ternary(a, b, c)
-                    .unwrap_or_else(|| panic!("eval_ternary failed for {:?}", op))
+                    .unwrap_or_else(|| panic!("eval_ternary failed for {op:?}"))
             }
-            Expr::Nary(kind, _) => panic!("Nary in eval_expr_scalar: {:?}", kind),
+            ExprNode::Nary(kind, _, _) => panic!("Nary in eval_arena_scalar: {kind:?}"),
         }
     }
 
     fn logged_expr_scalar_output(src: &str) -> f32 {
-        let expr = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        eval_expr_scalar(&expr, &REWRITE_BUG_INPUTS)
+        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
+        eval_arena_scalar(&arena, root, &REWRITE_BUG_INPUTS)
     }
 
     fn logged_expr_jit_output(src: &str) -> f32 {
-        let expr = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        let kernel = expr_to_kernel_code(&expr);
-        let (arena, root) = parse_kernel_code_arena(&kernel)
-            .unwrap_or_else(|| panic!("parse_kernel_code_arena failed: {kernel}"));
+        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
         benchmark_jit_arena(&arena, root)
-            .unwrap_or_else(|err| panic!("benchmark_jit_arena failed for {kernel}: {err:?}"))
+            .unwrap_or_else(|err| panic!("benchmark_jit_arena failed for {src}: {err:?}"))
             .output[0]
     }
 
     fn logged_expr_roundtrip_scalar_output(src: &str) -> f32 {
-        let expr = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        let kernel = expr_to_kernel_code(&expr);
-        let reparsed = parse_kernel_code(&kernel)
-            .unwrap_or_else(|| panic!("parse_kernel_code failed: {kernel}"));
-        eval_expr_scalar(&reparsed, &REWRITE_BUG_INPUTS)
+        // arena -> kernel-code -> arena round-trip must preserve scalar semantics.
+        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
+        let kernel = arena_to_kernel_code(&arena, root);
+        let (re_arena, re_root) = parse_kernel_code_arena(&kernel)
+            .unwrap_or_else(|| panic!("parse_kernel_code_arena failed: {kernel}"));
+        eval_arena_scalar(&re_arena, re_root, &REWRITE_BUG_INPUTS)
     }
 
     fn assert_scalar_and_jit_close(src: &str, epsilon: f32) {
@@ -940,23 +701,6 @@ mod tests {
             diff <= epsilon,
             "scalar/JIT mismatch\nexpr: {src}\nscalar: {scalar}\njit: {jit}\ndiff: {diff} > {epsilon}"
         );
-    }
-
-    fn collect_subexpressions<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
-        out.push(expr);
-        match expr {
-            Expr::Unary(_, a) => collect_subexpressions(a, out),
-            Expr::Binary(_, a, b) => {
-                collect_subexpressions(a, out);
-                collect_subexpressions(b, out);
-            }
-            Expr::Ternary(_, a, b, c) => {
-                collect_subexpressions(a, out);
-                collect_subexpressions(b, out);
-                collect_subexpressions(c, out);
-            }
-            Expr::Var(_) | Expr::Const(_) | Expr::Param(_) | Expr::Nary(_, _) => {}
-        }
     }
 
     #[test]
@@ -999,15 +743,13 @@ mod tests {
 
     #[test]
     fn test_parse_kernel_code_arena_round_trip() {
-        // Arena parse + arena_to_kernel_code should match the original.
+        // Arena parse + arena_to_kernel_code should re-parse cleanly.
         let src = "((X * Y) + (X * Y))";
         let (arena, root) = parse_kernel_code_arena(src).unwrap();
         let code = arena_to_kernel_code(&arena, root);
-        // The round-tripped form should parse cleanly.
         assert!(
-            parse_kernel_code(&code).is_some(),
-            "arena round-trip produced un-parseable code: {}",
-            code
+            parse_kernel_code_arena(&code).is_some(),
+            "arena round-trip produced un-parseable code: {code}"
         );
     }
 
@@ -1024,239 +766,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_expr() {
-        let expr = parse_expr("Add(Var(0), Var(1))").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
-
-        let expr = parse_expr("Mul(Add(Var(0), Var(1)), Var(2))").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Mul, _, _)));
-
-        let expr = parse_expr("MulAdd(Var(0), Var(1), Var(2))").unwrap();
-        assert!(matches!(expr, Expr::Ternary(OpKind::MulAdd, _, _, _)));
-    }
-
     // ========================================================================
     // Kernel Code Parser Tests
     // ========================================================================
 
-    #[test]
-    fn test_parse_kernel_code_variables() {
-        assert!(matches!(parse_kernel_code("X"), Some(Expr::Var(0))));
-        assert!(matches!(parse_kernel_code("Y"), Some(Expr::Var(1))));
-        assert!(matches!(parse_kernel_code("Z"), Some(Expr::Var(2))));
-        assert!(matches!(parse_kernel_code("W"), Some(Expr::Var(3))));
-    }
-
-    #[test]
-    fn test_parse_kernel_code_constants() {
-        assert!(matches!(parse_kernel_code("1.0"), Some(Expr::Const(v)) if (v - 1.0).abs() < 1e-6));
-        assert!(
-            matches!(parse_kernel_code("(4.595877)"), Some(Expr::Const(v)) if (v - 4.595877).abs() < 1e-5)
-        );
-        assert!(matches!(parse_kernel_code("0.0"), Some(Expr::Const(v)) if v.abs() < 1e-6));
-    }
-
-    #[test]
-    fn test_parse_kernel_code_binary_ops() {
-        let expr = parse_kernel_code("(X + Y)").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
-
-        let expr = parse_kernel_code("(X - Y)").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Sub, _, _)));
-
-        let expr = parse_kernel_code("(X * Y)").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Mul, _, _)));
-
-        let expr = parse_kernel_code("(X / Y)").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Div, _, _)));
-    }
-
-    #[test]
-    fn test_parse_kernel_code_from_benchmark_cache() {
-        let expr = parse_kernel_code("((4.595877) - Z)").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Sub, _, _)));
-
-        let expr = parse_kernel_code("((4.595877) + (-Z))").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
-
-        let expr = parse_kernel_code("((-Z) + (4.595877))").unwrap();
-        assert!(matches!(expr, Expr::Binary(OpKind::Add, _, _)));
-    }
-
-    #[test]
-    fn test_parse_kernel_code_unary_ops() {
-        let expr = parse_kernel_code("(-X)").unwrap();
-        assert!(matches!(expr, Expr::Unary(OpKind::Neg, _)));
-
-        let expr = parse_kernel_code("(X).sqrt()").unwrap();
-        assert!(matches!(expr, Expr::Unary(OpKind::Sqrt, _)));
-
-        let expr = parse_kernel_code("(X).abs()").unwrap();
-        assert!(matches!(expr, Expr::Unary(OpKind::Abs, _)));
-    }
-
-    #[test]
-    fn test_parse_kernel_code_nested() {
-        let expr = parse_kernel_code("((X + Y) * Z)").unwrap();
-        if let Expr::Binary(OpKind::Mul, left, right) = expr {
-            assert!(matches!(*left, Expr::Binary(OpKind::Add, _, _)));
-            assert!(matches!(*right, Expr::Var(2)));
-        } else {
-            panic!("Expected Binary(Mul, ...) got {:?}", expr);
-        }
-    }
-
-    #[test]
-    fn test_parse_kernel_code_method_chains() {
-        let expr = parse_kernel_code("(X).sqrt()");
-        assert!(expr.is_some(), "Should parse (X).sqrt()");
-
-        let expr = parse_kernel_code("(X).min(Y)");
-        assert!(expr.is_some(), "Should parse (X).min(Y)");
-
-        let expr = parse_kernel_code("((X).abs()).abs()");
-        assert!(expr.is_some(), "Should parse chained abs");
-
-        let expr = parse_kernel_code("(((X).rsqrt()).abs())");
-        assert!(expr.is_some(), "Should parse rsqrt then abs");
-    }
-
-    #[test]
-    fn test_parse_kernel_code_complex_expressions() {
-        let expr = parse_kernel_code("((-0.724020)).rsqrt()");
-        assert!(
-            expr.is_some(),
-            "Should parse rsqrt of negative const: {:?}",
-            expr
-        );
-
-        let expr = parse_kernel_code("((((X).rsqrt()).abs()).abs())");
-        assert!(expr.is_some(), "Should parse deeply nested methods");
-
-        let expr = parse_kernel_code("(X).min(((-Z)).max(Y))");
-        assert!(expr.is_some(), "Should parse nested min/max");
-
-        let expr = parse_kernel_code("(((-3.551370)).rsqrt() * (1.0 / W))");
-        assert!(expr.is_some(), "Should parse rsqrt multiplication");
-    }
-
-    #[test]
-    fn test_parse_actual_failures() {
-        let expr = parse_kernel_code(
-            "((((X).rsqrt()).abs()).abs()).min(((((-0.724020)).rsqrt() * (1.0 / (X).abs()))).min(W))",
-        );
-        assert!(expr.is_some(), "Should parse chained min: {:?}", expr);
-
-        let expr = parse_kernel_code(
-            "((W * (((Y * X)).max(X)).rsqrt()) + (W * (-(((Y).abs() * Z) - (((0.296980) * Z) + (-W))))))",
-        );
-        assert!(expr.is_some(), "Should parse complex expression");
-    }
-
     // ================================================================
     // expr_to_kernel_code round-trip tests
     // ================================================================
-
-    #[test]
-    fn test_expr_to_kernel_code_variables() {
-        assert_eq!(expr_to_kernel_code(&Expr::Var(0)), "X");
-        assert_eq!(expr_to_kernel_code(&Expr::Var(1)), "Y");
-        assert_eq!(expr_to_kernel_code(&Expr::Var(2)), "Z");
-        assert_eq!(expr_to_kernel_code(&Expr::Var(3)), "W");
-    }
-
-    #[test]
-    fn test_expr_to_kernel_code_constants() {
-        let code = expr_to_kernel_code(&Expr::Const(3.14));
-        let reparsed = parse_kernel_code(&code);
-        assert!(reparsed.is_some(), "Failed to reparse constant: {}", code);
-    }
-
-    /// String-level round-trip: serialize → parse → re-serialize must be identical.
-    fn assert_string_roundtrip(code: &str) {
-        let parsed = parse_kernel_code(code)
-            .unwrap_or_else(|| panic!("parse_kernel_code failed on: {}", code));
-        let re_emitted = expr_to_kernel_code(&parsed);
-        assert_eq!(code, re_emitted, "String round-trip failed");
-    }
-
-    #[test]
-    fn test_expr_to_kernel_code_roundtrip_simple() {
-        let expr = Expr::Binary(OpKind::Add, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-        let code = expr_to_kernel_code(&expr);
-        assert_string_roundtrip(&code);
-    }
-
-    #[test]
-    fn test_expr_to_kernel_code_roundtrip_unary_methods() {
-        for i in 0..OpKind::COUNT {
-            let Some(op) = OpKind::from_index(i) else {
-                continue;
-            };
-            if op.arity() != 1 {
-                continue;
-            }
-            let expr = Expr::Unary(op, Arc::new(Expr::Var(0)));
-            let code = expr_to_kernel_code(&expr);
-            assert_string_roundtrip(&code);
-        }
-    }
-
-    #[test]
-    fn test_expr_to_kernel_code_roundtrip_binary() {
-        for i in 0..OpKind::COUNT {
-            let Some(op) = OpKind::from_index(i) else {
-                continue;
-            };
-            if op.arity() != 2 {
-                continue;
-            }
-            let expr = Expr::Binary(op, Arc::new(Expr::Var(0)), Arc::new(Expr::Var(1)));
-            let code = expr_to_kernel_code(&expr);
-            assert_string_roundtrip(&code);
-        }
-    }
-
-    #[test]
-    fn test_expr_to_kernel_code_roundtrip_ternary() {
-        for i in 0..OpKind::COUNT {
-            let Some(op) = OpKind::from_index(i) else {
-                continue;
-            };
-            if op.arity() != 3 {
-                continue;
-            }
-            let expr = Expr::Ternary(
-                op,
-                Arc::new(Expr::Var(0)),
-                Arc::new(Expr::Var(1)),
-                Arc::new(Expr::Var(2)),
-            );
-            let code = expr_to_kernel_code(&expr);
-            assert_string_roundtrip(&code);
-        }
-    }
-
-    #[test]
-    fn test_expr_to_kernel_code_roundtrip_generated() {
-        use pixelflow_search::nnue::{ExprGenConfig, ExprGenerator};
-        let config = ExprGenConfig {
-            max_depth: 6,
-            leaf_prob: 0.3,
-            num_vars: 4,
-            include_fused: false,
-        };
-        let mut rng = ExprGenerator::new(12345, config);
-        for i in 0..200 {
-            let expr = rng.generate();
-            let code = expr_to_kernel_code(&expr);
-            let reparsed = parse_kernel_code(&code)
-                .unwrap_or_else(|| panic!("parse failed on expr #{}: {}", i, code));
-            let re_emitted = expr_to_kernel_code(&reparsed);
-            assert_eq!(code, re_emitted, "Round-trip failed on expr #{}", i);
-        }
-    }
 
     #[test]
     fn test_seed_42_t1_pair_is_close_under_scalar_semantics() {
@@ -1272,6 +788,9 @@ mod tests {
     }
 
     #[test]
+    // The x86-64 JIT lowers transcendentals in the compiler, not the emitter;
+    // these raw-op exprs need the NEON builtin emitter (aarch64).
+    #[cfg(target_arch = "aarch64")]
     fn test_seed_42_t1_initial_jit_matches_scalar() {
         let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
@@ -1289,6 +808,9 @@ mod tests {
     }
 
     #[test]
+    // The x86-64 JIT lowers transcendentals in the compiler, not the emitter;
+    // these raw-op exprs need the NEON builtin emitter (aarch64).
+    #[cfg(target_arch = "aarch64")]
     fn test_seed_42_t1_final_jit_matches_scalar() {
         let final_ = "log2(add(Const(0.001), abs(atan2(pow(add(abs(neg(pow(add(abs(Const(-0.9631642)), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(mul(min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))), exp(pow(add(abs(atan2(Const(0.1167655), Var(1))), Const(0.001)), Const(-1)))), exp(add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001))))))))))";
         assert_scalar_and_jit_close(final_, 1e-3);
@@ -1308,6 +830,9 @@ mod tests {
     }
 
     #[test]
+    // The x86-64 JIT lowers transcendentals in the compiler, not the emitter;
+    // these raw-op exprs need the NEON builtin emitter (aarch64).
+    #[cfg(target_arch = "aarch64")]
     fn test_seed_24042_t52_initial_jit_matches_scalar() {
         let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
@@ -1325,32 +850,12 @@ mod tests {
     }
 
     #[test]
+    // The x86-64 JIT lowers transcendentals in the compiler, not the emitter;
+    // these raw-op exprs need the NEON builtin emitter (aarch64).
+    #[cfg(target_arch = "aarch64")]
     fn test_seed_24042_t52_final_jit_matches_scalar() {
         let final_ = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(Const(0.12621832), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(Const(0.20414245), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(Const(0.093906365), Var(2)), mul(Const(0.093906365), Var(3))), max(Const(-1.3763785), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(Const(8.641348), recip(add(Const(1.7208018), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(Const(1.1988422), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(Const(1.670574), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         assert_scalar_and_jit_close(final_, 1e-3);
     }
 
-    #[test]
-    #[ignore]
-    fn diagnose_seed_24042_t52_initial_subexpression_mismatches() {
-        let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
-        let expr = parse_expr(initial).unwrap();
-        let mut subs = Vec::new();
-        collect_subexpressions(&expr, &mut subs);
-        let mut mismatches = Vec::new();
-        for sub in subs {
-            let text = expr_to_kernel_code(sub);
-            let scalar = eval_expr_scalar(sub, &REWRITE_BUG_INPUTS);
-            let (arena, root) = parse_kernel_code_arena(&text).unwrap();
-            let jit = benchmark_jit_arena(&arena, root).unwrap().output[0];
-            let diff = (scalar - jit).abs();
-            if diff > 1e-3 {
-                mismatches.push((diff, text, scalar, jit));
-            }
-        }
-        mismatches.sort_by(|a, b| b.0.total_cmp(&a.0));
-        for (diff, text, scalar, jit) in mismatches.into_iter().take(20) {
-            println!("diff={diff} scalar={scalar} jit={jit} expr={text}");
-        }
-    }
 }

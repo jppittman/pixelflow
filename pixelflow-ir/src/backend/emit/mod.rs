@@ -3002,6 +3002,124 @@ pub fn compile_arena_dag_with_ctx(
     })
 }
 
+/// Compile an [`ExprArena`] DAG into a scanline kernel (x86-64).
+///
+/// The emitted kernel contains its own loop: Y/Z/W are loaded once into
+/// xmm1/xmm2/xmm3 and stay there for the whole scanline (loop-invariant by
+/// construction); only X is reloaded per pixel from the input array. This
+/// eliminates the per-pixel `extern "C"` call overhead of the single-pixel
+/// [`KernelFn`].
+///
+/// The per-pixel body is the same Sethi-Ullman code produced by [`emit_arena`],
+/// so X-invariant subexpressions are recomputed each iteration (no hoisting on
+/// x86-64 yet — see [`MAX_PERSISTENT_SLOTS`]).
+///
+/// Matches the [`ScanlineKernelFn`](executable::ScanlineKernelFn) ABI:
+/// `(xs: *const __m128, y, z, w: __m128, out: *mut __m128, count: usize)`.
+/// Under SysV: `rdi = xs`, `xmm0 = y`, `xmm1 = z`, `xmm2 = w`, `rsi = out`,
+/// `rdx = count`.
+#[cfg(target_arch = "x86_64")]
+pub fn compile_arena_dag_scanline(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<ScanlineCompileResult, &'static str> {
+    const MAX_DEPTH: usize = 64;
+    if arena.depth(root) > MAX_DEPTH {
+        return Err("expression too deep");
+    }
+
+    // Per-pixel body: reads X from xmm0 and Y/Z/W from xmm1/2/3 (INPUT_REGS),
+    // writes the result into `result_reg`, using xmm4+ as scratch.
+    let (body, result_reg) = emit_arena(arena, root, 0)?;
+
+    let mut code: Vec<u8> = Vec::with_capacity(body.len() + 64);
+
+    // Shuffle incoming args into INPUT_REGS layout, freeing xmm0 for X:
+    //   y: xmm0 -> xmm1,  z: xmm1 -> xmm2,  w: xmm2 -> xmm3
+    // Done high-to-low so no live value is clobbered before it is copied.
+    x86_64::emit_movaps(&mut code, Reg(3), Reg(2)); // w
+    x86_64::emit_movaps(&mut code, Reg(2), Reg(1)); // z
+    x86_64::emit_movaps(&mut code, Reg(1), Reg(0)); // y
+
+    // xor eax, eax          ; loop index i = 0 (rax)
+    code.extend_from_slice(&[0x31, 0xC0]);
+
+    let loop_top = code.len();
+
+    // cmp rax, rdx          ; i vs count
+    code.extend_from_slice(&[0x48, 0x39, 0xD0]);
+    // jae loop_end          ; if i >= count, done
+    code.extend_from_slice(&[0x0F, 0x83]);
+    let jae_disp_at = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]); // rel32 placeholder
+
+    // movaps xmm0, [rdi]    ; x = xs[i]
+    x86_64::emit_movaps_load(&mut code, Reg(0), 0);
+
+    // Per-pixel computation.
+    code.extend_from_slice(&body);
+
+    // movaps [rsi], result_reg   ; out[i] = result
+    if result_reg.0 >= 8 {
+        code.push(0x44); // REX.R
+    }
+    code.push(0x0F);
+    code.push(0x29);
+    code.push(0x06 | ((result_reg.0 & 7) << 3)); // mod=00, rm=110 (rsi)
+
+    // add rdi, 16 ; add rsi, 16 ; inc rax
+    code.extend_from_slice(&[0x48, 0x83, 0xC7, 0x10]); // add rdi, 16
+    code.extend_from_slice(&[0x48, 0x83, 0xC6, 0x10]); // add rsi, 16
+    code.extend_from_slice(&[0x48, 0xFF, 0xC0]); // inc rax
+
+    // jmp loop_top
+    code.push(0xE9);
+    let jmp_disp_at = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]); // rel32 placeholder
+
+    let loop_end = code.len();
+    // ret
+    code.push(0xC3);
+
+    // Patch the forward jae (target = loop_end) and backward jmp (target = loop_top).
+    let jae_rel = (loop_end as i32) - (jae_disp_at as i32 + 4);
+    code[jae_disp_at..jae_disp_at + 4].copy_from_slice(&jae_rel.to_le_bytes());
+    let jmp_rel = (loop_top as i32) - (jmp_disp_at as i32 + 4);
+    code[jmp_disp_at..jmp_disp_at + 4].copy_from_slice(&jmp_rel.to_le_bytes());
+
+    let code = unsafe { executable::ExecutableCode::from_code(&code)? };
+    Ok(ScanlineCompileResult {
+        code,
+        spill_count: 0,
+        spill_bytes: 0,
+        max_regs: EmitCtx::default().max_regs,
+    })
+}
+
+/// Compile a scanline kernel with an explicit register budget (x86-64).
+///
+/// The `ctx` budget is advisory on x86-64 (see [`compile_arena_dag_with_ctx`]).
+#[cfg(target_arch = "x86_64")]
+pub fn compile_arena_dag_scanline_with_ctx(
+    arena: &ExprArena,
+    root: ExprId,
+    _ctx: EmitCtx,
+) -> Result<ScanlineCompileResult, &'static str> {
+    compile_arena_dag_scanline(arena, root)
+}
+
+/// Variance-aware hoisted scanline compilation (x86-64).
+///
+/// x86-64 has no persistent-slot hoisting yet ([`MAX_PERSISTENT_SLOTS`] == 0),
+/// so this is identical to the flat [`compile_arena_dag_scanline`].
+#[cfg(target_arch = "x86_64")]
+pub fn compile_arena_dag_scanline_hoisted(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<ScanlineCompileResult, &'static str> {
+    compile_arena_dag_scanline(arena, root)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -3798,6 +3916,72 @@ mod tests {
 
             // Should not crash or touch any memory.
             scanline.eval_scanline(xs, y, z, w, output);
+        }
+    }
+
+    /// The x86-64 scanline kernel must produce, for every pixel, exactly what
+    /// the single-pixel kernel produces for that pixel's X (with the same
+    /// loop-invariant Y/Z/W).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_scanline_matches_single_pixel_x86() {
+        use core::arch::x86_64::*;
+
+        // expr = (X*X + Y) * Z - W  (uses all four variables)
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let y = arena.push_var(1);
+        let z = arena.push_var(2);
+        let w = arena.push_var(3);
+        let xx = arena.push_binary(OpKind::Mul, x, x);
+        let xxy = arena.push_binary(OpKind::Add, xx, y);
+        let m = arena.push_binary(OpKind::Mul, xxy, z);
+        let root = arena.push_binary(OpKind::Sub, m, w);
+
+        let single = compile_arena_dag(&arena, root).expect("single-pixel compile failed");
+        let scan = compile_arena_dag_scanline(&arena, root).expect("scanline compile failed");
+
+        unsafe {
+            let y_v = _mm_set1_ps(2.0);
+            let z_v = _mm_set1_ps(3.0);
+            let w_v = _mm_set1_ps(0.5);
+
+            // Vec<__m128> is 16-byte aligned, satisfying the movaps contract.
+            let xs: Vec<__m128> = (0..7).map(|i| _mm_set1_ps(i as f32 * 0.7 - 1.5)).collect();
+            let mut out: Vec<__m128> = vec![_mm_set1_ps(0.0); xs.len()];
+
+            let sfunc: executable::ScanlineKernelFn = scan.code.as_fn();
+            sfunc(xs.as_ptr(), y_v, z_v, w_v, out.as_mut_ptr(), xs.len());
+
+            let kfunc: executable::KernelFn = single.code.as_fn();
+            for (i, &xv) in xs.iter().enumerate() {
+                let expected = kfunc(xv, y_v, z_v, w_v);
+                let e = _mm_cvtss_f32(expected);
+                let g = _mm_cvtss_f32(out[i]);
+                assert!(
+                    (e - g).abs() < 1e-5,
+                    "scanline pixel {i} mismatch: single={e} scanline={g}"
+                );
+            }
+        }
+    }
+
+    /// An empty scanline (count == 0) must be a no-op and not write `output`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_scanline_empty_x86() {
+        use core::arch::x86_64::*;
+
+        let mut arena = ExprArena::new();
+        let root = arena.push_var(0);
+        let scan = compile_arena_dag_scanline(&arena, root).expect("scanline compile failed");
+
+        unsafe {
+            let zero = _mm_set1_ps(0.0);
+            let xs: &[__m128] = &[];
+            let mut out: Vec<__m128> = Vec::new();
+            let sfunc: executable::ScanlineKernelFn = scan.code.as_fn();
+            sfunc(xs.as_ptr(), zero, zero, zero, out.as_mut_ptr(), 0);
         }
     }
 }
