@@ -459,26 +459,46 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
             let n_r = needs_arena(arena, *right);
             let dst = Reg(SCRATCH_BASE + depth);
 
-            // Sethi-Ullman: evaluate the heavier child first so it can use the
-            // lower (already-free) register pressure window.
-            let (mut code, l_reg, r_reg) = if n_l >= n_r {
+            // Whichever child is emitted at `depth` lands in `dst`. The
+            // two-operand SSE form emits `dst = src1 op src2` as
+            // `dst <- src1; dst op= src2`, so it is only correct when
+            // `dst == src1` or `dst != src2` — i.e. the operand sitting in
+            // `dst` must be passed as `src1`.
+            //
+            // Sethi-Ullman wants the heavier child evaluated first (into the
+            // lower register window). When the heavier child is the RIGHT
+            // operand, putting it in `dst` would make `dst == src2`, which the
+            // copy above corrupts. We can only recover by swapping operands,
+            // which is sound for commutative ops. For non-commutative ops we
+            // keep the LEFT child in `dst` instead (costing at most one extra
+            // register level), preserving correctness.
+            let commutative = matches!(
+                op,
+                OpKind::Add | OpKind::Mul | OpKind::Min | OpKind::Max | OpKind::Eq | OpKind::Ne
+            );
+            let eval_right_first = n_r > n_l && commutative;
+
+            // Returns operands as (src1, src2) with the in-`dst` operand first.
+            let (mut code, src1, src2) = if !eval_right_first {
                 let (mut code, l_reg) = emit_arena(arena, *left, depth)?;
                 let (r_code, r_reg) = emit_arena(arena, *right, depth + 1)?;
                 code.extend(r_code);
                 (code, l_reg, r_reg)
             } else {
+                // Right child in `dst`; swap so it becomes src1 (sound:
+                // commutative). `dst == src1` then satisfies the SSE invariant.
                 let (mut code, r_reg) = emit_arena(arena, *right, depth)?;
                 let (l_code, l_reg) = emit_arena(arena, *left, depth + 1)?;
                 code.extend(l_code);
-                (code, l_reg, r_reg)
+                (code, r_reg, l_reg)
             };
 
             match op {
                 OpKind::Atan2 | OpKind::Pow | OpKind::Hypot => {
                     let scratch = [Reg(12), Reg(13), Reg(14), Reg(15)];
-                    x86_64::emit_binary_transcendental(&mut code, *op, dst, l_reg, r_reg, scratch);
+                    x86_64::emit_binary_transcendental(&mut code, *op, dst, src1, src2, scratch);
                 }
-                _ => emit_binary(&mut code, *op, dst, l_reg, r_reg),
+                _ => emit_binary(&mut code, *op, dst, src1, src2),
             }
             Ok((code, dst))
         }

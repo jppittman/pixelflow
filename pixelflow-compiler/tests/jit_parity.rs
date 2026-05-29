@@ -8,13 +8,13 @@
 //! ground truth in *different* ops. Measured on x86-64:
 //!
 //! - `X + Y*Z` at (1,2,3): JIT = 2, combinator = 7 (correct). The JIT
-//!   miscompiles the FMA-fused shape — see [`jit_bug_fma_add_mul`].
+//!   miscompiled the FMA-fused shape (an SSE two-operand register clobber in
+//!   the Sethi-Ullman emitter); now fixed and guarded by [`jit_arithmetic`] /
+//!   [`jit_noncommutative_heavy_right`].
 //! - `sin(1)`: JIT = 0.8414683 (libm = 0.8414710, correct), combinator =
 //!   0.5116387 (badly inaccurate). Here the *combinator* is wrong.
 //!
-//! So we hold the JIT to f32 ground truth directly. Ops the JIT currently gets
-//! wrong are captured as `#[ignore]`d regression tests documenting the bug,
-//! rather than hidden.
+//! So we hold the JIT to f32 ground truth directly, not to the combinator.
 
 use pixelflow_compiler::kernel_jit;
 use pixelflow_core::{Field, Manifold};
@@ -87,9 +87,11 @@ macro_rules! jit_truth {
 fn jit_arithmetic() {
     jit_truth!("sub_div", kernel_jit!(|| (X - Y) / (Z + 1.0)), |x: f32, y: f32, z: f32, _w| (x - y) / (z + 1.0), 1e-4, 1e-4);
     jit_truth!("affine", kernel_jit!(|| 2.0 * X - 3.0 * Y + 1.0), |x: f32, y: f32, _z, _w| 2.0 * x - 3.0 * y + 1.0, 1e-4, 1e-4);
-    // FMA shape with the product on the LHS of the add — this one is correct
-    // (only the RHS-product shape `X + Y*Z` is broken; see jit_bug_fma_add_mul).
+    // FMA shapes, both operand orders. `X + Y*Z` (product on the RHS of the
+    // add) previously miscompiled to `Y` due to an SSE two-operand clobber in
+    // the Sethi-Ullman emitter; covered here as a regression guard.
     jit_truth!("mul_add", kernel_jit!(|| X * Y + Z), |x: f32, y: f32, z: f32, _w| x * y + z, 1e-4, 1e-4);
+    jit_truth!("add_mul", kernel_jit!(|| X + Y * Z), |x: f32, y: f32, z: f32, _w| x + y * z, 1e-4, 1e-4);
 }
 
 #[test]
@@ -139,20 +141,11 @@ fn jit_scalar_params() {
     }
 }
 
-// ===========================================================================
-// Known JIT bugs — documented regressions, ignored so the suite stays green.
-// Remove `#[ignore]` once the JIT backend is fixed.
-// ===========================================================================
-
-/// The JIT miscomputes `X + Y*Z` (an add whose RHS is a product, fused to FMA):
-/// at (1,2,3) it returns 2 instead of 7. Both combinator paths return 7.
-/// Suspected FMA operand-order bug in the arena lowering / JIT emit.
-/// The JIT miscomputes `X + Y*Z` — an add whose RHS is a product — returning 2
-/// instead of 7 at (1,2,3). The mirror shape `X*Y + Z` is correct (see
-/// `jit_arithmetic`), so this is an operand-order bug in FMA fusion / arena
-/// lowering, not a general arithmetic fault. Both combinator paths return 7.
+/// Non-commutative ops with the heavier operand on the right exercise the other
+/// half of the SSE two-operand hazard: the emitter can't swap operands, so it
+/// must keep the left operand in `dst`. Regression guard for that path.
 #[test]
-#[ignore = "JIT FMA bug: X + Y*Z returns 2 instead of 7 (see module docs)"]
-fn jit_bug_fma_add_mul() {
-    jit_truth!("add_mul", kernel_jit!(|| X + Y * Z), |x: f32, y: f32, z: f32, _w| x + y * z, 1e-4, 1e-4);
+fn jit_noncommutative_heavy_right() {
+    jit_truth!("sub_heavy_r", kernel_jit!(|| X - Y * Z), |x: f32, y: f32, z: f32, _w| x - y * z, 1e-4, 1e-4);
+    jit_truth!("div_heavy_r", kernel_jit!(|| X / (Y * Z + 1.0)), |x: f32, y: f32, z: f32, _w| x / (y * z + 1.0), 1e-4, 1e-4);
 }
