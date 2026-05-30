@@ -2261,19 +2261,81 @@ impl CompileWorkspace {
     }
 }
 
-/// Shared compilation backend: schedule + uses_map -> CompileResult.
+/// The architecture seam for the shared single-pixel driver.
 ///
-/// `compile_arena_dag_with_ctx` and the scanline compilers all produce the same
-/// `(schedule, uses_map)` format and then converge here.
-#[cfg(target_arch = "aarch64")]
-fn compile_from_schedule(
+/// `compile_dag_via_backend` owns the architecture-INDEPENDENT logic — schedule,
+/// register allocation, frame layout, and the Select short-circuit control flow
+/// — and calls an `IsaBackend` for the leaf operations that actually differ
+/// between x86-64 and aarch64 (instruction encoding, branch encoding, the
+/// prologue/epilogue, and any arch-specific finalization such as aarch64's
+/// constant pool). Both backends therefore run the *same* driver: there is one
+/// place that decides when to emit a guard branch, where the root goes, etc.
+///
+/// `Branch` is an opaque per-backend fixup token (aarch64 distinguishes CBZ from
+/// B; x86 uses a uniform rel32), patched later by `patch_branch`.
+trait IsaBackend {
+    type Branch;
+
+    /// Number of allocatable scratch registers (the `linear_scan` budget).
+    fn num_regs(&self) -> u8;
+
+    /// Per-compile setup before any code is emitted (e.g. seed a constant pool).
+    fn begin(&mut self, schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str>;
+
+    /// Function prologue (allocate the spill frame, set up any pool anchor).
+    fn prologue(&mut self, code: &mut Vec<u8>, frame_size: u32);
+
+    /// Emit one resolved instruction (with its reloads/store).
+    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str>;
+
+    /// Register-to-register move.
+    fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg);
+
+    /// Spill a register to a frame slot.
+    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str>;
+
+    /// Resolve a value to a register, reloading/rematerializing into `target`
+    /// if it is spilled or rematerialized.
+    fn emit_resolve(
+        &mut self,
+        code: &mut Vec<u8>,
+        vid: regalloc::ValueId,
+        target: Reg,
+        reg_for: &[Option<Reg>],
+        spill_for: &[Option<u32>],
+        remat_for: &[Option<u32>],
+    ) -> Reg;
+
+    /// Branch taken when `mask_reg` is all-false (skip the true arm).
+    fn emit_skip_if_all_false(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> Self::Branch;
+    /// Branch taken when `mask_reg` is all-true (skip the false arm).
+    fn emit_skip_if_all_true(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> Self::Branch;
+    /// Unconditional jump.
+    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch;
+    /// Patch a previously emitted branch to land at `target`.
+    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Self::Branch, target: usize);
+
+    /// Function epilogue: move the result into the return register, tear down
+    /// the frame, emit RET, and perform any arch-specific finalization (e.g.
+    /// append + anchor the constant pool). After this, `code` is complete.
+    fn epilogue(&mut self, code: &mut Vec<u8>, result_reg: Reg, frame_size: u32);
+}
+
+/// Drive a `(schedule, uses_map)` to machine code via an [`IsaBackend`].
+///
+/// This is the single shared single-pixel driver for both architectures. The
+/// control flow here — Select guard analysis, short-circuit branch emission and
+/// patching, root resolution — is identical regardless of ISA; only the leaf
+/// emits go through `backend`.
+fn compile_dag_via_backend<B: IsaBackend>(
     schedule: Vec<(regalloc::ValueId, ScheduledOp)>,
     uses_map: Vec<Vec<regalloc::ValueId>>,
-    ctx: EmitCtx,
+    backend: &mut B,
 ) -> Result<CompileResult, &'static str> {
-    // 2. Collect pre-colored values (variables -> input registers).
-    let mut precolored: alloc::collections::BTreeMap<regalloc::ValueId, Reg> =
-        alloc::collections::BTreeMap::new();
+    use alloc::collections::BTreeMap;
+
+    // Pre-colored values (variables -> input registers).
+    let mut precolored: BTreeMap<regalloc::ValueId, Reg> = BTreeMap::new();
     for (vid, op) in &schedule {
         if let ScheduledOp::Var(i) = op {
             if (*i as usize) >= INPUT_REGS.len() {
@@ -2283,77 +2345,39 @@ fn compile_from_schedule(
         }
     }
 
-    // 3. Register allocation: linear scan with Belady eviction.
-    //
-    // Our expressions are pure arithmetic DAGs in SSA form with ~22 scratch
-    // registers and typical live sets of 10-15. Graph coloring gives optimal
-    // register assignment (minimum registers) but builds an expensive O(n²)
-    // interference graph. With abundant registers relative to live-set width,
-    // linear scan produces identical or near-identical allocations at O(n×k)
-    // cost — effectively O(n) for k=22.
-    let allocation = regalloc::linear_scan(
-        &schedule,
-        &uses_map,
-        &precolored,
-        ctx.max_regs,
-        SCRATCH_BASE,
-    );
-
-    // 5. Layout: Allocation → FrameLayout
+    // Register allocation (linear scan + Belady eviction + spilling).
+    let allocation =
+        regalloc::linear_scan(&schedule, &uses_map, &precolored, backend.num_regs(), SCRATCH_BASE);
     let layout = FrameLayout::from_allocation(&allocation.spilled)?;
 
-    // 6. Analyze Select nodes for short-circuit opportunities
+    // Select short-circuit guards.
     let select_guards = analyze_select_guards(&schedule);
+    let sched_len = schedule.len();
 
-    // Build lookup structures for guard boundaries.
-    // For each schedule index, track if it's the start/end of a guarded arm region.
-    //
-    // At true_range.start:  emit "if mask all-false, skip to true_range.end"
-    // At false_range.start: emit "if mask all-true, skip to false_range.end"
-    // At select_idx: the BSL itself now only runs when lanes diverge (mixed mask)
-    use alloc::collections::BTreeMap;
-
-    // Map: schedule_idx → (guard_ref_idx, arm_kind)
-    // arm_kind: 0 = true-arm start, 1 = false-arm start
-    // At Select node: emit short-circuit MOVs + branch around BSL
     struct PendingBranch {
-        /// Index into select_guards
         guard_idx: usize,
-        /// 0 = true arm, 1 = false arm
         arm: u8,
     }
-
-    // Pre-compute: for each schedule index, what branches start/end here.
-    // Dense Vecs indexed by schedule index replace BTreeMaps for O(1) access.
-    let sched_len = schedule.len();
     let mut branch_starts: alloc::vec::Vec<alloc::vec::Vec<PendingBranch>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     let mut branch_ends: alloc::vec::Vec<alloc::vec::Vec<usize>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
-
     for (gi, guard) in select_guards.iter().enumerate() {
         if guard.true_range.0 != guard.true_range.1 {
-            branch_starts[guard.true_range.0].push(PendingBranch {
-                guard_idx: gi,
-                arm: 0,
-            });
+            branch_starts[guard.true_range.0].push(PendingBranch { guard_idx: gi, arm: 0 });
             if guard.true_range.1 < sched_len {
                 branch_ends[guard.true_range.1].push(gi);
             }
         }
         if guard.false_range.0 != guard.false_range.1 {
-            branch_starts[guard.false_range.0].push(PendingBranch {
-                guard_idx: gi,
-                arm: 1,
-            });
+            branch_starts[guard.false_range.0].push(PendingBranch { guard_idx: gi, arm: 1 });
             if guard.false_range.1 < sched_len {
                 branch_ends[guard.false_range.1].push(gi);
             }
         }
     }
 
-    // Build dense register/spill/remat lookup Vecs for O(1) access during emission.
-    // These replace repeated BTreeMap lookups that occur 3-6 times per schedule node.
+    // Dense ValueId -> location lookups for the hot loop.
     let max_vid = schedule.iter().map(|(v, _)| v.0).max().unwrap_or(0) as usize;
     let mut reg_for: alloc::vec::Vec<Option<Reg>> = alloc::vec![None; max_vid + 1];
     for (&vid, &reg) in &allocation.assignment {
@@ -2368,113 +2392,44 @@ fn compile_from_schedule(
         remat_for[vid.0 as usize] = Some(bits);
     }
 
-    // 7. Build constant pool from schedule (pre-seed with ScheduledOp::Const values;
-    //    builtins will add their polynomial coefficients incrementally during emission).
-    let mut pool = ConstPool::from_schedule(&schedule)?;
+    backend.begin(&schedule)?;
 
-    // Guard: bail early if the expression alone nearly fills the pool.
-    // Builtins (sin, cos, atan2, etc.) add up to ~60 polynomial coefficients
-    // during emission. If the expression constants + builtin headroom exceed
-    // the aarch64 12-bit LDR offset limit, the expression is too large to compile.
-    const BUILTIN_HEADROOM: usize = 128;
-    if pool.entries.len() + BUILTIN_HEADROOM > 4095 {
-        return Err("expression too large: constant pool would exceed 12-bit LDR offset limit");
-    }
+    let mut code: Vec<u8> = Vec::new();
+    backend.prologue(&mut code, layout.frame_size);
 
-    // 8. Resolve + Emit: (Schedule, Allocation, Layout) → MachineCode
-    let mut code = Vec::new();
+    let mut pending_patches: BTreeMap<(usize, u8), B::Branch> = BTreeMap::new();
 
-    // Prologue: allocate stack frame if we spilled
-    if layout.frame_size > 0 {
-        aarch64::emit_sub_sp(&mut code, layout.frame_size);
-    }
-
-    // Always emit ADR X17 placeholder — builtins (sin, cos, atan2, etc.) add
-    // their polynomial coefficients to the pool incrementally during emission,
-    // so we can't know at this point whether the pool will be empty.
-    let adr_patch_pos = aarch64::emit_adr_x17_placeholder(&mut code);
-
-    // Track pending branch patches: (guard_idx, arm) → code position to patch
-    let mut pending_patches: BTreeMap<(usize, u8), usize> = BTreeMap::new();
-
-    // Emit each scheduled operation via resolve → plan → emit,
-    // with Select short-circuit branches inserted at guard boundaries.
     for (sched_idx, (vid, sched_op)) in schedule.iter().enumerate() {
-        // Check if any guard branches need to be emitted before this instruction
-        if !branch_starts[sched_idx].is_empty() {
-            // Drain indices to avoid borrow issues with `code`
-            let n_branches = branch_starts[sched_idx].len();
-            for bi in 0..n_branches {
-                let (guard_idx, arm) = {
-                    let pb = &branch_starts[sched_idx][bi];
-                    (pb.guard_idx, pb.arm)
-                };
-                let guard = &select_guards[guard_idx];
-                // Resolve mask register
-                let mask_reg = emit_resolve_dense(
-                    &mut code,
-                    guard.mask_vid,
-                    RELOAD_REG,
-                    &reg_for,
-                    &spill_for,
-                    &remat_for,
-                    &pool,
-                );
+        // Guard branches that begin before this instruction.
+        for bi in 0..branch_starts[sched_idx].len() {
+            let (guard_idx, arm) = {
+                let pb = &branch_starts[sched_idx][bi];
+                (pb.guard_idx, pb.arm)
+            };
+            let guard = &select_guards[guard_idx];
+            let mask_reg = backend.emit_resolve(
+                &mut code, guard.mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for,
+            );
+            let branch = match arm {
+                0 => backend.emit_skip_if_all_false(&mut code, mask_reg),
+                _ => backend.emit_skip_if_all_true(&mut code, mask_reg),
+            };
+            pending_patches.insert((guard_idx, arm), branch);
+        }
 
-                match arm {
-                    0 => {
-                        // True arm start: skip if mask is all-false (no true lanes).
-                        // UMAXV S_scratch, V_mask.4S → if max==0, all lanes are false
-                        // We use v28 as scratch for the horizontal reduction
-                        let scratch = Reg(28);
-                        aarch64::emit_umaxv(&mut code, scratch, mask_reg);
-                        aarch64::emit_fmov_to_gp(&mut code, scratch);
-                        let patch = aarch64::emit_cbz_w16(&mut code);
-                        pending_patches.insert((guard_idx, 0), patch);
-                    }
-                    1 => {
-                        // False arm start: skip if mask is all-true (no false lanes).
-                        // UMINV S_scratch, V_mask.4S → if min==0xFFFFFFFF, all lanes are true
-                        let scratch = Reg(28);
-                        aarch64::emit_uminv(&mut code, scratch, mask_reg);
-                        aarch64::emit_fmov_to_gp(&mut code, scratch);
-                        // If UMINV result != 0, the minimum lane is nonzero, so check if it's all-ones.
-                        // Actually: if all lanes are 0xFFFFFFFF, UMINV = 0xFFFFFFFF.
-                        // We want to skip if ALL true, i.e., UMINV == 0xFFFFFFFF.
-                        // 0xFFFFFFFF as u32 is -1. CBZ won't fire. CBNZ will fire (skip).
-                        // But we need "skip if all-true" = "skip if UMINV == 0xFFFFFFFF"
-                        // = "skip if W16 == 0xFFFFFFFF"
-                        // We can use: CMP W16, #0; CSINV W16, WZR, WZR, NE; CBZ W16, skip
-                        // Or simpler: MVN W16, W16; CBZ W16, skip (if ~0xFFFFFFFF == 0)
-                        // MVN W16, W16 — bitwise NOT
-                        aarch64::emit32(&mut code, 0x2A3003F0); // ORN W16, WZR, W16 = MVN W16, W16
-                        let patch = aarch64::emit_cbz_w16(&mut code);
-                        pending_patches.insert((guard_idx, 1), patch);
-                    }
-                    _ => unreachable!(),
-                }
+        // Guard branches that end at this instruction (patch their targets).
+        for ei in 0..branch_ends[sched_idx].len() {
+            let gi = branch_ends[sched_idx][ei];
+            if let Some(branch) = pending_patches.remove(&(gi, 0)) {
+                let target = code.len();
+                backend.patch_branch(&mut code, branch, target);
+            }
+            if let Some(branch) = pending_patches.remove(&(gi, 1)) {
+                let target = code.len();
+                backend.patch_branch(&mut code, branch, target);
             }
         }
 
-        // Check if any guard branches end at this instruction (patch targets)
-        if !branch_ends[sched_idx].is_empty() {
-            let n_ends = branch_ends[sched_idx].len();
-            for ei in 0..n_ends {
-                let gi = branch_ends[sched_idx][ei];
-                // Patch the true-arm branch (arm=0) if it exists
-                if let Some(patch_pos) = pending_patches.remove(&(gi, 0)) {
-                    let target = code.len();
-                    aarch64::patch_cbz_cbnz(&mut code, patch_pos, target);
-                }
-                // Patch the false-arm branch (arm=1) if it exists
-                if let Some(patch_pos) = pending_patches.remove(&(gi, 1)) {
-                    let target = code.len();
-                    aarch64::patch_cbz_cbnz(&mut code, patch_pos, target);
-                }
-            }
-        }
-
-        // Emit the instruction itself
         let dst_loc = resolve_dst_loc_dense(*vid, &reg_for, &spill_for, &remat_for);
         let plan = resolve_operands(
             sched_op,
@@ -2484,151 +2439,230 @@ fn compile_from_schedule(
             &allocation.rematerialize,
         )?;
 
-        // For Select nodes that have guards, emit a short-circuit wrapper:
-        // If mask is uniform, just MOV the correct arm to dst (BSL not needed).
+        // Select with a guard region: emit a uniform-mask short-circuit wrapper.
         if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sched_op {
-            let guard = select_guards.iter().find(|g| g.select_idx == sched_idx);
-            if let Some(guard) = guard {
-                let has_true_guard = guard.true_range.0 != guard.true_range.1;
-                let has_false_guard = guard.false_range.0 != guard.false_range.1;
-
-                if has_true_guard || has_false_guard {
-                    // Resolve mask register for the all-lanes check
-                    let mask_reg = emit_resolve_dense(
-                        &mut code, *mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for, &pool,
+            if let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx) {
+                let has_true = guard.true_range.0 != guard.true_range.1;
+                let has_false = guard.false_range.0 != guard.false_range.1;
+                if has_true || has_false {
+                    let mask_reg = backend.emit_resolve(
+                        &mut code, *mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for,
                     );
-
                     let dst = match dst_loc {
                         Loc::Reg(r) => r,
                         Loc::Spill(_) => RELOAD_REGS[0],
                     };
-
-                    // Resolve true and false arm registers via dense O(1) lookup
                     let true_reg = reg_for.get(true_vid.0 as usize).and_then(|r| *r);
                     let false_reg = reg_for.get(false_vid.0 as usize).and_then(|r| *r);
 
-                    // Check all-false: UMAXV → FMOV → CBZ (if max==0, mask is all-false → use false arm)
-                    let scratch = Reg(28);
-                    aarch64::emit_umaxv(&mut code, scratch, mask_reg);
-                    aarch64::emit_fmov_to_gp(&mut code, scratch);
-                    let all_false_branch = aarch64::emit_cbz_w16(&mut code);
+                    let all_false = backend.emit_skip_if_all_false(&mut code, mask_reg);
+                    let all_true = backend.emit_skip_if_all_true(&mut code, mask_reg);
 
-                    // Check all-true: UMINV → FMOV → MVN → CBZ (if ~min==0, mask is all-true → use true arm)
-                    aarch64::emit_uminv(&mut code, scratch, mask_reg);
-                    aarch64::emit_fmov_to_gp(&mut code, scratch);
-                    aarch64::emit32(&mut code, 0x2A3003F0); // MVN W16, W16
-                    let all_true_branch = aarch64::emit_cbz_w16(&mut code);
+                    // Mixed lanes: the real select.
+                    backend.emit_plan(&mut code, &plan)?;
+                    let skip_end = backend.emit_jump(&mut code);
 
-                    // Mixed path: emit BSL (both arms already computed)
-                    emit_instruction_plan(&mut code, &plan, &mut pool)?;
-                    let skip_to_end = aarch64::emit_b(&mut code);
-
-                    // All-false target: MOV dst ← false_arm
+                    // All-false: dst <- false arm.
                     let all_false_target = code.len();
                     if let Some(freg) = false_reg {
-                        emit_mov_reg(&mut code, dst, freg);
+                        backend.emit_mov(&mut code, dst, freg);
                     } else {
-                        emit_resolve_dense(
-                            &mut code, *false_vid, dst, &reg_for, &spill_for, &remat_for, &pool,
-                        );
+                        backend.emit_resolve(&mut code, *false_vid, dst, &reg_for, &spill_for, &remat_for);
                     }
-                    let skip_to_end2 = aarch64::emit_b(&mut code);
+                    let skip_end2 = backend.emit_jump(&mut code);
 
-                    // All-true target: MOV dst ← true_arm
+                    // All-true: dst <- true arm.
                     let all_true_target = code.len();
                     if let Some(treg) = true_reg {
-                        emit_mov_reg(&mut code, dst, treg);
+                        backend.emit_mov(&mut code, dst, treg);
                     } else {
-                        emit_resolve_dense(
-                            &mut code, *true_vid, dst, &reg_for, &spill_for, &remat_for, &pool,
-                        );
+                        backend.emit_resolve(&mut code, *true_vid, dst, &reg_for, &spill_for, &remat_for);
                     }
 
-                    // End target (after all paths)
                     let end_target = code.len();
+                    backend.patch_branch(&mut code, all_false, all_false_target);
+                    backend.patch_branch(&mut code, all_true, all_true_target);
+                    backend.patch_branch(&mut code, skip_end, end_target);
+                    backend.patch_branch(&mut code, skip_end2, end_target);
 
-                    // Patch branches
-                    aarch64::patch_cbz_cbnz(&mut code, all_false_branch, all_false_target);
-                    aarch64::patch_cbz_cbnz(&mut code, all_true_branch, all_true_target);
-                    aarch64::patch_b(&mut code, skip_to_end, end_target);
-                    aarch64::patch_b(&mut code, skip_to_end2, end_target);
-
-                    // Store if spilled
                     if let Loc::Spill(offset) = dst_loc {
-                        aarch64::emit_str_sp(&mut code, dst, offset);
+                        backend.emit_store(&mut code, dst, offset)?;
                     }
-
-                    continue; // Skip the normal emit_instruction_plan below
+                    continue;
                 }
             }
         }
 
-        emit_instruction_plan(&mut code, &plan, &mut pool)?;
+        backend.emit_plan(&mut code, &plan)?;
     }
 
-    // Verify no pending patches remain unresolved
     assert!(
         pending_patches.is_empty(),
-        "BUG: {} Select short-circuit branches were never patched — \
-         arm regions don't end before the schedule does",
+        "BUG: {} Select short-circuit branches were never patched",
         pending_patches.len()
     );
 
-    // Epilogue: move result to v0, restore SP, RET
     let root = schedule.last().map(|(v, _)| *v).expect("empty schedule");
-    let result_reg = emit_resolve_dense(
-        &mut code, root, RELOAD_REG, &reg_for, &spill_for, &remat_for, &pool,
-    );
-
-    if result_reg.0 != 0 {
-        emit_mov_reg(&mut code, Reg(0), result_reg);
-    }
-
-    if layout.frame_size > 0 {
-        aarch64::emit_add_sp(&mut code, layout.frame_size);
-    }
-
-    // RET
-    code.extend_from_slice(&0xD65F03C0u32.to_le_bytes());
-
-    // Emit constant pool after RET and patch ADR X17.
-    // If the pool ended up empty (no constants needed), the ADR is harmless —
-    // it just sets X17 to an unused address. The 4-byte placeholder cost is
-    // negligible compared to the code savings from pool loads.
-    if !pool.is_empty() {
-        let adr_pos = adr_patch_pos;
-        // If the pool is going to be far away, upgrade ADR to ADRP + ADD.
-        // We check against 1MB (1 << 20) minus a small margin for alignment padding.
-        let estimated_offset = (code.len() as i64) - (adr_pos as i64);
-        let needs_adrp = estimated_offset >= (1 << 20) - 32;
-
-        if needs_adrp {
-            // We need 8 bytes instead of 4. Insert 4 dummy bytes right after the ADR placeholder.
-            // Since this is in the prologue, no PC-relative branches cross this insertion point,
-            // meaning all previously emitted branches remain perfectly valid.
-            code.splice(adr_pos + 4..adr_pos + 4, [0, 0, 0, 0]);
-        }
-
-        // Align pool start to 16 bytes (LDR Q requires 16-byte aligned data)
-        while code.len() % 16 != 0 {
-            code.push(0);
-        }
-        let pool_start = code.len();
-        for &bits in &pool.entries {
-            aarch64::emit_pool_entry(&mut code, bits);
-        }
-        aarch64::patch_adr_or_adrp(&mut code, adr_pos, pool_start, needs_adrp);
-    }
+    let result_reg =
+        backend.emit_resolve(&mut code, root, RELOAD_REG, &reg_for, &spill_for, &remat_for);
+    backend.epilogue(&mut code, result_reg, layout.frame_size);
 
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
-
     Ok(CompileResult {
         code: exec,
         spill_count: layout.spill_slots.len() as u32,
         spill_bytes: layout.frame_size,
-        max_regs: ctx.max_regs,
+        max_regs: backend.num_regs(),
     })
 }
+
+/// A pending aarch64 branch: CBZ and B are patched differently.
+#[cfg(target_arch = "aarch64")]
+enum Aarch64Branch {
+    Cbz(usize),
+    B(usize),
+}
+
+/// aarch64 implementation of the shared driver's leaf operations.
+///
+/// Mechanically wraps the existing aarch64 encoders + constant pool, so the
+/// emitted code is the same as the previous bespoke `compile_from_schedule`.
+#[cfg(target_arch = "aarch64")]
+struct Aarch64Backend {
+    pool: ConstPool,
+    adr_patch_pos: usize,
+    max_regs: u8,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl IsaBackend for Aarch64Backend {
+    type Branch = Aarch64Branch;
+
+    fn num_regs(&self) -> u8 {
+        self.max_regs
+    }
+
+    fn begin(&mut self, schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str> {
+        self.pool = ConstPool::from_schedule(schedule)?;
+        // Builtins add up to ~60 polynomial coefficients during emission; bail
+        // if the expression constants + headroom would exceed the 12-bit LDR
+        // offset limit.
+        const BUILTIN_HEADROOM: usize = 128;
+        if self.pool.entries.len() + BUILTIN_HEADROOM > 4095 {
+            return Err("expression too large: constant pool would exceed 12-bit LDR offset limit");
+        }
+        Ok(())
+    }
+
+    fn prologue(&mut self, code: &mut Vec<u8>, frame_size: u32) {
+        if frame_size > 0 {
+            aarch64::emit_sub_sp(code, frame_size);
+        }
+        // Builtins may add pool entries during emission, so always reserve the
+        // ADR anchor (harmless if the pool ends up empty).
+        self.adr_patch_pos = aarch64::emit_adr_x17_placeholder(code);
+    }
+
+    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
+        emit_instruction_plan(code, plan, &mut self.pool)
+    }
+
+    fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
+        emit_mov_reg(code, dst, src);
+    }
+
+    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str> {
+        aarch64::emit_str_sp(code, src, offset);
+        Ok(())
+    }
+
+    fn emit_resolve(
+        &mut self,
+        code: &mut Vec<u8>,
+        vid: regalloc::ValueId,
+        target: Reg,
+        reg_for: &[Option<Reg>],
+        spill_for: &[Option<u32>],
+        remat_for: &[Option<u32>],
+    ) -> Reg {
+        emit_resolve_dense(code, vid, target, reg_for, spill_for, remat_for, &self.pool)
+    }
+
+    fn emit_skip_if_all_false(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> Aarch64Branch {
+        let scratch = Reg(28);
+        aarch64::emit_umaxv(code, scratch, mask_reg); // max lane; 0 => all-false
+        aarch64::emit_fmov_to_gp(code, scratch);
+        Aarch64Branch::Cbz(aarch64::emit_cbz_w16(code))
+    }
+
+    fn emit_skip_if_all_true(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> Aarch64Branch {
+        let scratch = Reg(28);
+        aarch64::emit_uminv(code, scratch, mask_reg); // min lane; 0xFFFFFFFF => all-true
+        aarch64::emit_fmov_to_gp(code, scratch);
+        aarch64::emit32(code, 0x2A3003F0); // MVN W16, W16  -> 0 iff all-true
+        Aarch64Branch::Cbz(aarch64::emit_cbz_w16(code))
+    }
+
+    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Aarch64Branch {
+        Aarch64Branch::B(aarch64::emit_b(code))
+    }
+
+    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Aarch64Branch, target: usize) {
+        match branch {
+            Aarch64Branch::Cbz(p) => aarch64::patch_cbz_cbnz(code, p, target),
+            Aarch64Branch::B(p) => aarch64::patch_b(code, p, target),
+        }
+    }
+
+    fn epilogue(&mut self, code: &mut Vec<u8>, result_reg: Reg, frame_size: u32) {
+        if result_reg.0 != 0 {
+            emit_mov_reg(code, Reg(0), result_reg);
+        }
+        if frame_size > 0 {
+            aarch64::emit_add_sp(code, frame_size);
+        }
+        // RET
+        code.extend_from_slice(&0xD65F03C0u32.to_le_bytes());
+
+        // Emit the constant pool after RET and anchor X17.
+        if !self.pool.is_empty() {
+            let adr_pos = self.adr_patch_pos;
+            let estimated_offset = (code.len() as i64) - (adr_pos as i64);
+            let needs_adrp = estimated_offset >= (1 << 20) - 32;
+            if needs_adrp {
+                code.splice(adr_pos + 4..adr_pos + 4, [0, 0, 0, 0]);
+            }
+            while code.len() % 16 != 0 {
+                code.push(0);
+            }
+            let pool_start = code.len();
+            for &bits in &self.pool.entries {
+                aarch64::emit_pool_entry(code, bits);
+            }
+            aarch64::patch_adr_or_adrp(code, adr_pos, pool_start, needs_adrp);
+        }
+    }
+}
+
+/// Shared compilation backend: schedule + uses_map -> CompileResult.
+///
+/// `compile_arena_dag_with_ctx` and the scanline compilers all produce the same
+/// `(schedule, uses_map)` format and then converge on the architecture-shared
+/// [`compile_dag_via_backend`] driver via [`Aarch64Backend`].
+#[cfg(target_arch = "aarch64")]
+fn compile_from_schedule(
+    schedule: Vec<(regalloc::ValueId, ScheduledOp)>,
+    uses_map: Vec<Vec<regalloc::ValueId>>,
+    ctx: EmitCtx,
+) -> Result<CompileResult, &'static str> {
+    let mut backend = Aarch64Backend {
+        pool: ConstPool::new(),
+        adr_patch_pos: 0,
+        max_regs: ctx.max_regs,
+    };
+    compile_dag_via_backend(schedule, uses_map, &mut backend)
+}
+
 
 /// Info about an operation in the schedule.
 #[derive(Debug, Clone)]
@@ -3474,33 +3508,34 @@ pub fn compile_arena_dag_with_ctx(
 }
 
 // =============================================================================
-// x86-64 via the SHARED schedule → regalloc → resolve pipeline (with spilling).
+// x86-64 IsaBackend: the leaf emit for the SHARED single-pixel driver.
 // =============================================================================
 //
-// The single-pixel path above (`emit_arena`) is the stateless Sethi-Ullman tree
-// emitter: no spilling, hard-errors when the expression exceeds the SSE register
-// budget. This path instead reuses the architecture-independent pipeline the
-// aarch64 backend already uses — `arena_to_schedule` → `linear_scan` (Belady +
-// spilling) → `FrameLayout` → `resolve_operands` → `InstructionPlan` — and adds
-// only the x86 emit step. First step of unifying the two backends.
+// `compile_dag_via_backend` owns the control flow (schedule, regalloc, Select
+// short-circuit guards, root handling) for BOTH architectures; this is just the
+// x86 instruction encoding behind that seam, so x86 and aarch64 run the same
+// driver (no "works on my machine" divergence between them).
 //
-// Scope of THIS slice: the arithmetic/unary op subset (Var, Const, Unary,
-// Binary). FMA-fusion, Select, Clamp, and binary transcendentals produce
-// `ResolvedOp` variants this emitter rejects loudly — they (and the scanline
-// form) are the next step. Spills go to the System V red zone (the kernel is a
-// leaf): a `FrameLayout` slot at byte `offset` maps to `[rsp - (offset + 16)]`.
+// Spills go to the System V red zone (the kernel is a leaf): a `FrameLayout`
+// slot at byte `offset` maps to `[rsp - (offset + 16)]`.
 //
-// Register roles: xmm0-3 inputs (precolored), xmm4-10 allocatable (7),
-// xmm11-12 reload (`RELOAD_REGS`), xmm13 the two-operand hazard scratch.
+// Register roles: xmm0-3 inputs (precolored), xmm4-9 allocatable (6),
+// xmm10 fixed scratch (binary two-operand hazard + select temp), xmm11-12
+// reload (`RELOAD_REGS`), xmm13-15 builtin scratch.
 
-/// Allocatable scratch register count handed to `linear_scan` on x86 (xmm4-10).
+/// Allocatable scratch register count handed to `linear_scan` on x86 (xmm4-9).
 #[cfg(target_arch = "x86_64")]
-const X86_SCHED_NUM_REGS: u8 = 7;
+const X86_SCHED_NUM_REGS: u8 = 6;
 
-/// Scratch for the binary two-operand hazard (see `emit_binary_safe`). Distinct
-/// from the allocatable range (4-10) and the reload regs (11-12).
+/// Fixed scratch outside the allocatable range / reload regs: used for the
+/// binary two-operand hazard and as the select blend temp.
 #[cfg(target_arch = "x86_64")]
-const X86_HAZARD_SCRATCH: Reg = Reg(13);
+const X86_SCRATCH: Reg = Reg(10);
+
+/// Scratch quad for builtins / const materialization. Clear of the reload regs
+/// (11,12) so reloaded operands are never clobbered, and of `X86_SCRATCH`.
+#[cfg(target_arch = "x86_64")]
+const X86_BUILTIN_SCRATCH: [Reg; 4] = [Reg(13), Reg(14), Reg(15), Reg(13)];
 
 /// Map a `FrameLayout` spill offset to a red-zone `[rsp+disp8]` displacement.
 #[cfg(target_arch = "x86_64")]
@@ -3517,9 +3552,9 @@ fn x86_redzone_disp(offset: u32) -> Result<i8, &'static str> {
 /// assignment from the allocator.
 ///
 /// `emit_binary` computes `dst <- left; dst op= right`, which corrupts `right`
-/// when `dst == right` and `dst != left`. The Sethi-Ullman path avoids that by
-/// construction; here the allocator may assign `dst == right`, so handle it:
-/// swap for commutative ops, otherwise stash `right` in the hazard scratch.
+/// when `dst == right` and `dst != left`. The allocator may assign `dst ==
+/// right`, so handle it: swap for commutative ops, otherwise stash `right` in
+/// the fixed scratch.
 #[cfg(target_arch = "x86_64")]
 fn emit_binary_safe(code: &mut Vec<u8>, op: OpKind, dst: Reg, left: Reg, right: Reg) {
     use x86_64::*;
@@ -3528,159 +3563,159 @@ fn emit_binary_safe(code: &mut Vec<u8>, op: OpKind, dst: Reg, left: Reg, right: 
         OpKind::Add | OpKind::Mul | OpKind::Min | OpKind::Max | OpKind::Eq | OpKind::Ne
     );
     if dst == left || dst != right {
-        // dst==left: in-place. dst!=right: the `movaps dst,left` is safe.
         emit_binary(code, op, dst, left, right);
     } else if commutative {
-        // dst==right, dst!=left: `dst (==right) op= left` == left op right.
         emit_binary(code, op, dst, right, left);
     } else {
-        // dst==right, dst!=left, non-commutative: stash right, then left op right.
-        emit_movaps(code, X86_HAZARD_SCRATCH, right);
+        emit_movaps(code, X86_SCRATCH, right);
         emit_movaps(code, dst, left);
-        emit_binary(code, op, dst, dst, X86_HAZARD_SCRATCH);
+        emit_binary(code, op, dst, dst, X86_SCRATCH);
     }
 }
 
-/// Emit one resolved `InstructionPlan` as x86-64 (AVX) machine code.
+/// x86-64 implementation of the shared driver's leaf operations.
 #[cfg(target_arch = "x86_64")]
-fn emit_plan_x86(code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
-    use x86_64::*;
-    // emit_const and the Neg/Abs unaries take xmm scratch; keep it clear of the
-    // reload regs (11,12) so reloaded operands are never clobbered.
-    let scratch = [Reg(13), Reg(14), Reg(15), Reg(13)];
+struct X86Backend;
 
-    // 1. Reloads (spilled operands / rematerialized constants) into their targets.
-    for reload in &plan.reloads {
-        match reload {
-            Reload::FromStack { target, offset } => {
-                emit_movups_load_rsp(code, *target, x86_redzone_disp(*offset)?);
+#[cfg(target_arch = "x86_64")]
+impl IsaBackend for X86Backend {
+    /// rel32 field offset of the branch (uniform for jcc/jmp on x86).
+    type Branch = usize;
+
+    fn num_regs(&self) -> u8 {
+        X86_SCHED_NUM_REGS
+    }
+
+    fn begin(&mut self, _schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str> {
+        Ok(()) // x86 const loads are self-contained; no pool.
+    }
+
+    fn prologue(&mut self, _code: &mut Vec<u8>, _frame_size: u32) {
+        // Spills use the red zone; no frame to set up for a leaf.
+    }
+
+    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
+        use x86_64::*;
+        for reload in &plan.reloads {
+            match reload {
+                Reload::FromStack { target, offset } => {
+                    emit_movups_load_rsp(code, *target, x86_redzone_disp(*offset)?);
+                }
+                Reload::Const { target, val_bits } => {
+                    emit_const(code, *target, f32::from_bits(*val_bits), X86_BUILTIN_SCRATCH);
+                }
             }
-            Reload::Const { target, val_bits } => {
-                emit_const(code, *target, f32::from_bits(*val_bits), scratch);
+        }
+        if let Some((dst, src)) = plan.setup_mov {
+            emit_movaps(code, dst, src);
+        }
+        match &plan.op {
+            ResolvedOp::Nop => {}
+            ResolvedOp::LoadConst { dst, val_bits } => {
+                emit_const(code, *dst, f32::from_bits(*val_bits), X86_BUILTIN_SCRATCH);
+            }
+            ResolvedOp::Unary { op, dst, src } => {
+                emit_unary(code, *op, *dst, *src, X86_BUILTIN_SCRATCH);
+            }
+            ResolvedOp::Binary { op, dst, left, right } => match op {
+                OpKind::Atan2 | OpKind::Pow | OpKind::Hypot => {
+                    emit_binary_transcendental(code, *op, *dst, *left, *right, X86_BUILTIN_SCRATCH);
+                }
+                _ => emit_binary_safe(code, *op, *dst, *left, *right),
+            },
+            ResolvedOp::Select { dst, if_true, if_false } => {
+                // setup_mov already placed the mask in `dst`; blend in place.
+                emit_select(code, *dst, *dst, *if_true, *if_false, X86_SCRATCH);
+            }
+            // FMA-fusion and Clamp lower through ResolvedOp variants whose x86
+            // emit isn't wired yet; reject loudly rather than miscompile.
+            ResolvedOp::FusedMulAdd { .. }
+            | ResolvedOp::DecomposedMulAdd { .. }
+            | ResolvedOp::Clamp { .. } => {
+                return Err("x86 scheduled path: FMA/clamp not yet supported");
             }
         }
+        if let Some(store) = &plan.store {
+            emit_movups_store_rsp(code, store.src, x86_redzone_disp(store.offset)?);
+        }
+        Ok(())
     }
 
-    // 2. Setup MOV (unused by this op subset, but emit it if present).
-    if let Some((dst, src)) = plan.setup_mov {
-        emit_movaps(code, dst, src);
+    fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
+        x86_64::emit_movaps(code, dst, src);
     }
 
-    // 3. Main op.
-    match &plan.op {
-        ResolvedOp::Nop => {}
-        ResolvedOp::LoadConst { dst, val_bits } => {
-            emit_const(code, *dst, f32::from_bits(*val_bits), scratch);
-        }
-        ResolvedOp::Unary { op, dst, src } => {
-            emit_unary(code, *op, *dst, *src, scratch);
-        }
-        ResolvedOp::Binary {
-            op,
-            dst,
-            left,
-            right,
-        } => {
-            emit_binary_safe(code, *op, *dst, *left, *right);
-        }
-        // The next slice: these need FMA decomposition / horizontal reductions.
-        ResolvedOp::FusedMulAdd { .. }
-        | ResolvedOp::DecomposedMulAdd { .. }
-        | ResolvedOp::Select { .. }
-        | ResolvedOp::Clamp { .. } => {
-            return Err("x86 scheduled path: op not yet supported (FMA/select/clamp)");
+    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str> {
+        x86_64::emit_movups_store_rsp(code, src, x86_redzone_disp(offset)?);
+        Ok(())
+    }
+
+    fn emit_resolve(
+        &mut self,
+        code: &mut Vec<u8>,
+        vid: regalloc::ValueId,
+        target: Reg,
+        reg_for: &[Option<Reg>],
+        spill_for: &[Option<u32>],
+        remat_for: &[Option<u32>],
+    ) -> Reg {
+        let idx = vid.0 as usize;
+        if let Some(Some(reg)) = reg_for.get(idx) {
+            *reg
+        } else if let Some(Some(bits)) = remat_for.get(idx) {
+            x86_64::emit_const(code, target, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
+            target
+        } else if let Some(Some(offset)) = spill_for.get(idx) {
+            // Resolve is on a hot path with a known-valid frame; offset fits.
+            let disp = x86_redzone_disp(*offset).expect("spill offset within red zone");
+            x86_64::emit_movups_load_rsp(code, target, disp);
+            target
+        } else {
+            panic!("value {:?} has no register, spill slot, or rematerialize entry", vid);
         }
     }
 
-    // 4. Store (spilled result).
-    if let Some(store) = &plan.store {
-        emit_movups_store_rsp(code, store.src, x86_redzone_disp(store.offset)?);
+    fn emit_skip_if_all_false(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> usize {
+        x86_64::emit_movmskps_eax(code, mask_reg);
+        x86_64::emit_test_eax(code);
+        x86_64::emit_jcc_rel32(code, 0x84) // jz: taken when eax == 0 (all lanes false)
     }
 
-    Ok(())
+    fn emit_skip_if_all_true(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> usize {
+        x86_64::emit_movmskps_eax(code, mask_reg);
+        x86_64::emit_cmp_eax_imm8(code, 0x0F);
+        x86_64::emit_jcc_rel32(code, 0x84) // je: taken when eax == 0xF (all lanes true)
+    }
+
+    fn emit_jump(&mut self, code: &mut Vec<u8>) -> usize {
+        x86_64::emit_jmp_rel32(code)
+    }
+
+    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: usize, target: usize) {
+        x86_64::patch_rel32(code, branch, target);
+    }
+
+    fn epilogue(&mut self, code: &mut Vec<u8>, result_reg: Reg, _frame_size: u32) {
+        if result_reg.0 != 0 {
+            x86_64::emit_movaps(code, Reg(0), result_reg);
+        }
+        code.push(0xC3); // RET
+    }
 }
 
-/// Compile an arena DAG to a single-pixel kernel via the shared pipeline.
+/// Compile an arena DAG to a single-pixel kernel via the shared driver (x86).
 ///
-/// Same `KernelFn` ABI as [`compile_arena_dag`], but routed through
-/// schedule/regalloc/resolve with spilling instead of the Sethi-Ullman tree
-/// emitter, so deep expressions spill to the red zone rather than failing.
+/// Same `KernelFn` ABI as [`compile_arena_dag`], but routed through the
+/// architecture-independent `compile_dag_via_backend` (schedule → regalloc →
+/// Select guards → emit) — identical control flow to aarch64, with spilling.
 #[cfg(target_arch = "x86_64")]
 pub fn compile_arena_dag_scheduled(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<CompileResult, &'static str> {
-    use alloc::collections::BTreeMap;
-
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
-
-    let mut precolored: BTreeMap<regalloc::ValueId, Reg> = BTreeMap::new();
-    for (vid, op) in &schedule {
-        if let ScheduledOp::Var(i) = op {
-            if (*i as usize) >= INPUT_REGS.len() {
-                return Err("variable index out of range");
-            }
-            precolored.insert(*vid, INPUT_REGS[*i as usize]);
-        }
-    }
-
-    let allocation =
-        regalloc::linear_scan(&schedule, &uses, &precolored, X86_SCHED_NUM_REGS, SCRATCH_BASE);
-    let layout = FrameLayout::from_allocation(&allocation.spilled)?;
-
-    let mut code: Vec<u8> = Vec::new();
-    for (vid, op) in &schedule {
-        // A value that is only rematerialized (constant, no register, no spill)
-        // is recomputed at each use — its defining op emits nothing.
-        let assigned = allocation.assignment.get(vid);
-        let spilled = layout.spill_slots.get(vid);
-        if assigned.is_none() && spilled.is_none() && allocation.rematerialize.contains_key(vid) {
-            continue;
-        }
-        let dst_loc = match (assigned, spilled) {
-            (Some(&r), _) => Loc::Reg(r),
-            (None, Some(&off)) => Loc::Spill(off),
-            // No assignment/spill/remat: resolve_operands sends it to RELOAD_REGS[0].
-            (None, None) => Loc::Reg(RELOAD_REGS[0]),
-        };
-        let plan = resolve_operands(
-            op,
-            dst_loc,
-            &allocation.assignment,
-            &layout.spill_slots,
-            &allocation.rematerialize,
-        )?;
-        emit_plan_x86(&mut code, &plan)?;
-    }
-
-    // Move the root result into xmm0.
-    let root_vid = schedule.last().map(|(v, _)| *v).ok_or("empty schedule")?;
-    let scratch = [Reg(13), Reg(14), Reg(15), Reg(13)];
-    let result_reg = if let Some(&r) = allocation.assignment.get(&root_vid) {
-        r
-    } else if let Some(&bits) = allocation.rematerialize.get(&root_vid) {
-        x86_64::emit_const(&mut code, RELOAD_REGS[0], f32::from_bits(bits), scratch);
-        RELOAD_REGS[0]
-    } else if let Some(&off) = layout.spill_slots.get(&root_vid) {
-        x86_64::emit_movups_load_rsp(&mut code, RELOAD_REGS[0], x86_redzone_disp(off)?);
-        RELOAD_REGS[0]
-    } else {
-        return Err("root value has no location");
-    };
-    if result_reg.0 != 0 {
-        x86_64::emit_movaps(&mut code, Reg(0), result_reg);
-    }
-
-    code.push(0xC3); // RET
-
-    let code = unsafe { executable::ExecutableCode::from_code(&code)? };
-    Ok(CompileResult {
-        code,
-        spill_count: allocation.spilled.len() as u32,
-        spill_bytes: layout.frame_size,
-        max_regs: X86_SCHED_NUM_REGS,
-    })
+    compile_dag_via_backend(schedule, uses, &mut X86Backend)
 }
 
 /// Compile an [`ExprArena`] DAG into a scanline kernel (x86-64).
@@ -5024,6 +5059,34 @@ mod tests {
                 let got = run(&sched, px, py, 0.0, 0.0);
                 let tol = 1e-3 * want.abs().max(1.0);
                 assert!((got - want).abs() <= tol, "spill: got {got} want {want}");
+            }
+        }
+
+        /// Exercises the shared driver's Select short-circuit guard path on x86
+        /// (MOVMSKPS all-true/all-false branches): `(X > 0) ? Y*Y*Y : Z+Z+Z`,
+        /// with arm-exclusive subexpressions so a guard region forms. Uniform
+        /// inputs take the all-true / all-false branches.
+        #[test]
+        fn sched_select_guards() {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let z = a.push_var(2);
+            let zero = a.push_const(0.0);
+            let cond = a.push_binary(OpKind::Gt, x, zero); // X > 0 -> mask
+            let yy = a.push_binary(OpKind::Mul, y, y);
+            let yyy = a.push_binary(OpKind::Mul, yy, y); // true arm: Y^3
+            let zz = a.push_binary(OpKind::Add, z, z);
+            let zzz = a.push_binary(OpKind::Add, zz, z); // false arm: 3Z
+            let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
+
+            let sched = compile_arena_dag_scheduled(&a, root).expect("scheduled compile");
+
+            // x>0 -> all-true -> Y^3 ; x<=0 -> all-false -> 3Z.
+            for &(px, py, pz, _pw) in PTS {
+                let want = if px > 0.0 { py * py * py } else { 3.0 * pz };
+                let got = run(&sched, px, py, pz, 0.0);
+                assert!((got - want).abs() <= 1e-3, "select: ({px},{py},{pz}) got {got} want {want}");
             }
         }
     }
