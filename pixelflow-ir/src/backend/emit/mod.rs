@@ -411,9 +411,55 @@ fn needs_arena(arena: &ExprArena, id: ExprId) -> usize {
 #[cfg(target_arch = "x86_64")]
 const X86_MAX_VALUE_REG: u8 = 11;
 
+/// A value together with its derivative components, in register form.
+///
+/// `partials` is empty for a plain value — i.e. a `Field`, which in this model
+/// is just "Jet0" (zeroth-order: value, no derivatives). A first-order jet over
+/// `d` seeded directions carries `d` partial registers (`∂/∂dir`), matching
+/// `Jet2`/`Jet3` in `pixelflow-core`. The same `value + components` shape
+/// extends to higher order (a Hessian adds the second-order components) without
+/// changing this type — that generalization is deliberately *not* built yet.
 #[cfg(target_arch = "x86_64")]
-fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg), &'static str> {
+struct Jet {
+    val: Reg,
+    /// Forward-mode first partials, one per seeded direction. Empty == Jet0.
+    // Always empty until dual lowering lands (the `seed.is_empty()` guard in
+    // `emit_arena`); kept so the value/derivative shape is in place.
+    #[allow(dead_code)]
+    partials: alloc::vec::Vec<Reg>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Jet {
+    /// A zeroth-order jet (a plain `Field` value, no derivatives).
+    fn value(reg: Reg) -> Self {
+        Self {
+            val: reg,
+            partials: alloc::vec::Vec::new(),
+        }
+    }
+}
+
+/// Emit code for one arena node.
+///
+/// `seed` lists the input-variable indices that carry a unit first derivative
+/// (the forward-mode seed): empty seeds a plain value (`Jet0`/`Field`), `[0,1]`
+/// a `Jet2`, `[0,1,2]` a `Jet3`. Only the `Jet0` case is implemented today; a
+/// non-empty seed (dual lowering) is a hard error until the per-op chain-rule
+/// rules and the wider register model land.
+#[cfg(target_arch = "x86_64")]
+fn emit_arena(
+    arena: &ExprArena,
+    id: ExprId,
+    depth: u8,
+    seed: &[u8],
+) -> Result<(Vec<u8>, Jet), &'static str> {
     use x86_64::*;
+
+    // Dual (jet) lowering is not implemented yet; only Jet0 (plain value).
+    if !seed.is_empty() {
+        return Err("x86 JIT: dual (jet) lowering not yet implemented");
+    }
 
     // Reserve xmm12..15 for scratch: any node that allocates a value register
     // (everything except a bare Var, which reuses an input register) must fit
@@ -429,7 +475,7 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
             if *i as usize >= INPUT_REGS.len() {
                 return Err("variable index out of range");
             }
-            Ok((Vec::new(), INPUT_REGS[*i as usize]))
+            Ok((Vec::new(), Jet::value(INPUT_REGS[*i as usize])))
         }
 
         ExprNode::Const(val) => {
@@ -437,7 +483,7 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
             let mut code = Vec::new();
             let scratch = [Reg(13), Reg(14), Reg(15), Reg(15)];
             emit_const(&mut code, dst, *val, scratch);
-            Ok((code, dst))
+            Ok((code, Jet::value(dst)))
         }
 
         ExprNode::Param(_) => Err("Param not supported directly here"),
@@ -447,11 +493,12 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
             // `dst`. Transcendental builtins read `src` several times after they
             // start writing `dst`, so an in-place (dst == src) unary would corrupt
             // the input. Placing the child at depth+1 guarantees src != dst.
-            let (mut code, src) = emit_arena(arena, *child, depth + 1)?;
+            let (mut code, child_jet) = emit_arena(arena, *child, depth + 1, seed)?;
+            let src = child_jet.val;
             let dst = Reg(SCRATCH_BASE + depth);
             let scratch = [Reg(12), Reg(13), Reg(14), Reg(15)];
             emit_unary(&mut code, *op, dst, src, scratch);
-            Ok((code, dst))
+            Ok((code, Jet::value(dst)))
         }
 
         ExprNode::Binary(op, left, right) => {
@@ -480,17 +527,17 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
 
             // Returns operands as (src1, src2) with the in-`dst` operand first.
             let (mut code, src1, src2) = if !eval_right_first {
-                let (mut code, l_reg) = emit_arena(arena, *left, depth)?;
-                let (r_code, r_reg) = emit_arena(arena, *right, depth + 1)?;
+                let (mut code, l) = emit_arena(arena, *left, depth, seed)?;
+                let (r_code, r) = emit_arena(arena, *right, depth + 1, seed)?;
                 code.extend(r_code);
-                (code, l_reg, r_reg)
+                (code, l.val, r.val)
             } else {
                 // Right child in `dst`; swap so it becomes src1 (sound:
                 // commutative). `dst == src1` then satisfies the SSE invariant.
-                let (mut code, r_reg) = emit_arena(arena, *right, depth)?;
-                let (l_code, l_reg) = emit_arena(arena, *left, depth + 1)?;
+                let (mut code, r) = emit_arena(arena, *right, depth, seed)?;
+                let (l_code, l) = emit_arena(arena, *left, depth + 1, seed)?;
                 code.extend(l_code);
-                (code, r_reg, l_reg)
+                (code, r.val, l.val)
             };
 
             match op {
@@ -500,7 +547,7 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
                 }
                 _ => emit_binary(&mut code, *op, dst, src1, src2),
             }
-            Ok((code, dst))
+            Ok((code, Jet::value(dst)))
         }
 
         ExprNode::Ternary(op, a, b, c) => {
@@ -509,9 +556,10 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
             match op {
                 OpKind::MulAdd => {
                     // x86 doesn't have FMLA, use FMUL + FADD
-                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
-                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
-                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
+                    let (mut code, a_jet) = emit_arena(arena, *a, depth, seed)?;
+                    let (b_code, b_jet) = emit_arena(arena, *b, depth + 1, seed)?;
+                    let (c_code, c_jet) = emit_arena(arena, *c, depth + 2, seed)?;
+                    let (a_reg, b_reg, c_reg) = (a_jet.val, b_jet.val, c_jet.val);
 
                     code.extend(b_code);
                     code.extend(c_code);
@@ -520,30 +568,32 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
                     emit_binary(&mut code, OpKind::Mul, dst, a_reg, b_reg);
                     // dst = dst + c
                     emit_binary(&mut code, OpKind::Add, dst, dst, c_reg);
-                    Ok((code, dst))
+                    Ok((code, Jet::value(dst)))
                 }
 
                 OpKind::Clamp => {
                     // clamp(a, lo, hi) = max(min(a, hi), lo)
-                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
-                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
-                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
+                    let (mut code, a_jet) = emit_arena(arena, *a, depth, seed)?;
+                    let (b_code, b_jet) = emit_arena(arena, *b, depth + 1, seed)?;
+                    let (c_code, c_jet) = emit_arena(arena, *c, depth + 2, seed)?;
+                    let (a_reg, b_reg, c_reg) = (a_jet.val, b_jet.val, c_jet.val);
                     code.extend(b_code);
                     code.extend(c_code);
                     emit_binary(&mut code, OpKind::Min, dst, a_reg, c_reg);
                     emit_binary(&mut code, OpKind::Max, dst, dst, b_reg);
-                    Ok((code, dst))
+                    Ok((code, Jet::value(dst)))
                 }
 
                 OpKind::Select => {
                     // select(cond, if_true, if_false): cond is an all-ones/zeros mask.
-                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
-                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
-                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
+                    let (mut code, a_jet) = emit_arena(arena, *a, depth, seed)?;
+                    let (b_code, b_jet) = emit_arena(arena, *b, depth + 1, seed)?;
+                    let (c_code, c_jet) = emit_arena(arena, *c, depth + 2, seed)?;
+                    let (a_reg, b_reg, c_reg) = (a_jet.val, b_jet.val, c_jet.val);
                     code.extend(b_code);
                     code.extend(c_code);
                     x86_64::emit_select(&mut code, dst, a_reg, b_reg, c_reg, Reg(15));
-                    Ok((code, dst))
+                    Ok((code, Jet::value(dst)))
                 }
 
                 _ => Err("ternary emit not implemented"),
@@ -3047,7 +3097,8 @@ pub fn compile_arena_dag_with_ctx(
         return Err("expression too deep");
     }
 
-    let (mut code, result_reg) = emit_arena(arena, root, 0)?;
+    let (mut code, result_jet) = emit_arena(arena, root, 0, &[])?;
+    let result_reg = result_jet.val;
 
     // Move result to xmm0 if not already there.
     if result_reg.0 != 0 {
@@ -3094,7 +3145,8 @@ pub fn compile_arena_dag_scanline(
 
     // Per-pixel body: reads X from xmm0 and Y/Z/W from xmm1/2/3 (INPUT_REGS),
     // writes the result into `result_reg`, using xmm4+ as scratch.
-    let (body, result_reg) = emit_arena(arena, root, 0)?;
+    let (body, result_jet) = emit_arena(arena, root, 0, &[])?;
+    let result_reg = result_jet.val;
 
     let mut code: Vec<u8> = Vec::with_capacity(body.len() + 64);
 
