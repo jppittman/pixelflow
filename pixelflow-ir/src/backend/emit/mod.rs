@@ -30,6 +30,7 @@
 //! - This lets ML models learn register pressure vs spill tradeoffs
 
 pub mod aarch64;
+pub mod avx512;
 pub mod executable;
 pub mod regalloc;
 pub mod x86_64;
@@ -3719,6 +3720,202 @@ impl IsaBackend for X86Backend {
     }
 }
 
+// =============================================================================
+// AVX-512 backend: the leaf emit for the SHARED driver, 512-bit (zmm) kernels.
+// =============================================================================
+//
+// Mirrors `X86Backend`'s register roles exactly so it reuses the shared driver,
+// `linear_scan` budget, and the RELOAD_REGS/SCRATCH_BASE consts unchanged — only
+// the leaf encodings differ. EVEX is 3-operand and non-destructive, so there is
+// no SSE two-operand hazard (operands never clobbered; may alias dst), and we
+// have real hardware FMA.
+//
+// Register roles (zmm): zmm0-3 inputs, zmm4-9 allocatable (6), zmm10 fixed
+// scratch (FMA temp), zmm11-12 reload (RELOAD_REGS), zmm13-15 builtin scratch.
+//
+// Spills use a REAL stack frame, not the red zone: a zmm slot is 64 bytes, so
+// even one spill overflows the 128-byte red zone. `FrameLayout` hands out
+// offsets in 16-byte units (the shared layout assumes 128-bit slots); scale ×4
+// to 64-byte zmm slots, and allocate `frame_size * 4` in the prologue.
+//
+// Scope (Stage 1): the arithmetic subset (Var/Const/Unary{sqrt,neg,abs}/Binary
+// {add,sub,mul,div,min,max}/FMA). Select (k-mask class), Clamp, and the
+// transcendentals reject loudly and are later stages.
+
+/// Scale a `FrameLayout` 16-byte slot offset to a 64-byte zmm frame offset.
+#[cfg(target_arch = "x86_64")]
+fn avx512_slot_disp(offset: u32) -> i32 {
+    // FrameLayout packs slots at 16-byte stride; zmm needs 64. Slots live at
+    // [rsp + 0], [rsp + 64], ... within the frame we allocate in the prologue.
+    (offset as i32 / 16) * 64
+}
+
+/// Total zmm frame bytes for a `FrameLayout.frame_size` (16-byte units).
+#[cfg(target_arch = "x86_64")]
+fn avx512_frame_bytes(frame_size: u32) -> u32 {
+    (frame_size / 16) * 64
+}
+
+/// AVX-512 implementation of the shared driver's leaf operations.
+#[cfg(target_arch = "x86_64")]
+struct Avx512Backend;
+
+#[cfg(target_arch = "x86_64")]
+impl Avx512Backend {
+    fn reload(code: &mut Vec<u8>, reload: &Reload) {
+        match reload {
+            Reload::FromStack { target, offset } => {
+                avx512::emit_load_rsp(code, *target, avx512_slot_disp(*offset));
+            }
+            Reload::Const { target, val_bits } => {
+                avx512::emit_const(code, *target, f32::from_bits(*val_bits));
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl IsaBackend for Avx512Backend {
+    type Branch = usize;
+
+    fn num_regs(&self) -> u8 {
+        X86_SCHED_NUM_REGS // same 6 allocatable (zmm4-9)
+    }
+
+    fn begin(&mut self, _schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str> {
+        Ok(()) // const broadcast is self-contained; no pool.
+    }
+
+    fn prologue(&mut self, code: &mut Vec<u8>, frame_size: u32) {
+        let bytes = avx512_frame_bytes(frame_size);
+        if bytes > 0 {
+            avx512::emit_sub_rsp(code, bytes);
+        }
+    }
+
+    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
+        for r in &plan.reloads {
+            Self::reload(code, r);
+        }
+        if let Some((dst, src)) = plan.setup_mov {
+            avx512::emit_mov(code, dst, src);
+        }
+        match &plan.op {
+            ResolvedOp::Nop => {}
+            ResolvedOp::LoadConst { dst, val_bits } => {
+                avx512::emit_const(code, *dst, f32::from_bits(*val_bits));
+            }
+            ResolvedOp::Unary { op, dst, src } => {
+                avx512::emit_unary(code, *op, *dst, *src)?;
+            }
+            ResolvedOp::Binary { op, dst, left, right } => {
+                // EVEX 3-operand: no two-operand hazard, emit directly.
+                avx512::emit_binary(code, *op, *dst, *left, *right)?;
+            }
+            ResolvedOp::FusedMulAdd { dst, a, b } => {
+                // dst holds c (setup_mov); real FMA231: dst = a*b + dst.
+                avx512::emit_fmadd_c_in_dst(code, *dst, *a, *b);
+            }
+            ResolvedOp::DecomposedMulAdd { dst, a, b, c, c_deferred } => {
+                // dst = a*b, reload c (after the multiply if deferred), dst += c.
+                avx512::emit_binary(code, OpKind::Mul, *dst, *a, *b)?;
+                match c_deferred {
+                    Some(DeferredReload::FromStack(off)) => {
+                        avx512::emit_load_rsp(code, *c, avx512_slot_disp(*off));
+                    }
+                    Some(DeferredReload::Const(bits)) => {
+                        avx512::emit_const(code, *c, f32::from_bits(*bits));
+                    }
+                    None => {}
+                }
+                avx512::emit_binary(code, OpKind::Add, *dst, *dst, *c)?;
+            }
+            // Later stages: Select needs the k-mask class; Clamp/transcendentals
+            // the wide polynomial ports. Reject loudly rather than miscompile.
+            ResolvedOp::Select { .. } | ResolvedOp::Clamp { .. } => {
+                return Err("avx512: select/clamp not yet supported (k-mask stage)");
+            }
+        }
+        if let Some(store) = &plan.store {
+            avx512::emit_store_rsp(code, store.src, avx512_slot_disp(store.offset));
+        }
+        Ok(())
+    }
+
+    fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
+        avx512::emit_mov(code, dst, src);
+    }
+
+    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str> {
+        avx512::emit_store_rsp(code, src, avx512_slot_disp(offset));
+        Ok(())
+    }
+
+    fn emit_resolve(
+        &mut self,
+        code: &mut Vec<u8>,
+        vid: regalloc::ValueId,
+        target: Reg,
+        reg_for: &[Option<Reg>],
+        spill_for: &[Option<u32>],
+        remat_for: &[Option<u32>],
+    ) -> Reg {
+        let idx = vid.0 as usize;
+        if let Some(Some(reg)) = reg_for.get(idx) {
+            *reg
+        } else if let Some(Some(bits)) = remat_for.get(idx) {
+            avx512::emit_const(code, target, f32::from_bits(*bits));
+            target
+        } else if let Some(Some(offset)) = spill_for.get(idx) {
+            avx512::emit_load_rsp(code, target, avx512_slot_disp(*offset));
+            target
+        } else {
+            panic!("value {:?} has no register, spill slot, or rematerialize entry", vid);
+        }
+    }
+
+    // Select short-circuit guards are unreachable in Stage 1 (Select rejects in
+    // emit_plan), but the trait requires them. Provide honest panics so a future
+    // wiring mistake is loud rather than emitting bad branches.
+    fn emit_skip_if_all_false(&mut self, _c: &mut Vec<u8>, _m: Reg) -> usize {
+        unimplemented!("avx512 select guards: k-mask stage")
+    }
+    fn emit_skip_if_all_true(&mut self, _c: &mut Vec<u8>, _m: Reg) -> usize {
+        unimplemented!("avx512 select guards: k-mask stage")
+    }
+    fn emit_jump(&mut self, code: &mut Vec<u8>) -> usize {
+        x86_64::emit_jmp_rel32(code)
+    }
+    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: usize, target: usize) {
+        x86_64::patch_rel32(code, branch, target);
+    }
+
+    fn epilogue(&mut self, code: &mut Vec<u8>, result_reg: Reg, frame_size: u32) {
+        if result_reg.0 != 0 {
+            avx512::emit_mov(code, Reg(0), result_reg);
+        }
+        let bytes = avx512_frame_bytes(frame_size);
+        if bytes > 0 {
+            avx512::emit_add_rsp(code, bytes);
+        }
+        avx512::emit_ret(code);
+    }
+}
+
+/// Compile an arena DAG to an AVX-512 (512-bit, 16-lane zmm) kernel via the
+/// shared driver. Same arg shape as [`compile_arena_dag`] but the kernel's ABI
+/// is `__m512` (one pixel per lane, 16 pixels per call). Stage-1 arithmetic
+/// subset only; ops outside it return `Err`.
+#[cfg(target_arch = "x86_64")]
+pub fn compile_arena_dag_avx512(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<CompileResult, &'static str> {
+    let schedule = arena_to_schedule(arena, root);
+    let uses = arena_to_uses(&schedule);
+    compile_dag_via_backend(schedule, uses, &mut Avx512Backend)
+}
+
 /// Compile an [`ExprArena`] DAG into a scanline kernel (x86-64).
 ///
 /// The emitted kernel contains its own loop: Y/Z/W are loaded once into
@@ -5089,6 +5286,133 @@ mod tests {
                 let got = run(&sched, px, py, pz, 0.0);
                 assert!((got - want).abs() <= 1e-3, "select: ({px},{py},{pz}) got {got} want {want}");
             }
+        }
+    }
+
+    // =========================================================================
+    // AVX-512 end-to-end: arena -> shared driver -> EVEX zmm kernel, run on the
+    // host across all 16 lanes. Built only with +avx512f.
+    // =========================================================================
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    mod avx512_driver {
+        use super::*;
+        use crate::arena::ExprArena;
+
+        type K = unsafe extern "C" fn(
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+        ) -> core::arch::x86_64::__m512;
+
+        /// Run a compiled zmm kernel over 16 distinct lanes per coordinate.
+        fn run16(
+            res: &CompileResult,
+            xs: [f32; 16],
+            ys: [f32; 16],
+            zs: [f32; 16],
+        ) -> [f32; 16] {
+            unsafe {
+                use core::arch::x86_64::*;
+                let f: K = res.code.as_fn();
+                let r = f(
+                    _mm512_loadu_ps(xs.as_ptr()),
+                    _mm512_loadu_ps(ys.as_ptr()),
+                    _mm512_loadu_ps(zs.as_ptr()),
+                    _mm512_setzero_ps(),
+                );
+                let mut out = [0.0f32; 16];
+                _mm512_storeu_ps(out.as_mut_ptr(), r);
+                out
+            }
+        }
+
+        fn lanes() -> ([f32; 16], [f32; 16], [f32; 16]) {
+            let mut xs = [0.0; 16];
+            let mut ys = [0.0; 16];
+            let mut zs = [0.0; 16];
+            for i in 0..16 {
+                xs[i] = i as f32 - 7.0;
+                ys[i] = (i as f32) * 0.5 + 1.0;
+                zs[i] = 3.0 - (i as f32) * 0.25;
+            }
+            (xs, ys, zs)
+        }
+
+        fn check(got: [f32; 16], want: impl Fn(usize) -> f32, tag: &str) {
+            for i in 0..16 {
+                let w = want(i);
+                assert!((got[i] - w).abs() <= 1e-3, "{tag} lane {i}: got {} want {}", got[i], w);
+            }
+        }
+
+        /// sqrt(X*X + Y*Y) - Z, with a non-commutative shape and FMA-able terms,
+        /// fitting in registers (no spill).
+        #[test]
+        fn avx512_arith_no_spill() {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let z = a.push_var(2);
+            let xx = a.push_binary(OpKind::Mul, x, x);
+            let yy = a.push_binary(OpKind::Mul, y, y);
+            let sum = a.push_binary(OpKind::Add, xx, yy);
+            let dist = a.push_unary(OpKind::Sqrt, sum);
+            let root = a.push_binary(OpKind::Sub, dist, z);
+
+            let res = compile_arena_dag_avx512(&a, root).expect("avx512 compile");
+            assert_eq!(res.spill_count, 0, "should fit without spilling");
+
+            let (xs, ys, zs) = lanes();
+            check(
+                run16(&res, xs, ys, zs),
+                |i| (xs[i] * xs[i] + ys[i] * ys[i]).sqrt() - zs[i],
+                "norm-z",
+            );
+        }
+
+        /// A wide expression that exceeds the 6 allocatable zmm regs, forcing a
+        /// real 64-byte-slot stack frame (the SSE2 red zone cannot hold a zmm).
+        #[test]
+        fn avx512_spills_to_real_frame() {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let mut terms = alloc::vec::Vec::new();
+            for i in 1..=10u32 {
+                let c = a.push_const(i as f32);
+                let ax = a.push_binary(OpKind::Add, x, c);
+                let by = a.push_binary(OpKind::Add, y, c);
+                terms.push(a.push_binary(OpKind::Mul, ax, by));
+            }
+            while terms.len() > 1 {
+                let mut next = alloc::vec::Vec::new();
+                for pair in terms.chunks(2) {
+                    if pair.len() == 2 {
+                        next.push(a.push_binary(OpKind::Add, pair[0], pair[1]));
+                    } else {
+                        next.push(pair[0]);
+                    }
+                }
+                terms = next;
+            }
+            let root = terms[0];
+
+            let res = compile_arena_dag_avx512(&a, root).expect("avx512 compile");
+            assert!(res.spill_count > 0, "expected spilling");
+
+            let (xs, ys, zs) = lanes();
+            check(
+                run16(&res, xs, ys, zs),
+                |i| {
+                    let mut acc = 0.0f32;
+                    for k in 1..=10u32 {
+                        acc += (xs[i] + k as f32) * (ys[i] + k as f32);
+                    }
+                    acc
+                },
+                "spill",
+            );
         }
     }
 }
