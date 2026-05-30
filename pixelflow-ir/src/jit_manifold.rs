@@ -71,7 +71,7 @@ unsafe impl Send for JitManifold {}
 unsafe impl Sync for JitManifold {}
 
 // =============================================================================
-// Scanline JIT kernel — eliminates per-pixel function pointer overhead
+// Scanline JIT kernel — eliminates the per-batch function-pointer overhead
 // =============================================================================
 
 use crate::backend::emit::executable::ScanlineKernelFn;
@@ -79,7 +79,7 @@ use crate::backend::emit::executable::ScanlineKernelFn;
 /// A JIT-compiled scanline kernel that processes multiple pixels in a single call.
 ///
 /// Unlike [`JitManifold`] which calls through an `extern "C"` function pointer
-/// per pixel, `ScanlineJitManifold` contains its own loop in the emitted code.
+/// per batch, `ScanlineJitManifold` contains its own loop in the emitted code.
 /// Y/Z/W stay in NEON registers for the entire scanline (loop-invariant by
 /// construction), eliminating the ~2.2x overhead of the Rust-JIT boundary.
 pub struct ScanlineJitManifold {
@@ -98,7 +98,7 @@ impl ScanlineJitManifold {
     /// Evaluate the kernel across a scanline of pixels.
     ///
     /// The JIT'd code contains its own loop — Y/Z/W are loaded once and stay in
-    /// NEON registers for all pixels. Only X varies per pixel (loaded from `xs`).
+    /// NEON registers for all pixels. Only X varies across pixels (loaded per batch from `xs`).
     ///
     /// # Safety
     ///
@@ -138,7 +138,7 @@ impl ScanlineJitManifold {
     /// Evaluate the kernel across a scanline of pixels.
     ///
     /// The JIT'd code contains its own loop — Y/Z/W are loaded once and stay in
-    /// SSE registers for all pixels. Only X varies per pixel (loaded from `xs`).
+    /// SSE registers for all pixels. Only X varies across pixels (loaded per batch from `xs`).
     ///
     /// # Safety
     ///
