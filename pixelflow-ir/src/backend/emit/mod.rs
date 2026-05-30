@@ -897,6 +897,16 @@ pub enum JetOutput {
 
 /// Compile a single `JetOutput` component of the forward-mode dual of `arena`.
 ///
+/// NAMING SMELL — `compile_arena_dag_jet` packs ~three namespaces into one
+/// identifier (compile · arena_dag · jet). A good check when naming: *is this a
+/// name, or a namespace?* If it reads like a namespace, that's a signal to make
+/// it structure instead — a module/package, a method on a type, or a new struct
+/// — rather than a longer function name. The whole `compile_arena_dag*` family
+/// (`_with_ctx`, `_scanline`, `_scanline_with_ctx`, `_jet`, ...) is the same
+/// smell at scale; it likely wants to become e.g. `ArenaCompiler { scanline,
+/// jet, ctx, ... }`. Left as-is for now; flagged so we fix it deliberately, not
+/// by accident, when the backend is reorganized.
+///
 /// `seed` lists the differentiated input-variable indices (`[0,1]` = Jet2 over
 /// X,Y; `[0,1,2]` = Jet3 over X,Y,Z). Emits one component into xmm0, so the
 /// result matches the ordinary single-output [`KernelFn`] ABI — enough to
