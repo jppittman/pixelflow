@@ -144,6 +144,12 @@ Priority: AVX-512 > SSE2 > NEON > Scalar fallback. Detection via `build.rs` CPU 
 - Functions < 4 arguments (group into structs)
 - No boolean arguments (use enums or separate functions)
 - Named constants, no magic numbers
+- **Name vs namespace** - When a function name stacks several concepts
+  (`compile_arena_dag_jet` = compile + arena-dag + jet), ask: is this a *name*
+  or a *namespace*? A namespace inside a name is a smell — it usually means the
+  concepts want to be a module, a method on a struct, or a builder, not suffixes
+  on a free function. Especially watch for an accreting family of `*_with_ctx`,
+  `*_scanline`, `*_jet` variants: that's the cue to introduce the struct/builder.
 
 ## Common Patterns
 
