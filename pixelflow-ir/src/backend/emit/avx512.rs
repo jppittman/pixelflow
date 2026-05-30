@@ -74,10 +74,13 @@ fn evex_rrr(code: &mut Vec<u8>, map: Map, pp: Pp, w: bool, opcode: u8, dst: u8, 
 fn evex_rm_rsp(code: &mut Vec<u8>, map: Map, pp: Pp, w: bool, opcode: u8, reg: u8, disp: i32) {
     let r = ((reg >> 3) & 1) ^ 1;
     let rp = ((reg >> 4) & 1) ^ 1;
-    // Base = rsp; X is unused (no index) -> 1 inverted = 0... EVEX.X must be 1
-    // (i.e. encoded 0 after inversion means set; rsp index-less uses SIB).
-    let b = 1u8 ^ 1; // rsp is r/m base 4, bit3=0 -> B=1
-    let x = 1u8; // no index; EVEX.X stored as 1 (inverted of 0)
+    // Memory operand via SIB with base = rsp (encoding 4, bit3 = 0) and no
+    // index. EVEX.B/X are stored INVERTED: base bit3 = 0 -> B encoded 1; the
+    // "no index" SIB index field is 4 -> X encoded 1. (Encoding B = 0 here was
+    // the spill-path bug: it set the base's bit3, addressing r12 instead of
+    // rsp and faulting on a garbage pointer.)
+    let b = 1u8; // base rsp: logical bit3 0 -> encoded 1
+    let x = 1u8; // no index -> encoded 1
     let vvvv = 0x0F; // unused -> all ones
     let vp = 1u8; // V' unused -> 1
 
@@ -111,9 +114,22 @@ fn vorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::Non
 fn vxorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x57, d, s1, s2); }
 fn vandnps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x55, d, s1, s2); }
 
-// --- unary (one source, src1 = dst-or-zero per encoding) ---
-/// vsqrtps zmmD, zmmS — EVEX.512.0F.W0 51 /r ; vvvv unused (1111).
-fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x51, d, 0x1F, s); }
+/// Sentinel for the EVEX `vvvv`/`V'` source field on instructions that have no
+/// second source (2-operand forms): the field must read as *unused*, which the
+/// hardware encodes as `vvvv = 1111` AND `V' = 1`. In `evex_rrr` both are
+/// derived from the `src1` index by inversion, so the index that yields
+/// `vvvv=1111, V'=1` is **0** (not 0x1F — that has bit4 set, giving `V'=0` and a
+/// `#UD` / SIGILL).
+const UNUSED_VVVV: u8 = 0;
+
+/// Scratch register for unary mask materialization (neg/abs). zmm15 is outside
+/// the backend's allocatable range (zmm4-9), reload regs (zmm11-12), and inputs
+/// (zmm0-3), so it is always free here. Lets neg/abs handle `dst == src`.
+const UNARY_SCRATCH: Reg = Reg(15);
+
+// --- unary (one source; no second source -> UNUSED_VVVV) ---
+/// vsqrtps zmmD, zmmS — EVEX.512.0F.W0 51 /r ; vvvv unused.
+fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x51, d, UNUSED_VVVV, s); }
 
 // --- FMA (0F38, 66 prefix, W0). 213: dst = src1*dst + src2. ---
 fn vfmadd213ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F38, Pp::P66, false, 0xA8, d, s1, s2); }
@@ -123,17 +139,20 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 == src.0 {
         return;
     }
-    evex_rrr(code, Map::M0F, Pp::None, false, 0x28, dst.0, 0x1F, src.0);
+    evex_rrr(code, Map::M0F, Pp::None, false, 0x28, dst.0, UNUSED_VVVV, src.0);
 }
 
-/// vmovups zmmDST, [rsp+disp] — 512-bit reload (EVEX.512.F3.0F.W0 10 /r).
+/// vmovups zmmDST, [rsp+disp] — 512-bit reload (EVEX.512.0F.W0 10 /r).
+/// `vmovups` has NO mandatory prefix; `F3 0F 10` would be the *scalar* `vmovss`.
 pub fn emit_load_rsp(code: &mut Vec<u8>, dst: Reg, disp: i32) {
-    evex_rm_rsp(code, Map::M0F, Pp::F3, false, 0x10, dst.0, disp);
+    evex_rm_rsp(code, Map::M0F, Pp::None, false, 0x10, dst.0, disp);
 }
 
-/// vmovups [rsp+disp], zmmSRC — 512-bit spill store (EVEX.512.F3.0F.W0 11 /r).
+/// vmovups [rsp+disp], zmmSRC — 512-bit spill store (EVEX.512.0F.W0 11 /r).
+/// `vmovups` has NO mandatory prefix; `F3 0F 11` would be the *scalar* `vmovss`
+/// (which caused the spill-path SIGSEGV: a scalar store to a garbage SIB base).
 pub fn emit_store_rsp(code: &mut Vec<u8>, src: Reg, disp: i32) {
-    evex_rm_rsp(code, Map::M0F, Pp::F3, false, 0x11, src.0, disp);
+    evex_rm_rsp(code, Map::M0F, Pp::None, false, 0x11, src.0, disp);
 }
 
 /// Broadcast an f32 constant to all 16 lanes of `dst`.
@@ -148,13 +167,16 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
     code.extend_from_slice(&[0xC7, 0x44, 0x24, 0xFC]);
     code.extend_from_slice(&bits.to_le_bytes());
     // vbroadcastss zmm, [rsp-4]
-    evex_rm_rsp_disp8_broadcast(code, dst.0, -4);
+    evex_rm_rsp_broadcast(code, dst.0, -4);
 }
 
-/// `vbroadcastss zmm, [rsp+disp8]` (EVEX.512.66.0F38.W0 18 /r), disp as a small
-/// negative red-zone offset. Broadcast reads a single dword, so this is the
-/// scalar-source broadcast form.
-fn evex_rm_rsp_disp8_broadcast(code: &mut Vec<u8>, reg: u8, disp: i8) {
+/// `vbroadcastss zmm, [rsp+disp32]` (EVEX.512.66.0F38.W0 18 /r).
+///
+/// Uses a full `disp32` (`mod=10`) rather than EVEX compressed `disp8`: the
+/// compressed form scales the byte by the tuple element size (4 for a
+/// `vbroadcastss` scalar source), so a `disp8` of `-4` would address `[rsp-16]`,
+/// not `[rsp-4]`. `disp32` is never scaled, so the displacement is literal.
+fn evex_rm_rsp_broadcast(code: &mut Vec<u8>, reg: u8, disp: i32) {
     let r = ((reg >> 3) & 1) ^ 1;
     let rp = ((reg >> 4) & 1) ^ 1;
     let p0 = (r << 7) | (1 << 6) | (1 << 5) | (rp << 4) | (Map::M0F38 as u8);
@@ -165,10 +187,10 @@ fn evex_rm_rsp_disp8_broadcast(code: &mut Vec<u8>, reg: u8, disp: i8) {
     code.push(p1);
     code.push(p2);
     code.push(0x18);
-    // mod=01 (disp8), reg=reg, r/m=100 (SIB) ; SIB base=rsp ; disp8
-    code.push(0x40 | ((reg & 7) << 3) | 0b100);
+    // mod=10 (disp32), reg=reg, r/m=100 (SIB) ; SIB base=rsp ; disp32
+    code.push(0x80 | ((reg & 7) << 3) | 0b100);
     code.push(0x24);
-    code.push(disp as u8);
+    code.extend_from_slice(&disp.to_le_bytes());
 }
 
 // =============================================================================
@@ -220,16 +242,16 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg) -> Result<
     match op {
         OpKind::Sqrt => vsqrtps(code, dst.0, src.0),
         OpKind::Neg => {
-            // dst = src XOR sign-bit broadcast. Use a scratch-free trick: build
-            // the sign mask in dst is not possible (need src), so broadcast into
-            // dst then xor — but that needs src preserved. dst != src here
-            // (resolver gives a fresh dst), so: const(dst, -0.0); xor dst,src,dst.
-            emit_const(code, dst, f32::from_bits(0x8000_0000));
-            vxorps(code, dst.0, dst.0, src.0);
+            // dst = src XOR (-0.0 broadcast). Build the mask in a scratch reg,
+            // not dst: dst may alias src, and writing the mask into dst first
+            // would clobber the source before the xor reads it.
+            emit_const(code, UNARY_SCRATCH, f32::from_bits(0x8000_0000));
+            vxorps(code, dst.0, src.0, UNARY_SCRATCH.0);
         }
         OpKind::Abs => {
-            emit_const(code, dst, f32::from_bits(0x7FFF_FFFF));
-            vandps(code, dst.0, dst.0, src.0);
+            // dst = src AND (0x7FFFFFFF broadcast). Same aliasing concern.
+            emit_const(code, UNARY_SCRATCH, f32::from_bits(0x7FFF_FFFF));
+            vandps(code, dst.0, src.0, UNARY_SCRATCH.0);
         }
         _ => return Err("avx512: unary op not in Stage-1 subset"),
     }
