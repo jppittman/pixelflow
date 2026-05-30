@@ -3473,6 +3473,216 @@ pub fn compile_arena_dag_with_ctx(
     })
 }
 
+// =============================================================================
+// x86-64 via the SHARED schedule → regalloc → resolve pipeline (with spilling).
+// =============================================================================
+//
+// The single-pixel path above (`emit_arena`) is the stateless Sethi-Ullman tree
+// emitter: no spilling, hard-errors when the expression exceeds the SSE register
+// budget. This path instead reuses the architecture-independent pipeline the
+// aarch64 backend already uses — `arena_to_schedule` → `linear_scan` (Belady +
+// spilling) → `FrameLayout` → `resolve_operands` → `InstructionPlan` — and adds
+// only the x86 emit step. First step of unifying the two backends.
+//
+// Scope of THIS slice: the arithmetic/unary op subset (Var, Const, Unary,
+// Binary). FMA-fusion, Select, Clamp, and binary transcendentals produce
+// `ResolvedOp` variants this emitter rejects loudly — they (and the scanline
+// form) are the next step. Spills go to the System V red zone (the kernel is a
+// leaf): a `FrameLayout` slot at byte `offset` maps to `[rsp - (offset + 16)]`.
+//
+// Register roles: xmm0-3 inputs (precolored), xmm4-10 allocatable (7),
+// xmm11-12 reload (`RELOAD_REGS`), xmm13 the two-operand hazard scratch.
+
+/// Allocatable scratch register count handed to `linear_scan` on x86 (xmm4-10).
+#[cfg(target_arch = "x86_64")]
+const X86_SCHED_NUM_REGS: u8 = 7;
+
+/// Scratch for the binary two-operand hazard (see `emit_binary_safe`). Distinct
+/// from the allocatable range (4-10) and the reload regs (11-12).
+#[cfg(target_arch = "x86_64")]
+const X86_HAZARD_SCRATCH: Reg = Reg(13);
+
+/// Map a `FrameLayout` spill offset to a red-zone `[rsp+disp8]` displacement.
+#[cfg(target_arch = "x86_64")]
+fn x86_redzone_disp(offset: u32) -> Result<i8, &'static str> {
+    // Slots live below rsp: offset 0 -> [rsp-16], 16 -> [rsp-32], ...
+    let disp = -(offset as i64 + 16);
+    if disp < -128 {
+        return Err("x86 scheduled: spill frame exceeds 128-byte red zone");
+    }
+    Ok(disp as i8)
+}
+
+/// `dst = left op right` honoring SSE's two-operand form for *any* register
+/// assignment from the allocator.
+///
+/// `emit_binary` computes `dst <- left; dst op= right`, which corrupts `right`
+/// when `dst == right` and `dst != left`. The Sethi-Ullman path avoids that by
+/// construction; here the allocator may assign `dst == right`, so handle it:
+/// swap for commutative ops, otherwise stash `right` in the hazard scratch.
+#[cfg(target_arch = "x86_64")]
+fn emit_binary_safe(code: &mut Vec<u8>, op: OpKind, dst: Reg, left: Reg, right: Reg) {
+    use x86_64::*;
+    let commutative = matches!(
+        op,
+        OpKind::Add | OpKind::Mul | OpKind::Min | OpKind::Max | OpKind::Eq | OpKind::Ne
+    );
+    if dst == left || dst != right {
+        // dst==left: in-place. dst!=right: the `movaps dst,left` is safe.
+        emit_binary(code, op, dst, left, right);
+    } else if commutative {
+        // dst==right, dst!=left: `dst (==right) op= left` == left op right.
+        emit_binary(code, op, dst, right, left);
+    } else {
+        // dst==right, dst!=left, non-commutative: stash right, then left op right.
+        emit_movaps(code, X86_HAZARD_SCRATCH, right);
+        emit_movaps(code, dst, left);
+        emit_binary(code, op, dst, dst, X86_HAZARD_SCRATCH);
+    }
+}
+
+/// Emit one resolved `InstructionPlan` as x86-64 (AVX) machine code.
+#[cfg(target_arch = "x86_64")]
+fn emit_plan_x86(code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
+    use x86_64::*;
+    // emit_const and the Neg/Abs unaries take xmm scratch; keep it clear of the
+    // reload regs (11,12) so reloaded operands are never clobbered.
+    let scratch = [Reg(13), Reg(14), Reg(15), Reg(13)];
+
+    // 1. Reloads (spilled operands / rematerialized constants) into their targets.
+    for reload in &plan.reloads {
+        match reload {
+            Reload::FromStack { target, offset } => {
+                emit_movups_load_rsp(code, *target, x86_redzone_disp(*offset)?);
+            }
+            Reload::Const { target, val_bits } => {
+                emit_const(code, *target, f32::from_bits(*val_bits), scratch);
+            }
+        }
+    }
+
+    // 2. Setup MOV (unused by this op subset, but emit it if present).
+    if let Some((dst, src)) = plan.setup_mov {
+        emit_movaps(code, dst, src);
+    }
+
+    // 3. Main op.
+    match &plan.op {
+        ResolvedOp::Nop => {}
+        ResolvedOp::LoadConst { dst, val_bits } => {
+            emit_const(code, *dst, f32::from_bits(*val_bits), scratch);
+        }
+        ResolvedOp::Unary { op, dst, src } => {
+            emit_unary(code, *op, *dst, *src, scratch);
+        }
+        ResolvedOp::Binary {
+            op,
+            dst,
+            left,
+            right,
+        } => {
+            emit_binary_safe(code, *op, *dst, *left, *right);
+        }
+        // The next slice: these need FMA decomposition / horizontal reductions.
+        ResolvedOp::FusedMulAdd { .. }
+        | ResolvedOp::DecomposedMulAdd { .. }
+        | ResolvedOp::Select { .. }
+        | ResolvedOp::Clamp { .. } => {
+            return Err("x86 scheduled path: op not yet supported (FMA/select/clamp)");
+        }
+    }
+
+    // 4. Store (spilled result).
+    if let Some(store) = &plan.store {
+        emit_movups_store_rsp(code, store.src, x86_redzone_disp(store.offset)?);
+    }
+
+    Ok(())
+}
+
+/// Compile an arena DAG to a single-pixel kernel via the shared pipeline.
+///
+/// Same `KernelFn` ABI as [`compile_arena_dag`], but routed through
+/// schedule/regalloc/resolve with spilling instead of the Sethi-Ullman tree
+/// emitter, so deep expressions spill to the red zone rather than failing.
+#[cfg(target_arch = "x86_64")]
+pub fn compile_arena_dag_scheduled(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<CompileResult, &'static str> {
+    use alloc::collections::BTreeMap;
+
+    let schedule = arena_to_schedule(arena, root);
+    let uses = arena_to_uses(&schedule);
+
+    let mut precolored: BTreeMap<regalloc::ValueId, Reg> = BTreeMap::new();
+    for (vid, op) in &schedule {
+        if let ScheduledOp::Var(i) = op {
+            if (*i as usize) >= INPUT_REGS.len() {
+                return Err("variable index out of range");
+            }
+            precolored.insert(*vid, INPUT_REGS[*i as usize]);
+        }
+    }
+
+    let allocation =
+        regalloc::linear_scan(&schedule, &uses, &precolored, X86_SCHED_NUM_REGS, SCRATCH_BASE);
+    let layout = FrameLayout::from_allocation(&allocation.spilled)?;
+
+    let mut code: Vec<u8> = Vec::new();
+    for (vid, op) in &schedule {
+        // A value that is only rematerialized (constant, no register, no spill)
+        // is recomputed at each use — its defining op emits nothing.
+        let assigned = allocation.assignment.get(vid);
+        let spilled = layout.spill_slots.get(vid);
+        if assigned.is_none() && spilled.is_none() && allocation.rematerialize.contains_key(vid) {
+            continue;
+        }
+        let dst_loc = match (assigned, spilled) {
+            (Some(&r), _) => Loc::Reg(r),
+            (None, Some(&off)) => Loc::Spill(off),
+            // No assignment/spill/remat: resolve_operands sends it to RELOAD_REGS[0].
+            (None, None) => Loc::Reg(RELOAD_REGS[0]),
+        };
+        let plan = resolve_operands(
+            op,
+            dst_loc,
+            &allocation.assignment,
+            &layout.spill_slots,
+            &allocation.rematerialize,
+        )?;
+        emit_plan_x86(&mut code, &plan)?;
+    }
+
+    // Move the root result into xmm0.
+    let root_vid = schedule.last().map(|(v, _)| *v).ok_or("empty schedule")?;
+    let scratch = [Reg(13), Reg(14), Reg(15), Reg(13)];
+    let result_reg = if let Some(&r) = allocation.assignment.get(&root_vid) {
+        r
+    } else if let Some(&bits) = allocation.rematerialize.get(&root_vid) {
+        x86_64::emit_const(&mut code, RELOAD_REGS[0], f32::from_bits(bits), scratch);
+        RELOAD_REGS[0]
+    } else if let Some(&off) = layout.spill_slots.get(&root_vid) {
+        x86_64::emit_movups_load_rsp(&mut code, RELOAD_REGS[0], x86_redzone_disp(off)?);
+        RELOAD_REGS[0]
+    } else {
+        return Err("root value has no location");
+    };
+    if result_reg.0 != 0 {
+        x86_64::emit_movaps(&mut code, Reg(0), result_reg);
+    }
+
+    code.push(0xC3); // RET
+
+    let code = unsafe { executable::ExecutableCode::from_code(&code)? };
+    Ok(CompileResult {
+        code,
+        spill_count: allocation.spilled.len() as u32,
+        spill_bytes: layout.frame_size,
+        max_regs: X86_SCHED_NUM_REGS,
+    })
+}
+
 /// Compile an [`ExprArena`] DAG into a scanline kernel (x86-64).
 ///
 /// The emitted kernel contains its own loop: Y/Z/W are loaded once into
@@ -4708,6 +4918,113 @@ mod tests {
             let x = a.push_var(0);
             let root = a.push_unary(OpKind::Sin, x);
             assert!(compile_arena_dag_jet(&a, root, SEED_XY, JetOutput::Value).is_err());
+        }
+    }
+
+    // =========================================================================
+    // x86 shared-pipeline single-pixel path (schedule → regalloc → spill).
+    // =========================================================================
+    #[cfg(target_arch = "x86_64")]
+    mod sched {
+        use super::*;
+        use crate::arena::ExprArena;
+
+        fn run(res: &CompileResult, x: f32, y: f32, z: f32, w: f32) -> f32 {
+            unsafe {
+                use core::arch::x86_64::*;
+                let f: executable::KernelFn = res.code.as_fn();
+                let o = f(
+                    _mm_set1_ps(x),
+                    _mm_set1_ps(y),
+                    _mm_set1_ps(z),
+                    _mm_set1_ps(w),
+                );
+                _mm_cvtss_f32(o)
+            }
+        }
+
+        const PTS: &[(f32, f32, f32, f32)] = &[
+            (3.0, 4.0, 0.0, 1.0),
+            (1.0, 2.0, 3.0, 4.0),
+            (-2.0, 0.5, 1.5, -1.0),
+            (0.7, -1.3, 2.1, 0.2),
+        ];
+
+        /// The scheduled path must agree with the Sethi-Ullman path (and ground
+        /// truth) for expressions that fit in registers.
+        #[test]
+        fn sched_parity_no_spill() {
+            // f = sqrt(X*X + Y*Y) - Z, plus a non-commutative `X - Y*Z` shape.
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let z = a.push_var(2);
+            let xx = a.push_binary(OpKind::Mul, x, x);
+            let yy = a.push_binary(OpKind::Mul, y, y);
+            let sum = a.push_binary(OpKind::Add, xx, yy);
+            let dist = a.push_unary(OpKind::Sqrt, sum);
+            let yz = a.push_binary(OpKind::Mul, y, z);
+            let sub = a.push_binary(OpKind::Sub, dist, yz); // dist - Y*Z
+            let root = sub;
+
+            let sethi = compile_arena_dag(&a, root).expect("sethi compile");
+            let sched = compile_arena_dag_scheduled(&a, root).expect("scheduled compile");
+            assert_eq!(sched.spill_count, 0, "should fit without spilling");
+
+            for &(px, py, pz, pw) in PTS {
+                let want = (px * px + py * py).sqrt() - py * pz;
+                let g_sethi = run(&sethi, px, py, pz, pw);
+                let g_sched = run(&sched, px, py, pz, pw);
+                assert!((g_sethi - want).abs() <= 1e-4, "sethi {g_sethi} want {want}");
+                assert!((g_sched - want).abs() <= 1e-4, "sched {g_sched} want {want}");
+            }
+        }
+
+        /// A wide expression that exceeds the 7 allocatable registers must spill
+        /// (to the red zone) and still compute the right answer.
+        #[test]
+        fn sched_spills_and_is_correct() {
+            // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree so the 10
+            // products are live together — forcing spills with only 7 regs.
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let mut terms = alloc::vec::Vec::new();
+            for i in 1..=10u32 {
+                let c = a.push_const(i as f32);
+                let ax = a.push_binary(OpKind::Add, x, c);
+                let by = a.push_binary(OpKind::Add, y, c);
+                terms.push(a.push_binary(OpKind::Mul, ax, by));
+            }
+            while terms.len() > 1 {
+                let mut next = alloc::vec::Vec::new();
+                let mut it = terms.chunks(2);
+                while let Some(pair) = it.next() {
+                    if pair.len() == 2 {
+                        next.push(a.push_binary(OpKind::Add, pair[0], pair[1]));
+                    } else {
+                        next.push(pair[0]);
+                    }
+                }
+                terms = next;
+            }
+            let root = terms[0];
+
+            let sched = compile_arena_dag_scheduled(&a, root).expect("scheduled compile");
+            assert!(
+                sched.spill_count > 0,
+                "expected spilling; widen the expression if this regresses"
+            );
+
+            for &(px, py, _pz, _pw) in PTS {
+                let mut want = 0.0f32;
+                for i in 1..=10u32 {
+                    want += (px + i as f32) * (py + i as f32);
+                }
+                let got = run(&sched, px, py, 0.0, 0.0);
+                let tol = 1e-3 * want.abs().max(1.0);
+                assert!((got - want).abs() <= tol, "spill: got {got} want {want}");
+            }
         }
     }
 }
