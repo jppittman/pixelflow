@@ -896,3 +896,55 @@ pub fn emit_epilogue(code: &mut Vec<u8>, result: Reg) {
     // RET
     code.push(0xC3);
 }
+
+// =============================================================================
+// Branches — for the shared driver's Select short-circuit guards.
+// =============================================================================
+
+/// MOVMSKPS eax, xmm — gather the 4 lane sign bits into eax (0b0000..0b1111).
+/// For a select mask (lanes all-ones or all-zeros), eax == 0 means all-false
+/// and eax == 0xF means all-true.
+pub fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
+    if src.0 >= 8 {
+        code.push(0x41); // REX.B
+    }
+    code.push(0x0F);
+    code.push(0x50);
+    code.push(0xC0 | (src.0 & 7)); // mod=11, reg=eax(0), rm=src
+}
+
+/// Emit `jcc rel32` with a zero placeholder; returns the offset of the rel32
+/// field (pass to [`patch_rel32`]). `cc` is the 0x8_ condition byte (0x84 = je/jz,
+/// 0x85 = jne/jnz).
+pub fn emit_jcc_rel32(code: &mut Vec<u8>, cc: u8) -> usize {
+    code.push(0x0F);
+    code.push(cc);
+    let pos = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    pos
+}
+
+/// Emit `jmp rel32` with a zero placeholder; returns the rel32 field offset.
+pub fn emit_jmp_rel32(code: &mut Vec<u8>) -> usize {
+    code.push(0xE9);
+    let pos = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    pos
+}
+
+/// Patch a rel32 branch displacement (emitted by [`emit_jcc_rel32`] /
+/// [`emit_jmp_rel32`]) so it lands at `target`.
+pub fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
+    let rel = (target as i64) - (pos as i64 + 4);
+    code[pos..pos + 4].copy_from_slice(&(rel as i32).to_le_bytes());
+}
+
+/// TEST eax, eax (sets ZF iff eax == 0).
+pub fn emit_test_eax(code: &mut Vec<u8>) {
+    code.extend_from_slice(&[0x85, 0xC0]);
+}
+
+/// CMP eax, imm8 (sign-extended).
+pub fn emit_cmp_eax_imm8(code: &mut Vec<u8>, imm: u8) {
+    code.extend_from_slice(&[0x83, 0xF8, imm]);
+}
