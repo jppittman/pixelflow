@@ -3482,29 +3482,13 @@ pub fn compile_arena_dag_with_ctx(
     root: ExprId,
     _ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    const MAX_DEPTH: usize = 64;
-    if arena.depth(root) > MAX_DEPTH {
-        return Err("expression too deep");
-    }
-
-    let (mut code, result_jet) = emit_arena(arena, root, 0, &[])?;
-    let result_reg = result_jet.val;
-
-    // Move result to xmm0 if not already there.
-    if result_reg.0 != 0 {
-        x86_64::emit_movaps(&mut code, Reg(0), result_reg);
-    }
-
-    // RET
-    code.push(0xC3);
-
-    let code = unsafe { executable::ExecutableCode::from_code(&code)? };
-    Ok(CompileResult {
-        code,
-        spill_count: 0,
-        spill_bytes: 0,
-        max_regs: EmitCtx::default().max_regs,
-    })
+    // Single-pixel x86 now runs the same architecture-shared driver as aarch64
+    // (`compile_dag_via_backend`): schedule -> regalloc (with spilling) -> Select
+    // guards -> emit. The Sethi-Ullman `emit_arena` is retained only for the
+    // scanline body (`compile_arena_dag_scanline`), which has no spilling yet.
+    let schedule = arena_to_schedule(arena, root);
+    let uses = arena_to_uses(&schedule);
+    compile_dag_via_backend(schedule, uses, &mut X86Backend)
 }
 
 // =============================================================================
@@ -3532,10 +3516,12 @@ const X86_SCHED_NUM_REGS: u8 = 6;
 #[cfg(target_arch = "x86_64")]
 const X86_SCRATCH: Reg = Reg(10);
 
-/// Scratch quad for builtins / const materialization. Clear of the reload regs
-/// (11,12) so reloaded operands are never clobbered, and of `X86_SCRATCH`.
+/// Scratch quad for builtins (sin/cos/exp/atan2/...), which need FOUR distinct
+/// scratch registers. Clear of the allocatable range (4-9) and the reload regs
+/// (11,12). Includes `X86_SCRATCH` (xmm10): builtins don't use it for the
+/// hazard/select roles, so it is free as a fourth scratch here.
 #[cfg(target_arch = "x86_64")]
-const X86_BUILTIN_SCRATCH: [Reg; 4] = [Reg(13), Reg(14), Reg(15), Reg(13)];
+const X86_BUILTIN_SCRATCH: [Reg; 4] = [Reg(10), Reg(13), Reg(14), Reg(15)];
 
 /// Map a `FrameLayout` spill offset to a red-zone `[rsp+disp8]` displacement.
 #[cfg(target_arch = "x86_64")]
@@ -3627,12 +3613,42 @@ impl IsaBackend for X86Backend {
                 // setup_mov already placed the mask in `dst`; blend in place.
                 emit_select(code, *dst, *dst, *if_true, *if_false, X86_SCRATCH);
             }
-            // FMA-fusion and Clamp lower through ResolvedOp variants whose x86
-            // emit isn't wired yet; reject loudly rather than miscompile.
-            ResolvedOp::FusedMulAdd { .. }
-            | ResolvedOp::DecomposedMulAdd { .. }
-            | ResolvedOp::Clamp { .. } => {
-                return Err("x86 scheduled path: FMA/clamp not yet supported");
+            ResolvedOp::FusedMulAdd { dst, a, b } => {
+                // No hardware FMA assumed: `dst` already holds c (setup_mov);
+                // compute a*b in the fixed scratch, then add. a,b are never
+                // X86_SCRATCH (allocator/reload regs), and `a` is copied out
+                // before any write, so c==a / c==b are handled.
+                emit_movaps(code, X86_SCRATCH, *a);
+                emit_binary(code, OpKind::Mul, X86_SCRATCH, X86_SCRATCH, *b);
+                emit_binary(code, OpKind::Add, *dst, *dst, X86_SCRATCH);
+            }
+            ResolvedOp::DecomposedMulAdd { dst, a, b, c, c_deferred } => {
+                // dst = a*b, reload c (after the multiply, if deferred), dst += c.
+                emit_binary_safe(code, OpKind::Mul, *dst, *a, *b);
+                match c_deferred {
+                    Some(DeferredReload::FromStack(off)) => {
+                        emit_movups_load_rsp(code, *c, x86_redzone_disp(*off)?);
+                    }
+                    Some(DeferredReload::Const(bits)) => {
+                        emit_const(code, *c, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
+                    }
+                    None => {}
+                }
+                emit_binary_safe(code, OpKind::Add, *dst, *dst, *c);
+            }
+            ResolvedOp::Clamp { dst, val, lo, hi, lo_deferred } => {
+                // clamp(val, lo, hi) = max(min(val, hi), lo).
+                emit_binary_safe(code, OpKind::Min, *dst, *val, *hi);
+                match lo_deferred {
+                    Some(DeferredReload::FromStack(off)) => {
+                        emit_movups_load_rsp(code, *lo, x86_redzone_disp(*off)?);
+                    }
+                    Some(DeferredReload::Const(bits)) => {
+                        emit_const(code, *lo, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
+                    }
+                    None => {}
+                }
+                emit_binary_safe(code, OpKind::Max, *dst, *dst, *lo);
             }
         }
         if let Some(store) = &plan.store {
@@ -3701,21 +3717,6 @@ impl IsaBackend for X86Backend {
         }
         code.push(0xC3); // RET
     }
-}
-
-/// Compile an arena DAG to a single-pixel kernel via the shared driver (x86).
-///
-/// Same `KernelFn` ABI as [`compile_arena_dag`], but routed through the
-/// architecture-independent `compile_dag_via_backend` (schedule → regalloc →
-/// Select guards → emit) — identical control flow to aarch64, with spilling.
-#[cfg(target_arch = "x86_64")]
-pub fn compile_arena_dag_scheduled(
-    arena: &ExprArena,
-    root: ExprId,
-) -> Result<CompileResult, &'static str> {
-    let schedule = arena_to_schedule(arena, root);
-    let uses = arena_to_uses(&schedule);
-    compile_dag_via_backend(schedule, uses, &mut X86Backend)
 }
 
 /// Compile an [`ExprArena`] DAG into a scanline kernel (x86-64).
@@ -5003,7 +5004,7 @@ mod tests {
             let root = sub;
 
             let sethi = compile_arena_dag(&a, root).expect("sethi compile");
-            let sched = compile_arena_dag_scheduled(&a, root).expect("scheduled compile");
+            let sched = compile_arena_dag(&a, root).expect("scheduled compile");
             assert_eq!(sched.spill_count, 0, "should fit without spilling");
 
             for &(px, py, pz, pw) in PTS {
@@ -5045,7 +5046,7 @@ mod tests {
             }
             let root = terms[0];
 
-            let sched = compile_arena_dag_scheduled(&a, root).expect("scheduled compile");
+            let sched = compile_arena_dag(&a, root).expect("scheduled compile");
             assert!(
                 sched.spill_count > 0,
                 "expected spilling; widen the expression if this regresses"
@@ -5080,7 +5081,7 @@ mod tests {
             let zzz = a.push_binary(OpKind::Add, zz, z); // false arm: 3Z
             let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
 
-            let sched = compile_arena_dag_scheduled(&a, root).expect("scheduled compile");
+            let sched = compile_arena_dag(&a, root).expect("scheduled compile");
 
             // x>0 -> all-true -> Y^3 ; x<=0 -> all-false -> 3Z.
             for &(px, py, pz, _pw) in PTS {
