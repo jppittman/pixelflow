@@ -499,7 +499,7 @@ fn emit_sin_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: R
 }
 
 /// MOVUPS [rsp+disp8], xmm — red-zone spill store (unaligned, leaf-safe).
-fn emit_movups_store_rsp(code: &mut Vec<u8>, src: Reg, disp: i8) {
+pub fn emit_movups_store_rsp(code: &mut Vec<u8>, src: Reg, disp: i8) {
     if src.0 >= 8 {
         code.push(0x44); // REX.R
     }
@@ -511,7 +511,7 @@ fn emit_movups_store_rsp(code: &mut Vec<u8>, src: Reg, disp: i8) {
 }
 
 /// MOVUPS xmm, [rsp+disp8] — red-zone reload (unaligned, leaf-safe).
-fn emit_movups_load_rsp(code: &mut Vec<u8>, dst: Reg, disp: i8) {
+pub fn emit_movups_load_rsp(code: &mut Vec<u8>, dst: Reg, disp: i8) {
     if dst.0 >= 8 {
         code.push(0x44);
     }
