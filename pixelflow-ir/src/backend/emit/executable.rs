@@ -357,15 +357,16 @@ use core::arch::aarch64::float32x4_t;
 use core::arch::x86_64::__m128;
 
 /// JIT-compiled kernel signature for ARM64.
-/// Args: X in v0, Y in v1, Z in v2, W in v3
-/// Returns: result in v0
+/// Args: X in v0, Y in v1, Z in v2, W in v3; returns result in v0.
+/// Each arg/result is a SIMD vector, so one call computes one pixel per lane
+/// (4 pixels for a 128-bit vector), not a single pixel; the caller loops.
 #[cfg(target_arch = "aarch64")]
 pub type KernelFn =
     extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
 
 /// JIT-compiled scanline kernel signature for ARM64.
 ///
-/// Processes an entire scanline in a single call with no per-pixel Rust-JIT boundary.
+/// Processes an entire scanline in a single call with no per-batch Rust-JIT boundary.
 /// Y/Z/W stay in registers across the entire loop (loop-invariant hoisting by construction).
 ///
 /// Args:
@@ -385,9 +386,10 @@ pub type ScanlineKernelFn = extern "C" fn(
     usize,              // count
 );
 
-/// JIT-compiled kernel signature for x86-64.
-/// Args: X in xmm0, Y in xmm1, Z in xmm2, W in xmm3
-/// Returns: result in xmm0
+/// JIT-compiled kernel signature for x86-64 (SSE2, 128-bit `__m128`).
+/// Args: X in xmm0, Y in xmm1, Z in xmm2, W in xmm3; returns result in xmm0.
+/// One call computes one pixel per lane (4 pixels for `__m128`); the caller
+/// loops. The looping variant is `ScanlineKernelFn`.
 #[cfg(target_arch = "x86_64")]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 

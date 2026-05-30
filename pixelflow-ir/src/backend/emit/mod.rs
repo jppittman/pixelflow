@@ -1016,12 +1016,12 @@ pub fn compile_arena_dag_with_ctx(
 }
 
 /// Compile an [`ExprArena`] DAG into a scanline kernel that processes an entire
-/// row of pixels in a single call with no per-pixel Rust-JIT boundary crossing.
+/// row of pixels in a single call with no per-batch Rust-JIT boundary crossing.
 ///
 /// The emitted code contains its own loop: Y/Z/W stay in NEON registers across
-/// all iterations (loop-invariant by construction), only X is loaded per pixel
+/// all iterations (loop-invariant by construction), only X is loaded per batch
 /// from the input array. This eliminates the `extern "C"` function pointer
-/// overhead that dominates single-pixel `KernelFn` performance.
+/// overhead that dominates per-batch `KernelFn` performance.
 ///
 /// When the expression contains X-invariant subexpressions (depending only on Y,
 /// Z, or W), those are automatically hoisted into a setup block before the loop.
@@ -1069,7 +1069,7 @@ pub const MAX_PERSISTENT_SLOTS: usize = 8;
 #[cfg(target_arch = "x86_64")]
 pub const MAX_PERSISTENT_SLOTS: usize = 0; // Not yet implemented
 
-/// A two-phase schedule: setup (loop-invariant) then loop (per-pixel).
+/// A two-phase schedule: setup (loop-invariant) then loop (per-batch).
 ///
 /// Produced by [`arena_to_hoisted_schedule`]. The `schedule` Vec contains all
 /// nodes in variance-aware topological order: setup nodes at indices `0..split`,
@@ -1809,7 +1809,7 @@ fn compile_scanline_from_schedule(
     uses_map: Vec<Vec<regalloc::ValueId>>,
     ctx: EmitCtx,
 ) -> Result<ScanlineCompileResult, &'static str> {
-    // Register allocation (identical to single-pixel path).
+    // Register allocation (identical to per-batch path).
     let mut precolored: alloc::collections::BTreeMap<regalloc::ValueId, Reg> =
         alloc::collections::BTreeMap::new();
     for (vid, op) in &schedule {
@@ -1905,7 +1905,7 @@ fn compile_scanline_from_schedule(
     // ADR X17 placeholder for constant pool.
     let adr_patch_pos = aarch64::emit_adr_x17_placeholder(&mut code);
 
-    // 3. Kernel body (identical to single-pixel emit).
+    // 3. Kernel body (identical to per-batch emit).
     let mut pending_patches: BTreeMap<(usize, u8), usize> = BTreeMap::new();
 
     for (sched_idx, (vid, sched_op)) in schedule.iter().enumerate() {
@@ -2048,7 +2048,7 @@ fn compile_scanline_from_schedule(
         pending_patches.len()
     );
 
-    // 4. Move result to v0 (same as single-pixel epilogue).
+    // 4. Move result to v0 (same as per-batch epilogue).
     let root_vid = schedule.last().map(|(v, _)| *v).expect("empty schedule");
     let result_reg = emit_resolve_dense(
         &mut code, root_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for, &pool,
@@ -2261,7 +2261,7 @@ impl CompileWorkspace {
     }
 }
 
-/// The architecture seam for the shared single-pixel driver.
+/// The architecture seam for the shared per-batch driver.
 ///
 /// `compile_dag_via_backend` owns the architecture-INDEPENDENT logic — schedule,
 /// register allocation, frame layout, and the Select short-circuit control flow
@@ -2323,7 +2323,7 @@ trait IsaBackend {
 
 /// Drive a `(schedule, uses_map)` to machine code via an [`IsaBackend`].
 ///
-/// This is the single shared single-pixel driver for both architectures. The
+/// This is the single shared per-batch driver for both architectures. The
 /// control flow here — Select guard analysis, short-circuit branch emission and
 /// patching, root resolution — is identical regardless of ISA; only the leaf
 /// emits go through `backend`.
@@ -3482,7 +3482,7 @@ pub fn compile_arena_dag_with_ctx(
     root: ExprId,
     _ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Single-pixel x86 now runs the same architecture-shared driver as aarch64
+    // Per-batch x86 now runs the same architecture-shared driver as aarch64
     // (`compile_dag_via_backend`): schedule -> regalloc (with spilling) -> Select
     // guards -> emit. The Sethi-Ullman `emit_arena` is retained only for the
     // scanline body (`compile_arena_dag_scanline`), which has no spilling yet.
@@ -3492,7 +3492,7 @@ pub fn compile_arena_dag_with_ctx(
 }
 
 // =============================================================================
-// x86-64 IsaBackend: the leaf emit for the SHARED single-pixel driver.
+// x86-64 IsaBackend: the leaf emit for the SHARED per-batch driver.
 // =============================================================================
 //
 // `compile_dag_via_backend` owns the control flow (schedule, regalloc, Select
@@ -3723,11 +3723,11 @@ impl IsaBackend for X86Backend {
 ///
 /// The emitted kernel contains its own loop: Y/Z/W are loaded once into
 /// xmm1/xmm2/xmm3 and stay there for the whole scanline (loop-invariant by
-/// construction); only X is reloaded per pixel from the input array. This
-/// eliminates the per-pixel `extern "C"` call overhead of the single-pixel
+/// construction); only X is reloaded per batch from the input array. This
+/// eliminates the per-batch `extern "C"` call overhead of the per-batch
 /// [`KernelFn`].
 ///
-/// The per-pixel body is the same Sethi-Ullman code produced by [`emit_arena`],
+/// The per-batch body is the same Sethi-Ullman code produced by [`emit_arena`],
 /// so X-invariant subexpressions are recomputed each iteration (no hoisting on
 /// x86-64 yet — see [`MAX_PERSISTENT_SLOTS`]).
 ///
@@ -3745,7 +3745,7 @@ pub fn compile_arena_dag_scanline(
         return Err("expression too deep");
     }
 
-    // Per-pixel body: reads X from xmm0 and Y/Z/W from xmm1/2/3 (INPUT_REGS),
+    // Per-batch body: reads X from xmm0 and Y/Z/W from xmm1/2/3 (INPUT_REGS),
     // writes the result into `result_reg`, using xmm4+ as scratch.
     let (body, result_jet) = emit_arena(arena, root, 0, &[])?;
     let result_reg = result_jet.val;
@@ -3774,7 +3774,7 @@ pub fn compile_arena_dag_scanline(
     // movaps xmm0, [rdi]    ; x = xs[i]
     x86_64::emit_movaps_load(&mut code, Reg(0), 0);
 
-    // Per-pixel computation.
+    // Per-batch computation.
     code.extend_from_slice(&body);
 
     // movaps [rsi], result_reg   ; out[i] = result
@@ -4568,10 +4568,10 @@ mod tests {
         }
     }
 
-    /// Test scanline matches single-pixel results for a complex expression.
+    /// Test scanline matches per-batch results for a complex expression.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_matches_single_pixel() {
+    fn test_scanline_matches_per_batch() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4586,7 +4586,7 @@ mod tests {
         let root = arena.push_binary(OpKind::Mul, sum, diff);
 
         // Compile both variants from the same arena.
-        let single = compile_arena_dag(&arena, root).expect("single-pixel compile failed");
+        let single = compile_arena_dag(&arena, root).expect("per-batch compile failed");
         let scanline_result =
             compile_arena_dag_scanline(&arena, root).expect("scanline compile failed");
 
@@ -4638,11 +4638,11 @@ mod tests {
     }
 
     /// The x86-64 scanline kernel must produce, for every pixel, exactly what
-    /// the single-pixel kernel produces for that pixel's X (with the same
+    /// the per-batch kernel produces for that pixel's X (with the same
     /// loop-invariant Y/Z/W).
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_scanline_matches_single_pixel_x86() {
+    fn test_scanline_matches_per_batch_x86() {
         use core::arch::x86_64::*;
 
         // expr = (X*X + Y) * Z - W  (uses all four variables)
@@ -4656,7 +4656,7 @@ mod tests {
         let m = arena.push_binary(OpKind::Mul, xxy, z);
         let root = arena.push_binary(OpKind::Sub, m, w);
 
-        let single = compile_arena_dag(&arena, root).expect("single-pixel compile failed");
+        let single = compile_arena_dag(&arena, root).expect("per-batch compile failed");
         let scan = compile_arena_dag_scanline(&arena, root).expect("scanline compile failed");
 
         unsafe {
@@ -4703,7 +4703,7 @@ mod tests {
         }
     }
 
-    /// Run a single-pixel arena kernel at `x` (Y/Z/W = 0) and return lane 0.
+    /// Run a per-batch arena kernel at `x` (Y/Z/W = 0) and return lane 0.
     #[cfg(target_arch = "x86_64")]
     fn run1(arena: &ExprArena, root: ExprId, x: f32) -> f32 {
         use core::arch::x86_64::*;
@@ -4958,7 +4958,7 @@ mod tests {
     }
 
     // =========================================================================
-    // x86 shared-pipeline single-pixel path (schedule → regalloc → spill).
+    // x86 shared-pipeline per-batch path (schedule → regalloc → spill).
     // =========================================================================
     #[cfg(target_arch = "x86_64")]
     mod sched {
