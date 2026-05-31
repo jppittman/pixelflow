@@ -41,10 +41,12 @@ pub use traits::{EmitStyle, Op, OpMeta};
 /// at compile time, turning any width disagreement into a clear build error
 /// rather than a raw `transmute` size error (or, worse, a silent miscompile).
 ///
-/// Currently 16 (128-bit, SSE2/NEON) on every target: the wide (AVX-512)
-/// emitter exists (`backend::emit::avx512`) but is not yet wired into
-/// `compile_arena_dag`. When it is, this becomes 64 under
-/// `target_feature = "avx512f"`. Until then an AVX-512 `pixelflow-core` build
-/// (512-bit `Field`) fails the caller's assert, correctly signalling "the JIT
-/// does not emit this width yet."
+/// 64 (512-bit, AVX-512) when compiled with `target_feature = "avx512f"`, where
+/// `compile_arena_dag` routes to `Avx512Backend` and `KernelFn` is `__m512`;
+/// otherwise 16 (128-bit, SSE2/NEON). This matches `pixelflow-core`'s `Field`
+/// width under the same build flags, so the `kernel_jit!` assert holds.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub const JIT_VECTOR_BYTES: usize = 64;
+/// See the AVX-512 variant above.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 pub const JIT_VECTOR_BYTES: usize = 16;

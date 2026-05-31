@@ -94,6 +94,7 @@ fn test_jit_macro_negation() {
 // ============================================================================
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_sin() {
     // sin(0) = 0
     let m = kernel_jit!(|| X.sin());
@@ -102,6 +103,7 @@ fn test_jit_macro_sin() {
 }
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_sin_pi_half() {
     // sin(π/2) ≈ 1
     let m = kernel_jit!(|| X.sin());
@@ -110,6 +112,7 @@ fn test_jit_macro_sin_pi_half() {
 }
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_cos() {
     // cos(0) = 1
     let m = kernel_jit!(|| X.cos());
@@ -214,6 +217,7 @@ fn kernel_jit_same_semantics_as_kernel() {
 // ============================================================================
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_atan2_basic() {
     let m = kernel_jit!(|| Y.atan2(X));
     // atan2(1, 1) = π/4 — polynomial has ~0.06 error at t=1 boundary
@@ -234,6 +238,7 @@ fn test_jit_macro_atan2_basic() {
 }
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_atan2_quadrants() {
     let m = kernel_jit!(|| Y.atan2(X));
 
@@ -272,6 +277,7 @@ fn test_jit_macro_atan2_quadrants() {
 }
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_atan() {
     let m = kernel_jit!(|| X.atan());
     // atan(0.5) ≈ 0.4636 — well within polynomial range
@@ -287,6 +293,7 @@ fn test_jit_macro_atan() {
 }
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_asin() {
     let m = kernel_jit!(|| X.asin());
     // asin(0) = 0
@@ -302,6 +309,7 @@ fn test_jit_macro_asin() {
 }
 
 #[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn test_jit_macro_acos() {
     let m = kernel_jit!(|| X.acos());
     // acos(0.5) = π/3 ≈ 1.047 — exercises large-ratio path (ratio ≈ 1.73)

@@ -3483,13 +3483,24 @@ pub fn compile_arena_dag_with_ctx(
     root: ExprId,
     _ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Per-batch x86 now runs the same architecture-shared driver as aarch64
+    // Per-batch x86 runs the architecture-shared driver
     // (`compile_dag_via_backend`): schedule -> regalloc (with spilling) -> Select
     // guards -> emit. The Sethi-Ullman `emit_arena` is retained only for the
     // scanline body (`compile_arena_dag_scanline`), which has no spilling yet.
+    //
+    // Backend = build width: AVX-512 (512-bit zmm) when compiled +avx512f, else
+    // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
+    // KernelFn ABI stay consistent with the selected width.
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
-    compile_dag_via_backend(schedule, uses, &mut X86Backend)
+    #[cfg(target_feature = "avx512f")]
+    {
+        compile_dag_via_backend(schedule, uses, &mut Avx512Backend)
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        compile_dag_via_backend(schedule, uses, &mut X86Backend)
+    }
 }
 
 // =============================================================================
