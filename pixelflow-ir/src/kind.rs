@@ -63,11 +63,30 @@ pub enum OpKind {
 
     // --- Structure ---
     Tuple = 40,
+
+    // --- Bit manipulation (integer-domain primitives) ---
+    // These let exp/ln/log lower to arithmetic: each maps 1:1 to a single
+    // hardware instruction. Lanes are reinterpreted as i32 where noted;
+    // "reinterpret" itself is free (same register) and is not an op.
+    /// Truncate f32 lanes to i32 (`cvttps2dq` / `fcvtzs`).
+    TruncToInt = 41,
+    /// Convert i32 lanes to f32 (`cvtdq2ps` / `scvtf`).
+    IntToFloat = 42,
+    /// Integer (i32) lane-wise add (`paddd` / `add .4s`).
+    IAdd = 43,
+    /// Logical shift-left of i32 lanes; RHS is a `Const` shift amount.
+    Shl = 44,
+    /// Logical shift-right of i32 lanes; RHS is a `Const` shift amount.
+    Shr = 45,
+    /// Bitwise AND of lane bit patterns (`andps` / `and`).
+    BitAnd = 46,
+    /// Bitwise OR of lane bit patterns (`orps` / `orr`).
+    BitOr = 47,
 }
 
 impl OpKind {
     /// Total number of operations.
-    pub const COUNT: usize = 41;
+    pub const COUNT: usize = 48;
 
     /// Convert to array index.
     #[inline]
@@ -108,7 +127,9 @@ impl OpKind {
             | Self::Exp2
             | Self::Ln
             | Self::Log2
-            | Self::Log10 => 1,
+            | Self::Log10
+            | Self::TruncToInt
+            | Self::IntToFloat => 1,
 
             Self::Add
             | Self::Sub
@@ -124,7 +145,12 @@ impl OpKind {
             | Self::Gt
             | Self::Ge
             | Self::Eq
-            | Self::Ne => 2,
+            | Self::Ne
+            | Self::IAdd
+            | Self::Shl
+            | Self::Shr
+            | Self::BitAnd
+            | Self::BitOr => 2,
 
             Self::MulAdd | Self::Select | Self::Clamp => 3,
         }
@@ -174,6 +200,13 @@ impl OpKind {
             Self::Select => "select",
             Self::Clamp => "clamp",
             Self::Tuple => "tuple",
+            Self::TruncToInt => "trunc_to_int",
+            Self::IntToFloat => "int_to_float",
+            Self::IAdd => "iadd",
+            Self::Shl => "shl",
+            Self::Shr => "shr",
+            Self::BitAnd => "bitand",
+            Self::BitOr => "bitor",
         }
     }
 
@@ -221,6 +254,13 @@ impl OpKind {
             "select" => Some(Self::Select),
             "clamp" => Some(Self::Clamp),
             "tuple" => Some(Self::Tuple),
+            "trunc_to_int" => Some(Self::TruncToInt),
+            "int_to_float" => Some(Self::IntToFloat),
+            "iadd" => Some(Self::IAdd),
+            "shl" => Some(Self::Shl),
+            "shr" => Some(Self::Shr),
+            "bitand" => Some(Self::BitAnd),
+            "bitor" => Some(Self::BitOr),
             _ => None,
         }
     }
@@ -243,6 +283,14 @@ impl OpKind {
             | Self::Select
             | Self::Clamp => 4,
             Self::Mul | Self::MulAdd | Self::Recip | Self::Rsqrt => 5,
+            // Bit-manip primitives: single cheap integer/convert instructions.
+            Self::TruncToInt
+            | Self::IntToFloat
+            | Self::IAdd
+            | Self::Shl
+            | Self::Shr
+            | Self::BitAnd
+            | Self::BitOr => 1,
             Self::Div
             | Self::Sqrt
             | Self::Sin
@@ -361,7 +409,9 @@ impl OpKind {
             | Self::Exp2
             | Self::Ln
             | Self::Log2
-            | Self::Log10 => EmitStyle::UnaryMethod,
+            | Self::Log10
+            | Self::TruncToInt
+            | Self::IntToFloat => EmitStyle::UnaryMethod,
 
             // Binary infix: (a + b)
             Self::Add => EmitStyle::BinaryInfix("+"),
@@ -380,7 +430,12 @@ impl OpKind {
             | Self::Gt
             | Self::Ge
             | Self::Eq
-            | Self::Ne => EmitStyle::BinaryMethod,
+            | Self::Ne
+            | Self::IAdd
+            | Self::Shl
+            | Self::Shr
+            | Self::BitAnd
+            | Self::BitOr => EmitStyle::BinaryMethod,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select | Self::Clamp => EmitStyle::TernaryMethod,

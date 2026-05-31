@@ -185,5 +185,15 @@ pub fn op_from_kind(kind: OpKind) -> Option<&'static dyn Op> {
         OpKind::Tuple => Some(&Tuple),
         // Leaves (not operations)
         OpKind::Var | OpKind::Const => None,
+        // Bit-manip primitives are produced by *lowering* (after the e-graph
+        // runs), so they have no rewrite-rule `Op` and never appear in an
+        // e-graph. Treated as opaque here.
+        OpKind::TruncToInt
+        | OpKind::IntToFloat
+        | OpKind::IAdd
+        | OpKind::Shl
+        | OpKind::Shr
+        | OpKind::BitAnd
+        | OpKind::BitOr => None,
     }
 }

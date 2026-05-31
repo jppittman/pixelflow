@@ -787,7 +787,22 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, scratch: [
         OpKind::Asin => emit_asin_builtin(code, dst, src, scratch),
         OpKind::Acos => emit_acos_builtin(code, dst, src, scratch),
 
+        // Bit-manip primitives (integer-domain). Single instructions.
+        OpKind::TruncToInt => emit_vcvttps2dq(code, dst, src),
+        OpKind::IntToFloat => emit_vcvtdq2ps(code, dst, src),
+
         _ => panic!("x86_64 unary emit not implemented for {:?}", op),
+    }
+}
+
+/// Emit a logical shift of i32 lanes by a compile-time immediate.
+/// `Shl` -> `vpslld`, `Shr` -> `vpsrld` (logical). VEX form is 3-operand
+/// (`dst = src << imm`), so there is no two-operand hazard.
+pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
+    match op {
+        OpKind::Shl => emit_vpslld_imm(code, dst, src, amount),
+        OpKind::Shr => emit_vpsrld_imm(code, dst, src, amount),
+        _ => panic!("x86_64 emit_shift_imm: not a shift op: {:?}", op),
     }
 }
 
@@ -814,6 +829,12 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
         OpKind::Le => emit_cmp_tail(code, dst, src2, CMP_LE),
         OpKind::Gt => emit_cmp_tail(code, dst, src2, CMP_NLE),
         OpKind::Ge => emit_cmp_tail(code, dst, src2, CMP_GE),
+
+        // Bit-manip primitives. `dst` already holds src1 (moved above); the VEX
+        // 3-operand encoders take it as the vvvv source so this is in-place.
+        OpKind::IAdd => emit_vpaddd(code, dst, dst, src2),
+        OpKind::BitAnd => emit_vandps(code, dst, dst, src2),
+        OpKind::BitOr => emit_vorps(code, dst, dst, src2),
 
         _ => panic!("x86_64 binary emit not implemented for {:?}", op),
     }

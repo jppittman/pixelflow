@@ -501,6 +501,14 @@ impl OpEmbeddings {
             0.2,  // Select - 4 cycles
             0.3,  // Clamp - 6 cycles (2x compare + select)
             0.0,  // Tuple - free (structural)
+            // Bit-manip primitives: single cheap integer/convert instructions.
+            0.05, // TruncToInt - 1 cycle (cvttps2dq)
+            0.05, // IntToFloat - 1 cycle (cvtdq2ps)
+            0.05, // IAdd - 1 cycle (paddd)
+            0.05, // Shl - 1 cycle
+            0.05, // Shr - 1 cycle
+            0.05, // BitAnd - 1 cycle
+            0.05, // BitOr - 1 cycle
         ];
 
         let mut rng_state = seed.wrapping_add(1);

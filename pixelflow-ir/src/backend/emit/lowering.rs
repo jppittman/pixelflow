@@ -33,7 +33,14 @@ use alloc::vec::Vec;
 fn is_transcendental(op: OpKind) -> bool {
     matches!(
         op,
-        OpKind::Sin | OpKind::Cos | OpKind::Tan
+        OpKind::Sin
+            | OpKind::Cos
+            | OpKind::Tan
+            | OpKind::Exp
+            | OpKind::Exp2
+            | OpKind::Ln
+            | OpKind::Log2
+            | OpKind::Log10
     )
 }
 
@@ -163,8 +170,107 @@ fn expand_unary(arena: &mut ExprArena, op: OpKind, arg: ExprId) -> ExprId {
             let c = expand_sin(arena, shifted);
             arena.push_binary(OpKind::Div, s, c)
         }
+        OpKind::Exp2 => expand_exp2(arena, arg),
+        // exp(x) = 2^(x·log2 e)
+        OpKind::Exp => {
+            let log2e = arena.push_const(core::f32::consts::LOG2_E);
+            let scaled = arena.push_binary(OpKind::Mul, arg, log2e);
+            expand_exp2(arena, scaled)
+        }
+        OpKind::Log2 => expand_log2(arena, arg),
+        // ln(x) = log2(x)·ln 2
+        OpKind::Ln => {
+            let l = expand_log2(arena, arg);
+            let ln2 = arena.push_const(core::f32::consts::LN_2);
+            arena.push_binary(OpKind::Mul, l, ln2)
+        }
+        // log10(x) = log2(x)·log10 2
+        OpKind::Log10 => {
+            let l = expand_log2(arena, arg);
+            let log10_2 = arena.push_const(core::f32::consts::LOG10_2);
+            arena.push_binary(OpKind::Mul, l, log10_2)
+        }
         _ => unreachable!("expand_unary called on non-transcendental {op:?}"),
     }
+}
+
+/// `2^x` as a primitive subgraph.
+///
+/// Split `x = xi + xf` (xi integer, xf ∈ [0,1)); approximate `2^xf` by a
+/// degree-5 minimax polynomial; reconstruct `2^xi` by writing the IEEE-754
+/// exponent field directly: `2^xi = bitcast((int(xi) + 127) << 23)`. Built from
+/// the bit-manip primitives (`TruncToInt`/`IntToFloat`/`IAdd`/`Shl`) — these are
+/// the float↔int conversions a backend cannot avoid for exp/log.
+fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
+    // Clamp to a safe exponent range to avoid int overflow / inf.
+    let lo = arena.push_const(-126.0);
+    let hi = arena.push_const(126.0);
+    let x = arena.push_binary(OpKind::Max, x, lo);
+    let x = arena.push_binary(OpKind::Min, x, hi);
+
+    // xi = floor(x), xf = x - xi
+    let xi = arena.push_unary(OpKind::Floor, x);
+    let xf = arena.push_binary(OpKind::Sub, x, xi);
+
+    // 2^xf ≈ Horner(c5..c0) at xf  (minimax coefficients).
+    let c0 = arena.push_const(1.0);
+    let c1 = arena.push_const(0.693_147_18);
+    let c2 = arena.push_const(0.240_226_5);
+    let c3 = arena.push_const(0.055_504_11);
+    let c4 = arena.push_const(0.009_618_129);
+    let c5 = arena.push_const(0.001_333_355_8);
+    let p = horner_step(arena, c5, xf, c4);
+    let p = horner_step(arena, p, xf, c3);
+    let p = horner_step(arena, p, xf, c2);
+    let p = horner_step(arena, p, xf, c1);
+    let p = horner_step(arena, p, xf, c0);
+
+    // 2^xi = bitcast((int(xi) + 127) << 23).
+    let xi_int = arena.push_unary(OpKind::TruncToInt, xi);
+    let bias = arena.push_const(f32::from_bits(127)); // integer 127 as lane bits
+    let biased = arena.push_binary(OpKind::IAdd, xi_int, bias);
+    // Shift amount is read by value (`v as u32 as u8`), so it is a plain 23.0.
+    let shift = arena.push_const(23.0);
+    let pow2i = arena.push_binary(OpKind::Shl, biased, shift); // bitcast result
+
+    // 2^x = 2^xf · 2^xi
+    arena.push_binary(OpKind::Mul, p, pow2i)
+}
+
+/// `log2(x)` as a primitive subgraph (x > 0).
+///
+/// `log2(x) = e + log2(m)` where `e` is the unbiased exponent and `m ∈ [1,2)` is
+/// the mantissa. Extract `e` by shifting the exponent field down; rebuild `m` by
+/// masking the mantissa bits and OR-ing in exponent bias 127 (= 1.0). Then a
+/// degree-4 polynomial for `log2(m)` on `[1,2)`.
+fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
+    // Reinterpret x's bits as int (free) and extract exponent: e = (bits >> 23) - 127.
+    // Shift amount read by value -> plain 23.0.
+    let shift23 = arena.push_const(23.0);
+    let exp_field = arena.push_binary(OpKind::Shr, x, shift23); // int lanes
+    let exp_f = arena.push_unary(OpKind::IntToFloat, exp_field);
+    let bias = arena.push_const(127.0);
+    let e = arena.push_binary(OpKind::Sub, exp_f, bias);
+
+    // Mantissa m = bitcast((bits & 0x007FFFFF) | 0x3F800000) ∈ [1, 2).
+    let mant_mask = arena.push_const(f32::from_bits(0x007F_FFFF));
+    let one_bits = arena.push_const(f32::from_bits(0x3F80_0000));
+    let mant = arena.push_binary(OpKind::BitAnd, x, mant_mask);
+    let m = arena.push_binary(OpKind::BitOr, mant, one_bits);
+
+    // log2(m) on [1,2): polynomial in (m - 1).
+    let one = arena.push_const(1.0);
+    let t = arena.push_binary(OpKind::Sub, m, one);
+    let c1 = arena.push_const(1.442_695);
+    let c2 = arena.push_const(-0.721_347_5);
+    let c3 = arena.push_const(0.479_924_46);
+    let c4 = arena.push_const(-0.298_768_3);
+    let p = horner_step(arena, c4, t, c3);
+    let p = horner_step(arena, p, t, c2);
+    let p = horner_step(arena, p, t, c1);
+    let log2_m = arena.push_binary(OpKind::Mul, p, t);
+
+    arena.push_binary(OpKind::Add, e, log2_m)
 }
 
 /// `sin(x)` as a primitive subgraph (Chebyshev, matching the runtime path).
