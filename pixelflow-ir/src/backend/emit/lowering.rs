@@ -29,8 +29,8 @@ use crate::arena::{ExprArena, ExprId, ExprNode};
 use crate::kind::OpKind;
 use alloc::vec::Vec;
 
-/// Whether `op` is a transcendental this pass expands (so backends never see it).
-fn is_transcendental(op: OpKind) -> bool {
+/// Whether `op` is a unary transcendental this pass expands.
+fn is_transcendental_unary(op: OpKind) -> bool {
     matches!(
         op,
         OpKind::Sin
@@ -41,7 +41,15 @@ fn is_transcendental(op: OpKind) -> bool {
             | OpKind::Ln
             | OpKind::Log2
             | OpKind::Log10
+            | OpKind::Atan
+            | OpKind::Asin
+            | OpKind::Acos
     )
+}
+
+/// Whether `op` is a binary transcendental this pass expands.
+fn is_transcendental_binary(op: OpKind) -> bool {
+    matches!(op, OpKind::Atan2)
 }
 
 /// Expand every transcendental node reachable from `root` into a primitive
@@ -102,13 +110,20 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
                     ExprNode::Param(i) => arena.push_param(i),
                     ExprNode::Unary(op, a) => {
                         let a = m(a);
-                        if is_transcendental(op) {
+                        if is_transcendental_unary(op) {
                             expand_unary(arena, op, a)
                         } else {
                             arena.push_unary(op, a)
                         }
                     }
-                    ExprNode::Binary(op, a, b) => arena.push_binary(op, m(a), m(b)),
+                    ExprNode::Binary(op, a, b) => {
+                        let (a, b) = (m(a), m(b));
+                        if is_transcendental_binary(op) {
+                            expand_binary(arena, op, a, b)
+                        } else {
+                            arena.push_binary(op, a, b)
+                        }
+                    }
                     ExprNode::Ternary(op, a, b, c) => arena.push_ternary(op, m(a), m(b), m(c)),
                     ExprNode::Nary(op, start, len) => {
                         let (s, l) = (start as usize, len as usize);
@@ -140,11 +155,11 @@ pub fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (ExprAre
     // re-order / re-dedup nodes), which would perturb register allocation for
     // transcendental-free kernels; skipping it keeps lowering a true no-op for
     // them.
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Unary(op, _) if is_transcendental(*op)))
-    {
+    if !arena.nodes_raw().iter().any(|n| match n {
+        ExprNode::Unary(op, _) => is_transcendental_unary(*op),
+        ExprNode::Binary(op, _, _) => is_transcendental_binary(*op),
+        _ => false,
+    }) {
         return (arena.clone(), root);
     }
     let mut owned = arena.clone();
@@ -190,8 +205,87 @@ fn expand_unary(arena: &mut ExprArena, op: OpKind, arg: ExprId) -> ExprId {
             let log10_2 = arena.push_const(core::f32::consts::LOG10_2);
             arena.push_binary(OpKind::Mul, l, log10_2)
         }
+        // atan(x) = atan2(x, 1)
+        OpKind::Atan => {
+            let one = arena.push_const(1.0);
+            expand_atan2(arena, arg, one)
+        }
+        // asin(x) = atan2(x, sqrt(1 - x²))
+        OpKind::Asin => {
+            let one = arena.push_const(1.0);
+            let x2 = arena.push_binary(OpKind::Mul, arg, arg);
+            let t = arena.push_binary(OpKind::Sub, one, x2);
+            let s = arena.push_unary(OpKind::Sqrt, t);
+            expand_atan2(arena, arg, s)
+        }
+        // acos(x) = atan2(sqrt(1 - x²), x)
+        OpKind::Acos => {
+            let one = arena.push_const(1.0);
+            let x2 = arena.push_binary(OpKind::Mul, arg, arg);
+            let t = arena.push_binary(OpKind::Sub, one, x2);
+            let s = arena.push_unary(OpKind::Sqrt, t);
+            expand_atan2(arena, s, arg)
+        }
         _ => unreachable!("expand_unary called on non-transcendental {op:?}"),
     }
+}
+
+/// Expand a binary transcendental applied to (already-lowered) `a`, `b`.
+fn expand_binary(arena: &mut ExprArena, op: OpKind, a: ExprId, b: ExprId) -> ExprId {
+    match op {
+        OpKind::Atan2 => expand_atan2(arena, a, b),
+        _ => unreachable!("expand_binary called on non-transcendental {op:?}"),
+    }
+}
+
+/// `atan2(y, x)` (four-quadrant) as a primitive subgraph.
+///
+/// Mirrors the runtime Compounds version: reduce to a ratio in [-1,1] (swapping
+/// y/x when |y|>|x|), a degree-7 odd polynomial for atan on that interval, then
+/// quadrant fix-ups via `Select` on comparison masks. Uses `Select`/`Lt`/`Gt`/
+/// `Ge`/`Recip` — all primitives the value path emits. (Like other Select-using
+/// expansions this is value-path only; the jet path has no Ternary rule.)
+fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
+    let pi = arena.push_const(core::f32::consts::PI);
+    let half_pi = arena.push_const(core::f32::consts::FRAC_PI_2);
+    let zero = arena.push_const(0.0);
+
+    let abs_x = arena.push_unary(OpKind::Abs, x);
+    let abs_y = arena.push_unary(OpKind::Abs, y);
+
+    // swap = |y| > |x|; ratio = swap ? x/y : y/x  (keeps |ratio| <= 1).
+    let swap = arena.push_binary(OpKind::Gt, abs_y, abs_x);
+    let recip_y = arena.push_unary(OpKind::Recip, y);
+    let recip_x = arena.push_unary(OpKind::Recip, x);
+    let x_over_y = arena.push_binary(OpKind::Mul, x, recip_y);
+    let y_over_x = arena.push_binary(OpKind::Mul, y, recip_x);
+    let ratio = arena.push_ternary(OpKind::Select, swap, x_over_y, y_over_x);
+
+    // atan(ratio) on [-1,1]: ratio · Horner(c7,c5,c3,c1)(ratio²).
+    let r2 = arena.push_binary(OpKind::Mul, ratio, ratio);
+    let c1 = arena.push_const(1.0);
+    let c3 = arena.push_const(-0.333_333_33);
+    let c5 = arena.push_const(0.2);
+    let c7 = arena.push_const(-0.142_857_14);
+    let p = horner_step(arena, c7, r2, c5);
+    let p = horner_step(arena, p, r2, c3);
+    let p = horner_step(arena, p, r2, c1);
+    let atan_small = arena.push_binary(OpKind::Mul, ratio, p);
+
+    // If swapped, result is ±π/2 − atan_small (sign from ratio).
+    let ratio_nonneg = arena.push_binary(OpKind::Ge, ratio, zero);
+    let neg_half_pi = arena.push_unary(OpKind::Neg, half_pi);
+    let signed_half = arena.push_ternary(OpKind::Select, ratio_nonneg, half_pi, neg_half_pi);
+    let swapped_val = arena.push_binary(OpKind::Sub, signed_half, atan_small);
+    let atan_val = arena.push_ternary(OpKind::Select, swap, swapped_val, atan_small);
+
+    // Quadrant fix-up: if x < 0, add ±π (sign from y).
+    let x_neg = arena.push_binary(OpKind::Lt, x, zero);
+    let y_neg = arena.push_binary(OpKind::Lt, y, zero);
+    let neg_pi = arena.push_unary(OpKind::Neg, pi);
+    let adjust = arena.push_ternary(OpKind::Select, y_neg, neg_pi, pi);
+    let adjusted = arena.push_binary(OpKind::Add, atan_val, adjust);
+    arena.push_ternary(OpKind::Select, x_neg, adjusted, atan_val)
 }
 
 /// `2^x` as a primitive subgraph.
