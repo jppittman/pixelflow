@@ -101,8 +101,18 @@ define_op!(39, Clamp, "clamp", 3, TernaryMethod);
 // --- Structure ---
 define_op!(40, Tuple, "tuple", 0, Special);
 
-/// Total number of operations.
-pub const OP_COUNT: usize = 41;
+// Bit-manipulation primitives (integer-domain). Each maps 1:1 to a single
+// instruction; they let exp/ln/log lower to arithmetic.
+define_op!(41, TruncToInt, "trunc_to_int", 1, UnaryMethod);
+define_op!(42, IntToFloat, "int_to_float", 1, UnaryMethod);
+define_op!(43, IAdd, "iadd", 2, BinaryMethod);
+define_op!(44, Shl, "shl", 2, BinaryMethod);
+define_op!(45, Shr, "shr", 2, BinaryMethod);
+define_op!(46, BitAnd, "bitand", 2, BinaryMethod);
+define_op!(47, BitOr, "bitor", 2, BinaryMethod);
+
+/// Total number of operations. Must equal [`crate::kind::OpKind::COUNT`].
+pub const OP_COUNT: usize = 48;
 
 /// All operations in the IR, indexed by their INDEX constant.
 ///
@@ -111,7 +121,11 @@ pub const ALL_OPS: [&'static dyn OpMeta; OP_COUNT] = [
     &Var, &Const, &Add, &Sub, &Mul, &Div, &Neg, &Sqrt, &Rsqrt, &Abs, &Min, &Max, &MulAdd, &Recip,
     &Floor, &Ceil, &Round, &Fract, &Sin, &Cos, &Tan, &Asin, &Acos, &Atan, &Atan2, &Exp, &Exp2, &Ln,
     &Log2, &Log10, &Pow, &Hypot, &Lt, &Le, &Gt, &Ge, &Eq, &Ne, &Select, &Clamp, &Tuple,
+    &TruncToInt, &IntToFloat, &IAdd, &Shl, &Shr, &BitAnd, &BitOr,
 ];
+
+// Compile-time guard: the two op counts must agree.
+const _: () = assert!(OP_COUNT == crate::kind::OpKind::COUNT);
 
 /// Get an operation by name.
 pub fn op_by_name(name: &str) -> Option<&'static dyn OpMeta> {

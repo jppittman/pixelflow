@@ -1227,7 +1227,22 @@ pub(crate) fn emit_unary(
         OpKind::Asin => return emit_asin_builtin(code, pool, dst, src, scratch),
         OpKind::Acos => return emit_acos_builtin(code, pool, dst, src, scratch),
 
+        // Bit-manip primitives (integer-domain conversions).
+        OpKind::TruncToInt => emit_fcvtzs(code, dst, src), // f32 -> i32 (truncate)
+        OpKind::IntToFloat => emit_scvtf(code, dst, src),  // i32 -> f32
+
         _ => return Err("unary emit not implemented for this op"),
+    }
+    Ok(())
+}
+
+/// Emit a logical shift of i32 lanes by a compile-time immediate.
+/// `Shl` -> `SHL`, `Shr` -> `USHR` (logical right). NEON shifts are imm-form.
+pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) -> Result<(), &'static str> {
+    match op {
+        OpKind::Shl => emit_shl(code, dst, src, amount),
+        OpKind::Shr => emit_ushr(code, dst, src, amount),
+        _ => return Err("aarch64 emit_shift_imm: not a shift op"),
     }
     Ok(())
 }
@@ -1253,6 +1268,11 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
             emit_fcmeq(code, dst, src1, src2);
             emit_not(code, dst, dst);
         }
+
+        // Bit-manip primitives (integer-domain).
+        OpKind::IAdd => emit_add_i32(code, dst, src1, src2),
+        OpKind::BitAnd => emit_and(code, dst, src1, src2),
+        OpKind::BitOr => emit_orr(code, dst, src1, src2),
 
         _ => panic!("binary emit not implemented for {:?}", op),
     }

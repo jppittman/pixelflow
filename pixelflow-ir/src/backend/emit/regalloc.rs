@@ -455,7 +455,9 @@ pub fn linear_scan(
     for (i, (_, sop)) in schedule.iter().enumerate() {
         let operands: &[ValueId] = match sop {
             super::ScheduledOp::Var(_) | super::ScheduledOp::Const(_) => &[],
-            super::ScheduledOp::Unary(_, a) => core::slice::from_ref(a),
+            super::ScheduledOp::Unary(_, a) | super::ScheduledOp::ShiftImm(_, a, _) => {
+                core::slice::from_ref(a)
+            }
             super::ScheduledOp::Binary(_, a, b) => {
                 // Can't make a slice from two refs, handle below
                 let lu_a = &mut last_use[a.0 as usize];

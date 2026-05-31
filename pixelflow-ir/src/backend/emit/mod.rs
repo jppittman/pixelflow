@@ -196,6 +196,9 @@ pub enum ResolvedOp {
     LoadConst { dst: Reg, val_bits: u32 },
     /// Unary: dst = op(src).
     Unary { op: OpKind, dst: Reg, src: Reg },
+    /// Integer shift by a compile-time immediate: dst = src `op` amount, where
+    /// `op` is `Shl` or `Shr` (the hardware shift encoders are imm-only).
+    ShiftImm { op: OpKind, dst: Reg, src: Reg, amount: u8 },
     /// Binary: dst = op(left, right).
     Binary {
         op: OpKind,
@@ -1314,7 +1317,7 @@ where
     for (_, sched_op) in &schedule[split..] {
         let operands: alloc::vec::Vec<regalloc::ValueId> = match sched_op {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => alloc::vec![],
-            ScheduledOp::Unary(_, a) => alloc::vec![*a],
+            ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         };
@@ -1409,7 +1412,7 @@ fn compile_scanline_hoisted(
     for (_, sched_op) in &schedule[split..] {
         let operands: alloc::vec::Vec<regalloc::ValueId> = match sched_op {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => alloc::vec![],
-            ScheduledOp::Unary(_, a) => alloc::vec![*a],
+            ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         };
@@ -2252,7 +2255,7 @@ impl CompileWorkspace {
         for (_, op) in &self.schedule {
             let uses = match op {
                 ScheduledOp::Var(_) | ScheduledOp::Const(_) => Vec::new(),
-                ScheduledOp::Unary(_, a) => alloc::vec![*a],
+                ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
                 ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
                 ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
             };
@@ -2704,6 +2707,10 @@ pub enum ScheduledOp {
         regalloc::ValueId,
         regalloc::ValueId,
     ),
+    /// Bit-shift by a compile-time immediate: `op` is `Shl` or `Shr`, the value
+    /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
+    /// `arena_to_schedule` (so it never becomes a scheduled value / register).
+    ShiftImm(OpKind, regalloc::ValueId, u8),
 }
 
 // =============================================================================
@@ -2790,6 +2797,20 @@ fn arena_to_schedule(
                 i
             ),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
+            // Shl/Shr fold their Const shift-count operand into an immediate, so
+            // the count never becomes a scheduled value (matching the imm-only
+            // hardware shift encoders). The count const may still appear as its
+            // own schedule entry (harmless/unused) if shared.
+            ExprNode::Binary(op @ (OpKind::Shl | OpKind::Shr), a, b) => {
+                let amount = match arena.node(*b) {
+                    ExprNode::Const(v) => *v as u32 as u8,
+                    _ => panic!(
+                        "{:?} shift count must be a Const (lowering guarantees this)",
+                        op
+                    ),
+                };
+                ScheduledOp::ShiftImm(*op, map_child(a), amount)
+            }
             ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {
                 ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
@@ -2811,6 +2832,7 @@ fn arena_to_uses(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<Vec<regal
         .map(|(_, op)| match op {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => Vec::new(),
             ScheduledOp::Unary(_, a) => alloc::vec![*a],
+            ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         })
@@ -2859,7 +2881,7 @@ fn transitive_deps(
         if let Some(Some(sop)) = schedule_ops.get(v.0 as usize) {
             match sop {
                 ScheduledOp::Var(_) | ScheduledOp::Const(_) => {}
-                ScheduledOp::Unary(_, c) => {
+                ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) => {
                     worklist.push(*c);
                 }
                 ScheduledOp::Binary(_, l, r) => {
@@ -3113,6 +3135,15 @@ pub fn resolve_operands(
                 src,
             }
         }
+        ScheduledOp::ShiftImm(op_kind, child, amount) => {
+            let src = resolve(*child, tmp_op, &mut reloads);
+            ResolvedOp::ShiftImm {
+                op: *op_kind,
+                dst,
+                src,
+                amount: *amount,
+            }
+        }
         ScheduledOp::Binary(op_kind, left, right) => {
             let l_spilled = !assignment.contains_key(left);
             let r_spilled = !assignment.contains_key(right);
@@ -3304,6 +3335,9 @@ fn emit_instruction_plan(
         ResolvedOp::Unary { op, dst, src } => {
             let scratch = [Reg(28), Reg(29), Reg(30), Reg(31)];
             emit_unary(code, pool, *op, *dst, *src, scratch)?;
+        }
+        ResolvedOp::ShiftImm { op, dst, src, amount } => {
+            aarch64::emit_shift_imm(code, *op, *dst, *src, *amount)?;
         }
         ResolvedOp::Binary {
             op,
@@ -3641,6 +3675,9 @@ impl IsaBackend for X86Backend {
             ResolvedOp::Unary { op, dst, src } => {
                 emit_unary(code, *op, *dst, *src, X86_BUILTIN_SCRATCH);
             }
+            ResolvedOp::ShiftImm { op, dst, src, amount } => {
+                emit_shift_imm(code, *op, *dst, *src, *amount);
+            }
             ResolvedOp::Binary { op, dst, left, right } => match op {
                 OpKind::Atan2 | OpKind::Pow | OpKind::Hypot => {
                     emit_binary_transcendental(code, *op, *dst, *left, *right, X86_BUILTIN_SCRATCH);
@@ -3844,6 +3881,11 @@ impl IsaBackend for Avx512Backend {
             }
             ResolvedOp::Unary { op, dst, src } => {
                 avx512::emit_unary(code, *op, *dst, *src)?;
+            }
+            ResolvedOp::ShiftImm { .. } => {
+                // EVEX integer shift not wired yet -> exp/log don't lower on the
+                // AVX-512 path. Reject loudly rather than miscompile.
+                return Err("avx512: bit-shift (exp/log lowering) not yet supported");
             }
             ResolvedOp::Binary { op, dst, left, right } => {
                 // EVEX 3-operand: no two-operand hazard, emit directly.
@@ -5305,6 +5347,39 @@ mod tests {
                 // tan = sin/cos amplifies cos's ~2e-2 edge error as |x| grows
                 // (measured ~3.8e-2 at x=1). Honest bound for this polynomial.
                 assert!((run1(&a, t, xv) - xv.tan()).abs() <= 5e-2, "tan({xv})");
+            }
+        }
+
+        /// exp/exp2/ln/log2/log10 lower to arithmetic via the bit-manip
+        /// primitives (TruncToInt/IntToFloat/IAdd/Shl/Shr/BitAnd/BitOr) — the
+        /// float↔int twiddling no backend can avoid. Validated vs `f32`.
+        #[test]
+        fn exp_log_match_scalar() {
+            // exp / exp2 over a moderate range.
+            for &xv in &[-2.0f32, -0.5, 0.0, 0.7, 1.5, 3.0] {
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let e = a.push_unary(OpKind::Exp, x);
+                let rel = (run1(&a, e, xv) - xv.exp()).abs() / xv.exp().max(1.0);
+                assert!(rel <= 1e-2, "exp({xv})");
+
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let e2 = a.push_unary(OpKind::Exp2, x);
+                let rel = (run1(&a, e2, xv) - xv.exp2()).abs() / xv.exp2().max(1.0);
+                assert!(rel <= 1e-2, "exp2({xv})");
+            }
+            // ln / log2 / log10 over positive inputs.
+            for &xv in &[0.25f32, 0.5, 1.0, 2.0, 5.0, 100.0] {
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let l = a.push_unary(OpKind::Ln, x);
+                assert!((run1(&a, l, xv) - xv.ln()).abs() <= 3e-2, "ln({xv})");
+
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let l2 = a.push_unary(OpKind::Log2, x);
+                assert!((run1(&a, l2, xv) - xv.log2()).abs() <= 3e-2, "log2({xv})");
             }
         }
 

@@ -570,7 +570,9 @@ mod tests {
         for (vid, op) in &hoisted.schedule {
             let operands: alloc::vec::Vec<emit::regalloc::ValueId> = match op {
                 emit::ScheduledOp::Var(_) | emit::ScheduledOp::Const(_) => alloc::vec![],
-                emit::ScheduledOp::Unary(_, a) => alloc::vec![*a],
+                emit::ScheduledOp::Unary(_, a) | emit::ScheduledOp::ShiftImm(_, a, _) => {
+                    alloc::vec![*a]
+                }
                 emit::ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
                 emit::ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
             };
