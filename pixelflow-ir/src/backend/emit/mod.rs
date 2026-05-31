@@ -5445,5 +5445,56 @@ mod tests {
                 "spill",
             );
         }
+
+        /// Compare + select with non-exclusive arms: `(X < Y) ? X : Y` (== min).
+        /// No guard region forms, so this is the plain vcmpps->vpmovm2d mask +
+        /// vpternlogd blend path.
+        #[test]
+        fn avx512_compare_select_blend() {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let cond = a.push_binary(OpKind::Lt, x, y);
+            let root = a.push_ternary(OpKind::Select, cond, x, y);
+
+            let res = compile_arena_dag_avx512(&a, root).expect("avx512 compile");
+            let (xs, ys, zs) = lanes();
+            check(run16(&res, xs, ys, zs), |i| xs[i].min(ys[i]), "lt-select");
+        }
+
+        /// Select with arm-exclusive subexpressions: `(X > 0) ? Y*Y*Y : Z+Z+Z`.
+        /// Forms guard regions, exercising the vptestmd+kortestw short-circuit
+        /// branches (all-false skips Y^3, all-true skips 3Z) plus the per-lane
+        /// blend on mixed input.
+        #[test]
+        fn avx512_select_guards() {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let z = a.push_var(2);
+            let zero = a.push_const(0.0);
+            let cond = a.push_binary(OpKind::Gt, x, zero);
+            let yy = a.push_binary(OpKind::Mul, y, y);
+            let yyy = a.push_binary(OpKind::Mul, yy, y);
+            let zz = a.push_binary(OpKind::Add, z, z);
+            let zzz = a.push_binary(OpKind::Add, zz, z);
+            let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
+
+            let res = compile_arena_dag_avx512(&a, root).expect("avx512 compile");
+
+            let allpos = [2.0f32; 16];
+            let allneg = [-2.0f32; 16];
+            let ys = core::array::from_fn::<f32, 16, _>(|i| i as f32 * 0.5 + 1.0);
+            let zs = core::array::from_fn::<f32, 16, _>(|i| 3.0 - i as f32 * 0.25);
+            check(run16(&res, allpos, ys, zs), |i| ys[i] * ys[i] * ys[i], "guard-true");
+            check(run16(&res, allneg, ys, zs), |i| 3.0 * zs[i], "guard-false");
+
+            let mixed = core::array::from_fn::<f32, 16, _>(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
+            check(
+                run16(&res, mixed, ys, zs),
+                |i| if mixed[i] > 0.0 { ys[i] * ys[i] * ys[i] } else { 3.0 * zs[i] },
+                "guard-mixed",
+            );
+        }
     }
 }
