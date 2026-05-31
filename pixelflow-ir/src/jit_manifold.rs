@@ -43,14 +43,14 @@ impl JitManifold {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 impl JitManifold {
-    /// Evaluate the kernel at the given coordinates.
+    /// Evaluate the kernel at the given coordinates (SSE2, 128-bit, 4 lanes).
     ///
     /// # Safety
     ///
-    /// The caller must ensure the SIMD types match the platform ABI that the
-    /// emitter generated code for (x86-64 SSE2: `__m128`).
+    /// The caller must ensure the SIMD types match the platform ABI the emitter
+    /// generated code for (x86-64 SSE2: `__m128`).
     #[inline(always)]
     pub unsafe fn call(
         &self,
@@ -59,6 +59,29 @@ impl JitManifold {
         z: core::arch::x86_64::__m128,
         w: core::arch::x86_64::__m128,
     ) -> core::arch::x86_64::__m128 {
+        // SAFETY: The ExecutableCode was produced by our JIT compiler which
+        // emits code matching the KernelFn signature.
+        let func: KernelFn = unsafe { self.code.as_fn() };
+        func(x, y, z, w)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+impl JitManifold {
+    /// Evaluate the kernel at the given coordinates (AVX-512, 512-bit, 16 lanes).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the SIMD types match the platform ABI the emitter
+    /// generated code for (x86-64 AVX-512: `__m512`).
+    #[inline(always)]
+    pub unsafe fn call(
+        &self,
+        x: core::arch::x86_64::__m512,
+        y: core::arch::x86_64::__m512,
+        z: core::arch::x86_64::__m512,
+        w: core::arch::x86_64::__m512,
+    ) -> core::arch::x86_64::__m512 {
         // SAFETY: The ExecutableCode was produced by our JIT compiler which
         // emits code matching the KernelFn signature.
         let func: KernelFn = unsafe { self.code.as_fn() };

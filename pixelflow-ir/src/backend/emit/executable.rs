@@ -355,6 +355,8 @@ use core::arch::aarch64::float32x4_t;
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::__m128;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+use core::arch::x86_64::__m512;
 
 /// JIT-compiled kernel signature for ARM64.
 /// Args: X in v0, Y in v1, Z in v2, W in v3; returns result in v0.
@@ -386,14 +388,24 @@ pub type ScanlineKernelFn = extern "C" fn(
     usize,              // count
 );
 
-/// JIT-compiled kernel signature for x86-64 (SSE2, 128-bit `__m128`).
-/// Args: X in xmm0, Y in xmm1, Z in xmm2, W in xmm3; returns result in xmm0.
-/// One call computes one pixel per lane (4 pixels for `__m128`); the caller
-/// loops. The looping variant is `ScanlineKernelFn`.
-#[cfg(target_arch = "x86_64")]
+/// JIT-compiled per-batch kernel signature for x86-64.
+///
+/// Args: X/Y/Z/W in the first four vector registers; returns the result in the
+/// first. One call computes one pixel per lane; the caller loops.
+///
+/// The width tracks the build's selected SIMD: 512-bit `__m512` (16 lanes) when
+/// compiled with AVX-512, else 128-bit `__m128` (4 lanes, SSE2). This MUST match
+/// `pixelflow-core`'s `Field`; the `kernel_jit!` wrapper const-asserts
+/// `size_of::<Field>() == JIT_VECTOR_BYTES`. The looping variant is
+/// `ScanlineKernelFn`, which stays 128-bit (the scanline emitter is still SSE2).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub type KernelFn = extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
+
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 
-/// JIT-compiled scanline kernel signature for x86-64 (stub — not yet implemented).
+/// JIT-compiled scanline kernel signature for x86-64 (128-bit; the scanline
+/// emitter is SSE2 only, independent of the per-batch width).
 #[cfg(target_arch = "x86_64")]
 pub type ScanlineKernelFn = extern "C" fn(
     *const __m128, // x_array
