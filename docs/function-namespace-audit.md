@@ -6,6 +6,8 @@ into the identifier instead of being expressed by the module/type system._
 
 - Full machine-readable dump: [`docs/function-audit.tsv`](./function-audit.tsv)
   (6,486 rows: `crate · file · line · name · visibility · context · context_type · is_test`).
+- Coordinate decomposition: [`docs/function-coordinates.tsv`](./function-coordinates.tsv)
+  (544 production functions with ≥2 namespace coordinates: `verb · coordinate_tokens · qualifier_tokens`).
 - Extraction is whitespace/brace-aware and separates `#[cfg(test)]` / `#[test]`
   code from production code.
 
@@ -32,25 +34,92 @@ Production functions by crate:
 
 Visibility (production): `priv` 2,914 · `pub` 1,300 · `pub(crate)` 72 · `pub(restricted)` 41.
 
-## 2. What "a namespace in the name" means here
+## 2. The model: `name = verb + coordinates + qualifiers`
 
-A function name carries a namespace when a leading token duplicates something
-the type system could express:
+A function name answers two different questions, and only one of them belongs in
+the identifier:
 
-1. **Type-namespace (stutter)** — the prefix is a type that is *also the type of
-   the first/main argument*. The receiver should carry the namespace.
-   - `sh2_multiply(a: &Sh2, b: &Sh2)` → `Sh2::multiply` / `a.multiply(b)`
-   - `field_sin(s: NativeSimd) -> NativeSimd` → method on the SIMD wrapper
-   - `emit_addps(code: &mut Vec<u8>, …)` → method on an `Assembler(Vec<u8>)`
-2. **Verb-namespace** — the prefix is a verb shared by every fn in *one file*.
-   The file (module) already is the namespace, so the prefix is pure redundancy.
-   - `encode_*` (19, all in `aarch64.rs`), `optimize_*` (8, `optimize.rs`),
-     `find_*` (4, `emitter.rs`), `patch_*` (4, `aarch64.rs`).
-3. **Domain-namespace** — the prefix names a sub-domain spread across files that
-   has no home module yet (`objc_*`, `msg_*`, `wide_*`/`deep_*`, `acc_*`).
+- **verb** — *what does it do?* (`compile`, `emit`, `read`, `handle`). This is the
+  semantic core and the only thing that should survive in the bare name.
+- **coordinates** — *which one? / for what?* (`arena`, `dag`, `jet`, `scanline`,
+  `control`, `u32`, `x86`). These are **namespace coordinates**: they position the
+  function in a space. That positioning is the job of the **module path** or the
+  **type system** (an associated type, a generic parameter, an enum the function
+  matches on). When they pile up in the identifier instead, it means a namespace
+  or associated type is *missing* — `compile_arena_dag_jet` is really
+  `emit::compile` over `ExprArena`, output-shape and numeric-mode selected by type.
+- **qualifiers** — *which variant of the action?* (`with_ctx`, `hoisted`,
+  `parallel`). These genuinely modify the verb and may justify distinct entry
+  points or a parameter/builder. They are **not** namespaces.
+
+> The earlier "leading-prefix" framing was too weak. A coordinate is a coordinate
+> wherever it sits in the name, and *whether or not a type carrying it exists
+> today* — its presence in the name is precisely the evidence that the type or
+> module ought to exist.
+
+Worked example — the `compile_arena_dag*` family in `pixelflow-ir`, every member
+of which takes `arena: &ExprArena, root: ExprId`:
+
+| name | verb | coordinates | qualifiers | should be |
+|---|---|---|---|---|
+| `compile_arena` | compile | arena | — | `compile` (arena is the param type) |
+| `compile_arena_dag` | compile | arena, dag | — | `compile` → `CompileResult` |
+| `compile_arena_dag_scanline` | compile | arena, dag, scanline | — | output shape via return type |
+| `compile_arena_dag_scanline_hoisted` | compile | arena, dag, scanline | hoisted | strategy = real qualifier |
+| `compile_arena_dag_with_ctx` | compile | arena, dag | with_ctx | ctx = parameter |
+
+`arena`, `dag`, `scanline` say *which compile / for what*; `hoisted` and `with_ctx`
+say *how*. Strip the coordinates into the type system and the family collapses to
+one or two honest functions.
+
+### The latent axes (where coordinates should go)
+
+Counting how many production functions carry each kind of coordinate token
+(see `docs/function-coordinates.tsv` for the 544 functions with ≥2 coordinates):
+
+| coordinate axis | fns | structural home |
+|---|--:|---|
+| numeric repr (`jet`/`field`/`f32`/`u32`/`masked`/`raw`) | 194 | generic / associated type |
+| AST node kind (`unary`/`binary`/`ternary`/`nary`/`call`/`ident`/`literal`) | 131 | `match` on `OpKind` (one fn) |
+| IR / representation (`arena`/`dag`/`scanline`/`tree`/`graph`/`schedule`) | 129 | module path or return type |
+| actor lane (`control`/`management`/`data`) | 47 | per-lane type / trait method |
+| architecture (`x86`/`arm`/`neon`/`avx`/`sse`) | 10 | `#[cfg(target_arch)]` module |
+| platform (`macos`/`linux`/`x11`/`cocoa`/`wasm`) | 3 | platform module |
+
+Each axis is a concrete refactor: e.g. `read_u32`/`read_f32` → `read::<T>()`;
+`push_unary`/`push_binary`/`push_ternary`/`push_nary` → `push(node)` matching on
+arity; `handle_control`/`handle_data`/`handle_management` → a `Lane`-parametrized
+handler; `set_fp_fast_mode_x86`/`_arm` → `set_fp_fast_mode` in an arch `#[cfg]` module.
+
+### Distribution (production functions)
+
+| coordinate tokens in name | functions |
+|--:|--:|
+| 0 (already clean) | 2,088 |
+| 1 | 1,695 |
+| 2 | 481 |
+| 3 | 53 |
+| 4+ | 10 |
+
+**544 production functions carry ≥2 coordinate tokens** — the bulk-reorg target.
+
+### Sub-patterns of a single coordinate (the leading-prefix cases)
+
+The ≥4-prefix groups from §3 are the special case where the single coordinate is
+also the *leading* token; they still resolve via the same three homes:
+
+1. **Type-stutter** — coordinate is the first arg's type:
+   `sh2_multiply(a: &Sh2, b: &Sh2)` → `Sh2::multiply`;
+   `field_sin(s: NativeSimd)` → method on the SIMD wrapper;
+   `emit_addps(code: &mut Vec<u8>, …)` → method on `Assembler(Vec<u8>)`.
+2. **Verb redundant with its file** — every fn in one file shares the verb, so the
+   module already is the namespace: `encode_*` (19, `aarch64.rs`), `optimize_*`
+   (8, `optimize.rs`), `find_*`, `patch_*`.
+3. **Homeless domain** — a sub-domain across files with no home module yet
+   (`objc_*`, `msg_*`, `wide_*`/`deep_*`, `acc_*`).
 
 Test code uses prefixes deliberately as a grouping convention (`csi_*`, `sgr_*`,
-`esc_*`, `utf8_*`, `kubelet_*`, `adversarial_*`, `round_trip_*`); these are
+`esc_*`, `utf8_*`, `kubelet_*`, `adversarial_*`); these are descriptive sentences,
 **intentional and out of scope** — left as-is.
 
 ## 3. Findings — production free-function namespace groups (≥4)
@@ -116,39 +185,55 @@ This is small and low-risk — good warm-up candidates.
 
 ## 5. Proposed bulk reorganization plan
 
-Ordered by value-to-risk. Each step is independently shippable and test-gated
-(`cargo test --workspace` after each).
+The work is organized by **latent axis** (from §2), because each axis is a single
+structural decision applied to many functions at once. Each phase is independently
+shippable and test-gated (`cargo test --workspace` after each). Ordered by
+value-to-risk.
 
-**Phase 0 — guard rails.** Commit the dump + this report. Add a CI/clippy check
-(or xtask lint) that flags new `pub fn <verb>_*` free functions, so the surface
-doesn't regress while we clean up.
+**Phase 0 — guard rails.** Commit the dumps + this report. Add an xtask/clippy lint
+that rejects new function names carrying ≥2 coordinate tokens (re-uses
+`scripts/function_audit.py`), so names don't re-accumulate namespaces while we clean up.
 
-**Phase 1 — assembler API (biggest win).** Introduce `Assembler(Vec<u8>)` (or
-extend the existing code-buffer type) in `pixelflow-ir/src/backend/emit/`.
-Convert the 152 `emit_*` free fns to methods, collapsing 87 `pub` symbols into
-one type. This is the dominant public-API-surface reduction. Do it per-arch
-(x86_64, then aarch64) to keep diffs reviewable.
+**Phase 1 — collapse the `compile_*` / `emit_*` IR families (biggest win).**
+`pixelflow-ir/src/backend/emit/`. Two moves:
+- Introduce `Assembler(Vec<u8>)`; fold the 152 `emit_*` free fns (87 `pub`) into
+  methods, collapsing the flat assembler API into one type.
+- Collapse the `compile_arena_dag_scanline*` family: drop `arena` (it's the param
+  type), express output shape (`dag`/`scanline`) via the return type, keep only
+  real qualifiers (`hoisted`, `with_ctx`). Target: `emit::compile`.
 
-**Phase 2 — single-file verb prefixes (mechanical).** Strip redundant prefixes
-where the file is already the module: `encode_*`, `optimize_*`, `patch_*`,
-`find_*`, `generate_*`, `backward_*`, `parse_*`. Pure rename; rust-analyzer /
-`cargo fix`-style find-and-replace.
+**Phase 2 — AST-node-kind axis → enum dispatch (131 fns).** `push_unary` /
+`push_binary` / `push_ternary` / `push_nary`, `fold_unary`/`fold_binary`/…,
+`parse_*` node variants. Replace the per-variant functions with one function that
+matches on `OpKind`/arity. Concentrated in `pixelflow-ir`, `pixelflow-compiler`,
+`pixelflow-pipeline`.
 
-**Phase 3 — type-stutter folds.** `sh2_*`→`impl Sh2`, `field_*`→SIMD-wrapper
-methods, `compile_*`→`CompileWorkspace` assoc fns, the method-stutter table in §4.
+**Phase 3 — numeric-repr axis → generic / associated type (194 fns).**
+`read_u32`/`read_f32`/`write_f32` → `read::<T>()`/`write(v: T)` via a small codec
+trait; `field_*`/`jet_*` SIMD ops → methods on the wrapper; `select_raw`/`add_masked`
+mode tokens → keep private (these honor the "no public raw_*" rule — verify none leak).
 
-**Phase 4 — homeless domains → submodules.** `objc`/`msg` → `platform::macos::objc`;
-`read_*`/`write_*` → a `corpus::codec` module; `wide_*`/`deep_*`/`acc_*` into
-named network-shape modules; core-term `handle_*`/`process_*` onto their handler
-structs.
+**Phase 4 — actor-lane axis → type/trait (47 fns).** `handle_control` /
+`handle_data` / `handle_management` and `drain_control_and_management` → a
+`Lane`-parametrized handler or per-lane methods, in `actor-scheduler` + the
+`pixelflow-runtime`/`core-term` consumers.
 
-**Phase 5 — re-audit.** Re-run the extractor; confirm group counts dropped and no
-new flat `pub` namespaces appeared.
+**Phase 5 — architecture / platform axis → `#[cfg]` modules (13 fns).**
+`set_fp_fast_mode_x86`/`_arm`, `objc_*`/`msg_*` → `platform::macos::objc`. Small,
+mechanical, and aligns with the existing backend module layout.
+
+**Phase 6 — single-coordinate leftovers (the §3 prefix groups).** Mechanical
+prefix-strip where the file is already the module (`encode_*`, `optimize_*`,
+`patch_*`, `find_*`), type-stutter folds (`sh2_*`→`impl Sh2`), and homeless-domain
+submodules (`wide_*`/`deep_*`/`acc_*`), plus the method-stutter table in §4.
+
+**Phase 7 — re-audit.** Re-run `scripts/function_audit.py`; confirm the ≥2-coordinate
+count drops from 544 and no new flat `pub` namespaces appeared.
 
 ### Execution notes
-- Renames are the safe 80%; keep them prefix-strip-only and let the type/module
-  carry the namespace.
-- The API-surface changes (Phase 1, 3) are the ones worth careful review — they
-  touch `pub` items and directly serve the repo's "minimal public API" rule.
-- Re-run `python3` extractor (committed alongside) to regenerate the TSV at any
-  time and diff the namespace groups.
+- The biggest lever is the type system, not renaming: most coordinates disappear by
+  introducing one generic, enum-match, or associated type that serves dozens of fns.
+- The API-surface changes (Phases 1, 3) touch `pub` items and directly serve the
+  repo's "minimal public API" rule — review these carefully.
+- Re-run the committed extractor at any time to regenerate both TSVs and diff
+  coordinate counts before/after each phase.

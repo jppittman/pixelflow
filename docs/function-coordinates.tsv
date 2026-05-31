@@ -1,0 +1,545 @@
+crate	file	line	name	verb	coordinate_tokens	qualifier_tokens
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	615	compile_arena_dag_scanline_with_ctx	compile	arena dag scanline with ctx	with ctx
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	3147	compile_arena_dag_scanline_with_ctx	compile	arena dag scanline with ctx	with ctx
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	910	compile_arena_dag_scanline_hoisted	compile	arena dag scanline hoisted	hoisted
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	3160	compile_arena_dag_scanline_hoisted	compile	arena dag scanline hoisted	hoisted
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	582	compile_arena_dag_with_ctx	compile	arena dag with ctx	with ctx
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	3020	compile_arena_dag_with_ctx	compile	arena dag with ctx	with ctx
+pixelflow-runtime	pixelflow-runtime/src/vsync_actor.rs	31	try_consume_vsync_token		try consume vsync token	
+pixelflow-search	pixelflow-search/src/egraph/deps.rs	205	leaf_deps_and_children		leaf deps and children	
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	1706	node_cost_with_model		node cost with model	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2098	predict_log_cost_with_features		log cost with features	with
+actor-scheduler	actor-scheduler/src/lib.rs	856	drain_control_and_management	drain	control and management	
+actor-scheduler	actor-scheduler/src/lib.rs	1048	new_with_shutdown_mode		with shutdown mode	new with
+actor-scheduler	actor-scheduler/src/lib.rs	1035	new_with_wake_handler		with wake handler	new with
+core-term	core-term/src/term/emulator/mouse.rs	80	button_base_code		button base code	
+core-term	core-term/src/term/screen.rs	240	fill_region_with_glyph		region with glyph	with
+core-term	core-term/src/term/emulator/mod.rs	383	is_mouse_tracking_active		mouse tracking active	
+core-term	core-term/src/keys.rs	14	map_key_event_to_action	map	key event action	
+core-term	core-term/src/term/emulator/screen_ops.rs	191	move_down_one_line_and_dirty		move line and	
+core-term	core-term/src/term/emulator/input_handler.rs	20	process_user_input_action	process	user input action	
+core-term	core-term/src/term/emulator/mouse.rs	103	sgr_button_code		sgr button code	
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	1317	binary_method_expr		binary method expr	
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	310	block_has_opaque_with_locals		block has with	with
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	198	config_for_node_count		config node count	
+pixelflow-compiler	pixelflow-compiler/src/codegen/emitter.rs	132	find_at_manifold_params_inner	find	manifold params inner	inner
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	252	optimize_expr_with_model	optimize	expr with model	with
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	162	saturate_with_time_control		with time control	with
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	1308	unary_method_expr		unary method expr	
+pixelflow-compiler	pixelflow-compiler/src/codegen/struct_emitter.rs	122	with_eval_body		with eval body	with
+pixelflow-core	pixelflow-core/src/naked_test.rs	4	dummy_jit_kernel		dummy jit kernel	
+pixelflow-core	pixelflow-core/src/backend/fastmath.rs	139	set_fp_fast_mode_arm	set	fast mode arm	fast
+pixelflow-core	pixelflow-core/src/backend/fastmath.rs	100	set_fp_fast_mode_x86	set	fast mode x86	fast
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	683	arena_to_hoisted_schedule		arena hoisted schedule	hoisted
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	606	compile_arena_dag_scanline	compile	arena dag scanline	
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	3066	compile_arena_dag_scanline	compile	arena dag scanline	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	1725	emit_scanline_prologue_hoisted	emit	scanline prologue hoisted	hoisted
+pixelflow-ir	pixelflow-ir/src/arena.rs	219	nary_children_raw		nary children raw	raw
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	2296	scanline_prologue_hoisted		scanline prologue hoisted	hoisted
+pixelflow-ir	pixelflow-ir/src/backend/fastmath.rs	130	set_fp_fast_mode_arm	set	fast mode arm	fast
+pixelflow-ir	pixelflow-ir/src/backend/fastmath.rs	91	set_fp_fast_mode_x86	set	fast mode x86	fast
+pixelflow-pipeline	pixelflow-pipeline/src/training/factored.rs	547	arena_to_kernel_code		arena kernel code	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	1200	compute_d_graph_input_policy	compute	graph input policy	
+pixelflow-pipeline	pixelflow-pipeline/src/training/factored.rs	520	parse_kernel_code_arena	parse	kernel code arena	
+pixelflow-runtime	pixelflow-runtime/build.rs	1	has_x11_feature		has x11 feature	
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/cocoa.rs	188	init_with_content_rect	init	with content rect	with
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/cocoa.rs	226	make_key_and_order_front	make	key and order	
+pixelflow-runtime	pixelflow-runtime/src/engine_troupe.rs	824	raw_engine_handle		raw engine handle	raw
+pixelflow-runtime	pixelflow-runtime/src/engine_troupe.rs	410	trigger_render_with_window		render with window	with
+pixelflow-runtime	pixelflow-runtime/src/vsync_actor.rs	68	vsync_token_count		vsync token count	
+pixelflow-search	pixelflow-search/src/egraph/codegen.rs	102	dag_to_kernel_body		dag kernel body	
+pixelflow-search	pixelflow-search/src/egraph/codegen.rs	87	dag_to_kernel_code		dag kernel code	
+pixelflow-search	pixelflow-search/src/math/trig.rs	467	extract_cos_sin_mul	extract	cos sin mul	
+pixelflow-search	pixelflow-search/src/math/trig.rs	433	extract_sin_cos_mul	extract	sin cos mul	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	996	from_dag_choices_with_variance		dag with variance	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	3093	mask_mlp_forward_with_hidden		mask forward with	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2276	mask_score_all_rules_graph		mask score graph	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2490	mask_score_all_rules_with_hidden		mask score with	with
+pixelflow-search	pixelflow-search/src/math/trig.rs	410	match_sin_angle_sum	match	sin angle sum	
+pixelflow-search	pixelflow-search/src/math/power.rs	131	pow_special_value_rules		pow special value	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	1786	randomize_unified_arch_with_rng		unified with rng	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	3125	rule_mlp_forward_with_hidden		rule forward with	with
+pixelflow-search	pixelflow-search/src/egraph/saturate.rs	104	saturate_with_full_budget		with full budget	with full
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	3156	value_mlp_forward_with_hidden		value forward with	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	1919	with_randomized_mask_weights		with mask weights	with
+actor-scheduler	actor-scheduler/src/kubelet.rs	386	add_manual_pod	add	manual pod	
+actor-scheduler	actor-scheduler/src/kubelet.rs	347	add_pod_with_gate	add	pod with	with
+actor-scheduler	actor-scheduler/src/lib.rs	586	build_with_burst	build	with burst	with
+actor-scheduler	actor-scheduler/src/params.rs	200	control_burst_limit		control burst	
+actor-scheduler	actor-scheduler/src/params.rs	206	management_burst_limit		management burst	
+actor-scheduler	actor-scheduler/src/lib.rs	534	new_with_params		with params	new with
+actor-scheduler	actor-scheduler/src/lib.rs	1022	new_with_params		with params	new with
+actor-scheduler	actor-scheduler/src/spsc.rs	161	spsc_channel		spsc channel	
+actor-scheduler	actor-scheduler/src/spsc.rs	242	try_recv		try recv	
+actor-scheduler	actor-scheduler/src/spsc.rs	190	try_send		try send	
+actor-scheduler-macros	actor-scheduler-macros/src/lib.rs	423	new_with_waker		with waker	new with
+core-term	core-term/src/term/screen.rs	206	active_grid		active grid	
+core-term	core-term/src/term/screen.rs	197	active_grid_mut		active grid	mut
+core-term	core-term/src/term/emulator/mod.rs	339	apply_selection_clear	apply	selection clear	
+core-term	core-term/src/term/tests.rs	76	assert_screen_state		screen state	
+core-term	core-term/src/term/core_tests.rs	36	assert_screen_state		screen state	
+core-term	core-term/src/surface/manifold.rs	195	build_channel_tree	build	channel tree	
+core-term	core-term/src/surface/manifold.rs	165	cell_size		cell size	
+core-term	core-term/src/ansi/parser.rs	79	clear_csi_state	clear	csi state	
+core-term	core-term/src/ansi/parser.rs	92	clear_esc_state	clear	esc state	
+core-term	core-term/build.rs	107	create_macos_app_bundle	create	macos app	
+core-term	core-term/build.rs	157	create_macos_app_bundle	create	macos app	
+core-term	core-term/src/term/tests.rs	31	create_test_emulator	create	test emulator	
+core-term	core-term/src/term/core_tests.rs	9	create_test_emulator	create	test emulator	
+core-term	core-term/src/term/emulator/mod.rs	105	current_screen_context		screen context	context
+core-term	core-term/src/term/emulator/cursor_handler.rs	50	cursor_backward		cursor backward	
+core-term	core-term/src/term/emulator/cursor_handler.rs	44	cursor_forward		cursor forward	
+core-term	core-term/src/ansi/lexer.rs	87	decode_first_byte	decode	first byte	
+core-term	core-term/src/term/emulator/mode_handler.rs	27	designate_character_set		character set	
+core-term	core-term/build.rs	58	determine_display_driver		display driver	
+core-term	core-term/src/term/emulator/mouse.rs	37	encode_mouse_event	encode	mouse event	
+core-term	core-term/src/term/emulator/mod.rs	377	encode_mouse_event	encode	mouse event	
+core-term	core-term/src/term/screen.rs	622	enter_alt_screen		alt screen	
+core-term	core-term/src/ansi/parser.rs	261	enter_esc_in_string_state		esc state	
+core-term	core-term/src/term/emulator/screen_ops.rs	33	erase_in_display		erase display	
+core-term	core-term/src/term/emulator/screen_ops.rs	72	erase_in_line		erase line	
+core-term	core-term/src/term/screen.rs	639	exit_alt_screen		alt screen	
+core-term	core-term/src/term/tests.rs	354	fill_emulator_screen		emulator screen	
+core-term	core-term/src/terminal_app.rs	54	find_font_path	find	font path	
+core-term	core-term/src/term/tests.rs	63	get_glyph_from_snapshot	get	glyph snapshot	
+core-term	core-term/src/term/core_tests.rs	23	get_glyph_from_snapshot	get	glyph snapshot	
+core-term	core-term/src/term/mod.rs	89	get_render_snapshot	get	render snapshot	
+core-term	core-term/src/term/mod.rs	97	get_render_snapshot	get	render snapshot	
+core-term	core-term/src/term/emulator/mod.rs	172	get_render_snapshot	get	render snapshot	
+core-term	core-term/src/main.rs	53	get_secure_log_path	get	log path	
+core-term	core-term/src/term/screen.rs	1077	get_selected_text_block	get	text block	
+core-term	core-term/src/term/screen.rs	1002	get_selected_text_cell	get	text cell	
+core-term	core-term/src/term/emulator/ansi_handler.rs	141	handle_csi_command	handle	csi command	
+core-term	core-term/src/term/emulator/ansi_handler.rs	85	handle_esc_command	handle	esc command	
+core-term	core-term/src/term/emulator/input_handler.rs	81	handle_key_input	handle	key input	
+core-term	core-term/src/term/emulator/mode_handler.rs	79	handle_set_mode	handle	set mode	
+core-term	core-term/src/term/emulator/mode_handler.rs	36	handle_sgr_attributes	handle	sgr attributes	
+core-term	core-term/src/ansi/lexer.rs	199	is_control_code		control code	
+core-term	core-term/src/term/emulator/mouse.rs	116	legacy_button_code		button code	legacy
+core-term	core-term/src/terminal_app.rs	151	make_terminal_cell	make	terminal cell	
+core-term	core-term/src/ansi/commands.rs	534	map_basic_code_to_color	map	code color	
+core-term	core-term/src/term/charset.rs	75	map_to_dec_line_drawing	map	dec line	
+core-term	core-term/src/term/cursor.rs	309	move_left		move left	
+core-term	core-term/src/term/cursor.rs	322	move_right		move right	
+core-term	core-term/src/io/epoll.rs	44	new_libc_epoll_event		epoll event	new
+core-term	core-term/src/ansi/commands.rs	565	parse_extended_color	parse	extended color	
+core-term	core-term/src/term/emulator/ansi_handler.rs	24	process_ansi_command	process	ansi command	
+core-term	core-term/src/ansi/lexer.rs	207	process_byte_as_new_token	process	byte token	new
+core-term	core-term/src/term/emulator/input_handler.rs	154	process_control_event	process	control event	
+core-term	core-term/src/io/pty_tests.rs	17	read_from_pty_with_timeout	read	pty with	with
+core-term	core-term/src/term/tests.rs	37	resize_event		resize event	
+core-term	core-term/src/term/core_tests.rs	15	resize_event		resize event	
+core-term	core-term/src/term/emulator/screen_ops.rs	12	reverse_index		reverse index	
+core-term	core-term/src/term/emulator/mod.rs	278	scroll_viewport		scroll viewport	
+core-term	core-term/src/term/tests.rs	346	send_mouse_input	send	mouse input	
+core-term	core-term/src/io/pty.rs	54	set_pty_size_internal	set	pty size	internal
+core-term	core-term/src/term/core_tests.rs	1273	setup_ed_el_screen		setup screen	
+core-term	core-term/src/io/pty.rs	187	spawn_shell_command	spawn	shell command	
+core-term	core-term/src/terminal_app.rs	728	spawn_terminal_app	spawn	terminal app	
+core-term	core-term/src/io/pty.rs	81	spawn_with_config	spawn	with config	with
+core-term	core-term/src/term/emulator/key_translator.rs	9	translate_key_input	translate	key input	
+pixelflow-compiler	pixelflow-compiler/src/sema.rs	248	analyze_method_call		method call	
+pixelflow-compiler	pixelflow-compiler/src/ir_bridge.rs	60	ast_to_arena_inner		arena inner	inner
+pixelflow-compiler	pixelflow-compiler/src/ir_bridge.rs	249	ast_to_runtime_arena		runtime arena	
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	1326	binary_op_expr		binary expr	
+pixelflow-compiler	pixelflow-compiler/src/cost_builder.rs	25	build_learned_cost_model	build	cost model	
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	1080	dag_to_expr		dag expr	
+pixelflow-compiler	pixelflow-compiler/src/manifold_expr.rs	30	derive_manifold_expr	derive	manifold expr	
+pixelflow-compiler	pixelflow-compiler/src/lib.rs	343	derive_manifold_expr	derive	manifold expr	
+pixelflow-compiler	pixelflow-compiler/src/codegen/emitter.rs	272	emit_closure_kernel	emit	closure kernel	
+pixelflow-compiler	pixelflow-compiler/src/codegen/emitter.rs	459	emit_named_kernel	emit	named kernel	
+pixelflow-compiler	pixelflow-compiler/src/codegen/emitter.rs	670	emit_unified_binding	emit	unified binding	
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	350	expr_has_opaque_refs		expr has	
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	748	expr_to_egraph		expr egraph	
+pixelflow-compiler	pixelflow-compiler/src/codegen/emitter.rs	21	find_at_manifold_params	find	manifold params	
+pixelflow-compiler	pixelflow-compiler/src/codegen/emitter.rs	35	find_derivative_manifold_params	find	manifold params	
+pixelflow-compiler	pixelflow-compiler/src/codegen/emitter.rs	45	find_derivative_params_inner	find	params inner	inner
+pixelflow-compiler	pixelflow-compiler/src/fold.rs	67	fold_method_call	fold	method call	
+pixelflow-compiler	pixelflow-compiler/src/lib.rs	380	generate_binary_types	generate	binary types	
+pixelflow-compiler	pixelflow-compiler/src/symbol.rs	180	is_manifold_param		manifold param	
+pixelflow-compiler	pixelflow-compiler/src/lib.rs	187	kernel_jit		kernel jit	
+pixelflow-compiler	pixelflow-compiler/src/lib.rs	140	kernel_raw		kernel raw	raw
+pixelflow-compiler	pixelflow-compiler/src/annotate.rs	43	literal_count		literal count	
+pixelflow-compiler	pixelflow-compiler/src/symbol.rs	187	manifold_params		manifold params	
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	664	optimize_block_preserving_structure	optimize	block structure	preserving
+pixelflow-compiler	pixelflow-compiler/src/optimize.rs	245	optimize_with_model	optimize	with model	with
+pixelflow-compiler	pixelflow-compiler/src/cost_builder.rs	30	parse_cost_model_toml	parse	cost model	
+pixelflow-compiler	pixelflow-compiler/src/parser.rs	115	parse_struct_decl	parse	struct decl	
+pixelflow-compiler	pixelflow-compiler/src/symbol.rs	119	register_manifold_param		manifold param	
+pixelflow-compiler	pixelflow-compiler/src/ir_bridge.rs	25	scalar_param_indices		scalar param	
+pixelflow-compiler	pixelflow-compiler/src/codegen/struct_emitter.rs	91	with_derives		with derives	with
+pixelflow-compiler	pixelflow-compiler/src/codegen/struct_emitter.rs	108	with_fixed_domain		with domain	with
+pixelflow-core	pixelflow-core/src/jit.rs	21	_pixelflow_jit_patch_site		jit patch	
+pixelflow-core	pixelflow-core/src/combinators/block.rs	59	block_eval		block eval	
+pixelflow-core	pixelflow-core/src/lib.rs	1196	div_scalar		div scalar	
+pixelflow-core	pixelflow-core/src/jit.rs	51	evaluate_stripe_jit_patched	evaluate	stripe jit	
+pixelflow-core	pixelflow-core/src/lib.rs	1259	field_abs		field abs	
+pixelflow-core	pixelflow-core/src/lib.rs	1244	field_cos		field cos	
+pixelflow-core	pixelflow-core/src/lib.rs	1249	field_exp		field exp	
+pixelflow-core	pixelflow-core/src/lib.rs	1264	field_floor		field floor	
+pixelflow-core	pixelflow-core/src/lib.rs	1274	field_max		field max	
+pixelflow-core	pixelflow-core/src/lib.rs	1269	field_min		field min	
+pixelflow-core	pixelflow-core/src/lib.rs	1239	field_sin		field sin	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	521	from_f32_scaled		f32 scaled	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1132	from_f32_scaled		f32 scaled	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1726	from_f32_scaled		f32 scaled	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	456	from_f32_scaled		f32 scaled	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	301	from_f32_scaled		f32 scaled	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	552	from_f32_scaled		f32 scaled	
+pixelflow-core	pixelflow-core/src/bin/calibrate_costs.rs	264	get_config_dir	get	config dir	
+pixelflow-core	pixelflow-core/src/lib.rs	1356	jet_abs		jet abs	
+pixelflow-core	pixelflow-core/src/lib.rs	1321	jet_cos		jet cos	
+pixelflow-core	pixelflow-core/src/lib.rs	1334	jet_exp		jet exp	
+pixelflow-core	pixelflow-core/src/lib.rs	1373	jet_floor		jet floor	
+pixelflow-core	pixelflow-core/src/lib.rs	1396	jet_max		jet max	
+pixelflow-core	pixelflow-core/src/lib.rs	1383	jet_min		jet min	
+pixelflow-core	pixelflow-core/src/lib.rs	1309	jet_sin		jet sin	
+pixelflow-core	pixelflow-core/src/lib.rs	1285	jet_sqrt		jet sqrt	
+pixelflow-core	pixelflow-core/src/algebra.rs	198	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/algebra.rs	364	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/dual.rs	500	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/numeric.rs	188	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/ext.rs	321	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/lib.rs	695	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/lib.rs	1704	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	245	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	839	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1466	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	228	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	152	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	265	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/jet/jet2.rs	616	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/jet/jet2h.rs	861	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/jet/path_jet.rs	395	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/jet/jet3.rs	704	mul_add		mul add	
+pixelflow-core	pixelflow-core/src/numeric.rs	175	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/ext.rs	349	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/lib.rs	797	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/lib.rs	1684	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/jet/jet2.rs	744	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/jet/jet2h.rs	1055	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/jet/path_jet.rs	499	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/jet/jet3.rs	853	mul_rsqrt		mul rsqrt	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	582	pack_rgba		pack rgba	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1196	pack_rgba		pack rgba	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1792	pack_rgba		pack rgba	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	505	pack_rgba		pack rgba	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	349	pack_rgba		pack rgba	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	608	pack_rgba		pack rgba	
+pixelflow-core	pixelflow-core/src/ops/trig.rs	55	range_reduce_pi		range reduce	
+pixelflow-core	pixelflow-core/src/numeric.rs	207	raw_add		raw add	raw
+pixelflow-core	pixelflow-core/src/lib.rs	1724	raw_add		raw add	raw
+pixelflow-core	pixelflow-core/src/jet/jet2.rs	813	raw_add		raw add	raw
+pixelflow-core	pixelflow-core/src/jet/jet2h.rs	1119	raw_add		raw add	raw
+pixelflow-core	pixelflow-core/src/jet/path_jet.rs	531	raw_add		raw add	raw
+pixelflow-core	pixelflow-core/src/jet/jet3.rs	924	raw_add		raw add	raw
+pixelflow-core	pixelflow-core/src/numeric.rs	216	raw_div		raw div	raw
+pixelflow-core	pixelflow-core/src/lib.rs	1739	raw_div		raw div	raw
+pixelflow-core	pixelflow-core/src/jet/jet2.rs	828	raw_div		raw div	raw
+pixelflow-core	pixelflow-core/src/jet/jet2h.rs	1134	raw_div		raw div	raw
+pixelflow-core	pixelflow-core/src/jet/path_jet.rs	546	raw_div		raw div	raw
+pixelflow-core	pixelflow-core/src/jet/jet3.rs	939	raw_div		raw div	raw
+pixelflow-core	pixelflow-core/src/numeric.rs	213	raw_mul		raw mul	raw
+pixelflow-core	pixelflow-core/src/lib.rs	1734	raw_mul		raw mul	raw
+pixelflow-core	pixelflow-core/src/jet/jet2.rs	823	raw_mul		raw mul	raw
+pixelflow-core	pixelflow-core/src/jet/jet2h.rs	1129	raw_mul		raw mul	raw
+pixelflow-core	pixelflow-core/src/jet/path_jet.rs	541	raw_mul		raw mul	raw
+pixelflow-core	pixelflow-core/src/jet/jet3.rs	934	raw_mul		raw mul	raw
+pixelflow-core	pixelflow-core/src/numeric.rs	219	raw_neg		raw neg	raw
+pixelflow-core	pixelflow-core/src/lib.rs	1744	raw_neg		raw neg	raw
+pixelflow-core	pixelflow-core/src/jet/jet2.rs	833	raw_neg		raw neg	raw
+pixelflow-core	pixelflow-core/src/jet/jet2h.rs	1139	raw_neg		raw neg	raw
+pixelflow-core	pixelflow-core/src/jet/path_jet.rs	551	raw_neg		raw neg	raw
+pixelflow-core	pixelflow-core/src/jet/jet3.rs	944	raw_neg		raw neg	raw
+pixelflow-core	pixelflow-core/src/numeric.rs	210	raw_sub		raw sub	raw
+pixelflow-core	pixelflow-core/src/lib.rs	1729	raw_sub		raw sub	raw
+pixelflow-core	pixelflow-core/src/jet/jet2.rs	818	raw_sub		raw sub	raw
+pixelflow-core	pixelflow-core/src/jet/jet2h.rs	1124	raw_sub		raw sub	raw
+pixelflow-core	pixelflow-core/src/jet/path_jet.rs	536	raw_sub		raw sub	raw
+pixelflow-core	pixelflow-core/src/jet/jet3.rs	929	raw_sub		raw sub	raw
+pixelflow-core	pixelflow-core/src/combinators/spherical.rs	601	sh2_multiply_field		sh2 field	
+pixelflow-core	pixelflow-core/src/combinators/spherical.rs	587	sh2_multiply_static_field		sh2 field	static
+pixelflow-core	pixelflow-core/src/backend/x86.rs	179	simd_abs		simd abs	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	797	simd_abs		simd abs	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1414	simd_abs		simd abs	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	184	simd_abs		simd abs	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	116	simd_abs		simd abs	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	216	simd_abs		simd abs	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	230	simd_floor		simd floor	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	834	simd_floor		simd floor	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1457	simd_floor		simd floor	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	223	simd_floor		simd floor	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	147	simd_floor		simd floor	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	260	simd_floor		simd floor	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	193	simd_max		simd max	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	810	simd_max		simd max	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1427	simd_max		simd max	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	194	simd_max		simd max	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	126	simd_max		simd max	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	226	simd_max		simd max	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	188	simd_min		simd min	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	805	simd_min		simd min	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1422	simd_min		simd min	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	189	simd_min		simd min	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	121	simd_min		simd min	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	221	simd_min		simd min	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	274	simd_rsqrt		simd rsqrt	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	864	simd_rsqrt		simd rsqrt	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1485	simd_rsqrt		simd rsqrt	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	248	simd_rsqrt		simd rsqrt	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	168	simd_rsqrt		simd rsqrt	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	294	simd_rsqrt		simd rsqrt	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	198	simd_select		simd select	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	815	simd_select		simd select	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1432	simd_select		simd select	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	199	simd_select		simd select	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	131	simd_select		simd select	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	231	simd_select		simd select	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	174	simd_sqrt		simd sqrt	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	792	simd_sqrt		simd sqrt	
+pixelflow-core	pixelflow-core/src/backend/x86.rs	1409	simd_sqrt		simd sqrt	
+pixelflow-core	pixelflow-core/src/backend/wasm.rs	179	simd_sqrt		simd sqrt	
+pixelflow-core	pixelflow-core/src/backend/scalar.rs	111	simd_sqrt		simd sqrt	
+pixelflow-core	pixelflow-core/src/backend/arm.rs	211	simd_sqrt		simd sqrt	
+pixelflow-core	pixelflow-core/src/lib.rs	560	sqrt_fast		sqrt fast	fast
+pixelflow-core	pixelflow-core/src/lib.rs	1222	sub_scalar		sub scalar	
+pixelflow-graphics	pixelflow-graphics/src/subdiv/mod.rs	170	axis_patch		axis patch	
+pixelflow-graphics	pixelflow-graphics/examples/circle_asm.rs	11	circle_kernel		circle kernel	
+pixelflow-graphics	pixelflow-graphics/src/render/color.rs	574	color_manifold		color manifold	
+pixelflow-graphics	pixelflow-graphics/src/subdiv/mod.rs	342	eigen_patch		eigen patch	
+pixelflow-graphics	pixelflow-graphics/src/subdiv/mod.rs	280	first_tile_patch		first patch	
+pixelflow-graphics	pixelflow-graphics/src/fonts/ttf.rs	586	glyph_scaled		glyph scaled	
+pixelflow-graphics	pixelflow-graphics/src/fonts/ttf.rs	598	glyph_scaled_by_id		glyph scaled	
+pixelflow-graphics	pixelflow-graphics/src/shapes.rs	74	half_plane_x		half plane	
+pixelflow-graphics	pixelflow-graphics/src/shapes.rs	89	half_plane_y		half plane	
+pixelflow-graphics	pixelflow-graphics/src/spatial_bsp.rs	215	interior_count		interior count	
+pixelflow-graphics	pixelflow-graphics/src/fonts/ttf.rs	660	kern_scaled		kern scaled	
+pixelflow-graphics	pixelflow-graphics/src/spatial_bsp.rs	220	leaf_count		leaf count	
+pixelflow-graphics	pixelflow-graphics/src/animation.rs	67	screen_remap		screen remap	
+pixelflow-graphics	pixelflow-graphics/src/render/rasterizer/actor.rs	97	spawn_with_setup	spawn	with setup	with
+pixelflow-graphics	pixelflow-graphics/src/subdiv/mod.rs	262	tiled_axis_patch		axis patch	
+pixelflow-graphics	pixelflow-graphics/src/animation.rs	31	time_shift		time shift	
+pixelflow-graphics	pixelflow-graphics/src/render/color.rs	129	to_f32_rgba		f32 rgba	
+pixelflow-graphics	pixelflow-graphics/src/scene3d.rs	170	unit_sphere		unit sphere	
+pixelflow-graphics	pixelflow-graphics/src/subdiv/mod.rs	396	validate_eigen_domain		eigen domain	
+pixelflow-graphics	pixelflow-graphics/src/fonts/ttf.rs	127	with_kernel		with kernel	with
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	2265	arena_to_schedule		arena schedule	
+pixelflow-ir	pixelflow-ir/src/backend/emit/regalloc.rs	343	build_interference_graph	build	interference graph	
+pixelflow-ir	pixelflow-ir/src/backend/emit/regalloc.rs	192	color_graph		color graph	
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	570	compile_arena_dag	compile	arena dag	
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	3010	compile_arena_dag	compile	arena dag	
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	1381	compile_scanline_from_schedule	compile	scanline schedule	
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	944	compile_scanline_hoisted	compile	scanline hoisted	hoisted
+pixelflow-ir	pixelflow-ir/src/variance.rs	227	compute_arena_variance	compute	arena variance	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	2740	dump_jit_asm		jit asm	
+pixelflow-ir	pixelflow-ir/src/backend/emit/x86_64.rs	836	emit_binary_transcendental	emit	binary transcendental	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	1262	emit_binary_transcendental	emit	binary transcendental	
+pixelflow-ir	pixelflow-ir/src/backend/emit/x86_64.rs	442	emit_exp2_body	emit	exp2 body	
+pixelflow-ir	pixelflow-ir/src/backend/emit/x86_64.rs	255	emit_f32_const	emit	f32 const	const
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	2792	emit_instruction_plan	emit	instruction plan	
+pixelflow-ir	pixelflow-ir/src/backend/emit/x86_64.rs	398	emit_log2_body	emit	log2 body	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	465	emit_pool_entry	emit	pool entry	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	1816	emit_scanline_epilogue_hoisted	emit	scanline hoisted	hoisted
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	1572	emit_scanline_prologue	emit	scanline prologue	
+pixelflow-ir	pixelflow-ir/src/backend/emit/x86_64.rs	470	emit_sin_body	emit	sin body	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	730	emit_sin_body	emit	sin body	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	541	emit_u32_const	emit	u32 const	const
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	623	from_f32_scaled		f32 scaled	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1339	from_f32_scaled		f32 scaled	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	2018	from_f32_scaled		f32 scaled	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	545	from_f32_scaled		f32 scaled	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	326	from_f32_scaled		f32 scaled	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	331	from_f32_scaled		f32 scaled	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	647	from_f32_scaled		f32 scaled	
+pixelflow-ir	pixelflow-ir/src/arena.rs	338	has_var		has var	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	250	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	941	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1673	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	212	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	152	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/primitives.rs	105	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	126	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	249	mul_add		mul add	
+pixelflow-ir	pixelflow-ir/src/backend/compounds.rs	267	mul_rsqrt		mul rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	261	mul_rsqrt		mul rsqrt	
+pixelflow-ir	pixelflow-ir/src/arena.rs	257	nary_children_slice		nary children	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	377	needs_const_pool		const pool	const
+pixelflow-ir	pixelflow-ir/src/arena.rs	419	node_count_subtree		node count	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	684	pack_rgba		pack rgba	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1403	pack_rgba		pack rgba	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	2084	pack_rgba		pack rgba	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	594	pack_rgba		pack rgba	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	374	pack_rgba		pack rgba	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	703	pack_rgba		pack rgba	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	2172	pool_entry		pool entry	
+pixelflow-ir	pixelflow-ir/src/backend/emit/patch.rs	13	pthread_jit_write_protect_np		jit write	
+pixelflow-ir	pixelflow-ir/src/backend/emit/executable.rs	338	pthread_jit_write_protect_np		jit write	
+pixelflow-ir	pixelflow-ir/src/math.rs	19	range_reduce_pi		range reduce	
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	2302	scanline_epilogue_hoisted		scanline hoisted	hoisted
+pixelflow-ir	pixelflow-ir/src/backend/emit/aarch64.rs	2284	scanline_prologue		scanline prologue	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	184	simd_abs		simd abs	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	899	simd_abs		simd abs	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1621	simd_abs		simd abs	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	168	simd_abs		simd abs	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	116	simd_abs		simd abs	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	107	simd_abs		simd abs	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	200	simd_abs		simd abs	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	235	simd_floor		simd floor	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	936	simd_floor		simd floor	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1664	simd_floor		simd floor	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	207	simd_floor		simd floor	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	147	simd_floor		simd floor	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	123	simd_floor		simd floor	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	244	simd_floor		simd floor	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	198	simd_max		simd max	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	912	simd_max		simd max	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1634	simd_max		simd max	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	178	simd_max		simd max	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	126	simd_max		simd max	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	111	simd_max		simd max	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	210	simd_max		simd max	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	193	simd_min		simd min	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	907	simd_min		simd min	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1629	simd_min		simd min	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	173	simd_min		simd min	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	121	simd_min		simd min	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	109	simd_min		simd min	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	205	simd_min		simd min	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	279	simd_rsqrt		simd rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	966	simd_rsqrt		simd rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1692	simd_rsqrt		simd rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	232	simd_rsqrt		simd rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	168	simd_rsqrt		simd rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	135	simd_rsqrt		simd rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	278	simd_rsqrt		simd rsqrt	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	203	simd_select		simd select	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	917	simd_select		simd select	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1639	simd_select		simd select	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	183	simd_select		simd select	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	131	simd_select		simd select	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	114	simd_select		simd select	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	215	simd_select		simd select	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	179	simd_sqrt		simd sqrt	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	894	simd_sqrt		simd sqrt	
+pixelflow-ir	pixelflow-ir/src/backend/x86.rs	1616	simd_sqrt		simd sqrt	
+pixelflow-ir	pixelflow-ir/src/backend/wasm.rs	163	simd_sqrt		simd sqrt	
+pixelflow-ir	pixelflow-ir/src/backend/scalar.rs	111	simd_sqrt		simd sqrt	
+pixelflow-ir	pixelflow-ir/src/backend/mod.rs	105	simd_sqrt		simd sqrt	
+pixelflow-ir	pixelflow-ir/src/backend/arm.rs	195	simd_sqrt		simd sqrt	
+pixelflow-ir	pixelflow-ir/src/backend/emit/executable.rs	333	toggle_jit_write		jit write	
+pixelflow-ir	pixelflow-ir/src/backend/emit/mod.rs	298	with_max_regs		with max	with
+pixelflow-pipeline	pixelflow-pipeline/src/bin/gen_bench_corpus.rs	261	arena_structural_key		arena key	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	1030	backward_expr_proj_and_backbone	backward	expr and	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	1109	backward_graph_proj_and_backbone	backward	graph and	
+pixelflow-pipeline	pixelflow-pipeline/src/jit_bench.rs	337	benchmark_jit_arena		jit arena	
+pixelflow-pipeline	pixelflow-pipeline/src/jit_bench.rs	347	benchmark_jit_arena_repeated		jit arena	
+pixelflow-pipeline	pixelflow-pipeline/src/bin/bench_hoisted_scanline.rs	40	build_psychedelic_arena	build	psychedelic arena	
+pixelflow-pipeline	pixelflow-pipeline/src/training/self_play.rs	136	build_rule_templates	build	rule templates	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	699	clip_stats		clip stats	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	1182	compute_d_acc_input_policy	compute	input policy	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	1293	compute_d_acc_input_value	compute	input value	
+pixelflow-pipeline	pixelflow-pipeline/examples/critical_path_test.rs	30	deep_sqrt_chain		sqrt chain	deep
+pixelflow-pipeline	pixelflow-pipeline/src/bin/train_unified.rs	2005	default_max_trajectory_files		max trajectory	default
+pixelflow-pipeline	pixelflow-pipeline/src/bin/train_unified.rs	1987	default_mini_batch_size		batch size	default batch
+pixelflow-pipeline	pixelflow-pipeline/examples/egraph_choices.rs	84	div_sqrt		div sqrt	
+pixelflow-pipeline	pixelflow-pipeline/examples/egraph_choices.rs	90	fast_rsqrt		fast rsqrt	fast
+pixelflow-pipeline	pixelflow-pipeline/src/bin/train_unified.rs	563	final_model_path		model path	
+pixelflow-pipeline	pixelflow-pipeline/src/training/self_play.rs	610	generate_trajectory_batch	generate	trajectory batch	batch
+pixelflow-pipeline	pixelflow-pipeline/src/training/self_play.rs	633	generate_trajectory_batch_parallel	generate	trajectory batch	batch parallel
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	1463	group_clip_scale		clip scale	
+pixelflow-pipeline	pixelflow-pipeline/examples/egraph_choices.rs	46	mul_recip		mul recip	
+pixelflow-pipeline	pixelflow-pipeline/examples/egraph_choices.rs	70	mul_then_add		mul add	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	621	norm_policy_head		policy head	
+pixelflow-pipeline	pixelflow-pipeline/src/training/unified_backward.rs	603	norm_value_head		value head	
+pixelflow-pipeline	pixelflow-pipeline/src/training/self_play.rs	1002	read_advantages_binary	read	advantages binary	
+pixelflow-pipeline	pixelflow-pipeline/src/training/factored.rs	366	reduce_binary_ops	reduce	binary ops	
+pixelflow-pipeline	pixelflow-pipeline/examples/egraph_choices.rs	55	sqrt_squared		sqrt squared	
+pixelflow-pipeline	pixelflow-pipeline/examples/critical_path_test.rs	18	wide_sqrt_sum		sqrt sum	wide
+pixelflow-runtime	pixelflow-runtime/examples/animated_sphere.rs	119	build_scene_at_time	build	scene time	
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/cocoa.rs	236	content_view		content view	
+pixelflow-runtime	pixelflow-runtime/src/engine_troupe.rs	702	convert_mouse_button	convert	mouse button	
+pixelflow-runtime	pixelflow-runtime/src/api/private.rs	135	create_engine_actor	create	engine actor	
+pixelflow-runtime	pixelflow-runtime/src/frame.rs	105	create_frame_channel	create	frame channel	
+pixelflow-runtime	pixelflow-runtime/build.rs	49	determine_display_driver		display driver	
+pixelflow-runtime	pixelflow-runtime/src/engine_troupe.rs	815	engine_handle		engine handle	
+pixelflow-runtime	pixelflow-runtime/src/display/drivers/web/mod.rs	158	event_loop		event loop	
+pixelflow-runtime	pixelflow-runtime/src/engine_troupe.rs	384	handle_app_data	handle	app data	
+pixelflow-runtime	pixelflow-runtime/src/engine_troupe.rs	470	handle_driver_event	handle	driver event	
+pixelflow-runtime	pixelflow-runtime/src/platform/linux/events.rs	95	handle_selection_request	handle	selection request	
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/cocoa.rs	262	init_with_frame	init	with frame	with
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/cocoa.rs	314	key_code		key code	
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/objc.rs	198	msg_send_bool		send bool	
+pixelflow-runtime	pixelflow-runtime/src/platform/linux/window.rs	162	query_scale_factor		scale factor	
+pixelflow-runtime	pixelflow-runtime/src/vsync_actor.rs	45	return_vsync_token		vsync token	
+pixelflow-runtime	pixelflow-runtime/src/display/drivers/headless.rs	75	run_event_loop	run	event loop	
+pixelflow-runtime	pixelflow-runtime/src/display/drivers/web/mod.rs	94	run_event_loop	run	event loop	
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/window.rs	105	scale_factor		scale factor	
+pixelflow-runtime	pixelflow-runtime/src/platform/macos/cocoa.rs	220	set_content_view	set	content view	
+pixelflow-runtime	pixelflow-runtime/src/platform/linux/platform.rs	36	set_shared_waker	set	shared waker	
+pixelflow-runtime	pixelflow-runtime/src/vsync_actor.rs	159	spawn_clock_thread	spawn	clock thread	
+pixelflow-runtime	pixelflow-runtime/src/frame.rs	81	try_submit_frame		try frame	
+pixelflow-runtime	pixelflow-runtime/src/engine_troupe.rs	757	with_config		with config	with
+pixelflow-search	pixelflow-search/src/egraph/saturate.rs	189	achievable_cost_within_budget		cost budget	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	817	add_edge_with_pe	add	edge with	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	1135	add_var_ref_edges	add	var ref	ref
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	1054	apply_rule_at_index	apply	rule index	
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	1061	apply_rule_at_index_budgeted	apply	rule index	
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	1071	apply_rule_at_index_timed	apply	rule index	
+pixelflow-search	pixelflow-search/src/egraph/saturate.rs	153	apply_rules_counted_with_limits	apply	counted with	with
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	201	batch_with_chunk		batch with	batch with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2658	bernoulli_policy_from_accumulator		policy accumulator	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	3185	bilinear_forward_with_hidden		forward with	with
+pixelflow-search	pixelflow-search/src/egraph/extract.rs	691	build_extracted_dag_from_choices	build	extracted dag	
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	127	canonicalize_node		canonicalize node	
+pixelflow-search	pixelflow-search/src/egraph/mod.rs	94	collect_rule_templates		rule templates	
+pixelflow-search	pixelflow-search/src/egraph/deps.rs	162	compute_class_deps	compute	class deps	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2297	compute_mask_features	compute	mask features	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	643	const_cos		const cos	const
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	603	const_exp		const exp	const
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	617	const_sin		const sin	const
+pixelflow-search	pixelflow-search/src/egraph/cost.rs	63	cost_by_kind		cost kind	
+pixelflow-search	pixelflow-search/src/egraph/cost.rs	331	cost_by_kind		cost kind	
+pixelflow-search	pixelflow-search/src/egraph/codegen.rs	178	emit_op_with_args	emit	with args	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2428	encode_rule_from_arena	encode	rule arena	
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	1760	extract_dag_with_costs	extract	dag with	with
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	1728	extract_expr_with_costs	extract	expr with	with
+pixelflow-search	pixelflow-search/src/traits.rs	37	feature_space_size		feature size	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2116	forward_expr_only	forward	expr only	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	363	from_rule_templates		rule templates	
+pixelflow-search	pixelflow-search/src/nnue/mod.rs	605	generate_leaf_arena	generate	leaf arena	
+pixelflow-search	pixelflow-search/src/nnue/mod.rs	625	guard_nonnegative_arena		guard arena	
+pixelflow-search	pixelflow-search/src/nnue/mod.rs	617	guard_positive_nonzero_arena		guard arena	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	274	has_root_op		has root	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	268	has_templates		has templates	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	459	init_with_latency_prior	init	with latency	with
+pixelflow-search	pixelflow-search/src/math/algebra.rs	942	inverse_pair_rules		inverse pair	
+pixelflow-search	pixelflow-search/src/math/trig.rs	276	match_pythagorean_pair	match	pythagorean pair	
+pixelflow-search	pixelflow-search/src/math/trig.rs	583	match_sin_cos_same_arg	match	sin cos	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	452	new_with_latency_prior		with latency	new with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	1682	new_with_latency_prior		with latency	new with
+pixelflow-search	pixelflow-search/src/egraph/cost.rs	60	node_cost		node cost	
+pixelflow-search	pixelflow-search/src/egraph/cost.rs	327	node_cost		node cost	
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	296	node_count		node count	
+pixelflow-search	pixelflow-search/src/egraph/graph.rs	2145	node_count		node count	
+pixelflow-search	pixelflow-search/src/egraph/deps.rs	178	node_deps		node deps	
+pixelflow-search	pixelflow-search/src/egraph/cost.rs	146	node_op_cost		node cost	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	549	param_count		param count	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2507	param_count		param count	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2611	policy_from_accumulator		policy accumulator	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2629	policy_from_features		policy features	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2560	predict_cost_from_accumulator		cost accumulator	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2584	predict_cost_from_features		cost features	
+pixelflow-search	pixelflow-search/src/nnue/mod.rs	1128	push_arena_node	push	arena node	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	1929	randomize_mask_only		mask only	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	1748	randomize_weights_only		weights only	
+pixelflow-search	pixelflow-search/src/nnue/mod.rs	1086	remap_node		remap node	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	869	remove_edge_with_pe	remove	edge with	with
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	1148	remove_var_ref_edges	remove	var ref	ref
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	283	root_op_set		root set	
+pixelflow-search	pixelflow-search/src/egraph/saturate.rs	91	saturate_with_budget		with budget	with
+pixelflow-search	pixelflow-search/src/nnue/mod.rs	315	substitute_template_arena		template arena	
+pixelflow-search	pixelflow-search/src/nnue/factored.rs	2327	value_mlp_forward		value forward	
+pixelflow-search	pixelflow-search/src/egraph/deps.rs	43	var_deps		var deps	
+pixelflow-search	pixelflow-search/src/egraph/deps.rs	32	var_variance		var variance	
+xtask	xtask/src/main.rs	42	find_workspace_root	find	workspace root	
+xtask	xtask/src/main.rs	376	format_f32_array	format	f32 array	
