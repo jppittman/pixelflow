@@ -28,6 +28,8 @@ enum Map {
     M0F = 1,
     /// `0F38`
     M0F38 = 2,
+    /// `0F3A`
+    M0F3A = 3,
 }
 
 /// Mandatory prefix (EVEX `pp`).
@@ -235,6 +237,96 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
         _ => return Err("avx512: binary op not in Stage-1 subset"),
     }
     Ok(())
+}
+
+// =============================================================================
+// Masks & select — a mask is an ordinary vector (all-ones / all-zeros lanes) in
+// the regular zmm register file, exactly like NEON. It flows through the shared
+// allocator as a normal value; the k-register (k1) is only transient scratch
+// inside these encoders, never an allocatable class. This is the trait's job
+// (IsaBackend::emit_plan), not the allocator's.
+// =============================================================================
+
+/// `vcmpps`/`vpternlog` predicate (imm8). Same ordering as the SSE2 path.
+const CMP_EQ: u8 = 0;
+const CMP_LT: u8 = 1;
+const CMP_LE: u8 = 2;
+const CMP_NEQ: u8 = 4;
+const CMP_GE: u8 = 5;
+const CMP_GT: u8 = 6;
+
+/// Transient k-register used to receive a `vcmpps` result before it is widened
+/// to a vector mask. Never allocated — scratch internal to compare emission.
+const SCRATCH_K: u8 = 1;
+
+/// Like [`evex_rrr`] but appends an `imm8` (for `vcmpps`, `vpternlogd`).
+fn evex_rrr_imm(
+    code: &mut Vec<u8>,
+    map: Map,
+    pp: Pp,
+    w: bool,
+    opcode: u8,
+    dst: u8,
+    src1: u8,
+    src2: u8,
+    imm: u8,
+) {
+    evex_rrr(code, map, pp, w, opcode, dst, src1, src2);
+    code.push(imm);
+}
+
+/// Map a comparison `OpKind` to its `vcmpps` predicate imm8.
+fn cmp_pred(op: OpKind) -> Option<u8> {
+    Some(match op {
+        OpKind::Eq => CMP_EQ,
+        OpKind::Ne => CMP_NEQ,
+        OpKind::Lt => CMP_LT,
+        OpKind::Le => CMP_LE,
+        OpKind::Gt => CMP_GT,
+        OpKind::Ge => CMP_GE,
+        _ => return None,
+    })
+}
+
+/// Whether `op` is a comparison handled by [`emit_compare`].
+pub fn is_compare(op: OpKind) -> bool {
+    cmp_pred(op).is_some()
+}
+
+/// Emit `dst = (src1 <op> src2) ? all-ones : all-zeros` as a vector mask.
+///
+/// `vcmpps k1, src1, src2, pred` (EVEX.512.0F.W0 C2 /r ib) writes a k-register;
+/// `vpmovm2d dst, k1` (EVEX.512.F3.0F38.W0 38 /r) widens it to a per-lane
+/// all-ones/all-zeros vector occupying the allocator-assigned `dst` zmm.
+pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) -> Result<(), &'static str> {
+    let pred = cmp_pred(op).ok_or("avx512: not a comparison op")?;
+    // vcmpps k1, src1, src2, pred  (k-dest in ModRM.reg)
+    evex_rrr_imm(code, Map::M0F, Pp::None, false, 0xC2, SCRATCH_K, src1.0, src2.0, pred);
+    // vpmovm2d dst, k1  (widen mask -> vector)
+    evex_rrr(code, Map::M0F38, Pp::F3, false, 0x38, dst.0, UNUSED_VVVV, SCRATCH_K);
+    Ok(())
+}
+
+/// Emit `dst = mask ? if_true : if_false`, with the vector mask already in
+/// `dst` (placed there by `setup_mov`, matching the SSE2/NEON convention).
+///
+/// One `vpternlogd dst, if_true, if_false, 0xCA` (EVEX.512.66.0F3A.W0 25 /r ib):
+/// the truth table 0xCA computes `A?B:C` per bit with A=dst(mask), B=if_true,
+/// C=if_false, i.e. a per-lane select for an all-ones/all-zeros mask.
+pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
+    evex_rrr_imm(code, Map::M0F3A, Pp::P66, false, 0x25, dst.0, if_true.0, if_false.0, 0xCA);
+}
+
+/// Set flags from a vector mask for the Select short-circuit guards.
+///
+/// `vptestmd k1, mask, mask` sets `k1[i]` for each nonzero lane; `kortestw k1,k1`
+/// then sets ZF iff `k1 == 0` (all lanes false) and CF iff `k1 == 0xFFFF` (all
+/// 16 lanes true). The caller follows with `jz` (all-false) or `jc` (all-true).
+pub fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg) {
+    // vptestmd k1, mask, mask  (EVEX.512.66.0F38.W0 27 /r)
+    evex_rrr(code, Map::M0F38, Pp::P66, false, 0x27, SCRATCH_K, mask.0, mask.0);
+    // kortestw k1, k1  (VEX.L0.0F.W0 98 /r) -> C5 F8 98 C9
+    code.extend_from_slice(&[0xC5, 0xF8, 0x98, 0xC9]);
 }
 
 /// Emit `dst = op(src)` for a unary op (Stage-1 subset).
