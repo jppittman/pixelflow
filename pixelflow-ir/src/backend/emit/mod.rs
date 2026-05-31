@@ -2930,29 +2930,71 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
         vid_to_sched_idx[vid.0 as usize] = i;
     }
 
-    for (i, (_vid, sop)) in schedule.iter().enumerate() {
+    // Global consumer map: consumers[v.0] = every value that reads v as an
+    // operand. A node may only be guarded (skipped when its arm's mask is
+    // uniform) if EVERY consumer is inside that arm's subtree (or the select
+    // itself) — otherwise an outer/sibling expression reads a register the
+    // branch never computed. Subtree-local exclusivity (below) is necessary but
+    // NOT sufficient; this is the global check that was missing.
+    let mut consumers: alloc::vec::Vec<alloc::vec::Vec<regalloc::ValueId>> =
+        alloc::vec![alloc::vec::Vec::new(); max_vid + 1];
+    for (vid, sop) in schedule {
+        let mut add = |child: regalloc::ValueId| {
+            if (child.0 as usize) <= max_vid {
+                consumers[child.0 as usize].push(*vid);
+            }
+        };
+        match sop {
+            ScheduledOp::Var(_) | ScheduledOp::Const(_) => {}
+            ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) => add(*c),
+            ScheduledOp::Binary(_, a, b) => {
+                add(*a);
+                add(*b);
+            }
+            ScheduledOp::Ternary(_, a, b, c) => {
+                add(*a);
+                add(*b);
+                add(*c);
+            }
+        }
+    }
+
+    for (i, (sel_vid, sop)) in schedule.iter().enumerate() {
         if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sop {
             // Compute transitive deps for each subtree using the dense O(1) lookup
             let mask_deps = transitive_deps(*mask_vid, &schedule_ops);
             let true_deps = transitive_deps(*true_vid, &schedule_ops);
             let false_deps = transitive_deps(*false_vid, &schedule_ops);
 
-            // True-exclusive: in true_deps but NOT in mask_deps and NOT in false_deps
+            // A node is safe to skip under this arm only if every one of its
+            // consumers lies within the arm's subtree or is the select node
+            // itself. Otherwise skipping it (uniform-mask short-circuit) leaves a
+            // value some other expression still reads uninitialized.
+            let only_used_within = |v: regalloc::ValueId, arm: &BTreeSet<regalloc::ValueId>| {
+                consumers[v.0 as usize]
+                    .iter()
+                    .all(|c| *c == *sel_vid || arm.contains(c))
+            };
+
+            // True-exclusive: in true_deps but NOT in mask_deps and NOT in
+            // false_deps, AND used only within the true arm.
             let true_exclusive: BTreeSet<regalloc::ValueId> = true_deps
                 .difference(&mask_deps)
                 .copied()
                 .collect::<BTreeSet<_>>()
                 .difference(&false_deps)
                 .copied()
+                .filter(|v| only_used_within(*v, &true_deps))
                 .collect();
 
-            // False-exclusive: in false_deps but NOT in mask_deps and NOT in true_deps
+            // False-exclusive: symmetric.
             let false_exclusive: BTreeSet<regalloc::ValueId> = false_deps
                 .difference(&mask_deps)
                 .copied()
                 .collect::<BTreeSet<_>>()
                 .difference(&true_deps)
                 .copied()
+                .filter(|v| only_used_within(*v, &false_deps))
                 .collect();
 
             // Map to schedule indices using dense O(1) lookup
@@ -2984,14 +3026,16 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                     .next_back()
                     .expect("non-empty set has last element")
                     + 1;
-                // Verify contiguity: all indices in [start, end) should be either
-                // true_exclusive or shared. If there are false_exclusive nodes
-                // interleaved, we can't use a simple branch guard.
-                let has_false_in_range = (start..end).any(|idx| false_indices.contains(&idx));
-                if has_false_in_range {
-                    (i, i) // can't guard — fall back to BSL
-                } else {
+                // The branch skips the WHOLE range [start, end) when the mask is
+                // uniform, so EVERY index in it must be a true-exclusive node.
+                // If any in-range index is a shared node (used outside this arm)
+                // or a false-exclusive node, skipping it would leave a value some
+                // other expression reads uninitialized — fall back to BSL.
+                let all_exclusive = (start..end).all(|idx| true_indices.contains(&idx));
+                if all_exclusive {
                     (start, end)
+                } else {
+                    (i, i)
                 }
             };
 
@@ -3007,11 +3051,11 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                     .next_back()
                     .expect("non-empty set has last element")
                     + 1;
-                let has_true_in_range = (start..end).any(|idx| true_indices.contains(&idx));
-                if has_true_in_range {
-                    (i, i)
-                } else {
+                let all_exclusive = (start..end).all(|idx| false_indices.contains(&idx));
+                if all_exclusive {
                     (start, end)
+                } else {
+                    (i, i)
                 }
             };
 
@@ -5016,6 +5060,19 @@ mod tests {
         }
     }
 
+    /// Per-batch eval at (X=x, Y=y, Z=W=0), lane 0. 128-bit `KernelFn`, so gated
+    /// off `+avx512f` like `run1`.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    fn run_xy(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
+        use core::arch::x86_64::*;
+        let r = compile_arena_dag(arena, root).expect("compile failed");
+        unsafe {
+            let f: executable::KernelFn = r.code.as_fn();
+            let z = _mm_set1_ps(0.0);
+            _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
+        }
+    }
+
     /// Every x86-64 unary transcendental/round op must match its scalar
     /// reference across a range of inputs — these exercise `emit_arena` →
     /// `emit_unary` directly (not the compiler's lowering).
@@ -5380,6 +5437,49 @@ mod tests {
                 let x = a.push_var(0);
                 let l2 = a.push_unary(OpKind::Log2, x);
                 assert!((run1(&a, l2, xv) - xv.log2()).abs() <= 3e-2, "log2({xv})");
+            }
+        }
+
+        /// atan/atan2/asin/acos lower to arithmetic + Select (atan2 is the core;
+        /// the others derive from it). Value path only — atan2 uses Select, which
+        /// the jet path can't differentiate. Validated vs `f32`.
+        #[test]
+        fn inverse_trig_match_scalar() {
+            // The degree-7 atan polynomial is worst (~6e-2) at |ratio|=1; that
+            // dominates the tolerance. It catches logic/quadrant errors (which
+            // were off by whole radians via the guard bug), not approximation
+            // error. Tightening the polynomial is the tunable-precision lever.
+            const ATAN_TOL: f32 = 7e-2;
+
+            // atan over a wide range (exercises the |ratio|>1 swap branch).
+            for &xv in &[0.0f32, 0.3, 1.0, 2.5, -0.7, -4.0] {
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let at = a.push_unary(OpKind::Atan, x);
+                assert!((run1(&a, at, xv) - xv.atan()).abs() <= ATAN_TOL, "atan({xv})");
+            }
+            // asin/acos on [-1, 1].
+            for &xv in &[-0.9f32, -0.4, 0.0, 0.4, 0.9] {
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let s = a.push_unary(OpKind::Asin, x);
+                assert!((run1(&a, s, xv) - xv.asin()).abs() <= ATAN_TOL, "asin({xv})");
+
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let c = a.push_unary(OpKind::Acos, x);
+                assert!((run1(&a, c, xv) - xv.acos()).abs() <= ATAN_TOL, "acos({xv})");
+            }
+            // atan2 across quadrants (y in var0, x in var1). The (1,1)/(-1,-1)…
+            // cases sit at |ratio|=1, the polynomial's worst point.
+            let pts = [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0), (0.5, -2.0)];
+            for &(yv, xv) in &pts {
+                let mut a = ExprArena::new();
+                let y = a.push_var(0);
+                let x = a.push_var(1);
+                let r = a.push_binary(OpKind::Atan2, y, x);
+                let got = run_xy(&a, r, yv, xv);
+                assert!((got - yv.atan2(xv)).abs() <= ATAN_TOL, "atan2({yv},{xv}) = {got}");
             }
         }
 
