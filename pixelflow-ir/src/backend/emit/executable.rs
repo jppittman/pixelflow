@@ -420,7 +420,11 @@ pub type ScanlineKernelFn = extern "C" fn(
 // Tests
 // =============================================================================
 
-#[cfg(test)]
+// These tests hand-assemble SSE2 byte sequences and call them through the
+// 128-bit `KernelFn`, so they are specific to the non-AVX-512 ABI. Under
+// `+avx512f`, `KernelFn` is `__m512` and these `__m128` call sites don't type
+// check; the AVX-512 path is covered by the `avx512` tests in `mod.rs`.
+#[cfg(all(test, not(target_feature = "avx512f")))]
 mod tests {
     use super::*;
     use alloc::sync::Arc;

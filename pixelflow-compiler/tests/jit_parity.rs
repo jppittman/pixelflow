@@ -98,15 +98,8 @@ fn jit_arithmetic() {
 fn jit_unary() {
     jit_truth!("abs", kernel_jit!(|| (X - Y).abs()), |x: f32, y: f32, _z, _w| (x - y).abs(), 1e-5, 1e-5);
     jit_truth!("neg", kernel_jit!(|| (-X)), |x: f32, _y, _z, _w| -x, 1e-5, 1e-5);
-}
-
-/// `floor` is not in the AVX-512 backend's Stage-1 op set, so under `+avx512f`
-/// `compile_arena_dag` rejects it and `kernel_jit!` panics at build/run. Gate it
-/// off there until the wide backend grows rounding ops. (`abs`/`neg` above are
-/// in the subset and run on both widths.)
-#[test]
-#[cfg(not(target_feature = "avx512f"))]
-fn jit_unary_floor() {
+    // floor is now in the AVX-512 op set too (vrndscaleps), so this runs on
+    // both widths.
     jit_truth!("floor", kernel_jit!(|| X.floor()), |x: f32, _y, _z, _w| x.floor(), 1e-5, 1e-5);
 }
 

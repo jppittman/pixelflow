@@ -4868,8 +4868,11 @@ mod tests {
     /// The x86-64 scanline kernel must produce, for every pixel, exactly what
     /// the per-batch kernel produces for that pixel's X (with the same
     /// loop-invariant Y/Z/W).
+    // Compares the scanline kernel against the per-batch `KernelFn`, which is
+    // 128-bit under the default build; gated off `+avx512f` where `KernelFn` is
+    // `__m512` (the AVX-512 per-batch path is covered by the `avx512` tests).
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
     fn test_scanline_matches_per_batch_x86() {
         use core::arch::x86_64::*;
 
@@ -4932,7 +4935,9 @@ mod tests {
     }
 
     /// Run a per-batch arena kernel at `x` (Y/Z/W = 0) and return lane 0.
-    #[cfg(target_arch = "x86_64")]
+    /// 128-bit `KernelFn`; the builtin-parity tests below use it. Gated off
+    /// `+avx512f` (those builtins aren't in the AVX-512 op set yet anyway).
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
     fn run1(arena: &ExprArena, root: ExprId, x: f32) -> f32 {
         use core::arch::x86_64::*;
         let r = compile_arena_dag(arena, root).expect("compile failed");
@@ -4947,7 +4952,7 @@ mod tests {
     /// reference across a range of inputs — these exercise `emit_arena` →
     /// `emit_unary` directly (not the compiler's lowering).
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
     fn test_x86_unary_builtins_match_scalar() {
         // Tolerances reflect the shared (with aarch64) minimax-polynomial
         // accuracy over a sensible input range; exact ops use tight bounds.
@@ -4991,7 +4996,7 @@ mod tests {
 
     /// Binary transcendentals + comparisons + ternaries, JIT vs scalar.
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
     fn test_x86_binary_ternary_builtins_match_scalar() {
         use core::arch::x86_64::*;
         // Helper: compile f(X, Y) and eval at (x, y).
@@ -5088,7 +5093,9 @@ mod tests {
     // Uses hardware sqrtps/divps (no polynomial approximations), so tolerances
     // are tight.
     // =========================================================================
-    #[cfg(target_arch = "x86_64")]
+    // Calls kernels through the per-batch `KernelFn` (128-bit here); gated off
+    // `+avx512f` where that ABI is `__m512`.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
     mod jet {
         use super::*;
         use crate::arena::ExprArena;
@@ -5188,7 +5195,9 @@ mod tests {
     // =========================================================================
     // x86 shared-pipeline per-batch path (schedule → regalloc → spill).
     // =========================================================================
-    #[cfg(target_arch = "x86_64")]
+    // Calls kernels through the per-batch `KernelFn` (128-bit here); gated off
+    // `+avx512f` where that ABI is `__m512` (AVX-512 covered by `avx512_driver`).
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
     mod sched {
         use super::*;
         use crate::arena::ExprArena;
@@ -5495,6 +5504,25 @@ mod tests {
                 |i| if mixed[i] > 0.0 { ys[i] * ys[i] * ys[i] } else { 3.0 * zs[i] },
                 "guard-mixed",
             );
+        }
+
+        /// Rounding via vrndscaleps (floor/ceil/round), each a single EVEX op.
+        #[test]
+        fn avx512_rounding() {
+            // Mixed fractional/sign inputs so each rounding mode is distinct.
+            let xs = core::array::from_fn::<f32, 16, _>(|i| (i as f32 - 8.0) * 0.7);
+            let ones = [1.0f32; 16];
+            for (op, f, tag) in [
+                (OpKind::Floor, f32::floor as fn(f32) -> f32, "floor"),
+                (OpKind::Ceil, f32::ceil as fn(f32) -> f32, "ceil"),
+                (OpKind::Round, f32::round_ties_even as fn(f32) -> f32, "round"),
+            ] {
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let root = a.push_unary(op, x);
+                let res = compile_arena_dag_avx512(&a, root).expect("avx512 compile");
+                check(run16(&res, xs, ones, ones), |i| f(xs[i]), tag);
+            }
         }
     }
 }
