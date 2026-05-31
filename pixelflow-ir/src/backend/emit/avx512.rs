@@ -133,6 +133,13 @@ const UNARY_SCRATCH: Reg = Reg(15);
 /// vsqrtps zmmD, zmmS — EVEX.512.0F.W0 51 /r ; vvvv unused.
 fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x51, d, UNUSED_VVVV, s); }
 
+/// vrndscaleps zmmD, zmmS, imm8 — EVEX.512.66.0F3A.W0 08 /r ib ; vvvv unused.
+/// (Opcode 08 = packed-single; 09 is packed-double and needs W1.) Round each
+/// lane per `imm8` (see the Floor/Ceil/Round arms for the bit layout).
+fn vrndscaleps(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
+    evex_rrr_imm(c, Map::M0F3A, Pp::P66, false, 0x08, d, UNUSED_VVVV, s, imm);
+}
+
 // --- FMA (0F38, 66 prefix, W0). 213: dst = src1*dst + src2. ---
 fn vfmadd213ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F38, Pp::P66, false, 0xA8, d, s1, s2); }
 
@@ -345,6 +352,12 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg) -> Result<
             emit_const(code, UNARY_SCRATCH, f32::from_bits(0x7FFF_FFFF));
             vandps(code, dst.0, src.0, UNARY_SCRATCH.0);
         }
+        // Rounding: a single EVEX instruction (vrndscaleps), no polynomial.
+        // imm8 bit layout: bits[7:4] = scale (0 = integer), bits[3:0] = rounding
+        // mode (0 = nearest-even, 1 = toward -inf/floor, 2 = toward +inf/ceil).
+        OpKind::Floor => vrndscaleps(code, dst.0, src.0, 0x01),
+        OpKind::Ceil => vrndscaleps(code, dst.0, src.0, 0x02),
+        OpKind::Round => vrndscaleps(code, dst.0, src.0, 0x00),
         _ => return Err("avx512: unary op not in Stage-1 subset"),
     }
     Ok(())
