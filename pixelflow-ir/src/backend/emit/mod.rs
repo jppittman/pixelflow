@@ -3821,7 +3821,12 @@ impl IsaBackend for Avx512Backend {
             }
             ResolvedOp::Binary { op, dst, left, right } => {
                 // EVEX 3-operand: no two-operand hazard, emit directly.
-                avx512::emit_binary(code, *op, *dst, *left, *right)?;
+                // Comparisons produce a vector mask (vcmpps -> vpmovm2d).
+                if avx512::is_compare(*op) {
+                    avx512::emit_compare(code, *op, *dst, *left, *right)?;
+                } else {
+                    avx512::emit_binary(code, *op, *dst, *left, *right)?;
+                }
             }
             ResolvedOp::FusedMulAdd { dst, a, b } => {
                 // dst holds c (setup_mov); real FMA231: dst = a*b + dst.
@@ -3841,10 +3846,23 @@ impl IsaBackend for Avx512Backend {
                 }
                 avx512::emit_binary(code, OpKind::Add, *dst, *dst, *c)?;
             }
-            // Later stages: Select needs the k-mask class; Clamp/transcendentals
-            // the wide polynomial ports. Reject loudly rather than miscompile.
-            ResolvedOp::Select { .. } | ResolvedOp::Clamp { .. } => {
-                return Err("avx512: select/clamp not yet supported (k-mask stage)");
+            ResolvedOp::Select { dst, if_true, if_false } => {
+                // setup_mov already placed the vector mask in dst; one vpternlogd.
+                avx512::emit_select(code, *dst, *if_true, *if_false);
+            }
+            ResolvedOp::Clamp { dst, val, lo, hi, lo_deferred } => {
+                // clamp(val, lo, hi) = max(min(val, hi), lo). No mask needed.
+                avx512::emit_binary(code, OpKind::Min, *dst, *val, *hi)?;
+                match lo_deferred {
+                    Some(DeferredReload::FromStack(off)) => {
+                        avx512::emit_load_rsp(code, *lo, avx512_slot_disp(*off));
+                    }
+                    Some(DeferredReload::Const(bits)) => {
+                        avx512::emit_const(code, *lo, f32::from_bits(*bits));
+                    }
+                    None => {}
+                }
+                avx512::emit_binary(code, OpKind::Max, *dst, *dst, *lo)?;
             }
         }
         if let Some(store) = &plan.store {
@@ -3885,14 +3903,16 @@ impl IsaBackend for Avx512Backend {
         }
     }
 
-    // Select short-circuit guards are unreachable in Stage 1 (Select rejects in
-    // emit_plan), but the trait requires them. Provide honest panics so a future
-    // wiring mistake is loud rather than emitting bad branches.
-    fn emit_skip_if_all_false(&mut self, _c: &mut Vec<u8>, _m: Reg) -> usize {
-        unimplemented!("avx512 select guards: k-mask stage")
+    // Select short-circuit guards: reduce the vector mask to flags (vptestmd +
+    // kortestw) and branch. jz = all-false (skip true arm); jc = all-true (skip
+    // false arm). Mirrors the SSE2 MOVMSKPS guards, k-register-based.
+    fn emit_skip_if_all_false(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> usize {
+        avx512::emit_mask_flags(code, mask_reg);
+        x86_64::emit_jcc_rel32(code, 0x84) // jz: ZF set when k1 == 0 (all false)
     }
-    fn emit_skip_if_all_true(&mut self, _c: &mut Vec<u8>, _m: Reg) -> usize {
-        unimplemented!("avx512 select guards: k-mask stage")
+    fn emit_skip_if_all_true(&mut self, code: &mut Vec<u8>, mask_reg: Reg) -> usize {
+        avx512::emit_mask_flags(code, mask_reg);
+        x86_64::emit_jcc_rel32(code, 0x82) // jc: CF set when k1 == 0xFFFF (all true)
     }
     fn emit_jump(&mut self, code: &mut Vec<u8>) -> usize {
         x86_64::emit_jmp_rel32(code)
