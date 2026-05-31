@@ -114,22 +114,24 @@ fn jit_minmax() {
     jit_truth!("min_max", kernel_jit!(|| X.max(Y).min(Z)), |x: f32, y: f32, z: f32, _w| x.max(y).min(z), 1e-5, 1e-5);
 }
 
-/// Transcendentals (sin/cos/exp) are not in the AVX-512 backend's Stage-1 op
-/// set (the wide polynomial ports are a later stage), so `compile_arena_dag`
-/// rejects them under `+avx512f` and `kernel_jit!` panics. Gate off there; the
-/// 128-bit path covers them.
+/// sin/cos now lower to primitive arithmetic before codegen (see
+/// `pixelflow_ir::backend::emit::lowering`), so they run on BOTH the 128-bit and
+/// AVX-512 paths — no backend emits a transcendental. Tolerance is "ballpark"
+/// (these are polynomial approximations, ~few % at the range edges), set to
+/// catch logic errors, not certify ulp accuracy.
 #[test]
-#[cfg(not(target_feature = "avx512f"))]
-fn jit_transcendental() {
-    // Small-argument range. Tolerance here is "ballpark", not full f32
-    // precision: these are SIMD polynomial approximations (measured error up to
-    // ~1.3% for cos near x=1), so the bound is set to catch *logic* errors —
-    // like the FMA bug below, which is off by whole integers — not to certify
-    // ulp accuracy. Tightening the approximations is separate work. (The JIT's
-    // sin is already markedly more accurate than the combinator backend's; see
-    // the module docs.)
+fn jit_sin_cos() {
     jit_truth!("sin", kernel_jit!(|| X.sin()), |x: f32, _y, _z, _w| x.sin(), 3e-2, 3e-2, SMALL);
     jit_truth!("cos", kernel_jit!(|| X.cos()), |x: f32, _y, _z, _w| x.cos(), 3e-2, 3e-2, SMALL);
+}
+
+/// `exp` is not yet lowered (it needs float↔int bit-manip primitives, the next
+/// slice), so it still reaches the backend as an `Exp` op. The 128-bit path has
+/// an asm emitter; the AVX-512 backend rejects it. Gate off `+avx512f` until
+/// exp/log lowering lands.
+#[test]
+#[cfg(not(target_feature = "avx512f"))]
+fn jit_exp() {
     jit_truth!("exp", kernel_jit!(|| X.exp()), |x: f32, _y, _z, _w| x.exp(), 3e-2, 3e-2, SMALL);
 }
 

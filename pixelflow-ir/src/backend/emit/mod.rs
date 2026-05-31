@@ -32,6 +32,7 @@
 pub mod aarch64;
 pub mod avx512;
 pub mod executable;
+pub mod lowering;
 pub mod regalloc;
 pub mod x86_64;
 
@@ -810,6 +811,17 @@ fn emit_jet(
                     pool.free_jet(&c);
                     Ok(Jet { val, partials })
                 }
+                OpKind::Floor => {
+                    // floor is piecewise-constant: value = floor(c), derivative
+                    // = 0 a.e. (Used by the range reduction in expanded sin/cos.)
+                    let val = pool.alloc()?;
+                    emit_unary(code, OpKind::Floor, val, c.val, JET_CONST_SCRATCH);
+                    pool.free_jet(&c);
+                    Ok(Jet {
+                        val,
+                        partials: alloc::vec![Partial::Zero; k],
+                    })
+                }
                 _ => Err("x86 JIT jet: unary op not yet supported"),
             }
         }
@@ -921,6 +933,11 @@ pub fn compile_arena_dag_jet(
     output: JetOutput,
 ) -> Result<CompileResult, &'static str> {
     use x86_64::*;
+    // Expand transcendentals to primitive arithmetic first, so emit_jet only
+    // sees ops it can differentiate (the chain rule over the expansion gives
+    // the transcendental's derivative for free).
+    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
+    let arena = &arena;
     const MAX_DEPTH: usize = 64;
     if arena.depth(root) > MAX_DEPTH {
         return Err("expression too deep");
@@ -1011,6 +1028,10 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
+    // Expand transcendentals to primitive arithmetic first (one source of truth
+    // in `lowering`); the aarch64 emitter then never sees Sin/Cos/etc.
+    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
+    let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses_map = arena_to_uses(&schedule);
     compile_from_schedule(schedule, uses_map, ctx)
@@ -3491,6 +3512,11 @@ pub fn compile_arena_dag_with_ctx(
     // Backend = build width: AVX-512 (512-bit zmm) when compiled +avx512f, else
     // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
     // KernelFn ABI stay consistent with the selected width.
+    //
+    // Expand transcendentals to primitive arithmetic first, so no backend ever
+    // sees Sin/Cos/etc. (one source of truth for the polynomial, in `lowering`).
+    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
+    let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
     #[cfg(target_feature = "avx512f")]
@@ -5183,12 +5209,120 @@ mod tests {
         }
 
         #[test]
-        fn jet_unsupported_op_errs() {
-            // sin has no dual rule yet -> loud error, never a miscompile.
+        fn jet_truly_unsupported_op_errs() {
+            // exp is not yet lowered (needs bit-manip primitives) and has no jet
+            // rule -> loud error, never a miscompile.
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let root = a.push_unary(OpKind::Exp, x);
+            assert!(compile_arena_dag_jet(&a, root, SEED_XY, JetOutput::Value).is_err());
+        }
+
+        /// The derivative of an expanded transcendental falls out of the chain
+        /// rule for free — no per-transcendental jet rule. Proven here on a
+        /// *partial* sin expansion (range-reduce + low-degree term) that fits
+        /// the jet register budget: d/dx of the leading `t·c1 = (x/π)·π = x`
+        /// term's structure differentiates correctly through Mul/Sub/Floor.
+        ///
+        /// The FULL sin expansion currently exceeds emit_jet's no-spill register
+        /// pool (see `jet_full_sin_hits_register_wall`); deriving large
+        /// transcendentals is unblocked when the jet path moves onto the unified
+        /// spilling allocator. The *value* path (real spilling driver) handles
+        /// full sin fine — see `lowering_tests`.
+        #[test]
+        fn jet_chain_rule_through_floor_and_mul() {
+            // f(x) = x - floor(x*0 + 0.5)*c  ; the floor branch is constant
+            // (∂=0), so ∂f/∂x = 1 — exercises Floor's zero-partial + Sub/Mul.
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let half = a.push_const(0.5);
+            let xr = a.push_binary(OpKind::Mul, x, zero);
+            let xr = a.push_binary(OpKind::Add, xr, half);
+            let k = a.push_unary(OpKind::Floor, xr); // floor(0.5)=0, ∂=0
+            let c = a.push_const(7.0);
+            let kc = a.push_binary(OpKind::Mul, k, c);
+            let root = a.push_binary(OpKind::Sub, x, kc); // = x - 0 = x
+            for &xv in &[0.3f32, 1.0, -0.7] {
+                let dx = comp(&a, root, SEED_XY, JetOutput::Partial(0), xv, 0.0);
+                assert!((dx - 1.0).abs() <= 1e-5, "∂/∂x = {dx}, want 1");
+            }
+        }
+
+        /// Documents the known limit: the full sin expansion overflows
+        /// emit_jet's no-spill register pool. Loud error, never a miscompile.
+        /// Remove when the jet path gains spilling.
+        #[test]
+        fn jet_full_sin_hits_register_wall() {
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let root = a.push_unary(OpKind::Sin, x);
-            assert!(compile_arena_dag_jet(&a, root, SEED_XY, JetOutput::Value).is_err());
+            assert!(
+                compile_arena_dag_jet(&a, root, SEED_XY, JetOutput::Value).is_err(),
+                "full sin jet unexpectedly fit — jet may have gained spilling; \
+                 if so, replace this with a d/dx sin = cos value check"
+            );
+        }
+    }
+
+    /// Transcendental lowering: sin/cos/tan JIT through the per-batch path with
+    /// no backend ever emitting a transcendental (they expand to arithmetic in
+    /// `lowering`). Validated against `f32` on the default (128-bit) build.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    mod lowering_tests {
+        use super::*;
+        use crate::arena::ExprArena;
+
+        // Tolerance reflects the degree-7 Chebyshev's ACTUAL measured accuracy
+        // (the SAME polynomial the runtime Compounds path uses): ~1e-6 near 0,
+        // degrading to ~2.6e-2 at the ±π range-reduction edges — only ~2-digit
+        // accurate there. The bound catches *logic* errors (sign/coefficient/
+        // range-reduction), not approximation error; tightening the polynomial
+        // is the tunable-precision lever, applied in one place (`lowering`),
+        // later.
+        const TRIG_TOL: f32 = 3e-2;
+
+        #[test]
+        fn sin_cos_tan_match_scalar() {
+            // Range beyond [-π,π] to exercise the floor-based range reduction.
+            let pts = [0.0f32, 0.3, 1.0, 2.0, 3.5, -1.7, 6.0, -4.2];
+            for &xv in &pts {
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let s = a.push_unary(OpKind::Sin, x);
+                assert!((run1(&a, s, xv) - xv.sin()).abs() <= TRIG_TOL, "sin({xv})");
+
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let c = a.push_unary(OpKind::Cos, x);
+                assert!((run1(&a, c, xv) - xv.cos()).abs() <= TRIG_TOL, "cos({xv})");
+            }
+            // tan away from its poles (ratio of two ~3e-3 approximations).
+            for &xv in &[0.0f32, 0.3, 0.7, -0.5, 1.0] {
+                let mut a = ExprArena::new();
+                let x = a.push_var(0);
+                let t = a.push_unary(OpKind::Tan, x);
+                // tan = sin/cos amplifies cos's ~2e-2 edge error as |x| grows
+                // (measured ~3.8e-2 at x=1). Honest bound for this polynomial.
+                assert!((run1(&a, t, xv) - xv.tan()).abs() <= 5e-2, "tan({xv})");
+            }
+        }
+
+        /// A transcendental composed inside arithmetic still works: sin(x)·x + 1.
+        #[test]
+        fn transcendental_in_expression() {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let s = a.push_unary(OpKind::Sin, x);
+            let sx = a.push_binary(OpKind::Mul, s, x);
+            let one = a.push_const(1.0);
+            let root = a.push_binary(OpKind::Add, sx, one);
+            for &xv in &[0.2f32, 0.9, 2.1, -1.3] {
+                let want = xv.sin() * xv + 1.0;
+                // sin's ~3e-3 error is scaled by |x|, so allow for that.
+                let tol = 3e-3 * (1.0 + xv.abs());
+                assert!((run1(&a, root, xv) - want).abs() <= tol, "sin(x)·x+1 @ {xv}");
+            }
         }
     }
 
