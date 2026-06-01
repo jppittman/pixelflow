@@ -162,13 +162,19 @@ pub enum DisplayControl {
     ///
     /// **Sender**: Specifies visibility state.
     ///
-    /// **Receiver**: Shows or hides the window. Window remains in the taskbar/app switcher.
+    /// **Receiver**: Shows the window.
     ///
     /// # Arguments
     ///
     /// - `id`: Window identifier
-    /// - `visible`: `true` to show, `false` to hide
-    SetVisible { id: WindowId, visible: bool },
+    ShowWindow { id: WindowId },
+
+    /// **Receiver**: Hides the window. Window remains in the taskbar/app switcher.
+    ///
+    /// # Arguments
+    ///
+    /// - `id`: Window identifier
+    HideWindow { id: WindowId },
 
     /// Request an immediate redraw.
     ///
