@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2024-06-25 - Prevent reallocation overhead in terminal layout
+**Learning:** Found a performance bottleneck where terminal grid parsing allocates `Vec::new()` inside an outer hot loop over `rows` (`core-term/src/terminal_app.rs`), leading to heavy allocations during VSync redraws. The dimensions are pre-known (`rows`, `cols`).
+**Action:** When building grids or rendering structures with known sizes derived from `snapshot`, prefer `Vec::with_capacity(size)` over `Vec::new()` to avoid dynamic reallocation scaling penalties on the rendering thread.
