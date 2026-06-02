@@ -218,7 +218,7 @@ impl CodeBuffer {
         {
             // With MAP_JIT on macOS, the memory starts RW. Toggle to RX.
             unsafe {
-                toggle_jit_write(false);
+                toggle_jit_write(JitWriteState::Executable);
             }
         }
 
@@ -252,7 +252,7 @@ impl CodeBuffer {
             // Toggle to writable.
             #[cfg(target_os = "macos")]
             {
-                toggle_jit_write(true);
+                toggle_jit_write(JitWriteState::Writable);
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -273,7 +273,7 @@ impl CodeBuffer {
             // Toggle to executable.
             #[cfg(target_os = "macos")]
             {
-                toggle_jit_write(false);
+                toggle_jit_write(JitWriteState::Executable);
                 // Instruction cache coherence on Apple Silicon.
                 // sys_icache_invalidate is needed after writing code on ARM.
                 unsafe extern "C" {
@@ -329,20 +329,33 @@ impl Drop for CodeBuffer {
 ///
 /// This is much cheaper than mprotect (~0.5µs vs ~5µs) and is per-thread,
 /// so it doesn't affect other threads' ability to execute the code.
+/// Enum representing the requested JIT memory permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitWriteState {
+    /// JIT memory is writable (write-protect disabled).
+    Writable,
+    /// JIT memory is executable (write-protect enabled).
+    Executable,
+}
+
 #[cfg(target_os = "macos")]
-unsafe fn toggle_jit_write(writable: bool) {
+unsafe fn toggle_jit_write(state: JitWriteState) {
     // pthread_jit_write_protect_np(true) = write-protect (executable)
     // pthread_jit_write_protect_np(false) = writable (not executable)
     // Note: the semantics are inverted from what you'd expect!
     unsafe extern "C" {
         fn pthread_jit_write_protect_np(enabled: bool);
     }
-    // writable=true → we want to write → disable write protection
-    // writable=false → we want to execute → enable write protection
+    // JitWriteState::Writable → we want to write → disable write protection
+    // JitWriteState::Executable → we want to execute → enable write protection
     // SAFETY: pthread_jit_write_protect_np is always safe to call — it only
     // affects the calling thread's JIT write permission.
+    let enable_write_protect = match state {
+        JitWriteState::Writable => false,
+        JitWriteState::Executable => true,
+    };
     unsafe {
-        pthread_jit_write_protect_np(!writable);
+        pthread_jit_write_protect_np(enable_write_protect);
     }
 }
 

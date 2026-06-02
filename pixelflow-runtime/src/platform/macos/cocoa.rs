@@ -117,6 +117,34 @@ impl NSRect {
 
 // --- Wrappers ---
 
+/// Indicates whether to ignore other applications when activating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivateIgnore {
+    IgnoreOtherApps,
+    Normal,
+}
+
+/// Indicates whether an event should be dequeued or just peeked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequeueStatus {
+    Dequeue,
+    Peek,
+}
+
+/// Indicates whether window creation should be deferred until it's shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowDefer {
+    Defer,
+    Immediate,
+}
+
+/// Indicates whether a layer is requested for a view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRequest {
+    WantsLayer,
+    NoLayer,
+}
+
 /// Wrapper for NSApplication
 #[derive(Copy, Clone)]
 pub struct NSApplication(pub Id);
@@ -136,9 +164,12 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self, ignore: ActivateIgnore) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = match ignore {
+                ActivateIgnore::IgnoreOtherApps => YES,
+                ActivateIgnore::Normal => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -156,9 +187,12 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: DequeueStatus) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = match dequeue {
+                DequeueStatus::Dequeue => YES,
+                DequeueStatus::Peek => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -190,10 +224,13 @@ impl NSWindow {
         rect: NSRect,
         style_mask: u64,
         backing: u64,
-        defer: bool,
+        defer: WindowDefer,
     ) -> Self {
         unsafe {
-            let d = if defer { YES } else { NO };
+            let d = match defer {
+                WindowDefer::Defer => YES,
+                WindowDefer::Immediate => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
@@ -266,9 +303,12 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self, wants: LayerRequest) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = match wants {
+                LayerRequest::WantsLayer => YES,
+                LayerRequest::NoLayer => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }
