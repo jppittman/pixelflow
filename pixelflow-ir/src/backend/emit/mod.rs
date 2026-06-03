@@ -416,67 +416,16 @@ fn needs_arena(arena: &ExprArena, id: ExprId) -> usize {
 #[cfg(target_arch = "x86_64")]
 const X86_MAX_VALUE_REG: u8 = 11;
 
-/// One forward-mode partial derivative component.
-///
-/// Tracking statically-zero partials (rather than materializing `0.0` into a
-/// register) is what keeps register-resident dual lowering viable: seeds,
-/// constants, and direction-independent subexpressions carry `Zero` and cost
-/// neither a register nor an instruction.
-#[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy)]
-enum Partial {
-    /// Statically zero — no register, no work.
-    Zero,
-    /// A runtime value held in `Reg`.
-    Reg(Reg),
-}
-
-/// A value together with its derivative components, in register form.
-///
-/// `partials` is empty for a plain value — i.e. a `Field`, which in this model
-/// is just "Jet0" (zeroth-order: value, no derivatives). A first-order jet over
-/// `d` seeded directions carries `d` partials (`∂/∂dir`), matching `Jet2`/`Jet3`
-/// in `pixelflow-core`. The same `value + components` shape extends to higher
-/// order (a Hessian adds the second-order components) without changing this
-/// type — that generalization is deliberately *not* built yet.
-#[cfg(target_arch = "x86_64")]
-struct Jet {
-    val: Reg,
-    /// Forward-mode first partials, one per seeded direction. Empty == Jet0.
-    partials: alloc::vec::Vec<Partial>,
-}
-
-#[cfg(target_arch = "x86_64")]
-impl Jet {
-    /// A zeroth-order jet (a plain `Field` value, no derivatives).
-    fn value(reg: Reg) -> Self {
-        Self {
-            val: reg,
-            partials: alloc::vec::Vec::new(),
-        }
-    }
-}
-
-/// Emit code for one arena node.
-///
-/// `seed` lists the input-variable indices that carry a unit first derivative
-/// (the forward-mode seed): empty seeds a plain value (`Jet0`/`Field`), `[0,1]`
-/// a `Jet2`, `[0,1,2]` a `Jet3`. Only the `Jet0` case is implemented today; a
-/// non-empty seed (dual lowering) is a hard error until the per-op chain-rule
-/// rules and the wider register model land.
+/// Emit code for one arena node via the Sethi-Ullman tree scheme, returning the
+/// register holding its result. Used only by the scanline body emitter; the
+/// per-batch path goes through the shared schedule/regalloc driver.
 #[cfg(target_arch = "x86_64")]
 fn emit_arena(
     arena: &ExprArena,
     id: ExprId,
     depth: u8,
-    seed: &[u8],
-) -> Result<(Vec<u8>, Jet), &'static str> {
+) -> Result<(Vec<u8>, Reg), &'static str> {
     use x86_64::*;
-
-    // Dual (jet) lowering is not implemented yet; only Jet0 (plain value).
-    if !seed.is_empty() {
-        return Err("x86 JIT: dual (jet) lowering not yet implemented");
-    }
 
     // Reserve xmm12..15 for scratch: any node that allocates a value register
     // (everything except a bare Var, which reuses an input register) must fit
@@ -492,7 +441,7 @@ fn emit_arena(
             if *i as usize >= INPUT_REGS.len() {
                 return Err("variable index out of range");
             }
-            Ok((Vec::new(), Jet::value(INPUT_REGS[*i as usize])))
+            Ok((Vec::new(), INPUT_REGS[*i as usize]))
         }
 
         ExprNode::Const(val) => {
@@ -500,7 +449,7 @@ fn emit_arena(
             let mut code = Vec::new();
             let scratch = [Reg(13), Reg(14), Reg(15), Reg(15)];
             emit_const(&mut code, dst, *val, scratch);
-            Ok((code, Jet::value(dst)))
+            Ok((code, dst))
         }
 
         ExprNode::Param(_) => Err("Param not supported directly here"),
@@ -510,12 +459,11 @@ fn emit_arena(
             // `dst`. Transcendental builtins read `src` several times after they
             // start writing `dst`, so an in-place (dst == src) unary would corrupt
             // the input. Placing the child at depth+1 guarantees src != dst.
-            let (mut code, child_jet) = emit_arena(arena, *child, depth + 1, seed)?;
-            let src = child_jet.val;
+            let (mut code, src) = emit_arena(arena, *child, depth + 1)?;
             let dst = Reg(SCRATCH_BASE + depth);
             let scratch = [Reg(12), Reg(13), Reg(14), Reg(15)];
             emit_unary(&mut code, *op, dst, src, scratch);
-            Ok((code, Jet::value(dst)))
+            Ok((code, dst))
         }
 
         ExprNode::Binary(op, left, right) => {
@@ -544,17 +492,17 @@ fn emit_arena(
 
             // Returns operands as (src1, src2) with the in-`dst` operand first.
             let (mut code, src1, src2) = if !eval_right_first {
-                let (mut code, l) = emit_arena(arena, *left, depth, seed)?;
-                let (r_code, r) = emit_arena(arena, *right, depth + 1, seed)?;
+                let (mut code, l) = emit_arena(arena, *left, depth)?;
+                let (r_code, r) = emit_arena(arena, *right, depth + 1)?;
                 code.extend(r_code);
-                (code, l.val, r.val)
+                (code, l, r)
             } else {
                 // Right child in `dst`; swap so it becomes src1 (sound:
                 // commutative). `dst == src1` then satisfies the SSE invariant.
-                let (mut code, r) = emit_arena(arena, *right, depth, seed)?;
-                let (l_code, l) = emit_arena(arena, *left, depth + 1, seed)?;
+                let (mut code, r) = emit_arena(arena, *right, depth)?;
+                let (l_code, l) = emit_arena(arena, *left, depth + 1)?;
                 code.extend(l_code);
-                (code, r.val, l.val)
+                (code, r, l)
             };
 
             match op {
@@ -564,7 +512,7 @@ fn emit_arena(
                 }
                 _ => emit_binary(&mut code, *op, dst, src1, src2),
             }
-            Ok((code, Jet::value(dst)))
+            Ok((code, dst))
         }
 
         ExprNode::Ternary(op, a, b, c) => {
@@ -573,44 +521,39 @@ fn emit_arena(
             match op {
                 OpKind::MulAdd => {
                     // x86 doesn't have FMLA, use FMUL + FADD
-                    let (mut code, a_jet) = emit_arena(arena, *a, depth, seed)?;
-                    let (b_code, b_jet) = emit_arena(arena, *b, depth + 1, seed)?;
-                    let (c_code, c_jet) = emit_arena(arena, *c, depth + 2, seed)?;
-                    let (a_reg, b_reg, c_reg) = (a_jet.val, b_jet.val, c_jet.val);
-
+                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
+                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
+                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
                     code.extend(b_code);
                     code.extend(c_code);
-
                     // dst = a * b
                     emit_binary(&mut code, OpKind::Mul, dst, a_reg, b_reg);
                     // dst = dst + c
                     emit_binary(&mut code, OpKind::Add, dst, dst, c_reg);
-                    Ok((code, Jet::value(dst)))
+                    Ok((code, dst))
                 }
 
                 OpKind::Clamp => {
                     // clamp(a, lo, hi) = max(min(a, hi), lo)
-                    let (mut code, a_jet) = emit_arena(arena, *a, depth, seed)?;
-                    let (b_code, b_jet) = emit_arena(arena, *b, depth + 1, seed)?;
-                    let (c_code, c_jet) = emit_arena(arena, *c, depth + 2, seed)?;
-                    let (a_reg, b_reg, c_reg) = (a_jet.val, b_jet.val, c_jet.val);
+                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
+                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
+                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
                     code.extend(b_code);
                     code.extend(c_code);
                     emit_binary(&mut code, OpKind::Min, dst, a_reg, c_reg);
                     emit_binary(&mut code, OpKind::Max, dst, dst, b_reg);
-                    Ok((code, Jet::value(dst)))
+                    Ok((code, dst))
                 }
 
                 OpKind::Select => {
                     // select(cond, if_true, if_false): cond is an all-ones/zeros mask.
-                    let (mut code, a_jet) = emit_arena(arena, *a, depth, seed)?;
-                    let (b_code, b_jet) = emit_arena(arena, *b, depth + 1, seed)?;
-                    let (c_code, c_jet) = emit_arena(arena, *c, depth + 2, seed)?;
-                    let (a_reg, b_reg, c_reg) = (a_jet.val, b_jet.val, c_jet.val);
+                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
+                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
+                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
                     code.extend(b_code);
                     code.extend(c_code);
                     x86_64::emit_select(&mut code, dst, a_reg, b_reg, c_reg, Reg(15));
-                    Ok((code, Jet::value(dst)))
+                    Ok((code, dst))
                 }
 
                 _ => Err("ternary emit not implemented"),
@@ -619,366 +562,6 @@ fn emit_arena(
 
         ExprNode::Nary(_, _, _) => Err("Nary not supported in JIT"),
     }
-}
-
-// =============================================================================
-// Forward-mode dual (jet) lowering — register-resident, fail loudly.
-// =============================================================================
-//
-// This is the k>0 counterpart of `emit_arena`. It walks the arena and emits,
-// for the chosen forward-mode `seed`, a value plus one partial per seeded
-// direction (the chain rule per op). It is deliberately the *simple* version:
-//
-//   - A flat register pool over xmm4..=11; xmm12..15 stay scratch.
-//   - No spilling and no register reuse across a binary op's children: results
-//     are allocated fresh, children freed afterward. This keeps the bookkeeping
-//     obviously correct at the cost of register headroom.
-//   - Out of registers => hard error ("expression too complex"), never a
-//     miscompile.
-//
-// When the budget bites, the planned direction is to unify the x86 and aarch64
-// compilation pipelines (aarch64 already has a spilling linear-scan allocator),
-// not to special-case x86. Until then this covers small jet expressions.
-
-/// A flat free-list register pool over the value registers xmm4..=11.
-///
-/// Input registers (xmm0..3, the seed values) and scratch (xmm12..15) are never
-/// pooled. `alloc` fails loudly when exhausted.
-#[cfg(target_arch = "x86_64")]
-struct RegPool {
-    free: alloc::vec::Vec<Reg>,
-}
-
-#[cfg(target_arch = "x86_64")]
-impl RegPool {
-    fn new() -> Self {
-        // Hand out low registers first (4,5,6,...).
-        let free = (SCRATCH_BASE..=X86_MAX_VALUE_REG).rev().map(Reg).collect();
-        Self { free }
-    }
-
-    fn alloc(&mut self) -> Result<Reg, &'static str> {
-        self.free
-            .pop()
-            .ok_or("x86 JIT: out of registers for jet (expression too complex)")
-    }
-
-    /// Return a register to the pool. No-ops for non-pooled registers (inputs,
-    /// scratch), so callers can free a jet's components uniformly.
-    fn free_reg(&mut self, r: Reg) {
-        if (SCRATCH_BASE..=X86_MAX_VALUE_REG).contains(&r.0) && !self.free.contains(&r) {
-            self.free.push(r);
-        }
-    }
-
-    /// Free every pooled register a jet owns (its value and any `Reg` partials).
-    fn free_jet(&mut self, jet: &Jet) {
-        self.free_reg(jet.val);
-        for p in &jet.partials {
-            if let Partial::Reg(r) = p {
-                self.free_reg(*r);
-            }
-        }
-    }
-}
-
-/// Cross-term scratch register for the product/quotient rules (not pooled).
-#[cfg(target_arch = "x86_64")]
-const JET_SCRATCH: Reg = Reg(12);
-
-/// Const-materialization scratch (mirrors the `emit_const` usage elsewhere).
-#[cfg(target_arch = "x86_64")]
-const JET_CONST_SCRATCH: [Reg; 4] = [Reg(13), Reg(14), Reg(15), Reg(15)];
-
-/// `dst = a + b` / `dst = a - b` over partials, honoring `Zero`.
-#[cfg(target_arch = "x86_64")]
-fn jet_add_sub(
-    code: &mut Vec<u8>,
-    pool: &mut RegPool,
-    is_sub: bool,
-    a: Partial,
-    b: Partial,
-) -> Result<Partial, &'static str> {
-    use x86_64::*;
-    match (a, b) {
-        (Partial::Zero, Partial::Zero) => Ok(Partial::Zero),
-        // a ± 0 = a
-        (Partial::Reg(ra), Partial::Zero) => {
-            let d = pool.alloc()?;
-            emit_movaps(code, d, ra);
-            Ok(Partial::Reg(d))
-        }
-        // 0 + b = b ; 0 - b = -b
-        (Partial::Zero, Partial::Reg(rb)) => {
-            let d = pool.alloc()?;
-            emit_movaps(code, d, rb);
-            if is_sub {
-                emit_unary(code, OpKind::Neg, d, d, JET_CONST_SCRATCH);
-            }
-            Ok(Partial::Reg(d))
-        }
-        (Partial::Reg(ra), Partial::Reg(rb)) => {
-            let d = pool.alloc()?;
-            emit_movaps(code, d, ra);
-            emit_binary(code, if is_sub { OpKind::Sub } else { OpKind::Add }, d, d, rb);
-            Ok(Partial::Reg(d))
-        }
-    }
-}
-
-/// Emit the dual lowering of one arena node for the given forward-mode `seed`.
-#[cfg(target_arch = "x86_64")]
-fn emit_jet(
-    arena: &ExprArena,
-    id: ExprId,
-    seed: &[u8],
-    pool: &mut RegPool,
-    code: &mut Vec<u8>,
-) -> Result<Jet, &'static str> {
-    use x86_64::*;
-    let k = seed.len();
-
-    match arena.node(id) {
-        ExprNode::Var(i) => {
-            let i = *i;
-            if i as usize >= INPUT_REGS.len() {
-                return Err("variable index out of range");
-            }
-            // ∂(var_i)/∂(var_{seed[j]}) = 1 if seed[j] == i else 0.
-            let mut partials = alloc::vec::Vec::with_capacity(k);
-            for &d in seed {
-                if d == i {
-                    let r = pool.alloc()?;
-                    emit_const(code, r, 1.0, JET_CONST_SCRATCH);
-                    partials.push(Partial::Reg(r));
-                } else {
-                    partials.push(Partial::Zero);
-                }
-            }
-            Ok(Jet {
-                val: INPUT_REGS[i as usize],
-                partials,
-            })
-        }
-
-        ExprNode::Const(v) => {
-            let val = pool.alloc()?;
-            emit_const(code, val, *v, JET_CONST_SCRATCH);
-            Ok(Jet {
-                val,
-                partials: alloc::vec![Partial::Zero; k],
-            })
-        }
-
-        ExprNode::Unary(op, child) => {
-            let c = emit_jet(arena, *child, seed, pool, code)?;
-            match op {
-                OpKind::Neg => {
-                    // (-u)' = -u'
-                    let val = pool.alloc()?;
-                    emit_unary(code, OpKind::Neg, val, c.val, JET_CONST_SCRATCH);
-                    let mut partials = alloc::vec::Vec::with_capacity(k);
-                    for p in &c.partials {
-                        match p {
-                            Partial::Zero => partials.push(Partial::Zero),
-                            Partial::Reg(r) => {
-                                let d = pool.alloc()?;
-                                emit_unary(code, OpKind::Neg, d, *r, JET_CONST_SCRATCH);
-                                partials.push(Partial::Reg(d));
-                            }
-                        }
-                    }
-                    pool.free_jet(&c);
-                    Ok(Jet { val, partials })
-                }
-                OpKind::Sqrt => {
-                    // (√u)' = u' / (2√u) = u' * (0.5 / √u)
-                    let val = pool.alloc()?;
-                    emit_unary(code, OpKind::Sqrt, val, c.val, JET_CONST_SCRATCH);
-                    // factor = 0.5 / val  (scratch, recomputed per node)
-                    let factor = JET_SCRATCH;
-                    emit_const(code, factor, 0.5, JET_CONST_SCRATCH);
-                    emit_binary(code, OpKind::Div, factor, factor, val);
-                    let mut partials = alloc::vec::Vec::with_capacity(k);
-                    for p in &c.partials {
-                        match p {
-                            Partial::Zero => partials.push(Partial::Zero),
-                            Partial::Reg(r) => {
-                                let d = pool.alloc()?;
-                                emit_movaps(code, d, *r);
-                                emit_binary(code, OpKind::Mul, d, d, factor);
-                                partials.push(Partial::Reg(d));
-                            }
-                        }
-                    }
-                    pool.free_jet(&c);
-                    Ok(Jet { val, partials })
-                }
-                OpKind::Floor => {
-                    // floor is piecewise-constant: value = floor(c), derivative
-                    // = 0 a.e. (Used by the range reduction in expanded sin/cos.)
-                    let val = pool.alloc()?;
-                    emit_unary(code, OpKind::Floor, val, c.val, JET_CONST_SCRATCH);
-                    pool.free_jet(&c);
-                    Ok(Jet {
-                        val,
-                        partials: alloc::vec![Partial::Zero; k],
-                    })
-                }
-                _ => Err("x86 JIT jet: unary op not yet supported"),
-            }
-        }
-
-        ExprNode::Binary(op, left, right) => {
-            let l = emit_jet(arena, *left, seed, pool, code)?;
-            let r = emit_jet(arena, *right, seed, pool, code)?;
-
-            let result = match op {
-                OpKind::Add | OpKind::Sub => {
-                    let is_sub = matches!(op, OpKind::Sub);
-                    let val = pool.alloc()?;
-                    emit_movaps(code, val, l.val);
-                    emit_binary(code, *op, val, val, r.val);
-                    let mut partials = alloc::vec::Vec::with_capacity(k);
-                    for j in 0..k {
-                        partials.push(jet_add_sub(code, pool, is_sub, l.partials[j], r.partials[j])?);
-                    }
-                    Jet { val, partials }
-                }
-                OpKind::Mul => {
-                    // (uv)' = u'v + uv'
-                    let val = pool.alloc()?;
-                    emit_movaps(code, val, l.val);
-                    emit_binary(code, OpKind::Mul, val, val, r.val);
-                    let mut partials = alloc::vec::Vec::with_capacity(k);
-                    for j in 0..k {
-                        let p = match (l.partials[j], r.partials[j]) {
-                            (Partial::Zero, Partial::Zero) => Partial::Zero,
-                            // u'v
-                            (Partial::Reg(la), Partial::Zero) => {
-                                let d = pool.alloc()?;
-                                emit_movaps(code, d, la);
-                                emit_binary(code, OpKind::Mul, d, d, r.val);
-                                Partial::Reg(d)
-                            }
-                            // uv'
-                            (Partial::Zero, Partial::Reg(rb)) => {
-                                let d = pool.alloc()?;
-                                emit_movaps(code, d, l.val);
-                                emit_binary(code, OpKind::Mul, d, d, rb);
-                                Partial::Reg(d)
-                            }
-                            // u'v + uv'
-                            (Partial::Reg(la), Partial::Reg(rb)) => {
-                                let d = pool.alloc()?;
-                                emit_movaps(code, d, l.val);
-                                emit_binary(code, OpKind::Mul, d, d, rb); // u v'
-                                emit_movaps(code, JET_SCRATCH, la);
-                                emit_binary(code, OpKind::Mul, JET_SCRATCH, JET_SCRATCH, r.val); // u' v
-                                emit_binary(code, OpKind::Add, d, d, JET_SCRATCH);
-                                Partial::Reg(d)
-                            }
-                        };
-                        partials.push(p);
-                    }
-                    Jet { val, partials }
-                }
-                _ => {
-                    pool.free_jet(&l);
-                    pool.free_jet(&r);
-                    return Err("x86 JIT jet: binary op not yet supported");
-                }
-            };
-
-            pool.free_jet(&l);
-            pool.free_jet(&r);
-            Ok(result)
-        }
-
-        ExprNode::Ternary(..) => Err("x86 JIT jet: ternary not yet supported"),
-        ExprNode::Param(_) => Err("Param not supported directly here"),
-        ExprNode::Nary(..) => Err("Nary not supported in JIT"),
-    }
-}
-
-/// Which component of a dual-lowered kernel to return (in xmm0).
-#[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JetOutput {
-    /// The value component.
-    Value,
-    /// The first partial w.r.t. `seed[index]`.
-    Partial(usize),
-}
-
-/// Compile a single `JetOutput` component of the forward-mode dual of `arena`.
-///
-/// NAMING SMELL — `compile_arena_dag_jet` packs ~three namespaces into one
-/// identifier (compile · arena_dag · jet). A good check when naming: *is this a
-/// name, or a namespace?* If it reads like a namespace, that's a signal to make
-/// it structure instead — a module/package, a method on a type, or a new struct
-/// — rather than a longer function name. The whole `compile_arena_dag*` family
-/// (`_with_ctx`, `_scanline`, `_scanline_with_ctx`, `_jet`, ...) is the same
-/// smell at scale; it likely wants to become e.g. `ArenaCompiler { scanline,
-/// jet, ctx, ... }`. Left as-is for now; flagged so we fix it deliberately, not
-/// by accident, when the backend is reorganized.
-///
-/// `seed` lists the differentiated input-variable indices (`[0,1]` = Jet2 over
-/// X,Y; `[0,1,2]` = Jet3 over X,Y,Z). Emits one component into xmm0, so the
-/// result matches the ordinary single-output [`KernelFn`] ABI — enough to
-/// validate each derivative independently. A wider multi-output ABI is future
-/// work, paired with the scanline / pipeline-unification effort.
-#[cfg(target_arch = "x86_64")]
-pub fn compile_arena_dag_jet(
-    arena: &ExprArena,
-    root: ExprId,
-    seed: &[u8],
-    output: JetOutput,
-) -> Result<CompileResult, &'static str> {
-    use x86_64::*;
-    // Expand transcendentals to primitive arithmetic first, so emit_jet only
-    // sees ops it can differentiate (the chain rule over the expansion gives
-    // the transcendental's derivative for free).
-    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
-    let arena = &arena;
-    const MAX_DEPTH: usize = 64;
-    if arena.depth(root) > MAX_DEPTH {
-        return Err("expression too deep");
-    }
-    if let JetOutput::Partial(j) = output {
-        if j >= seed.len() {
-            return Err("jet output: partial index out of range for seed");
-        }
-    }
-
-    let mut pool = RegPool::new();
-    let mut code: Vec<u8> = Vec::new();
-    let jet = emit_jet(arena, root, seed, &mut pool, &mut code)?;
-
-    // Move the requested component into xmm0.
-    let src = match output {
-        JetOutput::Value => Partial::Reg(jet.val),
-        JetOutput::Partial(j) => jet.partials[j],
-    };
-    match src {
-        Partial::Reg(r) => {
-            if r.0 != 0 {
-                emit_movaps(&mut code, Reg(0), r);
-            }
-        }
-        // A statically-zero partial is the constant 0.0.
-        Partial::Zero => emit_const(&mut code, Reg(0), 0.0, JET_CONST_SCRATCH),
-    }
-
-    code.push(0xC3); // RET
-
-    let code = unsafe { executable::ExecutableCode::from_code(&code)? };
-    Ok(CompileResult {
-        code,
-        spill_count: 0,
-        spill_bytes: 0,
-        max_regs: EmitCtx::default().max_regs,
-    })
 }
 
 // =============================================================================
@@ -4087,8 +3670,7 @@ pub fn compile_arena_dag_scanline(
 
     // Per-batch body: reads X from xmm0 and Y/Z/W from xmm1/2/3 (INPUT_REGS),
     // writes the result into `result_reg`, using xmm4+ as scratch.
-    let (body, result_jet) = emit_arena(arena, root, 0, &[])?;
-    let result_reg = result_jet.val;
+    let (body, result_reg) = emit_arena(arena, root, 0)?;
 
     let mut code: Vec<u8> = Vec::with_capacity(body.len() + 64);
 
@@ -5217,153 +4799,6 @@ mod tests {
     // Forward-mode dual (jet) lowering — validated against analytic derivatives.
     // Uses hardware sqrtps/divps (no polynomial approximations), so tolerances
     // are tight.
-    // =========================================================================
-    // Calls kernels through the per-batch `KernelFn` (128-bit here); gated off
-    // `+avx512f` where that ABI is `__m512`.
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    mod jet {
-        use super::*;
-        use crate::arena::ExprArena;
-
-        /// Compile one dual component and evaluate it at (x,y,z,w) (lane 0).
-        fn comp(arena: &ExprArena, root: ExprId, seed: &[u8], out: JetOutput, x: f32, y: f32) -> f32 {
-            let r = compile_arena_dag_jet(arena, root, seed, out)
-                .expect("jet compile failed");
-            unsafe {
-                use core::arch::x86_64::*;
-                let f: executable::KernelFn = r.code.as_fn();
-                let o = f(_mm_set1_ps(x), _mm_set1_ps(y), _mm_set1_ps(0.0), _mm_set1_ps(0.0));
-                _mm_cvtss_f32(o)
-            }
-        }
-
-        const SEED_XY: &[u8] = &[0, 1]; // Jet2 over X, Y
-        const PTS: &[(f32, f32)] = &[(3.0, 4.0), (1.0, 2.0), (-2.0, 0.5), (0.7, -1.3)];
-
-        fn close(a: f32, b: f32, tag: &str) {
-            assert!((a - b).abs() <= 1e-4, "{tag}: got {a}, want {b}");
-        }
-
-        #[test]
-        fn jet_sum_of_squares() {
-            // f = X*X + Y*Y ; ∂x = 2x, ∂y = 2y
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let xx = a.push_binary(OpKind::Mul, x, x);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let root = a.push_binary(OpKind::Add, xx, yy);
-            for &(px, py) in PTS {
-                close(comp(&a, root, SEED_XY, JetOutput::Value, px, py), px * px + py * py, "val");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(0), px, py), 2.0 * px, "dx");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(1), px, py), 2.0 * py, "dy");
-            }
-        }
-
-        #[test]
-        fn jet_product() {
-            // f = X*Y ; ∂x = y, ∂y = x  (both partials nonzero -> cross term)
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_binary(OpKind::Mul, x, y);
-            for &(px, py) in PTS {
-                close(comp(&a, root, SEED_XY, JetOutput::Value, px, py), px * py, "val");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(0), px, py), py, "dx");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(1), px, py), px, "dy");
-            }
-        }
-
-        #[test]
-        fn jet_circle_sdf() {
-            // f = sqrt(X*X + Y*Y) - r ; ∂x = x/√(x²+y²), ∂y = y/√(x²+y²)
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let xx = a.push_binary(OpKind::Mul, x, x);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let sum = a.push_binary(OpKind::Add, xx, yy);
-            let dist = a.push_unary(OpKind::Sqrt, sum);
-            let r = a.push_const(1.5);
-            let root = a.push_binary(OpKind::Sub, dist, r);
-            for &(px, py) in PTS {
-                let d = (px * px + py * py).sqrt();
-                close(comp(&a, root, SEED_XY, JetOutput::Value, px, py), d - 1.5, "val");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(0), px, py), px / d, "dx");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(1), px, py), py / d, "dy");
-            }
-        }
-
-        #[test]
-        fn jet_neg_and_zero_partial() {
-            // f = -X ; ∂x = -1, ∂y = 0 (statically zero -> returns 0.0)
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let root = a.push_unary(OpKind::Neg, x);
-            for &(px, py) in PTS {
-                close(comp(&a, root, SEED_XY, JetOutput::Value, px, py), -px, "val");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(0), px, py), -1.0, "dx");
-                close(comp(&a, root, SEED_XY, JetOutput::Partial(1), px, py), 0.0, "dy");
-            }
-        }
-
-        #[test]
-        fn jet_truly_unsupported_op_errs() {
-            // exp is not yet lowered (needs bit-manip primitives) and has no jet
-            // rule -> loud error, never a miscompile.
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let root = a.push_unary(OpKind::Exp, x);
-            assert!(compile_arena_dag_jet(&a, root, SEED_XY, JetOutput::Value).is_err());
-        }
-
-        /// The derivative of an expanded transcendental falls out of the chain
-        /// rule for free — no per-transcendental jet rule. Proven here on a
-        /// *partial* sin expansion (range-reduce + low-degree term) that fits
-        /// the jet register budget: d/dx of the leading `t·c1 = (x/π)·π = x`
-        /// term's structure differentiates correctly through Mul/Sub/Floor.
-        ///
-        /// The FULL sin expansion currently exceeds emit_jet's no-spill register
-        /// pool (see `jet_full_sin_hits_register_wall`); deriving large
-        /// transcendentals is unblocked when the jet path moves onto the unified
-        /// spilling allocator. The *value* path (real spilling driver) handles
-        /// full sin fine — see `lowering_tests`.
-        #[test]
-        fn jet_chain_rule_through_floor_and_mul() {
-            // f(x) = x - floor(x*0 + 0.5)*c  ; the floor branch is constant
-            // (∂=0), so ∂f/∂x = 1 — exercises Floor's zero-partial + Sub/Mul.
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let half = a.push_const(0.5);
-            let xr = a.push_binary(OpKind::Mul, x, zero);
-            let xr = a.push_binary(OpKind::Add, xr, half);
-            let k = a.push_unary(OpKind::Floor, xr); // floor(0.5)=0, ∂=0
-            let c = a.push_const(7.0);
-            let kc = a.push_binary(OpKind::Mul, k, c);
-            let root = a.push_binary(OpKind::Sub, x, kc); // = x - 0 = x
-            for &xv in &[0.3f32, 1.0, -0.7] {
-                let dx = comp(&a, root, SEED_XY, JetOutput::Partial(0), xv, 0.0);
-                assert!((dx - 1.0).abs() <= 1e-5, "∂/∂x = {dx}, want 1");
-            }
-        }
-
-        /// Documents the known limit: the full sin expansion overflows
-        /// emit_jet's no-spill register pool. Loud error, never a miscompile.
-        /// Remove when the jet path gains spilling.
-        #[test]
-        fn jet_full_sin_hits_register_wall() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let root = a.push_unary(OpKind::Sin, x);
-            assert!(
-                compile_arena_dag_jet(&a, root, SEED_XY, JetOutput::Value).is_err(),
-                "full sin jet unexpectedly fit — jet may have gained spilling; \
-                 if so, replace this with a d/dx sin = cos value check"
-            );
-        }
-    }
-
     /// Transcendental lowering: sin/cos/tan JIT through the per-batch path with
     /// no backend ever emitting a transcendental (they expand to arithmetic in
     /// `lowering`). Validated against `f32` on the default (128-bit) build.
