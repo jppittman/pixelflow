@@ -172,11 +172,6 @@ fn emit_vmulps(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
     emit_vex_128_0f(code, 0x59, dst, src1, src2);
 }
 
-/// VDIVPS dst, src1, src2
-fn emit_vdivps(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    emit_vex_128_0f(code, 0x5E, dst, src1, src2);
-}
-
 /// VSQRTPS dst, src (VEX unary — src1 field is 0b1111 i.e. unused)
 fn emit_vsqrtps(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     // For unary VEX, vvvv = 0b1111 (src1 = Reg(15) inverted → all ones)
@@ -380,9 +375,6 @@ const CMP_LE: u8 = 2; // LE_OS
 const CMP_NEQ: u8 = 4; // NEQ_UQ
 const CMP_GE: u8 = 5; // NLT_US (>=)
 
-const SIGN_MASK: u32 = 0x8000_0000;
-const ABS_MASK: u32 = 0x7FFF_FFFF;
-
 // =============================================================================
 // Transcendental Builtins — inline polynomial sequences
 // =============================================================================
@@ -466,38 +458,6 @@ fn emit_exp2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: 
     emit_vmulps(code, dst, s2, s1); // dst = poly * 2^n
 }
 
-/// sin(x) core — TAU range reduction + odd Chebyshev polynomial.
-fn emit_sin_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: Reg) {
-    use core::f32::consts::{PI, TAU};
-    // k = floor(x/TAU + 0.5); x_reduced = x - k*TAU
-    emit_f32_const(code, s0, 1.0 / TAU);
-    emit_vmulps(code, s0, src, s0);
-    emit_f32_const(code, s2, 0.5);
-    emit_vaddps(code, s0, s0, s2);
-    emit_vroundps(code, s0, s0, 1); // s0 = k
-    emit_f32_const(code, s2, TAU);
-    emit_vmulps(code, s2, s0, s2); // s2 = k*TAU
-    emit_vsubps(code, s0, src, s2); // s0 = x_reduced
-    // t = x_reduced / PI
-    emit_f32_const(code, s2, 1.0 / PI);
-    emit_vmulps(code, s0, s0, s2); // s0 = t
-    // t² in s1
-    emit_vmulps(code, s1, s0, s0);
-    // poly = ((c7*t² + c5)*t² + c3)*t² + c1   (accumulator dst)
-    emit_f32_const(code, s2, -0.599_264_5_f32);
-    emit_f32_const(code, dst, 2.550_164_f32);
-    emit_vmulps(code, s2, s2, s1);
-    emit_vaddps(code, dst, s2, dst);
-    emit_f32_const(code, s2, -5.167_712_8_f32);
-    emit_vmulps(code, dst, dst, s1);
-    emit_vaddps(code, dst, dst, s2);
-    emit_f32_const(code, s2, core::f32::consts::PI);
-    emit_vmulps(code, dst, dst, s1);
-    emit_vaddps(code, dst, dst, s2);
-    // result = t * poly
-    emit_vmulps(code, dst, s0, dst);
-}
-
 /// MOVUPS [rsp+disp8], xmm — red-zone spill store (unaligned, leaf-safe).
 pub fn emit_movups_store_rsp(code: &mut Vec<u8>, src: Reg, disp: i8) {
     if src.0 >= 8 {
@@ -522,153 +482,9 @@ pub fn emit_movups_load_rsp(code: &mut Vec<u8>, dst: Reg, disp: i8) {
     code.push(disp as u8);
 }
 
-/// atan2(y, x) core.
-///
-/// Reduce |y/x| into [0,1] before the polynomial, then apply the ratio sign and
-/// a quadrant correction for x<0. Spills sign_r / sign_y / mask_neg_x into the
-/// 16-byte-aligned red zone (`[rsp-24/-40/-56]`), mirroring the aarch64 port.
-fn emit_atan2_core(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    y: Reg,
-    x: Reg,
-    s0: Reg,
-    s1: Reg,
-    s2: Reg,
-    s3: Reg,
-) {
-    // mask_neg_x = (x < 0) → spill
-    emit_vxorps(code, s0, s0, s0);
-    emit_vcmpps(code, s2, x, s0, CMP_LT);
-    emit_movups_store_rsp(code, s2, -24);
-
-    // r = y / x → dst
-    emit_vdivps(code, dst, y, x);
-    // ---- y, x dead ----
-
-    // sign_r = copysign(1, r) → spill
-    emit_f32_const(code, s0, f32::from_bits(SIGN_MASK));
-    emit_vandps(code, s0, dst, s0);
-    emit_f32_const(code, s1, 1.0);
-    emit_vorps(code, s0, s0, s1);
-    emit_movups_store_rsp(code, s0, -40);
-
-    // sign_y = copysign(1, y) → spill
-    emit_f32_const(code, s0, f32::from_bits(SIGN_MASK));
-    emit_vandps(code, s0, y, s0);
-    emit_f32_const(code, s1, 1.0);
-    emit_vorps(code, s0, s0, s1);
-    emit_movups_store_rsp(code, s0, -56);
-
-    // r_abs = |r| → s3
-    emit_f32_const(code, s0, f32::from_bits(ABS_MASK));
-    emit_vandps(code, s3, dst, s0);
-
-    // mask_large = r_abs > 1 → s1
-    emit_f32_const(code, s0, 1.0);
-    emit_vcmpps(code, s1, s3, s0, CMP_NLE);
-
-    // t = mask_large ? 1/r_abs : r_abs → dst
-    emit_f32_const(code, s0, 1.0);
-    emit_vdivps(code, s0, s0, s3); // s0 = 1/r_abs
-    emit_blend(code, dst, s1, s0, s3, s2); // dst = t (tmp = s2)
-
-    // t² → s0 ; t saved → s3
-    emit_vmulps(code, s0, dst, dst);
-    emit_movaps(code, s3, dst); // s3 = t
-
-    // poly = ((c7*t² + c5)*t² + c3)*t² + c1   (accumulator dst, s2 = const scratch)
-    emit_f32_const(code, s2, -0.142_857_14_f32);
-    emit_f32_const(code, dst, 0.2_f32);
-    emit_vmulps(code, s2, s2, s0);
-    emit_vaddps(code, dst, s2, dst);
-    emit_f32_const(code, s2, -0.333_333_34_f32);
-    emit_vmulps(code, dst, dst, s0);
-    emit_vaddps(code, dst, dst, s2);
-    emit_f32_const(code, s2, 0.999_999_9_f32);
-    emit_vmulps(code, dst, dst, s0);
-    emit_vaddps(code, dst, dst, s2);
-
-    // atan_small = poly * t
-    emit_vmulps(code, dst, dst, s3); // dst = atan_small ; s3 free
-
-    // atan_large = π/2 - atan_small → s2
-    emit_f32_const(code, s2, core::f32::consts::FRAC_PI_2);
-    emit_vsubps(code, s2, s2, dst);
-
-    // atan_val = mask_large ? atan_large : atan_small → dst (tmp = s3)
-    emit_blend(code, dst, s1, s2, dst, s3);
-
-    // atan_signed = atan_val * sign_r
-    emit_movups_load_rsp(code, s0, -40);
-    emit_vmulps(code, dst, dst, s0);
-
-    // correction = π * sign_y
-    emit_movups_load_rsp(code, s0, -56);
-    emit_f32_const(code, s1, core::f32::consts::PI);
-    emit_vmulps(code, s1, s1, s0);
-
-    // corrected = atan_signed + π*sign_y → s2
-    emit_vaddps(code, s2, dst, s1);
-
-    // result = mask_neg_x ? corrected : atan_signed → dst (tmp = s1)
-    emit_movups_load_rsp(code, s0, -24);
-    emit_blend(code, dst, s0, s2, dst, s1);
-}
-
 // ---------------------------------------------------------------------------
 // Public unary builtin entry points
 // ---------------------------------------------------------------------------
-
-pub fn emit_log2_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    emit_log2_body(code, dst, src, sc[0], sc[1], sc[2]);
-}
-
-pub fn emit_ln_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    emit_log2_body(code, dst, src, sc[0], sc[1], sc[2]);
-    emit_f32_const(code, sc[0], core::f32::consts::LN_2);
-    emit_vmulps(code, dst, dst, sc[0]);
-}
-
-pub fn emit_log10_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    emit_log2_body(code, dst, src, sc[0], sc[1], sc[2]);
-    emit_f32_const(code, sc[0], core::f32::consts::LOG10_2);
-    emit_vmulps(code, dst, dst, sc[0]);
-}
-
-pub fn emit_exp2_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    emit_exp2_body(code, dst, src, sc[0], sc[1], sc[2]);
-}
-
-pub fn emit_exp_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    // exp(x) = exp2(x * log2(e)); compute the product in sc[3] so the body
-    // still gets three free scratch (sc[0..2]).
-    emit_f32_const(code, sc[3], core::f32::consts::LOG2_E);
-    emit_vmulps(code, sc[3], src, sc[3]);
-    emit_exp2_body(code, dst, sc[3], sc[0], sc[1], sc[2]);
-}
-
-pub fn emit_sin_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    emit_sin_body(code, dst, src, sc[0], sc[1], sc[2]);
-}
-
-pub fn emit_cos_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    // cos(x) = sin(x + π/2); compute argument in sc[3].
-    emit_f32_const(code, sc[3], core::f32::consts::FRAC_PI_2);
-    emit_vaddps(code, sc[3], src, sc[3]);
-    emit_sin_body(code, dst, sc[3], sc[0], sc[1], sc[2]);
-}
-
-pub fn emit_tan_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    // tan = sin/cos. sin → dst, cos → sc[3], divide. src untouched by sin_body.
-    emit_sin_body(code, dst, src, sc[0], sc[1], sc[2]);
-    emit_f32_const(code, sc[3], core::f32::consts::FRAC_PI_2);
-    emit_vaddps(code, sc[3], src, sc[3]);
-    // cos(x): sin_body needs 3 scratch + its src(sc[3]); use sc[0..2], result → sc[3].
-    let cos = sc[3];
-    emit_sin_body(code, cos, sc[3], sc[0], sc[1], sc[2]); // overwrites sc[3] in place via dst==src? no
-    emit_vdivps(code, dst, dst, sc[3]);
-}
 
 pub fn emit_floor_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     emit_vroundps(code, dst, src, 1);
@@ -685,33 +501,6 @@ pub fn emit_round_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 pub fn emit_fract_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
     emit_vroundps(code, sc[0], src, 1); // floor
     emit_vsubps(code, dst, src, sc[0]); // x - floor(x)
-}
-
-pub fn emit_atan2_builtin(code: &mut Vec<u8>, dst: Reg, src_y: Reg, src_x: Reg, sc: [Reg; 4]) {
-    emit_atan2_core(code, dst, src_y, src_x, sc[0], sc[1], sc[2], sc[3]);
-}
-
-pub fn emit_atan_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    emit_f32_const(code, sc[3], 1.0);
-    emit_atan2_core(code, dst, src, sc[3], sc[0], sc[1], sc[2], sc[3]);
-}
-
-pub fn emit_asin_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    // asin(x) = atan2(x, sqrt(1 - x²)); denom → sc[3].
-    emit_vmulps(code, sc[3], src, src);
-    emit_f32_const(code, sc[0], 1.0);
-    emit_vsubps(code, sc[3], sc[0], sc[3]);
-    emit_vsqrtps(code, sc[3], sc[3]);
-    emit_atan2_core(code, dst, src, sc[3], sc[0], sc[1], sc[2], sc[3]);
-}
-
-pub fn emit_acos_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg, sc: [Reg; 4]) {
-    // acos(x) = atan2(sqrt(1 - x²), x); numerator → sc[3].
-    emit_vmulps(code, sc[3], src, src);
-    emit_f32_const(code, sc[0], 1.0);
-    emit_vsubps(code, sc[3], sc[0], sc[3]);
-    emit_vsqrtps(code, sc[3], sc[3]);
-    emit_atan2_core(code, dst, sc[3], src, sc[0], sc[1], sc[2], sc[3]);
 }
 
 /// pow(x, y) = exp2(y * log2(x)).
@@ -770,28 +559,15 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, scratch: [
         OpKind::Round => emit_round_builtin(code, dst, src),
         OpKind::Fract => emit_fract_builtin(code, dst, src, scratch),
 
-        // Exp / log family
-        OpKind::Exp => emit_exp_builtin(code, dst, src, scratch),
-        OpKind::Exp2 => emit_exp2_builtin(code, dst, src, scratch),
-        OpKind::Ln => emit_ln_builtin(code, dst, src, scratch),
-        OpKind::Log2 => emit_log2_builtin(code, dst, src, scratch),
-        OpKind::Log10 => emit_log10_builtin(code, dst, src, scratch),
-
-        // Trig
-        OpKind::Sin => emit_sin_builtin(code, dst, src, scratch),
-        OpKind::Cos => emit_cos_builtin(code, dst, src, scratch),
-        OpKind::Tan => emit_tan_builtin(code, dst, src, scratch),
-
-        // Inverse trigonometric builtins
-        OpKind::Atan => emit_atan_builtin(code, dst, src, scratch),
-        OpKind::Asin => emit_asin_builtin(code, dst, src, scratch),
-        OpKind::Acos => emit_acos_builtin(code, dst, src, scratch),
-
         // Bit-manip primitives (integer-domain). Single instructions.
         OpKind::TruncToInt => emit_vcvttps2dq(code, dst, src),
         OpKind::IntToFloat => emit_vcvtdq2ps(code, dst, src),
 
-        _ => panic!("x86_64 unary emit not implemented for {:?}", op),
+        // Transcendentals (sin/cos/tan/exp/exp2/ln/log2/log10/atan/asin/acos) are
+        // expanded to primitive arithmetic by `lowering` before codegen, so they
+        // never reach a backend. Reaching here means the lowering pass was
+        // skipped — a bug; fall through to the panic.
+        _ => panic!("x86_64 unary emit not implemented for {:?} (lowering not run?)", op),
     }
 }
 
@@ -863,7 +639,8 @@ pub fn emit_binary_transcendental(
     scratch: [Reg; 4],
 ) {
     match op {
-        OpKind::Atan2 => emit_atan2_builtin(code, dst, src1, src2, scratch),
+        // Atan2 is lowered to arithmetic before codegen; only Pow/Hypot still
+        // reach a backend (not yet lowered).
         OpKind::Pow => emit_pow_builtin(code, dst, src1, src2, scratch),
         OpKind::Hypot => emit_hypot_builtin(code, dst, src1, src2, scratch),
         _ => panic!(
