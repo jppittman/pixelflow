@@ -26,7 +26,7 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, mprotect};
+        use libc::{mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
         if code.is_empty() {
             return Err("empty code buffer");
@@ -166,7 +166,7 @@ impl CodeBuffer {
     /// Returns an error if mmap fails.
     #[cfg(unix)]
     pub fn new(capacity: usize) -> Result<Self, &'static str> {
-        use libc::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap};
+        use libc::{mmap, MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 
         if capacity == 0 {
             return Err("CodeBuffer capacity must be > 0");
@@ -218,7 +218,7 @@ impl CodeBuffer {
         {
             // With MAP_JIT on macOS, the memory starts RW. Toggle to RX.
             unsafe {
-                toggle_jit_write(false);
+                toggle_jit_write(JitWriteState::Executable);
             }
         }
 
@@ -252,7 +252,7 @@ impl CodeBuffer {
             // Toggle to writable.
             #[cfg(target_os = "macos")]
             {
-                toggle_jit_write(true);
+                toggle_jit_write(JitWriteState::Writable);
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -273,7 +273,7 @@ impl CodeBuffer {
             // Toggle to executable.
             #[cfg(target_os = "macos")]
             {
-                toggle_jit_write(false);
+                toggle_jit_write(JitWriteState::Executable);
                 // Instruction cache coherence on Apple Silicon.
                 // sys_icache_invalidate is needed after writing code on ARM.
                 unsafe extern "C" {
@@ -330,19 +330,28 @@ impl Drop for CodeBuffer {
 /// This is much cheaper than mprotect (~0.5µs vs ~5µs) and is per-thread,
 /// so it doesn't affect other threads' ability to execute the code.
 #[cfg(target_os = "macos")]
-unsafe fn toggle_jit_write(writable: bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitWriteState {
+    Writable,
+    Executable,
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn toggle_jit_write(state: JitWriteState) {
     // pthread_jit_write_protect_np(true) = write-protect (executable)
     // pthread_jit_write_protect_np(false) = writable (not executable)
     // Note: the semantics are inverted from what you'd expect!
     unsafe extern "C" {
         fn pthread_jit_write_protect_np(enabled: bool);
     }
-    // writable=true → we want to write → disable write protection
-    // writable=false → we want to execute → enable write protection
+    let enabled = match state {
+        JitWriteState::Executable => true,
+        JitWriteState::Writable => false,
+    };
     // SAFETY: pthread_jit_write_protect_np is always safe to call — it only
     // affects the calling thread's JIT write permission.
     unsafe {
-        pthread_jit_write_protect_np(!writable);
+        pthread_jit_write_protect_np(enabled);
     }
 }
 
