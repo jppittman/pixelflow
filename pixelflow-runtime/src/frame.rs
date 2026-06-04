@@ -147,44 +147,38 @@ mod tests {
     }
 
     #[test]
-    fn test_create_channels() {
-        let (_handle, _rx) = create_frame_channel::<TestSurface>();
-        let (_recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
-    }
-
-    #[test]
-    fn test_submit_and_receive() {
+    fn submit_frame_should_deliver_packet_when_called() {
         let (handle, rx) = create_frame_channel::<TestSurface>();
         let (recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
 
         let surface = TestSurface { color: 1.0 };
         let packet = FramePacket::new(surface, recycle_tx);
 
-        handle.submit_frame(packet).unwrap();
+        handle.submit_frame(packet).expect("Should succeed");
 
-        let received = rx.recv().unwrap();
+        let received = rx.recv().expect("Should succeed");
         assert_eq!(received.surface.color, 1.0);
     }
 
     #[test]
-    fn test_recycle_loop() {
+    fn recycle_should_return_packet_to_pool_when_called() {
         let (handle, rx) = create_frame_channel::<TestSurface>();
         let (recycle_tx, recycle_rx) = create_recycle_channel::<TestSurface>();
 
         // Create and submit a packet
         let surface = TestSurface { color: 1.0 };
         let packet = FramePacket::new(surface, Arc::clone(&recycle_tx));
-        handle.submit_frame(packet).unwrap();
+        handle.submit_frame(packet).expect("Should succeed");
 
         // Receive and "render" it
-        let received = rx.recv().unwrap();
+        let received = rx.recv().expect("Should succeed");
         assert_eq!(received.surface.color, 1.0);
 
         // Recycle using the method (clean API)
         received.recycle();
 
         // Logic thread receives the recycled packet
-        let recycled = recycle_rx.recv().unwrap();
+        let recycled = recycle_rx.recv().expect("Should succeed");
         assert_eq!(recycled.surface.color, 1.0);
     }
 }
