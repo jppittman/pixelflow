@@ -398,10 +398,12 @@ pub type ScanlineKernelFn = extern "C" fn(
 /// Args: X in xmm0, Y in xmm1, Z in xmm2, W in xmm3
 /// Returns: result in xmm0
 #[cfg(target_arch = "x86_64")]
+#[allow(improper_ctypes_definitions)]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 
 /// JIT-compiled scanline kernel signature for x86-64 (stub — not yet implemented).
 #[cfg(target_arch = "x86_64")]
+#[allow(improper_ctypes_definitions)]
 pub type ScanlineKernelFn = extern "C" fn(
     *const __m128, // x_array
     __m128,        // y (broadcast)

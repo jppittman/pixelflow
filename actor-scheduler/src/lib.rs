@@ -2761,7 +2761,7 @@ mod shutdown_tests {
         // Shutdown should respect timeout (~50ms + overhead for normal run loop batch)
         assert!(
             shutdown_duration < Duration::from_millis(150),
-            "Timeout should limit shutdown duration, took {:?}",
+            "Timeout should limit shutdown duration {:?}",
             shutdown_duration
         );
 
