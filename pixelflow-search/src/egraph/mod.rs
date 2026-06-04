@@ -17,6 +17,7 @@
 
 pub mod codegen;
 mod cost;
+pub mod derivative;
 pub mod deps;
 pub(crate) mod extract;
 mod graph;
@@ -27,6 +28,7 @@ pub mod saturate;
 
 // Re-export public API
 pub use cost::{CostFunction, CostModel};
+pub use derivative::{ChainRule, derivative_rules};
 pub use deps::{Deps, DepsAnalysis};
 pub use extract::{
     ExtractedDAG, IncrementalExtractor, build_extracted_dag_from_choices, choices_to_arena,

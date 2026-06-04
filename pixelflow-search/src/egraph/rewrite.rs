@@ -132,6 +132,14 @@ pub enum RewriteAction {
     ExpandSquare { a: EClassId, b: EClassId },
     /// DiffOfSquares: a² - b² -> (a+b)(a-b)
     DiffOfSquares { a: EClassId, b: EClassId },
+    /// Differentiate: expand `Dwrt(inner, var)` one chain-rule step.
+    ///
+    /// `inner` is a representative node of the expression being differentiated;
+    /// `var` is the variable index it is taken with respect to. The executor
+    /// builds the derivative subtree, emitting fresh `Dwrt` nodes for any
+    /// sub-expressions so equality saturation keeps pushing the derivative
+    /// toward the leaves until it dissolves into ordinary arithmetic.
+    Differentiate { inner: ENode, var: u8 },
 }
 
 /// A rewrite rule that can be applied to e-graph nodes.
