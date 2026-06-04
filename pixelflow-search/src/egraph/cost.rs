@@ -146,6 +146,11 @@ impl CostModel {
     pub fn node_op_cost(&self, node: &ENode) -> usize {
         match node {
             ENode::Var(_) | ENode::Const(_) => 0,
+            // `Dwrt` is the internal autodiff marker. It is rewritten away by
+            // the chain rule; a surviving one is the (not-yet-wired) jet
+            // fallback. Either way extraction must never choose it, so it is
+            // prohibitively expensive regardless of the learned weight table.
+            ENode::Op { op, .. } if op.kind() == OpKind::Dwrt => usize::MAX / 4,
             ENode::Op { op, .. } => self.cost(op.kind()),
         }
     }

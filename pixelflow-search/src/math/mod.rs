@@ -105,13 +105,16 @@ pub fn all_math_rules() -> Vec<Box<dyn Rewrite>> {
     rules
 }
 
-/// All rewrite rules: math (59) + fusion (2) = 61 total.
+/// All rewrite rules: math (59) + fusion (2) + differentiation (1) = 62 total.
 ///
 /// This is the complete rule set for optimization. Use this for training
-/// and production optimization where all rules should be available.
+/// and production optimization where all rules should be available. The
+/// differentiation rule is inert unless the expression contains a `Dwrt`
+/// node, so it costs nothing for derivative-free kernels.
 pub fn all_rules() -> Vec<Box<dyn Rewrite>> {
     let mut rules = all_math_rules();
     rules.extend(fusion_rules());
+    rules.extend(crate::egraph::derivative::derivative_rules());
     rules
 }
 
@@ -440,8 +443,8 @@ mod tests {
         let rules = all_rules();
         assert_eq!(
             rules.len(),
-            61,
-            "Expected 61 rules (59 math + 2 fusion), got {}",
+            62,
+            "Expected 62 rules (59 math + 2 fusion + 1 differentiation), got {}",
             rules.len()
         );
     }
