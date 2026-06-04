@@ -152,14 +152,20 @@ mod tests {
                 let ca = expr_to_egraph(arena, a, egraph);
                 let op = crate::egraph::ops::op_from_kind(kind)
                     .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
-                egraph.add(ENode::Op { op, children: vec![ca] })
+                egraph.add(ENode::Op {
+                    op,
+                    children: vec![ca],
+                })
             }
             ExprNode::Binary(kind, a, b) => {
                 let ca = expr_to_egraph(arena, a, egraph);
                 let cb = expr_to_egraph(arena, b, egraph);
                 let op = crate::egraph::ops::op_from_kind(kind)
                     .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
-                egraph.add(ENode::Op { op, children: vec![ca, cb] })
+                egraph.add(ENode::Op {
+                    op,
+                    children: vec![ca, cb],
+                })
             }
             ExprNode::Ternary(kind, a, b, c) => {
                 let ca = expr_to_egraph(arena, a, egraph);
@@ -167,7 +173,10 @@ mod tests {
                 let cc = expr_to_egraph(arena, c, egraph);
                 let op = crate::egraph::ops::op_from_kind(kind)
                     .unwrap_or_else(|| panic!("unsupported op in math test: {kind:?}"));
-                egraph.add(ENode::Op { op, children: vec![ca, cb, cc] })
+                egraph.add(ENode::Op {
+                    op,
+                    children: vec![ca, cb, cc],
+                })
             }
             ExprNode::Nary(kind, _, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
         }
@@ -305,8 +314,15 @@ mod tests {
                 continue;
             }
             let diff = (original - opt).abs();
-            let threshold = if original.abs() > 1.0 { 1e-5 * original.abs() } else { 1e-5 };
-            assert!(diff <= threshold, "associativity changed semantics at {point:?}: {original} vs {opt}");
+            let threshold = if original.abs() > 1.0 {
+                1e-5 * original.abs()
+            } else {
+                1e-5
+            };
+            assert!(
+                diff <= threshold,
+                "associativity changed semantics at {point:?}: {original} vs {opt}"
+            );
         }
 
         let canon = eg.find(root_class);
@@ -419,10 +435,18 @@ mod tests {
         let rev = ReverseAssociative::new(&crate::egraph::ops::Add);
 
         let mut a = ExprArena::new();
-        let assoc_lhs = assoc.lhs_template(&mut a).expect("Associative Add missing lhs_template");
-        let assoc_rhs = assoc.rhs_template(&mut a).expect("Associative Add missing rhs_template");
-        let rev_lhs = rev.lhs_template(&mut a).expect("ReverseAssociative Add missing lhs_template");
-        let rev_rhs = rev.rhs_template(&mut a).expect("ReverseAssociative Add missing rhs_template");
+        let assoc_lhs = assoc
+            .lhs_template(&mut a)
+            .expect("Associative Add missing lhs_template");
+        let assoc_rhs = assoc
+            .rhs_template(&mut a)
+            .expect("Associative Add missing rhs_template");
+        let rev_lhs = rev
+            .lhs_template(&mut a)
+            .expect("ReverseAssociative Add missing lhs_template");
+        let rev_rhs = rev
+            .rhs_template(&mut a)
+            .expect("ReverseAssociative Add missing rhs_template");
 
         assert!(
             a.subtree_eq(assoc_lhs, &a, rev_rhs),

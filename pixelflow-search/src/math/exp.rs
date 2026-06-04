@@ -23,10 +23,9 @@
 use std::marker::PhantomData;
 
 use crate::arena_pat;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-
+use pixelflow_ir::arena::{ExprArena, ExprId};
 
 // ============================================================================
 // FunctionInverse Trait
@@ -348,7 +347,6 @@ impl<T: Homomorphism> Rewrite for HomomorphismRule<T> {
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-
         // TargetOp(Func(V0), Func(V1))
         let fk = T::func().kind();
         Some(arena_pat!(__a, bin T::target_op().kind(), (un fk, (var 0)), (un fk, (var 1))))
@@ -409,7 +407,9 @@ impl Rewrite for PowerCombine {
     }
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Pow, (var 0), (var 1)), (bin OpKind::Pow, (var 0), (var 2))))
+        Some(
+            arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Pow, (var 0), (var 1)), (bin OpKind::Pow, (var 0), (var 2))),
+        )
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
