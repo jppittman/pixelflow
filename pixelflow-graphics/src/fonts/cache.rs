@@ -369,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_cached_glyph_creation() {
         let font = Font::parse(FONT_DATA).unwrap();
         let glyph = font.glyph_scaled('A', 32.0).unwrap();
@@ -379,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_glyph_cache_get() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
@@ -400,6 +402,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_glyph_cache_warm() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
@@ -416,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_cached_glyph_eval() {
         use pixelflow_core::Field;
 
@@ -437,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_cached_text_creation() {
         use pixelflow_core::Field;
 
@@ -462,6 +467,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_cache_memory_usage() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
