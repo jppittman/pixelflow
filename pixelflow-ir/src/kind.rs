@@ -82,11 +82,19 @@ pub enum OpKind {
     BitAnd = 46,
     /// Bitwise OR of lane bit patterns (`orps` / `orr`).
     BitOr = 47,
+
+    // --- Differentiation ---
+    /// Symbolic derivative `∂(child0)/∂(var)` where `child1` is a `Const` whose
+    /// value is the variable index (0=X, 1=Y, 2=Z, 3=W). The e-graph pushes
+    /// `Dwrt` toward the leaves via the chain rule, computing the derivative
+    /// analytically; whatever cannot be decomposed survives as a residual `Dwrt`
+    /// (the jet fallback — not yet wired). It must never reach a backend.
+    Dwrt = 48,
 }
 
 impl OpKind {
     /// Total number of operations.
-    pub const COUNT: usize = 48;
+    pub const COUNT: usize = 49;
 
     /// Convert to array index.
     #[inline]
@@ -150,7 +158,8 @@ impl OpKind {
             | Self::Shl
             | Self::Shr
             | Self::BitAnd
-            | Self::BitOr => 2,
+            | Self::BitOr
+            | Self::Dwrt => 2,
 
             Self::MulAdd | Self::Select | Self::Clamp => 3,
         }
@@ -207,6 +216,7 @@ impl OpKind {
             Self::Shr => "shr",
             Self::BitAnd => "bitand",
             Self::BitOr => "bitor",
+            Self::Dwrt => "dwrt",
         }
     }
 
@@ -261,6 +271,7 @@ impl OpKind {
             "shr" => Some(Self::Shr),
             "bitand" => Some(Self::BitAnd),
             "bitor" => Some(Self::BitOr),
+            "dwrt" => Some(Self::Dwrt),
             _ => None,
         }
     }
@@ -291,6 +302,10 @@ impl OpKind {
             | Self::Shr
             | Self::BitAnd
             | Self::BitOr => 1,
+            // Dwrt must be rewritten away before extraction; price it so the
+            // extractor never prefers a surviving derivative over a decomposed
+            // form. (A surviving Dwrt is then caught by a validation pass.)
+            Self::Dwrt => 1_000_000,
             Self::Div
             | Self::Sqrt
             | Self::Sin
@@ -436,6 +451,9 @@ impl OpKind {
             | Self::Shr
             | Self::BitAnd
             | Self::BitOr => EmitStyle::BinaryMethod,
+
+            // Differentiation: never emitted (rewritten away in the e-graph).
+            Self::Dwrt => EmitStyle::Special,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select | Self::Clamp => EmitStyle::TernaryMethod,

@@ -139,6 +139,14 @@ define_op!(Clamp);
 // === Aggregates ===
 define_op!(Tuple);
 
+// === Differentiation ===
+// `Dwrt(expr, var)` is the single autodiff operator. It exists only inside the
+// e-graph: chain-rule rewrites push it toward the leaves until it dissolves
+// into ordinary arithmetic. A surviving `Dwrt` after saturation is the jet
+// fallback (not yet wired) and carries a prohibitive cost so the extractor
+// never prefers it.
+define_op!(Dwrt);
+
 /// Look up a static `&dyn Op` reference by `OpKind`.
 ///
 /// Returns `None` for `Var` and `Const` (which are leaves, not operations).
@@ -183,6 +191,8 @@ pub fn op_from_kind(kind: OpKind) -> Option<&'static dyn Op> {
         OpKind::Select => Some(&Select),
         OpKind::Clamp => Some(&Clamp),
         OpKind::Tuple => Some(&Tuple),
+        // Autodiff operator: lives in the e-graph, rewritten by the chain rule.
+        OpKind::Dwrt => Some(&Dwrt),
         // Leaves (not operations)
         OpKind::Var | OpKind::Const => None,
         // Bit-manip primitives are produced by *lowering* (after the e-graph
