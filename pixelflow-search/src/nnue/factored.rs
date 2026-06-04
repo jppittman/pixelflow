@@ -509,6 +509,8 @@ impl OpEmbeddings {
             0.05, // Shr - 1 cycle
             0.05, // BitAnd - 1 cycle
             0.05, // BitOr - 1 cycle
+            // Dwrt - rewritten away by the e-graph (chain rule); never emitted.
+            1.0, // Dwrt - prohibitive so a surviving derivative never extracts
         ];
 
         let mut rng_state = seed.wrapping_add(1);

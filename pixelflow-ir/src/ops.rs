@@ -111,8 +111,12 @@ define_op!(45, Shr, "shr", 2, BinaryMethod);
 define_op!(46, BitAnd, "bitand", 2, BinaryMethod);
 define_op!(47, BitOr, "bitor", 2, BinaryMethod);
 
+// Differentiation operator. Rewritten away in the e-graph (chain rule); never
+// emitted, hence Special.
+define_op!(48, Dwrt, "dwrt", 2, Special);
+
 /// Total number of operations. Must equal [`crate::kind::OpKind::COUNT`].
-pub const OP_COUNT: usize = 48;
+pub const OP_COUNT: usize = 49;
 
 /// All operations in the IR, indexed by their INDEX constant.
 ///
@@ -121,7 +125,7 @@ pub const ALL_OPS: [&'static dyn OpMeta; OP_COUNT] = [
     &Var, &Const, &Add, &Sub, &Mul, &Div, &Neg, &Sqrt, &Rsqrt, &Abs, &Min, &Max, &MulAdd, &Recip,
     &Floor, &Ceil, &Round, &Fract, &Sin, &Cos, &Tan, &Asin, &Acos, &Atan, &Atan2, &Exp, &Exp2, &Ln,
     &Log2, &Log10, &Pow, &Hypot, &Lt, &Le, &Gt, &Ge, &Eq, &Ne, &Select, &Clamp, &Tuple,
-    &TruncToInt, &IntToFloat, &IAdd, &Shl, &Shr, &BitAnd, &BitOr,
+    &TruncToInt, &IntToFloat, &IAdd, &Shl, &Shr, &BitAnd, &BitOr, &Dwrt,
 ];
 
 // Compile-time guard: the two op counts must agree.
