@@ -893,6 +893,7 @@ where
 /// register allocator). The result is that expressions depending only on Y, Z,
 /// or W are computed once before the pixel loop.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn default_hoist_predicate(v: crate::variance::Variance) -> bool {
     v.is_x_invariant() && !v.is_const()
 }
@@ -2889,6 +2890,7 @@ fn emit_instruction_plan(
 ///
 /// Checks in order: register assignment, rematerialize (constant load),
 /// spill slot (stack load). Panics if value is not found anywhere.
+#[allow(clippy::too_many_arguments)]
 fn emit_resolve(
     code: &mut Vec<u8>,
     vid: regalloc::ValueId,

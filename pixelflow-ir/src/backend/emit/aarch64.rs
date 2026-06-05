@@ -1259,6 +1259,7 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
 }
 
 /// Emit binary transcendental operation (needs scratch registers).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_binary_transcendental(
     code: &mut Vec<u8>,
     pool: &mut super::ConstPool,
@@ -2649,7 +2650,7 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
     }
 
     // USHR Vd.4S, Vn.4S, #shift
-    if word & 0xFF80FC00 == 0x6F200400 {
+    if word & 0xFF80FC00 == 0x6F000400 {
         let immhb = (word >> 16) & 0x3F;
         let shift = 64u32.wrapping_sub(immhb) & 0x3F;
         return format!("ushr v{}.4s, v{}.4s, #{}", rd, rn, shift);
