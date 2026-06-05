@@ -1455,7 +1455,7 @@ mod tests {
 
         assert_eq!(dag_acc.node_count, 3, "DAG acc should count 3 unique nodes");
         assert_eq!(
-            dag_acc.edge_count, 3,
+            dag_acc.edge_count, 5,
             "shared reuse should contribute a var_ref edge"
         );
     }

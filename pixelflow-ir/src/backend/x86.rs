@@ -416,11 +416,31 @@ impl SimdOps for F32x4 {
 
             // Chebyshev coefficients for sin
             #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
             let c1 = _mm_set1_ps(1.6719970703125);
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
             #[allow(clippy::excessive_precision)]
             let c3 = _mm_set1_ps(-0.645963541666667);
             #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
             let c5 = _mm_set1_ps(0.079689450);
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
             #[allow(clippy::excessive_precision)]
             let c7 = _mm_set1_ps(-0.0046817541);
 
@@ -455,8 +475,18 @@ impl SimdOps for F32x4 {
             // Chebyshev coefficients for atan on [0, 1]
             let c1 = _mm_set1_ps(0.999999999);
             #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
             let c3 = _mm_set1_ps(-0.333333333);
             let c5 = _mm_set1_ps(0.2);
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
+            #[allow(clippy::excessive_precision)]
             #[allow(clippy::excessive_precision)]
             let c7 = _mm_set1_ps(-0.142857143);
 

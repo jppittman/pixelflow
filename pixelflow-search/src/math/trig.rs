@@ -19,10 +19,9 @@
 use std::marker::PhantomData;
 
 use crate::arena_pat;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-
+use pixelflow_ir::arena::{ExprArena, ExprId};
 
 // ============================================================================
 // AngleAddition Trait
@@ -397,7 +396,9 @@ impl Rewrite for ReverseAngleAddition {
     }
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(arena_pat!(__a, bin OpKind::Add, (bin OpKind::Mul, (un OpKind::Sin, (var 0)), (un OpKind::Cos, (var 1))), (bin OpKind::Mul, (un OpKind::Cos, (var 0)), (un OpKind::Sin, (var 1)))))
+        Some(
+            arena_pat!(__a, bin OpKind::Add, (bin OpKind::Mul, (un OpKind::Sin, (var 0)), (un OpKind::Cos, (var 1))), (bin OpKind::Mul, (un OpKind::Cos, (var 0)), (un OpKind::Sin, (var 1)))),
+        )
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
@@ -574,7 +575,9 @@ impl Rewrite for HalfAngleProduct {
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(arena_pat!(__a, bin OpKind::Div, (un OpKind::Sin, (bin OpKind::Add, (var 0), (var 0))), (cst 2.0)))
+        Some(
+            arena_pat!(__a, bin OpKind::Div, (un OpKind::Sin, (bin OpKind::Add, (var 0), (var 0))), (cst 2.0)),
+        )
     }
 }
 

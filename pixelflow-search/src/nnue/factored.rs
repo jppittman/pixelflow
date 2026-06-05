@@ -40,9 +40,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 use libm::sqrtf;
 
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 use crate::egraph::Rewrite;
 pub use pixelflow_ir::OpKind;
+use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
 // ============================================================================
 // Constants
@@ -384,7 +384,10 @@ impl ArenaRuleTemplates {
             arenas.push(tmpl);
         }
 
-        Self { arenas, root_op_set }
+        Self {
+            arenas,
+            root_op_set,
+        }
     }
 
     /// Number of rules.
@@ -3867,5 +3870,4 @@ mod tests {
         acc.remove_leaf();
         assert_eq!(acc.node_count, 0, "node_count must not underflow");
     }
-
 }

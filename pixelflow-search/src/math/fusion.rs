@@ -11,12 +11,10 @@
 //! `1 / sqrt(x)` → `rsqrt(x)` — fast approximate on x86 (rsqrtps/vrsqrtps)
 //!
 
-
 use crate::arena_pat;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-
+use pixelflow_ir::arena::{ExprArena, ExprId};
 
 // ============================================================================
 // FMA Fusion
