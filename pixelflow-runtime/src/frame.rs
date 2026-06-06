@@ -147,44 +147,45 @@ mod tests {
     }
 
     #[test]
-    fn test_create_channels() {
-        let (_handle, _rx) = create_frame_channel::<TestSurface>();
-        let (_recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
-    }
-
-    #[test]
-    fn test_submit_and_receive() {
+    fn handle_should_transmit_packet_when_submitted() {
         let (handle, rx) = create_frame_channel::<TestSurface>();
         let (recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
 
         let surface = TestSurface { color: 1.0 };
         let packet = FramePacket::new(surface, recycle_tx);
 
-        handle.submit_frame(packet).unwrap();
+        handle
+            .submit_frame(packet)
+            .expect("Failed to submit frame packet");
 
-        let received = rx.recv().unwrap();
-        assert_eq!(received.surface.color, 1.0);
+        let received = rx.recv().expect("Failed to receive frame packet");
+        assert_eq!(received.surface.color, 1.0, "Expected color to be 1.0");
     }
 
     #[test]
-    fn test_recycle_loop() {
+    fn packet_should_return_to_logic_thread_when_recycled() {
         let (handle, rx) = create_frame_channel::<TestSurface>();
         let (recycle_tx, recycle_rx) = create_recycle_channel::<TestSurface>();
 
         // Create and submit a packet
         let surface = TestSurface { color: 1.0 };
         let packet = FramePacket::new(surface, Arc::clone(&recycle_tx));
-        handle.submit_frame(packet).unwrap();
+        handle.submit_frame(packet).expect("Failed to submit frame");
 
         // Receive and "render" it
-        let received = rx.recv().unwrap();
-        assert_eq!(received.surface.color, 1.0);
+        let received = rx.recv().expect("Failed to receive frame");
+        assert_eq!(received.surface.color, 1.0, "Expected color to be 1.0");
 
         // Recycle using the method (clean API)
         received.recycle();
 
         // Logic thread receives the recycled packet
-        let recycled = recycle_rx.recv().unwrap();
-        assert_eq!(recycled.surface.color, 1.0);
+        let recycled = recycle_rx
+            .recv()
+            .expect("Failed to receive recycled packet");
+        assert_eq!(
+            recycled.surface.color, 1.0,
+            "Expected recycled color to be 1.0"
+        );
     }
 }
