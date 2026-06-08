@@ -40,7 +40,7 @@ pub unsafe fn end_patching(start: *mut u8, len: usize) {
     {
         // 1 = true (write disabled, execute enabled for the current thread)
         pthread_jit_write_protect_np(1);
-        
+
         // Flush the instruction cache for the modified region.
         // Apple requires this to be called AFTER restoring execute permissions.
         sys_icache_invalidate(start as *mut c_void, len);
