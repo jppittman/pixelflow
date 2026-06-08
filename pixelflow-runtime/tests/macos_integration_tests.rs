@@ -27,7 +27,7 @@ mod tests {
     impl Actor<EngineData, EngineControl, AppManagement> for MockEngine {
         fn handle_data(&mut self, msg: EngineData) -> HandlerResult {
             if let EngineData::FromDriver(evt) = msg {
-                self.captured_events.lock().unwrap().push(evt);
+                self.captured_events.lock().expect("Expected successful operation").push(evt);
             }
             Ok(())
         }
@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     #[ignore = "Requires UI interaction or window server"]
-    fn test_metal_ops_lifecycle() {
+    fn metal_ops_lifecycle() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_clone = events.clone();
 
@@ -79,7 +79,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         // 6. Verify Window Creation Event within MockEngine
-        let captured = events.lock().unwrap();
+        let captured = events.lock().expect("Expected successful operation");
         let found_window_id = captured.iter().find_map(|e| {
             if let pixelflow_runtime::display::messages::DisplayEvent::WindowCreated { window } = e
             {
@@ -95,7 +95,7 @@ mod tests {
         );
 
         // 7. Update Window Title
-        let win_id = found_window_id.unwrap();
+        let win_id = found_window_id.expect("Expected successful operation");
         let _ = ops.handle_control(DisplayControl::SetTitle {
             id: win_id,
             title: "Updated Title".to_string(),
