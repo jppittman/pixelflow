@@ -2394,6 +2394,17 @@ fn arena_to_schedule(
                 };
                 ScheduledOp::ShiftImm(*op, map_child(a), amount)
             }
+            // A `Dwrt` (autodiff) node must be eliminated by the e-graph chain
+            // rule before codegen. Reaching here means a `D(expr, var)` survived
+            // saturation -- i.e. an operator with no differentiation rule -- and
+            // the jet fallback that would handle the residual is not yet wired.
+            // Fail loudly here rather than as a cryptic instruction-emit panic.
+            ExprNode::Binary(OpKind::Dwrt, _, _) => panic!(
+                "arena_to_schedule: a Dwrt (autodiff) node reached the JIT \
+                 emitter. It should have been rewritten away by the e-graph \
+                 chain rule; a survivor means an operator lacks a derivative \
+                 rule and the jet fallback is not yet implemented."
+            ),
             ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {
                 ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
@@ -3769,6 +3780,18 @@ mod tests {
     use super::*;
     #[cfg(target_arch = "aarch64")]
     use alloc::boxed::Box;
+
+    /// A `Dwrt` that reaches codegen (no differentiation rule eliminated it)
+    /// must fail loudly at the schedule boundary, not as a cryptic emit panic.
+    #[test]
+    #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
+    fn surviving_dwrt_fails_loudly() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let v = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, x, v);
+        let _ = arena_to_schedule(&a, root);
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
