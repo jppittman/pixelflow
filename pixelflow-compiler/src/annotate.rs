@@ -38,11 +38,6 @@ impl AnnotationCtx {
     pub fn new() -> Self {
         Self { next_literal: 0 }
     }
-
-    /// Total number of literals collected.
-    pub fn literal_count(&self) -> usize {
-        self.next_literal
-    }
 }
 
 /// Collected literal for Let binding generation.
@@ -50,12 +45,6 @@ impl AnnotationCtx {
 pub struct CollectedLiteral {
     pub index: usize,
     pub lit: Lit,
-}
-
-/// Result of annotation: the annotated tree plus collected literals.
-pub struct AnnotationResult {
-    pub expr: Expr,
-    pub literals: Vec<CollectedLiteral>,
 }
 
 /// Annotate an expression tree, resolving literal Var indices in place.

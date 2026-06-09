@@ -39,9 +39,6 @@ pub fn parse(input: TokenStream) -> syn::Result<KernelDef> {
     syn::parse2(input)
 }
 
-/// Parser state for the closure-like syntax.
-struct KernelParser;
-
 impl Parse for KernelDef {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         // Try to parse optional struct declaration: [visibility] struct Name =
@@ -163,7 +160,7 @@ fn parse_type_annotations(input: ParseStream) -> syn::Result<(Option<Type>, Opti
     let fork = input.fork();
 
     // Try to parse a type
-    if let Ok(ty) = fork.parse::<Type>() {
+    if let Ok(_ty) = fork.parse::<Type>() {
         // Check if followed by `->`
         if fork.peek(Token![->]) {
             // Yes! This is `DomainType -> OutputType`

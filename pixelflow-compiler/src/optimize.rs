@@ -23,7 +23,7 @@
 //! ```
 
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, CallExpr, Expr, IdentExpr, LetStmt, LiteralExpr,
+    BinaryExpr, BinaryOp, BlockExpr, Expr, IdentExpr, LetStmt, LiteralExpr,
     MethodCallExpr, Stmt, UnaryExpr, UnaryOp,
 };
 use crate::sema::AnalyzedKernel;
@@ -572,91 +572,6 @@ fn is_coordinate_intrinsic(name: &str) -> bool {
     matches!(name, "X" | "Y" | "Z" | "W")
 }
 
-/// Inline all let-bindings in a block, producing a single expression.
-///
-/// Each local variable reference is replaced with its definition. The result
-/// is one expression with no let-bindings — the e-graph sees the whole DAG
-/// and can optimize across what were separate bindings.
-///
-/// CSE is recovered by the DAG extraction: shared subexpressions get
-/// ref_count > 1, and `dag_to_expr` emits new let-bindings for them.
-fn inline_block(block: BlockExpr) -> Expr {
-    let mut bindings: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
-
-    for stmt in &block.stmts {
-        if let Stmt::Let(let_stmt) = stmt {
-            // Substitute already-known bindings into this init
-            let inlined_init = substitute_locals(&let_stmt.init, &bindings);
-            bindings.insert(let_stmt.name.to_string(), inlined_init);
-        }
-    }
-
-    match &block.expr {
-        Some(final_expr) => substitute_locals(final_expr, &bindings),
-        None => make_literal(0.0, Span::call_site()),
-    }
-}
-
-/// Recursively substitute local variable references with their definitions.
-fn substitute_locals(expr: &Expr, bindings: &std::collections::HashMap<String, Expr>) -> Expr {
-    match expr {
-        Expr::Ident(ident) => {
-            let name = ident.name.to_string();
-            if let Some(replacement) = bindings.get(&name) {
-                replacement.clone()
-            } else {
-                expr.clone()
-            }
-        }
-        Expr::Literal(_) => expr.clone(),
-        Expr::Unary(u) => Expr::Unary(UnaryExpr {
-            op: u.op,
-            operand: Box::new(substitute_locals(&u.operand, bindings)),
-            span: u.span,
-        }),
-        Expr::Binary(b) => Expr::Binary(BinaryExpr {
-            op: b.op,
-            lhs: Box::new(substitute_locals(&b.lhs, bindings)),
-            rhs: Box::new(substitute_locals(&b.rhs, bindings)),
-            span: b.span,
-        }),
-        Expr::Call(c) => Expr::Call(CallExpr {
-            func: c.func.clone(),
-            args: c
-                .args
-                .iter()
-                .map(|a| substitute_locals(a, bindings))
-                .collect(),
-            span: c.span,
-        }),
-        Expr::MethodCall(m) => Expr::MethodCall(MethodCallExpr {
-            receiver: Box::new(substitute_locals(&m.receiver, bindings)),
-            method: m.method.clone(),
-            args: m
-                .args
-                .iter()
-                .map(|a| substitute_locals(a, bindings))
-                .collect(),
-            span: m.span,
-        }),
-        Expr::Block(inner) => {
-            // Nested block: inline it too
-            let mut inner_bindings = bindings.clone();
-            for stmt in &inner.stmts {
-                if let Stmt::Let(let_stmt) = stmt {
-                    let inlined = substitute_locals(&let_stmt.init, &inner_bindings);
-                    inner_bindings.insert(let_stmt.name.to_string(), inlined);
-                }
-            }
-            match &inner.expr {
-                Some(e) => substitute_locals(e, &inner_bindings),
-                None => make_literal(0.0, Span::call_site()),
-            }
-        }
-        // Verbatim/other: pass through unchanged
-        _ => expr.clone(),
-    }
-}
 
 /// Optimize a block while preserving its structure.
 ///

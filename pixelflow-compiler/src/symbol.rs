@@ -169,27 +169,6 @@ impl SymbolTable {
             .map_or(false, |s| s.kind == SymbolKind::Parameter)
     }
 
-    /// Get all scalar parameter symbols (for struct generation).
-    pub fn parameters(&self) -> impl Iterator<Item = &Symbol> {
-        self.symbols
-            .values()
-            .filter(|s| s.kind == SymbolKind::Parameter)
-    }
-
-    /// Check if a name is a manifold parameter.
-    pub fn is_manifold_param(&self, name: &str) -> bool {
-        self.symbols
-            .get(name)
-            .map_or(false, |s| s.kind == SymbolKind::ManifoldParam)
-    }
-
-    /// Get all manifold parameter symbols (for generic type generation).
-    pub fn manifold_params(&self) -> impl Iterator<Item = &Symbol> {
-        self.symbols
-            .values()
-            .filter(|s| s.kind == SymbolKind::ManifoldParam)
-    }
-
     /// Get all symbol names (for typo suggestions in error messages).
     pub fn all_names(&self) -> impl Iterator<Item = String> + '_ {
         self.symbols.keys().cloned()

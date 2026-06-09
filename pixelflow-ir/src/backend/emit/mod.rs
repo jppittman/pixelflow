@@ -2678,31 +2678,6 @@ fn emit_mov_reg(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     }
 }
 
-/// Resolve the destination location for a value in the DAG.
-fn resolve_dst_loc(
-    vid: regalloc::ValueId,
-    assignment: &alloc::collections::BTreeMap<regalloc::ValueId, Reg>,
-    spill_slots: &alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    rematerialize: &alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-) -> Loc {
-    if let Some(&reg) = assignment.get(&vid) {
-        Loc::Reg(reg)
-    } else if let Some(&offset) = spill_slots.get(&vid) {
-        Loc::Spill(offset)
-    } else if rematerialize.contains_key(&vid) {
-        // Rematerialized values don't need a destination — they're constants
-        // that will be re-emitted on each use. The "definition" is a no-op
-        // (the ScheduledOp::Const will be skipped by resolve_operands).
-        // Use Reg(0) as a dummy — won't be written.
-        Loc::Reg(RELOAD_REGS[0])
-    } else {
-        panic!(
-            "value {:?} has no assignment, spill slot, or rematerialize entry",
-            vid
-        );
-    }
-}
-
 /// Resolve a scheduled operation into a concrete instruction plan.
 ///
 /// This is a PURE FUNCTION: no mutation, no side effects, no code emission.
@@ -3037,35 +3012,6 @@ fn emit_instruction_plan(
     }
 
     Ok(())
-}
-
-/// Resolve a value to a register at emit time, emitting a reload if necessary.
-///
-/// Checks in order: register assignment, rematerialize (constant load),
-/// spill slot (stack load). Panics if value is not found anywhere.
-fn emit_resolve(
-    code: &mut Vec<u8>,
-    vid: regalloc::ValueId,
-    target: Reg,
-    assignment: &alloc::collections::BTreeMap<regalloc::ValueId, Reg>,
-    spill_slots: &alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    rematerialize: &alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    pool: &ConstPool,
-) -> Reg {
-    if let Some(&reg) = assignment.get(&vid) {
-        reg
-    } else if let Some(&bits) = rematerialize.get(&vid) {
-        emit_const_load(code, target, bits, pool);
-        target
-    } else if let Some(&offset) = spill_slots.get(&vid) {
-        aarch64::emit_ldr_sp(code, target, offset);
-        target
-    } else {
-        panic!(
-            "value {:?} has no register, spill slot, or rematerialize entry",
-            vid
-        );
-    }
 }
 
 /// Emit a deferred reload: either from stack or rematerialized constant.
