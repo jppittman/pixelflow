@@ -325,15 +325,19 @@ impl SimdOps for F32x4 {
         unsafe {
             let x_i32 = _mm_castps_si128(self.0);
 
-            // Extract exponent as float WITHOUT cvtepi32 (stays in float pipes)
-            let exp_mask = _mm_set1_epi32(0x7F800000_u32 as i32);
-            let raw_exp = _mm_and_si128(x_i32, exp_mask);
-            let one_bits = _mm_set1_epi32(0x3F800000_u32 as i32);
-            let exp_f = _mm_castsi128_ps(_mm_or_si128(raw_exp, one_bits));
-            let mut n = _mm_sub_ps(exp_f, _mm_set1_ps(128.0));
+            // Extract exponent using integer ops
+            // Shift right by 23 to get exponent in lowest 8 bits
+            let exp_shifted = _mm_srli_epi32(x_i32, 23);
+            // Mask to keep only 8 bits (remove sign bit if present)
+            let exp_masked = _mm_and_si128(exp_shifted, _mm_set1_epi32(0xFF));
+            // Subtract bias (127) to get unbiased exponent
+            let exp_unbiased = _mm_sub_epi32(exp_masked, _mm_set1_epi32(127));
+            // Convert to float
+            let mut n = _mm_cvtepi32_ps(exp_unbiased);
 
             // Extract mantissa in [1, 2)
             let mant_mask = _mm_set1_epi32(0x007FFFFF_u32 as i32);
+            let one_bits = _mm_set1_epi32(0x3F800000_u32 as i32);
             let mut f = _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(x_i32, mant_mask), one_bits));
 
             // Adjust to [√2/2, √2] range for better accuracy (centered at 1)
