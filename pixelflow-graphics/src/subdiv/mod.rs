@@ -62,7 +62,7 @@ use pixelflow_core::ops::compare::Lt;
 use pixelflow_core::{Field, Manifold, ManifoldExt, X, Y};
 
 /// Natural logarithm of 2, used for 2^x = exp(x * LN_2).
-const LN_2: f32 = 0.6931471805599453;
+const LN_2: f32 = core::f32::consts::LN_2;
 
 // ============================================================================
 // Regular Patch (Valence 4) - Standard B-Spline
@@ -584,7 +584,7 @@ mod tests {
         // If all control points are at the SAME location,
         // the surface should evaluate to that location everywhere.
         // This tests affine invariance.
-        let control_points = [[1.0f32, 2.0, 3.0]; 16];
+        let _control_points = [[1.0f32, 2.0, 3.0]; 16];
 
         let eigen = get_eigen(4).unwrap();
         println!("K = {}", eigen.k);
