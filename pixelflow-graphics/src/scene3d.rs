@@ -55,7 +55,7 @@ impl<M: ManifoldCompat<Field> + Send + Sync> Manifold<Jet3_4> for Lift<M> {
 /// Wraps a Field mask to implement Manifold<Jet3> for use as a Select condition.
 /// This is needed because Select<C, T, F> for Jet3 requires C: ManifoldCompat<Jet3, Output = Jet3>.
 #[derive(Clone, Copy)]
-// struct FieldMask(Field); // Removed unused struct
+struct FieldMask(Field);
 
 impl Manifold<Jet3_4> for FieldMask {
     type Output = Jet3;
