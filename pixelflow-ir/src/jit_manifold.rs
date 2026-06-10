@@ -15,6 +15,7 @@ pub struct JitManifold {
 
 impl JitManifold {
     /// Wrap compiled executable code.
+    #[must_use]
     pub fn new(code: ExecutableCode) -> Self {
         Self { code }
     }
@@ -52,6 +53,7 @@ impl JitManifold {
     /// The caller must ensure the SIMD types match the platform ABI that the
     /// emitter generated code for (x86-64 SSE2: `__m128`).
     #[inline(always)]
+    #[must_use]
     pub unsafe fn call(
         &self,
         x: core::arch::x86_64::__m128,
@@ -88,6 +90,7 @@ pub struct ScanlineJitManifold {
 
 impl ScanlineJitManifold {
     /// Wrap compiled scanline executable code.
+    #[must_use]
     pub fn new(code: ExecutableCode) -> Self {
         Self { code }
     }
@@ -110,6 +113,7 @@ impl ScanlineJitManifold {
     ///
     /// Panics if `output.len() < xs.len()`.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn eval_scanline(
         &self,
         xs: &[core::arch::aarch64::float32x4_t],
@@ -152,6 +156,7 @@ impl ScanlineJitManifold {
     ///
     /// [`compile_arena_dag_scanline`]: crate::backend::emit::compile_arena_dag_scanline
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn eval_scanline(
         &self,
         xs: &[core::arch::x86_64::__m128],

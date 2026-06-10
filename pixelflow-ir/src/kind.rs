@@ -71,11 +71,13 @@ impl OpKind {
 
     /// Convert to array index.
     #[inline]
+    #[must_use]
     pub const fn index(self) -> usize {
         self as usize
     }
 
     /// Convert index to OpKind.
+    #[must_use]
     pub fn from_index(idx: usize) -> Option<Self> {
         if idx >= Self::COUNT {
             return None;
@@ -85,6 +87,7 @@ impl OpKind {
     }
 
     /// Get the arity of the operation.
+    #[must_use]
     pub const fn arity(self) -> usize {
         match self {
             Self::Var | Self::Const | Self::Tuple => 0,
@@ -131,6 +134,7 @@ impl OpKind {
     }
 
     /// Get the display name of the operation.
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Var => "var",
@@ -178,6 +182,7 @@ impl OpKind {
     }
 
     /// Parse OpKind from its string name.
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "var" => Some(Self::Var),
@@ -226,6 +231,7 @@ impl OpKind {
     }
 
     /// Get the default cost estimate for this operation (in cycles).
+    #[must_use]
     pub const fn default_cost(self) -> usize {
         match self {
             Self::Var | Self::Const | Self::Tuple => 0,
@@ -263,6 +269,7 @@ impl OpKind {
     }
 
     /// Returns true if the operation is commutative (a op b == b op a).
+    #[must_use]
     pub const fn is_commutative(self) -> bool {
         matches!(
             self,
@@ -271,11 +278,13 @@ impl OpKind {
     }
 
     /// Returns true if the operation is associative ((a op b) op c == a op (b op c)).
+    #[must_use]
     pub const fn is_associative(self) -> bool {
         matches!(self, Self::Add | Self::Mul | Self::Min | Self::Max)
     }
 
     /// Returns the identity element if one exists (a op identity == a).
+    #[must_use]
     pub const fn identity(self) -> Option<f32> {
         match self {
             Self::Add | Self::Sub => Some(0.0),
@@ -285,6 +294,7 @@ impl OpKind {
     }
 
     /// Returns the annihilator element if one exists (a op annihilator == annihilator).
+    #[must_use]
     pub const fn annihilator(self) -> Option<f32> {
         match self {
             Self::Mul => Some(0.0),
@@ -293,6 +303,7 @@ impl OpKind {
     }
 
     /// Returns true if the operation is idempotent (a op a == a).
+    #[must_use]
     pub const fn is_idempotent(self) -> bool {
         matches!(self, Self::Min | Self::Max | Self::Abs)
     }
@@ -316,6 +327,7 @@ impl OpKind {
     ///
     /// Excluded because they are fused ops that only appear via rewrites:
     ///   MulAdd
+    #[must_use]
     pub const fn is_seed_op(self) -> bool {
         !matches!(
             self,
@@ -334,6 +346,7 @@ impl OpKind {
     }
 
     /// Get the emit style for code generation.
+    #[must_use]
     pub const fn emit_style(self) -> EmitStyle {
         match self {
             // Special cases handled separately
@@ -393,6 +406,7 @@ impl OpKind {
     ///
     /// Returns `None` for non-unary operations or operations that can't be
     /// evaluated at compile time.
+    #[must_use]
     pub fn eval_unary(self, x: f32) -> Option<f32> {
         match self {
             Self::Neg => Some(-x),
@@ -422,6 +436,7 @@ impl OpKind {
     /// Evaluate a binary operation on constant arguments.
     ///
     /// Returns `None` for non-binary operations.
+    #[must_use]
     pub fn eval_binary(self, x: f32, y: f32) -> Option<f32> {
         match self {
             Self::Add => Some(x + y),
@@ -452,6 +467,7 @@ impl OpKind {
     }
 
     /// Evaluate a ternary operation on constant arguments.
+    #[must_use]
     pub fn eval_ternary(self, x: f32, y: f32, z: f32) -> Option<f32> {
         match self {
             Self::MulAdd => Some(x * y + z),

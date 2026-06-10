@@ -68,11 +68,10 @@ impl ConstPool {
     fn from_schedule(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<Self, &'static str> {
         let mut pool = Self::new();
         for (_, op) in schedule {
-            if let ScheduledOp::Const(val) = op {
-                if aarch64::needs_const_pool(*val) {
+            if let ScheduledOp::Const(val) = op
+                && aarch64::needs_const_pool(*val) {
                     pool.push_f32(*val)?;
                 }
-            }
         }
         Ok(pool)
     }
@@ -139,6 +138,7 @@ pub enum Loc {
 
 impl Loc {
     /// Get the register, panicking if spilled.
+    #[must_use]
     pub fn reg(self) -> Reg {
         match self {
             Loc::Reg(r) => r,
@@ -295,6 +295,7 @@ impl Default for EmitCtx {
 
 impl EmitCtx {
     /// Create context with custom register budget.
+    #[must_use]
     pub fn with_max_regs(max_regs: u8) -> Self {
         Self {
             max_regs,
@@ -893,6 +894,7 @@ where
 /// register allocator). The result is that expressions depending only on Y, Z,
 /// or W are computed once before the pixel loop.
 #[inline]
+#[must_use]
 pub fn default_hoist_predicate(v: crate::variance::Variance) -> bool {
     v.is_x_invariant() && !v.is_const()
 }
@@ -2889,6 +2891,7 @@ fn emit_instruction_plan(
 ///
 /// Checks in order: register assignment, rematerialize (constant load),
 /// spill slot (stack load). Panics if value is not found anywhere.
+#[allow(clippy::too_many_arguments)]
 fn emit_resolve(
     code: &mut Vec<u8>,
     vid: regalloc::ValueId,

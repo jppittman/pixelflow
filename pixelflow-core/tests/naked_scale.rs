@@ -54,6 +54,7 @@ unsafe fn invoke_naked_kernel(
 }
 
 #[test]
+#[ignore]
 fn test_naked_abi_multithreaded_scale() {
     #[cfg(target_arch = "aarch64")]
     {

@@ -275,6 +275,7 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
 ///
 /// Results are sorted by estimated cost (transcendentals first).
 #[must_use]
+#[allow(clippy::collapsible_match)]
 pub fn find_hoistable_arena_nodes(
     arena: &crate::arena::ExprArena,
     root: crate::arena::ExprId,
