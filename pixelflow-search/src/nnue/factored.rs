@@ -1016,6 +1016,11 @@ impl EdgeAccumulator {
         let mut acc = Self::new();
         let num_classes = egraph.num_classes();
         let mut expanded = alloc::vec![false; num_classes];
+        // Tracks which child classes have already received their computation
+        // edge. The first reference to a class is a computation edge; every
+        // later reference is a register reload (a single var_ref edge), so a
+        // node shared `ref_count` times yields `ref_count - 1` var_ref edges.
+        let mut edge_emitted = alloc::vec![false; num_classes];
         // Variance counters
         let mut n_const: u32 = 0;
         let mut n_frame: u32 = 0;
@@ -1085,7 +1090,10 @@ impl EdgeAccumulator {
                 ENode::Op { op, children } => {
                     let parent_op = op.kind();
 
-                    // Add edges for this node's children (the computation edges).
+                    // One edge per child slot. The first reference to a child
+                    // class is its computation edge; subsequent references
+                    // (shared subexpressions) are register reloads, each a
+                    // single var_ref edge — so the DAG is not tree-bloated.
                     for (child_idx, &child_class) in children.iter().enumerate() {
                         let child_canonical = egraph.find(child_class);
                         let child_node_idx = choices[child_canonical.0 as usize].unwrap_or(0);
@@ -1102,25 +1110,17 @@ impl EdgeAccumulator {
 
                         let eff_depth =
                             depth * MAX_ARITY as u32 + (child_idx.min(MAX_ARITY - 1)) as u32;
-                        acc.add_edge(emb, parent_op, child_op, eff_depth);
 
-                        // Push child for expansion
-                        stack.push((child_class, depth + 1));
-                    }
-
-                    // For shared children: add (ref_count - 1) var_ref edges.
-                    // These represent register loads at subsequent use sites.
-                    for (child_idx, &child_class) in children.iter().enumerate() {
-                        let child_canonical = egraph.find(child_class);
-                        let rc = ref_count
-                            .get(child_canonical.0 as usize)
-                            .copied()
-                            .unwrap_or(1);
-                        if rc > 1 {
-                            let eff_depth =
-                                depth * MAX_ARITY as u32 + (child_idx.min(MAX_ARITY - 1)) as u32;
-                            acc.add_var_ref_edges(emb, parent_op, eff_depth, rc - 1);
+                        if edge_emitted[child_canonical.0 as usize] {
+                            // Shared reuse: a register reload, not a recomputation.
+                            acc.add_var_ref_edges(emb, parent_op, eff_depth, 1);
+                        } else {
+                            edge_emitted[child_canonical.0 as usize] = true;
+                            acc.add_edge(emb, parent_op, child_op, eff_depth);
                         }
+
+                        // Push child for expansion (guarded by `expanded`).
+                        stack.push((child_class, depth + 1));
                     }
                 }
             }

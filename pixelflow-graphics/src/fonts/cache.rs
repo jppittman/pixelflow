@@ -356,7 +356,9 @@ impl Manifold<Field4> for CachedText {
 mod tests {
     use super::*;
 
-    const FONT_DATA: &[u8] = include_bytes!("../../assets/NotoSansMono-Regular.ttf");
+    // Use the fallback font, which is committed directly (not Git-LFS) so the
+    // tests run without `git lfs pull`. NotoSansMono is an LFS pointer.
+    const FONT_DATA: &[u8] = include_bytes!("../../assets/DejaVuSansMono-Fallback.ttf");
 
     #[test]
     fn test_size_bucket() {

@@ -3,7 +3,7 @@
 use pixelflow_core::{Field, ManifoldCompat};
 use pixelflow_graphics::fonts::Font;
 
-const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansMono-Regular.ttf");
+const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
 #[test]
 fn parse_font_and_get_glyph() {

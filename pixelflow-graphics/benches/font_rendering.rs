@@ -8,7 +8,7 @@ use pixelflow_graphics::render::color::{Grayscale, Rgba8};
 use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
 
-const FONT_DATA: &[u8] = include_bytes!("../assets/NotoSansMono-Regular.ttf");
+const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
 // ============================================================================
 // PixelFlow Analytical Rendering Benchmarks
