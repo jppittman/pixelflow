@@ -361,13 +361,13 @@ mod tests {
     #[test]
     fn constant_expr_benchmarks_successfully() {
         let mut arena = ExprArena::new();
-        let root = arena.push_const(3.14);
+        let root = arena.push_const(core::f32::consts::PI);
         let result = benchmark_jit_arena(&arena, root)
             .expect("constant expression must JIT-compile and benchmark");
         for lane in &result.output {
             assert!(
-                (*lane - 3.14).abs() < 1e-5,
-                "expected all lanes ~3.14, got {}",
+                (*lane - core::f32::consts::PI).abs() < 1e-5,
+                "expected all lanes ~PI, got {}",
                 lane
             );
         }

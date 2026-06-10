@@ -179,7 +179,7 @@ fn mass_sender_drop_does_not_cause_race() {
             thread::spawn(move || {
                 barrier.wait();
                 for i in 0..10 {
-                    let _ = sender.send(Message::Data(i));
+                    sender.send(Message::Data(i)).ok();
                 }
                 // Sender dropped here - all 100 at roughly the same time
             })
@@ -247,7 +247,7 @@ fn actor_panic_does_not_corrupt_state() {
     });
 
     for i in 0..10 {
-        let _ = tx.send(Message::Data(i)); // Some will fail after panic
+        tx.send(Message::Data(i)).ok(); // Some will fail after panic
     }
 
     thread::sleep(Duration::from_millis(100));
@@ -813,7 +813,7 @@ fn shutdown_race_does_not_panic() {
         // Race: send and drop nearly simultaneously
         thread::spawn(move || {
             for i in 0..10 {
-                let _ = tx2.send(Message::Data(i));
+                tx2.send(Message::Data(i)).ok();
             }
         });
 
@@ -821,6 +821,6 @@ fn shutdown_race_does_not_panic() {
         drop(tx);
 
         // Should complete without panic
-        let _ = handle.join();
+        handle.join().ok();
     }
 }

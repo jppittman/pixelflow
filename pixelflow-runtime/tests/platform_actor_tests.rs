@@ -75,29 +75,37 @@ fn test_platform_actor_delegation() {
     // Note: We test `Actor` trait implementation directly, skipping Scheduler for unit test simplicity
 
     // Test Management (Create)
-    let _ = actor.handle_management(DisplayMgmt::Create {
-        settings: Default::default(),
-    });
+    actor
+        .handle_management(DisplayMgmt::Create {
+            settings: Default::default(),
+        })
+        .expect("handle_management should succeed");
 
     // Test Control (SetTitle)
-    let _ = actor.handle_control(DisplayControl::SetTitle {
-        id: pixelflow_runtime::api::private::WindowId(1),
-        title: "Test Window".to_string(),
-    });
+    actor
+        .handle_control(DisplayControl::SetTitle {
+            id: pixelflow_runtime::api::private::WindowId(1),
+            title: "Test Window".to_string(),
+        })
+        .expect("handle_control should succeed");
 
     // Test Data (Present)
-    let _ = actor.handle_data(DisplayData::Present {
-        window: pixelflow_runtime::display::messages::Window {
-            id: pixelflow_runtime::api::private::WindowId(1),
-            frame: Frame::new(100, 100),
-            width_px: 100,
-            height_px: 100,
-            scale: 1.0,
-        },
-    });
+    actor
+        .handle_data(DisplayData::Present {
+            window: pixelflow_runtime::display::messages::Window {
+                id: pixelflow_runtime::api::private::WindowId(1),
+                frame: Frame::new(100, 100),
+                width_px: 100,
+                height_px: 100,
+                scale: 1.0,
+            },
+        })
+        .expect("handle_data should succeed");
 
     // Test Park
-    let _ = actor.park(SystemStatus::Busy);
+    actor
+        .park(SystemStatus::Busy)
+        .expect("park should succeed");
 
     // 4. Verify Log
     let log = log_ref.lock().unwrap();

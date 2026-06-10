@@ -70,8 +70,9 @@ fn bench_keybindings(c: &mut Criterion) {
                 let key = black_box(target_key);
                 let mods = black_box(target_mods);
                 // Note: binary_search_by returns Result<usize, usize>
-                let _ = sorted_bindings
+                let found = sorted_bindings
                     .binary_search_by(|probe| (probe.key, probe.mods).cmp(&(key, mods)));
+                black_box(found)
             })
         });
     }

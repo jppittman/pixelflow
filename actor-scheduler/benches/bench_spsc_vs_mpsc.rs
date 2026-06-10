@@ -204,14 +204,14 @@ fn bench_send_latency(c: &mut Criterion) {
         let stop_c = stop.clone();
         let _consumer = thread::spawn(move || {
             while !stop_c.load(Ordering::Relaxed) {
-                let _ = rx.try_recv();
+                rx.try_recv().ok();
             }
         });
         thread::sleep(std::time::Duration::from_millis(1));
 
         let mut i = 0u64;
         b.iter(|| {
-            let _ = tx.try_send(i);
+            tx.try_send(i).ok();
             i += 1;
             black_box(i);
         });
@@ -225,14 +225,14 @@ fn bench_send_latency(c: &mut Criterion) {
         let stop_c = stop.clone();
         let _consumer = thread::spawn(move || {
             while !stop_c.load(Ordering::Relaxed) {
-                let _ = rx.try_recv();
+                rx.try_recv().ok();
             }
         });
         thread::sleep(std::time::Duration::from_millis(1));
 
         let mut i = 0u64;
         b.iter(|| {
-            let _ = tx.try_send(i);
+            tx.try_send(i).ok();
             i += 1;
             black_box(i);
         });
@@ -261,7 +261,7 @@ fn bench_send_latency_contended(c: &mut Criterion) {
                     let stop = stop.clone();
                     thread::spawn(move || {
                         while !stop.load(Ordering::Relaxed) {
-                            let _ = rx.try_recv();
+                            rx.try_recv().ok();
                             thread::yield_now();
                         }
                     })
@@ -275,7 +275,7 @@ fn bench_send_latency_contended(c: &mut Criterion) {
                         thread::spawn(move || {
                             let mut i = 0u64;
                             while !stop.load(Ordering::Relaxed) {
-                                let _ = tx.try_send(i);
+                                tx.try_send(i).ok();
                                 i += 1;
                             }
                         })
@@ -286,7 +286,7 @@ fn bench_send_latency_contended(c: &mut Criterion) {
 
                 let mut i = 0u64;
                 b.iter(|| {
-                    let _ = tx.try_send(i);
+                    tx.try_send(i).ok();
                     i += 1;
                     black_box(i);
                 });
@@ -312,7 +312,7 @@ fn bench_send_latency_contended(c: &mut Criterion) {
                 let stop_c = stop.clone();
                 let _consumer = thread::spawn(move || {
                     while !stop_c.load(Ordering::Relaxed) {
-                        let _ = inbox.drain(256, |_v: u64| Ok(()));
+                        inbox.drain(256, |_v: u64| Ok(())).ok();
                         thread::yield_now();
                     }
                 });
@@ -325,7 +325,7 @@ fn bench_send_latency_contended(c: &mut Criterion) {
                         thread::spawn(move || {
                             let mut i = 0u64;
                             while !stop.load(Ordering::Relaxed) {
-                                let _ = tx.try_send(i);
+                                tx.try_send(i).ok();
                                 i += 1;
                             }
                         })
@@ -336,7 +336,7 @@ fn bench_send_latency_contended(c: &mut Criterion) {
 
                 let mut i = 0u64;
                 b.iter(|| {
-                    let _ = my_tx.try_send(i);
+                    my_tx.try_send(i).ok();
                     i += 1;
                     black_box(i);
                 });
@@ -363,7 +363,7 @@ fn bench_roundtrip_latency(c: &mut Criterion) {
             loop {
                 match rx.recv() {
                     Ok(_v) => {
-                        let _ = ack_tx.try_send(());
+                        ack_tx.try_send(()).ok();
                     }
                     Err(_) => break,
                 }

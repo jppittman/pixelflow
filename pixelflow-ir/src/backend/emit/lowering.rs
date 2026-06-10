@@ -308,7 +308,7 @@ fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
 
     // 2^xf ≈ Horner(c5..c0) at xf  (minimax coefficients).
     let c0 = arena.push_const(1.0);
-    let c1 = arena.push_const(0.693_147_18);
+    let c1 = arena.push_const(core::f32::consts::LN_2);
     let c2 = arena.push_const(0.240_226_5);
     let c3 = arena.push_const(0.055_504_11);
     let c4 = arena.push_const(0.009_618_129);
@@ -355,7 +355,7 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     // log2(m) on [1,2): polynomial in (m - 1).
     let one = arena.push_const(1.0);
     let t = arena.push_binary(OpKind::Sub, m, one);
-    let c1 = arena.push_const(1.442_695);
+    let c1 = arena.push_const(core::f32::consts::LOG2_E);
     let c2 = arena.push_const(-0.721_347_5);
     let c3 = arena.push_const(0.479_924_46);
     let c4 = arena.push_const(-0.298_768_3);
@@ -395,7 +395,7 @@ fn expand_sin(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let t2 = arena.push_binary(OpKind::Mul, t, t);
 
     // Horner: p = ((c7·t2 + c5)·t2 + c3)·t2 + c1, expanded as mul+add.
-    let c1 = arena.push_const(3.141_592_653_589_79);
+    let c1 = arena.push_const(core::f32::consts::PI);
     let c3 = arena.push_const(-5.167_712_780_049_97);
     let c5 = arena.push_const(2.550_164_039_877_34);
     let c7 = arena.push_const(-0.599_264_528_932_149);

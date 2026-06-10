@@ -16,7 +16,7 @@ fn bench_field_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("field_creation");
 
     group.bench_function("from_f32_splat", |b| {
-        b.iter(|| black_box(Field::from(3.14159f32)))
+        b.iter(|| black_box(Field::from(core::f32::consts::PI)))
     });
 
     group.bench_function("sequential", |b| {

@@ -50,7 +50,7 @@ fn test_jet2h_unary_ops() {
     let x = Jet2H::x(Field::from(4.0));
 
     let sqrt_result = x.sqrt();
-    let _: Jet2H = sqrt_result.into();
+    let _converted: Jet2H = sqrt_result.into();
 
     let min_result = x.min(Jet2H::y(Field::from(3.0)));
     let _ = min_result.val;

@@ -604,7 +604,7 @@ pub(crate) fn emit_log2_builtin(
 
     // Phase 3: Reduce to [√2/2, √2] for better accuracy
     // mask = (f >= √2)
-    let sqrt2 = pool.push_f32(1.4142135624)?;
+    let sqrt2 = pool.push_f32(core::f32::consts::SQRT_2)?;
     emit_ldr_q_x17(code, s2, sqrt2);
     emit_fcmge(code, s2, s1, s2); // s2 = mask (all-ones where f >= √2)
     // adjust = 1.0 & mask
@@ -698,7 +698,7 @@ pub(crate) fn emit_exp2_builtin(
     emit_fmla(code, s2, dst, s1); // s2 = c2 + p*f
 
     // p = p*f + c1
-    let c1 = pool.push_f32(0.6931472_f32)?;
+    let c1 = pool.push_f32(core::f32::consts::LN_2)?;
     emit_ldr_q_x17(code, dst, c1);
     emit_fmla(code, dst, s2, s1); // dst = c1 + p*f
 
@@ -2235,7 +2235,9 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
     }
 
     // USHR Vd.4S, Vn.4S, #shift
-    if word & 0xFF80FC00 == 0x6F200400 {
+    // Mask includes immh[3:2] (bits 22:21) so the .4S arrangement selector
+    // (immh = 01xx) is matched; bits 20:16 carry the shift amount and stay free.
+    if word & 0xFFE0FC00 == 0x6F200400 {
         let immhb = (word >> 16) & 0x3F;
         let shift = 64u32.wrapping_sub(immhb) & 0x3F;
         return format!("ushr v{}.4s, v{}.4s, #{}", rd, rn, shift);
@@ -2424,7 +2426,7 @@ mod tests {
         emit_fmov_imm(
             &mut code,
             Reg(0),
-            3.14,
+            core::f32::consts::PI,
             [Reg(16), Reg(17), Reg(18), Reg(19)],
         );
         assert_eq!(
@@ -2518,11 +2520,11 @@ mod tests {
     #[test]
     fn asm_load_const_general() {
         let mut asm = Aarch64Asm::new();
-        asm.load_const(Reg(5), 3.14);
+        asm.load_const(Reg(5), core::f32::consts::PI);
         assert_eq!(
             asm.offset(),
             12,
-            "3.14 should be 3 instructions (MOVZ+MOVK+DUP)"
+            "PI should be 3 instructions (MOVZ+MOVK+DUP)"
         );
     }
 

@@ -912,7 +912,8 @@ mod tests {
             width_px: 1000,
             height_px: 800,
         };
-        let _ = app.handle_control(resize_event);
+        app.handle_control(resize_event)
+            .expect("handle_control should succeed");
 
         // Verify resize via snapshot
         let snapshot_new = app.emulator.get_render_snapshot().expect("Snapshot");
@@ -948,7 +949,8 @@ mod tests {
             text: Some("a".to_string()),
         };
 
-        let _ = app.handle_management(key_event);
+        app.handle_management(key_event)
+            .expect("handle_management should succeed");
 
         // We expect 'a' to be sent to PTY wrapped in PtyCommand::Write
         let received = pty_rx.try_recv();

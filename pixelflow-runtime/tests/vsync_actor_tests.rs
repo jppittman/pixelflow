@@ -87,7 +87,7 @@ impl Actor<RenderedResponse, VsyncCommand, VsyncManagement> for MockVsyncActor {
                 self.log(&format!("refresh_rate={:.1}", rate));
             }
             VsyncCommand::RequestCurrentFPS(sender) => {
-                let _ = sender.send(self.last_fps);
+                sender.send(self.last_fps).ok();
                 self.log(&format!("fps_requested:sent={:.1}", self.last_fps));
             }
             VsyncCommand::Shutdown => {

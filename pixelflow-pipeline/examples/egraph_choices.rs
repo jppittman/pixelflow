@@ -139,9 +139,9 @@ fn main() {
     let iterations = 100_000_000u64;
 
     // Varying inputs to prevent constant folding
-    let x = std::hint::black_box(3.14159f32);
-    let y = std::hint::black_box(2.71828f32);
-    let a = std::hint::black_box(1.41421f32);
+    let x = std::hint::black_box(core::f32::consts::PI);
+    let y = std::hint::black_box(core::f32::consts::E);
+    let a = std::hint::black_box(core::f32::consts::SQRT_2);
     let b = std::hint::black_box(1.73205f32);
     let c = std::hint::black_box(2.23607f32);
 

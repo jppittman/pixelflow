@@ -47,9 +47,9 @@ fn test_log2_known_values() {
         (0.25, -2.0),
         (1.5, 0.58496250072), // More precise reference
         (3.0, 1.58496250072),
-        (10.0, 3.32192809489),
+        (10.0, std::f32::consts::LOG2_10),
         (100.0, 6.64385618977),
-        (std::f32::consts::E, 1.44269504089), // log2(e)
+        (std::f32::consts::E, std::f32::consts::LOG2_E), // log2(e)
     ];
 
     for (input, expected) in test_cases {
@@ -155,7 +155,7 @@ fn test_log2_exp2_roundtrip() {
     // log2(2^x) should equal x (within floating point precision)
     // Errors compound in roundtrip, so threshold is 2e-4
     let test_values = [
-        -10.0, -5.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.14159, 5.0, 10.0,
+        -10.0, -5.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, std::f32::consts::PI, 5.0, 10.0,
     ];
 
     for x in test_values {
@@ -176,7 +176,18 @@ fn test_log2_exp2_roundtrip() {
 fn test_exp2_log2_roundtrip() {
     // 2^(log2(x)) should equal x
     // Errors compound in roundtrip, so threshold is 2e-4
-    let test_values = [0.001, 0.1, 0.5, 1.0, 1.5, 2.0, 3.14159, 10.0, 100.0, 1000.0];
+    let test_values = [
+        0.001,
+        0.1,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        std::f32::consts::PI,
+        10.0,
+        100.0,
+        1000.0,
+    ];
 
     for x in test_values {
         let roundtrip_f32 = eval_to_f32(Field::from(x).log2().exp2());
@@ -195,7 +206,7 @@ fn test_exp2_log2_roundtrip() {
 #[test]
 fn test_log2_simd_consistency() {
     // Test that all SIMD lanes produce consistent results
-    let test_value = 3.14159f32;
+    let test_value = std::f32::consts::PI;
     let zero = Field::from(0.0);
     let coords = (zero, zero, zero, zero);
     let result = Field::from(test_value).log2().eval(coords);

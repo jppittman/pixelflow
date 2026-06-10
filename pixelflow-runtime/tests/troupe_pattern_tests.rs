@@ -95,7 +95,7 @@ impl Actor<AlphaData, AlphaControl, AlphaManagement> for AlphaActor<'_> {
             AlphaControl::Ping => {
                 self.log.lock().unwrap().push("Alpha:Ping".to_string());
                 // Send pong to beta
-                let _ = self.dir.beta.send(Message::Control(BetaControl::Pong));
+                self.dir.beta.send(Message::Control(BetaControl::Pong)).ok();
             }
             AlphaControl::Shutdown => {
                 self.log.lock().unwrap().push("Alpha:Shutdown".to_string());
@@ -144,10 +144,10 @@ impl Actor<BetaData, BetaControl, BetaManagement> for BetaActor<'_> {
             BetaControl::Pong => {
                 self.log.lock().unwrap().push("Beta:Pong".to_string());
                 // Send back to alpha
-                let _ = self
-                    .dir
+                self.dir
                     .alpha
-                    .send(Message::Data(AlphaData("pong-response".to_string())));
+                    .send(Message::Data(AlphaData("pong-response".to_string())))
+                    .ok();
             }
             BetaControl::Shutdown => {
                 self.log.lock().unwrap().push("Beta:Shutdown".to_string());
@@ -561,7 +561,7 @@ fn circular_messaging_does_not_deadlock() {
                 if matches!(cmd, AlphaControl::Ping) {
                     let c = self.count.fetch_add(1, Ordering::SeqCst);
                     if c < self.max {
-                        let _ = self.beta_h.send(Message::Control(BetaControl::Pong));
+                        self.beta_h.send(Message::Control(BetaControl::Pong)).ok();
                     }
                 }
                 Ok(())
@@ -595,7 +595,7 @@ fn circular_messaging_does_not_deadlock() {
                 if matches!(cmd, BetaControl::Pong) {
                     let c = self.count.fetch_add(1, Ordering::SeqCst);
                     if c < self.max {
-                        let _ = self.alpha_h.send(Message::Control(AlphaControl::Ping));
+                        self.alpha_h.send(Message::Control(AlphaControl::Ping)).ok();
                     }
                 }
                 Ok(())

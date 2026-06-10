@@ -402,7 +402,7 @@ fn emit_log2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: 
 
     // Phase 3: branchless reduction to [√2/2, √2]
     // mask = (f >= √2); adjust = 1.0 & mask; n += adjust; f *= (1 - 0.5*adjust)
-    emit_f32_const(code, s2, 1.414_213_56_f32);
+    emit_f32_const(code, s2, core::f32::consts::SQRT_2);
     emit_vcmpps(code, s2, s1, s2, CMP_GE); // s2 = mask(f >= √2)
     emit_f32_const(code, s0, 1.0);
     emit_vandps(code, s0, s0, s2); // s0 = adjust (1.0 or 0.0)
@@ -443,7 +443,7 @@ fn emit_exp2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: 
     emit_f32_const(code, dst, 0.241_379_3_f32);
     emit_vmulps(code, s2, s2, s1);
     emit_vaddps(code, s2, s2, dst);
-    emit_f32_const(code, dst, 0.693_147_2_f32);
+    emit_f32_const(code, dst, core::f32::consts::LN_2);
     emit_vmulps(code, s2, s2, s1);
     emit_vaddps(code, s2, s2, dst);
     emit_f32_const(code, dst, 1.0_f32);
