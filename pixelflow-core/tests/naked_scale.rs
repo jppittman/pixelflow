@@ -1,9 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
-
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::float32x4_t;
 
+#[cfg(target_arch = "aarch64")]
 fn get_jit_mul_kernel() -> usize {
     // We emit raw AArch64 machine code for:
     // fmul v0.4s, v0.4s, v1.4s

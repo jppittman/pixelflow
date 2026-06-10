@@ -190,11 +190,14 @@ mod tests {
     /// Dropping the JoinHandle does NOT stop the thread; you must call
     /// `kill.send(Message::Shutdown)` and then `join.join()` to cleanly
     /// terminate the pod and disconnect the SPSC channels.
-    fn spawn_pod() -> (
-        ActorHandle<i32, i32, i32>, // svc: for ServiceHandle
-        ActorHandle<i32, i32, i32>, // kill: send Shutdown to stop pod
+    /// (svc: for ServiceHandle, kill: send Shutdown to stop pod, join handle)
+    type PodHandles = (
+        ActorHandle<i32, i32, i32>,
+        ActorHandle<i32, i32, i32>,
         thread::JoinHandle<()>,
-    ) {
+    );
+
+    fn spawn_pod() -> PodHandles {
         let mut builder = ActorBuilder::<i32, i32, i32>::new(100, None);
         let svc_handle = builder.add_producer();
         let kill_handle = builder.add_producer();

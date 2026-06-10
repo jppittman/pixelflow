@@ -12,6 +12,7 @@ use std::sync::Arc;
 /// lifting each character into the Manifold category.
 ///
 /// Returns a Sum of translated glyphs.
+#[must_use]
 pub fn text(
     font: &Font,
     text_str: &str,

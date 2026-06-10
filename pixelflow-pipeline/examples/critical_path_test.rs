@@ -58,6 +58,7 @@ fn deep_div(a: f32, b: f32, c: f32, d: f32) -> f32 {
 /// Wide form: (a*b + c*d) / (e + f)
 /// muls parallel, adds, one div at end
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn expr_wide(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> f32 {
     let ab = a * b;
     let cd = c * d;
@@ -68,6 +69,7 @@ fn expr_wide(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> f32 {
 /// Equivalent but more sequential: a*b/e + c*d/f (same math if e=f)
 /// But forces more dependencies
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn expr_sequential(a: f32, b: f32, c: f32, d: f32, e: f32, _f: f32) -> f32 {
     let t1 = a * b;
     let t2 = t1 / e;
@@ -76,7 +78,7 @@ fn expr_sequential(a: f32, b: f32, c: f32, d: f32, e: f32, _f: f32) -> f32 {
     t2 + t4
 }
 
-fn benchmark<F>(name: &str, mut f: F) -> f64
+fn benchmark<F>(_name: &str, mut f: F) -> f64
 where
     F: FnMut() -> f32,
 {

@@ -36,10 +36,10 @@ pub trait Compounds: Primitives {
         // Coefficients from minimax fit
         let c0 = Self::splat(1.0);
         let c1 = Self::splat(core::f32::consts::LN_2); // ln(2)
-        let c2 = Self::splat(0.24022650695910071);
-        let c3 = Self::splat(0.05550410866482157);
-        let c4 = Self::splat(0.009618129107628477);
-        let c5 = Self::splat(0.0013333558146428443);
+        let c2 = Self::splat(0.240_226_5);
+        let c3 = Self::splat(0.055_504_11);
+        let c4 = Self::splat(0.009_618_129);
+        let c5 = Self::splat(0.001_333_355_8);
 
         // Horner's method
         let p = c5.mul_add(xf, c4);
@@ -71,17 +71,17 @@ pub trait Compounds: Primitives {
         let exp = exp_bits.bits_to_f32() - Self::splat(127.0);
 
         // Extract mantissa and normalize to [1, 2)
-        let mantissa_bits = Self::from_bits(0x3F800000); // 1.0
-        let mantissa_mask = Self::from_bits(0x007FFFFF);
+        let _mantissa_bits = Self::from_bits(0x3F800000); // 1.0
+        let _mantissa_mask = Self::from_bits(0x007FFFFF);
         // This is simplified - proper impl needs AND/OR bit ops
 
         // Polynomial for log2(1+x) on [0, 1)
         let x = self * self.recip_approx() - Self::splat(1.0); // normalize to [0, 1)
 
         let c1 = Self::splat(core::f32::consts::LOG2_E); // 1/ln(2)
-        let c2 = Self::splat(-0.7213475204444817);
-        let c3 = Self::splat(0.4808983469629878);
-        let c4 = Self::splat(-0.3606737602222408);
+        let c2 = Self::splat(-0.721_347_5);
+        let c3 = Self::splat(0.480_898_35);
+        let c4 = Self::splat(-0.360_673_76);
 
         let p = c4.mul_add(x, c3);
         let p = p.mul_add(x, c2);
@@ -138,9 +138,9 @@ pub trait Compounds: Primitives {
         let t2 = t * t;
 
         let c1 = Self::splat(core::f32::consts::PI); // π
-        let c3 = Self::splat(-5.16771278004997);
-        let c5 = Self::splat(2.55016403987734);
-        let c7 = Self::splat(-0.599264528932149);
+        let c3 = Self::splat(-5.167_712_7);
+        let c5 = Self::splat(2.550_164);
+        let c7 = Self::splat(-0.599_264_5);
 
         let p = c7.mul_add(t2, c5);
         let p = p.mul_add(t2, c3);
@@ -180,9 +180,9 @@ pub trait Compounds: Primitives {
         // Polynomial for atan on [-1, 1]
         let r2 = ratio * ratio;
         let c1 = Self::splat(1.0);
-        let c3 = Self::splat(-0.333333333);
+        let c3 = Self::splat(-0.333_333_34);
         let c5 = Self::splat(0.2);
-        let c7 = Self::splat(-0.142857142);
+        let c7 = Self::splat(-0.142_857_15);
 
         let p = c7.mul_add(r2, c5);
         let p = p.mul_add(r2, c3);

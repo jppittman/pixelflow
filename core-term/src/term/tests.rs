@@ -90,10 +90,17 @@ fn assert_screen_state(
         // Ensure the first expected line (if any) isn't wider than the snapshot's column count.
         // This helps catch issues where the test itself might define an impossible expected screen.
         assert!(
-            snapshot.dimensions.0 >= expected_screen[0].chars().map(|c| crate::term::unicode::get_char_display_width(c).max(1)).sum::<usize>(),
+            snapshot.dimensions.0
+                >= expected_screen[0]
+                    .chars()
+                    .map(|c| crate::term::unicode::get_char_display_width(c).max(1))
+                    .sum::<usize>(),
             "Snapshot col count ({}) is less than the character-width-aware width of the first expected row ({}). Expected screen: {:?}",
             snapshot.dimensions.0,
-            expected_screen[0].chars().map(|c| crate::term::unicode::get_char_display_width(c).max(1)).sum::<usize>(),
+            expected_screen[0]
+                .chars()
+                .map(|c| crate::term::unicode::get_char_display_width(c).max(1))
+                .sum::<usize>(),
             expected_screen[0]
         );
     }
@@ -113,7 +120,12 @@ fn assert_screen_state(
                 let remaining_expected: String = expected_chars_iter.collect();
                 panic!(
                     "Snapshot row {} (len {}) is shorter than expected string '{}'. Expected char '{}' (and potentially '{}') at snapshot col {} would exceed width.",
-                    r, snapshot.dimensions.0, expected_row_str, expected_char, remaining_expected, s_col
+                    r,
+                    snapshot.dimensions.0,
+                    expected_row_str,
+                    expected_char,
+                    remaining_expected,
+                    s_col
                 );
             }
 
@@ -132,9 +144,15 @@ fn assert_screen_state(
             };
 
             assert_eq!(
-                cell_char, expected_char,
+                cell_char,
+                expected_char,
                 "Char mismatch at (row {}, snapshot_col {}). Expected '{}', got '{}'. Full expected row: '{}', Full actual row: '{:?}'",
-                r, s_col, expected_char, cell_char, expected_row_str, snapshot.lines.get(r).map(|l| &l.cells)
+                r,
+                s_col,
+                expected_char,
+                cell_char,
+                expected_row_str,
+                snapshot.lines.get(r).map(|l| &l.cells)
             );
 
             let char_width = crate::term::unicode::get_char_display_width(expected_char).max(1);
@@ -795,7 +813,7 @@ fn test_snapshot_with_selection() {
     let lines = vec![
         SnapshotLine {
             is_dirty: true,
-            cells: std::sync::Arc::new(vec![default_glyph.clone(); num_cols])
+            cells: std::sync::Arc::new(vec![default_glyph; num_cols])
         };
         num_rows
     ];

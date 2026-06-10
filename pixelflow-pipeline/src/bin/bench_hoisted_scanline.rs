@@ -87,16 +87,21 @@ fn build_psychedelic_arena() -> (ExprArena, ExprId) {
 /// Thin wrapper around JitManifold that implements Manifold.
 struct JitWrapper(pixelflow_ir::JitManifold);
 
+#[cfg(target_arch = "x86_64")]
+type JitLane = core::arch::x86_64::__m128;
+#[cfg(target_arch = "aarch64")]
+type JitLane = core::arch::aarch64::float32x4_t;
+
 impl Manifold<(Field, Field, Field, Field)> for JitWrapper {
     type Output = Field;
     #[inline(always)]
     fn eval(&self, (x, y, z, w): (Field, Field, Field, Field)) -> Field {
         unsafe {
-            core::mem::transmute(self.0.call(
-                core::mem::transmute(x),
-                core::mem::transmute(y),
-                core::mem::transmute(z),
-                core::mem::transmute(w),
+            core::mem::transmute::<JitLane, Field>(self.0.call(
+                core::mem::transmute::<Field, JitLane>(x),
+                core::mem::transmute::<Field, JitLane>(y),
+                core::mem::transmute::<Field, JitLane>(z),
+                core::mem::transmute::<Field, JitLane>(w),
             ))
         }
     }
@@ -292,7 +297,7 @@ fn main() {
     };
 
     #[cfg(not(target_arch = "aarch64"))]
-    let (scanline_ns_pixel, scanline_ns_frame, scanline_first, scanline_last) = {
+    let (_scanline_ns_pixel, _scanline_ns_frame, scanline_first, scanline_last) = {
         println!("  [SKIP] Hoisted scanline JIT not implemented for this architecture");
         (0.0f64, 0.0f64, per_pixel_first, per_pixel_last)
     };

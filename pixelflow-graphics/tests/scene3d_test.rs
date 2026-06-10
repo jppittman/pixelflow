@@ -293,9 +293,7 @@ fn test_color_chrome_sphere() {
             center: (0.0, 0.0, 4.0),
             radius: 1.0,
         },
-        material: ColorReflect {
-            inner: world.clone(),
-        },
+        material: ColorReflect { inner: world },
         background: world,
     };
 
@@ -408,7 +406,7 @@ fn test_mullet_vs_3channel_comparison() {
             let cell_z = z.val.floor().constant();
             let sum = (cell_x + cell_z).constant();
             let half = (sum * Field::from(0.5)).constant();
-            let fract_half = (half.clone() - half.floor()).constant();
+            let fract_half = (half - half.floor()).constant();
             let is_even = fract_half.abs().lt(Field::from(0.25));
 
             let (a, b) = match self.channel {
@@ -419,7 +417,7 @@ fn test_mullet_vs_3channel_comparison() {
 
             let color_a = Field::from(a);
             let color_b = Field::from(b);
-            let base_color = is_even.clone().select(color_a, color_b);
+            let base_color = is_even.select(color_a, color_b);
 
             let fx = (x.val - cell_x).constant();
             let fz = (z.val - cell_z).constant();
@@ -454,9 +452,7 @@ fn test_mullet_vs_3channel_comparison() {
                         center: (0.0, 0.0, 4.0),
                         radius: 1.0,
                     },
-                    material: Reflect {
-                        inner: world.clone(),
-                    },
+                    material: Reflect { inner: world },
                     background: world,
                 },
             },
@@ -539,9 +535,7 @@ fn test_mullet_vs_3channel_comparison() {
                     center: (0.0, 0.0, 4.0),
                     radius: 1.0,
                 },
-                material: ColorReflect {
-                    inner: world.clone(),
-                },
+                material: ColorReflect { inner: world },
                 background: world,
             },
         },
@@ -624,9 +618,7 @@ fn test_work_stealing_benchmark() {
             center: (0.0, 0.0, 4.0),
             radius: 1.0,
         },
-        material: ColorReflect {
-            inner: world.clone(),
-        },
+        material: ColorReflect { inner: world },
         background: world,
     };
 

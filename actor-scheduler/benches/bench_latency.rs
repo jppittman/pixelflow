@@ -2,7 +2,7 @@ use actor_scheduler::{
     Actor, ActorBuilder, ActorScheduler, ActorStatus, HandlerError, HandlerResult, Message,
     SystemStatus,
 };
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},

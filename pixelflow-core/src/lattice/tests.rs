@@ -271,7 +271,7 @@ fn discrete_manifold_clamp_oob_coords() {
 #[test]
 #[should_panic(expected = "does not match dimensions")]
 fn discrete_manifold_size_mismatch() {
-    let _ = DiscreteManifold::new(alloc::vec![1.0, 2.0, 3.0], 2, 2);
+    let _manifold = DiscreteManifold::new(alloc::vec![1.0, 2.0, 3.0], 2, 2);
 }
 
 // ---- ReduceOp identity elements ----

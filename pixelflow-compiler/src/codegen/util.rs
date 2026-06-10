@@ -33,6 +33,9 @@ pub fn sort_by_index(indexed: impl IntoIterator<Item = (usize, TokenStream)>) ->
 /// Build a tuple expression from values, handling the single-element case.
 ///
 /// Rust requires a trailing comma for single-element tuples: `(x,)` not `(x)`.
+// Only referenced from codegen/binding.rs, which is not currently wired into
+// the module tree.
+#[allow(dead_code)]
 pub fn build_tuple(values: &[TokenStream]) -> TokenStream {
     match values.len() {
         0 => quote! { () },

@@ -34,10 +34,11 @@ mod tests {
     use crate::term::action::UserInputAction;
 
     fn config_with_bindings(bindings: Vec<Keybinding>) -> Config {
-        let mut cfg = Config::default();
         // Use RawKeybindingsConfig::into() to populate the lookup map
-        cfg.keybindings = RawKeybindingsConfig { bindings }.into();
-        cfg
+        Config {
+            keybindings: RawKeybindingsConfig { bindings }.into(),
+            ..Default::default()
+        }
     }
 
     #[test]

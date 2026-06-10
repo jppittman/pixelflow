@@ -800,8 +800,8 @@ impl Troupe {
                 config: VsyncConfig {
                     refresh_rate: config.performance.target_fps as f64,
                 },
-                engine_handle: vsync_engine.engine,
-                self_handle: clock_vsync.vsync,
+                engine_handle: Box::new(vsync_engine.engine),
+                self_handle: Box::new(clock_vsync.vsync),
             }))
             .map_err(|e| RuntimeError::InitError(format!("Failed to configure vsync: {}", e)))?;
 

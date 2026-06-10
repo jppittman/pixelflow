@@ -1165,24 +1165,24 @@ fn empty_message_types_work() {
 #[test]
 fn zero_size_type_messages() {
     #[derive(Clone, Copy)]
-    struct ZST;
+    struct Zst;
 
-    let (tx, mut rx) = ActorScheduler::<ZST, ZST, ZST>::new(10, 100);
+    let (tx, mut rx) = ActorScheduler::<Zst, Zst, Zst>::new(10, 100);
     let count = Arc::new(AtomicUsize::new(0));
     let count_clone = count.clone();
 
     let handle = thread::spawn(move || {
-        struct ZSTActor(Arc<AtomicUsize>);
-        impl Actor<ZST, ZST, ZST> for ZSTActor {
-            fn handle_data(&mut self, _: ZST) -> HandlerResult {
+        struct ZstActor(Arc<AtomicUsize>);
+        impl Actor<Zst, Zst, Zst> for ZstActor {
+            fn handle_data(&mut self, _: Zst) -> HandlerResult {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
-            fn handle_control(&mut self, _: ZST) -> HandlerResult {
+            fn handle_control(&mut self, _: Zst) -> HandlerResult {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
-            fn handle_management(&mut self, _: ZST) -> HandlerResult {
+            fn handle_management(&mut self, _: Zst) -> HandlerResult {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -1190,11 +1190,11 @@ fn zero_size_type_messages() {
                 Ok(ActorStatus::Idle)
             }
         }
-        rx.run(&mut ZSTActor(count_clone));
+        rx.run(&mut ZstActor(count_clone));
     });
 
     for _ in 0..100 {
-        tx.send(Message::Data(ZST)).unwrap();
+        tx.send(Message::Data(Zst)).unwrap();
     }
 
     thread::sleep(Duration::from_millis(50));

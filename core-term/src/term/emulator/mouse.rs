@@ -162,36 +162,41 @@ mod tests {
     use super::*;
 
     fn modes_with_vt200() -> DecPrivateModes {
-        let mut modes = DecPrivateModes::default();
-        modes.mouse_vt200_mode = true;
-        modes
+        DecPrivateModes {
+            mouse_vt200_mode: true,
+            ..Default::default()
+        }
     }
 
     fn modes_with_sgr() -> DecPrivateModes {
-        let mut modes = DecPrivateModes::default();
-        modes.mouse_vt200_mode = true;
-        modes.mouse_sgr_mode = true;
-        modes
+        DecPrivateModes {
+            mouse_vt200_mode: true,
+            mouse_sgr_mode: true,
+            ..Default::default()
+        }
     }
 
     fn modes_with_x10() -> DecPrivateModes {
-        let mut modes = DecPrivateModes::default();
-        modes.mouse_x10_mode = true;
-        modes
+        DecPrivateModes {
+            mouse_x10_mode: true,
+            ..Default::default()
+        }
     }
 
     fn modes_with_any_event_sgr() -> DecPrivateModes {
-        let mut modes = DecPrivateModes::default();
-        modes.mouse_any_event_mode = true;
-        modes.mouse_sgr_mode = true;
-        modes
+        DecPrivateModes {
+            mouse_any_event_mode: true,
+            mouse_sgr_mode: true,
+            ..Default::default()
+        }
     }
 
     fn modes_with_button_event_sgr() -> DecPrivateModes {
-        let mut modes = DecPrivateModes::default();
-        modes.mouse_button_event_mode = true;
-        modes.mouse_sgr_mode = true;
-        modes
+        DecPrivateModes {
+            mouse_button_event_mode: true,
+            mouse_sgr_mode: true,
+            ..Default::default()
+        }
     }
 
     #[test]

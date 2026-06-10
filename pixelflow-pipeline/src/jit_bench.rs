@@ -214,11 +214,6 @@ fn validate_median(median: f64) -> Result<f64, BenchError> {
     Ok(median)
 }
 
-/// JIT-compile and benchmark one expression. Returns ns/eval (median of TIMED_RUNS).
-///
-/// Rejects:
-/// - NaN or negative timings
-/// - Absurdly large timings (>1s, indicating measurement failure)
 /// Result of benchmarking: timing and the full SIMD output for correctness checks.
 pub struct BenchResult {
     /// Median ns per evaluation.
@@ -322,7 +317,7 @@ fn benchmark_exec_code(
             let median_total = times[TIMED_RUNS / 2];
             let ns = median_total as f64 / (INNER_ITERS * repeat_batches) as f64;
 
-            return validate_median(ns).map(|ns| BenchResult { ns, output });
+            validate_median(ns).map(|ns| BenchResult { ns, output })
         }
     }
 

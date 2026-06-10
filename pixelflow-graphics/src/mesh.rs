@@ -18,6 +18,7 @@ pub struct Point3 {
 }
 
 impl Point3 {
+    #[must_use]
     pub fn new(x: f32, y: f32, z: f32) -> Self {
         Self { x, y, z }
     }
@@ -31,6 +32,7 @@ pub struct Quad {
 }
 
 impl Quad {
+    #[must_use]
     pub fn new(v0: usize, v1: usize, v2: usize, v3: usize) -> Self {
         Self {
             vertices: [v0, v1, v2, v3],
@@ -51,6 +53,7 @@ pub struct QuadMesh {
 
 impl QuadMesh {
     /// Create an empty mesh.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
@@ -152,16 +155,19 @@ impl QuadMesh {
     }
 
     /// Get vertex count.
+    #[must_use]
     pub fn vertex_count(&self) -> usize {
         self.vertices.len()
     }
 
     /// Get face count.
+    #[must_use]
     pub fn face_count(&self) -> usize {
         self.faces.len()
     }
 
     /// Check if vertex index is valid.
+    #[must_use]
     pub fn is_valid_vertex(&self, idx: usize) -> bool {
         idx < self.vertices.len()
     }

@@ -21,6 +21,7 @@ pub struct Frame<P: Pixel> {
 
 impl<P: Pixel> Frame<P> {
     /// Create a new frame filled with the default pixel (typically black/transparent).
+    #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
         let size = (width as usize) * (height as usize);
         let data = vec![P::default(); size];
@@ -35,6 +36,7 @@ impl<P: Pixel> Frame<P> {
     ///
     /// # Panics
     /// Panics if data length doesn't match width * height.
+    #[must_use]
     pub fn from_data(data: Vec<P>, width: u32, height: u32) -> Self {
         assert_eq!(data.len(), (width as usize) * (height as usize));
         Self {
@@ -58,6 +60,7 @@ impl<P: Pixel> Frame<P> {
     ///
     /// # Safety
     /// The returned slice aliases self.data. Don't use both simultaneously.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
@@ -82,6 +85,7 @@ impl<P: Pixel> Frame<P> {
     /// # Safety
     /// This function is safe only if `P` has the same memory layout as `u32`.
     /// For example, `Rgba` and `Bgra` are typically `u32` aliases.
+    #[must_use]
     pub fn as_u32_slice(&self) -> &[u32] {
         assert_eq!(std::mem::size_of::<P>(), std::mem::size_of::<u32>());
         unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u32, self.data.len()) }
@@ -105,6 +109,7 @@ impl<P: Pixel> Frame<P> {
     }
 
     /// Get immutable pixel slice.
+    #[must_use]
     pub fn as_slice(&self) -> &[P] {
         &self.data
     }

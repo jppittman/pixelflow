@@ -229,12 +229,12 @@ fn annotate_stmt(
         Stmt::Let(let_stmt) => {
             let (init, ctx1) = annotate_expr(&let_stmt.init, ctx, literals);
             (
-                Stmt::Let(LetStmt {
+                Stmt::Let(Box::new(LetStmt {
                     name: let_stmt.name.clone(),
                     ty: let_stmt.ty.clone(),
                     init,
                     span: let_stmt.span,
-                }),
+                })),
                 ctx1,
             )
         }

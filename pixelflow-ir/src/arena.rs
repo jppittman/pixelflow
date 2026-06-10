@@ -110,6 +110,12 @@ pub struct ExprArena {
     nary_children: Vec<ExprId>,
 }
 
+impl Default for ExprArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExprArena {
     /// Create an empty arena.
     #[must_use]
@@ -244,6 +250,7 @@ impl ExprArena {
     ///
     /// Panics if `id` is out of bounds.
     #[inline]
+    #[must_use]
     pub fn node(&self, id: ExprId) -> &ExprNode {
         &self.nodes[id.0 as usize]
     }
@@ -254,6 +261,7 @@ impl ExprArena {
     ///
     /// Panics if `start + len` exceeds the internal nary_children buffer.
     #[inline]
+    #[must_use]
     pub fn nary_children_slice(&self, start: u32, len: u16) -> &[ExprId] {
         let s = start as usize;
         let l = len as usize;
@@ -264,6 +272,7 @@ impl ExprArena {
     ///
     /// Leaf nodes map to: `Var -> OpKind::Var`, `Const/Param -> OpKind::Const`.
     #[inline]
+    #[must_use]
     pub fn kind(&self, id: ExprId) -> OpKind {
         match &self.nodes[id.0 as usize] {
             ExprNode::Var(_) => OpKind::Var,
@@ -277,6 +286,7 @@ impl ExprArena {
 
     /// Iterate over the child [`ExprId`]s of the node at `id`.
     #[inline]
+    #[must_use]
     pub fn children(&self, id: ExprId) -> ExprChildren<'_> {
         match &self.nodes[id.0 as usize] {
             ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => ExprChildren::Zero,

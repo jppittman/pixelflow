@@ -1,7 +1,9 @@
 //! JIT compilation benchmark for profiling.
 //! samply record cargo run --release -p pixelflow-ir --example jit_timing
 
+#[cfg(target_arch = "aarch64")]
 use pixelflow_ir::arena::ExprArena;
+#[cfg(target_arch = "aarch64")]
 use pixelflow_ir::kind::OpKind;
 
 #[cfg(target_arch = "aarch64")]
@@ -32,6 +34,7 @@ fn main() {
     eprintln!("aarch64 only");
 }
 
+#[cfg(target_arch = "aarch64")]
 fn build_expr(target_nodes: usize) -> (ExprArena, pixelflow_ir::arena::ExprId) {
     let mut arena = ExprArena::new();
     let x = arena.push_var(0);

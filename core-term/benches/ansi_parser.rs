@@ -14,11 +14,6 @@ fn ascii_text(size: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Mixed printable with newlines
-fn ascii_with_newlines(size: usize) -> Vec<u8> {
-    "Hello, World!\r\n".bytes().cycle().take(size).collect()
-}
-
 /// Heavy CSI sequences (cursor movement, SGR)
 fn csi_heavy(size: usize) -> Vec<u8> {
     // ESC[1;31m (red) + "X" + ESC[0m (reset) = 12 bytes per cycle

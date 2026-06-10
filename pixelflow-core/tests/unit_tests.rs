@@ -566,7 +566,7 @@ mod clone_copy_tests {
     #[test]
     fn axis_clone_should_work() {
         let axis = Axis::X;
-        let axis2 = axis.clone();
+        let axis2 = axis;
         assert_eq!(axis, axis2);
     }
 }

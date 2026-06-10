@@ -257,6 +257,8 @@ fn directory_allows_cross_actor_messaging() {
 
 /// Simulates the Troupe struct that troupe! would generate (SPSC pattern)
 struct TestTroupe {
+    // Mirrors the field layout troupe! generates; not read by these tests.
+    #[allow(dead_code)]
     directory: TestDirectory,
     // Schedulers run the actors when dropped; they're held here for that purpose.
     #[allow(dead_code)]
@@ -278,11 +280,11 @@ impl TestTroupe {
             ActorBuilder::<BetaData, BetaControl, BetaManagement>::new(1024, None);
 
         // Each actor gets its own directory with dedicated SPSC handles
-        let alpha_dir = TestDirectory {
+        let _alpha_dir = TestDirectory {
             alpha: alpha_builder.add_producer(),
             beta: beta_builder.add_producer(),
         };
-        let beta_dir = TestDirectory {
+        let _beta_dir = TestDirectory {
             alpha: alpha_builder.add_producer(),
             beta: beta_builder.add_producer(),
         };
@@ -296,8 +298,8 @@ impl TestTroupe {
             beta: beta_builder.add_producer(),
         };
 
-        let mut alpha_scheduler = alpha_builder.build();
-        let mut beta_scheduler = beta_builder.build();
+        let alpha_scheduler = alpha_builder.build();
+        let beta_scheduler = beta_builder.build();
 
         // Spawn actors
         // Note: In this test harness, we spawn them immediately.

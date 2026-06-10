@@ -22,29 +22,32 @@ pub struct BezierPatch {
 
 impl BezierPatch {
     /// Create a patch from 16 control points.
+    #[must_use]
     pub fn new(points: [[[f32; 3]; 4]; 4]) -> Self {
         Self { points }
     }
 
     /// Create a flat patch in XY plane at z=0.
+    #[must_use]
     pub fn flat(size: f32) -> Self {
         let mut points = [[[0.0f32; 3]; 4]; 4];
-        for v in 0..4 {
-            for u in 0..4 {
-                points[v][u] = [(u as f32 / 3.0) * size, (v as f32 / 3.0) * size, 0.0];
+        for (v, row) in points.iter_mut().enumerate() {
+            for (u, point) in row.iter_mut().enumerate() {
+                *point = [(u as f32 / 3.0) * size, (v as f32 / 3.0) * size, 0.0];
             }
         }
         Self { points }
     }
 
     /// Create a curved paraboloid patch.
+    #[must_use]
     pub fn paraboloid(size: f32, height: f32) -> Self {
         let mut points = [[[0.0f32; 3]; 4]; 4];
-        for v in 0..4 {
-            for u in 0..4 {
+        for (v, row) in points.iter_mut().enumerate() {
+            for (u, point) in row.iter_mut().enumerate() {
                 let nu = u as f32 / 3.0 - 0.5;
                 let nv = v as f32 / 3.0 - 0.5;
-                points[v][u] = [
+                *point = [
                     nu * size,
                     nv * size,
                     height * (1.0 - 4.0 * (nu * nu + nv * nv)),
@@ -61,6 +64,7 @@ impl BezierPatch {
     /// - dx, dy: first partials (tangent vectors)
     /// - dxx, dxy, dyy: second partials (curvature)
     #[inline]
+    #[must_use]
     pub fn eval(&self, u: Jet2H, v: Jet2H) -> [Jet2H; 3] {
         // Bernstein basis (cubic)
         let one = Jet2H::constant(Field::from(1.0));
@@ -86,10 +90,10 @@ impl BezierPatch {
         let zero = Jet2H::constant(Field::from(0.0));
         let mut p = [zero, zero, zero];
 
-        for j in 0..4 {
-            for i in 0..4 {
-                let w = bu[i] * bv[j];
-                let [cx, cy, cz] = self.points[j][i];
+        for (row, bvj) in self.points.iter().zip(bv.iter()) {
+            for (point, bui) in row.iter().zip(bu.iter()) {
+                let w = *bui * *bvj;
+                let [cx, cy, cz] = *point;
                 p[0] = p[0] + w * Jet2H::constant(Field::from(cx));
                 p[1] = p[1] + w * Jet2H::constant(Field::from(cy));
                 p[2] = p[2] + w * Jet2H::constant(Field::from(cz));

@@ -87,7 +87,7 @@ fn ast_to_arena_inner(
             if let Some(val) = extract_f64_from_lit(&lit.lit) {
                 Ok(arena.push_const(val as f32))
             } else {
-                Err(format!("Non-numeric literal"))
+                Err("Non-numeric literal".to_string())
             }
         }
 
@@ -117,7 +117,7 @@ fn ast_to_arena_inner(
 
             let op = match unary.op {
                 UnaryOp::Neg => OpKind::Neg,
-                UnaryOp::Not => return Err(format!("Unsupported unary op: Not")),
+                UnaryOp::Not => return Err("Unsupported unary op: Not".to_string()),
             };
 
             Ok(arena.push_unary(op, operand))
@@ -222,8 +222,7 @@ fn ast_to_arena_inner(
             for stmt in &block.stmts {
                 match stmt {
                     crate::ast::Stmt::Let(let_stmt) => {
-                        let id =
-                            ast_to_arena_inner(&let_stmt.init, param_indices, locals, arena)?;
+                        let id = ast_to_arena_inner(&let_stmt.init, param_indices, locals, arena)?;
                         locals.insert(let_stmt.name.to_string(), id);
                     }
                     // A non-binding statement has no value to thread; evaluate
@@ -234,14 +233,12 @@ fn ast_to_arena_inner(
                 }
             }
             match &block.expr {
-                Some(final_expr) => {
-                    ast_to_arena_inner(final_expr, param_indices, locals, arena)
-                }
-                None => Err(format!("Block has no final expression")),
+                Some(final_expr) => ast_to_arena_inner(final_expr, param_indices, locals, arena),
+                None => Err("Block has no final expression".to_string()),
             }
         }
 
-        _ => Err(format!("Unsupported expression type")),
+        _ => Err("Unsupported expression type".to_string()),
     }
 }
 

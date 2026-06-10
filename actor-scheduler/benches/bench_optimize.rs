@@ -741,18 +741,19 @@ impl GaussianProcess {
         }
 
         let mut ks = vec![0.0; n];
-        for i in 0..n {
-            ks[i] = self.kernel(x, &self.xs[i]);
+        for (k, xi) in ks.iter_mut().zip(self.xs.iter()) {
+            *k = self.kernel(x, xi);
         }
 
         let mean: f64 = ks.iter().zip(self.alpha.iter()).map(|(a, b)| a * b).sum();
 
         let mut v = vec![0.0; n];
         for i in 0..n {
-            let mut s = 0.0;
-            for j in 0..i {
-                s += self.chol[i * n + j] * v[j];
-            }
+            let s: f64 = self.chol[i * n..i * n + i]
+                .iter()
+                .zip(v.iter())
+                .map(|(c, vj)| c * vj)
+                .sum();
             v[i] = (ks[i] - s) / self.chol[i * n + i];
         }
         let vsq: f64 = v.iter().map(|vi| vi * vi).sum();

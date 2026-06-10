@@ -94,12 +94,14 @@ fn create_spsc_scheduler<D: Send + 'static, C: Send + 'static, M: Send + 'static
     (handle, scheduler)
 }
 
+type MultiSpsc<D, C, M> = (Vec<SpscHandle<D, C, M>>, SpscScheduler<D, C, M>);
+
 /// Create a multi-producer SPSC-sharded scheduler (for fairness tests).
 fn create_spsc_scheduler_multi<D: Send + 'static, C: Send + 'static, M: Send + 'static>(
     params: &SchedulerParams,
     data_buffer_size: usize,
     num_producers: usize,
-) -> (Vec<SpscHandle<D, C, M>>, SpscScheduler<D, C, M>) {
+) -> MultiSpsc<D, C, M> {
     let (tx_doorbell, rx_doorbell) = mpsc::sync_channel(1);
 
     let mut data_builder = InboxBuilder::new(data_buffer_size);
@@ -143,11 +145,7 @@ impl<D, C, M> SpscHandle<D, C, M> {
                 }
                 Err(TrySendError::Full(returned)) => {
                     msg = returned;
-                    if attempt < self.params.spin_attempts {
-                        // spin
-                    } else if attempt < self.params.spin_attempts + self.params.yield_attempts {
-                        thread::yield_now();
-                    } else {
+                    if attempt >= self.params.spin_attempts {
                         thread::yield_now();
                     }
                     attempt = attempt.saturating_add(1);
@@ -168,11 +166,7 @@ impl<D, C, M> SpscHandle<D, C, M> {
                 }
                 Err(TrySendError::Full(returned)) => {
                     msg = returned;
-                    if attempt < self.params.spin_attempts {
-                        // spin
-                    } else if attempt < self.params.spin_attempts + self.params.yield_attempts {
-                        thread::yield_now();
-                    } else {
+                    if attempt >= self.params.spin_attempts {
                         thread::yield_now();
                     }
                     attempt = attempt.saturating_add(1);
@@ -193,11 +187,7 @@ impl<D, C, M> SpscHandle<D, C, M> {
                 }
                 Err(TrySendError::Full(returned)) => {
                     msg = returned;
-                    if attempt < self.params.spin_attempts {
-                        // spin
-                    } else if attempt < self.params.spin_attempts + self.params.yield_attempts {
-                        thread::yield_now();
-                    } else {
+                    if attempt >= self.params.spin_attempts {
                         thread::yield_now();
                     }
                     attempt = attempt.saturating_add(1);
@@ -867,18 +857,19 @@ impl GaussianProcess {
         }
 
         let mut ks = vec![0.0; n];
-        for i in 0..n {
-            ks[i] = self.kernel(x, &self.xs[i]);
+        for (k, xi) in ks.iter_mut().zip(self.xs.iter()) {
+            *k = self.kernel(x, xi);
         }
 
         let mean: f64 = ks.iter().zip(self.alpha.iter()).map(|(a, b)| a * b).sum();
 
         let mut v = vec![0.0; n];
         for i in 0..n {
-            let mut s = 0.0;
-            for j in 0..i {
-                s += self.chol[i * n + j] * v[j];
-            }
+            let s: f64 = self.chol[i * n..i * n + i]
+                .iter()
+                .zip(v.iter())
+                .map(|(c, vj)| c * vj)
+                .sum();
             v[i] = (ks[i] - s) / self.chol[i * n + i];
         }
         let vsq: f64 = v.iter().map(|vi| vi * vi).sum();

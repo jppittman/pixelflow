@@ -933,7 +933,7 @@ impl Numeric for Jet2H {
         let log10_e = Field::from(core::f32::consts::LOG10_E);
         let inv = Field::from(1.0) / self.val;
         let inv_sq = inv.clone() * inv.clone();
-        let scale = inv * log10_e.clone();
+        let scale = inv * log10_e;
         let scale_sq = inv_sq * log10_e;
         Self::new(
             self.val.log10(),
@@ -966,7 +966,6 @@ impl Numeric for Jet2H {
     #[inline(always)]
     fn asin(self) -> Self {
         // asin(f)' = f' / sqrt(1-f²)
-        use crate::numeric::Numeric as _;
         let one = Field::from(1.0);
         let one_minus_sq = one.raw_sub(self.val.raw_mul(self.val));
         let inv_sqrt = one_minus_sq.rsqrt();
@@ -982,7 +981,6 @@ impl Numeric for Jet2H {
 
     #[inline(always)]
     fn acos(self) -> Self {
-        use crate::numeric::Numeric as _;
         let one = Field::from(1.0);
         let one_minus_sq = one.raw_sub(self.val.raw_mul(self.val));
         let neg_inv_sqrt = Field::from(0.0).raw_sub(one_minus_sq.rsqrt());
@@ -999,7 +997,6 @@ impl Numeric for Jet2H {
     #[inline(always)]
     fn atan(self) -> Self {
         // atan(f)' = f' / (1+f²)
-        use crate::numeric::Numeric as _;
         let one = Field::from(1.0);
         let one_plus_sq = one.raw_add(self.val.raw_mul(self.val));
         let inv = Field::from(1.0).raw_div(one_plus_sq);

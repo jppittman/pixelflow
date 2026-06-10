@@ -276,9 +276,9 @@ fn test_pty_child_termination_on_drop() {
             if let Err(e) = kill(child_pid, Some(Signal::SIGKILL)) {
                 log::warn!("SIGKILL of child {} failed: {}", child_pid, e);
             }
-                                                            // Depending on strictness, this could be a panic.
-                                                            // For CI stability, we might log and not panic, if SIGHUP is not 100% guaranteed kill for `sleep`.
-                                                            // panic!("Child process {} did not terminate after PTY drop.", child_pid);
+            // Depending on strictness, this could be a panic.
+            // For CI stability, we might log and not panic, if SIGHUP is not 100% guaranteed kill for `sleep`.
+            // panic!("Child process {} did not terminate after PTY drop.", child_pid);
         }
         Err(nix::Error::ESRCH) => {
             // ESRCH ("No such process") means the child terminated as expected.
@@ -332,7 +332,9 @@ fn test_pty_spawn_invalid_command() {
                     io_err.kind()
                 );
             } else {
-                log::warn!("Could not downcast error to std::io::Error to verify ErrorKind::NotFound, but an error occurred as expected.");
+                log::warn!(
+                    "Could not downcast error to std::io::Error to verify ErrorKind::NotFound, but an error occurred as expected."
+                );
             }
         }
     }

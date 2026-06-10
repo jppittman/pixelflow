@@ -156,6 +156,7 @@ impl DiscreteManifold {
     /// # Panics
     ///
     /// Panics if `buffer.len() != width * height`.
+    #[must_use]
     pub fn new(buffer: Vec<f32>, width: usize, height: usize) -> Self {
         assert_eq!(
             buffer.len(),
@@ -174,16 +175,19 @@ impl DiscreteManifold {
     }
 
     /// Width of the grid (X extent).
+    #[must_use]
     pub fn width(&self) -> usize {
         self.width
     }
 
     /// Height of the grid (Y extent).
+    #[must_use]
     pub fn height(&self) -> usize {
         self.height
     }
 
     /// Read-only access to the underlying buffer (row-major).
+    #[must_use]
     pub fn buffer(&self) -> &[f32] {
         &self.buffer
     }
@@ -194,6 +198,7 @@ impl DiscreteManifold {
     }
 
     /// Consume the DiscreteManifold and return the buffer.
+    #[must_use]
     pub fn into_buffer(self) -> Vec<f32> {
         self.buffer
     }
@@ -265,6 +270,7 @@ const FRAME_LOOP_VARS: [u8; 2] = [0, 1]; // X=0, Y=1
 
 impl FrameLattice {
     /// Convenience constructor: 2D frame with Z = time, W = 0.
+    #[must_use]
     pub fn new(width: usize, height: usize, z: f32) -> Self {
         Self {
             width,
@@ -412,6 +418,7 @@ const SCANLINE_LOOP_VARS: [u8; 1] = [0]; // X=0
 
 impl ScanlineLattice {
     /// Convenience constructor.
+    #[must_use]
     pub fn new(width: usize, y: f32, z: f32, w: f32) -> Self {
         Self { width, y, z, w }
     }
@@ -535,6 +542,7 @@ const POINT_LOOP_VARS: [u8; 0] = [];
 
 impl PointLattice {
     /// Create a point lattice at the given coordinates.
+    #[must_use]
     pub fn new(x: f32, y: f32, z: f32, w: f32) -> Self {
         Self { x, y, z, w }
     }

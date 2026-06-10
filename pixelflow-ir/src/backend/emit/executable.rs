@@ -79,22 +79,26 @@ impl ExecutableCode {
     /// The caller must ensure the code implements the correct calling convention
     /// and signature for type `F`.
     #[inline]
+    #[must_use]
     pub unsafe fn as_fn<F>(&self) -> F {
         // SAFETY: Caller guarantees F matches the compiled code's signature.
         unsafe { core::mem::transmute_copy(&self.ptr) }
     }
 
     /// Get the code as a byte slice (for debugging).
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     /// Length of the compiled code in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the code is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -199,16 +203,10 @@ impl CodeBuffer {
         // Immediately flip to RX so it's in a safe default state.
         #[cfg(not(target_os = "macos"))]
         {
-            let rc = unsafe {
-                libc::mprotect(
-                    ptr as *mut libc::c_void,
-                    capacity,
-                    libc::PROT_READ | libc::PROT_EXEC,
-                )
-            };
+            let rc = unsafe { libc::mprotect(ptr, capacity, libc::PROT_READ | libc::PROT_EXEC) };
             if rc != 0 {
                 unsafe {
-                    libc::munmap(ptr as *mut libc::c_void, capacity);
+                    libc::munmap(ptr, capacity);
                 }
                 return Err("CodeBuffer: initial mprotect to RX failed");
             }
@@ -298,16 +296,19 @@ impl CodeBuffer {
     }
 
     /// Current code length in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the buffer contains no code.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Total capacity in bytes.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -362,6 +363,7 @@ use core::arch::x86_64::__m512;
 /// Args: X in v0, Y in v1, Z in v2, W in v3; returns result in v0.
 /// Each arg/result is a SIMD vector, so one call computes one pixel per lane
 /// (4 pixels for a 128-bit vector), not a single pixel; the caller loops.
+#[allow(improper_ctypes_definitions)]
 #[cfg(target_arch = "aarch64")]
 pub type KernelFn =
     extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
@@ -378,6 +380,9 @@ pub type KernelFn =
 ///   v3 = W (broadcast, loop-invariant)
 ///   x1 = pointer to output array (128-bit aligned `float32x4_t` values)
 ///   x2 = count (number of SIMD groups to process)
+// SIMD vector types are not nominally FFI-safe, but both sides of this
+// boundary are our own JIT-emitted code using the platform vector ABI.
+#[allow(improper_ctypes_definitions)]
 #[cfg(target_arch = "aarch64")]
 pub type ScanlineKernelFn = extern "C" fn(
     *const float32x4_t, // x_array
@@ -398,14 +403,17 @@ pub type ScanlineKernelFn = extern "C" fn(
 /// `pixelflow-core`'s `Field`; the `kernel_jit!` wrapper const-asserts
 /// `size_of::<Field>() == JIT_VECTOR_BYTES`. The looping variant is
 /// `ScanlineKernelFn`, which stays 128-bit (the scanline emitter is still SSE2).
+#[allow(improper_ctypes_definitions)]
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub type KernelFn = extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
 
+#[allow(improper_ctypes_definitions)]
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 
 /// JIT-compiled scanline kernel signature for x86-64 (128-bit; the scanline
 /// emitter is SSE2 only, independent of the per-batch width).
+#[allow(improper_ctypes_definitions)]
 #[cfg(target_arch = "x86_64")]
 pub type ScanlineKernelFn = extern "C" fn(
     *const __m128, // x_array
@@ -427,7 +435,6 @@ pub type ScanlineKernelFn = extern "C" fn(
 #[cfg(all(test, not(target_feature = "avx512f")))]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
 
     #[test]
     #[cfg(target_arch = "aarch64")]
