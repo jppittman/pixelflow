@@ -21,6 +21,7 @@ const INDEX1D_LOOP_VARS: [u8; 1] = [0]; // X=0 only
 
 impl IndexLattice1D {
     /// Create a 1D index lattice over [0, len).
+    #[must_use]
     pub fn new(len: usize) -> Self {
         Self { len }
     }
@@ -158,6 +159,7 @@ const INDEX2D_LOOP_VARS: [u8; 2] = [0, 1]; // X=0, Y=1
 
 impl IndexLattice2D {
     /// Create a 2D index lattice over [0, width) × [0, height).
+    #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
         Self { width, height }
     }
@@ -323,7 +325,7 @@ impl IndexLattice2D {
         let w_field = Field::from(0.0);
         let step = Field::from(PARALLELISM as f32);
 
-        for j in 0..self.height {
+        for (j, out) in out_buffer.iter_mut().enumerate() {
             let y_field = Field::from(j as f32);
             let mut acc = op.identity();
 
@@ -356,7 +358,7 @@ impl IndexLattice2D {
                 ReduceOp::Min => packed.iter().cloned().fold(f32::INFINITY, f32::min),
                 ReduceOp::Max => packed.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
             };
-            out_buffer[j] = scalar;
+            *out = scalar;
         }
 
         DiscreteManifold::new(out_buffer, out_len, 1)
@@ -375,7 +377,7 @@ impl IndexLattice2D {
         let z_field = Field::from(0.0);
         let w_field = Field::from(0.0);
 
-        for i in 0..self.width {
+        for (i, out) in out_buffer.iter_mut().enumerate() {
             let x_field = Field::from(i as f32);
             let mut acc = op.identity();
 
@@ -402,7 +404,7 @@ impl IndexLattice2D {
                     packed[0],
                 );
             }
-            out_buffer[i] = packed[0];
+            *out = packed[0];
         }
 
         DiscreteManifold::new(out_buffer, out_len, 1)

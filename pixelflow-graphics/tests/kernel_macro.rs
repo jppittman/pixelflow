@@ -137,7 +137,7 @@ fn test_method_chaining() {
 fn test_kernel_is_clone() {
     let scale = kernel!(|factor: f32| X * factor);
     let k1 = scale(2.0);
-    let k2 = k1.clone();
+    let k2 = k1;
 
     let r1 = k1.eval(field4(5.0, 0.0, 0.0, 0.0));
     let r2 = k2.eval(field4(5.0, 0.0, 0.0, 0.0));
@@ -759,7 +759,7 @@ fn test_fused_combinators_with_kernel_composition() {
     let sdf = circle_sdf(0.0, 0.0, 1.0);
 
     // Use fused combinators - evaluates sdf ONCE per combinator
-    let grad_mag = GradientMag2D(sdf.clone());
+    let grad_mag = GradientMag2D(sdf);
     let aa = Antialias2D(sdf);
 
     // At (2, 0): gradient magnitude = 1.0, antialias = 1.0 / 1.0 = 1.0

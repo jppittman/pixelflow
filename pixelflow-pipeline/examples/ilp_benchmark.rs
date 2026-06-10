@@ -36,11 +36,11 @@ fn wide_8(vals: &[f32; 8]) -> f32 {
 #[inline(never)]
 fn deep_8(vals: &[f32; 8]) -> f32 {
     let mut acc = vals[0] + vals[1];
-    acc = acc + vals[2];
-    acc = acc + vals[3];
-    acc = acc + vals[4];
-    acc = acc + vals[5];
-    acc = acc + vals[6];
+    acc += vals[2];
+    acc += vals[3];
+    acc += vals[4];
+    acc += vals[5];
+    acc += vals[6];
     acc + vals[7]
 }
 

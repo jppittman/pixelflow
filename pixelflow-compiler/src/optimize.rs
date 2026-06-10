@@ -23,8 +23,8 @@
 //! ```
 
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, Expr, IdentExpr, LetStmt, LiteralExpr,
-    MethodCallExpr, Stmt, UnaryExpr, UnaryOp,
+    BinaryExpr, BinaryOp, BlockExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
+    UnaryExpr, UnaryOp,
 };
 use crate::sema::AnalyzedKernel;
 use pixelflow_search::egraph::{
@@ -354,14 +354,13 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
             // Check if the receiver is opaque (Verbatim) and args reference locals
             // This catches patterns like: ColorCube::default().at(red, green, blue, 1.0)
             // where ColorCube::default() is Verbatim and red/green/blue are locals
-            if matches!(call.receiver.as_ref(), Expr::Verbatim(_)) {
-                if call
+            if matches!(call.receiver.as_ref(), Expr::Verbatim(_))
+                && call
                     .args
                     .iter()
                     .any(|arg| expr_references_any(arg, local_names))
-                {
-                    return true;
-                }
+            {
+                return true;
             }
             // Check if this is a method on a captured variable (not X, Y, Z, W)
             if let Expr::Ident(ident) = call.receiver.as_ref() {
@@ -422,7 +421,7 @@ fn expr_has_opaque_refs(expr: &Expr, local_names: &std::collections::HashSet<Str
             }) || b
                 .expr
                 .as_ref()
-                .map_or(false, |e| expr_has_opaque_refs(e, local_names))
+                .is_some_and(|e| expr_has_opaque_refs(e, local_names))
         }
 
         Expr::Ident(_) | Expr::Literal(_) => false,
@@ -455,7 +454,7 @@ fn expr_references_any(expr: &Expr, names: &std::collections::HashSet<String>) -
             }) || b
                 .expr
                 .as_ref()
-                .map_or(false, |e| expr_references_any(e, names))
+                .is_some_and(|e| expr_references_any(e, names))
         }
         Expr::Literal(_) => false,
 
@@ -536,7 +535,7 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
             syn::Stmt::Local(local) => local
                 .init
                 .as_ref()
-                .map_or(false, |init| syn_expr_references_any(&init.expr, names)),
+                .is_some_and(|init| syn_expr_references_any(&init.expr, names)),
             syn::Stmt::Expr(expr, _) => syn_expr_references_any(expr, names),
             _ => false,
         }),
@@ -553,9 +552,7 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
                 || if_expr
                     .else_branch
                     .as_ref()
-                    .map_or(false, |(_, else_expr)| {
-                        syn_expr_references_any(else_expr, names)
-                    })
+                    .is_some_and(|(_, else_expr)| syn_expr_references_any(else_expr, names))
         }
 
         // Literals don't reference variables
@@ -571,7 +568,6 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
 fn is_coordinate_intrinsic(name: &str) -> bool {
     matches!(name, "X" | "Y" | "Z" | "W")
 }
-
 
 /// Optimize a block while preserving its structure.
 ///
@@ -1013,12 +1009,12 @@ impl EGraphContext {
                 let expr = self.eclass_to_expr(canonical, dag, &binding_names);
 
                 // Create let statement
-                stmts.push(Stmt::Let(LetStmt {
+                stmts.push(Stmt::Let(Box::new(LetStmt {
                     name: Ident::new(&var_name, span),
                     ty: None,
                     init: expr,
                     span,
-                }));
+                })));
 
                 binding_names.insert(canonical.index(), var_name);
                 binding_idx += 1;
@@ -1367,7 +1363,10 @@ fn make_literal(val: f64, span: Span) -> Expr {
         };
         return Expr::Verbatim(path);
     }
-    let mut s = val.to_string();
+    // Kernels evaluate in f32; format through f32 so the literal is the
+    // shortest string that round-trips to the value that actually executes.
+    // An f64-formatted literal would carry digits f32 can't represent.
+    let mut s = (val as f32).to_string();
     if !s.contains('.') && !s.contains('e') && !s.contains('E') {
         s.push_str(".0");
     }
@@ -1473,13 +1472,6 @@ mod tests {
     use crate::parser::parse;
     use crate::sema::analyze;
     use quote::quote;
-
-    fn optimize_code(input: proc_macro2::TokenStream) -> String {
-        let kernel = parse(input).unwrap();
-        let analyzed = analyze(kernel).unwrap();
-        let optimized = optimize(analyzed);
-        format!("{:?}", optimized.def.body)
-    }
 
     // ========================================================================
     // DAG Extraction Tests

@@ -41,6 +41,7 @@ enum Pp {
 /// Emit a 512-bit EVEX 3-operand reg/reg/reg instruction:
 /// `op zmmDST, zmmSRC1, zmmSRC2` where SRC1 is the EVEX.vvvv non-destructive
 /// source and SRC2 is the ModRM r/m. Registers may be zmm0..zmm31.
+#[allow(clippy::too_many_arguments)]
 fn evex_rrr(code: &mut Vec<u8>, map: Map, pp: Pp, opcode: u8, dst: u8, src1: u8, src2: u8) {
     // EVEX stores the high register bits INVERTED.
     let r = ((dst >> 3) & 1) ^ 1; // ModRM.reg bit3
@@ -51,8 +52,8 @@ fn evex_rrr(code: &mut Vec<u8>, map: Map, pp: Pp, opcode: u8, dst: u8, src1: u8,
     let vp = ((src1 >> 4) & 1) ^ 1; // vvvv bit4 (V'), inverted
 
     let p0 = (r << 7) | (x << 6) | (b << 5) | (rp << 4) | (map as u8); // R X B R' 00 mm
-    let p1 = (0 << 7) | (vvvv << 3) | (1 << 2) | (pp as u8); // W=0, vvvv, 1, pp
-    let p2 = (0 << 7) | (0b10 << 5) | (0 << 4) | (vp << 3) | 0; // z=0, L'L=10 (512), b=0, V', aaa=0
+    let p1 = (vvvv << 3) | (1 << 2) | (pp as u8); // W=0, vvvv, 1, pp
+    let p2 = (0b10 << 5) | (vp << 3); // z=0, L'L=10 (512), b=0, V', aaa=0
 
     code.push(0x62);
     code.push(p0);
@@ -176,8 +177,18 @@ fn evex_runtime_16_lanes() {
         for i in 0..16 {
             let want_a = (xs[i] + ys[i]) * zs[i];
             let want_b = xs[i] * ys[i] + zs[i];
-            assert!((oa[i] - want_a).abs() <= 1e-4, "lane {i}: (X+Y)*Z = {} want {}", oa[i], want_a);
-            assert!((ob[i] - want_b).abs() <= 1e-4, "lane {i}: X*Y+Z = {} want {}", ob[i], want_b);
+            assert!(
+                (oa[i] - want_a).abs() <= 1e-4,
+                "lane {i}: (X+Y)*Z = {} want {}",
+                oa[i],
+                want_a
+            );
+            assert!(
+                (ob[i] - want_b).abs() <= 1e-4,
+                "lane {i}: X*Y+Z = {} want {}",
+                ob[i],
+                want_b
+            );
         }
     }
 }

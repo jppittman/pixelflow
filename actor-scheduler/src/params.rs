@@ -328,17 +328,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "control_mgmt_buffer_size must be >= 1")]
     fn validates_buffer_size() {
-        let mut p = SchedulerParams::default();
-        p.control_mgmt_buffer_size = 0;
+        let p = SchedulerParams {
+            control_mgmt_buffer_size: 0,
+            ..Default::default()
+        };
         p.validate();
     }
 
     #[test]
     #[should_panic(expected = "jitter_min_pct")]
     fn validates_jitter_sum() {
-        let mut p = SchedulerParams::default();
-        p.jitter_min_pct = 80;
-        p.jitter_range_pct = 30; // 80 + 30 = 110 > 100
+        let p = SchedulerParams {
+            jitter_min_pct: 80,
+            jitter_range_pct: 30, // 80 + 30 = 110 > 100
+            ..Default::default()
+        };
         p.validate();
     }
 

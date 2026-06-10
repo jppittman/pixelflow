@@ -20,6 +20,12 @@ pub struct MockEngine {
     _thread: Option<std::thread::JoinHandle<()>>,
 }
 
+impl Default for MockEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockEngine {
     /// Create a new MockEngine. Returns the engine instance (to inspect messages)
     /// and the handle (to pass to the actor under test).

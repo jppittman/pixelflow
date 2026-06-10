@@ -369,7 +369,7 @@ fn clock_thread_stops_when_channel_closed() {
     // while sending. The important thing is that the thread stops.
     // assert!(result.is_ok(), "Clock thread should exit cleanly");
 
-    let ticks = result.unwrap_or_else(|_| 0); // If panic, it stopped.
+    let ticks = result.unwrap_or(0); // If panic, it stopped.
     assert!(
         ticks < 1000,
         "Clock thread should have exited before safety limit. Ticks: {}",
@@ -466,16 +466,13 @@ fn fps_request_handles_dropped_receiver() {
                 Ok(())
             }
             fn handle_control(&mut self, cmd: VsyncCommand) -> HandlerResult {
-                match cmd {
-                    VsyncCommand::RequestCurrentFPS(sender) => {
-                        let result = sender.send(60.0);
-                        if result.is_err() {
-                            self.0.lock().unwrap().push("fps_send_failed".to_string());
-                        } else {
-                            self.0.lock().unwrap().push("fps_sent".to_string());
-                        }
+                if let VsyncCommand::RequestCurrentFPS(sender) = cmd {
+                    let result = sender.send(60.0);
+                    if result.is_err() {
+                        self.0.lock().unwrap().push("fps_send_failed".to_string());
+                    } else {
+                        self.0.lock().unwrap().push("fps_sent".to_string());
                     }
-                    _ => {}
                 }
                 Ok(())
             }

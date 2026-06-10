@@ -50,6 +50,7 @@ use alloc::vec::Vec;
 /// a 128-bit NEON register). During code emission, these constants are loaded
 /// with a single `LDR Qt, [X17, #offset]` instead of the 3-instruction
 /// MOVZ+MOVK+DUP sequence.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) struct ConstPool {
     /// Deduplicated entries: f32 bit patterns in pool order.
     entries: Vec<u32>,
@@ -57,6 +58,7 @@ pub(crate) struct ConstPool {
     index: alloc::collections::BTreeMap<u32, u16>,
 }
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 impl ConstPool {
     /// Create an empty constant pool.
     pub(crate) fn new() -> Self {
@@ -70,10 +72,10 @@ impl ConstPool {
     fn from_schedule(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<Self, &'static str> {
         let mut pool = Self::new();
         for (_, op) in schedule {
-            if let ScheduledOp::Const(val) = op {
-                if aarch64::needs_const_pool(*val) {
-                    pool.push_f32(*val)?;
-                }
+            if let ScheduledOp::Const(val) = op
+                && aarch64::needs_const_pool(*val)
+            {
+                pool.push_f32(*val)?;
             }
         }
         Ok(pool)
@@ -117,6 +119,7 @@ impl ConstPool {
 /// Emit a constant load, using the constant pool when available.
 ///
 /// Falls back to `emit_fmov_imm` for zero and FMOV-encodable values.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn emit_const_load(code: &mut Vec<u8>, dst: Reg, val_bits: u32, pool: &ConstPool) {
     if let Some(offset) = pool.offset_for(val_bits) {
         aarch64::emit_ldr_q_x17(code, dst, offset);
@@ -141,6 +144,7 @@ pub enum Loc {
 
 impl Loc {
     /// Get the register, panicking if spilled.
+    #[must_use]
     pub fn reg(self) -> Reg {
         match self {
             Loc::Reg(r) => r,
@@ -198,7 +202,12 @@ pub enum ResolvedOp {
     Unary { op: OpKind, dst: Reg, src: Reg },
     /// Integer shift by a compile-time immediate: dst = src `op` amount, where
     /// `op` is `Shl` or `Shr` (the hardware shift encoders are imm-only).
-    ShiftImm { op: OpKind, dst: Reg, src: Reg, amount: u8 },
+    ShiftImm {
+        op: OpKind,
+        dst: Reg,
+        src: Reg,
+        amount: u8,
+    },
     /// Binary: dst = op(left, right).
     Binary {
         op: OpKind,
@@ -300,6 +309,7 @@ impl Default for EmitCtx {
 
 impl EmitCtx {
     /// Create context with custom register budget.
+    #[must_use]
     pub fn with_max_regs(max_regs: u8) -> Self {
         Self {
             max_regs,
@@ -420,19 +430,13 @@ const X86_MAX_VALUE_REG: u8 = 11;
 /// register holding its result. Used only by the scanline body emitter; the
 /// per-batch path goes through the shared schedule/regalloc driver.
 #[cfg(target_arch = "x86_64")]
-fn emit_arena(
-    arena: &ExprArena,
-    id: ExprId,
-    depth: u8,
-) -> Result<(Vec<u8>, Reg), &'static str> {
+fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg), &'static str> {
     use x86_64::*;
 
     // Reserve xmm12..15 for scratch: any node that allocates a value register
     // (everything except a bare Var, which reuses an input register) must fit
     // below the scratch floor.
-    if !matches!(arena.node(id), ExprNode::Var(_))
-        && SCRATCH_BASE + depth > X86_MAX_VALUE_REG
-    {
+    if !matches!(arena.node(id), ExprNode::Var(_)) && SCRATCH_BASE + depth > X86_MAX_VALUE_REG {
         return Err("x86 JIT: expression too deep for SSE register budget");
     }
 
@@ -927,6 +931,7 @@ where
 /// register allocator). The result is that expressions depending only on Y, Z,
 /// or W are computed once before the pixel loop.
 #[inline]
+#[must_use]
 pub fn default_hoist_predicate(v: crate::variance::Variance) -> bool {
     v.is_x_invariant() && !v.is_const()
 }
@@ -1894,16 +1899,19 @@ trait IsaBackend {
     fn prologue(&mut self, code: &mut Vec<u8>, frame_size: u32);
 
     /// Emit one resolved instruction (with its reloads/store).
-    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str>;
+    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan)
+    -> Result<(), &'static str>;
 
     /// Register-to-register move.
     fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg);
 
     /// Spill a register to a frame slot.
-    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str>;
+    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32)
+    -> Result<(), &'static str>;
 
     /// Resolve a value to a register, reloading/rematerializing into `target`
     /// if it is spilled or rematerialized.
+    #[allow(clippy::too_many_arguments)]
     fn emit_resolve(
         &mut self,
         code: &mut Vec<u8>,
@@ -1954,8 +1962,13 @@ fn compile_dag_via_backend<B: IsaBackend>(
     }
 
     // Register allocation (linear scan + Belady eviction + spilling).
-    let allocation =
-        regalloc::linear_scan(&schedule, &uses_map, &precolored, backend.num_regs(), SCRATCH_BASE);
+    let allocation = regalloc::linear_scan(
+        &schedule,
+        &uses_map,
+        &precolored,
+        backend.num_regs(),
+        SCRATCH_BASE,
+    );
     let layout = FrameLayout::from_allocation(&allocation.spilled)?;
 
     // Select short-circuit guards.
@@ -1972,13 +1985,19 @@ fn compile_dag_via_backend<B: IsaBackend>(
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     for (gi, guard) in select_guards.iter().enumerate() {
         if guard.true_range.0 != guard.true_range.1 {
-            branch_starts[guard.true_range.0].push(PendingBranch { guard_idx: gi, arm: 0 });
+            branch_starts[guard.true_range.0].push(PendingBranch {
+                guard_idx: gi,
+                arm: 0,
+            });
             if guard.true_range.1 < sched_len {
                 branch_ends[guard.true_range.1].push(gi);
             }
         }
         if guard.false_range.0 != guard.false_range.1 {
-            branch_starts[guard.false_range.0].push(PendingBranch { guard_idx: gi, arm: 1 });
+            branch_starts[guard.false_range.0].push(PendingBranch {
+                guard_idx: gi,
+                arm: 1,
+            });
             if guard.false_range.1 < sched_len {
                 branch_ends[guard.false_range.1].push(gi);
             }
@@ -2009,14 +2028,16 @@ fn compile_dag_via_backend<B: IsaBackend>(
 
     for (sched_idx, (vid, sched_op)) in schedule.iter().enumerate() {
         // Guard branches that begin before this instruction.
-        for bi in 0..branch_starts[sched_idx].len() {
-            let (guard_idx, arm) = {
-                let pb = &branch_starts[sched_idx][bi];
-                (pb.guard_idx, pb.arm)
-            };
+        for pb in &branch_starts[sched_idx] {
+            let (guard_idx, arm) = (pb.guard_idx, pb.arm);
             let guard = &select_guards[guard_idx];
             let mask_reg = backend.emit_resolve(
-                &mut code, guard.mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for,
+                &mut code,
+                guard.mask_vid,
+                RELOAD_REG,
+                &reg_for,
+                &spill_for,
+                &remat_for,
             );
             let branch = match arm {
                 0 => backend.emit_skip_if_all_false(&mut code, mask_reg),
@@ -2026,8 +2047,7 @@ fn compile_dag_via_backend<B: IsaBackend>(
         }
 
         // Guard branches that end at this instruction (patch their targets).
-        for ei in 0..branch_ends[sched_idx].len() {
-            let gi = branch_ends[sched_idx][ei];
+        for &gi in &branch_ends[sched_idx] {
             if let Some(branch) = pending_patches.remove(&(gi, 0)) {
                 let target = code.len();
                 backend.patch_branch(&mut code, branch, target);
@@ -2048,56 +2068,58 @@ fn compile_dag_via_backend<B: IsaBackend>(
         )?;
 
         // Select with a guard region: emit a uniform-mask short-circuit wrapper.
-        if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sched_op {
-            if let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx) {
-                let has_true = guard.true_range.0 != guard.true_range.1;
-                let has_false = guard.false_range.0 != guard.false_range.1;
-                if has_true || has_false {
-                    let mask_reg = backend.emit_resolve(
-                        &mut code, *mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for,
-                    );
-                    let dst = match dst_loc {
-                        Loc::Reg(r) => r,
-                        Loc::Spill(_) => RELOAD_REGS[0],
-                    };
-                    let true_reg = reg_for.get(true_vid.0 as usize).and_then(|r| *r);
-                    let false_reg = reg_for.get(false_vid.0 as usize).and_then(|r| *r);
+        if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sched_op
+            && let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx)
+        {
+            let has_true = guard.true_range.0 != guard.true_range.1;
+            let has_false = guard.false_range.0 != guard.false_range.1;
+            if has_true || has_false {
+                let mask_reg = backend.emit_resolve(
+                    &mut code, *mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for,
+                );
+                let dst = match dst_loc {
+                    Loc::Reg(r) => r,
+                    Loc::Spill(_) => RELOAD_REGS[0],
+                };
+                let true_reg = reg_for.get(true_vid.0 as usize).and_then(|r| *r);
+                let false_reg = reg_for.get(false_vid.0 as usize).and_then(|r| *r);
 
-                    let all_false = backend.emit_skip_if_all_false(&mut code, mask_reg);
-                    let all_true = backend.emit_skip_if_all_true(&mut code, mask_reg);
+                let all_false = backend.emit_skip_if_all_false(&mut code, mask_reg);
+                let all_true = backend.emit_skip_if_all_true(&mut code, mask_reg);
 
-                    // Mixed lanes: the real select.
-                    backend.emit_plan(&mut code, &plan)?;
-                    let skip_end = backend.emit_jump(&mut code);
+                // Mixed lanes: the real select.
+                backend.emit_plan(&mut code, &plan)?;
+                let skip_end = backend.emit_jump(&mut code);
 
-                    // All-false: dst <- false arm.
-                    let all_false_target = code.len();
-                    if let Some(freg) = false_reg {
-                        backend.emit_mov(&mut code, dst, freg);
-                    } else {
-                        backend.emit_resolve(&mut code, *false_vid, dst, &reg_for, &spill_for, &remat_for);
-                    }
-                    let skip_end2 = backend.emit_jump(&mut code);
-
-                    // All-true: dst <- true arm.
-                    let all_true_target = code.len();
-                    if let Some(treg) = true_reg {
-                        backend.emit_mov(&mut code, dst, treg);
-                    } else {
-                        backend.emit_resolve(&mut code, *true_vid, dst, &reg_for, &spill_for, &remat_for);
-                    }
-
-                    let end_target = code.len();
-                    backend.patch_branch(&mut code, all_false, all_false_target);
-                    backend.patch_branch(&mut code, all_true, all_true_target);
-                    backend.patch_branch(&mut code, skip_end, end_target);
-                    backend.patch_branch(&mut code, skip_end2, end_target);
-
-                    if let Loc::Spill(offset) = dst_loc {
-                        backend.emit_store(&mut code, dst, offset)?;
-                    }
-                    continue;
+                // All-false: dst <- false arm.
+                let all_false_target = code.len();
+                if let Some(freg) = false_reg {
+                    backend.emit_mov(&mut code, dst, freg);
+                } else {
+                    backend
+                        .emit_resolve(&mut code, *false_vid, dst, &reg_for, &spill_for, &remat_for);
                 }
+                let skip_end2 = backend.emit_jump(&mut code);
+
+                // All-true: dst <- true arm.
+                let all_true_target = code.len();
+                if let Some(treg) = true_reg {
+                    backend.emit_mov(&mut code, dst, treg);
+                } else {
+                    backend
+                        .emit_resolve(&mut code, *true_vid, dst, &reg_for, &spill_for, &remat_for);
+                }
+
+                let end_target = code.len();
+                backend.patch_branch(&mut code, all_false, all_false_target);
+                backend.patch_branch(&mut code, all_true, all_true_target);
+                backend.patch_branch(&mut code, skip_end, end_target);
+                backend.patch_branch(&mut code, skip_end2, end_target);
+
+                if let Loc::Spill(offset) = dst_loc {
+                    backend.emit_store(&mut code, dst, offset)?;
+                }
+                continue;
             }
         }
 
@@ -2111,8 +2133,9 @@ fn compile_dag_via_backend<B: IsaBackend>(
     );
 
     let root = schedule.last().map(|(v, _)| *v).expect("empty schedule");
-    let result_reg =
-        backend.emit_resolve(&mut code, root, RELOAD_REG, &reg_for, &spill_for, &remat_for);
+    let result_reg = backend.emit_resolve(
+        &mut code, root, RELOAD_REG, &reg_for, &spill_for, &remat_for,
+    );
     backend.epilogue(&mut code, result_reg, layout.frame_size);
 
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
@@ -2171,7 +2194,11 @@ impl IsaBackend for Aarch64Backend {
         self.adr_patch_pos = aarch64::emit_adr_x17_placeholder(code);
     }
 
-    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
+    fn emit_plan(
+        &mut self,
+        code: &mut Vec<u8>,
+        plan: &InstructionPlan,
+    ) -> Result<(), &'static str> {
         emit_instruction_plan(code, plan, &mut self.pool)
     }
 
@@ -2179,7 +2206,12 @@ impl IsaBackend for Aarch64Backend {
         emit_mov_reg(code, dst, src);
     }
 
-    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str> {
+    fn emit_store(
+        &mut self,
+        code: &mut Vec<u8>,
+        src: Reg,
+        offset: u32,
+    ) -> Result<(), &'static str> {
         aarch64::emit_str_sp(code, src, offset);
         Ok(())
     }
@@ -2270,7 +2302,6 @@ fn compile_from_schedule(
     };
     compile_dag_via_backend(schedule, uses_map, &mut backend)
 }
-
 
 /// Info about an operation in the schedule.
 #[derive(Debug, Clone)]
@@ -2626,11 +2657,7 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                 // or a false-exclusive node, skipping it would leave a value some
                 // other expression reads uninitialized — fall back to BSL.
                 let all_exclusive = (start..end).all(|idx| true_indices.contains(&idx));
-                if all_exclusive {
-                    (start, end)
-                } else {
-                    (i, i)
-                }
+                if all_exclusive { (start, end) } else { (i, i) }
             };
 
             let false_range = if false_indices.is_empty() {
@@ -2646,11 +2673,7 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                     .expect("non-empty set has last element")
                     + 1;
                 let all_exclusive = (start..end).all(|idx| false_indices.contains(&idx));
-                if all_exclusive {
-                    (start, end)
-                } else {
-                    (i, i)
-                }
+                if all_exclusive { (start, end) } else { (i, i) }
             };
 
             // Only create a guard if at least one arm has exclusive nodes
@@ -2949,7 +2972,12 @@ fn emit_instruction_plan(
             let scratch = [Reg(28), Reg(29), Reg(30), Reg(31)];
             emit_unary(code, pool, *op, *dst, *src, scratch)?;
         }
-        ResolvedOp::ShiftImm { op, dst, src, amount } => {
+        ResolvedOp::ShiftImm {
+            op,
+            dst,
+            src,
+            amount,
+        } => {
             aarch64::emit_shift_imm(code, *op, *dst, *src, *amount)?;
         }
         ResolvedOp::Binary {
@@ -3015,6 +3043,7 @@ fn emit_instruction_plan(
 }
 
 /// Emit a deferred reload: either from stack or rematerialized constant.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn emit_deferred(
     code: &mut Vec<u8>,
     target: Reg,
@@ -3228,7 +3257,10 @@ impl IsaBackend for X86Backend {
         X86_SCHED_NUM_REGS
     }
 
-    fn begin(&mut self, _schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str> {
+    fn begin(
+        &mut self,
+        _schedule: &[(regalloc::ValueId, ScheduledOp)],
+    ) -> Result<(), &'static str> {
         Ok(()) // x86 const loads are self-contained; no pool.
     }
 
@@ -3236,7 +3268,11 @@ impl IsaBackend for X86Backend {
         // Spills use the red zone; no frame to set up for a leaf.
     }
 
-    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
+    fn emit_plan(
+        &mut self,
+        code: &mut Vec<u8>,
+        plan: &InstructionPlan,
+    ) -> Result<(), &'static str> {
         use x86_64::*;
         for reload in &plan.reloads {
             match reload {
@@ -3244,7 +3280,12 @@ impl IsaBackend for X86Backend {
                     emit_movups_load_rsp(code, *target, x86_redzone_disp(*offset)?);
                 }
                 Reload::Const { target, val_bits } => {
-                    emit_const(code, *target, f32::from_bits(*val_bits), X86_BUILTIN_SCRATCH);
+                    emit_const(
+                        code,
+                        *target,
+                        f32::from_bits(*val_bits),
+                        X86_BUILTIN_SCRATCH,
+                    );
                 }
             }
         }
@@ -3259,16 +3300,30 @@ impl IsaBackend for X86Backend {
             ResolvedOp::Unary { op, dst, src } => {
                 emit_unary(code, *op, *dst, *src, X86_BUILTIN_SCRATCH);
             }
-            ResolvedOp::ShiftImm { op, dst, src, amount } => {
+            ResolvedOp::ShiftImm {
+                op,
+                dst,
+                src,
+                amount,
+            } => {
                 emit_shift_imm(code, *op, *dst, *src, *amount);
             }
-            ResolvedOp::Binary { op, dst, left, right } => match op {
+            ResolvedOp::Binary {
+                op,
+                dst,
+                left,
+                right,
+            } => match op {
                 OpKind::Atan2 | OpKind::Pow | OpKind::Hypot => {
                     emit_binary_transcendental(code, *op, *dst, *left, *right, X86_BUILTIN_SCRATCH);
                 }
                 _ => emit_binary_safe(code, *op, *dst, *left, *right),
             },
-            ResolvedOp::Select { dst, if_true, if_false } => {
+            ResolvedOp::Select {
+                dst,
+                if_true,
+                if_false,
+            } => {
                 // setup_mov already placed the mask in `dst`; blend in place.
                 emit_select(code, *dst, *dst, *if_true, *if_false, X86_SCRATCH);
             }
@@ -3281,7 +3336,13 @@ impl IsaBackend for X86Backend {
                 emit_binary(code, OpKind::Mul, X86_SCRATCH, X86_SCRATCH, *b);
                 emit_binary(code, OpKind::Add, *dst, *dst, X86_SCRATCH);
             }
-            ResolvedOp::DecomposedMulAdd { dst, a, b, c, c_deferred } => {
+            ResolvedOp::DecomposedMulAdd {
+                dst,
+                a,
+                b,
+                c,
+                c_deferred,
+            } => {
                 // dst = a*b, reload c (after the multiply, if deferred), dst += c.
                 emit_binary_safe(code, OpKind::Mul, *dst, *a, *b);
                 match c_deferred {
@@ -3295,7 +3356,13 @@ impl IsaBackend for X86Backend {
                 }
                 emit_binary_safe(code, OpKind::Add, *dst, *dst, *c);
             }
-            ResolvedOp::Clamp { dst, val, lo, hi, lo_deferred } => {
+            ResolvedOp::Clamp {
+                dst,
+                val,
+                lo,
+                hi,
+                lo_deferred,
+            } => {
                 // clamp(val, lo, hi) = max(min(val, hi), lo).
                 emit_binary_safe(code, OpKind::Min, *dst, *val, *hi);
                 match lo_deferred {
@@ -3320,7 +3387,12 @@ impl IsaBackend for X86Backend {
         x86_64::emit_movaps(code, dst, src);
     }
 
-    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str> {
+    fn emit_store(
+        &mut self,
+        code: &mut Vec<u8>,
+        src: Reg,
+        offset: u32,
+    ) -> Result<(), &'static str> {
         x86_64::emit_movups_store_rsp(code, src, x86_redzone_disp(offset)?);
         Ok(())
     }
@@ -3346,7 +3418,10 @@ impl IsaBackend for X86Backend {
             x86_64::emit_movups_load_rsp(code, target, disp);
             target
         } else {
-            panic!("value {:?} has no register, spill slot, or rematerialize entry", vid);
+            panic!(
+                "value {:?} has no register, spill slot, or rematerialize entry",
+                vid
+            );
         }
     }
 
@@ -3440,7 +3515,10 @@ impl IsaBackend for Avx512Backend {
         X86_SCHED_NUM_REGS // same 6 allocatable (zmm4-9)
     }
 
-    fn begin(&mut self, _schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str> {
+    fn begin(
+        &mut self,
+        _schedule: &[(regalloc::ValueId, ScheduledOp)],
+    ) -> Result<(), &'static str> {
         Ok(()) // const broadcast is self-contained; no pool.
     }
 
@@ -3451,7 +3529,11 @@ impl IsaBackend for Avx512Backend {
         }
     }
 
-    fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan) -> Result<(), &'static str> {
+    fn emit_plan(
+        &mut self,
+        code: &mut Vec<u8>,
+        plan: &InstructionPlan,
+    ) -> Result<(), &'static str> {
         for r in &plan.reloads {
             Self::reload(code, r);
         }
@@ -3471,7 +3553,12 @@ impl IsaBackend for Avx512Backend {
                 // AVX-512 path. Reject loudly rather than miscompile.
                 return Err("avx512: bit-shift (exp/log lowering) not yet supported");
             }
-            ResolvedOp::Binary { op, dst, left, right } => {
+            ResolvedOp::Binary {
+                op,
+                dst,
+                left,
+                right,
+            } => {
                 // EVEX 3-operand: no two-operand hazard, emit directly.
                 // Comparisons produce a vector mask (vcmpps -> vpmovm2d).
                 if avx512::is_compare(*op) {
@@ -3484,7 +3571,13 @@ impl IsaBackend for Avx512Backend {
                 // dst holds c (setup_mov); real FMA231: dst = a*b + dst.
                 avx512::emit_fmadd_c_in_dst(code, *dst, *a, *b);
             }
-            ResolvedOp::DecomposedMulAdd { dst, a, b, c, c_deferred } => {
+            ResolvedOp::DecomposedMulAdd {
+                dst,
+                a,
+                b,
+                c,
+                c_deferred,
+            } => {
                 // dst = a*b, reload c (after the multiply if deferred), dst += c.
                 avx512::emit_binary(code, OpKind::Mul, *dst, *a, *b)?;
                 match c_deferred {
@@ -3498,11 +3591,21 @@ impl IsaBackend for Avx512Backend {
                 }
                 avx512::emit_binary(code, OpKind::Add, *dst, *dst, *c)?;
             }
-            ResolvedOp::Select { dst, if_true, if_false } => {
+            ResolvedOp::Select {
+                dst,
+                if_true,
+                if_false,
+            } => {
                 // setup_mov already placed the vector mask in dst; one vpternlogd.
                 avx512::emit_select(code, *dst, *if_true, *if_false);
             }
-            ResolvedOp::Clamp { dst, val, lo, hi, lo_deferred } => {
+            ResolvedOp::Clamp {
+                dst,
+                val,
+                lo,
+                hi,
+                lo_deferred,
+            } => {
                 // clamp(val, lo, hi) = max(min(val, hi), lo). No mask needed.
                 avx512::emit_binary(code, OpKind::Min, *dst, *val, *hi)?;
                 match lo_deferred {
@@ -3527,7 +3630,12 @@ impl IsaBackend for Avx512Backend {
         avx512::emit_mov(code, dst, src);
     }
 
-    fn emit_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) -> Result<(), &'static str> {
+    fn emit_store(
+        &mut self,
+        code: &mut Vec<u8>,
+        src: Reg,
+        offset: u32,
+    ) -> Result<(), &'static str> {
         avx512::emit_store_rsp(code, src, avx512_slot_disp(offset));
         Ok(())
     }
@@ -3551,7 +3659,10 @@ impl IsaBackend for Avx512Backend {
             avx512::emit_load_rsp(code, target, avx512_slot_disp(*offset));
             target
         } else {
-            panic!("value {:?} has no register, spill slot, or rematerialize entry", vid);
+            panic!(
+                "value {:?} has no register, spill slot, or rematerialize entry",
+                vid
+            );
         }
     }
 
@@ -4633,26 +4744,102 @@ mod tests {
         // Tolerances reflect the shared (with aarch64) minimax-polynomial
         // accuracy over a sensible input range; exact ops use tight bounds.
         // `rel_err = |jit - scalar| / (1 + |scalar|)`.
-        let unary: &[(OpKind, fn(f32) -> f32, &[f32], f32)] = &[
-            (OpKind::Sqrt, |x| x.sqrt(), &[0.25, 1.0, 2.0, 9.0, 100.0], 1e-5),
+        type UnaryCase<'a> = (OpKind, fn(f32) -> f32, &'a [f32], f32);
+        let unary: &[UnaryCase] = &[
+            (
+                OpKind::Sqrt,
+                |x| x.sqrt(),
+                &[0.25, 1.0, 2.0, 9.0, 100.0],
+                1e-5,
+            ),
             (OpKind::Abs, |x| x.abs(), &[-3.0, -0.5, 0.0, 2.5], 1e-6),
             (OpKind::Neg, |x| -x, &[-3.0, 0.5, 2.5], 1e-6),
-            (OpKind::Floor, |x| x.floor(), &[-2.3, -0.1, 0.9, 1.5, 3.99], 1e-6),
-            (OpKind::Ceil, |x| x.ceil(), &[-2.3, -0.1, 0.9, 1.5, 3.01], 1e-6),
-            (OpKind::Round, |x| x.round_ties_even(), &[-2.4, -0.4, 0.4, 1.5, 2.6], 1e-6),
-            (OpKind::Fract, |x| x - x.floor(), &[-2.3, 0.1, 0.9, 3.75], 1e-5),
+            (
+                OpKind::Floor,
+                |x| x.floor(),
+                &[-2.3, -0.1, 0.9, 1.5, 3.99],
+                1e-6,
+            ),
+            (
+                OpKind::Ceil,
+                |x| x.ceil(),
+                &[-2.3, -0.1, 0.9, 1.5, 3.01],
+                1e-6,
+            ),
+            (
+                OpKind::Round,
+                |x| x.round_ties_even(),
+                &[-2.4, -0.4, 0.4, 1.5, 2.6],
+                1e-6,
+            ),
+            (
+                OpKind::Fract,
+                |x| x - x.floor(),
+                &[-2.3, 0.1, 0.9, 3.75],
+                1e-5,
+            ),
             // sin/cos: 4-term Chebyshev — accurate well inside [-π, π].
-            (OpKind::Sin, |x| x.sin(), &[-2.0, -1.0, -0.3, 0.0, 0.5, 1.5, 2.0], 6e-3),
-            (OpKind::Cos, |x| x.cos(), &[-1.0, -0.3, 0.0, 0.5, 1.0], 1.5e-2),
-            (OpKind::Tan, |x| x.tan(), &[-1.0, -0.3, 0.0, 0.3, 1.0], 2.5e-2),
-            (OpKind::Exp, |x| x.exp(), &[-2.0, -0.5, 0.0, 1.0, 2.0, 3.0], 5e-3),
-            (OpKind::Exp2, |x| x.exp2(), &[-3.0, -0.5, 0.0, 1.0, 4.0], 5e-3),
+            (
+                OpKind::Sin,
+                |x| x.sin(),
+                &[-2.0, -1.0, -0.3, 0.0, 0.5, 1.5, 2.0],
+                6e-3,
+            ),
+            (
+                OpKind::Cos,
+                |x| x.cos(),
+                &[-1.0, -0.3, 0.0, 0.5, 1.0],
+                1.5e-2,
+            ),
+            (
+                OpKind::Tan,
+                |x| x.tan(),
+                &[-1.0, -0.3, 0.0, 0.3, 1.0],
+                2.5e-2,
+            ),
+            (
+                OpKind::Exp,
+                |x| x.exp(),
+                &[-2.0, -0.5, 0.0, 1.0, 2.0, 3.0],
+                5e-3,
+            ),
+            (
+                OpKind::Exp2,
+                |x| x.exp2(),
+                &[-3.0, -0.5, 0.0, 1.0, 4.0],
+                5e-3,
+            ),
             (OpKind::Ln, |x| x.ln(), &[0.25, 0.5, 1.0, 2.0, 10.0], 5e-3),
-            (OpKind::Log2, |x| x.log2(), &[0.25, 0.5, 1.0, 2.0, 8.0], 5e-3),
-            (OpKind::Log10, |x| x.log10(), &[0.1, 0.5, 1.0, 10.0, 100.0], 5e-3),
-            (OpKind::Atan, |x| x.atan(), &[-5.0, -0.5, -0.2, 0.0, 0.2, 0.5, 5.0], 8e-3),
-            (OpKind::Asin, |x| x.asin(), &[-0.8, -0.5, 0.0, 0.5, 0.8], 1e-2),
-            (OpKind::Acos, |x| x.acos(), &[-0.8, -0.5, 0.0, 0.5, 0.8], 1e-2),
+            (
+                OpKind::Log2,
+                |x| x.log2(),
+                &[0.25, 0.5, 1.0, 2.0, 8.0],
+                5e-3,
+            ),
+            (
+                OpKind::Log10,
+                |x| x.log10(),
+                &[0.1, 0.5, 1.0, 10.0, 100.0],
+                5e-3,
+            ),
+            (
+                OpKind::Atan,
+                |x| x.atan(),
+                &[-5.0, -0.5, -0.2, 0.0, 0.2, 0.5, 5.0],
+                8e-3,
+            ),
+            (
+                OpKind::Asin,
+                |x| x.asin(),
+                &[-0.8, -0.5, 0.0, 0.5, 0.8],
+                1e-2,
+            ),
+            (
+                OpKind::Acos,
+                |x| x.acos(),
+                &[-0.8, -0.5, 0.0, 0.5, 0.8],
+                1e-2,
+            ),
         ];
         for &(op, scalar, inputs, tol) in unary {
             let mut arena = ExprArena::new();
@@ -4677,14 +4864,23 @@ mod tests {
         use core::arch::x86_64::*;
         // Helper: compile f(X, Y) and eval at (x, y).
         unsafe fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-            let r = compile_arena_dag(arena, root).expect("compile failed");
-            let f: executable::KernelFn = r.code.as_fn();
-            let z = _mm_set1_ps(0.0);
-            _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
+            unsafe {
+                let r = compile_arena_dag(arena, root).expect("compile failed");
+                let f: executable::KernelFn = r.code.as_fn();
+                let z = _mm_set1_ps(0.0);
+                _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
+            }
         }
 
         // atan2(y, x): arena Binary(Atan2, Y, X)  (op order: src1=y, src2=x)
-        let pts = [(0.5, 2.0), (2.0, 0.5), (-0.5, 2.0), (0.5, -2.0), (-2.0, -0.5), (3.0, -0.5)];
+        let pts = [
+            (0.5, 2.0),
+            (2.0, 0.5),
+            (-0.5, 2.0),
+            (0.5, -2.0),
+            (-2.0, -0.5),
+            (3.0, -0.5),
+        ];
         {
             let mut a = ExprArena::new();
             let y = a.push_var(1);
@@ -4693,7 +4889,10 @@ mod tests {
             for &(yv, xv) in &pts {
                 let got = unsafe { run2(&a, root, xv, yv) };
                 let want = yv.atan2(xv);
-                assert!((got - want).abs() <= 1.5e-2, "atan2({yv},{xv}): {got} vs {want}");
+                assert!(
+                    (got - want).abs() <= 1.5e-2,
+                    "atan2({yv},{xv}): {got} vs {want}"
+                );
             }
         }
         // pow(X, Y)
@@ -4718,7 +4917,10 @@ mod tests {
             for &(xv, yv) in &[(3.0f32, 4.0f32), (1.0, 1.0), (0.0, 2.0)] {
                 let got = unsafe { run2(&a, root, xv, yv) };
                 let want = xv.hypot(yv);
-                assert!((got - want).abs() <= 1e-4, "hypot({xv},{yv}): {got} vs {want}");
+                assert!(
+                    (got - want).abs() <= 1e-4,
+                    "hypot({xv},{yv}): {got} vs {want}"
+                );
             }
         }
         // Min / Max
@@ -4744,7 +4946,10 @@ mod tests {
             let root = a.push_ternary(OpKind::Clamp, x, lo, hi);
             for &xv in &[-0.5f32, 0.25, 0.9, 1.7] {
                 let got = run1(&a, root, xv);
-                assert!((got - xv.clamp(0.0, 1.0)).abs() <= 1e-6, "clamp({xv})={got}");
+                assert!(
+                    (got - xv.clamp(0.0, 1.0)).abs() <= 1e-6,
+                    "clamp({xv})={got}"
+                );
             }
         }
         // Select(X >= 0, 1.0, -1.0) == signum-ish
@@ -4860,30 +5065,48 @@ mod tests {
                 let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let at = a.push_unary(OpKind::Atan, x);
-                assert!((run1(&a, at, xv) - xv.atan()).abs() <= ATAN_TOL, "atan({xv})");
+                assert!(
+                    (run1(&a, at, xv) - xv.atan()).abs() <= ATAN_TOL,
+                    "atan({xv})"
+                );
             }
             // asin/acos on [-1, 1].
             for &xv in &[-0.9f32, -0.4, 0.0, 0.4, 0.9] {
                 let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let s = a.push_unary(OpKind::Asin, x);
-                assert!((run1(&a, s, xv) - xv.asin()).abs() <= ATAN_TOL, "asin({xv})");
+                assert!(
+                    (run1(&a, s, xv) - xv.asin()).abs() <= ATAN_TOL,
+                    "asin({xv})"
+                );
 
                 let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let c = a.push_unary(OpKind::Acos, x);
-                assert!((run1(&a, c, xv) - xv.acos()).abs() <= ATAN_TOL, "acos({xv})");
+                assert!(
+                    (run1(&a, c, xv) - xv.acos()).abs() <= ATAN_TOL,
+                    "acos({xv})"
+                );
             }
             // atan2 across quadrants (y in var0, x in var1). The (1,1)/(-1,-1)…
             // cases sit at |ratio|=1, the polynomial's worst point.
-            let pts = [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0), (0.5, -2.0)];
+            let pts = [
+                (1.0f32, 1.0f32),
+                (1.0, -1.0),
+                (-1.0, -1.0),
+                (-1.0, 1.0),
+                (0.5, -2.0),
+            ];
             for &(yv, xv) in &pts {
                 let mut a = ExprArena::new();
                 let y = a.push_var(0);
                 let x = a.push_var(1);
                 let r = a.push_binary(OpKind::Atan2, y, x);
                 let got = run_xy(&a, r, yv, xv);
-                assert!((got - yv.atan2(xv)).abs() <= ATAN_TOL, "atan2({yv},{xv}) = {got}");
+                assert!(
+                    (got - yv.atan2(xv)).abs() <= ATAN_TOL,
+                    "atan2({yv},{xv}) = {got}"
+                );
             }
         }
 
@@ -4900,7 +5123,10 @@ mod tests {
                 let want = xv.sin() * xv + 1.0;
                 // sin's ~3e-3 error is scaled by |x|, so allow for that.
                 let tol = 3e-3 * (1.0 + xv.abs());
-                assert!((run1(&a, root, xv) - want).abs() <= tol, "sin(x)·x+1 @ {xv}");
+                assert!(
+                    (run1(&a, root, xv) - want).abs() <= tol,
+                    "sin(x)·x+1 @ {xv}"
+                );
             }
         }
     }
@@ -4961,8 +5187,14 @@ mod tests {
                 let want = (px * px + py * py).sqrt() - py * pz;
                 let g_sethi = run(&sethi, px, py, pz, pw);
                 let g_sched = run(&sched, px, py, pz, pw);
-                assert!((g_sethi - want).abs() <= 1e-4, "sethi {g_sethi} want {want}");
-                assert!((g_sched - want).abs() <= 1e-4, "sched {g_sched} want {want}");
+                assert!(
+                    (g_sethi - want).abs() <= 1e-4,
+                    "sethi {g_sethi} want {want}"
+                );
+                assert!(
+                    (g_sched - want).abs() <= 1e-4,
+                    "sched {g_sched} want {want}"
+                );
             }
         }
 
@@ -4984,8 +5216,8 @@ mod tests {
             }
             while terms.len() > 1 {
                 let mut next = alloc::vec::Vec::new();
-                let mut it = terms.chunks(2);
-                while let Some(pair) = it.next() {
+                let it = terms.chunks(2);
+                for pair in it {
                     if pair.len() == 2 {
                         next.push(a.push_binary(OpKind::Add, pair[0], pair[1]));
                     } else {
@@ -5037,7 +5269,10 @@ mod tests {
             for &(px, py, pz, _pw) in PTS {
                 let want = if px > 0.0 { py * py * py } else { 3.0 * pz };
                 let got = run(&sched, px, py, pz, 0.0);
-                assert!((got - want).abs() <= 1e-3, "select: ({px},{py},{pz}) got {got} want {want}");
+                assert!(
+                    (got - want).abs() <= 1e-3,
+                    "select: ({px},{py},{pz}) got {got} want {want}"
+                );
             }
         }
     }
@@ -5059,12 +5294,7 @@ mod tests {
         ) -> core::arch::x86_64::__m512;
 
         /// Run a compiled zmm kernel over 16 distinct lanes per coordinate.
-        fn run16(
-            res: &CompileResult,
-            xs: [f32; 16],
-            ys: [f32; 16],
-            zs: [f32; 16],
-        ) -> [f32; 16] {
+        fn run16(res: &CompileResult, xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
             unsafe {
                 use core::arch::x86_64::*;
                 let f: K = res.code.as_fn();
@@ -5095,7 +5325,12 @@ mod tests {
         fn check(got: [f32; 16], want: impl Fn(usize) -> f32, tag: &str) {
             for i in 0..16 {
                 let w = want(i);
-                assert!((got[i] - w).abs() <= 1e-3, "{tag} lane {i}: got {} want {}", got[i], w);
+                assert!(
+                    (got[i] - w).abs() <= 1e-3,
+                    "{tag} lane {i}: got {} want {}",
+                    got[i],
+                    w
+                );
             }
         }
 
@@ -5208,13 +5443,23 @@ mod tests {
             let allneg = [-2.0f32; 16];
             let ys = core::array::from_fn::<f32, 16, _>(|i| i as f32 * 0.5 + 1.0);
             let zs = core::array::from_fn::<f32, 16, _>(|i| 3.0 - i as f32 * 0.25);
-            check(run16(&res, allpos, ys, zs), |i| ys[i] * ys[i] * ys[i], "guard-true");
+            check(
+                run16(&res, allpos, ys, zs),
+                |i| ys[i] * ys[i] * ys[i],
+                "guard-true",
+            );
             check(run16(&res, allneg, ys, zs), |i| 3.0 * zs[i], "guard-false");
 
             let mixed = core::array::from_fn::<f32, 16, _>(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
             check(
                 run16(&res, mixed, ys, zs),
-                |i| if mixed[i] > 0.0 { ys[i] * ys[i] * ys[i] } else { 3.0 * zs[i] },
+                |i| {
+                    if mixed[i] > 0.0 {
+                        ys[i] * ys[i] * ys[i]
+                    } else {
+                        3.0 * zs[i]
+                    }
+                },
                 "guard-mixed",
             );
         }
@@ -5228,7 +5473,11 @@ mod tests {
             for (op, f, tag) in [
                 (OpKind::Floor, f32::floor as fn(f32) -> f32, "floor"),
                 (OpKind::Ceil, f32::ceil as fn(f32) -> f32, "ceil"),
-                (OpKind::Round, f32::round_ties_even as fn(f32) -> f32, "round"),
+                (
+                    OpKind::Round,
+                    f32::round_ties_even as fn(f32) -> f32,
+                    "round",
+                ),
             ] {
                 let mut a = ExprArena::new();
                 let x = a.push_var(0);

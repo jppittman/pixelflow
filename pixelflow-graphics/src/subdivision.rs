@@ -45,6 +45,7 @@ impl EigenStructure {
     /// Create eigenstructure for regular vertex (valence 4).
     ///
     /// This is the simplest case - reduces to bicubic B-spline.
+    #[must_use]
     pub fn regular() -> Self {
         Self {
             valence: 4,
@@ -56,6 +57,7 @@ impl EigenStructure {
     /// Create eigenstructure for arbitrary valence.
     ///
     /// Uses Stam's formulas for eigendecomposition.
+    #[must_use]
     pub fn for_valence(valence: usize) -> Self {
         // TODO: Implement Stam eigenanalysis
         // For now, return placeholder
@@ -119,11 +121,13 @@ impl SubdivisionPatch {
     /// Check if this patch has any extraordinary vertices.
     ///
     /// Extraordinary = valence != 4 (the regular case).
+    #[must_use]
     pub fn is_extraordinary(&self) -> bool {
         self.corner_valences.iter().any(|&v| v != 4)
     }
 
     /// Get maximum valence among corners.
+    #[must_use]
     pub fn max_valence(&self) -> usize {
         *self.corner_valences.iter().max().unwrap()
     }
@@ -132,6 +136,7 @@ impl SubdivisionPatch {
     ///
     /// For regular patches (all valences = 4), uses bicubic B-spline basis.
     /// Returns [x, y, z] where each component is a Jet3 carrying derivatives.
+    #[must_use]
     pub fn eval_limit(&self, mesh: &QuadMesh, u: Jet3, v: Jet3) -> [Jet3; 3] {
         if self.is_regular() {
             // Regular case: bicubic B-spline (16 control points)
@@ -278,11 +283,13 @@ impl SubdivisionSurface {
     }
 
     /// Get number of patches.
+    #[must_use]
     pub fn patch_count(&self) -> usize {
         self.patches.len()
     }
 
     /// Get statistics about extraordinary vertices.
+    #[must_use]
     pub fn stats(&self) -> SurfaceStats {
         let total_patches = self.patches.len();
         let extraordinary_patches = self.patches.iter().filter(|p| p.is_extraordinary()).count();
@@ -336,6 +343,8 @@ pub struct SubdivisionGeometry {
 
 impl SubdivisionGeometry {
     /// Create geometry from a patch and mesh.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         patch: SubdivisionPatch,
         mesh: &QuadMesh,
@@ -450,9 +459,9 @@ impl Manifold<Jet3_4> for SubdivisionGeometry {
         // Return valid t if in bounds, else negative (miss)
         let miss = Field::from(-1.0);
         Jet3::new(
-            in_bounds.clone().select(t_hit.val, miss),
-            in_bounds.clone().select(t_hit.dx, miss),
-            in_bounds.clone().select(t_hit.dy, miss),
+            in_bounds.select(t_hit.val, miss),
+            in_bounds.select(t_hit.dx, miss),
+            in_bounds.select(t_hit.dy, miss),
             in_bounds.select(t_hit.dz, miss),
         )
     }
@@ -499,13 +508,13 @@ f 1 2 3 4
         let p = patch.eval_limit(&mesh, u, v);
 
         // Extract values (collapse AST)
-        let x = p[0].val;
-        let y = p[1].val;
-        let z = p[2].val;
+        let _x = p[0].val;
+        let _y = p[1].val;
+        let _z = p[2].val;
 
         // For bilinear fallback, center should be roughly (0.5, 0.5, 0.0)
         // We can't easily check SIMD Field values in tests, so this is a smoke test
-        assert_eq!(patch.is_extraordinary(), true);
+        assert!(patch.is_extraordinary());
     }
 
     #[test]

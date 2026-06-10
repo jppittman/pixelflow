@@ -61,9 +61,6 @@ use pixelflow_core::combinators::{At, Select};
 use pixelflow_core::ops::compare::Lt;
 use pixelflow_core::{Field, Manifold, ManifoldExt, X, Y};
 
-/// Natural logarithm of 2, used for 2^x = exp(x * LN_2).
-const LN_2: f32 = core::f32::consts::LN_2;
-
 // ============================================================================
 // Regular Patch (Valence 4) - Standard B-Spline
 // ============================================================================
@@ -84,6 +81,7 @@ const BSPLINE_BASIS: [[f32; 4]; 4] = [
 ///
 /// Uses X as u ∈ [0,1], Y as v ∈ [0,1].
 #[inline]
+#[must_use]
 pub fn bspline_patch(
     control_points: [[f32; 3]; 16],
 ) -> (
@@ -167,6 +165,8 @@ fn bspline_axis(control_points: &[[f32; 4]; 4]) -> impl Manifold<Output = Field>
 /// - `Map` for log2/floor/pow operations on coordinates
 /// - Recursive `Select` tree for tile depth routing
 /// - Per-eigenbasis weighting (may require K separate bicubics, not combined)
+// Kept as the single-tile reference implementation; see TODOs and module docs.
+#[allow(dead_code)]
 fn axis_patch(coeffs: [[f32; 16]; 3]) -> impl Manifold<Output = Field> {
     // TODO(subdiv): Implement eigenvalue power weighting λᵢⁿ⁻¹
     // TODO(subdiv): Implement recursive tiling for (u,v) < 0.5
@@ -339,6 +339,7 @@ fn first_tile_patch(coeffs: [[f32; 16]; 3]) -> impl Manifold<Output = Field> {
 ///
 /// For most artistic use cases, this is acceptable. For CAD-quality
 /// precision near extraordinary vertices, eigenvalue weighting is needed.
+#[must_use]
 pub fn eigen_patch(
     control_points: &[[f32; 3]],
     valence: usize,
@@ -355,24 +356,45 @@ pub fn eigen_patch(
     let mut proj_y = vec![0.0f32; k];
     let mut proj_z = vec![0.0f32; k];
 
-    for i in 0..k {
-        for j in 0..k.min(control_points.len()) {
+    for (i, ((px, py), pz)) in proj_x
+        .iter_mut()
+        .zip(proj_y.iter_mut())
+        .zip(proj_z.iter_mut())
+        .enumerate()
+    {
+        for (j, cp) in control_points.iter().take(k).enumerate() {
             let w = eigen.inv_eigen(j, i); // transpose
-            proj_x[i] += w * control_points[j][0];
-            proj_y[i] += w * control_points[j][1];
-            proj_z[i] += w * control_points[j][2];
+            *px += w * cp[0];
+            *py += w * cp[1];
+            *pz += w * cp[2];
         }
     }
 
     // Precompute bicubic coefficients for each subpatch
     let mut coeffs = [[[0.0f32; 16]; 3]; 3]; // [axis][subpatch][coeff]
-    for sub in 0..3 {
-        for c in 0..16 {
-            for basis in 0..k {
+    let [coeffs_x, coeffs_y, coeffs_z] = &mut coeffs;
+    for (sub, ((cx_sub, cy_sub), cz_sub)) in coeffs_x
+        .iter_mut()
+        .zip(coeffs_y.iter_mut())
+        .zip(coeffs_z.iter_mut())
+        .enumerate()
+    {
+        for (c, ((x, y), z)) in cx_sub
+            .iter_mut()
+            .zip(cy_sub.iter_mut())
+            .zip(cz_sub.iter_mut())
+            .enumerate()
+        {
+            for (basis, ((px, py), pz)) in proj_x
+                .iter()
+                .zip(proj_y.iter())
+                .zip(proj_z.iter())
+                .enumerate()
+            {
                 let s = eigen.spline(sub, basis, c);
-                coeffs[0][sub][c] += s * proj_x[basis];
-                coeffs[1][sub][c] += s * proj_y[basis];
-                coeffs[2][sub][c] += s * proj_z[basis];
+                *x += s * px;
+                *y += s * py;
+                *z += s * pz;
             }
         }
     }
@@ -395,7 +417,7 @@ pub fn eigen_patch(
 #[inline]
 pub fn validate_eigen_domain(u: f32, v: f32) {
     // Check bounds
-    if u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 {
+    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
         panic!(
             "eigen_patch: (u={}, v={}) outside valid domain [0, 1]²",
             u, v
@@ -420,6 +442,7 @@ pub fn validate_eigen_domain(u: f32, v: f32) {
 /// Returns a manifold type - the polynomial IS the composition,
 /// not a struct that computes it.
 #[inline]
+#[must_use]
 pub fn bicubic(c: [f32; 16]) -> impl Manifold<Output = Field> {
     // Powers of Y (v): Y, Y², Y³
     let v1 = Y;
@@ -584,16 +607,16 @@ mod tests {
         // If all control points are at the SAME location,
         // the surface should evaluate to that location everywhere.
         // This tests affine invariance.
-        let control_points = [[1.0f32, 2.0, 3.0]; 16];
+        let _control_points = [[1.0f32, 2.0, 3.0]; 16];
 
         let eigen = get_eigen(4).unwrap();
         println!("K = {}", eigen.k);
 
         // Project to eigenspace
         let mut projected_x = [0.0f32; 16];
-        for i in 0..16 {
+        for (i, px) in projected_x.iter_mut().enumerate() {
             for j in 0..16 {
-                projected_x[i] += eigen.inv_eigen(i, j) * 1.0; // all x = 1.0
+                *px += eigen.inv_eigen(i, j) * 1.0; // all x = 1.0
             }
         }
         println!("Projected x: {:?}", &projected_x[..4]);
@@ -614,19 +637,19 @@ mod tests {
 
         // Check what happens if we use columns instead of rows
         let mut projected_col = [0.0f32; 16];
-        for i in 0..16 {
+        for (i, pc) in projected_col.iter_mut().enumerate() {
             for j in 0..16 {
                 // Transpose: inv_eigen[j, i] instead of inv_eigen[i, j]
-                projected_col[i] += eigen.inv_eigen(j, i) * 1.0;
+                *pc += eigen.inv_eigen(j, i) * 1.0;
             }
         }
         println!("Projected (transposed): {:?}", &projected_col[..4]);
 
         // Combine with spline coefficients using TRANSPOSED projection
         let mut final_coeffs = [0.0f32; 16];
-        for coeff_idx in 0..16 {
-            for basis in 0..16 {
-                final_coeffs[coeff_idx] += eigen.spline(0, basis, coeff_idx) * projected_col[basis];
+        for (coeff_idx, fc) in final_coeffs.iter_mut().enumerate() {
+            for (basis, pc) in projected_col.iter().enumerate() {
+                *fc += eigen.spline(0, basis, coeff_idx) * pc;
             }
         }
         println!("Final coeffs (transposed): {:?}", &final_coeffs[..4]);
@@ -643,8 +666,8 @@ mod tests {
             let mut sum_at_center = 0.0f32;
             for basis in 0..16 {
                 let mut basis_coeffs = [0.0f32; 16];
-                for coeff_idx in 0..16 {
-                    basis_coeffs[coeff_idx] = eigen.spline(subpatch, basis, coeff_idx);
+                for (coeff_idx, bc) in basis_coeffs.iter_mut().enumerate() {
+                    *bc = eigen.spline(subpatch, basis, coeff_idx);
                 }
                 let basis_poly = bicubic(basis_coeffs);
                 sum_at_center += eval_scalar(&basis_poly, 0.5, 0.5);

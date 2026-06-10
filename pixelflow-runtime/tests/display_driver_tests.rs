@@ -241,7 +241,7 @@ fn modifiers_can_combine() {
 fn modifiers_clone_and_copy() {
     let mods1 = Modifiers::CONTROL | Modifiers::SUPER;
     let mods2 = mods1; // Copy
-    let mods3 = mods1.clone(); // Clone
+    let mods3 = mods1; // Clone
     assert_eq!(mods1, mods2);
     assert_eq!(mods1, mods3);
 }

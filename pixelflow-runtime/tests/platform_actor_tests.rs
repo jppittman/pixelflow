@@ -103,9 +103,7 @@ fn test_platform_actor_delegation() {
         .expect("handle_data should succeed");
 
     // Test Park
-    actor
-        .park(SystemStatus::Busy)
-        .expect("park should succeed");
+    actor.park(SystemStatus::Busy).expect("park should succeed");
 
     // 4. Verify Log
     let log = log_ref.lock().unwrap();

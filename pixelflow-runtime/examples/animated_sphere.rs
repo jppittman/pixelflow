@@ -120,7 +120,7 @@ fn build_scene_at_time(
     t: f32,
     width: u32,
     height: u32,
-) -> impl Manifold<Output = Discrete> + Clone + Sync + Send {
+) -> impl Manifold<Output = Discrete> + Clone {
     // Compute the animated X offset
     let x_offset = (t * FREQUENCY).sin() * AMPLITUDE;
     let cx = BASE_CENTER.0 + x_offset;
@@ -131,7 +131,7 @@ fn build_scene_at_time(
     let color_cube = ColorCube::default();
     let world = ColorSurface {
         geometry: plane(-1.0),
-        material: ColorChecker::new(color_cube.clone()),
+        material: ColorChecker::new(color_cube),
         background: ColorSky::new(color_cube),
     };
 
@@ -143,9 +143,7 @@ fn build_scene_at_time(
 
     let scene = ColorSurface {
         geometry: sphere,
-        material: ColorReflect {
-            inner: world.clone(),
-        },
+        material: ColorReflect { inner: world },
         background: world,
     };
 

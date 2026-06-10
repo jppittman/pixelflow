@@ -45,10 +45,10 @@ fn test_log2_known_values() {
         (8.0, 3.0),
         (0.5, -1.0),
         (0.25, -2.0),
-        (1.5, 0.58496250072), // More precise reference
-        (3.0, 1.58496250072),
+        (1.5, 0.584_962_5), // More precise reference
+        (3.0, 1.584_962_5),
         (10.0, std::f32::consts::LOG2_10),
-        (100.0, 6.64385618977),
+        (100.0, 6.643_856),
         (std::f32::consts::E, std::f32::consts::LOG2_E), // log2(e)
     ];
 
@@ -155,7 +155,18 @@ fn test_log2_exp2_roundtrip() {
     // log2(2^x) should equal x (within floating point precision)
     // Errors compound in roundtrip, so threshold is 2e-4
     let test_values = [
-        -10.0, -5.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, std::f32::consts::PI, 5.0, 10.0,
+        -10.0,
+        -5.5,
+        -1.0,
+        -0.5,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        std::f32::consts::PI,
+        5.0,
+        10.0,
     ];
 
     for x in test_values {

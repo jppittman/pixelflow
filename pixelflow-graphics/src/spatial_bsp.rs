@@ -95,6 +95,7 @@ impl<L> SpatialBSP<L> {
     ///
     /// Items are split recursively on the larger dimension until each
     /// region contains a single leaf.
+    #[must_use]
     pub fn from_positioned(items: Vec<Positioned<L>>) -> Self {
         if items.is_empty() {
             return Self {
@@ -212,11 +213,13 @@ impl<L> SpatialBSP<L> {
     }
 
     /// Number of interior nodes.
+    #[must_use]
     pub fn interior_count(&self) -> usize {
         self.interiors.len()
     }
 
     /// Number of leaf nodes.
+    #[must_use]
     pub fn leaf_count(&self) -> usize {
         self.leaves.len()
     }
@@ -258,6 +261,7 @@ where
 {
     /// Traverse the BSP tree, returning the blended result.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     fn traverse(&self, idx: usize, x: Field, y: Field, z: Field, w: Field) -> Discrete {
         let node = &self.interiors[idx];
 
@@ -293,6 +297,7 @@ where
 
     /// Evaluate a child node (either interior or leaf).
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     fn eval_child(&self, child: NodeRef, x: Field, y: Field, z: Field, w: Field) -> Discrete {
         match child {
             NodeRef::Interior(i) => self.traverse(i as usize, x, y, z, w),

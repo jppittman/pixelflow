@@ -10,6 +10,7 @@ pub struct Image {
 
 impl Image {
     /// Create a new image with the given dimensions.
+    #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
         Self {
             width,

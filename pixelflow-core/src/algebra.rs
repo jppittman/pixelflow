@@ -559,21 +559,21 @@ mod tests {
 
     #[test]
     fn test_bool_algebra() {
-        assert_eq!(bool::zero(), false);
-        assert_eq!(bool::one(), true);
+        assert!(!bool::zero());
+        assert!(bool::one());
 
         // Boolean ring (OR/AND)
-        assert_eq!(false.add(false), false);
-        assert_eq!(false.add(true), true);
-        assert_eq!(true.add(false), true);
-        assert_eq!(true.add(true), true);
+        assert!(!false.add(false));
+        assert!(false.add(true));
+        assert!(true.add(false));
+        assert!(true.add(true));
 
-        assert_eq!(false.mul(false), false);
-        assert_eq!(false.mul(true), false);
-        assert_eq!(true.mul(true), true);
+        assert!(!false.mul(false));
+        assert!(!false.mul(true));
+        assert!(true.mul(true));
 
-        assert_eq!(true.neg(), false);
-        assert_eq!(false.neg(), true);
+        assert!(!true.neg());
+        assert!(false.neg());
     }
 
     #[test]

@@ -54,12 +54,15 @@ pub enum SymbolKind {
 #[derive(Debug, Clone)]
 pub struct Symbol {
     /// The identifier name.
+    #[allow(dead_code)]
     pub name: Ident,
     /// What kind of symbol this is.
     pub kind: SymbolKind,
     /// The type (if known). Intrinsics have implicit types.
+    #[allow(dead_code)]
     pub ty: Option<Type>,
     /// Where the symbol was defined.
+    #[allow(dead_code)]
     pub span: Span,
 }
 
@@ -159,14 +162,15 @@ impl SymbolTable {
     pub fn is_intrinsic(&self, name: &str) -> bool {
         self.symbols
             .get(name)
-            .map_or(false, |s| s.kind == SymbolKind::Intrinsic)
+            .is_some_and(|s| s.kind == SymbolKind::Intrinsic)
     }
 
     /// Check if a name is a captured parameter.
+    #[cfg(test)]
     pub fn is_parameter(&self, name: &str) -> bool {
         self.symbols
             .get(name)
-            .map_or(false, |s| s.kind == SymbolKind::Parameter)
+            .is_some_and(|s| s.kind == SymbolKind::Parameter)
     }
 
     /// Get all symbol names (for typo suggestions in error messages).

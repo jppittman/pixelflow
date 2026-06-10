@@ -7,6 +7,7 @@
 ///
 /// Each byte contains two pixels: high nibble first, low nibble second.
 /// Expansion: nibble * 17 maps [0-15] to [0-255].
+#[must_use]
 pub fn ref_unpack_4bit(packed: &[u8], width: usize, height: usize) -> Vec<u8> {
     let pixel_count = width * height;
     let mut result = Vec::with_capacity(pixel_count);
@@ -33,6 +34,7 @@ fn read_4bpp_pixel(packed: &[u8], x: usize, y: usize, stride: usize) -> u8 {
     ref_gather_4bit_single(packed, x, y, stride)
 }
 
+#[must_use]
 pub fn ref_gather_4bit_single(packed: &[u8], x: usize, y: usize, stride: usize) -> u8 {
     let byte_idx = y * stride + (x / 2);
     let is_odd = x % 2 == 1;
@@ -50,6 +52,8 @@ pub fn ref_gather_4bit_single(packed: &[u8], x: usize, y: usize, stride: usize) 
 /// Bilinear interpolation (scalar float reference).
 ///
 /// Samples from a 2x2 neighborhood with fractional coordinates.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn ref_bilinear_interpolate(p00: u8, p10: u8, p01: u8, p11: u8, dx: f32, dy: f32) -> u8 {
     let top = p00 as f32 * (1.0 - dx) + p10 as f32 * dx;
     let bottom = p01 as f32 * (1.0 - dx) + p11 as f32 * dx;
@@ -58,6 +62,8 @@ pub fn ref_bilinear_interpolate(p00: u8, p10: u8, p01: u8, p11: u8, dx: f32, dy:
 }
 
 /// Sample from 4-bit packed image with bilinear filtering (scalar reference).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn ref_sample_4bit_bilinear(
     packed: &[u8],
     width: usize,
@@ -89,6 +95,7 @@ pub fn ref_sample_4bit_bilinear(
 /// Alpha blend two ARGB colors (scalar reference).
 ///
 /// Formula: (fg * alpha + bg * (256 - alpha)) >> 8
+#[must_use]
 pub fn ref_blend_alpha_argb(fg: u32, bg: u32, alpha: u32) -> u32 {
     let a_fg = ((fg >> 24) & 0xFF) as u16;
     let r_fg = ((fg >> 16) & 0xFF) as u16;
@@ -119,11 +126,13 @@ pub fn ref_blend_alpha_argb(fg: u32, bg: u32, alpha: u32) -> u32 {
 }
 
 /// Saturating add (scalar reference).
+#[must_use]
 pub fn ref_saturating_add_u32(a: u32, b: u32) -> u32 {
     a.saturating_add(b)
 }
 
 /// Saturating subtract (scalar reference).
+#[must_use]
 pub fn ref_saturating_sub_u32(a: u32, b: u32) -> u32 {
     a.saturating_sub(b)
 }

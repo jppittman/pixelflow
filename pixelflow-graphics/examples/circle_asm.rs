@@ -8,6 +8,7 @@ use std::hint::black_box;
 /// Circle kernel: (x-cx)^2 + (y-cy)^2 < r^2 ? 1.0 : 0.0
 /// This exercises Field mul, add, sub, and select
 #[inline(never)]
+#[must_use]
 pub fn circle_kernel(x: Field, y: Field) -> Field {
     let cx = 128.0f32;
     let cy = 128.0f32;

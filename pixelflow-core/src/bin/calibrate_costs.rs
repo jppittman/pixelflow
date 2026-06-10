@@ -295,7 +295,7 @@ fn backend_name() -> &'static str {
         not(target_feature = "avx512f")
     ))]
     {
-        return "SSE2";
+        "SSE2"
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]

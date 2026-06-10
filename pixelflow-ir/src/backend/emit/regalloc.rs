@@ -48,6 +48,7 @@ pub struct InterferenceGraph {
 
 impl InterferenceGraph {
     /// Create an empty interference graph.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -106,6 +107,7 @@ impl InterferenceGraph {
     }
 
     /// Get the degree of a value (number of interferences).
+    #[must_use]
     pub fn degree(&self, v: ValueId) -> usize {
         let idx = v.0 as usize;
         if idx < self.capacity {
@@ -125,11 +127,13 @@ impl InterferenceGraph {
         }
     }
 
+    #[must_use]
     pub fn values(&self) -> &[ValueId] {
         &self.values
     }
 
     /// Get neighbors of a value.
+    #[must_use]
     pub fn neighbors(&self, v: ValueId) -> &[ValueId] {
         let idx = v.0 as usize;
         if idx < self.capacity {
@@ -140,12 +144,14 @@ impl InterferenceGraph {
     }
 
     /// Check if a value is pre-colored.
+    #[must_use]
     pub fn is_precolored(&self, v: ValueId) -> bool {
         let idx = v.0 as usize;
         idx < self.capacity && self.precolored[idx].is_some()
     }
 
     /// Get the pre-assigned register for a value, if any.
+    #[must_use]
     pub fn precolor_of(&self, v: ValueId) -> Option<Reg> {
         let idx = v.0 as usize;
         if idx < self.capacity {
@@ -156,11 +162,13 @@ impl InterferenceGraph {
     }
 
     /// Number of values in the graph.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
     /// Check if graph is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
@@ -189,6 +197,7 @@ pub struct RegAllocation {
 /// * `graph` - The interference graph
 /// * `num_regs` - Number of available registers
 /// * `scratch_base` - First scratch register index
+#[must_use]
 pub fn color_graph(graph: &InterferenceGraph, num_regs: u8, scratch_base: u8) -> RegAllocation {
     // Dense assignment Vec: assignment[vid.0] = Some(Reg) if colored.
     let capacity = graph.capacity;
@@ -407,6 +416,7 @@ where
 ///
 /// This is O(n * k) where n = schedule length, k = number of registers.
 /// For our use case (k=22 scratch regs), this is effectively O(n).
+#[must_use]
 pub fn linear_scan(
     schedule: &[(ValueId, super::ScheduledOp)],
     _uses_map: &[Vec<ValueId>],
