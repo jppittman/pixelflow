@@ -14,7 +14,7 @@ use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
 use std::sync::Arc;
 
-const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansMono-Regular.ttf");
+const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
 // =============================================================================
 // Regression: SIMD mask AND must use `&` not `*`
@@ -29,12 +29,18 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansMono-Regular.ttf");
 fn regression_mask_and_not_multiply() {
     // Create a 400x400 square from (100,100) to (500,500)
     // Use Geometry with lines (which now produce smooth AA coverage)
-    let lines: Vec<Line<LineKernel>> = vec![
-        make_line([[100.0, 100.0], [500.0, 100.0]]).unwrap(), // bottom
-        make_line([[500.0, 100.0], [500.0, 500.0]]).unwrap(), // right
-        make_line([[500.0, 500.0], [100.0, 500.0]]).unwrap(), // top
-        make_line([[100.0, 500.0], [100.0, 100.0]]).unwrap(), // left
-    ];
+    // Horizontal edges (bottom/top) contribute nothing to the winding number,
+    // so `make_line` correctly rejects them (returns None). The square's inside
+    // test is fully determined by the two vertical edges.
+    let lines: Vec<Line<LineKernel>> = [
+        make_line([[100.0, 100.0], [500.0, 100.0]]), // bottom (horizontal → None)
+        make_line([[500.0, 100.0], [500.0, 500.0]]), // right
+        make_line([[500.0, 500.0], [100.0, 500.0]]), // top (horizontal → None)
+        make_line([[100.0, 500.0], [100.0, 100.0]]), // left
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let geo: Geometry<Line<LineKernel>, Quad<QuadKernel>> = Geometry {
         lines: Arc::from(lines),
         quads: Arc::from(vec![]),
@@ -104,24 +110,26 @@ fn regression_line_x_intersection_test() {
     };
     let lifted = Grayscale(geo);
 
-    // Points to the left (x < 500) should contribute winding (high coverage)
-    let mut left_pixels = [0u32; PARALLELISM];
-    materialize_discrete(&lifted, 100.0, 300.0, &mut left_pixels);
-    let left_value = left_pixels[0] & 0xFF;
-    assert!(
-        left_value > 200,
-        "Point left of line should get high contribution, got {}",
-        left_value
-    );
-
-    // Points well to the right (x >= 500) should have low contribution
+    // Winding uses left-ray casting: a point contributes when the segment's
+    // crossing lies at or to its left (X >= x_int). For this vertical segment
+    // at x=500, that means points to the RIGHT register the crossing and get
+    // full coverage; points to the LEFT see no crossing.
     let mut right_pixels = [0u32; PARALLELISM];
     materialize_discrete(&lifted, 600.0, 300.0, &mut right_pixels);
     let right_value = right_pixels[0] & 0xFF;
     assert!(
-        right_value < 50,
-        "Point right of line should get low contribution, got {}",
+        right_value > 200,
+        "Point right of line should get high contribution, got {}",
         right_value
+    );
+
+    let mut left_pixels = [0u32; PARALLELISM];
+    materialize_discrete(&lifted, 100.0, 300.0, &mut left_pixels);
+    let left_value = left_pixels[0] & 0xFF;
+    assert!(
+        left_value < 50,
+        "Point left of line should get low contribution, got {}",
+        left_value
     );
 }
 
