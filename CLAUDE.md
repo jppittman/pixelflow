@@ -39,13 +39,13 @@ Cargo workspace with 12 member crates:
 | Crate | Purpose |
 |-------|---------|
 | `pixelflow-core` | SIMD algebra. `Field`, `Manifold`, coordinate variables, ops. Multi-backend (AVX-512/SSE2/NEON/scalar). Edition 2024. |
-| `pixelflow-compiler` | Proc-macro compiler: `kernel!` macro, lexer, parser, sema, AST optimization, codegen. Edition 2024. |
-| `pixelflow-ir` | Shared IR. `ExprArena` (sole IR), OpKind enum, backend execution traits, JIT manifold. |
+| `pixelflow-compiler` | Proc-macro compiler: `kernel!` / `kernel_jit!` macros, lexer, parser, sema, AST optimization, monomorphizing + JIT codegen backends. Edition 2024. |
+| `pixelflow-ir` | Shared IR. `ExprArena` (sole IR), `OpKind` enum (incl. `Dwrt` autodiff op), backend execution traits, `JitManifold` (executable code). |
 | `pixelflow-graphics` | Font loading (TTF, SDF), colors (`Rgba8`, `Color`), rasterization, antialiasing, shapes. |
 | `pixelflow-ml` | Neural networks for compiler optimization. NNUE training, HCE extraction, e-graph training. |
 | `pixelflow-search` | E-graph optimization. Rewrite rules, saturation, cost extraction, NNUE-guided search. |
 | `pixelflow-pipeline` | Training orchestrator. Self-play, unified backward pass, critic server, hyperparameter sweep. |
-| `pixelflow-runtime` | Display drivers (macOS Cocoa, headless, Metal, Web WASM), input handling, vsync, render pool. |
+| `pixelflow-runtime` | Display drivers (headless, Metal, Web WASM) + platform layers (macOS Cocoa, Linux X11), input handling, vsync, render pool, engine troupe. |
 | `actor-scheduler` | Priority channels with `troupe!` macro. Control > Management > Data lanes. |
 | `actor-scheduler-macros` | Procedural macros for actor system. |
 | `core-term` | Terminal application: PTY management, ANSI processing, terminal emulator, key translation. |
@@ -84,6 +84,31 @@ The compiler uses e-graphs (equality graphs) to find optimal instruction sequenc
 3. **Extract** minimum-cost implementation using NNUE-guided search
 
 NNUE cost model is inspired by Stockfish: HalfEP features with incremental updates, making evaluation O(rewrite_size).
+
+#### Codegen Backends
+
+After optimization, an `AnalyzedKernel` is lowered through one of two backends:
+
+- **Monomorphizing combinator backend** (`codegen/`): emits a fused combinator
+  tree that LLVM monomorphizes into a SIMD kernel with no runtime dispatch. This
+  is the classic path and the default for `kernel!`.
+- **JIT backend** (`jit_backend.rs`): lowers the optimized body to an
+  `ExprArena` DAG and emits code that JIT-compiles the DAG at runtime into an
+  `ExecutableCode`/`JitManifold` (pixelflow-ir), bypassing LLVM. `kernel_jit!`
+  always routes here; `kernel!` routes here for JIT-eligible kernels (see
+  `is_jit_eligible`) and falls back to the combinator backend otherwise.
+
+#### Symbolic Differentiation (autodiff)
+
+Autodiff is a single IR operator, `Dwrt(expr, var)` (`OpKind::Dwrt`); the intended
+author surface is `D(expr, var)` (not yet wired into the `kernel!` frontend — the
+operator currently lives at the IR/e-graph level). The chain rule is one e-graph
+rewrite that expands a `Dwrt` node one step toward the leaves; equality saturation
+runs it to fixpoint and the residual arithmetic is optimized by the ordinary
+algebra/FMA rules in the *same* e-graph — so there is no phase-ordering problem
+between differentiation and fusion. A `Dwrt` that survives saturation is priced
+prohibitively and rejected loudly at lowering (the jet fallback is not yet wired).
+See `pixelflow-search/src/egraph/derivative.rs`.
 
 ### ExprArena
 
@@ -169,6 +194,20 @@ let unit_circle = circle(0.0, 0.0, 1.0);
 ```
 
 Use `kernel_raw!` to skip optimization (for benchmarking exact expression forms).
+
+### JIT-Compiled Kernels
+
+`kernel_jit!` has the same syntax as `kernel!` but always lowers through the JIT
+backend (runtime DAG compilation, bypassing LLVM). The only difference between
+`kernel!` and `kernel_jit!` is the backend; both run identical optimization.
+
+```rust
+use pixelflow_compiler::kernel_jit;
+use pixelflow_core::{X, Y};
+
+let builder = kernel_jit!(|cx: f32, r: f32| (X - cx) * r);
+let manifold = builder(2.0, 3.0);
+```
 
 ### Composing Manifolds
 
