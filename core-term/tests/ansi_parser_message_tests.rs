@@ -30,7 +30,7 @@ impl Actor<Vec<u8>, (), ()> for RealParserActor {
 
         let commands = self.parser.process_bytes(&data);
         if !commands.is_empty() {
-            let _ = self.cmd_tx.send(commands);
+            self.cmd_tx.send(commands).ok();
         }
         Ok(())
     }

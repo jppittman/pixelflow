@@ -57,7 +57,7 @@ impl Actor<Vec<u8>, (), ()> for TestParserActor {
         }
 
         if !commands.is_empty() {
-            let _ = self.output_tx.send(commands);
+            self.output_tx.send(commands).ok();
         }
         Ok(())
     }
@@ -290,9 +290,9 @@ impl Actor<TestEngineData, TestEngineControl, TestEngineManagement> for TestTerm
             TestEngineControl::Resize(width, height) => {
                 self.resize_count.fetch_add(1, Ordering::SeqCst);
                 // In real app, this would update terminal dimensions
-                let _ = self
-                    .pty_output_tx
-                    .send(format!("RESIZE:{}x{}", width, height).into_bytes());
+                self.pty_output_tx
+                    .send(format!("RESIZE:{}x{}", width, height).into_bytes())
+                    .ok();
             }
             TestEngineControl::Close => {
                 // Handle close
@@ -305,7 +305,7 @@ impl Actor<TestEngineData, TestEngineControl, TestEngineManagement> for TestTerm
         match mgmt {
             TestEngineManagement::KeyPress(c) => {
                 self.keypress_count.fetch_add(1, Ordering::SeqCst);
-                let _ = self.pty_output_tx.send(vec![c as u8]);
+                self.pty_output_tx.send(vec![c as u8]).ok();
             }
             TestEngineManagement::SpecialKey(key) => {
                 self.keypress_count.fetch_add(1, Ordering::SeqCst);
@@ -318,7 +318,7 @@ impl Actor<TestEngineData, TestEngineControl, TestEngineManagement> for TestTerm
                     _ => vec![],
                 };
                 if !bytes.is_empty() {
-                    let _ = self.pty_output_tx.send(bytes);
+                    self.pty_output_tx.send(bytes).ok();
                 }
             }
         }
@@ -579,7 +579,7 @@ fn multi_actor_chain_roundtrip() {
                 })
                 .collect();
             if !text.is_empty() {
-                let _ = self.output_tx.send(text);
+                self.output_tx.send(text).ok();
             }
             Ok(())
         }
@@ -680,7 +680,7 @@ fn roundtrip_handles_actor_panic_gracefully() {
 
     // Send messages
     for i in 1..=5 {
-        let _ = tx.send(Message::Data(format!("msg{}", i)));
+        tx.send(Message::Data(format!("msg{}", i))).ok();
     }
 
     thread::sleep(Duration::from_millis(100));

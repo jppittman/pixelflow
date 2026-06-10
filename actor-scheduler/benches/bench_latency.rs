@@ -22,13 +22,13 @@ impl Actor<(), (), ()> for LatencyActor {
 
     fn handle_control(&mut self, _: ()) -> HandlerResult {
         // Immediately signal completion
-        let _ = self.response_tx.send(());
+        self.response_tx.send(()).ok();
         Ok(())
     }
 
     fn handle_management(&mut self, _: ()) -> HandlerResult {
         // Immediately signal completion
-        let _ = self.response_tx.send(());
+        self.response_tx.send(()).ok();
         Ok(())
     }
 
@@ -99,7 +99,7 @@ fn bench_control_latency_under_load(c: &mut Criterion) {
         let stop_clone = stop.clone();
         let flooder = thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
-                let _ = tx_data.send(Message::Data(()));
+                tx_data.send(Message::Data(())).ok();
             }
         });
 
@@ -181,7 +181,7 @@ fn bench_management_latency_under_load(c: &mut Criterion) {
         let stop_clone = stop.clone();
         let flooder = thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
-                let _ = tx_control.send(Message::Control(()));
+                tx_control.send(Message::Control(())).ok();
             }
         });
 

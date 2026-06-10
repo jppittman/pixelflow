@@ -4055,13 +4055,13 @@ mod tests {
     #[test]
     fn test_resolve_const() {
         let (assign, spills, remat) = make_maps(&[(0, 6)], &[]);
-        let op = ScheduledOp::Const(3.14);
+        let op = ScheduledOp::Const(core::f32::consts::PI);
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
         assert_eq!(
             plan.op,
             ResolvedOp::LoadConst {
                 dst: Reg(6),
-                val_bits: 3.14f32.to_bits()
+                val_bits: core::f32::consts::PI.to_bits()
             }
         );
     }

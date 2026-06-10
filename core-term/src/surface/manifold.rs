@@ -345,7 +345,8 @@ mod tests {
         rasterize(&grid, &mut frame, 1);
 
         // Check pixel at (4, 0) - should be in first cell (0,0) - white
-        let pixel_index = 0 * 8 + 4; // row 0, col 4
+        let (row, col) = (0usize, 4usize);
+        let pixel_index = row * 8 + col;
         let r = frame.data[pixel_index].r();
         assert!(r > 200, "Expected white, got r={}", r);
     }

@@ -35,7 +35,7 @@ pub trait Compounds: Primitives {
         // Polynomial approximation for 2^xf on [0, 1)
         // Coefficients from minimax fit
         let c0 = Self::splat(1.0);
-        let c1 = Self::splat(0.6931471805599453); // ln(2)
+        let c1 = Self::splat(core::f32::consts::LN_2); // ln(2)
         let c2 = Self::splat(0.24022650695910071);
         let c3 = Self::splat(0.05550410866482157);
         let c4 = Self::splat(0.009618129107628477);
@@ -78,7 +78,7 @@ pub trait Compounds: Primitives {
         // Polynomial for log2(1+x) on [0, 1)
         let x = self * self.recip_approx() - Self::splat(1.0); // normalize to [0, 1)
 
-        let c1 = Self::splat(1.4426950408889634); // 1/ln(2)
+        let c1 = Self::splat(core::f32::consts::LOG2_E); // 1/ln(2)
         let c2 = Self::splat(-0.7213475204444817);
         let c3 = Self::splat(0.4808983469629878);
         let c4 = Self::splat(-0.3606737602222408);
@@ -94,21 +94,21 @@ pub trait Compounds: Primitives {
     /// Natural exponential: e^x.
     #[inline(always)]
     fn exp(self) -> Self {
-        const LOG2_E: f32 = 1.4426950408889634;
+        const LOG2_E: f32 = core::f32::consts::LOG2_E;
         (self * Self::splat(LOG2_E)).exp2()
     }
 
     /// Natural logarithm: ln(x).
     #[inline(always)]
     fn ln(self) -> Self {
-        const LN_2: f32 = 0.6931471805599453;
+        const LN_2: f32 = core::f32::consts::LN_2;
         self.log2() * Self::splat(LN_2)
     }
 
     /// Base-10 logarithm.
     #[inline(always)]
     fn log10(self) -> Self {
-        const LOG10_2: f32 = 0.30102999566398120;
+        const LOG10_2: f32 = core::f32::consts::LOG10_2;
         self.log2() * Self::splat(LOG10_2)
     }
 
@@ -137,7 +137,7 @@ pub trait Compounds: Primitives {
         // sin(π*t) ≈ π*t * (1 - t²*(c3 + t²*(c5 + t²*c7)))
         let t2 = t * t;
 
-        let c1 = Self::splat(3.14159265358979); // π
+        let c1 = Self::splat(core::f32::consts::PI); // π
         let c3 = Self::splat(-5.16771278004997);
         let c5 = Self::splat(2.55016403987734);
         let c7 = Self::splat(-0.599264528932149);

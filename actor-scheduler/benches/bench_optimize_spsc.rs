@@ -208,11 +208,11 @@ impl<D, C, M> SpscHandle<D, C, M> {
     }
 
     fn send_shutdown(&self) {
-        let _ = self.tx_doorbell.send(System::Shutdown);
+        self.tx_doorbell.send(System::Shutdown).ok();
     }
 
     fn wake(&self) {
-        let _ = self.tx_doorbell.try_send(System::Wake);
+        self.tx_doorbell.try_send(System::Wake).ok();
     }
 }
 
@@ -427,11 +427,11 @@ impl Actor<(), (), ()> for LatencyActor {
         Ok(())
     }
     fn handle_control(&mut self, _: ()) -> HandlerResult {
-        let _ = self.response_tx.send(());
+        self.response_tx.send(()).ok();
         Ok(())
     }
     fn handle_management(&mut self, _: ()) -> HandlerResult {
-        let _ = self.response_tx.send(());
+        self.response_tx.send(()).ok();
         Ok(())
     }
     fn park(&mut self, h: SystemStatus) -> Result<ActorStatus, HandlerError> {
@@ -603,13 +603,13 @@ fn measure_fairness_under_flood(params: &SchedulerParams) -> f64 {
     let sf = stop.clone();
     let flooder = thread::spawn(move || {
         while !sf.load(Ordering::Relaxed) {
-            let _ = flood_handle.send_control(());
+            flood_handle.send_control(()).ok();
         }
     });
 
     thread::sleep(Duration::from_millis(2));
     for i in 0..data_target {
-        let _ = data_handle.send_data(i);
+        data_handle.send_data(i).ok();
     }
     thread::sleep(Duration::from_millis(15));
 
@@ -638,7 +638,7 @@ fn measure_latency_under_load(params: &SchedulerParams) -> f64 {
             Ok(())
         }
         fn handle_control(&mut self, _: ()) -> HandlerResult {
-            let _ = self.response_tx.send(());
+            self.response_tx.send(()).ok();
             Ok(())
         }
         fn handle_management(&mut self, _: ()) -> HandlerResult {
@@ -669,7 +669,7 @@ fn measure_latency_under_load(params: &SchedulerParams) -> f64 {
     let data_sender = thread::spawn(move || {
         let mut i = 0i32;
         while !sf.load(Ordering::Relaxed) {
-            let _ = data_handle.send_data(i);
+            data_handle.send_data(i).ok();
             i = i.wrapping_add(1);
         }
     });
@@ -712,7 +712,7 @@ fn measure_burst_recovery(params: &SchedulerParams) -> f64 {
             Ok(())
         }
         fn handle_control(&mut self, _: ()) -> HandlerResult {
-            let _ = self.response_tx.send(());
+            self.response_tx.send(()).ok();
             Ok(())
         }
         fn handle_management(&mut self, _: ()) -> HandlerResult {

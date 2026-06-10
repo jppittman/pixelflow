@@ -62,7 +62,7 @@ use pixelflow_core::ops::compare::Lt;
 use pixelflow_core::{Field, Manifold, ManifoldExt, X, Y};
 
 /// Natural logarithm of 2, used for 2^x = exp(x * LN_2).
-const LN_2: f32 = 0.6931471805599453;
+const LN_2: f32 = core::f32::consts::LN_2;
 
 // ============================================================================
 // Regular Patch (Valence 4) - Standard B-Spline
