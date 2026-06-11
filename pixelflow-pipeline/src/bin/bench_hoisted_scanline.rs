@@ -292,7 +292,7 @@ fn main() {
     };
 
     #[cfg(not(target_arch = "aarch64"))]
-    let (_scanline_ns_pixel, _scanline_ns_frame, scanline_first, scanline_last) = {
+    let (scanline_ns_pixel, scanline_ns_frame, scanline_first, scanline_last) = {
         println!("  [SKIP] Hoisted scanline JIT not implemented for this architecture");
         (0.0f64, 0.0f64, per_pixel_first, per_pixel_last)
     };

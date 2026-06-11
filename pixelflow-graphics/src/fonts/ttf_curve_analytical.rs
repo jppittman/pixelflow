@@ -11,7 +11,7 @@
 //! abs().min(1.0) to convert winding to inside/outside coverage.
 
 use pixelflow_compiler::kernel;
-use pixelflow_core::{Field, Manifold, ManifoldExt};
+use pixelflow_core::{Field, Manifold, ManifoldExt, W, X, Y, Z};
 
 type Field4 = (Field, Field, Field, Field);
 

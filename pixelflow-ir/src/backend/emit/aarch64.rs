@@ -772,7 +772,7 @@ pub fn emit_hypot_builtin(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
 /// Emit unary operation - dispatches to appropriate instruction(s)
 pub(crate) fn emit_unary(
     code: &mut Vec<u8>,
-    _pool: &mut super::ConstPool,
+    pool: &mut super::ConstPool,
     op: OpKind,
     dst: Reg,
     src: Reg,
