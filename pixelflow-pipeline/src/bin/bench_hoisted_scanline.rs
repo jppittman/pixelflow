@@ -116,6 +116,7 @@ unsafe impl Sync for JitWrapper {}
 /// The inner loop mirrors FrameLattice::collapse() -- scanline eval + store to
 /// a flat f32 buffer -- so the comparison is apples-to-apples.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
 fn bench_scanline_eval(
     scanline_jit: &pixelflow_ir::ScanlineJitManifold,
     width: usize,

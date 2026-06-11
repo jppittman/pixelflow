@@ -29,6 +29,7 @@ impl JitManifold {
     ///
     /// The caller must ensure the SIMD types match the platform ABI that the
     /// emitter generated code for (ARM64 NEON: `float32x4_t`).
+    #[must_use]
     #[inline(always)]
     pub unsafe fn call(
         &self,
@@ -135,6 +136,7 @@ impl ScanlineJitManifold {
     /// # Panics
     ///
     /// Panics if `output.len() < xs.len()`.
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     pub unsafe fn eval_scanline(
         &self,

@@ -280,6 +280,9 @@ fn benchmark_exec_code(
             let median_total = times[TIMED_RUNS / 2];
             let ns = median_total as f64 / (INNER_ITERS * repeat_batches) as f64;
 
+            // `return` is required: this aarch64 block is syntactically followed
+            // by the cfg'd-out x86_64/fallback blocks, so it is not a tail expr.
+            #[allow(clippy::needless_return)]
             return validate_median(ns).map(|ns| BenchResult { ns, output });
         }
     }

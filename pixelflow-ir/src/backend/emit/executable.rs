@@ -434,6 +434,10 @@ pub type ScanlineKernelFn = extern "C" fn(
 // check; the AVX-512 path is covered by the `avx512` tests in `mod.rs`.
 #[cfg(all(test, not(target_feature = "avx512f")))]
 mod tests {
+    // These tests hand-assemble instruction words as `base | Rd | (Rn << 5) | ...`;
+    // the `| 0` / `(0 << 5)` terms document zero register fields on purpose.
+    #![allow(clippy::identity_op)]
+
     use super::*;
 
     #[test]
