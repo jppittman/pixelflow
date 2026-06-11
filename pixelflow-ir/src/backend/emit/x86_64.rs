@@ -402,7 +402,7 @@ fn emit_log2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: 
 
     // Phase 3: branchless reduction to [√2/2, √2]
     // mask = (f >= √2); adjust = 1.0 & mask; n += adjust; f *= (1 - 0.5*adjust)
-    emit_f32_const(code, s2, 1.414_213_56_f32);
+    emit_f32_const(code, s2, core::f32::consts::SQRT_2);
     emit_vcmpps(code, s2, s1, s2, CMP_GE); // s2 = mask(f >= √2)
     emit_f32_const(code, s0, 1.0);
     emit_vandps(code, s0, s0, s2); // s0 = adjust (1.0 or 0.0)
@@ -431,6 +431,8 @@ fn emit_log2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: 
 }
 
 /// exp2(x) core — floor/frac split + 5-term Horner + 2^n bit scaling.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_exp2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: Reg) {
     emit_vroundps(code, s0, src, 1); // s0 = n = floor(x)
     emit_vsubps(code, s1, src, s0); // s1 = f = x - n
@@ -443,7 +445,7 @@ fn emit_exp2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: 
     emit_f32_const(code, dst, 0.241_379_3_f32);
     emit_vmulps(code, s2, s2, s1);
     emit_vaddps(code, s2, s2, dst);
-    emit_f32_const(code, dst, 0.693_147_2_f32);
+    emit_f32_const(code, dst, core::f32::consts::LN_2);
     emit_vmulps(code, s2, s2, s1);
     emit_vaddps(code, s2, s2, dst);
     emit_f32_const(code, dst, 1.0_f32);
@@ -521,6 +523,8 @@ pub fn emit_hypot_builtin(code: &mut Vec<u8>, dst: Reg, x: Reg, y: Reg, sc: [Reg
 /// select(cond, if_true, if_false) — bit blend (`cond` is an all-ones/zeros mask).
 ///
 /// `tmp` must differ from `cond`, `if_true`, and `if_false`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_select(code: &mut Vec<u8>, dst: Reg, cond: Reg, if_true: Reg, if_false: Reg, tmp: Reg) {
     emit_blend(code, dst, cond, if_true, if_false, tmp);
 }
@@ -630,6 +634,8 @@ fn emit_cmp_tail(code: &mut Vec<u8>, dst: Reg, src2: Reg, pred: u8) {
 }
 
 /// Emit binary transcendental operation (needs scratch registers).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_binary_transcendental(
     code: &mut Vec<u8>,
     op: OpKind,
@@ -651,6 +657,8 @@ pub fn emit_binary_transcendental(
 }
 
 /// Emit ternary operation
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_ternary(code: &mut Vec<u8>, op: OpKind, dst: Reg, a: Reg, b: Reg, c: Reg) {
     match op {
         OpKind::MulAdd => {

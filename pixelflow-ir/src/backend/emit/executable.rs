@@ -412,11 +412,13 @@ pub type ScanlineKernelFn = extern "C" fn(
 pub type KernelFn = extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[allow(improper_ctypes_definitions)]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 
 /// JIT-compiled scanline kernel signature for x86-64 (128-bit; the scanline
 /// emitter is SSE2 only, independent of the per-batch width).
 #[cfg(target_arch = "x86_64")]
+#[allow(improper_ctypes_definitions)]
 pub type ScanlineKernelFn = extern "C" fn(
     *const __m128, // x_array
     __m128,        // y (broadcast)
