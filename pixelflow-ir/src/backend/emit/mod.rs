@@ -2048,10 +2048,11 @@ fn compile_dag_via_backend<B: IsaBackend>(
         )?;
 
         // Select with a guard region: emit a uniform-mask short-circuit wrapper.
-        if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sched_op {
-            if let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx) {
-                let has_true = guard.true_range.0 != guard.true_range.1;
-                let has_false = guard.false_range.0 != guard.false_range.1;
+        if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sched_op
+            && let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx)
+        {
+            let has_true = guard.true_range.0 != guard.true_range.1;
+            let has_false = guard.false_range.0 != guard.false_range.1;
                 if has_true || has_false {
                     let mask_reg = backend.emit_resolve(
                         &mut code, *mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for,
@@ -2098,7 +2099,6 @@ fn compile_dag_via_backend<B: IsaBackend>(
                     }
                     continue;
                 }
-            }
         }
 
         backend.emit_plan(&mut code, &plan)?;
@@ -4676,11 +4676,13 @@ mod tests {
     fn test_x86_binary_ternary_builtins_match_scalar() {
         use core::arch::x86_64::*;
         // Helper: compile f(X, Y) and eval at (x, y).
-        unsafe fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
+        fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
             let r = compile_arena_dag(arena, root).expect("compile failed");
-            let f: executable::KernelFn = r.code.as_fn();
-            let z = _mm_set1_ps(0.0);
-            _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
+            unsafe {
+                let f: executable::KernelFn = r.code.as_fn();
+                let z = _mm_set1_ps(0.0);
+                _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
+            }
         }
 
         // atan2(y, x): arena Binary(Atan2, Y, X)  (op order: src1=y, src2=x)

@@ -437,7 +437,7 @@ pub type ScanlineKernelFn = extern "C" fn(
 #[cfg(all(test, not(target_feature = "avx512f")))]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
+
 
     #[test]
     #[cfg(target_arch = "aarch64")]

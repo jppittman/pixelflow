@@ -110,6 +110,12 @@ pub struct ExprArena {
     nary_children: Vec<ExprId>,
 }
 
+impl Default for ExprArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExprArena {
     /// Create an empty arena.
     #[must_use]

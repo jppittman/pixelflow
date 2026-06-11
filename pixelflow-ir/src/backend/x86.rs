@@ -415,10 +415,10 @@ impl SimdOps for F32x4 {
             let t = _mm_mul_ps(x, _mm_set1_ps(PI_INV));
 
             // Chebyshev coefficients for sin
-            let c1 = _mm_set1_ps(1.6719970703125);
-            let c3 = _mm_set1_ps(-0.645963541666667);
-            let c5 = _mm_set1_ps(0.079689450);
-            let c7 = _mm_set1_ps(-0.0046817541);
+            let c1 = _mm_set1_ps(1.6719971);
+            let c3 = _mm_set1_ps(-0.64596355);
+            let c5 = _mm_set1_ps(0.07968945);
+            let c7 = _mm_set1_ps(-0.004681754);
 
             // Horner's method: ((C7*t² + C5)*t² + C3)*t² + C1)*t
             let t2 = _mm_mul_ps(t, t);
@@ -2115,7 +2115,7 @@ impl U32x16 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
 
     #[test]
     #[cfg(target_feature = "avx512f")]
