@@ -26,7 +26,7 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, mprotect};
 
         if code.is_empty() {
             return Err("empty code buffer");
@@ -166,7 +166,7 @@ impl CodeBuffer {
     /// Returns an error if mmap fails.
     #[cfg(unix)]
     pub fn new(capacity: usize) -> Result<Self, &'static str> {
-        use libc::{mmap, MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap};
 
         if capacity == 0 {
             return Err("CodeBuffer capacity must be > 0");
