@@ -19,8 +19,8 @@ use pixelflow_search::egraph::{
 use pixelflow_search::nnue::factored::INPUT_DIM;
 use pixelflow_search::nnue::factored::MAX_ARITY;
 use pixelflow_search::nnue::{
-    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_ACC_DIM, GRAPH_INPUT_DIM,
-    GraphAccumulator, OpKind, RuleTemplates,
+    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_ACC_DIM,
+    GRAPH_INPUT_DIM, GraphAccumulator, OpKind, RuleTemplates,
 };
 
 use crate::jit_bench::benchmark_jit_arena;
@@ -1394,7 +1394,10 @@ mod tests {
         assert!((v[95] - (-1.0)).abs() < 1e-9, "values[95] mismatch");
         // Scalar features are appended after the `GRAPH_ACC_DIM`-long values block.
         assert!((v[GRAPH_ACC_DIM] - 5.0).abs() < 1e-9, "edge_count mismatch");
-        assert!((v[GRAPH_ACC_DIM + 1] - 8.0).abs() < 1e-9, "node_count mismatch");
+        assert!(
+            (v[GRAPH_ACC_DIM + 1] - 8.0).abs() < 1e-9,
+            "node_count mismatch"
+        );
     }
 
     #[test]

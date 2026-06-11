@@ -83,10 +83,10 @@ pub fn derivative_rules() -> Vec<Box<dyn Rewrite>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::arena_pat;
     use super::super::CostModel;
     use super::super::extract::extract;
+    use super::*;
+    use crate::arena_pat;
     use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
     /// Evaluate an arena subtree at the given variable values.
@@ -97,7 +97,8 @@ mod tests {
             ExprNode::Param(p) => panic!("Param({p}) in extracted derivative"),
             ExprNode::Unary(op, a) => {
                 let a = eval(arena, a, vars);
-                op.eval_unary(a).unwrap_or_else(|| panic!("eval_unary {op:?}"))
+                op.eval_unary(a)
+                    .unwrap_or_else(|| panic!("eval_unary {op:?}"))
             }
             ExprNode::Binary(op, a, b) => {
                 let a = eval(arena, a, vars);
@@ -184,7 +185,11 @@ mod tests {
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (var 0));
         let (out, root) = differentiate(&a, e, 0);
-        for p in &[[1.5, 0.0, 0.0, 0.0], [-3.0, 0.0, 0.0, 0.0], [4.2, 0.0, 0.0, 0.0]] {
+        for p in &[
+            [1.5, 0.0, 0.0, 0.0],
+            [-3.0, 0.0, 0.0, 0.0],
+            [4.2, 0.0, 0.0, 0.0],
+        ] {
             assert_close(eval(&out, root, p), 2.0 * p[0], p);
         }
     }
@@ -220,7 +225,11 @@ mod tests {
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, un OpKind::Sin, (var 0));
         let (out, root) = differentiate(&a, e, 0);
-        for p in &[[0.0, 0.0, 0.0, 0.0], [0.7, 0.0, 0.0, 0.0], [-1.2, 0.0, 0.0, 0.0]] {
+        for p in &[
+            [0.0, 0.0, 0.0, 0.0],
+            [0.7, 0.0, 0.0, 0.0],
+            [-1.2, 0.0, 0.0, 0.0],
+        ] {
             assert_close(eval(&out, root, p), p[0].cos(), p);
         }
     }

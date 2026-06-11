@@ -85,33 +85,93 @@ macro_rules! jit_truth {
 
 #[test]
 fn jit_arithmetic() {
-    jit_truth!("sub_div", kernel_jit!(|| (X - Y) / (Z + 1.0)), |x: f32, y: f32, z: f32, _w| (x - y) / (z + 1.0), 1e-4, 1e-4);
-    jit_truth!("affine", kernel_jit!(|| 2.0 * X - 3.0 * Y + 1.0), |x: f32, y: f32, _z, _w| 2.0 * x - 3.0 * y + 1.0, 1e-4, 1e-4);
+    jit_truth!(
+        "sub_div",
+        kernel_jit!(|| (X - Y) / (Z + 1.0)),
+        |x: f32, y: f32, z: f32, _w| (x - y) / (z + 1.0),
+        1e-4,
+        1e-4
+    );
+    jit_truth!(
+        "affine",
+        kernel_jit!(|| 2.0 * X - 3.0 * Y + 1.0),
+        |x: f32, y: f32, _z, _w| 2.0 * x - 3.0 * y + 1.0,
+        1e-4,
+        1e-4
+    );
     // FMA shapes, both operand orders. `X + Y*Z` (product on the RHS of the
     // add) previously miscompiled to `Y` due to an SSE two-operand clobber in
     // the Sethi-Ullman emitter; covered here as a regression guard.
-    jit_truth!("mul_add", kernel_jit!(|| X * Y + Z), |x: f32, y: f32, z: f32, _w| x * y + z, 1e-4, 1e-4);
-    jit_truth!("add_mul", kernel_jit!(|| X + Y * Z), |x: f32, y: f32, z: f32, _w| x + y * z, 1e-4, 1e-4);
+    jit_truth!(
+        "mul_add",
+        kernel_jit!(|| X * Y + Z),
+        |x: f32, y: f32, z: f32, _w| x * y + z,
+        1e-4,
+        1e-4
+    );
+    jit_truth!(
+        "add_mul",
+        kernel_jit!(|| X + Y * Z),
+        |x: f32, y: f32, z: f32, _w| x + y * z,
+        1e-4,
+        1e-4
+    );
 }
 
 #[test]
 fn jit_unary() {
-    jit_truth!("abs", kernel_jit!(|| (X - Y).abs()), |x: f32, y: f32, _z, _w| (x - y).abs(), 1e-5, 1e-5);
-    jit_truth!("neg", kernel_jit!(|| (-X)), |x: f32, _y, _z, _w| -x, 1e-5, 1e-5);
+    jit_truth!(
+        "abs",
+        kernel_jit!(|| (X - Y).abs()),
+        |x: f32, y: f32, _z, _w| (x - y).abs(),
+        1e-5,
+        1e-5
+    );
+    jit_truth!(
+        "neg",
+        kernel_jit!(|| (-X)),
+        |x: f32, _y, _z, _w| -x,
+        1e-5,
+        1e-5
+    );
     // floor is now in the AVX-512 op set too (vrndscaleps), so this runs on
     // both widths.
-    jit_truth!("floor", kernel_jit!(|| X.floor()), |x: f32, _y, _z, _w| x.floor(), 1e-5, 1e-5);
+    jit_truth!(
+        "floor",
+        kernel_jit!(|| X.floor()),
+        |x: f32, _y, _z, _w| x.floor(),
+        1e-5,
+        1e-5
+    );
 }
 
 #[test]
 fn jit_sqrt_norm() {
-    jit_truth!("norm2", kernel_jit!(|| (X * X + Y * Y).sqrt()), |x: f32, y: f32, _z, _w| (x * x + y * y).sqrt(), 1e-3, 1e-3);
-    jit_truth!("norm3", kernel_jit!(|| (X * X + Y * Y + Z * Z).sqrt()), |x: f32, y: f32, z: f32, _w| (x * x + y * y + z * z).sqrt(), 1e-3, 1e-3);
+    jit_truth!(
+        "norm2",
+        kernel_jit!(|| (X * X + Y * Y).sqrt()),
+        |x: f32, y: f32, _z, _w| (x * x + y * y).sqrt(),
+        1e-3,
+        1e-3
+    );
+    jit_truth!(
+        "norm3",
+        kernel_jit!(|| (X * X + Y * Y + Z * Z).sqrt()),
+        |x: f32, y: f32, z: f32, _w| (x * x + y * y + z * z).sqrt(),
+        1e-3,
+        1e-3
+    );
 }
 
 #[test]
 fn jit_minmax() {
-    jit_truth!("min_max", kernel_jit!(|| X.max(Y).min(Z)), |x: f32, y: f32, z: f32, _w| x.max(y).min(z), 1e-5, 1e-5);
+    jit_truth!(
+        "min_max",
+        kernel_jit!(|| X.max(Y).min(Z)),
+        |x: f32, y: f32, z: f32, _w| x.max(y).min(z),
+        1e-5,
+        1e-5
+    );
 }
 
 /// sin/cos now lower to primitive arithmetic before codegen (see
@@ -121,8 +181,22 @@ fn jit_minmax() {
 /// catch logic errors, not certify ulp accuracy.
 #[test]
 fn jit_sin_cos() {
-    jit_truth!("sin", kernel_jit!(|| X.sin()), |x: f32, _y, _z, _w| x.sin(), 3e-2, 3e-2, SMALL);
-    jit_truth!("cos", kernel_jit!(|| X.cos()), |x: f32, _y, _z, _w| x.cos(), 3e-2, 3e-2, SMALL);
+    jit_truth!(
+        "sin",
+        kernel_jit!(|| X.sin()),
+        |x: f32, _y, _z, _w| x.sin(),
+        3e-2,
+        3e-2,
+        SMALL
+    );
+    jit_truth!(
+        "cos",
+        kernel_jit!(|| X.cos()),
+        |x: f32, _y, _z, _w| x.cos(),
+        3e-2,
+        3e-2,
+        SMALL
+    );
 }
 
 /// `exp` is not yet lowered (it needs float↔int bit-manip primitives, the next
@@ -132,7 +206,14 @@ fn jit_sin_cos() {
 #[test]
 #[cfg(not(target_feature = "avx512f"))]
 fn jit_exp() {
-    jit_truth!("exp", kernel_jit!(|| X.exp()), |x: f32, _y, _z, _w| x.exp(), 3e-2, 3e-2, SMALL);
+    jit_truth!(
+        "exp",
+        kernel_jit!(|| X.exp()),
+        |x: f32, _y, _z, _w| x.exp(),
+        3e-2,
+        3e-2,
+        SMALL
+    );
 }
 
 #[test]
@@ -155,6 +236,18 @@ fn jit_scalar_params() {
 /// must keep the left operand in `dst`. Regression guard for that path.
 #[test]
 fn jit_noncommutative_heavy_right() {
-    jit_truth!("sub_heavy_r", kernel_jit!(|| X - Y * Z), |x: f32, y: f32, z: f32, _w| x - y * z, 1e-4, 1e-4);
-    jit_truth!("div_heavy_r", kernel_jit!(|| X / (Y * Z + 1.0)), |x: f32, y: f32, z: f32, _w| x / (y * z + 1.0), 1e-4, 1e-4);
+    jit_truth!(
+        "sub_heavy_r",
+        kernel_jit!(|| X - Y * Z),
+        |x: f32, y: f32, z: f32, _w| x - y * z,
+        1e-4,
+        1e-4
+    );
+    jit_truth!(
+        "div_heavy_r",
+        kernel_jit!(|| X / (Y * Z + 1.0)),
+        |x: f32, y: f32, z: f32, _w| x / (y * z + 1.0),
+        1e-4,
+        1e-4
+    );
 }
