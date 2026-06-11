@@ -107,8 +107,11 @@ impl<L> SpatialBSP<L> {
             return Self::single(items.into_iter().next().unwrap().leaf);
         }
 
-        let mut interiors = Vec::new();
-        let mut leaves = Vec::new();
+        // PERF: Preallocate vectors using known target sizes to eliminate expensive heap
+        // reallocation overhead during recursive tree construction. A full binary tree
+        // with N leaves has exactly N - 1 interior nodes.
+        let mut interiors = Vec::with_capacity(items.len() - 1);
+        let mut leaves = Vec::with_capacity(items.len());
 
         // Recursively build the tree
         let _root = Self::build_tree(&mut interiors, &mut leaves, items);

@@ -584,7 +584,7 @@ mod tests {
         // If all control points are at the SAME location,
         // the surface should evaluate to that location everywhere.
         // This tests affine invariance.
-        let control_points = [[1.0f32, 2.0, 3.0]; 16];
+        let _control_points = [[1.0f32, 2.0, 3.0]; 16];
 
         let eigen = get_eigen(4).unwrap();
         println!("K = {}", eigen.k);

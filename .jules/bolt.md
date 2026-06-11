@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2023-10-24 - Preallocating Vectors in Tree Construction
+**Learning:** During recursive tree construction (like BSP trees), dynamically growing vectors with `Vec::new()` causes frequent reallocation overhead. Since a full binary tree with N leaves has exactly N - 1 interior nodes, we can calculate the exact capacity needed upfront.
+**Action:** Always initialize dynamically growing vectors with known target sizes using `Vec::with_capacity(size)` in performance-critical hot paths to eliminate heap reallocation overhead.
