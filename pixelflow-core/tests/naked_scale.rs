@@ -1,5 +1,7 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::float32x4_t;
+#[cfg(target_arch = "aarch64")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(target_arch = "aarch64")]
 fn get_jit_mul_kernel() -> usize {
@@ -33,21 +35,25 @@ unsafe fn invoke_naked_kernel(
     vw: float32x4_t,
 ) -> float32x4_t {
     let mut result: float32x4_t;
-    std::arch::asm!(
-        "blr {func}",
-        func = in(reg) func_ptr,
-        inout("v0") vx => result,
-        in("v1") vy,
-        in("v2") vz,
-        in("v3") vw,
-        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-        out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-        out("x16") _, out("x17") _,
-        options(nomem, nostack, preserves_flags)
-    );
+    // SAFETY: `func_ptr` is a valid JIT-emitted kernel following the documented
+    // NEON ABI (v0..v3 in, v0 out); the clobber list covers all volatile regs.
+    unsafe {
+        std::arch::asm!(
+            "blr {func}",
+            func = in(reg) func_ptr,
+            inout("v0") vx => result,
+            in("v1") vy,
+            in("v2") vz,
+            in("v3") vw,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("x16") _, out("x17") _,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
     result
 }
 

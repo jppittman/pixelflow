@@ -847,13 +847,9 @@ impl Field<u32> {
     /// Pack 4 Fields (RGBA, 0.0-1.0) into packed u32 pixels.
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
+    #[must_use]
     pub fn pack(r: Field, g: Field, b: Field, a: Field) -> Self {
-        Self(backend::arm::U32x4::pack_rgba(
-            unsafe { core::mem::transmute(r.0) },
-            unsafe { core::mem::transmute(g.0) },
-            unsafe { core::mem::transmute(b.0) },
-            unsafe { core::mem::transmute(a.0) },
-        ))
+        Self(backend::arm::U32x4::pack_rgba(r.0, g.0, b.0, a.0))
     }
 
     /// Pack 4 Fields (RGBA, 0.0-1.0) into packed u32 pixels.

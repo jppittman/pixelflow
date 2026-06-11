@@ -344,7 +344,7 @@ impl SimdOps for F32x4 {
 
             // Adjust to [√2/2, √2] range for better accuracy (centered at 1)
             // If f >= √2, divide by 2 and increment exponent
-            let sqrt2 = vdupq_n_f32(1.4142135624);
+            let sqrt2 = vdupq_n_f32(core::f32::consts::SQRT_2);
             let mask = vcgeq_f32(f, sqrt2);
             let adjust = vandq_u32(mask, vreinterpretq_u32_f32(vdupq_n_f32(1.0)));
             n = vaddq_f32(n, vreinterpretq_f32_u32(adjust));
@@ -353,11 +353,11 @@ impl SimdOps for F32x4 {
             // Polynomial for log2(f) on [√2/2, √2]
             // Fitted using least squares on Chebyshev nodes
             // Max error: ~1e-4
-            let c4 = vdupq_n_f32(-0.3200435159);
-            let c3 = vdupq_n_f32(1.7974969154);
-            let c2 = vdupq_n_f32(-4.1988046176);
-            let c1 = vdupq_n_f32(5.7270231695);
-            let c0 = vdupq_n_f32(-3.0056146714);
+            let c4 = vdupq_n_f32(-0.320_043_5);
+            let c3 = vdupq_n_f32(1.797_496_9);
+            let c2 = vdupq_n_f32(-4.198_805);
+            let c1 = vdupq_n_f32(5.727_023);
+            let c0 = vdupq_n_f32(-3.005_614_8);
 
             // Horner's method using NEON FMA: vfmaq_f32(c, a, b) = a*b + c
             let poly = vfmaq_f32(c3, c4, f);
@@ -383,7 +383,7 @@ impl SimdOps for F32x4 {
             let c4 = vdupq_n_f32(0.0135557);
             let c3 = vdupq_n_f32(0.0520323);
             let c2 = vdupq_n_f32(0.2413793);
-            let c1 = vdupq_n_f32(0.6931472);
+            let c1 = vdupq_n_f32(core::f32::consts::LN_2);
             let c0 = vdupq_n_f32(1.0);
 
             // Horner's method
@@ -419,10 +419,10 @@ impl SimdOps for F32x4 {
             let x = vsubq_f32(self.0, vmulq_f32(k, vdupq_n_f32(TWO_PI)));
             let t = vmulq_f32(x, vdupq_n_f32(PI_INV));
 
-            let c1 = vdupq_n_f32(1.6719970703125);
-            let c3 = vdupq_n_f32(-0.645963541666667);
-            let c5 = vdupq_n_f32(0.079689450);
-            let c7 = vdupq_n_f32(-0.0046817541);
+            let c1 = vdupq_n_f32(1.671_997_1);
+            let c3 = vdupq_n_f32(-0.645_963_55);
+            let c5 = vdupq_n_f32(0.079_689_45);
+            let c7 = vdupq_n_f32(-0.004_681_754);
 
             let t2 = vmulq_f32(t, t);
             let poly = vfmaq_f32(c5, c7, t2);
@@ -447,9 +447,9 @@ impl SimdOps for F32x4 {
             let x = vsubq_f32(self.0, vmulq_f32(k, vdupq_n_f32(TWO_PI)));
             let t = vmulq_f32(x, vdupq_n_f32(PI_INV));
 
-            let c0 = vdupq_n_f32(1.5707963267948966);
-            let c2 = vdupq_n_f32(-2.467401341);
-            let c4 = vdupq_n_f32(0.609469381);
+            let c0 = vdupq_n_f32(core::f32::consts::FRAC_PI_2);
+            let c2 = vdupq_n_f32(-2.467_401_3);
+            let c4 = vdupq_n_f32(0.609_469_35);
             let c6 = vdupq_n_f32(-0.038854038);
 
             let t2 = vmulq_f32(t, t);
@@ -472,9 +472,9 @@ impl SimdOps for F32x4 {
             let r_abs = vabsq_f32(r);
 
             let c1 = vdupq_n_f32(0.999999999);
-            let c3 = vdupq_n_f32(-0.333333333);
+            let c3 = vdupq_n_f32(-0.333_333_34);
             let c5 = vdupq_n_f32(0.2);
-            let c7 = vdupq_n_f32(-0.142857143);
+            let c7 = vdupq_n_f32(-0.142_857_15);
 
             let t = r_abs;
             let t2 = vmulq_f32(t, t);
@@ -699,6 +699,7 @@ impl Shr<u32> for U32x4 {
 
 impl U32x4 {
     /// Pack 4 f32 Fields (RGBA) into packed u32 pixels.
+    #[must_use]
     #[inline(always)]
     pub fn pack_rgba(r: F32x4, g: F32x4, b: F32x4, a: F32x4) -> Self {
         unsafe {

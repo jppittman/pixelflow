@@ -273,6 +273,9 @@ fn get_config_dir() -> PathBuf {
 }
 
 /// Get the SIMD backend name for display.
+// Each arch arm is a mutually-exclusive cfg block, so the `return` in the
+// active arm is required (it is not the function's tail expression).
+#[allow(clippy::needless_return)]
 fn backend_name() -> &'static str {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {

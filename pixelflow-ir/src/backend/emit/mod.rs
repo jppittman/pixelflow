@@ -1145,12 +1145,8 @@ fn compile_scanline_hoisted(
     for (sched_idx, (vid, sched_op)) in schedule[..split].iter().enumerate() {
         // Branch guards (same logic as non-hoisted path).
         if !branch_starts[sched_idx].is_empty() {
-            let n_branches = branch_starts[sched_idx].len();
-            for bi in 0..n_branches {
-                let (guard_idx, arm) = {
-                    let pb = &branch_starts[sched_idx][bi];
-                    (pb.guard_idx, pb.arm)
-                };
+            for pb in &branch_starts[sched_idx] {
+                let (guard_idx, arm) = (pb.guard_idx, pb.arm);
                 let guard = &select_guards[guard_idx];
                 let mask_reg = emit_resolve_dense(
                     &mut code,
@@ -1183,9 +1179,7 @@ fn compile_scanline_hoisted(
         }
 
         if !branch_ends[sched_idx].is_empty() {
-            let n_ends = branch_ends[sched_idx].len();
-            for ei in 0..n_ends {
-                let gi = branch_ends[sched_idx][ei];
+            for &gi in &branch_ends[sched_idx] {
                 if let Some(patch_pos) = pending_patches.remove(&(gi, 0)) {
                     let target = code.len();
                     aarch64::patch_cbz_cbnz(&mut code, patch_pos, target);
@@ -1219,12 +1213,8 @@ fn compile_scanline_hoisted(
 
         // Branch guards.
         if !branch_starts[sched_idx].is_empty() {
-            let n_branches = branch_starts[sched_idx].len();
-            for bi in 0..n_branches {
-                let (guard_idx, arm) = {
-                    let pb = &branch_starts[sched_idx][bi];
-                    (pb.guard_idx, pb.arm)
-                };
+            for pb in &branch_starts[sched_idx] {
+                let (guard_idx, arm) = (pb.guard_idx, pb.arm);
                 let guard = &select_guards[guard_idx];
                 let mask_reg = emit_resolve_dense(
                     &mut code,
@@ -1257,9 +1247,7 @@ fn compile_scanline_hoisted(
         }
 
         if !branch_ends[sched_idx].is_empty() {
-            let n_ends = branch_ends[sched_idx].len();
-            for ei in 0..n_ends {
-                let gi = branch_ends[sched_idx][ei];
+            for &gi in &branch_ends[sched_idx] {
                 if let Some(patch_pos) = pending_patches.remove(&(gi, 0)) {
                     let target = code.len();
                     aarch64::patch_cbz_cbnz(&mut code, patch_pos, target);
@@ -1524,12 +1512,8 @@ fn compile_scanline_from_schedule(
     for (sched_idx, (vid, sched_op)) in schedule.iter().enumerate() {
         // Guard branch starts
         if !branch_starts[sched_idx].is_empty() {
-            let n_branches = branch_starts[sched_idx].len();
-            for bi in 0..n_branches {
-                let (guard_idx, arm) = {
-                    let pb = &branch_starts[sched_idx][bi];
-                    (pb.guard_idx, pb.arm)
-                };
+            for pb in &branch_starts[sched_idx] {
+                let (guard_idx, arm) = (pb.guard_idx, pb.arm);
                 let guard = &select_guards[guard_idx];
                 let mask_reg = emit_resolve_dense(
                     &mut code,
@@ -1564,9 +1548,7 @@ fn compile_scanline_from_schedule(
 
         // Guard branch ends
         if !branch_ends[sched_idx].is_empty() {
-            let n_ends = branch_ends[sched_idx].len();
-            for ei in 0..n_ends {
-                let gi = branch_ends[sched_idx][ei];
+            for &gi in &branch_ends[sched_idx] {
                 if let Some(patch_pos) = pending_patches.remove(&(gi, 0)) {
                     let target = code.len();
                     aarch64::patch_cbz_cbnz(&mut code, patch_pos, target);
@@ -2272,7 +2254,7 @@ impl IsaBackend for Aarch64Backend {
             if needs_adrp {
                 code.splice(adr_pos + 4..adr_pos + 4, [0, 0, 0, 0]);
             }
-            while code.len() % 16 != 0 {
+            while !code.len().is_multiple_of(16) {
                 code.push(0);
             }
             let pool_start = code.len();
@@ -3094,6 +3076,7 @@ fn resolve_dst_loc_dense(
 /// Accepts pre-built `Vec<Option<T>>` slices indexed by `ValueId.0` for O(1)
 /// lookups instead of O(log n) BTreeMap lookups.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
 fn emit_resolve_dense(
     code: &mut Vec<u8>,
     vid: regalloc::ValueId,
@@ -3836,7 +3819,7 @@ pub fn compile_arena_dag_scanline_hoisted(
 mod tests {
     use super::*;
     #[cfg(target_arch = "aarch64")]
-    use alloc::boxed::Box;
+    use crate::arena::ExprArena;
 
     /// A `Dwrt` that reaches codegen (no differentiation rule eliminated it)
     /// must fail loudly at the schedule boundary, not as a cryptic emit panic.
@@ -4343,7 +4326,7 @@ mod tests {
         }
     }
 
-    /// Verify arena compilation matches direct `Expr` compilation for the same expression.
+    // Verify arena compilation matches direct `Expr` compilation for the same expression.
     // =====================================================================
     // Scanline kernel tests
     // =====================================================================
