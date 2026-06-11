@@ -772,7 +772,7 @@ pub fn emit_hypot_builtin(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
 /// Emit unary operation - dispatches to appropriate instruction(s)
 pub(crate) fn emit_unary(
     code: &mut Vec<u8>,
-    pool: &mut super::ConstPool,
+    _pool: &mut super::ConstPool,
     op: OpKind,
     dst: Reg,
     src: Reg,
@@ -1016,7 +1016,7 @@ pub fn patch_b(code: &mut [u8], patch_pos: usize, target_pos: usize) {
 // =============================================================================
 
 /// Emit function prologue
-pub fn emit_prologue(code: &mut Vec<u8>) {
+pub fn emit_prologue(_code: &mut Vec<u8>) {
     // For a simple JIT kernel, we might not need much
     // Input pointer already in X0
     // Just ensure we're aligned
@@ -2424,7 +2424,7 @@ mod tests {
         emit_fmov_imm(
             &mut code,
             Reg(0),
-            std::f32::consts::PI,
+            3.14,
             [Reg(16), Reg(17), Reg(18), Reg(19)],
         );
         assert_eq!(
@@ -2518,7 +2518,7 @@ mod tests {
     #[test]
     fn asm_load_const_general() {
         let mut asm = Aarch64Asm::new();
-        asm.load_const(Reg(5), std::f32::consts::PI);
+        asm.load_const(Reg(5), 3.14);
         assert_eq!(
             asm.offset(),
             12,

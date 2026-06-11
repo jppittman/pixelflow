@@ -3725,12 +3725,14 @@ pub fn compile_arena_dag_scanline_hoisted(
 mod tests {
     use super::*;
     #[cfg(target_arch = "aarch64")]
+    use alloc::boxed::Box;
+
     /// A `Dwrt` that reaches codegen (no differentiation rule eliminated it)
     /// must fail loudly at the schedule boundary, not as a cryptic emit panic.
     #[test]
     #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
     fn surviving_dwrt_fails_loudly() {
-        let mut a = crate::ExprArena::new();
+        let mut a = ExprArena::new();
         let x = a.push_var(0);
         let v = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, x, v);
@@ -4631,7 +4633,8 @@ mod tests {
         // Tolerances reflect the shared (with aarch64) minimax-polynomial
         // accuracy over a sensible input range; exact ops use tight bounds.
         // `rel_err = |jit - scalar| / (1 + |scalar|)`.
-        let unary: &[(OpKind, fn(f32) -> f32, &[f32], f32)] = &[
+        type UnaryTest = (OpKind, fn(f32) -> f32, &'static [f32], f32);
+        let unary: &[UnaryTest] = &[
             (OpKind::Sqrt, |x| x.sqrt(), &[0.25, 1.0, 2.0, 9.0, 100.0], 1e-5),
             (OpKind::Abs, |x| x.abs(), &[-3.0, -0.5, 0.0, 2.5], 1e-6),
             (OpKind::Neg, |x| -x, &[-3.0, 0.5, 2.5], 1e-6),
@@ -4684,7 +4687,7 @@ mod tests {
         // atan2(y, x): arena Binary(Atan2, Y, X)  (op order: src1=y, src2=x)
         let pts = [(0.5, 2.0), (2.0, 0.5), (-0.5, 2.0), (0.5, -2.0), (-2.0, -0.5), (3.0, -0.5)];
         {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let y = a.push_var(1);
             let x = a.push_var(0);
             let root = a.push_binary(OpKind::Atan2, y, x);
@@ -4696,7 +4699,7 @@ mod tests {
         }
         // pow(X, Y)
         {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let root = a.push_binary(OpKind::Pow, x, y);
@@ -4709,7 +4712,7 @@ mod tests {
         }
         // hypot(X, Y)
         {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let root = a.push_binary(OpKind::Hypot, x, y);
@@ -4724,7 +4727,7 @@ mod tests {
             (OpKind::Min, f32::min as fn(f32, f32) -> f32),
             (OpKind::Max, f32::max as fn(f32, f32) -> f32),
         ] {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let root = a.push_binary(op, x, y);
@@ -4735,7 +4738,7 @@ mod tests {
         }
         // Clamp(X, 0.0, 1.0)
         {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let lo = a.push_const(0.0);
             let hi = a.push_const(1.0);
@@ -4747,7 +4750,7 @@ mod tests {
         }
         // Select(X >= 0, 1.0, -1.0) == signum-ish
         {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let zero = a.push_const(0.0);
             let cond = a.push_binary(OpKind::Ge, x, zero);
@@ -4788,19 +4791,19 @@ mod tests {
             // Range beyond [-π,π] to exercise the floor-based range reduction.
             let pts = [0.0f32, 0.3, 1.0, 2.0, 3.5, -1.7, 6.0, -4.2];
             for &xv in &pts {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let s = a.push_unary(OpKind::Sin, x);
                 assert!((run1(&a, s, xv) - xv.sin()).abs() <= TRIG_TOL, "sin({xv})");
 
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let c = a.push_unary(OpKind::Cos, x);
                 assert!((run1(&a, c, xv) - xv.cos()).abs() <= TRIG_TOL, "cos({xv})");
             }
             // tan away from its poles (ratio of two ~3e-3 approximations).
             for &xv in &[0.0f32, 0.3, 0.7, -0.5, 1.0] {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let t = a.push_unary(OpKind::Tan, x);
                 // tan = sin/cos amplifies cos's ~2e-2 edge error as |x| grows
@@ -4816,13 +4819,13 @@ mod tests {
         fn exp_log_match_scalar() {
             // exp / exp2 over a moderate range.
             for &xv in &[-2.0f32, -0.5, 0.0, 0.7, 1.5, 3.0] {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let e = a.push_unary(OpKind::Exp, x);
                 let rel = (run1(&a, e, xv) - xv.exp()).abs() / xv.exp().max(1.0);
                 assert!(rel <= 1e-2, "exp({xv})");
 
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let e2 = a.push_unary(OpKind::Exp2, x);
                 let rel = (run1(&a, e2, xv) - xv.exp2()).abs() / xv.exp2().max(1.0);
@@ -4830,12 +4833,12 @@ mod tests {
             }
             // ln / log2 / log10 over positive inputs.
             for &xv in &[0.25f32, 0.5, 1.0, 2.0, 5.0, 100.0] {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let l = a.push_unary(OpKind::Ln, x);
                 assert!((run1(&a, l, xv) - xv.ln()).abs() <= 3e-2, "ln({xv})");
 
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let l2 = a.push_unary(OpKind::Log2, x);
                 assert!((run1(&a, l2, xv) - xv.log2()).abs() <= 3e-2, "log2({xv})");
@@ -4855,19 +4858,19 @@ mod tests {
 
             // atan over a wide range (exercises the |ratio|>1 swap branch).
             for &xv in &[0.0f32, 0.3, 1.0, 2.5, -0.7, -4.0] {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let at = a.push_unary(OpKind::Atan, x);
                 assert!((run1(&a, at, xv) - xv.atan()).abs() <= ATAN_TOL, "atan({xv})");
             }
             // asin/acos on [-1, 1].
             for &xv in &[-0.9f32, -0.4, 0.0, 0.4, 0.9] {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let s = a.push_unary(OpKind::Asin, x);
                 assert!((run1(&a, s, xv) - xv.asin()).abs() <= ATAN_TOL, "asin({xv})");
 
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let c = a.push_unary(OpKind::Acos, x);
                 assert!((run1(&a, c, xv) - xv.acos()).abs() <= ATAN_TOL, "acos({xv})");
@@ -4876,7 +4879,7 @@ mod tests {
             // cases sit at |ratio|=1, the polynomial's worst point.
             let pts = [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0), (0.5, -2.0)];
             for &(yv, xv) in &pts {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let y = a.push_var(0);
                 let x = a.push_var(1);
                 let r = a.push_binary(OpKind::Atan2, y, x);
@@ -4888,7 +4891,7 @@ mod tests {
         /// A transcendental composed inside arithmetic still works: sin(x)·x + 1.
         #[test]
         fn transcendental_in_expression() {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let s = a.push_unary(OpKind::Sin, x);
             let sx = a.push_binary(OpKind::Mul, s, x);
@@ -4939,7 +4942,7 @@ mod tests {
         #[test]
         fn sched_parity_no_spill() {
             // f = sqrt(X*X + Y*Y) - Z, plus a non-commutative `X - Y*Z` shape.
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_var(2);
@@ -4970,7 +4973,7 @@ mod tests {
         fn sched_spills_and_is_correct() {
             // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree so the 10
             // products are live together — forcing spills with only 7 regs.
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let mut terms = alloc::vec::Vec::new();
@@ -5017,7 +5020,7 @@ mod tests {
         /// inputs take the all-true / all-false branches.
         #[test]
         fn sched_select_guards() {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_var(2);
@@ -5101,7 +5104,7 @@ mod tests {
         /// fitting in registers (no spill).
         #[test]
         fn avx512_arith_no_spill() {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_var(2);
@@ -5126,7 +5129,7 @@ mod tests {
         /// real 64-byte-slot stack frame (the SSE2 red zone cannot hold a zmm).
         #[test]
         fn avx512_spills_to_real_frame() {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let mut terms = alloc::vec::Vec::new();
@@ -5171,7 +5174,7 @@ mod tests {
         /// vpternlogd blend path.
         #[test]
         fn avx512_compare_select_blend() {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let cond = a.push_binary(OpKind::Lt, x, y);
@@ -5188,7 +5191,7 @@ mod tests {
         /// blend on mixed input.
         #[test]
         fn avx512_select_guards() {
-            let mut a = crate::ExprArena::new();
+            let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_var(2);
@@ -5228,7 +5231,7 @@ mod tests {
                 (OpKind::Ceil, f32::ceil as fn(f32) -> f32, "ceil"),
                 (OpKind::Round, f32::round_ties_even as fn(f32) -> f32, "round"),
             ] {
-                let mut a = crate::ExprArena::new();
+                let mut a = ExprArena::new();
                 let x = a.push_var(0);
                 let root = a.push_unary(op, x);
                 let res = compile_arena_dag_avx512(&a, root).expect("avx512 compile");

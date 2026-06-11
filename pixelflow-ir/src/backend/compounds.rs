@@ -71,8 +71,8 @@ pub trait Compounds: Primitives {
         let exp = exp_bits.bits_to_f32() - Self::splat(127.0);
 
         // Extract mantissa and normalize to [1, 2)
-        let mantissa_bits = Self::from_bits(0x3F800000); // 1.0
-        let mantissa_mask = Self::from_bits(0x007FFFFF);
+        let _mantissa_bits = Self::from_bits(0x3F800000); // 1.0
+        let _mantissa_mask = Self::from_bits(0x007FFFFF);
         // This is simplified - proper impl needs AND/OR bit ops
 
         // Polynomial for log2(1+x) on [0, 1)
