@@ -6,10 +6,7 @@ use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote};
 
 use crate::annotate::{AnnotationCtx, annotate};
-use crate::ast::{
-    BinaryOp, Expr, ParamKind,
-    Stmt, UnaryOp,
-};
+use crate::ast::{BinaryOp, Expr, ParamKind, Stmt, UnaryOp};
 use crate::sema::AnalyzedKernel;
 use crate::symbol::SymbolKind;
 
@@ -18,10 +15,7 @@ use super::util::{build_array, sort_by_index, standard_imports};
 
 /// Scan an annotated expression to find manifold params used with `.at()`.
 /// Returns the set of manifold param names that need ManifoldExt trait bound.
-fn find_at_manifold_params(
-    expr: &Expr,
-    symbols: &crate::symbol::SymbolTable,
-) -> HashSet<String> {
+fn find_at_manifold_params(expr: &Expr, symbols: &crate::symbol::SymbolTable) -> HashSet<String> {
     let mut result = HashSet::new();
     find_at_manifold_params_inner(expr, symbols, &mut result);
     result

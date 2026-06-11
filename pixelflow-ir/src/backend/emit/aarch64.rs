@@ -803,7 +803,13 @@ pub(crate) fn emit_unary(
 
 /// Emit a logical shift of i32 lanes by a compile-time immediate.
 /// `Shl` -> `SHL`, `Shr` -> `USHR` (logical right). NEON shifts are imm-form.
-pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) -> Result<(), &'static str> {
+pub fn emit_shift_imm(
+    code: &mut Vec<u8>,
+    op: OpKind,
+    dst: Reg,
+    src: Reg,
+    amount: u8,
+) -> Result<(), &'static str> {
     match op {
         OpKind::Shl => emit_shl(code, dst, src, amount),
         OpKind::Shr => emit_ushr(code, dst, src, amount),
@@ -2424,7 +2430,7 @@ mod tests {
         emit_fmov_imm(
             &mut code,
             Reg(0),
-            3.14,
+            std::f32::consts::PI,
             [Reg(16), Reg(17), Reg(18), Reg(19)],
         );
         assert_eq!(
@@ -2518,7 +2524,7 @@ mod tests {
     #[test]
     fn asm_load_const_general() {
         let mut asm = Aarch64Asm::new();
-        asm.load_const(Reg(5), 3.14);
+        asm.load_const(Reg(5), std::f32::consts::PI);
         assert_eq!(
             asm.offset(),
             12,

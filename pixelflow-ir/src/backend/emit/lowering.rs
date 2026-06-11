@@ -91,8 +91,7 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
                     }
                     ExprNode::Nary(_, start, len) => {
                         let (s, l) = (start as usize, len as usize);
-                        let children: Vec<ExprId> =
-                            arena.nary_children_raw()[s..s + l].to_vec();
+                        let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
                         for child in children.into_iter().rev() {
                             work.push(Task::Descend(child));
                         }

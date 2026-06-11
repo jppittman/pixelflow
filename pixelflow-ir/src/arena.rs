@@ -739,7 +739,7 @@ mod tests {
         assert_eq!(arena.kind(v), OpKind::Var);
         assert_eq!(arena.children(v).count(), 0);
 
-        let c = arena.push_const(3.14);
+        let c = arena.push_const(std::f32::consts::PI);
         assert_eq!(arena.kind(c), OpKind::Const);
         assert_eq!(arena.children(c).count(), 0);
 

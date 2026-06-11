@@ -28,12 +28,10 @@
 //! - x/x → Canonicalize(MulRecip) → x * recip(x) → InverseAnnihilation → 1
 //! - x-x → Canonicalize(AddNeg) → x + neg(x) → InverseAnnihilation → 0
 
-
 use crate::arena_pat;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-
+use pixelflow_ir::arena::{ExprArena, ExprId};
 
 const EPSILON: f32 = 1e-6;
 
@@ -119,7 +117,7 @@ impl Rewrite for PowSpecialValue {
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         match &self.result {
-            PowResult::Constant(c) => Some(arena_pat!(__a, cst *c)),
+            PowResult::Constant(c) => Some(arena_pat!(__a, cst * c)),
             PowResult::Identity => Some(arena_pat!(__a, var 0)),
             PowResult::UnaryOp(op) => Some(arena_pat!(__a, un op.kind(), (var 0))),
             PowResult::SelfMul => Some(arena_pat!(__a, bin OpKind::Mul, (var 0), (var 0))),
@@ -298,13 +296,11 @@ impl Rewrite for LogPower {
     }
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-
         let lk = self.log_op.kind();
         Some(arena_pat!(__a, un lk, (bin OpKind::Pow, (var 0), (var 1))))
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-
         let lk = self.log_op.kind();
         Some(arena_pat!(__a, bin OpKind::Mul, (var 1), (un lk, (var 0))))
     }
@@ -422,11 +418,15 @@ impl Rewrite for DiffOfSquares {
     }
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(arena_pat!(__a, bin OpKind::Sub, (bin OpKind::Mul, (var 0), (var 0)), (bin OpKind::Mul, (var 1), (var 1))))
+        Some(
+            arena_pat!(__a, bin OpKind::Sub, (bin OpKind::Mul, (var 0), (var 0)), (bin OpKind::Mul, (var 1), (var 1))),
+        )
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Add, (var 0), (var 1)), (bin OpKind::Sub, (var 0), (var 1))))
+        Some(
+            arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Add, (var 0), (var 1)), (bin OpKind::Sub, (var 0), (var 1))),
+        )
     }
 }
 

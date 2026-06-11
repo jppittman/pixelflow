@@ -23,8 +23,8 @@
 //! ```
 
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, Expr, IdentExpr, LetStmt, LiteralExpr,
-    MethodCallExpr, Stmt, UnaryExpr, UnaryOp,
+    BinaryExpr, BinaryOp, BlockExpr, Expr, IdentExpr, LetStmt, LiteralExpr, MethodCallExpr, Stmt,
+    UnaryExpr, UnaryOp,
 };
 use crate::sema::AnalyzedKernel;
 use pixelflow_search::egraph::{
@@ -571,7 +571,6 @@ fn syn_expr_references_any(expr: &syn::Expr, names: &std::collections::HashSet<S
 fn is_coordinate_intrinsic(name: &str) -> bool {
     matches!(name, "X" | "Y" | "Z" | "W")
 }
-
 
 /// Optimize a block while preserving its structure.
 ///

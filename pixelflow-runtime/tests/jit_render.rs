@@ -13,8 +13,8 @@
 //! polynomial-approximation accuracy for `sin`/`sqrt`.
 
 use pixelflow_compiler::{kernel, kernel_jit};
-use pixelflow_core::{X, Y};
 use pixelflow_core::ManifoldExt;
+use pixelflow_core::{X, Y};
 use pixelflow_graphics::render::color::Rgba8;
 use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
@@ -67,7 +67,12 @@ fn colored_scene_renders_via_jit_matching_combinators() {
     // a real failure (wrong scene, wrong wiring) would be off by tens or more.
     let mut max_diff = 0u8;
     let mut worst = (0usize, 0u8, 0u8);
-    for (i, (a, b)) in frame_combo.data.iter().zip(frame_jit.data.iter()).enumerate() {
+    for (i, (a, b)) in frame_combo
+        .data
+        .iter()
+        .zip(frame_jit.data.iter())
+        .enumerate()
+    {
         for (ca, cb) in [(a.r(), b.r()), (a.g(), b.g()), (a.b(), b.b())] {
             let d = ca.abs_diff(cb);
             if d > max_diff {
