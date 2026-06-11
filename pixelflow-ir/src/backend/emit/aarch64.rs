@@ -2424,7 +2424,7 @@ mod tests {
         emit_fmov_imm(
             &mut code,
             Reg(0),
-            3.14,
+            std::f32::consts::PI,
             [Reg(16), Reg(17), Reg(18), Reg(19)],
         );
         assert_eq!(
@@ -2518,7 +2518,7 @@ mod tests {
     #[test]
     fn asm_load_const_general() {
         let mut asm = Aarch64Asm::new();
-        asm.load_const(Reg(5), 3.14);
+        asm.load_const(Reg(5), std::f32::consts::PI);
         assert_eq!(
             asm.offset(),
             12,
