@@ -3738,6 +3738,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
     fn surviving_dwrt_fails_loudly() {
+        use crate::ExprArena;
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let v = a.push_const(0.0);

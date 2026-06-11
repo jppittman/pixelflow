@@ -28,13 +28,15 @@ fn emit_vex_128_0f(code: &mut Vec<u8>, opcode: u8, dst: Reg, src1: Reg, src2: Re
 
     code.push(0xC4);
     code.push(r | x | b | 0x01); // map = 0F
-    code.push(vvvv | 0x00); // W=0, L=0 (128-bit), pp=00
+    code.push(vvvv); // W=0, L=0 (128-bit), pp=00
     code.push(opcode);
     code.push(0xC0 | ((dst.0 & 7) << 3) | (src2.0 & 7)); // ModRM
 }
 
 /// Emit a VEX-encoded 3-operand instruction with an immediate byte.
 /// VEX.128.0F: dst = op(src1, src2, imm8)
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_vex_128_0f_imm(code: &mut Vec<u8>, opcode: u8, dst: Reg, src1: Reg, src2: Reg, imm8: u8) {
     emit_vex_128_0f(code, opcode, dst, src1, src2);
     code.push(imm8);
@@ -309,6 +311,8 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, _scratch: [Reg; 4]) {
 /// `reg` is the ModRM.reg operand (a register, or a `/digit` opcode extension
 /// passed as `Reg(digit)`); `vvvv` is the inverted extra source (pass `Reg(0)`
 /// when unused — that encodes the required `1111`); `rm` is the ModRM.rm reg.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_vex(code: &mut Vec<u8>, pp: u8, mmmmm: u8, w: u8, reg: Reg, vvvv: Reg, rm: Reg, opcode: u8) {
     let rbit = if reg.0 >= 8 { 0x00 } else { 0x80 };
     let xbit = 0x40;
@@ -363,6 +367,8 @@ fn emit_vpsrld_imm(code: &mut Vec<u8>, dst: Reg, src: Reg, imm: u8) {
 /// Bit-select (NEON BSL analogue): `dst = (mask & if_true) | (~mask & if_false)`.
 ///
 /// `tmp` must differ from `dst`, `mask`, `if_true`, and `if_false`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_blend(code: &mut Vec<u8>, dst: Reg, mask: Reg, if_true: Reg, if_false: Reg, tmp: Reg) {
     emit_vandps(code, tmp, mask, if_true); // tmp = mask & if_true
     emit_vandnps(code, dst, mask, if_false); // dst = ~mask & if_false
@@ -387,6 +393,8 @@ const CMP_GE: u8 = 5; // NLT_US (>=)
 //   scratch[0..4] — clobbered scratch (4 distinct registers)
 
 /// log2(x) core — exponent extraction + mantissa reduction + 5-term Horner.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn emit_log2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: Reg) {
     // Phase 1: n = float(exponent_bits - 127)
     emit_vpsrld_imm(code, s0, src, 23); // s0 = bits >> 23
