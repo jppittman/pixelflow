@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2024-06-12 - Eliminate Vec Heap Allocation in BSP Tree Construction
+**Learning:** Found a performance bottleneck in `pixelflow-graphics` spatial BSP tree construction. `Vec::new()` was used repeatedly for interior nodes and leaves instead of allocating with a known capacity (`Vec::with_capacity`). When the tree is rebuilt frequently or with large item sets, these default `Vec` instantiations cause many expensive, avoidable heap reallocations as the collections grow.
+**Action:** In hot paths or code sections where collection sizes are bounded or strictly predictable (like binary tree nodes derived from an item count `n`), always use `Vec::with_capacity(size)` instead of `Vec::new()` to eliminate the memory reallocation overhead entirely.
