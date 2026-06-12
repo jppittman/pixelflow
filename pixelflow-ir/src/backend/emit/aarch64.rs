@@ -2279,7 +2279,10 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
     }
 
     // SHL Vd.4S, Vn.4S, #shift
-    if word & 0xFF80FC00 == 0x4F005400 {
+    // Mask includes immh[3:2] (bits 22:21) so only the .4S arrangement
+    // (immh = 01xx) matches; bits 20:16 carry the shift amount and stay free.
+    // Without this a 64-bit `SHL .2D` (immh = 1xxx) would mis-decode as `.4s`.
+    if word & 0xFFE0FC00 == 0x4F205400 {
         let immhb = (word >> 16) & 0x3F;
         let shift = immhb.wrapping_sub(32);
         return format!("shl v{}.4s, v{}.4s, #{}", rd, rn, shift);
@@ -2647,6 +2650,33 @@ mod tests {
         assert!(
             dis.contains("fadd v0.4s, v1.4s, v2.4s"),
             "expected fadd decode, got: {dis}"
+        );
+    }
+
+    // Round-trip the NEON shift-by-immediate encoders through the disassembler.
+    // These guard the `immh` arrangement bits in the decoder masks: the `.4S`
+    // form sets immh = 01xx, so emitted words have bits[23:21] = 001. A mask
+    // that ignores those bits either never matches (the USHR bug fixed here) or
+    // mis-decodes the 64-bit `.2D` form as `.4s` (the SHL case).
+    #[test]
+    fn disassemble_ushr() {
+        let mut code = Vec::new();
+        emit_ushr(&mut code, Reg(0), Reg(0), 23); // used by the log2 lowering
+        let dis = disassemble_code(&code);
+        assert!(
+            dis.contains("ushr v0.4s, v0.4s, #23"),
+            "expected ushr decode, got: {dis}"
+        );
+    }
+
+    #[test]
+    fn disassemble_shl() {
+        let mut code = Vec::new();
+        emit_shl(&mut code, Reg(1), Reg(2), 8);
+        let dis = disassemble_code(&code);
+        assert!(
+            dis.contains("shl v1.4s, v2.4s, #8"),
+            "expected shl decode, got: {dis}"
         );
     }
 
