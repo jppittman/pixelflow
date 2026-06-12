@@ -176,8 +176,18 @@ fn evex_runtime_16_lanes() {
         for i in 0..16 {
             let want_a = (xs[i] + ys[i]) * zs[i];
             let want_b = xs[i] * ys[i] + zs[i];
-            assert!((oa[i] - want_a).abs() <= 1e-4, "lane {i}: (X+Y)*Z = {} want {}", oa[i], want_a);
-            assert!((ob[i] - want_b).abs() <= 1e-4, "lane {i}: X*Y+Z = {} want {}", ob[i], want_b);
+            assert!(
+                (oa[i] - want_a).abs() <= 1e-4,
+                "lane {i}: (X+Y)*Z = {} want {}",
+                oa[i],
+                want_a
+            );
+            assert!(
+                (ob[i] - want_b).abs() <= 1e-4,
+                "lane {i}: X*Y+Z = {} want {}",
+                ob[i],
+                want_b
+            );
         }
     }
 }

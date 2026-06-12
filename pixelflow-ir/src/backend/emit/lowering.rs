@@ -91,8 +91,7 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
                     }
                     ExprNode::Nary(_, start, len) => {
                         let (s, l) = (start as usize, len as usize);
-                        let children: Vec<ExprId> =
-                            arena.nary_children_raw()[s..s + l].to_vec();
+                        let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
                         for child in children.into_iter().rev() {
                             work.push(Task::Descend(child));
                         }
@@ -149,6 +148,7 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
 /// (the clone is two `Vec`s and the walk just copies), so every entry can call
 /// it unconditionally and be sure no backend — per-batch, scanline, or jet —
 /// ever sees a transcendental node.
+#[must_use]
 pub fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
     // Identity fast-path: if there is nothing to lower, return the arena
     // unchanged. The rebuild below is not bit-identical to the input (it can
@@ -308,7 +308,7 @@ fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
 
     // 2^xf ≈ Horner(c5..c0) at xf  (minimax coefficients).
     let c0 = arena.push_const(1.0);
-    let c1 = arena.push_const(0.693_147_18);
+    let c1 = arena.push_const(0.693_147_2);
     let c2 = arena.push_const(0.240_226_5);
     let c3 = arena.push_const(0.055_504_11);
     let c4 = arena.push_const(0.009_618_129);
@@ -395,10 +395,10 @@ fn expand_sin(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let t2 = arena.push_binary(OpKind::Mul, t, t);
 
     // Horner: p = ((c7·t2 + c5)·t2 + c3)·t2 + c1, expanded as mul+add.
-    let c1 = arena.push_const(3.141_592_653_589_79);
-    let c3 = arena.push_const(-5.167_712_780_049_97);
-    let c5 = arena.push_const(2.550_164_039_877_34);
-    let c7 = arena.push_const(-0.599_264_528_932_149);
+    let c1 = arena.push_const(3.141_592_7);
+    let c3 = arena.push_const(-5.167_712_7);
+    let c5 = arena.push_const(2.550_164);
+    let c7 = arena.push_const(-0.599_264_5);
     let p = horner_step(arena, c7, t2, c5);
     let p = horner_step(arena, p, t2, c3);
     let p = horner_step(arena, p, t2, c1);

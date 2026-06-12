@@ -40,14 +40,14 @@ pub fn emit_ldr_voff(code: &mut Vec<u8>, dst: Reg, offset: u16) {
     // Encoding: 0x3DC00000 | (imm12 << 10) | (Rn << 5) | Rt
     // imm12 is offset/16 for 128-bit loads
     let imm12 = (offset / 16) as u32;
-    let inst = 0x3DC00000 | (imm12 << 10) | (0 << 5) | (dst.0 as u32); // X0 as base
+    let inst = (0x3DC00000 | (imm12 << 10)) | (dst.0 as u32); // X0 as base
     emit32(code, inst);
 }
 
 /// STR Vt, [X0, #offset] - Store 128-bit vector to base + offset
 pub fn emit_str_voff(code: &mut Vec<u8>, src: Reg, offset: u16) {
     let imm12 = (offset / 16) as u32;
-    let inst = 0x3D800000 | (imm12 << 10) | (0 << 5) | (src.0 as u32);
+    let inst = (0x3D800000 | (imm12 << 10)) | (src.0 as u32);
     emit32(code, inst);
 }
 
@@ -58,7 +58,7 @@ pub fn emit_str_voff(code: &mut Vec<u8>, src: Reg, offset: u16) {
 /// the address, then load from [X16].
 pub fn emit_ldr_sp(code: &mut Vec<u8>, dst: Reg, offset: u32) {
     assert!(
-        offset % 16 == 0,
+        offset.is_multiple_of(16),
         "emit_ldr_sp: offset {offset} not 16-byte aligned"
     );
     let imm12 = offset / 16;
@@ -70,7 +70,7 @@ pub fn emit_ldr_sp(code: &mut Vec<u8>, dst: Reg, offset: u32) {
         // ADD X16, SP, #offset  (may need multiple instructions)
         emit_add_x16_sp(code, offset);
         // LDR Qt, [X16]
-        let inst = 0x3DC00000 | (0 << 10) | (16 << 5) | (dst.0 as u32);
+        let inst = 0x3DC00000 | (16 << 5) | (dst.0 as u32);
         emit32(code, inst);
     }
 }
@@ -80,7 +80,7 @@ pub fn emit_ldr_sp(code: &mut Vec<u8>, dst: Reg, offset: u32) {
 /// Small offsets use scaled immediate. Large offsets use X16 scratch.
 pub fn emit_str_sp(code: &mut Vec<u8>, src: Reg, offset: u32) {
     assert!(
-        offset % 16 == 0,
+        offset.is_multiple_of(16),
         "emit_str_sp: offset {offset} not 16-byte aligned"
     );
     let imm12 = offset / 16;
@@ -91,7 +91,7 @@ pub fn emit_str_sp(code: &mut Vec<u8>, src: Reg, offset: u32) {
     } else {
         emit_add_x16_sp(code, offset);
         // STR Qt, [X16]
-        let inst = 0x3D800000 | (0 << 10) | (16 << 5) | (src.0 as u32);
+        let inst = 0x3D800000 | (16 << 5) | (src.0 as u32);
         emit32(code, inst);
     }
 }
@@ -306,8 +306,8 @@ pub fn emit_fmov_imm(code: &mut Vec<u8>, dst: Reg, val: f32, _scratch: [Reg; 4])
     // General case: load via GP register (W16)
     // This is 3 instructions but works for any f32 value.
     // Use W16 (IP0) as scratch - it's caller-saved and not used for arguments
-    let lo16 = (bits & 0xFFFF) as u32;
-    let hi16 = (bits >> 16) as u32;
+    let lo16 = bits & 0xFFFF;
+    let hi16 = bits >> 16;
 
     // MOVZ W16, #lo16
     emit32(code, 0x52800010 | (lo16 << 5));
@@ -330,6 +330,7 @@ pub fn emit_fmov_imm(code: &mut Vec<u8>, dst: Reg, val: f32, _scratch: [Reg; 4])
 /// Common examples: 1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 0.25, 1.5, etc.
 ///
 /// Returns `None` for non-encodable values (including ±0.0, denormals, NaN, Inf).
+#[must_use]
 pub fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
     let bits = val.to_bits();
 
@@ -374,6 +375,7 @@ pub fn emit_dup_s0(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 // =============================================================================
 
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
+#[must_use]
 pub fn needs_const_pool(val: f32) -> bool {
     val.to_bits() != 0 && try_encode_fmov_imm8(val).is_none()
 }
@@ -405,7 +407,7 @@ pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_
         let page_offset = (target_page - pc_page) >> 12;
 
         assert!(
-            page_offset >= -(1 << 20) && page_offset < (1 << 20),
+            (-(1 << 20)..(1 << 20)).contains(&page_offset),
             "ADRP page offset {} out of range (±4GB)",
             page_offset
         );
@@ -431,7 +433,7 @@ pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_
         );
         let offset = (target_pos as i64) - (adr_pos as i64);
         assert!(
-            offset >= -(1 << 20) && offset < (1 << 20),
+            (-(1 << 20)..(1 << 20)).contains(&offset),
             "ADR offset {} out of range (±1MB)",
             offset
         );
@@ -449,7 +451,7 @@ pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_
 /// where imm12 = byte_offset / 16, Rn = 17 (X17).
 pub fn emit_ldr_q_x17(code: &mut Vec<u8>, dst: Reg, byte_offset: u16) {
     assert!(
-        byte_offset % 16 == 0,
+        byte_offset.is_multiple_of(16),
         "constant pool offset {} not 16-byte aligned",
         byte_offset
     );
@@ -544,8 +546,8 @@ fn emit_u32_const(code: &mut Vec<u8>, dst: Reg, bits: u32) {
         emit32(code, 0x4F000400 | (dst.0 as u32));
         return;
     }
-    let lo16 = (bits & 0xFFFF) as u32;
-    let hi16 = (bits >> 16) as u32;
+    let lo16 = bits & 0xFFFF;
+    let hi16 = bits >> 16;
     // MOVZ W16, #lo16
     emit32(code, 0x52800010 | (lo16 << 5));
     // MOVK W16, #hi16, LSL #16
@@ -604,7 +606,7 @@ pub(crate) fn emit_log2_builtin(
 
     // Phase 3: Reduce to [√2/2, √2] for better accuracy
     // mask = (f >= √2)
-    let sqrt2 = pool.push_f32(1.4142135624)?;
+    let sqrt2 = pool.push_f32(1.414_213_5)?;
     emit_ldr_q_x17(code, s2, sqrt2);
     emit_fcmge(code, s2, s1, s2); // s2 = mask (all-ones where f >= √2)
     // adjust = 1.0 & mask
@@ -632,24 +634,24 @@ pub(crate) fn emit_log2_builtin(
     // Horner: alternate dst and s2 as accumulator, s1 = f throughout.
 
     // p = c4*f + c3
-    let c4 = pool.push_f32(-0.3200435159_f32)?;
+    let c4 = pool.push_f32(-0.320_043_5_f32)?;
     emit_ldr_q_x17(code, s2, c4);
-    let c3 = pool.push_f32(1.7974969154_f32)?;
+    let c3 = pool.push_f32(1.797_496_9_f32)?;
     emit_ldr_q_x17(code, s0, c3);
     emit_fmla(code, s0, s2, s1); // s0 = c3 + c4*f
 
     // p = p*f + c2
-    let c2 = pool.push_f32(-4.1988046176_f32)?;
+    let c2 = pool.push_f32(-4.198_805_f32)?;
     emit_ldr_q_x17(code, s2, c2);
     emit_fmla(code, s2, s0, s1); // s2 = c2 + p*f
 
     // p = p*f + c1
-    let c1 = pool.push_f32(5.7270231695_f32)?;
+    let c1 = pool.push_f32(5.727_023_f32)?;
     emit_ldr_q_x17(code, s0, c1);
     emit_fmla(code, s0, s2, s1); // s0 = c1 + p*f
 
     // p = p*f + c0
-    let c0 = pool.push_f32(-3.0056146714_f32)?;
+    let c0 = pool.push_f32(-3.005_614_8_f32)?;
     emit_ldr_q_x17(code, s2, c0);
     emit_fmla(code, s2, s0, s1); // s2 = c0 + p*f
 
@@ -772,7 +774,7 @@ pub fn emit_hypot_builtin(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
 /// Emit unary operation - dispatches to appropriate instruction(s)
 pub(crate) fn emit_unary(
     code: &mut Vec<u8>,
-    pool: &mut super::ConstPool,
+    _pool: &mut super::ConstPool,
     op: OpKind,
     dst: Reg,
     src: Reg,
@@ -803,7 +805,13 @@ pub(crate) fn emit_unary(
 
 /// Emit a logical shift of i32 lanes by a compile-time immediate.
 /// `Shl` -> `SHL`, `Shr` -> `USHR` (logical right). NEON shifts are imm-form.
-pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) -> Result<(), &'static str> {
+pub fn emit_shift_imm(
+    code: &mut Vec<u8>,
+    op: OpKind,
+    dst: Reg,
+    src: Reg,
+    amount: u8,
+) -> Result<(), &'static str> {
     match op {
         OpKind::Shl => emit_shl(code, dst, src, amount),
         OpKind::Shr => emit_ushr(code, dst, src, amount),
@@ -977,7 +985,7 @@ pub fn emit_b(code: &mut Vec<u8>) -> usize {
 pub fn patch_cbz_cbnz(code: &mut [u8], patch_pos: usize, target_pos: usize) {
     let offset = (target_pos as i64 - patch_pos as i64) / 4;
     assert!(
-        offset >= -(1 << 18) && offset < (1 << 18),
+        (-(1 << 18)..(1 << 18)).contains(&offset),
         "CBZ/CBNZ branch offset {} out of range (±1MB)",
         offset
     );
@@ -996,7 +1004,7 @@ pub fn patch_cbz_cbnz(code: &mut [u8], patch_pos: usize, target_pos: usize) {
 pub fn patch_b(code: &mut [u8], patch_pos: usize, target_pos: usize) {
     let offset = (target_pos as i64 - patch_pos as i64) / 4;
     assert!(
-        offset >= -(1 << 25) && offset < (1 << 25),
+        (-(1 << 25)..(1 << 25)).contains(&offset),
         "B branch offset {} out of range (±128MB)",
         offset
     );
@@ -1016,7 +1024,7 @@ pub fn patch_b(code: &mut [u8], patch_pos: usize, target_pos: usize) {
 // =============================================================================
 
 /// Emit function prologue
-pub fn emit_prologue(code: &mut Vec<u8>) {
+pub fn emit_prologue(_code: &mut Vec<u8>) {
     // For a simple JIT kernel, we might not need much
     // Input pointer already in X0
     // Just ensure we're aligned
@@ -1225,7 +1233,7 @@ pub fn emit_scanline_epilogue(code: &mut Vec<u8>, prologue: &ScanlinePrologue, r
     let branch_pos = code.len();
     let offset_instr = (prologue.loop_header as i64 - branch_pos as i64) / 4;
     assert!(
-        offset_instr >= -(1 << 18) && offset_instr < (1 << 18),
+        (-(1 << 18)..(1 << 18)).contains(&offset_instr),
         "scanline loop back-edge offset {offset_instr} out of ±1MB range"
     );
     let imm19 = (offset_instr as u32) & 0x7FFFF;
@@ -1417,7 +1425,7 @@ pub fn emit_scanline_epilogue_hoisted(
     let branch_pos = code.len();
     let offset_instr = (prologue.loop_header as i64 - branch_pos as i64) / 4;
     assert!(
-        offset_instr >= -(1 << 18) && offset_instr < (1 << 18),
+        (-(1 << 18)..(1 << 18)).contains(&offset_instr),
         "scanline loop back-edge offset {offset_instr} out of +/-1MB range"
     );
     let imm19 = (offset_instr as u32) & 0x7FFFF;
@@ -1465,7 +1473,7 @@ pub fn emit_scanline_epilogue_hoisted(
 fn patch_cbz_x(code: &mut [u8], patch_pos: usize, target_pos: usize) {
     let offset = (target_pos as i64 - patch_pos as i64) / 4;
     assert!(
-        offset >= -(1 << 18) && offset < (1 << 18),
+        (-(1 << 18)..(1 << 18)).contains(&offset),
         "CBZ branch offset {offset} out of ±1MB range"
     );
     let imm19 = (offset as u32) & 0x7FFFF;
@@ -1499,11 +1507,13 @@ pub struct Aarch64Asm {
 
 impl Aarch64Asm {
     /// Create a new assembler with an empty code buffer.
+    #[must_use]
     pub fn new() -> Self {
         Self { code: Vec::new() }
     }
 
     /// Create a new assembler with pre-allocated capacity.
+    #[must_use]
     pub fn with_capacity(n: usize) -> Self {
         Self {
             code: Vec::with_capacity(n),
@@ -1512,12 +1522,14 @@ impl Aarch64Asm {
 
     /// Current code offset in bytes (useful for branch patching).
     #[inline]
+    #[must_use]
     pub fn offset(&self) -> usize {
         self.code.len()
     }
 
     /// Borrow the code buffer.
     #[inline]
+    #[must_use]
     pub fn code(&self) -> &[u8] {
         &self.code
     }
@@ -1530,6 +1542,7 @@ impl Aarch64Asm {
 
     /// Consume the assembler, returning the code buffer.
     #[inline]
+    #[must_use]
     pub fn into_code(self) -> Vec<u8> {
         self.code
     }
@@ -1911,6 +1924,7 @@ impl Aarch64Asm {
     ///
     /// Decodes common NEON floating-point, memory, move, comparison, branch,
     /// and control instructions. Unknown encodings are shown as "unknown".
+    #[must_use]
     pub fn disassemble(&self) -> String {
         disassemble_code(&self.code)
     }
@@ -1924,6 +1938,7 @@ impl Aarch64Asm {
 ///
 /// Public so that `dump_jit_asm` and other callers can disassemble code
 /// produced by the free-function emitters without constructing an `Aarch64Asm`.
+#[must_use]
 pub fn disassemble_code(code: &[u8]) -> String {
     let mut out = String::new();
     for (i, chunk) in code.chunks(4).enumerate() {
@@ -2297,7 +2312,7 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
 
     // B (unconditional)
     if word & 0xFC000000 == 0x14000000 {
-        return format!("b <imm>");
+        return "b <imm>".to_string();
     }
 
     // SUBS Xd, Xn, Xm (register)

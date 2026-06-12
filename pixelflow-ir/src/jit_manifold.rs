@@ -15,6 +15,7 @@ pub struct JitManifold {
 
 impl JitManifold {
     /// Wrap compiled executable code.
+    #[must_use]
     pub fn new(code: ExecutableCode) -> Self {
         Self { code }
     }
@@ -52,6 +53,7 @@ impl JitManifold {
     /// The caller must ensure the SIMD types match the platform ABI the emitter
     /// generated code for (x86-64 SSE2: `__m128`).
     #[inline(always)]
+    #[must_use]
     pub unsafe fn call(
         &self,
         x: core::arch::x86_64::__m128,
@@ -111,6 +113,7 @@ pub struct ScanlineJitManifold {
 
 impl ScanlineJitManifold {
     /// Wrap compiled scanline executable code.
+    #[must_use]
     pub fn new(code: ExecutableCode) -> Self {
         Self { code }
     }

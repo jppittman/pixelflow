@@ -48,7 +48,16 @@ enum Pp {
 /// Emit a 512-bit EVEX 3-operand register form: `op zmmDST, zmmSRC1, zmmSRC2`,
 /// where SRC1 is the non-destructive EVEX.vvvv source and SRC2 is the ModRM
 /// r/m. Any of `zmm0..zmm31` is valid. `w` sets EVEX.W.
-fn evex_rrr(code: &mut Vec<u8>, map: Map, pp: Pp, w: bool, opcode: u8, dst: u8, src1: u8, src2: u8) {
+fn evex_rrr(
+    code: &mut Vec<u8>,
+    map: Map,
+    pp: Pp,
+    w: bool,
+    opcode: u8,
+    dst: u8,
+    src1: u8,
+    src2: u8,
+) {
     // EVEX stores the high register bits inverted.
     let r = ((dst >> 3) & 1) ^ 1; // ModRM.reg bit3
     let rp = ((dst >> 4) & 1) ^ 1; // ModRM.reg bit4 (R')
@@ -103,18 +112,38 @@ fn evex_rm_rsp(code: &mut Vec<u8>, map: Map, pp: Pp, w: bool, opcode: u8, reg: u
 }
 
 // --- packed-single arithmetic (0F, no prefix, W0) ---
-fn vaddps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x58, d, s1, s2); }
-fn vsubps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x5C, d, s1, s2); }
-fn vmulps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x59, d, s1, s2); }
-fn vdivps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x5E, d, s1, s2); }
-fn vminps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x5D, d, s1, s2); }
-fn vmaxps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x5F, d, s1, s2); }
+fn vaddps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x58, d, s1, s2);
+}
+fn vsubps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x5C, d, s1, s2);
+}
+fn vmulps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x59, d, s1, s2);
+}
+fn vdivps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x5E, d, s1, s2);
+}
+fn vminps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x5D, d, s1, s2);
+}
+fn vmaxps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x5F, d, s1, s2);
+}
 
 // --- bitwise (0F, 66 prefix for the integer-domain forms; use ps forms) ---
-fn vandps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x54, d, s1, s2); }
-fn vorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x56, d, s1, s2); }
-fn vxorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x57, d, s1, s2); }
-fn vandnps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x55, d, s1, s2); }
+fn vandps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x54, d, s1, s2);
+}
+fn vorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x56, d, s1, s2);
+}
+fn vxorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x57, d, s1, s2);
+}
+fn vandnps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x55, d, s1, s2);
+}
 
 /// Sentinel for the EVEX `vvvv`/`V'` source field on instructions that have no
 /// second source (2-operand forms): the field must read as *unused*, which the
@@ -131,7 +160,9 @@ const UNARY_SCRATCH: Reg = Reg(15);
 
 // --- unary (one source; no second source -> UNUSED_VVVV) ---
 /// vsqrtps zmmD, zmmS — EVEX.512.0F.W0 51 /r ; vvvv unused.
-fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) { evex_rrr(c, Map::M0F, Pp::None, false, 0x51, d, UNUSED_VVVV, s); }
+fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) {
+    evex_rrr(c, Map::M0F, Pp::None, false, 0x51, d, UNUSED_VVVV, s);
+}
 
 /// vrndscaleps zmmD, zmmS, imm8 — EVEX.512.66.0F3A.W0 08 /r ib ; vvvv unused.
 /// (Opcode 08 = packed-single; 09 is packed-double and needs W1.) Round each
@@ -141,14 +172,25 @@ fn vrndscaleps(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 }
 
 // --- FMA (0F38, 66 prefix, W0). 213: dst = src1*dst + src2. ---
-fn vfmadd213ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) { evex_rrr(c, Map::M0F38, Pp::P66, false, 0xA8, d, s1, s2); }
+fn vfmadd213ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
+    evex_rrr(c, Map::M0F38, Pp::P66, false, 0xA8, d, s1, s2);
+}
 
 /// vmovaps zmmDST, zmmSRC — register copy (EVEX.512.0F.W0 28 /r).
 pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 == src.0 {
         return;
     }
-    evex_rrr(code, Map::M0F, Pp::None, false, 0x28, dst.0, UNUSED_VVVV, src.0);
+    evex_rrr(
+        code,
+        Map::M0F,
+        Pp::None,
+        false,
+        0x28,
+        dst.0,
+        UNUSED_VVVV,
+        src.0,
+    );
 }
 
 /// vmovups zmmDST, [rsp+disp] — 512-bit reload (EVEX.512.0F.W0 10 /r).
@@ -189,7 +231,7 @@ fn evex_rm_rsp_broadcast(code: &mut Vec<u8>, reg: u8, disp: i32) {
     let r = ((reg >> 3) & 1) ^ 1;
     let rp = ((reg >> 4) & 1) ^ 1;
     let p0 = (r << 7) | (1 << 6) | (1 << 5) | (rp << 4) | (Map::M0F38 as u8);
-    let p1 = (0 << 7) | (0x0F << 3) | (1 << 2) | (Pp::P66 as u8);
+    let p1 = (0x0F << 3) | (1 << 2) | (Pp::P66 as u8);
     let p2 = (0b10 << 5) | (1 << 3);
     code.push(0x62);
     code.push(p0);
@@ -232,7 +274,13 @@ pub fn emit_ret(code: &mut Vec<u8>) {
 /// EVEX is 3-operand and non-destructive, so unlike SSE there is no
 /// two-operand hazard: `src1`/`src2` are never clobbered and may alias `dst`.
 /// Returns `Err` for ops not in the Stage-1 arithmetic subset.
-pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) -> Result<(), &'static str> {
+pub fn emit_binary(
+    code: &mut Vec<u8>,
+    op: OpKind,
+    dst: Reg,
+    src1: Reg,
+    src2: Reg,
+) -> Result<(), &'static str> {
     let (d, s1, s2) = (dst.0, src1.0, src2.0);
     match op {
         OpKind::Add => vaddps(code, d, s1, s2),
@@ -296,6 +344,7 @@ fn cmp_pred(op: OpKind) -> Option<u8> {
 }
 
 /// Whether `op` is a comparison handled by [`emit_compare`].
+#[must_use]
 pub fn is_compare(op: OpKind) -> bool {
     cmp_pred(op).is_some()
 }
@@ -305,12 +354,37 @@ pub fn is_compare(op: OpKind) -> bool {
 /// `vcmpps k1, src1, src2, pred` (EVEX.512.0F.W0 C2 /r ib) writes a k-register;
 /// `vpmovm2d dst, k1` (EVEX.512.F3.0F38.W0 38 /r) widens it to a per-lane
 /// all-ones/all-zeros vector occupying the allocator-assigned `dst` zmm.
-pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) -> Result<(), &'static str> {
+pub fn emit_compare(
+    code: &mut Vec<u8>,
+    op: OpKind,
+    dst: Reg,
+    src1: Reg,
+    src2: Reg,
+) -> Result<(), &'static str> {
     let pred = cmp_pred(op).ok_or("avx512: not a comparison op")?;
     // vcmpps k1, src1, src2, pred  (k-dest in ModRM.reg)
-    evex_rrr_imm(code, Map::M0F, Pp::None, false, 0xC2, SCRATCH_K, src1.0, src2.0, pred);
+    evex_rrr_imm(
+        code,
+        Map::M0F,
+        Pp::None,
+        false,
+        0xC2,
+        SCRATCH_K,
+        src1.0,
+        src2.0,
+        pred,
+    );
     // vpmovm2d dst, k1  (widen mask -> vector)
-    evex_rrr(code, Map::M0F38, Pp::F3, false, 0x38, dst.0, UNUSED_VVVV, SCRATCH_K);
+    evex_rrr(
+        code,
+        Map::M0F38,
+        Pp::F3,
+        false,
+        0x38,
+        dst.0,
+        UNUSED_VVVV,
+        SCRATCH_K,
+    );
     Ok(())
 }
 
@@ -321,7 +395,17 @@ pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: R
 /// the truth table 0xCA computes `A?B:C` per bit with A=dst(mask), B=if_true,
 /// C=if_false, i.e. a per-lane select for an all-ones/all-zeros mask.
 pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
-    evex_rrr_imm(code, Map::M0F3A, Pp::P66, false, 0x25, dst.0, if_true.0, if_false.0, 0xCA);
+    evex_rrr_imm(
+        code,
+        Map::M0F3A,
+        Pp::P66,
+        false,
+        0x25,
+        dst.0,
+        if_true.0,
+        if_false.0,
+        0xCA,
+    );
 }
 
 /// Set flags from a vector mask for the Select short-circuit guards.
@@ -331,7 +415,16 @@ pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
 /// 16 lanes true). The caller follows with `jz` (all-false) or `jc` (all-true).
 pub fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg) {
     // vptestmd k1, mask, mask  (EVEX.512.66.0F38.W0 27 /r)
-    evex_rrr(code, Map::M0F38, Pp::P66, false, 0x27, SCRATCH_K, mask.0, mask.0);
+    evex_rrr(
+        code,
+        Map::M0F38,
+        Pp::P66,
+        false,
+        0x27,
+        SCRATCH_K,
+        mask.0,
+        mask.0,
+    );
     // kortestw k1, k1  (VEX.L0.0F.W0 98 /r) -> C5 F8 98 C9
     code.extend_from_slice(&[0xC5, 0xF8, 0x98, 0xC9]);
 }
@@ -373,11 +466,21 @@ pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
 }
 
 /// Bitwise helpers exposed for completeness / future mask emulation.
-pub fn emit_and(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) { vandps(code, dst.0, s1.0, s2.0); }
-pub fn emit_or(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) { vorps(code, dst.0, s1.0, s2.0); }
-pub fn emit_xor(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) { vxorps(code, dst.0, s1.0, s2.0); }
-pub fn emit_andn(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) { vandnps(code, dst.0, s1.0, s2.0); }
-pub fn emit_fmadd213(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) { vfmadd213ps(code, dst.0, s1.0, s2.0); }
+pub fn emit_and(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) {
+    vandps(code, dst.0, s1.0, s2.0);
+}
+pub fn emit_or(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) {
+    vorps(code, dst.0, s1.0, s2.0);
+}
+pub fn emit_xor(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) {
+    vxorps(code, dst.0, s1.0, s2.0);
+}
+pub fn emit_andn(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) {
+    vandnps(code, dst.0, s1.0, s2.0);
+}
+pub fn emit_fmadd213(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) {
+    vfmadd213ps(code, dst.0, s1.0, s2.0);
+}
 
 #[cfg(test)]
 mod tests {
@@ -428,7 +531,12 @@ mod tests {
         fn check(got: [f32; 16], want: impl Fn(usize) -> f32, tag: &str) {
             for i in 0..16 {
                 let w = want(i);
-                assert!((got[i] - w).abs() <= 1e-3, "{tag} lane {i}: got {} want {}", got[i], w);
+                assert!(
+                    (got[i] - w).abs() <= 1e-3,
+                    "{tag} lane {i}: got {} want {}",
+                    got[i],
+                    w
+                );
             }
         }
 

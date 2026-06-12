@@ -79,22 +79,26 @@ impl ExecutableCode {
     /// The caller must ensure the code implements the correct calling convention
     /// and signature for type `F`.
     #[inline]
+    #[must_use]
     pub unsafe fn as_fn<F>(&self) -> F {
         // SAFETY: Caller guarantees F matches the compiled code's signature.
         unsafe { core::mem::transmute_copy(&self.ptr) }
     }
 
     /// Get the code as a byte slice (for debugging).
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     /// Length of the compiled code in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the code is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -298,16 +302,19 @@ impl CodeBuffer {
     }
 
     /// Current code length in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the buffer contains no code.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Total capacity in bytes.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -379,6 +386,7 @@ pub type KernelFn =
 ///   x1 = pointer to output array (128-bit aligned `float32x4_t` values)
 ///   x2 = count (number of SIMD groups to process)
 #[cfg(target_arch = "aarch64")]
+#[allow(improper_ctypes_definitions)]
 pub type ScanlineKernelFn = extern "C" fn(
     *const float32x4_t, // x_array
     float32x4_t,        // y (broadcast)
@@ -402,11 +410,13 @@ pub type ScanlineKernelFn = extern "C" fn(
 pub type KernelFn = extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[allow(improper_ctypes_definitions)]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 
 /// JIT-compiled scanline kernel signature for x86-64 (128-bit; the scanline
 /// emitter is SSE2 only, independent of the per-batch width).
 #[cfg(target_arch = "x86_64")]
+#[allow(improper_ctypes_definitions)]
 pub type ScanlineKernelFn = extern "C" fn(
     *const __m128, // x_array
     __m128,        // y (broadcast)

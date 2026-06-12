@@ -138,8 +138,7 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
         // N-param: emit a builder closure that JITs on call.
         let param_names: Vec<proc_macro2::Ident> =
             scalar_params.iter().map(|p| p.name.clone()).collect();
-        let param_types: Vec<TokenStream> =
-            scalar_params.iter().map(|_| quote! { f32 }).collect();
+        let param_types: Vec<TokenStream> = scalar_params.iter().map(|_| quote! { f32 }).collect();
         // Params slice in declaration order: first param = index 0.
         let param_slice = quote! { &[ #( #param_names as f32 ),* ] };
 

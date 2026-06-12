@@ -226,7 +226,7 @@ pub trait SimdOps:
     /// ln(x) = log2(x) * ln(2)
     #[inline(always)]
     fn ln(self) -> Self {
-        const LN_2: f32 = 0.6931471805599453;
+        const LN_2: f32 = 0.693_147_2;
         self.log2() * Self::splat(LN_2)
     }
 
@@ -234,7 +234,7 @@ pub trait SimdOps:
     /// log10(x) = log2(x) * log10(2)
     #[inline(always)]
     fn log10(self) -> Self {
-        const LOG10_2: f32 = 0.30102999566398120;
+        const LOG10_2: f32 = 0.301_03;
         self.log2() * Self::splat(LOG10_2)
     }
 

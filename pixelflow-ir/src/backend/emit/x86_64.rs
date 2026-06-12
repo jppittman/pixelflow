@@ -28,7 +28,7 @@ fn emit_vex_128_0f(code: &mut Vec<u8>, opcode: u8, dst: Reg, src1: Reg, src2: Re
 
     code.push(0xC4);
     code.push(r | x | b | 0x01); // map = 0F
-    code.push(vvvv | 0x00); // W=0, L=0 (128-bit), pp=00
+    code.push(vvvv); // W=0, L=0 (128-bit), pp=00
     code.push(opcode);
     code.push(0xC0 | ((dst.0 & 7) << 3) | (src2.0 & 7)); // ModRM
 }
@@ -309,7 +309,16 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, _scratch: [Reg; 4]) {
 /// `reg` is the ModRM.reg operand (a register, or a `/digit` opcode extension
 /// passed as `Reg(digit)`); `vvvv` is the inverted extra source (pass `Reg(0)`
 /// when unused — that encodes the required `1111`); `rm` is the ModRM.rm reg.
-fn emit_vex(code: &mut Vec<u8>, pp: u8, mmmmm: u8, w: u8, reg: Reg, vvvv: Reg, rm: Reg, opcode: u8) {
+fn emit_vex(
+    code: &mut Vec<u8>,
+    pp: u8,
+    mmmmm: u8,
+    w: u8,
+    reg: Reg,
+    vvvv: Reg,
+    rm: Reg,
+    opcode: u8,
+) {
     let rbit = if reg.0 >= 8 { 0x00 } else { 0x80 };
     let xbit = 0x40;
     let bbit = if rm.0 >= 8 { 0x00 } else { 0x20 };
@@ -402,7 +411,7 @@ fn emit_log2_body(code: &mut Vec<u8>, dst: Reg, src: Reg, s0: Reg, s1: Reg, s2: 
 
     // Phase 3: branchless reduction to [√2/2, √2]
     // mask = (f >= √2); adjust = 1.0 & mask; n += adjust; f *= (1 - 0.5*adjust)
-    emit_f32_const(code, s2, 1.414_213_56_f32);
+    emit_f32_const(code, s2, 1.414_213_5_f32);
     emit_vcmpps(code, s2, s1, s2, CMP_GE); // s2 = mask(f >= √2)
     emit_f32_const(code, s0, 1.0);
     emit_vandps(code, s0, s0, s2); // s0 = adjust (1.0 or 0.0)
@@ -567,7 +576,10 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, scratch: [
         // expanded to primitive arithmetic by `lowering` before codegen, so they
         // never reach a backend. Reaching here means the lowering pass was
         // skipped — a bug; fall through to the panic.
-        _ => panic!("x86_64 unary emit not implemented for {:?} (lowering not run?)", op),
+        _ => panic!(
+            "x86_64 unary emit not implemented for {:?} (lowering not run?)",
+            op
+        ),
     }
 }
 

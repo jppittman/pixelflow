@@ -84,7 +84,12 @@ fn run_scalar(code: &ExecutableCode, x: f32, y: f32, z: f32, w: f32) -> f32 {
     // SAFETY: SSE2 is the baseline on x86-64; the JIT emitted `__m128` ABI.
     unsafe {
         let f: KernelFn = code.as_fn();
-        let r = f(_mm_set1_ps(x), _mm_set1_ps(y), _mm_set1_ps(z), _mm_set1_ps(w));
+        let r = f(
+            _mm_set1_ps(x),
+            _mm_set1_ps(y),
+            _mm_set1_ps(z),
+            _mm_set1_ps(w),
+        );
         _mm_cvtss_f32(r)
     }
 }
@@ -111,7 +116,12 @@ fn run_scalar(code: &ExecutableCode, x: f32, y: f32, z: f32, w: f32) -> f32 {
     // SAFETY: NEON is mandatory on aarch64; the JIT emitted the `float32x4_t` ABI.
     unsafe {
         let f: KernelFn = code.as_fn();
-        let r = f(vdupq_n_f32(x), vdupq_n_f32(y), vdupq_n_f32(z), vdupq_n_f32(w));
+        let r = f(
+            vdupq_n_f32(x),
+            vdupq_n_f32(y),
+            vdupq_n_f32(z),
+            vdupq_n_f32(w),
+        );
         vgetq_lane_f32(r, 0)
     }
 }
