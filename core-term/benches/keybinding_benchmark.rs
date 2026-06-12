@@ -63,7 +63,7 @@ fn bench_keybindings(c: &mut Criterion) {
         // Benchmark O(log n) Binary Search
         let mut sorted_bindings = bindings.clone();
         // Requires KeySymbol and Modifiers to implement Ord (added in pixelflow-runtime)
-        sorted_bindings.sort_by(|a, b| (a.key, a.mods).cmp(&(b.key, b.mods)));
+        sorted_bindings.sort_by_key(|a| (a.key, a.mods));
 
         group.bench_function(format!("lookup_binsearch_size_{}", size), |b| {
             b.iter(|| {
