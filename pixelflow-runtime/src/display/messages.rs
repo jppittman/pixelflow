@@ -167,8 +167,14 @@ pub enum DisplayControl {
     /// # Arguments
     ///
     /// - `id`: Window identifier
-    /// - `visible`: `true` to show, `false` to hide
-    SetVisible { id: WindowId, visible: bool },
+    ShowWindow { id: WindowId },
+
+    /// Hide a window.
+    ///
+    /// # Arguments
+    ///
+    /// - `id`: Window identifier
+    HideWindow { id: WindowId },
 
     /// Request an immediate redraw.
     ///
