@@ -1,0 +1,17 @@
+# Test-runner policy.
+#
+# No single test may run longer than 10 minutes. nextest marks a test "slow"
+# after each `period` and TERMINATES it after `terminate-after` periods, then
+# reports the offending test by name and fails the run. 60s x 10 = 600s = 10m.
+#
+# This is a per-test cap (each test runs in its own process), so a single hung
+# test fails fast and is named in the log instead of stalling the whole job.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# CI inherits the cap above and just turns up reporting so the slow/timed-out
+# test is unmissable in the log.
+[profile.ci]
+final-status-level = "slow"
+failure-output = "immediate-final"

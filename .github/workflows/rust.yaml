@@ -7,6 +7,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Cancel superseded runs on the same ref so a hung job doesn't linger.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   clippy:
     name: Clippy
@@ -42,6 +47,9 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Backstop for non-test hangs (compile / doctests). The precise
+    # "no test over 10 minutes" policy is enforced per-test by nextest below.
+    timeout-minutes: 30
     strategy:
       # Continue running other jobs even if one fails, to see all failures
       fail-fast: false
@@ -62,6 +70,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       # Caching dependencies speeds up subsequent runs.
       - name: Cache dependencies
         uses: actions/cache@v3
@@ -74,6 +87,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Compile tests first so the run step below is (mostly) pure execution.
+      - name: Build tests
+        shell: bash
+        run: cargo nextest run --workspace --no-run
+
+      # Per-test hard cap: nextest TERMINATES any test exceeding 10 minutes and
+      # names it in the log (see .config/nextest.toml), failing the run.
       - name: Run workspace tests
         shell: bash
-        run: cargo test --workspace --verbose
+        run: cargo nextest run --workspace --profile ci
+
+      # nextest does not run doctests; run them separately.
+      - name: Run doctests
+        shell: bash
+        run: cargo test --workspace --doc
