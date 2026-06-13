@@ -260,7 +260,7 @@ out(j) = act( Gather(bias, j, 0)
             + ReduceAdd(i, N, Gather(W, i, j) * Gather(input, i, 0)) )
 ```
 
-collapsed over `IndexLattice1D { len: M }` to produce the next layer's
+collapsed over `Lattice::index(M)` to produce the next layer's
 (pinned) input. With `N` static and weights frozen:
 
 - small `N` → fully unrolled FMA chain, weights as immediates;
@@ -304,11 +304,18 @@ store op.
 
 ## Open Questions
 
-- **Surface naming.** Code says `Lattice` (domain) and `DiscreteManifold`
-  (data); the language story says "kernels and lattices." Likely resolution:
-  the user-facing word for collapsed data *is* "lattice" (`lattice<W, H>` in
-  the macro), and `DiscreteManifold` stays as the internal type name — but a
-  rename to `Lattice2D`/`LatticeData` is cheap now and expensive later.
+- ~~**Surface naming.**~~ **Resolved (Jun 13, 2026): no types in the name.**
+  There is one `Lattice` struct — `extent: [u32; 4]`, `origin: [f32; 4]` —
+  and the former `FrameLattice`/`ScanlineLattice`/`PointLattice`/
+  `IndexLattice1D`/`IndexLattice2D` zoo is deleted in favor of constructors
+  (`Lattice::frame/scanline/point/index/index2`). Shape is data, not a type:
+  extents only need to be static at *JIT-compile* time (when the kernel is
+  specialized), never at Rust-compile time, so there are no const generics
+  and no dimension suffixes. The per-lane vs horizontal reduction split that
+  used to be type-encoded is now method-encoded (`collapse_with` vs
+  `collapse_scalar`). The kernel-side surface is likewise macro-level
+  (`lattice` parameters in `kernel!`), not type-level. `DiscreteManifold`
+  stays as the name for collapsed data.
 - **Bilinear gather.** Nearest-neighbor has zero derivative; a `Gather2`
   (2×2 lerp) would be smooth and jet-friendly for texture-space AA. Defer
   until a concrete consumer appears — glyph AA is currently baked at collapse

@@ -1,9 +1,9 @@
-//! Benchmark: Hoisted Scanline JIT vs Per-Pixel JIT vs LLVM FrameLattice
+//! Benchmark: Hoisted Scanline JIT vs Per-Pixel JIT vs LLVM frame lattice
 //!
 //! Compares three evaluation strategies on a psychedelic shader expression:
 //!
-//!   1. **Per-pixel JIT (FrameLattice)**: JitManifold wrapped in a Manifold impl,
-//!      evaluated via `FrameLattice::collapse()`. This is structurally identical
+//!   1. **Per-pixel JIT (frame lattice)**: JitManifold wrapped in a Manifold impl,
+//!      evaluated via `Lattice::collapse()`. This is structurally identical
 //!      to the LLVM `kernel!` path (same loop, same per-SIMD-group call boundary).
 //!
 //!   2. **Scanline JIT (flat)**: `ScanlineJitManifold` without hoisting -- the loop
@@ -17,10 +17,7 @@
 //! Usage:
 //!   cargo run --release -p pixelflow-pipeline --bin bench_hoisted_scanline
 
-use pixelflow_core::{
-    Field, Manifold,
-    lattice::{FrameLattice, Lattice},
-};
+use pixelflow_core::{Field, Manifold, lattice::Lattice};
 use pixelflow_ir::{ExprArena, ExprId, OpKind};
 use std::time::Instant;
 
@@ -113,7 +110,7 @@ unsafe impl Sync for JitWrapper {}
 /// Run the scanline JIT eval loop over `frames` frames using a pre-compiled
 /// `ScanlineJitManifold`. Returns (total_ns, first_pixel, last_pixel).
 ///
-/// The inner loop mirrors FrameLattice::collapse() -- scanline eval + store to
+/// The inner loop mirrors Lattice::collapse() -- scanline eval + store to
 /// a flat f32 buffer -- so the comparison is apples-to-apples.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
@@ -206,7 +203,7 @@ fn main() {
     let per_pixel_code_bytes = per_pixel_result.code.len();
     let per_pixel_jit = pixelflow_ir::JitManifold::new(per_pixel_result.code);
     let wrapper = JitWrapper(per_pixel_jit);
-    let lattice = FrameLattice::new(WIDTH, HEIGHT, Z_TIME);
+    let lattice = Lattice::frame(WIDTH, HEIGHT, Z_TIME);
 
     #[cfg(target_arch = "aarch64")]
     let (scanline_hoisted_jit, scanline_code_bytes, num_hoisted) = {
@@ -232,7 +229,7 @@ fn main() {
     println!();
 
     // =====================================================================
-    // Lane 1: Per-pixel via FrameLattice::collapse()
+    // Lane 1: Per-pixel via Lattice::collapse()
     // =====================================================================
     print!("  Warming up per-pixel path ({} frames)...", WARMUP_FRAMES);
     for _ in 0..WARMUP_FRAMES {
@@ -320,7 +317,7 @@ fn main() {
     );
     println!(
         "  {:34} {:>10.2} {:>10.2} {:>10}",
-        "Per-pixel JIT (FrameLattice):",
+        "Per-pixel JIT (frame lattice):",
         per_pixel_ns_pixel,
         per_pixel_ns_frame / 1_000_000.0,
         per_pixel_code_bytes
