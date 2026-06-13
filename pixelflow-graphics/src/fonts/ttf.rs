@@ -779,8 +779,12 @@ impl<'a> Font<'a> {
             .collect();
 
         // Partition segments into lines and quads
-        let mut lines = Vec::new();
-        let mut quads = Vec::new();
+        // A font outline consists of at most `np` segments (typically split between lines and quads).
+        // Allocating half of `np` as a conservative upper bound for each reduces heap reallocations.
+        let estimated_lines = np / 2;
+        let estimated_quads = np / 2;
+        let mut lines = Vec::with_capacity(estimated_lines);
+        let mut quads = Vec::with_capacity(estimated_quads);
 
         let mut start = 0;
         for &e in ends.iter() {
