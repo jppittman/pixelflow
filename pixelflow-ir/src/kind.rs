@@ -90,11 +90,21 @@ pub enum OpKind {
     /// analytically; whatever cannot be decomposed survives as a residual `Dwrt`
     /// (the jet fallback — not yet wired). It must never reach a backend.
     Dwrt = 48,
+
+    // --- Bound memory (lattices) ---
+    /// Buffer leaf: a slot referencing a `BufferDecl` in the arena's buffer
+    /// table. The declared extents are static IR; the contents are bound at
+    /// JIT-compile time. See `docs/designs/KERNELS_AND_LATTICES.md`.
+    Buffer = 49,
+    /// Read a bound buffer: `Gather(buffer, x, y)` where `buffer` is a
+    /// `Buffer` leaf. Semantics match `DiscreteManifold::eval`: floor the
+    /// indices, clamp to the declared extents, gather row-major.
+    Gather = 50,
 }
 
 impl OpKind {
     /// Total number of operations.
-    pub const COUNT: usize = 49;
+    pub const COUNT: usize = 51;
 
     /// Convert to array index.
     #[inline]
@@ -117,7 +127,7 @@ impl OpKind {
     #[must_use]
     pub const fn arity(self) -> usize {
         match self {
-            Self::Var | Self::Const | Self::Tuple => 0,
+            Self::Var | Self::Const | Self::Tuple | Self::Buffer => 0,
 
             Self::Neg
             | Self::Sqrt
@@ -164,7 +174,7 @@ impl OpKind {
             | Self::BitOr
             | Self::Dwrt => 2,
 
-            Self::MulAdd | Self::Select | Self::Clamp => 3,
+            Self::MulAdd | Self::Select | Self::Clamp | Self::Gather => 3,
         }
     }
 
@@ -221,6 +231,8 @@ impl OpKind {
             Self::BitAnd => "bitand",
             Self::BitOr => "bitor",
             Self::Dwrt => "dwrt",
+            Self::Buffer => "buffer",
+            Self::Gather => "gather",
         }
     }
 
@@ -277,6 +289,8 @@ impl OpKind {
             "bitand" => Some(Self::BitAnd),
             "bitor" => Some(Self::BitOr),
             "dwrt" => Some(Self::Dwrt),
+            "buffer" => Some(Self::Buffer),
+            "gather" => Some(Self::Gather),
             _ => None,
         }
     }
@@ -285,7 +299,10 @@ impl OpKind {
     #[must_use]
     pub const fn default_cost(self) -> usize {
         match self {
-            Self::Var | Self::Const | Self::Tuple => 0,
+            Self::Var | Self::Const | Self::Tuple | Self::Buffer => 0,
+            // Memory read: native gather on AVX2/AVX-512, scalar loads on
+            // NEON/SSE2. Priced between an arithmetic op and a transcendental.
+            Self::Gather => 10,
             Self::Neg | Self::Abs | Self::Floor | Self::Ceil | Self::Round | Self::Fract => 1,
             Self::Add
             | Self::Sub
@@ -380,6 +397,7 @@ impl OpKind {
     /// - MulAdd (fused — should only arise from rewrite rules)
     /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
     /// - Select (needs mask input — only valid composed with a comparison)
+    /// - Buffer/Gather (memory ops — require a bound buffer, not synthesizable)
     #[must_use]
     pub const fn is_seed_op(self) -> bool {
         !matches!(
@@ -395,6 +413,8 @@ impl OpKind {
                 | Self::Eq
                 | Self::Ne
                 | Self::Select
+                | Self::Buffer
+                | Self::Gather
         )
     }
 
@@ -457,6 +477,9 @@ impl OpKind {
 
             // Differentiation: never emitted (rewritten away in the e-graph).
             Self::Dwrt => EmitStyle::Special,
+
+            // Memory ops: emitted by the JIT binding path, not as method calls.
+            Self::Buffer | Self::Gather => EmitStyle::Special,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select | Self::Clamp => EmitStyle::TernaryMethod,

@@ -394,6 +394,11 @@ fn needs_arena(arena: &ExprArena, id: ExprId) -> usize {
             "ExprNode::Param({}) reached the JIT emitter — call substitute_params before compile",
             i
         ),
+        ExprNode::Buffer(b) => panic!(
+            "ExprNode::Buffer({}) reached the JIT emitter — memory ops require a binding table \
+             (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+            b.0
+        ),
 
         // Unary: same as child (result overwrites input)
         ExprNode::Unary(_, child) => needs_arena(arena, *child),
@@ -478,6 +483,10 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
         }
 
         ExprNode::Param(_) => Err("Param not supported directly here"),
+
+        ExprNode::Buffer(_) => {
+            Err("Buffer/Gather not yet supported by the JIT emitter (binding tables land in M2)")
+        }
 
         ExprNode::Unary(op, child) => {
             // Emit the child one depth deeper so its result register differs from
@@ -770,7 +779,7 @@ where
         let node = arena.node(ExprId(idx as u32));
         let is_trivial = matches!(
             node,
-            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_)
+            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_)
         );
         is_setup[idx] = !is_trivial && partition(v);
     }
@@ -864,6 +873,11 @@ where
                 "ExprNode::Param({i}) reached the JIT emitter -- \
                  call substitute_params before compile_arena()"
             ),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
+                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+                b.0
+            ),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child, &id_map)),
             ExprNode::Binary(op, a, b) => {
                 ScheduledOp::Binary(*op, map_child(a, &id_map), map_child(b, &id_map))
@@ -898,6 +912,11 @@ where
             ExprNode::Param(i) => panic!(
                 "ExprNode::Param({i}) reached the JIT emitter -- \
                  call substitute_params before compile_arena()"
+            ),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
+                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+                b.0
             ),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child, &id_map)),
             ExprNode::Binary(op, a, b) => {
@@ -1821,6 +1840,11 @@ impl CompileWorkspace {
                      call substitute_params before compile",
                     i
                 ),
+                crate::arena::ExprNode::Buffer(b) => panic!(
+                    "ExprNode::Buffer({}) reached CompileWorkspace — memory ops require a \
+                     binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+                    b.0
+                ),
                 crate::arena::ExprNode::Unary(op, child) => {
                     ScheduledOp::Unary(*op, map_child(child))
                 }
@@ -2408,6 +2432,11 @@ fn arena_to_schedule(
                 "ExprNode::Param({}) reached the JIT emitter -- \
                  call substitute_params before compile_arena()",
                 i
+            ),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
+                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+                b.0
             ),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
             // Shl/Shr fold their Const shift-count operand into an immediate, so
