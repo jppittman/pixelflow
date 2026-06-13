@@ -233,10 +233,7 @@ pub use zst::Zst;
 pub use manifold::Differentiable;
 
 // Lattice types for manifold evaluation over finite domains
-pub use lattice::{
-    DiscreteManifold, FrameLattice, IndexLattice1D, IndexLattice2D, Lattice, LatticeDomain,
-    PointLattice, ReduceOp, ScanlineLattice,
-};
+pub use lattice::{DiscreteManifold, Lattice, ReduceOp};
 
 // ============================================================================
 // Field: The ONLY User-Facing SIMD Type
