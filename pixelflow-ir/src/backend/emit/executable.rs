@@ -26,51 +26,22 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, mprotect};
+        let mut buf = CodeBuffer::new(code.len())?;
+        // write_code handles all the OS-specific JIT toggling and cache invalidation.
+        let _func: KernelFn = unsafe { buf.write_code(code)? };
 
-        if code.is_empty() {
-            return Err("empty code buffer");
-        }
+        let ptr = buf.ptr;
+        let capacity = buf.capacity;
+        let len = buf.len;
 
-        // Round up to page size (usually 4KB, but 16KB on Apple Silicon)
-        let page_size = page_size();
-        let capacity = (code.len() + page_size - 1) & !(page_size - 1);
+        // We take ownership of the buffer's memory so it's not freed when `buf` drops.
+        core::mem::forget(buf);
 
-        // SAFETY: All syscalls below are safe given valid arguments (which we ensure).
-        unsafe {
-            // 1. Allocate read-write memory
-            let ptr = mmap(
-                ptr::null_mut(),
-                capacity,
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANON,
-                -1,
-                0,
-            );
-
-            if ptr == libc::MAP_FAILED {
-                return Err("mmap failed");
-            }
-
-            let ptr = ptr as *mut u8;
-
-            // 2. Copy code into the buffer
-            ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
-
-            // 3. Flip to read-execute (W^X)
-            let result = mprotect(ptr as *mut libc::c_void, capacity, PROT_READ | PROT_EXEC);
-
-            if result != 0 {
-                libc::munmap(ptr as *mut libc::c_void, capacity);
-                return Err("mprotect failed");
-            }
-
-            Ok(Self {
-                ptr,
-                len: code.len(),
-                capacity,
-            })
-        }
+        Ok(Self {
+            ptr,
+            len,
+            capacity,
+        })
     }
 
     /// Get a function pointer to the compiled code.
