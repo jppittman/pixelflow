@@ -152,15 +152,15 @@ impl CodeBuffer {
 
         // On macOS with JIT support, use MAP_JIT for pthread_jit_write_protect_np.
         #[cfg(target_os = "macos")]
-        let flags = MAP_PRIVATE | MAP_ANON | libc::MAP_JIT;
+        let (flags, prot) = (MAP_PRIVATE | MAP_ANON | libc::MAP_JIT, PROT_READ | PROT_WRITE | libc::PROT_EXEC);
         #[cfg(not(target_os = "macos"))]
-        let flags = MAP_PRIVATE | MAP_ANON;
+        let (flags, prot) = (MAP_PRIVATE | MAP_ANON, PROT_READ | PROT_WRITE);
 
         let ptr = unsafe {
             mmap(
                 ptr::null_mut(),
                 capacity,
-                PROT_READ | PROT_WRITE,
+                prot,
                 flags,
                 -1,
                 0,
