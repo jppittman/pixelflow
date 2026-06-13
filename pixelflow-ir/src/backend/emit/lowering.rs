@@ -78,7 +78,10 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
                 }
                 work.push(Task::Emit(id));
                 match arena.node(id).clone() {
-                    ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => {}
+                    ExprNode::Var(_)
+                    | ExprNode::Const(_)
+                    | ExprNode::Param(_)
+                    | ExprNode::Buffer(_) => {}
                     ExprNode::Unary(_, a) => work.push(Task::Descend(a)),
                     ExprNode::Binary(_, a, b) => {
                         work.push(Task::Descend(b));
@@ -107,6 +110,8 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
                     ExprNode::Var(i) => arena.push_var(i),
                     ExprNode::Const(v) => arena.push_const(v),
                     ExprNode::Param(i) => arena.push_param(i),
+                    // Same arena, so the buffer table (and ids) stay valid.
+                    ExprNode::Buffer(b) => arena.push_buffer(b),
                     ExprNode::Unary(op, a) => {
                         let a = m(a);
                         if is_transcendental_unary(op) {

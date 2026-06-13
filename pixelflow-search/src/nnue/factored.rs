@@ -514,6 +514,8 @@ impl OpEmbeddings {
             0.05, // BitOr - 1 cycle
             // Dwrt - rewritten away by the e-graph (chain rule); never emitted.
             1.0, // Dwrt - prohibitive so a surviving derivative never extracts
+            0.0, // Buffer - leaf, free
+            0.5, // Gather - memory read, ~10 cycles
         ];
 
         let mut rng_state = seed.wrapping_add(1);
@@ -930,7 +932,7 @@ impl EdgeAccumulator {
 
             acc.node_count += 1;
             match arena.node(id) {
-                ExprNode::Var(_) | ExprNode::Const(_) => {}
+                ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Buffer(_) => {}
                 ExprNode::Param(i) => {
                     panic!("ExprNode::Param({i}) reached NNUE cost model — substitute params first")
                 }

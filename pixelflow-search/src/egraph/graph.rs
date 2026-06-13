@@ -368,6 +368,13 @@ impl EGraph {
                 ExprNode::Param(i) => {
                     panic!("add_arena: ExprNode::Param({i}) not valid after kernel compilation")
                 }
+                ExprNode::Buffer(b) => {
+                    panic!(
+                        "add_arena: ExprNode::Buffer({}) — memory ops are not yet representable \
+                         in the e-graph (KERNELS_AND_LATTICES.md M3)",
+                        b.0
+                    )
+                }
                 ExprNode::Unary(op, child) => {
                     let child_id = id_map[child.0 as usize].unwrap_or_else(|| {
                         panic!(

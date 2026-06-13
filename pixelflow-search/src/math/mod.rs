@@ -151,6 +151,7 @@ mod tests {
             ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
             ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
             ExprNode::Param(i) => panic!("Param({i}) reached math tests"),
+            ExprNode::Buffer(b) => panic!("Buffer({}) reached math tests", b.0),
             ExprNode::Unary(kind, a) => {
                 let ca = expr_to_egraph(arena, a, egraph);
                 let op = crate::egraph::ops::op_from_kind(kind)
@@ -215,6 +216,7 @@ mod tests {
             ExprNode::Var(i) => vars[i as usize],
             ExprNode::Const(c) => c,
             ExprNode::Param(_) => panic!("Param in eval_arena"),
+            ExprNode::Buffer(_) => panic!("Buffer in eval_arena (memory not bindable here)"),
             ExprNode::Unary(op, a) => {
                 let a = eval_arena(arena, a, vars);
                 op.eval_unary(a)

@@ -241,6 +241,9 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
                 }
             }
             ExprNode::Const(_) => Variance::CONST,
+            // A buffer leaf is constant; a Gather's variance is the union of
+            // its index expressions (handled by the Ternary arm below).
+            ExprNode::Buffer(_) => Variance::CONST,
             ExprNode::Param(_) => {
                 // Parameters are substituted before JIT compilation.
                 // If we see one here, treat conservatively as all-varying.
@@ -328,9 +331,13 @@ pub fn find_hoistable_arena_nodes(
         let id = ExprId(i as u32);
         let node = arena.node(id);
 
-        // Skip trivial nodes (Var, Const, Param) — not worth a register
+        // Skip trivial nodes (Var, Const, Param, Buffer) — not worth a register
         let priority = match node {
-            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => continue,
+            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) => {
+                continue;
+            }
+            // A loop-invariant memory read is well worth a register.
+            ExprNode::Ternary(OpKind::Gather, _, _, _) => 2,
             ExprNode::Unary(
                 OpKind::Sin
                 | OpKind::Cos
