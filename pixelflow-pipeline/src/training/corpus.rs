@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn round_trip_with_const_and_unary() {
         let mut arena = ExprArena::new();
-        let c = arena.push_const(3.14);
+        let c = arena.push_const(std::f32::consts::PI);
         let root = arena.push_unary(OpKind::Sqrt, c);
 
         let entries = vec![("sqrt_pi".to_string(), arena, root)];
@@ -397,7 +397,10 @@ mod tests {
         assert_eq!(loaded[0].0, "sqrt_pi");
         // Check the const value round-trips
         match loaded[0].1.node(ExprId(0)) {
-            ExprNode::Const(v) => assert!((v - 3.14).abs() < 1e-6, "const mismatch: {v}"),
+            ExprNode::Const(v) => assert!(
+                (v - std::f32::consts::PI).abs() < 1e-6,
+                "const mismatch: {v}"
+            ),
             other => panic!("expected Const, got {other:?}"),
         }
 
@@ -494,7 +497,7 @@ mod tests {
 
         // Entry 2: sqrt(3.14)
         let mut a2 = ExprArena::new();
-        let c = a2.push_const(3.14);
+        let c = a2.push_const(std::f32::consts::PI);
         let r2 = a2.push_unary(OpKind::Sqrt, c);
         entries.push(("sqrt_pi".to_string(), a2, r2));
 
