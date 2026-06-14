@@ -660,6 +660,7 @@ fn gacc_from_replay(step: &ReplayStep) -> GraphAccumulator {
 struct ReplayStep {
     acc: Vec<f32>,             // 132 floats (INPUT_DIM)
     graph_acc: Vec<f32>,       // GRAPH_INPUT_DIM floats — VSA graph state
+    #[allow(dead_code)]
     expr_embed: Vec<f32>,      // 32 floats (EMBED_DIM) — expr_proj output at decision time
     rule_embed: Vec<f32>,      // 32 floats (EMBED_DIM)
     edges: Vec<(u8, u8, u16)>, // Edge list for embedding gradient flow

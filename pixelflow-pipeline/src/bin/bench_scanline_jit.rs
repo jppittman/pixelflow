@@ -9,6 +9,7 @@ use pixelflow_pipeline::training::factored::parse_kernel_code_arena;
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
 }
+#[allow(dead_code)]
 fn nanos_now() -> u64 {
     #[cfg(target_os = "macos")]
     unsafe {

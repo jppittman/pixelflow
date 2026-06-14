@@ -677,6 +677,7 @@ mod tests {
         eval_arena_scalar(&arena, root, &REWRITE_BUG_INPUTS)
     }
 
+    #[allow(dead_code)]
     fn logged_expr_jit_output(src: &str) -> f32 {
         let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
         benchmark_jit_arena(&arena, root)
@@ -693,6 +694,7 @@ mod tests {
         eval_arena_scalar(&re_arena, re_root, &REWRITE_BUG_INPUTS)
     }
 
+    #[allow(dead_code)]
     fn assert_scalar_and_jit_close(src: &str, epsilon: f32) {
         let scalar = logged_expr_scalar_output(src);
         let jit = logged_expr_jit_output(src);

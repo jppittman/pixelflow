@@ -3006,10 +3006,10 @@ mod tests {
                 let (a, n, err) = check_gradient(grads.d_interaction[i][j], num_grad);
 
                 // Skip relative error check for near-zero gradients where noise dominates
-                if (a as f64).abs() < abs_threshold as f64 && n.abs() < abs_threshold as f64 {
+                if (a as f64).abs() < abs_threshold && n.abs() < abs_threshold {
                     let abs_err = (a as f64 - n).abs();
                     assert!(
-                        abs_err < abs_threshold as f64,
+                        abs_err < abs_threshold,
                         "interaction[{i}][{j}]: near-zero gradient abs_err={abs_err:.8e} exceeds threshold"
                     );
                     eprintln!(

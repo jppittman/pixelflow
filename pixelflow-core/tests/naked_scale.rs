@@ -62,7 +62,7 @@ fn test_naked_abi_multithreaded_scale() {
     #[cfg(target_arch = "aarch64")]
     {
         let num_threads = 16;
-        let ops_per_thread = 1_000_000;
+        let ops_per_thread = 10_000; // Drastically reduce loop iterations to avoid GitHub Actions macOS runner timeout (was > 600s)
         let kernel_ptr = get_jit_mul_kernel();
         let total_successes = AtomicUsize::new(0);
 
