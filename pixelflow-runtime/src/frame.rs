@@ -147,12 +147,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_channels() {
-        let (_handle, _rx) = create_frame_channel::<TestSurface>();
-        let (_recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
-    }
-
-    #[test]
     fn test_submit_and_receive() {
         let (handle, rx) = create_frame_channel::<TestSurface>();
         let (recycle_tx, _recycle_rx) = create_recycle_channel::<TestSurface>();
