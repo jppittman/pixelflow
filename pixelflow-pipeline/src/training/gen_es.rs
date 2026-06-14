@@ -179,12 +179,12 @@ impl GenEs {
         }
 
         // Fail fast on NaN gradient — something upstream is broken.
-        for d in 0..ES_DIM {
+        for (d, g) in grad.iter().enumerate().take(ES_DIM) {
             assert!(
-                grad[d].is_finite(),
+                g.is_finite(),
                 "NaN/Inf in grad[{d}]={}, scale={scale}, n={n}, sigma={}, mu={:?}, \
                  epsilons={:?}, normalized={:?}, fitnesses={:?}",
-                grad[d],
+                g,
                 self.sigma,
                 self.mu,
                 epsilons,
@@ -194,8 +194,8 @@ impl GenEs {
         }
 
         // Update mu and clamp to [0, 1].
-        for d in 0..ES_DIM {
-            self.mu[d] = clamp01(self.mu[d] + self.alpha * grad[d]);
+        for (d, g) in grad.iter().enumerate().take(ES_DIM) {
+            self.mu[d] = clamp01(self.mu[d] + self.alpha * g);
         }
 
         eprintln!(
@@ -397,25 +397,13 @@ pub fn denormalize(params: &[f32; ES_DIM]) -> BwdGenConfig {
 #[must_use]
 pub fn log_ns(ns: f64) -> f32 {
     assert!(!ns.is_nan(), "log_ns called with NaN");
-    let clamped = if ns < 1e-3 {
-        1e-3
-    } else if ns > 1e9 {
-        1e9
-    } else {
-        ns
-    };
+    let clamped = ns.clamp(1e-3, 1e9);
     libm::logf(clamped as f32)
 }
 
 /// Clamp to [0, 1].
 fn clamp01(v: f32) -> f32 {
-    if v < 0.0 {
-        0.0
-    } else if v > 1.0 {
-        1.0
-    } else {
-        v
-    }
+    v.clamp(0.0, 1.0)
 }
 
 // ============================================================================

@@ -127,6 +127,11 @@ impl MmapReplayBuffer {
         self.records.len()
     }
 
+    /// Returns true if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     /// Push a single record. If over capacity, FIFO evict oldest.
     pub fn push(&mut self, record: ReplayRecord) {
         self.records.push(record);
@@ -208,12 +213,12 @@ fn records_as_bytes(records: &[ReplayRecord]) -> &[u8] {
 
 fn bytes_as_records(bytes: &[u8]) -> &[ReplayRecord] {
     assert!(
-        bytes.len() % RECORD_SIZE == 0,
+        bytes.len().is_multiple_of(RECORD_SIZE),
         "[REPLAY] Byte buffer length {} is not a multiple of record size {RECORD_SIZE}",
         bytes.len(),
     );
     assert!(
-        bytes.as_ptr() as usize % std::mem::align_of::<ReplayRecord>() == 0 || bytes.is_empty(),
+        (bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<ReplayRecord>()) || bytes.is_empty(),
         "[REPLAY] Byte buffer is not aligned to ReplayRecord alignment",
     );
     unsafe {
