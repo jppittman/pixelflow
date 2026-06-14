@@ -343,14 +343,16 @@ unsafe fn toggle_jit_write(state: JitWriteState) {
     // pthread_jit_write_protect_np(false) = writable (not executable)
     // Note: the semantics are inverted from what you'd expect!
     unsafe extern "C" {
-        fn pthread_jit_write_protect_np(enabled: core::ffi::c_int);
+        fn pthread_jit_write_protect_np(enabled: bool);
     }
+
     // writable=true → we want to write → disable write protection
     // writable=false → we want to execute → enable write protection
     let enabled = match state {
-        JitWriteState::Writable => 0,
-        JitWriteState::Executable => 1,
+        JitWriteState::Writable => false,
+        JitWriteState::Executable => true,
     };
+
     // SAFETY: pthread_jit_write_protect_np is always safe to call — it only
     // affects the calling thread's JIT write permission.
     unsafe {
