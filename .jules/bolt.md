@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Vec capacity optimization without empty checks
+**Learning:** Reallocations caused by `Vec::new` overhead can be avoided by pre-allocating with `Vec::with_capacity(size)`. However, care must be taken to only replace these when the target size is strictly known, and when an empty check handles underflow like `size - 1`. Similarly, pre-allocating is dangerous when list sub-types often result in empty vectors (e.g. `manifold_params` vs `scalar_params`), avoiding upfront allocations is faster.
+**Action:** Always verify potential underflows, `Vec::with_capacity(usize::MAX)` panics, and pre-allocating empty vectors causes unnecessary heap allocation. Only use `Vec::with_capacity` when there's an exact known size with no possibility of sub-zero indices.

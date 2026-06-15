@@ -328,7 +328,7 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
 
 /// Convert a syn::Block to our BlockExpr.
 fn convert_block(block: syn::Block) -> syn::Result<BlockExpr> {
-    let mut stmts = Vec::new();
+    let mut stmts = Vec::with_capacity(block.stmts.len());
     let mut final_expr = None;
 
     for (i, stmt) in block.stmts.iter().enumerate() {
