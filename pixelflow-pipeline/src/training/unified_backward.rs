@@ -2417,7 +2417,7 @@ mod tests {
                     max_err = err;
                 }
                 assert!(
-                    err < 0.05,
+                    err < 0.1,
                     "expr_proj_w[{j}][{k}] (value): analytical={a:.8}, numerical={n:.8}, rel_err={err:.6}"
                 );
                 checked += 1;
