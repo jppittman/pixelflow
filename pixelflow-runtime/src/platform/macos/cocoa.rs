@@ -6,6 +6,24 @@
 use super::sys::{self, Id, BOOL, NO, YES};
 use std::ffi::c_void;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    IgnoreOtherApps,
+    RespectOtherApps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequeueBehavior {
+    Dequeue,
+    Peek,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WantsLayer {
+    Yes,
+    No,
+}
+
 // --- Helpers ---
 
 /// Convert Rust string to NSString id.
@@ -136,9 +154,13 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self, policy: ActivationPolicy) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = if policy == ActivationPolicy::IgnoreOtherApps {
+                YES
+            } else {
+                NO
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -156,9 +178,14 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, behavior: DequeueBehavior) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = if behavior == DequeueBehavior::Dequeue {
+                YES
+            } else {
+                NO
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -170,6 +197,12 @@ impl NSApplication {
             NSEvent(ptr)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferCreation {
+    Defer,
+    Immediate,
 }
 
 /// Wrapper for NSWindow
@@ -190,10 +223,14 @@ impl NSWindow {
         rect: NSRect,
         style_mask: u64,
         backing: u64,
-        defer: bool,
+        defer_creation: DeferCreation,
     ) -> Self {
         unsafe {
-            let d = if defer { YES } else { NO };
+            let d = if defer_creation == DeferCreation::Defer {
+                YES
+            } else {
+                NO
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
@@ -266,9 +303,9 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self, wants: WantsLayer) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = if wants == WantsLayer::Yes { YES } else { NO };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }
