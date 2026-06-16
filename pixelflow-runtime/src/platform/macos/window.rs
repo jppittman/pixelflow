@@ -1,6 +1,8 @@
 use crate::api::public::WindowDescriptor;
 use crate::error::RuntimeError;
-use crate::platform::macos::cocoa::{NSPoint, NSRect, NSSize, NSView, NSWindow};
+use crate::platform::macos::cocoa::{
+    DeferCreation, NSPoint, NSRect, NSSize, NSView, NSWindow, WantsLayer,
+};
 use crate::platform::macos::sys::{self, Id, BOOL, YES};
 use std::ffi::c_void;
 
@@ -28,7 +30,7 @@ impl MacWindow {
             rect,
             style_mask,
             backing,
-            cocoa::DeferCreation::Immediate,
+            DeferCreation::Immediate,
         );
         window.set_title(&desc.title);
 
@@ -65,7 +67,7 @@ impl MacWindow {
             sys::send_1::<(), Id>(view.0, sys::sel(b"setLayer:\0"), layer);
 
             // [view setWantsLayer: YES]
-            view.set_wants_layer(cocoa::WantsLayer::Yes);
+            view.set_wants_layer(WantsLayer::Yes);
         }
 
         window.set_content_view(view);
