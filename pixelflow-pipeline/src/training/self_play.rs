@@ -19,7 +19,7 @@ use pixelflow_search::egraph::{
 use pixelflow_search::nnue::factored::INPUT_DIM;
 use pixelflow_search::nnue::factored::MAX_ARITY;
 use pixelflow_search::nnue::{
-    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_ACC_DIM,
+    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue,
     GRAPH_INPUT_DIM, GraphAccumulator, OpKind, RuleTemplates,
 };
 
@@ -1261,6 +1261,7 @@ pub fn generate_corpus_trajectories_parallel(
 
 #[cfg(test)]
 mod tests {
+    use pixelflow_search::nnue::GRAPH_ACC_DIM;
     use super::*;
 
     #[test]
