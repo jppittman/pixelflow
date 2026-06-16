@@ -288,11 +288,13 @@ impl TerminalApp {
         let default_bg = self.config.colors.background;
 
         // Build 2-level BSP: Vertical (Rows) -> Horizontal (Cells)
-        let mut row_items = Vec::new();
+        // Pre-allocate row_items with capacity `rows` to avoid reallocation in the render loop.
+        let mut row_items = Vec::with_capacity(rows);
 
         for row in 0..rows {
             let line = &snapshot.lines[row];
-            let mut cell_items = Vec::new();
+            // Pre-allocate cell_items with capacity `cols` to avoid reallocation in the render loop.
+            let mut cell_items = Vec::with_capacity(cols);
 
             for col in 0..cols {
                 let glyph = &line.cells[col];
