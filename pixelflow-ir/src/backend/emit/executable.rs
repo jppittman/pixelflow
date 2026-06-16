@@ -62,9 +62,10 @@ impl ExecutableCode {
 
             // Instruction cache coherence on Apple Silicon.
             // sys_icache_invalidate is needed after writing code on ARM.
+            // Apple requires this to be called AFTER restoring execute permissions.
             #[cfg(target_os = "macos")]
             {
-                extern "C" {
+                unsafe extern "C" {
                     fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
                 }
                 sys_icache_invalidate(ptr as *mut core::ffi::c_void, code.len());
