@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Test Naming Style Guide Violation Fixes
+**Learning:** Found an issue where tests in `pixelflow-core/src/naked_test.rs` didn't conform to the BDD naming convention (e.g., `test_naked_call`).
+**Action:** Replaced simple generic test prefixes like `test_` with descriptive suffixes to match `[method]_should_[outcome]_when_[condition]` structure as required by the style guide for test clarity.
