@@ -397,25 +397,13 @@ pub fn denormalize(params: &[f32; ES_DIM]) -> BwdGenConfig {
 #[must_use]
 pub fn log_ns(ns: f64) -> f32 {
     assert!(!ns.is_nan(), "log_ns called with NaN");
-    let clamped = if ns < 1e-3 {
-        1e-3
-    } else if ns > 1e9 {
-        1e9
-    } else {
-        ns
-    };
+    let clamped = ns.clamp(1e-3, 1e9);
     libm::logf(clamped as f32)
 }
 
 /// Clamp to [0, 1].
 fn clamp01(v: f32) -> f32 {
-    if v < 0.0 {
-        0.0
-    } else if v > 1.0 {
-        1.0
-    } else {
-        v
-    }
+    v.clamp(0.0, 1.0)
 }
 
 // ============================================================================

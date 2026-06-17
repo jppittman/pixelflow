@@ -127,6 +127,11 @@ impl MmapReplayBuffer {
         self.records.len()
     }
 
+    /// True if buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     /// Push a single record. If over capacity, FIFO evict oldest.
     pub fn push(&mut self, record: ReplayRecord) {
         self.records.push(record);
