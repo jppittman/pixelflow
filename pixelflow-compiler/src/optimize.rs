@@ -993,7 +993,8 @@ impl EGraphContext {
 
         // Build a map from shared e-class indices to their let-binding names
         let mut binding_names: HashMap<usize, String> = HashMap::new();
-        let mut stmts: Vec<Stmt> = Vec::new();
+        // Pre-allocate assuming roughly one binding per scheduled instruction (except root)
+        let mut stmts: Vec<Stmt> = Vec::with_capacity(dag.schedule.len().saturating_sub(1));
 
         // Emit let-bindings for shared e-classes in topological order
         let mut binding_idx = 0usize;

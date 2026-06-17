@@ -488,7 +488,8 @@ pub fn emit_leveled(
     let root = builder.build(annotated);
 
     // Generate code for each level
-    let mut stmts = Vec::new();
+    let stmts_len: usize = builder.levels.iter().map(|l| l.len()).sum();
+    let mut stmts = Vec::with_capacity(stmts_len);
 
     for (level_idx, level) in builder.levels.iter().enumerate() {
         for (node_idx, node) in level.iter().enumerate() {

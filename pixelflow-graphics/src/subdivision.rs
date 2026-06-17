@@ -50,7 +50,7 @@ impl EigenStructure {
         Self {
             valence: 4,
             eigenvalues: vec![1.0, 0.25, 0.25, 0.0625],
-            eigenvectors: Vec::new(), // TODO: B-spline basis
+            eigenvectors: Vec::with_capacity(4), // TODO: B-spline basis
         }
     }
 
@@ -63,8 +63,8 @@ impl EigenStructure {
         // For now, return placeholder
         Self {
             valence,
-            eigenvalues: Vec::new(),
-            eigenvectors: Vec::new(),
+            eigenvalues: Vec::with_capacity(valence),
+            eigenvectors: Vec::with_capacity(valence),
         }
     }
 }

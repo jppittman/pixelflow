@@ -300,7 +300,7 @@ impl CachedText {
     ///
     /// Glyphs are retrieved from the cache (or baked on-demand).
     pub fn new(font: &Font, cache: &mut GlyphCache, text: &str, size: f32) -> Self {
-        let mut glyphs = Vec::new();
+        let mut glyphs = Vec::with_capacity(text.len());
         let mut cursor_x = 0.0f32;
         let mut prev_id = None;
 
