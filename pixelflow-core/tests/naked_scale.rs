@@ -68,6 +68,13 @@ fn test_naked_abi_multithreaded_scale() {
             for _ in 0..num_threads {
                 let successes = &total_successes;
                 s.spawn(move || {
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        extern "C" {
+                            fn pthread_jit_write_protect_np(enabled: core::ffi::c_int);
+                        }
+                        pthread_jit_write_protect_np(1);
+                    }
                     let mut local_successes = 0;
 
                     let x = [1.0f32, 2.0, 3.0, 4.0];

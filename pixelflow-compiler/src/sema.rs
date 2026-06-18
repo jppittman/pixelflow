@@ -49,7 +49,11 @@ pub struct AnalyzedKernel {
 /// Perform semantic analysis on a parsed kernel.
 pub fn analyze(kernel: KernelDef) -> syn::Result<AnalyzedKernel> {
     // Anonymous kernels (no struct_decl) allow captured variables from environment
-    let kernel_type = if kernel.struct_decl.is_none() { KernelType::Anonymous } else { KernelType::Named };
+    let kernel_type = if kernel.struct_decl.is_none() {
+        KernelType::Anonymous
+    } else {
+        KernelType::Named
+    };
     let mut analyzer = SemanticAnalyzer::new(kernel_type);
 
     // Register all parameters in the symbol table
