@@ -15,14 +15,12 @@ fn get_jit_mul_kernel() -> usize {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len() * 4) };
 
-    let exec = unsafe {
-        pixelflow_ir::backend::emit::executable::ExecutableCode::from_code(bytes).unwrap()
-    };
+    let mut buf = pixelflow_ir::backend::emit::executable::CodeBuffer::new(4096).unwrap();
+    let func = unsafe { buf.write_code::<extern "C" fn()>(bytes).unwrap() };
 
-    // Leak the executable so it lives forever (it's just a test)
-    let ptr = unsafe { exec.as_fn::<extern "C" fn()>() as usize };
-    std::mem::forget(exec);
-    ptr
+    // Leak the buffer so it lives forever (it's just a test)
+    Box::leak(Box::new(buf));
+    func as usize
 }
 
 #[cfg(target_arch = "aarch64")]
