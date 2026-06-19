@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Terminal Grid Pre-allocation
+**Learning:** The core terminal app rebuilds its spatial BSP from the terminal grid on every frame, and its nested row/cell iterations were using `Vec::new()`, causing dynamic reallocation overhead per frame.
+**Action:** When building collections corresponding to 2D grid structures (like terminal rows and columns), use `Vec::with_capacity` using the known dimensions to eliminate hot-path reallocation overhead.
