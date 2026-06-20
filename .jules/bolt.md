@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Refactoring Boolean Traps in Cocoa Wrapper
+**Learning:** I learned that boolean arguments in wrapper functions (e.g., `activate_ignoring_other_apps(true)`) violate the style guidelines by obscuring intent at the call site.
+**Action:** Refactored multiple Cocoa FFI wrapper functions in `pixelflow-runtime/src/platform/macos/cocoa.rs` to split into separate methods with distinct names (e.g., `set_wants_layer()` and `clear_wants_layer()`) rather than passing a boolean flag.
