@@ -494,7 +494,7 @@ pub fn emit_leveled(
         for (node_idx, node) in level.iter().enumerate() {
             let var_name = NodeRef::new(level_idx, node_idx).var_name();
 
-            let value = emit_node(node, use_jet_wrapper);
+            let value = emit_node(node, WrapperMode::from(use_jet_wrapper));
             stmts.push(quote! { let #var_name = #value; });
         }
     }
@@ -510,7 +510,20 @@ pub fn emit_leveled(
 }
 
 /// Emit code for a single node
-fn emit_node(node: &LeveledNode, use_jet_wrapper: bool) -> TokenStream {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WrapperMode {
+    Jet,
+    Direct,
+}
+
+impl From<bool> for WrapperMode {
+    fn from(b: bool) -> Self {
+        if b { WrapperMode::Jet } else { WrapperMode::Direct }
+    }
+}
+
+fn emit_node(node: &LeveledNode, wrapper_mode: WrapperMode) -> TokenStream {
+    let use_jet_wrapper = wrapper_mode == WrapperMode::Jet;
     match &node.kind {
         LeveledNodeKind::Param { name, kind } => {
             let name_ident = format_ident!("{}", name);

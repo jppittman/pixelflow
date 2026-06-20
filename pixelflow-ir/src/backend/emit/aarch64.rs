@@ -393,7 +393,20 @@ pub fn emit_adr_x17_placeholder(code: &mut Vec<u8>) -> usize {
 
 /// Patch a previously emitted `ADR X17` placeholder at `adr_pos` to point to `target_pos`.
 /// If `is_adrp` is true, assumes 8 bytes are reserved and patches `ADRP X17` + `ADD X17`.
-pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_adrp: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AdrMode {
+    Adr,
+    Adrp,
+}
+
+impl From<bool> for AdrMode {
+    fn from(b: bool) -> Self {
+        if b { AdrMode::Adrp } else { AdrMode::Adr }
+    }
+}
+
+pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, mode: AdrMode) {
+    let is_adrp = mode == AdrMode::Adrp;
     if is_adrp {
         assert!(
             adr_pos + 8 <= code.len(),
@@ -1867,8 +1880,8 @@ impl Aarch64Asm {
 
     /// Patch an ADR or ADRP+ADD at `adr_pos` to point to `target_pos`.
     #[inline]
-    pub fn patch_adr_or_adrp(&mut self, adr_pos: usize, target_pos: usize, is_adrp: bool) {
-        patch_adr_or_adrp(&mut self.code, adr_pos, target_pos, is_adrp);
+    pub fn patch_adr_or_adrp(&mut self, adr_pos: usize, target_pos: usize, mode: AdrMode) {
+        patch_adr_or_adrp(&mut self.code, adr_pos, target_pos, mode);
     }
 
     /// Emit ADR X17, #0 placeholder. Returns patch position.

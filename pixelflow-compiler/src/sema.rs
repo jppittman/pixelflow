@@ -23,6 +23,18 @@
 //! - The populated symbol table
 //! - Any resolved type information
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KernelType {
+    Named,
+    Anonymous,
+}
+
+impl From<bool> for KernelType {
+    fn from(b: bool) -> Self {
+        if b { KernelType::Anonymous } else { KernelType::Named }
+    }
+}
+
 use crate::ast::{BlockExpr, Expr, KernelDef, LetStmt, MethodCallExpr, Param, ParamKind, Stmt};
 use crate::symbol::{SymbolKind, SymbolTable};
 use pixelflow_ir::known_method_names;
@@ -50,7 +62,7 @@ pub struct AnalyzedKernel {
 pub fn analyze(kernel: KernelDef) -> syn::Result<AnalyzedKernel> {
     // Anonymous kernels (no struct_decl) allow captured variables from environment
     let is_anonymous = kernel.struct_decl.is_none();
-    let mut analyzer = SemanticAnalyzer::new(is_anonymous);
+    let mut analyzer = SemanticAnalyzer::new(KernelType::from(is_anonymous));
 
     // Register all parameters in the symbol table
     for param in &kernel.params {
@@ -74,7 +86,8 @@ struct SemanticAnalyzer {
 }
 
 impl SemanticAnalyzer {
-    fn new(is_anonymous: bool) -> Self {
+    fn new(kernel_type: KernelType) -> Self {
+        let is_anonymous = kernel_type == KernelType::Anonymous;
         SemanticAnalyzer {
             symbols: SymbolTable::new(),
             is_anonymous,
