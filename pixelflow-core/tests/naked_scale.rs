@@ -22,6 +22,19 @@ fn get_jit_mul_kernel() -> usize {
     // Leak the executable so it lives forever (it's just a test)
     let ptr = unsafe { exec.as_fn::<extern "C" fn()>() as usize };
     std::mem::forget(exec);
+
+    // Invalidate icache because we just wrote code
+    // Required on Apple Silicon
+    #[cfg(target_os = "macos")]
+    unsafe {
+        std::arch::asm!(
+            "ic ivau, {0}",
+            "dsb ish",
+            "isb",
+            in(reg) ptr,
+        );
+    }
+
     ptr
 }
 
