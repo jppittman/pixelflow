@@ -75,7 +75,7 @@ impl ExecutableCode {
             #[cfg(target_arch = "aarch64")]
             #[cfg(target_os = "macos")]
             {
-                unsafe extern "C" {
+                extern "C" {
                     fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
                 }
                 sys_icache_invalidate(ptr as *mut core::ffi::c_void, code.len());
@@ -290,7 +290,7 @@ impl CodeBuffer {
                 toggle_jit_write(JitWriteState::Executable);
                 // Instruction cache coherence on Apple Silicon.
                 // sys_icache_invalidate is needed after writing code on ARM.
-                unsafe extern "C" {
+                extern "C" {
                     fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
                 }
                 sys_icache_invalidate(self.ptr as *mut core::ffi::c_void, code.len());
