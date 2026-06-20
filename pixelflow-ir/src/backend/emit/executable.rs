@@ -36,6 +36,12 @@ impl ExecutableCode {
         let page_size = page_size();
         let capacity = (code.len() + page_size - 1) & !(page_size - 1);
 
+        // On macOS with JIT support, use MAP_JIT for pthread_jit_write_protect_np.
+        #[cfg(target_os = "macos")]
+        let flags = MAP_PRIVATE | MAP_ANON | libc::MAP_JIT;
+        #[cfg(not(target_os = "macos"))]
+        let flags = MAP_PRIVATE | MAP_ANON;
+
         // SAFETY: All syscalls below are safe given valid arguments (which we ensure).
         unsafe {
             // 1. Allocate read-write memory
@@ -43,7 +49,7 @@ impl ExecutableCode {
                 ptr::null_mut(),
                 capacity,
                 PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANON,
+                flags,
                 -1,
                 0,
             );
@@ -63,6 +69,16 @@ impl ExecutableCode {
             if result != 0 {
                 libc::munmap(ptr as *mut libc::c_void, capacity);
                 return Err("mprotect failed");
+            }
+
+            // Invalidate instruction cache if necessary
+            #[cfg(target_arch = "aarch64")]
+            #[cfg(target_os = "macos")]
+            {
+                extern "C" {
+                    fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
+                }
+                sys_icache_invalidate(ptr as *mut core::ffi::c_void, code.len());
             }
 
             Ok(Self {
