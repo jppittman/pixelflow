@@ -13,3 +13,9 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Vec capacity allocation in hot paths
+**Learning:** During register allocation in the compiler backend (`color_graph` and `build_interference_graph`), vectors were being initialized with `Vec::new()` inside tight loops or for known schedule sizes. This causes unnecessary reallocation overhead as the vectors grow.
+**Action:** When a vector's size can be reasonably bounded or is exactly known (e.g., from a schedule's length), use `Vec::with_capacity(size)` to prevent multiple allocations and improve memory access patterns.
+## 2025-12-28 - Loop hoisting vector instantiation
+**Learning:** Initializing `Vec::with_capacity()` inside a tight loop still results in a heap allocation on every single iteration, even if it prevents multiple reallocations as elements are added. This defeats the purpose of the optimization.
+**Action:** When a vector's size can be bounded and it's used inside a loop, hoist the vector instantiation outside the loop and call `.clear()` on each iteration. This reuses a single heap allocation across all loop iterations.

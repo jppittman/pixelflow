@@ -218,13 +218,15 @@ pub fn color_graph(graph: &InterferenceGraph, num_regs: u8, scratch_base: u8) ->
     // used_colors[c] = true if color c is taken by a neighbor.
     let mut used_colors: Vec<bool> = vec![false; (scratch_base as usize) + (num_regs as usize)];
 
+    // Mark colors used by neighbors.
+    let mut marked: Vec<usize> = Vec::with_capacity(8);
+
     for v in ordering {
         if assignment_dense[v.0 as usize].is_some() {
             continue; // Already pre-colored.
         }
 
-        // Mark colors used by neighbors.
-        let mut marked: Vec<usize> = Vec::new();
+        marked.clear();
         for &neighbor in graph.neighbors(v) {
             if let Some(Reg(c)) = assignment_dense[neighbor.0 as usize] {
                 let ci = c as usize;
@@ -245,7 +247,7 @@ pub fn color_graph(graph: &InterferenceGraph, num_regs: u8, scratch_base: u8) ->
         }
 
         // Clear marks for next iteration.
-        for ci in marked {
+        for &ci in &marked {
             used_colors[ci] = false;
         }
 
@@ -367,7 +369,7 @@ where
     // Dense live set: live[vid.0] = true if the value is currently live.
     // live_list tracks which values are live for O(|live|) iteration.
     let mut live: Vec<bool> = vec![false; live_capacity];
-    let mut live_list: Vec<ValueId> = Vec::new();
+    let mut live_list: Vec<ValueId> = Vec::with_capacity(schedule.len());
 
     // Walk schedule in reverse (backward liveness analysis).
     for (v, _) in schedule.iter().rev() {
