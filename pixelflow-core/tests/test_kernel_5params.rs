@@ -5,7 +5,7 @@
 use pixelflow_compiler::kernel;
 
 #[test]
-fn kernel_5_params_compiles_should_succeed_when_invoked() {
+fn kernel_5_params_compiles_works() {
     // THE KEY TEST: This should now compile with 5 params!
     // The old nested Let approach caused trait solver explosion at this point.
 
@@ -18,7 +18,7 @@ fn kernel_5_params_compiles_should_succeed_when_invoked() {
 }
 
 #[test]
-fn kernel_6_params_compiles_should_succeed_when_invoked() {
+fn kernel_6_params_compiles_works() {
     // Test 6 parameters
     let k = kernel!(|a: f32, b: f32, c: f32, d: f32, e: f32, f: f32| { a + b + c + d + e + f });
 
@@ -26,7 +26,7 @@ fn kernel_6_params_compiles_should_succeed_when_invoked() {
 }
 
 #[test]
-fn kernel_7_params_compiles_should_succeed_when_invoked() {
+fn kernel_7_params_compiles_works() {
     // Test 7 parameters
     let k = kernel!(|a: f32, b: f32, c: f32, d: f32, e: f32, f: f32, g: f32| {
         a + b + c + d + e + f + g
@@ -36,7 +36,7 @@ fn kernel_7_params_compiles_should_succeed_when_invoked() {
 }
 
 #[test]
-fn kernel_8_params_compiles_should_succeed_when_invoked() {
+fn kernel_8_params_compiles_works() {
     // Even more ambitious - 8 parameters!
     // This would definitely fail with nested Let.
 
@@ -52,7 +52,7 @@ fn kernel_8_params_compiles_should_succeed_when_invoked() {
 }
 
 #[test]
-fn jet_kernel_with_param_should_succeed_when_invoked() {
+fn jet_kernel_with_param_works() {
     use pixelflow_compiler::kernel;
     use pixelflow_core::{Field, Manifold, jet::Jet3};
 

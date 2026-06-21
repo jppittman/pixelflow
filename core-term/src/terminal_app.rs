@@ -896,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_control_resize_should_succeed_when_invoked() {
+    fn handle_control_resize_works() {
         let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_management_keydown_should_succeed_when_invoked() {
+    fn handle_management_keydown_works() {
         let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,

@@ -9,7 +9,7 @@ use pixelflow_core::jet::Jet2H;
 
 /// Verify that Jet2H seeding operations compile and produce values.
 #[test]
-fn jet2h_seeding_should_succeed_when_invoked() {
+fn jet2h_seeding_works() {
     let x = Jet2H::x(Field::from(2.0));
     let _ = x.val;
     let _ = x.dx;
@@ -27,7 +27,7 @@ fn jet2h_seeding_should_succeed_when_invoked() {
 
 /// Verify that Jet2H arithmetic operations work.
 #[test]
-fn jet2h_arithmetic_should_succeed_when_invoked() {
+fn jet2h_arithmetic_works() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
 
@@ -46,7 +46,7 @@ fn jet2h_arithmetic_should_succeed_when_invoked() {
 
 /// Verify that Jet2H unary operations work.
 #[test]
-fn jet2h_unary_ops_should_succeed_when_invoked() {
+fn jet2h_unary_ops_works() {
     let x = Jet2H::x(Field::from(4.0));
 
     let sqrt_result = x.sqrt();
@@ -61,7 +61,7 @@ fn jet2h_unary_ops_should_succeed_when_invoked() {
 
 /// Verify that Jet2H comparison operations work.
 #[test]
-fn jet2h_comparison_should_succeed_when_invoked() {
+fn jet2h_comparison_works() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
 
@@ -73,7 +73,7 @@ fn jet2h_comparison_should_succeed_when_invoked() {
 
 /// Verify that Jet2H bitwise operations work.
 #[test]
-fn jet2h_bitwise_should_succeed_when_invoked() {
+fn jet2h_bitwise_works() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
 
@@ -84,7 +84,7 @@ fn jet2h_bitwise_should_succeed_when_invoked() {
 
 /// Verify that Jet2H select works.
 #[test]
-fn jet2h_select_should_succeed_when_invoked() {
+fn jet2h_select_works() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
     let mask = x.lt(y);
@@ -95,7 +95,7 @@ fn jet2h_select_should_succeed_when_invoked() {
 
 /// Verify that complex Jet2H expressions compile.
 #[test]
-fn jet2h_complex_expression_should_succeed_when_invoked() {
+fn jet2h_complex_expression_works() {
     let x = Jet2H::x(Field::from(3.0));
     let y = Jet2H::y(Field::from(4.0));
 

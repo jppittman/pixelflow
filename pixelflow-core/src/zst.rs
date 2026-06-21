@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_variables_are_zst_should_succeed_when_invoked() {
+    fn coordinate_variables_are_zst_works() {
         assert_zst::<crate::variables::X>();
         assert_zst::<crate::variables::Y>();
         assert_zst::<crate::variables::Z>();
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn spherical_harmonics_are_zst_should_succeed_when_invoked() {
+    fn spherical_harmonics_are_zst_works() {
         assert_zst::<crate::combinators::SphericalHarmonic<0, 0>>();
         assert_zst::<crate::combinators::SphericalHarmonic<1, -1>>();
         assert_zst::<crate::combinators::ZonalHarmonic<0>>();
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn operators_with_zst_operands_are_zst_should_succeed_when_invoked() {
+    fn operators_with_zst_operands_are_zst_works() {
         use crate::variables::{X, Y};
 
         // Binary operators
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_expression_is_zst_should_succeed_when_invoked() {
+    fn complex_expression_is_zst_works() {
         use crate::variables::{X, Y};
 
         // Test that (X * X + Y * Y).sqrt() is a ZST
@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn combinators_with_zst_operands_are_zst_should_succeed_when_invoked() {
+    fn combinators_with_zst_operands_are_zst_works() {
         use crate::variables::{X, Y, Z};
 
         // Select combinator

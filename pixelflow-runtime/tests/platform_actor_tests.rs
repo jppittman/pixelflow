@@ -63,7 +63,7 @@ impl PlatformOps for MockOps {
 }
 
 #[test]
-fn platform_actor_delegation_should_succeed_when_invoked() {
+fn platform_actor_delegation_works() {
     // 1. Create MockOps
     let ops = MockOps::new();
     let log_ref = ops.log.clone();

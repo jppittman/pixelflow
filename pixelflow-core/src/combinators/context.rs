@@ -643,33 +643,33 @@ mod context_domain_tests {
     fn check_manifold<P: Copy + Send + Sync, M: Manifold<P>>(_m: &M) {}
 
     #[test]
-    fn x_in_context_domain_should_succeed_when_invoked() {
+    fn x_in_context_domain_works() {
         // X should work in context-extended domain via Spatial impl
         check_manifold::<CtxDomain, _>(&X);
     }
 
     #[test]
-    fn dz_x_in_context_domain_should_succeed_when_invoked() {
+    fn dz_x_in_context_domain_works() {
         // DZ(X) should work since X::Output = Jet3: HasDz
         check_manifold::<CtxDomain, _>(&DZ(X));
     }
 
     #[test]
-    fn ctxvar_in_context_domain_should_succeed_when_invoked() {
+    fn ctxvar_in_context_domain_works() {
         // CtxVar should read from context
         let cv = CtxVar::<A0, 0>::new();
         check_manifold::<CtxDomain, _>(&cv);
     }
 
     #[test]
-    fn mul_dz_x_in_context_domain_should_succeed_when_invoked() {
+    fn mul_dz_x_in_context_domain_works() {
         // DZ(X) * DZ(X) should work
         let expr = crate::Mul(DZ(X), DZ(X));
         check_manifold::<CtxDomain, _>(&expr);
     }
 
     #[test]
-    fn muladd_dz_in_context_domain_should_succeed_when_invoked() {
+    fn muladd_dz_in_context_domain_works() {
         // mul_add(DZ(X), DZ(X), Mul(DX(X), DX(X))) should work - all Field outputs
         let expr = MulAdd(
             DZ(X),
@@ -680,7 +680,7 @@ mod context_domain_tests {
     }
 
     #[test]
-    fn comparison_in_context_domain_should_succeed_when_invoked() {
+    fn comparison_in_context_domain_works() {
         // CtxVar.gt(CtxVar) should work
         let a = CtxVar::<A0, 0>::new();
         let b = CtxVar::<A0, 1>::new();
@@ -689,7 +689,7 @@ mod context_domain_tests {
     }
 
     #[test]
-    fn and_in_context_domain_should_succeed_when_invoked() {
+    fn and_in_context_domain_works() {
         // (a > b) & (a < c) should work
         let a = CtxVar::<A0, 0>::new();
         let b = CtxVar::<A0, 1>::new();
@@ -700,7 +700,7 @@ mod context_domain_tests {
 
     // Test matching the GeometryMask kernel pattern
     #[test]
-    fn geometry_mask_pattern_should_succeed_when_invoked() {
+    fn geometry_mask_pattern_works() {
         // geometry: kernel is ContextFree<&M> where M: Manifold<Jet3_4, Output = Jet3>
         // DZ(geometry) should work, returning Field
         fn check_geometry_mask<M>(geometry: &M)
@@ -734,7 +734,7 @@ mod context_domain_tests {
     }
 
     #[test]
-    fn select_in_context_domain_should_succeed_when_invoked() {
+    fn select_in_context_domain_works() {
         // Select requires branches with matching output types
         use crate::combinators::Select;
 
@@ -752,7 +752,7 @@ mod context_domain_tests {
     }
 
     #[test]
-    fn select_with_valof_in_context_domain_should_succeed_when_invoked() {
+    fn select_with_valof_in_context_domain_works() {
         // More complex: Select with ValOf branches
         use crate::combinators::Select;
         use crate::ops::derivative::V;
@@ -770,7 +770,7 @@ mod context_domain_tests {
     }
 
     #[test]
-    fn checker_like_pattern_should_succeed_when_invoked() {
+    fn checker_like_pattern_works() {
         // Replicate the Checker kernel pattern with 12 context elements
         // Uses Field coordinates since V() extracts the value component (Field)
         use crate::Z;
@@ -814,7 +814,7 @@ mod context_domain_tests {
     }
 
     #[test]
-    fn muladd_select_pattern_should_succeed_when_invoked() {
+    fn muladd_select_pattern_works() {
         // Test MulAdd with Select - this is the exact pattern failing
         // Uses Field coordinates since V() extracts the value component (Field)
         use crate::combinators::Select;

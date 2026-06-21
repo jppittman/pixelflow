@@ -271,7 +271,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn variance_union_should_succeed_when_invoked() {
+    fn variance_union_works() {
         assert_eq!(Variance::CONST.union(Variance::CONST), Variance::CONST);
         assert_eq!(Variance::CONST.union(Variance::W), Variance::W);
         assert_eq!(Variance::CONST.union(Variance::X), Variance::X);
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn var_variance_should_succeed_when_invoked() {
+    fn var_variance_works() {
         assert_eq!(var_variance(0), Variance::X);
         assert_eq!(var_variance(1), Variance::Y);
         assert_eq!(var_variance(2), Variance::Z);
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn const_analysis_should_succeed_when_invoked() {
+    fn const_analysis_works() {
         let mut eg = EGraph::new();
         let c = eg.add(ENode::constant(42.0));
 
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn w_only_analysis_should_succeed_when_invoked() {
+    fn w_only_analysis_works() {
         let mut eg = EGraph::new();
         let w = eg.add(ENode::Var(3)); // W
         let two = eg.add(ENode::constant(2.0));
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn xy_analysis_should_succeed_when_invoked() {
+    fn xy_analysis_works() {
         let mut eg = EGraph::new();
         let x = eg.add(ENode::Var(0)); // X
         let y = eg.add(ENode::Var(1)); // Y
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_deps_hoistable_should_succeed_when_invoked() {
+    fn mixed_deps_hoistable_works() {
         // sin(W * 2.0) + X:
         //   sin(W * 2.0) has variance {W} (X-invariant, hoistable)
         //   X has variance {X}
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn y_only_is_hoistable_should_succeed_when_invoked() {
+    fn y_only_is_hoistable_works() {
         // sin(Y) + X: sin(Y) has variance {Y}, is X-invariant, should be hoistable
         let mut eg = EGraph::new();
         let y = eg.add(ENode::Var(1));
@@ -409,7 +409,7 @@ mod tests {
     /// - Const(0)  has variance = {}
     /// - class variance = meet({X}, {}) = {} (CONST)
     #[test]
-    fn meet_across_enodes_x_minus_x_is_const_should_succeed_when_invoked() {
+    fn meet_across_enodes_x_minus_x_is_const_works() {
         let mut eg = EGraph::new();
 
         let x = eg.add(ENode::Var(0));
@@ -438,7 +438,7 @@ mod tests {
 
     /// Meet of {X,Y} and {W} should give {W} (fewer deps).
     #[test]
-    fn meet_xy_and_w_gives_w_should_succeed_when_invoked() {
+    fn meet_xy_and_w_gives_w_works() {
         let mut eg = EGraph::new();
 
         let x = eg.add(ENode::Var(0));
@@ -464,7 +464,7 @@ mod tests {
 
     /// Parent benefits from meet-reduced child.
     #[test]
-    fn meet_propagates_to_parents_should_succeed_when_invoked() {
+    fn meet_propagates_to_parents_works() {
         let mut eg = EGraph::new();
 
         let x = eg.add(ENode::Var(0));

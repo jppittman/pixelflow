@@ -201,7 +201,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn parse_simple_quad_should_succeed_when_invoked() {
+    fn parse_simple_quad_works() {
         let obj = "
 # Simple cube (partial)
 v 0.0 0.0 0.0
@@ -217,7 +217,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn valence_computation_should_succeed_when_invoked() {
+    fn valence_computation_works() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -235,7 +235,7 @@ f 4 1 5 5
     }
 
     #[test]
-    fn reject_triangles_should_succeed_when_invoked() {
+    fn reject_triangles_works() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -248,7 +248,7 @@ f 1 2 3
     }
 
     #[test]
-    fn texture_coordinates_ignored_should_succeed_when_invoked() {
+    fn texture_coordinates_ignored_works() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0

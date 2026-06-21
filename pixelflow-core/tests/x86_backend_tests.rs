@@ -7,7 +7,7 @@ mod tests {
     use std::prelude::v1::*;
 
     #[test]
-    fn sse2_arithmetic_should_succeed_when_invoked() {
+    fn sse2_arithmetic_works() {
         let a = F32x4::splat(2.0);
         let b = F32x4::splat(3.0);
 
@@ -30,7 +30,7 @@ mod tests {
     }
 
     #[test]
-    fn sse2_sequential_should_succeed_when_invoked() {
+    fn sse2_sequential_works() {
         let seq = F32x4::sequential(10.0);
         let mut out = [0.0; 4];
         seq.store(&mut out);
@@ -38,7 +38,7 @@ mod tests {
     }
 
     #[test]
-    fn sse2_logic_should_succeed_when_invoked() {
+    fn sse2_logic_works() {
         let a = F32x4::splat(1.0);
         let b = F32x4::splat(2.0);
 
@@ -62,7 +62,7 @@ mod tests {
     }
 
     #[test]
-    fn sse2_bitwise_should_succeed_when_invoked() {
+    fn sse2_bitwise_works() {
         let a = F32x4::splat(1.0); // 1.0 is 0x3f800000
         let b = F32x4::splat(2.0); // 2.0 is 0x40000000
         let c = a & b;
@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn sse2_math_should_succeed_when_invoked() {
+    fn sse2_math_works() {
         let a = F32x4::splat(4.0);
         let sqrt = a.simd_sqrt();
         let mut out = [0.0; 4];
@@ -90,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn sse2_mask_any_all_should_succeed_when_invoked() {
+    fn sse2_mask_any_all_works() {
         // Test MaskOps methods directly on masks
         let zero = F32x4::splat(0.0);
         let zero_mask = zero.float_to_mask();
@@ -109,14 +109,14 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn sse2_store_panic_should_succeed_when_invoked() {
+    fn sse2_store_panic_works() {
         let a = F32x4::default();
         let mut out = [0.0; 3]; // Too small
         a.store(&mut out);
     }
 
     #[test]
-    fn sse2_reciprocal_math_should_succeed_when_invoked() {
+    fn sse2_reciprocal_math_works() {
         let a = F32x4::splat(4.0);
         let mut out = [0.0; 4];
 

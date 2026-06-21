@@ -77,14 +77,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ascii_char_width_should_succeed_when_invoked() {
+    fn ascii_char_width_works() {
         assert_eq!(get_char_display_width('A'), 1, "Width of 'A' should be 1");
         assert_eq!(get_char_display_width(' '), 1, "Width of space should be 1");
         assert_eq!(get_char_display_width('~'), 1, "Width of '~' should be 1");
     }
 
     #[test]
-    fn box_drawing_char_widths_should_succeed_when_invoked() {
+    fn box_drawing_char_widths_works() {
         assert_eq!(
             get_char_display_width('─'),
             1,
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn cjk_wide_char_widths_should_succeed_when_invoked() {
+    fn cjk_wide_char_widths_works() {
         assert_eq!(
             get_char_display_width('世'),
             2,
@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn control_char_widths_should_succeed_when_invoked() {
+    fn control_char_widths_works() {
         assert_eq!(
             get_char_display_width('\u{0000}'),
             0,
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_width_chars_should_succeed_when_invoked() {
+    fn zero_width_chars_works() {
         assert_eq!(
             get_char_display_width('\u{200D}'),
             0,
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn locale_initializer_called_should_succeed_when_invoked() {
+    fn locale_initializer_called_works() {
         // Ensure OnceLock mechanism is engaged
         let _ = get_char_display_width(' ');
         assert!(

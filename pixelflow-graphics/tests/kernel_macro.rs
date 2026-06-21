@@ -57,7 +57,7 @@ fn fields_close(a: Field, b: Field, epsilon: f32) -> bool {
 
 /// Test a kernel with one parameter.
 #[test]
-fn one_param_kernel_should_succeed_when_invoked() {
+fn one_param_kernel_works() {
     // X offset by a parameter
     let offset_x = kernel!(|dx: f32| X + dx);
     let k = offset_x(10.0);
@@ -73,7 +73,7 @@ fn one_param_kernel_should_succeed_when_invoked() {
 
 /// Test a kernel with two parameters.
 #[test]
-fn two_param_kernel_should_succeed_when_invoked() {
+fn two_param_kernel_works() {
     // Offset both X and Y
     let offset_xy = kernel!(|dx: f32, dy: f32| (X + dx) + (Y + dy));
     let k = offset_xy(10.0, 20.0);
@@ -89,7 +89,7 @@ fn two_param_kernel_should_succeed_when_invoked() {
 
 /// Test a kernel with no parameters.
 #[test]
-fn zero_param_kernel_should_succeed_when_invoked() {
+fn zero_param_kernel_works() {
     // Simple distance from origin (no params)
     let dist = kernel!(|| (X * X + Y * Y).sqrt());
     let k = dist();
@@ -105,7 +105,7 @@ fn zero_param_kernel_should_succeed_when_invoked() {
 
 /// Test method chaining (ManifoldExt integration).
 #[test]
-fn method_chaining_should_succeed_when_invoked() {
+fn method_chaining_works() {
     // Clamped value using .max().min()
     let clamp = kernel!(|lo: f32, hi: f32| X.max(lo).min(hi));
     let k = clamp(0.0, 1.0);
@@ -134,7 +134,7 @@ fn method_chaining_should_succeed_when_invoked() {
 
 /// Test that kernels are Clone (not Copy, since they hold data).
 #[test]
-fn kernel_is_clone_should_succeed_when_invoked() {
+fn kernel_is_clone_works() {
     let scale = kernel!(|factor: f32| X * factor);
     let k1 = scale(2.0);
     let k2 = k1;
@@ -148,7 +148,7 @@ fn kernel_is_clone_should_succeed_when_invoked() {
 
 /// Test that different instantiations are independent.
 #[test]
-fn independent_instantiations_should_succeed_when_invoked() {
+fn independent_instantiations_works() {
     let scale = kernel!(|factor: f32| X * factor);
 
     let double = scale(2.0);
@@ -169,7 +169,7 @@ fn independent_instantiations_should_succeed_when_invoked() {
 
 /// Test sqrt method.
 #[test]
-fn sqrt_should_succeed_when_invoked() {
+fn sqrt_works() {
     let root = kernel!(|val: f32| (X + val).sqrt());
     let k = root(7.0);
 
@@ -180,7 +180,7 @@ fn sqrt_should_succeed_when_invoked() {
 
 /// Test floor method.
 #[test]
-fn floor_should_succeed_when_invoked() {
+fn floor_works() {
     let floored = kernel!(|| X.floor());
     let k = floored();
 
@@ -193,7 +193,7 @@ fn floor_should_succeed_when_invoked() {
 
 /// Test abs method.
 #[test]
-fn abs_should_succeed_when_invoked() {
+fn abs_works() {
     let absolute = kernel!(|offset: f32| (X - offset).abs());
     let k = absolute(5.0);
 
@@ -210,7 +210,7 @@ fn abs_should_succeed_when_invoked() {
 /// This is verified by the fact that the kernel compiles at all -
 /// if parameters were injected directly, the expression wouldn't be Copy.
 #[test]
-fn zst_expression_is_copy_should_succeed_when_invoked() {
+fn zst_expression_is_copy_works() {
     // This kernel uses the parameter twice in the expression.
     // If the expression weren't Copy (ZST-based), this wouldn't compile
     // because the parameter would be moved on first use.
@@ -229,7 +229,7 @@ fn zst_expression_is_copy_should_succeed_when_invoked() {
 /// Test a kernel with three parameters.
 /// This demonstrates the new Let/Var binding system since Z/W slots only support 2.
 #[test]
-fn three_param_kernel_should_succeed_when_invoked() {
+fn three_param_kernel_works() {
     // Translate point by (dx, dy) and add z offset
     let translate_3d = kernel!(|dx: f32, dy: f32, dz: f32| (X + dx) + (Y + dy) + dz);
     let k = translate_3d(10.0, 20.0, 30.0);
@@ -246,7 +246,7 @@ fn three_param_kernel_should_succeed_when_invoked() {
 /// Test a kernel with four parameters.
 /// Demonstrates full 4-parameter support.
 #[test]
-fn four_param_kernel_should_succeed_when_invoked() {
+fn four_param_kernel_works() {
     // Combine all four parameters with coordinates
     let quad_combine = kernel!(|a: f32, b: f32, c: f32, d: f32| a + b + c + d + X + Y);
     let k = quad_combine(1.0, 2.0, 3.0, 4.0);
@@ -263,7 +263,7 @@ fn four_param_kernel_should_succeed_when_invoked() {
 /// Test a 4-parameter sphere SDF kernel.
 /// This is a practical example: signed distance from a sphere at (cx, cy, cz) with radius r.
 #[test]
-fn sphere_sdf_kernel_should_succeed_when_invoked() {
+fn sphere_sdf_kernel_works() {
     // Sphere SDF: distance from center minus radius
     let sphere_sdf = kernel!(|cx: f32, cy: f32, cz: f32, r: f32| {
         let dx = X - cx;
@@ -295,7 +295,7 @@ fn sphere_sdf_kernel_should_succeed_when_invoked() {
 /// Test parameter ordering with 3 parameters.
 /// Verifies that parameters are correctly bound (first param deepest in stack).
 #[test]
-fn parameter_ordering_three_should_succeed_when_invoked() {
+fn parameter_ordering_three_works() {
     // Each parameter has a different multiplier to verify correct binding
     let order_test = kernel!(|a: f32, b: f32, c: f32| a * 100.0 + b * 10.0 + c);
     let k = order_test(1.0, 2.0, 3.0);
@@ -311,7 +311,7 @@ fn parameter_ordering_three_should_succeed_when_invoked() {
 
 /// Test that parameters can be used multiple times in 3+ param kernels.
 #[test]
-fn param_reuse_three_should_succeed_when_invoked() {
+fn param_reuse_three_works() {
     // Use each parameter twice
     let reuse = kernel!(|a: f32, b: f32, c: f32| (a + a) + (b + b) + (c + c));
     let k = reuse(1.0, 2.0, 3.0);
@@ -343,7 +343,7 @@ fn jet3_4(x: f32, y: f32, z: f32, w: f32) -> Jet3_4 {
 
 /// Test a simple Jet3 kernel (domain inferred from output type).
 #[test]
-fn jet3_simple_should_succeed_when_invoked() {
+fn jet3_simple_works() {
     // X + Y with Jet3 output → domain is Jet3_4
     let add_xy = kernel!(|| -> Jet3 X + Y);
     let k = add_xy();
@@ -363,7 +363,7 @@ fn jet3_simple_should_succeed_when_invoked() {
 
 /// Test Jet3 kernel with parameters (sphere SDF).
 #[test]
-fn jet3_sphere_sdf_should_succeed_when_invoked() {
+fn jet3_sphere_sdf_works() {
     // Sphere SDF: distance from center minus radius
     // Using Jet3 for automatic differentiation (normals)
     let sphere_sdf = kernel!(|cx: f32, cy: f32, cz: f32, r: f32| -> Jet3 {
@@ -396,7 +396,7 @@ fn jet3_sphere_sdf_should_succeed_when_invoked() {
 /// Test basic kernel composition with a single manifold parameter.
 /// This is the core use case: composing a distance function with a circle SDF.
 #[test]
-fn simple_kernel_composition_should_succeed_when_invoked() {
+fn simple_kernel_composition_works() {
     // Distance from a point (parametric)
     let dist = kernel!(|cx: f32, cy: f32| {
         let dx = X - cx;
@@ -429,7 +429,7 @@ fn simple_kernel_composition_should_succeed_when_invoked() {
 
 /// Test kernel composition with offset centers.
 #[test]
-fn kernel_composition_with_offset_should_succeed_when_invoked() {
+fn kernel_composition_with_offset_works() {
     let dist = kernel!(|cx: f32, cy: f32| {
         let dx = X - cx;
         let dy = Y - cy;
@@ -468,7 +468,7 @@ fn kernel_composition_with_offset_should_succeed_when_invoked() {
 /// 3. A different codegen strategy (e.g., leveled evaluation)
 #[test]
 #[ignore = "two-manifold params require ManifoldBind2 implementation"]
-fn two_manifold_params_should_succeed_when_invoked() {
+fn two_manifold_params_works() {
     // Test body commented out until ManifoldBind2 is implemented
     // See the original test for the intended behavior:
     //
@@ -479,7 +479,7 @@ fn two_manifold_params_should_succeed_when_invoked() {
 
 /// Test mixed manifold and scalar parameters.
 #[test]
-fn mixed_manifold_scalar_params_should_succeed_when_invoked() {
+fn mixed_manifold_scalar_params_works() {
     // Scale an SDF by a factor
     let scale_sdf = kernel!(|inner: kernel, factor: f32| inner * factor);
 
@@ -499,7 +499,7 @@ fn mixed_manifold_scalar_params_should_succeed_when_invoked() {
 
 /// Test chained kernel composition (three levels deep).
 #[test]
-fn chained_composition_should_succeed_when_invoked() {
+fn chained_composition_works() {
     // Basic X coordinate
     let get_x = kernel!(|| X);
 
@@ -522,7 +522,7 @@ fn chained_composition_should_succeed_when_invoked() {
 
 /// Test that composed kernels can be cloned (the inner kernel is owned).
 #[test]
-fn composed_kernel_ownership_should_succeed_when_invoked() {
+fn composed_kernel_ownership_works() {
     let dist = kernel!(|cx: f32, cy: f32| {
         let dx = X - cx;
         let dy = Y - cy;
@@ -548,7 +548,7 @@ fn composed_kernel_ownership_should_succeed_when_invoked() {
 /// creating type mismatches with ZST expression tree types.
 /// With the annotation pass, literals become Var<N> references bound via Let.
 #[test]
-fn jet3_with_literals_should_succeed_when_invoked() {
+fn jet3_with_literals_works() {
     // Inverse square root with literal numerator
     // This expression: 1.0 / (X*X + Y*Y + Z*Z).sqrt()
     // Tests that the literal 1.0 is properly handled in Jet3 mode
@@ -581,7 +581,7 @@ fn jet3_with_literals_should_succeed_when_invoked() {
 /// Test Jet3 kernel with multiple literals.
 /// Verifies that multiple literals each get their own Var<N> binding.
 #[test]
-fn jet3_multiple_literals_should_succeed_when_invoked() {
+fn jet3_multiple_literals_works() {
     // Expression with multiple literals: 2.0 * X + 3.0
     let affine = kernel!(|| -> Jet3 2.0 * X + 3.0);
     let k = affine();
@@ -600,7 +600,7 @@ fn jet3_multiple_literals_should_succeed_when_invoked() {
 /// Test Jet3 kernel with literals AND parameters.
 /// Both literals and params become Var<N> - they should coexist correctly.
 #[test]
-fn jet3_literals_and_params_should_succeed_when_invoked() {
+fn jet3_literals_and_params_works() {
     // offset + 2.0 * X - 0.5
     let kernel = kernel!(|offset: f32| -> Jet3 offset + 2.0 * X - 0.5);
     let k = kernel(10.0);
@@ -655,7 +655,7 @@ fn jet3_4_seeded(x: f32, y: f32, z: f32) -> Jet3_4 {
 
 /// Test GradientMag2D computes √(dx² + dy²) with single eval.
 #[test]
-fn gradient_mag_2d_should_succeed_when_invoked() {
+fn gradient_mag_2d_works() {
     // For f(x,y) = sqrt(x² + y²), the gradient is (x/r, y/r) where r = sqrt(x²+y²)
     // Gradient magnitude is always 1.0 for distance fields
     let dist =
@@ -673,7 +673,7 @@ fn gradient_mag_2d_should_succeed_when_invoked() {
 
 /// Test GradientMag3D computes √(dx² + dy² + dz²) with single eval.
 #[test]
-fn gradient_mag_3d_should_succeed_when_invoked() {
+fn gradient_mag_3d_works() {
     // For f(x,y,z) = sqrt(x² + y² + z²), gradient magnitude is 1.0
     let dist = (pixelflow_core::X * pixelflow_core::X
         + pixelflow_core::Y * pixelflow_core::Y
@@ -692,7 +692,7 @@ fn gradient_mag_3d_should_succeed_when_invoked() {
 
 /// Test Antialias2D computes val / √(dx² + dy²) with single eval.
 #[test]
-fn antialias_2d_should_succeed_when_invoked() {
+fn antialias_2d_works() {
     // Circle SDF using kernel! macro (handles literal promotion)
     // At (2, 0): val = 1.0, gradient = (1, 0), so antialias = 1.0 / 1.0 = 1.0
     let circle_sdf = kernel!(|| -> Jet2 { (X * X + Y * Y).sqrt() - 1.0 });
@@ -709,7 +709,7 @@ fn antialias_2d_should_succeed_when_invoked() {
 
 /// Test Antialias3D computes val / √(dx² + dy² + dz²) with single eval.
 #[test]
-fn antialias_3d_should_succeed_when_invoked() {
+fn antialias_3d_works() {
     // Sphere SDF using kernel! macro
     // At (2, 0, 0): val = 1.0, gradient = (1, 0, 0), so antialias = 1.0 / 1.0 = 1.0
     let sphere_sdf = kernel!(|| -> Jet3 { (X * X + Y * Y + Z * Z).sqrt() - 1.0 });
@@ -726,7 +726,7 @@ fn antialias_3d_should_succeed_when_invoked() {
 
 /// Test Normalized2D returns unit gradient vector with single eval.
 #[test]
-fn normalized_2d_should_succeed_when_invoked() {
+fn normalized_2d_works() {
     // Distance field: sqrt(x² + y²)
     // At (3, 4): gradient = (3/5, 4/5) = (0.6, 0.8)
     let dist =
@@ -747,7 +747,7 @@ fn normalized_2d_should_succeed_when_invoked() {
 
 /// Test fused combinators with kernel-composed manifolds.
 #[test]
-fn fused_combinators_with_kernel_composition_should_succeed_when_invoked() {
+fn fused_combinators_with_kernel_composition_works() {
     // Create a circle SDF kernel
     let circle_sdf = kernel!(|cx: f32, cy: f32, r: f32| -> Jet2 {
         let dx = X - cx;
@@ -795,7 +795,7 @@ use pixelflow_core::{DX, DY, DZ, V};
 
 /// Test V accessor extracts the value component from Jet2.
 #[test]
-fn v_accessor_should_succeed_when_invoked() {
+fn v_accessor_works() {
     // Distance from origin: sqrt(x² + y²)
     let dist =
         (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
@@ -813,7 +813,7 @@ fn v_accessor_should_succeed_when_invoked() {
 
 /// Test DX accessor extracts ∂f/∂x from Jet2.
 #[test]
-fn dx_accessor_should_succeed_when_invoked() {
+fn dx_accessor_works() {
     // Distance from origin: sqrt(x² + y²)
     // ∂dist/∂x = x / sqrt(x² + y²) = x / dist
     let dist =
@@ -832,7 +832,7 @@ fn dx_accessor_should_succeed_when_invoked() {
 
 /// Test DY accessor extracts ∂f/∂y from Jet2.
 #[test]
-fn dy_accessor_should_succeed_when_invoked() {
+fn dy_accessor_works() {
     // Distance from origin: sqrt(x² + y²)
     // ∂dist/∂y = y / sqrt(x² + y²) = y / dist
     let dist =
@@ -851,7 +851,7 @@ fn dy_accessor_should_succeed_when_invoked() {
 
 /// Test DZ accessor extracts ∂f/∂z from Jet3.
 #[test]
-fn dz_accessor_should_succeed_when_invoked() {
+fn dz_accessor_works() {
     // 3D distance from origin: sqrt(x² + y² + z²)
     // ∂dist/∂z = z / sqrt(x² + y² + z²)
     let dist = (pixelflow_core::X * pixelflow_core::X
@@ -876,7 +876,7 @@ fn dz_accessor_should_succeed_when_invoked() {
 /// `(DX(sdf) * DX(sdf) + DY(sdf) * DY(sdf)).sqrt()` now work with ManifoldExt.
 /// CSE (Phase 6) will optimize away redundant evaluations.
 #[test]
-fn manual_gradient_magnitude_should_succeed_when_invoked() {
+fn manual_gradient_magnitude_works() {
     // Distance from origin
     let dist =
         (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();

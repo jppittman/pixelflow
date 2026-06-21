@@ -3472,7 +3472,7 @@ mod tests {
     use alloc::sync::Arc;
 
     #[test]
-    fn param_count_should_succeed_when_invoked() {
+    fn param_count_works() {
         // Verify parameter count is reasonable and finite
         let count = ExprNnue::param_count();
         assert!(count > 0, "Should have parameters");
@@ -3488,7 +3488,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn consolidated_param_count_should_succeed_when_invoked() {
+    fn consolidated_param_count_works() {
         // Param count should include backbone + all unified heads
         let count = ExprNnue::param_count();
         // Backbone: embeddings + w1 + b1 = ~9,728
@@ -3506,7 +3506,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn rule_features_initialization_should_succeed_when_invoked() {
+    fn rule_features_initialization_works() {
         let mut rule_features = RuleFeatures::new();
 
         // All features should be zero initially
@@ -3527,7 +3527,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_rule_deterministic_should_succeed_when_invoked() {
+    fn encode_rule_deterministic_works() {
         let net = ExprNnue::new_random(42);
         let features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
 
@@ -3554,7 +3554,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_all_rules_should_succeed_when_invoked() {
+    fn encode_all_rules_works() {
         let net = ExprNnue::new_random(42);
         let mut rule_features = RuleFeatures::new();
 
@@ -3597,7 +3597,7 @@ mod tests {
     }
 
     #[test]
-    fn bilinear_score_computation_should_succeed_when_invoked() {
+    fn bilinear_score_computation_works() {
         let net = ExprNnue::new_random(42);
 
         // Create test vectors
@@ -3628,7 +3628,7 @@ mod tests {
     }
 
     #[test]
-    fn randomize_mask_only_should_succeed_when_invoked() {
+    fn randomize_mask_only_works() {
         let mut net = ExprNnue::new();
 
         // Set some backbone values that should be preserved
@@ -3683,7 +3683,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn complex_pe_roundtrip_should_succeed_when_invoked() {
+    fn complex_pe_roundtrip_works() {
         // add_edge + remove_edge should return the accumulator to zero.
         let emb = OpEmbeddings::new_random(42);
         let mut acc = EdgeAccumulator::new();
@@ -3718,7 +3718,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn graph_acc_normalize_unit_norm_per_section_should_succeed_when_invoked() {
+    fn graph_acc_normalize_unit_norm_per_section_works() {
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
         // Build a non-trivial accumulator: several edges
@@ -3756,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_acc_normalize_scalars_preserved_should_succeed_when_invoked() {
+    fn graph_acc_normalize_scalars_preserved_works() {
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
         gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
@@ -3785,7 +3785,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_acc_normalize_zero_is_safe_should_succeed_when_invoked() {
+    fn graph_acc_normalize_zero_is_safe_works() {
         // A fresh (zero) accumulator should normalize without NaN/Inf.
         let gacc = GraphAccumulator::new();
         let normed = gacc.normalized();
@@ -3799,7 +3799,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_acc_normalize_in_place_matches_normalized_should_succeed_when_invoked() {
+    fn graph_acc_normalize_in_place_matches_normalized_works() {
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
         gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
@@ -3821,7 +3821,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_acc_normalize_scale_invariance_should_succeed_when_invoked() {
+    fn graph_acc_normalize_scale_invariance_works() {
         // Doubling all edges (adding each edge twice) should yield the same
         // normalized vector, proving scale invariance.
         let emb = OpEmbeddings::new_random(42);
@@ -3850,7 +3850,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_acc_normalize_idempotent_should_succeed_when_invoked() {
+    fn graph_acc_normalize_idempotent_works() {
         // Normalizing twice should produce the same result.
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
@@ -3875,7 +3875,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn graph_acc_remove_leaf_saturates_at_zero_should_succeed_when_invoked() {
+    fn graph_acc_remove_leaf_saturates_at_zero_works() {
         let mut acc = GraphAccumulator::new();
         acc.remove_leaf();
         assert_eq!(acc.node_count, 0, "node_count must not underflow");

@@ -28,7 +28,7 @@ fn x_plus_param(val: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
 }
 
 #[test]
-fn simple_param_should_succeed_when_invoked() {
+fn simple_param_works() {
     let k = simple_return_param(42.0);
     let rx = Jet3::constant(Field::from(1.0));
     let ry = Jet3::constant(Field::from(2.0));
@@ -48,7 +48,7 @@ fn simple_param_should_succeed_when_invoked() {
 }
 
 #[test]
-fn x_plus_param_should_succeed_when_invoked() {
+fn x_plus_param_works() {
     let k = x_plus_param(10.0);
     // X = 5.0, so result should be 15.0
     let rx = Jet3::constant(Field::from(5.0));
@@ -126,7 +126,7 @@ fn test_discriminant(
 }
 
 #[test]
-fn step1_d_dot_c_should_succeed_when_invoked() {
+fn step1_d_dot_c_works() {
     let k = test_d_dot_c(0.0, 0.0, 4.0);
     // Ray direction: (0, 0, 1)
     let rx = Jet3::constant(Field::from(0.0));
@@ -144,7 +144,7 @@ fn step1_d_dot_c_should_succeed_when_invoked() {
 }
 
 #[test]
-fn step2_c_sq_should_succeed_when_invoked() {
+fn step2_c_sq_works() {
     let k = test_c_sq(0.0, 0.0, 4.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
@@ -161,7 +161,7 @@ fn step2_c_sq_should_succeed_when_invoked() {
 }
 
 #[test]
-fn step3a_r_sq_should_succeed_when_invoked() {
+fn step3a_r_sq_works() {
     let k = test_r_sq(1.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
@@ -178,7 +178,7 @@ fn step3a_r_sq_should_succeed_when_invoked() {
 }
 
 #[test]
-fn step3b_c_sq_minus_r_sq_should_succeed_when_invoked() {
+fn step3b_c_sq_minus_r_sq_works() {
     let k = test_c_sq_minus_r_sq(0.0, 0.0, 4.0, 1.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
@@ -195,7 +195,7 @@ fn step3b_c_sq_minus_r_sq_should_succeed_when_invoked() {
 }
 
 #[test]
-fn step3c_d_dot_c_sq_should_succeed_when_invoked() {
+fn step3c_d_dot_c_sq_works() {
     let k = test_d_dot_c_sq(0.0, 0.0, 4.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
@@ -212,7 +212,7 @@ fn step3c_d_dot_c_sq_should_succeed_when_invoked() {
 }
 
 #[test]
-fn step3_discriminant_should_succeed_when_invoked() {
+fn step3_discriminant_works() {
     let k = test_discriminant(0.0, 0.0, 4.0, 1.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
@@ -229,7 +229,7 @@ fn step3_discriminant_should_succeed_when_invoked() {
 }
 
 #[test]
-fn sphere_hit_should_succeed_when_invoked() {
+fn sphere_hit_works() {
     // Sphere at (0, 0, 4) with radius 1
     let sphere = sphere_at(0.0, 0.0, 4.0, 1.0);
 

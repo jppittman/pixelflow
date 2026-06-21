@@ -605,7 +605,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rgba8_components_should_succeed_when_invoked() {
+    fn rgba8_components_works() {
         let c = Rgba8::new(0x11, 0x22, 0x33, 0xFF);
         assert_eq!(c.r(), 0x11);
         assert_eq!(c.g(), 0x22);
@@ -614,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn bgra8_components_should_succeed_when_invoked() {
+    fn bgra8_components_works() {
         let c = Bgra8::new(0x33, 0x22, 0x11, 0xFF);
         assert_eq!(c.b(), 0x33);
         assert_eq!(c.g(), 0x22);
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn rgba8_to_bgra8_should_succeed_when_invoked() {
+    fn rgba8_to_bgra8_works() {
         let rgba = Rgba8::new(0x11, 0x22, 0x33, 0xFF);
         let bgra = Bgra8::from(rgba);
         assert_eq!(bgra.r(), 0x11);
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn named_color_manifold_should_succeed_when_invoked() {
+    fn named_color_manifold_works() {
         use pixelflow_core::{materialize_discrete, PARALLELISM};
         let red = NamedColor::Red;
         let mut out = vec![0u32; PARALLELISM];
@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn color_manifold_should_succeed_when_invoked() {
+    fn color_manifold_works() {
         use pixelflow_core::{materialize_discrete, PARALLELISM};
         let c = Color::Rgb(10, 20, 30);
         let mut out = vec![0u32; PARALLELISM];

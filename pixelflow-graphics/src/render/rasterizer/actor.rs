@@ -234,7 +234,7 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     #[test]
-    fn rasterizer_actor_basic_should_succeed_when_invoked() {
+    fn rasterizer_actor_basic_works() {
         // Step 1: Spawn with setup handle
         let (setup_handle, actor_thread) = RasterizerActor::<Rgba8>::spawn_with_setup(1);
 
@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn rasterizer_actor_thread_count_update_should_succeed_when_invoked() {
+    fn rasterizer_actor_thread_count_update_works() {
         // Spawn with setup
         let (setup_handle, actor_thread) = RasterizerActor::<Rgba8>::spawn_with_setup(2);
 
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn rasterizer_actor_pause_resume_should_succeed_when_invoked() {
+    fn rasterizer_actor_pause_resume_works() {
         // Spawn with setup
         let (setup_handle, actor_thread) = RasterizerActor::<Rgba8>::spawn_with_setup(1);
 

@@ -647,7 +647,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sh_orthonormality_should_succeed_when_invoked() {
+    fn sh_orthonormality_works() {
         // Y_0^0 should be constant = 1/(2√π) ≈ 0.282
         let y00 = SphericalHarmonic::<0, 0>;
         let val = y00.eval((
@@ -662,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn sh_coeffs_dot_should_succeed_when_invoked() {
+    fn sh_coeffs_dot_works() {
         let a = Sh2 {
             coeffs: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         };
