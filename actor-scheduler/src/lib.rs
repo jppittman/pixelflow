@@ -1938,7 +1938,7 @@ mod troupe_tests {
     /// Test the SPSC-based directory pattern: each actor gets its own Directory
     /// with dedicated SPSC handles to every other actor.
     #[test]
-    fn troupe_directory_pattern_should_succeed_when_invoked() {
+    fn troupe_directory_pattern_works() {
         // Create builders for each actor
         let mut engine_builder =
             ActorBuilder::<EngineData, EngineControl, EngineManagement>::new(1024, None);
@@ -2459,7 +2459,7 @@ mod troupe_nesting_tests {
 
     /// Test the two-phase Troupe pattern: new() → exposed() → play()
     #[test]
-    fn troupe_two_phase_pattern_should_succeed_when_invoked() {
+    fn troupe_two_phase_pattern_works() {
         // Phase 1: Create child troupe (no threads yet)
         let mut child = WorkerTroupe::new();
 
@@ -2489,7 +2489,7 @@ mod troupe_nesting_tests {
 
     /// Test that ExposedHandles can outlive the Troupe struct
     #[test]
-    fn exposed_handles_outlive_troupe_struct_should_succeed_when_invoked() {
+    fn exposed_handles_outlive_troupe_struct_works() {
         let exposed = {
             let mut child = WorkerTroupe::new();
             child.exposed() // ExposedHandles escapes
@@ -2544,7 +2544,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn shutdown_immediate_exits_quickly_under_flood_should_succeed_when_invoked() {
+    fn shutdown_immediate_exits_quickly_under_flood_works() {
         let (tx, mut rx) =
             ActorScheduler::new_with_shutdown_mode(100, 100, ShutdownMode::Immediate);
 
@@ -2588,7 +2588,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn shutdown_drain_control_processes_control_and_mgmt_should_succeed_when_invoked() {
+    fn shutdown_drain_control_processes_control_and_mgmt_works() {
         let (tx, mut rx) =
             ActorScheduler::new_with_shutdown_mode(100, 100, ShutdownMode::DrainControl);
 
@@ -2639,7 +2639,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn shutdown_drain_all_processes_everything_should_succeed_when_invoked() {
+    fn shutdown_drain_all_processes_everything_works() {
         let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
             100,
             100,
@@ -2686,7 +2686,7 @@ mod shutdown_tests {
     }
 
     #[test]
-    fn shutdown_drain_all_timeout_fallback_should_succeed_when_invoked() {
+    fn shutdown_drain_all_timeout_fallback_works() {
         let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
             10,   // Small burst limit to check shutdown frequently
             1000, // Large buffer to avoid blocking sends

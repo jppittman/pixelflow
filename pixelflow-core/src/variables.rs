@@ -153,7 +153,7 @@ mod tests {
     use crate::Field;
 
     #[test]
-    fn x_on_2d_should_succeed_when_invoked() {
+    fn x_on_2d_works() {
         let domain = (Field::from(3.0), Field::from(4.0));
         let result = X.eval(domain);
         let mut buf = [0.0f32; crate::PARALLELISM];
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn y_on_2d_should_succeed_when_invoked() {
+    fn y_on_2d_works() {
         let domain = (Field::from(3.0), Field::from(4.0));
         let result = Y.eval(domain);
         let mut buf = [0.0f32; crate::PARALLELISM];
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn z_on_2d_is_zero_should_succeed_when_invoked() {
+    fn z_on_2d_is_zero_works() {
         let domain = (Field::from(3.0), Field::from(4.0));
         let result = Z.eval(domain);
         let mut buf = [0.0f32; crate::PARALLELISM];
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn on_4d_should_succeed_when_invoked() {
+    fn on_4d_works() {
         let domain = (
             Field::from(1.0),
             Field::from(2.0),

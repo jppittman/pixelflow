@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn single_leaf_should_succeed_when_invoked() {
+    fn single_leaf_works() {
         let bsp = SpatialBSP::single(SolidColor::new(255, 0, 0, 255));
 
         assert_eq!(
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn two_leaves_should_succeed_when_invoked() {
+    fn two_leaves_works() {
         let items = vec![
             Positioned {
                 bounds: (0.0, 0.0, 50.0, 100.0),
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_bsp_should_succeed_when_invoked() {
+    fn empty_bsp_works() {
         let bsp: SpatialBSP<SolidColor> = SpatialBSP::from_positioned(vec![]);
 
         assert_eq!(bsp.interior_count(), 0, "Empty BSP has no interior nodes");
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn four_leaves_grid_should_succeed_when_invoked() {
+    fn four_leaves_grid_works() {
         // 2x2 grid
         let items = vec![
             Positioned {
@@ -1797,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_of_wide_strips_should_succeed_when_invoked() {
+    fn stack_of_wide_strips_works() {
         use pixelflow_core::{materialize_discrete, PARALLELISM};
 
         // Create 2 wide, short items, stacked vertically.

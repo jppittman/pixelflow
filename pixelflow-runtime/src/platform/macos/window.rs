@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     #[ignore = "Requires macOS window server and Metal device"]
-    fn window_creation_should_succeed_when_invoked() {
+    fn window_creation_works() {
         let desc = WindowDescriptor {
             width: 800,
             height: 600,
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     #[ignore = "Requires macOS window server and Metal device"]
-    fn metal_layer_config_should_succeed_when_invoked() {
+    fn metal_layer_config_works() {
         let desc = WindowDescriptor {
             width: 100,
             height: 100,
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     #[ignore = "Requires macOS window server and Metal device"]
-    fn resize_state_should_succeed_when_invoked() {
+    fn resize_state_works() {
         let desc = WindowDescriptor {
             width: 200,
             height: 200,
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn abi_alignment_should_succeed_when_invoked() {
+    fn abi_alignment_works() {
         // Verify our assumption about ABI alignment for MTLSize vs CGSize
         // This is a static check of our struct definitions vs likely platform values
         use std::mem;

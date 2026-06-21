@@ -427,7 +427,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_denormalize_roundtrip_should_succeed_when_invoked() {
+    fn normalize_denormalize_roundtrip_works() {
         let original = BwdGenConfig {
             max_depth: 10, // Within ES range [5, 20]
             ..BwdGenConfig::default()
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn denormalize_clamps_should_succeed_when_invoked() {
+    fn denormalize_clamps_works() {
         // All below minimum → should clamp to range minimums.
         let below = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0];
         let config = denormalize(&below);
@@ -554,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn box_muller_distribution_should_succeed_when_invoked() {
+    fn box_muller_distribution_works() {
         let mut es = GenEs {
             mu: [0.5; ES_DIM],
             sigma: 0.1,
@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn log_ns_should_succeed_when_invoked() {
+    fn log_ns_works() {
         // log(1.0) = 0.0
         let v = log_ns(1.0);
         assert!(
@@ -622,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn clamp01_should_succeed_when_invoked() {
+    fn clamp01_works() {
         assert_eq!(clamp01(-0.5), 0.0);
         assert_eq!(clamp01(0.0), 0.0);
         assert_eq!(clamp01(0.5), 0.5);
@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn gen_es_new_initializes_from_defaults_should_succeed_when_invoked() {
+    fn gen_es_new_initializes_from_defaults_works() {
         let es = GenEs::new(GenEsConfig::default(), RuleTemplates::new());
 
         // mu should be the normalized defaults.
@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn rand_normal_no_nan_with_interleaved_rng_should_succeed_when_invoked() {
+    fn rand_normal_no_nan_with_interleaved_rng_works() {
         // Reproduce the actual training seed and interleave rand_u64 calls
         // between rand_normal batches (simulating evaluate_candidate flow).
         let mut es = GenEs {

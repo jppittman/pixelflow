@@ -223,7 +223,7 @@ fn assert_screen_state(
 }
 
 #[test]
-fn simple_char_input_should_succeed_when_invoked() {
+fn simple_char_input_works() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
@@ -236,7 +236,7 @@ fn simple_char_input_should_succeed_when_invoked() {
 }
 
 #[test]
-fn newline_input_should_succeed_when_invoked() {
+fn newline_input_works() {
     let mut term = create_test_emulator(10, 2);
     // Enable Linefeed/Newline Mode (LNM)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(CsiCommand::SetMode(
@@ -253,7 +253,7 @@ fn newline_input_should_succeed_when_invoked() {
 }
 
 #[test]
-fn carriage_return_input_should_succeed_when_invoked() {
+fn carriage_return_input_works() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
@@ -266,7 +266,7 @@ fn carriage_return_input_should_succeed_when_invoked() {
 }
 
 #[test]
-fn csi_cursor_forward_cuf_should_succeed_when_invoked() {
+fn csi_cursor_forward_cuf_works() {
     let mut term = create_test_emulator(10, 1); // Cursor at (0,0)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorForward(1),
@@ -282,7 +282,7 @@ fn csi_cursor_forward_cuf_should_succeed_when_invoked() {
 }
 
 #[test]
-fn csi_ed_clear_below_csi_j_should_succeed_when_invoked() {
+fn csi_ed_clear_below_csi_j_works() {
     let mut term = create_test_emulator(3, 2);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
@@ -310,7 +310,7 @@ fn csi_ed_clear_below_csi_j_should_succeed_when_invoked() {
 }
 
 #[test]
-fn csi_sgr_fg_color_should_succeed_when_invoked() {
+fn csi_sgr_fg_color_works() {
     let mut term = create_test_emulator(5, 1);
     let red_attr = vec![Attribute::Foreground(Color::Named(NamedColor::Red))];
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -388,7 +388,7 @@ fn fill_emulator_screen(emu: &mut TerminalEmulator, text_lines: Vec<String>) {
 
 // --- Basic Selection Flow Tests ---
 #[test]
-fn mouse_press_starts_selection_should_succeed_when_invoked() {
+fn mouse_press_starts_selection_works() {
     let mut emu = create_test_emulator(10, 5);
     let action = send_mouse_input(&mut emu, start_selection_at(1, 1), MouseButton::Left);
 
@@ -420,7 +420,7 @@ fn mouse_press_starts_selection_should_succeed_when_invoked() {
 }
 
 #[test]
-fn mouse_drag_updates_selection_should_succeed_when_invoked() {
+fn mouse_drag_updates_selection_works() {
     let mut emu = create_test_emulator(10, 5);
     send_mouse_input(&mut emu, start_selection_at(1, 1), MouseButton::Left);
     let action = send_mouse_input(&mut emu, extend_selection_to(5, 2), MouseButton::Left);
@@ -448,7 +448,7 @@ fn mouse_drag_updates_selection_should_succeed_when_invoked() {
 }
 
 #[test]
-fn mouse_release_ends_selection_activity_should_succeed_when_invoked() {
+fn mouse_release_ends_selection_activity_works() {
     let mut emu = create_test_emulator(10, 5);
     send_mouse_input(&mut emu, start_selection_at(1, 1), MouseButton::Left);
     send_mouse_input(&mut emu, extend_selection_to(5, 2), MouseButton::Left);
@@ -488,14 +488,14 @@ fn mouse_release_ends_selection_activity_should_succeed_when_invoked() {
 
 // --- Copy Action Tests ---
 #[test]
-fn initiate_copy_no_selection_should_succeed_when_invoked() {
+fn initiate_copy_no_selection_works() {
     let mut emu = create_test_emulator(10, 5);
     let action = emu.interpret_input(EmulatorInput::User(UserInputAction::InitiateCopy));
     assert_eq!(action, None, "Should return None if no selection exists.");
 }
 
 #[test]
-fn initiate_copy_with_selection_should_succeed_when_invoked() {
+fn initiate_copy_with_selection_works() {
     let mut emu = create_test_emulator(10, 2);
     fill_emulator_screen(&mut emu, vec!["Hello".to_string(), "World".to_string()]);
 
@@ -516,7 +516,7 @@ fn initiate_copy_with_selection_should_succeed_when_invoked() {
 }
 
 #[test]
-fn initiate_copy_block_selection_should_succeed_when_invoked() {
+fn initiate_copy_block_selection_works() {
     let mut emu = create_test_emulator(3, 3);
     fill_emulator_screen(
         &mut emu,
@@ -543,7 +543,7 @@ fn initiate_copy_block_selection_should_succeed_when_invoked() {
 
 // --- Selection Clearing Tests ---
 #[test]
-fn new_mouse_press_clears_old_selection_should_succeed_when_invoked() {
+fn new_mouse_press_clears_old_selection_works() {
     let mut emu = create_test_emulator(10, 5);
 
     send_mouse_input(&mut emu, start_selection_at(0, 0), MouseButton::Left);
@@ -591,7 +591,7 @@ fn new_mouse_press_clears_old_selection_should_succeed_when_invoked() {
 
 // --- Selection Interaction with Scrolling Test ---
 #[test]
-fn selection_coordinates_adjust_on_scroll_should_succeed_when_invoked() {
+fn selection_coordinates_adjust_on_scroll_works() {
     let mut emu = create_test_emulator(10, 3);
     fill_emulator_screen(
         &mut emu,
@@ -649,7 +649,7 @@ fn selection_coordinates_adjust_on_scroll_should_succeed_when_invoked() {
 
 // --- Selection with Alternate Screen Test ---
 #[test]
-fn selection_on_alt_screen_then_exit_should_succeed_when_invoked() {
+fn selection_on_alt_screen_then_exit_works() {
     let mut emu = create_test_emulator(10, 3);
     fill_emulator_screen(
         &mut emu,
@@ -702,7 +702,7 @@ fn selection_on_alt_screen_then_exit_should_succeed_when_invoked() {
 // --- End of Selection with Alternate Screen Test ---
 
 #[test]
-fn resize_larger_should_succeed_when_invoked() {
+fn resize_larger_works() {
     let mut term = create_test_emulator(5, 2);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
@@ -727,7 +727,7 @@ fn resize_larger_should_succeed_when_invoked() {
 }
 
 #[test]
-fn resize_smaller_content_truncation_should_succeed_when_invoked() {
+fn resize_smaller_content_truncation_works() {
     let mut term = create_test_emulator(5, 2);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('H')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('e')));
@@ -744,7 +744,7 @@ fn resize_smaller_content_truncation_should_succeed_when_invoked() {
 }
 
 #[test]
-fn osc_set_window_title_should_succeed_when_invoked() {
+fn osc_set_window_title_works() {
     let mut term = create_test_emulator(10, 1);
 
     let action = term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Osc(
@@ -765,7 +765,7 @@ fn osc_set_window_title_should_succeed_when_invoked() {
 }
 
 #[test]
-fn key_event_printable_char_should_succeed_when_invoked() {
+fn key_event_printable_char_works() {
     let mut term = create_test_emulator(5, 1);
     let key_input = UserInputAction::KeyInput {
         symbol: KeySymbol::Char('x'),
@@ -784,7 +784,7 @@ fn key_event_printable_char_should_succeed_when_invoked() {
 }
 
 #[test]
-fn key_event_arrow_up_should_succeed_when_invoked() {
+fn key_event_arrow_up_works() {
     let mut term = create_test_emulator(5, 1);
     let key_input = UserInputAction::KeyInput {
         symbol: KeySymbol::Up,
@@ -801,7 +801,7 @@ fn key_event_arrow_up_should_succeed_when_invoked() {
 }
 
 #[test]
-fn snapshot_with_selection_should_succeed_when_invoked() {
+fn snapshot_with_selection_works() {
     let num_cols = 10;
     let num_rows = 2;
     let default_glyph = Glyph::Single(ContentCell {
@@ -860,7 +860,7 @@ fn snapshot_with_selection_should_succeed_when_invoked() {
 }
 
 #[test]
-fn mode_show_cursor_dectcem_should_succeed_when_invoked() {
+fn mode_show_cursor_dectcem_works() {
     let mut term = create_test_emulator(5, 1);
 
     let snap_default = term.get_render_snapshot().expect("Snapshot was None");
@@ -897,7 +897,7 @@ fn mode_show_cursor_dectcem_should_succeed_when_invoked() {
 // --- PS1 Multi-line Prompt Tests ---
 
 #[test]
-fn ps1_multiline_prompt_at_bottom_causes_scroll_should_succeed_when_invoked() {
+fn ps1_multiline_prompt_at_bottom_causes_scroll_works() {
     let mut term = create_test_emulator(5, 3);
 
     for _ in 0..5 {
@@ -927,7 +927,7 @@ fn ps1_multiline_prompt_at_bottom_causes_scroll_should_succeed_when_invoked() {
 }
 
 #[test]
-fn ps1_multiline_prompt_ends_on_last_line_no_scroll_by_prompt_should_succeed_when_invoked() {
+fn ps1_multiline_prompt_ends_on_last_line_no_scroll_by_prompt_works() {
     let mut term = create_test_emulator(5, 3);
 
     for _ in 0..5 {
@@ -950,7 +950,7 @@ fn ps1_multiline_prompt_ends_on_last_line_no_scroll_by_prompt_should_succeed_whe
 }
 
 #[test]
-fn ps1_multiline_prompt_last_line_fills_screen_then_input_should_succeed_when_invoked() {
+fn ps1_multiline_prompt_last_line_fills_screen_then_input_works() {
     let mut term = create_test_emulator(3, 2);
 
     for _ in 0..3 {
@@ -980,7 +980,7 @@ fn ps1_multiline_prompt_last_line_fills_screen_then_input_should_succeed_when_in
 }
 
 #[test]
-fn ps1_prompt_causes_multiple_scrolls_should_succeed_when_invoked() {
+fn ps1_prompt_causes_multiple_scrolls_works() {
     let mut term = create_test_emulator(3, 2);
 
     for _ in 0..3 {
@@ -1009,7 +1009,7 @@ fn ps1_prompt_causes_multiple_scrolls_should_succeed_when_invoked() {
 }
 
 #[test]
-fn ps1_prompt_with_internal_wrapping_and_scrolling_should_succeed_when_invoked() {
+fn ps1_prompt_with_internal_wrapping_and_scrolling_works() {
     let mut term = create_test_emulator(3, 2);
     for _ in 0..3 {
         term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
@@ -1044,7 +1044,7 @@ fn ps1_prompt_with_internal_wrapping_and_scrolling_should_succeed_when_invoked()
 }
 
 #[test]
-fn ps1_multiline_exact_fill_then_scroll_on_final_lf_should_succeed_when_invoked() {
+fn ps1_multiline_exact_fill_then_scroll_on_final_lf_works() {
     let mut term = create_test_emulator(3, 2);
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('P')));
@@ -1064,7 +1064,7 @@ fn ps1_multiline_exact_fill_then_scroll_on_final_lf_should_succeed_when_invoked(
 }
 
 #[test]
-fn ps1_multiline_with_sgr_at_bottom_scrolls_should_succeed_when_invoked() {
+fn ps1_multiline_with_sgr_at_bottom_scrolls_works() {
     let mut term = create_test_emulator(5, 2);
 
     for _ in 0..5 {
@@ -1148,7 +1148,7 @@ fn ps1_multiline_with_sgr_at_bottom_scrolls_should_succeed_when_invoked() {
 }
 
 #[test]
-fn lf_at_bottom_of_partial_scrolling_region_no_origin_mode_should_succeed_when_invoked() {
+fn lf_at_bottom_of_partial_scrolling_region_no_origin_mode_works() {
     let cols = 10;
     let rows = 5;
     let mut emu = create_test_emulator(cols, rows);
@@ -1232,7 +1232,7 @@ fn lf_at_bottom_of_partial_scrolling_region_no_origin_mode_should_succeed_when_i
     );
 }
 #[test]
-fn primary_device_attributes_response_should_succeed_when_invoked() {
+fn primary_device_attributes_response_works() {
     let mut term = create_test_emulator(80, 24);
 
     let input_da = EmulatorInput::Ansi(AnsiCommand::Csi(CsiCommand::PrimaryDeviceAttributes));
@@ -1254,7 +1254,7 @@ mod selection_logic_tests {
     use crate::term::snapshot::SelectionRange;
 
     #[test]
-    fn start_selection_should_succeed_when_invoked() {
+    fn start_selection_works() {
         let mut emu = create_test_emulator(10, 5);
         let point = Point { x: 2, y: 1 };
 
@@ -1274,7 +1274,7 @@ mod selection_logic_tests {
     }
 
     #[test]
-    fn extend_selection_active_and_inactive_should_succeed_when_invoked() {
+    fn extend_selection_active_and_inactive_works() {
         let mut emu = create_test_emulator(10, 5);
         let start_point = Point { x: 2, y: 1 };
         let extend_point = Point { x: 5, y: 2 };
@@ -1300,7 +1300,7 @@ mod selection_logic_tests {
     }
 
     #[test]
-    fn apply_selection_clear_click_and_drag_should_succeed_when_invoked() {
+    fn apply_selection_clear_click_and_drag_works() {
         let mut emu = create_test_emulator(10, 5);
         let point1 = Point { x: 2, y: 1 };
         let point2 = Point { x: 5, y: 1 };
@@ -1344,7 +1344,7 @@ mod selection_logic_tests {
     }
 
     #[test]
-    fn clear_selection_should_succeed_when_invoked() {
+    fn clear_selection_works() {
         let mut emu = create_test_emulator(10, 5);
 
         // Create and deactivate a selection
@@ -1369,13 +1369,13 @@ mod get_selected_text_tests {
     use super::*;
 
     #[test]
-    fn get_selected_text_no_selection_should_succeed_when_invoked() {
+    fn get_selected_text_no_selection_works() {
         let emu = create_test_emulator(10, 5);
         assert_eq!(emu.get_selected_text(), None);
     }
 
     #[test]
-    fn get_selected_text_single_line_should_succeed_when_invoked() {
+    fn get_selected_text_single_line_works() {
         let mut emu = create_test_emulator(10, 5);
         fill_emulator_screen(&mut emu, vec!["Hello World".to_string()]);
 
@@ -1392,7 +1392,7 @@ mod get_selected_text_tests {
     }
 
     #[test]
-    fn get_selected_text_single_line_trailing_spaces_in_selection_should_succeed_when_invoked() {
+    fn get_selected_text_single_line_trailing_spaces_in_selection_works() {
         let mut emu = create_test_emulator(10, 1);
         fill_emulator_screen(&mut emu, vec!["Hi   ".to_string()]);
 
@@ -1408,7 +1408,7 @@ mod get_selected_text_tests {
     }
 
     #[test]
-    fn get_selected_text_multi_line_should_succeed_when_invoked() {
+    fn get_selected_text_multi_line_works() {
         let mut emu = create_test_emulator(10, 5);
         fill_emulator_screen(
             &mut emu,
@@ -1431,7 +1431,7 @@ mod get_selected_text_tests {
     }
 
     #[test]
-    fn get_selected_text_multi_line_full_lines_should_succeed_when_invoked() {
+    fn get_selected_text_multi_line_full_lines_works() {
         let mut emu = create_test_emulator(10, 3);
         fill_emulator_screen(
             &mut emu,
@@ -1467,7 +1467,7 @@ mod get_selected_text_tests {
     }
 
     #[test]
-    fn get_selected_text_line_boundaries_should_succeed_when_invoked() {
+    fn get_selected_text_line_boundaries_works() {
         let mut emu = create_test_emulator(10, 2);
         fill_emulator_screen(
             &mut emu,
@@ -1486,7 +1486,7 @@ mod get_selected_text_tests {
     }
 
     #[test]
-    fn get_selected_text_empty_cells_within_grid_should_succeed_when_invoked() {
+    fn get_selected_text_empty_cells_within_grid_works() {
         let mut emu = create_test_emulator(5, 1);
         // Create sparse content: "A   E" by printing A, moving cursor to col 4, then printing E
         emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
@@ -1507,7 +1507,7 @@ mod get_selected_text_tests {
     }
 
     #[test]
-    fn get_selected_text_selection_beyond_line_length_should_succeed_when_invoked() {
+    fn get_selected_text_selection_beyond_line_length_works() {
         let mut emu = create_test_emulator(10, 1);
         fill_emulator_screen(&mut emu, vec!["Test".to_string()]);
 
@@ -1523,7 +1523,7 @@ mod get_selected_text_tests {
     }
 
     #[test]
-    fn get_selected_text_reversed_points_should_succeed_when_invoked() {
+    fn get_selected_text_reversed_points_works() {
         let mut emu = create_test_emulator(10, 5);
         fill_emulator_screen(&mut emu, vec!["Hello World".to_string()]);
 
@@ -1545,7 +1545,7 @@ mod paste_text_tests {
     use super::*;
 
     #[test]
-    fn paste_text_bracketed_off_simple_should_succeed_when_invoked() {
+    fn paste_text_bracketed_off_simple_works() {
         let mut emu = create_test_emulator(20, 1);
         // Bracketed paste mode is off by default - just verify behavior
 
@@ -1562,7 +1562,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn paste_text_bracketed_off_with_newline_should_succeed_when_invoked() {
+    fn paste_text_bracketed_off_with_newline_works() {
         let mut emu = create_test_emulator(20, 2);
         // Bracketed paste mode is off by default - just verify behavior
 
@@ -1576,7 +1576,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn paste_text_bracketed_off_causes_wrap_should_succeed_when_invoked() {
+    fn paste_text_bracketed_off_causes_wrap_works() {
         let mut emu = create_test_emulator(5, 2);
         // Bracketed paste mode is off by default - just verify wrapping behavior
 
@@ -1592,7 +1592,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn paste_text_bracketed_on_logs_warning_processes_chars_should_succeed_when_invoked() {
+    fn paste_text_bracketed_on_logs_warning_processes_chars_works() {
         let mut emu = create_test_emulator(20, 1);
         // Enable bracketed paste mode
         emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
@@ -1612,7 +1612,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn ansi_resize_sets_terminal_dimensions_should_succeed_when_invoked() {
+    fn ansi_resize_sets_terminal_dimensions_works() {
         let mut emu = create_test_emulator(80, 24);
         assert_eq!(emu.dimensions(), (80, 24));
 
@@ -1631,7 +1631,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn ansi_resize_updates_snapshot_dimensions_should_succeed_when_invoked() {
+    fn ansi_resize_updates_snapshot_dimensions_works() {
         let mut emu = create_test_emulator(80, 24);
 
         let resize_command = AnsiCommand::Csi(CsiCommand::WindowManipulation {
@@ -1650,7 +1650,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn ansi_resize_with_zero_rows_ignored_should_succeed_when_invoked() {
+    fn ansi_resize_with_zero_rows_ignored_works() {
         let mut emu = create_test_emulator(80, 24);
 
         let resize_command = AnsiCommand::Csi(CsiCommand::WindowManipulation {
@@ -1668,7 +1668,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn ansi_resize_with_zero_cols_ignored_should_succeed_when_invoked() {
+    fn ansi_resize_with_zero_cols_ignored_works() {
         let mut emu = create_test_emulator(80, 24);
 
         let resize_command = AnsiCommand::Csi(CsiCommand::WindowManipulation {
@@ -1686,7 +1686,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn ansi_resize_with_missing_params_ignored_should_succeed_when_invoked() {
+    fn ansi_resize_with_missing_params_ignored_works() {
         let mut emu = create_test_emulator(80, 24);
 
         let resize_command = AnsiCommand::Csi(CsiCommand::WindowManipulation {
@@ -1717,7 +1717,7 @@ mod paste_text_tests {
     }
 
     #[test]
-    fn window_manipulation_report_size_should_succeed_when_invoked() {
+    fn window_manipulation_report_size_works() {
         let mut emu = create_test_emulator(80, 24);
 
         let report_command = AnsiCommand::Csi(CsiCommand::WindowManipulation {
