@@ -297,32 +297,32 @@ mod tests {
     use pixelflow_core::Sh2;
 
     #[test]
-    fn test_elu_feature_positive() {
+    fn elu_feature_positive_should_succeed_when_invoked() {
         let f = EluFeature;
         let result = f.apply(Field::from(0.0));
         let _ = result;
     }
 
     #[test]
-    fn test_elu_feature_dimension() {
+    fn elu_feature_dimension_should_succeed_when_invoked() {
         let f = EluFeature;
         assert_eq!(f.dim(), 1);
     }
 
     #[test]
-    fn test_elu_feature_is_send_sync() {
+    fn elu_feature_is_send_sync_should_succeed_when_invoked() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<EluFeature>();
     }
 
     #[test]
-    fn test_random_fourier_feature_dimension_correct() {
+    fn random_fourier_feature_dimension_correct_should_succeed_when_invoked() {
         let rff = RandomFourierFeature::new(vec![1.0, 2.0, 3.0]);
         assert_eq!(rff.num_features, 6);
     }
 
     #[test]
-    fn test_harmonic_attention_accumulate() {
+    fn harmonic_attention_accumulate_should_succeed_when_invoked() {
         let mut attn: HarmonicAttention<9> = HarmonicAttention::new(3);
         let key_sh = Sh2 {
             coeffs: [0.282, 0.0, 0.489, 0.0, 0.0, 0.0, 0.315, 0.0, 0.0],
@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_harmonic_attention_reset() {
+    fn harmonic_attention_reset_should_succeed_when_invoked() {
         let mut attn: HarmonicAttention<9> = HarmonicAttention::new(3);
         let key_sh = Sh2 {
             coeffs: [1.0, 0.5, 0.3, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -350,21 +350,21 @@ mod tests {
     }
 
     #[test]
-    fn test_sh_feature_map_projects_direction() {
+    fn sh_feature_map_projects_direction_should_succeed_when_invoked() {
         let result =
             ShFeatureMap::<9>::project(Field::from(0.0), Field::from(0.0), Field::from(1.0));
         assert_eq!(result.len(), 9);
     }
 
     #[test]
-    fn test_linear_attention_new() {
+    fn linear_attention_new_should_succeed_when_invoked() {
         let attn = LinearAttention::new(EluFeature, 4, 3);
         assert_eq!(attn.feature_dim, 4);
         assert_eq!(attn.value_dim, 3);
     }
 
     #[test]
-    fn test_correspondence_doc() {
+    fn correspondence_doc_should_succeed_when_invoked() {
         let correspondence = HarmonicAttentionIsGlobalIllumination::CORRESPONDENCE;
         assert!(correspondence.contains("Linear Attention"));
     }

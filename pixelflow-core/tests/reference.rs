@@ -142,7 +142,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ref_unpack_4bit() {
+    fn ref_unpack_4bit_should_succeed_when_invoked() {
         // Test data: 0x12 = high:1, low:2 -> 17, 34
         let packed = [0x12u8];
         let result = ref_unpack_4bit(&packed, 2, 1);
@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_gather_4bit_single() {
+    fn ref_gather_4bit_single_should_succeed_when_invoked() {
         // [0x12, 0x34] represents [1*17, 2*17, 3*17, 4*17]
         let packed = [0x12u8, 0x34];
         let stride = 2; // 2 bytes per row, so 4 pixels per row
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_bilinear_interpolate() {
+    fn ref_bilinear_interpolate_should_succeed_when_invoked() {
         // 50% blend horizontally and vertically
         let result = ref_bilinear_interpolate(0, 100, 100, 200, 0.5, 0.5);
         // Average of [0, 100, 100, 200] = 100
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_blend_alpha() {
+    fn ref_blend_alpha_should_succeed_when_invoked() {
         // White fg, black bg, 50% alpha in all channels
         let fg = 0xFF_FF_FF_FF;
         let bg = 0x00_00_00_00;
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_saturating_operations() {
+    fn ref_saturating_operations_should_succeed_when_invoked() {
         assert_eq!(ref_saturating_add_u32(u32::MAX, 1), u32::MAX);
         assert_eq!(ref_saturating_sub_u32(0, 1), 0);
         assert_eq!(ref_saturating_add_u32(100, 50), 150);

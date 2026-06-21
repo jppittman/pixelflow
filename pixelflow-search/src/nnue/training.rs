@@ -233,7 +233,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_metrics() {
+    fn metrics_should_succeed_when_invoked() {
         let mut metrics = Metrics::new();
 
         // Record some results
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_configs() {
+    fn resource_configs_should_succeed_when_invoked() {
         let oracle = ResourceConfig::oracle();
         let constrained = ResourceConfig::constrained();
         let eval = ResourceConfig::evaluation();
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_training_result() {
+    fn training_result_should_succeed_when_invoked() {
         let result = TrainingResult {
             oracle_cost: 100,
             initial_guided_cost: 150,

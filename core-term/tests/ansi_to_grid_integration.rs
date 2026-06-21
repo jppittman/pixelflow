@@ -9,7 +9,7 @@ use core_term::ansi::commands::{AnsiCommand, C0Control, CsiCommand};
 use support::minimal_test_harness::MinimalTestHarness;
 
 #[test]
-fn test_single_character_print() {
+fn single_character_print_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print a single character
@@ -34,7 +34,7 @@ fn test_single_character_print() {
 }
 
 #[test]
-fn test_multiple_characters() {
+fn multiple_characters_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print multiple characters
@@ -60,7 +60,7 @@ fn test_multiple_characters() {
 }
 
 #[test]
-fn test_newline_advances_row() {
+fn newline_advances_row_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print, newline, print again
@@ -78,7 +78,7 @@ fn test_newline_advances_row() {
 }
 
 #[test]
-fn test_cursor_position_command() {
+fn cursor_position_command_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Move cursor to (5, 10), then print
@@ -95,7 +95,7 @@ fn test_cursor_position_command() {
 }
 
 #[test]
-fn test_multiline_text() {
+fn multiline_text_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print text with newlines
@@ -143,7 +143,7 @@ fn test_multiline_text() {
 // =============================================================================
 
 #[test]
-fn test_grid_checksum_changes_on_input() {
+fn grid_checksum_changes_on_input_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     // Get initial checksum (empty grid)
@@ -174,7 +174,7 @@ fn test_grid_checksum_changes_on_input() {
 }
 
 #[test]
-fn test_grid_checksum_stable_without_changes() {
+fn grid_checksum_stable_without_changes_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     // Print a character
@@ -192,7 +192,7 @@ fn test_grid_checksum_stable_without_changes() {
 }
 
 #[test]
-fn test_multiple_characters_change_checksum() {
+fn multiple_characters_change_checksum_should_succeed_when_invoked() {
     let mut harness = MinimalTestHarness::new();
 
     let mut checksums = Vec::new();
@@ -220,7 +220,7 @@ fn test_multiple_characters_change_checksum() {
 // =============================================================================
 
 #[test]
-fn test_bug_grid_changes_without_render_trigger() {
+fn bug_grid_changes_without_render_trigger_should_succeed_when_invoked() {
     // This test documents the ACTUAL BUG:
     // Grid state changes when ANSI commands are processed,
     // but send_frame() is never called, so the display doesn't update.

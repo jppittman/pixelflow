@@ -371,7 +371,7 @@ mod tests {
     const FONT_DATA: &[u8] = include_bytes!("../../assets/DejaVuSansMono-Fallback.ttf");
 
     #[test]
-    fn test_size_bucket() {
+    fn size_bucket_should_succeed_when_invoked() {
         assert_eq!(size_bucket(8.0), 8);
         assert_eq!(size_bucket(9.0), 12);
         assert_eq!(size_bucket(12.0), 12);
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_glyph_creation() {
+    fn cached_glyph_creation_should_succeed_when_invoked() {
         let font = Font::parse(FONT_DATA).unwrap();
         let glyph = font.glyph_scaled('A', 32.0).unwrap();
         let cached = CachedGlyph::new(&glyph, 32);
@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn test_glyph_cache_get() {
+    fn glyph_cache_get_should_succeed_when_invoked() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
 
@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn test_glyph_cache_warm() {
+    fn glyph_cache_warm_should_succeed_when_invoked() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
 
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_glyph_eval() {
+    fn cached_glyph_eval_should_succeed_when_invoked() {
         use pixelflow_core::Field;
 
         let font = Font::parse(FONT_DATA).unwrap();
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_text_creation() {
+    fn cached_text_creation_should_succeed_when_invoked() {
         use pixelflow_core::Field;
 
         let font = Font::parse(FONT_DATA).unwrap();
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_memory_usage() {
+    fn cache_memory_usage_should_succeed_when_invoked() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
 

@@ -67,7 +67,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_load_learned_weights() {
+    fn load_learned_weights_should_succeed_when_invoked() {
         let model = build_learned_cost_model();
 
         // Sanity checks: expensive ops should cost more than cheap ones
@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_toml() {
+    fn parse_toml_should_succeed_when_invoked() {
         let toml = r#"
             # Comment
             add = 10

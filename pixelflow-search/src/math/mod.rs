@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_algebraic_rules_preserve_semantics() {
+    fn algebraic_rules_preserve_semantics_should_succeed_when_invoked() {
         let pts = standard_test_points();
         let mut a = ExprArena::new();
 
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trig_rules_preserve_semantics() {
+    fn trig_rules_preserve_semantics_should_succeed_when_invoked() {
         let pts = standard_test_points();
         let mut a = ExprArena::new();
 
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_left_to_right() {
+    fn associativity_left_to_right_should_succeed_when_invoked() {
         // (v0 + v1) + v2 should produce v0 + (v1 + v2) in the e-graph
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, bin OpKind::Add, (bin OpKind::Add, (var 0), (var 1)), (var 2));
@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_right_to_left() {
+    fn associativity_right_to_left_should_succeed_when_invoked() {
         // v0 + (v1 + v2) should produce (v0 + v1) + v2 in the e-graph
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, bin OpKind::Add, (var 0), (bin OpKind::Add, (var 1), (var 2)));
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_mul() {
+    fn associativity_mul_should_succeed_when_invoked() {
         // (v0 * v1) * v2 should produce v0 * (v1 * v2) and vice versa
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, bin OpKind::Mul, (bin OpKind::Mul, (var 0), (var 1)), (var 2));
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_min_max() {
+    fn associativity_min_max_should_succeed_when_invoked() {
         let pts = standard_test_points();
         let mut a = ExprArena::new();
 
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associativity_templates() {
+    fn associativity_templates_should_succeed_when_invoked() {
         // Verify all associativity rules have valid lhs/rhs templates and that
         // Associative LHS == ReverseAssociative RHS (and vice versa) structurally.
         let assoc = Associative::new(&crate::egraph::ops::Add);
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_rules_count() {
+    fn all_rules_count_should_succeed_when_invoked() {
         // Verify we have the expected number of rules after removal.
         let rules = all_rules();
         assert_eq!(

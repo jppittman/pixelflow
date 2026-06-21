@@ -26,7 +26,7 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, mprotect};
 
         if code.is_empty() {
             return Err("empty code buffer");
@@ -170,7 +170,7 @@ impl CodeBuffer {
     /// Returns an error if mmap fails.
     #[cfg(unix)]
     pub fn new(capacity: usize) -> Result<Self, &'static str> {
-        use libc::{mmap, MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap};
 
         if capacity == 0 {
             return Err("CodeBuffer capacity must be > 0");
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_return_x() {
+    fn jit_return_x_should_succeed_when_invoked() {
         // Simplest kernel: return X (already in v0)
         // Just RET - input X is already in v0, which is the return register!
 
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_add_xy() {
+    fn jit_add_xy_should_succeed_when_invoked() {
         // kernel: X + Y
         // v0 = X, v1 = Y, return v0 + v1
 
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_complex_expr() {
+    fn jit_complex_expr_should_succeed_when_invoked() {
         // kernel: (X + Y) * Z
         // Uses register allocation:
         //   v0=X, v1=Y, v2=Z, v3=W
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_const_05_raw() {
+    fn jit_const_05_raw_should_succeed_when_invoked() {
         // Test raw constant loading for 0.5
         // MOVZ W16, #0
         // MOVK W16, #0x3F00, LSL #16  (0x3F000000 = 0.5f)
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_jit_return_x_x86() {
+    fn jit_return_x_x86_should_succeed_when_invoked() {
         // Simplest kernel: return X (already in xmm0)
 
         let mut code = Vec::new();
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_jit_add_xy_x86() {
+    fn jit_add_xy_x86_should_succeed_when_invoked() {
         // kernel: X + Y
 
         let mut code = Vec::new();

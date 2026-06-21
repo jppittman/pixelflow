@@ -18,7 +18,7 @@ fn eval_to_f32<M: Manifold<(Field, Field, Field, Field), Output = Field>>(m: M) 
 }
 
 #[test]
-fn test_log2_powers_of_two() {
+fn log2_powers_of_two_should_succeed_when_invoked() {
     // log2(2^n) should equal approximately n for integer powers
     // Our polynomial approximation achieves ~1e-4 accuracy
     for n in -10..=10 {
@@ -37,7 +37,7 @@ fn test_log2_powers_of_two() {
 }
 
 #[test]
-fn test_log2_known_values() {
+fn log2_known_values_should_succeed_when_invoked() {
     let test_cases = [
         (1.0, 0.0),
         (2.0, 1.0),
@@ -75,7 +75,7 @@ fn test_log2_known_values() {
 }
 
 #[test]
-fn test_log2_accuracy_sweep() {
+fn log2_accuracy_sweep_should_succeed_when_invoked() {
     // Test accuracy across a wide range using std::f32 as reference
     let mut max_abs_error = 0.0f32;
     let mut max_rel_error = 0.0f32;
@@ -119,7 +119,7 @@ fn test_log2_accuracy_sweep() {
 }
 
 #[test]
-fn test_log2_mantissa_range() {
+fn log2_mantissa_range_should_succeed_when_invoked() {
     // Thorough test of the polynomial approximation in [1, 2) range
     let mut max_error = 0.0f32;
     let mut worst_input = 1.0f32;
@@ -151,7 +151,7 @@ fn test_log2_mantissa_range() {
 }
 
 #[test]
-fn test_log2_exp2_roundtrip() {
+fn log2_exp2_roundtrip_should_succeed_when_invoked() {
     // log2(2^x) should equal x (within floating point precision)
     // Errors compound in roundtrip, so threshold is 2e-4
     let test_values = [
@@ -184,7 +184,7 @@ fn test_log2_exp2_roundtrip() {
 }
 
 #[test]
-fn test_exp2_log2_roundtrip() {
+fn exp2_log2_roundtrip_should_succeed_when_invoked() {
     // 2^(log2(x)) should equal x
     // Errors compound in roundtrip, so threshold is 2e-4
     let test_values = [
@@ -215,7 +215,7 @@ fn test_exp2_log2_roundtrip() {
 }
 
 #[test]
-fn test_log2_simd_consistency() {
+fn log2_simd_consistency_should_succeed_when_invoked() {
     // Test that all SIMD lanes produce consistent results
     let test_value = std::f32::consts::PI;
     let zero = Field::from(0.0);
@@ -245,7 +245,7 @@ fn test_log2_simd_consistency() {
 }
 
 #[test]
-fn test_log2_special_values() {
+fn log2_special_values_should_succeed_when_invoked() {
     // Test edge cases
     let one_f32 = eval_to_f32(Field::from(1.0).log2());
     assert!(
@@ -263,7 +263,7 @@ fn test_log2_special_values() {
 }
 
 #[test]
-fn test_exp2_powers() {
+fn exp2_powers_should_succeed_when_invoked() {
     // exp2(n) should equal 2^n exactly for small integers
     for n in -5..=5 {
         let result_f32 = eval_to_f32(Field::from(n as f32).exp2());
@@ -282,7 +282,7 @@ fn test_exp2_powers() {
 }
 
 #[test]
-fn test_exp2_accuracy_sweep() {
+fn exp2_accuracy_sweep_should_succeed_when_invoked() {
     let mut max_error = 0.0f32;
     let mut worst_input = 0.0f32;
 
@@ -312,7 +312,7 @@ fn test_exp2_accuracy_sweep() {
 }
 
 #[test]
-fn test_polynomial_coefficients_range() {
+fn polynomial_coefficients_range_should_succeed_when_invoked() {
     // Verify polynomial works correctly in [1, 2) by testing many points
     // This is the critical range where the polynomial approximation is applied
 
