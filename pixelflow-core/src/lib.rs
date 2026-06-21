@@ -2235,7 +2235,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gather_behavior_works() {
+    fn gather_behavior_should_succeed_when_invoked() {
         let data = [10.0, 20.0, 30.0, 40.0, 50.0];
         // Indices: 0.0, 1.9 (trunc to 1), 2.1 (trunc to 2), 4.0
         // We expect: data[0], data[1], data[2], data[4]

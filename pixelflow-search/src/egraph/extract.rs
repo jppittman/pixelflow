@@ -1187,7 +1187,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_simple_works() {
+    fn extract_simple_should_succeed_when_invoked() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
 
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_with_ops_works() {
+    fn extract_with_ops_should_succeed_when_invoked() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -1221,7 +1221,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn extract_dag_simple_works() {
+    fn extract_dag_simple_should_succeed_when_invoked() {
         // X + Y: no sharing
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_dag_shared_subexpr_works() {
+    fn extract_dag_shared_subexpr_should_succeed_when_invoked() {
         // X * X: X is used twice
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_dag_triple_use_works() {
+    fn extract_dag_triple_use_should_succeed_when_invoked() {
         // sin(X) * sin(X) + sin(X): sin(X) used 3 times
         // We simulate this structure without actual sin
         let mut egraph = EGraph::new();
@@ -1296,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_dag_nested_sharing_works() {
+    fn extract_dag_nested_sharing_should_succeed_when_invoked() {
         // (X + Y) * (X + Y): (X + Y) is shared
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1323,7 +1323,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn compute_ref_counts_no_sharing_works() {
+    fn compute_ref_counts_no_sharing_should_succeed_when_invoked() {
         // X + Y: no sharing
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_ref_counts_shared_works() {
+    fn compute_ref_counts_shared_should_succeed_when_invoked() {
         // X * X: X is used twice
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1382,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_ref_counts_triple_use_works() {
+    fn compute_ref_counts_triple_use_should_succeed_when_invoked() {
         // sqrt(X) * sqrt(X) + sqrt(X): sqrt(X) referenced 3 times
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn dag_accumulator_handles_shared_subexpressions_works() {
+    fn dag_accumulator_handles_shared_subexpressions_should_succeed_when_invoked() {
         use crate::nnue::{EdgeAccumulator, ExprNnue};
 
         // sin(X) * sin(X): tree has 2x sin edges, DAG has 1x sin + 1x var_ref
@@ -1466,7 +1466,7 @@ mod tests {
 
     /// X + Y should produce an arena with exactly 3 nodes: Var(0), Var(1), Add.
     #[test]
-    fn choices_to_arena_simple_works() {
+    fn choices_to_arena_simple_should_succeed_when_invoked() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -1491,7 +1491,7 @@ mod tests {
     /// X * X should produce an arena with exactly 2 nodes: Var(0) and Mul.
     /// The shared Var(0) e-class must reuse one ExprId rather than being duplicated.
     #[test]
-    fn choices_to_arena_shared_works() {
+    fn choices_to_arena_shared_should_succeed_when_invoked() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let mul = egraph.add(ENode::Op {
@@ -1516,7 +1516,7 @@ mod tests {
 
     /// Direct extraction and explicit `choices_to_arena` should agree for tree-shaped inputs.
     #[test]
-    fn extract_matches_choices_to_arena_works() {
+    fn extract_matches_choices_to_arena_should_succeed_when_invoked() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));

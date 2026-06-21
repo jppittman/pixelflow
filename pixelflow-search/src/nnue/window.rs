@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_window_works() {
+    fn empty_window_should_succeed_when_invoked() {
         let w = InstructionWindow::new(8);
         assert_eq!(w.len(), 0);
         assert!(w.is_empty());
@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn push_and_capacity_works() {
+    fn push_and_capacity_should_succeed_when_invoked() {
         let emb = make_emb();
         let mut w = InstructionWindow::new(4);
 
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_works() {
+    fn eviction_should_succeed_when_invoked() {
         let emb = make_emb();
         let mut w = InstructionWindow::new(4);
 
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_undoes_contribution_works() {
+    fn eviction_undoes_contribution_should_succeed_when_invoked() {
         let emb = make_emb();
 
         // Strategy: push A, B, C, D into a cap-4 window.
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_invariance_works() {
+    fn phase_invariance_should_succeed_when_invoked() {
         // Push the same 4-instruction sequence at two different starting offsets.
         // The canonicalized accumulators should be equal.
         let emb = make_emb();
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_schedule_works() {
+    fn evaluate_schedule_should_succeed_when_invoked() {
         let nnue = ExprNnue::new_random(42);
         let emb = OpEmbeddings::new_random(42);
 

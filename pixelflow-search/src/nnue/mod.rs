@@ -1151,7 +1151,7 @@ mod tests {
     use libm::fabsf;
 
     #[test]
-    fn op_type_roundtrip_works() {
+    fn op_type_roundtrip_should_succeed_when_invoked() {
         for i in 0..OpKind::COUNT {
             let op = OpKind::from_index(i).unwrap();
             assert_eq!(op.index(), i);
@@ -1167,7 +1167,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn bwd_generator_produces_valid_pairs_works() {
+    fn bwd_generator_produces_valid_pairs_should_succeed_when_invoked() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();
@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn bwd_generator_has_fused_ops_works() {
+    fn bwd_generator_has_fused_ops_should_succeed_when_invoked() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig {
@@ -1219,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn bwd_generator_with_templates_works() {
+    fn bwd_generator_with_templates_should_succeed_when_invoked() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();

@@ -371,7 +371,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_var_works() {
+    fn from_var_should_succeed_when_invoked() {
         assert_eq!(Variance::from_var(0), Variance::X);
         assert_eq!(Variance::from_var(1), Variance::Y);
         assert_eq!(Variance::from_var(2), Variance::Z);
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn union_works() {
+    fn union_should_succeed_when_invoked() {
         assert_eq!(Variance::X.union(Variance::Y), Variance::from_bits(0b0011));
         assert_eq!(Variance::CONST.union(Variance::Z), Variance::Z);
         assert_eq!(Variance::X.union(Variance::X), Variance::X);
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn meet_works() {
+    fn meet_should_succeed_when_invoked() {
         // Fewer deps wins
         assert_eq!(Variance::CONST.meet(Variance::X), Variance::CONST);
         assert_eq!(Variance::X.meet(Variance::CONST), Variance::CONST);
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn queries_works() {
+    fn queries_should_succeed_when_invoked() {
         assert!(Variance::CONST.is_const());
         assert!(!Variance::X.is_const());
 
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_format_works() {
+    fn debug_format_should_succeed_when_invoked() {
         assert_eq!(format!("{:?}", Variance::CONST), "Variance(CONST)");
         assert_eq!(format!("{:?}", Variance::X), "Variance{X}");
         assert_eq!(
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn popcount_works() {
+    fn popcount_should_succeed_when_invoked() {
         assert_eq!(Variance::CONST.popcount(), 0);
         assert_eq!(Variance::X.popcount(), 1);
         assert_eq!(Variance::X.union(Variance::Y).popcount(), 2);
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_arena_variance_works() {
+    fn compute_arena_variance_should_succeed_when_invoked() {
         use crate::arena::ExprArena;
         use crate::kind::OpKind;
 
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn find_hoistable_arena_nodes_works() {
+    fn find_hoistable_arena_nodes_should_succeed_when_invoked() {
         use crate::arena::ExprArena;
         use crate::kind::OpKind;
 
@@ -518,7 +518,7 @@ mod tests {
     /// (sin(Z*0.3) is used by the loop's multiply, and Z*0.3 is used by sin
     /// which is itself in setup, so only sin(Z*0.3) crosses).
     #[test]
-    fn hoisted_schedule_partitioning_works() {
+    fn hoisted_schedule_partitioning_should_succeed_when_invoked() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;
@@ -606,7 +606,7 @@ mod tests {
 
     /// Verify that a purely X-dependent expression produces an empty setup phase.
     #[test]
-    fn hoisted_schedule_no_setup_for_x_only_works() {
+    fn hoisted_schedule_no_setup_for_x_only_should_succeed_when_invoked() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;
@@ -636,7 +636,7 @@ mod tests {
 
     /// Verify that constants alone do not trigger hoisting (they are rematerialized).
     #[test]
-    fn hoisted_schedule_constants_not_hoisted_works() {
+    fn hoisted_schedule_constants_not_hoisted_should_succeed_when_invoked() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;

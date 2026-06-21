@@ -499,7 +499,7 @@ mod tests {
     use crate::{Field, X};
 
     #[test]
-    fn let_binding_new_style_works() {
+    fn let_binding_new_style_should_succeed_when_invoked() {
         // let v = 10.0; v + 5.0
         let expr = Let::new(10.0f32, Var::<N0>::new() + 5.0f32);
 
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn let_with_spatial_works() {
+    fn let_with_spatial_should_succeed_when_invoked() {
         // let dist = x; dist * 2
         let expr = Let::new(X, Var::<N0>::new() * 2.0f32);
 
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_let_new_style_works() {
+    fn nested_let_new_style_should_succeed_when_invoked() {
         // let a = 3.0; let b = 4.0; a + b
         let expr = Let::new(
             3.0f32, // a = 3.0 (becomes Var<1> after second let)
@@ -549,7 +549,7 @@ mod tests {
     // Commented out until legacy binding system is fixed or removed.
     /*
     #[test]
-    fn legacy_peano_get_works() {
+    fn legacy_peano_get_should_succeed_when_invoked() {
         let ctx: (Field, (Field, Empty)) = (Field::from(10.0), (Field::from(20.0), Empty));
 
         // Index 0 should get 10.0 (head)
@@ -566,7 +566,7 @@ mod tests {
     */
 
     #[test]
-    fn legacy_let_binding_works() {
+    fn legacy_let_binding_should_succeed_when_invoked() {
         // let x = 5.0; x + x
         let graph = Let::new(Lift(5.0f32), GAdd(Var::<N0>::new(), Var::<N0>::new()));
 

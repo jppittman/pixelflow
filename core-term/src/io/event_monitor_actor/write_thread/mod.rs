@@ -82,7 +82,7 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     #[test]
-    fn write_thread_handles_resize_command_works() {
+    fn write_thread_handles_resize_command_should_succeed_when_invoked() {
         // Create a real PTY for testing
         let config = PtyConfig {
             command_executable: "/bin/cat",
@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn write_thread_handles_write_command_works() {
+    fn write_thread_handles_write_command_should_succeed_when_invoked() {
         let config = PtyConfig {
             command_executable: "/bin/cat",
             args: &[],

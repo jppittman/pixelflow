@@ -53,38 +53,38 @@ fn eval3(
 // ============================================================================
 
 #[test]
-fn jit_macro_return_x_works() {
+fn jit_macro_return_x_should_succeed_when_invoked() {
     let m = kernel_jit!(|| X);
     assert_eq!(eval1(&m, 42.0), 42.0);
 }
 
 #[test]
-fn jit_macro_add_xy_works() {
+fn jit_macro_add_xy_should_succeed_when_invoked() {
     let m = kernel_jit!(|| X + Y);
     assert_eq!(eval2(&m, 10.0, 32.0), 42.0);
 }
 
 #[test]
-fn jit_macro_complex_expr_works() {
+fn jit_macro_complex_expr_should_succeed_when_invoked() {
     // (X + Y) * Z
     let m = kernel_jit!(|| (X + Y) * Z);
     assert_eq!(eval3(&m, 2.0, 5.0, 6.0), 42.0); // (2+5)*6 = 42
 }
 
 #[test]
-fn jit_macro_subtraction_works() {
+fn jit_macro_subtraction_should_succeed_when_invoked() {
     let m = kernel_jit!(|| X - Y);
     assert_eq!(eval2(&m, 100.0, 58.0), 42.0);
 }
 
 #[test]
-fn jit_macro_division_works() {
+fn jit_macro_division_should_succeed_when_invoked() {
     let m = kernel_jit!(|| X / Y);
     assert_eq!(eval2(&m, 84.0, 2.0), 42.0);
 }
 
 #[test]
-fn jit_macro_negation_works() {
+fn jit_macro_negation_should_succeed_when_invoked() {
     let m = kernel_jit!(|| -X);
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
@@ -121,20 +121,20 @@ fn test_jit_macro_cos() {
 }
 
 #[test]
-fn jit_macro_sqrt_works() {
+fn jit_macro_sqrt_should_succeed_when_invoked() {
     // sqrt(1764) = 42
     let m = kernel_jit!(|| X.sqrt());
     assert_eq!(eval1(&m, 1764.0), 42.0);
 }
 
 #[test]
-fn jit_macro_abs_works() {
+fn jit_macro_abs_should_succeed_when_invoked() {
     let m = kernel_jit!(|| X.abs());
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
 
 #[test]
-fn jit_macro_min_max_works() {
+fn jit_macro_min_max_should_succeed_when_invoked() {
     let m_min = kernel_jit!(|| X.min(Y));
     let m_max = kernel_jit!(|| X.max(Y));
     assert_eq!(eval2(&m_min, 10.0, 42.0), 10.0);

@@ -474,7 +474,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn regular_patch_works() {
+    fn regular_patch_should_succeed_when_invoked() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -491,7 +491,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn limit_eval_works() {
+    fn limit_eval_should_succeed_when_invoked() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -518,7 +518,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn surface_stats_works() {
+    fn surface_stats_should_succeed_when_invoked() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0

@@ -143,7 +143,7 @@ mod tests {
     use crate::PARALLELISM;
 
     #[test]
-    fn texture_creation_works() {
+    fn texture_creation_should_succeed_when_invoked() {
         let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let tex = Texture::new(data, 4, 4);
         assert_eq!(tex.width(), 4);
@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_sample_works() {
+    fn texture_sample_should_succeed_when_invoked() {
         // Create 4x4 texture with values 0-15
         let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let tex = Texture::new(data, 4, 4);
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_clamping_works() {
+    fn texture_clamping_should_succeed_when_invoked() {
         let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let tex = Texture::new(data, 4, 4);
 
