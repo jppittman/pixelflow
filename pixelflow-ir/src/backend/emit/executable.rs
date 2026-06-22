@@ -39,11 +39,16 @@ impl ExecutableCode {
         // SAFETY: All syscalls below are safe given valid arguments (which we ensure).
         unsafe {
             // 1. Allocate read-write memory
+            #[cfg(target_os = "macos")]
+            let flags = MAP_PRIVATE | MAP_ANON | libc::MAP_JIT;
+            #[cfg(not(target_os = "macos"))]
+            let flags = MAP_PRIVATE | MAP_ANON;
+
             let ptr = mmap(
                 ptr::null_mut(),
                 capacity,
                 PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANON,
+                flags,
                 -1,
                 0,
             );
@@ -54,15 +59,28 @@ impl ExecutableCode {
 
             let ptr = ptr as *mut u8;
 
+            #[cfg(target_os = "macos")]
+            toggle_jit_write(JitWriteState::Writable);
+
             // 2. Copy code into the buffer
             ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
 
             // 3. Flip to read-execute (W^X)
-            let result = mprotect(ptr as *mut libc::c_void, capacity, PROT_READ | PROT_EXEC);
-
-            if result != 0 {
-                libc::munmap(ptr as *mut libc::c_void, capacity);
-                return Err("mprotect failed");
+            #[cfg(target_os = "macos")]
+            {
+                toggle_jit_write(JitWriteState::Executable);
+                unsafe extern "C" {
+                    fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
+                }
+                sys_icache_invalidate(ptr as *mut core::ffi::c_void, capacity);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let result = mprotect(ptr as *mut libc::c_void, capacity, PROT_READ | PROT_EXEC);
+                if result != 0 {
+                    libc::munmap(ptr as *mut libc::c_void, capacity);
+                    return Err("mprotect failed");
+                }
             }
 
             Ok(Self {

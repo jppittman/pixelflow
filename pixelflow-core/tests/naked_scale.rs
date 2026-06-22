@@ -15,13 +15,12 @@ fn get_jit_mul_kernel() -> usize {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u8, code.len() * 4) };
 
-    let exec = unsafe {
-        pixelflow_ir::backend::emit::executable::ExecutableCode::from_code(bytes).unwrap()
-    };
+    let mut buf = pixelflow_ir::backend::emit::executable::CodeBuffer::new(4096).unwrap();
+    // write_code handles Apple Silicon's pthread_jit_write_protect_np and sys_icache_invalidate
+    let ptr = buf.write_code(bytes).unwrap() as usize;
 
-    // Leak the executable so it lives forever (it's just a test)
-    let ptr = unsafe { exec.as_fn::<extern "C" fn()>() as usize };
-    std::mem::forget(exec);
+    // Leak the buffer so it lives forever (it's just a test)
+    std::mem::forget(buf);
     ptr
 }
 

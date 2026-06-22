@@ -17,3 +17,7 @@
 ## 2024-06-22 - Avoid loop hoisting when functions take ownership
 **Learning:** Attempted to hoist the `cell_items` vector initialization outside the row loop to reuse a single heap allocation. However, `SpatialBSP::from_positioned` takes ownership of the vector (`Vec<Positioned<L>>`). Because the value is moved, we cannot safely clear and reuse the same vector instance across loop iterations in Rust without deep clones, negating the benefit.
 **Action:** When a function consumes a collection by value in a tight loop, prioritize `Vec::with_capacity(size)` over hoisting to minimize reallocation overhead, instead of trying to reuse an object whose ownership is consumed.
+
+## 2024-06-22 - JIT Memory Execution on Apple Silicon
+**Learning:** Found two tests failing intermittently/hanging on `macos-latest` CI. Root cause was that `ExecutableCode::from_code` (used extensively to compile DAG nodes directly without `CodeBuffer`) lacked `MAP_JIT`, `pthread_jit_write_protect_np`, and `sys_icache_invalidate` entirely. Thus it would write to normal memory, call `mprotect(PROT_EXEC)`, and jump to it, which on Apple Silicon either hits a stale icache (causing it to execute garbage and fail assertions) or just hangs.
+**Action:** When working with JIT memory allocation on Apple Silicon, ensure *every* code path that allocates executable memory uses `MAP_JIT`, toggles thread-local write permissions via `pthread_jit_write_protect_np`, and invalidates the instruction cache using `sys_icache_invalidate`.
