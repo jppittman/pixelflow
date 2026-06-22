@@ -17,7 +17,7 @@ fn get_jit_mul_kernel() -> usize {
 
     let mut buf = pixelflow_ir::backend::emit::executable::CodeBuffer::new(4096).unwrap();
     // write_code handles Apple Silicon's pthread_jit_write_protect_np and sys_icache_invalidate
-    let ptr = buf.write_code(bytes).unwrap() as usize;
+    let ptr = unsafe { buf.write_code::<extern "C" fn()>(bytes).unwrap() as usize };
 
     // Leak the buffer so it lives forever (it's just a test)
     std::mem::forget(buf);
