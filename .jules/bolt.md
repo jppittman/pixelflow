@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2024-06-22 - Avoid loop hoisting when functions take ownership
+**Learning:** Attempted to hoist the `cell_items` vector initialization outside the row loop to reuse a single heap allocation. However, `SpatialBSP::from_positioned` takes ownership of the vector (`Vec<Positioned<L>>`). Because the value is moved, we cannot safely clear and reuse the same vector instance across loop iterations in Rust without deep clones, negating the benefit.
+**Action:** When a function consumes a collection by value in a tight loop, prioritize `Vec::with_capacity(size)` over hoisting to minimize reallocation overhead, instead of trying to reuse an object whose ownership is consumed.
