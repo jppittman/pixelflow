@@ -2,7 +2,9 @@ use crate::api::private::{EngineActorHandle, EngineData, WindowId};
 use crate::display::messages::{DisplayControl, DisplayData, DisplayEvent, DisplayMgmt, Window};
 use crate::display::ops::PlatformOps;
 use crate::error::RuntimeError;
-use crate::platform::macos::cocoa::{self, event_type, NSApplication, NSPasteboard};
+use crate::platform::macos::cocoa::{
+    self, event_type, ActivationPolicyFlag, EventDequeue, NSApplication, NSPasteboard,
+};
 use crate::platform::macos::events;
 use crate::platform::macos::sys;
 use crate::platform::macos::window::MacWindow;
@@ -45,7 +47,7 @@ impl MetalOps {
             app.set_activation_policy(NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
 
             app.finish_launching();
-            app.activate_ignoring_other_apps(true);
+            app.activate_ignoring_other_apps(ActivationPolicyFlag::IgnoreOtherApps);
 
             app
         };
@@ -222,7 +224,7 @@ impl PlatformOps for MetalOps {
                 u64::MAX,
                 until_date,
                 mode,
-                true, // dequeue
+                EventDequeue::Dequeue, // dequeue
             );
 
             // Release mode string

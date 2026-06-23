@@ -1,6 +1,6 @@
 use crate::api::public::WindowDescriptor;
 use crate::error::RuntimeError;
-use crate::platform::macos::cocoa::{NSPoint, NSRect, NSSize, NSView, NSWindow};
+use crate::platform::macos::cocoa::{LayerRequest, NSPoint, NSRect, NSSize, NSView, NSWindow};
 use crate::platform::macos::sys::{self, Id, BOOL, YES};
 use std::ffi::c_void;
 
@@ -60,7 +60,7 @@ impl MacWindow {
             sys::send_1::<(), Id>(view.0, sys::sel(b"setLayer:\0"), layer);
 
             // [view setWantsLayer: YES]
-            view.set_wants_layer(true);
+            view.set_wants_layer(LayerRequest::WantsLayer);
         }
 
         window.set_content_view(view);

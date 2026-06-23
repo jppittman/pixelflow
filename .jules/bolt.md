@@ -13,3 +13,10 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Execution Plan Groundedness (Anchor Strings)
+**Learning:** When using Python replacement scripts to inject code (like enums) at the module scope, assuming standard comment headers (like `// --- Structs ---`) exist based on general conventions can lead to script failures if the target string isn't perfectly matched.
+**Action:** Always explicitly verify the existence and exact wording of target anchor strings in the bash trace using commands like `cat` or `grep` before writing replacement scripts.
+
+## 2025-12-28 - Execution Verification Scope
+**Learning:** Running `cargo clippy --all-targets` in a monorepo or large workspace might surface pre-existing warnings in unrelated crates (e.g., `pixelflow-pipeline` warnings when modifying `pixelflow-runtime`).
+**Action:** Focus verification on the specific crate modified (`cargo check -p <crate>`) and ignore pre-existing unrelated warnings during routine refactors, unless explicitly instructed to clean up the entire workspace.
