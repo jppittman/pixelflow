@@ -534,7 +534,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dual2_arithmetic() {
+    fn dual2_arithmetic() {
         let x = Dual2::<f32>::x(3.0);
         let y = Dual2::<f32>::y(4.0);
 
@@ -554,7 +554,7 @@ mod tests {
     // Transcendental tests only run on scalar fallback platforms
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
-    fn test_dual2_sqrt() {
+    fn dual2_sqrt() {
         let x = Dual2::<f32>::x(3.0);
         let y = Dual2::<f32>::y(4.0);
 
@@ -573,7 +573,7 @@ mod tests {
     // Transcendental tests only run on scalar fallback platforms
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
-    fn test_dual3_normal() {
+    fn dual3_normal() {
         // Sphere SDF: f(x,y,z) = sqrt(x² + y² + z²) - 1
         // At point (1, 0, 0), gradient is (1, 0, 0)
         let x = Dual3::<f32>::x(1.0);
@@ -591,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_select() {
+    fn dual_select() {
         let a = Dual2::<f32>::x(1.0);
         let b = Dual2::<f32>::y(2.0);
 
@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_comparison() {
+    fn dual_comparison() {
         let x = Dual2::<f32>::x(3.0);
         let y = Dual2::<f32>::y(4.0);
 
@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_chain_rule_mul() {
+    fn dual_chain_rule_mul() {
         // Test: f(x) = x², f'(x) = 2x
         // At x = 3: x² = 9, 2x = 6
         let x = Dual1::<f32>::var::<0>(3.0);
@@ -633,7 +633,7 @@ mod tests {
     // Transcendental chain rule test only runs on scalar fallback
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
-    fn test_dual_chain_rule_sin() {
+    fn dual_chain_rule_sin() {
         // Test: f(x) = sin(x), f'(x) = cos(x)
         // At x = 0: sin(0) = 0, cos(0) = 1
         let x = Dual1::<f32>::var::<0>(0.0);

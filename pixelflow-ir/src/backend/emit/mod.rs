@@ -3881,21 +3881,21 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_frame_layout_empty() {
+    fn frame_layout_empty() {
         let layout = FrameLayout::from_allocation(&[]).unwrap();
         assert_eq!(layout.frame_size, 0);
         assert!(layout.spill_slots.is_empty());
     }
 
     #[test]
-    fn test_frame_layout_one_spill() {
+    fn frame_layout_one_spill() {
         let layout = FrameLayout::from_allocation(&[regalloc::ValueId(5)]).unwrap();
         assert_eq!(layout.frame_size, 16);
         assert_eq!(layout.spill_slots[&regalloc::ValueId(5)], 0);
     }
 
     #[test]
-    fn test_frame_layout_alignment() {
+    fn frame_layout_alignment() {
         let spilled = [
             regalloc::ValueId(1),
             regalloc::ValueId(2),
@@ -3935,7 +3935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_no_spills() {
+    fn resolve_binary_no_spills() {
         // left=v4, right=v5, dst=v6 — all in registers
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -3955,7 +3955,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_left_spilled() {
+    fn resolve_binary_left_spilled() {
         // left spilled at offset 0, right in v5
         let (assign, spills, remat) = make_maps(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -3981,7 +3981,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_both_spilled() {
+    fn resolve_binary_both_spilled() {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let (assign, spills, remat) = make_maps(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -4015,7 +4015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dst_spilled_generates_store() {
+    fn resolve_dst_spilled_generates_store() {
         // dst is spilled → compute into RELOAD_REGS[0], then store
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5)], &[(2, 32)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -4041,7 +4041,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_fmla_path() {
+    fn resolve_muladd_fmla_path() {
         // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 7), (3, 8)], &[]);
         let op = ScheduledOp::Ternary(
@@ -4066,7 +4066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_both_ab_spilled() {
+    fn resolve_muladd_decomposed_both_ab_spilled() {
         // a and b both spilled → decomposed FMUL+FADD path
         // c in register
         let (assign, spills, remat) = make_maps(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
@@ -4114,7 +4114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_all_three_spilled() {
+    fn resolve_muladd_decomposed_all_three_spilled() {
         // a, b, c all spilled → decomposed with deferred c reload
         let (assign, spills, remat) = make_maps(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
         let op = ScheduledOp::Ternary(
@@ -4137,7 +4137,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_var_is_nop() {
+    fn resolve_var_is_nop() {
         let (assign, spills, remat) = make_maps(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
         let plan = resolve_operands(&op, Loc::Reg(Reg(0)), &assign, &spills, &remat).unwrap();
@@ -4147,7 +4147,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_const() {
+    fn resolve_const() {
         let (assign, spills, remat) = make_maps(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
@@ -4173,7 +4173,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_arena_to_schedule_simple() {
+    fn arena_to_schedule_simple() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4201,7 +4201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_to_schedule_filters_unreachable() {
+    fn arena_to_schedule_filters_unreachable() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4221,7 +4221,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_to_uses() {
+    fn verify_arena_to_uses() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();

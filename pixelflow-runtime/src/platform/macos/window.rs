@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_abi_alignment() {
+    fn abi_alignment() {
         // Verify our assumption about ABI alignment for MTLSize vs CGSize
         // This is a static check of our struct definitions vs likely platform values
         use std::mem;

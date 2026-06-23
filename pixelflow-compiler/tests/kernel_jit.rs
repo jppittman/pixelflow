@@ -53,38 +53,38 @@ fn eval3(
 // ============================================================================
 
 #[test]
-fn test_jit_macro_return_x() {
+fn jit_macro_return_x() {
     let m = kernel_jit!(|| X);
     assert_eq!(eval1(&m, 42.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_add_xy() {
+fn jit_macro_add_xy() {
     let m = kernel_jit!(|| X + Y);
     assert_eq!(eval2(&m, 10.0, 32.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_complex_expr() {
+fn jit_macro_complex_expr() {
     // (X + Y) * Z
     let m = kernel_jit!(|| (X + Y) * Z);
     assert_eq!(eval3(&m, 2.0, 5.0, 6.0), 42.0); // (2+5)*6 = 42
 }
 
 #[test]
-fn test_jit_macro_subtraction() {
+fn jit_macro_subtraction() {
     let m = kernel_jit!(|| X - Y);
     assert_eq!(eval2(&m, 100.0, 58.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_division() {
+fn jit_macro_division() {
     let m = kernel_jit!(|| X / Y);
     assert_eq!(eval2(&m, 84.0, 2.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_negation() {
+fn jit_macro_negation() {
     let m = kernel_jit!(|| -X);
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
@@ -121,20 +121,20 @@ fn test_jit_macro_cos() {
 }
 
 #[test]
-fn test_jit_macro_sqrt() {
+fn jit_macro_sqrt() {
     // sqrt(1764) = 42
     let m = kernel_jit!(|| X.sqrt());
     assert_eq!(eval1(&m, 1764.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_abs() {
+fn jit_macro_abs() {
     let m = kernel_jit!(|| X.abs());
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
 
 #[test]
-fn test_jit_macro_min_max() {
+fn jit_macro_min_max() {
     let m_min = kernel_jit!(|| X.min(Y));
     let m_max = kernel_jit!(|| X.max(Y));
     assert_eq!(eval2(&m_min, 10.0, 42.0), 10.0);
