@@ -20,3 +20,7 @@
 ## 2025-12-28 - Execution Verification Scope
 **Learning:** Running `cargo clippy --all-targets` in a monorepo or large workspace might surface pre-existing warnings in unrelated crates (e.g., `pixelflow-pipeline` warnings when modifying `pixelflow-runtime`).
 **Action:** Focus verification on the specific crate modified (`cargo check -p <crate>`) and ignore pre-existing unrelated warnings during routine refactors, unless explicitly instructed to clean up the entire workspace.
+
+## 2025-12-28 - Flaky Tests (Timeout Thresholds)
+**Learning:** In busy CI environments, tight timeouts (e.g., 150ms) can easily cause flaky test failures due to thread scheduling overhead, even if the underlying code is correct.
+**Action:** Always provide generous margins of error (e.g., 500ms instead of 150ms) when testing timing-dependent behavior to ensure robustness across different execution environments.
