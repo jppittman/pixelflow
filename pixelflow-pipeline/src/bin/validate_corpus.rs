@@ -96,7 +96,7 @@ fn main() {
         let (arena, root) = match parse_kernel_code_arena(expression) {
             Some(parsed) => parsed,
             None => {
-                if total <= 20 || parse_failed % 100 == 0 {
+                if total <= 20 || parse_failed.is_multiple_of(100) {
                     eprintln!(
                         "[PARSE FAIL] {name}: {}",
                         &expression[..expression.len().min(80)]

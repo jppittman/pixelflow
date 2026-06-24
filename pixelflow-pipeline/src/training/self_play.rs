@@ -18,8 +18,7 @@ use pixelflow_search::egraph::{
 };
 use pixelflow_search::nnue::factored::INPUT_DIM;
 use pixelflow_search::nnue::factored::MAX_ARITY;
-use pixelflow_search::nnue::{
-    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_ACC_DIM,
+use pixelflow_search::nnue::{GRAPH_ACC_DIM, BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue,
     GRAPH_INPUT_DIM, GraphAccumulator, OpKind, RuleTemplates,
 };
 
@@ -683,7 +682,7 @@ pub fn generate_trajectory_batch_parallel(
 
     // Parallel: partition work items across workers, spawn scoped threads.
     let num_rules = rules.len();
-    let chunk_size = (count + num_workers - 1) / num_workers;
+    let chunk_size = count.div_ceil(num_workers);
     let chunks: Vec<&[(ExprArena, ExprId, String, String)]> =
         work_items.chunks(chunk_size).collect();
     let actual_workers = chunks.len();
@@ -700,7 +699,7 @@ pub fn generate_trajectory_batch_parallel(
             .enumerate()
             .map(|(worker_id, chunk)| {
                 // Each worker borrows model, rule_embeds, and creates its own rules.
-                let model_ref = &*model;
+                let model_ref = model;
                 let rule_embeds_ref = &rule_embeds;
 
                 std::thread::Builder::new()
@@ -1176,7 +1175,7 @@ pub fn generate_corpus_trajectories_parallel(
 
     // Parallel: partition work items across workers.
     let num_rules = rules.len();
-    let chunk_size = (count + num_workers - 1) / num_workers;
+    let chunk_size = count.div_ceil(num_workers);
     let chunks: Vec<&[(usize, String)]> = work_items.chunks(chunk_size).collect();
     let actual_workers = chunks.len();
 
@@ -1189,7 +1188,7 @@ pub fn generate_corpus_trajectories_parallel(
             .into_iter()
             .enumerate()
             .map(|(worker_id, chunk)| {
-                let model_ref = &*model;
+                let model_ref = model;
                 let rule_embeds_ref = &rule_embeds;
                 let corpus_ref = corpus;
 
