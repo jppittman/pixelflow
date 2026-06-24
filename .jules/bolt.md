@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Avoid FlatMap and Iterator Allocation Overhead
+**Learning:** In hot paths like font rasterization (`push_segs`), using `.flat_map()` with nested vector allocations (`vec![]`) introduces significant overhead due to constant dynamic allocations.
+**Action:** Replaced functional chaining and dynamic allocations with explicit `Vec::with_capacity` and standard loops to improve rasterization performance.
