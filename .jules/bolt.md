@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Test Case Enforcement based on Style Guide
+**Learning:** Found test files that did not conform to the style guide in `docs/STYLE.md` such as `pixelflow-runtime/src/frame.rs`. Specifically, there was a test without any assertions, and test names with the generic `test_` prefix instead of the BDD-style `[method]_should_[outcome]_when_[condition]`.
+**Action:** Always verify test names and structures against `STYLE.md`. Delete empty tests or tests without assertions. Strip the generic `test_` prefix from test function names and use the designated naming convention.
