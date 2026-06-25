@@ -25,3 +25,7 @@
 ## 2025-06-25 - Fix Timeout in naked_scale test
 **Learning:** For a test executing thousands of inline assembly blocks across multiple threads, GitHub runners with slower IO/performance limits might timeout when running `std::thread::scope` containing an enormous amount of cycles. The exact cause is intermittent and related to the execution duration on macos runners on github actions.
 **Action:** Decrease `ops_per_thread` to `1_000` to be reliable across environments.
+
+## 2025-06-25 - Fix Timeout in naked_scale test (Second Fix)
+**Learning:** For tests executing huge amounts of inline assembly (e.g. `naked_scale` running `10_000` loops across `16` threads), decreasing it to `1_000` was still timing out on GitHub actions due to the sheer overhead of spinning up the environment alongside other heavy tests running concurrently.
+**Action:** Decrease `ops_per_thread` to `100` to guarantee stability and prevent 10 minute runner timeouts, as 16 threads running 100 loops is enough to verify multithreaded logic without hitting resource limits.
