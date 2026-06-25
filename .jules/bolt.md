@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Terminal Rendering Vector Capacity Preallocation
+**Learning:** During the terminal BSP tree construction in `core-term/src/terminal_app.rs`, `Vec::new()` was used to initialize `row_items` and `cell_items` inside loops. Because the upper bounds of elements are known (`rows` and `cols`), dynamically appending elements triggers repeated heap reallocations.
+**Action:** Always preallocate dynamically growing vectors using `Vec::with_capacity(size)` in performance-critical hot paths when the exact size is known and strictly greater than zero, to eliminate reallocation overhead.
