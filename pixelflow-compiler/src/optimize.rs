@@ -1479,7 +1479,7 @@ mod tests {
 
     /// Test DAG optimization with shared subexpressions.
     #[test]
-    fn test_dag_optimization_shared_subexpr() {
+    fn verify_dag_optimization_shared_subexpr() {
         // sin(X) * sin(X) should emit a let-binding
         let input = quote! { || X.sin() * X.sin() };
         let kernel = parse(input).unwrap();
@@ -1504,7 +1504,7 @@ mod tests {
 
     /// Test DAG optimization with triple use of shared subexpr.
     #[test]
-    fn test_dag_optimization_triple_shared() {
+    fn verify_dag_optimization_triple_shared() {
         // sqrt(X) * sqrt(X) + sqrt(X) should emit let-binding
         let input = quote! { || X.sqrt() * X.sqrt() + X.sqrt() };
         let kernel = parse(input).unwrap();
@@ -1522,7 +1522,7 @@ mod tests {
 
     /// Test that simple expressions without sharing don't get wrapped in blocks.
     #[test]
-    fn test_dag_optimization_no_sharing() {
+    fn verify_dag_optimization_no_sharing() {
         // X + Y has no sharing, should remain simple
         let input = quote! { || X + Y };
         let kernel = parse(input).unwrap();
@@ -1542,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_pipeline_discriminant() {
+    fn verify_full_pipeline_discriminant() {
         use crate::codegen;
 
         // Full pipeline test matching actual kernel! macro

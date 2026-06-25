@@ -76,7 +76,7 @@ impl<M: ManifoldCompat<Field, Output = Discrete>> Manifold<Field4> for ColorScre
 }
 
 #[test]
-fn test_sphere_on_floor() {
+fn verify_sphere_on_floor() {
     const W: usize = 400;
     const H: usize = 300;
 
@@ -127,7 +127,7 @@ fn test_sphere_on_floor() {
 
 /// Test with solid gray material (non-reflective)
 #[test]
-fn test_sphere_on_matte_floor() {
+fn verify_sphere_on_matte_floor() {
     const W: usize = 400;
     const H: usize = 300;
 
@@ -191,7 +191,7 @@ fn test_sphere_on_matte_floor() {
 
 /// Chrome sphere on checkerboard floor
 #[test]
-fn test_chrome_sphere_on_checkerboard() {
+fn verify_chrome_sphere_on_checkerboard() {
     const WIDTH: usize = 400;
     const HEIGHT: usize = 300;
 

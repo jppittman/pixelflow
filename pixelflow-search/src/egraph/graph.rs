@@ -1542,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inverse_add() {
+    fn verify_inverse_add() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let neg_x = eg.add(ENode::Op {
@@ -1559,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inverse_mul() {
+    fn verify_inverse_mul() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let recip_x = eg.add(ENode::Op {
@@ -1576,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_complex_inverse() {
+    fn verify_complex_inverse() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let five = eg.add(ENode::constant(5.0));
@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_subtraction() {
+    fn verify_nested_subtraction() {
         // a - (b - c) should equal a - b + c
         // Test: 10 - (6 - 2) = 10 - 4 = 6
         let mut eg = egraph_with_rules();
@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_sub_pattern() {
+    fn verify_mul_sub_pattern() {
         // This is the problematic pattern from discriminant:
         // d*d - (c - r) where d=4, c=16, r=1
         let mut eg = egraph_with_rules();
@@ -1651,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_sub_pattern_with_vars() {
+    fn verify_mul_sub_pattern_with_vars() {
         // x*x - (y - z)
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_sub_pattern_with_fma() {
+    fn verify_mul_sub_pattern_with_fma() {
         // Same pattern but with FMA costs (what the kernel! macro uses)
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
@@ -1718,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discriminant_structure() {
+    fn verify_discriminant_structure() {
         // Match the actual discriminant structure:
         // d_dot_c² - (c_sq - r_sq) where c_sq = a² + b² and r_sq = r²
         let mut eg = egraph_with_rules();
@@ -1765,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_penalty_calculation() {
+    fn verify_depth_penalty_calculation() {
         // Test the hinge penalty function
         let mut costs = CostModel::new();
         costs.depth_threshold = 5;
@@ -1782,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shallow_cost_model() {
+    fn verify_shallow_cost_model() {
         // Shallow model should have aggressive depth penalty
         let costs = CostModel::shallow();
         assert_eq!(costs.depth_threshold, 16);
@@ -1795,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_aware_extraction() {
+    fn verify_depth_aware_extraction() {
         // Build a deep expression: ((((x + 1) + 1) + 1) + 1)
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));

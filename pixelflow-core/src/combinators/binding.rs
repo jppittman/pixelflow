@@ -499,7 +499,7 @@ mod tests {
     use crate::{Field, X};
 
     #[test]
-    fn test_let_binding_new_style() {
+    fn verify_let_binding_new_style() {
         // let v = 10.0; v + 5.0
         let expr = Let::new(10.0f32, Var::<N0>::new() + 5.0f32);
 
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_let_with_spatial() {
+    fn verify_let_with_spatial() {
         // let dist = x; dist * 2
         let expr = Let::new(X, Var::<N0>::new() * 2.0f32);
 
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_let_new_style() {
+    fn verify_nested_let_new_style() {
         // let a = 3.0; let b = 4.0; a + b
         let expr = Let::new(
             3.0f32, // a = 3.0 (becomes Var<1> after second let)
@@ -549,7 +549,7 @@ mod tests {
     // Commented out until legacy binding system is fixed or removed.
     /*
     #[test]
-    fn test_legacy_peano_get() {
+    fn verify_legacy_peano_get() {
         let ctx: (Field, (Field, Empty)) = (Field::from(10.0), (Field::from(20.0), Empty));
 
         // Index 0 should get 10.0 (head)
@@ -566,7 +566,7 @@ mod tests {
     */
 
     #[test]
-    fn test_legacy_let_binding() {
+    fn verify_legacy_let_binding() {
         // let x = 5.0; x + x
         let graph = Let::new(Lift(5.0f32), GAdd(Var::<N0>::new(), Var::<N0>::new()));
 

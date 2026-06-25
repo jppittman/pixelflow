@@ -9,7 +9,7 @@ use pixelflow_core::jet::Jet2H;
 
 /// Verify that Jet2H seeding operations compile and produce values.
 #[test]
-fn test_jet2h_seeding() {
+fn verify_jet2h_seeding() {
     let x = Jet2H::x(Field::from(2.0));
     let _ = x.val;
     let _ = x.dx;
@@ -27,7 +27,7 @@ fn test_jet2h_seeding() {
 
 /// Verify that Jet2H arithmetic operations work.
 #[test]
-fn test_jet2h_arithmetic() {
+fn verify_jet2h_arithmetic() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
 
@@ -46,7 +46,7 @@ fn test_jet2h_arithmetic() {
 
 /// Verify that Jet2H unary operations work.
 #[test]
-fn test_jet2h_unary_ops() {
+fn verify_jet2h_unary_ops() {
     let x = Jet2H::x(Field::from(4.0));
 
     let sqrt_result = x.sqrt();
@@ -61,7 +61,7 @@ fn test_jet2h_unary_ops() {
 
 /// Verify that Jet2H comparison operations work.
 #[test]
-fn test_jet2h_comparison() {
+fn verify_jet2h_comparison() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
 
@@ -73,7 +73,7 @@ fn test_jet2h_comparison() {
 
 /// Verify that Jet2H bitwise operations work.
 #[test]
-fn test_jet2h_bitwise() {
+fn verify_jet2h_bitwise() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
 
@@ -84,7 +84,7 @@ fn test_jet2h_bitwise() {
 
 /// Verify that Jet2H select works.
 #[test]
-fn test_jet2h_select() {
+fn verify_jet2h_select() {
     let x = Jet2H::x(Field::from(2.0));
     let y = Jet2H::y(Field::from(3.0));
     let mask = x.lt(y);
@@ -95,7 +95,7 @@ fn test_jet2h_select() {
 
 /// Verify that complex Jet2H expressions compile.
 #[test]
-fn test_jet2h_complex_expression() {
+fn verify_jet2h_complex_expression() {
     let x = Jet2H::x(Field::from(3.0));
     let y = Jet2H::y(Field::from(4.0));
 

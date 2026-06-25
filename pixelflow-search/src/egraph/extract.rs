@@ -1187,7 +1187,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_simple() {
+    fn verify_extract_simple() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
 
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_with_ops() {
+    fn verify_extract_with_ops() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -1221,7 +1221,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_extract_dag_simple() {
+    fn verify_extract_dag_simple() {
         // X + Y: no sharing
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_shared_subexpr() {
+    fn verify_extract_dag_shared_subexpr() {
         // X * X: X is used twice
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_triple_use() {
+    fn verify_extract_dag_triple_use() {
         // sin(X) * sin(X) + sin(X): sin(X) used 3 times
         // We simulate this structure without actual sin
         let mut egraph = EGraph::new();
@@ -1296,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_nested_sharing() {
+    fn verify_extract_dag_nested_sharing() {
         // (X + Y) * (X + Y): (X + Y) is shared
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1323,7 +1323,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_compute_ref_counts_no_sharing() {
+    fn verify_compute_ref_counts_no_sharing() {
         // X + Y: no sharing
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_ref_counts_shared() {
+    fn verify_compute_ref_counts_shared() {
         // X * X: X is used twice
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1382,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_ref_counts_triple_use() {
+    fn verify_compute_ref_counts_triple_use() {
         // sqrt(X) * sqrt(X) + sqrt(X): sqrt(X) referenced 3 times
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_accumulator_handles_shared_subexpressions() {
+    fn verify_dag_accumulator_handles_shared_subexpressions() {
         use crate::nnue::{EdgeAccumulator, ExprNnue};
 
         // sin(X) * sin(X): tree has 2x sin edges, DAG has 1x sin + 1x var_ref
@@ -1466,7 +1466,7 @@ mod tests {
 
     /// X + Y should produce an arena with exactly 3 nodes: Var(0), Var(1), Add.
     #[test]
-    fn test_choices_to_arena_simple() {
+    fn verify_choices_to_arena_simple() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -1491,7 +1491,7 @@ mod tests {
     /// X * X should produce an arena with exactly 2 nodes: Var(0) and Mul.
     /// The shared Var(0) e-class must reuse one ExprId rather than being duplicated.
     #[test]
-    fn test_choices_to_arena_shared() {
+    fn verify_choices_to_arena_shared() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let mul = egraph.add(ENode::Op {
@@ -1516,7 +1516,7 @@ mod tests {
 
     /// Direct extraction and explicit `choices_to_arena` should agree for tree-shaped inputs.
     #[test]
-    fn test_extract_matches_choices_to_arena() {
+    fn verify_extract_matches_choices_to_arena() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));

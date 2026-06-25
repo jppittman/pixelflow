@@ -77,14 +77,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ascii_char_width() {
+    fn verify_ascii_char_width() {
         assert_eq!(get_char_display_width('A'), 1, "Width of 'A' should be 1");
         assert_eq!(get_char_display_width(' '), 1, "Width of space should be 1");
         assert_eq!(get_char_display_width('~'), 1, "Width of '~' should be 1");
     }
 
     #[test]
-    fn test_box_drawing_char_widths() {
+    fn verify_box_drawing_char_widths() {
         assert_eq!(
             get_char_display_width('─'),
             1,
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cjk_wide_char_widths() {
+    fn verify_cjk_wide_char_widths() {
         assert_eq!(
             get_char_display_width('世'),
             2,
@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_control_char_widths() {
+    fn verify_control_char_widths() {
         assert_eq!(
             get_char_display_width('\u{0000}'),
             0,
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_width_chars() {
+    fn verify_zero_width_chars() {
         assert_eq!(
             get_char_display_width('\u{200D}'),
             0,
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_locale_initializer_called() {
+    fn verify_locale_initializer_called() {
         // Ensure OnceLock mechanism is engaged
         let _ = get_char_display_width(' ');
         assert!(

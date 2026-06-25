@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-06-25 - Rename Test Methods
+**Learning:** Tests must not contain the `test_` prefix as per `STYLE.md`.
+**Action:** Renamed all tests to omit the `test_` prefix, using `verify_` for tests whose names start with digits or conflict with existing functions. Used python regex scripts for a project-wide search-and-replace, and tested against edge cases (like `size_bucket()` or `clamp01()`) to prevent unintentional modifications of actual function logic in tests.

@@ -303,7 +303,7 @@ mod tests {
     use super::super::ops;
 
     #[test]
-    fn test_dag_simple_no_sharing() {
+    fn dag_simple_no_sharing() {
         // X + Y: no sharing, should produce simple expression
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_shared_var() {
+    fn dag_shared_var() {
         // X * X: X is shared, but variables don't need let-bindings
         // (they're already O(1) to access)
         let mut egraph = EGraph::new();
@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_shared_subexpr() {
+    fn dag_shared_subexpr() {
         // sqrt(X) * sqrt(X): sqrt(X) is an expensive shared subexpr
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_triple_shared() {
+    fn dag_triple_shared() {
         // sqrt(X) * sqrt(X) + sqrt(X): sqrt(X) used 3 times
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_nested_sharing() {
+    fn dag_nested_sharing() {
         // (X + Y) * (X + Y) + (X + Y): (X + Y) used 3 times
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_to_kernel_code() {
+    fn verify_dag_to_kernel_code() {
         // Test the full kernel code generation
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_complex_expression() {
+    fn dag_complex_expression() {
         // Build: (X * Y) + (X * Y) * (Z + W)
         // (X * Y) is shared between two uses
         let mut egraph = EGraph::new();

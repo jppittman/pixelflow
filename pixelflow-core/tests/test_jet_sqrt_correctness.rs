@@ -2,7 +2,7 @@ use pixelflow_core::Jet2; // Use Alias
 use pixelflow_core::{Field, ManifoldExt};
 
 #[test]
-fn test_sqrt_derivative() {
+fn verify_sqrt_derivative() {
     // Test at x=4.0
     let x_val = Field::from(4.0);
     let x_jet = Jet2::x(x_val);
@@ -30,7 +30,7 @@ fn test_sqrt_derivative() {
 }
 
 #[test]
-fn test_sqrt_derivative_zero() {
+fn verify_sqrt_derivative_zero() {
     // Check behavior at 0.0
     let x_val = Field::from(0.0);
     let x_jet = Jet2::x(x_val);

@@ -122,7 +122,7 @@ mod tests {
     use pixelflow_core::ManifoldCompat;
 
     #[test]
-    fn test_flat_patch() {
+    fn verify_flat_patch() {
         let patch = BezierPatch::flat(1.0);
         let z = Field::from(0.0);
         let result = patch.eval_raw(Field::from(0.5), Field::from(0.5), z, z);
@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn test_derivatives() {
+    fn verify_derivatives() {
         let patch = BezierPatch::paraboloid(2.0, 1.0);
         let u = Jet2H::x(Field::from(0.5));
         let v = Jet2H::y(Field::from(0.5));

@@ -896,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_control_resize() {
+    fn verify_handle_control_resize() {
         let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_management_keydown() {
+    fn verify_handle_management_keydown() {
         let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,

@@ -129,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pixels_to_cells_basic() {
+    fn verify_pixels_to_cells_basic() {
         let layout = Layout {
             cols: 80,
             rows: 24,
@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pixels_to_cells_with_padding() {
+    fn verify_pixels_to_cells_with_padding() {
         let layout = Layout {
             cols: 80,
             rows: 24,
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pixels_to_cells_out_of_bounds() {
+    fn verify_pixels_to_cells_out_of_bounds() {
         let layout = Layout {
             cols: 80,
             rows: 24,
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cells_to_pixels() {
+    fn verify_cells_to_pixels() {
         let layout = Layout {
             cols: 80,
             rows: 24,
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pixel_dimensions() {
+    fn verify_pixel_dimensions() {
         let layout = Layout {
             cols: 80,
             rows: 24,
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resize() {
+    fn verify_resize() {
         let mut layout = Layout::new(80, 24);
 
         assert_eq!(layout.cols, 80);

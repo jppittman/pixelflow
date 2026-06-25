@@ -605,7 +605,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rgba8_components() {
+    fn verify_rgba8_components() {
         let c = Rgba8::new(0x11, 0x22, 0x33, 0xFF);
         assert_eq!(c.r(), 0x11);
         assert_eq!(c.g(), 0x22);
@@ -614,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bgra8_components() {
+    fn verify_bgra8_components() {
         let c = Bgra8::new(0x33, 0x22, 0x11, 0xFF);
         assert_eq!(c.b(), 0x33);
         assert_eq!(c.g(), 0x22);
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rgba8_to_bgra8() {
+    fn verify_rgba8_to_bgra8() {
         let rgba = Rgba8::new(0x11, 0x22, 0x33, 0xFF);
         let bgra = Bgra8::from(rgba);
         assert_eq!(bgra.r(), 0x11);
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn test_named_color_manifold() {
+    fn verify_named_color_manifold() {
         use pixelflow_core::{materialize_discrete, PARALLELISM};
         let red = NamedColor::Red;
         let mut out = vec![0u32; PARALLELISM];
@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_color_manifold() {
+    fn verify_color_manifold() {
         use pixelflow_core::{materialize_discrete, PARALLELISM};
         let c = Color::Rgb(10, 20, 30);
         let mut out = vec![0u32; PARALLELISM];

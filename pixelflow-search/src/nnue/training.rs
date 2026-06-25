@@ -233,7 +233,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_metrics() {
+    fn verify_metrics() {
         let mut metrics = Metrics::new();
 
         // Record some results
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_configs() {
+    fn verify_resource_configs() {
         let oracle = ResourceConfig::oracle();
         let constrained = ResourceConfig::constrained();
         let eval = ResourceConfig::evaluation();
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_training_result() {
+    fn verify_training_result() {
         let result = TrainingResult {
             oracle_cost: 100,
             initial_guided_cost: 150,

@@ -28,7 +28,7 @@ fn x_plus_param(val: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
 }
 
 #[test]
-fn test_simple_param() {
+fn simple_param() {
     let k = simple_return_param(42.0);
     let rx = Jet3::constant(Field::from(1.0));
     let ry = Jet3::constant(Field::from(2.0));
@@ -48,7 +48,7 @@ fn test_simple_param() {
 }
 
 #[test]
-fn test_x_plus_param() {
+fn verify_x_plus_param() {
     let k = x_plus_param(10.0);
     // X = 5.0, so result should be 15.0
     let rx = Jet3::constant(Field::from(5.0));
@@ -70,25 +70,25 @@ fn test_x_plus_param() {
 
 // Test d_dot_c = X * cx + Y * cy + Z * cz
 // For ray (0, 0, 1) and center (0, 0, 4): d_dot_c = 0*0 + 0*0 + 1*4 = 4
-fn test_d_dot_c(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
+fn verify_d_dot_c(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
     kernel!(|cx: f32, cy: f32, cz: f32| -> Jet3 { X * cx + Y * cy + Z * cz })(cx, cy, cz)
 }
 
 // Test c_sq = cx*cx + cy*cy + cz*cz (should be 16 for center at (0,0,4))
 // Returns Field since this only computes with scalar params
-fn test_c_sq(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Field> + Clone {
+fn verify_c_sq(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Field> + Clone {
     kernel!(|cx: f32, cy: f32, cz: f32| -> Field { cx * cx + cy * cy + cz * cz })(cx, cy, cz)
 }
 
 // Test: just r*r (should be 1 for r=1)
 // Returns Field since this only computes with scalar params
-fn test_r_sq(r: f32) -> impl Manifold<Jet3_4, Output = Field> + Clone {
+fn verify_r_sq(r: f32) -> impl Manifold<Jet3_4, Output = Field> + Clone {
     kernel!(|r: f32| -> Field { r * r })(r)
 }
 
 // Test: c_sq - r_sq (should be 15 for c_sq=16, r_sq=1)
 // Returns Field since this only computes with scalar params
-fn test_c_sq_minus_r_sq(
+fn verify_c_sq_minus_r_sq(
     cx: f32,
     cy: f32,
     cz: f32,
@@ -102,7 +102,7 @@ fn test_c_sq_minus_r_sq(
 }
 
 // Test: d_dot_c * d_dot_c (should be 16)
-fn test_d_dot_c_sq(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
+fn verify_d_dot_c_sq(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = Jet3> + Clone {
     kernel!(|cx: f32, cy: f32, cz: f32| -> Jet3 {
         let d_dot_c = X * cx + Y * cy + Z * cz;
         d_dot_c * d_dot_c
@@ -111,7 +111,7 @@ fn test_d_dot_c_sq(cx: f32, cy: f32, cz: f32) -> impl Manifold<Jet3_4, Output = 
 
 // Test discriminant = d_dot_c² - (c_sq - r_sq)
 // = 4*4 - (16 - 1) = 16 - 15 = 1
-fn test_discriminant(
+fn verify_discriminant(
     cx: f32,
     cy: f32,
     cz: f32,
@@ -126,8 +126,8 @@ fn test_discriminant(
 }
 
 #[test]
-fn test_step1_d_dot_c() {
-    let k = test_d_dot_c(0.0, 0.0, 4.0);
+fn step1_d_dot_c() {
+    let k = verify_d_dot_c(0.0, 0.0, 4.0);
     // Ray direction: (0, 0, 1)
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
@@ -144,8 +144,8 @@ fn test_step1_d_dot_c() {
 }
 
 #[test]
-fn test_step2_c_sq() {
-    let k = test_c_sq(0.0, 0.0, 4.0);
+fn step2_c_sq() {
+    let k = verify_c_sq(0.0, 0.0, 4.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
     let rz = Jet3::constant(Field::from(1.0));
@@ -161,8 +161,8 @@ fn test_step2_c_sq() {
 }
 
 #[test]
-fn test_step3a_r_sq() {
-    let k = test_r_sq(1.0);
+fn step3a_r_sq() {
+    let k = verify_r_sq(1.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
     let rz = Jet3::constant(Field::from(1.0));
@@ -178,8 +178,8 @@ fn test_step3a_r_sq() {
 }
 
 #[test]
-fn test_step3b_c_sq_minus_r_sq() {
-    let k = test_c_sq_minus_r_sq(0.0, 0.0, 4.0, 1.0);
+fn step3b_c_sq_minus_r_sq() {
+    let k = verify_c_sq_minus_r_sq(0.0, 0.0, 4.0, 1.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
     let rz = Jet3::constant(Field::from(1.0));
@@ -195,8 +195,8 @@ fn test_step3b_c_sq_minus_r_sq() {
 }
 
 #[test]
-fn test_step3c_d_dot_c_sq() {
-    let k = test_d_dot_c_sq(0.0, 0.0, 4.0);
+fn step3c_d_dot_c_sq() {
+    let k = verify_d_dot_c_sq(0.0, 0.0, 4.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
     let rz = Jet3::constant(Field::from(1.0));
@@ -212,8 +212,8 @@ fn test_step3c_d_dot_c_sq() {
 }
 
 #[test]
-fn test_step3_discriminant() {
-    let k = test_discriminant(0.0, 0.0, 4.0, 1.0);
+fn step3_discriminant() {
+    let k = verify_discriminant(0.0, 0.0, 4.0, 1.0);
     let rx = Jet3::constant(Field::from(0.0));
     let ry = Jet3::constant(Field::from(0.0));
     let rz = Jet3::constant(Field::from(1.0));
@@ -229,7 +229,7 @@ fn test_step3_discriminant() {
 }
 
 #[test]
-fn test_sphere_hit() {
+fn sphere_hit() {
     // Sphere at (0, 0, 4) with radius 1
     let sphere = sphere_at(0.0, 0.0, 4.0, 1.0);
 

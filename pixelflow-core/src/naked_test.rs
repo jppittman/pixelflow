@@ -13,7 +13,7 @@ pub extern "C" fn dummy_jit_kernel(x: float32x4_t, y: float32x4_t, _z: float32x4
     }
 }
 
-pub fn test_naked_call() {
+pub fn verify_naked_call() {
     let x_arr = [2.0f32, 3.0, 4.0, 5.0];
     let y_arr = [10.0f32, 10.0, 10.0, 10.0];
     

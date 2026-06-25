@@ -103,7 +103,9 @@ impl PlatformOps for LinuxOps {
                 DisplayControl::Bell => {
                     window.bell();
                 }
-                DisplayControl::ShowWindow { .. } | DisplayControl::HideWindow { .. } | DisplayControl::RequestRedraw { .. } => {
+                DisplayControl::ShowWindow { .. }
+                | DisplayControl::HideWindow { .. }
+                | DisplayControl::RequestRedraw { .. } => {
                     // Not implemented for Linux yet
                 }
             }

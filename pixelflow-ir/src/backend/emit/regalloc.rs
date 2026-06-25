@@ -632,7 +632,7 @@ mod tests {
     use alloc::collections::BTreeSet;
 
     #[test]
-    fn test_empty_graph() {
+    fn verify_empty_graph() {
         let graph = InterferenceGraph::new();
         let alloc = color_graph(&graph, 8, 4);
         assert!(alloc.assignment.is_empty());
@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_interference() {
+    fn verify_no_interference() {
         let mut graph = InterferenceGraph::new();
         graph.add_value(ValueId(0));
         graph.add_value(ValueId(1));
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chain_interference() {
+    fn verify_chain_interference() {
         let mut graph = InterferenceGraph::new();
         // Linear chain: 0 -- 1 -- 2
         graph.add_value(ValueId(0));
@@ -678,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clique_needs_more_colors() {
+    fn verify_clique_needs_more_colors() {
         let mut graph = InterferenceGraph::new();
         // Triangle (3-clique): all interfere with all
         for i in 0..3 {
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_precolored() {
+    fn verify_precolored() {
         let mut graph = InterferenceGraph::new();
         graph.precolor(ValueId(0), Reg(0)); // Input register
         graph.add_value(ValueId(1));
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spilling() {
+    fn verify_spilling() {
         let mut graph = InterferenceGraph::new();
         // 4-clique with only 2 registers available
         for i in 0..4 {

@@ -5,7 +5,7 @@ use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
 
 #[test]
-fn test_parallel_rasterization_matches_sequential() {
+fn verify_parallel_rasterization_matches_sequential() {
     let width = 100;
     let height = 100;
     let color = Color::Named(NamedColor::Green);
