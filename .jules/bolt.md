@@ -20,3 +20,7 @@
 ## 2025-12-28 - Flaky CI Fixes (Timing & Precision)
 **Learning:** Hardcoded loop iterations in tests (`10_000` ops per thread across 16 threads) can cause catastrophic timeouts (>600s) on constrained CI runners, despite taking milliseconds locally. Additionally, `1e-1` is sometimes too tight for JIT numerical equivalence across platforms.
 **Action:** Always scale down loop iterations to reasonable bounded limits (`100`) in tests using `std::thread::spawn` and relax floating-point assertions to `2e-1` to preserve resilience.
+
+## 2025-12-28 - Ignoring Code Unrelated to Patch
+**Learning:** Running `cargo clippy --all-targets --all-features -- -D warnings` often surfaces a massive number of pre-existing warnings in unrelated crates (e.g. `pixelflow-pipeline`).
+**Action:** When working on isolated refactoring or fixing specific flaky tests in specific crates (`pixelflow-core` and `pixelflow-search`), rely on `cargo test` and `cargo check` restricted to those specific crates (`-p pixelflow-core -p pixelflow-search`) to avoid getting blocked by pre-existing lint issues elsewhere, as per the Execution Verification Scope rule.
