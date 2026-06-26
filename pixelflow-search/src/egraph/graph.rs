@@ -230,7 +230,12 @@ impl EGraph {
             processed += 1;
             let id = self.find(id);
             let nodes = std::mem::take(&mut self.classes[id.index()].nodes);
-            let mut new_nodes = Vec::new();
+            let capacity = nodes.len();
+            let mut new_nodes = if capacity > 0 {
+                Vec::with_capacity(capacity)
+            } else {
+                Vec::new()
+            };
             for mut node in nodes {
                 self.canonicalize_node(&mut node);
                 if let Some(&existing) = self.memo.get(&node) {
@@ -503,12 +508,15 @@ impl EGraph {
         };
 
         let class_id = self.find(class_id);
-        let nodes = self.classes[class_id.index()].nodes.clone();
-        let Some(node) = nodes.get(node_idx) else {
-            return false;
+        let node = {
+            let nodes = &self.classes[class_id.index()].nodes;
+            match nodes.get(node_idx) {
+                Some(n) => n.clone(),
+                None => return false,
+            }
         };
 
-        let Some(action) = rule.apply(self, class_id, node) else {
+        let Some(action) = rule.apply(self, class_id, &node) else {
             return false;
         };
 
