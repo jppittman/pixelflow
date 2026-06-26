@@ -19,3 +19,6 @@
 ## 2025-12-28 - Flaky Timeout Bounds in CI
 **Learning:** Hardcoded timing assertions (e.g., `shutdown_duration < Duration::from_millis(150)`) can be flaky on shared CI runners under heavy load, causing tests to intermittently fail due to scheduling delays out of our control.
 **Action:** Relax timeout bounds to account for shared environment noise (e.g., increased from 150ms to 500ms) when testing failure modes.
+## 2025-12-28 - Flaky Tests under High Concurrency
+**Learning:** Multithreaded tests that iterate thousands of times (like `test_naked_abi_multithreaded_scale` which spawns 16 threads for 10_000 iterations each) can easily timeout on resource-constrained CI machines.
+**Action:** When writing or fixing tests intended to verify correctness in a multithreaded context, reduce the number of threads or iterations to a level sufficient to prove concurrency safety without risking timeouts (e.g., lowered to 4 threads and 1_000 iterations).
