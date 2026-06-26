@@ -53,38 +53,38 @@ fn eval3(
 // ============================================================================
 
 #[test]
-fn jit_macro_return_x() {
+fn test_jit_macro_return_x() {
     let m = kernel_jit!(|| X);
     assert_eq!(eval1(&m, 42.0), 42.0);
 }
 
 #[test]
-fn jit_macro_add_xy() {
+fn test_jit_macro_add_xy() {
     let m = kernel_jit!(|| X + Y);
     assert_eq!(eval2(&m, 10.0, 32.0), 42.0);
 }
 
 #[test]
-fn jit_macro_complex_expr() {
+fn test_jit_macro_complex_expr() {
     // (X + Y) * Z
     let m = kernel_jit!(|| (X + Y) * Z);
     assert_eq!(eval3(&m, 2.0, 5.0, 6.0), 42.0); // (2+5)*6 = 42
 }
 
 #[test]
-fn jit_macro_subtraction() {
+fn test_jit_macro_subtraction() {
     let m = kernel_jit!(|| X - Y);
     assert_eq!(eval2(&m, 100.0, 58.0), 42.0);
 }
 
 #[test]
-fn jit_macro_division() {
+fn test_jit_macro_division() {
     let m = kernel_jit!(|| X / Y);
     assert_eq!(eval2(&m, 84.0, 2.0), 42.0);
 }
 
 #[test]
-fn jit_macro_negation() {
+fn test_jit_macro_negation() {
     let m = kernel_jit!(|| -X);
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
@@ -95,7 +95,7 @@ fn jit_macro_negation() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_sin() {
+fn test_jit_macro_sin() {
     // sin(0) = 0
     let m = kernel_jit!(|| X.sin());
     let val = eval1(&m, 0.0);
@@ -104,7 +104,7 @@ fn verify_jit_macro_sin() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_sin_pi_half() {
+fn test_jit_macro_sin_pi_half() {
     // sin(π/2) ≈ 1
     let m = kernel_jit!(|| X.sin());
     let val = eval1(&m, core::f32::consts::FRAC_PI_2);
@@ -113,7 +113,7 @@ fn verify_jit_macro_sin_pi_half() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_cos() {
+fn test_jit_macro_cos() {
     // cos(0) = 1
     let m = kernel_jit!(|| X.cos());
     let val = eval1(&m, 0.0);
@@ -121,20 +121,20 @@ fn verify_jit_macro_cos() {
 }
 
 #[test]
-fn jit_macro_sqrt() {
+fn test_jit_macro_sqrt() {
     // sqrt(1764) = 42
     let m = kernel_jit!(|| X.sqrt());
     assert_eq!(eval1(&m, 1764.0), 42.0);
 }
 
 #[test]
-fn jit_macro_abs() {
+fn test_jit_macro_abs() {
     let m = kernel_jit!(|| X.abs());
     assert_eq!(eval1(&m, -42.0), 42.0);
 }
 
 #[test]
-fn jit_macro_min_max() {
+fn test_jit_macro_min_max() {
     let m_min = kernel_jit!(|| X.min(Y));
     let m_max = kernel_jit!(|| X.max(Y));
     assert_eq!(eval2(&m_min, 10.0, 42.0), 10.0);
@@ -218,7 +218,7 @@ fn kernel_jit_same_semantics_as_kernel() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_atan2_basic() {
+fn test_jit_macro_atan2_basic() {
     let m = kernel_jit!(|| Y.atan2(X));
     // atan2(1, 1) = π/4 — polynomial has ~0.06 error at t=1 boundary
     let val = eval2(&m, 1.0, 1.0);
@@ -239,7 +239,7 @@ fn verify_jit_macro_atan2_basic() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_atan2_quadrants() {
+fn test_jit_macro_atan2_quadrants() {
     let m = kernel_jit!(|| Y.atan2(X));
 
     // Use ratio = 0.5 (well inside polynomial range) for quadrant tests
@@ -278,7 +278,7 @@ fn verify_jit_macro_atan2_quadrants() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_atan() {
+fn test_jit_macro_atan() {
     let m = kernel_jit!(|| X.atan());
     // atan(0.5) ≈ 0.4636 — well within polynomial range
     let val = eval1(&m, 0.5);
@@ -294,7 +294,7 @@ fn verify_jit_macro_atan() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_asin() {
+fn test_jit_macro_asin() {
     let m = kernel_jit!(|| X.asin());
     // asin(0) = 0
     let val0 = eval1(&m, 0.0);
@@ -310,7 +310,7 @@ fn verify_jit_macro_asin() {
 
 #[test]
 #[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
-fn verify_jit_macro_acos() {
+fn test_jit_macro_acos() {
     let m = kernel_jit!(|| X.acos());
     // acos(0.5) = π/3 ≈ 1.047 — exercises large-ratio path (ratio ≈ 1.73)
     let val_half = eval1(&m, 0.5);

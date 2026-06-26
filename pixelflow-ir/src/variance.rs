@@ -371,7 +371,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verify_from_var() {
+    fn test_from_var() {
         assert_eq!(Variance::from_var(0), Variance::X);
         assert_eq!(Variance::from_var(1), Variance::Y);
         assert_eq!(Variance::from_var(2), Variance::Z);
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_union() {
+    fn test_union() {
         assert_eq!(Variance::X.union(Variance::Y), Variance::from_bits(0b0011));
         assert_eq!(Variance::CONST.union(Variance::Z), Variance::Z);
         assert_eq!(Variance::X.union(Variance::X), Variance::X);
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_meet() {
+    fn test_meet() {
         // Fewer deps wins
         assert_eq!(Variance::CONST.meet(Variance::X), Variance::CONST);
         assert_eq!(Variance::X.meet(Variance::CONST), Variance::CONST);
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn queries() {
+    fn test_queries() {
         assert!(Variance::CONST.is_const());
         assert!(!Variance::X.is_const());
 
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_format() {
+    fn test_debug_format() {
         assert_eq!(format!("{:?}", Variance::CONST), "Variance(CONST)");
         assert_eq!(format!("{:?}", Variance::X), "Variance{X}");
         assert_eq!(
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_popcount() {
+    fn test_popcount() {
         assert_eq!(Variance::CONST.popcount(), 0);
         assert_eq!(Variance::X.popcount(), 1);
         assert_eq!(Variance::X.union(Variance::Y).popcount(), 2);
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_compute_arena_variance() {
+    fn test_compute_arena_variance() {
         use crate::arena::ExprArena;
         use crate::kind::OpKind;
 
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_find_hoistable_arena_nodes() {
+    fn test_find_hoistable_arena_nodes() {
         use crate::arena::ExprArena;
         use crate::kind::OpKind;
 
@@ -518,7 +518,7 @@ mod tests {
     /// (sin(Z*0.3) is used by the loop's multiply, and Z*0.3 is used by sin
     /// which is itself in setup, so only sin(Z*0.3) crosses).
     #[test]
-    fn hoisted_schedule_partitioning() {
+    fn test_hoisted_schedule_partitioning() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;
@@ -606,7 +606,7 @@ mod tests {
 
     /// Verify that a purely X-dependent expression produces an empty setup phase.
     #[test]
-    fn hoisted_schedule_no_setup_for_x_only() {
+    fn test_hoisted_schedule_no_setup_for_x_only() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;
@@ -636,7 +636,7 @@ mod tests {
 
     /// Verify that constants alone do not trigger hoisting (they are rematerialized).
     #[test]
-    fn hoisted_schedule_constants_not_hoisted() {
+    fn test_hoisted_schedule_constants_not_hoisted() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;

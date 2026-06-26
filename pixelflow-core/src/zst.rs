@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinate_variables_are_zst() {
+    fn test_coordinate_variables_are_zst() {
         assert_zst::<crate::variables::X>();
         assert_zst::<crate::variables::Y>();
         assert_zst::<crate::variables::Z>();
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn spherical_harmonics_are_zst() {
+    fn test_spherical_harmonics_are_zst() {
         assert_zst::<crate::combinators::SphericalHarmonic<0, 0>>();
         assert_zst::<crate::combinators::SphericalHarmonic<1, -1>>();
         assert_zst::<crate::combinators::ZonalHarmonic<0>>();
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn operators_with_zst_operands_are_zst() {
+    fn test_operators_with_zst_operands_are_zst() {
         use crate::variables::{X, Y};
 
         // Binary operators
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_expression_is_zst() {
+    fn test_complex_expression_is_zst() {
         use crate::variables::{X, Y};
 
         // Test that (X * X + Y * Y).sqrt() is a ZST
@@ -631,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn combinators_with_zst_operands_are_zst() {
+    fn test_combinators_with_zst_operands_are_zst() {
         use crate::variables::{X, Y, Z};
 
         // Select combinator

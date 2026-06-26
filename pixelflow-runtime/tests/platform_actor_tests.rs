@@ -63,7 +63,7 @@ impl PlatformOps for MockOps {
 }
 
 #[test]
-fn platform_actor_delegation() {
+fn test_platform_actor_delegation() {
     // 1. Create MockOps
     let ops = MockOps::new();
     let log_ref = ops.log.clone();

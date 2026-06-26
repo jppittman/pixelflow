@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn algebraic_rules_preserve_semantics() {
+    fn test_algebraic_rules_preserve_semantics() {
         let pts = standard_test_points();
         let mut a = ExprArena::new();
 
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn trig_rules_preserve_semantics() {
+    fn test_trig_rules_preserve_semantics() {
         let pts = standard_test_points();
         let mut a = ExprArena::new();
 
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn associativity_left_to_right() {
+    fn test_associativity_left_to_right() {
         // (v0 + v1) + v2 should produce v0 + (v1 + v2) in the e-graph
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, bin OpKind::Add, (bin OpKind::Add, (var 0), (var 1)), (var 2));
@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn associativity_right_to_left() {
+    fn test_associativity_right_to_left() {
         // v0 + (v1 + v2) should produce (v0 + v1) + v2 in the e-graph
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, bin OpKind::Add, (var 0), (bin OpKind::Add, (var 1), (var 2)));
@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn associativity_mul() {
+    fn test_associativity_mul() {
         // (v0 * v1) * v2 should produce v0 * (v1 * v2) and vice versa
         let mut a = ExprArena::new();
         let e = arena_pat!(&mut a, bin OpKind::Mul, (bin OpKind::Mul, (var 0), (var 1)), (var 2));
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn associativity_min_max() {
+    fn test_associativity_min_max() {
         let pts = standard_test_points();
         let mut a = ExprArena::new();
 
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn associativity_templates() {
+    fn test_associativity_templates() {
         // Verify all associativity rules have valid lhs/rhs templates and that
         // Associative LHS == ReverseAssociative RHS (and vice versa) structurally.
         let assoc = Associative::new(&crate::egraph::ops::Add);
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn all_rules_count() {
+    fn test_all_rules_count() {
         // Verify we have the expected number of rules after removal.
         let rules = all_rules();
         assert_eq!(

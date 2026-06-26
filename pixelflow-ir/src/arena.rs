@@ -742,7 +742,7 @@ mod tests {
 
     // 1. test_push_and_access
     #[test]
-    fn push_and_access() {
+    fn test_push_and_access() {
         let mut arena = ExprArena::new();
 
         let v = arena.push_var(0);
@@ -775,7 +775,7 @@ mod tests {
 
     // 2. test_node_count
     #[test]
-    fn node_count() {
+    fn test_node_count() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let c1 = arena.push_const(1.0);
@@ -795,7 +795,7 @@ mod tests {
 
     // 3. test_depth
     #[test]
-    fn verify_depth() {
+    fn test_depth() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let v1 = arena.push_var(1);
@@ -807,7 +807,7 @@ mod tests {
 
     // 4. test_has_var
     #[test]
-    fn verify_has_var() {
+    fn test_has_var() {
         let mut arena1 = ExprArena::new();
         let v0 = arena1.push_var(0);
         let c1 = arena1.push_const(1.0);
@@ -823,7 +823,7 @@ mod tests {
 
     // 5. test_has_degenerate
     #[test]
-    fn verify_has_degenerate() {
+    fn test_has_degenerate() {
         let mut arena1 = ExprArena::new();
         let root1 = arena1.push_const(f32::NAN);
         assert!(arena1.has_degenerate(root1));
@@ -852,7 +852,7 @@ mod tests {
 
     // 7. test_clear_preserves_capacity
     #[test]
-    fn clear_preserves_capacity() {
+    fn test_clear_preserves_capacity() {
         let mut arena = ExprArena::with_capacity(64);
         let _v = arena.push_var(0);
         let _c = arena.push_const(1.0);
@@ -870,7 +870,7 @@ mod tests {
 
     // 7. test_substitute_params
     #[test]
-    fn verify_substitute_params() {
+    fn test_substitute_params() {
         let mut arena = ExprArena::new();
         let p0 = arena.push_param(0);
         let p1 = arena.push_param(1);
@@ -889,7 +889,7 @@ mod tests {
 
     // 8. test_nary
     #[test]
-    fn nary() {
+    fn test_nary() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let v1 = arena.push_var(1);
@@ -905,7 +905,7 @@ mod tests {
 
     // 9. test_display
     #[test]
-    fn verify_display() {
+    fn test_display() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let v1 = arena.push_var(1);
@@ -919,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn size_of_expr_node() {
+    fn test_size_of_expr_node() {
         // Compile-time assertion exists above, but also verify at runtime.
         assert!(
             core::mem::size_of::<ExprNode>() <= 16,
@@ -929,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_children_exact_size() {
+    fn test_expr_children_exact_size() {
         let mut arena = ExprArena::new();
         let v = arena.push_var(0);
         let c = arena.push_const(1.0);

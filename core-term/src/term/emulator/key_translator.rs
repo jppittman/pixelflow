@@ -162,7 +162,7 @@ mod tests {
     use crate::term::modes::DecPrivateModes;
 
     #[test]
-    fn simple_chars() {
+    fn test_simple_chars() {
         let modes = DecPrivateModes::default();
         assert_eq!(
             translate_key_input(
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_chars() {
+    fn test_ctrl_chars() {
         let modes = DecPrivateModes::default();
         // Test Ctrl+c
         assert_eq!(
@@ -195,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_chars() {
+    fn test_alt_chars() {
         let modes = DecPrivateModes::default();
         assert_eq!(
             translate_key_input(KeySymbol::Char('a'), Modifiers::ALT, None, &modes),
@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn arrow_keys_normal_mode() {
+    fn test_arrow_keys_normal_mode() {
         let modes = DecPrivateModes {
             cursor_keys_app_mode: false,
             ..Default::default()
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn arrow_keys_app_mode() {
+    fn test_arrow_keys_app_mode() {
         let modes = DecPrivateModes {
             cursor_keys_app_mode: true,
             ..Default::default()
@@ -252,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab() {
+    fn test_shift_tab() {
         let modes = DecPrivateModes::default();
         assert_eq!(
             translate_key_input(KeySymbol::Tab, Modifiers::SHIFT, None, &modes),

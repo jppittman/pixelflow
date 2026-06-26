@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn saturate_with_budget_simple() {
+    fn test_saturate_with_budget_simple() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let zero = eg.add(ENode::constant(0.0));
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn saturate_with_budget_exhausted() {
+    fn test_saturate_with_budget_exhausted() {
         let mut eg = egraph_with_rules();
         // Create a moderately complex expression
         let x = eg.add(ENode::Var(0));
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn achievable_cost() {
+    fn test_achievable_cost() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let zero = eg.add(ENode::constant(0.0));
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn saturation_result_growth_ratio() {
+    fn test_saturation_result_growth_ratio() {
         let result = SaturationResult {
             iterations: 5,
             total_unions: 10,

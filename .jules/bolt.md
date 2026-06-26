@@ -13,14 +13,3 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
-## 2025-12-28 - Test Naming Style Enforcements
-**Learning:** Functions starting with `test_` cause E0061 errors when naively stripping `test_` via automated string replacement if the original target function (being tested) already has the same name without the prefix.
-**Action:** When performing bulk renames of test functions in Rust to comply with BDD or descriptive naming guidelines, it is much safer to prepend `verify_` after stripping `test_` to prevent shadowing actual APIs and causing compilation failures.
-
-## 2025-12-28 - Flaky CI Fixes (Timing & Precision)
-**Learning:** Hardcoded loop iterations in tests (`10_000` ops per thread across 16 threads) can cause catastrophic timeouts (>600s) on constrained CI runners, despite taking milliseconds locally. Additionally, `1e-1` is sometimes too tight for JIT numerical equivalence across platforms.
-**Action:** Always scale down loop iterations to reasonable bounded limits (`100`) in tests using `std::thread::spawn` and relax floating-point assertions to `2e-1` to preserve resilience.
-
-## 2025-12-28 - Ignoring Code Unrelated to Patch
-**Learning:** Running `cargo clippy --all-targets --all-features -- -D warnings` often surfaces a massive number of pre-existing warnings in unrelated crates (e.g. `pixelflow-pipeline`).
-**Action:** When working on isolated refactoring or fixing specific flaky tests in specific crates (`pixelflow-core` and `pixelflow-search`), rely on `cargo test` and `cargo check` restricted to those specific crates (`-p pixelflow-core -p pixelflow-search`) to avoid getting blocked by pre-existing lint issues elsewhere, as per the Execution Verification Scope rule.

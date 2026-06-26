@@ -82,7 +82,7 @@ mod tests {
     use crate::variables::{X, Y};
 
     #[test]
-    fn block_compiles_and_runs() {
+    fn test_block_compiles_and_runs() {
         let inner = X + Y;
         let blocked = Block::new(inner);
 
@@ -99,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn block_nested() {
+    fn test_block_nested() {
         // Block of a Block should still work
         let inner = X * Y;
         let blocked = Block::new(Block::new(inner));
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn block_with_complex_expr() {
+    fn test_block_with_complex_expr() {
         // More complex expression to verify register pressure scenario
         let expr = (X + Y) * (X - Y);
         let blocked = Block::new(expr);

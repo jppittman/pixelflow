@@ -3,7 +3,7 @@ use pixelflow_core::{ManifoldCompat, ManifoldExt, X, Y};
 
 #[test]
 #[ignore = "Needs internal Field access for lane extraction"]
-fn verify_jet2_automatic_gradient() {
+fn test_jet2_automatic_gradient() {
     // Expression: x² + y
     let expr = X * X + Y;
 
@@ -21,7 +21,7 @@ fn verify_jet2_automatic_gradient() {
 
 #[test]
 #[ignore = "Needs internal Field access for lane extraction"]
-fn verify_jet2_product_rule() {
+fn test_jet2_product_rule() {
     let expr = X * Y;
 
     let x_jet = Jet2::x(3.0.into());
@@ -34,7 +34,7 @@ fn verify_jet2_product_rule() {
 
 #[test]
 #[ignore = "Needs internal Field access for lane extraction"]
-fn verify_jet2_chain_rule_sqrt() {
+fn test_jet2_chain_rule_sqrt() {
     let expr = X.sqrt();
 
     let x_jet = Jet2::x(16.0.into());
@@ -45,7 +45,7 @@ fn verify_jet2_chain_rule_sqrt() {
 
 #[test]
 #[ignore = "Needs internal Field access for lane extraction"]
-fn verify_jet2_circle_normal() {
+fn test_jet2_circle_normal() {
     // Compute distance from origin - the SDF of a circle centered at origin
     // We use just the sqrt(x² + y²) part to get the autodiff gradients.
     // The constant radius subtraction happens after evaluation to keep Jet2 compatibility.

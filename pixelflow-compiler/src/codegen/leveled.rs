@@ -606,13 +606,13 @@ mod tests {
     }
 
     #[test]
-    fn node_ref_var_name() {
+    fn test_node_ref_var_name() {
         let r = NodeRef::new(2, 3);
         assert_eq!(r.var_name().to_string(), "__l2_3");
     }
 
     #[test]
-    fn deps_const_only() {
+    fn test_deps_const_only() {
         // Pure constant expression: 1.0 + 2.0
         let stats = analyze_input(quote! { || 1.0 + 2.0 });
         assert!(stats.varying_nodes == 0, "Expected no varying nodes");
@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn deps_varying_only() {
+    fn test_deps_varying_only() {
         // Pure varying: X + Y
         let stats = analyze_input(quote! { || X + Y });
         assert!(stats.varying_nodes > 0, "Expected varying nodes");
@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn deps_uniform_only() {
+    fn test_deps_uniform_only() {
         // Pure uniform: W * 2.0
         let stats = analyze_input(quote! { || W * 2.0 });
         assert!(stats.const_nodes > 0, "Expected const nodes (2.0)");
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn deps_mixed() {
+    fn test_deps_mixed() {
         // Mixed: (W * 0.5).sin() + X
         // W*0.5 and sin(...) are uniform
         // X is varying
@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn deps_scalar_params_are_const() {
+    fn test_deps_scalar_params_are_const() {
         // Scalar parameters captured at kernel creation are Const
         let stats = analyze_input(quote! { |r: f32| X - r });
         // r is Const (scalar param)
@@ -664,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn deps_lattice_join() {
+    fn test_deps_lattice_join() {
         assert_eq!(Deps::Const.join(Deps::Const), Deps::Const);
         assert_eq!(Deps::Const.join(Deps::Uniform), Deps::Uniform);
         assert_eq!(Deps::Const.join(Deps::Varying), Deps::Varying);

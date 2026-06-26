@@ -6,7 +6,7 @@
 use pixelflow_core::{WithContext, X, Y};
 
 #[test]
-fn with_context_5_params_compiles() {
+fn test_with_context_5_params_compiles() {
     // THE KEY TEST: This compiles with 5 params where nested Let fails!
     //
     // WithContext creates: WithContext<(V0, V1, V2, V3, V4), Body>
@@ -30,7 +30,7 @@ fn with_context_5_params_compiles() {
 }
 
 #[test]
-fn with_context_constructs() {
+fn test_with_context_constructs() {
     // Just verify it constructs correctly
     let v0 = X;
     let v1 = Y;

@@ -371,7 +371,7 @@ mod tests {
     const FONT_DATA: &[u8] = include_bytes!("../../assets/DejaVuSansMono-Fallback.ttf");
 
     #[test]
-    fn verify_size_bucket() {
+    fn test_size_bucket() {
         assert_eq!(size_bucket(8.0), 8);
         assert_eq!(size_bucket(9.0), 12);
         assert_eq!(size_bucket(12.0), 12);
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_glyph_creation() {
+    fn test_cached_glyph_creation() {
         let font = Font::parse(FONT_DATA).unwrap();
         let glyph = font.glyph_scaled('A', 32.0).unwrap();
         let cached = CachedGlyph::new(&glyph, 32);
@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn glyph_cache_get() {
+    fn test_glyph_cache_get() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
 
@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn glyph_cache_warm() {
+    fn test_glyph_cache_warm() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
 
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_glyph_eval() {
+    fn test_cached_glyph_eval() {
         use pixelflow_core::Field;
 
         let font = Font::parse(FONT_DATA).unwrap();
@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_text_creation() {
+    fn test_cached_text_creation() {
         use pixelflow_core::Field;
 
         let font = Font::parse(FONT_DATA).unwrap();
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_memory_usage() {
+    fn test_cache_memory_usage() {
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();
 

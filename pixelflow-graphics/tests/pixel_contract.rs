@@ -6,7 +6,7 @@ use pixelflow_graphics::render::color::{Bgra8, Rgba8};
 use pixelflow_graphics::render::pixel::Pixel;
 
 #[test]
-fn rgba8_components() {
+fn test_rgba8_components() {
     let rgba = Rgba8::new(0x11, 0x22, 0x33, 0x44);
     assert_eq!(rgba.r(), 0x11);
     assert_eq!(rgba.g(), 0x22);
@@ -15,7 +15,7 @@ fn rgba8_components() {
 }
 
 #[test]
-fn bgra8_components() {
+fn test_bgra8_components() {
     let bgra = Bgra8::new(0x33, 0x22, 0x11, 0x44);
     assert_eq!(bgra.b(), 0x33);
     assert_eq!(bgra.g(), 0x22);
@@ -24,7 +24,7 @@ fn bgra8_components() {
 }
 
 #[test]
-fn swizzle_correctness() {
+fn test_swizzle_correctness() {
     let rgba = Rgba8::new(0x11, 0x22, 0x33, 0x44);
     let bgra = Bgra8::from(rgba);
 
@@ -35,7 +35,7 @@ fn swizzle_correctness() {
 }
 
 #[test]
-fn pixel_from_rgba_f32() {
+fn test_pixel_from_rgba_f32() {
     let rgba = Rgba8::from_rgba(1.0, 0.5, 0.0, 1.0);
     assert_eq!(rgba.r(), 255);
     assert!(rgba.g() > 120 && rgba.g() < 140); // ~127
@@ -44,7 +44,7 @@ fn pixel_from_rgba_f32() {
 }
 
 #[test]
-fn pixel_from_u32() {
+fn test_pixel_from_u32() {
     let packed: u32 = 0xFF332211; // ABGR in memory = RGBA little-endian
     let rgba = Rgba8::from_u32(packed);
     assert_eq!(rgba.to_u32(), packed);

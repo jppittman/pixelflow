@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     #[ignore = "Requires UI interaction or window server"]
-    fn verify_metal_ops_lifecycle() {
+    fn test_metal_ops_lifecycle() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_clone = events.clone();
 
