@@ -201,7 +201,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_parse_simple_quad() {
+    fn parse_simple_quad() {
         let obj = "
 # Simple cube (partial)
 v 0.0 0.0 0.0
@@ -217,7 +217,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn test_valence_computation() {
+    fn valence_computation() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -235,7 +235,7 @@ f 4 1 5 5
     }
 
     #[test]
-    fn test_reject_triangles() {
+    fn reject_triangles() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -248,7 +248,7 @@ f 1 2 3
     }
 
     #[test]
-    fn test_texture_coordinates_ignored() {
+    fn texture_coordinates_ignored() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0

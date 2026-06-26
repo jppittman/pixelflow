@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Test Naming Style Enforcements
+**Learning:** Functions starting with `test_` cause E0061 errors when naively stripping `test_` via automated string replacement if the original target function (being tested) already has the same name without the prefix.
+**Action:** When performing bulk renames of test functions in Rust to comply with BDD or descriptive naming guidelines, it is much safer to prepend `verify_` after stripping `test_` to prevent shadowing actual APIs and causing compilation failures.

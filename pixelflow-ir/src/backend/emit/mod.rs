@@ -3835,7 +3835,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_needs_simple() {
+    fn verify_needs_simple() {
         // X + Y: both leaves need 1, binary needs max(1,1)+1 = 2
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -3846,7 +3846,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_needs_unbalanced() {
+    fn verify_needs_unbalanced() {
         // (X + Y) + Z: left needs 2, right needs 1, total = max(2,1) = 2
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -3859,7 +3859,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_needs_balanced_deep() {
+    fn verify_needs_balanced_deep() {
         // (X + Y) + (Z + W): both sides need 2, total = 2+1 = 3
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -3881,21 +3881,21 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_frame_layout_empty() {
+    fn frame_layout_empty() {
         let layout = FrameLayout::from_allocation(&[]).unwrap();
         assert_eq!(layout.frame_size, 0);
         assert!(layout.spill_slots.is_empty());
     }
 
     #[test]
-    fn test_frame_layout_one_spill() {
+    fn frame_layout_one_spill() {
         let layout = FrameLayout::from_allocation(&[regalloc::ValueId(5)]).unwrap();
         assert_eq!(layout.frame_size, 16);
         assert_eq!(layout.spill_slots[&regalloc::ValueId(5)], 0);
     }
 
     #[test]
-    fn test_frame_layout_alignment() {
+    fn frame_layout_alignment() {
         let spilled = [
             regalloc::ValueId(1),
             regalloc::ValueId(2),
@@ -3935,7 +3935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_no_spills() {
+    fn resolve_binary_no_spills() {
         // left=v4, right=v5, dst=v6 — all in registers
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -3955,7 +3955,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_left_spilled() {
+    fn resolve_binary_left_spilled() {
         // left spilled at offset 0, right in v5
         let (assign, spills, remat) = make_maps(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -3981,7 +3981,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_both_spilled() {
+    fn resolve_binary_both_spilled() {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let (assign, spills, remat) = make_maps(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -4015,7 +4015,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dst_spilled_generates_store() {
+    fn resolve_dst_spilled_generates_store() {
         // dst is spilled → compute into RELOAD_REGS[0], then store
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5)], &[(2, 32)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -4041,7 +4041,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_fmla_path() {
+    fn resolve_muladd_fmla_path() {
         // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 7), (3, 8)], &[]);
         let op = ScheduledOp::Ternary(
@@ -4066,7 +4066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_both_ab_spilled() {
+    fn resolve_muladd_decomposed_both_ab_spilled() {
         // a and b both spilled → decomposed FMUL+FADD path
         // c in register
         let (assign, spills, remat) = make_maps(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
@@ -4114,7 +4114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_all_three_spilled() {
+    fn resolve_muladd_decomposed_all_three_spilled() {
         // a, b, c all spilled → decomposed with deferred c reload
         let (assign, spills, remat) = make_maps(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
         let op = ScheduledOp::Ternary(
@@ -4137,7 +4137,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_var_is_nop() {
+    fn resolve_var_is_nop() {
         let (assign, spills, remat) = make_maps(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
         let plan = resolve_operands(&op, Loc::Reg(Reg(0)), &assign, &spills, &remat).unwrap();
@@ -4147,7 +4147,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_const() {
+    fn resolve_const() {
         let (assign, spills, remat) = make_maps(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
@@ -4173,7 +4173,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_arena_to_schedule_simple() {
+    fn arena_to_schedule_simple() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4201,7 +4201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_to_schedule_filters_unreachable() {
+    fn arena_to_schedule_filters_unreachable() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4221,7 +4221,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_to_uses() {
+    fn verify_arena_to_uses() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4240,7 +4240,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_arena_compile_simple() {
+    fn verify_arena_compile_simple() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4266,7 +4266,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_arena_compile_with_constant() {
+    fn verify_arena_compile_with_constant() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4294,7 +4294,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_arena_compile_with_spills() {
+    fn verify_arena_compile_with_spills() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4334,7 +4334,7 @@ mod tests {
     /// Verify the register-offset LDR/STR encodings work at all.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_handcoded_add() {
+    fn verify_scanline_handcoded_add() {
         use core::arch::aarch64::*;
 
         // Hand-coded scanline kernel: output[i] = X[i] + Y
@@ -4419,7 +4419,7 @@ mod tests {
     /// Test the register-offset LDR/STR encoding with a manual loop.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_reg_offset_encoding() {
+    fn verify_scanline_reg_offset_encoding() {
         use core::arch::aarch64::*;
 
         // Test: load+store one Q value using post-index addressing.
@@ -4458,7 +4458,7 @@ mod tests {
     /// Test scanline kernel for X + Y (simplest possible expression).
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_add_xy() {
+    fn verify_scanline_add_xy() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4495,7 +4495,7 @@ mod tests {
     /// Test scanline kernel for return X (identity).
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_return_x() {
+    fn verify_scanline_return_x() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4523,7 +4523,7 @@ mod tests {
     /// Test scanline kernel with constant: (X * 2.0) + 3.0
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_with_constants() {
+    fn verify_scanline_with_constants() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4556,7 +4556,7 @@ mod tests {
     /// Test scanline matches per-batch results for a complex expression.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_matches_per_batch() {
+    fn verify_scanline_matches_per_batch() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4599,7 +4599,7 @@ mod tests {
     /// Test scanline with empty input (should be a no-op).
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_empty() {
+    fn verify_scanline_empty() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4630,7 +4630,7 @@ mod tests {
     // `__m512` (the AVX-512 per-batch path is covered by the `avx512` tests).
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    fn test_scanline_matches_per_batch_x86() {
+    fn verify_scanline_matches_per_batch_x86() {
         use core::arch::x86_64::*;
 
         // expr = (X*X + Y) * Z - W  (uses all four variables)
@@ -4675,7 +4675,7 @@ mod tests {
     /// An empty scanline (count == 0) must be a no-op and not write `output`.
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_scanline_empty_x86() {
+    fn verify_scanline_empty_x86() {
         use core::arch::x86_64::*;
 
         let mut arena = ExprArena::new();
@@ -4723,7 +4723,7 @@ mod tests {
     /// `emit_unary` directly (not the compiler's lowering).
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    fn test_x86_unary_builtins_match_scalar() {
+    fn verify_x86_unary_builtins_match_scalar() {
         // Tolerances reflect the shared (with aarch64) minimax-polynomial
         // accuracy over a sensible input range; exact ops use tight bounds.
         // `rel_err = |jit - scalar| / (1 + |scalar|)`.
@@ -4843,7 +4843,7 @@ mod tests {
     /// Binary transcendentals + comparisons + ternaries, JIT vs scalar.
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    fn test_x86_binary_ternary_builtins_match_scalar() {
+    fn verify_x86_binary_ternary_builtins_match_scalar() {
         use core::arch::x86_64::*;
         // Helper: compile f(X, Y) and eval at (x, y).
         unsafe fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
