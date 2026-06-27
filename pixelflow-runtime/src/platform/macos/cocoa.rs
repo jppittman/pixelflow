@@ -1,12 +1,12 @@
-pub enum DequeueBehavior {
-    Dequeue,
-    Peek,
-}
-
 //! Cocoa Wrapper Layer (The Clean Room)
 //!
 //! This module defines safe, Rust-friendly wrappers around the raw Objective-C runtime.
 //! No strings in driver logic. No unsafe blocks in driver logic.
+
+pub enum DequeueBehavior {
+    Dequeue,
+    Peek,
+}
 
 use super::sys::{self, Id, BOOL, NO, YES};
 use std::ffi::c_void;
