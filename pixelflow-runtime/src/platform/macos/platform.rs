@@ -222,7 +222,7 @@ impl PlatformOps for MetalOps {
                 u64::MAX,
                 until_date,
                 mode,
-                true, // dequeue
+                cocoa::DequeueEvent::Yes, // dequeue
             );
 
             // Release mode string
