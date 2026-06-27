@@ -4,5 +4,3 @@
 //! These tests verify that Jet2H operations compile and execute without panicking.
 //! For detailed numerical verification, use the materialize API with real outputs.
 
-use pixelflow_core::Field;
-use pixelflow_core::jet::Jet2H;

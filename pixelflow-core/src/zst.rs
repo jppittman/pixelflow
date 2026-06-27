@@ -575,6 +575,7 @@ impl<M: crate::Zst + Copy> Copy for crate::ops::derivative::Curvature2D<M> {}
 #[cfg(test)]
 mod tests {
     // Helper function to assert a type is a ZST
+    #[allow(dead_code)]
     fn assert_zst<T: crate::Zst>() {
         assert_eq!(core::mem::size_of::<T>(), 0);
     }

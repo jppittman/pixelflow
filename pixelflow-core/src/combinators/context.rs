@@ -629,18 +629,18 @@ impl<
 
 #[cfg(test)]
 mod context_domain_tests {
-    use super::*;
-    use crate::Field;
-    use crate::X;
-    use crate::ext::ManifoldExt;
-    use crate::jet::Jet3;
-    use crate::ops::binary::MulAdd;
-    use crate::ops::derivative::DZ;
-    use crate::ops::logic::And;
 
-    type CtxDomain = (([Jet3; 3],), (Jet3, Jet3, Jet3, Jet3));
 
-    fn check_manifold<P: Copy + Send + Sync, M: Manifold<P>>(_m: &M) {}
+
+
+
+
+
+
+
+
+
+
 
     // Test matching the GeometryMask kernel pattern
 }
