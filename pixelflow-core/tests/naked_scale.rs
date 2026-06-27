@@ -58,7 +58,7 @@ unsafe fn invoke_naked_kernel(
 }
 
 #[test]
-fn test_naked_abi_multithreaded_scale() {
+fn naked_abi_multithreaded_scale() {
     #[cfg(target_arch = "aarch64")]
     {
         let num_threads = 16;

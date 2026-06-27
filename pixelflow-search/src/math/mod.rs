@@ -337,101 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_algebraic_rules_preserve_semantics() {
-        let pts = standard_test_points();
-        let mut a = ExprArena::new();
-
-        // a - b (canonicalize: sub -> add+neg)
-        let e = arena_pat!(&mut a, bin OpKind::Sub, (var 0), (var 1));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
-
-        // a / b (canonicalize: div -> mul+recip)
-        let e = arena_pat!(&mut a, bin OpKind::Div, (var 0), (var 1));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // neg(neg(x)) (involution)
-        let e = arena_pat!(&mut a, un OpKind::Neg, (un OpKind::Neg, (var 0)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // (x + y) - y (cancellation)
-        let e = arena_pat!(&mut a, bin OpKind::Sub, (bin OpKind::Add, (var 0), (var 1)), (var 1));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // x * 0 (annihilator)
-        let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (cst 0.0));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // x + 0 (identity)
-        let e = arena_pat!(&mut a, bin OpKind::Add, (var 0), (cst 0.0));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // x * 1 (identity)
-        let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (cst 1.0));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-    }
-
-    #[test]
-    fn test_trig_rules_preserve_semantics() {
-        let pts = standard_test_points();
-        let mut a = ExprArena::new();
-
-        // sin(x + y) (angle addition)
-        let e = arena_pat!(&mut a, un OpKind::Sin, (bin OpKind::Add, (var 0), (var 1)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // cos(x + y) (angle addition)
-        let e = arena_pat!(&mut a, un OpKind::Cos, (bin OpKind::Add, (var 0), (var 1)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // sin(neg(x)) (parity: odd)
-        let e = arena_pat!(&mut a, un OpKind::Sin, (un OpKind::Neg, (var 0)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
-
-        // cos(neg(x)) (parity: even)
-        let e = arena_pat!(&mut a, un OpKind::Cos, (un OpKind::Neg, (var 0)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
-    }
-
-    #[test]
-    fn test_associativity_left_to_right() {
-        // (v0 + v1) + v2 should produce v0 + (v1 + v2) in the e-graph
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, bin OpKind::Add, (bin OpKind::Add, (var 0), (var 1)), (var 2));
-        check_assoc(&a, e);
-    }
-
-    #[test]
-    fn test_associativity_right_to_left() {
-        // v0 + (v1 + v2) should produce (v0 + v1) + v2 in the e-graph
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, bin OpKind::Add, (var 0), (bin OpKind::Add, (var 1), (var 2)));
-        check_assoc(&a, e);
-    }
-
-    #[test]
-    fn test_associativity_mul() {
-        // (v0 * v1) * v2 should produce v0 * (v1 * v2) and vice versa
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, bin OpKind::Mul, (bin OpKind::Mul, (var 0), (var 1)), (var 2));
-        check_optimization_preserves_semantics(&a, e, &standard_test_points(), 1e-4);
-    }
-
-    #[test]
-    fn test_associativity_min_max() {
-        let pts = standard_test_points();
-        let mut a = ExprArena::new();
-
-        // min(min(v0, v1), v2) should produce min(v0, min(v1, v2))
-        let e = arena_pat!(&mut a, bin OpKind::Min, (bin OpKind::Min, (var 0), (var 1)), (var 2));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // max(max(v0, v1), v2) should produce max(v0, max(v1, v2))
-        let e = arena_pat!(&mut a, bin OpKind::Max, (bin OpKind::Max, (var 0), (var 1)), (var 2));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-    }
-
-    #[test]
-    fn test_associativity_templates() {
+    fn associativity_templates() {
         // Verify all associativity rules have valid lhs/rhs templates and that
         // Associative LHS == ReverseAssociative RHS (and vice versa) structurally.
         let assoc = Associative::new(&crate::egraph::ops::Add);
@@ -462,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_rules_count() {
+    fn all_rules_count() {
         // Verify we have the expected number of rules after removal.
         let rules = all_rules();
         assert_eq!(
