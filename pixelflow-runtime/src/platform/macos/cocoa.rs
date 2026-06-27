@@ -1,3 +1,8 @@
+pub enum DequeueBehavior {
+    Dequeue,
+    Peek,
+}
+
 //! Cocoa Wrapper Layer (The Clean Room)
 //!
 //! This module defines safe, Rust-friendly wrappers around the raw Objective-C runtime.
@@ -136,10 +141,9 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self) {
         unsafe {
-            let val = if ignore { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), YES);
         }
     }
 
@@ -156,9 +160,12 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: DequeueBehavior) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = match dequeue {
+                DequeueBehavior::Dequeue => YES,
+                DequeueBehavior::Peek => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -266,10 +273,15 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self) {
         unsafe {
-            let val = if wants { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), YES);
+        }
+    }
+
+    pub fn unset_wants_layer(&self) {
+        unsafe {
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), NO);
         }
     }
 
