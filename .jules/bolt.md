@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Style Enforcement: Boolean Trap
+**Learning:** Found multiple methods in the macOS Cocoa platform layer (`activate_ignoring_other_apps`, `next_event`, `init_with_content_rect`, `set_wants_layer`) taking unstructured boolean flags, violating `STYLE.md`'s recommendation against boolean arguments.
+**Action:** Replaced these boolean arguments with explicitly named enums (`IgnoreOtherApps`, `DequeueEvent`, `DeferCreation`, `WantsLayer`) to improve call-site readability and prevent the "boolean trap".

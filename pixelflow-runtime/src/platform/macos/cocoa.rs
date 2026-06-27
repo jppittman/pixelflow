@@ -121,6 +121,18 @@ impl NSRect {
 #[derive(Copy, Clone)]
 pub struct NSApplication(pub Id);
 
+#[derive(Copy, Clone)]
+pub enum IgnoreOtherApps {
+    Yes,
+    No,
+}
+
+#[derive(Copy, Clone)]
+pub enum DequeueEvent {
+    Yes,
+    No,
+}
+
 impl NSApplication {
     pub fn shared() -> Self {
         unsafe {
@@ -136,9 +148,12 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self, ignore: IgnoreOtherApps) {
         unsafe {
-            let val = if ignore { YES } else { NO };
+            let val = match ignore {
+                IgnoreOtherApps::Yes => YES,
+                IgnoreOtherApps::No => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
         }
     }
@@ -156,9 +171,13 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+
+    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: DequeueEvent) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
+            let d = match dequeue {
+                DequeueEvent::Yes => YES,
+                DequeueEvent::No => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
@@ -176,6 +195,12 @@ impl NSApplication {
 #[derive(Copy, Clone)]
 pub struct NSWindow(pub Id);
 
+#[derive(Copy, Clone)]
+pub enum DeferCreation {
+    Yes,
+    No,
+}
+
 impl NSWindow {
     pub fn alloc() -> Self {
         unsafe {
@@ -190,10 +215,13 @@ impl NSWindow {
         rect: NSRect,
         style_mask: u64,
         backing: u64,
-        defer: bool,
+        defer: DeferCreation,
     ) -> Self {
         unsafe {
-            let d = if defer { YES } else { NO };
+            let d = match defer {
+                DeferCreation::Yes => YES,
+                DeferCreation::No => NO,
+            };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
@@ -251,6 +279,12 @@ impl NSWindow {
 #[derive(Copy, Clone)]
 pub struct NSView(pub Id);
 
+#[derive(Copy, Clone)]
+pub enum WantsLayer {
+    Yes,
+    No,
+}
+
 impl NSView {
     pub fn alloc() -> Self {
         unsafe {
@@ -266,9 +300,12 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer(&self, wants: WantsLayer) {
         unsafe {
-            let val = if wants { YES } else { NO };
+            let val = match wants {
+                WantsLayer::Yes => YES,
+                WantsLayer::No => NO,
+            };
             sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
         }
     }
