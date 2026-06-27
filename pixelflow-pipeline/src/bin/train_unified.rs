@@ -982,17 +982,14 @@ fn real_main() {
         }
 
         // Replace NaN/non-finite jit_cost_ns with a penalty cost instead of dropping trajectories
-        let max_cost_ns = trajectories
-            .iter()
-            .flat_map(|t| t.steps.iter())
-            .filter_map(|s| {
-                if s.jit_cost_ns.is_finite() {
-                    Some(s.jit_cost_ns)
-                } else {
-                    None
+        let mut max_cost_ns = 0.0f64;
+        for t in &trajectories {
+            for s in &t.steps {
+                if s.jit_cost_ns.is_finite() && s.jit_cost_ns > max_cost_ns {
+                    max_cost_ns = s.jit_cost_ns;
                 }
-            })
-            .fold(0.0f64, f64::max);
+            }
+        }
         let penalty_cost_ns = (max_cost_ns * 2.0).max(100.0);
 
         let mut nan_replaced = 0usize;
@@ -2373,17 +2370,14 @@ fn run_trial(
             }
 
             // Replace NaN/non-finite jit_cost_ns with penalty
-            let max_cost_ns = trajectories
-                .iter()
-                .flat_map(|t| t.steps.iter())
-                .filter_map(|s| {
-                    if s.jit_cost_ns.is_finite() {
-                        Some(s.jit_cost_ns)
-                    } else {
-                        None
+            let mut max_cost_ns = 0.0f64;
+            for t in &trajectories {
+                for s in &t.steps {
+                    if s.jit_cost_ns.is_finite() && s.jit_cost_ns > max_cost_ns {
+                        max_cost_ns = s.jit_cost_ns;
                     }
-                })
-                .fold(0.0f64, f64::max);
+                }
+            }
             let penalty_cost_ns = (max_cost_ns * 2.0).max(100.0);
 
             for traj in &mut trajectories {

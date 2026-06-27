@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Eliminating Vector Reallocation in Iterators
+**Learning:** Avoid using `.flat_map()` or `.filter_map()` chained with `.fold()` in hot paths, especially when instantiating vectors (e.g. `vec![]`) inside the map closure on every loop iteration. This causes substantial memory allocation overhead.
+**Action:** Replace functional iterator chains containing dynamic inner vector allocations with explicit `for` loops pre-allocated using `Vec::with_capacity(size)`.

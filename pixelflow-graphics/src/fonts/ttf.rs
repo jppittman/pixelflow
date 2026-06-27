@@ -843,18 +843,15 @@ fn push_segs(
     if pts.is_empty() {
         return;
     }
-    let exp: Vec<_> = pts
-        .iter()
-        .enumerate()
-        .flat_map(|(i, &(x, y, on))| {
-            let (nx, ny, non) = pts[(i + 1) % pts.len()];
-            if !on && !non {
-                vec![(x, y, on), ((x + nx) / 2.0, (y + ny) / 2.0, true)]
-            } else {
-                vec![(x, y, on)]
-            }
-        })
-        .collect();
+    let mut exp = Vec::with_capacity(pts.len());
+    for i in 0..pts.len() {
+        let (x, y, on) = pts[i];
+        let (nx, ny, non) = pts[(i + 1) % pts.len()];
+        exp.push((x, y, on));
+        if !on && !non {
+            exp.push(((x + nx) / 2.0, (y + ny) / 2.0, true));
+        }
+    }
 
     if exp.is_empty() {
         return;
