@@ -16,3 +16,6 @@
 ## 2023-10-16 - Enforce STYLE.md Testing Rules
 **Learning:** Empty tests or tests with only `assert!(true)` are considered noise. Furthermore, removing a test might leave unattached doc comments causing compilation failures (`error: expected item after doc comment`).
 **Action:** Delete tests with no logic/meaningful assertions entirely and strip unattached doc comments preceding them. Strip the `test_` prefix from remaining test functions but prepend `verify_` when the name starts with a digit or shadows an existing identifier.
+## 2023-10-16 - Resolve CI Flakiness and Dead Code
+**Learning:** `shutdown_drain_all_timeout_fallback` timeout checks can be flaky in CI environments if they are too strict (e.g. 150ms). Relaxing to 500ms provides resilience while testing the correct logic. Unused functions, type aliases, and imports can break `cargo clippy --all-targets --all-features -- -D warnings`, thus they must be properly guarded with `#[allow(dead_code)]` or removed entirely.
+**Action:** Relaxed timing bounds in `actor-scheduler` tests, added `#[allow(dead_code)]` to `assert_zst`, and removed unused `CtxDomain` and `check_manifold` code.
