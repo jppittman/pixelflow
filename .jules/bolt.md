@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - Flaky Timeout in actor-scheduler
+**Learning:** `test_shutdown_drain_all_timeout_fallback` frequently failed on CI environments because the hardcoded shutdown timeout bound of 150ms was too tight for variable CI execution latency.
+**Action:** Always generous timeout bounds (e.g., 500ms instead of 150ms) for timing-sensitive test assertions, particularly in CI environments where CPU and scheduler overhead is unpredictable.
