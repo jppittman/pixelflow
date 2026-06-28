@@ -136,10 +136,9 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps(&self) {
         unsafe {
-            let val = if ignore { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), YES);
         }
     }
 
@@ -156,16 +155,29 @@ impl NSApplication {
     }
 
     // nextEventMatchingMask:untilDate:inMode:dequeue:
-    pub fn next_event(&self, mask: u64, date: Id, mode: Id, dequeue: bool) -> NSEvent {
+    pub fn next_event_dequeue(&self, mask: u64, date: Id, mode: Id) -> NSEvent {
         unsafe {
-            let d = if dequeue { YES } else { NO };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
                 mask,
                 date,
                 mode,
-                d,
+                YES,
+            );
+            NSEvent(ptr)
+        }
+    }
+
+    pub fn next_event_peek(&self, mask: u64, date: Id, mode: Id) -> NSEvent {
+        unsafe {
+            let ptr: Id = sys::send_4(
+                self.0,
+                sys::sel(b"nextEventMatchingMask:untilDate:inMode:dequeue:\0"),
+                mask,
+                date,
+                mode,
+                NO,
             );
             NSEvent(ptr)
         }
@@ -185,22 +197,39 @@ impl NSWindow {
         }
     }
 
-    pub fn init_with_content_rect(
+    pub fn init_with_content_rect_deferred(
         &self,
         rect: NSRect,
         style_mask: u64,
         backing: u64,
-        defer: bool,
     ) -> Self {
         unsafe {
-            let d = if defer { YES } else { NO };
             let ptr: Id = sys::send_4(
                 self.0,
                 sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
                 rect,
                 style_mask,
                 backing,
-                d,
+                YES,
+            );
+            Self(ptr)
+        }
+    }
+
+    pub fn init_with_content_rect_immediate(
+        &self,
+        rect: NSRect,
+        style_mask: u64,
+        backing: u64,
+    ) -> Self {
+        unsafe {
+            let ptr: Id = sys::send_4(
+                self.0,
+                sys::sel(b"initWithContentRect:styleMask:backing:defer:\0"),
+                rect,
+                style_mask,
+                backing,
+                NO,
             );
             Self(ptr)
         }
@@ -266,10 +295,15 @@ impl NSView {
         }
     }
 
-    pub fn set_wants_layer(&self, wants: bool) {
+    pub fn set_wants_layer_enabled(&self) {
         unsafe {
-            let val = if wants { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), YES);
+        }
+    }
+
+    pub fn set_wants_layer_disabled(&self) {
+        unsafe {
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"setWantsLayer:\0"), NO);
         }
     }
 

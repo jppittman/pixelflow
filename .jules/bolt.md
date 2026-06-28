@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2024-05-18 - Avoid Boolean Arguments for API Clarity
+**Learning:** Found several macOS platform FFI functions taking `bool` arguments which obscures the call site intent and violates `STYLE.md` principles. For instance, `next_event(..., true)` vs `next_event(..., false)`.
+**Action:** Replaced boolean arguments with separate explicit methods (e.g., `next_event_dequeue()` vs `next_event_peek()`, and `init_with_content_rect_deferred()` vs `init_with_content_rect_immediate()`) to clarify intent and avoid boolean traps.
