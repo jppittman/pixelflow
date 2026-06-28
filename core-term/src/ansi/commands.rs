@@ -448,11 +448,10 @@ impl AnsiCommand {
 
     /// Parses SGR parameters into a list of `Attribute`s.
     fn parse_sgr(params: Vec<u16>) -> Vec<Attribute> {
-        let mut attrs = Vec::new();
         if params.is_empty() {
-            attrs.push(Attribute::Reset);
-            return attrs;
+            return vec![Attribute::Reset];
         }
+        let mut attrs = Vec::with_capacity(params.len());
         let mut iter = params.iter().peekable();
         while let Some(&param) = iter.next() {
             match param {
