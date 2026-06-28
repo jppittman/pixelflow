@@ -451,6 +451,8 @@ impl AnsiCommand {
         if params.is_empty() {
             return vec![Attribute::Reset];
         }
+        // OPTIMIZATION: Pre-allocate capacity using params length to eliminate
+        // unnecessary heap re-allocations during the parsing loop in this hot path.
         let mut attrs = Vec::with_capacity(params.len());
         let mut iter = params.iter().peekable();
         while let Some(&param) = iter.next() {
