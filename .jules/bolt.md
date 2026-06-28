@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2024-05-15 - StyleEnforcer on Test Guidelines
+**Learning:** Enforcing the `STYLE.md` guideline for test function naming requires stripping `test_` prefixes while maintaining compilation safety by avoiding shadowing (e.g. prepending `verify_` for imported functions like `color_manifold`). Note that while removing tests without meaningful assertions was part of a previous learning, it is often destructive (e.g. panics/expects are valid assertions) and should be avoided or done manually.
+**Action:** When enforcing testing guidelines, carefully consider how a language's test framework handles failure before programmatically deleting test cases. We only apply the test renaming based on our findings.
