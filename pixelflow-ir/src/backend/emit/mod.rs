@@ -1372,7 +1372,12 @@ fn compile_scanline_hoisted(
         for &bits in &pool.entries {
             aarch64::emit_pool_entry(&mut code, bits);
         }
-        aarch64::patch_adr_or_adrp(&mut code, adr_pos, pool_start, needs_adrp);
+        let adr_type = if needs_adrp {
+            aarch64::AdrType::Adrp
+        } else {
+            aarch64::AdrType::Adr
+        };
+        aarch64::patch_adr_or_adrp(&mut code, adr_pos, pool_start, adr_type);
     }
 
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
@@ -1674,7 +1679,12 @@ fn compile_scanline_from_schedule(
         for &bits in &pool.entries {
             aarch64::emit_pool_entry(&mut code, bits);
         }
-        aarch64::patch_adr_or_adrp(&mut code, adr_pos, pool_start, needs_adrp);
+        let adr_type = if needs_adrp {
+            aarch64::AdrType::Adrp
+        } else {
+            aarch64::AdrType::Adr
+        };
+        aarch64::patch_adr_or_adrp(&mut code, adr_pos, pool_start, adr_type);
     }
 
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
@@ -2261,7 +2271,12 @@ impl IsaBackend for Aarch64Backend {
             for &bits in &self.pool.entries {
                 aarch64::emit_pool_entry(code, bits);
             }
-            aarch64::patch_adr_or_adrp(code, adr_pos, pool_start, needs_adrp);
+            let adr_type = if needs_adrp {
+                aarch64::AdrType::Adrp
+            } else {
+                aarch64::AdrType::Adr
+            };
+            aarch64::patch_adr_or_adrp(code, adr_pos, pool_start, adr_type);
         }
     }
 }
