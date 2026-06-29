@@ -201,14 +201,20 @@ impl EventMonitor {
 
         // Convert kernel events to our events
         events_out.clear();
-        let mut seen_tokens = std::collections::HashSet::new();
 
         for i in 0..nev as usize {
             let kev = &kevents[i];
             let token = kev.udata as u64;
 
-            // Only add each token once (might have both read and write events)
-            if seen_tokens.insert(token) {
+            if let Some(event) = events_out.iter_mut().find(|e| e.token == token) {
+                // Update flags for existing token
+                if kev.filter == libc::EVFILT_READ {
+                    event.flags |= KqueueFlags::EPOLLIN;
+                }
+                if kev.filter == libc::EVFILT_WRITE {
+                    event.flags |= KqueueFlags::EPOLLOUT;
+                }
+            } else {
                 let mut flags = KqueueFlags::empty();
                 if kev.filter == libc::EVFILT_READ {
                     flags |= KqueueFlags::EPOLLIN;
@@ -218,16 +224,6 @@ impl EventMonitor {
                 }
 
                 events_out.push(KqueueEvent { token, flags });
-            } else {
-                // Update flags for existing token
-                if let Some(event) = events_out.iter_mut().find(|e| e.token == token) {
-                    if kev.filter == libc::EVFILT_READ {
-                        event.flags |= KqueueFlags::EPOLLIN;
-                    }
-                    if kev.filter == libc::EVFILT_WRITE {
-                        event.flags |= KqueueFlags::EPOLLOUT;
-                    }
-                }
             }
         }
 

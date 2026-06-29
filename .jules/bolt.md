@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-12-28 - Kqueue Event Loop HashSet Allocation Overhead
+**Learning:** The macOS kqueue event loop in `core-term` was allocating a `HashSet` (`std::collections::HashSet::new()`) on every polling iteration to track seen event tokens. This caused unnecessary heap allocations in a hot path, impacting performance.
+**Action:** For small collections like returned event tokens, use a simple vector search (`.iter_mut().find()`) to check for existence instead of instantiating a `HashSet`. This eliminates the allocation overhead while maintaining correctness.
