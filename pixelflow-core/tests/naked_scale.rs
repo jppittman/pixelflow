@@ -9,7 +9,7 @@ fn get_jit_mul_kernel() -> usize {
     // fmul v0.4s, v0.4s, v1.4s
     // ret
     let code: [u32; 2] = [
-        0x4E21D800, // fmul v0.4s, v0.4s, v1.4s
+        0x6E21DC00, // fmul v0.4s, v0.4s, v1.4s
         0xD65F03C0, // ret
     ];
     let bytes: &[u8] =
@@ -36,7 +36,11 @@ unsafe fn invoke_naked_kernel(
 ) -> float32x4_t {
     let mut result: float32x4_t;
     // SAFETY: `func_ptr` is a valid JIT-emitted kernel following the documented
-    // NEON ABI (v0..v3 in, v0 out); the clobber list covers all volatile regs.
+    // NEON ABI (v0..v3 in, v0 out); `clobber_abi("C")` clobbers every register
+    // AAPCS64 marks caller-saved (including `lr`/x30, which `blr` overwrites
+    // with the return address — a manual clobber list omitted that once and
+    // the corrupted return address sent the function's epilogue to garbage,
+    // hanging the test).
     unsafe {
         std::arch::asm!(
             "blr {func}",
@@ -45,13 +49,8 @@ unsafe fn invoke_naked_kernel(
             in("v1") vy,
             in("v2") vz,
             in("v3") vw,
-            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-            out("x16") _, out("x17") _,
-            options(nomem, nostack, preserves_flags)
+            clobber_abi("C"),
+            options(nostack)
         );
     }
     result

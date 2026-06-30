@@ -289,7 +289,8 @@ pub struct InstructionPlan {
 #[derive(Clone, Debug)]
 pub struct EmitCtx {
     /// Maximum scratch registers before spilling (ML parameter).
-    /// Default: 24 (v4-v27 on ARM64).
+    /// Default: 10 (v16-v25 on ARM64; v8-v15 are callee-saved and excluded —
+    /// see `SCRATCH_BASE`).
     pub max_regs: u8,
     /// Current spill offset from SP.
     pub spill_offset: u32,
@@ -300,7 +301,7 @@ pub struct EmitCtx {
 impl Default for EmitCtx {
     fn default() -> Self {
         Self {
-            max_regs: 22, // v4-v25 (v26-v27 reserved for RELOAD_REGS)
+            max_regs: 10, // v16-v25 on ARM64 (v8-v15 callee-saved & excluded, v26-v27 reserved for RELOAD_REGS)
             spill_offset: 0,
             spill_count: 0,
         }
@@ -329,8 +330,25 @@ impl EmitCtx {
 /// Input registers: X=v0, Y=v1, Z=v2, W=v3
 pub const INPUT_REGS: [Reg; 4] = [Reg(0), Reg(1), Reg(2), Reg(3)];
 
-/// First scratch register (after inputs)
+/// First scratch register (after inputs), x86-64.
+///
+/// SysV has no callee-saved XMM registers, so any register past the inputs
+/// is fair game.
+#[cfg(target_arch = "x86_64")]
 pub const SCRATCH_BASE: u8 = 4;
+
+/// First scratch register (after inputs), aarch64.
+///
+/// AAPCS64 callee-saves the low 64 bits of v8-v15. The per-batch and
+/// scanline kernels here are leaf functions emitted with no prologue/epilogue
+/// that preserves them, so the generic scratch pool must steer clear of that
+/// range entirely — handing one of v8-v15 to `linear_scan` as a scratch
+/// register would silently corrupt whatever the *caller* had live there
+/// across the JIT call. (The scanline-hoisted path still uses v8-v15
+/// deliberately for its hoisted boundary values, but that path has its own
+/// explicit save/restore prologue — see `compile_scanline_hoisted`.)
+#[cfg(target_arch = "aarch64")]
+pub const SCRATCH_BASE: u8 = 16;
 
 /// Reload registers for spilled values.
 ///
@@ -340,9 +358,12 @@ pub const SCRATCH_BASE: u8 = 4;
 ///
 /// Layout (ARM64):
 ///   v0-v3:   INPUT_REGS (X, Y, Z, W)
-///   v4-v25:  allocatable scratch (max_regs=22)
+///   v8-v15:  callee-saved; reserved for scanline-hoisted boundary values only
+///            (never handed out by the generic scratch pool — see
+///            `SCRATCH_BASE`)
+///   v16-v25: allocatable scratch (max_regs=10)
 ///   v26-v27: RELOAD_REGS (spill reload area)
-///   v28-v31: immediate construction scratch (emit_fmov_imm)
+///   v28-v31: fixed-purpose scratch (select-guard reduction, imm construction)
 #[cfg(target_arch = "aarch64")]
 pub const RELOAD_REGS: [Reg; 2] = [Reg(26), Reg(27)];
 
@@ -1043,21 +1064,17 @@ fn compile_scanline_hoisted(
     // Build uses map for the full schedule.
     let uses_map = arena_to_uses(&schedule);
 
-    // Reduce scratch register budget: v8-v(7+num_hoisted) are reserved for hoisted values.
-    // The default allocatable range is v4-v25 (22 regs). We shrink the top end by num_hoisted.
+    // Hoisted boundary values live in v8-v(7+num_hoisted) (precolored above);
+    // the generic scratch pool starts at `SCRATCH_BASE` (v16 on aarch64), so
+    // the two ranges never overlap and the budget needs no adjustment for
+    // `num_hoisted`.
     let ctx = EmitCtx::default();
-    let adjusted_max_regs = ctx.max_regs.saturating_sub(num_hoisted_u8);
-    assert!(
-        adjusted_max_regs >= 4,
-        "register budget too small after reserving {num_hoisted} persistent slots: \
-         only {adjusted_max_regs} scratch registers remain (need at least 4)"
-    );
 
     let allocation = regalloc::linear_scan(
         &schedule,
         &uses_map,
         &precolored,
-        adjusted_max_regs,
+        ctx.max_regs,
         SCRATCH_BASE,
     );
 
