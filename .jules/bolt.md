@@ -13,3 +13,8 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2024-06-30 - Revert Unstable Clippy Fixes
+
+**Learning:** `cargo clippy --fix` applied fixes for `clippy::manual_is_multiple_of` that replaced standard modulo equality checks (`a % b == 0`) with the `.is_multiple_of()` method. This method is not stabilized for primitive types, resulting in a build failure across multiple crates.
+**Action:** When running `cargo clippy --fix`, specifically ignore or manually revert changes that introduce the unstable `is_multiple_of()` method to primitive integer types to maintain compatibility with the stable Rust toolchain.
