@@ -13,3 +13,6 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+## 2025-12-28 - HashSet Instantiation in Hot Loops
+**Learning:** `kqueue.rs` was instantiating a `HashSet` on every event loop iteration to track seen tokens for deduplication. This causes unnecessary heap allocations for small `nev` counts, especially since a linear search over `events_out` is sufficient and allocation-free.
+**Action:** In hot event loops or loops with small bounded bounds, replace `HashSet` deduplication with linear search over a pre-existing dynamically growing `Vec` using `.iter_mut().find()` to eliminate memory allocation overhead.
