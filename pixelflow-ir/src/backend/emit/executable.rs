@@ -65,6 +65,18 @@ impl ExecutableCode {
                 return Err("mprotect failed");
             }
 
+            // Instruction cache coherence on Apple Silicon: the I-cache is not
+            // automatically coherent with the D-cache, so code written via the
+            // store above can otherwise be invisible (or stale) to the fetch
+            // unit until explicitly invalidated.
+            #[cfg(target_os = "macos")]
+            {
+                unsafe extern "C" {
+                    fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
+                }
+                sys_icache_invalidate(ptr as *mut core::ffi::c_void, code.len());
+            }
+
             Ok(Self {
                 ptr,
                 len: code.len(),
