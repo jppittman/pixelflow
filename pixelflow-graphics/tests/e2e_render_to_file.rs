@@ -253,8 +253,6 @@ fn e2e_solid_color_renders_correctly() {
     println!("Solid cyan image saved to: {}", output_path.display());
 }
 
-/// Test using the built-in shapes module
-
 /// Test that Frame operations work correctly
 #[test]
 fn e2e_frame_operations() {

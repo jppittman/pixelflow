@@ -457,16 +457,6 @@ fn test_kernel_composition_with_offset() {
         "circle SDF at center should be -5"
     );
 }
-
-/// Test multiple manifold parameters (SDF union).
-///
-/// TODO: Two-manifold case needs ManifoldBind2 or similar for type inference.
-/// Currently uses Computed fallback which breaks type inference.
-/// The pattern `|a: kernel, b: kernel| a.min(b)` requires either:
-/// 1. ManifoldBind2<M1, M2, Body> that carries both manifold types
-/// 2. Explicit type annotations in the generated closure
-/// 3. A different codegen strategy (e.g., leveled evaluation)
-
 /// Test mixed manifold and scalar parameters.
 #[test]
 fn test_mixed_manifold_scalar_params() {
