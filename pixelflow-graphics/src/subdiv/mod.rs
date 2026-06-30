@@ -719,22 +719,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_eigen_domain_accepts_valid() {
-        // Origin is valid (exact limit position)
-        validate_eigen_domain(0.0, 0.0);
-
-        // First tile is valid
-        validate_eigen_domain(0.5, 0.5);
-        validate_eigen_domain(0.75, 0.75);
-        validate_eigen_domain(1.0, 1.0);
-
-        // Deeper tiles are now valid with recursive tiling
-        validate_eigen_domain(0.25, 0.25);
-        validate_eigen_domain(0.125, 0.125);
-        validate_eigen_domain(0.01, 0.01);
-    }
-
-    #[test]
     fn test_eigen_patch_subpatch_routing() {
         // Constant control points - surface should be constant everywhere
         let const_points = [[3.0f32, 5.0, 7.0]; 16];

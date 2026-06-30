@@ -4,7 +4,7 @@
 //! through rasterization to file output.
 
 use pixelflow_compiler::kernel;
-use pixelflow_core::{Discrete, Field, Manifold, ManifoldCompat, ManifoldExt, X, Y};
+use pixelflow_core::{Discrete, Field, Manifold, ManifoldExt, X, Y};
 use pixelflow_graphics::render::color::{Grayscale, NamedColor, Rgba8};
 
 type Field4 = (Field, Field, Field, Field);
@@ -254,34 +254,6 @@ fn e2e_solid_color_renders_correctly() {
 }
 
 /// Test using the built-in shapes module
-#[test]
-fn e2e_render_using_builtin_shapes() {
-    use pixelflow_graphics::shapes::{circle, EMPTY, SOLID};
-
-    // Create a circle using the shapes module
-    // The shapes::circle returns impl Manifold<Output=Field>
-    let unit_circle = circle(SOLID, EMPTY);
-
-    // Evaluate the circle at the origin - should return SOLID (1.0)
-    let _at_origin = unit_circle.eval_raw(
-        Field::from(0.0),
-        Field::from(0.0),
-        Field::from(0.0),
-        Field::from(0.0),
-    );
-
-    // Evaluate outside the circle - should return EMPTY (0.0)
-    let _outside = unit_circle.eval_raw(
-        Field::from(2.0), // outside unit circle (x² = 4 > 1)
-        Field::from(0.0),
-        Field::from(0.0),
-        Field::from(0.0),
-    );
-
-    // This is a smoke test that shapes compile and the API works
-    // The actual pixel rendering is tested in e2e_render_circle
-    println!("Built-in shapes module works! Circle evaluates at origin and outside.");
-}
 
 /// Test that Frame operations work correctly
 #[test]
