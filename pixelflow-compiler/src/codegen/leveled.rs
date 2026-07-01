@@ -479,10 +479,16 @@ pub fn analyze_deps(
 }
 
 /// Emit leveled code from annotated expression.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WrapperType {
+    Standard,
+    Jet,
+}
+
 pub fn emit_leveled(
     analyzed: &AnalyzedKernel,
     annotated: &Expr,
-    use_jet_wrapper: bool,
+    wrapper_type: WrapperType,
 ) -> TokenStream {
     let mut builder = LevelBuilder::new(analyzed);
     let root = builder.build(annotated);
@@ -494,7 +500,7 @@ pub fn emit_leveled(
         for (node_idx, node) in level.iter().enumerate() {
             let var_name = NodeRef::new(level_idx, node_idx).var_name();
 
-            let value = emit_node(node, use_jet_wrapper);
+            let value = emit_node(node, wrapper_type);
             stmts.push(quote! { let #var_name = #value; });
         }
     }
@@ -510,7 +516,7 @@ pub fn emit_leveled(
 }
 
 /// Emit code for a single node
-fn emit_node(node: &LeveledNode, use_jet_wrapper: bool) -> TokenStream {
+fn emit_node(node: &LeveledNode, wrapper_type: WrapperType) -> TokenStream {
     match &node.kind {
         LeveledNodeKind::Param { name, kind } => {
             let name_ident = format_ident!("{}", name);
@@ -520,7 +526,7 @@ fn emit_node(node: &LeveledNode, use_jet_wrapper: bool) -> TokenStream {
                     quote! { #name_ident.eval(__p) }
                 }
                 ParamKind::Scalar(_) => {
-                    if use_jet_wrapper {
+                    if wrapper_type == WrapperType::Jet {
                         quote! { __ScalarType::from_f32(#name_ident) }
                     } else {
                         quote! { ::pixelflow_core::Field::from(#name_ident) }
@@ -531,7 +537,7 @@ fn emit_node(node: &LeveledNode, use_jet_wrapper: bool) -> TokenStream {
 
         LeveledNodeKind::Literal { value } => {
             let lit = *value as f32;
-            if use_jet_wrapper {
+            if wrapper_type == WrapperType::Jet {
                 quote! { __ScalarType::from_f32(#lit) }
             } else {
                 quote! { ::pixelflow_core::Field::from(#lit) }
