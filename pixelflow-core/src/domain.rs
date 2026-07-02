@@ -274,7 +274,7 @@ mod tests {
     use crate::Field;
 
     #[test]
-    fn test_2d_spatial() {
+    fn verify_2d_spatial() {
         let domain = (Field::from(3.0), Field::from(4.0));
         let mut buf = [0.0f32; crate::PARALLELISM];
 
@@ -293,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_4d_spatial() {
+    fn verify_4d_spatial() {
         let domain = (
             Field::from(1.0),
             Field::from(2.0),
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn test_let_extended() {
+    fn let_extended() {
         // Simulate: let v = 10.0 in ... on 2D domain
         let base = (Field::from(3.0), Field::from(4.0));
         let extended = LetExtended(Field::from(10.0), base);
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_let() {
+    fn nested_let() {
         // let a = 10.0 in let b = 20.0 in ... on 2D domain
         let base = (Field::from(3.0), Field::from(4.0));
         let inner = LetExtended(Field::from(20.0), base); // b = 20.0

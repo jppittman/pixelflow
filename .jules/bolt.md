@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2024-07-02 - Enforce Style Guidelines for Test Naming
+**Learning:** Bulk renaming `#[test]` functions by simply stripping the `test_` prefix can inadvertently cause compiler errors (like E0061) if the new function name shadows an existing function in scope that the test body intends to call.
+**Action:** When renaming tests, always check if the stripped name collides with another symbol (e.g., by scanning the file for calls using the new name) and safely fallback to prepending `verify_` to avoid conflicts.

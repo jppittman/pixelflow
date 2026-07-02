@@ -1162,7 +1162,7 @@ mod tests {
     use libm::fabsf;
 
     #[test]
-    fn test_op_type_roundtrip() {
+    fn op_type_roundtrip() {
         for i in 0..OpKind::COUNT {
             let op = OpKind::from_index(i).unwrap();
             assert_eq!(op.index(), i);
@@ -1178,7 +1178,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_bwd_generator_produces_valid_pairs() {
+    fn bwd_generator_produces_valid_pairs() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_has_fused_ops() {
+    fn bwd_generator_has_fused_ops() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig {
@@ -1230,7 +1230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_with_templates() {
+    fn bwd_generator_with_templates() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();

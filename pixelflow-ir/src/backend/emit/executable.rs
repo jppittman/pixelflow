@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_return_x() {
+    fn jit_return_x() {
         // Simplest kernel: return X (already in v0)
         // Just RET - input X is already in v0, which is the return register!
 
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_add_xy() {
+    fn jit_add_xy() {
         // kernel: X + Y
         // v0 = X, v1 = Y, return v0 + v1
 
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_complex_expr() {
+    fn jit_complex_expr() {
         // kernel: (X + Y) * Z
         // Uses register allocation:
         //   v0=X, v1=Y, v2=Z, v3=W
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_const_05_raw() {
+    fn jit_const_05_raw() {
         // Test raw constant loading for 0.5
         // MOVZ W16, #0
         // MOVK W16, #0x3F00, LSL #16  (0x3F000000 = 0.5f)
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_jit_return_x_x86() {
+    fn jit_return_x_x86() {
         // Simplest kernel: return X (already in xmm0)
 
         let mut code = Vec::new();
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_jit_add_xy_x86() {
+    fn jit_add_xy_x86() {
         // kernel: X + Y
 
         let mut code = Vec::new();

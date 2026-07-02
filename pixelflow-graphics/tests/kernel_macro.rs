@@ -57,7 +57,7 @@ fn fields_close(a: Field, b: Field, epsilon: f32) -> bool {
 
 /// Test a kernel with one parameter.
 #[test]
-fn test_one_param_kernel() {
+fn one_param_kernel() {
     // X offset by a parameter
     let offset_x = kernel!(|dx: f32| X + dx);
     let k = offset_x(10.0);
@@ -73,7 +73,7 @@ fn test_one_param_kernel() {
 
 /// Test a kernel with two parameters.
 #[test]
-fn test_two_param_kernel() {
+fn two_param_kernel() {
     // Offset both X and Y
     let offset_xy = kernel!(|dx: f32, dy: f32| (X + dx) + (Y + dy));
     let k = offset_xy(10.0, 20.0);
@@ -89,7 +89,7 @@ fn test_two_param_kernel() {
 
 /// Test a kernel with no parameters.
 #[test]
-fn test_zero_param_kernel() {
+fn zero_param_kernel() {
     // Simple distance from origin (no params)
     let dist = kernel!(|| (X * X + Y * Y).sqrt());
     let k = dist();
@@ -105,7 +105,7 @@ fn test_zero_param_kernel() {
 
 /// Test method chaining (ManifoldExt integration).
 #[test]
-fn test_method_chaining() {
+fn method_chaining() {
     // Clamped value using .max().min()
     let clamp = kernel!(|lo: f32, hi: f32| X.max(lo).min(hi));
     let k = clamp(0.0, 1.0);
@@ -134,7 +134,7 @@ fn test_method_chaining() {
 
 /// Test that kernels are Clone (not Copy, since they hold data).
 #[test]
-fn test_kernel_is_clone() {
+fn kernel_is_clone() {
     let scale = kernel!(|factor: f32| X * factor);
     let k1 = scale(2.0);
     let k2 = k1;
@@ -148,7 +148,7 @@ fn test_kernel_is_clone() {
 
 /// Test that different instantiations are independent.
 #[test]
-fn test_independent_instantiations() {
+fn independent_instantiations() {
     let scale = kernel!(|factor: f32| X * factor);
 
     let double = scale(2.0);
@@ -169,7 +169,7 @@ fn test_independent_instantiations() {
 
 /// Test sqrt method.
 #[test]
-fn test_sqrt() {
+fn verify_sqrt() {
     let root = kernel!(|val: f32| (X + val).sqrt());
     let k = root(7.0);
 
@@ -180,7 +180,7 @@ fn test_sqrt() {
 
 /// Test floor method.
 #[test]
-fn test_floor() {
+fn verify_floor() {
     let floored = kernel!(|| X.floor());
     let k = floored();
 
@@ -193,7 +193,7 @@ fn test_floor() {
 
 /// Test abs method.
 #[test]
-fn test_abs() {
+fn verify_abs() {
     let absolute = kernel!(|offset: f32| (X - offset).abs());
     let k = absolute(5.0);
 
@@ -210,7 +210,7 @@ fn test_abs() {
 /// This is verified by the fact that the kernel compiles at all -
 /// if parameters were injected directly, the expression wouldn't be Copy.
 #[test]
-fn test_zst_expression_is_copy() {
+fn zst_expression_is_copy() {
     // This kernel uses the parameter twice in the expression.
     // If the expression weren't Copy (ZST-based), this wouldn't compile
     // because the parameter would be moved on first use.
@@ -229,7 +229,7 @@ fn test_zst_expression_is_copy() {
 /// Test a kernel with three parameters.
 /// This demonstrates the new Let/Var binding system since Z/W slots only support 2.
 #[test]
-fn test_three_param_kernel() {
+fn three_param_kernel() {
     // Translate point by (dx, dy) and add z offset
     let translate_3d = kernel!(|dx: f32, dy: f32, dz: f32| (X + dx) + (Y + dy) + dz);
     let k = translate_3d(10.0, 20.0, 30.0);
@@ -246,7 +246,7 @@ fn test_three_param_kernel() {
 /// Test a kernel with four parameters.
 /// Demonstrates full 4-parameter support.
 #[test]
-fn test_four_param_kernel() {
+fn four_param_kernel() {
     // Combine all four parameters with coordinates
     let quad_combine = kernel!(|a: f32, b: f32, c: f32, d: f32| a + b + c + d + X + Y);
     let k = quad_combine(1.0, 2.0, 3.0, 4.0);
@@ -263,7 +263,7 @@ fn test_four_param_kernel() {
 /// Test a 4-parameter sphere SDF kernel.
 /// This is a practical example: signed distance from a sphere at (cx, cy, cz) with radius r.
 #[test]
-fn test_sphere_sdf_kernel() {
+fn sphere_sdf_kernel() {
     // Sphere SDF: distance from center minus radius
     let sphere_sdf = kernel!(|cx: f32, cy: f32, cz: f32, r: f32| {
         let dx = X - cx;
@@ -295,7 +295,7 @@ fn test_sphere_sdf_kernel() {
 /// Test parameter ordering with 3 parameters.
 /// Verifies that parameters are correctly bound (first param deepest in stack).
 #[test]
-fn test_parameter_ordering_three() {
+fn parameter_ordering_three() {
     // Each parameter has a different multiplier to verify correct binding
     let order_test = kernel!(|a: f32, b: f32, c: f32| a * 100.0 + b * 10.0 + c);
     let k = order_test(1.0, 2.0, 3.0);
@@ -311,7 +311,7 @@ fn test_parameter_ordering_three() {
 
 /// Test that parameters can be used multiple times in 3+ param kernels.
 #[test]
-fn test_param_reuse_three() {
+fn param_reuse_three() {
     // Use each parameter twice
     let reuse = kernel!(|a: f32, b: f32, c: f32| (a + a) + (b + b) + (c + c));
     let k = reuse(1.0, 2.0, 3.0);
@@ -343,7 +343,7 @@ fn jet3_4(x: f32, y: f32, z: f32, w: f32) -> Jet3_4 {
 
 /// Test a simple Jet3 kernel (domain inferred from output type).
 #[test]
-fn test_jet3_simple() {
+fn jet3_simple() {
     // X + Y with Jet3 output → domain is Jet3_4
     let add_xy = kernel!(|| -> Jet3 X + Y);
     let k = add_xy();
@@ -363,7 +363,7 @@ fn test_jet3_simple() {
 
 /// Test Jet3 kernel with parameters (sphere SDF).
 #[test]
-fn test_jet3_sphere_sdf() {
+fn jet3_sphere_sdf() {
     // Sphere SDF: distance from center minus radius
     // Using Jet3 for automatic differentiation (normals)
     let sphere_sdf = kernel!(|cx: f32, cy: f32, cz: f32, r: f32| -> Jet3 {
@@ -396,7 +396,7 @@ fn test_jet3_sphere_sdf() {
 /// Test basic kernel composition with a single manifold parameter.
 /// This is the core use case: composing a distance function with a circle SDF.
 #[test]
-fn test_simple_kernel_composition() {
+fn simple_kernel_composition() {
     // Distance from a point (parametric)
     let dist = kernel!(|cx: f32, cy: f32| {
         let dx = X - cx;
@@ -429,7 +429,7 @@ fn test_simple_kernel_composition() {
 
 /// Test kernel composition with offset centers.
 #[test]
-fn test_kernel_composition_with_offset() {
+fn kernel_composition_with_offset() {
     let dist = kernel!(|cx: f32, cy: f32| {
         let dx = X - cx;
         let dy = Y - cy;
@@ -468,7 +468,7 @@ fn test_kernel_composition_with_offset() {
 /// 3. A different codegen strategy (e.g., leveled evaluation)
 #[test]
 #[ignore = "two-manifold params require ManifoldBind2 implementation"]
-fn test_two_manifold_params() {
+fn two_manifold_params() {
     // Test body commented out until ManifoldBind2 is implemented
     // See the original test for the intended behavior:
     //
@@ -479,7 +479,7 @@ fn test_two_manifold_params() {
 
 /// Test mixed manifold and scalar parameters.
 #[test]
-fn test_mixed_manifold_scalar_params() {
+fn mixed_manifold_scalar_params() {
     // Scale an SDF by a factor
     let scale_sdf = kernel!(|inner: kernel, factor: f32| inner * factor);
 
@@ -499,7 +499,7 @@ fn test_mixed_manifold_scalar_params() {
 
 /// Test chained kernel composition (three levels deep).
 #[test]
-fn test_chained_composition() {
+fn chained_composition() {
     // Basic X coordinate
     let get_x = kernel!(|| X);
 
@@ -522,7 +522,7 @@ fn test_chained_composition() {
 
 /// Test that composed kernels can be cloned (the inner kernel is owned).
 #[test]
-fn test_composed_kernel_ownership() {
+fn composed_kernel_ownership() {
     let dist = kernel!(|cx: f32, cy: f32| {
         let dx = X - cx;
         let dy = Y - cy;
@@ -548,7 +548,7 @@ fn test_composed_kernel_ownership() {
 /// creating type mismatches with ZST expression tree types.
 /// With the annotation pass, literals become Var<N> references bound via Let.
 #[test]
-fn test_jet3_with_literals() {
+fn jet3_with_literals() {
     // Inverse square root with literal numerator
     // This expression: 1.0 / (X*X + Y*Y + Z*Z).sqrt()
     // Tests that the literal 1.0 is properly handled in Jet3 mode
@@ -581,7 +581,7 @@ fn test_jet3_with_literals() {
 /// Test Jet3 kernel with multiple literals.
 /// Verifies that multiple literals each get their own Var<N> binding.
 #[test]
-fn test_jet3_multiple_literals() {
+fn jet3_multiple_literals() {
     // Expression with multiple literals: 2.0 * X + 3.0
     let affine = kernel!(|| -> Jet3 2.0 * X + 3.0);
     let k = affine();
@@ -600,7 +600,7 @@ fn test_jet3_multiple_literals() {
 /// Test Jet3 kernel with literals AND parameters.
 /// Both literals and params become Var<N> - they should coexist correctly.
 #[test]
-fn test_jet3_literals_and_params() {
+fn jet3_literals_and_params() {
     // offset + 2.0 * X - 0.5
     let kernel = kernel!(|offset: f32| -> Jet3 offset + 2.0 * X - 0.5);
     let k = kernel(10.0);
@@ -655,7 +655,7 @@ fn jet3_4_seeded(x: f32, y: f32, z: f32) -> Jet3_4 {
 
 /// Test GradientMag2D computes √(dx² + dy²) with single eval.
 #[test]
-fn test_gradient_mag_2d() {
+fn gradient_mag_2d() {
     // For f(x,y) = sqrt(x² + y²), the gradient is (x/r, y/r) where r = sqrt(x²+y²)
     // Gradient magnitude is always 1.0 for distance fields
     let dist =
@@ -673,7 +673,7 @@ fn test_gradient_mag_2d() {
 
 /// Test GradientMag3D computes √(dx² + dy² + dz²) with single eval.
 #[test]
-fn test_gradient_mag_3d() {
+fn gradient_mag_3d() {
     // For f(x,y,z) = sqrt(x² + y² + z²), gradient magnitude is 1.0
     let dist = (pixelflow_core::X * pixelflow_core::X
         + pixelflow_core::Y * pixelflow_core::Y
@@ -692,7 +692,7 @@ fn test_gradient_mag_3d() {
 
 /// Test Antialias2D computes val / √(dx² + dy²) with single eval.
 #[test]
-fn test_antialias_2d() {
+fn antialias_2d() {
     // Circle SDF using kernel! macro (handles literal promotion)
     // At (2, 0): val = 1.0, gradient = (1, 0), so antialias = 1.0 / 1.0 = 1.0
     let circle_sdf = kernel!(|| -> Jet2 { (X * X + Y * Y).sqrt() - 1.0 });
@@ -709,7 +709,7 @@ fn test_antialias_2d() {
 
 /// Test Antialias3D computes val / √(dx² + dy² + dz²) with single eval.
 #[test]
-fn test_antialias_3d() {
+fn antialias_3d() {
     // Sphere SDF using kernel! macro
     // At (2, 0, 0): val = 1.0, gradient = (1, 0, 0), so antialias = 1.0 / 1.0 = 1.0
     let sphere_sdf = kernel!(|| -> Jet3 { (X * X + Y * Y + Z * Z).sqrt() - 1.0 });
@@ -726,7 +726,7 @@ fn test_antialias_3d() {
 
 /// Test Normalized2D returns unit gradient vector with single eval.
 #[test]
-fn test_normalized_2d() {
+fn normalized_2d() {
     // Distance field: sqrt(x² + y²)
     // At (3, 4): gradient = (3/5, 4/5) = (0.6, 0.8)
     let dist =
@@ -747,7 +747,7 @@ fn test_normalized_2d() {
 
 /// Test fused combinators with kernel-composed manifolds.
 #[test]
-fn test_fused_combinators_with_kernel_composition() {
+fn fused_combinators_with_kernel_composition() {
     // Create a circle SDF kernel
     let circle_sdf = kernel!(|cx: f32, cy: f32, r: f32| -> Jet2 {
         let dx = X - cx;
@@ -795,7 +795,7 @@ use pixelflow_core::{DX, DY, DZ, V};
 
 /// Test V accessor extracts the value component from Jet2.
 #[test]
-fn test_v_accessor() {
+fn v_accessor() {
     // Distance from origin: sqrt(x² + y²)
     let dist =
         (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
@@ -813,7 +813,7 @@ fn test_v_accessor() {
 
 /// Test DX accessor extracts ∂f/∂x from Jet2.
 #[test]
-fn test_dx_accessor() {
+fn dx_accessor() {
     // Distance from origin: sqrt(x² + y²)
     // ∂dist/∂x = x / sqrt(x² + y²) = x / dist
     let dist =
@@ -832,7 +832,7 @@ fn test_dx_accessor() {
 
 /// Test DY accessor extracts ∂f/∂y from Jet2.
 #[test]
-fn test_dy_accessor() {
+fn dy_accessor() {
     // Distance from origin: sqrt(x² + y²)
     // ∂dist/∂y = y / sqrt(x² + y²) = y / dist
     let dist =
@@ -851,7 +851,7 @@ fn test_dy_accessor() {
 
 /// Test DZ accessor extracts ∂f/∂z from Jet3.
 #[test]
-fn test_dz_accessor() {
+fn dz_accessor() {
     // 3D distance from origin: sqrt(x² + y² + z²)
     // ∂dist/∂z = z / sqrt(x² + y² + z²)
     let dist = (pixelflow_core::X * pixelflow_core::X
@@ -876,7 +876,7 @@ fn test_dz_accessor() {
 /// `(DX(sdf) * DX(sdf) + DY(sdf) * DY(sdf)).sqrt()` now work with ManifoldExt.
 /// CSE (Phase 6) will optimize away redundant evaluations.
 #[test]
-fn test_manual_gradient_magnitude() {
+fn manual_gradient_magnitude() {
     // Distance from origin
     let dist =
         (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
@@ -897,7 +897,7 @@ fn test_manual_gradient_magnitude() {
 // The kernel! macro doesn't yet add HasDerivatives bounds when derivative accessors are used.
 //
 // #[test]
-// fn test_manual_antialias() {
+// fn manual_antialias() {
 //     let circle = kernel!(|| -> Jet2 { (X * X + Y * Y).sqrt() - 1.0 });
 //     let sdf = circle();
 //     let antialias = kernel!(|m: kernel| V(m) / (DX(m) * DX(m) + DY(m) * DY(m)).sqrt());
@@ -911,7 +911,7 @@ fn test_manual_gradient_magnitude() {
 // The kernel! macro doesn't yet add HasDerivatives bounds when derivative accessors are used.
 //
 // #[test]
-// fn test_derivative_accessors_with_composition() {
+// fn derivative_accessors_with_composition() {
 //     let circle_sdf = kernel!(|cx: f32, cy: f32, r: f32| -> Jet2 {
 //         let dx = X - cx;
 //         let dy = Y - cy;
