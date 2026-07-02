@@ -95,6 +95,7 @@ mod tests {
             ExprNode::Var(i) => vars[i as usize],
             ExprNode::Const(c) => c,
             ExprNode::Param(p) => panic!("Param({p}) in extracted derivative"),
+            ExprNode::Buffer(b) => panic!("Buffer({}) in extracted derivative", b.0),
             ExprNode::Unary(op, a) => {
                 let a = eval(arena, a, vars);
                 op.eval_unary(a)

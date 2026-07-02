@@ -90,11 +90,59 @@ pub enum OpKind {
     /// analytically; whatever cannot be decomposed survives as a residual `Dwrt`
     /// (the jet fallback — not yet wired). It must never reach a backend.
     Dwrt = 48,
+
+    // --- Bound memory (lattices) ---
+    /// Buffer leaf: a slot referencing a `BufferDecl` in the arena's buffer
+    /// table. The declared extents are static IR; the contents are bound at
+    /// JIT-compile time. See `docs/designs/KERNELS_AND_LATTICES.md`.
+    Buffer = 49,
+    /// Read a bound buffer: `Gather(buffer, x, y)` where `buffer` is a
+    /// `Buffer` leaf. Semantics match `DiscreteManifold::eval`: floor the
+    /// indices, clamp to the declared extents, gather row-major.
+    Gather = 50,
+    /// Primitive gather: `RawGather(buffer, index)` reads `buffer`'s contents
+    /// at the already-computed linear lane `index` (truncated to int), with no
+    /// floor/clamp/row-major math. `Gather` lowers to index arithmetic (built
+    /// from existing ops) plus this primitive — the analogue of `raw_mul` under
+    /// `mul`. The index is trusted to be in bounds (the lowering clamps it).
+    RawGather = 51,
+
+    // --- Reduction (lattice fold) ---
+    /// Fold a body over a bounded domain. Encoded
+    /// `Nary(Reduce, [Const(combiner), Const(reduce_var), Const(extent), body])`:
+    /// `combiner` is the monoid op index (`Add`/`Mul`/`Min`/`Max`), `body`
+    /// references `Var(reduce_var)` (indices 4..8), and the fold runs over
+    /// `0..extent`. The combiner is a *child* (a parameter), not baked into the
+    /// opcode, so one `Reduce` covers every monoid and can later take an
+    /// arbitrary combiner function. Lowered to an unrolled accumulation by
+    /// `expand_reduce` before codegen — the analogue of `Gather -> RawGather`.
+    Reduce = 52,
 }
 
 impl OpKind {
     /// Total number of operations.
-    pub const COUNT: usize = 49;
+    pub const COUNT: usize = 53;
+
+    /// Monoid identity for an op usable as a reduction combiner
+    /// (`Add`→0, `Mul`→1, `Min`→+∞, `Max`→−∞). `None` if `self` is not a valid
+    /// combiner.
+    #[must_use]
+    pub const fn monoid_identity(self) -> Option<f32> {
+        match self {
+            Self::Add => Some(0.0),
+            Self::Mul => Some(1.0),
+            Self::Min => Some(f32::INFINITY),
+            Self::Max => Some(f32::NEG_INFINITY),
+            _ => None,
+        }
+    }
+
+    /// Whether `self` is a valid reduction combiner (an associative monoid op
+    /// with an identity).
+    #[must_use]
+    pub const fn is_monoid(self) -> bool {
+        self.monoid_identity().is_some()
+    }
 
     /// Convert to array index.
     #[inline]
@@ -117,7 +165,7 @@ impl OpKind {
     #[must_use]
     pub const fn arity(self) -> usize {
         match self {
-            Self::Var | Self::Const | Self::Tuple => 0,
+            Self::Var | Self::Const | Self::Tuple | Self::Buffer => 0,
 
             Self::Neg
             | Self::Sqrt
@@ -162,9 +210,13 @@ impl OpKind {
             | Self::Shr
             | Self::BitAnd
             | Self::BitOr
-            | Self::Dwrt => 2,
+            | Self::Dwrt
+            | Self::RawGather => 2,
 
-            Self::MulAdd | Self::Select | Self::Clamp => 3,
+            Self::MulAdd | Self::Select | Self::Clamp | Self::Gather => 3,
+
+            // N-ary: [combiner, reduce_var, extent, body].
+            Self::Reduce => 4,
         }
     }
 
@@ -221,6 +273,10 @@ impl OpKind {
             Self::BitAnd => "bitand",
             Self::BitOr => "bitor",
             Self::Dwrt => "dwrt",
+            Self::Buffer => "buffer",
+            Self::Gather => "gather",
+            Self::RawGather => "raw_gather",
+            Self::Reduce => "reduce",
         }
     }
 
@@ -277,6 +333,10 @@ impl OpKind {
             "bitand" => Some(Self::BitAnd),
             "bitor" => Some(Self::BitOr),
             "dwrt" => Some(Self::Dwrt),
+            "buffer" => Some(Self::Buffer),
+            "gather" => Some(Self::Gather),
+            "raw_gather" => Some(Self::RawGather),
+            "reduce" => Some(Self::Reduce),
             _ => None,
         }
     }
@@ -285,7 +345,13 @@ impl OpKind {
     #[must_use]
     pub const fn default_cost(self) -> usize {
         match self {
-            Self::Var | Self::Const | Self::Tuple => 0,
+            Self::Var | Self::Const | Self::Tuple | Self::Buffer => 0,
+            // Memory read: native gather on AVX2/AVX-512, scalar loads on
+            // NEON/SSE2. Priced between an arithmetic op and a transcendental.
+            Self::Gather | Self::RawGather => 10,
+            // Reduction is lowered (unrolled) away before costing; price the
+            // node itself at zero so a stray one never dominates extraction.
+            Self::Reduce => 0,
             Self::Neg | Self::Abs | Self::Floor | Self::Ceil | Self::Round | Self::Fract => 1,
             Self::Add
             | Self::Sub
@@ -380,6 +446,7 @@ impl OpKind {
     /// - MulAdd (fused — should only arise from rewrite rules)
     /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
     /// - Select (needs mask input — only valid composed with a comparison)
+    /// - Buffer/Gather (memory ops — require a bound buffer, not synthesizable)
     #[must_use]
     pub const fn is_seed_op(self) -> bool {
         !matches!(
@@ -395,6 +462,10 @@ impl OpKind {
                 | Self::Eq
                 | Self::Ne
                 | Self::Select
+                | Self::Buffer
+                | Self::Gather
+                | Self::RawGather
+                | Self::Reduce
         )
     }
 
@@ -457,6 +528,12 @@ impl OpKind {
 
             // Differentiation: never emitted (rewritten away in the e-graph).
             Self::Dwrt => EmitStyle::Special,
+
+            // Memory ops: emitted by the JIT binding path, not as method calls.
+            Self::Buffer | Self::Gather | Self::RawGather => EmitStyle::Special,
+
+            // Reduction: lowered to unrolled arithmetic before codegen.
+            Self::Reduce => EmitStyle::Special,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select | Self::Clamp => EmitStyle::TernaryMethod,

@@ -243,6 +243,11 @@ pub enum ResolvedOp {
         hi: Reg,
         lo_deferred: Option<DeferredReload>,
     },
+    /// Bound-memory gather: `dst = buffer[slot][idx_lane]`. Emitted only on the
+    /// AVX-512 backend (native `vgatherdps`); other backends reject it. The
+    /// buffer base pointer is loaded from the context struct (rdi) at
+    /// `slot * 8`.
+    Gather { dst: Reg, idx: Reg, slot: u16 },
 }
 
 /// A deferred reload: value loaded mid-instruction (after a partial computation).
@@ -394,6 +399,11 @@ fn needs_arena(arena: &ExprArena, id: ExprId) -> usize {
             "ExprNode::Param({}) reached the JIT emitter — call substitute_params before compile",
             i
         ),
+        ExprNode::Buffer(b) => panic!(
+            "ExprNode::Buffer({}) reached the JIT emitter — memory ops require a binding table \
+             (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+            b.0
+        ),
 
         // Unary: same as child (result overwrites input)
         ExprNode::Unary(_, child) => needs_arena(arena, *child),
@@ -478,6 +488,10 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
         }
 
         ExprNode::Param(_) => Err("Param not supported directly here"),
+
+        ExprNode::Buffer(_) => {
+            Err("Buffer/Gather not yet supported by the JIT emitter (binding tables land in M2)")
+        }
 
         ExprNode::Unary(op, child) => {
             // Emit the child one depth deeper so its result register differs from
@@ -639,9 +653,12 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Expand transcendentals to primitive arithmetic first (one source of truth
-    // in `lowering`); the aarch64 emitter then never sees Sin/Cos/etc.
-    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
+    // Lower reductions, memory reads, then transcendentals to primitives (one
+    // source of truth in `lowering`); the aarch64 emitter then never sees
+    // Reduce/Gather/Sin/Cos/etc. (aarch64 gather emission is a later slice.)
+    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::expand_gather_owned(&arena, root);
+    let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses_map = arena_to_uses(&schedule);
@@ -667,18 +684,6 @@ pub fn compile_arena_dag_scanline(
     root: crate::arena::ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
     compile_arena_dag_scanline_hoisted(arena, root)
-}
-
-/// Compile a scanline kernel with explicit register budget.
-#[cfg(target_arch = "aarch64")]
-pub fn compile_arena_dag_scanline_with_ctx(
-    arena: &crate::arena::ExprArena,
-    root: crate::arena::ExprId,
-    ctx: EmitCtx,
-) -> Result<ScanlineCompileResult, &'static str> {
-    let schedule = arena_to_schedule(arena, root);
-    let uses_map = arena_to_uses(&schedule);
-    compile_scanline_from_schedule(schedule, uses_map, ctx)
 }
 
 // =============================================================================
@@ -770,7 +775,7 @@ where
         let node = arena.node(ExprId(idx as u32));
         let is_trivial = matches!(
             node,
-            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_)
+            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_)
         );
         is_setup[idx] = !is_trivial && partition(v);
     }
@@ -864,6 +869,11 @@ where
                 "ExprNode::Param({i}) reached the JIT emitter -- \
                  call substitute_params before compile_arena()"
             ),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
+                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+                b.0
+            ),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child, &id_map)),
             ExprNode::Binary(op, a, b) => {
                 ScheduledOp::Binary(*op, map_child(a, &id_map), map_child(b, &id_map))
@@ -899,6 +909,11 @@ where
                 "ExprNode::Param({i}) reached the JIT emitter -- \
                  call substitute_params before compile_arena()"
             ),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
+                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+                b.0
+            ),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child, &id_map)),
             ExprNode::Binary(op, a, b) => {
                 ScheduledOp::Binary(*op, map_child(a, &id_map), map_child(b, &id_map))
@@ -925,7 +940,9 @@ where
     for (_, sched_op) in &schedule[split..] {
         let operands: alloc::vec::Vec<regalloc::ValueId> = match sched_op {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => alloc::vec![],
-            ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+            ScheduledOp::Unary(_, a)
+            | ScheduledOp::ShiftImm(_, a, _)
+            | ScheduledOp::Gather(a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         };
@@ -1021,7 +1038,9 @@ fn compile_scanline_hoisted(
     for (_, sched_op) in &schedule[split..] {
         let operands: alloc::vec::Vec<regalloc::ValueId> = match sched_op {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => alloc::vec![],
-            ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+            ScheduledOp::Unary(_, a)
+            | ScheduledOp::ShiftImm(_, a, _)
+            | ScheduledOp::Gather(a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         };
@@ -1821,6 +1840,11 @@ impl CompileWorkspace {
                      call substitute_params before compile",
                     i
                 ),
+                crate::arena::ExprNode::Buffer(b) => panic!(
+                    "ExprNode::Buffer({}) reached CompileWorkspace — memory ops require a \
+                     binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
+                    b.0
+                ),
                 crate::arena::ExprNode::Unary(op, child) => {
                     ScheduledOp::Unary(*op, map_child(child))
                 }
@@ -1842,7 +1866,9 @@ impl CompileWorkspace {
         for (_, op) in &self.schedule {
             let uses = match op {
                 ScheduledOp::Var(_) | ScheduledOp::Const(_) => Vec::new(),
-                ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+                ScheduledOp::Unary(_, a)
+                | ScheduledOp::ShiftImm(_, a, _)
+                | ScheduledOp::Gather(a, _) => alloc::vec![*a],
                 ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
                 ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
             };
@@ -1942,11 +1968,18 @@ trait IsaBackend {
 /// control flow here — Select guard analysis, short-circuit branch emission and
 /// patching, root resolution — is identical regardless of ISA; only the leaf
 /// emits go through `backend`.
-fn compile_dag_via_backend<B: IsaBackend>(
+/// Emit the register-allocated *body* of a DAG — the per-op instruction stream
+/// plus root resolution — with **no** prologue, epilogue, or `RET`. Returns the
+/// body bytes, the register holding the root value, the spill-frame size, and
+/// the spill count. The body's branches are self-relative, so a caller may
+/// freely prepend a prologue / wrap it in a loop / append an epilogue. This is
+/// the seam that lets both the per-batch kernel and the internal-loop collapse
+/// driver share one body emitter.
+fn emit_dag_body<B: IsaBackend>(
     schedule: Vec<(regalloc::ValueId, ScheduledOp)>,
     uses_map: Vec<Vec<regalloc::ValueId>>,
     backend: &mut B,
-) -> Result<CompileResult, &'static str> {
+) -> Result<(Vec<u8>, Reg, u32, u32), &'static str> {
     use alloc::collections::BTreeMap;
 
     // Pre-colored values (variables -> input registers).
@@ -2020,8 +2053,8 @@ fn compile_dag_via_backend<B: IsaBackend>(
 
     backend.begin(&schedule)?;
 
+    // No prologue here — the caller frames the body (see the fn doc).
     let mut code: Vec<u8> = Vec::new();
-    backend.prologue(&mut code, layout.frame_size);
 
     let mut pending_patches: BTreeMap<(usize, u8), B::Branch> = BTreeMap::new();
 
@@ -2135,13 +2168,36 @@ fn compile_dag_via_backend<B: IsaBackend>(
     let result_reg = backend.emit_resolve(
         &mut code, root, RELOAD_REG, &reg_for, &spill_for, &remat_for,
     );
-    backend.epilogue(&mut code, result_reg, layout.frame_size);
+
+    Ok((
+        code,
+        result_reg,
+        layout.frame_size,
+        layout.spill_slots.len() as u32,
+    ))
+}
+
+/// Drive a `(schedule, uses_map)` to a complete per-batch function via an
+/// [`IsaBackend`]: prologue, body, epilogue (root in the return register, frame
+/// torn down, `RET`). Byte-for-byte identical to the pre-refactor emitter — the
+/// body is simply produced by [`emit_dag_body`] and framed here.
+fn compile_dag_via_backend<B: IsaBackend>(
+    schedule: Vec<(regalloc::ValueId, ScheduledOp)>,
+    uses_map: Vec<Vec<regalloc::ValueId>>,
+    backend: &mut B,
+) -> Result<CompileResult, &'static str> {
+    let (body, result_reg, frame_size, spill_count) = emit_dag_body(schedule, uses_map, backend)?;
+
+    let mut code: Vec<u8> = Vec::new();
+    backend.prologue(&mut code, frame_size);
+    code.extend_from_slice(&body);
+    backend.epilogue(&mut code, result_reg, frame_size);
 
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
     Ok(CompileResult {
         code: exec,
-        spill_count: layout.spill_slots.len() as u32,
-        spill_bytes: layout.frame_size,
+        spill_count,
+        spill_bytes: frame_size,
         max_regs: backend.num_regs(),
     })
 }
@@ -2324,6 +2380,11 @@ pub enum ScheduledOp {
     /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
     /// `arena_to_schedule` (so it never becomes a scheduled value / register).
     ShiftImm(OpKind, regalloc::ValueId, u8),
+    /// Bound-memory gather: read buffer `slot` at the lane index computed by the
+    /// value operand. Lowered from `RawGather(Buffer(slot), index)`; the buffer
+    /// leaf is folded out to the `slot` immediate (like `ShiftImm`'s count) so it
+    /// never becomes a scheduled value. The index is the one real input.
+    Gather(regalloc::ValueId, u16),
 }
 
 // =============================================================================
@@ -2409,6 +2470,12 @@ fn arena_to_schedule(
                  call substitute_params before compile_arena()",
                 i
             ),
+            // A Buffer leaf is always folded into a `Gather`'s `slot` immediate
+            // (below), so any Buffer that survives as its own reachable node is a
+            // dead operand — never consumed as a value. Emit a harmless dead
+            // placeholder occupying its ValueId slot, exactly as ShiftImm leaves
+            // its folded shift-count Const as a dead schedule entry.
+            ExprNode::Buffer(_) => ScheduledOp::Const(0.0),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
             // Shl/Shr fold their Const shift-count operand into an immediate, so
             // the count never becomes a scheduled value (matching the imm-only
@@ -2423,6 +2490,15 @@ fn arena_to_schedule(
                     ),
                 };
                 ScheduledOp::ShiftImm(*op, map_child(a), amount)
+            }
+            // RawGather folds its Buffer leaf into the `slot` immediate (like a
+            // shift count); only the index operand becomes a scheduled value.
+            ExprNode::Binary(OpKind::RawGather, buf, idx) => {
+                let slot = match arena.node(*buf) {
+                    ExprNode::Buffer(id) => id.0,
+                    other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
+                };
+                ScheduledOp::Gather(map_child(idx), slot)
             }
             // A `Dwrt` (autodiff) node must be eliminated by the e-graph chain
             // rule before codegen. Reaching here means a `D(expr, var)` survived
@@ -2457,6 +2533,7 @@ fn arena_to_uses(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<Vec<regal
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => Vec::new(),
             ScheduledOp::Unary(_, a) => alloc::vec![*a],
             ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+            ScheduledOp::Gather(a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         })
@@ -2505,7 +2582,9 @@ fn transitive_deps(
         if let Some(Some(sop)) = schedule_ops.get(v.0 as usize) {
             match sop {
                 ScheduledOp::Var(_) | ScheduledOp::Const(_) => {}
-                ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) => {
+                ScheduledOp::Unary(_, c)
+                | ScheduledOp::ShiftImm(_, c, _)
+                | ScheduledOp::Gather(c, _) => {
                     worklist.push(*c);
                 }
                 ScheduledOp::Binary(_, l, r) => {
@@ -2570,7 +2649,9 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
         };
         match sop {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => {}
-            ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) => add(*c),
+            ScheduledOp::Unary(_, c)
+            | ScheduledOp::ShiftImm(_, c, _)
+            | ScheduledOp::Gather(c, _) => add(*c),
             ScheduledOp::Binary(_, a, b) => {
                 add(*a);
                 add(*b);
@@ -2779,6 +2860,14 @@ pub fn resolve_operands(
                 amount: *amount,
             }
         }
+        ScheduledOp::Gather(child, slot) => {
+            let idx = resolve(*child, tmp_op, &mut reloads);
+            ResolvedOp::Gather {
+                dst,
+                idx,
+                slot: *slot,
+            }
+        }
         ScheduledOp::Binary(op_kind, left, right) => {
             let l_spilled = !assignment.contains_key(left);
             let r_spilled = !assignment.contains_key(right);
@@ -2979,6 +3068,11 @@ fn emit_instruction_plan(
         } => {
             aarch64::emit_shift_imm(code, *op, *dst, *src, *amount)?;
         }
+        ResolvedOp::Gather { .. } => {
+            // NEON has no native gather; the scalar-load lowering is a later
+            // slice. Reject rather than miscompile.
+            return Err("aarch64: bound-memory gather not yet supported");
+        }
         ResolvedOp::Binary {
             op,
             dst,
@@ -3160,9 +3254,15 @@ pub fn compile_arena_dag_with_ctx(
     // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
     // KernelFn ABI stay consistent with the selected width.
     //
-    // Expand transcendentals to primitive arithmetic first, so no backend ever
-    // sees Sin/Cos/etc. (one source of truth for the polynomial, in `lowering`).
-    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
+    // Lower, in order: reductions (unroll -> arithmetic + gathers), then memory
+    // reads (Gather -> index math + RawGather), then transcendentals. Each is a
+    // no-op when absent. Reduce runs first so the gathers it unrolls get lowered
+    // too. A kernel that reads bound memory takes its buffer bases from a context
+    // pointer in rdi; the emitted body is identical either way, so the caller
+    // invokes it as `CtxKernelFn` instead of `KernelFn`.
+    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::expand_gather_owned(&arena, root);
+    let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
@@ -3307,6 +3407,11 @@ impl IsaBackend for X86Backend {
                 amount,
             } => {
                 emit_shift_imm(code, *op, *dst, *src, *amount);
+            }
+            ResolvedOp::Gather { .. } => {
+                // SSE2 has no native gather; the scalar-load lowering is a later
+                // slice. Only the AVX-512 path emits gather for now.
+                return Err("sse2: bound-memory gather not yet supported (AVX-512 only)");
             }
             ResolvedOp::Binary {
                 op,
@@ -3553,6 +3658,21 @@ impl IsaBackend for Avx512Backend {
                 // AVX-512 path. Reject loudly rather than miscompile.
                 return Err("avx512: bit-shift (exp/log lowering) not yet supported");
             }
+            ResolvedOp::Gather { dst, idx, slot } => {
+                // dst = buffer[slot][idx]. The context pointer (array of buffer
+                // base pointers) is caller-provided in rdi; arithmetic/const emit
+                // never touches rdi, so it survives to here. zmm13/zmm14 are the
+                // backend's reserved non-allocatable scratch (see UNARY_SCRATCH).
+                const IDX_INT: Reg = Reg(13);
+                const GATHER_DST: Reg = Reg(14);
+                const RAX: u8 = 0;
+                const RDI: u8 = 7;
+                avx512::emit_cvttps2dq(code, IDX_INT, *idx); // float idx -> int32 lanes
+                avx512::emit_set_gather_mask(code); // k1 = 0xFFFF (clobbers rax)
+                avx512::emit_load_ptr_from_ctx(code, RAX, RDI, (*slot as i32) * 8);
+                avx512::emit_gather(code, GATHER_DST, RAX, IDX_INT);
+                avx512::emit_mov(code, *dst, GATHER_DST);
+            }
             ResolvedOp::Binary {
                 op,
                 dst,
@@ -3710,6 +3830,106 @@ pub fn compile_arena_dag_avx512(
     compile_dag_via_backend(schedule, uses, &mut Avx512Backend)
 }
 
+/// Compile an [`ExprArena`] DAG into an AVX-512 **collapse** kernel: the domain
+/// loop is emitted *inside* the code, so one call fills the whole output with no
+/// per-batch Rust↔JIT boundary. This is the internal-loop realization of a
+/// lattice collapse — the point of the whole design.
+///
+/// The per-batch body (produced by [`emit_dag_body`], with reductions/gathers
+/// already lowered) is wrapped in a loop over 16-lane groups: each iteration
+/// loads X from `xs`, zeroes Y/Z/W, runs the body (its gathers read buffer bases
+/// from the context in `rdi`), and stores the result to `out`. Matches the
+/// [`CollapseKernelFn`](executable::CollapseKernelFn) ABI
+/// `(ctx: rdi, xs: rsi, out: rdx, groups: rcx)`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub fn compile_collapse_avx512(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<CompileResult, &'static str> {
+    // Same lowering pipeline as the per-batch path.
+    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::expand_gather_owned(&arena, root);
+    let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let arena = &arena;
+
+    let schedule = arena_to_schedule(arena, root);
+    let uses = arena_to_uses(&schedule);
+    let (body, result_reg, frame_size, spill_count) =
+        emit_dag_body(schedule, uses, &mut Avx512Backend)?;
+
+    let code = emit_avx512_collapse_loop(&body, result_reg, frame_size);
+    let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
+    Ok(CompileResult {
+        code: exec,
+        spill_count,
+        spill_bytes: frame_size,
+        max_regs: Avx512Backend.num_regs(),
+    })
+}
+
+/// Wrap a per-batch AVX-512 `body` (result in `result_reg`, spilling into a
+/// `frame_size`-byte frame) in the collapse loop scaffold. The body's branches
+/// are self-relative, so inlining it inside the loop is sound.
+///
+/// Register roles (SysV): rdi=ctx (untouched by the body's gathers, which only
+/// read through it), rsi=xs, rdx=out, rcx=groups, r8=loop counter, rax=gather
+/// base scratch. Y/Z/W (zmm1/2/3) are re-zeroed each iteration.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn emit_avx512_collapse_loop(body: &[u8], result_reg: Reg, frame_size: u32) -> Vec<u8> {
+    let mut code: Vec<u8> = Vec::with_capacity(body.len() + 64);
+
+    // Frame set up once (spills reuse it every iteration).
+    if frame_size > 0 {
+        avx512::emit_sub_rsp(&mut code, frame_size);
+    }
+
+    // xor r8, r8            ; group index i = 0
+    code.extend_from_slice(&[0x4D, 0x31, 0xC0]);
+
+    let loop_top = code.len();
+    // cmp r8, rcx           ; i vs groups
+    code.extend_from_slice(&[0x49, 0x39, 0xC8]);
+    // jae loop_end
+    code.extend_from_slice(&[0x0F, 0x83]);
+    let jae_at = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Y/Z/W = 0 (re-zeroed each iteration; the body reads them as INPUT_REGS).
+    avx512::emit_xor(&mut code, Reg(1), Reg(1), Reg(1));
+    avx512::emit_xor(&mut code, Reg(2), Reg(2), Reg(2));
+    avx512::emit_xor(&mut code, Reg(3), Reg(3), Reg(3));
+    // X = xs[i] : zmm0 <- [rsi]
+    avx512::emit_load_zmm_base(&mut code, Reg(0), 6);
+
+    // Per-batch body (gathers read the context in rdi).
+    code.extend_from_slice(body);
+
+    // out[i] = result : [rdx] <- result_reg
+    avx512::emit_store_zmm_base(&mut code, result_reg, 2);
+
+    // add rsi, 64 ; add rdx, 64 ; inc r8 ; jmp loop_top
+    code.extend_from_slice(&[0x48, 0x83, 0xC6, 0x40]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC2, 0x40]);
+    code.extend_from_slice(&[0x49, 0xFF, 0xC0]);
+    code.push(0xE9);
+    let jmp_at = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    let loop_end = code.len();
+    if frame_size > 0 {
+        avx512::emit_add_rsp(&mut code, frame_size);
+    }
+    avx512::emit_ret(&mut code);
+
+    // Patch the forward jae (-> loop_end) and backward jmp (-> loop_top).
+    let jae_rel = (loop_end as i32) - (jae_at as i32 + 4);
+    code[jae_at..jae_at + 4].copy_from_slice(&jae_rel.to_le_bytes());
+    let jmp_rel = (loop_top as i32) - (jmp_at as i32 + 4);
+    code[jmp_at..jmp_at + 4].copy_from_slice(&jmp_rel.to_le_bytes());
+
+    code
+}
+
 /// Compile an [`ExprArena`] DAG into a scanline kernel (x86-64).
 ///
 /// The emitted kernel contains its own loop: Y/Z/W are loaded once into
@@ -3804,18 +4024,6 @@ pub fn compile_arena_dag_scanline(
     })
 }
 
-/// Compile a scanline kernel with an explicit register budget (x86-64).
-///
-/// The `ctx` budget is advisory on x86-64 (see [`compile_arena_dag_with_ctx`]).
-#[cfg(target_arch = "x86_64")]
-pub fn compile_arena_dag_scanline_with_ctx(
-    arena: &ExprArena,
-    root: ExprId,
-    _ctx: EmitCtx,
-) -> Result<ScanlineCompileResult, &'static str> {
-    compile_arena_dag_scanline(arena, root)
-}
-
 /// Variance-aware hoisted scanline compilation (x86-64).
 ///
 /// x86-64 has no persistent-slot hoisting yet ([`MAX_PERSISTENT_SLOTS`] == 0),
@@ -3852,7 +4060,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_needs_simple() {
+    fn needs_simple() {
         // X + Y: both leaves need 1, binary needs max(1,1)+1 = 2
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -3863,7 +4071,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_needs_unbalanced() {
+    fn needs_unbalanced() {
         // (X + Y) + Z: left needs 2, right needs 1, total = max(2,1) = 2
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -3876,7 +4084,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_needs_balanced_deep() {
+    fn needs_balanced_deep() {
         // (X + Y) + (Z + W): both sides need 2, total = 2+1 = 3
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -3898,21 +4106,21 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_frame_layout_empty() {
+    fn frame_layout_empty() {
         let layout = FrameLayout::from_allocation(&[]).unwrap();
         assert_eq!(layout.frame_size, 0);
         assert!(layout.spill_slots.is_empty());
     }
 
     #[test]
-    fn test_frame_layout_one_spill() {
+    fn frame_layout_one_spill() {
         let layout = FrameLayout::from_allocation(&[regalloc::ValueId(5)]).unwrap();
         assert_eq!(layout.frame_size, 16);
         assert_eq!(layout.spill_slots[&regalloc::ValueId(5)], 0);
     }
 
     #[test]
-    fn test_frame_layout_alignment() {
+    fn frame_layout_alignment() {
         let spilled = [
             regalloc::ValueId(1),
             regalloc::ValueId(2),
@@ -3952,7 +4160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_no_spills() {
+    fn resolve_binary_no_spills() {
         // left=v4, right=v5, dst=v6 — all in registers
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -3972,7 +4180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_left_spilled() {
+    fn resolve_binary_left_spilled() {
         // left spilled at offset 0, right in v5
         let (assign, spills, remat) = make_maps(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -3998,7 +4206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_binary_both_spilled() {
+    fn resolve_binary_both_spilled() {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let (assign, spills, remat) = make_maps(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -4032,7 +4240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dst_spilled_generates_store() {
+    fn resolve_dst_spilled_generates_store() {
         // dst is spilled → compute into RELOAD_REGS[0], then store
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5)], &[(2, 32)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -4058,7 +4266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_fmla_path() {
+    fn resolve_muladd_fmla_path() {
         // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
         let (assign, spills, remat) = make_maps(&[(0, 4), (1, 5), (2, 7), (3, 8)], &[]);
         let op = ScheduledOp::Ternary(
@@ -4083,7 +4291,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_both_ab_spilled() {
+    fn resolve_muladd_decomposed_both_ab_spilled() {
         // a and b both spilled → decomposed FMUL+FADD path
         // c in register
         let (assign, spills, remat) = make_maps(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
@@ -4131,7 +4339,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_muladd_decomposed_all_three_spilled() {
+    fn resolve_muladd_decomposed_all_three_spilled() {
         // a, b, c all spilled → decomposed with deferred c reload
         let (assign, spills, remat) = make_maps(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
         let op = ScheduledOp::Ternary(
@@ -4154,7 +4362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_var_is_nop() {
+    fn resolve_var_is_nop() {
         let (assign, spills, remat) = make_maps(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
         let plan = resolve_operands(&op, Loc::Reg(Reg(0)), &assign, &spills, &remat).unwrap();
@@ -4164,7 +4372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_const() {
+    fn resolve_const() {
         let (assign, spills, remat) = make_maps(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
         let plan = resolve_operands(&op, Loc::Reg(Reg(6)), &assign, &spills, &remat).unwrap();
@@ -4190,7 +4398,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_arena_to_schedule_simple() {
+    fn arena_to_schedule_simple() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4218,7 +4426,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_to_schedule_filters_unreachable() {
+    fn arena_to_schedule_filters_unreachable() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4238,7 +4446,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_to_uses() {
+    fn verify_arena_to_uses() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4257,7 +4465,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_arena_compile_simple() {
+    fn arena_compile_simple() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4283,7 +4491,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_arena_compile_with_constant() {
+    fn arena_compile_with_constant() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4311,7 +4519,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_arena_compile_with_spills() {
+    fn arena_compile_with_spills() {
         use crate::arena::ExprArena;
 
         let mut arena = ExprArena::new();
@@ -4351,7 +4559,7 @@ mod tests {
     /// Verify the register-offset LDR/STR encodings work at all.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_handcoded_add() {
+    fn scanline_handcoded_add() {
         use core::arch::aarch64::*;
 
         // Hand-coded scanline kernel: output[i] = X[i] + Y
@@ -4436,7 +4644,7 @@ mod tests {
     /// Test the register-offset LDR/STR encoding with a manual loop.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_reg_offset_encoding() {
+    fn scanline_reg_offset_encoding() {
         use core::arch::aarch64::*;
 
         // Test: load+store one Q value using post-index addressing.
@@ -4475,7 +4683,7 @@ mod tests {
     /// Test scanline kernel for X + Y (simplest possible expression).
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_add_xy() {
+    fn scanline_add_xy() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4512,7 +4720,7 @@ mod tests {
     /// Test scanline kernel for return X (identity).
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_return_x() {
+    fn scanline_return_x() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4540,7 +4748,7 @@ mod tests {
     /// Test scanline kernel with constant: (X * 2.0) + 3.0
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_with_constants() {
+    fn scanline_with_constants() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4573,7 +4781,7 @@ mod tests {
     /// Test scanline matches per-batch results for a complex expression.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_matches_per_batch() {
+    fn scanline_matches_per_batch() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4616,7 +4824,7 @@ mod tests {
     /// Test scanline with empty input (should be a no-op).
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_scanline_empty() {
+    fn scanline_empty() {
         use crate::arena::ExprArena;
         use core::arch::aarch64::*;
 
@@ -4647,7 +4855,7 @@ mod tests {
     // `__m512` (the AVX-512 per-batch path is covered by the `avx512` tests).
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    fn test_scanline_matches_per_batch_x86() {
+    fn scanline_matches_per_batch_x86() {
         use core::arch::x86_64::*;
 
         // expr = (X*X + Y) * Z - W  (uses all four variables)
@@ -4692,7 +4900,7 @@ mod tests {
     /// An empty scanline (count == 0) must be a no-op and not write `output`.
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_scanline_empty_x86() {
+    fn scanline_empty_x86() {
         use core::arch::x86_64::*;
 
         let mut arena = ExprArena::new();
@@ -4740,7 +4948,7 @@ mod tests {
     /// `emit_unary` directly (not the compiler's lowering).
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    fn test_x86_unary_builtins_match_scalar() {
+    fn x86_unary_builtins_match_scalar() {
         // Tolerances reflect the shared (with aarch64) minimax-polynomial
         // accuracy over a sensible input range; exact ops use tight bounds.
         // `rel_err = |jit - scalar| / (1 + |scalar|)`.
@@ -4860,7 +5068,7 @@ mod tests {
     /// Binary transcendentals + comparisons + ternaries, JIT vs scalar.
     #[test]
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    fn test_x86_binary_ternary_builtins_match_scalar() {
+    fn x86_binary_ternary_builtins_match_scalar() {
         use core::arch::x86_64::*;
         // Helper: compile f(X, Y) and eval at (x, y).
         unsafe fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
@@ -5332,6 +5540,235 @@ mod tests {
                     w
                 );
             }
+        }
+
+        // ---- Bound-memory gather: JIT vs reference interpreter ----
+
+        type CtxK = unsafe extern "C" fn(
+            *const *const f32,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+        ) -> core::arch::x86_64::__m512;
+
+        /// Run a compiled gather kernel as a `CtxKernelFn`: the context (array of
+        /// buffer base pointers) goes in rdi, coords in zmm0..3.
+        fn run16_ctx(
+            res: &CompileResult,
+            ctx: &[*const f32],
+            xs: [f32; 16],
+            ys: [f32; 16],
+        ) -> [f32; 16] {
+            unsafe {
+                use core::arch::x86_64::*;
+                let f: CtxK = res.code.as_fn();
+                let r = f(
+                    ctx.as_ptr(),
+                    _mm512_loadu_ps(xs.as_ptr()),
+                    _mm512_loadu_ps(ys.as_ptr()),
+                    _mm512_setzero_ps(),
+                    _mm512_setzero_ps(),
+                );
+                let mut out = [0.0f32; 16];
+                _mm512_storeu_ps(out.as_mut_ptr(), r);
+                out
+            }
+        }
+
+        /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
+        /// the reference interpreter, over the same coords and binding.
+        fn check_against_interp(
+            arena: &ExprArena,
+            root: ExprId,
+            buffers: &[&[f32]],
+            xs: [f32; 16],
+            ys: [f32; 16],
+            tag: &str,
+        ) {
+            let res = compile_arena_dag(arena, root).expect("compile gather kernel");
+            let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
+            let got = run16_ctx(&res, &ctx, xs, ys);
+
+            let bindings = crate::binding::BindingTable::bind(arena, buffers).unwrap();
+            for i in 0..16 {
+                let want =
+                    crate::eval::eval_scalar(arena, root, &[xs[i], ys[i], 0.0, 0.0], &bindings);
+                assert_eq!(got[i], want, "{tag} lane {i} (x={}, y={})", xs[i], ys[i]);
+            }
+        }
+
+        fn idx_lanes() -> ([f32; 16], [f32; 16]) {
+            // A spread of in-range, fractional, and out-of-range coordinates so
+            // the clamp and floor paths are all exercised.
+            let xs = [
+                0.0, 1.0, 2.9, 7.0, -3.0, 100.0, 4.0, 5.5, 6.0, 0.1, 3.0, 2.0, 1.9, 7.9, -0.5, 4.4,
+            ];
+            let ys = [
+                0.0, 0.0, 1.0, 1.9, 2.0, 2.0, -1.0, 3.0, 0.5, 2.9, 1.0, 3.9, 0.0, 2.0, 5.0, 1.0,
+            ];
+            (xs, ys)
+        }
+
+        #[test]
+        fn gather_jit_matches_interpreter() {
+            // 8x4 buffer, gather at (X, Y).
+            let (w, h) = (8usize, 4usize);
+            let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let root = a.push_gather(b, x, y);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
+        }
+
+        #[test]
+        fn gather_composed_with_arithmetic() {
+            // out = gather(buf, X, Y) * 2 + Y — proves gather is a schedulable
+            // mid-expression node, not just a whole-kernel root.
+            let (w, h) = (8usize, 4usize);
+            let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let g = a.push_gather(b, x, y);
+            let two = a.push_const(2.0);
+            let scaled = a.push_binary(OpKind::Mul, g, two);
+            let root = a.push_binary(OpKind::Add, scaled, y);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
+        }
+
+        #[test]
+        fn gather_two_buffers() {
+            // coverage.select via arithmetic: gA(X,Y) + gB(Y,X) with two distinct
+            // bound buffers, exercising slot 0 and slot 1 of the context.
+            let (w, h) = (6usize, 6usize);
+            let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
+            let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
+            let mut a = ExprArena::new();
+            let ba = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let bb = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let ga = a.push_gather(ba, x, y);
+            let gb = a.push_gather(bb, y, x);
+            let root = a.push_binary(OpKind::Add, ga, gb);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(
+                &a,
+                root,
+                &[buf_a.as_slice(), buf_b.as_slice()],
+                xs,
+                ys,
+                "2-buf",
+            );
+        }
+
+        #[test]
+        fn collapse_matmul_one_call_fills_output() {
+            // The whole point: emit the domain loop INSIDE the kernel, so ONE
+            // call fills the entire matmul output vector — no per-batch boundary.
+            // out(j) = Σ_i W(i,j) * input(i), over j = 0..OUT.
+            use crate::arena::BufferDecl;
+            type Collapse = unsafe extern "C" fn(*const *const f32, *const f32, *mut f32, usize);
+
+            let (in_dim, out_dim) = (5usize, 32usize); // OUT = 2 groups of 16
+            let w: Vec<f32> = (0..(in_dim * out_dim)).map(|k| (k as f32).sin()).collect();
+            let input: Vec<f32> = (0..in_dim).map(|k| (k as f32 - 2.0) * 0.5).collect();
+
+            let mut a = ExprArena::new();
+            let wb = a.declare_buffer(BufferDecl {
+                width: in_dim as u32,
+                height: out_dim as u32,
+            });
+            let ib = a.declare_buffer(BufferDecl {
+                width: in_dim as u32,
+                height: 1,
+            });
+            let i = a.push_var(4);
+            let j = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let wg = a.push_gather(wb, i, j);
+            let ig = a.push_gather(ib, i, zero);
+            let prod = a.push_binary(OpKind::Mul, wg, ig);
+            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
+
+            let res = compile_collapse_avx512(&a, root).expect("collapse compile");
+
+            // Domain xs = [0, 1, ..., OUT-1]; groups = OUT/16.
+            let groups = out_dim / 16;
+            let xs: Vec<f32> = (0..out_dim).map(|k| k as f32).collect();
+            let mut out = vec![0.0f32; out_dim];
+            let ctx: Vec<*const f32> = vec![w.as_ptr(), input.as_ptr()];
+
+            unsafe {
+                let f: Collapse = res.code.as_fn();
+                f(ctx.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), groups);
+            }
+
+            // Compare every output lane to the reference interpreter.
+            let bindings =
+                crate::binding::BindingTable::bind(&a, &[w.as_slice(), input.as_slice()]).unwrap();
+            for jj in 0..out_dim {
+                let want =
+                    crate::eval::eval_scalar(&a, root, &[jj as f32, 0.0, 0.0, 0.0], &bindings);
+                assert_eq!(out[jj], want, "collapse out[{jj}]");
+            }
+        }
+
+        #[test]
+        fn matmul_reduce_jit_matches_interpreter() {
+            // out(j) = Σ_i W(i,j) * input(i), evaluated per output lane j = X.
+            // The reduction over i unrolls to a flat gather/FMA chain (bound
+            // extent), and the whole thing runs as one CtxKernelFn.
+            //   W is IN×OUT row-major (width=IN, height=OUT); input is length IN.
+            let (in_dim, out_dim) = (4usize, 6usize);
+            let w: Vec<f32> = (0..(in_dim * out_dim))
+                .map(|k| (k as f32) * 0.5 - 2.0)
+                .collect();
+            let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
+
+            let mut a = ExprArena::new();
+            let wb = a.declare_buffer(crate::arena::BufferDecl {
+                width: in_dim as u32,
+                height: out_dim as u32,
+            });
+            let ib = a.declare_buffer(crate::arena::BufferDecl {
+                width: in_dim as u32,
+                height: 1,
+            });
+            // body(i, j=X) = W(i, X) * input(i, 0)
+            let i = a.push_var(4);
+            let j = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let wg = a.push_gather(wb, i, j);
+            let ig = a.push_gather(ib, i, zero);
+            let prod = a.push_binary(OpKind::Mul, wg, ig);
+            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
+
+            let buffers: &[&[f32]] = &[w.as_slice(), input.as_slice()];
+            // Output lanes j = 0..6 (rest clamp to the last row, harmless here).
+            let xs = [
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
+            ];
+            let ys = [0.0f32; 16];
+            check_against_interp(&a, root, buffers, xs, ys, "matmul");
         }
 
         /// sqrt(X*X + Y*Y) - Z, with a non-commutative shape and FMA-able terms,

@@ -474,7 +474,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_regular_patch() {
+    fn regular_patch() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -491,7 +491,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn test_limit_eval() {
+    fn limit_eval() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -518,7 +518,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn test_surface_stats() {
+    fn surface_stats() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0

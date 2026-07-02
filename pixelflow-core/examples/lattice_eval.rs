@@ -1,4 +1,4 @@
-use pixelflow_core::lattice::{DiscreteManifold, FrameLattice, Lattice};
+use pixelflow_core::lattice::{DiscreteManifold, Lattice};
 use pixelflow_core::{Field, Manifold};
 
 fn main() {
@@ -37,7 +37,7 @@ fn main() {
     println!("{:?} {:?}", p01, p11);
 
     // Collapse a constant manifold over a 4x4 frame
-    let lattice = FrameLattice::new(4, 4, 0.0);
+    let lattice = Lattice::frame(4, 4, 0.0);
     let collapsed = lattice.collapse(&1.5f32);
     println!(
         "\nCollapsed 4x4 constant manifold (1.5): {:?}",

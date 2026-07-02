@@ -115,8 +115,21 @@ define_op!(47, BitOr, "bitor", 2, BinaryMethod);
 // emitted, hence Special.
 define_op!(48, Dwrt, "dwrt", 2, Special);
 
+// Bound memory (lattices). Buffer is a leaf referencing the arena's buffer
+// table; Gather reads a bound buffer (floor + clamp + row-major gather).
+// Both are emitted by the JIT binding path, hence Special.
+define_op!(49, Buffer, "buffer", 0, Special);
+define_op!(50, Gather, "gather", 3, Special);
+// Primitive gather (buffer + precomputed linear index). `Gather` lowers to
+// index arithmetic plus this; emitted directly by the JIT gather path.
+define_op!(51, RawGather, "raw_gather", 2, Special);
+// Reduction (lattice fold). N-ary: [combiner, reduce_var, extent, body].
+// The combiner is a child parameter, so one op covers every monoid. Lowered to
+// unrolled arithmetic by `expand_reduce` before codegen.
+define_op!(52, Reduce, "reduce", 4, Special);
+
 /// Total number of operations. Must equal [`crate::kind::OpKind::COUNT`].
-pub const OP_COUNT: usize = 49;
+pub const OP_COUNT: usize = 53;
 
 /// All operations in the IR, indexed by their INDEX constant.
 ///
@@ -171,6 +184,10 @@ pub const ALL_OPS: [&'static dyn OpMeta; OP_COUNT] = [
     &BitAnd,
     &BitOr,
     &Dwrt,
+    &Buffer,
+    &Gather,
+    &RawGather,
+    &Reduce,
 ];
 
 // Compile-time guard: the two op counts must agree.

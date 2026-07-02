@@ -205,5 +205,8 @@ pub fn op_from_kind(kind: OpKind) -> Option<&'static dyn Op> {
         | OpKind::Shr
         | OpKind::BitAnd
         | OpKind::BitOr => None,
+        // Memory ops are not yet representable in the e-graph: a Buffer leaf
+        // references an arena-local table that e-classes cannot carry.
+        OpKind::Buffer | OpKind::Gather | OpKind::RawGather | OpKind::Reduce => None,
     }
 }
