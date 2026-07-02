@@ -248,6 +248,37 @@ impl ExprArena {
         self.push_ternary(OpKind::Gather, buf, x, y)
     }
 
+    /// Push a reduction `Nary(Reduce, [Const(combiner), Const(reduce_var),
+    /// Const(extent), body])`.
+    ///
+    /// `combiner` is the monoid op folded with (`Add`/`Mul`/`Min`/`Max`);
+    /// `reduce_var` is the index (4..8) that `body` folds over; `extent` is the
+    /// trip count. Lowered to an unrolled accumulation by `expand_reduce`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `combiner` is not a monoid op or `reduce_var` is outside 4..8.
+    pub fn push_reduce(
+        &mut self,
+        combiner: OpKind,
+        reduce_var: u8,
+        extent: u32,
+        body: ExprId,
+    ) -> ExprId {
+        assert!(
+            combiner.is_monoid(),
+            "push_reduce: {combiner:?} is not a valid reduction combiner"
+        );
+        assert!(
+            (4..8).contains(&reduce_var),
+            "push_reduce: reduce_var {reduce_var} out of range (must be 4..8)"
+        );
+        let c = self.push_const(combiner.index() as f32);
+        let v = self.push_const(reduce_var as f32);
+        let n = self.push_const(extent as f32);
+        self.push_nary(OpKind::Reduce, &[c, v, n, body])
+    }
+
     /// Get the declaration for a buffer slot.
     ///
     /// # Panics

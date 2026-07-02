@@ -125,20 +125,26 @@ Algebraic properties:
   *with* AA baked in, or from sampling smooth kernels directly; bilinear
   gather is future work (§Open Questions).
 
-### 3. `OpKind::ReduceAdd/ReduceMul/ReduceMin/ReduceMax` — bounded loops
+### 3. `OpKind::Reduce` — one op, combiner as a parameter
 
-Reduction enters the IR with a **static trip count**, following the `Dwrt`
-encoding convention (child is a `Const` carrying a variable index):
+Reduction enters the IR as a **single** op with a **static trip count**. The
+combiner is a *child*, not part of the opcode — one `Reduce` covers every
+monoid, and because the combiner is a subexpression it can later generalize
+from a monoid marker to an arbitrary fold function (the standard-library
+direction). Encoded n-ary, following the `Dwrt` "op-params-as-`Const`-children"
+precedent:
 
 ```rust
-// Ternary(ReduceAdd, Const(var_idx), Const(extent), body)
-//   var_idx: which variable the reduction binds (see below)
-//   extent:  static trip count — the "bound" in bound memory
-//   body:    expression that may reference Var(var_idx)
+// Nary(Reduce, [Const(combiner), Const(reduce_var), Const(extent), body])
+//   combiner:   OpKind index of the monoid (Add/Mul/Min/Max)
+//   reduce_var: which variable the reduction binds (indices 4..8)
+//   extent:     static trip count — the "bound" in bound memory
+//   body:       expression that may reference Var(reduce_var)
 ```
 
-Four `OpKind`s rather than a payload enum keeps `ReduceOp`'s monoid metadata
-where it already lives (`OpKind::identity()`, `is_associative()`, etc.).
+Rejected: four `ReduceAdd/Mul/Min/Max` opcodes. Baking the combiner into the
+opcode proliferates the IR and forecloses arbitrary combiners. Monoid metadata
+lives on the base ops instead (`OpKind::monoid_identity()`, `is_monoid()`).
 
 **Binding:** reduction variables take indices 4..=7. `Variance` is a `u8`
 with only the low nibble used; the high nibble tracks reduce-var dependence
@@ -280,7 +286,7 @@ store op.
 |---|---|
 | `pixelflow-ir` | `ExprNode::Buffer`, `BufferDecl` table on arena; `OpKind::Gather`, `OpKind::Reduce*` (+ arity/cost/name/emit metadata); variance: high-nibble reduce vars, gather = union of indices, reduce removes its var; emitter: gather lowering per backend, reduce lowering with unroll heuristics, address/value const-folding; `BindingTable`; `JitManifold` holds `Arc`s |
 | `pixelflow-core` | `DiscreteManifold` buffer → `Arc<[f32]>` + `freeze()`; delete `combinators/texture.rs` in favor of `DiscreteManifold`; lattice `collapse` JIT fast path (the TODO at `lattice/mod.rs:13-15`) |
-| `pixelflow-compiler` | `kernel!` grows lattice parameters: `kernel!(\|atlas: lattice<W, H>\| atlas(X * 2.0, Y))` → `Gather`; `sum(i, N, body)` → `ReduceAdd`; sema rejects out-of-scope reduce vars |
+| `pixelflow-compiler` | `kernel!` grows lattice parameters: `kernel!(\|atlas: lattice<W, H>\| atlas(X * 2.0, Y))` → `Gather`; `sum(i, N, body)` → `Reduce`; sema rejects out-of-scope reduce vars |
 | `pixelflow-search` | rewrite rules: gather CSE, hoisting uniform-index gathers, reduce linearity (`Σ(a·f + g) = a·Σf + Σg`), reduce-of-select; NNUE features for the new ops |
 | `pixelflow-graphics` | fonts on `DiscreteManifold`; atlas as frozen lattice |
 | `core-term` | frame as one bound kernel: grid `Pinned`, atlas `Frozen` |

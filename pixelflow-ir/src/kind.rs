@@ -106,11 +106,43 @@ pub enum OpKind {
     /// from existing ops) plus this primitive — the analogue of `raw_mul` under
     /// `mul`. The index is trusted to be in bounds (the lowering clamps it).
     RawGather = 51,
+
+    // --- Reduction (lattice fold) ---
+    /// Fold a body over a bounded domain. Encoded
+    /// `Nary(Reduce, [Const(combiner), Const(reduce_var), Const(extent), body])`:
+    /// `combiner` is the monoid op index (`Add`/`Mul`/`Min`/`Max`), `body`
+    /// references `Var(reduce_var)` (indices 4..8), and the fold runs over
+    /// `0..extent`. The combiner is a *child* (a parameter), not baked into the
+    /// opcode, so one `Reduce` covers every monoid and can later take an
+    /// arbitrary combiner function. Lowered to an unrolled accumulation by
+    /// `expand_reduce` before codegen — the analogue of `Gather -> RawGather`.
+    Reduce = 52,
 }
 
 impl OpKind {
     /// Total number of operations.
-    pub const COUNT: usize = 52;
+    pub const COUNT: usize = 53;
+
+    /// Monoid identity for an op usable as a reduction combiner
+    /// (`Add`→0, `Mul`→1, `Min`→+∞, `Max`→−∞). `None` if `self` is not a valid
+    /// combiner.
+    #[must_use]
+    pub const fn monoid_identity(self) -> Option<f32> {
+        match self {
+            Self::Add => Some(0.0),
+            Self::Mul => Some(1.0),
+            Self::Min => Some(f32::INFINITY),
+            Self::Max => Some(f32::NEG_INFINITY),
+            _ => None,
+        }
+    }
+
+    /// Whether `self` is a valid reduction combiner (an associative monoid op
+    /// with an identity).
+    #[must_use]
+    pub const fn is_monoid(self) -> bool {
+        self.monoid_identity().is_some()
+    }
 
     /// Convert to array index.
     #[inline]
@@ -182,6 +214,9 @@ impl OpKind {
             | Self::RawGather => 2,
 
             Self::MulAdd | Self::Select | Self::Clamp | Self::Gather => 3,
+
+            // N-ary: [combiner, reduce_var, extent, body].
+            Self::Reduce => 4,
         }
     }
 
@@ -241,6 +276,7 @@ impl OpKind {
             Self::Buffer => "buffer",
             Self::Gather => "gather",
             Self::RawGather => "raw_gather",
+            Self::Reduce => "reduce",
         }
     }
 
@@ -300,6 +336,7 @@ impl OpKind {
             "buffer" => Some(Self::Buffer),
             "gather" => Some(Self::Gather),
             "raw_gather" => Some(Self::RawGather),
+            "reduce" => Some(Self::Reduce),
             _ => None,
         }
     }
@@ -312,6 +349,9 @@ impl OpKind {
             // Memory read: native gather on AVX2/AVX-512, scalar loads on
             // NEON/SSE2. Priced between an arithmetic op and a transcendental.
             Self::Gather | Self::RawGather => 10,
+            // Reduction is lowered (unrolled) away before costing; price the
+            // node itself at zero so a stray one never dominates extraction.
+            Self::Reduce => 0,
             Self::Neg | Self::Abs | Self::Floor | Self::Ceil | Self::Round | Self::Fract => 1,
             Self::Add
             | Self::Sub
@@ -425,6 +465,7 @@ impl OpKind {
                 | Self::Buffer
                 | Self::Gather
                 | Self::RawGather
+                | Self::Reduce
         )
     }
 
@@ -490,6 +531,9 @@ impl OpKind {
 
             // Memory ops: emitted by the JIT binding path, not as method calls.
             Self::Buffer | Self::Gather | Self::RawGather => EmitStyle::Special,
+
+            // Reduction: lowered to unrolled arithmetic before codegen.
+            Self::Reduce => EmitStyle::Special,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select | Self::Clamp => EmitStyle::TernaryMethod,

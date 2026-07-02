@@ -517,6 +517,7 @@ impl OpEmbeddings {
             0.0, // Buffer - leaf, free
             0.5, // Gather - memory read, ~10 cycles
             0.5, // RawGather - primitive memory read, ~10 cycles
+            0.0, // Reduce - lowered (unrolled) before costing
         ];
 
         let mut rng_state = seed.wrapping_add(1);

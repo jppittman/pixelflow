@@ -303,6 +303,213 @@ fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> Exp
     arena.push_binary(OpKind::RawGather, buf, idx)
 }
 
+// ─────────────────────────────── Reduce lowering ──────────────────────────────
+
+/// Unroll every `Reduce` reachable from `root` into an explicit accumulation
+/// tree, returning the (possibly new) root in the same arena.
+///
+/// `Reduce([combiner, var, extent, body])` becomes
+/// `combiner(body[var:=0], combiner(body[var:=1], … body[var:=N-1]))` — N
+/// inlined copies of `body` with the reduction index substituted as a `Const`.
+/// Because the extent is static (bound memory), each copy's gather indices
+/// become constant, so the emitter folds their addresses to immediates: the
+/// fold compiles to a flat, call-free, unrolled kernel. This is the reduction
+/// analogue of [`expand_gather`].
+pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
+    let old_len = arena.nodes_raw().len();
+    let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
+
+    enum Task {
+        Descend(ExprId),
+        Emit(ExprId),
+    }
+    let mut work: Vec<Task> = alloc::vec![Task::Descend(root)];
+
+    while let Some(task) = work.pop() {
+        match task {
+            Task::Descend(id) => {
+                if id_map[id.0 as usize].is_some() {
+                    continue;
+                }
+                work.push(Task::Emit(id));
+                match arena.node(id).clone() {
+                    ExprNode::Var(_)
+                    | ExprNode::Const(_)
+                    | ExprNode::Param(_)
+                    | ExprNode::Buffer(_) => {}
+                    ExprNode::Unary(_, a) => work.push(Task::Descend(a)),
+                    ExprNode::Binary(_, a, b) => {
+                        work.push(Task::Descend(b));
+                        work.push(Task::Descend(a));
+                    }
+                    ExprNode::Ternary(_, a, b, c) => {
+                        work.push(Task::Descend(c));
+                        work.push(Task::Descend(b));
+                        work.push(Task::Descend(a));
+                    }
+                    ExprNode::Nary(_, start, len) => {
+                        let (s, l) = (start as usize, len as usize);
+                        let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+                        for child in children.into_iter().rev() {
+                            work.push(Task::Descend(child));
+                        }
+                    }
+                }
+            }
+            Task::Emit(id) => {
+                if id_map[id.0 as usize].is_some() {
+                    continue;
+                }
+                let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
+                let new_id = match arena.node(id).clone() {
+                    ExprNode::Var(i) => arena.push_var(i),
+                    ExprNode::Const(v) => arena.push_const(v),
+                    ExprNode::Param(i) => arena.push_param(i),
+                    ExprNode::Buffer(b) => arena.push_buffer(b),
+                    ExprNode::Unary(op, a) => arena.push_unary(op, m(a)),
+                    ExprNode::Binary(op, a, b) => arena.push_binary(op, m(a), m(b)),
+                    ExprNode::Ternary(op, a, b, c) => arena.push_ternary(op, m(a), m(b), m(c)),
+                    ExprNode::Nary(OpKind::Reduce, start, len) => {
+                        let (s, l) = (start as usize, len as usize);
+                        debug_assert_eq!(l, 4, "Reduce has 4 children");
+                        let ch: [ExprId; 4] = {
+                            let raw = &arena.nary_children_raw()[s..s + l];
+                            [raw[0], raw[1], raw[2], raw[3]]
+                        };
+                        // Children are already lowered; read the (lowered) Const
+                        // metadata and unroll over the lowered body.
+                        unroll_reduce(arena, m(ch[0]), m(ch[1]), m(ch[2]), m(ch[3]))
+                    }
+                    ExprNode::Nary(op, start, len) => {
+                        let (s, l) = (start as usize, len as usize);
+                        let mapped: Vec<ExprId> = arena.nary_children_raw()[s..s + l]
+                            .iter()
+                            .copied()
+                            .map(m)
+                            .collect();
+                        arena.push_nary(op, &mapped)
+                    }
+                };
+                id_map[id.0 as usize] = Some(new_id);
+            }
+        }
+    }
+
+    id_map[root.0 as usize].expect("root lowered")
+}
+
+/// Owned wrapper mirroring [`expand_transcendentals_owned`]: identity fast-path
+/// when the arena has no `Reduce`, otherwise clone-and-lower.
+#[must_use]
+pub fn expand_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+    if !arena
+        .nodes_raw()
+        .iter()
+        .any(|n| matches!(n, ExprNode::Nary(OpKind::Reduce, _, _)))
+    {
+        return (arena.clone(), root);
+    }
+    let mut owned = arena.clone();
+    let new_root = expand_reduce(&mut owned, root);
+    (owned, new_root)
+}
+
+/// Build the unrolled accumulation for one reduction whose children are already
+/// lowered. Reads `combiner`/`var`/`extent` from their `Const` nodes, then folds
+/// `extent` substituted copies of `body` under the combiner monoid.
+fn unroll_reduce(
+    arena: &mut ExprArena,
+    combiner: ExprId,
+    var: ExprId,
+    extent: ExprId,
+    body: ExprId,
+) -> ExprId {
+    let combiner_op = OpKind::from_index(const_val(arena, combiner, "reduce combiner") as usize)
+        .expect("reduce combiner must be a valid OpKind index");
+    let var_idx = const_val(arena, var, "reduce var") as u8;
+    let n = const_val(arena, extent, "reduce extent") as usize;
+
+    // Empty domain folds to the monoid identity.
+    if n == 0 {
+        let id = combiner_op
+            .monoid_identity()
+            .expect("reduce combiner is a monoid");
+        return arena.push_const(id);
+    }
+
+    // acc = body[var:=0]; then acc = combiner(acc, body[var:=k]) for k in 1..N.
+    let mut acc = substitute_var(arena, body, var_idx, 0.0);
+    for k in 1..n {
+        let term = substitute_var(arena, body, var_idx, k as f32);
+        acc = arena.push_binary(combiner_op, acc, term);
+    }
+    acc
+}
+
+/// Read the value of a `Const` node (reduction metadata).
+fn const_val(arena: &ExprArena, id: ExprId, what: &str) -> f32 {
+    match arena.node(id) {
+        ExprNode::Const(v) => *v,
+        other => panic!("{what} must be a Const, got {other:?}"),
+    }
+}
+
+/// Clone the subtree at `root`, replacing every `Var(var)` with `Const(value)`.
+/// Shared nodes are rebuilt once (memoized), so a DAG body stays a DAG.
+fn substitute_var(arena: &mut ExprArena, root: ExprId, var: u8, value: f32) -> ExprId {
+    let n = arena.nodes_raw().len();
+    let mut memo: Vec<Option<ExprId>> = alloc::vec![None; n];
+    subst_rec(arena, root, var, value, &mut memo)
+}
+
+fn subst_rec(
+    arena: &mut ExprArena,
+    id: ExprId,
+    var: u8,
+    value: f32,
+    memo: &mut Vec<Option<ExprId>>,
+) -> ExprId {
+    let idx = id.0 as usize;
+    if let Some(Some(m)) = memo.get(idx) {
+        return *m;
+    }
+    let new = match arena.node(id).clone() {
+        ExprNode::Var(i) if i == var => arena.push_const(value),
+        ExprNode::Var(i) => arena.push_var(i),
+        ExprNode::Const(v) => arena.push_const(v),
+        ExprNode::Param(i) => arena.push_param(i),
+        ExprNode::Buffer(b) => arena.push_buffer(b),
+        ExprNode::Unary(op, a) => {
+            let a = subst_rec(arena, a, var, value, memo);
+            arena.push_unary(op, a)
+        }
+        ExprNode::Binary(op, a, b) => {
+            let a = subst_rec(arena, a, var, value, memo);
+            let b = subst_rec(arena, b, var, value, memo);
+            arena.push_binary(op, a, b)
+        }
+        ExprNode::Ternary(op, a, b, c) => {
+            let a = subst_rec(arena, a, var, value, memo);
+            let b = subst_rec(arena, b, var, value, memo);
+            let c = subst_rec(arena, c, var, value, memo);
+            arena.push_ternary(op, a, b, c)
+        }
+        ExprNode::Nary(op, start, len) => {
+            let (s, l) = (start as usize, len as usize);
+            let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+            let mapped: Vec<ExprId> = children
+                .into_iter()
+                .map(|ch| subst_rec(arena, ch, var, value, memo))
+                .collect();
+            arena.push_nary(op, &mapped)
+        }
+    };
+    if idx < memo.len() {
+        memo[idx] = Some(new);
+    }
+    new
+}
+
 /// Expand a single transcendental unary op applied to (already-lowered) `arg`.
 fn expand_unary(arena: &mut ExprArena, op: OpKind, arg: ExprId) -> ExprId {
     match op {

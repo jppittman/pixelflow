@@ -33,23 +33,36 @@ pub fn eval_scalar(
         arena,
         vars,
         bindings,
+        reduce_vars: [0.0; 4],
     }
     .eval(root)
 }
 
 /// The immutable evaluation environment threaded through the recursion: the
-/// arena, the coordinate values, and the buffer bindings. Grouping them keeps
-/// the recursive helpers to a single `ExprId` argument.
+/// arena, the coordinate values, the buffer bindings, and the current binding
+/// of each reduction index (`Var(4..8)`). Grouping them keeps the recursive
+/// helpers to a single `ExprId` argument.
+#[derive(Clone, Copy)]
 struct Env<'a> {
     arena: &'a ExprArena,
     vars: &'a [f32; 4],
     bindings: &'a BindingTable<'a>,
+    /// Values bound to reduction indices `Var(4)..Var(8)` by enclosing folds.
+    reduce_vars: [f32; 4],
 }
 
 impl Env<'_> {
     fn eval(&self, id: ExprId) -> f32 {
         match self.arena.node(id) {
-            ExprNode::Var(i) => self.vars[*i as usize],
+            ExprNode::Var(i) => {
+                let i = *i as usize;
+                // 0..4 are coordinates; 4..8 are reduction indices.
+                if i < 4 {
+                    self.vars[i]
+                } else {
+                    self.reduce_vars[i - 4]
+                }
+            }
             ExprNode::Const(v) => *v,
             ExprNode::Param(p) => panic!("eval_scalar: Param({p}) — substitute params first"),
             ExprNode::Buffer(b) => panic!(
@@ -75,6 +88,11 @@ impl Env<'_> {
                 let z = self.eval(*c);
                 op.eval_ternary(x, y, z)
                     .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for ternary {op:?}"))
+            }
+            ExprNode::Nary(OpKind::Reduce, start, len) => {
+                assert_eq!(*len, 4, "Reduce must have 4 children");
+                let ch = self.arena.nary_children_slice(*start, *len);
+                self.reduce(ch[0], ch[1], ch[2], ch[3])
             }
             ExprNode::Nary(op, _, _) => panic!("eval_scalar: Nary({op:?}) unsupported"),
         }
@@ -115,6 +133,44 @@ impl Env<'_> {
         let data = self.bindings.slot(id);
         let index = self.eval(idx);
         data[libm::floorf(index) as usize]
+    }
+
+    /// Fold `body` over the reduction index `Var(reduce_var)` = `0..extent`,
+    /// combining terms with the monoid named by the `combiner` child. This is
+    /// the reference definition that the unrolled `expand_reduce` form must
+    /// match. `combiner`, `reduce_var`, and `extent` are `Const` children.
+    fn reduce(&self, combiner: ExprId, reduce_var: ExprId, extent: ExprId, body: ExprId) -> f32 {
+        let op = OpKind::from_index(self.const_of(combiner, "reduce combiner") as usize)
+            .expect("reduce combiner must be a valid OpKind index");
+        let var_idx = self.const_of(reduce_var, "reduce var index") as usize;
+        let n = self.const_of(extent, "reduce extent") as usize;
+        assert!(
+            (4..8).contains(&var_idx),
+            "reduce index Var({var_idx}) out of range (must be 4..8)"
+        );
+        let slot = var_idx - 4;
+
+        let mut acc = op
+            .monoid_identity()
+            .unwrap_or_else(|| panic!("reduce combiner {op:?} is not a monoid"));
+        for k in 0..n {
+            let mut child = *self;
+            child.reduce_vars[slot] = k as f32;
+            let term = child.eval(body);
+            // Combine under the monoid op (Add/Mul/Min/Max).
+            acc = op
+                .eval_binary(acc, term)
+                .expect("monoid combiner evaluates on two scalars");
+        }
+        acc
+    }
+
+    /// Read a `Const` child that encodes an integer parameter.
+    fn const_of(&self, id: ExprId, what: &str) -> f32 {
+        match self.arena.node(id) {
+            ExprNode::Const(v) => *v,
+            other => panic!("reduce {what} must be a Const, got {other:?}"),
+        }
     }
 }
 
@@ -253,6 +309,97 @@ mod tests {
         // X = 2 -> buffer[2] = 7 -> 7*2 + 1 = 15
         let got = eval_scalar(&arena, root, &[2.0, 0.0, 0.0, 0.0], &bindings);
         assert_eq!(got, 15.0);
+    }
+
+    #[test]
+    fn reduce_sum_of_squares() {
+        // sum_{i=0}^{3} (i+1)^2 = 1 + 4 + 9 + 16 = 30, folded over Var(4).
+        let mut arena = ExprArena::new();
+        let i = arena.push_var(4);
+        let one = arena.push_const(1.0);
+        let ip1 = arena.push_binary(OpKind::Add, i, one);
+        let sq = arena.push_binary(OpKind::Mul, ip1, ip1);
+        let root = arena.push_reduce(OpKind::Add, 4, 4, sq);
+
+        let bindings = BindingTable::empty();
+        assert_eq!(eval_scalar(&arena, root, &[0.0; 4], &bindings), 30.0);
+    }
+
+    #[test]
+    fn reduce_max_and_mul() {
+        // max_{i=0..4} i = 3 ; prod_{i=1..4}(via body i+1) = 2*3*4 = 24.
+        let mut arena = ExprArena::new();
+        let i = arena.push_var(4);
+        let max_root = arena.push_reduce(OpKind::Max, 4, 4, i);
+        let bindings = BindingTable::empty();
+        assert_eq!(eval_scalar(&arena, max_root, &[0.0; 4], &bindings), 3.0);
+
+        let one = arena.push_const(1.0);
+        let ip1 = arena.push_binary(OpKind::Add, i, one);
+        // product over i=1..4 of (i+1): i=1->2, 2->3, 3->4  => start at i=0 -> 1
+        // Reduce over 0..4 of (i+1) = 1*2*3*4 = 24.
+        let mul_root = arena.push_reduce(OpKind::Mul, 4, 4, ip1);
+        assert_eq!(eval_scalar(&arena, mul_root, &[0.0; 4], &bindings), 24.0);
+    }
+
+    #[test]
+    fn reduce_lowering_preserves_semantics() {
+        // Σ over i of (X + i), lowered by expand_reduce, must equal the fold.
+        use crate::backend::emit::lowering::expand_reduce;
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let i = arena.push_var(4);
+        let body = arena.push_binary(OpKind::Add, x, i);
+        let root = arena.push_reduce(OpKind::Add, 4, 5, body); // Σ_{i=0}^{4}(X+i)
+
+        let mut lowered = arena.clone();
+        let lroot = expand_reduce(&mut lowered, root);
+        // No Reduce node remains reachable from the new root.
+        let mut stack = alloc::vec![lroot];
+        while let Some(id) = stack.pop() {
+            assert!(!matches!(
+                lowered.node(id),
+                ExprNode::Nary(OpKind::Reduce, _, _)
+            ));
+            for c in lowered.children(id) {
+                stack.push(c);
+            }
+        }
+        let b = BindingTable::empty();
+        for xv in [-2.0f32, 0.0, 3.5, 10.0] {
+            let want = eval_scalar(&arena, root, &[xv, 0.0, 0.0, 0.0], &b);
+            let got = eval_scalar(&lowered, lroot, &[xv, 0.0, 0.0, 0.0], &b);
+            assert_eq!(want, got, "reduce lowering at X={xv}");
+            // Σ_{i=0}^{4}(X+i) = 5X + 10.
+            assert_eq!(want, 5.0 * xv + 10.0);
+        }
+    }
+
+    #[test]
+    fn reduce_matmul_dot_over_gather() {
+        // out = Σ_i W(i,0) * input(i,0), the matmul kernel body for one output.
+        use crate::arena::BufferDecl;
+        let w = alloc::vec![2.0f32, 3.0, 4.0]; // W column
+        let inp = alloc::vec![10.0f32, 20.0, 30.0];
+        let mut arena = ExprArena::new();
+        let wb = arena.declare_buffer(BufferDecl {
+            width: 3,
+            height: 1,
+        });
+        let ib = arena.declare_buffer(BufferDecl {
+            width: 3,
+            height: 1,
+        });
+        let i = arena.push_var(4);
+        let zero = arena.push_const(0.0);
+        let wg = arena.push_gather(wb, i, zero);
+        let ig = arena.push_gather(ib, i, zero);
+        let prod = arena.push_binary(OpKind::Mul, wg, ig);
+        let root = arena.push_reduce(OpKind::Add, 4, 3, prod);
+
+        let bindings = BindingTable::bind(&arena, &[w.as_slice(), inp.as_slice()]).unwrap();
+        // 2*10 + 3*20 + 4*30 = 20 + 60 + 120 = 200.
+        assert_eq!(eval_scalar(&arena, root, &[0.0; 4], &bindings), 200.0);
     }
 
     #[test]
