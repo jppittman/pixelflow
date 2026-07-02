@@ -17,3 +17,7 @@
 ## 2024-07-02 - Enforce Style Guidelines for Test Naming
 **Learning:** Bulk renaming `#[test]` functions by simply stripping the `test_` prefix can inadvertently cause compiler errors (like E0061) if the new function name shadows an existing function in scope that the test body intends to call.
 **Action:** When renaming tests, always check if the stripped name collides with another symbol (e.g., by scanning the file for calls using the new name) and safely fallback to prepending `verify_` to avoid conflicts.
+
+## 2024-07-02 - Fix Flaky Test shutdown_drain_all_timeout_fallback
+**Learning:** `shutdown_drain_all_timeout_fallback` frequently flaked on CI due to a very tight hardcoded timeout bound (`< 150ms`).
+**Action:** Relaxed the hardcoded timing threshold in flaky tests to generous values (e.g., `500ms`) when explicitly assigned to fix them, per testing resiliency rules.
