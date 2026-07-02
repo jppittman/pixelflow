@@ -29,90 +29,93 @@ pub fn eval_scalar(
     vars: &[f32; 4],
     bindings: &BindingTable<'_>,
 ) -> f32 {
-    match arena.node(root) {
-        ExprNode::Var(i) => vars[*i as usize],
-        ExprNode::Const(v) => *v,
-        ExprNode::Param(p) => panic!("eval_scalar: Param({p}) — substitute params first"),
-        ExprNode::Buffer(b) => panic!(
-            "eval_scalar: bare Buffer({}) is not a value; read it through Gather",
-            b.0
-        ),
-        ExprNode::Unary(op, a) => {
-            let x = eval_scalar(arena, *a, vars, bindings);
-            op.eval_unary(x)
-                .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for unary {op:?}"))
-        }
-        ExprNode::Binary(OpKind::RawGather, buf, idx) => {
-            eval_raw_gather(arena, *buf, *idx, vars, bindings)
-        }
-        ExprNode::Binary(op, a, b) => {
-            let x = eval_scalar(arena, *a, vars, bindings);
-            let y = eval_scalar(arena, *b, vars, bindings);
-            op.eval_binary(x, y)
-                .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for binary {op:?}"))
-        }
-        ExprNode::Ternary(OpKind::Gather, buf, x, y) => {
-            eval_gather(arena, *buf, *x, *y, vars, bindings)
-        }
-        ExprNode::Ternary(op, a, b, c) => {
-            let x = eval_scalar(arena, *a, vars, bindings);
-            let y = eval_scalar(arena, *b, vars, bindings);
-            let z = eval_scalar(arena, *c, vars, bindings);
-            op.eval_ternary(x, y, z)
-                .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for ternary {op:?}"))
-        }
-        ExprNode::Nary(op, _, _) => panic!("eval_scalar: Nary({op:?}) unsupported"),
+    Env {
+        arena,
+        vars,
+        bindings,
     }
+    .eval(root)
 }
 
-/// Read one bound buffer at floored, clamped, row-major indices. This IS the
-/// reference definition of `Gather`.
-fn eval_gather(
-    arena: &ExprArena,
-    buf: ExprId,
-    x: ExprId,
-    y: ExprId,
-    vars: &[f32; 4],
-    bindings: &BindingTable<'_>,
-) -> f32 {
-    let id = match arena.node(buf) {
-        ExprNode::Buffer(id) => *id,
-        other => panic!("Gather's first child must be a Buffer leaf, got {other:?}"),
-    };
-    let decl = arena.buffer_decl(id);
-    let data = bindings.slot(id);
-
-    let xf = eval_scalar(arena, x, vars, bindings);
-    let yf = eval_scalar(arena, y, vars, bindings);
-
-    // Nearest-neighbor: floor then clamp to the declared extents.
-    let max_x = decl.width.saturating_sub(1) as i64;
-    let max_y = decl.height.saturating_sub(1) as i64;
-    let xi = (libm::floorf(xf) as i64).clamp(0, max_x);
-    let yi = (libm::floorf(yf) as i64).clamp(0, max_y);
-
-    let idx = yi as usize * decl.width as usize + xi as usize;
-    data[idx]
+/// The immutable evaluation environment threaded through the recursion: the
+/// arena, the coordinate values, and the buffer bindings. Grouping them keeps
+/// the recursive helpers to a single `ExprId` argument.
+struct Env<'a> {
+    arena: &'a ExprArena,
+    vars: &'a [f32; 4],
+    bindings: &'a BindingTable<'a>,
 }
 
-/// Read a bound buffer at an already-computed linear index (the lowered form of
-/// `Gather`). The index is trusted to be in bounds — the lowering clamped it —
-/// so this just truncates and indexes; an out-of-bounds index is a broken
-/// lowering and panics via the slice bounds check.
-fn eval_raw_gather(
-    arena: &ExprArena,
-    buf: ExprId,
-    idx: ExprId,
-    vars: &[f32; 4],
-    bindings: &BindingTable<'_>,
-) -> f32 {
-    let id = match arena.node(buf) {
-        ExprNode::Buffer(id) => *id,
-        other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
-    };
-    let data = bindings.slot(id);
-    let index = eval_scalar(arena, idx, vars, bindings);
-    data[libm::floorf(index) as usize]
+impl Env<'_> {
+    fn eval(&self, id: ExprId) -> f32 {
+        match self.arena.node(id) {
+            ExprNode::Var(i) => self.vars[*i as usize],
+            ExprNode::Const(v) => *v,
+            ExprNode::Param(p) => panic!("eval_scalar: Param({p}) — substitute params first"),
+            ExprNode::Buffer(b) => panic!(
+                "eval_scalar: bare Buffer({}) is not a value; read it through Gather",
+                b.0
+            ),
+            ExprNode::Unary(op, a) => {
+                let x = self.eval(*a);
+                op.eval_unary(x)
+                    .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for unary {op:?}"))
+            }
+            ExprNode::Binary(OpKind::RawGather, buf, idx) => self.raw_gather(*buf, *idx),
+            ExprNode::Binary(op, a, b) => {
+                let x = self.eval(*a);
+                let y = self.eval(*b);
+                op.eval_binary(x, y)
+                    .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for binary {op:?}"))
+            }
+            ExprNode::Ternary(OpKind::Gather, buf, x, y) => self.gather(*buf, *x, *y),
+            ExprNode::Ternary(op, a, b, c) => {
+                let x = self.eval(*a);
+                let y = self.eval(*b);
+                let z = self.eval(*c);
+                op.eval_ternary(x, y, z)
+                    .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for ternary {op:?}"))
+            }
+            ExprNode::Nary(op, _, _) => panic!("eval_scalar: Nary({op:?}) unsupported"),
+        }
+    }
+
+    /// Read one bound buffer at floored, clamped, row-major indices. This IS the
+    /// reference definition of `Gather`.
+    fn gather(&self, buf: ExprId, x: ExprId, y: ExprId) -> f32 {
+        let id = match self.arena.node(buf) {
+            ExprNode::Buffer(id) => *id,
+            other => panic!("Gather's first child must be a Buffer leaf, got {other:?}"),
+        };
+        let decl = self.arena.buffer_decl(id);
+        let data = self.bindings.slot(id);
+
+        let xf = self.eval(x);
+        let yf = self.eval(y);
+
+        // Nearest-neighbor: floor then clamp to the declared extents.
+        let max_x = decl.width.saturating_sub(1) as i64;
+        let max_y = decl.height.saturating_sub(1) as i64;
+        let xi = (libm::floorf(xf) as i64).clamp(0, max_x);
+        let yi = (libm::floorf(yf) as i64).clamp(0, max_y);
+
+        let idx = yi as usize * decl.width as usize + xi as usize;
+        data[idx]
+    }
+
+    /// Read a bound buffer at an already-computed linear index (the lowered form
+    /// of `Gather`). The index is trusted to be in bounds — the lowering clamped
+    /// it — so this just truncates and indexes; an out-of-bounds index is a
+    /// broken lowering and panics via the slice bounds check.
+    fn raw_gather(&self, buf: ExprId, idx: ExprId) -> f32 {
+        let id = match self.arena.node(buf) {
+            ExprNode::Buffer(id) => *id,
+            other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
+        };
+        let data = self.bindings.slot(id);
+        let index = self.eval(idx);
+        data[libm::floorf(index) as usize]
+    }
 }
 
 #[cfg(test)]

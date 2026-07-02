@@ -566,7 +566,8 @@ pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
     let vvvv = 0x0F; // unused -> encoded 1111
 
     let p0 = (r << 7) | (x << 6) | (b << 5) | (rp << 4) | (Map::M0F38 as u8);
-    let p1 = (0 << 7) | (vvvv << 3) | (1 << 2) | (Pp::P66 as u8);
+    // W=0 (bit7 clear): gather uses signed dword indices.
+    let p1 = (vvvv << 3) | (1 << 2) | (Pp::P66 as u8);
     // z=0, L'L=10 (512-bit), b=0, V' = index bit4, aaa=001 (k1).
     let p2 = (0b10 << 5) | (vp << 3) | 0b001;
 
