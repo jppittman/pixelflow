@@ -100,11 +100,17 @@ pub enum OpKind {
     /// `Buffer` leaf. Semantics match `DiscreteManifold::eval`: floor the
     /// indices, clamp to the declared extents, gather row-major.
     Gather = 50,
+    /// Primitive gather: `RawGather(buffer, index)` reads `buffer`'s contents
+    /// at the already-computed linear lane `index` (truncated to int), with no
+    /// floor/clamp/row-major math. `Gather` lowers to index arithmetic (built
+    /// from existing ops) plus this primitive — the analogue of `raw_mul` under
+    /// `mul`. The index is trusted to be in bounds (the lowering clamps it).
+    RawGather = 51,
 }
 
 impl OpKind {
     /// Total number of operations.
-    pub const COUNT: usize = 51;
+    pub const COUNT: usize = 52;
 
     /// Convert to array index.
     #[inline]
@@ -172,7 +178,8 @@ impl OpKind {
             | Self::Shr
             | Self::BitAnd
             | Self::BitOr
-            | Self::Dwrt => 2,
+            | Self::Dwrt
+            | Self::RawGather => 2,
 
             Self::MulAdd | Self::Select | Self::Clamp | Self::Gather => 3,
         }
@@ -233,6 +240,7 @@ impl OpKind {
             Self::Dwrt => "dwrt",
             Self::Buffer => "buffer",
             Self::Gather => "gather",
+            Self::RawGather => "raw_gather",
         }
     }
 
@@ -291,6 +299,7 @@ impl OpKind {
             "dwrt" => Some(Self::Dwrt),
             "buffer" => Some(Self::Buffer),
             "gather" => Some(Self::Gather),
+            "raw_gather" => Some(Self::RawGather),
             _ => None,
         }
     }
@@ -302,7 +311,7 @@ impl OpKind {
             Self::Var | Self::Const | Self::Tuple | Self::Buffer => 0,
             // Memory read: native gather on AVX2/AVX-512, scalar loads on
             // NEON/SSE2. Priced between an arithmetic op and a transcendental.
-            Self::Gather => 10,
+            Self::Gather | Self::RawGather => 10,
             Self::Neg | Self::Abs | Self::Floor | Self::Ceil | Self::Round | Self::Fract => 1,
             Self::Add
             | Self::Sub
@@ -415,6 +424,7 @@ impl OpKind {
                 | Self::Select
                 | Self::Buffer
                 | Self::Gather
+                | Self::RawGather
         )
     }
 
@@ -479,7 +489,7 @@ impl OpKind {
             Self::Dwrt => EmitStyle::Special,
 
             // Memory ops: emitted by the JIT binding path, not as method calls.
-            Self::Buffer | Self::Gather => EmitStyle::Special,
+            Self::Buffer | Self::Gather | Self::RawGather => EmitStyle::Special,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select | Self::Clamp => EmitStyle::TernaryMethod,
