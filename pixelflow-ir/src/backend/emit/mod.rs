@@ -686,17 +686,6 @@ pub fn compile_arena_dag_scanline(
     compile_arena_dag_scanline_hoisted(arena, root)
 }
 
-/// Compile a scanline kernel with explicit register budget.
-#[cfg(target_arch = "aarch64")]
-pub fn compile_arena_dag_scanline_with_ctx(
-    arena: &crate::arena::ExprArena,
-    root: crate::arena::ExprId,
-    ctx: EmitCtx,
-) -> Result<ScanlineCompileResult, &'static str> {
-    let schedule = arena_to_schedule(arena, root);
-    let uses_map = arena_to_uses(&schedule);
-    compile_scanline_from_schedule(schedule, uses_map, ctx)
-}
 
 // =============================================================================
 // Variance-aware hoisted scanline compilation
@@ -4034,18 +4023,6 @@ pub fn compile_arena_dag_scanline(
         spill_bytes: 0,
         max_regs: EmitCtx::default().max_regs,
     })
-}
-
-/// Compile a scanline kernel with an explicit register budget (x86-64).
-///
-/// The `ctx` budget is advisory on x86-64 (see [`compile_arena_dag_with_ctx`]).
-#[cfg(target_arch = "x86_64")]
-pub fn compile_arena_dag_scanline_with_ctx(
-    arena: &ExprArena,
-    root: ExprId,
-    _ctx: EmitCtx,
-) -> Result<ScanlineCompileResult, &'static str> {
-    compile_arena_dag_scanline(arena, root)
 }
 
 /// Variance-aware hoisted scanline compilation (x86-64).
