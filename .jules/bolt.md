@@ -13,3 +13,7 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
+
+## 2025-01-20 - Boolean Arguments in APIs
+**Learning:** Found a boolean argument violation in `pixelflow-compiler/src/sema.rs` (`SemanticAnalyzer::new(is_anonymous: bool)`).
+**Action:** Replaced the boolean argument with a strongly typed enum (`KernelType { Anonymous, Named }`) to adhere to `STYLE.md` guidelines for better readability and API safety.
