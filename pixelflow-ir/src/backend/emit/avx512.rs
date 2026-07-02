@@ -540,6 +540,41 @@ pub fn emit_load_ptr_from_ctx(code: &mut Vec<u8>, dst_gpr: u8, ctx_gpr: u8, disp
     code.extend_from_slice(&disp.to_le_bytes());
 }
 
+/// `vmovups zmmDST, [baseGPR]` — load a 512-bit vector from a GP-register base
+/// (EVEX.512.0F.W0 10 /r, mod=00). `base_gpr` must not be rsp/rbp/r12/r13 (they
+/// force a SIB/disp form); the collapse driver uses rsi/rdx.
+pub fn emit_load_zmm_base(code: &mut Vec<u8>, dst: Reg, base_gpr: u8) {
+    evex_mem_base(code, 0x10, dst.0, base_gpr);
+}
+
+/// `vmovups [baseGPR], zmmSRC` — store a 512-bit vector to a GP-register base
+/// (EVEX.512.0F.W0 11 /r, mod=00). Same base-register restriction as
+/// [`emit_load_zmm_base`].
+pub fn emit_store_zmm_base(code: &mut Vec<u8>, src: Reg, base_gpr: u8) {
+    evex_mem_base(code, 0x11, src.0, base_gpr);
+}
+
+/// EVEX `vmovups` between a `zmm` and `[base_gpr]` (no index, no displacement).
+fn evex_mem_base(code: &mut Vec<u8>, opcode: u8, reg: u8, base: u8) {
+    debug_assert!(
+        base != 4 && base != 5 && base != 12 && base != 13,
+        "evex_mem_base: base must not be rsp/rbp/r12/r13 (mod=00 direct form)"
+    );
+    let r = ((reg >> 3) & 1) ^ 1;
+    let rp = ((reg >> 4) & 1) ^ 1;
+    let b = ((base >> 3) & 1) ^ 1;
+    let p0 = (r << 7) | (1 << 6) | (b << 5) | (rp << 4) | (Map::M0F as u8);
+    let p1 = (0x0F << 3) | (1 << 2) | (Pp::None as u8);
+    let p2 = (0b10 << 5) | (1 << 3);
+    code.push(0x62);
+    code.push(p0);
+    code.push(p1);
+    code.push(p2);
+    code.push(opcode);
+    // ModRM: mod=00, reg=reg[2:0], r/m=base[2:0] (direct memory, no SIB).
+    code.push(((reg & 7) << 3) | (base & 7));
+}
+
 /// `vgatherdps zmmDST{k1}, [baseGPR + zmmINDEX*4]`
 /// (EVEX.512.66.0F38.W0 92 /vsib, mask = k1, scale = 4).
 ///

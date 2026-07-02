@@ -1980,11 +1980,18 @@ trait IsaBackend {
 /// control flow here — Select guard analysis, short-circuit branch emission and
 /// patching, root resolution — is identical regardless of ISA; only the leaf
 /// emits go through `backend`.
-fn compile_dag_via_backend<B: IsaBackend>(
+/// Emit the register-allocated *body* of a DAG — the per-op instruction stream
+/// plus root resolution — with **no** prologue, epilogue, or `RET`. Returns the
+/// body bytes, the register holding the root value, the spill-frame size, and
+/// the spill count. The body's branches are self-relative, so a caller may
+/// freely prepend a prologue / wrap it in a loop / append an epilogue. This is
+/// the seam that lets both the per-batch kernel and the internal-loop collapse
+/// driver share one body emitter.
+fn emit_dag_body<B: IsaBackend>(
     schedule: Vec<(regalloc::ValueId, ScheduledOp)>,
     uses_map: Vec<Vec<regalloc::ValueId>>,
     backend: &mut B,
-) -> Result<CompileResult, &'static str> {
+) -> Result<(Vec<u8>, Reg, u32, u32), &'static str> {
     use alloc::collections::BTreeMap;
 
     // Pre-colored values (variables -> input registers).
@@ -2058,8 +2065,8 @@ fn compile_dag_via_backend<B: IsaBackend>(
 
     backend.begin(&schedule)?;
 
+    // No prologue here — the caller frames the body (see the fn doc).
     let mut code: Vec<u8> = Vec::new();
-    backend.prologue(&mut code, layout.frame_size);
 
     let mut pending_patches: BTreeMap<(usize, u8), B::Branch> = BTreeMap::new();
 
@@ -2173,13 +2180,36 @@ fn compile_dag_via_backend<B: IsaBackend>(
     let result_reg = backend.emit_resolve(
         &mut code, root, RELOAD_REG, &reg_for, &spill_for, &remat_for,
     );
-    backend.epilogue(&mut code, result_reg, layout.frame_size);
+
+    Ok((
+        code,
+        result_reg,
+        layout.frame_size,
+        layout.spill_slots.len() as u32,
+    ))
+}
+
+/// Drive a `(schedule, uses_map)` to a complete per-batch function via an
+/// [`IsaBackend`]: prologue, body, epilogue (root in the return register, frame
+/// torn down, `RET`). Byte-for-byte identical to the pre-refactor emitter — the
+/// body is simply produced by [`emit_dag_body`] and framed here.
+fn compile_dag_via_backend<B: IsaBackend>(
+    schedule: Vec<(regalloc::ValueId, ScheduledOp)>,
+    uses_map: Vec<Vec<regalloc::ValueId>>,
+    backend: &mut B,
+) -> Result<CompileResult, &'static str> {
+    let (body, result_reg, frame_size, spill_count) = emit_dag_body(schedule, uses_map, backend)?;
+
+    let mut code: Vec<u8> = Vec::new();
+    backend.prologue(&mut code, frame_size);
+    code.extend_from_slice(&body);
+    backend.epilogue(&mut code, result_reg, frame_size);
 
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
     Ok(CompileResult {
         code: exec,
-        spill_count: layout.spill_slots.len() as u32,
-        spill_bytes: layout.frame_size,
+        spill_count,
+        spill_bytes: frame_size,
         max_regs: backend.num_regs(),
     })
 }
@@ -3810,6 +3840,106 @@ pub fn compile_arena_dag_avx512(
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
     compile_dag_via_backend(schedule, uses, &mut Avx512Backend)
+}
+
+/// Compile an [`ExprArena`] DAG into an AVX-512 **collapse** kernel: the domain
+/// loop is emitted *inside* the code, so one call fills the whole output with no
+/// per-batch Rust↔JIT boundary. This is the internal-loop realization of a
+/// lattice collapse — the point of the whole design.
+///
+/// The per-batch body (produced by [`emit_dag_body`], with reductions/gathers
+/// already lowered) is wrapped in a loop over 16-lane groups: each iteration
+/// loads X from `xs`, zeroes Y/Z/W, runs the body (its gathers read buffer bases
+/// from the context in `rdi`), and stores the result to `out`. Matches the
+/// [`CollapseKernelFn`](executable::CollapseKernelFn) ABI
+/// `(ctx: rdi, xs: rsi, out: rdx, groups: rcx)`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub fn compile_collapse_avx512(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<CompileResult, &'static str> {
+    // Same lowering pipeline as the per-batch path.
+    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::expand_gather_owned(&arena, root);
+    let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let arena = &arena;
+
+    let schedule = arena_to_schedule(arena, root);
+    let uses = arena_to_uses(&schedule);
+    let (body, result_reg, frame_size, spill_count) =
+        emit_dag_body(schedule, uses, &mut Avx512Backend)?;
+
+    let code = emit_avx512_collapse_loop(&body, result_reg, frame_size);
+    let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
+    Ok(CompileResult {
+        code: exec,
+        spill_count,
+        spill_bytes: frame_size,
+        max_regs: Avx512Backend.num_regs(),
+    })
+}
+
+/// Wrap a per-batch AVX-512 `body` (result in `result_reg`, spilling into a
+/// `frame_size`-byte frame) in the collapse loop scaffold. The body's branches
+/// are self-relative, so inlining it inside the loop is sound.
+///
+/// Register roles (SysV): rdi=ctx (untouched by the body's gathers, which only
+/// read through it), rsi=xs, rdx=out, rcx=groups, r8=loop counter, rax=gather
+/// base scratch. Y/Z/W (zmm1/2/3) are re-zeroed each iteration.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+fn emit_avx512_collapse_loop(body: &[u8], result_reg: Reg, frame_size: u32) -> Vec<u8> {
+    let mut code: Vec<u8> = Vec::with_capacity(body.len() + 64);
+
+    // Frame set up once (spills reuse it every iteration).
+    if frame_size > 0 {
+        avx512::emit_sub_rsp(&mut code, frame_size);
+    }
+
+    // xor r8, r8            ; group index i = 0
+    code.extend_from_slice(&[0x4D, 0x31, 0xC0]);
+
+    let loop_top = code.len();
+    // cmp r8, rcx           ; i vs groups
+    code.extend_from_slice(&[0x49, 0x39, 0xC8]);
+    // jae loop_end
+    code.extend_from_slice(&[0x0F, 0x83]);
+    let jae_at = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    // Y/Z/W = 0 (re-zeroed each iteration; the body reads them as INPUT_REGS).
+    avx512::emit_xor(&mut code, Reg(1), Reg(1), Reg(1));
+    avx512::emit_xor(&mut code, Reg(2), Reg(2), Reg(2));
+    avx512::emit_xor(&mut code, Reg(3), Reg(3), Reg(3));
+    // X = xs[i] : zmm0 <- [rsi]
+    avx512::emit_load_zmm_base(&mut code, Reg(0), 6);
+
+    // Per-batch body (gathers read the context in rdi).
+    code.extend_from_slice(body);
+
+    // out[i] = result : [rdx] <- result_reg
+    avx512::emit_store_zmm_base(&mut code, result_reg, 2);
+
+    // add rsi, 64 ; add rdx, 64 ; inc r8 ; jmp loop_top
+    code.extend_from_slice(&[0x48, 0x83, 0xC6, 0x40]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC2, 0x40]);
+    code.extend_from_slice(&[0x49, 0xFF, 0xC0]);
+    code.push(0xE9);
+    let jmp_at = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+
+    let loop_end = code.len();
+    if frame_size > 0 {
+        avx512::emit_add_rsp(&mut code, frame_size);
+    }
+    avx512::emit_ret(&mut code);
+
+    // Patch the forward jae (-> loop_end) and backward jmp (-> loop_top).
+    let jae_rel = (loop_end as i32) - (jae_at as i32 + 4);
+    code[jae_at..jae_at + 4].copy_from_slice(&jae_rel.to_le_bytes());
+    let jmp_rel = (loop_top as i32) - (jmp_at as i32 + 4);
+    code[jmp_at..jmp_at + 4].copy_from_slice(&jmp_rel.to_le_bytes());
+
+    code
 }
 
 /// Compile an [`ExprArena`] DAG into a scanline kernel (x86-64).
@@ -5572,6 +5702,58 @@ mod tests {
                 ys,
                 "2-buf",
             );
+        }
+
+        #[test]
+        fn collapse_matmul_one_call_fills_output() {
+            // The whole point: emit the domain loop INSIDE the kernel, so ONE
+            // call fills the entire matmul output vector — no per-batch boundary.
+            // out(j) = Σ_i W(i,j) * input(i), over j = 0..OUT.
+            use crate::arena::BufferDecl;
+            type Collapse = unsafe extern "C" fn(*const *const f32, *const f32, *mut f32, usize);
+
+            let (in_dim, out_dim) = (5usize, 32usize); // OUT = 2 groups of 16
+            let w: Vec<f32> = (0..(in_dim * out_dim)).map(|k| (k as f32).sin()).collect();
+            let input: Vec<f32> = (0..in_dim).map(|k| (k as f32 - 2.0) * 0.5).collect();
+
+            let mut a = ExprArena::new();
+            let wb = a.declare_buffer(BufferDecl {
+                width: in_dim as u32,
+                height: out_dim as u32,
+            });
+            let ib = a.declare_buffer(BufferDecl {
+                width: in_dim as u32,
+                height: 1,
+            });
+            let i = a.push_var(4);
+            let j = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let wg = a.push_gather(wb, i, j);
+            let ig = a.push_gather(ib, i, zero);
+            let prod = a.push_binary(OpKind::Mul, wg, ig);
+            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
+
+            let res = compile_collapse_avx512(&a, root).expect("collapse compile");
+
+            // Domain xs = [0, 1, ..., OUT-1]; groups = OUT/16.
+            let groups = out_dim / 16;
+            let xs: Vec<f32> = (0..out_dim).map(|k| k as f32).collect();
+            let mut out = vec![0.0f32; out_dim];
+            let ctx: Vec<*const f32> = vec![w.as_ptr(), input.as_ptr()];
+
+            unsafe {
+                let f: Collapse = res.code.as_fn();
+                f(ctx.as_ptr(), xs.as_ptr(), out.as_mut_ptr(), groups);
+            }
+
+            // Compare every output lane to the reference interpreter.
+            let bindings =
+                crate::binding::BindingTable::bind(&a, &[w.as_slice(), input.as_slice()]).unwrap();
+            for jj in 0..out_dim {
+                let want =
+                    crate::eval::eval_scalar(&a, root, &[jj as f32, 0.0, 0.0, 0.0], &bindings);
+                assert_eq!(out[jj], want, "collapse out[{jj}]");
+            }
         }
 
         #[test]
