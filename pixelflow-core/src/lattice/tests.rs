@@ -72,7 +72,7 @@ fn frame_coord_generation() {
 #[should_panic(expected = "out of bounds")]
 fn frame_coord_oob() {
     let lattice = Lattice::frame(4, 3, 0.0);
-    let _ = lattice.coord(12);
+    let _c = lattice.coord(12);
 }
 
 // ---- Scanline coord generation ----
@@ -109,7 +109,7 @@ fn point_collapse_single_eval() {
 #[should_panic(expected = "out of bounds")]
 fn point_coord_oob() {
     let lattice = Lattice::point(0.0, 0.0, 0.0, 0.0);
-    let _ = lattice.coord(1);
+    let _c = lattice.coord(1);
 }
 
 // ---- DiscreteManifold round-trip ----
