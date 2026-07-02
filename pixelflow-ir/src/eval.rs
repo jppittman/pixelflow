@@ -42,6 +42,9 @@ pub fn eval_scalar(
             op.eval_unary(x)
                 .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for unary {op:?}"))
         }
+        ExprNode::Binary(OpKind::RawGather, buf, idx) => {
+            eval_raw_gather(arena, *buf, *idx, vars, bindings)
+        }
         ExprNode::Binary(op, a, b) => {
             let x = eval_scalar(arena, *a, vars, bindings);
             let y = eval_scalar(arena, *b, vars, bindings);
@@ -92,6 +95,26 @@ fn eval_gather(
     data[idx]
 }
 
+/// Read a bound buffer at an already-computed linear index (the lowered form of
+/// `Gather`). The index is trusted to be in bounds — the lowering clamped it —
+/// so this just truncates and indexes; an out-of-bounds index is a broken
+/// lowering and panics via the slice bounds check.
+fn eval_raw_gather(
+    arena: &ExprArena,
+    buf: ExprId,
+    idx: ExprId,
+    vars: &[f32; 4],
+    bindings: &BindingTable<'_>,
+) -> f32 {
+    let id = match arena.node(buf) {
+        ExprNode::Buffer(id) => *id,
+        other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
+    };
+    let data = bindings.slot(id);
+    let index = eval_scalar(arena, idx, vars, bindings);
+    data[libm::floorf(index) as usize]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +162,70 @@ mod tests {
             let got = eval_scalar(&arena, gather, &[cx, cy, 0.0, 0.0], &bindings);
             let want = discrete_eval(&buf, width, height, cx, cy);
             assert_eq!(got, want, "gather at ({cx}, {cy})");
+        }
+    }
+
+    #[test]
+    fn lowering_preserves_gather_semantics() {
+        // The crux of M2 slice 1: expand_gather must produce an index
+        // expression that evaluates identically to the high-level Gather.
+        use crate::backend::emit::lowering::expand_gather;
+
+        let width = 5usize;
+        let height = 4usize;
+        let buf: vec::Vec<f32> = (0..(width * height)).map(|i| i as f32 + 0.5).collect();
+
+        let mut arena = ExprArena::new();
+        let b = arena.declare_buffer(BufferDecl {
+            width: width as u32,
+            height: height as u32,
+        });
+        // Gather with non-trivial index expressions: (X*2, Y+1).
+        let x = arena.push_var(0);
+        let y = arena.push_var(1);
+        let two = arena.push_const(2.0);
+        let one = arena.push_const(1.0);
+        let xx = arena.push_binary(OpKind::Mul, x, two);
+        let yy = arena.push_binary(OpKind::Add, y, one);
+        let gather = arena.push_gather(b, xx, yy);
+
+        // Lower a clone; the buffer table is preserved, so the same binding works.
+        let mut lowered_arena = arena.clone();
+        let lowered_root = expand_gather(&mut lowered_arena, gather);
+
+        // The lowered form REACHABLE from the new root must contain a
+        // RawGather and no high-level Gather. (The arena is append-only, so the
+        // original Gather remains as unreachable garbage in nodes_raw().)
+        let mut reachable = alloc::vec::Vec::new();
+        let mut stack = alloc::vec![lowered_root];
+        while let Some(id) = stack.pop() {
+            reachable.push(lowered_arena.node(id).clone());
+            for c in lowered_arena.children(id) {
+                stack.push(c);
+            }
+        }
+        assert!(
+            reachable
+                .iter()
+                .any(|n| matches!(n, ExprNode::Binary(OpKind::RawGather, _, _)))
+        );
+        assert!(
+            !reachable
+                .iter()
+                .any(|n| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
+        );
+
+        let bindings = BindingTable::bind(&arena, &[buf.as_slice()]).unwrap();
+        let lowered_bindings = BindingTable::bind(&lowered_arena, &[buf.as_slice()]).unwrap();
+
+        // Sweep coords including fractional and out-of-range values.
+        for xi in [-2.0f32, 0.0, 0.7, 1.0, 2.0, 3.0, 10.0] {
+            for yi in [-1.0f32, 0.0, 0.4, 1.0, 2.0, 3.0, 8.0] {
+                let vars = [xi, yi, 0.0, 0.0];
+                let hi = eval_scalar(&arena, gather, &vars, &bindings);
+                let lo = eval_scalar(&lowered_arena, lowered_root, &vars, &lowered_bindings);
+                assert_eq!(hi, lo, "gather vs lowered at ({xi}, {yi})");
+            }
         }
     }
 

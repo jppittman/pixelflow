@@ -120,9 +120,12 @@ define_op!(48, Dwrt, "dwrt", 2, Special);
 // Both are emitted by the JIT binding path, hence Special.
 define_op!(49, Buffer, "buffer", 0, Special);
 define_op!(50, Gather, "gather", 3, Special);
+// Primitive gather (buffer + precomputed linear index). `Gather` lowers to
+// index arithmetic plus this; emitted directly by the JIT gather path.
+define_op!(51, RawGather, "raw_gather", 2, Special);
 
 /// Total number of operations. Must equal [`crate::kind::OpKind::COUNT`].
-pub const OP_COUNT: usize = 51;
+pub const OP_COUNT: usize = 52;
 
 /// All operations in the IR, indexed by their INDEX constant.
 ///
@@ -179,6 +182,7 @@ pub const ALL_OPS: [&'static dyn OpMeta; OP_COUNT] = [
     &Dwrt,
     &Buffer,
     &Gather,
+    &RawGather,
 ];
 
 // Compile-time guard: the two op counts must agree.

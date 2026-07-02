@@ -172,6 +172,137 @@ pub fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (ExprAre
     (owned, new_root)
 }
 
+// ─────────────────────────────── Gather lowering ──────────────────────────────
+
+/// Lower every high-level `Gather(buffer, x, y)` reachable from `root` into
+/// index arithmetic plus a primitive [`OpKind::RawGather`], returning the
+/// (possibly new) root in the same arena.
+///
+/// The index expression is byte-for-byte the one `DiscreteManifold::eval`
+/// computes — `clamp(floor(idx), 0, extent-1)` per axis, then
+/// `yi * width + xi` — so the emitter only ever sees ops it already supports
+/// (`Floor`, `Clamp`, `Mul`, `Add`) plus the single `RawGather` primitive.
+/// This is the analogue of [`expand_transcendentals`] for memory reads.
+pub fn expand_gather(arena: &mut ExprArena, root: ExprId) -> ExprId {
+    let old_len = arena.nodes_raw().len();
+    let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
+
+    enum Task {
+        Descend(ExprId),
+        Emit(ExprId),
+    }
+    let mut work: Vec<Task> = alloc::vec![Task::Descend(root)];
+
+    while let Some(task) = work.pop() {
+        match task {
+            Task::Descend(id) => {
+                if id_map[id.0 as usize].is_some() {
+                    continue;
+                }
+                work.push(Task::Emit(id));
+                match arena.node(id).clone() {
+                    ExprNode::Var(_)
+                    | ExprNode::Const(_)
+                    | ExprNode::Param(_)
+                    | ExprNode::Buffer(_) => {}
+                    ExprNode::Unary(_, a) => work.push(Task::Descend(a)),
+                    ExprNode::Binary(_, a, b) => {
+                        work.push(Task::Descend(b));
+                        work.push(Task::Descend(a));
+                    }
+                    ExprNode::Ternary(_, a, b, c) => {
+                        work.push(Task::Descend(c));
+                        work.push(Task::Descend(b));
+                        work.push(Task::Descend(a));
+                    }
+                    ExprNode::Nary(_, start, len) => {
+                        let (s, l) = (start as usize, len as usize);
+                        let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+                        for child in children.into_iter().rev() {
+                            work.push(Task::Descend(child));
+                        }
+                    }
+                }
+            }
+            Task::Emit(id) => {
+                if id_map[id.0 as usize].is_some() {
+                    continue;
+                }
+                let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
+                let new_id = match arena.node(id).clone() {
+                    ExprNode::Var(i) => arena.push_var(i),
+                    ExprNode::Const(v) => arena.push_const(v),
+                    ExprNode::Param(i) => arena.push_param(i),
+                    ExprNode::Buffer(b) => arena.push_buffer(b),
+                    ExprNode::Unary(op, a) => arena.push_unary(op, m(a)),
+                    ExprNode::Binary(op, a, b) => arena.push_binary(op, m(a), m(b)),
+                    ExprNode::Ternary(OpKind::Gather, buf, x, y) => {
+                        lower_gather(arena, m(buf), m(x), m(y))
+                    }
+                    ExprNode::Ternary(op, a, b, c) => arena.push_ternary(op, m(a), m(b), m(c)),
+                    ExprNode::Nary(op, start, len) => {
+                        let (s, l) = (start as usize, len as usize);
+                        let mapped: Vec<ExprId> = arena.nary_children_raw()[s..s + l]
+                            .iter()
+                            .copied()
+                            .map(m)
+                            .collect();
+                        arena.push_nary(op, &mapped)
+                    }
+                };
+                id_map[id.0 as usize] = Some(new_id);
+            }
+        }
+    }
+
+    id_map[root.0 as usize].expect("root lowered")
+}
+
+/// Owned wrapper mirroring [`expand_transcendentals_owned`]: identity fast-path
+/// when the arena has no `Gather`, otherwise clone-and-lower.
+#[must_use]
+pub fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+    if !arena
+        .nodes_raw()
+        .iter()
+        .any(|n| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
+    {
+        return (arena.clone(), root);
+    }
+    let mut owned = arena.clone();
+    let new_root = expand_gather(&mut owned, root);
+    (owned, new_root)
+}
+
+/// Build the index arithmetic for one gather and wrap it in a `RawGather`.
+///
+/// `buf`/`x`/`y` are already lowered nodes in `arena`; `buf` is a `Buffer` leaf.
+/// Produces `RawGather(buf, clamp(floor(y),0,h-1) * width + clamp(floor(x),0,w-1))`,
+/// matching `DiscreteManifold::eval`.
+fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> ExprId {
+    let decl = match arena.node(buf) {
+        ExprNode::Buffer(id) => *arena.buffer_decl(*id),
+        other => panic!("lower_gather: first child must be a Buffer leaf, got {other:?}"),
+    };
+
+    let zero = arena.push_const(0.0);
+    let max_x = arena.push_const(decl.width.saturating_sub(1) as f32);
+    let max_y = arena.push_const(decl.height.saturating_sub(1) as f32);
+    let width = arena.push_const(decl.width as f32);
+
+    // xi = clamp(floor(x), 0, width-1); yi = clamp(floor(y), 0, height-1)
+    let fx = arena.push_unary(OpKind::Floor, x);
+    let xi = arena.push_ternary(OpKind::Clamp, fx, zero, max_x);
+    let fy = arena.push_unary(OpKind::Floor, y);
+    let yi = arena.push_ternary(OpKind::Clamp, fy, zero, max_y);
+
+    // idx = yi * width + xi  (float; exact for indices < 2^24, as in DiscreteManifold)
+    let row = arena.push_binary(OpKind::Mul, yi, width);
+    let idx = arena.push_binary(OpKind::Add, row, xi);
+
+    arena.push_binary(OpKind::RawGather, buf, idx)
+}
+
 /// Expand a single transcendental unary op applied to (already-lowered) `arg`.
 fn expand_unary(arena: &mut ExprArena, op: OpKind, arg: ExprId) -> ExprId {
     match op {
