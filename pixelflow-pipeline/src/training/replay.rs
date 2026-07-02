@@ -213,7 +213,7 @@ fn bytes_as_records(bytes: &[u8]) -> &[ReplayRecord] {
         bytes.len(),
     );
     assert!(
-        bytes.as_ptr() as usize % std::mem::align_of::<ReplayRecord>() == 0 || bytes.is_empty(),
+        (bytes.as_ptr() as usize) % std::mem::align_of::<ReplayRecord>() == 0 || bytes.is_empty(),
         "[REPLAY] Byte buffer is not aligned to ReplayRecord alignment",
     );
     unsafe {
