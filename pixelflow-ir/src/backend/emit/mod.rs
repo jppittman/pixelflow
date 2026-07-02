@@ -653,10 +653,11 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Lower memory reads and transcendentals to primitives (one source of truth
-    // in `lowering`); the aarch64 emitter then never sees Gather or Sin/Cos/etc.
-    // (aarch64 gather emission itself is a later slice — it will reject for now.)
-    let (arena, root) = lowering::expand_gather_owned(arena, root);
+    // Lower reductions, memory reads, then transcendentals to primitives (one
+    // source of truth in `lowering`); the aarch64 emitter then never sees
+    // Reduce/Gather/Sin/Cos/etc. (aarch64 gather emission is a later slice.)
+    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
@@ -3235,12 +3236,14 @@ pub fn compile_arena_dag_with_ctx(
     // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
     // KernelFn ABI stay consistent with the selected width.
     //
-    // Lower memory reads (Gather -> index math + RawGather) and transcendentals
-    // to primitives, so no backend sees either. Both are no-ops when absent. A
-    // kernel that contains a gather reads its buffer bases from a context pointer
-    // in rdi; the emitted body is identical either way, so the caller simply
+    // Lower, in order: reductions (unroll -> arithmetic + gathers), then memory
+    // reads (Gather -> index math + RawGather), then transcendentals. Each is a
+    // no-op when absent. Reduce runs first so the gathers it unrolls get lowered
+    // too. A kernel that reads bound memory takes its buffer bases from a context
+    // pointer in rdi; the emitted body is identical either way, so the caller
     // invokes it as `CtxKernelFn` instead of `KernelFn`.
-    let (arena, root) = lowering::expand_gather_owned(arena, root);
+    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
@@ -5569,6 +5572,45 @@ mod tests {
                 ys,
                 "2-buf",
             );
+        }
+
+        #[test]
+        fn matmul_reduce_jit_matches_interpreter() {
+            // out(j) = Σ_i W(i,j) * input(i), evaluated per output lane j = X.
+            // The reduction over i unrolls to a flat gather/FMA chain (bound
+            // extent), and the whole thing runs as one CtxKernelFn.
+            //   W is IN×OUT row-major (width=IN, height=OUT); input is length IN.
+            let (in_dim, out_dim) = (4usize, 6usize);
+            let w: Vec<f32> = (0..(in_dim * out_dim))
+                .map(|k| (k as f32) * 0.5 - 2.0)
+                .collect();
+            let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
+
+            let mut a = ExprArena::new();
+            let wb = a.declare_buffer(crate::arena::BufferDecl {
+                width: in_dim as u32,
+                height: out_dim as u32,
+            });
+            let ib = a.declare_buffer(crate::arena::BufferDecl {
+                width: in_dim as u32,
+                height: 1,
+            });
+            // body(i, j=X) = W(i, X) * input(i, 0)
+            let i = a.push_var(4);
+            let j = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let wg = a.push_gather(wb, i, j);
+            let ig = a.push_gather(ib, i, zero);
+            let prod = a.push_binary(OpKind::Mul, wg, ig);
+            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
+
+            let buffers: &[&[f32]] = &[w.as_slice(), input.as_slice()];
+            // Output lanes j = 0..6 (rest clamp to the last row, harmless here).
+            let xs = [
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
+            ];
+            let ys = [0.0f32; 16];
+            check_against_interp(&a, root, buffers, xs, ys, "matmul");
         }
 
         /// sqrt(X*X + Y*Y) - Z, with a non-commutative shape and FMA-able terms,

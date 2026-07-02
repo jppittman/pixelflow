@@ -123,9 +123,13 @@ define_op!(50, Gather, "gather", 3, Special);
 // Primitive gather (buffer + precomputed linear index). `Gather` lowers to
 // index arithmetic plus this; emitted directly by the JIT gather path.
 define_op!(51, RawGather, "raw_gather", 2, Special);
+// Reduction (lattice fold). N-ary: [combiner, reduce_var, extent, body].
+// The combiner is a child parameter, so one op covers every monoid. Lowered to
+// unrolled arithmetic by `expand_reduce` before codegen.
+define_op!(52, Reduce, "reduce", 4, Special);
 
 /// Total number of operations. Must equal [`crate::kind::OpKind::COUNT`].
-pub const OP_COUNT: usize = 52;
+pub const OP_COUNT: usize = 53;
 
 /// All operations in the IR, indexed by their INDEX constant.
 ///
@@ -183,6 +187,7 @@ pub const ALL_OPS: [&'static dyn OpMeta; OP_COUNT] = [
     &Buffer,
     &Gather,
     &RawGather,
+    &Reduce,
 ];
 
 // Compile-time guard: the two op counts must agree.
