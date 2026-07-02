@@ -243,6 +243,11 @@ pub enum ResolvedOp {
         hi: Reg,
         lo_deferred: Option<DeferredReload>,
     },
+    /// Bound-memory gather: `dst = buffer[slot][idx_lane]`. Emitted only on the
+    /// AVX-512 backend (native `vgatherdps`); other backends reject it. The
+    /// buffer base pointer is loaded from the context struct (rdi) at
+    /// `slot * 8`.
+    Gather { dst: Reg, idx: Reg, slot: u16 },
 }
 
 /// A deferred reload: value loaded mid-instruction (after a partial computation).
@@ -648,9 +653,11 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Expand transcendentals to primitive arithmetic first (one source of truth
-    // in `lowering`); the aarch64 emitter then never sees Sin/Cos/etc.
-    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
+    // Lower memory reads and transcendentals to primitives (one source of truth
+    // in `lowering`); the aarch64 emitter then never sees Gather or Sin/Cos/etc.
+    // (aarch64 gather emission itself is a later slice — it will reject for now.)
+    let (arena, root) = lowering::expand_gather_owned(arena, root);
+    let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses_map = arena_to_uses(&schedule);
@@ -944,7 +951,9 @@ where
     for (_, sched_op) in &schedule[split..] {
         let operands: alloc::vec::Vec<regalloc::ValueId> = match sched_op {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => alloc::vec![],
-            ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+            ScheduledOp::Unary(_, a)
+            | ScheduledOp::ShiftImm(_, a, _)
+            | ScheduledOp::Gather(a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         };
@@ -1040,7 +1049,9 @@ fn compile_scanline_hoisted(
     for (_, sched_op) in &schedule[split..] {
         let operands: alloc::vec::Vec<regalloc::ValueId> = match sched_op {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => alloc::vec![],
-            ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+            ScheduledOp::Unary(_, a)
+            | ScheduledOp::ShiftImm(_, a, _)
+            | ScheduledOp::Gather(a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         };
@@ -1866,7 +1877,9 @@ impl CompileWorkspace {
         for (_, op) in &self.schedule {
             let uses = match op {
                 ScheduledOp::Var(_) | ScheduledOp::Const(_) => Vec::new(),
-                ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+                ScheduledOp::Unary(_, a)
+                | ScheduledOp::ShiftImm(_, a, _)
+                | ScheduledOp::Gather(a, _) => alloc::vec![*a],
                 ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
                 ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
             };
@@ -2348,6 +2361,11 @@ pub enum ScheduledOp {
     /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
     /// `arena_to_schedule` (so it never becomes a scheduled value / register).
     ShiftImm(OpKind, regalloc::ValueId, u8),
+    /// Bound-memory gather: read buffer `slot` at the lane index computed by the
+    /// value operand. Lowered from `RawGather(Buffer(slot), index)`; the buffer
+    /// leaf is folded out to the `slot` immediate (like `ShiftImm`'s count) so it
+    /// never becomes a scheduled value. The index is the one real input.
+    Gather(regalloc::ValueId, u16),
 }
 
 // =============================================================================
@@ -2433,11 +2451,12 @@ fn arena_to_schedule(
                  call substitute_params before compile_arena()",
                 i
             ),
-            ExprNode::Buffer(b) => panic!(
-                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
-                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
-                b.0
-            ),
+            // A Buffer leaf is always folded into a `Gather`'s `slot` immediate
+            // (below), so any Buffer that survives as its own reachable node is a
+            // dead operand — never consumed as a value. Emit a harmless dead
+            // placeholder occupying its ValueId slot, exactly as ShiftImm leaves
+            // its folded shift-count Const as a dead schedule entry.
+            ExprNode::Buffer(_) => ScheduledOp::Const(0.0),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
             // Shl/Shr fold their Const shift-count operand into an immediate, so
             // the count never becomes a scheduled value (matching the imm-only
@@ -2452,6 +2471,15 @@ fn arena_to_schedule(
                     ),
                 };
                 ScheduledOp::ShiftImm(*op, map_child(a), amount)
+            }
+            // RawGather folds its Buffer leaf into the `slot` immediate (like a
+            // shift count); only the index operand becomes a scheduled value.
+            ExprNode::Binary(OpKind::RawGather, buf, idx) => {
+                let slot = match arena.node(*buf) {
+                    ExprNode::Buffer(id) => id.0,
+                    other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
+                };
+                ScheduledOp::Gather(map_child(idx), slot)
             }
             // A `Dwrt` (autodiff) node must be eliminated by the e-graph chain
             // rule before codegen. Reaching here means a `D(expr, var)` survived
@@ -2486,6 +2514,7 @@ fn arena_to_uses(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<Vec<regal
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => Vec::new(),
             ScheduledOp::Unary(_, a) => alloc::vec![*a],
             ScheduledOp::ShiftImm(_, a, _) => alloc::vec![*a],
+            ScheduledOp::Gather(a, _) => alloc::vec![*a],
             ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
             ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
         })
@@ -2534,7 +2563,9 @@ fn transitive_deps(
         if let Some(Some(sop)) = schedule_ops.get(v.0 as usize) {
             match sop {
                 ScheduledOp::Var(_) | ScheduledOp::Const(_) => {}
-                ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) => {
+                ScheduledOp::Unary(_, c)
+                | ScheduledOp::ShiftImm(_, c, _)
+                | ScheduledOp::Gather(c, _) => {
                     worklist.push(*c);
                 }
                 ScheduledOp::Binary(_, l, r) => {
@@ -2599,7 +2630,9 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
         };
         match sop {
             ScheduledOp::Var(_) | ScheduledOp::Const(_) => {}
-            ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) => add(*c),
+            ScheduledOp::Unary(_, c)
+            | ScheduledOp::ShiftImm(_, c, _)
+            | ScheduledOp::Gather(c, _) => add(*c),
             ScheduledOp::Binary(_, a, b) => {
                 add(*a);
                 add(*b);
@@ -2808,6 +2841,14 @@ pub fn resolve_operands(
                 amount: *amount,
             }
         }
+        ScheduledOp::Gather(child, slot) => {
+            let idx = resolve(*child, tmp_op, &mut reloads);
+            ResolvedOp::Gather {
+                dst,
+                idx,
+                slot: *slot,
+            }
+        }
         ScheduledOp::Binary(op_kind, left, right) => {
             let l_spilled = !assignment.contains_key(left);
             let r_spilled = !assignment.contains_key(right);
@@ -3008,6 +3049,11 @@ fn emit_instruction_plan(
         } => {
             aarch64::emit_shift_imm(code, *op, *dst, *src, *amount)?;
         }
+        ResolvedOp::Gather { .. } => {
+            // NEON has no native gather; the scalar-load lowering is a later
+            // slice. Reject rather than miscompile.
+            return Err("aarch64: bound-memory gather not yet supported");
+        }
         ResolvedOp::Binary {
             op,
             dst,
@@ -3189,9 +3235,13 @@ pub fn compile_arena_dag_with_ctx(
     // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
     // KernelFn ABI stay consistent with the selected width.
     //
-    // Expand transcendentals to primitive arithmetic first, so no backend ever
-    // sees Sin/Cos/etc. (one source of truth for the polynomial, in `lowering`).
-    let (arena, root) = lowering::expand_transcendentals_owned(arena, root);
+    // Lower memory reads (Gather -> index math + RawGather) and transcendentals
+    // to primitives, so no backend sees either. Both are no-ops when absent. A
+    // kernel that contains a gather reads its buffer bases from a context pointer
+    // in rdi; the emitted body is identical either way, so the caller simply
+    // invokes it as `CtxKernelFn` instead of `KernelFn`.
+    let (arena, root) = lowering::expand_gather_owned(arena, root);
+    let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
@@ -3336,6 +3386,11 @@ impl IsaBackend for X86Backend {
                 amount,
             } => {
                 emit_shift_imm(code, *op, *dst, *src, *amount);
+            }
+            ResolvedOp::Gather { .. } => {
+                // SSE2 has no native gather; the scalar-load lowering is a later
+                // slice. Only the AVX-512 path emits gather for now.
+                return Err("sse2: bound-memory gather not yet supported (AVX-512 only)");
             }
             ResolvedOp::Binary {
                 op,
@@ -3581,6 +3636,21 @@ impl IsaBackend for Avx512Backend {
                 // EVEX integer shift not wired yet -> exp/log don't lower on the
                 // AVX-512 path. Reject loudly rather than miscompile.
                 return Err("avx512: bit-shift (exp/log lowering) not yet supported");
+            }
+            ResolvedOp::Gather { dst, idx, slot } => {
+                // dst = buffer[slot][idx]. The context pointer (array of buffer
+                // base pointers) is caller-provided in rdi; arithmetic/const emit
+                // never touches rdi, so it survives to here. zmm13/zmm14 are the
+                // backend's reserved non-allocatable scratch (see UNARY_SCRATCH).
+                const IDX_INT: Reg = Reg(13);
+                const GATHER_DST: Reg = Reg(14);
+                const RAX: u8 = 0;
+                const RDI: u8 = 7;
+                avx512::emit_cvttps2dq(code, IDX_INT, *idx); // float idx -> int32 lanes
+                avx512::emit_set_gather_mask(code); // k1 = 0xFFFF (clobbers rax)
+                avx512::emit_load_ptr_from_ctx(code, RAX, RDI, (*slot as i32) * 8);
+                avx512::emit_gather(code, GATHER_DST, RAX, IDX_INT);
+                avx512::emit_mov(code, *dst, GATHER_DST);
             }
             ResolvedOp::Binary {
                 op,
@@ -5361,6 +5431,144 @@ mod tests {
                     w
                 );
             }
+        }
+
+        // ---- Bound-memory gather: JIT vs reference interpreter ----
+
+        type CtxK = unsafe extern "C" fn(
+            *const *const f32,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+            core::arch::x86_64::__m512,
+        ) -> core::arch::x86_64::__m512;
+
+        /// Run a compiled gather kernel as a `CtxKernelFn`: the context (array of
+        /// buffer base pointers) goes in rdi, coords in zmm0..3.
+        fn run16_ctx(
+            res: &CompileResult,
+            ctx: &[*const f32],
+            xs: [f32; 16],
+            ys: [f32; 16],
+        ) -> [f32; 16] {
+            unsafe {
+                use core::arch::x86_64::*;
+                let f: CtxK = res.code.as_fn();
+                let r = f(
+                    ctx.as_ptr(),
+                    _mm512_loadu_ps(xs.as_ptr()),
+                    _mm512_loadu_ps(ys.as_ptr()),
+                    _mm512_setzero_ps(),
+                    _mm512_setzero_ps(),
+                );
+                let mut out = [0.0f32; 16];
+                _mm512_storeu_ps(out.as_mut_ptr(), r);
+                out
+            }
+        }
+
+        /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
+        /// the reference interpreter, over the same coords and binding.
+        fn check_against_interp(
+            arena: &ExprArena,
+            root: ExprId,
+            buffers: &[&[f32]],
+            xs: [f32; 16],
+            ys: [f32; 16],
+            tag: &str,
+        ) {
+            let res = compile_arena_dag(arena, root).expect("compile gather kernel");
+            let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
+            let got = run16_ctx(&res, &ctx, xs, ys);
+
+            let bindings = crate::binding::BindingTable::bind(arena, buffers).unwrap();
+            for i in 0..16 {
+                let want =
+                    crate::eval::eval_scalar(arena, root, &[xs[i], ys[i], 0.0, 0.0], &bindings);
+                assert_eq!(got[i], want, "{tag} lane {i} (x={}, y={})", xs[i], ys[i]);
+            }
+        }
+
+        fn idx_lanes() -> ([f32; 16], [f32; 16]) {
+            // A spread of in-range, fractional, and out-of-range coordinates so
+            // the clamp and floor paths are all exercised.
+            let xs = [
+                0.0, 1.0, 2.9, 7.0, -3.0, 100.0, 4.0, 5.5, 6.0, 0.1, 3.0, 2.0, 1.9, 7.9, -0.5, 4.4,
+            ];
+            let ys = [
+                0.0, 0.0, 1.0, 1.9, 2.0, 2.0, -1.0, 3.0, 0.5, 2.9, 1.0, 3.9, 0.0, 2.0, 5.0, 1.0,
+            ];
+            (xs, ys)
+        }
+
+        #[test]
+        fn gather_jit_matches_interpreter() {
+            // 8x4 buffer, gather at (X, Y).
+            let (w, h) = (8usize, 4usize);
+            let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let root = a.push_gather(b, x, y);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
+        }
+
+        #[test]
+        fn gather_composed_with_arithmetic() {
+            // out = gather(buf, X, Y) * 2 + Y — proves gather is a schedulable
+            // mid-expression node, not just a whole-kernel root.
+            let (w, h) = (8usize, 4usize);
+            let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let g = a.push_gather(b, x, y);
+            let two = a.push_const(2.0);
+            let scaled = a.push_binary(OpKind::Mul, g, two);
+            let root = a.push_binary(OpKind::Add, scaled, y);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
+        }
+
+        #[test]
+        fn gather_two_buffers() {
+            // coverage.select via arithmetic: gA(X,Y) + gB(Y,X) with two distinct
+            // bound buffers, exercising slot 0 and slot 1 of the context.
+            let (w, h) = (6usize, 6usize);
+            let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
+            let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
+            let mut a = ExprArena::new();
+            let ba = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let bb = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let ga = a.push_gather(ba, x, y);
+            let gb = a.push_gather(bb, y, x);
+            let root = a.push_binary(OpKind::Add, ga, gb);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(
+                &a,
+                root,
+                &[buf_a.as_slice(), buf_b.as_slice()],
+                xs,
+                ys,
+                "2-buf",
+            );
         }
 
         /// sqrt(X*X + Y*Y) - Z, with a non-commutative shape and FMA-able terms,
