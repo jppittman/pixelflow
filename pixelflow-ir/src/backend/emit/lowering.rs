@@ -52,15 +52,19 @@ fn is_transcendental_binary(op: OpKind) -> bool {
     matches!(op, OpKind::Atan2)
 }
 
-/// Expand every transcendental node reachable from `root` into a primitive
-/// arithmetic subgraph, returning the (possibly new) root in the same arena.
+/// Post-order rebuild of the arena reachable from `root`, one lowering pass.
 ///
-/// Post-order rebuild over the arena, mirroring [`ExprArena::substitute_params`]:
-/// children are lowered first, then each node is re-emitted with its children
-/// remapped — except transcendental nodes, which are replaced by their
-/// polynomial expansion. Shared subexpressions are lowered once (the `id_map`
-/// dedups), so the DAG structure is preserved.
-pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
+/// For each node (children first), `lower(arena, node, map)` may return
+/// `Some(new)` to replace it — using `map(old_child)` to look up an
+/// already-lowered child — or `None` to keep it as a plain structural copy.
+/// Shared subexpressions are rebuilt once (`id_map` dedups), so a DAG stays a
+/// DAG. This is the single skeleton behind [`expand_transcendentals`],
+/// [`expand_gather`], and [`expand_reduce`]; each supplies only its `lower`
+/// hook. Mirrors [`ExprArena::substitute_params`].
+fn rebuild_arena<F>(arena: &mut ExprArena, root: ExprId, mut lower: F) -> ExprId
+where
+    F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Option<ExprId>,
+{
     let old_len = arena.nodes_raw().len();
     let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
 
@@ -77,67 +81,21 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
                     continue;
                 }
                 work.push(Task::Emit(id));
-                match arena.node(id).clone() {
-                    ExprNode::Var(_)
-                    | ExprNode::Const(_)
-                    | ExprNode::Param(_)
-                    | ExprNode::Buffer(_) => {}
-                    ExprNode::Unary(_, a) => work.push(Task::Descend(a)),
-                    ExprNode::Binary(_, a, b) => {
-                        work.push(Task::Descend(b));
-                        work.push(Task::Descend(a));
-                    }
-                    ExprNode::Ternary(_, a, b, c) => {
-                        work.push(Task::Descend(c));
-                        work.push(Task::Descend(b));
-                        work.push(Task::Descend(a));
-                    }
-                    ExprNode::Nary(_, start, len) => {
-                        let (s, l) = (start as usize, len as usize);
-                        let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
-                        for child in children.into_iter().rev() {
-                            work.push(Task::Descend(child));
-                        }
-                    }
+                // Descend children reversed so they emit left-to-right.
+                let children: Vec<ExprId> = arena.children(id).collect();
+                for child in children.into_iter().rev() {
+                    work.push(Task::Descend(child));
                 }
             }
             Task::Emit(id) => {
                 if id_map[id.0 as usize].is_some() {
                     continue;
                 }
+                let node = arena.node(id).clone();
                 let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
-                let new_id = match arena.node(id).clone() {
-                    ExprNode::Var(i) => arena.push_var(i),
-                    ExprNode::Const(v) => arena.push_const(v),
-                    ExprNode::Param(i) => arena.push_param(i),
-                    // Same arena, so the buffer table (and ids) stay valid.
-                    ExprNode::Buffer(b) => arena.push_buffer(b),
-                    ExprNode::Unary(op, a) => {
-                        let a = m(a);
-                        if is_transcendental_unary(op) {
-                            expand_unary(arena, op, a)
-                        } else {
-                            arena.push_unary(op, a)
-                        }
-                    }
-                    ExprNode::Binary(op, a, b) => {
-                        let (a, b) = (m(a), m(b));
-                        if is_transcendental_binary(op) {
-                            expand_binary(arena, op, a, b)
-                        } else {
-                            arena.push_binary(op, a, b)
-                        }
-                    }
-                    ExprNode::Ternary(op, a, b, c) => arena.push_ternary(op, m(a), m(b), m(c)),
-                    ExprNode::Nary(op, start, len) => {
-                        let (s, l) = (start as usize, len as usize);
-                        let mapped: Vec<ExprId> = arena.nary_children_raw()[s..s + l]
-                            .iter()
-                            .copied()
-                            .map(m)
-                            .collect();
-                        arena.push_nary(op, &mapped)
-                    }
+                let new_id = match lower(arena, &node, &m) {
+                    Some(new) => new,
+                    None => copy_node(arena, &node, &m),
                 };
                 id_map[id.0 as usize] = Some(new_id);
             }
@@ -145,6 +103,42 @@ pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
     }
 
     id_map[root.0 as usize].expect("root lowered")
+}
+
+/// Structural copy of `node` into `arena` with its children remapped by `m`.
+/// The default action for any node a lowering hook does not replace.
+fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprId) -> ExprId {
+    match node {
+        ExprNode::Var(i) => arena.push_var(*i),
+        ExprNode::Const(v) => arena.push_const(*v),
+        ExprNode::Param(i) => arena.push_param(*i),
+        // Same arena, so the buffer table (and ids) stay valid.
+        ExprNode::Buffer(b) => arena.push_buffer(*b),
+        ExprNode::Unary(op, a) => arena.push_unary(*op, m(*a)),
+        ExprNode::Binary(op, a, b) => arena.push_binary(*op, m(*a), m(*b)),
+        ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, m(*a), m(*b), m(*c)),
+        ExprNode::Nary(op, start, len) => {
+            let (s, l) = (*start as usize, *len as usize);
+            let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+            let mapped: Vec<ExprId> = children.into_iter().map(&m).collect();
+            arena.push_nary(*op, &mapped)
+        }
+    }
+}
+
+/// Expand every transcendental node reachable from `root` into a primitive
+/// arithmetic subgraph, returning the (possibly new) root in the same arena.
+/// Non-transcendental nodes are copied unchanged (see [`rebuild_arena`]).
+pub fn expand_transcendentals(arena: &mut ExprArena, root: ExprId) -> ExprId {
+    rebuild_arena(arena, root, |arena, node, m| match node {
+        ExprNode::Unary(op, a) if is_transcendental_unary(*op) => {
+            Some(expand_unary(arena, *op, m(*a)))
+        }
+        ExprNode::Binary(op, a, b) if is_transcendental_binary(*op) => {
+            Some(expand_binary(arena, *op, m(*a), m(*b)))
+        }
+        _ => None,
+    })
 }
 
 /// Convenience wrapper for the public `compile_arena_dag*` entries, which hold a
@@ -184,78 +178,12 @@ pub fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (ExprAre
 /// (`Floor`, `Clamp`, `Mul`, `Add`) plus the single `RawGather` primitive.
 /// This is the analogue of [`expand_transcendentals`] for memory reads.
 pub fn expand_gather(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    let old_len = arena.nodes_raw().len();
-    let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
-
-    enum Task {
-        Descend(ExprId),
-        Emit(ExprId),
-    }
-    let mut work: Vec<Task> = alloc::vec![Task::Descend(root)];
-
-    while let Some(task) = work.pop() {
-        match task {
-            Task::Descend(id) => {
-                if id_map[id.0 as usize].is_some() {
-                    continue;
-                }
-                work.push(Task::Emit(id));
-                match arena.node(id).clone() {
-                    ExprNode::Var(_)
-                    | ExprNode::Const(_)
-                    | ExprNode::Param(_)
-                    | ExprNode::Buffer(_) => {}
-                    ExprNode::Unary(_, a) => work.push(Task::Descend(a)),
-                    ExprNode::Binary(_, a, b) => {
-                        work.push(Task::Descend(b));
-                        work.push(Task::Descend(a));
-                    }
-                    ExprNode::Ternary(_, a, b, c) => {
-                        work.push(Task::Descend(c));
-                        work.push(Task::Descend(b));
-                        work.push(Task::Descend(a));
-                    }
-                    ExprNode::Nary(_, start, len) => {
-                        let (s, l) = (start as usize, len as usize);
-                        let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
-                        for child in children.into_iter().rev() {
-                            work.push(Task::Descend(child));
-                        }
-                    }
-                }
-            }
-            Task::Emit(id) => {
-                if id_map[id.0 as usize].is_some() {
-                    continue;
-                }
-                let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
-                let new_id = match arena.node(id).clone() {
-                    ExprNode::Var(i) => arena.push_var(i),
-                    ExprNode::Const(v) => arena.push_const(v),
-                    ExprNode::Param(i) => arena.push_param(i),
-                    ExprNode::Buffer(b) => arena.push_buffer(b),
-                    ExprNode::Unary(op, a) => arena.push_unary(op, m(a)),
-                    ExprNode::Binary(op, a, b) => arena.push_binary(op, m(a), m(b)),
-                    ExprNode::Ternary(OpKind::Gather, buf, x, y) => {
-                        lower_gather(arena, m(buf), m(x), m(y))
-                    }
-                    ExprNode::Ternary(op, a, b, c) => arena.push_ternary(op, m(a), m(b), m(c)),
-                    ExprNode::Nary(op, start, len) => {
-                        let (s, l) = (start as usize, len as usize);
-                        let mapped: Vec<ExprId> = arena.nary_children_raw()[s..s + l]
-                            .iter()
-                            .copied()
-                            .map(m)
-                            .collect();
-                        arena.push_nary(op, &mapped)
-                    }
-                };
-                id_map[id.0 as usize] = Some(new_id);
-            }
+    rebuild_arena(arena, root, |arena, node, m| match node {
+        ExprNode::Ternary(OpKind::Gather, buf, x, y) => {
+            Some(lower_gather(arena, m(*buf), m(*x), m(*y)))
         }
-    }
-
-    id_map[root.0 as usize].expect("root lowered")
+        _ => None,
+    })
 }
 
 /// Owned wrapper mirroring [`expand_transcendentals_owned`]: identity fast-path
@@ -316,86 +244,20 @@ fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> Exp
 /// fold compiles to a flat, call-free, unrolled kernel. This is the reduction
 /// analogue of [`expand_gather`].
 pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    let old_len = arena.nodes_raw().len();
-    let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
-
-    enum Task {
-        Descend(ExprId),
-        Emit(ExprId),
-    }
-    let mut work: Vec<Task> = alloc::vec![Task::Descend(root)];
-
-    while let Some(task) = work.pop() {
-        match task {
-            Task::Descend(id) => {
-                if id_map[id.0 as usize].is_some() {
-                    continue;
-                }
-                work.push(Task::Emit(id));
-                match arena.node(id).clone() {
-                    ExprNode::Var(_)
-                    | ExprNode::Const(_)
-                    | ExprNode::Param(_)
-                    | ExprNode::Buffer(_) => {}
-                    ExprNode::Unary(_, a) => work.push(Task::Descend(a)),
-                    ExprNode::Binary(_, a, b) => {
-                        work.push(Task::Descend(b));
-                        work.push(Task::Descend(a));
-                    }
-                    ExprNode::Ternary(_, a, b, c) => {
-                        work.push(Task::Descend(c));
-                        work.push(Task::Descend(b));
-                        work.push(Task::Descend(a));
-                    }
-                    ExprNode::Nary(_, start, len) => {
-                        let (s, l) = (start as usize, len as usize);
-                        let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
-                        for child in children.into_iter().rev() {
-                            work.push(Task::Descend(child));
-                        }
-                    }
-                }
-            }
-            Task::Emit(id) => {
-                if id_map[id.0 as usize].is_some() {
-                    continue;
-                }
-                let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
-                let new_id = match arena.node(id).clone() {
-                    ExprNode::Var(i) => arena.push_var(i),
-                    ExprNode::Const(v) => arena.push_const(v),
-                    ExprNode::Param(i) => arena.push_param(i),
-                    ExprNode::Buffer(b) => arena.push_buffer(b),
-                    ExprNode::Unary(op, a) => arena.push_unary(op, m(a)),
-                    ExprNode::Binary(op, a, b) => arena.push_binary(op, m(a), m(b)),
-                    ExprNode::Ternary(op, a, b, c) => arena.push_ternary(op, m(a), m(b), m(c)),
-                    ExprNode::Nary(OpKind::Reduce, start, len) => {
-                        let (s, l) = (start as usize, len as usize);
-                        debug_assert_eq!(l, 4, "Reduce has 4 children");
-                        let ch: [ExprId; 4] = {
-                            let raw = &arena.nary_children_raw()[s..s + l];
-                            [raw[0], raw[1], raw[2], raw[3]]
-                        };
-                        // Children are already lowered; read the (lowered) Const
-                        // metadata and unroll over the lowered body.
-                        unroll_reduce(arena, m(ch[0]), m(ch[1]), m(ch[2]), m(ch[3]))
-                    }
-                    ExprNode::Nary(op, start, len) => {
-                        let (s, l) = (start as usize, len as usize);
-                        let mapped: Vec<ExprId> = arena.nary_children_raw()[s..s + l]
-                            .iter()
-                            .copied()
-                            .map(m)
-                            .collect();
-                        arena.push_nary(op, &mapped)
-                    }
-                };
-                id_map[id.0 as usize] = Some(new_id);
-            }
+    rebuild_arena(arena, root, |arena, node, m| match node {
+        ExprNode::Nary(OpKind::Reduce, start, len) => {
+            let (s, l) = (*start as usize, *len as usize);
+            debug_assert_eq!(l, 4, "Reduce has 4 children");
+            let ch: [ExprId; 4] = {
+                let raw = &arena.nary_children_raw()[s..s + l];
+                [raw[0], raw[1], raw[2], raw[3]]
+            };
+            // Children are already lowered; read the (lowered) Const metadata
+            // and unroll over the lowered body.
+            Some(unroll_reduce(arena, m(ch[0]), m(ch[1]), m(ch[2]), m(ch[3])))
         }
-    }
-
-    id_map[root.0 as usize].expect("root lowered")
+        _ => None,
+    })
 }
 
 /// Owned wrapper mirroring [`expand_transcendentals_owned`]: identity fast-path

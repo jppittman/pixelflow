@@ -1,6 +1,8 @@
 # Kernels and Lattices: Bound Memory in the Language
 
-**Status:** Draft for review (June 13, 2026)
+**Status:** IR + lowering + interpreter + AVX-512 JIT + internal-loop collapse
+implemented and hardware-tested (June 2026). SSE2/aarch64 gather, 2-D collapse,
+and the fonts/ML consumers remain — see Milestones.
 
 Builds on: [LATTICE_EVAL.md](LATTICE_EVAL.md) (lattice as representable functor),
 [lattice-scheduling-types.md](lattice-scheduling-types.md) (variance as schedule),
@@ -284,7 +286,7 @@ store op.
 
 | Crate | Change |
 |---|---|
-| `pixelflow-ir` | `ExprNode::Buffer`, `BufferDecl` table on arena; `OpKind::Gather`, `OpKind::Reduce*` (+ arity/cost/name/emit metadata); variance: high-nibble reduce vars, gather = union of indices, reduce removes its var; emitter: gather lowering per backend, reduce lowering with unroll heuristics, address/value const-folding; `BindingTable`; `JitManifold` holds `Arc`s |
+| `pixelflow-ir` | `ExprNode::Buffer` + `BufferDecl` table on arena; `OpKind::Gather`/`RawGather`/`Reduce` (single reduce op, combiner as a child); variance: gather = union of index variances; lowering (`expand_gather`/`expand_reduce`, sharing one `rebuild_arena` skeleton); AVX-512 `vgatherdps` + the internal-loop collapse driver (`emit_dag_body` + loop scaffold); `BindingTable` + reference interpreter. Remaining: SSE2/aarch64 gather, `Frozen`/`Pinned` binding + `Arc`-owning `JitManifold` |
 | `pixelflow-core` | `DiscreteManifold` buffer → `Arc<[f32]>` + `freeze()`; delete `combinators/texture.rs` in favor of `DiscreteManifold`; lattice `collapse` JIT fast path (the TODO at `lattice/mod.rs:13-15`) |
 | `pixelflow-compiler` | `kernel!` grows lattice parameters: `kernel!(\|atlas: lattice<W, H>\| atlas(X * 2.0, Y))` → `Gather`; `sum(i, N, body)` → `Reduce`; sema rejects out-of-scope reduce vars |
 | `pixelflow-search` | rewrite rules: gather CSE, hoisting uniform-index gathers, reduce linearity (`Σ(a·f + g) = a·Σf + Σg`), reduce-of-select; NNUE features for the new ops |
@@ -293,20 +295,43 @@ store op.
 
 ## Milestones (independently landable)
 
-1. **M1 — Memory in the IR.** `Buffer` leaf, `BufferDecl`, `Gather`,
-   variance, interpreter execution via existing `Field::gather`. Tests:
-   gather round-trips `DiscreteManifold::eval`.
-2. **M2 — JIT binding.** `BindingTable`, `Arc` lifetimes, gather emission on
-   all backends, address immediates, Frozen value folding. Tests: JIT vs
-   interpreter equivalence on sampled kernels.
-3. **M3 — Reduce + unrolling.** `Reduce*` ops, high-nibble variance, emitter
-   unroll heuristics, `collapse_axis` lowering to the JIT. Tests: dot
-   product/matmul vs interpreted lattice results; benchmark unrolled vs
-   interpreted inner product.
-4. **M4 — Fonts unification.** `Texture` → `DiscreteManifold`; atlas sampled
-   in-kernel; terminal frame through the JIT end to end.
-5. **M5 — ML inference.** NNUE forward pass as bound kernels; benchmark
-   against the ad-hoc path.
+Status as of Jun 2026 — the IR / lowering / interpreter / AVX-512 JIT and the
+internal-loop collapse driver are **implemented and hardware-tested**; the
+remaining backends and the fonts/ML consumers are the follow-on work (the
+"move to the MacBook" step).
+
+1. ✅ **M1 — Memory in the IR.** `Buffer` leaf + `BufferDecl` table, `OpKind::Gather`,
+   variance (`Buffer` = `CONST`, `Gather` = union of index variances). Reference
+   interpreter (`eval::eval_scalar`) executes `Gather` via a borrowed
+   `BindingTable`; a round-trip test asserts equivalence to `DiscreteManifold::eval`.
+2. ✅ **M2 — Gather lowering + AVX-512 JIT.** `Gather` lowers to index math +
+   `OpKind::RawGather` (`expand_gather`), so no backend sees the high-level op.
+   AVX-512 emits `vgatherdps` (`emit_gather` et al.), threading buffer bases
+   through a context pointer in `rdi` (`CtxKernelFn`) — coords stay in `zmm0..3`,
+   so the body is byte-identical to a plain kernel. Tests: JIT == interpreter,
+   incl. composition and multi-buffer. **SSE2/aarch64 gather (scalar-loads) is
+   the remaining backend work.**
+3. ✅ **M3 — Reduce + unrolling.** One `OpKind::Reduce` (combiner as a `Const`
+   child; no `ReduceAdd/Mul/…` proliferation). `expand_reduce` unrolls it into a
+   flat accumulation, so bound-extent gather indices go constant → address
+   folding. `sum`/`dot`/`matmul` are library compositions of `Reduce` + `Gather`,
+   not new primitives. Tests: interpreter folds, lowering-equivalence, matmul
+   dot-over-gather; matmul JIT == interpreter on hardware.
+4. ✅ **#1 — Internal-loop collapse driver.** `compile_collapse_avx512` emits the
+   domain loop *inside* the kernel (`emit_dag_body` + a loop scaffold), so a whole
+   lattice collapse is **one call** with no per-batch boundary — coordinates are
+   induction values. Test: `out(j)=Σ W(i,j)·input(i)` filled in one call, matching
+   the interpreter for all lanes. Currently a 1-D output domain; 2-D frames (nested
+   loop) are a follow-on.
+5. ◻ **M4 — Fonts unification.** `Texture` → `DiscreteManifold`; glyph atlas as a
+   frozen lattice sampled in-kernel; terminal frame through the JIT end to end.
+6. ◻ **M5 — ML inference.** NNUE forward pass as bound kernels; benchmark against
+   the ad-hoc path.
+
+Not yet built (deferred by design): the `Frozen`/`Pinned` binding distinction and
+`Arc`-owning `JitManifold` (the interpreter binding borrows; JIT tests pass raw
+base pointers), the `kernel!` lattice/`sum` surface syntax, and the e-graph/NNUE
+rules for the new ops.
 
 ## Open Questions
 

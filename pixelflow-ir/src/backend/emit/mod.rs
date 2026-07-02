@@ -686,7 +686,6 @@ pub fn compile_arena_dag_scanline(
     compile_arena_dag_scanline_hoisted(arena, root)
 }
 
-
 // =============================================================================
 // Variance-aware hoisted scanline compilation
 // =============================================================================
