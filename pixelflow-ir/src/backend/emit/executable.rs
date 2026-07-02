@@ -430,6 +430,18 @@ pub type ScanlineKernelFn = extern "C" fn(
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub type KernelFn = extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
 
+/// JIT-compiled kernel that reads bound memory (x86-64 AVX-512).
+///
+/// Identical to [`KernelFn`] plus a leading context pointer: an array of buffer
+/// base pointers, one per declared [`BufferId`](crate::arena::BufferId) in slot
+/// order. System V places this integer-class pointer in `rdi`, disjoint from the
+/// coordinate vectors in `zmm0..3`, so the emitted body is byte-for-byte the
+/// same as a `KernelFn` — only kernels containing a `Gather` read `rdi`. The
+/// caller picks this type iff the arena declared buffers.
+#[allow(improper_ctypes_definitions)]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub type CtxKernelFn = extern "C" fn(*const *const f32, __m512, __m512, __m512, __m512) -> __m512;
+
 #[allow(improper_ctypes_definitions)]
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
