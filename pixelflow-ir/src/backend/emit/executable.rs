@@ -442,6 +442,19 @@ pub type KernelFn = extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub type CtxKernelFn = extern "C" fn(*const *const f32, __m512, __m512, __m512, __m512) -> __m512;
 
+/// JIT-compiled *collapse* kernel (x86-64 AVX-512): the whole lattice domain
+/// loop is inside the emitted code, so one call fills the entire output — no
+/// per-batch Rust↔JIT boundary. This is the internal-loop realization of the
+/// lattice: coordinates are induction values, not arguments.
+///
+/// SysV argument registers: `rdi` = context (array of buffer base pointers),
+/// `rsi` = `xs` (domain X coordinates, 16-lane groups), `rdx` = `out` (output,
+/// 16-lane groups), `rcx` = `groups` (number of 16-lane groups). Y/Z/W are zero
+/// inside the kernel. `xs`/`out` are read/written 64 bytes at a time and must
+/// hold at least `groups * 16` f32s.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub type CollapseKernelFn = extern "C" fn(*const *const f32, *const f32, *mut f32, usize);
+
 #[allow(improper_ctypes_definitions)]
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
