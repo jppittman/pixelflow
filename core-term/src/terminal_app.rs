@@ -287,12 +287,26 @@ impl TerminalApp {
         let default_fg = self.config.colors.foreground;
         let default_bg = self.config.colors.background;
 
+        if rows == 0 || cols == 0 {
+            let (r, g, b, a) = default_bg.to_f32_rgba();
+            return (
+                Arc::new(At {
+                    inner: ColorCube::default(),
+                    x: r,
+                    y: g,
+                    z: b,
+                    w: a,
+                }),
+                (grid_width, grid_height),
+            );
+        }
+
         // Build 2-level BSP: Vertical (Rows) -> Horizontal (Cells)
-        let mut row_items = Vec::new();
+        let mut row_items = Vec::with_capacity(rows);
 
         for row in 0..rows {
             let line = &snapshot.lines[row];
-            let mut cell_items = Vec::new();
+            let mut cell_items = Vec::with_capacity(cols);
 
             for col in 0..cols {
                 let glyph = &line.cells[col];
