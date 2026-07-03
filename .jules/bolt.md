@@ -21,3 +21,6 @@
 ## 2024-07-02 - Fix Flaky Test shutdown_drain_all_timeout_fallback
 **Learning:** `shutdown_drain_all_timeout_fallback` frequently flaked on CI due to a very tight hardcoded timeout bound (`< 150ms`).
 **Action:** Relaxed the hardcoded timing threshold in flaky tests to generous values (e.g., `500ms`) when explicitly assigned to fix them, per testing resiliency rules.
+## 2024-07-03 - Enforcing Match Over Else If
+**Learning:** `STYLE.md` strictly dictates the use of `match` over `if`/`else if` chains when dealing with a fixed set of conditions (like specific string literal matching). The codebase contained instances where strings were checked sequentially using `else if`, which violates this structural style rule and is less idiomatic in Rust.
+**Action:** When adding new conditional logic checking against known literal values, proactively use `match` statements instead of chained `if`/`else if` blocks to ensure compliance with project style guidelines.

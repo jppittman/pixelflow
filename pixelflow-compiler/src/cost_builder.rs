@@ -40,17 +40,17 @@ fn parse_cost_model_toml(toml: &str) -> CostModel {
             let key = key.trim();
             let value = value.trim();
             if let Ok(v) = value.parse::<usize>() {
-                if key == "depth_threshold" {
-                    model.depth_threshold = v;
-                } else if key == "depth_penalty" {
-                    model.depth_penalty = v;
-                } else {
-                    // Try to match OpKind by name
-                    for i in 0..OpKind::COUNT {
-                        if let Some(op) = OpKind::from_index(i) {
-                            if op.name() == key {
-                                model.set_cost(op, v);
-                                break;
+                match key {
+                    "depth_threshold" => model.depth_threshold = v,
+                    "depth_penalty" => model.depth_penalty = v,
+                    _ => {
+                        // Try to match OpKind by name
+                        for i in 0..OpKind::COUNT {
+                            if let Some(op) = OpKind::from_index(i) {
+                                if op.name() == key {
+                                    model.set_cost(op, v);
+                                    break;
+                                }
                             }
                         }
                     }
