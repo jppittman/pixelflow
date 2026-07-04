@@ -21,3 +21,6 @@
 ## 2024-07-02 - Fix Flaky Test shutdown_drain_all_timeout_fallback
 **Learning:** `shutdown_drain_all_timeout_fallback` frequently flaked on CI due to a very tight hardcoded timeout bound (`< 150ms`).
 **Action:** Relaxed the hardcoded timing threshold in flaky tests to generous values (e.g., `500ms`) when explicitly assigned to fix them, per testing resiliency rules.
+## 2024-07-04 - Style Enforcement: Avoiding else if chains
+**Learning:** Enforcing the `STYLE.md` guideline to prefer `match` over `else if` chains improves code clarity, especially for conditional branching. However, directly translating an `else if` with a complex logical condition into a `match` might require matching on a dummy value like `()` and using match guards (`_ if condition =>`) when the conditions are not easily expressible as simple enum patterns.
+**Action:** When refactoring `else if` statements to `match` statements based on style guidelines, use the `match () { _ if condition => ... }` pattern if the conditions involve complex boolean logic or external state checks that cannot be directly matched against a single variable.
