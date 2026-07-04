@@ -21,3 +21,6 @@
 ## 2024-07-02 - Fix Flaky Test shutdown_drain_all_timeout_fallback
 **Learning:** `shutdown_drain_all_timeout_fallback` frequently flaked on CI due to a very tight hardcoded timeout bound (`< 150ms`).
 **Action:** Relaxed the hardcoded timing threshold in flaky tests to generous values (e.g., `500ms`) when explicitly assigned to fix them, per testing resiliency rules.
+## 2025-07-04 - Enforcing Style Guidelines for else if
+**Learning:** Found deep `else if` chains violating the `STYLE.md` guideline to prefer `match` over `else if`. While refactoring, it's important not to mix initial `if` with `match ()` in the `else` branch, and match directly on the subject variable.
+**Action:** Replaced `else if` chains evaluating floats with `match` blocks directly matching on the variable with guard clauses.

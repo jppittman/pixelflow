@@ -38,25 +38,18 @@ use pixelflow_ir::EmitStyle;
 
 /// Format a constant value as Rust code.
 fn format_const(v: f32) -> String {
-    if v.is_nan() {
-        "f32::NAN".to_string()
-    } else if v.is_infinite() {
-        if v.is_sign_positive() {
-            "f32::INFINITY".to_string()
-        } else {
-            "f32::NEG_INFINITY".to_string()
+    match v {
+        _ if v.is_nan() => "f32::NAN".to_string(),
+        _ if v.is_infinite() && v.is_sign_positive() => "f32::INFINITY".to_string(),
+        _ if v.is_infinite() => "f32::NEG_INFINITY".to_string(),
+        _ if v == 0.0 => "0.0".to_string(),
+        _ if v == 1.0 => "1.0".to_string(),
+        _ if v == -1.0 => "(-1.0)".to_string(),
+        _ if v.fract() == 0.0 && v.abs() < 1000.0 => {
+            // Integer-valued floats
+            format!("{:.1}", v)
         }
-    } else if v == 0.0 {
-        "0.0".to_string()
-    } else if v == 1.0 {
-        "1.0".to_string()
-    } else if v == -1.0 {
-        "(-1.0)".to_string()
-    } else if v.fract() == 0.0 && v.abs() < 1000.0 {
-        // Integer-valued floats
-        format!("{:.1}", v)
-    } else {
-        format!("({:.6})", v)
+        _ => format!("({:.6})", v),
     }
 }
 
