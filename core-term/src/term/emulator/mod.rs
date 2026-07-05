@@ -279,13 +279,17 @@ impl TerminalEmulator {
         let old_offset = self.viewport_offset;
         let max_offset = self.screen.scrollback.len();
 
-        if lines > 0 {
-            // Scroll up into history
-            self.viewport_offset = (self.viewport_offset + lines as usize).min(max_offset);
-        } else if lines < 0 {
-            // Scroll down toward live screen
-            let abs_lines = (-lines) as usize;
-            self.viewport_offset = self.viewport_offset.saturating_sub(abs_lines);
+        match lines.cmp(&0) {
+            std::cmp::Ordering::Greater => {
+                // Scroll up into history
+                self.viewport_offset = (self.viewport_offset + lines as usize).min(max_offset);
+            }
+            std::cmp::Ordering::Less => {
+                // Scroll down toward live screen
+                let abs_lines = (-lines) as usize;
+                self.viewport_offset = self.viewport_offset.saturating_sub(abs_lines);
+            }
+            std::cmp::Ordering::Equal => {}
         }
 
         // Mark all lines dirty if viewport changed

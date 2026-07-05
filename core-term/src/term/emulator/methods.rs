@@ -74,10 +74,14 @@ impl TerminalEmulator {
         let screen_ctx = self.current_screen_context();
         let (_, current_physical_y) = self.cursor_controller.physical_screen_pos(&screen_ctx);
 
-        if current_physical_y == screen_ctx.scroll_bot {
-            self.screen.scroll_up(1, ScrollHistory::Save);
-        } else if current_physical_y < screen_ctx.height.saturating_sub(1) {
-            self.cursor_controller.move_down(1, &screen_ctx);
+        match current_physical_y {
+            y if y == screen_ctx.scroll_bot => {
+                self.screen.scroll_up(1, ScrollHistory::Save);
+            }
+            y if y < screen_ctx.height.saturating_sub(1) => {
+                self.cursor_controller.move_down(1, &screen_ctx);
+            }
+            _ => {}
         }
         if current_physical_y < self.screen.height {
             self.screen.mark_line_dirty(current_physical_y);

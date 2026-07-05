@@ -14,10 +14,14 @@ impl TerminalEmulator {
         let screen_ctx = self.current_screen_context();
         let (_, current_physical_y) = self.cursor_controller.physical_screen_pos(&screen_ctx);
 
-        if current_physical_y == screen_ctx.scroll_top {
-            self.screen.scroll_down(1);
-        } else if current_physical_y > 0 {
-            self.cursor_controller.move_up(1);
+        match current_physical_y {
+            y if y == screen_ctx.scroll_top => {
+                self.screen.scroll_down(1);
+            }
+            y if y > 0 => {
+                self.cursor_controller.move_up(1);
+            }
+            _ => {}
         }
         if current_physical_y < self.screen.height {
             self.screen.mark_line_dirty(current_physical_y);
@@ -233,19 +237,23 @@ impl TerminalEmulator {
             // Cursor logical_y is the same as physical_y.
             // Scrolling should occur if the cursor is at the bottom of the active scrolling region (scroll_bot).
             // This aligns with st.c's tnewline behavior: `if (y == term.bot) tscrollup(term.top, 1);`
-            if current_physical_y == screen_ctx.scroll_bot {
-                self.screen.scroll_up(1, ScrollHistory::Save); // scroll_up uses screen.scroll_top and screen.scroll_bot
-                scrolled_this_op = true;
-                log::trace!(
-                    "move_down_one_line (origin_mode OFF): Scrolled region [{},{}] due to cursor at scroll_bot ({})",
-                    screen_ctx.scroll_top, screen_ctx.scroll_bot, current_physical_y
-                );
-                // Cursor logical_y (and physical_y) effectively stays on this line (screen_ctx.scroll_bot),
-                // which is now blanked due to the scroll. The subsequent carriage_return (if part of LF handling)
-                // will move the cursor to column 0 of this line.
-            } else if current_physical_y < screen_ctx.height.saturating_sub(1) {
-                // Not at scroll_bot, and also not at the very last physical line of the screen, so simply move down.
-                self.cursor_controller.move_down(1, &screen_ctx);
+            match current_physical_y {
+                y if y == screen_ctx.scroll_bot => {
+                    self.screen.scroll_up(1, ScrollHistory::Save); // scroll_up uses screen.scroll_top and screen.scroll_bot
+                    scrolled_this_op = true;
+                    log::trace!(
+                        "move_down_one_line (origin_mode OFF): Scrolled region [{},{}] due to cursor at scroll_bot ({})",
+                        screen_ctx.scroll_top, screen_ctx.scroll_bot, current_physical_y
+                    );
+                    // Cursor logical_y (and physical_y) effectively stays on this line (screen_ctx.scroll_bot),
+                    // which is now blanked due to the scroll. The subsequent carriage_return (if part of LF handling)
+                    // will move the cursor to column 0 of this line.
+                }
+                y if y < screen_ctx.height.saturating_sub(1) => {
+                    // Not at scroll_bot, and also not at the very last physical line of the screen, so simply move down.
+                    self.cursor_controller.move_down(1, &screen_ctx);
+                }
+                _ => {}
             }
             // If current_physical_y == screen_ctx.height.saturating_sub(1) AND it was NOT screen_ctx.scroll_bot
             // (i.e., cursor is on physical last line, but this line is *below* a smaller active scroll region),

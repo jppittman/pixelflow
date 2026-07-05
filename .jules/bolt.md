@@ -21,3 +21,7 @@
 ## 2024-07-02 - Fix Flaky Test shutdown_drain_all_timeout_fallback
 **Learning:** `shutdown_drain_all_timeout_fallback` frequently flaked on CI due to a very tight hardcoded timeout bound (`< 150ms`).
 **Action:** Relaxed the hardcoded timing threshold in flaky tests to generous values (e.g., `500ms`) when explicitly assigned to fix them, per testing resiliency rules.
+
+## 2024-07-05 - Refactoring Control Flow in core-term
+**Learning:** Rust's `match` expressions offer safer and more idiomatic control flow than `else if` chains, especially when matching on multiple boolean flags (which can be grouped into tuples) or fixed conditions.
+**Action:** Always prefer `match` over `else if` when dealing with multiple interrelated conditions. When converting, ensure direct matching on variables or tuples rather than using the `match () { _ if condition => }` anti-pattern.

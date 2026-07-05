@@ -614,26 +614,11 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 log::trace!("Mouse move: cell ({}, {})", col, row);
                 // any-event mode (1003) reports all motion;
                 // button-event mode (1002) only reports motion while a button is held
-                if self.emulator.reports_all_motion() {
-                    let button = self
-                        .pressed_mouse_button
-                        .unwrap_or(pixelflow_runtime::input::MouseButton::Left);
-                    if let Some(bytes) =
-                        self.emulator
-                            .encode_mouse_event(crate::term::MouseEncodingParams {
-                                button,
-                                col,
-                                row,
-                                kind: crate::term::MouseEventKind::Motion,
-                            })
-                    {
-                        if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
-                            log::warn!("Failed to send mouse motion to PTY: {}", e);
-                        }
-                    }
-                } else if self.emulator.reports_button_motion() {
-                    // button-event mode: only report when a button is held
-                    if let Some(button) = self.pressed_mouse_button {
+                match (self.emulator.reports_all_motion(), self.emulator.reports_button_motion()) {
+                    (true, _) => {
+                        let button = self
+                            .pressed_mouse_button
+                            .unwrap_or(pixelflow_runtime::input::MouseButton::Left);
                         if let Some(bytes) =
                             self.emulator
                                 .encode_mouse_event(crate::term::MouseEncodingParams {
@@ -648,6 +633,25 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                             }
                         }
                     }
+                    (false, true) => {
+                        // button-event mode: only report when a button is held
+                        if let Some(button) = self.pressed_mouse_button {
+                            if let Some(bytes) =
+                                self.emulator
+                                    .encode_mouse_event(crate::term::MouseEncodingParams {
+                                        button,
+                                        col,
+                                        row,
+                                        kind: crate::term::MouseEventKind::Motion,
+                                    })
+                            {
+                                if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
+                                    log::warn!("Failed to send mouse motion to PTY: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             EngineEventManagement::MouseScroll {
