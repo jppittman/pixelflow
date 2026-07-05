@@ -264,9 +264,11 @@ fn extract_modifiers(state: u32) -> Modifiers {
 
 fn xkeysym_to_keysymbol(keysym_val: xlib::KeySym, text: &str) -> KeySymbol {
     if !text.is_empty() {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() == 1 && chars[0] != '\u{FFFD}' {
-            return KeySymbol::Char(chars[0]);
+        let mut chars = text.chars();
+        if let Some(c) = chars.next() {
+            if chars.next().is_none() && c != '\u{FFFD}' {
+                return KeySymbol::Char(c);
+            }
         }
     }
     match keysym_val as u32 {
