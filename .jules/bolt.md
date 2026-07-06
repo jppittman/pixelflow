@@ -21,3 +21,6 @@
 ## 2024-07-02 - Fix Flaky Test shutdown_drain_all_timeout_fallback
 **Learning:** `shutdown_drain_all_timeout_fallback` frequently flaked on CI due to a very tight hardcoded timeout bound (`< 150ms`).
 **Action:** Relaxed the hardcoded timing threshold in flaky tests to generous values (e.g., `500ms`) when explicitly assigned to fix them, per testing resiliency rules.
+## 2026-07-02 - Test Naming Style Enforcement
+**Learning:** The project's style guidelines strictly prohibit the use of generic `test_` prefixes for test function names.
+**Action:** When creating new tests or refactoring existing ones, always strip the `test_` prefix. If the resulting name starts with a digit or shadows an existing symbol, prepend `verify_` instead.
