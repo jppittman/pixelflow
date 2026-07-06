@@ -2,8 +2,6 @@
 //!
 //! cargo run --release -p pixelflow-pipeline --features training --bin bench_scanline_jit
 
-use pixelflow_ir::ScanlineJitManifold;
-use pixelflow_ir::backend::emit::compile_arena_dag_scanline;
 use pixelflow_pipeline::jit_bench::benchmark_jit_arena;
 use pixelflow_pipeline::training::factored::parse_kernel_code_arena;
 
@@ -29,7 +27,7 @@ fn main() {
     let first_line = content.lines().next().expect("empty file");
     let d: serde_json::Value = serde_json::from_str(first_line).expect("parse json");
     let code = d["expression"].as_str().expect("no expression field");
-    let name = d["name"].as_str().unwrap_or("?");
+    let _name = d["name"].as_str().unwrap_or("?");
 
     let (arena, root) = parse_kernel_code_arena(code).expect("parse failed");
 

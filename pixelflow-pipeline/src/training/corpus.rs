@@ -128,6 +128,9 @@ fn write_node(w: &mut impl Write, node: &ExprNode) -> io::Result<()> {
             w.write_all(&start.to_le_bytes())?;
             w.write_all(&len.to_le_bytes())?;
         }
+        ExprNode::Buffer(_) => {
+            panic!("Serialization for ExprNode::Buffer not implemented yet")
+        }
     }
     Ok(())
 }

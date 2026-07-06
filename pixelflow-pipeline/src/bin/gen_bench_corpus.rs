@@ -294,6 +294,7 @@ fn arena_structural_key(arena: &ExprArena, root: ExprId) -> Vec<SigNode> {
                         let child_ids: Vec<u32> = children.iter().map(|child| ids[child]).collect();
                         SigNode::Nary(*op, child_ids.into_boxed_slice())
                     }
+                    ExprNode::Buffer(_) => panic!("Buffer not supported in gen_bench_corpus"),
                 };
                 let sig_id = signatures.len() as u32;
                 signatures.push(sig);
@@ -308,7 +309,7 @@ fn arena_structural_key(arena: &ExprArena, root: ExprId) -> Vec<SigNode> {
 fn main() {
     let args = Args::parse();
 
-    let per_band = (args.target + BANDS.len() - 1) / BANDS.len();
+    let per_band = args.target.div_ceil(BANDS.len());
     let mut seen = HashSet::new();
     let mut entries: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = Vec::new();
     let mut skipped_too_large = 0usize;
