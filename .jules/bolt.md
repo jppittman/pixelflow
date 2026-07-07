@@ -24,3 +24,6 @@
 ## 2025-12-29 - Avoid Intermediate Vectors and use Vec::with_capacity
 **Learning:** Performance can be impacted by intermediate allocations like `text.chars().collect::<Vec<char>>()` when extracting small segments.
 **Action:** Avoid `.collect()` into an intermediate Vector when doing simple tasks like extracting characters or single items, and instead use the Iterator functions directly (`chars.next()`). Also use `Vec::with_capacity` when the required capacity is known ahead of time.
+## 2024-07-07 - Avoid else if chains by matching boolean tuples
+**Learning:** In Rust, complex `if / else if` chains evaluating multiple boolean conditions can be refactored into `match` expressions matching over a tuple of booleans (e.g., `match (cond1, cond2)`). This conforms to the idiom of preferring `match` over `else if`.
+**Action:** Use tuple matching for multiple condition evaluation instead of chaining `else if` statements when updating control flow.
