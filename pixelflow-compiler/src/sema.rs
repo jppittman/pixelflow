@@ -50,7 +50,8 @@ pub struct AnalyzedKernel {
 pub fn analyze(kernel: KernelDef) -> syn::Result<AnalyzedKernel> {
     // Anonymous kernels (no struct_decl) allow captured variables from environment
     let is_anonymous = kernel.struct_decl.is_none();
-    let mut analyzer = SemanticAnalyzer::new(is_anonymous);
+    let kernel_type = if is_anonymous { KernelType::Anonymous } else { KernelType::Named };
+    let mut analyzer = SemanticAnalyzer::new(kernel_type);
 
     // Register all parameters in the symbol table
     for param in &kernel.params {
@@ -73,11 +74,17 @@ struct SemanticAnalyzer {
     is_anonymous: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelType {
+    Anonymous,
+    Named,
+}
+
 impl SemanticAnalyzer {
-    fn new(is_anonymous: bool) -> Self {
+    fn new(kernel_type: KernelType) -> Self {
         SemanticAnalyzer {
             symbols: SymbolTable::new(),
-            is_anonymous,
+            is_anonymous: kernel_type == KernelType::Anonymous,
         }
     }
 
