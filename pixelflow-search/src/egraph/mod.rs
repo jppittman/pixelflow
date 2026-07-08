@@ -23,6 +23,7 @@ pub(crate) mod extract;
 mod graph;
 mod node;
 pub mod ops;
+pub mod provenance;
 pub mod rewrite;
 pub mod saturate;
 
@@ -37,6 +38,10 @@ pub use extract::{
 pub use graph::{ApplyResult, EGraph, EGraphBatch, RewriteTarget};
 pub use node::{EClassId, ENode};
 pub use ops::Op;
+pub use provenance::{
+    ApplicationId, ApplicationRecord, ENodeId, Origin, Provenance, UnionEvent,
+    derivation_ancestors, format_derivation_trace,
+};
 pub use rewrite::{Rewrite, RewriteAction};
 pub use saturate::{SaturationResult, achievable_cost_within_budget, saturate_with_budget};
 
