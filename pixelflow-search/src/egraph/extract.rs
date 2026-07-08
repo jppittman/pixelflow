@@ -54,28 +54,7 @@ impl<'a> IncrementalExtractor<'a> {
         // NNUE extraction head certifies as cheaper.
         let num_classes = egraph.num_classes();
         let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
-        // Index 0 in each e-class is the original node (first added).
-        // Only set choices for classes reachable from root.
-        {
-            let mut stack = alloc::vec![root_class];
-            let mut visited = alloc::vec![false; num_classes];
-            while let Some(class) = stack.pop() {
-                let canonical = egraph.find(class);
-                let idx = canonical.0 as usize;
-                if idx >= num_classes || visited[idx] {
-                    continue;
-                }
-                visited[idx] = true;
-                choices[idx] = Some(0); // Original node
-                if let Some(node) = egraph.nodes(canonical).first() {
-                    if let ENode::Op { children, .. } = node {
-                        for &child in children {
-                            stack.push(child);
-                        }
-                    }
-                }
-            }
-        }
+        backfill_reachable_defaults(egraph, root_class, &mut choices);
 
         // Run variance analysis once — O(n) over e-graph, provides
         // per-e-class coordinate dependency info to the extraction head.
@@ -113,7 +92,14 @@ impl<'a> IncrementalExtractor<'a> {
                     continue;
                 }
 
-                let current_node_idx = choices[canonical.0 as usize].unwrap_or(0);
+                let current_node_idx = choices[canonical.0 as usize].unwrap_or_else(|| {
+                    panic!(
+                        "extract_choices_only: e-class {} is active (reachable from root) \
+                         but has no recorded choice — backfill_reachable_defaults should have \
+                         populated every class returned by get_active_classes",
+                        canonical.0
+                    )
+                });
                 let candidates_to_try = nodes.len().min(self.top_k);
 
                 // Best-improvement: evaluate ALL candidates, pick the cheapest.
@@ -167,16 +153,18 @@ impl<'a> IncrementalExtractor<'a> {
 
                     // The newly-chosen node may have children in e-classes
                     // that weren't reachable before (saturation merges can
-                    // introduce new children). Ensure they have a choice so
-                    // downstream codegen doesn't hit a missing entry.
+                    // introduce new children). Backfill the ENTIRE newly
+                    // reachable subtree (not just direct children) so the
+                    // invariant "every class in `active` has Some(choice)"
+                    // actually holds — a shallow, direct-children-only
+                    // backfill left grandchildren `None`, which callers
+                    // like `get_active_classes` and the refinement loop
+                    // below were then silently defaulting to node 0 for,
+                    // masking a real gap instead of restoring it.
                     let nodes = egraph.nodes(canonical);
                     if let Some(ENode::Op { children, .. }) = nodes.get(idx) {
                         for &child in children {
-                            let cc = egraph.find(child);
-                            let ci = cc.0 as usize;
-                            if ci < choices.len() && choices[ci].is_none() {
-                                choices[ci] = Some(0);
-                            }
+                            backfill_reachable_defaults(egraph, child, &mut choices);
                         }
                     }
                 }
@@ -289,7 +277,14 @@ impl<'a> IncrementalExtractor<'a> {
 
             active.push(canonical);
 
-            let node_idx = choices[canonical.0 as usize].unwrap_or(0);
+            let node_idx = choices[canonical.0 as usize].unwrap_or_else(|| {
+                panic!(
+                    "get_active_classes: e-class {} reachable from root has no recorded \
+                     choice — extract_choices_only must call backfill_reachable_defaults \
+                     transitively before invoking get_active_classes",
+                    canonical.0
+                )
+            });
             let nodes = egraph.nodes(canonical);
             if node_idx < nodes.len() {
                 if let ENode::Op { children, .. } = &nodes[node_idx] {
@@ -301,6 +296,44 @@ impl<'a> IncrementalExtractor<'a> {
         }
 
         active
+    }
+}
+
+/// Transitively fill in `Some(0)` (the original/first node) for every
+/// e-class reachable from `start` that doesn't yet have a recorded choice.
+///
+/// This restores the invariant relied on throughout `extract_choices_only`
+/// and its helpers (`get_active_classes`, the refinement loop, and
+/// `choices_to_arena`): every e-class reachable from the root via the
+/// *currently chosen* nodes has `Some` entry in `choices`. Saturation merges
+/// and NNUE-guided swaps can both introduce children that were not part of
+/// the original bootstrap walk; if those children are left `None`, callers
+/// fall back to `unwrap_or(0)`, which silently (and possibly incorrectly,
+/// since node 0 may not be the reachable/consistent variant) treats an
+/// unrecorded choice as if it were recorded. Making the backfill transitive
+/// here means that fallback becomes unreachable in practice, and any future
+/// gap is a real bug caught loudly rather than papered over downstream.
+///
+/// Already-visited classes (`choices[idx].is_some()`) stop the walk — this
+/// keeps the traversal to genuinely new subtrees.
+fn backfill_reachable_defaults(egraph: &EGraph, start: EClassId, choices: &mut [Option<usize>]) {
+    let num_classes = choices.len();
+    let mut stack = alloc::vec![start];
+
+    while let Some(class) = stack.pop() {
+        let canonical = egraph.find(class);
+        let idx = canonical.0 as usize;
+        if idx >= num_classes || choices[idx].is_some() {
+            continue;
+        }
+        choices[idx] = Some(0); // Original/first node in the e-class.
+        if let Some(node) = egraph.nodes(canonical).first() {
+            if let ENode::Op { children, .. } = node {
+                for &child in children {
+                    stack.push(child);
+                }
+            }
+        }
     }
 }
 
@@ -813,7 +846,22 @@ pub fn choices_to_arena(
                     continue;
                 }
 
-                let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or(0);
+                // No recorded choice for a reachable e-class means the extractor
+                // that produced `choices` violated the invariant that every class
+                // reachable from `root` (via chosen nodes) has an entry — e.g. a
+                // saturation-introduced child that wasn't transitively backfilled.
+                // Silently materialising node 0 here would paper over that bug by
+                // emitting a node that may not even be the reachable/consistent
+                // variant. Panic loudly instead so the extractor bug gets fixed
+                // at the source rather than surfacing as a subtly wrong kernel.
+                let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or_else(|| {
+                    panic!(
+                        "choices_to_arena: e-class {} is reachable from root {} but has \
+                         no recorded extraction choice — the extractor that produced \
+                         `choices` must guarantee every reachable e-class has Some(idx)",
+                        idx, root.0
+                    )
+                });
 
                 let nodes = egraph.nodes(canonical);
                 assert!(

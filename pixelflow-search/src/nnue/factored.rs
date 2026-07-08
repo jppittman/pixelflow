@@ -1055,16 +1055,40 @@ impl EdgeAccumulator {
                     // single var_ref edge — so the DAG is not tree-bloated.
                     for (child_idx, &child_class) in children.iter().enumerate() {
                         let child_canonical = egraph.find(child_class);
-                        let child_node_idx = choices[child_canonical.0 as usize].unwrap_or(0);
-                        let child_nodes = egraph.nodes(child_canonical);
-                        let child_op = if child_node_idx < child_nodes.len() {
-                            match &child_nodes[child_node_idx] {
-                                ENode::Var(_) => OpKind::Var,
-                                ENode::Const(_) => OpKind::Const,
-                                ENode::Op { op: cop, .. } => cop.kind(),
+                        // NOTE on why this is `None`-tolerant unlike the parent
+                        // choice lookup above (which panics on out-of-bounds):
+                        // this function is also called on SPECULATIVE, in-progress
+                        // `choices` during `extract_choices_only`'s candidate
+                        // search (extract.rs ~121-137) — a tentative swap is
+                        // applied to `choices[canonical]` and evaluated for cost
+                        // *before* it is accepted, and children introduced by that
+                        // tentative (possibly-rejected) swap are only transitively
+                        // backfilled via `backfill_reachable_defaults` if/when the
+                        // swap actually wins (extract.rs ~149-169). So an
+                        // unrecorded child choice here is a legitimate, expected
+                        // case, not an invariant violation like the ones above.
+                        // Treat it the same way the parent lookup treats an
+                        // unreachable class (line ~1057: `None => continue`): skip
+                        // contributing an edge rather than fabricating one from a
+                        // guessed node 0 / `OpKind::Var`, which would silently
+                        // feed the cost model a made-up feature.
+                        let child_op = match choices[child_canonical.0 as usize] {
+                            None => None,
+                            Some(child_node_idx) => {
+                                let child_nodes = egraph.nodes(child_canonical);
+                                child_nodes.get(child_node_idx).map(|n| match n {
+                                    ENode::Var(_) => OpKind::Var,
+                                    ENode::Const(_) => OpKind::Const,
+                                    ENode::Op { op: cop, .. } => cop.kind(),
+                                })
                             }
-                        } else {
-                            OpKind::Var // fallback
+                        };
+                        let Some(child_op) = child_op else {
+                            // No recorded (or in-bounds) choice for this child yet
+                            // — skip the edge for this speculative candidate; it
+                            // contributes no signal to the cost estimate rather
+                            // than a fabricated one.
+                            continue;
                         };
 
                         let eff_depth =

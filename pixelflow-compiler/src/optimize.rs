@@ -1092,11 +1092,24 @@ impl EGraphContext {
             });
         }
 
-        // Get the best node for this e-class.
-        // Default to node 0 (the original expression's node) when no choice
-        // was recorded — this happens when saturation merges introduce
-        // children that weren't in the initial reachable set.
-        let node_idx = dag.best_node_idx(canonical).unwrap_or(0);
+        // Get the best node for this e-class. `dag.choices` comes from
+        // `IncrementalExtractor::extract_choices_only`, which transitively
+        // backfills every e-class reachable from root (including children
+        // introduced by saturation merges or NNUE-guided swaps) via
+        // `backfill_reachable_defaults` — see pixelflow-search's
+        // egraph/extract.rs. A missing choice here means that invariant was
+        // violated upstream; silently defaulting to node 0 would risk
+        // emitting a node that isn't even the reachable/consistent variant
+        // for this e-class, so fail loudly instead of masking the bug.
+        let node_idx = dag.best_node_idx(canonical).unwrap_or_else(|| {
+            panic!(
+                "eclass_to_expr: e-class {} reachable from root {} has no recorded \
+                 extraction choice — IncrementalExtractor::extract_choices_only must \
+                 guarantee every reachable e-class has Some(idx)",
+                canonical.index(),
+                dag.root.index()
+            )
+        });
         let node = &self.egraph.nodes(canonical)[node_idx];
 
         match node {
