@@ -236,6 +236,13 @@ impl EGraph {
                 if let Some(&existing) = self.memo.get(&node) {
                     let existing = self.find(existing);
                     if existing != id {
+                        // `union` may pick either `id` or `existing` as the
+                        // surviving parent. If `id` survives, `union`'s
+                        // extend() appends `existing`'s nodes directly onto
+                        // `self.classes[id.index()].nodes` — which we just
+                        // emptied via mem::take above. We MUST extend (not
+                        // overwrite) below, or those appended nodes are
+                        // silently dropped when we write `new_nodes` back.
                         self.union(id, existing);
                     }
                 } else {
@@ -243,7 +250,10 @@ impl EGraph {
                 }
                 new_nodes.push(node);
             }
-            self.classes[id.index()].nodes = new_nodes;
+            // Extend, not assign: a mid-loop union() above may have already
+            // pushed nodes onto classes[id.index()].nodes (see comment above).
+            // Overwriting here would silently discard them.
+            self.classes[id.index()].nodes.extend(new_nodes);
         }
         self.worklist.len()
     }
@@ -1518,6 +1528,119 @@ mod tests {
         AddNeg, Annihilator, Cancellation, Canonicalize, Commutative, Distributive, Identity,
         InverseAnnihilation, Involution, MulRecip,
     };
+
+    /// Regression test for a `rebuild_budgeted` bug: when canonicalizing the
+    /// worklist item `id`'s nodes triggers a union whose surviving parent is
+    /// `id` itself, `union()`'s `extend()` appends the merged-in class's
+    /// nodes directly onto `classes[id.index()].nodes` (which `rebuild_budgeted`
+    /// had just emptied via `mem::take`). The old code then did
+    /// `classes[id.index()].nodes = new_nodes`, an outright *assignment* that
+    /// clobbered whatever `union()` had just appended — silently dropping
+    /// nodes. The fix extends instead of assigning.
+    ///
+    /// Trigger recipe:
+    /// - class 3 (`nc = Neg(c)`, c = class 2) is the worklist item being
+    ///   rebuilt (`id = 3`).
+    /// - Before nc's rebuild, `union(b, c)` merges class 2 into class 1
+    ///   (1 < 2), so canonicalizing `Neg(c)` during nc's rebuild turns it
+    ///   into `Neg(b)`.
+    /// - `Neg(b)` is already memoized as class 4 (`nb = Neg(b)`, created
+    ///   after nc so it has a strictly higher id: 4 > 3).
+    /// - Because `id (3) < existing (4)`, `union(3, 4)` picks **3** as the
+    ///   surviving parent — reproducing the exact "current worklist item
+    ///   survives the merge" case that dropped nodes.
+    /// - Class 4 (`nb`) must still hold its node at the moment of that
+    ///   inner union, which it does (only class 3's `.nodes` was drained).
+    #[test]
+    fn rebuild_budgeted_does_not_drop_nodes_when_current_class_survives_union() {
+        let mut eg = EGraph::new();
+
+        let _a = eg.add(ENode::Var(0)); // class 0 (unused, keeps ids spaced out)
+        let b = eg.add(ENode::Var(1)); // class 1
+        let c = eg.add(ENode::Var(2)); // class 2
+        let nc = eg.add(ENode::Op {
+            op: &ops::Neg,
+            children: vec![c],
+        }); // class 3: memo Neg([2]) -> 3
+        let nb = eg.add(ENode::Op {
+            op: &ops::Neg,
+            children: vec![b],
+        }); // class 4: memo Neg([1]) -> 4
+        let d = eg.add(ENode::Var(3)); // class 5, dummy used only to enqueue `nc`
+        let marker = eg.add(ENode::Var(9)); // class 6: a node unique to nb's class
+
+        assert_eq!(nc.index(), 3, "test assumes nc is class 3");
+        assert_eq!(nb.index(), 4, "test assumes nb is class 4");
+
+        // Enqueue class 3 (nc) on the worklist without disturbing its node
+        // list content: nc (3) < d (5), so nc survives as parent and simply
+        // gains an extra Var(3) node — it does not lose anything.
+        eg.union(nc, d);
+        assert_eq!(eg.pending_rebuilds(), 1);
+
+        // Give nb's class a node with no structural twin anywhere else
+        // (`Var(9)`), so its loss is directly observable. nb (4) < marker
+        // (6), so nb survives as parent and gains `Var(9)`.
+        eg.union(nb, marker);
+
+        // Now merge c into b. b (1) < c (2), so b survives; c's node list
+        // (just `Var(2)`) is merged in. This does NOT yet touch nc/nb.
+        eg.union(b, c);
+
+        // Rebuild exactly one worklist item. LIFO worklist: the most
+        // recently pushed parent (class 1, from union(b,c)) pops first.
+        // Process it, then process class 3 (nc) next so its rebuild is the
+        // one that triggers the id-survives-merge collision with nb (4).
+        //
+        // Drain the whole worklist via rebuild() (equivalent to
+        // rebuild_budgeted(usize::MAX)) so ordering doesn't need to be
+        // hand-tracked — the bug reproduces regardless of pop order, as
+        // long as nc's rebuild eventually runs after b/c are merged.
+        eg.rebuild();
+
+        // The critical assertion: nb's class (now merged into nc's class,
+        // since nc=3 < nb=4 survives) must still contain BOTH nodes that
+        // were live before the merge: nc's own `Neg([canonical c])` and
+        // nb's `Neg([b])` (same canonical shape, but a distinct ENode
+        // instance in the vec before dedup would also be acceptable — the
+        // point is the vec must not have been clobbered to something
+        // that lost nb's contribution entirely).
+        let surviving = eg.find(nc);
+        assert_eq!(
+            surviving,
+            eg.find(nb),
+            "nc and nb should have been unioned via the canonicalization collision"
+        );
+
+        let nodes = eg.nodes(surviving);
+        assert!(
+            !nodes.is_empty(),
+            "rebuild_budgeted must not silently drop all nodes from the surviving class"
+        );
+
+        // The dummy Var(3) node pushed onto nc's class via `union(nc, d)`
+        // earlier must have survived.
+        assert!(
+            nodes.iter().any(|n| matches!(n, ENode::Var(3))),
+            "expected Var(3) (pushed before the id-survives merge) to still be present; \
+             rebuild_budgeted's overwrite bug would have dropped it"
+        );
+
+        // The critical, structurally-unique marker node from nb's class
+        // (`Var(9)`) must have survived being merged into nc's class via
+        // union()'s extend(). This is exactly the data the overwrite bug
+        // silently discarded: union() appended it to
+        // `classes[id.index()].nodes` mid-loop, and the old
+        // `self.classes[id.index()].nodes = new_nodes` assignment clobbered
+        // it because `new_nodes` was built from nc's pre-union node list,
+        // which never contained `Var(9)`.
+        assert!(
+            nodes.iter().any(|n| matches!(n, ENode::Var(9))),
+            "expected Var(9) (nb's unique marker, merged in via union()'s extend) \
+             to still be present; rebuild_budgeted's overwrite bug drops nodes appended \
+             by a mid-loop union() when the current worklist item survives as parent"
+        );
+    }
 
     /// Create an e-graph with standard algebraic rules for testing.
     fn egraph_with_rules() -> EGraph {
