@@ -1216,6 +1216,52 @@ mod tests {
         assert_eq!(root.0, 2);
     }
 
+    #[test]
+    fn extract_latency_prior_picks_cheaper_equivalent_form() {
+        // x + x and x * 2 are equivalent, but under the latency-prior cost
+        // model Add (4 cycles) is cheaper than Mul (5 cycles), so once the
+        // two forms are unioned into one e-class, extraction must pick the
+        // Add form.
+        //
+        // This is the extraction-side counterpart to the existing
+        // NNUE latency-prior tests: it exercises `CostModel::latency_prior`
+        // (the static cost table), not the neural model.
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let two = egraph.add(ENode::constant(2.0));
+
+        let x_plus_x = egraph.add(ENode::Op {
+            op: &super::super::ops::Add,
+            children: alloc::vec![x, x],
+        });
+        let x_times_2 = egraph.add(ENode::Op {
+            op: &super::super::ops::Mul,
+            children: alloc::vec![x, two],
+        });
+
+        egraph.union(x_plus_x, x_times_2);
+
+        let costs = CostModel::latency_prior();
+        assert!(
+            costs.cost(pixelflow_ir::OpKind::Add) < costs.cost(pixelflow_ir::OpKind::Mul),
+            "test assumes Add is strictly cheaper than Mul in the latency prior"
+        );
+
+        let (arena, root, cost) = extract(&egraph, egraph.find(x_plus_x), &costs);
+
+        // Cheapest form is `x + x`: Add(4) + Var(0) + Var(0) = 4.
+        assert_eq!(cost, costs.cost(pixelflow_ir::OpKind::Add));
+
+        let root_node = arena.node(root);
+        assert!(
+            matches!(
+                root_node,
+                pixelflow_ir::arena::ExprNode::Binary(pixelflow_ir::OpKind::Add, _, _)
+            ),
+            "extraction with the latency-prior cost model should pick the Add form, got {root_node:?}"
+        );
+    }
+
     // ========================================================================
     // DAG Extraction Tests
     // ========================================================================

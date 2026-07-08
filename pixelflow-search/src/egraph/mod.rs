@@ -16,7 +16,7 @@
 //! Mathematical rewrite rules are now in the [`crate::math`] module.
 
 pub mod codegen;
-mod cost;
+pub(crate) mod cost;
 pub mod deps;
 pub mod derivative;
 pub(crate) mod extract;

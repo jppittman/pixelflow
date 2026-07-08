@@ -41,6 +41,7 @@ use alloc::vec::Vec;
 use libm::sqrtf;
 
 use crate::egraph::Rewrite;
+use crate::egraph::cost::LATENCY_PRIOR_CYCLES;
 pub use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
@@ -459,73 +460,24 @@ impl OpEmbeddings {
     }
 
     /// Initialize with latency priors in place.
+    ///
+    /// Dimension 0 = latency, normalized to `[0, 1]` by dividing the shared
+    /// [`LATENCY_PRIOR_CYCLES`] cycle table (source of truth, also used by
+    /// `egraph::cost::CostModel::latency_prior`) by `LATENCY_NORMALIZER`.
     pub fn init_with_latency_prior(&mut self, seed: u64) {
-        // Known latencies (cycles) - these are approximate and can be refined
-        // Dimension 0 = latency, normalized to [0, 1] range (divide by max ~20)
-        let latencies: [f32; OpKind::COUNT] = [
-            0.0,  // Var - free
-            0.0,  // Const - free
-            0.2,  // Add - 4 cycles
-            0.2,  // Sub - 4 cycles
-            0.25, // Mul - 5 cycles
-            0.75, // Div - 15 cycles
-            0.05, // Neg - 1 cycle
-            0.75, // Sqrt - 15 cycles
-            0.25, // Rsqrt - 5 cycles (fast approximation)
-            0.05, // Abs - 1 cycle
-            0.2,  // Min - 4 cycles
-            0.2,  // Max - 4 cycles
-            0.25, // MulAdd - 5 cycles (fused)
-            0.5,  // Recip - 10 cycles
-            0.2,  // Floor - 4 cycles
-            0.2,  // Ceil - 4 cycles
-            0.2,  // Round - 4 cycles
-            0.2,  // Fract - 4 cycles
-            0.5,  // Sin - 10 cycles
-            0.5,  // Cos - 10 cycles
-            0.5,  // Tan - 10 cycles
-            0.5,  // Asin - 10 cycles
-            0.5,  // Acos - 10 cycles
-            0.5,  // Atan - 10 cycles
-            0.5,  // Exp - 10 cycles
-            0.5,  // Exp2 - 10 cycles
-            0.5,  // Ln - 10 cycles
-            0.5,  // Log2 - 10 cycles
-            0.5,  // Log10 - 10 cycles
-            0.5,  // Atan2 - 10 cycles
-            0.6,  // Pow - 12 cycles
-            0.4,  // Hypot - 8 cycles
-            0.15, // Lt - 3 cycles
-            0.15, // Le - 3 cycles
-            0.15, // Gt - 3 cycles
-            0.15, // Ge - 3 cycles
-            0.15, // Eq - 3 cycles
-            0.15, // Ne - 3 cycles
-            0.2,  // Select - 4 cycles
-            0.3,  // Clamp - 6 cycles (2x compare + select)
-            0.0,  // Tuple - free (structural)
-            // Bit-manip primitives: single cheap integer/convert instructions.
-            0.05, // TruncToInt - 1 cycle (cvttps2dq)
-            0.05, // IntToFloat - 1 cycle (cvtdq2ps)
-            0.05, // IAdd - 1 cycle (paddd)
-            0.05, // Shl - 1 cycle
-            0.05, // Shr - 1 cycle
-            0.05, // BitAnd - 1 cycle
-            0.05, // BitOr - 1 cycle
-            // Dwrt - rewritten away by the e-graph (chain rule); never emitted.
-            1.0, // Dwrt - prohibitive so a surviving derivative never extracts
-            0.0, // Buffer - leaf, free
-            0.5, // Gather - memory read, ~10 cycles
-            0.5, // RawGather - primitive memory read, ~10 cycles
-            0.0, // Reduce - lowered (unrolled) before costing
-        ];
+        // Cycle estimate above which we don't bother distinguishing further;
+        // used only to squash LATENCY_PRIOR_CYCLES into [0, 1]. Dwrt's
+        // deliberately-prohibitive 1000-cycle entry saturates to 1.0 here,
+        // same as before this table was shared with CostModel.
+        const LATENCY_NORMALIZER: f32 = 20.0;
 
         let mut rng_state = seed.wrapping_add(1);
         let small_scale = 0.1; // Small noise for other dimensions
 
         for op_idx in 0..OpKind::COUNT {
-            // Dimension 0: latency prior
-            self.e[op_idx][0] = latencies[op_idx];
+            // Dimension 0: latency prior, normalized from the shared cycle table.
+            let cycles = LATENCY_PRIOR_CYCLES[op_idx] as f32;
+            self.e[op_idx][0] = (cycles / LATENCY_NORMALIZER).min(1.0);
 
             // Dimensions 1..K: small random for learning interactions
             for dim in 1..K {
