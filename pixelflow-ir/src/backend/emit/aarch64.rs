@@ -472,6 +472,75 @@ pub fn emit_pool_entry(code: &mut Vec<u8>, val_bits: u32) {
 }
 
 // =============================================================================
+// Bound-Memory Gather (scalar-load lowering — NEON has no native gather)
+// =============================================================================
+
+/// UMOV Wd, Vn.S[lane] — extract a 32-bit vector lane into a GP register.
+pub fn emit_umov_w(code: &mut Vec<u8>, gpr_dst: u8, src: Reg, lane: u8) {
+    debug_assert!(lane < 4);
+    let imm5 = ((lane as u32) << 3) | 0b100; // S-lane element size
+    emit32(
+        code,
+        0x0E003C00 | (imm5 << 16) | ((src.0 as u32) << 5) | (gpr_dst as u32),
+    );
+}
+
+/// INS Vd.S[lane], Wn — insert a GP register into a 32-bit vector lane.
+pub fn emit_ins_w(code: &mut Vec<u8>, dst: Reg, lane: u8, gpr_src: u8) {
+    debug_assert!(lane < 4);
+    let imm5 = ((lane as u32) << 3) | 0b100;
+    emit32(
+        code,
+        0x4E001C00 | (imm5 << 16) | ((gpr_src as u32) << 5) | (dst.0 as u32),
+    );
+}
+
+/// LDR Xt, [Xn, #offset] — load a 64-bit pointer (e.g. a buffer base from the
+/// context array). `offset` must be a multiple of 8 and < 32768.
+pub fn emit_ldr_x_imm(code: &mut Vec<u8>, gpr_dst: u8, gpr_base: u8, offset: u32) {
+    assert!(
+        offset.is_multiple_of(8),
+        "pointer load offset {offset} not 8-byte aligned"
+    );
+    let imm12 = offset / 8;
+    assert!(imm12 < 4096, "pointer load offset {offset} exceeds LDR imm12 range");
+    emit32(
+        code,
+        0xF9400000 | (imm12 << 10) | ((gpr_base as u32) << 5) | (gpr_dst as u32),
+    );
+}
+
+/// LDR Wt, [Xn, Wm, UXTW #2] — 32-bit element load at `base + index * 4`.
+pub fn emit_ldr_w_uxtw2(code: &mut Vec<u8>, gpr_dst: u8, gpr_base: u8, gpr_index: u8) {
+    emit32(
+        code,
+        0xB8605800
+            | ((gpr_index as u32) << 16)
+            | ((gpr_base as u32) << 5)
+            | (gpr_dst as u32),
+    );
+}
+
+/// dst.4S = base[idx_int.S[lane]] for each lane — the NEON gather: four scalar
+/// loads through GP scratch. `base_gpr` holds the buffer base pointer;
+/// `idx_int` holds int32 lane indices (already converted and in-bounds by the
+/// `expand_gather` lowering). Clobbers `idx_gpr` and `val_gpr`.
+pub fn emit_gather(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    base_gpr: u8,
+    idx_int: Reg,
+    idx_gpr: u8,
+    val_gpr: u8,
+) {
+    for lane in 0..4 {
+        emit_umov_w(code, idx_gpr, idx_int, lane);
+        emit_ldr_w_uxtw2(code, val_gpr, base_gpr, idx_gpr);
+        emit_ins_w(code, dst, lane, val_gpr);
+    }
+}
+
+// =============================================================================
 // Integer Vector Operations (for bit manipulation in transcendentals)
 // =============================================================================
 
@@ -515,7 +584,7 @@ fn emit_orr(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
 
 /// FCVTZS Vd.4S, Vn.4S (float to signed int, round toward zero)
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-fn emit_fcvtzs(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+pub fn emit_fcvtzs(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     emit32(code, encode_2misc(0x4EA1B800, dst, src));
 }
 
@@ -2765,5 +2834,44 @@ mod tests {
             lines[2].starts_with("   8:"),
             "third line should start at offset 8"
         );
+    }
+
+    /// Encodings cross-checked against clang: `fcvtzs v28.4s, v5.4s` etc.,
+    /// assembled with `clang -c -arch arm64` and dumped with objdump.
+    #[test]
+    fn gather_primitive_encodings() {
+        fn one(f: impl FnOnce(&mut Vec<u8>)) -> u32 {
+            let mut code = Vec::new();
+            f(&mut code);
+            assert_eq!(code.len(), 4);
+            u32::from_le_bytes(code[..4].try_into().unwrap())
+        }
+
+        // fcvtzs v28.4s, v5.4s
+        assert_eq!(one(|c| emit_fcvtzs(c, Reg(28), Reg(5))), 0x4EA1B8BC);
+        // ldr x9, [x0, #8]
+        assert_eq!(one(|c| emit_ldr_x_imm(c, 9, 0, 8)), 0xF9400409);
+        // ldr x9, [x0]
+        assert_eq!(one(|c| emit_ldr_x_imm(c, 9, 0, 0)), 0xF9400009);
+        // umov w10, v28.s[0..3]
+        assert_eq!(one(|c| emit_umov_w(c, 10, Reg(28), 0)), 0x0E043F8A);
+        assert_eq!(one(|c| emit_umov_w(c, 10, Reg(28), 1)), 0x0E0C3F8A);
+        assert_eq!(one(|c| emit_umov_w(c, 10, Reg(28), 2)), 0x0E143F8A);
+        assert_eq!(one(|c| emit_umov_w(c, 10, Reg(28), 3)), 0x0E1C3F8A);
+        // ldr w11, [x9, w10, uxtw #2]
+        assert_eq!(one(|c| emit_ldr_w_uxtw2(c, 11, 9, 10)), 0xB86A592B);
+        // ins v6.s[0..3], w11
+        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 0, 11)), 0x4E041D66);
+        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 1, 11)), 0x4E0C1D66);
+        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 2, 11)), 0x4E141D66);
+        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 3, 11)), 0x4E1C1D66);
+    }
+
+    #[test]
+    fn gather_compound_is_four_scalar_loads() {
+        let mut code = Vec::new();
+        emit_gather(&mut code, Reg(6), 9, Reg(28), 10, 11);
+        // 4 lanes x (umov + ldr + ins) = 12 instructions.
+        assert_eq!(code.len(), 12 * 4);
     }
 }

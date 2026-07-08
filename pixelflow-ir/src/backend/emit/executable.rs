@@ -391,6 +391,24 @@ use core::arch::x86_64::__m512;
 pub type KernelFn =
     extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
 
+/// JIT-compiled kernel that reads bound memory (ARM64).
+///
+/// Identical to [`KernelFn`] plus a leading context pointer: an array of buffer
+/// base pointers, one per declared [`BufferId`](crate::arena::BufferId) in slot
+/// order. AAPCS64 places this integer-class pointer in `x0`, disjoint from the
+/// coordinate vectors in `v0..3`, so the emitted body is byte-for-byte the same
+/// as a `KernelFn` — only kernels containing a `Gather` read `x0`. The caller
+/// picks this type iff the arena declared buffers.
+#[allow(improper_ctypes_definitions)]
+#[cfg(target_arch = "aarch64")]
+pub type CtxKernelFn = extern "C" fn(
+    *const *const f32,
+    float32x4_t,
+    float32x4_t,
+    float32x4_t,
+    float32x4_t,
+) -> float32x4_t;
+
 /// JIT-compiled scanline kernel signature for ARM64.
 ///
 /// Processes an entire scanline in a single call with no per-batch Rust-JIT boundary.

@@ -869,11 +869,11 @@ where
                 "ExprNode::Param({i}) reached the JIT emitter -- \
                  call substitute_params before compile_arena()"
             ),
-            ExprNode::Buffer(b) => panic!(
-                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
-                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
-                b.0
-            ),
+            // Dead placeholder, as in `arena_to_schedule`: a Buffer leaf is only
+            // ever consumed folded into a Gather slot immediate. The scanline
+            // compile entries reject Gather (no context register in that ABI),
+            // so a placeholder here is never read.
+            ExprNode::Buffer(_) => ScheduledOp::Const(0.0),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child, &id_map)),
             ExprNode::Binary(op, a, b) => {
                 ScheduledOp::Binary(*op, map_child(a, &id_map), map_child(b, &id_map))
@@ -909,11 +909,9 @@ where
                 "ExprNode::Param({i}) reached the JIT emitter -- \
                  call substitute_params before compile_arena()"
             ),
-            ExprNode::Buffer(b) => panic!(
-                "ExprNode::Buffer({}) reached the JIT emitter -- memory ops require a \
-                 binding table (KERNELS_AND_LATTICES.md M2, not yet implemented)",
-                b.0
-            ),
+            // Dead placeholder, as in `arena_to_schedule` (see the setup-phase
+            // arm above): the scanline entries reject Gather, so never read.
+            ExprNode::Buffer(_) => ScheduledOp::Const(0.0),
             ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child, &id_map)),
             ExprNode::Binary(op, a, b) => {
                 ScheduledOp::Binary(*op, map_child(a, &id_map), map_child(b, &id_map))
@@ -989,6 +987,20 @@ pub fn compile_arena_dag_scanline_hoisted(
     root: crate::arena::ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
     let hoisted = arena_to_hoisted_schedule(arena, root, default_hoist_predicate);
+
+    // The scanline ABI has no context argument — x0 is the X-array pointer —
+    // so a bound-memory gather (which reads its buffer base from x0) cannot
+    // be emitted here. Reject rather than miscompile with a clobbered base.
+    // Both forms are checked: lowered `RawGather` (ScheduledOp::Gather) and
+    // the high-level ternary (this path runs no lowering passes).
+    if hoisted.schedule.iter().any(|(_, op)| {
+        matches!(
+            op,
+            ScheduledOp::Gather(..) | ScheduledOp::Ternary(OpKind::Gather, ..)
+        )
+    }) {
+        return Err("aarch64 scanline: bound-memory gather not supported (per-batch ctx kernel only)");
+    }
 
     // If nothing to hoist, fall back to the non-hoisted path (no overhead).
     if hoisted.split == 0 || hoisted.num_hoisted == 0 {
@@ -3068,10 +3080,24 @@ fn emit_instruction_plan(
         } => {
             aarch64::emit_shift_imm(code, *op, *dst, *src, *amount)?;
         }
-        ResolvedOp::Gather { .. } => {
-            // NEON has no native gather; the scalar-load lowering is a later
-            // slice. Reject rather than miscompile.
-            return Err("aarch64: bound-memory gather not yet supported");
+        ResolvedOp::Gather { dst, idx, slot } => {
+            // dst = buffer[slot][idx], via four scalar loads (NEON has no
+            // native gather). The context pointer (array of buffer base
+            // pointers) is caller-provided in x0 per AAPCS64 — disjoint from
+            // the coordinate vectors in v0..3 and never touched by the
+            // arithmetic/const emit, so it survives to here (the scanline
+            // path, whose ABI repurposes x0, rejects Gather at compile).
+            // v28 is fixed-purpose scratch (outside the allocatable range);
+            // x9-x11 are caller-saved GPR scratch clear of the branch guard
+            // (w16) and the const-pool anchor (x17).
+            const IDX_INT: Reg = Reg(28);
+            const BASE_GPR: u8 = 9;
+            const IDX_GPR: u8 = 10;
+            const VAL_GPR: u8 = 11;
+            const CTX_GPR: u8 = 0;
+            emit_fcvtzs(code, IDX_INT, *idx); // float idx -> int32 lanes
+            emit_ldr_x_imm(code, BASE_GPR, CTX_GPR, (*slot as u32) * 8);
+            emit_gather(code, *dst, BASE_GPR, IDX_INT, IDX_GPR, VAL_GPR);
         }
         ResolvedOp::Binary {
             op,
@@ -5482,6 +5508,219 @@ mod tests {
                     "select: ({px},{py},{pz}) got {got} want {want}"
                 );
             }
+        }
+    }
+
+    // =========================================================================
+    // aarch64 end-to-end: bound-memory gather through the shared driver, run
+    // on the host across 4 NEON lanes. Mirrors the avx512_driver gather tests
+    // (same coordinate spreads, same interpreter oracle) at 128-bit width.
+    // =========================================================================
+    #[cfg(target_arch = "aarch64")]
+    mod aarch64_gather_driver {
+        use super::*;
+        use crate::arena::{ExprArena, ExprId};
+
+        /// Run a compiled gather kernel as a `CtxKernelFn`: the context (array
+        /// of buffer base pointers) goes in x0, coords in v0..3.
+        fn run4_ctx(
+            res: &CompileResult,
+            ctx: &[*const f32],
+            xs: [f32; 4],
+            ys: [f32; 4],
+        ) -> [f32; 4] {
+            unsafe {
+                use core::arch::aarch64::*;
+                let f: executable::CtxKernelFn = res.code.as_fn();
+                let r = f(
+                    ctx.as_ptr(),
+                    vld1q_f32(xs.as_ptr()),
+                    vld1q_f32(ys.as_ptr()),
+                    vdupq_n_f32(0.0),
+                    vdupq_n_f32(0.0),
+                );
+                let mut out = [0.0f32; 4];
+                vst1q_f32(out.as_mut_ptr(), r);
+                out
+            }
+        }
+
+        /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
+        /// the reference interpreter, over the same coords and binding. The 16
+        /// coordinate pairs run as four 4-lane batches.
+        fn check_against_interp(
+            arena: &ExprArena,
+            root: ExprId,
+            buffers: &[&[f32]],
+            xs: [f32; 16],
+            ys: [f32; 16],
+            tag: &str,
+        ) {
+            let res = compile_arena_dag(arena, root).expect("compile gather kernel");
+            let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
+            let bindings = crate::binding::BindingTable::bind(arena, buffers).unwrap();
+
+            for batch in 0..4 {
+                let mut cx = [0.0f32; 4];
+                let mut cy = [0.0f32; 4];
+                cx.copy_from_slice(&xs[batch * 4..batch * 4 + 4]);
+                cy.copy_from_slice(&ys[batch * 4..batch * 4 + 4]);
+                let got = run4_ctx(&res, &ctx, cx, cy);
+                for i in 0..4 {
+                    let want = crate::eval::eval_scalar(
+                        arena,
+                        root,
+                        &[cx[i], cy[i], 0.0, 0.0],
+                        &bindings,
+                    );
+                    assert_eq!(
+                        got[i], want,
+                        "{tag} batch {batch} lane {i} (x={}, y={})",
+                        cx[i], cy[i]
+                    );
+                }
+            }
+        }
+
+        fn idx_lanes() -> ([f32; 16], [f32; 16]) {
+            // A spread of in-range, fractional, and out-of-range coordinates so
+            // the clamp and floor paths are all exercised.
+            let xs = [
+                0.0, 1.0, 2.9, 7.0, -3.0, 100.0, 4.0, 5.5, 6.0, 0.1, 3.0, 2.0, 1.9, 7.9, -0.5, 4.4,
+            ];
+            let ys = [
+                0.0, 0.0, 1.0, 1.9, 2.0, 2.0, -1.0, 3.0, 0.5, 2.9, 1.0, 3.9, 0.0, 2.0, 5.0, 1.0,
+            ];
+            (xs, ys)
+        }
+
+        #[test]
+        fn gather_jit_matches_interpreter() {
+            // 8x4 buffer, gather at (X, Y).
+            let (w, h) = (8usize, 4usize);
+            let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let root = a.push_gather(b, x, y);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
+        }
+
+        #[test]
+        fn gather_composed_with_arithmetic() {
+            // out = gather(buf, X, Y) * 2 + Y — proves gather is a schedulable
+            // mid-expression node, not just a whole-kernel root.
+            let (w, h) = (8usize, 4usize);
+            let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let g = a.push_gather(b, x, y);
+            let two = a.push_const(2.0);
+            let scaled = a.push_binary(OpKind::Mul, g, two);
+            let root = a.push_binary(OpKind::Add, scaled, y);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
+        }
+
+        #[test]
+        fn gather_two_buffers() {
+            // gA(X,Y) + gB(Y,X) with two distinct bound buffers, exercising
+            // slot 0 and slot 1 of the context.
+            let (w, h) = (6usize, 6usize);
+            let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
+            let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
+            let mut a = ExprArena::new();
+            let ba = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let bb = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let ga = a.push_gather(ba, x, y);
+            let gb = a.push_gather(bb, y, x);
+            let root = a.push_binary(OpKind::Add, ga, gb);
+            let (xs, ys) = idx_lanes();
+            check_against_interp(
+                &a,
+                root,
+                &[buf_a.as_slice(), buf_b.as_slice()],
+                xs,
+                ys,
+                "2-buf",
+            );
+        }
+
+        #[test]
+        fn matmul_reduce_jit_matches_interpreter() {
+            // out(j) = Σ_i W(i,j) * input(i), evaluated per output lane j = X.
+            // The reduction over i unrolls to a flat gather/FMA chain (bound
+            // extent), and the whole thing runs as one CtxKernelFn.
+            //   W is IN×OUT row-major (width=IN, height=OUT); input is length IN.
+            let (in_dim, out_dim) = (4usize, 6usize);
+            let w: Vec<f32> = (0..(in_dim * out_dim))
+                .map(|k| (k as f32) * 0.5 - 2.0)
+                .collect();
+            let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
+
+            let mut a = ExprArena::new();
+            let wb = a.declare_buffer(crate::arena::BufferDecl {
+                width: in_dim as u32,
+                height: out_dim as u32,
+            });
+            let ib = a.declare_buffer(crate::arena::BufferDecl {
+                width: in_dim as u32,
+                height: 1,
+            });
+            // body(i, j=X) = W(i, X) * input(i, 0)
+            let i = a.push_var(4);
+            let j = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let wg = a.push_gather(wb, i, j);
+            let ig = a.push_gather(ib, i, zero);
+            let prod = a.push_binary(OpKind::Mul, wg, ig);
+            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
+
+            let buffers: &[&[f32]] = &[w.as_slice(), input.as_slice()];
+            // Output lanes j = 0..6 (rest clamp to the last row, harmless here).
+            let xs = [
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
+            ];
+            let ys = [0.0f32; 16];
+            check_against_interp(&a, root, buffers, xs, ys, "matmul");
+        }
+
+        #[test]
+        fn scanline_rejects_gather() {
+            // The scanline ABI repurposes x0 as the X-array pointer, so a
+            // bound-memory gather must be rejected at compile — never emitted
+            // against a clobbered context register.
+            let (w, h) = (8usize, 4usize);
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(crate::arena::BufferDecl {
+                width: w as u32,
+                height: h as u32,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let root = a.push_gather(b, x, y);
+            let err = compile_arena_dag_scanline(&a, root)
+                .err()
+                .expect("scanline must reject gather");
+            assert!(err.contains("gather"), "unexpected error: {err}");
         }
     }
 

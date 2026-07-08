@@ -1,8 +1,9 @@
 # Kernels and Lattices: Bound Memory in the Language
 
 **Status:** IR + lowering + interpreter + AVX-512 JIT + internal-loop collapse
-implemented and hardware-tested (June 2026). SSE2/aarch64 gather, 2-D collapse,
-and the fonts/ML consumers remain — see Milestones.
+implemented and hardware-tested (June 2026). aarch64 gather landed and
+hardware-tested on Apple Silicon (July 2026). SSE2 gather, 2-D collapse, and
+the fonts/ML consumers remain — see Milestones.
 
 Builds on: [LATTICE_EVAL.md](LATTICE_EVAL.md) (lattice as representable functor),
 [lattice-scheduling-types.md](lattice-scheduling-types.md) (variance as schedule),
@@ -286,7 +287,7 @@ store op.
 
 | Crate | Change |
 |---|---|
-| `pixelflow-ir` | `ExprNode::Buffer` + `BufferDecl` table on arena; `OpKind::Gather`/`RawGather`/`Reduce` (single reduce op, combiner as a child); variance: gather = union of index variances; lowering (`expand_gather`/`expand_reduce`, sharing one `rebuild_arena` skeleton); AVX-512 `vgatherdps` + the internal-loop collapse driver (`emit_dag_body` + loop scaffold); `BindingTable` + reference interpreter. Remaining: SSE2/aarch64 gather, `Frozen`/`Pinned` binding + `Arc`-owning `JitManifold` |
+| `pixelflow-ir` | `ExprNode::Buffer` + `BufferDecl` table on arena; `OpKind::Gather`/`RawGather`/`Reduce` (single reduce op, combiner as a child); variance: gather = union of index variances; lowering (`expand_gather`/`expand_reduce`, sharing one `rebuild_arena` skeleton); AVX-512 `vgatherdps` + the internal-loop collapse driver (`emit_dag_body` + loop scaffold); `BindingTable` + reference interpreter; aarch64 scalar-load gather + `CtxKernelFn` (ctx in `x0`). Remaining: SSE2 gather, `Frozen`/`Pinned` binding + `Arc`-owning `JitManifold` |
 | `pixelflow-core` | `DiscreteManifold` buffer → `Arc<[f32]>` + `freeze()`; delete `combinators/texture.rs` in favor of `DiscreteManifold`; lattice `collapse` JIT fast path (the TODO at `lattice/mod.rs:13-15`) |
 | `pixelflow-compiler` | `kernel!` grows lattice parameters: `kernel!(\|atlas: lattice<W, H>\| atlas(X * 2.0, Y))` → `Gather`; `sum(i, N, body)` → `Reduce`; sema rejects out-of-scope reduce vars |
 | `pixelflow-search` | rewrite rules: gather CSE, hoisting uniform-index gathers, reduce linearity (`Σ(a·f + g) = a·Σf + Σg`), reduce-of-select; NNUE features for the new ops |
@@ -309,7 +310,10 @@ remaining backends and the fonts/ML consumers are the follow-on work (the
    AVX-512 emits `vgatherdps` (`emit_gather` et al.), threading buffer bases
    through a context pointer in `rdi` (`CtxKernelFn`) — coords stay in `zmm0..3`,
    so the body is byte-identical to a plain kernel. Tests: JIT == interpreter,
-   incl. composition and multi-buffer. **SSE2/aarch64 gather (scalar-loads) is
+   incl. composition and multi-buffer. aarch64 emits the four-scalar-load
+   sequence (`fcvtzs` + per-lane `umov`/`ldr`/`ins`) with the context pointer
+   in `x0`, same byte-identical-body property; the scanline path (whose ABI
+   repurposes `x0`) rejects gather at compile. **SSE2 gather (scalar-loads) is
    the remaining backend work.**
 3. ✅ **M3 — Reduce + unrolling.** One `OpKind::Reduce` (combiner as a `Const`
    child; no `ReduceAdd/Mul/…` proliferation). `expand_reduce` unrolls it into a
