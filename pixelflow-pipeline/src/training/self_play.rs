@@ -161,7 +161,9 @@ pub fn collect_edges_dedup_arena(arena: &ExprArena, root: ExprId) -> Vec<(u8, u8
         }
 
         match arena.node(id) {
-            ExprNode::Var(_) | ExprNode::Const(_) => {}
+            // Buffer is a leaf (bound-memory reference, no children) — same
+            // treatment as Var/Const. Matches pixelflow-search/nnue/factored.rs:887.
+            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Buffer(_) => {}
             ExprNode::Param(i) => {
                 panic!("ExprNode::Param({i}) reached edge collection — substitute params first")
             }

@@ -108,6 +108,11 @@ fn write_node(w: &mut impl Write, node: &ExprNode) -> io::Result<()> {
         ExprNode::Param(i) => {
             w.write_all(&[TAG_PARAM, *i])?;
         }
+        ExprNode::Buffer(b) => panic!(
+            "ExprNode::Buffer({}) reached corpus serialization — memory ops are not yet \
+             representable in the training corpus format (M2, see KERNELS_AND_LATTICES.md)",
+            b.0
+        ),
         ExprNode::Unary(op, a) => {
             w.write_all(&[TAG_UNARY, *op as u8])?;
             w.write_all(&a.0.to_le_bytes())?;

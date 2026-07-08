@@ -580,6 +580,11 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "ExprNode::Param({}) reached arena_to_kernel_code — substitute params first",
                         i
                     ),
+                    ExprNode::Buffer(b) => panic!(
+                        "ExprNode::Buffer({}) reached arena_to_kernel_code — memory ops require \
+                         a binding table, not yet wired (M2, see KERNELS_AND_LATTICES.md)",
+                        b.0
+                    ),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _) => emit_op_kc(*op, &args),

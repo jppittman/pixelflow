@@ -2045,9 +2045,6 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
-dependencies = [
- "pixelflow-search",
-]
 
 [[package]]
 name = "yoke"
