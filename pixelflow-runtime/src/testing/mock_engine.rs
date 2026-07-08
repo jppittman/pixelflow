@@ -64,7 +64,7 @@ impl MockEngine {
     }
 
     pub fn messages(&self) -> std::sync::MutexGuard<'_, Vec<ReceivedMessage>> {
-        self.messages.lock().unwrap()
+        self.messages.lock().expect("Mutex should not be poisoned")
     }
 }
 
@@ -77,7 +77,7 @@ impl Actor<EngineData, EngineControl, AppManagement> for MessageCollector {
     fn handle_data(&mut self, msg: EngineData) -> HandlerResult {
         self.messages
             .lock()
-            .unwrap()
+            .expect("Mutex should not be poisoned")
             .push(ReceivedMessage::Data(msg));
         Ok(())
     }
@@ -85,7 +85,7 @@ impl Actor<EngineData, EngineControl, AppManagement> for MessageCollector {
     fn handle_control(&mut self, msg: EngineControl) -> HandlerResult {
         self.messages
             .lock()
-            .unwrap()
+            .expect("Mutex should not be poisoned")
             .push(ReceivedMessage::Control(msg));
         Ok(())
     }
@@ -93,7 +93,7 @@ impl Actor<EngineData, EngineControl, AppManagement> for MessageCollector {
     fn handle_management(&mut self, msg: AppManagement) -> HandlerResult {
         self.messages
             .lock()
-            .unwrap()
+            .expect("Mutex should not be poisoned")
             .push(ReceivedMessage::Management(msg));
         Ok(())
     }
