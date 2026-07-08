@@ -7,7 +7,6 @@
 //! - unified backward pass
 //! - self-play trajectory generation
 //! - ES-guided corpus growth
-//! - replay persistence
 
 #[cfg(feature = "training")]
 pub mod factored;
@@ -26,6 +25,3 @@ pub mod self_play;
 
 #[cfg(feature = "training")]
 pub mod gen_es;
-
-#[cfg(feature = "training")]
-pub mod replay;

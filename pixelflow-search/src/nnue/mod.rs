@@ -6,13 +6,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-#![allow(dead_code)] // Prototype code
 #![allow(clippy::only_used_in_recursion)]
 
 extern crate alloc;
 
 pub mod factored;
-pub mod window;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -27,9 +25,6 @@ pub use factored::ExprNnue;
 
 /// Re-export key types from factored module.
 pub use factored::{EdgeAccumulator, GraphAccumulator, OpEmbeddings};
-
-/// Re-export InstructionWindow for sliding-window scheduling.
-pub use window::InstructionWindow;
 
 /// Re-export unified mask architecture constants and types.
 pub use factored::{

@@ -20,9 +20,9 @@ use alloc::vec::Vec;
 ///
 /// - **Pass 1 (Bootstrap)**: extract shallowest tree (minimum AST node count per
 ///   e-class). This is fast and gives a reasonable starting point.
-/// - **Passes 2-3 (Refine)**: for each active e-class, try alternative nodes
+/// - **Passes 2-10 (Refine)**: for each active e-class, try alternative nodes
 ///   using O(Δ) accumulator updates. Accept if strictly lower cost.
-///   Repeat until fixpoint or `MAX_PASSES` (3) reached.
+///   Repeat until fixpoint or `MAX_PASSES` (10) reached.
 pub struct IncrementalExtractor<'a> {
     nnue: &'a ExprNnue,
     top_k: usize,
@@ -176,84 +176,6 @@ impl<'a> IncrementalExtractor<'a> {
         }
 
         (current_cost, choices)
-    }
-
-    /// Pass 1: Bottom-up DP choosing the node with fewest total AST nodes.
-    fn extract_shallowest(&self, egraph: &EGraph, root: EClassId) -> Vec<Option<usize>> {
-        use alloc::collections::BTreeSet;
-
-        const CYCLE_COUNT: usize = 1_000_000;
-
-        let num_classes = egraph.num_classes();
-        let mut best_count: Vec<Option<usize>> = alloc::vec![None; num_classes];
-        let mut best_node: Vec<Option<usize>> = alloc::vec![None; num_classes];
-
-        let mut stack: Vec<(EClassId, bool)> = vec![(root, false)];
-        let mut on_stack: BTreeSet<u32> = BTreeSet::new();
-
-        while let Some((class, children_done)) = stack.pop() {
-            let canonical = egraph.find(class);
-
-            if best_count[canonical.0 as usize].is_some() {
-                continue;
-            }
-
-            if !children_done {
-                if !on_stack.insert(canonical.0) {
-                    continue;
-                }
-                stack.push((canonical, true));
-
-                for node in egraph.nodes(canonical) {
-                    if let ENode::Op { children, .. } = node {
-                        for &child in children {
-                            let child_can = egraph.find(child);
-                            if best_count[child_can.0 as usize].is_none() {
-                                stack.push((child, false));
-                            }
-                        }
-                    }
-                }
-            } else {
-                on_stack.remove(&canonical.0);
-
-                let nodes = egraph.nodes(canonical);
-                let mut min_count = usize::MAX;
-                let mut min_idx = 0;
-
-                for (idx, node) in nodes.iter().enumerate() {
-                    let count = match node {
-                        ENode::Var(_) | ENode::Const(_) => 1,
-                        ENode::Op { children, .. } => {
-                            if children.iter().any(|&c| egraph.find(c) == canonical) {
-                                CYCLE_COUNT
-                            } else {
-                                let child_sum: usize = children
-                                    .iter()
-                                    .map(|&c| {
-                                        let cc = egraph.find(c);
-                                        best_count[cc.0 as usize].unwrap_or(CYCLE_COUNT)
-                                    })
-                                    .sum();
-                                1usize.saturating_add(child_sum)
-                            }
-                        }
-                    };
-
-                    if count < min_count {
-                        min_count = count;
-                        min_idx = idx;
-                    }
-                }
-
-                best_count[canonical.0 as usize] = Some(min_count);
-                best_node[canonical.0 as usize] = Some(min_idx);
-            }
-        }
-
-        break_choice_cycles(egraph, root, &mut best_node);
-
-        best_node
     }
 
     /// Walk the current best tree and collect active (reachable) e-class IDs.

@@ -33,8 +33,6 @@
 //! | Accumulator build | O(nodes²) | O(edges) | O(nodes) |
 //! | Incremental update | O(subtree²) | O(Δedges × K) | O(subtree) |
 
-#![allow(dead_code)] // Prototype code
-
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -700,7 +698,7 @@ pub struct EdgeAccumulator {
 
     /// Number of shared subtrees skipped via CSE deduplication.
     ///
-    /// Incremented by `from_expr_dedup` each time a subtree that was already
+    /// Incremented by `from_arena_dedup` each time a subtree that was already
     /// walked is encountered again. The duplicate's edges are NOT re-added to
     /// the accumulator — this field is purely diagnostic and does NOT feed into
     /// the network.
@@ -921,18 +919,6 @@ impl EdgeAccumulator {
         }
 
         acc
-    }
-
-    /// Merge another accumulator into this one (vector addition).
-    ///
-    /// Both flat and depth-encoded halves are additive.
-    pub fn merge(&mut self, other: &Self) {
-        for i in 0..4 * K {
-            self.values[i] += other.values[i];
-        }
-        self.edge_count += other.edge_count;
-        self.node_count += other.node_count;
-        self.backref_count += other.backref_count;
     }
 
     // ========================================================================
@@ -1506,12 +1492,12 @@ pub struct Edge {
 /// ## Architecture
 ///
 /// ```text
-/// expr → OpEmbeddings → EdgeAccumulator → hidden [64] → expr_proj → expr_embed [24]
+/// expr → OpEmbeddings → EdgeAccumulator → hidden [64] → expr_proj → expr_embed [32]
 ///                                                            ├─→ value_mlp → cost (extraction head)
 ///                                                            └─→ [embed, cost] → mask_mlp → bilinear → score (saturation head)
 /// ```
 ///
-/// **Extraction head**: `expr_embed → value_mlp (24→16→1)` predicts log-nanosecond cost.
+/// **Extraction head**: `expr_embed → value_mlp (32→16→1)` predicts log-nanosecond cost.
 /// **Saturation head**: `[expr_embed, value_pred] → mask_mlp → bilinear(mask_features, rule_embed)` scores rules.
 ///
 /// Rule embeddings come from LHS/RHS templates via `rule_proj`, not from learned per-rule embeddings.
@@ -1538,7 +1524,7 @@ pub struct ExprNnue {
     // ========== UNIFIED MASK ARCHITECTURE ==========
     // These fields support the new bilinear expr-rule interaction model
     // that scales to 1000+ rules.
-    /// Projects backbone hidden (64) to shared expr embedding (EMBED_DIM=24).
+    /// Projects backbone hidden (64) to shared expr embedding (EMBED_DIM=32).
     /// Weights: [HIDDEN_DIM x EMBED_DIM]
     pub expr_proj_w: [[f32; EMBED_DIM]; HIDDEN_DIM],
     /// Expr projection bias: [EMBED_DIM]
@@ -2545,57 +2531,6 @@ impl ExprNnue {
     // The accumulator can be incrementally updated as rules are applied.
     // ========================================================================
 
-    /// Predict cost directly from accumulator (for MCTS evaluation).
-    ///
-    /// Skips expr parsing - just forward pass through backbone + extraction head.
-    /// Use this for fast MCTS rollout evaluation.
-    #[must_use]
-    pub fn predict_cost_from_accumulator(&self, acc: &EdgeAccumulator) -> f32 {
-        let hidden = self.forward_shared(acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        // Value MLP: EMBED_DIM → MLP_HIDDEN (ReLU) → 1
-        let mut h = self.value_mlp_b1;
-        for i in 0..EMBED_DIM {
-            for j in 0..MLP_HIDDEN {
-                h[j] += expr_embed[i] * self.value_mlp_w1[i][j];
-            }
-        }
-        for j in 0..MLP_HIDDEN {
-            h[j] = h[j].max(0.0); // ReLU
-        }
-
-        let mut cost = self.value_mlp_b2;
-        for j in 0..MLP_HIDDEN {
-            cost += h[j] * self.value_mlp_w2[j];
-        }
-        cost
-    }
-
-    /// Predict cost with pre-computed accumulator (for MCTS).
-    #[must_use]
-    pub fn predict_cost_from_features(&self, acc: &EdgeAccumulator) -> f32 {
-        let hidden = self.forward_shared(acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        // Value MLP: EMBED_DIM → MLP_HIDDEN (ReLU) → 1
-        let mut h = self.value_mlp_b1;
-        for i in 0..EMBED_DIM {
-            for j in 0..MLP_HIDDEN {
-                h[j] += expr_embed[i] * self.value_mlp_w1[i][j];
-            }
-        }
-        for j in 0..MLP_HIDDEN {
-            h[j] = h[j].max(0.0); // ReLU
-        }
-
-        let mut cost = self.value_mlp_b2;
-        for j in 0..MLP_HIDDEN {
-            cost += h[j] * self.value_mlp_w2[j];
-        }
-        cost
-    }
-
     /// Get policy logits from accumulator (for MCTS prior).
     ///
     /// Returns scores for all rules. Use softmax to get probabilities.
@@ -3373,28 +3308,6 @@ impl ExprNnue {
         }
 
         d_expr_embed
-    }
-
-    /// Backprop through expr projection (optional, for fine-tuning).
-    ///
-    /// Updates expr_proj weights. Backbone (w1, b1) remains frozen.
-    #[allow(dead_code)]
-    fn backprop_expr_proj(
-        &mut self,
-        d_expr_embed: &[f32; EMBED_DIM],
-        hidden: &[f32; HIDDEN_DIM],
-        lr: f32,
-    ) {
-        // d_expr_embed → expr_proj_w, expr_proj_b
-        for j in 0..HIDDEN_DIM {
-            for k in 0..EMBED_DIM {
-                self.expr_proj_w[j][k] -= lr * hidden[j] * d_expr_embed[k];
-            }
-        }
-
-        for k in 0..EMBED_DIM {
-            self.expr_proj_b[k] -= lr * d_expr_embed[k];
-        }
     }
 }
 

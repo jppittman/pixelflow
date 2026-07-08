@@ -11,7 +11,7 @@ profiling = ["pprof"]
 
 [dependencies]
 pixelflow-ir = { path = "../pixelflow-ir" }
-pixelflow-search = { path = "../pixelflow-search", features = ["std", "nnue"] }
+pixelflow-search = { path = "../pixelflow-search", features = ["std"] }
 pixelflow-core = { path = "../pixelflow-core" }
 pixelflow-compiler = { path = "../pixelflow-compiler" }
 libm = "0.2.15"
