@@ -153,13 +153,14 @@ impl EventMonitor {
         );
 
         // Use a fixed-size buffer for libc calls
-        let mut libc_events: [libc::epoll_event; 32] = unsafe { std::mem::zeroed() };
+        const MAX_EVENTS: usize = 32;
+        let mut libc_events: [libc::epoll_event; MAX_EVENTS] = unsafe { std::mem::zeroed() };
 
         let num_events = unsafe {
             libc::epoll_wait(
                 self.epoll_fd,
                 libc_events.as_mut_ptr(),
-                32,
+                MAX_EVENTS as i32,
                 timeout_ms as libc::c_int,
             )
         };

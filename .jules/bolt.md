@@ -24,3 +24,7 @@
 ## 2025-12-29 - Avoid Intermediate Vectors and use Vec::with_capacity
 **Learning:** Performance can be impacted by intermediate allocations like `text.chars().collect::<Vec<char>>()` when extracting small segments.
 **Action:** Avoid `.collect()` into an intermediate Vector when doing simple tasks like extracting characters or single items, and instead use the Iterator functions directly (`chars.next()`). Also use `Vec::with_capacity` when the required capacity is known ahead of time.
+
+## 2024-07-08 - Small collection O(N) deduplication optimization
+**Learning:** In hot I/O multiplexing event loops (kqueue/epoll) within the core-term crate, `std::collections::HashSet` was being initialized repeatedly to track seen file descriptor tokens. Constructing and dropping a `HashSet` involves significant heap allocation and hashing overhead which is entirely unjustified for small arrays (`MAX_EVENTS = 32`). A simple O(N) linear search using `iter_mut().find()` over a pre-existing vector avoids dynamic allocations and is dramatically faster at this scale.
+**Action:** When tracking seen elements or deduplicating small collections (N <= 32) in performance-critical paths, avoid `HashSet::new()` completely. Instead, use a pre-existing vector and perform a linear search (e.g. `.find()`), relying on L1 cache speed.
