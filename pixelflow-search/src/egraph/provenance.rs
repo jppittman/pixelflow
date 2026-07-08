@@ -214,6 +214,16 @@ impl Provenance {
     pub fn union_events(&self) -> &[UnionEvent] {
         &self.unions
     }
+
+    /// Iterate every recorded application, in firing order, paired with its
+    /// `ApplicationId`. The counterpart to indexed lookup via [`Self::application`]
+    /// for callers (e.g. the hindsight labeler) that need to walk the whole log.
+    pub fn applications(&self) -> impl Iterator<Item = (ApplicationId, &ApplicationRecord)> {
+        self.applications
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (ApplicationId(i as u64), r))
+    }
 }
 
 /// Compute the transitive set of rewrite-rule firings ([`ApplicationId`]s)

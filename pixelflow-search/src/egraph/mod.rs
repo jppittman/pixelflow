@@ -21,6 +21,7 @@ pub mod deps;
 pub mod derivative;
 pub(crate) mod extract;
 mod graph;
+mod labeler;
 mod node;
 pub mod ops;
 pub mod provenance;
@@ -36,6 +37,7 @@ pub use extract::{
     compute_ref_counts, extract_dag, extract_neural_to_arena,
 };
 pub use graph::{ApplyResult, EGraph, EGraphBatch, RewriteTarget};
+pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
 pub use node::{EClassId, ENode};
 pub use ops::Op;
 pub use provenance::{
