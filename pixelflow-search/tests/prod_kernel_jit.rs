@@ -14,9 +14,10 @@
 //!              ->  transcendental lowering + register allocation + codegen
 //!              ->  native machine code, executed on real coordinates.
 //!
-//! Note: the checked-in NNUE weights (`pixelflow-compiler/weights/expr_nnue.bin`)
-//! are a Git-LFS pointer, not the real tensor, so this drives the extractor with
-//! the latency-prior cost model. The point is the *pipeline*, end to end.
+//! Note: there are no validated trained NNUE weights shipped with the compiler
+//! (see `pixelflow-compiler/src/optimize.rs`), so this drives the extractor
+//! with the no-op zero-weight cost model — extraction keeps the original
+//! form; peephole/CSE still run. The point is the *pipeline*, end to end.
 
 use pixelflow_ir::backend::emit::compile_arena_dag;
 use pixelflow_ir::{ExprArena, ExprId, OpKind};

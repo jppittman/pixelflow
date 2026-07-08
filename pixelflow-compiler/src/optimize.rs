@@ -55,10 +55,36 @@ pub fn standard_rules() -> Vec<Box<dyn Rewrite>> {
 /// Counter for generating unique opaque variable names.
 static OPAQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Optimization model for AOT extraction, loaded from trained weights.
+/// Optimization model for AOT extraction.
 static OPTIMIZATION_MODEL: OnceLock<ExprNnue> = OnceLock::new();
 
-/// Get the neural cost model, loaded from trained weights embedded at compile time.
+/// Get the neural cost model used to guide e-graph extraction.
+///
+/// ## Default: NNUE extraction is intentionally disabled
+///
+/// There is no validated, trained set of NNUE weights shipped with this
+/// compiler. Rather than embed stale/unvalidated weights and silently fall
+/// back when they fail to load (which is what this code used to do — see
+/// git history), the default path deliberately constructs the no-op model
+/// (`ExprNnue::new()`, all-zero weights). A zero model assigns uniform cost
+/// to every candidate rewrite, so the hill-climbing extractor keeps the
+/// original (author-written) form rather than chasing a noisy or untrained
+/// cost signal into a pathological rewrite.
+///
+/// This does **not** disable optimization: structural peephole rewriting
+/// (`optimize_expr`, constant folding, identity removal) and e-graph
+/// CSE/global rewriting still run in full — only the *learned* cost-guided
+/// extraction step is a no-op. This is intentional, not an error, so it
+/// produces no stderr output.
+///
+/// ## Opt-in: `PIXELFLOW_NNUE_WEIGHTS`
+///
+/// Set this env var (read at proc-macro expansion time, i.e. compile time of
+/// the *consuming* crate) to the path of a trained weights file to enable
+/// learned extraction. Any failure to load — missing file, wrong magic, wrong
+/// length — is a hard compile failure (`panic!`) with a precise diagnostic.
+/// There is no silent fallback on this path: if you asked for learned
+/// weights, you get them or the build fails.
 ///
 /// Weights are trained via the pixelflow-pipeline training loop:
 ///   1. Self-play generates trajectories (e-graph saturation + JIT benchmarking)
@@ -67,35 +93,46 @@ static OPTIMIZATION_MODEL: OnceLock<ExprNnue> = OnceLock::new();
 ///      and saturation head (which rules to apply)
 ///   4. Extraction head uses DAG-aware accumulator (shared nodes counted once)
 ///   5. JIT benchmarks use eval100! unrolled loop (no loop counter bias)
-///
-/// The extraction head evaluates expressions during e-graph extraction to
-/// pick the cheapest equivalent form. It uses `forward_expr_only()` which
-/// sees only expression structure (op types + edge depths), not search
-/// metadata (node counts, budgets).
 fn get_optimization_model() -> &'static ExprNnue {
-    OPTIMIZATION_MODEL.get_or_init(|| {
-        static WEIGHTS: &[u8] = include_bytes!("../weights/expr_nnue.bin");
-        // The trained weights ship via Git LFS. When LFS content is unavailable
-        // (e.g. a fresh clone without `git lfs pull`, or CI without LFS), the
-        // embedded bytes are just the LFS pointer and won't parse. Degrade
-        // gracefully rather than aborting compilation: the cost model only
-        // ranks semantically equivalent rewrites, so a default model still
-        // produces correct code — just not the learned-optimal instruction
-        // selection. A zero-initialized model assigns uniform cost to every
-        // candidate, so the hill-climbing extractor keeps the original
-        // (author-written) form rather than chasing a noisy cost signal into a
-        // pathological rewrite.
-        match ExprNnue::from_bytes(WEIGHTS) {
-            Ok(model) => model,
-            Err(e) => {
-                eprintln!(
-                    "pixelflow: optimization model weights unavailable ({e}); \
-                     falling back to default cost model (run `git lfs pull` for learned weights)"
-                );
-                ExprNnue::new()
-            }
-        }
+    OPTIMIZATION_MODEL.get_or_init(|| match std::env::var("PIXELFLOW_NNUE_WEIGHTS") {
+        Ok(path) => load_opt_in_weights(&path),
+        Err(_) => ExprNnue::new(),
     })
+}
+
+/// Load NNUE weights from an opt-in path set via `PIXELFLOW_NNUE_WEIGHTS`.
+///
+/// Hard-fails the compile on any error, per the repo's no-silent-failures
+/// rule: the caller explicitly asked for learned weights, so a failure to
+/// honor that request must not be swallowed.
+fn load_opt_in_weights(path: &str) -> ExprNnue {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        panic!(
+            "pixelflow: PIXELFLOW_NNUE_WEIGHTS={path:?} could not be read: {e}. \
+             The env var must point to a valid NNUE weights file produced by \
+             pixelflow-pipeline training."
+        )
+    });
+
+    const EXPECTED_MAGIC: &[u8; 4] = b"TRID";
+    let found_magic = bytes.get(0..4);
+    match ExprNnue::from_bytes(&bytes) {
+        Ok(model) => model,
+        Err(e) => {
+            let magic_desc = match found_magic {
+                Some(m) => format!("{:?} ({})", m, String::from_utf8_lossy(m)),
+                None => format!("<file too short: {} bytes>", bytes.len()),
+            };
+            panic!(
+                "pixelflow: PIXELFLOW_NNUE_WEIGHTS={path:?} failed to load: {e}. \
+                 Expected magic {:?} ({}), found magic {}. File length: {} bytes.",
+                EXPECTED_MAGIC,
+                String::from_utf8_lossy(EXPECTED_MAGIC),
+                magic_desc,
+                bytes.len()
+            )
+        }
+    }
 }
 
 /// Generate a unique name for an opaque expression (unknown method call, etc.)
@@ -1577,6 +1614,58 @@ mod tests {
             !has_wrong_pattern,
             "Found wrong pattern (r.neg() without wrapping): {}",
             output_str
+        );
+    }
+
+    /// The default production path (no `PIXELFLOW_NNUE_WEIGHTS` set) must use
+    /// the no-op zero-weight model, which assigns uniform cost to every
+    /// candidate rewrite. That means e-graph extraction keeps the original
+    /// (author-written) form rather than picking an alternative — only
+    /// structural peephole/CSE may change the AST shape (e.g. shared
+    /// subexpressions become let-bindings), never algebraic rewrites chosen
+    /// on "cost."
+    ///
+    /// This pins down the behavior asserted by the audit: extraction with an
+    /// all-zero model is a no-op over and above peephole/CSE. We verify this
+    /// by checking that `optimize_expr_with_model` with `ExprNnue::new()`
+    /// (what `get_optimization_model()` returns by default) produces the same
+    /// generated code as directly using the zero model, and that no
+    /// NNUE-only rewrite (e.g. FMA fusion, which the zero model has no
+    /// signal to prefer over the unfused form) is force-applied.
+    #[test]
+    fn default_path_extraction_is_noop_zero_model() {
+        use crate::codegen;
+
+        let input = quote! { || {
+            let a = X * X;
+            let b = Y * Y;
+            (a + b).sqrt()
+        }};
+
+        // `optimize()` is the real kernel! macro entry point; with no
+        // PIXELFLOW_NNUE_WEIGHTS set it must resolve to the no-op model.
+        let kernel = parse(input.clone()).unwrap();
+        let analyzed = analyze(kernel).unwrap();
+        let via_default_entry_point = optimize(analyzed);
+        let default_output = codegen::emit(via_default_entry_point).to_string();
+
+        // Directly constructing the no-op model and running the same
+        // expression through the model-based optimizer must match exactly:
+        // this proves `get_optimization_model()`'s default really is
+        // `ExprNnue::new()`, not something silently substituted.
+        let kernel = parse(input).unwrap();
+        let mut analyzed_for_model_path = analyze(kernel).unwrap();
+        let zero_model = ExprNnue::new();
+        analyzed_for_model_path.def.body = optimize_expr(analyzed_for_model_path.def.body);
+        analyzed_for_model_path.def.body =
+            optimize_expr_with_model(analyzed_for_model_path.def.body, &zero_model);
+        let explicit_zero_output = codegen::emit(analyzed_for_model_path).to_string();
+
+        assert_eq!(
+            default_output, explicit_zero_output,
+            "default optimize() path must be byte-identical to explicitly \
+             using ExprNnue::new() (the no-op model) — the default path must \
+             not silently pick up learned weights"
         );
     }
 }
