@@ -66,3 +66,8 @@ required-features = ["training"]
 name = "bench_scanline_jit"
 path = "src/bin/bench_scanline_jit.rs"
 required-features = ["training"]
+
+[[bin]]
+name = "bench_extraction_3way"
+path = "src/bin/bench_extraction_3way.rs"
+required-features = ["training"]
