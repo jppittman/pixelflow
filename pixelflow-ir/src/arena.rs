@@ -1048,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_and_gather() {
+    fn arena_should_create_gather_when_buffer_declared() {
         let mut arena = ExprArena::new();
         let buf = arena.declare_buffer(BufferDecl {
             width: 16,
@@ -1074,7 +1074,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "not declared")]
-    fn test_push_buffer_undeclared() {
+    fn push_buffer_should_panic_when_undeclared() {
         let mut arena = ExprArena::new();
         let _ = arena.push_buffer(BufferId(0));
     }
