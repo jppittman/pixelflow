@@ -1312,16 +1312,19 @@ fn optimize_unary(mut unary: UnaryExpr) -> Expr {
 fn optimize_block(mut block: BlockExpr) -> Expr {
     // Optimize statements
     for stmt in &mut block.stmts {
-        if let Stmt::Let(let_stmt) = stmt {
-            let_stmt.init = optimize_expr(std::mem::replace(
-                &mut let_stmt.init,
-                make_literal(0.0, Span::call_site()), // Dummy placeholder
-            ));
-        } else if let Stmt::Expr(expr) = stmt {
-            *expr = optimize_expr(std::mem::replace(
-                expr,
-                make_literal(0.0, Span::call_site()), // Dummy placeholder
-            ));
+        match stmt {
+            Stmt::Let(let_stmt) => {
+                let_stmt.init = optimize_expr(std::mem::replace(
+                    &mut let_stmt.init,
+                    make_literal(0.0, Span::call_site()), // Dummy placeholder
+                ));
+            }
+            Stmt::Expr(expr) => {
+                *expr = optimize_expr(std::mem::replace(
+                    expr,
+                    make_literal(0.0, Span::call_site()), // Dummy placeholder
+                ));
+            }
         }
     }
 
