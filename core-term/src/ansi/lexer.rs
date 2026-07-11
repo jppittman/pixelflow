@@ -268,7 +268,7 @@ impl AnsiLexer {
 
     /// Consumes and returns all accumulated tokens.
     pub fn take_tokens(&mut self) -> Vec<AnsiToken> {
-        trace!("taking {:?} tokens from lexer", &self.tokens);
+        trace!("taking {:?} tokens from lexer", self.tokens);
         mem::take(&mut self.tokens)
     }
 
