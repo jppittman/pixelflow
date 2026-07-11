@@ -49,8 +49,12 @@ pub struct AnalyzedKernel {
 /// Perform semantic analysis on a parsed kernel.
 pub fn analyze(kernel: KernelDef) -> syn::Result<AnalyzedKernel> {
     // Anonymous kernels (no struct_decl) allow captured variables from environment
-    let is_anonymous = kernel.struct_decl.is_none();
-    let mut analyzer = SemanticAnalyzer::new(is_anonymous);
+    let kernel_type = if kernel.struct_decl.is_none() {
+        KernelType::Anonymous
+    } else {
+        KernelType::Named
+    };
+    let mut analyzer = SemanticAnalyzer::new(kernel_type);
 
     // Register all parameters in the symbol table
     for param in &kernel.params {
@@ -67,17 +71,22 @@ pub fn analyze(kernel: KernelDef) -> syn::Result<AnalyzedKernel> {
 }
 
 /// The semantic analyzer state.
+enum KernelType {
+    Anonymous,
+    Named,
+}
+
 struct SemanticAnalyzer {
     symbols: SymbolTable,
     /// Whether this is an anonymous kernel (allows captured variables).
-    is_anonymous: bool,
+    kernel_type: KernelType,
 }
 
 impl SemanticAnalyzer {
-    fn new(is_anonymous: bool) -> Self {
+    fn new(kernel_type: KernelType) -> Self {
         SemanticAnalyzer {
             symbols: SymbolTable::new(),
-            is_anonymous,
+            kernel_type,
         }
     }
 
@@ -185,7 +194,7 @@ impl SemanticAnalyzer {
             None => {
                 // For anonymous kernels, unknown symbols are captured from environment
                 // The Rust closure will handle the capture - no error needed
-                if self.is_anonymous {
+                if matches!(self.kernel_type, KernelType::Anonymous) {
                     return Ok(SymbolKind::Local); // Treat as external/captured
                 }
 
