@@ -508,7 +508,6 @@ impl<'a> ArenaKernelParser<'a> {
 }
 
 /// Parser result: (parsed value, remaining input)
-
 /// Parse kernel code directly into an [`ExprArena`] (DAG) with structural sharing.
 ///
 /// Identical subexpressions map to the same [`ExprId`], so the returned arena is
@@ -586,6 +585,9 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                     ExprNode::Nary(op, _, _) => panic!(
                         "arena_to_kernel_code: Nary({}) not representable in kernel code syntax",
                         op.name()
+                    ),
+                    ExprNode::Buffer(_) => panic!(
+                        "arena_to_kernel_code: Buffer not representable in kernel code syntax"
                     ),
                 };
                 result_stack.push(emitted);
@@ -669,6 +671,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("eval_ternary failed for {op:?}"))
             }
             ExprNode::Nary(kind, _, _) => panic!("Nary in eval_arena_scalar: {kind:?}"),
+            ExprNode::Buffer(_) => panic!("Buffer in eval_arena_scalar"),
         }
     }
 

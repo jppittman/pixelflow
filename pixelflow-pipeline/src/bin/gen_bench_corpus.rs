@@ -294,6 +294,7 @@ fn arena_structural_key(arena: &ExprArena, root: ExprId) -> Vec<SigNode> {
                         let child_ids: Vec<u32> = children.iter().map(|child| ids[child]).collect();
                         SigNode::Nary(*op, child_ids.into_boxed_slice())
                     }
+                    ExprNode::Buffer(_) => unimplemented!(),
                 };
                 let sig_id = signatures.len() as u32;
                 signatures.push(sig);

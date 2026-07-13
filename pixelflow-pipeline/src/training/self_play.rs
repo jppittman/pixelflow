@@ -19,7 +19,7 @@ use pixelflow_search::egraph::{
 use pixelflow_search::nnue::factored::INPUT_DIM;
 use pixelflow_search::nnue::factored::MAX_ARITY;
 use pixelflow_search::nnue::{
-    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue, GRAPH_ACC_DIM,
+    BwdGenConfig, BwdGenerator, EMBED_DIM, EdgeAccumulator, ExprNnue,
     GRAPH_INPUT_DIM, GraphAccumulator, OpKind, RuleTemplates,
 };
 
@@ -220,6 +220,7 @@ pub fn collect_edges_dedup_arena(arena: &ExprArena, root: ExprId) -> Vec<(u8, u8
                     stack.push((child, d + 1));
                 }
             }
+            ExprNode::Buffer(_) => {}
         }
     }
 
@@ -1262,6 +1263,7 @@ pub fn generate_corpus_trajectories_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pixelflow_search::nnue::GRAPH_ACC_DIM;
 
     #[test]
     fn acc_to_vec_correct_length() {
