@@ -2,43 +2,23 @@
 
 use super::TerminalEmulator;
 use crate::term::action::EmulatorAction;
-use log::{debug, warn};
+use log::debug;
 
 impl TerminalEmulator {
     pub(super) fn handle_osc(&mut self, data: Vec<u8>) -> Option<EmulatorAction> {
         let osc_str = String::from_utf8_lossy(&data);
-        let parts: Vec<&str> = osc_str.splitn(2, ';').collect();
-
-        let ps_str: &str;
-        let content_str: &str;
-
-        match parts.len() {
-            1 => {
+        let (ps_str, content_str) = match osc_str.split_once(';') {
+            Some((ps, content)) => (ps, content),
+            None => {
                 // No semicolon found, treat the whole string as Ps, content is empty
-                ps_str = parts[0];
-                content_str = "";
                 // Log a debug message for this case, as it might be an implicit expectation
                 debug!(
-                    "OSC sequence without semicolon: '{}'. Interpreting Ps='{}', Pt='{}'",
-                    osc_str, ps_str, content_str
+                    "OSC sequence without semicolon: '{}'. Interpreting Ps='{}', Pt=''",
+                    osc_str, osc_str
                 );
+                (osc_str.as_ref(), "")
             }
-            2 => {
-                // Semicolon found, standard case
-                ps_str = parts[0];
-                content_str = parts[1];
-            }
-            _ => {
-                // This case should ideally not be reached with splitn(2, ';')
-                // but handle defensively.
-                warn!(
-                    "Malformed OSC sequence (unexpected parts count for {}): {}",
-                    parts.len(),
-                    osc_str
-                );
-                return None;
-            }
-        }
+        };
 
         // Attempt to parse Ps, default to 0 if parsing fails (e.g., "Implicit Title")
         // Using u32::MAX as a sentinel for unhandled 'ps' codes later is fine,

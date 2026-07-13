@@ -24,3 +24,7 @@
 ## 2025-12-29 - Avoid Intermediate Vectors and use Vec::with_capacity
 **Learning:** Performance can be impacted by intermediate allocations like `text.chars().collect::<Vec<char>>()` when extracting small segments.
 **Action:** Avoid `.collect()` into an intermediate Vector when doing simple tasks like extracting characters or single items, and instead use the Iterator functions directly (`chars.next()`). Also use `Vec::with_capacity` when the required capacity is known ahead of time.
+
+## 2024-05-24 - String Splitting Allocations
+**Learning:** Extracting parts of a string using `.splitn().collect::<Vec<_>>()` unnecessarily allocates an intermediate Vector on the heap.
+**Action:** Always prefer methods that yield tuples or iterators directly, such as `.split_once()`, to extract substrings without allocation.
