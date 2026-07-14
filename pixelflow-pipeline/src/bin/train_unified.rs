@@ -660,7 +660,6 @@ fn gacc_from_replay(step: &ReplayStep) -> GraphAccumulator {
 struct ReplayStep {
     acc: Vec<f32>,             // 132 floats (INPUT_DIM)
     graph_acc: Vec<f32>,       // GRAPH_INPUT_DIM floats — VSA graph state
-    expr_embed: Vec<f32>,      // 32 floats (EMBED_DIM) — expr_proj output at decision time
     rule_embed: Vec<f32>,      // 32 floats (EMBED_DIM)
     edges: Vec<(u8, u8, u16)>, // Edge list for embedding gradient flow
     matched: bool,
@@ -696,7 +695,6 @@ impl ReplayBuffer {
                 self.steps.push(ReplayStep {
                     acc: step.accumulator_state.clone(),
                     graph_acc: step.graph_accumulator_state.clone(),
-                    expr_embed: step.expression_embedding.clone(),
                     rule_embed: step.rule_embedding.clone(),
                     edges: step.edges.clone(),
                     matched: step.matched,
@@ -1428,7 +1426,7 @@ fn real_main() {
             f64::NAN
         } else {
             let mid = speedups.len() / 2;
-            if speedups.len() % 2 == 0 {
+            if speedups.len().is_multiple_of(2) {
                 (speedups[mid - 1] + speedups[mid]) / 2.0
             } else {
                 speedups[mid]
@@ -2153,7 +2151,7 @@ fn validate_on_shaders(model: &ExprNnue) -> f64 {
 
     speedups.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
     let mid = speedups.len() / 2;
-    let median = if speedups.len() % 2 == 0 {
+    let median = if speedups.len().is_multiple_of(2) {
         (speedups[mid - 1] + speedups[mid]) / 2.0
     } else {
         speedups[mid]
@@ -2447,7 +2445,7 @@ fn run_trial(
                 f64::NAN
             } else {
                 let mid = speedups.len() / 2;
-                if speedups.len() % 2 == 0 {
+                if speedups.len().is_multiple_of(2) {
                     (speedups[mid - 1] + speedups[mid]) / 2.0
                 } else {
                     speedups[mid]

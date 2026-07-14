@@ -587,6 +587,7 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "arena_to_kernel_code: Nary({}) not representable in kernel code syntax",
                         op.name()
                     ),
+                    ExprNode::Buffer(b) => format!("buf_{}", b.0),
                 };
                 result_stack.push(emitted);
             }
@@ -669,6 +670,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("eval_ternary failed for {op:?}"))
             }
             ExprNode::Nary(kind, _, _) => panic!("Nary in eval_arena_scalar: {kind:?}"),
+            ExprNode::Buffer(_) => panic!("Buffer node not supported in scalar eval"),
         }
     }
 
