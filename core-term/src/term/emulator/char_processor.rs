@@ -21,17 +21,17 @@ impl TerminalEmulator {
         let (cursor_x, cursor_y) = self.cursor_controller.physical_screen_pos(&screen_ctx);
 
         // Determine the position of the base character cell.
-        let (base_x, base_y) = if cursor_x > 0 {
-            (cursor_x - 1, cursor_y)
-        } else if cursor_y > 0 {
-            (screen_ctx.width.saturating_sub(1), cursor_y - 1)
-        } else {
-            // Cursor is at (0, 0) — no previous cell to attach to.
-            trace!(
-                "attach_combining_char: no previous cell at origin, discarding '{}'",
-                combining
-            );
-            return;
+        let (base_x, base_y) = match (cursor_x > 0, cursor_y > 0) {
+            (true, _) => (cursor_x - 1, cursor_y),
+            (false, true) => (screen_ctx.width.saturating_sub(1), cursor_y - 1),
+            (false, false) => {
+                // Cursor is at (0, 0) — no previous cell to attach to.
+                trace!(
+                    "attach_combining_char: no previous cell at origin, discarding '{}'",
+                    combining
+                );
+                return;
+            }
         };
 
         if base_y >= self.screen.height || base_x >= self.screen.width {
