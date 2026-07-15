@@ -614,7 +614,7 @@ impl AnsiCommand {
                 shape: param_or(0, 1), // Default shape 1 (blinking block) or 0 (default)
             })),
             // Handle 't' for WindowManipulation, checking intermediates for safety
-            (_, _, b't') if intermediates.is_empty() || intermediates == b" " => {
+            (_, i, b't') if i.is_empty() || i == b" " => {
                 // Ensure 't' is not part of a more complex sequence like DECSTUI
                 let ps1 = param_or(0, 0);
                 let ps2 = params.get(1).copied();
