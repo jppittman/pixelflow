@@ -24,3 +24,6 @@
 ## 2025-12-29 - Avoid Intermediate Vectors and use Vec::with_capacity
 **Learning:** Performance can be impacted by intermediate allocations like `text.chars().collect::<Vec<char>>()` when extracting small segments.
 **Action:** Avoid `.collect()` into an intermediate Vector when doing simple tasks like extracting characters or single items, and instead use the Iterator functions directly (`chars.next()`). Also use `Vec::with_capacity` when the required capacity is known ahead of time.
+## 2025-12-29 - Avoid Intermediate Vectors for Split Operations
+**Learning:** In the `handle_osc` terminal emulation function, `osc_str.splitn(2, ';').collect::<Vec<&str>>()` was used to parse a sequence, causing an unnecessary heap allocation on every OSC sequence parsed.
+**Action:** Replaced `.splitn().collect()` with `.split_once(';')`, which returns a tuple instead of a `Vec`, eliminating the intermediate allocation and improving performance on a hot path.
