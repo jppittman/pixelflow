@@ -508,7 +508,7 @@ impl<'a> ArenaKernelParser<'a> {
 }
 
 /// Parser result: (parsed value, remaining input)
-
+///
 /// Parse kernel code directly into an [`ExprArena`] (DAG) with structural sharing.
 ///
 /// Identical subexpressions map to the same [`ExprId`], so the returned arena is
