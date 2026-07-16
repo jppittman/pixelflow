@@ -102,6 +102,7 @@ pub fn actor_impl(_attr: TokenStream, item: TokenStream) -> TokenStream {
 struct ActorAttrs {
     is_main: bool,
     is_exposed: bool,
+    is_waker: bool,
 }
 
 /// Parse attributes from a bracket group like [main], [expose], [main, expose]
@@ -111,6 +112,12 @@ fn parse_attrs(group_str: &str) -> ActorAttrs {
         match part.trim() {
             "main" => attrs.is_main = true,
             "expose" => attrs.is_exposed = true,
+            // An actor that blocks in `park()` on a file descriptor (epoll,
+            // kqueue) needs a `WakeHandler` wired into its inbound handles so
+            // sends interrupt the poll. `[waker]` reserves a slot in the
+            // generated `Wakers` struct for that actor. `[main]` implies a
+            // waker slot too (the platform waker), preserving prior behavior.
+            "waker" => attrs.is_waker = true,
             "" => {}
             other => panic!("unknown attribute: {}", other),
         }
@@ -155,6 +162,10 @@ pub fn troupe(input: TokenStream) -> TokenStream {
     // Parse: name: Type [attrs], ...
     // (name, type, is_main, is_exposed)
     let mut actors: Vec<(String, String, bool, bool)> = Vec::new();
+    // Parallel to `actors`: true if the actor gets a `Wakers` slot ([main] or
+    // [waker]). Kept separate so the existing 4-tuple destructures are
+    // untouched.
+    let mut waker_slots: Vec<bool> = Vec::new();
     let mut tokens = input.into_iter().peekable();
 
     while let Some(tok) = tokens.next() {
@@ -206,6 +217,7 @@ pub fn troupe(input: TokenStream) -> TokenStream {
             tokens.next(); // consume the bracket group
         }
 
+        waker_slots.push(attrs.is_main || attrs.is_waker);
         actors.push((name, type_name, attrs.is_main, attrs.is_exposed));
 
         // Skip comma if present
@@ -285,12 +297,18 @@ pub fn troupe(input: TokenStream) -> TokenStream {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Generate builder creation in new()
-    // Main actor gets the wake_handler parameter, others get None
+    // Generate builder creation in new_with_wakers().
+    // Waker-slot actors ([main] or [waker]) take their `wakers.<name>` field;
+    // all others get None.
     let create_builders: String = actors
         .iter()
-        .map(|(name, ty, is_main, _)| {
-            let waker = if *is_main { "main_waker" } else { "None" };
+        .zip(waker_slots.iter())
+        .map(|((name, ty, _, _), is_slot)| {
+            let waker = if *is_slot {
+                format!("wakers.{name}")
+            } else {
+                "None".to_string()
+            };
             format!(
                 "let mut {name}_builder = ::actor_scheduler::ActorBuilder::<
                     <{ty} as ::actor_scheduler::ActorTypes>::Data,
@@ -299,6 +317,45 @@ pub fn troupe(input: TokenStream) -> TokenStream {
                 >::new(1024, {waker});"
             )
         })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `Wakers` struct: one optional handle per waker slot. Always has at least
+    // the [main] actor's field, so `new_with_waker`/`new` shims below compile.
+    let wakers_fields: String = actors
+        .iter()
+        .zip(waker_slots.iter())
+        .filter(|(_, is_slot)| **is_slot)
+        .map(|((name, _, _, _), _)| {
+            format!(
+                "pub {name}: ::std::option::Option<::std::sync::Arc<dyn ::actor_scheduler::WakeHandler>>,"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `Wakers { main: main_waker, <other slots>: None }` for the back-compat
+    // `new_with_waker` shim.
+    let wakers_from_main: String = actors
+        .iter()
+        .zip(waker_slots.iter())
+        .filter(|(_, is_slot)| **is_slot)
+        .map(|((name, _, is_main, _), _)| {
+            if *is_main {
+                format!("{name}: main_waker,")
+            } else {
+                format!("{name}: None,")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `Wakers { all slots: None }` for the `new` shim.
+    let wakers_all_none: String = actors
+        .iter()
+        .zip(waker_slots.iter())
+        .filter(|(_, is_slot)| **is_slot)
+        .map(|((name, _, _, _), _)| format!("{name}: None,"))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -403,6 +460,16 @@ pub fn troupe(input: TokenStream) -> TokenStream {
             {exposed_fields}
         }}
 
+        /// Wake handlers for the troupe's waker-slot actors ([main] / [waker]).
+        ///
+        /// One optional field per slot: `Some(waker)` wires that `WakeHandler`
+        /// into every inbound handle of the actor, so a send interrupts the
+        /// `park()` poll it is blocked in; `None` leaves it doorbell-only.
+        #[derive(Default)]
+        pub struct Wakers {{
+            {wakers_fields}
+        }}
+
         /// Troupe manages actor group lifecycle.
         ///
         /// Stores [`ActorBuilder`]s until `play()` so that `exposed()` can
@@ -414,13 +481,13 @@ pub fn troupe(input: TokenStream) -> TokenStream {
         }}
 
         impl Troupe {{
-            /// Create a new troupe with per-actor directories.
+            /// Create a new troupe, wiring a wake handler into each waker slot.
             ///
             /// This is phase 1 of two-phase initialization:
-            /// 1. `new()` - create builders and per-actor directories
+            /// 1. `new_with_wakers()` - create builders and per-actor directories
             /// 2. `exposed()` - (optional) create handles for parent troupe
             /// 3. `play()` - build schedulers, spawn threads, run actors
-            pub fn new_with_waker(main_waker: Option<::std::sync::Arc<dyn ::actor_scheduler::WakeHandler>>) -> Self {{
+            pub fn new_with_wakers(wakers: Wakers) -> Self {{
                 {create_builders}
 
                 // Each actor gets its own Directory with dedicated SPSC handles
@@ -431,9 +498,20 @@ pub fn troupe(input: TokenStream) -> TokenStream {
                 }}
             }}
 
-            /// Create a new troupe without a wake handler.
+            /// Create a new troupe with a wake handler for the [main] actor only.
+            ///
+            /// Back-compat shim: all other waker slots get `None`.
+            pub fn new_with_waker(main_waker: Option<::std::sync::Arc<dyn ::actor_scheduler::WakeHandler>>) -> Self {{
+                Self::new_with_wakers(Wakers {{
+                    {wakers_from_main}
+                }})
+            }}
+
+            /// Create a new troupe without any wake handlers.
             pub fn new() -> Self {{
-                Self::new_with_waker(None)
+                Self::new_with_wakers(Wakers {{
+                    {wakers_all_none}
+                }})
             }}
 
             /// Create exposed handles by adding new SPSC producers.

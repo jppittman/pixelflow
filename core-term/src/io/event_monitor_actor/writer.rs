@@ -10,14 +10,25 @@
 //! Writes are nonblocking. If the kernel PTY buffer fills (a stopped shell mid
 //! large paste), the unwritten tail is queued in `pending` and `park()` waits
 //! for `EPOLLOUT` — with the waker registered alongside, so Resize and
-//! Shutdown still get through while the queue drains. The old thread's
-//! blocking `write_all` wedged everything behind a full buffer.
+//! Shutdown still get through while the queue drains.
+//!
+//! # Pre-bind buffering
+//!
+//! The app holds the writer handle before the troupe's `Bind` lands, and a
+//! `Resize` (Control) actually outranks `Bind` (Management) in a scheduler
+//! wake. So the writer accepts Data and Control while unbound: writes queue in
+//! `pending`, and a resize is coalesced into `pending_resize` and applied when
+//! `Bind` arrives. (The PTY is already sized at spawn, so a pre-bind resize is
+//! only ever a refinement.)
 
-use super::{NoManagement, WriterControl};
-use crate::io::event::{EventFlags, EventMonitor};
+use super::{Directory, WriterControl, WriterManagement};
+use crate::io::event::{Event, EventFlags, EventMonitor};
 use crate::io::pty::{NixPty, PtyChannel};
 use crate::io::waker::FdWaker;
-use actor_scheduler::{Actor, ActorStatus, HandlerError, HandlerResult, SystemStatus};
+use crate::io::Resize;
+use actor_scheduler::{
+    Actor, ActorStatus, ActorTypes, HandlerError, HandlerResult, SystemStatus, TroupeActor,
+};
 use log::*;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -27,22 +38,27 @@ const TOKEN_PTY: u64 = 0;
 const TOKEN_WAKER: u64 = 1;
 
 pub(super) struct PtyWriter {
-    pty: NixPty,
-    monitor: EventMonitor,
-    waker: Arc<FdWaker>,
-    /// Bytes accepted but not yet written to the PTY.
+    /// PTY + monitor + waker, present once `Bind` has been handled.
+    bound: Option<BoundWriter>,
+    /// Bytes accepted but not yet written. Accumulates even while unbound.
     pending: VecDeque<Vec<u8>>,
     /// Offset of the first unwritten byte in `pending.front()`.
     cursor: usize,
+    /// Latest resize requested while unbound, applied at `Bind`.
+    pending_resize: Option<Resize>,
     /// Set on unrecoverable write errors (child gone); further writes drop.
     broken: bool,
-    events: Vec<crate::io::event::Event>,
 }
 
-impl PtyWriter {
-    /// Builds the writer and registers the PTY (write interest) and waker.
-    /// Called on the writer thread (the monitor stays thread-local).
-    pub(super) fn new(pty: NixPty, waker: Arc<FdWaker>) -> anyhow::Result<Self> {
+struct BoundWriter {
+    pty: NixPty,
+    monitor: EventMonitor,
+    waker: Arc<FdWaker>,
+    events: Vec<Event>,
+}
+
+impl BoundWriter {
+    fn bind(pty: NixPty, waker: Arc<FdWaker>) -> anyhow::Result<Self> {
         let monitor = EventMonitor::new()?;
         // Registered permanently; park() only polls while `pending` is
         // non-empty, so level-triggered "always writable" costs nothing.
@@ -52,17 +68,20 @@ impl PtyWriter {
             pty,
             monitor,
             waker,
-            pending: VecDeque::new(),
-            cursor: 0,
-            broken: false,
             events: Vec::with_capacity(16),
         })
     }
+}
 
-    /// Write queued bytes until done or the kernel buffer is full.
+impl PtyWriter {
+    /// Write queued bytes until done or the kernel buffer is full. No-op while
+    /// unbound (bytes stay queued for the post-`Bind` flush).
     fn flush_pending(&mut self) {
+        let Some(bound) = self.bound.as_mut() else {
+            return;
+        };
         while let Some(front) = self.pending.front() {
-            match self.pty.write(&front[self.cursor..]) {
+            match bound.pty.write(&front[self.cursor..]) {
                 Ok(n) => {
                     self.cursor += n;
                     if self.cursor == front.len() {
@@ -72,7 +91,11 @@ impl PtyWriter {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(e) => {
-                    error!("PTY write error, dropping {} queued buffers: {}", self.pending.len(), e);
+                    error!(
+                        "PTY write error, dropping {} queued buffers: {}",
+                        self.pending.len(),
+                        e
+                    );
                     self.pending.clear();
                     self.cursor = 0;
                     self.broken = true;
@@ -81,38 +104,69 @@ impl PtyWriter {
             }
         }
     }
+
+    fn apply_resize(&mut self, resize: Resize) {
+        let Some(bound) = self.bound.as_ref() else {
+            // Not bound yet: remember the latest requested size.
+            self.pending_resize = Some(resize);
+            return;
+        };
+        // Resize failures are non-fatal (child may have exited).
+        if let Err(e) = bound.pty.resize(resize.cols, resize.rows) {
+            warn!("Failed to resize PTY to {}x{}: {}", resize.cols, resize.rows, e);
+        } else {
+            debug!("PTY resized to {}x{}", resize.cols, resize.rows);
+        }
+    }
 }
 
-impl Actor<Vec<u8>, WriterControl, NoManagement> for PtyWriter {
+impl ActorTypes for PtyWriter {
+    type Data = Vec<u8>;
+    type Control = WriterControl;
+    type Management = WriterManagement;
+}
+
+impl TroupeActor<Directory> for PtyWriter {
+    fn new(_dir: Directory) -> Self {
+        Self {
+            bound: None,
+            pending: VecDeque::new(),
+            cursor: 0,
+            pending_resize: None,
+            broken: false,
+        }
+    }
+}
+
+impl Actor<Vec<u8>, WriterControl, WriterManagement> for PtyWriter {
     fn handle_data(&mut self, bytes: Vec<u8>) -> HandlerResult {
         if self.broken || bytes.is_empty() {
             return Ok(());
         }
         self.pending.push_back(bytes);
-        // Common case: queue was empty and the PTY is writable, so this
-        // completes immediately and park() never needs to poll.
+        // Common case (bound, queue was empty, PTY writable): flushes inline
+        // and park() never needs to poll. Unbound: stays queued.
         self.flush_pending();
         Ok(())
     }
 
     fn handle_control(&mut self, msg: WriterControl) -> HandlerResult {
-        match msg {
-            WriterControl::Resize(resize) => {
-                // Resize failures are non-fatal (child may have exited).
-                if let Err(e) = self.pty.resize(resize.cols, resize.rows) {
-                    warn!(
-                        "Failed to resize PTY to {}x{}: {}",
-                        resize.cols, resize.rows, e
-                    );
-                } else {
-                    debug!("PTY resized to {}x{}", resize.cols, resize.rows);
-                }
-            }
-        }
+        let WriterControl::Resize(resize) = msg;
+        self.apply_resize(resize);
         Ok(())
     }
 
-    fn handle_management(&mut self, _msg: NoManagement) -> HandlerResult {
+    fn handle_management(&mut self, msg: WriterManagement) -> HandlerResult {
+        let WriterManagement::Bind { pty, waker } = msg;
+        match BoundWriter::bind(pty, waker) {
+            Ok(bound) => self.bound = Some(bound),
+            Err(e) => return Err(HandlerError::recoverable(format!("PTY writer bind failed: {e}"))),
+        }
+        // Apply anything queued before the bind.
+        if let Some(resize) = self.pending_resize.take() {
+            self.apply_resize(resize);
+        }
+        self.flush_pending();
         Ok(())
     }
 
@@ -123,18 +177,21 @@ impl Actor<Vec<u8>, WriterControl, NoManagement> for PtyWriter {
             // this is the common state (keystrokes flush inline).
             return Ok(ActorStatus::Idle);
         }
+        let Some(bound) = self.bound.as_mut() else {
+            return Ok(ActorStatus::Idle); // unbound: nothing to poll on yet
+        };
 
         // Kernel buffer was full; wait until it drains or a message arrives.
-        if !self.waker.arm() {
+        if !bound.waker.arm() {
             return Ok(ActorStatus::Busy); // raced-in messages: drain first
         }
 
-        let poll = self.monitor.events(&mut self.events, -1);
-        self.waker.disarm();
+        let poll = bound.monitor.events(&mut bound.events, -1);
+        bound.waker.disarm();
         poll.map_err(|e| HandlerError::recoverable(format!("PTY writer poll failed: {e}")))?;
 
         let mut pty_writable = false;
-        for event in &self.events {
+        for event in &bound.events {
             match event.token {
                 TOKEN_WAKER => {} // already drained by disarm()
                 TOKEN_PTY => pty_writable = true,
@@ -154,58 +211,99 @@ impl Actor<Vec<u8>, WriterControl, NoManagement> for PtyWriter {
 mod tests {
     use super::*;
     use crate::io::pty::PtyConfig;
-    use crate::io::Resize;
-    use actor_scheduler::{ActorScheduler, Message};
+    use crate::io::waker::FdWaker;
 
-    fn spawn_cat_pty() -> NixPty {
-        let config = PtyConfig {
+    // A directly-driven writer (bypassing the troupe) for unit coverage of the
+    // bind + flush logic.
+    fn bound_writer(pty: NixPty) -> PtyWriter {
+        let mut w = PtyWriter {
+            bound: None,
+            pending: VecDeque::new(),
+            cursor: 0,
+            pending_resize: None,
+            broken: false,
+        };
+        let waker = Arc::new(FdWaker::new().expect("waker"));
+        w.handle_management(WriterManagement::Bind { pty, waker })
+            .expect("bind");
+        w
+    }
+
+    fn cat_pty() -> NixPty {
+        NixPty::spawn_with_config(&PtyConfig {
             command_executable: "/bin/cat",
             args: &[],
             initial_cols: 80,
             initial_rows: 24,
-        };
-        NixPty::spawn_with_config(&config).expect("Failed to spawn PTY")
-    }
-
-    fn run_writer(
-        pty: NixPty,
-        waker: Arc<FdWaker>,
-        mut rx: ActorScheduler<Vec<u8>, WriterControl, NoManagement>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            let mut writer = PtyWriter::new(pty, waker).expect("writer construction");
-            rx.run(&mut writer);
         })
+        .expect("pty")
     }
 
     #[test]
-    fn writer_handles_resize_and_write() {
+    fn write_before_bind_is_flushed_at_bind() {
+        let mut w = PtyWriter {
+            bound: None,
+            pending: VecDeque::new(),
+            cursor: 0,
+            pending_resize: None,
+            broken: false,
+        };
+        // Queue while unbound.
+        w.handle_data(b"queued".to_vec()).expect("data");
+        assert_eq!(w.pending.len(), 1, "unbound write should queue");
+
         let waker = Arc::new(FdWaker::new().expect("waker"));
-        let (tx, rx) = ActorScheduler::new_with_wake_handler(10, 16, Some(waker.clone()));
+        w.handle_management(WriterManagement::Bind {
+            pty: cat_pty(),
+            waker,
+        })
+        .expect("bind");
+        // cat is draining, so the queued bytes flush immediately.
+        assert!(w.pending.is_empty(), "bind should flush queued writes");
+    }
 
-        let handle = run_writer(spawn_cat_pty(), waker, rx);
+    #[test]
+    fn resize_before_bind_is_coalesced() {
+        let mut w = PtyWriter {
+            bound: None,
+            pending: VecDeque::new(),
+            cursor: 0,
+            pending_resize: None,
+            broken: false,
+        };
+        w.handle_control(WriterControl::Resize(Resize { cols: 10, rows: 5 }))
+            .expect("resize1");
+        w.handle_control(WriterControl::Resize(Resize {
+            cols: 100,
+            rows: 40,
+        }))
+        .expect("resize2");
+        assert_eq!(
+            w.pending_resize,
+            Some(Resize {
+                cols: 100,
+                rows: 40
+            }),
+            "pre-bind resizes coalesce to the latest"
+        );
 
-        tx.send(Message::Control(WriterControl::Resize(Resize {
+        let waker = Arc::new(FdWaker::new().expect("waker"));
+        w.handle_management(WriterManagement::Bind {
+            pty: cat_pty(),
+            waker,
+        })
+        .expect("bind");
+        assert!(w.pending_resize.is_none(), "bind should apply the resize");
+    }
+
+    #[test]
+    fn bound_writer_accepts_writes() {
+        let mut w = bound_writer(cat_pty());
+        w.handle_data(b"hello".to_vec()).expect("write");
+        w.handle_control(WriterControl::Resize(Resize {
             cols: 120,
             rows: 40,
-        })))
-        .expect("send resize");
-        tx.send(Message::Data(b"hello".to_vec())).expect("send write");
-
-        tx.send(Message::Shutdown).expect("send shutdown");
-        handle.join().expect("writer thread");
-    }
-
-    #[test]
-    fn writer_exits_when_handles_drop() {
-        let waker = Arc::new(FdWaker::new().expect("waker"));
-        let (tx, rx) = ActorScheduler::new_with_wake_handler(10, 16, Some(waker.clone()));
-
-        let handle = run_writer(spawn_cat_pty(), waker, rx);
-
-        tx.send(Message::Data(b"line1\n".to_vec())).expect("send");
-        drop(tx);
-
-        handle.join().expect("writer thread");
+        }))
+        .expect("resize");
     }
 }

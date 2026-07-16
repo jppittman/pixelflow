@@ -825,7 +825,7 @@ struct TerminalAppParamsRegistered {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::event_monitor_actor::NoManagement;
+    use crate::io::event_monitor_actor::WriterManagement;
     use crate::term::TerminalEmulator;
     use actor_scheduler::{
         Actor, ActorScheduler, ActorStatus, HandlerError, HandlerResult, SystemStatus,
@@ -840,7 +840,7 @@ mod tests {
         resizes: Vec<Resize>,
     }
 
-    impl Actor<Vec<u8>, WriterControl, NoManagement> for WriterProbe {
+    impl Actor<Vec<u8>, WriterControl, WriterManagement> for WriterProbe {
         fn handle_data(&mut self, bytes: Vec<u8>) -> HandlerResult {
             self.data.push(bytes);
             Ok(())
@@ -850,7 +850,7 @@ mod tests {
             self.resizes.push(resize);
             Ok(())
         }
-        fn handle_management(&mut self, _msg: NoManagement) -> HandlerResult {
+        fn handle_management(&mut self, _msg: WriterManagement) -> HandlerResult {
             Ok(())
         }
         fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
@@ -858,7 +858,7 @@ mod tests {
         }
     }
 
-    type WriterScheduler = ActorScheduler<Vec<u8>, WriterControl, NoManagement>;
+    type WriterScheduler = ActorScheduler<Vec<u8>, WriterControl, WriterManagement>;
 
     /// Drain everything the app has sent to the writer so far.
     fn drain_writer(rx: &mut WriterScheduler, probe: &mut WriterProbe) {
@@ -914,7 +914,8 @@ mod tests {
         }
 
         let emulator = TerminalEmulator::new(80, 24);
-        let (pty_writer, writer_rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(64, 128);
+        let (pty_writer, writer_rx) =
+            ActorScheduler::<Vec<u8>, WriterControl, WriterManagement>::new(64, 128);
 
         // Create engine handles with ActorBuilder (SPSC - each producer is unique)
         let mut engine_builder = actor_scheduler::ActorBuilder::<

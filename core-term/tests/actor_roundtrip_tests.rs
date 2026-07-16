@@ -757,7 +757,7 @@ fn roundtrip_sender_dropped_during_processing() {
 // on Data, `WriterControl::Resize` on Control. These tests pin the contract
 // at that boundary using a probe actor in place of the real PtyWriter.
 
-use core_term::io::event_monitor_actor::{NoManagement, WriterControl};
+use core_term::io::event_monitor_actor::WriterControl;
 use core_term::io::Resize;
 
 /// Records everything the writer actor would have received, in drain order.
@@ -772,7 +772,7 @@ enum WriterEvent {
     Resize(Resize),
 }
 
-impl Actor<Vec<u8>, WriterControl, NoManagement> for WriterProbe {
+impl Actor<Vec<u8>, WriterControl, ()> for WriterProbe {
     fn handle_data(&mut self, bytes: Vec<u8>) -> HandlerResult {
         self.received.push(WriterEvent::Write(bytes));
         Ok(())
@@ -782,7 +782,7 @@ impl Actor<Vec<u8>, WriterControl, NoManagement> for WriterProbe {
         self.received.push(WriterEvent::Resize(resize));
         Ok(())
     }
-    fn handle_management(&mut self, _msg: NoManagement) -> HandlerResult {
+    fn handle_management(&mut self, _msg: ()) -> HandlerResult {
         Ok(())
     }
     fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
@@ -791,7 +791,7 @@ impl Actor<Vec<u8>, WriterControl, NoManagement> for WriterProbe {
 }
 
 fn drain_probe(
-    rx: &mut ActorScheduler<Vec<u8>, WriterControl, NoManagement>,
+    rx: &mut ActorScheduler<Vec<u8>, WriterControl, ()>,
     probe: &mut WriterProbe,
 ) {
     for _ in 0..8 {
@@ -804,7 +804,7 @@ fn drain_probe(
 /// A resize sent on the control lane reaches the writer actor.
 #[test]
 fn pty_writer_resize_delivery_at_actor_boundary() {
-    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, ()>::new(16, 16);
 
     tx.send(Message::Control(WriterControl::Resize(Resize {
         cols: 120,
@@ -827,7 +827,7 @@ fn pty_writer_resize_delivery_at_actor_boundary() {
 /// Resizes stay FIFO within the control lane.
 #[test]
 fn pty_writer_resize_ordering_preserved() {
-    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, ()>::new(16, 16);
 
     for (cols, rows) in [(80, 24), (120, 40), (200, 60)] {
         tx.send(Message::Control(WriterControl::Resize(Resize {
@@ -860,7 +860,7 @@ fn pty_writer_resize_ordering_preserved() {
 /// drained *before* them. Control preempts Data.
 #[test]
 fn pty_writer_resize_preempts_queued_writes() {
-    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, ()>::new(16, 16);
 
     tx.send(Message::Data(b"hello".to_vec())).unwrap();
     tx.send(Message::Data(b"world".to_vec())).unwrap();
@@ -891,7 +891,7 @@ fn pty_writer_resize_preempts_queued_writes() {
 /// buffered messages drain.
 #[test]
 fn pty_writer_completes_on_handle_drop() {
-    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, ()>::new(16, 16);
 
     tx.send(Message::Data(b"last words".to_vec())).unwrap();
     drop(tx);
@@ -910,7 +910,7 @@ fn pty_writer_completes_on_handle_drop() {
 /// Resize survives boundary values.
 #[test]
 fn pty_writer_resize_boundary_values() {
-    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, ()>::new(16, 16);
 
     for (cols, rows) in [(1, 1), (u16::MAX, u16::MAX)] {
         tx.send(Message::Control(WriterControl::Resize(Resize {
@@ -938,7 +938,7 @@ fn pty_writer_resize_boundary_values() {
 /// Multiple producers (dedicated SPSC handles) all deliver.
 #[test]
 fn pty_writer_receives_from_multiple_producers() {
-    let mut builder = ActorBuilder::<Vec<u8>, WriterControl, NoManagement>::new(32, None);
+    let mut builder = ActorBuilder::<Vec<u8>, WriterControl, ()>::new(32, None);
     let tx1 = builder.add_producer();
     let tx2 = builder.add_producer();
     let mut rx = builder.build();
