@@ -1,3 +1,4 @@
+#![allow(clippy::missing_transmute_annotations, unused_variables)]
 //! Benchmark: Hoisted Scanline JIT vs Per-Pixel JIT vs LLVM FrameLattice
 //!
 //! Compares three evaluation strategies on a psychedelic shader expression:

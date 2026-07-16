@@ -402,10 +402,12 @@ pub type ScanlineKernelFn = extern "C" fn(
 // #[repr(C)] or transparent logic cannot be applied to type aliases directly, but we can suppress the clippy warning.
 #[allow(improper_ctypes_definitions)]
 #[allow(improper_ctypes_definitions)]
+#[allow(improper_ctypes_definitions)]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
 
 /// JIT-compiled scanline kernel signature for x86-64 (stub — not yet implemented).
 #[cfg(target_arch = "x86_64")]
+#[allow(improper_ctypes_definitions)]
 #[allow(improper_ctypes_definitions)]
 #[allow(improper_ctypes_definitions)]
 pub type ScanlineKernelFn = extern "C" fn(

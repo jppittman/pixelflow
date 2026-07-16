@@ -113,6 +113,7 @@ pub struct ExprArena {
 impl ExprArena {
     /// Create an empty arena.
     #[must_use]
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),

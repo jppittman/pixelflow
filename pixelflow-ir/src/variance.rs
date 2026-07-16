@@ -331,6 +331,7 @@ pub fn find_hoistable_arena_nodes(
         // Skip trivial nodes (Var, Const, Param) — not worth a register
         let priority = match node {
             ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => continue,
+            #[allow(clippy::collapsible_match)]
             ExprNode::Unary(op, _) => match *op {
                 OpKind::Sin
                 | OpKind::Cos

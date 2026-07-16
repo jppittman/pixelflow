@@ -893,6 +893,7 @@ where
 /// register allocator). The result is that expressions depending only on Y, Z,
 /// or W are computed once before the pixel loop.
 #[inline]
+#[allow(clippy::must_use_candidate)]
 pub fn default_hoist_predicate(v: crate::variance::Variance) -> bool {
     v.is_x_invariant() && !v.is_const()
 }

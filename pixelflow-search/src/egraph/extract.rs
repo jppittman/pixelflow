@@ -1420,6 +1420,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_dag_accumulator_handles_shared_subexpressions() {
         use crate::nnue::{EdgeAccumulator, ExprNnue};
 

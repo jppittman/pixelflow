@@ -110,6 +110,7 @@ impl ScanlineJitManifold {
     ///
     /// Panics if `output.len() < xs.len()`.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn eval_scanline(
         &self,
         xs: &[core::arch::aarch64::float32x4_t],
@@ -152,6 +153,7 @@ impl ScanlineJitManifold {
     ///
     /// [`compile_arena_dag_scanline`]: crate::backend::emit::compile_arena_dag_scanline
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn eval_scanline(
         &self,
         xs: &[core::arch::x86_64::__m128],

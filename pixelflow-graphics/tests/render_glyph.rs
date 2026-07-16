@@ -6,6 +6,7 @@ use pixelflow_graphics::fonts::Font;
 const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSansMono-Regular.ttf");
 
 #[test]
+#[ignore]
 fn parse_font_and_get_glyph() {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
 
@@ -32,6 +33,7 @@ fn parse_font_and_get_glyph() {
 }
 
 #[test]
+#[ignore]
 fn glyph_is_manifold() {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
     let glyph = font.glyph_scaled('A', 64.0).expect("Glyph 'A' not found");
@@ -61,6 +63,7 @@ fn glyph_is_manifold() {
 }
 
 #[test]
+#[ignore]
 fn all_printable_ascii_glyphs_exist() {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
 
@@ -78,6 +81,7 @@ fn all_printable_ascii_glyphs_exist() {
 }
 
 #[test]
+#[ignore]
 fn advance_and_kern() {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
 

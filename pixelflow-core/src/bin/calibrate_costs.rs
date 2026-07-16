@@ -1,3 +1,4 @@
+#![allow(clippy::needless_return)]
 //! Cost model calibration from SIMD benchmarks.
 //!
 //! This tool measures the actual performance of SIMD operations on the current

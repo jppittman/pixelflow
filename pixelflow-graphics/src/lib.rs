@@ -1,3 +1,22 @@
+#![allow(unused_doc_comments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::explicit_auto_deref)]
+#![allow(clippy::large_const_arrays)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::excessive_precision)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::approx_constant)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::useless_format)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
 //! # PixelFlow Graphics
 //!
 //! Turns **algebraic manifolds into pixels** through three composable tiers: colors, fonts, and materialization.

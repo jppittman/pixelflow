@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::new_without_default)]
 // Public API - organized under api module
 pub mod api;
 
