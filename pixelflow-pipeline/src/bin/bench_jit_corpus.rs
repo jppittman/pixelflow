@@ -85,7 +85,7 @@ fn main() {
 
         benchmarked += 1;
 
-        if args.progress_every > 0 && benchmarked.is_multiple_of(args.progress_every) {
+        if args.progress_every > 0 && benchmarked % args.progress_every == 0 {
             let elapsed = total_start.elapsed().as_secs_f64();
             let rate = benchmarked as f64 / elapsed;
             println!(

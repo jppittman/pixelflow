@@ -45,7 +45,7 @@ impl MetalOps {
             app.set_activation_policy(NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
 
             app.finish_launching();
-            app.activate_ignoring_other_apps(cocoa::ActivationPolicy::IgnoreOtherApps);
+            app.activate_ignoring_other_apps(true);
 
             app
         };
@@ -218,9 +218,12 @@ impl PlatformOps for MetalOps {
             }
 
             // Use wrapper for next_event
-            let event =
-                self.app
-                    .next_event(u64::MAX, until_date, mode, cocoa::DequeueBehavior::Dequeue);
+            let event = self.app.next_event(
+                u64::MAX,
+                until_date,
+                mode,
+                true, // dequeue
+            );
 
             // Release mode string
             sys::send::<()>(mode, sys::sel(b"release\0"));

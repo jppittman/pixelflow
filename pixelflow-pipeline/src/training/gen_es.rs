@@ -437,7 +437,7 @@ mod tests {
         // All normalized values should be in [0, 1].
         for (i, &v) in normed.iter().enumerate() {
             assert!(
-                (0.0..=1.0).contains(&v),
+                v >= 0.0 && v <= 1.0,
                 "normalized[{}] = {} out of [0,1]",
                 i,
                 v

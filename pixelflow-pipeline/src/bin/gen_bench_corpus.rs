@@ -308,7 +308,7 @@ fn arena_structural_key(arena: &ExprArena, root: ExprId) -> Vec<SigNode> {
 fn main() {
     let args = Args::parse();
 
-    let per_band = args.target.div_ceil(BANDS.len());
+    let per_band = (args.target + BANDS.len() - 1) / BANDS.len();
     let mut seen = HashSet::new();
     let mut entries: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = Vec::new();
     let mut skipped_too_large = 0usize;

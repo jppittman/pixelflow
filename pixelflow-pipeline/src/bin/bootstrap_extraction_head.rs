@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use pixelflow_search::egraph::all_rules;
-use pixelflow_search::nnue::factored::{EMBED_DIM, EdgeAccumulator, ExprNnue, GraphAccumulator};
+use pixelflow_search::nnue::factored::{EMBED_DIM, EdgeAccumulator, ExprNnue, GraphAccumulator, K};
 use pixelflow_search::nnue::{BwdGenConfig, BwdGenerator};
 
 use pixelflow_pipeline::jit_bench::benchmark_jit_arena;

@@ -26,7 +26,7 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, mprotect};
+        use libc::{mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 
         if code.is_empty() {
             return Err("empty code buffer");
@@ -59,17 +59,6 @@ impl ExecutableCode {
 
             // 3. Flip to read-execute (W^X)
             let result = mprotect(ptr as *mut libc::c_void, capacity, PROT_READ | PROT_EXEC);
-
-            // Instruction cache coherence on Apple Silicon.
-            // sys_icache_invalidate is needed after writing code on ARM.
-            // Apple requires this to be called AFTER restoring execute permissions.
-            #[cfg(target_os = "macos")]
-            {
-                unsafe extern "C" {
-                    fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
-                }
-                sys_icache_invalidate(ptr as *mut core::ffi::c_void, code.len());
-            }
 
             if result != 0 {
                 libc::munmap(ptr as *mut libc::c_void, capacity);
@@ -181,7 +170,7 @@ impl CodeBuffer {
     /// Returns an error if mmap fails.
     #[cfg(unix)]
     pub fn new(capacity: usize) -> Result<Self, &'static str> {
-        use libc::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap};
+        use libc::{mmap, MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 
         if capacity == 0 {
             return Err("CodeBuffer capacity must be > 0");
