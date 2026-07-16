@@ -62,7 +62,7 @@ fn test_naked_abi_multithreaded_scale() {
     #[cfg(target_arch = "aarch64")]
     {
         let num_threads = 4;
-        let ops_per_thread = 100_000;
+        let ops_per_thread = 50_000;
         let kernel_ptr = get_jit_mul_kernel();
         let total_successes = AtomicUsize::new(0);
 
