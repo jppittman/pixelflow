@@ -196,11 +196,6 @@ mod tests {
         tex.data()[0]
     }
 
-    #[test]
-    fn circle_at_origin() {
-        // Point at origin should be inside
-        // Point at (2, 0) should be outside
-    }
 
     #[test]
     fn composition_works() {

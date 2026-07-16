@@ -201,8 +201,8 @@ pub struct CodeEmitter<'a> {
 impl<'a> CodeEmitter<'a> {
     pub fn new(analyzed: &'a AnalyzedKernel) -> Self {
         // Separate params into scalars and manifolds
-        let mut scalar_params = Vec::new();
-        let mut manifold_params = Vec::new();
+        let mut scalar_params = Vec::with_capacity(analyzed.def.params.len());
+        let mut manifold_params = Vec::with_capacity(analyzed.def.params.len());
 
         for param in &analyzed.def.params {
             match param.kind {

@@ -108,8 +108,8 @@ impl<L> SpatialBSP<L> {
             return Self::single(items.into_iter().next().unwrap().leaf);
         }
 
-        let mut interiors = Vec::new();
-        let mut leaves = Vec::new();
+        let mut interiors = Vec::with_capacity(items.len().saturating_sub(1));
+        let mut leaves = Vec::with_capacity(items.len());
 
         // Recursively build the tree
         let _root = Self::build_tree(&mut interiors, &mut leaves, items);
@@ -1611,8 +1611,8 @@ mod tests {
                 let axis = interior.axis;
 
                 // Collect centers from left and right subtrees
-                let mut left_centers = Vec::new();
-                let mut right_centers = Vec::new();
+                let mut left_centers = Vec::with_capacity(centers.len() / 2);
+                let mut right_centers = Vec::with_capacity(centers.len() / 2);
 
                 fn collect_centers<L>(
                     bsp: &SpatialBSP<L>,

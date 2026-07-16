@@ -41,6 +41,7 @@ const TAG_UNARY: u8 = 3;
 const TAG_BINARY: u8 = 4;
 const TAG_TERNARY: u8 = 5;
 const TAG_NARY: u8 = 6;
+const TAG_BUFFER: u8 = 7;
 
 // ── Write ────────────────────────────────────────────────────────────────────
 
@@ -108,11 +109,6 @@ fn write_node(w: &mut impl Write, node: &ExprNode) -> io::Result<()> {
         ExprNode::Param(i) => {
             w.write_all(&[TAG_PARAM, *i])?;
         }
-        ExprNode::Buffer(b) => panic!(
-            "ExprNode::Buffer({}) reached corpus serialization — memory ops are not yet \
-             representable in the training corpus format (M2, see KERNELS_AND_LATTICES.md)",
-            b.0
-        ),
         ExprNode::Unary(op, a) => {
             w.write_all(&[TAG_UNARY, *op as u8])?;
             w.write_all(&a.0.to_le_bytes())?;
@@ -132,6 +128,10 @@ fn write_node(w: &mut impl Write, node: &ExprNode) -> io::Result<()> {
             w.write_all(&[TAG_NARY, *op as u8])?;
             w.write_all(&start.to_le_bytes())?;
             w.write_all(&len.to_le_bytes())?;
+        }
+        ExprNode::Buffer(b) => {
+            w.write_all(&[TAG_BUFFER])?;
+            w.write_all(&b.0.to_le_bytes())?;
         }
     }
     Ok(())
@@ -250,6 +250,10 @@ fn read_node(r: &mut Cursor<'_>) -> io::Result<ExprNode> {
             let start = r.read_u32()?;
             let len = r.read_u16()?;
             Ok(ExprNode::Nary(op, start, len))
+        }
+        TAG_BUFFER => {
+            let b = pixelflow_ir::arena::BufferId(r.read_u16()?);
+            Ok(ExprNode::Buffer(b))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

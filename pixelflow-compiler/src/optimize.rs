@@ -1038,7 +1038,8 @@ impl EGraphContext {
 
         // Build a map from shared e-class indices to their let-binding names
         let mut binding_names: HashMap<usize, String> = HashMap::new();
-        let mut stmts: Vec<Stmt> = Vec::new();
+        // Pre-allocate assuming roughly one binding per scheduled instruction (except root)
+        let mut stmts: Vec<Stmt> = Vec::with_capacity(dag.schedule.len().saturating_sub(1));
 
         // Emit let-bindings for shared e-classes in topological order
         let mut binding_idx = 0usize;
@@ -1370,16 +1371,19 @@ fn optimize_unary(mut unary: UnaryExpr) -> Expr {
 fn optimize_block(mut block: BlockExpr) -> Expr {
     // Optimize statements
     for stmt in &mut block.stmts {
-        if let Stmt::Let(let_stmt) = stmt {
-            let_stmt.init = optimize_expr(std::mem::replace(
-                &mut let_stmt.init,
-                make_literal(0.0, Span::call_site()), // Dummy placeholder
-            ));
-        } else if let Stmt::Expr(expr) = stmt {
-            *expr = optimize_expr(std::mem::replace(
-                expr,
-                make_literal(0.0, Span::call_site()), // Dummy placeholder
-            ));
+        match stmt {
+            Stmt::Let(let_stmt) => {
+                let_stmt.init = optimize_expr(std::mem::replace(
+                    &mut let_stmt.init,
+                    make_literal(0.0, Span::call_site()), // Dummy placeholder
+                ));
+            }
+            Stmt::Expr(expr) => {
+                *expr = optimize_expr(std::mem::replace(
+                    expr,
+                    make_literal(0.0, Span::call_site()), // Dummy placeholder
+                ));
+            }
         }
     }
 
