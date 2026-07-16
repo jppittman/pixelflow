@@ -24,3 +24,6 @@
 ## 2025-12-29 - Avoid Intermediate Vectors and use Vec::with_capacity
 **Learning:** Performance can be impacted by intermediate allocations like `text.chars().collect::<Vec<char>>()` when extracting small segments.
 **Action:** Avoid `.collect()` into an intermediate Vector when doing simple tasks like extracting characters or single items, and instead use the Iterator functions directly (`chars.next()`). Also use `Vec::with_capacity` when the required capacity is known ahead of time.
+## 2026-07-16 - Do not remove log imports indiscriminately
+**Learning:** Even if a `warn!` macro is removed in one scope, `warn!` is very often used in other error-handling logic further down the file (especially in parsing and emulation fallbacks).
+**Action:** Before removing a `use log::warn;` import based on local changes, always run a full `cargo check` or `git grep` within the file to ensure the macro is entirely unused across the entire module.
