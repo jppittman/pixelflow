@@ -2649,14 +2649,14 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
     }
 
     // USHR Vd.4S, Vn.4S, #shift
-    if word & 0xFF80FC00 == 0x6F200400 {
+    if word & 0xFF80FC00 == 0x4F000400 {
         let immhb = (word >> 16) & 0x3F;
         let shift = 64u32.wrapping_sub(immhb) & 0x3F;
         return format!("ushr v{}.4s, v{}.4s, #{}", rd, rn, shift);
     }
 
     // SHL Vd.4S, Vn.4S, #shift
-    if word & 0xFF80FC00 == 0x4F005400 {
+    if word & 0xFF80FC00 == 0x6F005400 {
         let immhb = (word >> 16) & 0x3F;
         let shift = immhb.wrapping_sub(32);
         return format!("shl v{}.4s, v{}.4s, #{}", rd, rn, shift);
