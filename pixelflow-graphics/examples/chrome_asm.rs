@@ -2,13 +2,13 @@
 //!
 //! Run: cargo-asm -p pixelflow-graphics --example chrome_asm eval_one_pixel --release
 
-use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::combinators::At;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Discrete, Field, Manifold, ManifoldCompat};
 use pixelflow_graphics::render::color::RgbaColorCube;
+use pixelflow_compiler::ManifoldExpr;
 use pixelflow_graphics::scene3d::{
-    plane, ColorChecker, ColorReflect, ColorScreenToDir, ColorSky, ColorSurface,
+    ColorChecker, ColorReflect, ColorScreenToDir, ColorSky, ColorSurface, plane,
 };
 
 type Field4 = (Field, Field, Field, Field);
@@ -87,9 +87,7 @@ pub fn eval_one_pixel(x: Field, y: Field) -> Discrete {
             center: (0.0, 0.0, 4.0),
             radius: 1.0,
         },
-        material: ColorReflect {
-            inner: world.clone(),
-        },
+        material: ColorReflect { inner: world.clone() },
         background: world,
     };
 

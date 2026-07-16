@@ -23,9 +23,9 @@
 //! values. Instead we test using Field-level comparisons and check that all
 //! lanes satisfy the expected condition.
 
-use pixelflow_compiler::kernel;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Field, Manifold, ManifoldExt};
+use pixelflow_compiler::kernel;
 
 type Field4 = (Field, Field, Field, Field);
 
@@ -629,7 +629,7 @@ fn test_jet3_literals_and_params() {
 // - Normalized3D(m)  → (dx, dy, dz) / √(dx² + dy² + dz²)
 
 use pixelflow_core::jet::Jet2;
-use pixelflow_core::{Antialias2D, Antialias3D, GradientMag2D, GradientMag3D, Normalized2D};
+use pixelflow_core::{GradientMag2D, GradientMag3D, Antialias2D, Antialias3D, Normalized2D};
 
 type Jet2_4 = (Jet2, Jet2, Jet2, Jet2);
 
@@ -658,8 +658,9 @@ fn jet3_4_seeded(x: f32, y: f32, z: f32) -> Jet3_4 {
 fn test_gradient_mag_2d() {
     // For f(x,y) = sqrt(x² + y²), the gradient is (x/r, y/r) where r = sqrt(x²+y²)
     // Gradient magnitude is always 1.0 for distance fields
-    let dist =
-        (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
+    let dist = (pixelflow_core::X * pixelflow_core::X
+        + pixelflow_core::Y * pixelflow_core::Y)
+        .sqrt();
 
     let grad_mag = GradientMag2D(dist);
 
@@ -695,7 +696,9 @@ fn test_gradient_mag_3d() {
 fn test_antialias_2d() {
     // Circle SDF using kernel! macro (handles literal promotion)
     // At (2, 0): val = 1.0, gradient = (1, 0), so antialias = 1.0 / 1.0 = 1.0
-    let circle_sdf = kernel!(|| -> Jet2 { (X * X + Y * Y).sqrt() - 1.0 });
+    let circle_sdf = kernel!(|| -> Jet2 {
+        (X * X + Y * Y).sqrt() - 1.0
+    });
     let sdf = circle_sdf();
 
     let aa = Antialias2D(sdf);
@@ -712,7 +715,9 @@ fn test_antialias_2d() {
 fn test_antialias_3d() {
     // Sphere SDF using kernel! macro
     // At (2, 0, 0): val = 1.0, gradient = (1, 0, 0), so antialias = 1.0 / 1.0 = 1.0
-    let sphere_sdf = kernel!(|| -> Jet3 { (X * X + Y * Y + Z * Z).sqrt() - 1.0 });
+    let sphere_sdf = kernel!(|| -> Jet3 {
+        (X * X + Y * Y + Z * Z).sqrt() - 1.0
+    });
     let sdf = sphere_sdf();
 
     let aa = Antialias3D(sdf);
@@ -729,8 +734,9 @@ fn test_antialias_3d() {
 fn test_normalized_2d() {
     // Distance field: sqrt(x² + y²)
     // At (3, 4): gradient = (3/5, 4/5) = (0.6, 0.8)
-    let dist =
-        (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
+    let dist = (pixelflow_core::X * pixelflow_core::X
+        + pixelflow_core::Y * pixelflow_core::Y)
+        .sqrt();
 
     let normal = Normalized2D(dist);
 
@@ -791,14 +797,15 @@ fn test_fused_combinators_with_kernel_composition() {
 // FUSED COMBINATORS (GradientMag2D, Antialias2D, etc.) which evaluate
 // the inner manifold once and compute derived quantities efficiently.
 
-use pixelflow_core::{DX, DY, DZ, V};
+use pixelflow_core::{V, DX, DY, DZ};
 
 /// Test V accessor extracts the value component from Jet2.
 #[test]
 fn test_v_accessor() {
     // Distance from origin: sqrt(x² + y²)
-    let dist =
-        (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
+    let dist = (pixelflow_core::X * pixelflow_core::X
+        + pixelflow_core::Y * pixelflow_core::Y)
+        .sqrt();
 
     // Extract just the value
     let val_only = V(dist);
@@ -816,8 +823,9 @@ fn test_v_accessor() {
 fn test_dx_accessor() {
     // Distance from origin: sqrt(x² + y²)
     // ∂dist/∂x = x / sqrt(x² + y²) = x / dist
-    let dist =
-        (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
+    let dist = (pixelflow_core::X * pixelflow_core::X
+        + pixelflow_core::Y * pixelflow_core::Y)
+        .sqrt();
 
     // Extract ∂f/∂x
     let dx_only = DX(dist);
@@ -835,8 +843,9 @@ fn test_dx_accessor() {
 fn test_dy_accessor() {
     // Distance from origin: sqrt(x² + y²)
     // ∂dist/∂y = y / sqrt(x² + y²) = y / dist
-    let dist =
-        (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
+    let dist = (pixelflow_core::X * pixelflow_core::X
+        + pixelflow_core::Y * pixelflow_core::Y)
+        .sqrt();
 
     // Extract ∂f/∂y
     let dy_only = DY(dist);
@@ -878,8 +887,9 @@ fn test_dz_accessor() {
 #[test]
 fn test_manual_gradient_magnitude() {
     // Distance from origin
-    let dist =
-        (pixelflow_core::X * pixelflow_core::X + pixelflow_core::Y * pixelflow_core::Y).sqrt();
+    let dist = (pixelflow_core::X * pixelflow_core::X
+        + pixelflow_core::Y * pixelflow_core::Y)
+        .sqrt();
 
     // Manual gradient magnitude using DX/DY accessors
     let grad_mag = (DX(dist) * DX(dist) + DY(dist) * DY(dist)).sqrt();

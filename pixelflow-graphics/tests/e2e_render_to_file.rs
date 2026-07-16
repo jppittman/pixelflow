@@ -3,8 +3,8 @@
 //! This test verifies the full pipeline from manifold composition
 //! through rasterization to file output.
 
-use pixelflow_compiler::kernel;
 use pixelflow_core::{Discrete, Field, Manifold, ManifoldCompat, ManifoldExt, X, Y};
+use pixelflow_compiler::kernel;
 use pixelflow_graphics::render::color::{Grayscale, NamedColor, Rgba8};
 
 type Field4 = (Field, Field, Field, Field);

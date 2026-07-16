@@ -20,9 +20,9 @@
 //! - No finite differences, no extra evaluations
 
 use crate::mesh::{Point3, QuadMesh};
-use pixelflow_compiler::ManifoldExpr;
 use pixelflow_core::jet::Jet3;
 use pixelflow_core::{Field, Manifold, ManifoldExt};
+use pixelflow_compiler::ManifoldExpr;
 
 /// The 4D Jet3 domain type for 3D ray tracing autodiff.
 type Jet3_4 = (Jet3, Jet3, Jet3, Jet3);

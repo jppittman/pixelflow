@@ -271,12 +271,7 @@ where
         let mut xs = Field::sequential(x as f32 + 0.5);
         let step = Field::from(PARALLELISM as f32);
         // Field ignores the domain arguments, so we pass zeroes. Hoisted to avoid reconstruction.
-        let dummy_domain = (
-            Field::from(0.0),
-            Field::from(0.0),
-            Field::from(0.0),
-            Field::from(0.0),
-        );
+        let dummy_domain = (Field::from(0.0), Field::from(0.0), Field::from(0.0), Field::from(0.0));
 
         // SIMD Hot Path - process PARALLELISM pixels at a time
         while x + PARALLELISM <= stripe.width {

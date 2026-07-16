@@ -9,8 +9,8 @@
 //! 3. Use proptest to generate random inputs
 //! 4. Assert kernel output matches reference within epsilon
 
-use pixelflow_compiler::kernel;
 use pixelflow_core::{Field, Manifold};
+use pixelflow_compiler::kernel;
 use proptest::prelude::*;
 
 type Field4 = (Field, Field, Field, Field);
@@ -25,12 +25,7 @@ const EPSILON: f32 = 1e-4;
 const ABS_EPSILON: f32 = 1e-6;
 
 fn field4(x: f32, y: f32, z: f32, w: f32) -> Field4 {
-    (
-        Field::from(x),
-        Field::from(y),
-        Field::from(z),
-        Field::from(w),
-    )
+    (Field::from(x), Field::from(y), Field::from(z), Field::from(w))
 }
 
 /// Extract first lane from Field for comparison.
@@ -331,9 +326,7 @@ fn regression_sqrt_with_param() {
 
     assert!(
         approx_eq(result, expected),
-        "sqrt with param: got {} expected {}",
-        result,
-        expected
+        "sqrt with param: got {} expected {}", result, expected
     );
 }
 
@@ -348,9 +341,7 @@ fn regression_mul_then_method() {
 
     assert!(
         approx_eq(result, expected),
-        "mul then abs: got {} expected {}",
-        result,
-        expected
+        "mul then abs: got {} expected {}", result, expected
     );
 }
 
@@ -364,8 +355,6 @@ fn regression_sub_then_method() {
 
     assert!(
         approx_eq(result, expected),
-        "sub then floor: got {} expected {}",
-        result,
-        expected
+        "sub then floor: got {} expected {}", result, expected
     );
 }

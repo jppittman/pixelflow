@@ -4,12 +4,12 @@
 //! to single-threaded execution, and handle edge cases (small height, odd dimensions).
 
 use pixelflow_core::{Field, Manifold};
-use pixelflow_graphics::render::color::Rgba8;
 use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::parallel::{
     render_parallel, render_work_stealing, RenderOptions,
 };
 use pixelflow_graphics::render::rasterizer::rasterize;
+use pixelflow_graphics::render::color::Rgba8;
 
 // A simple test manifold: Gradient X + Y
 #[derive(Copy, Clone)]
@@ -23,12 +23,7 @@ impl Manifold<(Field, Field, Field, Field)> for TestGradient {
         // Evaluate AST to get Field values
         // Note: Field ops return AST nodes, so we must call .eval() to get the result.
         // Since operands are concrete Fields, we can pass dummy coordinates.
-        let dummy: (Field, Field, Field, Field) = (
-            Field::default(),
-            Field::default(),
-            Field::default(),
-            Field::default(),
-        );
+        let dummy: (Field, Field, Field, Field) = (Field::default(), Field::default(), Field::default(), Field::default());
 
         // Simple gradient: (x + y) * 0.1
         let val = ((x + y) * Field::from(0.1)).eval(dummy);
@@ -60,10 +55,7 @@ fn render_parallel_matches_single_threaded_output() {
     // Target: render_parallel
     render_parallel(&TestGradient, &mut frame, options);
 
-    assert_eq!(
-        frame.data, reference.data,
-        "render_parallel output mismatch"
-    );
+    assert_eq!(frame.data, reference.data, "render_parallel output mismatch");
 }
 
 #[test]
@@ -77,10 +69,7 @@ fn render_parallel_matches_single_threaded_output_odd_threads() {
 
     render_parallel(&TestGradient, &mut frame, options);
 
-    assert_eq!(
-        frame.data, reference.data,
-        "render_parallel (3 threads) output mismatch"
-    );
+    assert_eq!(frame.data, reference.data, "render_parallel (3 threads) output mismatch");
 }
 
 #[test]
@@ -95,10 +84,7 @@ fn render_parallel_handles_small_height() {
 
     render_parallel(&TestGradient, &mut frame, options);
 
-    assert_eq!(
-        frame.data, reference.data,
-        "render_parallel small height mismatch"
-    );
+    assert_eq!(frame.data, reference.data, "render_parallel small height mismatch");
 }
 
 #[test]
@@ -115,10 +101,7 @@ fn render_parallel_handles_height_one() {
     // but we test the interface contract.
     render_parallel(&TestGradient, &mut frame, options);
 
-    assert_eq!(
-        frame.data, reference.data,
-        "render_parallel height=1 mismatch"
-    );
+    assert_eq!(frame.data, reference.data, "render_parallel height=1 mismatch");
 }
 
 #[test]
@@ -132,10 +115,7 @@ fn render_work_stealing_matches_single_threaded_output() {
 
     render_work_stealing(&TestGradient, &mut frame, options);
 
-    assert_eq!(
-        frame.data, reference.data,
-        "render_work_stealing output mismatch"
-    );
+    assert_eq!(frame.data, reference.data, "render_work_stealing output mismatch");
 }
 
 #[test]
@@ -149,8 +129,5 @@ fn render_work_stealing_handles_height_one() {
 
     render_work_stealing(&TestGradient, &mut frame, options);
 
-    assert_eq!(
-        frame.data, reference.data,
-        "render_work_stealing height=1 mismatch"
-    );
+    assert_eq!(frame.data, reference.data, "render_work_stealing height=1 mismatch");
 }
