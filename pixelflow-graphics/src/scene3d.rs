@@ -365,7 +365,7 @@ kernel!(pub struct Surface = |geometry: kernel, material: kernel, background: ke
     let valid_t = (V(t) > 0.0) & (V(t) < t_max);
     let deriv_mag_sq = DX(t) * DX(t) + DY(t) * DY(t) + DZ(t) * DZ(t);
     let valid_deriv = deriv_mag_sq < (deriv_max * deriv_max);
-    let mask = (valid_t & valid_deriv).constant();
+    let mask = valid_t & valid_deriv;
 
     // 3. Hit point: P = ray * t (always computed; Select short-circuits if mask is all-false)
     let hx = X * t;
@@ -391,7 +391,7 @@ kernel!(pub struct ColorSurface = |geometry: kernel, material: kernel, backgroun
     let valid_t = (V(t) > 0.0) & (V(t) < t_max);
     let deriv_mag_sq = DX(t) * DX(t) + DY(t) * DY(t) + DZ(t) * DZ(t);
     let valid_deriv = deriv_mag_sq < (deriv_max * deriv_max);
-    let mask = (valid_t & valid_deriv).constant();
+    let mask = valid_t & valid_deriv;
 
     // 3. Hit point: P = ray * t (always computed; Select short-circuits if mask is all-false)
     let hx = X * t;
@@ -520,7 +520,7 @@ kernel!(pub struct GeometryMask = |geometry: kernel| Jet3 -> Field {
     let deriv_mag_sq = DX(t) * DX(t) + DY(t) * DY(t) + DZ(t) * DZ(t);
     let valid_deriv = deriv_mag_sq < (deriv_max * deriv_max);
 
-    (valid_t & valid_deriv).constant()
+    valid_t & valid_deriv
 });
 
 impl<G, M> Scene for SceneObject<G, M>
@@ -652,7 +652,7 @@ impl<M: ManifoldCompat<Jet3, Output = Field>> Manifold<Jet3_4> for Reflect<M> {
         let r_z = d_jet_z - k * n_jet_z;
 
         // Recurse with curved reflected rays
-        self.inner.eval((r_x, r_y, r_z, w))
+        self.inner.eval(r_x, r_y, r_z, w)
     }
 }
 
