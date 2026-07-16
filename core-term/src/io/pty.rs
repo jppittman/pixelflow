@@ -1,10 +1,9 @@
 // src/os/pty.rs
 
 use anyhow::{Context, Result};
+use std::ffi::CString;
 use std::io::{Read, Result as IoResult, Write};
 use std::os::unix::io::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
 use std::sync::Arc;
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -14,6 +13,13 @@ use nix::sys::termios;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+
+/// `POSIX_SPAWN_SETSID` — the libc crate doesn't expose it for Apple targets.
+/// Value from macOS `<spawn.h>` (available since 10.13).
+#[cfg(target_os = "macos")]
+const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
+#[cfg(not(target_os = "macos"))]
+use libc::POSIX_SPAWN_SETSID;
 
 /// Configuration for spawning a PTY.
 #[derive(Debug, Clone)]
@@ -69,9 +75,22 @@ impl NixPty {
 
     /// Spawns a new process connected to a PTY using the given configuration.
     ///
-    /// This uses `std::process::Command` to handle forking safely, avoiding potential
-    /// deadlocks in multi-threaded environments (like `cargo test`) that can occur with
-    /// manual `fork` and non-async-signal-safe code (e.g. `malloc` in `eprintln!`).
+    /// The child is created with `posix_spawnp`, **never `fork`**. This
+    /// process is heavily threaded (actor system; libtest runs tests as
+    /// threads), and on macOS `fork` runs libmalloc's atfork handlers, which
+    /// take every malloc zone lock. A concurrent fork + allocation reliably
+    /// wedges the whole process at 0% CPU (`_xzm_fork_lock_wait` in the
+    /// forking thread, `_os_unfair_lock_lock_slow` under `malloc` everywhere
+    /// else). `posix_spawn` runs no user-space code in the child: on macOS it
+    /// is a kernel-side spawn, on Linux glibc a vfork-style `clone` executing
+    /// only direct syscalls — no atfork handlers ever fire.
+    ///
+    /// The old `pre_exec` work maps onto spawn-native mechanisms:
+    /// - `setsid()`   → `POSIX_SPAWN_SETSID` attribute flag
+    /// - `TIOCSCTTY`  → the child *opens the slave path* as fd 0 after
+    ///   `setsid`: a session leader's first tty open acquires it as the
+    ///   controlling terminal on both Linux and the BSDs
+    /// - `dup2(0/1/2)` → file actions (`addopen` + `adddup2`)
     ///
     /// # Parameters
     /// * `config` - Configuration for the PTY and command.
@@ -84,9 +103,9 @@ impl NixPty {
         let master_fd = pty_results.master;
         let slave_fd = pty_results.slave;
 
-        // Set FD_CLOEXEC on both master and slave so they are closed in the child upon exec.
-        // We will dup2 the slave to 0,1,2 in pre_exec, so the duplicated FDs will remain open,
-        // while the original slave_fd (and master_fd) will be closed.
+        // Neither parent fd may leak into the child: it re-opens the slave by
+        // path, and an inherited master would keep the PTY alive after we
+        // close ours.
         Self::set_cloexec(&master_fd)?;
         Self::set_cloexec(&slave_fd)?;
 
@@ -100,45 +119,10 @@ impl NixPty {
         termios::tcsetattr(&slave_fd, termios::SetArg::TCSANOW, &termios_attrs)
             .with_context(|| "Failed to set terminal attributes to raw mode")?;
 
-        let mut cmd = Command::new(config.command_executable);
-        cmd.args(config.args);
-
-        // Pre-exec setup in the child.
-        // Must use only async-signal-safe functions (no malloc, no locks).
-        let slave_raw_fd = slave_fd.as_raw_fd();
-        unsafe {
-            cmd.pre_exec(move || {
-                // Create new session
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                // Set controlling terminal
-                // On macOS/BSD, TIOCSCTTY is unsigned long, but ioctl expects unsigned long.
-                // However, constants might be inferred as u32.
-                // We cast both arguments to ensure compatibility across platforms.
-                if libc::ioctl(slave_raw_fd, libc::TIOCSCTTY as _, 0 as libc::c_int) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                // Dup2 slave to stdin, stdout, stderr
-                if libc::dup2(slave_raw_fd, libc::STDIN_FILENO) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::dup2(slave_raw_fd, libc::STDOUT_FILENO) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::dup2(slave_raw_fd, libc::STDERR_FILENO) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-
-                // We don't need to manually close slave_raw_fd or master_fd here
-                // because we set FD_CLOEXEC on them in the parent.
-                // dup2 clears FD_CLOEXEC on the new FDs (0, 1, 2), so they will persist.
-
-                Ok(())
-            });
-        }
+        // Size the PTY before the child starts so the shell's first size
+        // query already sees the real dimensions.
+        Self::set_pty_size_internal(&slave_fd, config.initial_cols, config.initial_rows)
+            .with_context(|| "Failed to set initial PTY size")?;
 
         log::debug!(
             "Spawning command: {} with args {:?}",
@@ -146,21 +130,12 @@ impl NixPty {
             config.args
         );
 
-        // Spawn the process
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn command '{}'", config.command_executable))?;
-
-        let child_pid = Pid::from_raw(child.id() as i32);
+        let child_pid = Self::posix_spawn_child(config, &slave_fd)?;
         log::debug!(
             "Parent: Spawned child with PID {}, PTY master FD {}",
             child_pid,
             master_fd.as_raw_fd()
         );
-
-        // In parent: configure master PTY size and non-blocking I/O
-        Self::set_pty_size_internal(&master_fd, config.initial_cols, config.initial_rows)
-            .with_context(|| "Parent: Failed to set initial PTY size")?;
 
         Self::set_fd_nonblocking(&master_fd)
             .with_context(|| "Parent: Failed to set master PTY to non-blocking")?;
@@ -172,6 +147,115 @@ impl NixPty {
             master_fd: Arc::new(master_fd),
             child_pid: Some(child_pid),
         })
+    }
+
+    /// Spawn the PTY child via `posix_spawnp`. See [`spawn_with_config`]
+    /// for why this must not fork.
+    ///
+    /// [`spawn_with_config`]: Self::spawn_with_config
+    fn posix_spawn_child(config: &PtyConfig, slave_fd: &OwnedFd) -> Result<Pid> {
+        use std::os::unix::ffi::OsStringExt;
+
+        // All heap work happens here in the parent, before the spawn call.
+        let slave_path = nix::unistd::ttyname(slave_fd.as_fd())
+            .context("Failed to resolve PTY slave path")?;
+        let slave_path = CString::new(slave_path.into_os_string().into_vec())
+            .context("PTY slave path contains NUL")?;
+        let exe = CString::new(config.command_executable)
+            .context("Command executable contains NUL")?;
+        let mut argv: Vec<CString> = Vec::with_capacity(config.args.len() + 1);
+        argv.push(exe.clone());
+        for arg in config.args {
+            argv.push(CString::new(*arg).context("Command argument contains NUL")?);
+        }
+        // Inherit our environment (a NUL inside a var can't cross exec; skip it).
+        let env: Vec<CString> = std::env::vars_os()
+            .filter_map(|(key, value)| {
+                let mut kv = key.into_vec();
+                kv.push(b'=');
+                kv.extend(value.into_vec());
+                CString::new(kv).ok()
+            })
+            .collect();
+
+        let mut argv_ptrs: Vec<*mut libc::c_char> = argv
+            .iter()
+            .map(|s| s.as_ptr() as *mut libc::c_char)
+            .collect();
+        argv_ptrs.push(std::ptr::null_mut());
+        let mut env_ptrs: Vec<*mut libc::c_char> = env
+            .iter()
+            .map(|s| s.as_ptr() as *mut libc::c_char)
+            .collect();
+        env_ptrs.push(std::ptr::null_mut());
+
+        let mut pid: libc::pid_t = 0;
+        let rc = unsafe {
+            let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+            let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+            libc::posix_spawn_file_actions_init(&mut actions);
+            libc::posix_spawnattr_init(&mut attr);
+
+            // Child (in order): setsid via attr flag, then open the slave as
+            // stdin — the open is what acquires the controlling terminal,
+            // since by then the child is a session leader — then clone it to
+            // stdout/stderr.
+            libc::posix_spawn_file_actions_addopen(
+                &mut actions,
+                libc::STDIN_FILENO,
+                slave_path.as_ptr(),
+                libc::O_RDWR,
+                0,
+            );
+            libc::posix_spawn_file_actions_adddup2(
+                &mut actions,
+                libc::STDIN_FILENO,
+                libc::STDOUT_FILENO,
+            );
+            libc::posix_spawn_file_actions_adddup2(
+                &mut actions,
+                libc::STDIN_FILENO,
+                libc::STDERR_FILENO,
+            );
+
+            // Reset every signal disposition and unblock everything. Rust
+            // sets SIGPIPE to SIG_IGN, and ignored dispositions survive
+            // exec — without this, `foo | head` pipelines in the shell
+            // would never terminate on a closed pipe.
+            let mut default_signals: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut default_signals);
+            libc::posix_spawnattr_setsigdefault(&mut attr, &default_signals);
+            let mut empty_mask: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty_mask);
+            libc::posix_spawnattr_setsigmask(&mut attr, &empty_mask);
+            libc::posix_spawnattr_setflags(
+                &mut attr,
+                (POSIX_SPAWN_SETSID
+                    | libc::POSIX_SPAWN_SETSIGDEF
+                    | libc::POSIX_SPAWN_SETSIGMASK) as libc::c_short,
+            );
+
+            let rc = libc::posix_spawnp(
+                &mut pid,
+                exe.as_ptr(),
+                &actions,
+                &attr,
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            );
+
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+            libc::posix_spawnattr_destroy(&mut attr);
+            rc
+        };
+
+        if rc != 0 {
+            // posix_spawn reports errors as a return value, not via errno.
+            return Err(IoError::from_raw_os_error(rc)).with_context(|| {
+                format!("Failed to spawn command '{}'", config.command_executable)
+            });
+        }
+        Ok(Pid::from_raw(pid))
     }
 
     /// Creates a clone of the PTY handle for reading.
