@@ -13,7 +13,3 @@
 ## 2025-12-28 - Rasterizer Inner Loop Hoisting
 **Learning:** The inner loop of `execute_stripe` was re-evaluating `Field::sequential(start)` on every iteration, which involves multiple SIMD instructions (broadcast/load + add).
 **Action:** Hoisted the initialization of `xs` out of the loop and updated it incrementally using a pre-computed `step` vector. This reduced the inner loop overhead significantly, yielding a ~34% improvement in rasterization throughput.
-
-## 2025-06-21 - Pre-allocating BSP Tree Nodes
-**Learning:** When building a BSP tree from a known number of leaves N, the number of interior nodes is always exactly N - 1.
-**Action:** Use `Vec::with_capacity(N - 1)` for interior nodes and `Vec::with_capacity(N)` for leaf nodes to eliminate all dynamic reallocations during tree construction.

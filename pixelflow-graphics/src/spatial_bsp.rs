@@ -108,10 +108,8 @@ impl<L> SpatialBSP<L> {
             return Self::single(items.into_iter().next().unwrap().leaf);
         }
 
-        // ⚡ Bolt Optimization: A BSP tree with N leaves always has exactly N-1 interior nodes.
-        // Pre-allocating exact capacities eliminates dynamic resizing overhead during tree build.
-        let mut interiors = Vec::with_capacity(items.len().saturating_sub(1));
-        let mut leaves = Vec::with_capacity(items.len());
+        let mut interiors = Vec::new();
+        let mut leaves = Vec::new();
 
         // Recursively build the tree
         let _root = Self::build_tree(&mut interiors, &mut leaves, items);
