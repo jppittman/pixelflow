@@ -103,6 +103,29 @@ fn determine_display_driver(target_os: &str) -> String {
     }
 }
 
+/// Walk up from the crate manifest directory to find the workspace root
+/// (the ancestor directory whose Cargo.toml contains a `[workspace]` table).
+/// Mirrors `xtask`'s `find_workspace_root`, since the bundle must land in
+/// the same place `xtask bundle-run` expects it.
+#[cfg(target_os = "macos")]
+fn find_workspace_root(manifest_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut current = manifest_dir.to_path_buf();
+    loop {
+        let cargo_toml = current.join("Cargo.toml");
+        if let Ok(contents) = std::fs::read_to_string(&cargo_toml) {
+            if contents.contains("[workspace]") {
+                return current;
+            }
+        }
+        if !current.pop() {
+            panic!(
+                "Could not find workspace root above {}",
+                manifest_dir.display()
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn create_macos_app_bundle() {
     use std::fs;
@@ -110,10 +133,11 @@ fn create_macos_app_bundle() {
     use std::path::Path;
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let bundle_dir = Path::new(&manifest_dir).join("CoreTerm.app/Contents");
+    let workspace_root = find_workspace_root(Path::new(&manifest_dir));
+    let bundle_dir = workspace_root.join("CoreTerm.app/Contents");
 
     // Create bundle structure (cleanup old bundle if it exists - failure is OK)
-    fs::remove_dir_all(Path::new(&manifest_dir).join("CoreTerm.app")).ok();
+    fs::remove_dir_all(workspace_root.join("CoreTerm.app")).ok();
     fs::create_dir_all(bundle_dir.join("MacOS")).expect("Failed to create MacOS directory");
     fs::create_dir_all(bundle_dir.join("Resources")).expect("Failed to create Resources directory");
 
