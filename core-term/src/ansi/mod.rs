@@ -349,3 +349,8 @@ impl AnsiParser for AnsiProcessor {
 // Include tests module if defined in this file
 #[cfg(test)]
 mod tests; // Assuming tests are in ansi/tests.rs
+
+#[cfg(test)]
+mod pict; // PICT-style pairwise covering-array generator (POC)
+#[cfg(test)]
+mod pict_sgr_tests; // Pairwise SGR parser testing built on `pict`
