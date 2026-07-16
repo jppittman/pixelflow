@@ -8,11 +8,11 @@ use core::ops::*;
 
 // Shared minimax polynomial coefficients (f32 precision)
 mod log2_poly {
-    pub const C4: f32 = -0.320_043_5;
-    pub const C3: f32 = 1.797_496_9;
-    pub const C2: f32 = -4.198_805;
-    pub const C1: f32 = 5.727_023;
-    pub const C0: f32 = -3.005_614_8;
+    pub const C4: f32 = -0.080_010_876_1;
+    pub const C3: f32 = 0.635_511_111_5;
+    pub const C2: f32 = -2.099_402_269_9;
+    pub const C1: f32 = 4.049_616_881_5;
+    pub const C0: f32 = -2.505_614_658_0;
 }
 
 /// 2^f on [0, 1), degree-4 minimax. Max error: ~1e-7.
@@ -315,7 +315,7 @@ impl SimdOps for F32x4 {
     #[inline(always)]
     fn log2(self) -> Self {
         // SSE2: Use bit manipulation for exponent/mantissa extraction
-        // Uses range [√2/2, √2] centered at 1 for better polynomial accuracy
+        // Uses range [1, 2)
         // log2(x) = exponent + log2(mantissa)
         unsafe {
             let x_i32 = _mm_castps_si128(self.0);
@@ -328,32 +328,20 @@ impl SimdOps for F32x4 {
             // Subtract bias (127) to get unbiased exponent
             let exp_unbiased = _mm_sub_epi32(exp_masked, _mm_set1_epi32(127));
             // Convert to float
-            let mut n = _mm_cvtepi32_ps(exp_unbiased);
+            let n = _mm_cvtepi32_ps(exp_unbiased);
 
             // Extract mantissa in [1, 2)
             let mant_mask = _mm_set1_epi32(0x007FFFFF_u32 as i32);
             let one_bits = _mm_set1_epi32(0x3F800000_u32 as i32);
-            let mut f = _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(x_i32, mant_mask), one_bits));
+            let f = _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(x_i32, mant_mask), one_bits));
 
-            // Adjust to [√2/2, √2] range for better accuracy (centered at 1)
-            // If f >= √2, divide by 2 and increment exponent
-            let sqrt2 = _mm_set1_ps(core::f32::consts::SQRT_2);
-            let mask = _mm_cmpge_ps(f, sqrt2);
-            let adjust = _mm_and_ps(mask, _mm_set1_ps(1.0));
-            n = _mm_add_ps(n, adjust);
-            f = _mm_or_ps(
-                _mm_and_ps(mask, _mm_mul_ps(f, _mm_set1_ps(0.5))),
-                _mm_andnot_ps(mask, f),
-            );
-
-            // Polynomial for log2(f) on [√2/2, √2]
+            // Polynomial for log2(f) on [1, 2)
             // Fitted using least squares on Chebyshev nodes
-            // Max error: ~1e-4
-            let c4 = _mm_set1_ps(log2_poly::C4);
-            let c3 = _mm_set1_ps(log2_poly::C3);
-            let c2 = _mm_set1_ps(log2_poly::C2);
-            let c1 = _mm_set1_ps(log2_poly::C1);
-            let c0 = _mm_set1_ps(log2_poly::C0);
+            let c4 = _mm_set1_ps(-0.080_010_876_1);
+            let c3 = _mm_set1_ps(0.635_511_111_5);
+            let c2 = _mm_set1_ps(-2.099_402_269_9);
+            let c1 = _mm_set1_ps(4.049_616_881_5);
+            let c0 = _mm_set1_ps(-2.505_614_658_0);
 
             // Horner's method (no FMA on base SSE2)
             let mut poly = _mm_add_ps(_mm_mul_ps(c4, f), c3);
