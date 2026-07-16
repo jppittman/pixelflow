@@ -371,10 +371,63 @@ pub fn benchmark_jit_arena_repeated(
     benchmark_exec_code(result.code, repeat_batches)
 }
 
+/// Convert nanoseconds to log-nanoseconds (floored at 1e-3ns, capped at 1s).
+///
+/// Relocated from the deleted `training::gen_es` (the ES-guided corpus-growth
+/// optimizer it lived in was RL-adjacent scaffolding removed per
+/// docs/plans/2026-07-07-guided-saturation-redesign.md); this conversion
+/// itself is just a unit change on a [`BenchResult::ns`] measurement, used by
+/// the surviving supervised extraction-head training path.
+///
+/// # Panics
+///
+/// Panics if `ns` is NaN.
+#[must_use]
+pub fn log_ns(ns: f64) -> f32 {
+    assert!(!ns.is_nan(), "log_ns called with NaN");
+    let clamped = if ns < 1e-3 {
+        1e-3
+    } else if ns > 1e9 {
+        1e9
+    } else {
+        ns
+    };
+    libm::logf(clamped as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pixelflow_ir::ExprArena;
+
+    #[test]
+    fn verify_log_ns() {
+        // log(1.0) = 0.0
+        let v = log_ns(1.0);
+        assert!(
+            libm::fabsf(v) < 0.001,
+            "log_ns(1.0) should be ~0.0, got {}",
+            v
+        );
+
+        // Values below 1e-3 should be floored to 1e-3.
+        let v_low = log_ns(0.0001);
+        let v_floor = log_ns(1e-3);
+        assert!(
+            libm::fabsf(v_low - v_floor) < 0.001,
+            "log_ns(0.0001) should equal log_ns(1e-3), got {} vs {}",
+            v_low,
+            v_floor
+        );
+
+        // log(e) ≈ 1.0
+        let v_e = log_ns(core::f64::consts::E);
+        assert!(
+            libm::fabsf(v_e - 1.0) < 0.01,
+            "log_ns(e) should be ~1.0, got {}",
+            v_e
+        );
+    }
 
     #[test]
     fn constant_expr_benchmarks_successfully() {
