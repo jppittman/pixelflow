@@ -17,3 +17,11 @@
 ## 2025-12-28 - Render Loop Vector Reallocation
 **Learning:** Found dynamic vector allocations (`Vec::new()`) in the hot path of `terminal_app.rs` during snapshot rendering, causing unnecessary reallocation overhead despite the dimensions (`rows`, `cols`) being known.
 **Action:** Always check loop allocations in render loops and replace `Vec::new()` with `Vec::with_capacity(size)` when the exact layout dimensions are known.
+
+## 2025-12-28 - Render Loop Vector Reallocation
+**Learning:** Found dynamic vector allocations (`Vec::new()`) in the hot path of `terminal_app.rs` during snapshot rendering, causing unnecessary reallocation overhead despite the dimensions (`rows`, `cols`) being known.
+**Action:** Always check loop allocations in render loops and replace `Vec::new()` with `Vec::with_capacity(size)` when the exact layout dimensions are known.
+
+## 2025-12-28 - Render Loop Vector Reallocation
+**Learning:** Found dynamic vector allocations (`Vec::new()`) in the hot path of `terminal_app.rs` during snapshot rendering, causing unnecessary reallocation overhead despite the dimensions (`rows`, `cols`) being known.
+**Action:** Always check loop allocations in render loops and replace `Vec::new()` with `Vec::with_capacity(size)` when the exact layout dimensions are known.

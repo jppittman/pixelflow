@@ -1428,7 +1428,7 @@ fn real_main() {
             f64::NAN
         } else {
             let mid = speedups.len() / 2;
-            if speedups.len() % 2 == 0 {
+            if speedups.len().is_multiple_of(2) {
                 (speedups[mid - 1] + speedups[mid]) / 2.0
             } else {
                 speedups[mid]
@@ -2153,7 +2153,7 @@ fn validate_on_shaders(model: &ExprNnue) -> f64 {
 
     speedups.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
     let mid = speedups.len() / 2;
-    let median = if speedups.len() % 2 == 0 {
+    let median = if speedups.len().is_multiple_of(2) {
         (speedups[mid - 1] + speedups[mid]) / 2.0
     } else {
         speedups[mid]
@@ -2447,7 +2447,7 @@ fn run_trial(
                 f64::NAN
             } else {
                 let mid = speedups.len() / 2;
-                if speedups.len() % 2 == 0 {
+                if speedups.len().is_multiple_of(2) {
                     (speedups[mid - 1] + speedups[mid]) / 2.0
                 } else {
                     speedups[mid]

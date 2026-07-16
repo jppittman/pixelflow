@@ -177,14 +177,11 @@ fn prod_swirl_kernel_through_nnue_and_jit() {
             (got_opt - want).abs() <= 6e-2,
             "optimized JIT at ({x},{y}): got {got_opt}, want {want}"
         );
-        // Removing flakey assertion where NNUE changed semantics
-        /*
         assert!(
             (got_orig - got_opt).abs() <= 1e-1,
             "NNUE extraction changed semantics at ({x},{y}): \
              original {got_orig} vs optimized {got_opt}"
         );
-        */
     }
     eprintln!(
         "[swirl] max error vs analytic f32 = {max_ref_err:.4}, \
