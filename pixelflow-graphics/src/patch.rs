@@ -22,11 +22,13 @@ pub struct BezierPatch {
 
 impl BezierPatch {
     /// Create a patch from 16 control points.
+    #[must_use]
     pub fn new(points: [[[f32; 3]; 4]; 4]) -> Self {
         Self { points }
     }
 
     /// Create a flat patch in XY plane at z=0.
+    #[must_use]
     pub fn flat(size: f32) -> Self {
         let mut points = [[[0.0f32; 3]; 4]; 4];
         for v in 0..4 {
@@ -38,6 +40,7 @@ impl BezierPatch {
     }
 
     /// Create a curved paraboloid patch.
+    #[must_use]
     pub fn paraboloid(size: f32, height: f32) -> Self {
         let mut points = [[[0.0f32; 3]; 4]; 4];
         for v in 0..4 {
@@ -61,6 +64,7 @@ impl BezierPatch {
     /// - dx, dy: first partials (tangent vectors)
     /// - dxx, dxy, dyy: second partials (curvature)
     #[inline]
+    #[must_use]
     pub fn eval(&self, u: Jet2H, v: Jet2H) -> [Jet2H; 3] {
         // Bernstein basis (cubic)
         let one = Jet2H::constant(Field::from(1.0));

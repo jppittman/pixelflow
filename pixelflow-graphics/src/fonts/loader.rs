@@ -67,6 +67,7 @@ pub struct DataSource {
 
 impl DataSource {
     /// Create a new data source from a byte vector.
+    #[must_use]
     pub fn new(data: Vec<u8>) -> Self {
         Self { data }
     }
@@ -109,6 +110,7 @@ impl EmbeddedSource {
     /// Create a new embedded source from static data.
     ///
     /// Typically used with `include_bytes!()`.
+    #[must_use]
     pub const fn new(data: &'static [u8]) -> Self {
         Self { data }
     }

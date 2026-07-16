@@ -331,7 +331,8 @@ pub fn find_hoistable_arena_nodes(
         // Skip trivial nodes (Var, Const, Param) — not worth a register
         let priority = match node {
             ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => continue,
-            ExprNode::Unary(OpKind::Sin
+            ExprNode::Unary(op, _) => match *op {
+                OpKind::Sin
                 | OpKind::Cos
                 | OpKind::Exp
                 | OpKind::Exp2
@@ -344,8 +345,9 @@ pub fn find_hoistable_arena_nodes(
                 | OpKind::Atan
                 | OpKind::Atan2
                 | OpKind::Pow
-                | OpKind::Tan, _) => 3, // Transcendentals: highest priority
-            ExprNode::Unary(_, _) => 1,
+                | OpKind::Tan => 3, // Transcendentals: highest priority
+                _ => 1,
+            },
             ExprNode::Binary(op, _, _) => match *op {
                 OpKind::Div => 2, // Division is expensive
                 OpKind::Pow | OpKind::Atan2 | OpKind::Hypot => 3,

@@ -322,7 +322,7 @@ fn benchmark_exec_code(
             let median_total = times[TIMED_RUNS / 2];
             let ns = median_total as f64 / (INNER_ITERS * repeat_batches) as f64;
 
-            return validate_median(ns).map(|ns| BenchResult { ns, output });
+            validate_median(ns).map(|ns| BenchResult { ns, output })
         }
     }
 

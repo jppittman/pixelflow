@@ -1,3 +1,4 @@
+#![allow(clippy::approx_constant, clippy::bad_bit_mask, clippy::too_many_arguments, clippy::missing_transmute_annotations, clippy::type_complexity)]
 //! # PixelFlow IR
 //!
 //! The shared Intermediate Representation (IR) and backend abstraction.

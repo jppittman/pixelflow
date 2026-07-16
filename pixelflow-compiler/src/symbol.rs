@@ -159,14 +159,14 @@ impl SymbolTable {
     pub fn is_intrinsic(&self, name: &str) -> bool {
         self.symbols
             .get(name)
-            .map_or(false, |s| s.kind == SymbolKind::Intrinsic)
+            .is_some_and(|s| s.kind == SymbolKind::Intrinsic)
     }
 
     /// Check if a name is a captured parameter.
     pub fn is_parameter(&self, name: &str) -> bool {
         self.symbols
             .get(name)
-            .map_or(false, |s| s.kind == SymbolKind::Parameter)
+            .is_some_and(|s| s.kind == SymbolKind::Parameter)
     }
 
     /// Get all symbol names (for typo suggestions in error messages).

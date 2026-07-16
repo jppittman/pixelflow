@@ -213,7 +213,7 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             let op = BinaryOp::from_syn(&expr_binary.op).ok_or_else(|| {
                 let op_str = quote::quote!(#expr_binary.op).to_string();
                 syn::Error::new_spanned(
-                    &expr_binary.op,
+                    expr_binary.op,
                     format!(
                         "unsupported binary operator `{}`\n\
                          \n\
@@ -241,7 +241,7 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             let op = UnaryOp::from_syn(&expr_unary.op).ok_or_else(|| {
                 let op_str = quote::quote!(#expr_unary.op).to_string();
                 syn::Error::new_spanned(
-                    &expr_unary.op,
+                    expr_unary.op,
                     format!(
                         "unsupported unary operator `{}`\n\
                          \n\

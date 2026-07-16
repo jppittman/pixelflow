@@ -415,10 +415,10 @@ impl SimdOps for F32x4 {
             let t = _mm_mul_ps(x, _mm_set1_ps(PI_INV));
 
             // Chebyshev coefficients for sin
-            let c1 = _mm_set1_ps(1.6719971);
-            let c3 = _mm_set1_ps(-0.64596355);
-            let c5 = _mm_set1_ps(0.07968945);
-            let c7 = _mm_set1_ps(-0.004681754);
+            let c1 = _mm_set1_ps(1.671_997_1);
+            let c3 = _mm_set1_ps(-0.645_963_55);
+            let c5 = _mm_set1_ps(0.079_689_45);
+            let c7 = _mm_set1_ps(-0.004_681_754);
 
             // Horner's method: ((C7*t² + C5)*t² + C3)*t² + C1)*t
             let t2 = _mm_mul_ps(t, t);
@@ -450,9 +450,9 @@ impl SimdOps for F32x4 {
 
             // Chebyshev coefficients for atan on [0, 1]
             let c1 = _mm_set1_ps(0.999999999);
-            let c3 = _mm_set1_ps(-0.333333333);
+            let c3 = _mm_set1_ps(-0.333_333_34);
             let c5 = _mm_set1_ps(0.2);
-            let c7 = _mm_set1_ps(-0.142857143);
+            let c7 = _mm_set1_ps(-0.142_857_15);
 
             // Horner's method
             let t = r_abs;

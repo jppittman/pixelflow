@@ -94,6 +94,7 @@ impl<P: Pixel + Send + 'static> RasterizerActor<P> {
     /// let rasterizer = setup_handle.register(response_tx);
     /// // Now you can send render requests via `rasterizer`
     /// ```
+    #[must_use]
     pub fn spawn_with_setup(num_threads: usize) -> (RasterizerSetupHandle<P>, JoinHandle<()>) {
         // Create the setup channel (buffer=1, only one setup message ever)
         let (setup_tx, setup_rx) = mpsc::sync_channel::<RasterSetup<P>>(1);

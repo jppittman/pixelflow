@@ -79,22 +79,26 @@ impl ExecutableCode {
     /// The caller must ensure the code implements the correct calling convention
     /// and signature for type `F`.
     #[inline]
+    #[must_use]
     pub unsafe fn as_fn<F>(&self) -> F {
         // SAFETY: Caller guarantees F matches the compiled code's signature.
         unsafe { core::mem::transmute_copy(&self.ptr) }
     }
 
     /// Get the code as a byte slice (for debugging).
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     /// Length of the compiled code in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the code is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -218,7 +222,7 @@ impl CodeBuffer {
         {
             // With MAP_JIT on macOS, the memory starts RW. Toggle to RX.
             unsafe {
-                toggle_jit_write(JitWriteState::Executable);
+                toggle_jit_write(false);
             }
         }
 
@@ -252,7 +256,7 @@ impl CodeBuffer {
             // Toggle to writable.
             #[cfg(target_os = "macos")]
             {
-                toggle_jit_write(JitWriteState::Writable);
+                toggle_jit_write(true);
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -273,7 +277,7 @@ impl CodeBuffer {
             // Toggle to executable.
             #[cfg(target_os = "macos")]
             {
-                toggle_jit_write(JitWriteState::Executable);
+                toggle_jit_write(false);
                 // Instruction cache coherence on Apple Silicon.
                 // sys_icache_invalidate is needed after writing code on ARM.
                 unsafe extern "C" {
@@ -298,16 +302,19 @@ impl CodeBuffer {
     }
 
     /// Current code length in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the buffer contains no code.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Total capacity in bytes.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -322,37 +329,27 @@ impl Drop for CodeBuffer {
     }
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JitWriteState {
-    Writable,
-    Executable,
-}
-
 /// Toggle JIT write protection on macOS (Apple Silicon).
 ///
-/// Sets the current thread's MAP_JIT memory permission.
-/// - `JitWriteState::Writable`: The memory is writable but not executable.
-/// - `JitWriteState::Executable`: The memory is executable but not writable (W^X).
+/// When `writable` is true, the current thread can write to MAP_JIT memory.
+/// When false, the memory is executable but not writable (W^X).
 ///
 /// This is much cheaper than mprotect (~0.5µs vs ~5µs) and is per-thread,
 /// so it doesn't affect other threads' ability to execute the code.
 #[cfg(target_os = "macos")]
-unsafe fn toggle_jit_write(state: JitWriteState) {
+unsafe fn toggle_jit_write(writable: bool) {
     // pthread_jit_write_protect_np(true) = write-protect (executable)
     // pthread_jit_write_protect_np(false) = writable (not executable)
     // Note: the semantics are inverted from what you'd expect!
     unsafe extern "C" {
-        fn pthread_jit_write_protect_np(enabled: core::ffi::c_int);
+        fn pthread_jit_write_protect_np(enabled: bool);
     }
-    let enabled = match state {
-        JitWriteState::Writable => 0,
-        JitWriteState::Executable => 1,
-    };
+    // writable=true → we want to write → disable write protection
+    // writable=false → we want to execute → enable write protection
     // SAFETY: pthread_jit_write_protect_np is always safe to call — it only
     // affects the calling thread's JIT write permission.
     unsafe {
-        pthread_jit_write_protect_np(enabled);
+        pthread_jit_write_protect_np(!writable);
     }
 }
 

@@ -167,6 +167,7 @@ impl Manifold<Jet3_4> for UnitSphere {
 /// Unit sphere centered at origin.
 /// Solves |t * ray| = 1  =>  t = 1 / |ray|
 #[inline]
+#[must_use]
 pub fn unit_sphere() -> UnitSphere {
     UnitSphere
 }
@@ -189,6 +190,7 @@ impl Manifold<Jet3_4> for PlaneKernel {
 /// Horizontal plane at y = height.
 /// Solves P.y = height => t * ry = height => t = height / ry
 #[allow(dead_code)]
+#[must_use]
 pub fn plane(height: f32) -> PlaneKernel {
     PlaneKernel { h: height }
 }
@@ -213,6 +215,7 @@ pub struct PathJetSphere {
 }
 
 impl PathJetSphere {
+    #[must_use]
     pub fn new(center: (f32, f32, f32), radius: f32) -> Self {
         Self { center, radius }
     }
@@ -1018,6 +1021,7 @@ kernel!(pub struct Checker = || Jet3 -> Field {
 /// Simple Sky Gradient based on Y direction.
 ///
 /// Uses Lift to project Jet3 → Field (discards derivatives - sky doesn't need AA).
+#[must_use]
 pub fn sky() -> Lift<impl Manifold<Field4, Output = Field> + Clone> {
     Lift(kernel!(|| {
         let t = (Y * 0.5 + 0.5).max(0.0).min(1.0);
@@ -1103,12 +1107,12 @@ impl<C: ManifoldCompat<Field, Output = Discrete>> Manifold<Jet3_4> for ColorChec
         let z_val: Field = z.val;
 
         // Which checker cell are we in?
-        let cell_x = x_val.clone().floor();
-        let cell_z = z_val.clone().floor();
+        let cell_x = x_val.floor();
+        let cell_z = z_val.floor();
         let sum = (cell_x.clone() + cell_z.clone()).constant();
         let half = Field::from(0.5);
-        let sum_half = (sum.clone() * half.clone()).constant();
-        let fract_half = (sum_half.clone() - sum_half.floor()).constant();
+        let sum_half = (sum * half).constant();
+        let fract_half = (sum_half - sum_half.floor()).constant();
         let is_even = fract_half.abs().lt(Field::from(0.25));
 
         // Colors (warm and cool)
@@ -1124,9 +1128,9 @@ impl<C: ManifoldCompat<Field, Output = Discrete>> Manifold<Jet3_4> for ColorChec
         let fz = (z_val - cell_z).constant();
 
         // Distance to nearest edge (0.0 or 1.0 boundary)
-        let dx_edge = (fx - half.clone()).abs().constant();
-        let dz_edge = (fz - half.clone()).abs().constant();
-        let dist_to_edge = (half.clone() - dx_edge).min(half - dz_edge).constant();
+        let dx_edge = (fx - half).abs().constant();
+        let dz_edge = (fz - half).abs().constant();
+        let dist_to_edge = (half - dx_edge).min(half - dz_edge).constant();
 
         // Gradient magnitude from Jet3 derivatives
         let grad_x = (x.dx * x.dx + x.dy * x.dy + x.dz * x.dz).sqrt().constant();
@@ -1137,22 +1141,22 @@ impl<C: ManifoldCompat<Field, Output = Discrete>> Manifold<Jet3_4> for ColorChec
         let zero = Field::from(0.0);
         let one = Field::from(1.0);
         let coverage = (dist_to_edge / pixel_size)
-            .min(one.clone())
+            .min(one)
             .max(zero)
             .constant();
 
         // Select and blend colors
-        let r_base = is_even.clone().select(ra.clone(), rb.clone());
-        let g_base = is_even.clone().select(ga.clone(), gb.clone());
-        let b_base = is_even.clone().select(ba.clone(), bb.clone());
+        let r_base = is_even.select(ra, rb);
+        let g_base = is_even.select(ga, gb);
+        let b_base = is_even.select(ba, bb);
 
-        let r_neighbor = is_even.clone().select(rb, ra);
-        let g_neighbor = is_even.clone().select(gb, ga);
+        let r_neighbor = is_even.select(rb, ra);
+        let g_neighbor = is_even.select(gb, ga);
         let b_neighbor = is_even.select(bb, ba);
 
-        let inv_coverage = (one.clone() - coverage.clone()).constant();
-        let r = (r_base * coverage.clone() + r_neighbor * inv_coverage.clone()).constant();
-        let g = (g_base * coverage.clone() + g_neighbor * inv_coverage.clone()).constant();
+        let inv_coverage = (one - coverage).constant();
+        let r = (r_base * coverage + r_neighbor * inv_coverage).constant();
+        let g = (g_base * coverage + g_neighbor * inv_coverage).constant();
         let b = (b_base * coverage + b_neighbor * inv_coverage).constant();
 
         // Sample the color cube

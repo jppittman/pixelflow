@@ -78,6 +78,7 @@ impl CachedGlyph {
     /// Create a cached glyph by baking a glyph manifold.
     ///
     /// The glyph is rasterized at `size × size` resolution.
+    #[must_use]
     pub fn new<L, Q>(glyph: &Glyph<L, Q>, size: usize) -> Self
     where
         L: Manifold<Field4, Output = Field>,
@@ -108,12 +109,14 @@ impl CachedGlyph {
 
     /// Get the cache width.
     #[inline]
+    #[must_use]
     pub fn width(&self) -> usize {
         self.width
     }
 
     /// Get the cache height.
     #[inline]
+    #[must_use]
     pub fn height(&self) -> usize {
         self.height
     }
@@ -173,6 +176,7 @@ pub struct GlyphCache {
 
 impl GlyphCache {
     /// Create an empty glyph cache.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -180,6 +184,7 @@ impl GlyphCache {
     }
 
     /// Create a cache with pre-allocated capacity.
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(capacity),
@@ -209,6 +214,7 @@ impl GlyphCache {
     }
 
     /// Check if a glyph is cached at this size.
+    #[must_use]
     pub fn contains(&self, ch: char, size: f32) -> bool {
         let bucket = size_bucket(size);
         let key = CacheKey {
@@ -238,16 +244,19 @@ impl GlyphCache {
     }
 
     /// Number of cached glyphs.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Check if the cache is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Estimated memory usage in bytes.
+    #[must_use]
     pub fn memory_usage(&self) -> usize {
         self.entries
             .values()
@@ -332,6 +341,7 @@ impl CachedText {
     }
 
     /// Get the composed glyph structure.
+    #[must_use]
     pub fn inner(&self) -> &Sum<Affine<CachedGlyph>> {
         &self.inner
     }

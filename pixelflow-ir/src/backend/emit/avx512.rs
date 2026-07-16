@@ -189,7 +189,7 @@ fn evex_rm_rsp_broadcast(code: &mut Vec<u8>, reg: u8, disp: i32) {
     let r = ((reg >> 3) & 1) ^ 1;
     let rp = ((reg >> 4) & 1) ^ 1;
     let p0 = (r << 7) | (1 << 6) | (1 << 5) | (rp << 4) | (Map::M0F38 as u8);
-    let p1 = (0 << 7) | (0x0F << 3) | (1 << 2) | (Pp::P66 as u8);
+    let p1 = (0x0F << 3) | (1 << 2) | (Pp::P66 as u8);
     let p2 = (0b10 << 5) | (1 << 3);
     code.push(0x62);
     code.push(p0);
@@ -296,6 +296,7 @@ fn cmp_pred(op: OpKind) -> Option<u8> {
 }
 
 /// Whether `op` is a comparison handled by [`emit_compare`].
+#[must_use]
 pub fn is_compare(op: OpKind) -> bool {
     cmp_pred(op).is_some()
 }

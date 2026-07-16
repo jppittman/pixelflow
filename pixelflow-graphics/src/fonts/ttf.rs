@@ -102,6 +102,7 @@ pub struct Quad<K> {
 
 /// Create a quad with analytical Loop-Blinn kernel from control points.
 #[inline(always)]
+#[must_use]
 pub fn make_quad(points: [[f32; 2]; 3]) -> Quad<QuadKernel> {
     let kernel = AnalyticalQuad::new(points[0], points[1], points[2]);
     Quad { kernel }
@@ -116,6 +117,7 @@ pub struct Line<K> {
 
 /// Create a line with analytical kernel from control points.
 #[inline(always)]
+#[must_use]
 pub fn make_line(points: [[f32; 2]; 2]) -> Option<Line<LineKernel>> {
     let kernel = AnalyticalLine::from_points(points[0], points[1])?;
     Some(Line { kernel })
@@ -331,8 +333,8 @@ enum Loca<'a> {
 impl Loca<'_> {
     fn get(&self, i: usize) -> Option<usize> {
         match self {
-            Self::Short(d) => Some(R(*d, i * 2).u16()? as usize * 2),
-            Self::Long(d) => Some(R(*d, i * 4).u32()? as usize),
+            Self::Short(d) => Some(R(d, i * 2).u16()? as usize * 2),
+            Self::Long(d) => Some(R(d, i * 4).u32()? as usize),
         }
     }
 }
@@ -346,24 +348,24 @@ impl Cmap<'_> {
     fn lookup(&self, c: u32) -> Option<u16> {
         match self {
             Self::Fmt4(d) if c <= 0xFFFF => {
-                let n = R(*d, 6).u16()? as usize / 2;
+                let n = R(d, 6).u16()? as usize / 2;
                 (0..n).find_map(|i| {
-                    let end = R(*d, 14 + i * 2).u16()?;
+                    let end = R(d, 14 + i * 2).u16()?;
                     if c as u16 > end {
                         return None;
                     }
-                    let start = R(*d, 16 + n * 2 + i * 2).u16()?;
+                    let start = R(d, 16 + n * 2 + i * 2).u16()?;
                     if (c as u16) < start {
                         return Some(0);
                     }
-                    let delta = R(*d, 16 + n * 4 + i * 2).i16()?;
-                    let range = R(*d, 16 + n * 6 + i * 2).u16()?;
+                    let delta = R(d, 16 + n * 4 + i * 2).i16()?;
+                    let range = R(d, 16 + n * 6 + i * 2).u16()?;
                     Some(if range == 0 {
                         (c as i16).wrapping_add(delta) as u16
                     } else {
                         let off =
                             16 + n * 6 + i * 2 + range as usize + (c as u16 - start) as usize * 2;
-                        let g = R(*d, off).u16()?;
+                        let g = R(d, off).u16()?;
                         if g == 0 {
                             0
                         } else {
@@ -372,11 +374,11 @@ impl Cmap<'_> {
                     })
                 })
             }
-            Self::Fmt12(d) => (0..R(*d, 12).u32()? as usize).find_map(|i| {
+            Self::Fmt12(d) => (0..R(d, 12).u32()? as usize).find_map(|i| {
                 let (s, e, g) = (
-                    R(*d, 16 + i * 12).u32()?,
-                    R(*d, 20 + i * 12).u32()?,
-                    R(*d, 24 + i * 12).u32()?,
+                    R(d, 16 + i * 12).u32()?,
+                    R(d, 20 + i * 12).u32()?,
+                    R(d, 24 + i * 12).u32()?,
                 );
                 (c >= s && c <= e).then(|| (g + c - s) as u16)
             }),
@@ -433,14 +435,14 @@ impl<'a> Kern<'a> {
 
                 while lo < hi {
                     let mid = (lo + hi) / 2;
-                    let pair = ((R(*data, mid * 6).u16().unwrap_or(0) as u32) << 16)
-                        | (R(*data, mid * 6 + 2).u16().unwrap_or(0) as u32);
+                    let pair = ((R(data, mid * 6).u16().unwrap_or(0) as u32) << 16)
+                        | (R(data, mid * 6 + 2).u16().unwrap_or(0) as u32);
 
                     match pair.cmp(&key) {
                         std::cmp::Ordering::Less => lo = mid + 1,
                         std::cmp::Ordering::Greater => hi = mid,
                         std::cmp::Ordering::Equal => {
-                            return R(*data, mid * 6 + 4).i16().unwrap_or(0)
+                            return R(data, mid * 6 + 4).i16().unwrap_or(0)
                         }
                     }
                 }
@@ -491,6 +493,7 @@ pub struct Font<'a> {
 }
 
 impl<'a> Font<'a> {
+    #[must_use]
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         // TTF header: sfntVersion(4) + numTables(2) + searchRange(2) + entrySelector(2) + rangeShift(2) = 12 bytes
         // Table record: tag(4) + checksum(4) + offset(4) + length(4) = 16 bytes
@@ -569,20 +572,24 @@ impl<'a> Font<'a> {
     /// Use this when you need the glyph ID to batch multiple operations,
     /// avoiding redundant CMAP lookups in tight loops.
     #[inline]
+    #[must_use]
     pub fn cmap_lookup(&self, ch: char) -> Option<u16> {
         self.cmap.lookup(ch as u32)
     }
 
+    #[must_use]
     pub fn glyph(&self, ch: char) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
         self.compile(self.cmap.lookup(ch as u32)?)
     }
 
     /// Get glyph by pre-looked-up glyph ID (avoids redundant CMAP lookup).
     #[inline]
+    #[must_use]
     pub fn glyph_by_id(&self, id: u16) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
         self.compile(id)
     }
 
+    #[must_use]
     pub fn glyph_scaled(
         &self,
         ch: char,
@@ -595,6 +602,7 @@ impl<'a> Font<'a> {
     /// Get scaled glyph by pre-looked-up glyph ID.
     ///
     /// Avoids redundant CMAP lookup when you already have the glyph ID.
+    #[must_use]
     pub fn glyph_scaled_by_id(
         &self,
         id: u16,
@@ -616,6 +624,7 @@ impl<'a> Font<'a> {
         .into())))
     }
 
+    #[must_use]
     pub fn advance(&self, ch: char) -> Option<f32> {
         let id = self.cmap.lookup(ch as u32)?;
         self.advance_by_id(id)
@@ -625,11 +634,13 @@ impl<'a> Font<'a> {
     ///
     /// Avoids redundant CMAP lookup when you already have the glyph ID.
     #[inline]
+    #[must_use]
     pub fn advance_by_id(&self, id: u16) -> Option<f32> {
         let i = (id as usize).min(self.num_hm.saturating_sub(1));
         Some(R(self.data, self.hmtx + i * 4).u16()? as f32)
     }
 
+    #[must_use]
     pub fn advance_scaled(&self, ch: char, size: f32) -> Option<f32> {
         Some(self.advance(ch)? * size / self.units_per_em as f32)
     }
@@ -637,11 +648,13 @@ impl<'a> Font<'a> {
     /// Get scaled advance width by pre-looked-up glyph ID.
     ///
     /// Avoids redundant CMAP lookup when you already have the glyph ID.
+    #[must_use]
     pub fn advance_scaled_by_id(&self, id: u16, size: f32) -> Option<f32> {
         Some(self.advance_by_id(id)? * size / self.units_per_em as f32)
     }
 
     /// Get kerning adjustment between two characters in font units.
+    #[must_use]
     pub fn kern(&self, left: char, right: char) -> f32 {
         let left_id = self.cmap.lookup(left as u32).unwrap_or(0);
         let right_id = self.cmap.lookup(right as u32).unwrap_or(0);
@@ -652,11 +665,13 @@ impl<'a> Font<'a> {
     ///
     /// Avoids redundant CMAP lookups when you already have both glyph IDs.
     #[inline]
+    #[must_use]
     pub fn kern_by_ids(&self, left_id: u16, right_id: u16) -> f32 {
         self.kern.get(left_id, right_id) as f32
     }
 
     /// Get kerning adjustment between two characters, scaled to size.
+    #[must_use]
     pub fn kern_scaled(&self, left: char, right: char, size: f32) -> f32 {
         self.kern(left, right) * size / self.units_per_em as f32
     }

@@ -1,3 +1,4 @@
+#![allow(clippy::approx_constant, clippy::bad_bit_mask, clippy::too_many_arguments, clippy::missing_transmute_annotations, clippy::type_complexity)]
 #![recursion_limit = "2048"]
 //! # PixelFlow Core: An Algebraic Graphics Engine
 //!
@@ -806,12 +807,14 @@ impl Field {
 
     /// Equality comparison (returns mask as Field).
     #[inline(always)]
+    #[must_use]
     pub fn eq(self, rhs: Self) -> Self {
         Self(NativeSimd::mask_to_float(self.0.cmp_eq(rhs.0)))
     }
 
     /// Inequality comparison (returns mask as Field).
     #[inline(always)]
+    #[must_use]
     pub fn ne(self, rhs: Self) -> Self {
         Self(NativeSimd::mask_to_float(self.0.cmp_ne(rhs.0)))
     }

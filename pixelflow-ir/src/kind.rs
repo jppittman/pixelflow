@@ -380,7 +380,7 @@ impl OpKind {
     /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
     /// - Select (needs mask input — only valid composed with a comparison)
     /// Returns true if this op can appear in randomly generated seed expressions
-    ///   fed to the JIT training pipeline.
+    /// fed to the JIT training pipeline.
     ///
     /// Excluded because they produce mask/non-float output:
     ///   Lt, Le, Gt, Ge, Eq, Ne, Select

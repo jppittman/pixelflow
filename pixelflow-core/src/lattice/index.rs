@@ -21,6 +21,7 @@ const INDEX1D_LOOP_VARS: [u8; 1] = [0]; // X=0 only
 
 impl IndexLattice1D {
     /// Create a 1D index lattice over [0, len).
+    #[must_use]
     pub fn new(len: usize) -> Self {
         Self { len }
     }
@@ -158,6 +159,7 @@ const INDEX2D_LOOP_VARS: [u8; 2] = [0, 1]; // X=0, Y=1
 
 impl IndexLattice2D {
     /// Create a 2D index lattice over [0, width) × [0, height).
+    #[must_use]
     pub fn new(width: usize, height: usize) -> Self {
         Self { width, height }
     }

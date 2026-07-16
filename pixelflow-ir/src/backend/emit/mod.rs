@@ -70,11 +70,10 @@ impl ConstPool {
     fn from_schedule(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<Self, &'static str> {
         let mut pool = Self::new();
         for (_, op) in schedule {
-            if let ScheduledOp::Const(val) = op {
-                if aarch64::needs_const_pool(*val) {
+            if let ScheduledOp::Const(val) = op
+                && aarch64::needs_const_pool(*val) {
                     pool.push_f32(*val)?;
                 }
-            }
         }
         Ok(pool)
     }
@@ -1907,7 +1906,6 @@ trait IsaBackend {
 
     /// Resolve a value to a register, reloading/rematerializing into `target`
     /// if it is spilled or rematerialized.
-    #[allow(clippy::too_many_arguments)]
     fn emit_resolve(
         &mut self,
         code: &mut Vec<u8>,
@@ -2013,8 +2011,9 @@ fn compile_dag_via_backend<B: IsaBackend>(
 
     for (sched_idx, (vid, sched_op)) in schedule.iter().enumerate() {
         // Guard branches that begin before this instruction.
-        for pb in branch_starts[sched_idx].iter() {
+        for bi in 0..branch_starts[sched_idx].len() {
             let (guard_idx, arm) = {
+                let pb = &branch_starts[sched_idx][bi];
                 (pb.guard_idx, pb.arm)
             };
             let guard = &select_guards[guard_idx];
@@ -2029,8 +2028,8 @@ fn compile_dag_via_backend<B: IsaBackend>(
         }
 
         // Guard branches that end at this instruction (patch their targets).
-        for gi in branch_ends[sched_idx].iter() {
-            let gi = *gi;
+        for ei in 0..branch_ends[sched_idx].len() {
+            let gi = branch_ends[sched_idx][ei];
             if let Some(branch) = pending_patches.remove(&(gi, 0)) {
                 let target = code.len();
                 backend.patch_branch(&mut code, branch, target);
@@ -2052,10 +2051,9 @@ fn compile_dag_via_backend<B: IsaBackend>(
 
         // Select with a guard region: emit a uniform-mask short-circuit wrapper.
         if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sched_op
-            && let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx)
-        {
-            let has_true = guard.true_range.0 != guard.true_range.1;
-            let has_false = guard.false_range.0 != guard.false_range.1;
+            && let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx) {
+                let has_true = guard.true_range.0 != guard.true_range.1;
+                let has_false = guard.false_range.0 != guard.false_range.1;
                 if has_true || has_false {
                     let mask_reg = backend.emit_resolve(
                         &mut code, *mask_vid, RELOAD_REG, &reg_for, &spill_for, &remat_for,
@@ -2102,7 +2100,7 @@ fn compile_dag_via_backend<B: IsaBackend>(
                     }
                     continue;
                 }
-        }
+            }
 
         backend.emit_plan(&mut code, &plan)?;
     }
@@ -2187,7 +2185,6 @@ impl IsaBackend for Aarch64Backend {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_resolve(
         &mut self,
         code: &mut Vec<u8>,
@@ -3329,7 +3326,6 @@ impl IsaBackend for X86Backend {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_resolve(
         &mut self,
         code: &mut Vec<u8>,
@@ -3537,7 +3533,6 @@ impl IsaBackend for Avx512Backend {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_resolve(
         &mut self,
         code: &mut Vec<u8>,
@@ -3738,8 +3733,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
     fn surviving_dwrt_fails_loudly() {
-        use crate::ExprArena;
-        let mut a = ExprArena::new();
+        let mut a = crate::ExprArena::new();
         let x = a.push_var(0);
         let v = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, x, v);
@@ -4683,14 +4677,12 @@ mod tests {
     fn test_x86_binary_ternary_builtins_match_scalar() {
         use core::arch::x86_64::*;
         // Helper: compile f(X, Y) and eval at (x, y).
-        fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
+        unsafe fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 { unsafe {
             let r = compile_arena_dag(arena, root).expect("compile failed");
-            unsafe {
-                let f: executable::KernelFn = r.code.as_fn();
-                let z = _mm_set1_ps(0.0);
-                _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
-            }
-        }
+            let f: executable::KernelFn = r.code.as_fn();
+            let z = _mm_set1_ps(0.0);
+            _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
+        }}
 
         // atan2(y, x): arena Binary(Atan2, Y, X)  (op order: src1=y, src2=x)
         let pts = [(0.5, 2.0), (2.0, 0.5), (-0.5, 2.0), (0.5, -2.0), (-2.0, -0.5), (3.0, -0.5)];
@@ -4700,7 +4692,7 @@ mod tests {
             let x = a.push_var(0);
             let root = a.push_binary(OpKind::Atan2, y, x);
             for &(yv, xv) in &pts {
-                let got = run2(&a, root, xv, yv);
+                let got = unsafe { run2(&a, root, xv, yv) };
                 let want = yv.atan2(xv);
                 assert!((got - want).abs() <= 1.5e-2, "atan2({yv},{xv}): {got} vs {want}");
             }
@@ -4712,7 +4704,7 @@ mod tests {
             let y = a.push_var(1);
             let root = a.push_binary(OpKind::Pow, x, y);
             for &(xv, yv) in &[(2.0f32, 3.0f32), (9.0, 0.5), (4.0, -1.0), (1.5, 2.0)] {
-                let got = run2(&a, root, xv, yv);
+                let got = unsafe { run2(&a, root, xv, yv) };
                 let want = xv.powf(yv);
                 let err = (got - want).abs() / (1.0 + want.abs());
                 assert!(err <= 5e-3, "pow({xv},{yv}): {got} vs {want} err={err}");
@@ -4725,7 +4717,7 @@ mod tests {
             let y = a.push_var(1);
             let root = a.push_binary(OpKind::Hypot, x, y);
             for &(xv, yv) in &[(3.0f32, 4.0f32), (1.0, 1.0), (0.0, 2.0)] {
-                let got = run2(&a, root, xv, yv);
+                let got = unsafe { run2(&a, root, xv, yv) };
                 let want = xv.hypot(yv);
                 assert!((got - want).abs() <= 1e-4, "hypot({xv},{yv}): {got} vs {want}");
             }
@@ -4740,7 +4732,7 @@ mod tests {
             let y = a.push_var(1);
             let root = a.push_binary(op, x, y);
             for &(xv, yv) in &[(1.0f32, 2.0f32), (3.0, -1.0), (-2.0, -5.0)] {
-                let got = run2(&a, root, xv, yv);
+                let got = unsafe { run2(&a, root, xv, yv) };
                 assert!((got - f(xv, yv)).abs() <= 1e-6, "{op:?}({xv},{yv})");
             }
         }
