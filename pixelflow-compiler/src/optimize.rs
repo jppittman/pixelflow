@@ -28,8 +28,8 @@ use crate::ast::{
 };
 use crate::sema::AnalyzedKernel;
 use pixelflow_search::egraph::{
-    EClassId, EGraph, ENode, ExtractedDAG, IncrementalExtractor, Rewrite,
-    build_extracted_dag_from_choices, compute_ref_counts, ops,
+    CostModel, EClassId, EGraph, ENode, ExtractedDAG, IncrementalExtractor, Rewrite,
+    build_extracted_dag_from_choices, compute_ref_counts, extract_dag, ops,
 };
 use pixelflow_search::math::all_rules as search_all_rules;
 use pixelflow_search::nnue::ExprNnue;
@@ -58,24 +58,17 @@ static OPAQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Optimization model for AOT extraction.
 static OPTIMIZATION_MODEL: OnceLock<ExprNnue> = OnceLock::new();
 
-/// Get the neural cost model used to guide e-graph extraction.
+/// Which cost model drives e-graph extraction.
 ///
-/// ## Default: NNUE extraction is intentionally disabled
+/// ## Default: static latency-prior extraction
 ///
-/// There is no validated, trained set of NNUE weights shipped with this
-/// compiler. Rather than embed stale/unvalidated weights and silently fall
-/// back when they fail to load (which is what this code used to do — see
-/// git history), the default path deliberately constructs the no-op model
-/// (`ExprNnue::new()`, all-zero weights). A zero model assigns uniform cost
-/// to every candidate rewrite, so the hill-climbing extractor keeps the
-/// original (author-written) form rather than chasing a noisy or untrained
-/// cost signal into a pathological rewrite.
-///
-/// This does **not** disable optimization: structural peephole rewriting
-/// (`optimize_expr`, constant folding, identity removal) and e-graph
-/// CSE/global rewriting still run in full — only the *learned* cost-guided
-/// extraction step is a no-op. This is intentional, not an error, so it
-/// produces no stderr output.
+/// The recorded 3-way benchmark (docs/results/2026-07-08-extraction-3way.md)
+/// measured NNUE extraction ~6.7% slower (geomean) than the handcrafted
+/// latency prior at ~31x the extraction-time cost, while extraction itself
+/// (prior vs no-swap) was worth ~33%. Per the Phase 2 gate in
+/// docs/plans/2026-07-07-guided-saturation-redesign.md, the static
+/// [`CostModel::latency_prior`] is therefore the default and the learned
+/// model is opt-in only.
 ///
 /// ## Opt-in: `PIXELFLOW_NNUE_WEIGHTS`
 ///
@@ -85,19 +78,33 @@ static OPTIMIZATION_MODEL: OnceLock<ExprNnue> = OnceLock::new();
 /// length — is a hard compile failure (`panic!`) with a precise diagnostic.
 /// There is no silent fallback on this path: if you asked for learned
 /// weights, you get them or the build fails.
-///
-/// Weights are trained via the pixelflow-pipeline training loop:
-///   1. Self-play generates trajectories (e-graph saturation + JIT benchmarking)
-///   2. Decision Transformer critic assigns temporal credit (advantages)
-///   3. Joint backprop trains the extraction head (expression → cost)
-///      and saturation head (which rules to apply)
-///   4. Extraction head uses DAG-aware accumulator (shared nodes counted once)
-///   5. JIT benchmarks use eval100! unrolled loop (no loop counter bias)
-fn get_optimization_model() -> &'static ExprNnue {
-    OPTIMIZATION_MODEL.get_or_init(|| match std::env::var("PIXELFLOW_NNUE_WEIGHTS") {
-        Ok(path) => load_opt_in_weights(&path),
-        Err(_) => ExprNnue::new(),
-    })
+pub(crate) enum Extraction<'a> {
+    /// Opt-in learned extraction (`PIXELFLOW_NNUE_WEIGHTS` set).
+    Nnue(&'a ExprNnue),
+    /// Default: static per-op latency-prior costs.
+    Static(CostModel),
+}
+
+impl Extraction<'_> {
+    /// Per-e-class extraction choices under this policy.
+    fn choices(&self, egraph: &EGraph, root: EClassId) -> Vec<Option<usize>> {
+        match self {
+            Extraction::Nnue(model) => {
+                let extractor = IncrementalExtractor::new(model, 8);
+                extractor.extract_choices_only(egraph, root).1
+            }
+            Extraction::Static(costs) => extract_dag(egraph, root, costs).choices,
+        }
+    }
+}
+
+fn get_extraction() -> Extraction<'static> {
+    match std::env::var("PIXELFLOW_NNUE_WEIGHTS") {
+        Ok(path) => {
+            Extraction::Nnue(OPTIMIZATION_MODEL.get_or_init(|| load_opt_in_weights(&path)))
+        }
+        Err(_) => Extraction::Static(CostModel::latency_prior()),
+    }
 }
 
 /// Load NNUE weights from an opt-in path set via `PIXELFLOW_NNUE_WEIGHTS`.
@@ -278,15 +285,16 @@ pub fn optimize(mut analyzed: AnalyzedKernel) -> AnalyzedKernel {
     optimize_with_model(analyzed)
 }
 
-/// Optimize an analyzed kernel using learned extraction.
+/// Optimize an analyzed kernel using cost-guided extraction (static
+/// latency prior by default; learned NNUE via `PIXELFLOW_NNUE_WEIGHTS`).
 pub fn optimize_with_model(mut analyzed: AnalyzedKernel) -> AnalyzedKernel {
-    let model = get_optimization_model();
-    analyzed.def.body = optimize_expr_with_model(analyzed.def.body, model);
+    let extraction = get_extraction();
+    analyzed.def.body = optimize_expr_with_model(analyzed.def.body, &extraction);
     analyzed
 }
 
-/// Optimize a single expression using e-graph saturation and neural extraction.
-fn optimize_expr_with_model(expr: Expr, model: &ExprNnue) -> Expr {
+/// Optimize a single expression using e-graph saturation and cost-guided extraction.
+fn optimize_expr_with_model(expr: Expr, extraction: &Extraction<'_>) -> Expr {
     // Blocks: pass directly to optimize_via_model. The e-graph's expr_to_egraph
     // already handles Block by adding each let-binding to var_to_eclass, so
     // references share e-classes. Let-bindings are CSE hints. The e-graph sees
@@ -296,27 +304,27 @@ fn optimize_expr_with_model(expr: Expr, model: &ExprNnue) -> Expr {
     // preserve structure. Pure arithmetic blocks go through the e-graph whole.
     if let Expr::Block(block) = expr {
         if block_has_opaque_with_locals(&block) {
-            return optimize_block_preserving_structure(block, model);
+            return optimize_block_preserving_structure(block, extraction);
         }
-        return optimize_via_model(&Expr::Block(block), model);
+        return optimize_via_model(&Expr::Block(block), extraction);
     }
 
     // For non-block expressions, treat as a unit for global optimization.
-    optimize_via_model(&expr, model)
+    optimize_via_model(&expr, extraction)
 }
 
-/// Optimize an expression via e-graph with neural extraction + DAG CSE.
+/// Optimize an expression via e-graph with cost-guided extraction + DAG CSE.
 ///
-/// Uses the NNUE extraction head to pick the cheapest equivalent form
-/// via DAG-aware hill climbing, then emits let-bindings for shared
-/// subexpressions. This avoids tree-bloating where shared e-classes
-/// get duplicated, and produces code with CSE.
+/// Uses the extraction policy (static latency prior by default, NNUE
+/// opt-in) to pick the cheapest equivalent form, then emits let-bindings
+/// for shared subexpressions. This avoids tree-bloating where shared
+/// e-classes get duplicated, and produces code with CSE.
 ///
 /// Always uses the DAG codegen path. `dag_to_expr` handles non-shared
 /// expressions correctly (returns the expression without a block wrapper),
 /// so the old "no sharing — simple tree" fallback is unnecessary and
 /// removed. CSE is always preserved.
-fn optimize_via_model(expr: &Expr, model: &ExprNnue) -> Expr {
+fn optimize_via_model(expr: &Expr, extraction: &Extraction<'_>) -> Expr {
     let mut ctx = EGraphContext::new();
     let root = ctx.expr_to_egraph(expr);
 
@@ -324,8 +332,7 @@ fn optimize_via_model(expr: &Expr, model: &ExprNnue) -> Expr {
     saturate_with_time_control(&mut ctx.egraph, &config_for_node_count(node_count));
 
     // Extract via arena path (CSE-preserving) then convert choices → DAG.
-    let extractor = IncrementalExtractor::new(model, 8);
-    let (_cost, choices) = extractor.extract_choices_only(&ctx.egraph, root);
+    let choices = extraction.choices(&ctx.egraph, root);
 
     // Build ExtractedDAG: ref_counts drive let-binding placement.
     // dag_to_expr emits let-bindings for shared subexpressions and returns
@@ -609,15 +616,15 @@ fn is_coordinate_intrinsic(name: &str) -> bool {
 /// Optimize a block while preserving its structure.
 ///
 /// Each let binding and the final expression are optimized independently.
-fn optimize_block_preserving_structure(mut block: BlockExpr, model: &ExprNnue) -> Expr {
+fn optimize_block_preserving_structure(mut block: BlockExpr, extraction: &Extraction<'_>) -> Expr {
     for stmt in &mut block.stmts {
         if let Stmt::Let(let_stmt) = stmt {
             let init = std::mem::replace(&mut let_stmt.init, make_literal(0.0, Span::call_site()));
-            let_stmt.init = optimize_expr_with_model(init, model);
+            let_stmt.init = optimize_expr_with_model(init, extraction);
         }
     }
     if let Some(final_expr) = block.expr.take() {
-        block.expr = Some(Box::new(optimize_expr_with_model(*final_expr, model)));
+        block.expr = Some(Box::new(optimize_expr_with_model(*final_expr, extraction)));
     }
     Expr::Block(block)
 }
@@ -1537,7 +1544,8 @@ mod tests {
 
         // Use neural optimizer
         let model = ExprNnue::new_random(42);
-        let optimized = optimize_expr_with_model(analyzed.def.body.clone(), &model);
+        let optimized =
+            optimize_expr_with_model(analyzed.def.body.clone(), &Extraction::Nnue(&model));
 
         let debug = format!("{:?}", optimized);
         eprintln!("DAG optimized sin(X)*sin(X): {}", debug);
@@ -1561,7 +1569,8 @@ mod tests {
         let analyzed = analyze(kernel).unwrap();
 
         let model = ExprNnue::new_random(42);
-        let optimized = optimize_expr_with_model(analyzed.def.body.clone(), &model);
+        let optimized =
+            optimize_expr_with_model(analyzed.def.body.clone(), &Extraction::Nnue(&model));
 
         let debug = format!("{:?}", optimized);
         eprintln!("DAG optimized sqrt(X)*sqrt(X)+sqrt(X): {}", debug);
@@ -1579,7 +1588,8 @@ mod tests {
         let analyzed = analyze(kernel).unwrap();
 
         let model = ExprNnue::new_random(42);
-        let optimized = optimize_expr_with_model(analyzed.def.body.clone(), &model);
+        let optimized =
+            optimize_expr_with_model(analyzed.def.body.clone(), &Extraction::Nnue(&model));
 
         let debug = format!("{:?}", optimized);
         eprintln!("DAG optimized X+Y: {}", debug);
@@ -1631,22 +1641,16 @@ mod tests {
     }
 
     /// The default production path (no `PIXELFLOW_NNUE_WEIGHTS` set) must use
-    /// the no-op zero-weight model, which assigns uniform cost to every
-    /// candidate rewrite. That means e-graph extraction keeps the original
-    /// (author-written) form rather than picking an alternative — only
-    /// structural peephole/CSE may change the AST shape (e.g. shared
-    /// subexpressions become let-bindings), never algebraic rewrites chosen
-    /// on "cost."
+    /// static latency-prior extraction — the Phase 2 gate decision recorded in
+    /// docs/results/2026-07-08-extraction-3way.md (NNUE lost to the prior by
+    /// ~6.7% geomean at ~31x extraction cost).
     ///
-    /// This pins down the behavior asserted by the audit: extraction with an
-    /// all-zero model is a no-op over and above peephole/CSE. We verify this
-    /// by checking that `optimize_expr_with_model` with `ExprNnue::new()`
-    /// (what `get_optimization_model()` returns by default) produces the same
-    /// generated code as directly using the zero model, and that no
-    /// NNUE-only rewrite (e.g. FMA fusion, which the zero model has no
-    /// signal to prefer over the unfused form) is force-applied.
+    /// We verify the default `optimize()` entry point is byte-identical to
+    /// explicitly running `Extraction::Static(CostModel::latency_prior())` —
+    /// proving the default neither silently picks up learned weights nor
+    /// silently degrades to a zero-cost (no-op) model.
     #[test]
-    fn default_path_extraction_is_noop_zero_model() {
+    fn default_path_extraction_is_static_latency_prior() {
         use crate::codegen;
 
         let input = quote! { || {
@@ -1656,29 +1660,28 @@ mod tests {
         }};
 
         // `optimize()` is the real kernel! macro entry point; with no
-        // PIXELFLOW_NNUE_WEIGHTS set it must resolve to the no-op model.
+        // PIXELFLOW_NNUE_WEIGHTS set it must resolve to the static prior.
         let kernel = parse(input.clone()).unwrap();
         let analyzed = analyze(kernel).unwrap();
         let via_default_entry_point = optimize(analyzed);
         let default_output = codegen::emit(via_default_entry_point).to_string();
 
-        // Directly constructing the no-op model and running the same
-        // expression through the model-based optimizer must match exactly:
-        // this proves `get_optimization_model()`'s default really is
-        // `ExprNnue::new()`, not something silently substituted.
+        // Directly constructing the static-prior policy and running the same
+        // expression through the optimizer must match exactly.
         let kernel = parse(input).unwrap();
-        let mut analyzed_for_model_path = analyze(kernel).unwrap();
-        let zero_model = ExprNnue::new();
-        analyzed_for_model_path.def.body = optimize_expr(analyzed_for_model_path.def.body);
-        analyzed_for_model_path.def.body =
-            optimize_expr_with_model(analyzed_for_model_path.def.body, &zero_model);
-        let explicit_zero_output = codegen::emit(analyzed_for_model_path).to_string();
+        let mut analyzed_for_static_path = analyze(kernel).unwrap();
+        let static_extraction = Extraction::Static(CostModel::latency_prior());
+        analyzed_for_static_path.def.body = optimize_expr(analyzed_for_static_path.def.body);
+        analyzed_for_static_path.def.body =
+            optimize_expr_with_model(analyzed_for_static_path.def.body, &static_extraction);
+        let explicit_static_output = codegen::emit(analyzed_for_static_path).to_string();
 
         assert_eq!(
-            default_output, explicit_zero_output,
+            default_output, explicit_static_output,
             "default optimize() path must be byte-identical to explicitly \
-             using ExprNnue::new() (the no-op model) — the default path must \
-             not silently pick up learned weights"
+             using Extraction::Static(CostModel::latency_prior()) — the \
+             default must not silently pick up learned weights or degrade \
+             to a zero-cost model"
         );
     }
 }
