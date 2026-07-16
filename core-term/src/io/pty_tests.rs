@@ -197,6 +197,43 @@ fn pty_read_write_interaction() {
 }
 
 #[test]
+fn pty_child_acquires_controlling_terminal() {
+    // /dev/tty resolves only through the controlling terminal. The spawn
+    // path acquires the ctty via setsid + first-tty-open (posix_spawn has no
+    // TIOCSCTTY); if that dance broke, the redirect below would fail and
+    // "ctty-ok" would never reach the master.
+    let config = PtyConfig {
+        command_executable: "/bin/sh",
+        args: &["-c", "echo ctty-ok > /dev/tty"],
+        initial_cols: DEFAULT_COLS,
+        initial_rows: DEFAULT_ROWS,
+    };
+
+    let mut pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
+    let output = read_from_pty_with_timeout(&mut pty, "ctty-ok")
+        .unwrap_or_else(|e| panic!("child could not write to /dev/tty: {}", e));
+    assert!(output.contains("ctty-ok"));
+}
+
+#[test]
+fn pty_child_gets_default_sigpipe() {
+    // Rust ignores SIGPIPE and ignored dispositions survive exec; the spawn
+    // path must reset it or `foo | head`-style pipelines never terminate.
+    // `yes` only exits here by dying of SIGPIPE when `head` closes the pipe.
+    let config = PtyConfig {
+        command_executable: "/bin/sh",
+        args: &["-c", "yes | head -c 4 > /dev/null && echo pipe-done"],
+        initial_cols: DEFAULT_COLS,
+        initial_rows: DEFAULT_ROWS,
+    };
+
+    let mut pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
+    let output = read_from_pty_with_timeout(&mut pty, "pipe-done")
+        .unwrap_or_else(|e| panic!("pipeline did not terminate (SIGPIPE ignored?): {}", e));
+    assert!(output.contains("pipe-done"));
+}
+
+#[test]
 fn pty_resize_successful() {
     // Use `sleep` from PATH to be cross-platform (macOS has /bin/sleep, Linux /usr/bin/sleep)
     let config = PtyConfig {
