@@ -59,6 +59,9 @@ pub mod parity;
 pub mod power;
 pub mod trig;
 
+#[cfg(test)]
+mod pict_rewrite_tests; // PICT-style pairwise testing of the rewrite rules (POC)
+
 use crate::egraph::rewrite::Rewrite;
 
 // Re-export key types for convenience
