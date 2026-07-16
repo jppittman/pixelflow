@@ -371,13 +371,32 @@ mod tests {
     const FONT_DATA: &[u8] = include_bytes!("../../assets/DejaVuSansMono-Fallback.ttf");
 
     #[test]
-    fn verify_size_bucket() {
-        assert_eq!(size_bucket(8.0), 8);
-        assert_eq!(size_bucket(9.0), 12);
-        assert_eq!(size_bucket(12.0), 12);
-        assert_eq!(size_bucket(13.0), 16);
-        assert_eq!(size_bucket(16.0), 16);
-        assert_eq!(size_bucket(17.0), 20);
+    fn glyph_cache_buckets_sizes_within_4px_together() {
+        let font = Font::parse(FONT_DATA).unwrap();
+        let mut cache = GlyphCache::new();
+
+        // 9.0 and 12.0 both round up into the 12px bucket, so caching one
+        // makes the cache report the other as already cached.
+        cache.get(&font, 'A', 9.0);
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache.contains('A', 12.0),
+            "9.0 and 12.0 should share the 12px bucket"
+        );
+
+        // 13.0 rounds up to the next bucket (16px), so it must not collide
+        // with the 12px bucket.
+        assert!(
+            !cache.contains('A', 13.0),
+            "13.0 should land in a different bucket than 12.0"
+        );
+
+        // Sizes at or below the minimum clamp to the 8px bucket.
+        cache.get(&font, 'B', 1.0);
+        assert!(
+            cache.contains('B', 8.0),
+            "sub-minimum sizes should clamp to the 8px bucket"
+        );
     }
 
     #[test]

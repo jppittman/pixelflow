@@ -163,8 +163,12 @@ mod tests {
     use crate::io::event::KqueueFlags as EventFlags;
 
     fn pipe_has_byte(waker: &FdWaker) -> bool {
+        use std::os::fd::BorrowedFd;
         let mut buf = [0u8; 8];
-        nix::unistd::read(&waker.read, &mut buf).is_ok_and(|n| n > 0)
+        // SAFETY: `waker` is borrowed for the duration of this call, so its
+        // read fd stays open and valid for the lifetime of `fd`.
+        let fd = unsafe { BorrowedFd::borrow_raw(waker.as_raw_fd()) };
+        nix::unistd::read(fd, &mut buf).is_ok_and(|n| n > 0)
     }
 
     #[test]

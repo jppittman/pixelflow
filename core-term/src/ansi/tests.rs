@@ -49,6 +49,77 @@ fn it_should_process_c0_bel() {
 }
 
 #[test]
+fn c0control_from_byte_accepts_only_the_documented_control_range() {
+    // Valid C0 range (0x00..=0x1F) except ESC, which is handled separately,
+    // plus DEL (0x7F). `from_byte` transmutes the byte into `C0Control`, so
+    // any byte outside this exact set must return `None` rather than
+    // reinterpreting an arbitrary byte as an enum discriminant.
+    for byte in 0u8..=0xFF {
+        let expected_valid = (byte <= 0x1F && byte != 0x1B) || byte == 0x7F;
+        assert_eq!(
+            C0Control::from_byte(byte).is_some(),
+            expected_valid,
+            "byte {:#04x} validity mismatch",
+            byte
+        );
+    }
+
+    assert_eq!(
+        C0Control::from_byte(0x1B),
+        None,
+        "ESC is handled separately"
+    );
+    assert_eq!(C0Control::from_byte(0x7F), Some(C0Control::DEL));
+    assert_eq!(
+        C0Control::from_byte(b'A'),
+        None,
+        "printable ASCII is not a C0 control"
+    );
+}
+
+#[test]
+fn c0control_display_prints_the_mnemonic_for_every_variant() {
+    let expected: &[(C0Control, &str)] = &[
+        (C0Control::NUL, "NUL"),
+        (C0Control::SOH, "SOH"),
+        (C0Control::STX, "STX"),
+        (C0Control::ETX, "ETX"),
+        (C0Control::EOT, "EOT"),
+        (C0Control::ENQ, "ENQ"),
+        (C0Control::ACK, "ACK"),
+        (C0Control::BEL, "BEL"),
+        (C0Control::BS, "BS"),
+        (C0Control::HT, "HT"),
+        (C0Control::LF, "LF"),
+        (C0Control::VT, "VT"),
+        (C0Control::FF, "FF"),
+        (C0Control::CR, "CR"),
+        (C0Control::SO, "SO"),
+        (C0Control::SI, "SI"),
+        (C0Control::DLE, "DLE"),
+        (C0Control::DC1, "DC1"),
+        (C0Control::DC2, "DC2"),
+        (C0Control::DC3, "DC3"),
+        (C0Control::DC4, "DC4"),
+        (C0Control::NAK, "NAK"),
+        (C0Control::SYN, "SYN"),
+        (C0Control::ETB, "ETB"),
+        (C0Control::CAN, "CAN"),
+        (C0Control::EM, "EM"),
+        (C0Control::SUB, "SUB"),
+        (C0Control::ESC, "ESC"),
+        (C0Control::FS, "FS"),
+        (C0Control::GS, "GS"),
+        (C0Control::RS, "RS"),
+        (C0Control::US, "US"),
+        (C0Control::DEL, "DEL"),
+    ];
+    for (control, mnemonic) in expected {
+        assert_eq!(&control.to_string(), mnemonic);
+    }
+}
+
+#[test]
 fn it_should_process_csi_h_as_cup_1_1() {
     let bytes = b"\x1B[H"; // CSI H -> CUP (1, 1)
     let commands = process_bytes(bytes);
@@ -266,6 +337,43 @@ fn it_should_process_csi_window_manipulation_t() {
             ps3: None
         })],
         "Expected WindowManipulation for CSI 14t"
+    );
+}
+
+#[test]
+fn it_should_not_treat_a_t_with_other_intermediates_as_window_manipulation() {
+    // 't' is only WindowManipulation with no intermediate or a single space
+    // intermediate; any other intermediate belongs to a different (currently
+    // unsupported) sequence and must not be misparsed as WindowManipulation.
+    // The parser remaps the resulting `CsiCommand::Unsupported` to `Error`.
+    let commands = process_bytes(b"\x1b[1$t");
+    assert_eq!(
+        commands,
+        vec![AnsiCommand::Error(b't')],
+        "CSI 1 $ t should not be parsed as WindowManipulation"
+    );
+}
+
+#[test]
+fn it_should_process_csi_set_and_reset_mode() {
+    // CSI 4 h -> SetMode(IRM), CSI 4 l -> ResetMode(IRM)
+    assert_eq!(
+        process_bytes(b"\x1b[4h"),
+        vec![AnsiCommand::Csi(CsiCommand::SetMode(4))]
+    );
+    assert_eq!(
+        process_bytes(b"\x1b[4l"),
+        vec![AnsiCommand::Csi(CsiCommand::ResetMode(4))]
+    );
+}
+
+#[test]
+fn it_should_process_csi_clear_tab_stops_via_g() {
+    // CSI 3 g -> ClearTabStops(3), distinct from the CSI...W (TBC) path
+    let commands = process_bytes(b"\x1b[3g");
+    assert_eq!(
+        commands,
+        vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(3))]
     );
 }
 
@@ -603,6 +711,66 @@ fn it_should_abort_csi_on_esc_and_process_subsequent_csi() {
             Attribute::Italic
         ]))]
     );
+}
+
+#[test]
+fn it_should_abort_csi_entry_on_esc_and_process_subsequent_csi() {
+    // ESC aborts the CSI before any params/intermediates are collected.
+    let bytes = b"\x1B[\x1B[3m";
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+            Attribute::Italic
+        ]))]
+    );
+}
+
+#[test]
+fn it_should_abort_csi_intermediate_on_esc_and_process_subsequent_csi() {
+    // ' ' pushes into CsiIntermediate state (DECSCUSR-style), then ESC aborts.
+    let bytes = b"\x1B[ \x1B[3m";
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+            Attribute::Italic
+        ]))]
+    );
+}
+
+#[test]
+fn it_should_stay_in_escape_state_on_repeated_esc() {
+    // A second ESC while already in the Escape state re-arms rather than
+    // being dispatched as an (invalid) C0 control.
+    let bytes = b"\x1B\x1Bc"; // ESC ESC c -> RIS, no stray C0Control(ESC) command
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![AnsiCommand::Esc(EscCommand::ResetToInitialState)]
+    );
+}
+
+#[test]
+fn it_should_ignore_invalid_esc_intermediate_charset_designator() {
+    // ' ' (0x20) is below the valid charset-designator range ('0'..='~'),
+    // so both the intermediate and the final byte are reported as Ignored
+    // rather than forming a SelectCharacterSet command.
+    let bytes = b"\x1B( ";
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![AnsiCommand::Ignore(b'('), AnsiCommand::Ignore(b' ')]
+    );
+}
+
+#[test]
+fn it_should_dispatch_non_esc_c0_control_received_in_escape_state() {
+    // A C0 control other than ESC, received right after a bare ESC, aborts
+    // the pending escape sequence and is dispatched as its own command.
+    let bytes = b"\x1B\x07"; // ESC BEL
+    let commands = process_bytes(bytes);
+    assert_eq!(commands, vec![AnsiCommand::C0Control(C0Control::BEL)]);
 }
 
 #[cfg(test)]
@@ -1416,6 +1584,38 @@ mod mutation_tests {
             cmds,
             vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
                 Attribute::NoOverlined
+            ]))]
+        );
+    }
+
+    #[test]
+    fn sgr_underline_color_set_is_58() {
+        // 58;5;42 -> UnderlineColor(Indexed(42))
+        let cmds = process_bytes(b"\x1b[58;5;42m");
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+                Attribute::UnderlineColor(Color::Indexed(42))
+            ]))]
+        );
+
+        // 58;2;10;20;30 -> UnderlineColor(Rgb(10, 20, 30))
+        let cmds = process_bytes(b"\x1b[58;2;10;20;30m");
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+                Attribute::UnderlineColor(Color::Rgb(10, 20, 30))
+            ]))]
+        );
+    }
+
+    #[test]
+    fn sgr_underline_color_default_is_59() {
+        let cmds = process_bytes(b"\x1b[59m");
+        assert_eq!(
+            cmds,
+            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+                Attribute::UnderlineColor(Color::Default)
             ]))]
         );
     }

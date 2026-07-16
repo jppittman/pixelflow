@@ -1614,7 +1614,12 @@ mod paste_text_tests {
     #[test]
     fn ansi_resize_sets_terminal_dimensions() {
         let mut emu = create_test_emulator(80, 24);
-        assert_eq!(emu.dimensions(), (80, 24));
+        assert_eq!(
+            emu.get_render_snapshot()
+                .expect("Snapshot was None")
+                .dimensions,
+            (80, 24)
+        );
 
         let resize_command = AnsiCommand::Csi(CsiCommand::WindowManipulation {
             ps1: 8,
@@ -1624,7 +1629,9 @@ mod paste_text_tests {
         emu.interpret_input(EmulatorInput::Ansi(resize_command));
 
         assert_eq!(
-            emu.dimensions(),
+            emu.get_render_snapshot()
+                .expect("Snapshot was None")
+                .dimensions,
             (100, 30),
             "Terminal should resize to 100 cols x 30 rows"
         );
@@ -1661,7 +1668,9 @@ mod paste_text_tests {
         emu.interpret_input(EmulatorInput::Ansi(resize_command));
 
         assert_eq!(
-            emu.dimensions(),
+            emu.get_render_snapshot()
+                .expect("Snapshot was None")
+                .dimensions,
             (80, 24),
             "Terminal should ignore resize with zero rows"
         );
@@ -1679,7 +1688,9 @@ mod paste_text_tests {
         emu.interpret_input(EmulatorInput::Ansi(resize_command));
 
         assert_eq!(
-            emu.dimensions(),
+            emu.get_render_snapshot()
+                .expect("Snapshot was None")
+                .dimensions,
             (80, 24),
             "Terminal should ignore resize with zero cols"
         );
@@ -1697,7 +1708,9 @@ mod paste_text_tests {
         emu.interpret_input(EmulatorInput::Ansi(resize_command));
 
         assert_eq!(
-            emu.dimensions(),
+            emu.get_render_snapshot()
+                .expect("Snapshot was None")
+                .dimensions,
             (80, 24),
             "Terminal should ignore resize with missing rows parameter"
         );
@@ -1710,7 +1723,9 @@ mod paste_text_tests {
         emu.interpret_input(EmulatorInput::Ansi(resize_command2));
 
         assert_eq!(
-            emu.dimensions(),
+            emu.get_render_snapshot()
+                .expect("Snapshot was None")
+                .dimensions,
             (80, 24),
             "Terminal should ignore resize with missing cols parameter"
         );
