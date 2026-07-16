@@ -118,19 +118,25 @@ impl Actor<Vec<u8>, WriterControl, NoManagement> for PtyWriter {
 
     fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
         if self.broken || self.pending.is_empty() {
-            // Message-driven: let the scheduler block on the doorbell.
+            // Message-driven: let the scheduler block on the doorbell. With
+            // the waker unarmed, sends to this actor cost no wake syscall —
+            // this is the common state (keystrokes flush inline).
             return Ok(ActorStatus::Idle);
         }
 
         // Kernel buffer was full; wait until it drains or a message arrives.
-        self.monitor
-            .events(&mut self.events, -1)
-            .map_err(|e| HandlerError::recoverable(format!("PTY writer poll failed: {e}")))?;
+        if !self.waker.arm() {
+            return Ok(ActorStatus::Busy); // raced-in messages: drain first
+        }
+
+        let poll = self.monitor.events(&mut self.events, -1);
+        self.waker.disarm();
+        poll.map_err(|e| HandlerError::recoverable(format!("PTY writer poll failed: {e}")))?;
 
         let mut pty_writable = false;
         for event in &self.events {
             match event.token {
-                TOKEN_WAKER => self.waker.drain(),
+                TOKEN_WAKER => {} // already drained by disarm()
                 TOKEN_PTY => pty_writable = true,
                 other => debug!("PTY writer: unexpected poll token {}", other),
             }

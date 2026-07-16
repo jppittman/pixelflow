@@ -20,7 +20,7 @@
 //! [`PtySender::send_child_exited`] so the terminal can quit instead of
 //! sitting on a dead session.
 
-use super::{NoControl, NoManagement, ParserControl};
+use super::{FilledBuf, NoControl, NoManagement, ParserControl};
 use crate::io::event::{EventFlags, EventMonitor};
 use crate::io::pty::NixPty;
 use crate::io::traits::PtySender;
@@ -47,8 +47,10 @@ pub(super) struct PtyReader {
     monitor: EventMonitor,
     waker: Arc<FdWaker>,
     /// Buffers available for reading. Refilled via the data lane.
+    /// Invariant: every buffer has `len() == READ_BUFFER_SIZE` — buffers are
+    /// never resized, so no read ever pays a re-zeroing memset.
     pool: Vec<Vec<u8>>,
-    parser_tx: ActorHandle<Vec<u8>, ParserControl, NoManagement>,
+    parser_tx: ActorHandle<FilledBuf, ParserControl, NoManagement>,
     app_tx: Box<dyn PtySender>,
     events: Vec<crate::io::event::Event>,
     eof: bool,
@@ -60,7 +62,7 @@ impl PtyReader {
     pub(super) fn new(
         pty: NixPty,
         waker: Arc<FdWaker>,
-        parser_tx: ActorHandle<Vec<u8>, ParserControl, NoManagement>,
+        parser_tx: ActorHandle<FilledBuf, ParserControl, NoManagement>,
         app_tx: Box<dyn PtySender>,
     ) -> anyhow::Result<Self> {
         let monitor = EventMonitor::new()?;
@@ -81,7 +83,6 @@ impl PtyReader {
     /// Read until the PTY would block or the pool runs dry.
     fn read_available(&mut self) {
         while let Some(mut buf) = self.pool.pop() {
-            buf.resize(READ_BUFFER_SIZE, 0);
             match self.pty.read(&mut buf) {
                 Ok(0) => {
                     self.pool.push(buf);
@@ -89,9 +90,9 @@ impl PtyReader {
                     self.mark_eof();
                     return;
                 }
-                Ok(n) => {
-                    buf.truncate(n);
-                    if let Err(e) = self.parser_tx.send(Message::Data(buf)) {
+                Ok(len) => {
+                    if let Err(e) = self.parser_tx.send(Message::Data(FilledBuf { data: buf, len }))
+                    {
                         warn!("PTY reader: parser channel closed: {}", e);
                         self.mark_eof();
                         return;
@@ -123,9 +124,15 @@ impl PtyReader {
 }
 
 impl Actor<Vec<u8>, NoControl, NoManagement> for PtyReader {
-    fn handle_data(&mut self, buf: Vec<u8>) -> HandlerResult {
+    fn handle_data(&mut self, mut buf: Vec<u8>) -> HandlerResult {
         if self.eof {
             return Ok(()); // pool is no longer needed; let buffers drop
+        }
+        // Restore the pool invariant if a producer hands us a nonconforming
+        // buffer; the cost lands here (once per recycle, normally a no-op)
+        // instead of on every read.
+        if buf.len() != READ_BUFFER_SIZE {
+            buf.resize(READ_BUFFER_SIZE, 0);
         }
         self.pool.push(buf);
         Ok(())
@@ -144,14 +151,21 @@ impl Actor<Vec<u8>, NoControl, NoManagement> for PtyReader {
             return Ok(ActorStatus::Idle);
         }
 
-        self.monitor
-            .events(&mut self.events, -1)
-            .map_err(|e| HandlerError::recoverable(format!("PTY reader poll failed: {e}")))?;
+        // Wakes that raced in while we were processing mean messages are
+        // queued: hand back Busy so the scheduler drains them now instead of
+        // blocking with their wake bytes already consumed.
+        if !self.waker.arm() {
+            return Ok(ActorStatus::Busy);
+        }
+
+        let poll = self.monitor.events(&mut self.events, -1);
+        self.waker.disarm();
+        poll.map_err(|e| HandlerError::recoverable(format!("PTY reader poll failed: {e}")))?;
 
         let mut pty_ready = false;
         for event in &self.events {
             match event.token {
-                TOKEN_WAKER => self.waker.drain(),
+                TOKEN_WAKER => {} // already drained by disarm()
                 TOKEN_PTY => pty_ready = true,
                 other => debug!("PTY reader: unexpected poll token {}", other),
             }
