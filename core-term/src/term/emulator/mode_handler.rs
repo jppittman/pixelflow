@@ -104,7 +104,10 @@ impl TerminalEmulator {
                     Some(DecModeConstant::TextCursorEnable) => {
                         self.dec_modes.text_cursor_enable_mode = enable;
                         let visibility = CursorVisibility::from(enable);
-                        self.cursor_controller.set_visible(visibility);
+                        match visibility {
+                            CursorVisibility::Visible => self.cursor_controller.show(),
+                            CursorVisibility::Hidden => self.cursor_controller.hide(),
+                        }
                         action_to_return = Some(EmulatorAction::SetCursorVisibility(visibility));
                     }
                     Some(DecModeConstant::AltScreenBufferClear)
