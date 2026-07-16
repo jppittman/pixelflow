@@ -2,8 +2,9 @@ use crate::ansi::commands::AnsiCommand;
 use crate::color::Color;
 use crate::config::Config;
 use crate::glyph::Glyph;
+use crate::io::event_monitor_actor::{PtyWriterHandle, WriterControl};
 use crate::io::traits::PtySender;
-use crate::io::PtyCommand;
+use crate::io::Resize;
 use crate::messages::TerminalData;
 use crate::term::TerminalEmulator;
 use actor_scheduler::{
@@ -31,6 +32,12 @@ impl PtySender for TerminalAppSender {
             .send(Message::Data(TerminalData::Pty(cmds)))
             .map_err(|e| anyhow::anyhow!("Failed to send PTY data to app: {}", e))
     }
+
+    fn send_child_exited(&self) -> Result<(), anyhow::Error> {
+        self.handle
+            .send(Message::Data(TerminalData::ChildExited))
+            .map_err(|e| anyhow::anyhow!("Failed to send child exit to app: {}", e))
+    }
 }
 
 /// Helper to create a positioned terminal cell with background blending.
@@ -41,7 +48,6 @@ use pixelflow_runtime::api::public::AppData;
 use pixelflow_runtime::api::public::EngineHandle;
 use pixelflow_runtime::platform::ColorCube;
 use pixelflow_runtime::{EngineEventControl, EngineEventData, EngineEventManagement};
-use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
 /// Font filename (looked up in multiple locations)
@@ -117,7 +123,7 @@ struct CellColors {
 /// terminal content via the engine handle.
 pub struct TerminalApp {
     pub emulator: TerminalEmulator,
-    pty_tx: SyncSender<PtyCommand>,
+    pty_writer: PtyWriterHandle,
     config: Config,
     engine_tx: EngineHandle,
     /// Memory-mapped font file.
@@ -133,8 +139,8 @@ pub struct TerminalApp {
 pub struct TerminalAppParams {
     /// Terminal emulator instance.
     pub emulator: TerminalEmulator,
-    /// Channel to send commands to PTY (writes and resizes).
-    pub pty_tx: SyncSender<PtyCommand>,
+    /// Handle to the PTY writer actor (Data = bytes, Control = resize).
+    pub pty_writer: PtyWriterHandle,
     /// Application configuration.
     pub config: Config,
     /// Unregistered engine handle (app will call register()).
@@ -144,6 +150,23 @@ pub struct TerminalAppParams {
 }
 
 impl TerminalApp {
+    /// Send bytes to the shell via the PTY writer's data lane.
+    fn write_pty(&self, bytes: Vec<u8>) {
+        if let Err(e) = self.pty_writer.send(Message::Data(bytes)) {
+            log::warn!("Failed to send input to PTY writer: {}", e);
+        }
+    }
+
+    /// Resize the PTY via the writer's control lane (preempts queued writes).
+    fn resize_pty(&self, cols: u16, rows: u16) {
+        if let Err(e) = self
+            .pty_writer
+            .send(Message::Control(WriterControl::Resize(Resize { cols, rows })))
+        {
+            log::warn!("Failed to send PTY resize command: {}", e);
+        }
+    }
+
     /// Helper to create a positioned terminal cell with background blending.
     ///
     /// Composition: bg + cov * (fg - bg)
@@ -229,7 +252,7 @@ impl TerminalApp {
 
         Self {
             emulator: params.emulator,
-            pty_tx: params.pty_tx,
+            pty_writer: params.pty_writer,
             config: params.config,
             engine_tx: params.engine_tx,
             loaded_font,
@@ -436,6 +459,13 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 // or we could trigger a redraw if we want immediate feedback (but risk flooding)
                 // For now, let's just update state. The next RequestFrame will pick it up.
             }
+            TerminalData::ChildExited => {
+                use pixelflow_runtime::api::public::AppManagement;
+                log::info!("PTY child exited, shutting down");
+                self.engine_tx
+                    .send(Message::Management(AppManagement::Quit))
+                    .expect("Failed to send Quit to engine");
+            }
         }
         Ok(())
     }
@@ -479,13 +509,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 if let Some(EmulatorAction::ResizePty { cols, rows }) =
                     self.emulator.interpret_input(input)
                 {
-                    // Send resize command to PTY write thread
-                    if let Err(e) = self
-                        .pty_tx
-                        .send(PtyCommand::Resize(crate::io::Resize { cols, rows }))
-                    {
-                        log::warn!("Failed to send PTY resize command: {}", e);
-                    }
+                    self.resize_pty(cols, rows);
                 }
 
                 // Request a redraw after resize
@@ -519,9 +543,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 if let Some(action) = self.emulator.interpret_input(input) {
                     match action {
                         EmulatorAction::WritePty(bytes) => {
-                            if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
-                                log::warn!("Failed to send input to PTY: {}", e);
-                            }
+                            self.write_pty(bytes);
                         }
                         EmulatorAction::Quit => {
                             // Handle quit - send quit to engine
@@ -549,13 +571,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                             unimplemented!("EmulatorAction::RequestClipboardContent");
                         }
                         EmulatorAction::ResizePty { cols, rows } => {
-                            // Send resize command to PTY write thread
-                            if let Err(e) = self
-                                .pty_tx
-                                .send(PtyCommand::Resize(crate::io::Resize { cols, rows }))
-                            {
-                                log::warn!("Failed to send PTY resize command: {}", e);
-                            }
+                            self.resize_pty(cols, rows);
                         }
                     }
                 }
@@ -579,9 +595,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                             kind: crate::term::MouseEventKind::Press,
                         })
                 {
-                    if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
-                        log::warn!("Failed to send mouse press to PTY: {}", e);
-                    }
+                    self.write_pty(bytes);
                 }
             }
             EngineEventManagement::MouseRelease { button, x, y } => {
@@ -603,9 +617,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                             kind: crate::term::MouseEventKind::Release,
                         })
                 {
-                    if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
-                        log::warn!("Failed to send mouse release to PTY: {}", e);
-                    }
+                    self.write_pty(bytes);
                 }
             }
             EngineEventManagement::MouseMove { x, y, mods: _ } => {
@@ -627,9 +639,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                                 kind: crate::term::MouseEventKind::Motion,
                             })
                     {
-                        if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
-                            log::warn!("Failed to send mouse motion to PTY: {}", e);
-                        }
+                        self.write_pty(bytes);
                     }
                 } else if self.emulator.reports_button_motion() {
                     // button-event mode: only report when a button is held
@@ -643,9 +653,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                                     kind: crate::term::MouseEventKind::Motion,
                                 })
                         {
-                            if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
-                                log::warn!("Failed to send mouse motion to PTY: {}", e);
-                            }
+                            self.write_pty(bytes);
                         }
                     }
                 }
@@ -677,9 +685,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                                 kind: crate::term::MouseEventKind::Press,
                             })
                     {
-                        if let Err(e) = self.pty_tx.send(PtyCommand::Write(bytes)) {
-                            log::warn!("Failed to send mouse scroll to PTY: {}", e);
-                        }
+                        self.write_pty(bytes);
                     }
                 } else {
                     // Scrollback navigation: negative dy scrolls up (into history),
@@ -705,9 +711,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
             EngineEventManagement::Paste(text) => {
                 log::trace!("Paste: {} bytes", text.len());
                 // Send pasted text to PTY
-                self.pty_tx
-                    .send(PtyCommand::Write(text.into_bytes()))
-                    .expect("Failed to send paste to PTY");
+                self.write_pty(text.into_bytes());
             }
         }
         Ok(())
@@ -720,8 +724,10 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
 }
 
 /// Handles returned by [`spawn_terminal_app`]: a keep-alive handle for the
-/// caller, a handle for the PTY sender, and the app thread's join handle.
+/// caller, handles for the PTY parser and reader sinks, and the app thread's
+/// join handle.
 pub type TerminalAppHandles = (
+    actor_scheduler::ActorHandle<TerminalData, EngineEventControl, EngineEventManagement>,
     actor_scheduler::ActorHandle<TerminalData, EngineEventControl, EngineEventManagement>,
     actor_scheduler::ActorHandle<TerminalData, EngineEventControl, EngineEventManagement>,
     std::thread::JoinHandle<()>,
@@ -739,7 +745,8 @@ pub fn spawn_terminal_app(params: TerminalAppParams) -> std::io::Result<Terminal
     let mut builder =
         ActorBuilder::<TerminalData, EngineEventControl, EngineEventManagement>::new(128, None);
     let app_handle = builder.add_producer(); // For the caller (returns to main, keep-alive)
-    let pty_handle = builder.add_producer(); // For the PTY sender (TerminalAppSender)
+    let parser_handle = builder.add_producer(); // For the PTY parser sink (AnsiCommands)
+    let reader_handle = builder.add_producer(); // For the PTY reader sink (ChildExited)
     let adapter_handle = builder.add_producer(); // For TerminalAppAdapter (engine→app)
     let mut app_rx = builder.build_with_burst(10, actor_scheduler::ShutdownMode::default());
 
@@ -790,7 +797,7 @@ pub fn spawn_terminal_app(params: TerminalAppParams) -> std::io::Result<Terminal
     // Create app with registered engine handle
     let app_params_registered = TerminalAppParamsRegistered {
         emulator: params.emulator,
-        pty_tx: params.pty_tx,
+        pty_writer: params.pty_writer,
         config: params.config,
         engine_tx,
     };
@@ -804,13 +811,13 @@ pub fn spawn_terminal_app(params: TerminalAppParams) -> std::io::Result<Terminal
             app_rx.run(&mut app);
         })?;
 
-    Ok((app_handle, pty_handle, handle))
+    Ok((app_handle, parser_handle, reader_handle, handle))
 }
 
 /// Parameters after registration (internal use).
 struct TerminalAppParamsRegistered {
     emulator: TerminalEmulator,
-    pty_tx: SyncSender<PtyCommand>,
+    pty_writer: PtyWriterHandle,
     config: Config,
     engine_tx: EngineHandle,
 }
@@ -818,12 +825,49 @@ struct TerminalAppParamsRegistered {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::PtyCommand;
+    use crate::io::event_monitor_actor::NoManagement;
     use crate::term::TerminalEmulator;
-    use actor_scheduler::Actor;
+    use actor_scheduler::{
+        Actor, ActorScheduler, ActorStatus, HandlerError, HandlerResult, SystemStatus,
+    };
     use pixelflow_runtime::input::{KeySymbol, Modifiers};
     use pixelflow_runtime::{EngineEventControl, EngineEventManagement, WindowId};
-    use std::sync::mpsc::Receiver;
+
+    /// Test double for the PTY writer actor: records what the app sends.
+    #[derive(Default)]
+    struct WriterProbe {
+        data: Vec<Vec<u8>>,
+        resizes: Vec<Resize>,
+    }
+
+    impl Actor<Vec<u8>, WriterControl, NoManagement> for WriterProbe {
+        fn handle_data(&mut self, bytes: Vec<u8>) -> HandlerResult {
+            self.data.push(bytes);
+            Ok(())
+        }
+        fn handle_control(&mut self, msg: WriterControl) -> HandlerResult {
+            let WriterControl::Resize(resize) = msg;
+            self.resizes.push(resize);
+            Ok(())
+        }
+        fn handle_management(&mut self, _msg: NoManagement) -> HandlerResult {
+            Ok(())
+        }
+        fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
+            Ok(ActorStatus::Idle)
+        }
+    }
+
+    type WriterScheduler = ActorScheduler<Vec<u8>, WriterControl, NoManagement>;
+
+    /// Drain everything the app has sent to the writer so far.
+    fn drain_writer(rx: &mut WriterScheduler, probe: &mut WriterProbe) {
+        for _ in 0..4 {
+            if rx.poll_once(probe).is_some() {
+                break;
+            }
+        }
+    }
 
     // Define a DummyPixel struct for testing
     #[allow(dead_code)]
@@ -846,7 +890,7 @@ mod tests {
     // Returns None if font is missing/invalid (e.g. LFS pointer), skipping the test.
     fn create_test_app() -> Option<(
         TerminalApp,
-        Receiver<PtyCommand>,
+        WriterScheduler,
         pixelflow_runtime::api::private::EngineActorHandle,
         pixelflow_runtime::api::private::EngineActorScheduler,
     )> {
@@ -870,7 +914,7 @@ mod tests {
         }
 
         let emulator = TerminalEmulator::new(80, 24);
-        let (pty_tx, pty_rx) = std::sync::mpsc::sync_channel(128);
+        let (pty_writer, writer_rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(64, 128);
 
         // Create engine handles with ActorBuilder (SPSC - each producer is unique)
         let mut engine_builder = actor_scheduler::ActorBuilder::<
@@ -886,18 +930,18 @@ mod tests {
         let config = Config::default();
         let params = TerminalAppParamsRegistered {
             emulator,
-            pty_tx,
+            pty_writer,
             config,
             engine_tx: EngineHandle::new_for_test(engine_tx_for_test),
         };
         let app = TerminalApp::new_registered(params);
 
-        Some((app, pty_rx, engine_tx, engine_scheduler))
+        Some((app, writer_rx, engine_tx, engine_scheduler))
     }
 
     #[test]
     fn handle_control_resize() {
-        let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
+        let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
         };
@@ -925,21 +969,22 @@ mod tests {
             "Emulator should have resized to 100x50"
         );
 
-        // Verify PTY resize command was sent
-        let cmd = pty_rx.try_recv().expect("Should receive resize command");
+        // Verify the resize went out on the writer's control lane
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
         assert_eq!(
-            cmd,
-            PtyCommand::Resize(crate::io::Resize {
+            probe.resizes,
+            vec![Resize {
                 cols: 100,
                 rows: 50
-            }),
+            }],
             "PTY resize command should match new dimensions"
         );
     }
 
     #[test]
     fn handle_management_keydown() {
-        let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
+        let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
         };
@@ -954,10 +999,9 @@ mod tests {
         app.handle_management(key_event)
             .expect("handle_management should succeed");
 
-        // We expect 'a' to be sent to PTY wrapped in PtyCommand::Write
-        let received = pty_rx.try_recv();
-        assert!(received.is_ok(), "Should receive data on PTY channel");
-        let cmd = received.unwrap();
-        assert_eq!(cmd, PtyCommand::Write(vec![b'a']));
+        // We expect 'a' on the writer's data lane
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![vec![b'a']]);
     }
 }

@@ -6,7 +6,8 @@
 //! Following TDD principles: write tests first, uncover bugs, fix them.
 
 use actor_scheduler::{
-    Actor, ActorScheduler, ActorStatus, HandlerError, HandlerResult, Message, SystemStatus,
+    Actor, ActorBuilder, ActorScheduler, ActorStatus, HandlerError, HandlerResult, Message,
+    SystemStatus,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -749,202 +750,236 @@ fn roundtrip_sender_dropped_during_processing() {
 }
 
 // =============================================================================
-// PTY Resize Actor Boundary Tests
+// PTY Writer Actor Boundary Tests
 // =============================================================================
+//
+// The app talks to the PTY writer actor over two lanes: bytes for the shell
+// on Data, `WriterControl::Resize` on Control. These tests pin the contract
+// at that boundary using a probe actor in place of the real PtyWriter.
 
-use core_term::io::PtyCommand;
+use core_term::io::event_monitor_actor::{NoManagement, WriterControl};
+use core_term::io::Resize;
 
-/// Test that PtyCommand::Resize is properly sent and received at the actor boundary.
-/// This tests the channel contract between TerminalApp and WriteThread.
+/// Records everything the writer actor would have received, in drain order.
+#[derive(Default)]
+struct WriterProbe {
+    received: Vec<WriterEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WriterEvent {
+    Write(Vec<u8>),
+    Resize(Resize),
+}
+
+impl Actor<Vec<u8>, WriterControl, NoManagement> for WriterProbe {
+    fn handle_data(&mut self, bytes: Vec<u8>) -> HandlerResult {
+        self.received.push(WriterEvent::Write(bytes));
+        Ok(())
+    }
+    fn handle_control(&mut self, msg: WriterControl) -> HandlerResult {
+        let WriterControl::Resize(resize) = msg;
+        self.received.push(WriterEvent::Resize(resize));
+        Ok(())
+    }
+    fn handle_management(&mut self, _msg: NoManagement) -> HandlerResult {
+        Ok(())
+    }
+    fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
+        Ok(ActorStatus::Idle)
+    }
+}
+
+fn drain_probe(
+    rx: &mut ActorScheduler<Vec<u8>, WriterControl, NoManagement>,
+    probe: &mut WriterProbe,
+) {
+    for _ in 0..8 {
+        if rx.poll_once(probe).is_some() {
+            break;
+        }
+    }
+}
+
+/// A resize sent on the control lane reaches the writer actor.
 #[test]
-fn pty_command_resize_delivery_at_actor_boundary() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PtyCommand>(16);
+fn pty_writer_resize_delivery_at_actor_boundary() {
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
 
-    // Simulate sending resize command from TerminalApp
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
+    tx.send(Message::Control(WriterControl::Resize(Resize {
         cols: 120,
         rows: 40,
-    }))
+    })))
     .expect("Should send resize command");
 
-    // Simulate receiving in WriteThread
-    let cmd = rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let mut probe = WriterProbe::default();
+    drain_probe(&mut rx, &mut probe);
 
     assert_eq!(
-        cmd,
-        PtyCommand::Resize(core_term::io::Resize {
+        probe.received,
+        vec![WriterEvent::Resize(Resize {
             cols: 120,
             rows: 40
-        })
+        })]
     );
 }
 
-/// Test that multiple resize commands maintain ordering (FIFO).
+/// Resizes stay FIFO within the control lane.
 #[test]
-fn pty_command_resize_ordering_preserved() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PtyCommand>(16);
+fn pty_writer_resize_ordering_preserved() {
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
 
-    // Send multiple resize commands
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
-        cols: 80,
-        rows: 24,
-    }))
-    .unwrap();
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
-        cols: 120,
-        rows: 40,
-    }))
-    .unwrap();
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
-        cols: 200,
-        rows: 60,
-    }))
-    .unwrap();
+    for (cols, rows) in [(80, 24), (120, 40), (200, 60)] {
+        tx.send(Message::Control(WriterControl::Resize(Resize {
+            cols,
+            rows,
+        })))
+        .unwrap();
+    }
 
-    // Verify FIFO order
+    let mut probe = WriterProbe::default();
+    drain_probe(&mut rx, &mut probe);
+
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Resize(core_term::io::Resize { cols: 80, rows: 24 })
-    );
-    assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Resize(core_term::io::Resize {
-            cols: 120,
-            rows: 40
-        })
-    );
-    assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Resize(core_term::io::Resize {
-            cols: 200,
-            rows: 60
-        })
+        probe.received,
+        vec![
+            WriterEvent::Resize(Resize { cols: 80, rows: 24 }),
+            WriterEvent::Resize(Resize {
+                cols: 120,
+                rows: 40
+            }),
+            WriterEvent::Resize(Resize {
+                cols: 200,
+                rows: 60
+            }),
+        ]
     );
 }
 
-/// Test that Write and Resize commands are correctly interleaved.
+/// The point of the lane split: a resize queued *after* bulk writes is
+/// drained *before* them. Control preempts Data.
 #[test]
-fn pty_command_write_and_resize_interleaved() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PtyCommand>(16);
+fn pty_writer_resize_preempts_queued_writes() {
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
 
-    // Interleave write and resize commands
-    tx.send(PtyCommand::Write(b"hello".to_vec())).unwrap();
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
+    tx.send(Message::Data(b"hello".to_vec())).unwrap();
+    tx.send(Message::Data(b"world".to_vec())).unwrap();
+    tx.send(Message::Control(WriterControl::Resize(Resize {
         cols: 100,
         rows: 50,
-    }))
+    })))
     .unwrap();
-    tx.send(PtyCommand::Write(b"world".to_vec())).unwrap();
 
-    // Verify interleaved order
+    let mut probe = WriterProbe::default();
+    drain_probe(&mut rx, &mut probe);
+
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Write(b"hello".to_vec())
-    );
-    assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Resize(core_term::io::Resize {
-            cols: 100,
-            rows: 50
-        })
-    );
-    assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Write(b"world".to_vec())
+        probe.received,
+        vec![
+            WriterEvent::Resize(Resize {
+                cols: 100,
+                rows: 50
+            }),
+            WriterEvent::Write(b"hello".to_vec()),
+            WriterEvent::Write(b"world".to_vec()),
+        ],
+        "resize should jump ahead of queued writes"
     );
 }
 
-/// Test that sender drop properly signals channel closure.
+/// Dropping every producer completes the writer's scheduler after the
+/// buffered messages drain.
 #[test]
-fn pty_command_channel_closure_on_sender_drop() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PtyCommand>(16);
+fn pty_writer_completes_on_handle_drop() {
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
 
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
-        cols: 80,
-        rows: 24,
-    }))
-    .unwrap();
-
+    tx.send(Message::Data(b"last words".to_vec())).unwrap();
     drop(tx);
 
-    // First recv should succeed
-    assert!(rx.recv().is_ok());
+    let mut probe = WriterProbe::default();
+    let phase = loop {
+        if let Some(phase) = rx.poll_once(&mut probe) {
+            break phase;
+        }
+    };
 
-    // Second recv should fail (channel closed)
-    assert!(rx.recv().is_err());
+    assert_eq!(phase, actor_scheduler::PodPhase::Completed);
+    assert_eq!(probe.received, vec![WriterEvent::Write(b"last words".to_vec())]);
 }
 
-/// Test resize command with extreme values (boundary conditions).
+/// Resize survives boundary values.
 #[test]
-fn pty_command_resize_boundary_values() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PtyCommand>(16);
+fn pty_writer_resize_boundary_values() {
+    let (tx, mut rx) = ActorScheduler::<Vec<u8>, WriterControl, NoManagement>::new(16, 16);
 
-    // Minimum valid size
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
-        cols: 1,
-        rows: 1,
-    }))
-    .unwrap();
+    for (cols, rows) in [(1, 1), (u16::MAX, u16::MAX)] {
+        tx.send(Message::Control(WriterControl::Resize(Resize {
+            cols,
+            rows,
+        })))
+        .unwrap();
+    }
 
-    // Maximum u16 values
-    tx.send(PtyCommand::Resize(core_term::io::Resize {
-        cols: u16::MAX,
-        rows: u16::MAX,
-    }))
-    .unwrap();
+    let mut probe = WriterProbe::default();
+    drain_probe(&mut rx, &mut probe);
 
     assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Resize(core_term::io::Resize { cols: 1, rows: 1 })
-    );
-    assert_eq!(
-        rx.recv_timeout(Duration::from_millis(100)).unwrap(),
-        PtyCommand::Resize(core_term::io::Resize {
-            cols: u16::MAX,
-            rows: u16::MAX
-        })
+        probe.received,
+        vec![
+            WriterEvent::Resize(Resize { cols: 1, rows: 1 }),
+            WriterEvent::Resize(Resize {
+                cols: u16::MAX,
+                rows: u16::MAX
+            }),
+        ]
     );
 }
 
-/// Test that resize commands from multiple threads are all delivered.
+/// Multiple producers (dedicated SPSC handles) all deliver.
 #[test]
-fn pty_command_resize_from_multiple_senders() {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<PtyCommand>(32);
-
-    let tx1 = tx.clone();
-    let tx2 = tx.clone();
+fn pty_writer_receives_from_multiple_producers() {
+    let mut builder = ActorBuilder::<Vec<u8>, WriterControl, NoManagement>::new(32, None);
+    let tx1 = builder.add_producer();
+    let tx2 = builder.add_producer();
+    let mut rx = builder.build();
 
     let h1 = thread::spawn(move || {
-        for i in 0..5 {
-            tx1.send(PtyCommand::Resize(core_term::io::Resize {
+        for i in 0..5u16 {
+            tx1.send(Message::Control(WriterControl::Resize(Resize {
                 cols: 100 + i,
                 rows: 50,
-            }))
+            })))
             .unwrap();
         }
     });
 
     let h2 = thread::spawn(move || {
         for i in 0..5 {
-            tx2.send(PtyCommand::Write(format!("msg{}", i).into_bytes()))
+            tx2.send(Message::Data(format!("msg{}", i).into_bytes()))
                 .unwrap();
         }
     });
 
     h1.join().unwrap();
     h2.join().unwrap();
-    drop(tx); // Drop original sender
 
-    // Count received commands
-    let mut resize_count = 0;
-    let mut write_count = 0;
-
-    while let Ok(cmd) = rx.try_recv() {
-        match cmd {
-            PtyCommand::Resize(_) => resize_count += 1,
-            PtyCommand::Write(_) => write_count += 1,
+    let mut probe = WriterProbe::default();
+    loop {
+        if rx.poll_once(&mut probe).is_some() {
+            break;
         }
     }
+
+    let resize_count = probe
+        .received
+        .iter()
+        .filter(|e| matches!(e, WriterEvent::Resize(_)))
+        .count();
+    let write_count = probe
+        .received
+        .iter()
+        .filter(|e| matches!(e, WriterEvent::Write(_)))
+        .count();
 
     assert_eq!(resize_count, 5, "Should receive 5 resize commands");
     assert_eq!(write_count, 5, "Should receive 5 write commands");
