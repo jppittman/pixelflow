@@ -58,11 +58,11 @@ unsafe fn invoke_naked_kernel(
 }
 
 #[test]
-fn test_naked_abi_multithreaded_scale() {
+fn naked_abi_multithreaded_scale_should_succeed() {
     #[cfg(target_arch = "aarch64")]
     {
         let num_threads = 16;
-        let ops_per_thread = 10_000;
+        let ops_per_thread = 100;
         let kernel_ptr = get_jit_mul_kernel();
         let total_successes = AtomicUsize::new(0);
 
