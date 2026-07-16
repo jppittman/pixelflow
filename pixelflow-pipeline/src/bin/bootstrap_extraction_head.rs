@@ -15,12 +15,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use pixelflow_search::egraph::all_rules;
-use pixelflow_search::nnue::factored::{EMBED_DIM, EdgeAccumulator, ExprNnue, GraphAccumulator, K};
+use pixelflow_search::nnue::factored::{EMBED_DIM, EdgeAccumulator, ExprNnue, GraphAccumulator};
 use pixelflow_search::nnue::{BwdGenConfig, BwdGenerator};
 
-use pixelflow_pipeline::jit_bench::benchmark_jit_arena;
-use pixelflow_pipeline::training::gen_es::log_ns;
-use pixelflow_pipeline::training::self_play::{build_rule_templates, load_corpus_exprs};
+use pixelflow_pipeline::jit_bench::{benchmark_jit_arena, log_ns};
+use pixelflow_pipeline::training::episodes::{build_rule_templates, load_corpus_exprs};
 use pixelflow_pipeline::training::unified_backward::{
     UnifiedGradients, apply_unified_sgd, backward_value, forward_cached,
 };

@@ -655,6 +655,11 @@ mod tests {
             ExprNode::Var(i) => vars[i as usize],
             ExprNode::Const(c) => c,
             ExprNode::Param(i) => panic!("Param in eval_arena_scalar: {i}"),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) reached eval_arena_scalar — memory ops require a binding \
+                 table, not yet wired (M2, see KERNELS_AND_LATTICES.md)",
+                b.0
+            ),
             ExprNode::Unary(op, a) => {
                 let a = eval_arena_scalar(arena, a, vars);
                 op.eval_unary(a)
