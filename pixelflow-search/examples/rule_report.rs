@@ -87,8 +87,11 @@ fn normalize() -> (ExprArena, ExprId) {
     (a, out)
 }
 
+/// A named kernel builder: (label, constructor).
+type KernelCase = (&'static str, fn() -> (ExprArena, ExprId));
+
 fn main() {
-    let cases: Vec<(&str, fn() -> (ExprArena, ExprId))> = vec![
+    let cases: Vec<KernelCase> = vec![
         ("swirl", swirl),
         ("circle_sdf", circle_sdf),
         ("poly", poly),

@@ -3097,7 +3097,16 @@ fn emit_instruction_plan(
             const CTX_GPR: u8 = 0;
             emit_fcvtzs(code, IDX_INT, *idx); // float idx -> int32 lanes
             emit_ldr_x_imm(code, BASE_GPR, CTX_GPR, (*slot as u32) * 8);
-            emit_gather(code, *dst, BASE_GPR, IDX_INT, IDX_GPR, VAL_GPR);
+            emit_gather(
+                code,
+                *dst,
+                IDX_INT,
+                aarch64::GatherGprs {
+                    base: BASE_GPR,
+                    idx: IDX_GPR,
+                    val: VAL_GPR,
+                },
+            );
         }
         ResolvedOp::Binary {
             op,
@@ -5545,6 +5554,7 @@ mod tests {
             }
         }
 
+        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
         /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
         /// the reference interpreter, over the same coords and binding. The 16
         /// coordinate pairs run as four 4-lane batches.
@@ -5817,6 +5827,7 @@ mod tests {
 
         /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
         /// the reference interpreter, over the same coords and binding.
+        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
         fn check_against_interp(
             arena: &ExprArena,
             root: ExprId,

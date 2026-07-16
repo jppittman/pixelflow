@@ -385,13 +385,8 @@ pub fn benchmark_jit_arena_repeated(
 #[must_use]
 pub fn log_ns(ns: f64) -> f32 {
     assert!(!ns.is_nan(), "log_ns called with NaN");
-    let clamped = if ns < 1e-3 {
-        1e-3
-    } else if ns > 1e9 {
-        1e9
-    } else {
-        ns
-    };
+    // NaN already rejected above, so clamp's total order is well-defined here.
+    let clamped = ns.clamp(1e-3, 1e9);
     libm::logf(clamped as f32)
 }
 

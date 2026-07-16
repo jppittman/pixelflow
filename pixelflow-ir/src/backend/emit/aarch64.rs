@@ -521,22 +521,25 @@ pub fn emit_ldr_w_uxtw2(code: &mut Vec<u8>, gpr_dst: u8, gpr_base: u8, gpr_index
     );
 }
 
+/// GP registers used by the scalar-load gather sequence.
+pub struct GatherGprs {
+    /// Holds the buffer base pointer (survives the whole sequence).
+    pub base: u8,
+    /// Scratch: one extracted lane index at a time. Clobbered.
+    pub idx: u8,
+    /// Scratch: one loaded value at a time. Clobbered.
+    pub val: u8,
+}
+
 /// dst.4S = base[idx_int.S[lane]] for each lane — the NEON gather: four scalar
-/// loads through GP scratch. `base_gpr` holds the buffer base pointer;
+/// loads through GP scratch. `gprs.base` holds the buffer base pointer;
 /// `idx_int` holds int32 lane indices (already converted and in-bounds by the
-/// `expand_gather` lowering). Clobbers `idx_gpr` and `val_gpr`.
-pub fn emit_gather(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    base_gpr: u8,
-    idx_int: Reg,
-    idx_gpr: u8,
-    val_gpr: u8,
-) {
+/// `expand_gather` lowering). Clobbers `gprs.idx` and `gprs.val`.
+pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, gprs: GatherGprs) {
     for lane in 0..4 {
-        emit_umov_w(code, idx_gpr, idx_int, lane);
-        emit_ldr_w_uxtw2(code, val_gpr, base_gpr, idx_gpr);
-        emit_ins_w(code, dst, lane, val_gpr);
+        emit_umov_w(code, gprs.idx, idx_int, lane);
+        emit_ldr_w_uxtw2(code, gprs.val, gprs.base, gprs.idx);
+        emit_ins_w(code, dst, lane, gprs.val);
     }
 }
 
@@ -2870,7 +2873,16 @@ mod tests {
     #[test]
     fn gather_compound_is_four_scalar_loads() {
         let mut code = Vec::new();
-        emit_gather(&mut code, Reg(6), 9, Reg(28), 10, 11);
+        emit_gather(
+            &mut code,
+            Reg(6),
+            Reg(28),
+            GatherGprs {
+                base: 9,
+                idx: 10,
+                val: 11,
+            },
+        );
         // 4 lanes x (umov + ldr + ins) = 12 instructions.
         assert_eq!(code.len(), 12 * 4);
     }

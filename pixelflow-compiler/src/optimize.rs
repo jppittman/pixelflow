@@ -81,8 +81,9 @@ static OPTIMIZATION_MODEL: OnceLock<ExprNnue> = OnceLock::new();
 pub(crate) enum Extraction<'a> {
     /// Opt-in learned extraction (`PIXELFLOW_NNUE_WEIGHTS` set).
     Nnue(&'a ExprNnue),
-    /// Default: static per-op latency-prior costs.
-    Static(CostModel),
+    /// Default: static per-op latency-prior costs. Boxed — `CostModel` is far
+    /// larger than the `Nnue` reference, so an unboxed variant bloats the enum.
+    Static(Box<CostModel>),
 }
 
 impl Extraction<'_> {
@@ -93,7 +94,7 @@ impl Extraction<'_> {
                 let extractor = IncrementalExtractor::new(model, 8);
                 extractor.extract_choices_only(egraph, root).1
             }
-            Extraction::Static(costs) => extract_dag(egraph, root, costs).choices,
+            Extraction::Static(costs) => extract_dag(egraph, root, costs.as_ref()).choices,
         }
     }
 }
@@ -103,7 +104,7 @@ fn get_extraction() -> Extraction<'static> {
         Ok(path) => {
             Extraction::Nnue(OPTIMIZATION_MODEL.get_or_init(|| load_opt_in_weights(&path)))
         }
-        Err(_) => Extraction::Static(CostModel::latency_prior()),
+        Err(_) => Extraction::Static(Box::new(CostModel::latency_prior())),
     }
 }
 
@@ -1670,7 +1671,7 @@ mod tests {
         // expression through the optimizer must match exactly.
         let kernel = parse(input).unwrap();
         let mut analyzed_for_static_path = analyze(kernel).unwrap();
-        let static_extraction = Extraction::Static(CostModel::latency_prior());
+        let static_extraction = Extraction::Static(Box::new(CostModel::latency_prior()));
         analyzed_for_static_path.def.body = optimize_expr(analyzed_for_static_path.def.body);
         analyzed_for_static_path.def.body =
             optimize_expr_with_model(analyzed_for_static_path.def.body, &static_extraction);
