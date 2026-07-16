@@ -14,7 +14,7 @@ PixelFlow answers three questions:
 
 2. **What if SIMD was algebra, not an optimization?** Instead of SIMD as a lower-level concern, PixelFlow treats SIMD vectors as the natural representation of continuous fields over coordinates.
 
-3. **What if the type system compiled graphics?** The entire rendering pipeline—composed from six primitives (Warp, Grade, Lerp, Select, Fix, Compute)—monomorphizes into fused kernels with zero runtime dispatch.
+3. **What if the type system compiled graphics?** Expressions written with the `kernel!` macro are compiled through an e-graph optimizer and codegen pipeline, monomorphizing into fused kernels with zero runtime dispatch.
 
 ## The Stack
 
@@ -28,6 +28,12 @@ PixelFlow answers three questions:
 │ pixelflow-graphics (Materialization)    │  Colors, fonts, compositing,
 │                                         │  rasterization to pixels
 ├─────────────────────────────────────────┤
+│ pixelflow-compiler (Frontend)           │  kernel! macro: lexer, parser, sema,
+│                                         │  codegen
+│ pixelflow-search (Optimization)         │  E-graph saturation, rewrite rules,
+│                                         │  cost-model extraction
+│ pixelflow-ir (IR)                       │  ExprArena, OpKind, backend traits
+├─────────────────────────────────────────┤
 │ pixelflow-core (Algebra)                │  Field, Manifold, coordinates,
 │                                         │  no_std, SIMD abstraction
 └─────────────────────────────────────────┘
@@ -38,68 +44,65 @@ PixelFlow answers three questions:
 | Crate | Edition | Purpose |
 |-------|---------|---------|
 | `pixelflow-core` | 2024 | Pure algebra. `Field`, `Manifold`, coordinate variables. No I/O, no colors. |
+| `pixelflow-compiler` | 2024 | Proc-macro compiler: `kernel!` macro, lexer, parser, sema, codegen. |
+| `pixelflow-ir` | 2024 | Shared IR. `ExprArena`, `OpKind`, backend execution traits, JIT manifold. |
+| `pixelflow-search` | 2024 | E-graph optimization: rewrite rules, saturation, cost-model extraction. |
+| `pixelflow-pipeline` | 2024 | Cost-model tooling: JIT bench harness, corpus generation, extraction benchmarks. |
 | `pixelflow-graphics` | 2021 | Colors (`Rgba8`), fonts, rasterization, antialiasing via automatic differentiation. |
+| `pixelflow-ml` | 2024 | Graphics ML experiments (harmonic attention, spherical-harmonic feature maps). |
 | `pixelflow-runtime` | 2021 | Display drivers (Cocoa/X11/Web), input handling, render orchestration. |
 | `actor-scheduler` | 2024 | Priority message passing with `troupe!` macro for lock-free concurrent actors. |
+| `actor-scheduler-macros` | 2024 | Procedural macros for the actor system. |
 | `core-term` | 2021 | Terminal emulator. ANSI parsing, PTY management, state machine. The first PixelFlow consumer. |
+| `xtask` | 2021 | Build tooling: macOS app bundling, codegen tasks. |
+
+### Compiler Pipeline
+
+Code written with the `kernel!` macro doesn't compile directly to assembly—it flows through an optimization pipeline:
+
+```
+Source → Lexer → Parser → Sema → Optimize (e-graph) → Codegen → Rust TokenStream
+```
+
+The optimizer builds an e-graph from the expression, saturates it with rewrite rules (associativity, FMA fusion, etc.), and extracts the minimum-cost implementation using a handwritten, latency-prior cost model (the default). A learned NNUE cost model exists as an opt-in experiment but hasn't beaten the handwritten model in benchmarks, so it isn't the default. See CLAUDE.md's "Cost-Model Training" section for details.
 
 ## The Manifold Abstraction
 
-Everything in PixelFlow is a `Manifold`—a functor from 4D coordinates to a value:
+Everything in PixelFlow is a `Manifold`—a domain-generic function from coordinates to a value:
 
 ```rust
-trait Manifold<Input = Field> {
+trait Manifold<P = (Field, Field, Field, Field)>: Send + Sync {
     type Output;
-    fn eval_raw(&self, x: Input, y: Input, z: Input, w: Input) -> Self::Output;
+    fn eval(&self, p: P) -> Self::Output;
 }
 ```
 
-`Manifold` is a true functor: a structure-preserving map that respects composition. You can build arbitrarily complex manifolds by composing simpler ones, and the type system optimizes the entire composition into fused SIMD code.
+`P` is the domain the manifold operates on—`(Field, Field)` for a 2D kernel, `(Jet2, Jet2)` for 2D with automatic differentiation, and so on. A 2D kernel only pays for the coordinates it declares; there's no tax for unused dimensions.
 
-This enables:
-- **Coordinate transformation** (warping, camera movement, distortion)
-- **Rendering** (colors, textures, signed distance fields)
-- **Simulation** (fractals, iterative systems, time-based animation)
-- **Automatic differentiation** (gradients for antialiasing, normals, ray marching)
+Manifolds compose via operator overloading, and the type tree *is* the compute graph—when `eval` is called, the compiler monomorphizes and inlines the whole tree into a single fused kernel.
 
-## Common Composition Patterns
-
-In practice, most PixelFlow graphics compose from a few recurring patterns (though the system is not limited to them):
-
-1. **Warp** — Remap coordinates before sampling a manifold
-2. **Grade** — Linear transform on values (matrix + bias)
-3. **Lerp** — Smooth interpolation between two manifolds
-4. **Select** — Branchless conditional (discrete choice via lane masks)
-5. **Fix** — Iteration as a coordinate dimension (for Mandelbrot, raymarching, animation)
-6. **Compute** — Direct closure (escape hatch for opaque computation)
-
-These patterns compose freely. Any manifold can be built from combinations of simpler ones.
+**Writing manifolds by hand is a legacy pattern.** The intended way to write PixelFlow code today is the `kernel!` macro, which compiles an expression through the e-graph optimizer and codegen pipeline instead of relying on hand-composed combinator types (see [Extending PixelFlow](#extending-pixelflow) below).
 
 ## Performance
 
-- **Target:** 155 FPS at 1080p (~5 nanoseconds per pixel)
+- **Throughput:** 155 FPS at 1080p (~5 nanoseconds per pixel)
 - **Backend:** Pure CPU, no GPU required. SIMD: AVX-512, SSE2, NEON
 - **Memory:** Zero allocation per frame (ping-pong buffer strategy)
 - **Compilation:** Entire scene monomorphizes into fused kernels
+- **Latency:** <5ms input-to-render (actor model)
 
 ## Getting Started with PixelFlow
 
 ### Documentation
 
-The complete PixelFlow architecture is documented in `/docs/`:
-
-- **[NORTH_STAR.md](docs/NORTH_STAR.md)** — PixelFlow vision, philosophy, and high-level design
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Detailed crate architecture and dependencies
-- **[ACTOR_ARCHITECTURE.md](docs/ACTOR_ARCHITECTURE.md)** — Zero-latency input via actor model
-- **[STYLE.md](docs/STYLE.md)** — Code style guide and design principles
-
-For core-term specifics:
-- **[THREADING_DESIGN.md](docs/THREADING_DESIGN.md)** — Platform-specific threading and I/O
-- **[PERFORMANCE_ANALYSIS.md](docs/PERFORMANCE_ANALYSIS.md)** — Profiling and optimization notes
+- **[CLAUDE.md](CLAUDE.md)** — Architectural constraints, workspace structure, and development guidelines
+- **[docs/STYLE.md](docs/STYLE.md)** — Code style guide and design principles
+- **[docs/designs/](docs/designs/)** — Design docs for the compiler, e-graph search, and actor scheduler
+- **[docs/plans/](docs/plans/)** — In-flight design and migration plans
 
 ### Prerequisites
 
-- **Rust:** Nightly (see `rust-toolchain.toml`)
+- **Rust:** Stable (see `rust-toolchain.toml`)
 - **Platform dependencies:**
   - **macOS:** Native Cocoa support
   - **Linux:** X11 development headers
@@ -155,7 +158,7 @@ PixelFlow: **pull** each pixel samples what it needs.
 ```rust
 // A pixel asks: "What color am I?"
 // The manifold computes only what's necessary.
-let color = manifold.eval_raw(x, y, 0.0, 0.0);
+let color = manifold.eval((x, y));
 ```
 
 This eliminates:
@@ -189,31 +192,29 @@ PixelFlow is extracted from core-term because:
 
 ## Extending PixelFlow
 
-### Creating a New Manifold
+### Writing a Kernel
+
+The `kernel!` macro is the intended way to write PixelFlow code: it compiles your expression through the e-graph optimizer instead of relying on hand-composed combinator types.
 
 ```rust
-use pixelflow_core::{Manifold, X, Y};
+use pixelflow_compiler::kernel;
+use pixelflow_core::{Field, Manifold};
 
-// A circle signed distance field
-let circle = (X * X + Y * Y).sqrt() - 100.0;
+// A parameterized kernel: instantiating it with concrete params returns a manifold
+let circle = kernel!(|cx: f32, cy: f32, r: f32| {
+    let dx = X - cx;
+    let dy = Y - cy;
+    (dx * dx + dy * dy).sqrt() - r
+});
 
-// Compose with warp (zoom by 2x)
-let zoomed = circle.warp(|x, y, z, w| (x * 2.0, y * 2.0, z, w));
+let unit_circle = circle(0.0, 0.0, 1.0);
 
-// Render to pixels (handled by pixelflow-graphics)
+// Evaluate at a point
+let p = (Field::from(1.5), Field::from(2.0), Field::from(0.0), Field::from(0.0));
+let result = unit_circle.eval(p);
 ```
 
-### Composing Graphics
-
-```rust
-use pixelflow_graphics::{Color, NamedColor};
-
-let background = Color::Named(NamedColor::Black);
-let foreground = circle.select(
-    Color::Named(NamedColor::White),
-    background,
-);
-```
+Hand-writing `Manifold` impls directly (composing `X`, `Y` with operators and combinators like `.at()` or `.select()`) still works and is used internally, but it's a legacy pattern being phased out in favor of `kernel!`.
 
 ## Contributing
 
@@ -223,13 +224,6 @@ Key points:
 - **Code style:** Follow Rust idioms. See [STYLE.md](docs/STYLE.md).
 - **No magic in PixelFlow:** Keep the algebra pure and portable.
 - **Tests:** Public API changes require test updates.
-
-## Performance Targets
-
-- **Throughput:** 155 FPS at 1080p (full terminal)
-- **Per-pixel cost:** ~5 nanoseconds
-- **Memory:** Zero allocations per frame (ping-pong buffers)
-- **Latency:** <5ms input-to-render (actor model)
 
 ## Research Context
 
