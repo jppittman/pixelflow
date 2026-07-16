@@ -2,7 +2,7 @@
 
 ## Metadata
 - **Author**: Claude (requested by jppittman)
-- **Status**: Phases 1 & 2 implemented (troupe!-wired actors; kubelet supervision pending)
+- **Status**: Done. Phases 1 & 2 implemented (troupe!-wired actors). Phase 3 (Kubelet supervision) deliberately not pursued — see §5 Phase 3.
 - **Created**: 2026-07-16
 - **Reviewers**: —
 
@@ -325,14 +325,34 @@ Two obstacles, both with existing idioms:
   the engine troupe. The PTY troupe therefore nests: `s.spawn(|| pty_troupe.play())`
   — the documented two-phase nesting pattern in `actor-scheduler/src/lib.rs`.
 
-### Phase 3 — supervision (future)
+### Phase 3 — supervision: not pursued
 
-With Phase 2 in place, the parser (stateless between `Reset`s) is the ideal
-first Kubelet-managed pod: `RestartPolicy::OnFailure`, `ServiceHandle` from
-the reader, `ParserControl::Reset` on restart. Reader/writer own FDs and are
-*not* restartable in place; their failure should escalate to `ChildExited`
-semantics instead. This aligns with `actor-scheduler-supervisor-migration.md`
-and gives the supervision work a real consumer beyond tests.
+The original sketch proposed Kubelet-managing the parser (`RestartPolicy::
+OnFailure`, `ServiceHandle` from the reader, `ParserControl::Reset` on
+restart), reasoning that a malformed escape sequence shouldn't take down the
+terminal. That reasoning doesn't survive contact with this workspace's build
+config: every profile (`dev`, `release`, `bench`, `dist`) sets `panic =
+"abort"`. Under `panic=abort` a panic anywhere — including inside
+`PtyParser::handle_data` — terminates the whole process immediately;
+`catch_unwind` is a no-op, there is no unwind for Kubelet to observe. Restart
+supervision can only ever fire on an *explicit* `HandlerError::Recoverable`
+return, never on an actual bug, and `PtyParser` doesn't have one — malformed
+ANSI is already data to it, not an error (see `it_should_process_csi_with_
+invalid_final_byte_as_error` and friends).
+
+That's not an accident to route around; it's the project's stated philosophy.
+Fail fast, fail loud: a broken invariant (an out-of-bounds index, an `unwrap`
+that shouldn't fire) should crash the *process*, not be caught, contained, and
+quietly restarted underneath the user. If a condition is truly recoverable,
+the code should say so explicitly by returning `Err`, not by leaving a panic
+for a supervisor to paper over. Building Kubelet wiring here would mean
+either (a) it does nothing, because nothing in the parser ever returns
+`Recoverable`, or (b) it tempts someone into papering over a real bug with a
+`Recoverable` return instead of fixing it — the opposite of what this
+codebase wants. Phase 3 stops here. `actor-scheduler`'s Kubelet/ServiceHandle
+machinery remains available for an actor with a genuine, anticipated,
+non-bug failure mode (a network reconnect, a resource retry) — the PTY
+pipeline isn't one.
 
 ---
 
