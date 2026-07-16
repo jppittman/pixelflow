@@ -740,6 +740,57 @@ fn it_should_abort_csi_intermediate_on_esc_and_process_subsequent_csi() {
 }
 
 #[test]
+fn it_should_dispatch_non_esc_c0_control_received_in_csi_entry() {
+    // A C0 control other than ESC, received before any CSI params, is
+    // dispatched as its own command (and the CSI is dropped) rather than
+    // being treated as an ESC-abort into the Escape state.
+    let bytes = b"\x1B[\x07A"; // ESC [ BEL A
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![
+            AnsiCommand::C0Control(C0Control::BEL),
+            AnsiCommand::Print('A')
+        ]
+    );
+}
+
+#[test]
+fn it_should_dispatch_non_esc_c0_control_received_in_csi_param() {
+    let bytes = b"\x1B[1\x07A"; // ESC [ 1 BEL A
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![
+            AnsiCommand::C0Control(C0Control::BEL),
+            AnsiCommand::Print('A')
+        ]
+    );
+}
+
+#[test]
+fn it_should_dispatch_non_esc_c0_control_received_in_csi_intermediate() {
+    let bytes = b"\x1B[ \x07A"; // ESC [ ' ' BEL A
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![
+            AnsiCommand::C0Control(C0Control::BEL),
+            AnsiCommand::Print('A')
+        ]
+    );
+}
+
+#[test]
+fn it_should_report_error_for_unexpected_char_in_csi_entry() {
+    // ':' is not a digit, ';', private marker, intermediate, or final byte,
+    // so it hits the CsiEntry fallback and is reported as an Error.
+    let bytes = b"\x1B[:";
+    let commands = process_bytes(bytes);
+    assert_eq!(commands, vec![AnsiCommand::Error(b':')]);
+}
+
+#[test]
 fn it_should_stay_in_escape_state_on_repeated_esc() {
     // A second ESC while already in the Escape state re-arms rather than
     // being dispatched as an (invalid) C0 control.
