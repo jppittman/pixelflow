@@ -24,12 +24,6 @@ mod tests {
         }
     }
 
-    // We can't easily instantiate VsyncActor because EngineActorHandle is private.
-    // But we can check if the code we added compiles and the logic is correct conceptually.
-
-    // Since we cannot run the test because of missing dependencies/private types being inaccessible,
-    // we will rely on 'cargo check' which we already ran.
-
     #[test]
     fn vsync_command_debug() {
         let (tx, _rx) = mpsc::channel();
