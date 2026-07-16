@@ -201,8 +201,8 @@ pub struct CodeEmitter<'a> {
 impl<'a> CodeEmitter<'a> {
     pub fn new(analyzed: &'a AnalyzedKernel) -> Self {
         // Separate params into scalars and manifolds
-        let mut scalar_params = Vec::new();
-        let mut manifold_params = Vec::new();
+        let mut scalar_params = Vec::with_capacity(analyzed.def.params.len());
+        let mut manifold_params = Vec::with_capacity(analyzed.def.params.len());
 
         for param in &analyzed.def.params {
             match param.kind {
@@ -283,7 +283,7 @@ impl<'a> CodeEmitter<'a> {
         // Always adjust param indices to account for literals in context
         // Literals go into A0 (Scalars), so only adjust scalar params (ArrayID 0)
         let literal_count = self.collected_literals.len();
-        for (_, (array_id, idx)) in self.param_indices.iter_mut() {
+        for (array_id, idx) in self.param_indices.values_mut() {
             if *array_id == 0 {
                 *idx += literal_count;
             }
@@ -511,7 +511,7 @@ impl<'a> CodeEmitter<'a> {
         // Always adjust param indices to account for literals in context
         // Literals go into A0 (Scalars), so only adjust scalar params (ArrayID 0)
         let literal_count = self.collected_literals.len();
-        for (_, (array_id, idx)) in self.param_indices.iter_mut() {
+        for (array_id, idx) in self.param_indices.values_mut() {
             if *array_id == 0 {
                 *idx += literal_count;
             }

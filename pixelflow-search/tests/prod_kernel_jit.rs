@@ -14,9 +14,10 @@
 //!              ->  transcendental lowering + register allocation + codegen
 //!              ->  native machine code, executed on real coordinates.
 //!
-//! Note: the checked-in NNUE weights (`pixelflow-compiler/weights/expr_nnue.bin`)
-//! are a Git-LFS pointer, not the real tensor, so this drives the extractor with
-//! the latency-prior cost model. The point is the *pipeline*, end to end.
+//! Note: there are no validated trained NNUE weights shipped with the compiler
+//! (see `pixelflow-compiler/src/optimize.rs`), so this drives the extractor
+//! with the no-op zero-weight cost model — extraction keeps the original
+//! form; peephole/CSE still run. The point is the *pipeline*, end to end.
 
 use pixelflow_ir::backend::emit::compile_arena_dag;
 use pixelflow_ir::{ExprArena, ExprId, OpKind};
@@ -170,17 +171,16 @@ fn prod_swirl_kernel_through_nnue_and_jit() {
         max_cross_err = max_cross_err.max((got_orig - got_opt).abs());
 
         assert!(
-            (got_orig - want).abs() <= 1.0,
+            (got_orig - want).abs() <= 6e-2,
             "original JIT at ({x},{y}): got {got_orig}, want {want}"
         );
         assert!(
-            (got_opt - want).abs() <= 1.0,
+            (got_opt - want).abs() <= 6e-2,
             "optimized JIT at ({x},{y}): got {got_opt}, want {want}"
         );
-        // NNUE extraction might slightly change semantics due to fast math ops, but should be close.
         assert!(
-            (got_orig - got_opt).abs() <= 5e-1,
-            "NNUE extraction changed semantics too much at ({x},{y}): \
+            (got_orig - got_opt).abs() <= 1e-1,
+            "NNUE extraction changed semantics at ({x},{y}): \
              original {got_orig} vs optimized {got_opt}"
         );
     }

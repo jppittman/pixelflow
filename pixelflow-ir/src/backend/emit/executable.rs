@@ -26,7 +26,7 @@ impl ExecutableCode {
     /// for the current architecture.
     #[cfg(unix)]
     pub unsafe fn from_code(code: &[u8]) -> Result<Self, &'static str> {
-        use libc::{mmap, mprotect, MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, mprotect};
 
         if code.is_empty() {
             return Err("empty code buffer");
@@ -63,6 +63,18 @@ impl ExecutableCode {
             if result != 0 {
                 libc::munmap(ptr as *mut libc::c_void, capacity);
                 return Err("mprotect failed");
+            }
+
+            // Instruction cache coherence on Apple Silicon: the I-cache is not
+            // automatically coherent with the D-cache, so code written via the
+            // store above can otherwise be invisible (or stale) to the fetch
+            // unit until explicitly invalidated.
+            #[cfg(target_os = "macos")]
+            {
+                unsafe extern "C" {
+                    fn sys_icache_invalidate(start: *mut core::ffi::c_void, size: usize);
+                }
+                sys_icache_invalidate(ptr as *mut core::ffi::c_void, code.len());
             }
 
             Ok(Self {
@@ -170,7 +182,7 @@ impl CodeBuffer {
     /// Returns an error if mmap fails.
     #[cfg(unix)]
     pub fn new(capacity: usize) -> Result<Self, &'static str> {
-        use libc::{mmap, MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+        use libc::{MAP_ANON, MAP_PRIVATE, PROT_READ, PROT_WRITE, mmap};
 
         if capacity == 0 {
             return Err("CodeBuffer capacity must be > 0");
@@ -379,6 +391,24 @@ use core::arch::x86_64::__m512;
 pub type KernelFn =
     extern "C" fn(float32x4_t, float32x4_t, float32x4_t, float32x4_t) -> float32x4_t;
 
+/// JIT-compiled kernel that reads bound memory (ARM64).
+///
+/// Identical to [`KernelFn`] plus a leading context pointer: an array of buffer
+/// base pointers, one per declared [`BufferId`](crate::arena::BufferId) in slot
+/// order. AAPCS64 places this integer-class pointer in `x0`, disjoint from the
+/// coordinate vectors in `v0..3`, so the emitted body is byte-for-byte the same
+/// as a `KernelFn` — only kernels containing a `Gather` read `x0`. The caller
+/// picks this type iff the arena declared buffers.
+#[allow(improper_ctypes_definitions)]
+#[cfg(target_arch = "aarch64")]
+pub type CtxKernelFn = extern "C" fn(
+    *const *const f32,
+    float32x4_t,
+    float32x4_t,
+    float32x4_t,
+    float32x4_t,
+) -> float32x4_t;
+
 /// JIT-compiled scanline kernel signature for ARM64.
 ///
 /// Processes an entire scanline in a single call with no per-batch Rust-JIT boundary.
@@ -418,6 +448,31 @@ pub type ScanlineKernelFn = extern "C" fn(
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub type KernelFn = extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
 
+/// JIT-compiled kernel that reads bound memory (x86-64 AVX-512).
+///
+/// Identical to [`KernelFn`] plus a leading context pointer: an array of buffer
+/// base pointers, one per declared [`BufferId`](crate::arena::BufferId) in slot
+/// order. System V places this integer-class pointer in `rdi`, disjoint from the
+/// coordinate vectors in `zmm0..3`, so the emitted body is byte-for-byte the
+/// same as a `KernelFn` — only kernels containing a `Gather` read `rdi`. The
+/// caller picks this type iff the arena declared buffers.
+#[allow(improper_ctypes_definitions)]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub type CtxKernelFn = extern "C" fn(*const *const f32, __m512, __m512, __m512, __m512) -> __m512;
+
+/// JIT-compiled *collapse* kernel (x86-64 AVX-512): the whole lattice domain
+/// loop is inside the emitted code, so one call fills the entire output — no
+/// per-batch Rust↔JIT boundary. This is the internal-loop realization of the
+/// lattice: coordinates are induction values, not arguments.
+///
+/// SysV argument registers: `rdi` = context (array of buffer base pointers),
+/// `rsi` = `xs` (domain X coordinates, 16-lane groups), `rdx` = `out` (output,
+/// 16-lane groups), `rcx` = `groups` (number of 16-lane groups). Y/Z/W are zero
+/// inside the kernel. `xs`/`out` are read/written 64 bytes at a time and must
+/// hold at least `groups * 16` f32s.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub type CollapseKernelFn = extern "C" fn(*const *const f32, *const f32, *mut f32, usize);
+
 #[allow(improper_ctypes_definitions)]
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
 pub type KernelFn = extern "C" fn(__m128, __m128, __m128, __m128) -> __m128;
@@ -453,7 +508,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_return_x() {
+    fn jit_return_x() {
         // Simplest kernel: return X (already in v0)
         // Just RET - input X is already in v0, which is the return register!
 
@@ -482,7 +537,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_add_xy() {
+    fn jit_add_xy() {
         // kernel: X + Y
         // v0 = X, v1 = Y, return v0 + v1
 
@@ -514,7 +569,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_complex_expr() {
+    fn jit_complex_expr() {
         // kernel: (X + Y) * Z
         // Uses register allocation:
         //   v0=X, v1=Y, v2=Z, v3=W
@@ -557,7 +612,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn test_jit_const_05_raw() {
+    fn jit_const_05_raw() {
         // Test raw constant loading for 0.5
         // MOVZ W16, #0
         // MOVK W16, #0x3F00, LSL #16  (0x3F000000 = 0.5f)
@@ -595,7 +650,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_jit_return_x_x86() {
+    fn jit_return_x_x86() {
         // Simplest kernel: return X (already in xmm0)
 
         let mut code = Vec::new();
@@ -621,7 +676,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn test_jit_add_xy_x86() {
+    fn jit_add_xy_x86() {
         // kernel: X + Y
 
         let mut code = Vec::new();

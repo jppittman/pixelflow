@@ -138,16 +138,27 @@ Optuna scores trials by validation speedup on held-out real shader expressions (
 
 ## Step 6: Deploy Weights
 
-```bash
-# Copy best checkpoint to compiler
-cp pixelflow-pipeline/data/unified/model_r<BEST>.bin \
-   pixelflow-compiler/weights/expr_nnue.bin
+NNUE extraction is **disabled by default** — no validated trained weights are
+embedded or shipped with the compiler (`pixelflow-compiler/src/optimize.rs`
+constructs the no-op zero-weight model unconditionally). Structural
+peephole/CSE optimization still runs; only the learned cost-guided extraction
+step is a no-op by default.
 
-# Rebuild — every kernel! now uses trained weights
+To try trained weights, point the opt-in env var at your checkpoint and
+rebuild. Any load failure (missing file, wrong magic, wrong length) is a hard
+compile-time panic — there is no silent fallback:
+
+```bash
+# Point the compiler at your trained checkpoint
+export PIXELFLOW_NNUE_WEIGHTS=pixelflow-pipeline/data/unified/model_r<BEST>.bin
+
+# Rebuild — every kernel! now uses these weights, or the build fails loudly
 cargo build --release
 ```
 
-The weights are embedded via `include_bytes!` in `pixelflow-compiler/src/optimize.rs`. No runtime file loading.
+`PIXELFLOW_NNUE_WEIGHTS` is read via `std::env::var` at proc-macro expansion
+time (i.e. when the *consuming* crate is compiled), so it must be set in the
+environment of that `cargo build` invocation.
 
 ## Key Design Decisions
 
@@ -197,5 +208,4 @@ Op weights match ShaderToy shader analysis: 36% mul, 18% add, 14% sub, 6% div, w
 | `pixelflow-pipeline/src/bin/bootstrap_extraction_head.rs` | Initial value head training |
 | `pixelflow-search/src/nnue/factored.rs` | ExprNnue model + EdgeAccumulator |
 | `pixelflow-search/src/egraph/extract.rs` | DAG-aware incremental extraction |
-| `pixelflow-compiler/src/optimize.rs` | kernel! macro integration |
-| `pixelflow-compiler/weights/expr_nnue.bin` | Trained weights (shipped) |
+| `pixelflow-compiler/src/optimize.rs` | kernel! macro integration; `PIXELFLOW_NNUE_WEIGHTS` opt-in loader |

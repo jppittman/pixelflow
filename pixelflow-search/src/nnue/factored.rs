@@ -33,14 +33,13 @@
 //! | Accumulator build | O(nodes²) | O(edges) | O(nodes) |
 //! | Incremental update | O(subtree²) | O(Δedges × K) | O(subtree) |
 
-#![allow(dead_code)] // Prototype code
-
 extern crate alloc;
 
 use alloc::vec::Vec;
 use libm::sqrtf;
 
 use crate::egraph::Rewrite;
+use crate::egraph::cost::LATENCY_PRIOR_CYCLES;
 pub use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
@@ -459,69 +458,24 @@ impl OpEmbeddings {
     }
 
     /// Initialize with latency priors in place.
+    ///
+    /// Dimension 0 = latency, normalized to `[0, 1]` by dividing the shared
+    /// [`LATENCY_PRIOR_CYCLES`] cycle table (source of truth, also used by
+    /// `egraph::cost::CostModel::latency_prior`) by `LATENCY_NORMALIZER`.
     pub fn init_with_latency_prior(&mut self, seed: u64) {
-        // Known latencies (cycles) - these are approximate and can be refined
-        // Dimension 0 = latency, normalized to [0, 1] range (divide by max ~20)
-        let latencies: [f32; OpKind::COUNT] = [
-            0.0,  // Var - free
-            0.0,  // Const - free
-            0.2,  // Add - 4 cycles
-            0.2,  // Sub - 4 cycles
-            0.25, // Mul - 5 cycles
-            0.75, // Div - 15 cycles
-            0.05, // Neg - 1 cycle
-            0.75, // Sqrt - 15 cycles
-            0.25, // Rsqrt - 5 cycles (fast approximation)
-            0.05, // Abs - 1 cycle
-            0.2,  // Min - 4 cycles
-            0.2,  // Max - 4 cycles
-            0.25, // MulAdd - 5 cycles (fused)
-            0.5,  // Recip - 10 cycles
-            0.2,  // Floor - 4 cycles
-            0.2,  // Ceil - 4 cycles
-            0.2,  // Round - 4 cycles
-            0.2,  // Fract - 4 cycles
-            0.5,  // Sin - 10 cycles
-            0.5,  // Cos - 10 cycles
-            0.5,  // Tan - 10 cycles
-            0.5,  // Asin - 10 cycles
-            0.5,  // Acos - 10 cycles
-            0.5,  // Atan - 10 cycles
-            0.5,  // Exp - 10 cycles
-            0.5,  // Exp2 - 10 cycles
-            0.5,  // Ln - 10 cycles
-            0.5,  // Log2 - 10 cycles
-            0.5,  // Log10 - 10 cycles
-            0.5,  // Atan2 - 10 cycles
-            0.6,  // Pow - 12 cycles
-            0.4,  // Hypot - 8 cycles
-            0.15, // Lt - 3 cycles
-            0.15, // Le - 3 cycles
-            0.15, // Gt - 3 cycles
-            0.15, // Ge - 3 cycles
-            0.15, // Eq - 3 cycles
-            0.15, // Ne - 3 cycles
-            0.2,  // Select - 4 cycles
-            0.3,  // Clamp - 6 cycles (2x compare + select)
-            0.0,  // Tuple - free (structural)
-            // Bit-manip primitives: single cheap integer/convert instructions.
-            0.05, // TruncToInt - 1 cycle (cvttps2dq)
-            0.05, // IntToFloat - 1 cycle (cvtdq2ps)
-            0.05, // IAdd - 1 cycle (paddd)
-            0.05, // Shl - 1 cycle
-            0.05, // Shr - 1 cycle
-            0.05, // BitAnd - 1 cycle
-            0.05, // BitOr - 1 cycle
-            // Dwrt - rewritten away by the e-graph (chain rule); never emitted.
-            1.0, // Dwrt - prohibitive so a surviving derivative never extracts
-        ];
+        // Cycle estimate above which we don't bother distinguishing further;
+        // used only to squash LATENCY_PRIOR_CYCLES into [0, 1]. Dwrt's
+        // deliberately-prohibitive 1000-cycle entry saturates to 1.0 here,
+        // same as before this table was shared with CostModel.
+        const LATENCY_NORMALIZER: f32 = 20.0;
 
         let mut rng_state = seed.wrapping_add(1);
         let small_scale = 0.1; // Small noise for other dimensions
 
         for op_idx in 0..OpKind::COUNT {
-            // Dimension 0: latency prior
-            self.e[op_idx][0] = latencies[op_idx];
+            // Dimension 0: latency prior, normalized from the shared cycle table.
+            let cycles = LATENCY_PRIOR_CYCLES[op_idx] as f32;
+            self.e[op_idx][0] = (cycles / LATENCY_NORMALIZER).min(1.0);
 
             // Dimensions 1..K: small random for learning interactions
             for dim in 1..K {
@@ -744,7 +698,7 @@ pub struct EdgeAccumulator {
 
     /// Number of shared subtrees skipped via CSE deduplication.
     ///
-    /// Incremented by `from_expr_dedup` each time a subtree that was already
+    /// Incremented by `from_arena_dedup` each time a subtree that was already
     /// walked is encountered again. The duplicate's edges are NOT re-added to
     /// the accumulator — this field is purely diagnostic and does NOT feed into
     /// the network.
@@ -930,7 +884,7 @@ impl EdgeAccumulator {
 
             acc.node_count += 1;
             match arena.node(id) {
-                ExprNode::Var(_) | ExprNode::Const(_) => {}
+                ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Buffer(_) => {}
                 ExprNode::Param(i) => {
                     panic!("ExprNode::Param({i}) reached NNUE cost model — substitute params first")
                 }
@@ -965,18 +919,6 @@ impl EdgeAccumulator {
         }
 
         acc
-    }
-
-    /// Merge another accumulator into this one (vector addition).
-    ///
-    /// Both flat and depth-encoded halves are additive.
-    pub fn merge(&mut self, other: &Self) {
-        for i in 0..4 * K {
-            self.values[i] += other.values[i];
-        }
-        self.edge_count += other.edge_count;
-        self.node_count += other.node_count;
-        self.backref_count += other.backref_count;
     }
 
     // ========================================================================
@@ -1099,16 +1041,40 @@ impl EdgeAccumulator {
                     // single var_ref edge — so the DAG is not tree-bloated.
                     for (child_idx, &child_class) in children.iter().enumerate() {
                         let child_canonical = egraph.find(child_class);
-                        let child_node_idx = choices[child_canonical.0 as usize].unwrap_or(0);
-                        let child_nodes = egraph.nodes(child_canonical);
-                        let child_op = if child_node_idx < child_nodes.len() {
-                            match &child_nodes[child_node_idx] {
-                                ENode::Var(_) => OpKind::Var,
-                                ENode::Const(_) => OpKind::Const,
-                                ENode::Op { op: cop, .. } => cop.kind(),
+                        // NOTE on why this is `None`-tolerant unlike the parent
+                        // choice lookup above (which panics on out-of-bounds):
+                        // this function is also called on SPECULATIVE, in-progress
+                        // `choices` during `extract_choices_only`'s candidate
+                        // search (extract.rs ~121-137) — a tentative swap is
+                        // applied to `choices[canonical]` and evaluated for cost
+                        // *before* it is accepted, and children introduced by that
+                        // tentative (possibly-rejected) swap are only transitively
+                        // backfilled via `backfill_reachable_defaults` if/when the
+                        // swap actually wins (extract.rs ~149-169). So an
+                        // unrecorded child choice here is a legitimate, expected
+                        // case, not an invariant violation like the ones above.
+                        // Treat it the same way the parent lookup treats an
+                        // unreachable class (line ~1057: `None => continue`): skip
+                        // contributing an edge rather than fabricating one from a
+                        // guessed node 0 / `OpKind::Var`, which would silently
+                        // feed the cost model a made-up feature.
+                        let child_op = match choices[child_canonical.0 as usize] {
+                            None => None,
+                            Some(child_node_idx) => {
+                                let child_nodes = egraph.nodes(child_canonical);
+                                child_nodes.get(child_node_idx).map(|n| match n {
+                                    ENode::Var(_) => OpKind::Var,
+                                    ENode::Const(_) => OpKind::Const,
+                                    ENode::Op { op: cop, .. } => cop.kind(),
+                                })
                             }
-                        } else {
-                            OpKind::Var // fallback
+                        };
+                        let Some(child_op) = child_op else {
+                            // No recorded (or in-bounds) choice for this child yet
+                            // — skip the edge for this speculative candidate; it
+                            // contributes no signal to the cost estimate rather
+                            // than a fabricated one.
+                            continue;
                         };
 
                         let eff_depth =
@@ -1526,12 +1492,12 @@ pub struct Edge {
 /// ## Architecture
 ///
 /// ```text
-/// expr → OpEmbeddings → EdgeAccumulator → hidden [64] → expr_proj → expr_embed [24]
+/// expr → OpEmbeddings → EdgeAccumulator → hidden [64] → expr_proj → expr_embed [32]
 ///                                                            ├─→ value_mlp → cost (extraction head)
 ///                                                            └─→ [embed, cost] → mask_mlp → bilinear → score (saturation head)
 /// ```
 ///
-/// **Extraction head**: `expr_embed → value_mlp (24→16→1)` predicts log-nanosecond cost.
+/// **Extraction head**: `expr_embed → value_mlp (32→16→1)` predicts log-nanosecond cost.
 /// **Saturation head**: `[expr_embed, value_pred] → mask_mlp → bilinear(mask_features, rule_embed)` scores rules.
 ///
 /// Rule embeddings come from LHS/RHS templates via `rule_proj`, not from learned per-rule embeddings.
@@ -1558,7 +1524,7 @@ pub struct ExprNnue {
     // ========== UNIFIED MASK ARCHITECTURE ==========
     // These fields support the new bilinear expr-rule interaction model
     // that scales to 1000+ rules.
-    /// Projects backbone hidden (64) to shared expr embedding (EMBED_DIM=24).
+    /// Projects backbone hidden (64) to shared expr embedding (EMBED_DIM=32).
     /// Weights: [HIDDEN_DIM x EMBED_DIM]
     pub expr_proj_w: [[f32; EMBED_DIM]; HIDDEN_DIM],
     /// Expr projection bias: [EMBED_DIM]
@@ -2565,57 +2531,6 @@ impl ExprNnue {
     // The accumulator can be incrementally updated as rules are applied.
     // ========================================================================
 
-    /// Predict cost directly from accumulator (for MCTS evaluation).
-    ///
-    /// Skips expr parsing - just forward pass through backbone + extraction head.
-    /// Use this for fast MCTS rollout evaluation.
-    #[must_use]
-    pub fn predict_cost_from_accumulator(&self, acc: &EdgeAccumulator) -> f32 {
-        let hidden = self.forward_shared(acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        // Value MLP: EMBED_DIM → MLP_HIDDEN (ReLU) → 1
-        let mut h = self.value_mlp_b1;
-        for i in 0..EMBED_DIM {
-            for j in 0..MLP_HIDDEN {
-                h[j] += expr_embed[i] * self.value_mlp_w1[i][j];
-            }
-        }
-        for j in 0..MLP_HIDDEN {
-            h[j] = h[j].max(0.0); // ReLU
-        }
-
-        let mut cost = self.value_mlp_b2;
-        for j in 0..MLP_HIDDEN {
-            cost += h[j] * self.value_mlp_w2[j];
-        }
-        cost
-    }
-
-    /// Predict cost with pre-computed accumulator (for MCTS).
-    #[must_use]
-    pub fn predict_cost_from_features(&self, acc: &EdgeAccumulator) -> f32 {
-        let hidden = self.forward_shared(acc);
-        let expr_embed = self.compute_expr_embed(&hidden);
-
-        // Value MLP: EMBED_DIM → MLP_HIDDEN (ReLU) → 1
-        let mut h = self.value_mlp_b1;
-        for i in 0..EMBED_DIM {
-            for j in 0..MLP_HIDDEN {
-                h[j] += expr_embed[i] * self.value_mlp_w1[i][j];
-            }
-        }
-        for j in 0..MLP_HIDDEN {
-            h[j] = h[j].max(0.0); // ReLU
-        }
-
-        let mut cost = self.value_mlp_b2;
-        for j in 0..MLP_HIDDEN {
-            cost += h[j] * self.value_mlp_w2[j];
-        }
-        cost
-    }
-
     /// Get policy logits from accumulator (for MCTS prior).
     ///
     /// Returns scores for all rules. Use softmax to get probabilities.
@@ -3394,28 +3309,6 @@ impl ExprNnue {
 
         d_expr_embed
     }
-
-    /// Backprop through expr projection (optional, for fine-tuning).
-    ///
-    /// Updates expr_proj weights. Backbone (w1, b1) remains frozen.
-    #[allow(dead_code)]
-    fn backprop_expr_proj(
-        &mut self,
-        d_expr_embed: &[f32; EMBED_DIM],
-        hidden: &[f32; HIDDEN_DIM],
-        lr: f32,
-    ) {
-        // d_expr_embed → expr_proj_w, expr_proj_b
-        for j in 0..HIDDEN_DIM {
-            for k in 0..EMBED_DIM {
-                self.expr_proj_w[j][k] -= lr * hidden[j] * d_expr_embed[k];
-            }
-        }
-
-        for k in 0..EMBED_DIM {
-            self.expr_proj_b[k] -= lr * d_expr_embed[k];
-        }
-    }
 }
 
 /// Dot product of two arrays.
@@ -3472,7 +3365,7 @@ mod tests {
     use alloc::sync::Arc;
 
     #[test]
-    fn test_param_count() {
+    fn verify_param_count() {
         // Verify parameter count is reasonable and finite
         let count = ExprNnue::param_count();
         assert!(count > 0, "Should have parameters");
@@ -3488,7 +3381,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_consolidated_param_count() {
+    fn consolidated_param_count() {
         // Param count should include backbone + all unified heads
         let count = ExprNnue::param_count();
         // Backbone: embeddings + w1 + b1 = ~9,728
@@ -3506,7 +3399,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_rule_features_initialization() {
+    fn rule_features_initialization() {
         let mut rule_features = RuleFeatures::new();
 
         // All features should be zero initially
@@ -3527,7 +3420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_rule_deterministic() {
+    fn encode_rule_deterministic() {
         let net = ExprNnue::new_random(42);
         let features = [0.25, 0.3, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0];
 
@@ -3554,7 +3447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_all_rules() {
+    fn verify_encode_all_rules() {
         let net = ExprNnue::new_random(42);
         let mut rule_features = RuleFeatures::new();
 
@@ -3597,7 +3490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bilinear_score_computation() {
+    fn bilinear_score_computation() {
         let net = ExprNnue::new_random(42);
 
         // Create test vectors
@@ -3628,7 +3521,7 @@ mod tests {
     }
 
     #[test]
-    fn test_randomize_mask_only() {
+    fn verify_randomize_mask_only() {
         let mut net = ExprNnue::new();
 
         // Set some backbone values that should be preserved
@@ -3683,7 +3576,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_complex_pe_roundtrip() {
+    fn complex_pe_roundtrip() {
         // add_edge + remove_edge should return the accumulator to zero.
         let emb = OpEmbeddings::new_random(42);
         let mut acc = EdgeAccumulator::new();
@@ -3718,7 +3611,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_graph_acc_normalize_unit_norm_per_section() {
+    fn graph_acc_normalize_unit_norm_per_section() {
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
         // Build a non-trivial accumulator: several edges
@@ -3756,7 +3649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_acc_normalize_scalars_preserved() {
+    fn graph_acc_normalize_scalars_preserved() {
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
         gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
@@ -3785,7 +3678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_acc_normalize_zero_is_safe() {
+    fn graph_acc_normalize_zero_is_safe() {
         // A fresh (zero) accumulator should normalize without NaN/Inf.
         let gacc = GraphAccumulator::new();
         let normed = gacc.normalized();
@@ -3799,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_acc_normalize_in_place_matches_normalized() {
+    fn graph_acc_normalize_in_place_matches_normalized() {
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
         gacc.add_edge(&emb, OpKind::Add, OpKind::Mul);
@@ -3821,7 +3714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_acc_normalize_scale_invariance() {
+    fn graph_acc_normalize_scale_invariance() {
         // Doubling all edges (adding each edge twice) should yield the same
         // normalized vector, proving scale invariance.
         let emb = OpEmbeddings::new_random(42);
@@ -3850,7 +3743,7 @@ mod tests {
     }
 
     #[test]
-    fn test_graph_acc_normalize_idempotent() {
+    fn graph_acc_normalize_idempotent() {
         // Normalizing twice should produce the same result.
         let emb = OpEmbeddings::new_random(42);
         let mut gacc = GraphAccumulator::new();
@@ -3875,7 +3768,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_graph_acc_remove_leaf_saturates_at_zero() {
+    fn graph_acc_remove_leaf_saturates_at_zero() {
         let mut acc = GraphAccumulator::new();
         acc.remove_leaf();
         assert_eq!(acc.node_count, 0, "node_count must not underflow");

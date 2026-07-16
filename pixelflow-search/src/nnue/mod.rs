@@ -6,13 +6,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-#![allow(dead_code)] // Prototype code
 #![allow(clippy::only_used_in_recursion)]
 
 extern crate alloc;
 
 pub mod factored;
-pub mod window;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -27,9 +25,6 @@ pub use factored::ExprNnue;
 
 /// Re-export key types from factored module.
 pub use factored::{EdgeAccumulator, GraphAccumulator, OpEmbeddings};
-
-/// Re-export InstructionWindow for sliding-window scheduling.
-pub use window::InstructionWindow;
 
 /// Re-export unified mask architecture constants and types.
 pub use factored::{
@@ -265,6 +260,11 @@ pub fn pattern_match_arena(
                 ExprNode::Param(j) if i == j => {}
                 _ => return None,
             },
+            // Buffer must match the same slot.
+            ExprNode::Buffer(b) => match arena.node(e_id) {
+                ExprNode::Buffer(c) if b == c => {}
+                _ => return None,
+            },
             // Structural match: op must match, push children onto the stack.
             ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
                 ExprNode::Unary(e_op, e_a) if e_op == t_op => {
@@ -356,6 +356,10 @@ pub fn substitute_template_arena(
             }
             ExprNode::Const(c) => target_arena.push_const(c),
             ExprNode::Param(i) => target_arena.push_param(i),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) in a rewrite template — memory ops are not rewritable yet",
+                b.0
+            ),
             ExprNode::Unary(op, t_a) => {
                 let a = ExprId(remap[t_a.0 as usize]);
                 target_arena.push_unary(op, a)
@@ -1087,6 +1091,7 @@ impl BwdGenerator {
             ExprNode::Var(v) => ExprNode::Var(*v),
             ExprNode::Const(c) => ExprNode::Const(*c),
             ExprNode::Param(p) => ExprNode::Param(*p),
+            ExprNode::Buffer(b) => ExprNode::Buffer(*b),
             ExprNode::Unary(op, a) => ExprNode::Unary(*op, remap[a.0 as usize]),
             ExprNode::Binary(op, a, b) => {
                 ExprNode::Binary(*op, remap[a.0 as usize], remap[b.0 as usize])
@@ -1129,6 +1134,7 @@ impl BwdGenerator {
             ExprNode::Var(v) => arena.push_var(*v),
             ExprNode::Const(c) => arena.push_const(*c),
             ExprNode::Param(p) => arena.push_param(*p),
+            ExprNode::Buffer(b) => arena.push_buffer(*b),
             ExprNode::Unary(op, a) => arena.push_unary(*op, *a),
             ExprNode::Binary(op, a, b) => arena.push_binary(*op, *a, *b),
             ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, *a, *b, *c),
@@ -1151,7 +1157,7 @@ mod tests {
     use libm::fabsf;
 
     #[test]
-    fn test_op_type_roundtrip() {
+    fn op_type_roundtrip() {
         for i in 0..OpKind::COUNT {
             let op = OpKind::from_index(i).unwrap();
             assert_eq!(op.index(), i);
@@ -1167,7 +1173,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_bwd_generator_produces_valid_pairs() {
+    fn bwd_generator_produces_valid_pairs() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();
@@ -1189,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_has_fused_ops() {
+    fn bwd_generator_has_fused_ops() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig {
@@ -1219,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bwd_generator_with_templates() {
+    fn bwd_generator_with_templates() {
         use crate::egraph::collect_rule_templates;
         let templates = collect_rule_templates();
         let config = BwdGenConfig::default();

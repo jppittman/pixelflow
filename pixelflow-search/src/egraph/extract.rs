@@ -20,9 +20,9 @@ use alloc::vec::Vec;
 ///
 /// - **Pass 1 (Bootstrap)**: extract shallowest tree (minimum AST node count per
 ///   e-class). This is fast and gives a reasonable starting point.
-/// - **Passes 2-3 (Refine)**: for each active e-class, try alternative nodes
+/// - **Passes 2-10 (Refine)**: for each active e-class, try alternative nodes
 ///   using O(Δ) accumulator updates. Accept if strictly lower cost.
-///   Repeat until fixpoint or `MAX_PASSES` (3) reached.
+///   Repeat until fixpoint or `MAX_PASSES` (10) reached.
 pub struct IncrementalExtractor<'a> {
     nnue: &'a ExprNnue,
     top_k: usize,
@@ -54,28 +54,7 @@ impl<'a> IncrementalExtractor<'a> {
         // NNUE extraction head certifies as cheaper.
         let num_classes = egraph.num_classes();
         let mut choices: Vec<Option<usize>> = alloc::vec![None; num_classes];
-        // Index 0 in each e-class is the original node (first added).
-        // Only set choices for classes reachable from root.
-        {
-            let mut stack = alloc::vec![root_class];
-            let mut visited = alloc::vec![false; num_classes];
-            while let Some(class) = stack.pop() {
-                let canonical = egraph.find(class);
-                let idx = canonical.0 as usize;
-                if idx >= num_classes || visited[idx] {
-                    continue;
-                }
-                visited[idx] = true;
-                choices[idx] = Some(0); // Original node
-                if let Some(node) = egraph.nodes(canonical).first() {
-                    if let ENode::Op { children, .. } = node {
-                        for &child in children {
-                            stack.push(child);
-                        }
-                    }
-                }
-            }
-        }
+        backfill_reachable_defaults(egraph, root_class, &mut choices);
 
         // Run variance analysis once — O(n) over e-graph, provides
         // per-e-class coordinate dependency info to the extraction head.
@@ -113,7 +92,14 @@ impl<'a> IncrementalExtractor<'a> {
                     continue;
                 }
 
-                let current_node_idx = choices[canonical.0 as usize].unwrap_or(0);
+                let current_node_idx = choices[canonical.0 as usize].unwrap_or_else(|| {
+                    panic!(
+                        "extract_choices_only: e-class {} is active (reachable from root) \
+                         but has no recorded choice — backfill_reachable_defaults should have \
+                         populated every class returned by get_active_classes",
+                        canonical.0
+                    )
+                });
                 let candidates_to_try = nodes.len().min(self.top_k);
 
                 // Best-improvement: evaluate ALL candidates, pick the cheapest.
@@ -167,16 +153,18 @@ impl<'a> IncrementalExtractor<'a> {
 
                     // The newly-chosen node may have children in e-classes
                     // that weren't reachable before (saturation merges can
-                    // introduce new children). Ensure they have a choice so
-                    // downstream codegen doesn't hit a missing entry.
+                    // introduce new children). Backfill the ENTIRE newly
+                    // reachable subtree (not just direct children) so the
+                    // invariant "every class in `active` has Some(choice)"
+                    // actually holds — a shallow, direct-children-only
+                    // backfill left grandchildren `None`, which callers
+                    // like `get_active_classes` and the refinement loop
+                    // below were then silently defaulting to node 0 for,
+                    // masking a real gap instead of restoring it.
                     let nodes = egraph.nodes(canonical);
                     if let Some(ENode::Op { children, .. }) = nodes.get(idx) {
                         for &child in children {
-                            let cc = egraph.find(child);
-                            let ci = cc.0 as usize;
-                            if ci < choices.len() && choices[ci].is_none() {
-                                choices[ci] = Some(0);
-                            }
+                            backfill_reachable_defaults(egraph, child, &mut choices);
                         }
                     }
                 }
@@ -188,84 +176,6 @@ impl<'a> IncrementalExtractor<'a> {
         }
 
         (current_cost, choices)
-    }
-
-    /// Pass 1: Bottom-up DP choosing the node with fewest total AST nodes.
-    fn extract_shallowest(&self, egraph: &EGraph, root: EClassId) -> Vec<Option<usize>> {
-        use alloc::collections::BTreeSet;
-
-        const CYCLE_COUNT: usize = 1_000_000;
-
-        let num_classes = egraph.num_classes();
-        let mut best_count: Vec<Option<usize>> = alloc::vec![None; num_classes];
-        let mut best_node: Vec<Option<usize>> = alloc::vec![None; num_classes];
-
-        let mut stack: Vec<(EClassId, bool)> = vec![(root, false)];
-        let mut on_stack: BTreeSet<u32> = BTreeSet::new();
-
-        while let Some((class, children_done)) = stack.pop() {
-            let canonical = egraph.find(class);
-
-            if best_count[canonical.0 as usize].is_some() {
-                continue;
-            }
-
-            if !children_done {
-                if !on_stack.insert(canonical.0) {
-                    continue;
-                }
-                stack.push((canonical, true));
-
-                for node in egraph.nodes(canonical) {
-                    if let ENode::Op { children, .. } = node {
-                        for &child in children {
-                            let child_can = egraph.find(child);
-                            if best_count[child_can.0 as usize].is_none() {
-                                stack.push((child, false));
-                            }
-                        }
-                    }
-                }
-            } else {
-                on_stack.remove(&canonical.0);
-
-                let nodes = egraph.nodes(canonical);
-                let mut min_count = usize::MAX;
-                let mut min_idx = 0;
-
-                for (idx, node) in nodes.iter().enumerate() {
-                    let count = match node {
-                        ENode::Var(_) | ENode::Const(_) => 1,
-                        ENode::Op { children, .. } => {
-                            if children.iter().any(|&c| egraph.find(c) == canonical) {
-                                CYCLE_COUNT
-                            } else {
-                                let child_sum: usize = children
-                                    .iter()
-                                    .map(|&c| {
-                                        let cc = egraph.find(c);
-                                        best_count[cc.0 as usize].unwrap_or(CYCLE_COUNT)
-                                    })
-                                    .sum();
-                                1usize.saturating_add(child_sum)
-                            }
-                        }
-                    };
-
-                    if count < min_count {
-                        min_count = count;
-                        min_idx = idx;
-                    }
-                }
-
-                best_count[canonical.0 as usize] = Some(min_count);
-                best_node[canonical.0 as usize] = Some(min_idx);
-            }
-        }
-
-        break_choice_cycles(egraph, root, &mut best_node);
-
-        best_node
     }
 
     /// Walk the current best tree and collect active (reachable) e-class IDs.
@@ -289,7 +199,14 @@ impl<'a> IncrementalExtractor<'a> {
 
             active.push(canonical);
 
-            let node_idx = choices[canonical.0 as usize].unwrap_or(0);
+            let node_idx = choices[canonical.0 as usize].unwrap_or_else(|| {
+                panic!(
+                    "get_active_classes: e-class {} reachable from root has no recorded \
+                     choice — extract_choices_only must call backfill_reachable_defaults \
+                     transitively before invoking get_active_classes",
+                    canonical.0
+                )
+            });
             let nodes = egraph.nodes(canonical);
             if node_idx < nodes.len() {
                 if let ENode::Op { children, .. } = &nodes[node_idx] {
@@ -301,6 +218,44 @@ impl<'a> IncrementalExtractor<'a> {
         }
 
         active
+    }
+}
+
+/// Transitively fill in `Some(0)` (the original/first node) for every
+/// e-class reachable from `start` that doesn't yet have a recorded choice.
+///
+/// This restores the invariant relied on throughout `extract_choices_only`
+/// and its helpers (`get_active_classes`, the refinement loop, and
+/// `choices_to_arena`): every e-class reachable from the root via the
+/// *currently chosen* nodes has `Some` entry in `choices`. Saturation merges
+/// and NNUE-guided swaps can both introduce children that were not part of
+/// the original bootstrap walk; if those children are left `None`, callers
+/// fall back to `unwrap_or(0)`, which silently (and possibly incorrectly,
+/// since node 0 may not be the reachable/consistent variant) treats an
+/// unrecorded choice as if it were recorded. Making the backfill transitive
+/// here means that fallback becomes unreachable in practice, and any future
+/// gap is a real bug caught loudly rather than papered over downstream.
+///
+/// Already-visited classes (`choices[idx].is_some()`) stop the walk — this
+/// keeps the traversal to genuinely new subtrees.
+fn backfill_reachable_defaults(egraph: &EGraph, start: EClassId, choices: &mut [Option<usize>]) {
+    let num_classes = choices.len();
+    let mut stack = alloc::vec![start];
+
+    while let Some(class) = stack.pop() {
+        let canonical = egraph.find(class);
+        let idx = canonical.0 as usize;
+        if idx >= num_classes || choices[idx].is_some() {
+            continue;
+        }
+        choices[idx] = Some(0); // Original/first node in the e-class.
+        if let Some(node) = egraph.nodes(canonical).first() {
+            if let ENode::Op { children, .. } = node {
+                for &child in children {
+                    stack.push(child);
+                }
+            }
+        }
     }
 }
 
@@ -813,7 +768,22 @@ pub fn choices_to_arena(
                     continue;
                 }
 
-                let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or(0);
+                // No recorded choice for a reachable e-class means the extractor
+                // that produced `choices` violated the invariant that every class
+                // reachable from `root` (via chosen nodes) has an entry — e.g. a
+                // saturation-introduced child that wasn't transitively backfilled.
+                // Silently materialising node 0 here would paper over that bug by
+                // emitting a node that may not even be the reachable/consistent
+                // variant. Panic loudly instead so the extractor bug gets fixed
+                // at the source rather than surfacing as a subtly wrong kernel.
+                let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or_else(|| {
+                    panic!(
+                        "choices_to_arena: e-class {} is reachable from root {} but has \
+                         no recorded extraction choice — the extractor that produced \
+                         `choices` must guarantee every reachable e-class has Some(idx)",
+                        idx, root.0
+                    )
+                });
 
                 let nodes = egraph.nodes(canonical);
                 assert!(
@@ -1187,7 +1157,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_simple() {
+    fn extract_simple() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
 
@@ -1200,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_with_ops() {
+    fn extract_with_ops() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -1216,12 +1186,58 @@ mod tests {
         assert_eq!(root.0, 2);
     }
 
+    #[test]
+    fn extract_latency_prior_picks_cheaper_equivalent_form() {
+        // x + x and x * 2 are equivalent, but under the latency-prior cost
+        // model Add (4 cycles) is cheaper than Mul (5 cycles), so once the
+        // two forms are unioned into one e-class, extraction must pick the
+        // Add form.
+        //
+        // This is the extraction-side counterpart to the existing
+        // NNUE latency-prior tests: it exercises `CostModel::latency_prior`
+        // (the static cost table), not the neural model.
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let two = egraph.add(ENode::constant(2.0));
+
+        let x_plus_x = egraph.add(ENode::Op {
+            op: &super::super::ops::Add,
+            children: alloc::vec![x, x],
+        });
+        let x_times_2 = egraph.add(ENode::Op {
+            op: &super::super::ops::Mul,
+            children: alloc::vec![x, two],
+        });
+
+        egraph.union(x_plus_x, x_times_2);
+
+        let costs = CostModel::latency_prior();
+        assert!(
+            costs.cost(pixelflow_ir::OpKind::Add) < costs.cost(pixelflow_ir::OpKind::Mul),
+            "test assumes Add is strictly cheaper than Mul in the latency prior"
+        );
+
+        let (arena, root, cost) = extract(&egraph, egraph.find(x_plus_x), &costs);
+
+        // Cheapest form is `x + x`: Add(4) + Var(0) + Var(0) = 4.
+        assert_eq!(cost, costs.cost(pixelflow_ir::OpKind::Add));
+
+        let root_node = arena.node(root);
+        assert!(
+            matches!(
+                root_node,
+                pixelflow_ir::arena::ExprNode::Binary(pixelflow_ir::OpKind::Add, _, _)
+            ),
+            "extraction with the latency-prior cost model should pick the Add form, got {root_node:?}"
+        );
+    }
+
     // ========================================================================
     // DAG Extraction Tests
     // ========================================================================
 
     #[test]
-    fn test_extract_dag_simple() {
+    fn extract_dag_simple() {
         // X + Y: no sharing
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1242,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_shared_subexpr() {
+    fn extract_dag_shared_subexpr() {
         // X * X: X is used twice
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1261,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_triple_use() {
+    fn extract_dag_triple_use() {
         // sin(X) * sin(X) + sin(X): sin(X) used 3 times
         // We simulate this structure without actual sin
         let mut egraph = EGraph::new();
@@ -1296,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dag_nested_sharing() {
+    fn extract_dag_nested_sharing() {
         // (X + Y) * (X + Y): (X + Y) is shared
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1323,7 +1339,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_compute_ref_counts_no_sharing() {
+    fn compute_ref_counts_no_sharing() {
         // X + Y: no sharing
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1358,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_ref_counts_shared() {
+    fn compute_ref_counts_shared() {
         // X * X: X is used twice
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1382,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_ref_counts_triple_use() {
+    fn compute_ref_counts_triple_use() {
         // sqrt(X) * sqrt(X) + sqrt(X): sqrt(X) referenced 3 times
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
@@ -1420,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dag_accumulator_handles_shared_subexpressions() {
+    fn dag_accumulator_handles_shared_subexpressions() {
         use crate::nnue::{EdgeAccumulator, ExprNnue};
 
         // sin(X) * sin(X): tree has 2x sin edges, DAG has 1x sin + 1x var_ref
@@ -1466,7 +1482,7 @@ mod tests {
 
     /// X + Y should produce an arena with exactly 3 nodes: Var(0), Var(1), Add.
     #[test]
-    fn test_choices_to_arena_simple() {
+    fn choices_to_arena_simple() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -1491,7 +1507,7 @@ mod tests {
     /// X * X should produce an arena with exactly 2 nodes: Var(0) and Mul.
     /// The shared Var(0) e-class must reuse one ExprId rather than being duplicated.
     #[test]
-    fn test_choices_to_arena_shared() {
+    fn choices_to_arena_shared() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let mul = egraph.add(ENode::Op {
@@ -1516,7 +1532,7 @@ mod tests {
 
     /// Direct extraction and explicit `choices_to_arena` should agree for tree-shaped inputs.
     #[test]
-    fn test_extract_matches_choices_to_arena() {
+    fn extract_matches_choices_to_arena() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));

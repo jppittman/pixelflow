@@ -16,13 +16,15 @@
 //! Mathematical rewrite rules are now in the [`crate::math`] module.
 
 pub mod codegen;
-mod cost;
+pub(crate) mod cost;
 pub mod deps;
 pub mod derivative;
 pub(crate) mod extract;
 mod graph;
+mod labeler;
 mod node;
 pub mod ops;
+pub mod provenance;
 pub mod rewrite;
 pub mod saturate;
 
@@ -35,8 +37,13 @@ pub use extract::{
     compute_ref_counts, extract_dag, extract_neural_to_arena,
 };
 pub use graph::{ApplyResult, EGraph, EGraphBatch, RewriteTarget};
+pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
 pub use node::{EClassId, ENode};
 pub use ops::Op;
+pub use provenance::{
+    ApplicationId, ApplicationRecord, ENodeId, Origin, Provenance, UnionEvent,
+    derivation_ancestors, format_derivation_trace,
+};
 pub use rewrite::{Rewrite, RewriteAction};
 pub use saturate::{SaturationResult, achievable_cost_within_budget, saturate_with_budget};
 

@@ -486,6 +486,137 @@ pub fn emit_fmadd213(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) {
     vfmadd213ps(code, dst.0, s1.0, s2.0);
 }
 
+// =============================================================================
+// Bound-memory gather (RawGather lowering target)
+//
+// `vgatherdps zmm{k1}, [base_gpr + zmm_index*4]` reads one f32 per lane from a
+// bound buffer. The lowered index is a float (`clamp(floor(x))·1 + …`), so it is
+// first truncated to signed int32 lanes with `vcvttps2dq`. The writemask k1 must
+// be all-ones going in (the instruction clears completed lanes), so it is reset
+// before every gather.
+// =============================================================================
+
+/// `vcvttps2dq zmmDST, zmmSRC` — truncate packed f32 → signed int32 lanes
+/// (EVEX.512.F3.0F.W0 5B /r). The lowered gather index is an exact non-negative
+/// integer in float form, so truncation is lossless and matches the reference
+/// interpreter's `floorf(index) as usize`.
+pub fn emit_cvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+    evex_rrr(
+        code,
+        Map::M0F,
+        Pp::F3,
+        false,
+        0x5B,
+        dst.0,
+        UNUSED_VVVV,
+        src.0,
+    );
+}
+
+/// Set the gather writemask `k1` to all-ones (`mov eax, 0xFFFF; kmovw k1, eax`).
+///
+/// A gather requires a non-zero writemask and *clears* the bits it completes, so
+/// this must run before each gather. Clobbers `eax` (caller-saved scratch).
+pub fn emit_set_gather_mask(code: &mut Vec<u8>) {
+    // mov eax, 0x0000FFFF
+    code.extend_from_slice(&[0xB8, 0xFF, 0xFF, 0x00, 0x00]);
+    // kmovw k1, eax  (VEX.L0.0F.W0 92 /r ; ModRM 11 001 000)
+    code.extend_from_slice(&[0xC5, 0xF8, 0x92, 0xC8]);
+}
+
+/// `mov dstGPR, [ctxGPR + disp32]` (REX.W 8B /r) — load a 64-bit buffer base
+/// pointer out of the context struct. `dst_gpr`/`ctx_gpr` are raw GP register
+/// numbers (e.g. `rax`=0, `rdi`=7). Only low-8 GPRs are supported (no REX.B),
+/// which is all the emitter needs (`rax` dest, `rdi` context).
+pub fn emit_load_ptr_from_ctx(code: &mut Vec<u8>, dst_gpr: u8, ctx_gpr: u8, disp: i32) {
+    debug_assert!(
+        dst_gpr < 8 && ctx_gpr < 8,
+        "emit_load_ptr_from_ctx: GPR8 only"
+    );
+    // REX.W ; 8B ; mod=10 reg=dst r/m=ctx ; disp32
+    code.push(0x48);
+    code.push(0x8B);
+    code.push(0x80 | ((dst_gpr & 7) << 3) | (ctx_gpr & 7));
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+/// `vmovups zmmDST, [baseGPR]` — load a 512-bit vector from a GP-register base
+/// (EVEX.512.0F.W0 10 /r, mod=00). `base_gpr` must not be rsp/rbp/r12/r13 (they
+/// force a SIB/disp form); the collapse driver uses rsi/rdx.
+pub fn emit_load_zmm_base(code: &mut Vec<u8>, dst: Reg, base_gpr: u8) {
+    evex_mem_base(code, 0x10, dst.0, base_gpr);
+}
+
+/// `vmovups [baseGPR], zmmSRC` — store a 512-bit vector to a GP-register base
+/// (EVEX.512.0F.W0 11 /r, mod=00). Same base-register restriction as
+/// [`emit_load_zmm_base`].
+pub fn emit_store_zmm_base(code: &mut Vec<u8>, src: Reg, base_gpr: u8) {
+    evex_mem_base(code, 0x11, src.0, base_gpr);
+}
+
+/// EVEX `vmovups` between a `zmm` and `[base_gpr]` (no index, no displacement).
+fn evex_mem_base(code: &mut Vec<u8>, opcode: u8, reg: u8, base: u8) {
+    debug_assert!(
+        base != 4 && base != 5 && base != 12 && base != 13,
+        "evex_mem_base: base must not be rsp/rbp/r12/r13 (mod=00 direct form)"
+    );
+    let r = ((reg >> 3) & 1) ^ 1;
+    let rp = ((reg >> 4) & 1) ^ 1;
+    let b = ((base >> 3) & 1) ^ 1;
+    let p0 = (r << 7) | (1 << 6) | (b << 5) | (rp << 4) | (Map::M0F as u8);
+    let p1 = (0x0F << 3) | (1 << 2) | (Pp::None as u8);
+    let p2 = (0b10 << 5) | (1 << 3);
+    code.push(0x62);
+    code.push(p0);
+    code.push(p1);
+    code.push(p2);
+    code.push(opcode);
+    // ModRM: mod=00, reg=reg[2:0], r/m=base[2:0] (direct memory, no SIB).
+    code.push(((reg & 7) << 3) | (base & 7));
+}
+
+/// `vgatherdps zmmDST{k1}, [baseGPR + zmmINDEX*4]`
+/// (EVEX.512.66.0F38.W0 92 /vsib, mask = k1, scale = 4).
+///
+/// Gathers one f32 per lane at `base + index_lane*4`. The caller must ensure
+/// `k1` is all-ones ([`emit_set_gather_mask`]), the index lanes are int32
+/// ([`emit_cvttps2dq`]), and `dst != index` (the instruction forbids the
+/// destination and index vectors aliasing). `base_gpr` must not be rbp/r13
+/// (mod=00 SIB base restriction) — the emitter uses `rax`.
+pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
+    let d = dst.0;
+    let idx = index.0;
+    let base = base_gpr;
+    debug_assert!(d != idx, "vgatherdps: dst and index must differ");
+    debug_assert!(
+        base != 5 && base != 13,
+        "vgatherdps: base must not be rbp/r13"
+    );
+
+    let r = ((d >> 3) & 1) ^ 1; // dst bit3  -> EVEX.R
+    let rp = ((d >> 4) & 1) ^ 1; // dst bit4  -> EVEX.R'
+    let x = ((idx >> 3) & 1) ^ 1; // index bit3 -> EVEX.X
+    let b = ((base >> 3) & 1) ^ 1; // base bit3  -> EVEX.B
+    let vp = ((idx >> 4) & 1) ^ 1; // index bit4 -> EVEX.V'
+    let vvvv = 0x0F; // unused -> encoded 1111
+
+    let p0 = (r << 7) | (x << 6) | (b << 5) | (rp << 4) | (Map::M0F38 as u8);
+    // W=0 (bit7 clear): gather uses signed dword indices.
+    let p1 = (vvvv << 3) | (1 << 2) | (Pp::P66 as u8);
+    // z=0, L'L=10 (512-bit), b=0, V' = index bit4, aaa=001 (k1).
+    let p2 = (0b10 << 5) | (vp << 3) | 0b001;
+
+    code.push(0x62);
+    code.push(p0);
+    code.push(p1);
+    code.push(p2);
+    code.push(0x92);
+    // ModRM: mod=00, reg=dst[2:0], r/m=100 (SIB follows).
+    code.push(((d & 7) << 3) | 0b100);
+    // SIB: scale=10 (*4), index=idx[2:0], base=base[2:0].
+    code.push((0b10 << 6) | ((idx & 7) << 3) | (base & 7));
+}
+
 #[cfg(test)]
 mod tests {
     //! Hardware validation. The byte-level EVEX encodings for 2-operand forms,
@@ -612,6 +743,42 @@ mod tests {
             emit_fmadd_c_in_dst(&mut c, Reg(5), X, Y);
             emit_mov(&mut c, X, Reg(5));
             check(run(&c, xs, ys, zs), |i| xs[i] * ys[i] + zs[i], "fma231");
+        }
+
+        #[test]
+        fn gather_from_buffer() {
+            // JIT a function: fn(*const f32 base [rdi], __m512 idx_float [zmm0]) -> __m512
+            // that truncates the float indices, sets the mask, and gathers
+            // base[idx] per lane. Validates the VSIB vgatherdps bytes on hardware.
+            type G = unsafe extern "C" fn(*const f32, __m512) -> __m512;
+
+            let mut c = Vec::new();
+            emit_cvttps2dq(&mut c, Reg(13), Reg(0)); // zmm13 = (i32) idx_float
+            emit_set_gather_mask(&mut c); // k1 = 0xFFFF
+            emit_gather(&mut c, Reg(14), 7, Reg(13)); // zmm14{k1} = [rdi + zmm13*4]
+            emit_mov(&mut c, Reg(0), Reg(14)); // return in zmm0
+            emit_ret(&mut c);
+
+            let buf: Vec<f32> = (0..64).map(|i| (i as f32) * 1.5 + 0.25).collect();
+            // Distinct per-lane indices, including repeats and the ends.
+            let idx: [f32; 16] = [
+                0.0, 63.0, 1.0, 2.0, 10.0, 10.0, 5.0, 32.0, 7.0, 8.0, 63.0, 0.0, 20.0, 21.0, 40.0,
+                41.0,
+            ];
+
+            let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
+            let out = unsafe {
+                let f: G = exec.as_fn();
+                let r = f(buf.as_ptr(), _mm512_loadu_ps(idx.as_ptr()));
+                let mut out = [0.0f32; 16];
+                _mm512_storeu_ps(out.as_mut_ptr(), r);
+                out
+            };
+
+            for i in 0..16 {
+                let want = buf[idx[i] as usize];
+                assert_eq!(out[i], want, "gather lane {i}: idx {}", idx[i]);
+            }
         }
 
         #[test]

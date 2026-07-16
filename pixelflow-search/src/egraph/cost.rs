@@ -23,6 +23,82 @@ use super::node::ENode;
 use pixelflow_ir::OpKind;
 
 // ============================================================================
+// Latency Prior — single source of truth
+// ============================================================================
+
+/// Handcrafted per-op cycle-latency estimates, indexed by `OpKind::index()`.
+///
+/// This is the ONE place these numbers are allowed to live. Both the static
+/// [`CostModel`] (via [`CostModel::latency_prior`]) and the NNUE's embedding
+/// initialization (`nnue::factored::OpEmbeddings::init_with_latency_prior`)
+/// derive their costs from this table so the two representations cannot
+/// drift apart. If you're tempted to hand-tune a number in one place,
+/// change it here instead.
+///
+/// Values are approximate cycle counts on typical x86_64/AArch64 SIMD
+/// hardware; refine as real measurements come in (see `calibrate_costs`).
+pub const LATENCY_PRIOR_CYCLES: [usize; OpKind::COUNT] = [
+    0,  // Var - free
+    0,  // Const - free
+    4,  // Add
+    4,  // Sub
+    5,  // Mul
+    15, // Div
+    1,  // Neg
+    15, // Sqrt
+    5,  // Rsqrt - fast approximation
+    1,  // Abs
+    4,  // Min
+    4,  // Max
+    5,  // MulAdd - fused
+    10, // Recip
+    4,  // Floor
+    4,  // Ceil
+    4,  // Round
+    4,  // Fract
+    10, // Sin
+    10, // Cos
+    10, // Tan
+    10, // Asin
+    10, // Acos
+    10, // Atan
+    10, // Exp
+    10, // Exp2
+    10, // Ln
+    10, // Log2
+    10, // Log10
+    10, // Atan2
+    12, // Pow
+    8,  // Hypot
+    3,  // Lt
+    3,  // Le
+    3,  // Gt
+    3,  // Ge
+    3,  // Eq
+    3,  // Ne
+    4,  // Select
+    6,  // Clamp - 2x compare + select
+    0,  // Tuple - free (structural)
+    // Bit-manip primitives: single cheap integer/convert instructions.
+    1, // TruncToInt - cvttps2dq
+    1, // IntToFloat - cvtdq2ps
+    1, // IAdd - paddd
+    1, // Shl
+    1, // Shr
+    1, // BitAnd
+    1, // BitOr
+    // Dwrt - rewritten away by the e-graph (chain rule); never emitted.
+    // Extraction must never choose a surviving one, so it gets a
+    // prohibitive (but finite, non-saturating) cost here. `node_op_cost`
+    // additionally hard-codes usize::MAX/4 as a belt-and-suspenders guard.
+    1000, // Dwrt
+    0,    // Buffer - leaf, free
+    10,   // Gather - memory read
+    10,   // RawGather - primitive memory read
+    0,    // Reduce - lowered (unrolled) before costing
+];
+
+// ============================================================================
 // Cost Function Trait
 // ============================================================================
 
@@ -86,8 +162,38 @@ impl Default for CostModel {
 }
 
 impl CostModel {
-    /// Create an empty cost model with zero weights.
+    /// Create a cost model seeded with the handcrafted latency-prior cycle
+    /// table ([`LATENCY_PRIOR_CYCLES`]).
+    ///
+    /// This is the default: an all-zero cost model makes every expression
+    /// "free" and extraction degenerates to an arbitrary tie-break, so
+    /// zero-cost is never a useful baseline for real extraction. Use
+    /// [`CostModel::zero`] explicitly if you actually want all-zero costs
+    /// (e.g. to test structural properties independent of cost).
     pub fn new() -> Self {
+        Self::latency_prior()
+    }
+
+    /// Create a cost model from the handcrafted latency-prior cycle table.
+    ///
+    /// Source of truth: [`LATENCY_PRIOR_CYCLES`], shared with
+    /// `nnue::factored::OpEmbeddings::init_with_latency_prior` so the static
+    /// and learned cost models cannot drift apart.
+    pub fn latency_prior() -> Self {
+        Self {
+            costs: LATENCY_PRIOR_CYCLES,
+            depth_threshold: 1024, // Effectively disabled
+            depth_penalty: 0,
+        }
+    }
+
+    /// Create an all-zero cost model.
+    ///
+    /// Every expression costs nothing, so extraction can't distinguish
+    /// equivalent forms on cost alone. Only useful for tests that check
+    /// structural extraction behavior (DAG sharing, cycle handling, etc.)
+    /// independent of any particular cost table.
+    pub fn zero() -> Self {
         Self {
             costs: [0usize; OpKind::COUNT],
             depth_threshold: 1024, // Effectively disabled
@@ -156,6 +262,13 @@ impl CostModel {
     }
 
     /// Get cost by operation name (for backward compatibility).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` does not match a known `OpKind`. Silently mapping
+    /// an unrecognized name to `Add`'s cost would let typos and stale
+    /// callers pass through with a wrong-but-plausible number — fail loud
+    /// instead.
     pub fn cost_by_name(&self, name: &str) -> usize {
         // Map name to OpKind
         let op = match name {
@@ -200,7 +313,7 @@ impl CostModel {
             "select" => OpKind::Select,
             "clamp" => OpKind::Clamp,
             "tuple" => OpKind::Tuple,
-            _ => return self.costs[OpKind::Add.index()], // Default for unknown
+            _ => panic!("CostModel::cost_by_name: unknown op name {name:?}"),
         };
         self.costs[op.index()]
     }
@@ -227,66 +340,126 @@ impl CostModel {
     }
 
     /// Load cost model from a TOML file.
+    ///
+    /// Starts from [`CostModel::zero`] (not [`CostModel::latency_prior`]) so
+    /// the returned model reflects exactly what's in the file — mixing in
+    /// the latency prior for keys the file doesn't mention would silently
+    /// blend two cost sources together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file can't be read, or if a `key = value`
+    /// line has a value that fails to parse as `usize`. A malformed line is
+    /// a real misconfiguration; silently skipping it would let a typo'd
+    /// weight file produce a model that looks valid but isn't.
     pub fn load_toml<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let contents = fs::read_to_string(path)?;
-        let mut model = Self::new();
+        let mut model = Self::zero();
 
-        for line in contents.lines() {
+        for (lineno, line) in contents.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim();
-                if let Ok(v) = value.parse::<usize>() {
-                    if key == "depth_threshold" {
-                        model.depth_threshold = v;
-                    } else if key == "depth_penalty" {
-                        model.depth_penalty = v;
-                    } else if let Some(op) = OpKind::from_name(key) {
-                        // O(1) lookup via OpKind::from_name
-                        model.costs[op.index()] = v;
-                    }
-                    // Unknown keys are silently ignored (external data format)
-                }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("cost model TOML line {}: missing '=': {line:?}", lineno + 1),
+                ));
+            };
+            let key = key.trim();
+            let value = value.trim();
+            let v = value.parse::<usize>().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "cost model TOML line {}: value {value:?} for key {key:?} is not a usize: {e}",
+                        lineno + 1
+                    ),
+                )
+            })?;
+
+            if key == "depth_threshold" {
+                model.depth_threshold = v;
+            } else if key == "depth_penalty" {
+                model.depth_penalty = v;
+            } else if let Some(op) = OpKind::from_name(key) {
+                // O(1) lookup via OpKind::from_name
+                model.costs[op.index()] = v;
+            } else {
+                // Unrecognized op name: this is an external, evolving file
+                // format (older/newer OpKind sets), so we don't hard-fail —
+                // but we don't stay silent either.
+                eprintln!(
+                    "warning: cost model TOML line {}: unknown key {key:?}, ignoring",
+                    lineno + 1
+                );
             }
         }
 
         Ok(model)
     }
 
-    /// Try to load from a standard location, falling back to fully_optimized.
+    /// Try to load from a standard location, falling back to the latency
+    /// prior if none is found.
+    ///
+    /// Each candidate location is tried in order. A location that simply
+    /// doesn't exist is expected (most of these are optional overrides) and
+    /// is skipped quietly; a location that exists but fails to *parse* is a
+    /// real misconfiguration and is reported loudly (`eprintln!`) before
+    /// moving on, so a typo'd cost file never fails silently into a
+    /// different cost model without a trace.
     pub fn load_or_default() -> Self {
-        // Check environment variable first
+        // Check environment variable first. If the user explicitly set
+        // PIXELFLOW_COST_MODEL, a missing/unparsable file is always loud —
+        // they asked for this specific file.
         if let Ok(path) = std::env::var("PIXELFLOW_COST_MODEL") {
-            if let Ok(model) = Self::load_toml(&path) {
-                return model;
+            match Self::load_toml(&path) {
+                Ok(model) => return model,
+                Err(e) => eprintln!(
+                    "warning: PIXELFLOW_COST_MODEL={path:?} failed to load ({e}); falling back"
+                ),
             }
         }
 
-        // Try user config directory
+        // Try user config directory.
         if let Some(home) = std::env::var_os("HOME") {
             let config_path = Path::new(&home).join(".config/pixelflow/cost_model.toml");
-            if let Ok(model) = Self::load_toml(&config_path) {
-                return model;
+            match Self::load_toml(&config_path) {
+                Ok(model) => return model,
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    eprintln!(
+                        "warning: cost model {config_path:?} exists but failed to load ({e}); falling back"
+                    );
+                }
+                Err(_) => {} // not found: expected, this is an optional override
             }
         }
 
-        // Try workspace data directory (for development)
+        // Try workspace data directory (for development).
         let workspace_paths = [
             "pixelflow-ml/data/learned_cost_model.toml",
             "../pixelflow-ml/data/learned_cost_model.toml",
         ];
         for path in workspace_paths {
-            if let Ok(model) = Self::load_toml(path) {
-                return model;
+            match Self::load_toml(path) {
+                Ok(model) => return model,
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    eprintln!(
+                        "warning: cost model {path:?} exists but failed to load ({e}); falling back"
+                    );
+                }
+                Err(_) => {} // not found: expected, this is an optional override
             }
         }
 
-        // Default to empty settings
-        Self::new()
+        // No override found anywhere: use the handcrafted latency prior.
+        // This is a loud, intentional default — NOT the old all-zero
+        // fallback, which made every op "free" and was useless for
+        // extraction. If you need a genuinely all-zero model, use
+        // `CostModel::zero()` explicitly.
+        Self::latency_prior()
     }
 
     // =========================================================================
@@ -294,8 +467,13 @@ impl CostModel {
     // =========================================================================
 
     /// Create from HashMap (for backward compatibility).
+    ///
+    /// Starts from [`CostModel::zero`], not [`CostModel::latency_prior`] —
+    /// same reasoning as [`CostModel::load_toml`]: the caller handed us an
+    /// explicit map, so the result should reflect exactly that map, not a
+    /// blend with the handcrafted prior.
     pub fn from_map(costs: &HashMap<String, usize>) -> Self {
-        let mut model = Self::new();
+        let mut model = Self::zero();
         for (key, &value) in costs {
             if key == "depth_threshold" {
                 model.depth_threshold = value;

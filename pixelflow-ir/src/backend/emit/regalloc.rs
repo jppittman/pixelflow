@@ -465,9 +465,9 @@ pub fn linear_scan(
     for (i, (_, sop)) in schedule.iter().enumerate() {
         let operands: &[ValueId] = match sop {
             super::ScheduledOp::Var(_) | super::ScheduledOp::Const(_) => &[],
-            super::ScheduledOp::Unary(_, a) | super::ScheduledOp::ShiftImm(_, a, _) => {
-                core::slice::from_ref(a)
-            }
+            super::ScheduledOp::Unary(_, a)
+            | super::ScheduledOp::ShiftImm(_, a, _)
+            | super::ScheduledOp::Gather(a, _) => core::slice::from_ref(a),
             super::ScheduledOp::Binary(_, a, b) => {
                 // Can't make a slice from two refs, handle below
                 let lu_a = &mut last_use[a.0 as usize];
@@ -632,7 +632,7 @@ mod tests {
     use alloc::collections::BTreeSet;
 
     #[test]
-    fn test_empty_graph() {
+    fn empty_graph() {
         let graph = InterferenceGraph::new();
         let alloc = color_graph(&graph, 8, 4);
         assert!(alloc.assignment.is_empty());
@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_interference() {
+    fn no_interference() {
         let mut graph = InterferenceGraph::new();
         graph.add_value(ValueId(0));
         graph.add_value(ValueId(1));
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chain_interference() {
+    fn chain_interference() {
         let mut graph = InterferenceGraph::new();
         // Linear chain: 0 -- 1 -- 2
         graph.add_value(ValueId(0));
@@ -678,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clique_needs_more_colors() {
+    fn clique_needs_more_colors() {
         let mut graph = InterferenceGraph::new();
         // Triangle (3-clique): all interfere with all
         for i in 0..3 {
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_precolored() {
+    fn precolored() {
         let mut graph = InterferenceGraph::new();
         graph.precolor(ValueId(0), Reg(0)); // Input register
         graph.add_value(ValueId(1));
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spilling() {
+    fn spilling() {
         let mut graph = InterferenceGraph::new();
         // 4-clique with only 2 registers available
         for i in 0..4 {

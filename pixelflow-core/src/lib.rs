@@ -233,10 +233,7 @@ pub use zst::Zst;
 pub use manifold::Differentiable;
 
 // Lattice types for manifold evaluation over finite domains
-pub use lattice::{
-    DiscreteManifold, FrameLattice, IndexLattice1D, IndexLattice2D, Lattice, LatticeDomain,
-    PointLattice, ReduceOp, ScanlineLattice,
-};
+pub use lattice::{DiscreteManifold, Lattice, ReduceOp};
 
 // ============================================================================
 // Field: The ONLY User-Facing SIMD Type
@@ -2235,7 +2232,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_gather_behavior() {
+    fn gather_behavior() {
         let data = [10.0, 20.0, 30.0, 40.0, 50.0];
         // Indices: 0.0, 1.9 (trunc to 1), 2.1 (trunc to 2), 4.0
         // We expect: data[0], data[1], data[2], data[4]

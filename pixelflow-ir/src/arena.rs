@@ -18,6 +18,27 @@ use crate::kind::OpKind;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ExprId(pub u32);
 
+// ───────────────────────────────────────── Buffers ────────────────────────────
+
+/// Slot index into an [`ExprArena`]'s buffer table. Copy, 2 bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct BufferId(pub u16);
+
+/// Declaration of a bound memory buffer: the static shape of a collapsed
+/// lattice. The extents are part of the IR (like a `Const`) even though the
+/// contents are bound later, at JIT-compile time. Static extents are what
+/// allow the emitter to fold address arithmetic, drop provably in-bounds
+/// clamps, and unroll reduction loops.
+///
+/// Layout is row-major with `stride == width`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BufferDecl {
+    /// X extent (samples per row).
+    pub width: u32,
+    /// Y extent (number of rows).
+    pub height: u32,
+}
+
 // ───────────────────────────────────────── ExprNode ───────────────────────────
 
 /// A single expression node stored in the arena.
@@ -28,6 +49,9 @@ pub enum ExprNode {
     Var(u8),
     Const(f32),
     Param(u8),
+    /// Bound-memory leaf: references a [`BufferDecl`] in the arena's buffer
+    /// table. Read through `Ternary(OpKind::Gather, buffer, x, y)`.
+    Buffer(BufferId),
     Unary(OpKind, ExprId),
     Binary(OpKind, ExprId, ExprId),
     Ternary(OpKind, ExprId, ExprId, ExprId),
@@ -108,6 +132,9 @@ impl ExactSizeIterator for ExprChildren<'_> {}
 pub struct ExprArena {
     nodes: Vec<ExprNode>,
     nary_children: Vec<ExprId>,
+    /// Buffer declarations, indexed by [`BufferId`]. The memory analogue of
+    /// the symbol table: shapes are static IR, contents are bound at JIT time.
+    buffers: Vec<BufferDecl>,
 }
 
 impl Default for ExprArena {
@@ -123,6 +150,7 @@ impl ExprArena {
         Self {
             nodes: Vec::new(),
             nary_children: Vec::new(),
+            buffers: Vec::new(),
         }
     }
 
@@ -132,6 +160,7 @@ impl ExprArena {
         Self {
             nodes: Vec::with_capacity(n),
             nary_children: Vec::new(),
+            buffers: Vec::new(),
         }
     }
 
@@ -139,6 +168,7 @@ impl ExprArena {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.nary_children.clear();
+        self.buffers.clear();
     }
 
     /// Number of nodes in the arena. This is the O(1) node count.
@@ -176,6 +206,95 @@ impl ExprArena {
     /// Push a `Param(i)` node.
     pub fn push_param(&mut self, i: u8) -> ExprId {
         self.push_node(ExprNode::Param(i))
+    }
+
+    /// Declare a buffer slot, returning its [`BufferId`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer table is full (`u16::MAX` slots).
+    pub fn declare_buffer(&mut self, decl: BufferDecl) -> BufferId {
+        assert!(
+            self.buffers.len() < u16::MAX as usize,
+            "declare_buffer: buffer table full ({} slots)",
+            self.buffers.len()
+        );
+        let id = BufferId(self.buffers.len() as u16);
+        self.buffers.push(decl);
+        id
+    }
+
+    /// Push a `Buffer(id)` leaf node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` has not been declared via [`ExprArena::declare_buffer`].
+    pub fn push_buffer(&mut self, id: BufferId) -> ExprId {
+        assert!(
+            (id.0 as usize) < self.buffers.len(),
+            "push_buffer: BufferId({}) not declared (table has {} entries)",
+            id.0,
+            self.buffers.len()
+        );
+        self.push_node(ExprNode::Buffer(id))
+    }
+
+    /// Push a `Gather(buffer, x, y)` read of a declared buffer.
+    ///
+    /// Semantics match `DiscreteManifold::eval`: floor the indices, clamp to
+    /// the declared extents, gather row-major.
+    pub fn push_gather(&mut self, buffer: BufferId, x: ExprId, y: ExprId) -> ExprId {
+        let buf = self.push_buffer(buffer);
+        self.push_ternary(OpKind::Gather, buf, x, y)
+    }
+
+    /// Push a reduction `Nary(Reduce, [Const(combiner), Const(reduce_var),
+    /// Const(extent), body])`.
+    ///
+    /// `combiner` is the monoid op folded with (`Add`/`Mul`/`Min`/`Max`);
+    /// `reduce_var` is the index (4..8) that `body` folds over; `extent` is the
+    /// trip count. Lowered to an unrolled accumulation by `expand_reduce`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `combiner` is not a monoid op or `reduce_var` is outside 4..8.
+    pub fn push_reduce(
+        &mut self,
+        combiner: OpKind,
+        reduce_var: u8,
+        extent: u32,
+        body: ExprId,
+    ) -> ExprId {
+        assert!(
+            combiner.is_monoid(),
+            "push_reduce: {combiner:?} is not a valid reduction combiner"
+        );
+        assert!(
+            (4..8).contains(&reduce_var),
+            "push_reduce: reduce_var {reduce_var} out of range (must be 4..8)"
+        );
+        let c = self.push_const(combiner.index() as f32);
+        let v = self.push_const(reduce_var as f32);
+        let n = self.push_const(extent as f32);
+        self.push_nary(OpKind::Reduce, &[c, v, n, body])
+    }
+
+    /// Get the declaration for a buffer slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is out of bounds.
+    #[inline]
+    #[must_use]
+    pub fn buffer_decl(&self, id: BufferId) -> &BufferDecl {
+        &self.buffers[id.0 as usize]
+    }
+
+    /// All declared buffers, indexed by [`BufferId`].
+    #[inline]
+    #[must_use]
+    pub fn buffers(&self) -> &[BufferDecl] {
+        &self.buffers
     }
 
     /// Push a unary operation node.
@@ -234,11 +353,27 @@ impl ExprArena {
     /// `nodes` is in-bounds, and that `Nary` start/len pairs index validly
     /// into `nary_children`. Violating this will cause panics on access,
     /// not UB.
+    /// The reconstructed arena has an empty buffer table; arenas containing
+    /// `Buffer` nodes must use [`ExprArena::from_raw_with_buffers`].
     #[must_use]
     pub fn from_raw(nodes: Vec<ExprNode>, nary_children: Vec<ExprId>) -> Self {
+        Self::from_raw_with_buffers(nodes, nary_children, Vec::new())
+    }
+
+    /// Reconstruct an arena from raw parts including the buffer table.
+    ///
+    /// Same logical safety contract as [`ExprArena::from_raw`]; additionally,
+    /// every `Buffer(id)` node must index validly into `buffers`.
+    #[must_use]
+    pub fn from_raw_with_buffers(
+        nodes: Vec<ExprNode>,
+        nary_children: Vec<ExprId>,
+        buffers: Vec<BufferDecl>,
+    ) -> Self {
         Self {
             nodes,
             nary_children,
+            buffers,
         }
     }
 
@@ -277,6 +412,7 @@ impl ExprArena {
         match &self.nodes[id.0 as usize] {
             ExprNode::Var(_) => OpKind::Var,
             ExprNode::Const(_) | ExprNode::Param(_) => OpKind::Const,
+            ExprNode::Buffer(_) => OpKind::Buffer,
             ExprNode::Unary(op, _) => *op,
             ExprNode::Binary(op, _, _) => *op,
             ExprNode::Ternary(op, _, _, _) => *op,
@@ -289,7 +425,9 @@ impl ExprArena {
     #[must_use]
     pub fn children(&self, id: ExprId) -> ExprChildren<'_> {
         match &self.nodes[id.0 as usize] {
-            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => ExprChildren::Zero,
+            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) => {
+                ExprChildren::Zero
+            }
             ExprNode::Unary(_, a) => ExprChildren::One(*a),
             ExprNode::Binary(_, a, b) => ExprChildren::Two(*a, *b),
             ExprNode::Ternary(_, a, b, c) => ExprChildren::Three(*a, *b, *c),
@@ -312,7 +450,10 @@ impl ExprArena {
 
         while let Some((id, d)) = stack.pop() {
             match &self.nodes[id.0 as usize] {
-                ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => {
+                ExprNode::Var(_)
+                | ExprNode::Const(_)
+                | ExprNode::Param(_)
+                | ExprNode::Buffer(_) => {
                     max_depth = max_depth.max(d);
                 }
                 ExprNode::Unary(_, a) => {
@@ -352,7 +493,7 @@ impl ExprArena {
         while let Some(id) = stack.pop() {
             match &self.nodes[id.0 as usize] {
                 ExprNode::Var(_) => return true,
-                ExprNode::Const(_) | ExprNode::Param(_) => {}
+                ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) => {}
                 ExprNode::Unary(_, a) => stack.push(*a),
                 ExprNode::Binary(_, a, b) => {
                     stack.push(*a);
@@ -397,7 +538,10 @@ impl ExprArena {
                     stack.push(*a);
                     stack.push(*b);
                 }
-                ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => {}
+                ExprNode::Var(_)
+                | ExprNode::Const(_)
+                | ExprNode::Param(_)
+                | ExprNode::Buffer(_) => {}
                 ExprNode::Unary(_, a) => stack.push(*a),
                 ExprNode::Binary(_, a, b) => {
                     stack.push(*a);
@@ -434,7 +578,10 @@ impl ExprArena {
         while let Some(id) = stack.pop() {
             count += 1;
             match &self.nodes[id.0 as usize] {
-                ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => {}
+                ExprNode::Var(_)
+                | ExprNode::Const(_)
+                | ExprNode::Param(_)
+                | ExprNode::Buffer(_) => {}
                 ExprNode::Unary(_, a) => stack.push(*a),
                 ExprNode::Binary(_, a, b) => {
                     stack.push(*a);
@@ -490,7 +637,10 @@ impl ExprArena {
                     }
                     work.push(Task::Emit(id));
                     match &self.nodes[id.0 as usize] {
-                        ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => {}
+                        ExprNode::Var(_)
+                        | ExprNode::Const(_)
+                        | ExprNode::Param(_)
+                        | ExprNode::Buffer(_) => {}
                         ExprNode::Unary(_, a) => {
                             work.push(Task::Descend(*a));
                         }
@@ -530,6 +680,8 @@ impl ExprArena {
                         }
                         ExprNode::Var(i) => self.push_var(i),
                         ExprNode::Const(v) => self.push_const(v),
+                        // Buffer ids stay valid: the table lives in this arena.
+                        ExprNode::Buffer(b) => self.push_node(ExprNode::Buffer(b)),
                         ExprNode::Unary(op, a) => {
                             let na = id_map[a.0 as usize]
                                 .expect("substitute_params: child not yet mapped for Unary");
@@ -591,6 +743,7 @@ impl ExprArena {
                     ExprNode::Var(i) => write!(f, "Var({})", i)?,
                     ExprNode::Const(v) => write!(f, "Const({})", v)?,
                     ExprNode::Param(i) => write!(f, "Param({})", i)?,
+                    ExprNode::Buffer(b) => write!(f, "Buffer({})", b.0)?,
                     ExprNode::Unary(op, a) => {
                         stack.push(Task::WriteStr(")"));
                         stack.push(Task::Visit(*a));
@@ -675,6 +828,13 @@ impl ExprArena {
                         return false;
                     }
                 }
+                // Buffer slots compare by id AND declared shape, so the
+                // comparison is meaningful across arenas with different tables.
+                (ExprNode::Buffer(sb), ExprNode::Buffer(ob)) => {
+                    if sb != ob || self.buffers[sb.0 as usize] != other.buffers[ob.0 as usize] {
+                        return false;
+                    }
+                }
                 (ExprNode::Unary(s_op, s_a), ExprNode::Unary(o_op, o_a)) => {
                     if s_op != o_op {
                         return false;
@@ -742,7 +902,7 @@ mod tests {
 
     // 1. test_push_and_access
     #[test]
-    fn test_push_and_access() {
+    fn push_and_access() {
         let mut arena = ExprArena::new();
 
         let v = arena.push_var(0);
@@ -775,7 +935,7 @@ mod tests {
 
     // 2. test_node_count
     #[test]
-    fn test_node_count() {
+    fn node_count() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let c1 = arena.push_const(1.0);
@@ -795,7 +955,7 @@ mod tests {
 
     // 3. test_depth
     #[test]
-    fn test_depth() {
+    fn verify_depth() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let v1 = arena.push_var(1);
@@ -807,7 +967,7 @@ mod tests {
 
     // 4. test_has_var
     #[test]
-    fn test_has_var() {
+    fn verify_has_var() {
         let mut arena1 = ExprArena::new();
         let v0 = arena1.push_var(0);
         let c1 = arena1.push_const(1.0);
@@ -823,7 +983,7 @@ mod tests {
 
     // 5. test_has_degenerate
     #[test]
-    fn test_has_degenerate() {
+    fn verify_has_degenerate() {
         let mut arena1 = ExprArena::new();
         let root1 = arena1.push_const(f32::NAN);
         assert!(arena1.has_degenerate(root1));
@@ -852,7 +1012,7 @@ mod tests {
 
     // 7. test_clear_preserves_capacity
     #[test]
-    fn test_clear_preserves_capacity() {
+    fn clear_preserves_capacity() {
         let mut arena = ExprArena::with_capacity(64);
         let _v = arena.push_var(0);
         let _c = arena.push_const(1.0);
@@ -870,7 +1030,7 @@ mod tests {
 
     // 7. test_substitute_params
     #[test]
-    fn test_substitute_params() {
+    fn verify_substitute_params() {
         let mut arena = ExprArena::new();
         let p0 = arena.push_param(0);
         let p1 = arena.push_param(1);
@@ -887,9 +1047,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn push_gather_should_create_node_when_valid() {
+        let mut arena = ExprArena::new();
+        let buf = arena.declare_buffer(BufferDecl {
+            width: 16,
+            height: 8,
+        });
+        assert_eq!(arena.buffers().len(), 1);
+        assert_eq!(arena.buffer_decl(buf).width, 16);
+
+        let x = arena.push_var(0);
+        let y = arena.push_var(1);
+        let gather = arena.push_gather(buf, x, y);
+
+        // Gather is a ternary whose first child is the Buffer leaf.
+        assert_eq!(arena.kind(gather), OpKind::Gather);
+        let children: Vec<ExprId> = arena.children(gather).collect();
+        assert_eq!(children.len(), 3);
+        assert!(matches!(arena.node(children[0]), ExprNode::Buffer(b) if *b == buf));
+        assert_eq!(arena.kind(children[0]), OpKind::Buffer);
+        assert_eq!(arena.children(children[0]).count(), 0); // Buffer is a leaf
+
+        assert_eq!(format!("{}", arena.display(children[0])), "Buffer(0)");
+    }
+
+    #[test]
+    #[should_panic(expected = "not declared")]
+    fn push_buffer_should_panic_when_undeclared() {
+        let mut arena = ExprArena::new();
+        let _ = arena.push_buffer(BufferId(0));
+    }
+
     // 8. test_nary
     #[test]
-    fn test_nary() {
+    fn nary() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let v1 = arena.push_var(1);
@@ -905,7 +1097,7 @@ mod tests {
 
     // 9. test_display
     #[test]
-    fn test_display() {
+    fn verify_display() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let v1 = arena.push_var(1);
@@ -919,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_size_of_expr_node() {
+    fn size_of_expr_node() {
         // Compile-time assertion exists above, but also verify at runtime.
         assert!(
             core::mem::size_of::<ExprNode>() <= 16,
@@ -929,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_children_exact_size() {
+    fn expr_children_exact_size() {
         let mut arena = ExprArena::new();
         let v = arena.push_var(0);
         let c = arena.push_const(1.0);

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use super::cost::{CostFunction, CostModel};
 use super::node::{EClassId, ENode};
 use super::ops::{self, Op};
+use super::provenance::{ApplicationRecord, ENodeId, Origin, Provenance, UnionEvent};
 use super::rewrite::{Rewrite, RewriteAction};
 use pixelflow_ir::kind::OpKind;
 
@@ -22,6 +23,21 @@ pub struct RewriteTarget {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EClass {
     pub(crate) nodes: Vec<ENode>,
+    /// Stable identity per node, parallel to `nodes`: `tags[i]` names
+    /// `nodes[i]`. Must be kept in lockstep with `nodes` through every
+    /// mutation (union's extend, rebuild's take/canonicalize/extend) — see
+    /// `provenance` module docs.
+    pub(crate) tags: Vec<ENodeId>,
+}
+
+/// Context describing which rewrite application (if any) is currently
+/// responsible for e-nodes/unions created by `add()`/`union()`. Set for the
+/// duration of `apply_action_from_rule`, `None` otherwise (e.g. during
+/// `rebuild_budgeted`'s congruence-closure unions, or seed insertion).
+#[derive(Clone, Copy, Debug)]
+struct ActiveApplication {
+    rule_idx: usize,
+    application_id: super::provenance::ApplicationId,
 }
 
 pub struct EGraph {
@@ -32,6 +48,16 @@ pub struct EGraph {
     /// Rules are shared via Arc so EGraph can be cloned for search branching.
     rules: std::sync::Arc<Vec<Box<dyn Rewrite>>>,
     pub match_counts: HashMap<String, usize>,
+    /// Global monotonic counter minting `ENodeId`s in `add()`.
+    next_enode_id: u64,
+    /// Saturation-iteration counter, advanced once per `saturate_with_limits`
+    /// loop iteration. Recorded on every `ApplicationRecord`/`UnionEvent`.
+    step: usize,
+    /// Rule provenance: origins, application log, union journal.
+    provenance: Provenance,
+    /// Which rewrite application (if any) is currently executing — read by
+    /// `add()`/`union()` to attribute newly created nodes/unions.
+    active_application: Option<ActiveApplication>,
 }
 
 impl Default for EGraph {
@@ -49,6 +75,10 @@ impl Clone for EGraph {
             worklist: self.worklist.clone(),
             rules: self.rules.clone(), // Arc clone - cheap, shares rules
             match_counts: self.match_counts.clone(),
+            next_enode_id: self.next_enode_id,
+            step: self.step,
+            provenance: self.provenance.clone(),
+            active_application: self.active_application,
         }
     }
 }
@@ -76,6 +106,10 @@ impl EGraph {
             worklist: Vec::new(),
             rules: std::sync::Arc::new(Vec::new()),
             match_counts: HashMap::new(),
+            next_enode_id: 0,
+            step: 0,
+            provenance: Provenance::new(),
+            active_application: None,
         }
     }
 
@@ -90,6 +124,10 @@ impl EGraph {
             worklist: Vec::new(),
             rules: std::sync::Arc::new(rules),
             match_counts: HashMap::new(),
+            next_enode_id: 0,
+            step: 0,
+            provenance: Provenance::new(),
+            active_application: None,
         }
     }
 
@@ -150,8 +188,16 @@ impl EGraph {
             return EClassId(0);
         }
         let id = EClassId(self.classes.len() as u32);
+        let enode_id = ENodeId(self.next_enode_id);
+        self.next_enode_id += 1;
+        let origin = match self.active_application {
+            Some(active) => Origin::Rule(active.application_id),
+            None => Origin::Seed,
+        };
+        self.provenance.record_origin(enode_id, origin);
         self.classes.push(EClass {
             nodes: vec![node.clone()],
+            tags: vec![enode_id],
         });
         self.parent.push(id);
         self.memo.insert(node, id);
@@ -167,8 +213,16 @@ impl EGraph {
         let (parent, child) = if a.0 < b.0 { (a, b) } else { (b, a) };
         self.parent[child.index()] = parent;
         let child_nodes = std::mem::take(&mut self.classes[child.index()].nodes);
+        let child_tags = std::mem::take(&mut self.classes[child.index()].tags);
         self.classes[parent.index()].nodes.extend(child_nodes);
+        self.classes[parent.index()].tags.extend(child_tags);
         self.worklist.push(parent);
+        self.provenance.record_union(UnionEvent {
+            rule_idx: self.active_application.map(|a| a.rule_idx),
+            step: self.step,
+            class_a: parent,
+            class_b: child,
+        });
         parent
     }
 
@@ -230,20 +284,49 @@ impl EGraph {
             processed += 1;
             let id = self.find(id);
             let nodes = std::mem::take(&mut self.classes[id.index()].nodes);
+            // `tags` must stay zipped with `nodes` through this loop: no
+            // reordering happens (nodes are only appended to `new_nodes` in
+            // the same order they're drained from `nodes`), so zipping by
+            // index here and pushing to `new_tags` in lockstep with
+            // `new_nodes` keeps every tag pointed at the right node.
+            let tags = std::mem::take(&mut self.classes[id.index()].tags);
+            debug_assert_eq!(
+                nodes.len(),
+                tags.len(),
+                "EClass.nodes and EClass.tags must never desync"
+            );
             let mut new_nodes = Vec::new();
-            for mut node in nodes {
+            let mut new_tags = Vec::new();
+            for (mut node, tag) in nodes.into_iter().zip(tags) {
                 self.canonicalize_node(&mut node);
                 if let Some(&existing) = self.memo.get(&node) {
                     let existing = self.find(existing);
                     if existing != id {
+                        // `union` may pick either `id` or `existing` as the
+                        // surviving parent. If `id` survives, `union`'s
+                        // extend() appends `existing`'s nodes (and tags)
+                        // directly onto `self.classes[id.index()]` — which we
+                        // just emptied via mem::take above. We MUST extend
+                        // (not overwrite) below, or those appended
+                        // nodes/tags are silently dropped when we write
+                        // `new_nodes`/`new_tags` back. This is a rebuild-time
+                        // congruence-closure union, not a rule firing, so it
+                        // carries no rule_idx in the provenance journal
+                        // (`active_application` is whatever the caller left
+                        // it as — normally `None` outside rule application).
                         self.union(id, existing);
                     }
                 } else {
                     self.memo.insert(node.clone(), id);
                 }
                 new_nodes.push(node);
+                new_tags.push(tag);
             }
-            self.classes[id.index()].nodes = new_nodes;
+            // Extend, not assign: a mid-loop union() above may have already
+            // pushed nodes/tags onto classes[id.index()] (see comment above).
+            // Overwriting here would silently discard them.
+            self.classes[id.index()].nodes.extend(new_nodes);
+            self.classes[id.index()].tags.extend(new_tags);
         }
         self.worklist.len()
     }
@@ -256,6 +339,64 @@ impl EGraph {
     pub fn nodes(&self, id: EClassId) -> &[ENode] {
         let id = self.find(id);
         &self.classes[id.index()].nodes
+    }
+
+    /// Get the stable `ENodeId` tags for the canonical class's nodes,
+    /// parallel to `nodes(id)` — `tags(id)[i]` names `nodes(id)[i]`.
+    pub fn tags(&self, id: EClassId) -> &[ENodeId] {
+        let id = self.find(id);
+        &self.classes[id.index()].tags
+    }
+
+    /// Access the rule-provenance side tables (origins, application log,
+    /// union journal). See the `provenance` module for details.
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    /// Look up the `ENode` for a given stable tag within a class, if it's
+    /// still present there. `O(class size)` — classes are small in practice
+    /// (equality-saturated e-classes rarely exceed a few dozen nodes).
+    pub fn node_for_tag(&self, id: EClassId, tag: ENodeId) -> Option<&ENode> {
+        let id = self.find(id);
+        let class = &self.classes[id.index()];
+        class
+            .tags
+            .iter()
+            .position(|&t| t == tag)
+            .map(|i| &class.nodes[i])
+    }
+
+    /// Compute the transitive rewrite-application ancestry of a set of
+    /// chosen `(EClassId, ENodeId)` pairs (typically the nodes an extraction
+    /// pass selected). See [`super::provenance::derivation_ancestors`] for
+    /// the exact over-approximation made.
+    pub fn derivation_ancestors(
+        &self,
+        chosen_nodes: &[(EClassId, ENodeId)],
+    ) -> std::collections::BTreeSet<super::provenance::ApplicationId> {
+        let tags_of = |class: EClassId| -> Vec<ENodeId> { self.tags(class).to_vec() };
+        let children_of = |tag: ENodeId| -> Vec<EClassId> {
+            for class in self.classes.iter() {
+                if let Some(idx) = class.tags.iter().position(|&t| t == tag) {
+                    return class.nodes[idx].children();
+                }
+            }
+            Vec::new()
+        };
+        super::provenance::derivation_ancestors(&tags_of, &children_of, &self.provenance, chosen_nodes)
+    }
+
+    /// Render a human-readable derivation trace for the given ancestry set
+    /// (from [`EGraph::derivation_ancestors`]), resolving rule names via
+    /// this e-graph's rule list.
+    pub fn format_derivation_trace(
+        &self,
+        ancestors: &std::collections::BTreeSet<super::provenance::ApplicationId>,
+    ) -> String {
+        let rule_name =
+            |idx: usize| -> Option<String> { self.rule(idx).map(|r| r.name().to_string()) };
+        super::provenance::format_derivation_trace(&self.provenance, ancestors, &rule_name)
     }
 
     /// Get the number of registered rewrite rules.
@@ -367,6 +508,13 @@ impl EGraph {
                 ExprNode::Const(v) => self.add(ENode::constant(*v)),
                 ExprNode::Param(i) => {
                     panic!("add_arena: ExprNode::Param({i}) not valid after kernel compilation")
+                }
+                ExprNode::Buffer(b) => {
+                    panic!(
+                        "add_arena: ExprNode::Buffer({}) — memory ops are not yet representable \
+                         in the e-graph (KERNELS_AND_LATTICES.md M3)",
+                        b.0
+                    )
                 }
                 ExprNode::Unary(op, child) => {
                     let child_id = id_map[child.0 as usize].unwrap_or_else(|| {
@@ -512,9 +660,14 @@ impl EGraph {
             return false;
         };
 
+        // Guided search calls this once per discrete rewrite decision — the
+        // step counter's granularity here is "one apply_single_rule call",
+        // mirroring "one saturate_with_limits iteration" for the batched path.
+        self.step += 1;
+
         // The batched path already knows how to execute every action; reuse
         // it so the single-step path can't drift out of sync.
-        let changed = self.apply_action(class_id, action) > 0;
+        let changed = self.apply_action_from_rule(rule_idx, class_id, action) > 0;
 
         if changed {
             self.rebuild();
@@ -566,6 +719,11 @@ impl EGraph {
             if self.classes.len() > max_classes {
                 return;
             }
+
+            // Advance the provenance step counter once per saturation
+            // iteration — every ApplicationRecord/UnionEvent produced by
+            // this iteration's rule applications shares this step.
+            self.step += 1;
 
             // Apply all rules in a single batch — one rebuild per iteration
             let unions = {
@@ -683,7 +841,7 @@ impl EGraph {
         // Do NOT rebuild here — caller is responsible for calling rebuild()
         // after all rules for the epoch are applied (lazy/batched rebuild).
         for (class_id, action) in updates {
-            unions += self.apply_action(class_id, action);
+            unions += self.apply_action_from_rule(rule_idx, class_id, action);
         }
 
         ApplyResult {
@@ -692,7 +850,49 @@ impl EGraph {
         }
     }
 
+    /// Apply a rewrite action on behalf of a specific rule, attributing
+    /// every e-node created and every union performed while executing it to
+    /// one [`super::provenance::ApplicationId`].
+    ///
+    /// This is the sole entry point into `apply_action` from rule-driven
+    /// call sites (`apply_single_rule`, `apply_rule_at_index_timed`,
+    /// `apply_rules_budgeted`) — it exists so provenance attribution can't
+    /// drift out of sync with the actual rewrite dispatch: every caller that
+    /// knows a `rule_idx` funnels through here instead of calling
+    /// `apply_action` directly.
+    ///
+    /// Records one [`ApplicationRecord`] up front (even if the action turns
+    /// out to produce no net change, e.g. a `Union` with an already-equal
+    /// target) — the record's cost is a single `Vec::push`, and recording
+    /// unconditionally keeps `step` bookkeeping simple. `match_root` is the
+    /// class the rule matched against, i.e. `class_id` as passed in (cheap:
+    /// already in hand at the call site).
+    fn apply_action_from_rule(
+        &mut self,
+        rule_idx: usize,
+        class_id: EClassId,
+        action: RewriteAction,
+    ) -> usize {
+        let application_id = self.provenance.record_application(ApplicationRecord {
+            rule_idx,
+            step: self.step,
+            match_root: class_id,
+        });
+        let previous = self.active_application.replace(ActiveApplication {
+            rule_idx,
+            application_id,
+        });
+        let result = self.apply_action(class_id, action);
+        self.active_application = previous;
+        result
+    }
+
     /// Apply a rewrite action and return 1 if a union was made, 0 otherwise.
+    ///
+    /// Internal executor. Rule-driven callers must go through
+    /// `apply_action_from_rule` so provenance attribution stays correct;
+    /// this function itself has no notion of "which rule" — it only knows
+    /// how to execute the `RewriteAction` variants.
     fn apply_action(&mut self, class_id: EClassId, action: RewriteAction) -> usize {
         match action {
             RewriteAction::Union(target_id) => {
@@ -1378,8 +1578,12 @@ impl EGraph {
     }
 
     fn apply_rules_budgeted(&mut self, max_nodes: usize) -> usize {
+        // One call = one "apply all rules once" pass, the same granularity
+        // saturate_with_limits uses for its step counter.
+        self.step += 1;
+
         let mut unions = 0;
-        let mut updates: Vec<(EClassId, RewriteAction)> = Vec::new();
+        let mut updates: Vec<(usize, EClassId, RewriteAction)> = Vec::new();
 
         let canonical_ids = self.canonical_class_ids();
         for canonical in canonical_ids {
@@ -1389,9 +1593,9 @@ impl EGraph {
             let nodes: Vec<ENode> = self.classes[canonical.index()].nodes.clone();
 
             for node in &nodes {
-                for rule in self.rules.iter() {
+                for (rule_idx, rule) in self.rules.iter().enumerate() {
                     if let Some(action) = rule.apply(self, canonical, node) {
-                        updates.push((canonical, action));
+                        updates.push((rule_idx, canonical, action));
                         *self
                             .match_counts
                             .entry(rule.name().to_string())
@@ -1401,8 +1605,8 @@ impl EGraph {
             }
         }
 
-        for (class_id, action) in updates {
-            unions += self.apply_action(class_id, action);
+        for (rule_idx, class_id, action) in updates {
+            unions += self.apply_action_from_rule(rule_idx, class_id, action);
             if self.classes.len() > max_nodes {
                 break;
             }
@@ -1507,10 +1711,124 @@ impl EGraph {
 mod tests {
     use super::*;
     use crate::egraph::ops;
+    use crate::egraph::provenance::ApplicationId;
     use crate::math::algebra::{
         AddNeg, Annihilator, Cancellation, Canonicalize, Commutative, Distributive, Identity,
         InverseAnnihilation, Involution, MulRecip,
     };
+
+    /// Regression test for a `rebuild_budgeted` bug: when canonicalizing the
+    /// worklist item `id`'s nodes triggers a union whose surviving parent is
+    /// `id` itself, `union()`'s `extend()` appends the merged-in class's
+    /// nodes directly onto `classes[id.index()].nodes` (which `rebuild_budgeted`
+    /// had just emptied via `mem::take`). The old code then did
+    /// `classes[id.index()].nodes = new_nodes`, an outright *assignment* that
+    /// clobbered whatever `union()` had just appended — silently dropping
+    /// nodes. The fix extends instead of assigning.
+    ///
+    /// Trigger recipe:
+    /// - class 3 (`nc = Neg(c)`, c = class 2) is the worklist item being
+    ///   rebuilt (`id = 3`).
+    /// - Before nc's rebuild, `union(b, c)` merges class 2 into class 1
+    ///   (1 < 2), so canonicalizing `Neg(c)` during nc's rebuild turns it
+    ///   into `Neg(b)`.
+    /// - `Neg(b)` is already memoized as class 4 (`nb = Neg(b)`, created
+    ///   after nc so it has a strictly higher id: 4 > 3).
+    /// - Because `id (3) < existing (4)`, `union(3, 4)` picks **3** as the
+    ///   surviving parent — reproducing the exact "current worklist item
+    ///   survives the merge" case that dropped nodes.
+    /// - Class 4 (`nb`) must still hold its node at the moment of that
+    ///   inner union, which it does (only class 3's `.nodes` was drained).
+    #[test]
+    fn rebuild_budgeted_does_not_drop_nodes_when_current_class_survives_union() {
+        let mut eg = EGraph::new();
+
+        let _a = eg.add(ENode::Var(0)); // class 0 (unused, keeps ids spaced out)
+        let b = eg.add(ENode::Var(1)); // class 1
+        let c = eg.add(ENode::Var(2)); // class 2
+        let nc = eg.add(ENode::Op {
+            op: &ops::Neg,
+            children: vec![c],
+        }); // class 3: memo Neg([2]) -> 3
+        let nb = eg.add(ENode::Op {
+            op: &ops::Neg,
+            children: vec![b],
+        }); // class 4: memo Neg([1]) -> 4
+        let d = eg.add(ENode::Var(3)); // class 5, dummy used only to enqueue `nc`
+        let marker = eg.add(ENode::Var(9)); // class 6: a node unique to nb's class
+
+        assert_eq!(nc.index(), 3, "test assumes nc is class 3");
+        assert_eq!(nb.index(), 4, "test assumes nb is class 4");
+
+        // Enqueue class 3 (nc) on the worklist without disturbing its node
+        // list content: nc (3) < d (5), so nc survives as parent and simply
+        // gains an extra Var(3) node — it does not lose anything.
+        eg.union(nc, d);
+        assert_eq!(eg.pending_rebuilds(), 1);
+
+        // Give nb's class a node with no structural twin anywhere else
+        // (`Var(9)`), so its loss is directly observable. nb (4) < marker
+        // (6), so nb survives as parent and gains `Var(9)`.
+        eg.union(nb, marker);
+
+        // Now merge c into b. b (1) < c (2), so b survives; c's node list
+        // (just `Var(2)`) is merged in. This does NOT yet touch nc/nb.
+        eg.union(b, c);
+
+        // Rebuild exactly one worklist item. LIFO worklist: the most
+        // recently pushed parent (class 1, from union(b,c)) pops first.
+        // Process it, then process class 3 (nc) next so its rebuild is the
+        // one that triggers the id-survives-merge collision with nb (4).
+        //
+        // Drain the whole worklist via rebuild() (equivalent to
+        // rebuild_budgeted(usize::MAX)) so ordering doesn't need to be
+        // hand-tracked — the bug reproduces regardless of pop order, as
+        // long as nc's rebuild eventually runs after b/c are merged.
+        eg.rebuild();
+
+        // The critical assertion: nb's class (now merged into nc's class,
+        // since nc=3 < nb=4 survives) must still contain BOTH nodes that
+        // were live before the merge: nc's own `Neg([canonical c])` and
+        // nb's `Neg([b])` (same canonical shape, but a distinct ENode
+        // instance in the vec before dedup would also be acceptable — the
+        // point is the vec must not have been clobbered to something
+        // that lost nb's contribution entirely).
+        let surviving = eg.find(nc);
+        assert_eq!(
+            surviving,
+            eg.find(nb),
+            "nc and nb should have been unioned via the canonicalization collision"
+        );
+
+        let nodes = eg.nodes(surviving);
+        assert!(
+            !nodes.is_empty(),
+            "rebuild_budgeted must not silently drop all nodes from the surviving class"
+        );
+
+        // The dummy Var(3) node pushed onto nc's class via `union(nc, d)`
+        // earlier must have survived.
+        assert!(
+            nodes.iter().any(|n| matches!(n, ENode::Var(3))),
+            "expected Var(3) (pushed before the id-survives merge) to still be present; \
+             rebuild_budgeted's overwrite bug would have dropped it"
+        );
+
+        // The critical, structurally-unique marker node from nb's class
+        // (`Var(9)`) must have survived being merged into nc's class via
+        // union()'s extend(). This is exactly the data the overwrite bug
+        // silently discarded: union() appended it to
+        // `classes[id.index()].nodes` mid-loop, and the old
+        // `self.classes[id.index()].nodes = new_nodes` assignment clobbered
+        // it because `new_nodes` was built from nc's pre-union node list,
+        // which never contained `Var(9)`.
+        assert!(
+            nodes.iter().any(|n| matches!(n, ENode::Var(9))),
+            "expected Var(9) (nb's unique marker, merged in via union()'s extend) \
+             to still be present; rebuild_budgeted's overwrite bug drops nodes appended \
+             by a mid-loop union() when the current worklist item survives as parent"
+        );
+    }
 
     /// Create an e-graph with standard algebraic rules for testing.
     fn egraph_with_rules() -> EGraph {
@@ -1542,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inverse_add() {
+    fn inverse_add() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let neg_x = eg.add(ENode::Op {
@@ -1559,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inverse_mul() {
+    fn inverse_mul() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let recip_x = eg.add(ENode::Op {
@@ -1576,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn test_complex_inverse() {
+    fn complex_inverse() {
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
         let five = eg.add(ENode::constant(5.0));
@@ -1593,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_subtraction() {
+    fn nested_subtraction() {
         // a - (b - c) should equal a - b + c
         // Test: 10 - (6 - 2) = 10 - 4 = 6
         let mut eg = egraph_with_rules();
@@ -1621,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_sub_pattern() {
+    fn mul_sub_pattern() {
         // This is the problematic pattern from discriminant:
         // d*d - (c - r) where d=4, c=16, r=1
         let mut eg = egraph_with_rules();
@@ -1651,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_sub_pattern_with_vars() {
+    fn mul_sub_pattern_with_vars() {
         // x*x - (y - z)
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
@@ -1684,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_sub_pattern_with_fma() {
+    fn mul_sub_pattern_with_fma() {
         // Same pattern but with FMA costs (what the kernel! macro uses)
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
@@ -1718,7 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discriminant_structure() {
+    fn discriminant_structure() {
         // Match the actual discriminant structure:
         // d_dot_c² - (c_sq - r_sq) where c_sq = a² + b² and r_sq = r²
         let mut eg = egraph_with_rules();
@@ -1765,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_penalty_calculation() {
+    fn depth_penalty_calculation() {
         // Test the hinge penalty function
         let mut costs = CostModel::new();
         costs.depth_threshold = 5;
@@ -1782,7 +2100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shallow_cost_model() {
+    fn shallow_cost_model() {
         // Shallow model should have aggressive depth penalty
         let costs = CostModel::shallow();
         assert_eq!(costs.depth_threshold, 16);
@@ -1795,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_aware_extraction() {
+    fn depth_aware_extraction() {
         // Build a deep expression: ((((x + 1) + 1) + 1) + 1)
         let mut eg = egraph_with_rules();
         let x = eg.add(ENode::Var(0));
@@ -1822,6 +2140,252 @@ mod tests {
         shallow_costs.depth_penalty = 1000;
         let (arena2, root2) = eg.extract_expr_with_costs(current, &shallow_costs);
         assert!(arena2.node_count_subtree(root2) > 0);
+    }
+
+    // ========================================================================
+    // Provenance tests
+    // ========================================================================
+
+    /// Find the `RewriteTarget` for a given rule name, failing loudly (not
+    /// silently) if it isn't present — a missing match means the test setup
+    /// is wrong, not that provenance has nothing to check.
+    fn find_target(eg: &EGraph, rule_name: &str) -> RewriteTarget {
+        eg.find_rewrite_matches()
+            .into_iter()
+            .find(|t| eg.rule(t.rule_idx).unwrap().name() == rule_name)
+            .unwrap_or_else(|| panic!("no rewrite match found for rule {rule_name:?}"))
+    }
+
+    /// Like `find_target`, but further restricted to matches against a
+    /// specific (already-canonical) class — needed once a class holds
+    /// multiple nodes that all match the same rule name.
+    fn find_target_in_class(eg: &EGraph, rule_name: &str, class: EClassId) -> RewriteTarget {
+        eg.find_rewrite_matches()
+            .into_iter()
+            .find(|t| eg.rule(t.rule_idx).unwrap().name() == rule_name && t.class_id == class)
+            .unwrap_or_else(|| {
+                panic!("no rewrite match found for rule {rule_name:?} in class {class:?}")
+            })
+    }
+
+    #[test]
+    fn provenance_tiny_expression_one_rewrite_matches_hand_derivation() {
+        // x + y, then apply Commutative -> y + x (a fresh Create'd node).
+        let mut eg = egraph_with_rules();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let sum = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, y],
+        });
+
+        // Hand-derivation: x, y, and sum are all seeds.
+        for &(class, _) in &[(x, "x"), (y, "y"), (sum, "sum")] {
+            for &tag in eg.tags(class) {
+                assert_eq!(
+                    eg.provenance().origin(tag),
+                    Some(Origin::Seed),
+                    "seed node in class {class:?} should be Origin::Seed"
+                );
+            }
+        }
+        assert_eq!(eg.provenance().application_count(), 0);
+        assert_eq!(eg.provenance().union_count(), 0);
+
+        let target = find_target(&eg, "commutative");
+        assert_eq!(target.class_id, eg.find(sum));
+
+        let applied = eg.apply_single_rule(target.rule_idx, target.class_id, target.node_idx);
+        assert!(applied, "commutative rule should have applied to x + y");
+
+        // Hand-derivation: exactly one application recorded, for the
+        // "commutative" rule, matched against `sum`'s class.
+        assert_eq!(eg.provenance().application_count(), 1);
+        let record = eg.provenance().application(ApplicationId(0)).unwrap();
+        assert_eq!(record.rule_idx, target.rule_idx);
+        assert_eq!(record.match_root, eg.find(sum));
+        assert_eq!(eg.rule(record.rule_idx).unwrap().name(), "commutative");
+
+        // Hand-derivation: the new commuted node (y + x) has Origin::Rule
+        // pointing at that one application; it lives in the same class as
+        // `sum` post-union.
+        let commuted_class = eg.find(sum);
+        let rule_origin_tags: Vec<ENodeId> = eg
+            .tags(commuted_class)
+            .iter()
+            .copied()
+            .filter(|&t| matches!(eg.provenance().origin(t), Some(Origin::Rule(_))))
+            .collect();
+        assert_eq!(
+            rule_origin_tags.len(),
+            1,
+            "expected exactly one rule-created node in the merged class"
+        );
+        assert_eq!(
+            eg.provenance().origin(rule_origin_tags[0]),
+            Some(Origin::Rule(ApplicationId(0)))
+        );
+
+        // Hand-derivation: exactly one union event, attributed to the
+        // commutative rule's index, at the step apply_single_rule ran on.
+        assert_eq!(eg.provenance().union_count(), 1);
+        let union_event = eg.provenance().union_events()[0];
+        assert_eq!(union_event.rule_idx, Some(target.rule_idx));
+    }
+
+    #[test]
+    fn provenance_chain_rule_b_consumes_rule_a_product() {
+        // Chain: apply Commutative to (x + y) producing (y + x) [rule A],
+        // then apply Commutative again to a *different* sum, (y + x) + z,
+        // whose match consumes the class that A's product lives in as a
+        // child. derivation_ancestors of B's product must include A's
+        // application.
+        let mut eg = egraph_with_rules();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let z = eg.add(ENode::Var(2));
+        let inner = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, y],
+        }); // x + y
+        let outer = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![inner, z],
+        }); // (x + y) + z
+
+        // Rule A: commute the inner sum (x + y) -> (y + x).
+        let target_a = find_target_in_class(&eg, "commutative", eg.find(inner));
+        assert!(eg.apply_single_rule(target_a.rule_idx, target_a.class_id, target_a.node_idx));
+        let app_a = ApplicationId(0);
+
+        // Rule B: commute the outer sum ((x+y)+z) -> (z + (x+y)). After
+        // rule A, inner's class holds both `x+y` and `y+x`, both of which
+        // still match "commutative" — so we must specifically target
+        // outer's class rather than take the first "commutative" match.
+        let target_b = find_target_in_class(&eg, "commutative", eg.find(outer));
+        assert!(eg.apply_single_rule(target_b.rule_idx, target_b.class_id, target_b.node_idx));
+        let app_b = ApplicationId(1);
+        assert_eq!(eg.provenance().application_count(), 2);
+
+        // Find B's produced node: the rule-created node in outer's class
+        // whose origin is app_b.
+        let outer_class = eg.find(outer);
+        let b_product_tag = eg
+            .tags(outer_class)
+            .iter()
+            .copied()
+            .find(|&t| eg.provenance().origin(t) == Some(Origin::Rule(app_b)))
+            .expect("expected a node created by application B in outer's class");
+
+        let ancestors = eg.derivation_ancestors(&[(outer_class, b_product_tag)]);
+        assert!(
+            ancestors.contains(&app_b),
+            "B's own application must be in its own ancestry"
+        );
+        assert!(
+            ancestors.contains(&app_a),
+            "A's application (which produced the node B's match consumed as \
+             a child of the outer sum) must be included in B's product's ancestry"
+        );
+
+        // Sanity: the trace formats without panicking and mentions both
+        // applications' rule name.
+        let trace = eg.format_derivation_trace(&ancestors);
+        assert!(trace.contains("commutative"));
+    }
+
+    #[test]
+    fn provenance_union_driven_case_includes_congruence_union_event() {
+        // Build two structurally-identical-after-canonicalization Neg nodes
+        // in different classes purely because their children start out
+        // unmerged, then union the children directly (not through a rule).
+        //
+        // Congruence closure only reconsiders a class's memo key when that
+        // class itself is on the rebuild worklist (see rebuild_budgeted) —
+        // union(b, c) alone doesn't touch nb/nc's classes. So we also
+        // enqueue nc via a harmless union(nc, marker) (nc's numeric id is
+        // lower, so nc survives as parent and just gains an extra node);
+        // this is the same enqueue trick used in
+        // rebuild_budgeted_does_not_drop_nodes_when_current_class_survives_union.
+        // When rebuild() then reprocesses nc, canonicalizing Neg([c]) turns
+        // it into Neg([b]) (since union(b,c) already ran), which collides
+        // with nb's memo entry — a congruence-closure union with
+        // rule_idx = None.
+        let mut eg = egraph_with_rules();
+        let b = eg.add(ENode::Var(1));
+        let c = eg.add(ENode::Var(2));
+        let nb = eg.add(ENode::Op {
+            op: &ops::Neg,
+            children: vec![b],
+        });
+        let nc = eg.add(ENode::Op {
+            op: &ops::Neg,
+            children: vec![c],
+        });
+        let marker = eg.add(ENode::Var(9));
+
+        assert_eq!(eg.provenance().union_count(), 0);
+
+        // Enqueue nc on the worklist without disturbing its semantics.
+        eg.union(nc, marker);
+        // Direct union, not via a rule: rule_idx must be None on the
+        // resulting UnionEvent.
+        eg.union(b, c);
+        eg.rebuild();
+
+        assert_eq!(eg.find(nb), eg.find(nc), "Neg(b) and Neg(c) should have merged");
+
+        // At least one recorded union event must have rule_idx = None
+        // (the direct union(b, c) and/or the congruence-closure union that
+        // merged nb/nc during rebuild).
+        assert!(
+            eg.provenance()
+                .union_events()
+                .iter()
+                .any(|e| e.rule_idx.is_none()),
+            "expected at least one non-rule-driven (congruence/direct) union event"
+        );
+    }
+
+    /// Overhead measurement: total saturation time and provenance record
+    /// counts on a reasonably deep expression. Not a correctness test —
+    /// `#[ignore]`d so normal `cargo test` runs stay fast; run explicitly
+    /// with `cargo test -p pixelflow-search --release -- --ignored
+    /// provenance_overhead`. See module docs on `provenance` for the
+    /// numbers observed when this was last run.
+    #[test]
+    #[ignore]
+    fn provenance_overhead_timing() {
+        let mut eg = egraph_with_rules();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+
+        // A reasonably deep expression: alternating +/-/* chain over x, y.
+        let mut current = x;
+        for i in 0..40 {
+            let op: &'static dyn Op = match i % 3 {
+                0 => &ops::Add,
+                1 => &ops::Mul,
+                _ => &ops::Sub,
+            };
+            current = eg.add(ENode::Op {
+                op,
+                children: vec![current, y],
+            });
+        }
+
+        let start = std::time::Instant::now();
+        eg.saturate();
+        let elapsed = start.elapsed();
+
+        eprintln!(
+            "provenance overhead: saturation took {:?}; origins={} applications={} unions={} classes={}",
+            elapsed,
+            eg.provenance().origin_count(),
+            eg.provenance().application_count(),
+            eg.provenance().union_count(),
+            eg.num_classes(),
+        );
     }
 }
 

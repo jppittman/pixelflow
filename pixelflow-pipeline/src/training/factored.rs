@@ -508,7 +508,7 @@ impl<'a> ArenaKernelParser<'a> {
 }
 
 /// Parser result: (parsed value, remaining input)
-
+///
 /// Parse kernel code directly into an [`ExprArena`] (DAG) with structural sharing.
 ///
 /// Identical subexpressions map to the same [`ExprId`], so the returned arena is
@@ -580,6 +580,11 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "ExprNode::Param({}) reached arena_to_kernel_code — substitute params first",
                         i
                     ),
+                    ExprNode::Buffer(b) => panic!(
+                        "ExprNode::Buffer({}) reached arena_to_kernel_code — memory ops require \
+                         a binding table, not yet wired (M2, see KERNELS_AND_LATTICES.md)",
+                        b.0
+                    ),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _) => emit_op_kc(*op, &args),
@@ -650,6 +655,11 @@ mod tests {
             ExprNode::Var(i) => vars[i as usize],
             ExprNode::Const(c) => c,
             ExprNode::Param(i) => panic!("Param in eval_arena_scalar: {i}"),
+            ExprNode::Buffer(b) => panic!(
+                "ExprNode::Buffer({}) reached eval_arena_scalar — memory ops require a binding \
+                 table, not yet wired (M2, see KERNELS_AND_LATTICES.md)",
+                b.0
+            ),
             ExprNode::Unary(op, a) => {
                 let a = eval_arena_scalar(arena, a, vars);
                 op.eval_unary(a)
@@ -669,6 +679,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("eval_ternary failed for {op:?}"))
             }
             ExprNode::Nary(kind, _, _) => panic!("Nary in eval_arena_scalar: {kind:?}"),
+            ExprNode::Buffer(_) => panic!("Buffer node not supported in scalar eval"),
         }
     }
 
@@ -704,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_arena_basic() {
+    fn parse_kernel_code_arena_basic() {
         // Simple expression: no structural sharing expected.
         let (arena, root) = parse_kernel_code_arena("(X + Y)").unwrap();
         assert!(
@@ -716,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_arena_structural_sharing() {
+    fn parse_kernel_code_arena_structural_sharing() {
         // (X + X): the two X leaves are structurally identical and should share an id.
         let (arena, _root) = parse_kernel_code_arena("(X + X)").unwrap();
         // Without sharing: 3 nodes (X, X, Add). With sharing: 2 nodes (X, Add).
@@ -729,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_arena_deeply_shared() {
+    fn parse_kernel_code_arena_deeply_shared() {
         // ((X + Y) * (X + Y)): the (X + Y) subtree appears twice — should be shared.
         // Without sharing: 7 nodes. With sharing: 4 nodes (X, Y, Add, Mul).
         let (arena, _root) = parse_kernel_code_arena("((X + Y) * (X + Y))").unwrap();
@@ -742,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_arena_round_trip() {
+    fn parse_kernel_code_arena_round_trip() {
         // Arena parse + arena_to_kernel_code should re-parse cleanly.
         let src = "((X * Y) + (X * Y))";
         let (arena, root) = parse_kernel_code_arena(src).unwrap();
@@ -754,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_kernel_code_arena_methods() {
+    fn parse_kernel_code_arena_methods() {
         let src = "(((X).abs()).min(Y)).mul_add(Z, W)";
         let (arena, root) = parse_kernel_code_arena(src).unwrap();
         let code = arena_to_kernel_code(&arena, root);
@@ -775,7 +786,7 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_seed_42_t1_pair_is_close_under_scalar_semantics() {
+    fn seed_42_t1_pair_is_close_under_scalar_semantics() {
         let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
         let final_ = "log2(add(Const(0.001), abs(atan2(pow(add(abs(neg(pow(add(abs(Const(-0.9631642)), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(mul(min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))), exp(pow(add(abs(atan2(Const(0.1167655), Var(1))), Const(0.001)), Const(-1)))), exp(add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001))))))))))";
         let initial = logged_expr_scalar_output(initial);
@@ -792,13 +803,13 @@ mod tests {
     // register budget (it rejects them with an error). The aarch64 backend uses
     // linear-scan allocation with spilling, so it handles arbitrary depth.
     #[cfg(target_arch = "aarch64")]
-    fn test_seed_42_t1_initial_jit_matches_scalar() {
+    fn seed_42_t1_initial_jit_matches_scalar() {
         let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
     }
 
     #[test]
-    fn test_seed_42_t1_initial_roundtrip_scalar_matches_tree_scalar() {
+    fn seed_42_t1_initial_roundtrip_scalar_matches_tree_scalar() {
         let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
         let tree = logged_expr_scalar_output(initial);
         let roundtrip = logged_expr_roundtrip_scalar_output(initial);
@@ -813,13 +824,13 @@ mod tests {
     // register budget (it rejects them with an error). The aarch64 backend uses
     // linear-scan allocation with spilling, so it handles arbitrary depth.
     #[cfg(target_arch = "aarch64")]
-    fn test_seed_42_t1_final_jit_matches_scalar() {
+    fn seed_42_t1_final_jit_matches_scalar() {
         let final_ = "log2(add(Const(0.001), abs(atan2(pow(add(abs(neg(pow(add(abs(Const(-0.9631642)), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(mul(min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))), exp(pow(add(abs(atan2(Const(0.1167655), Var(1))), Const(0.001)), Const(-1)))), exp(add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001))))))))))";
         assert_scalar_and_jit_close(final_, 1e-3);
     }
 
     #[test]
-    fn test_seed_24042_t52_pair_is_close_under_scalar_semantics() {
+    fn seed_24042_t52_pair_is_close_under_scalar_semantics() {
         let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         let final_ = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(Const(0.12621832), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(Const(0.20414245), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(Const(0.093906365), Var(2)), mul(Const(0.093906365), Var(3))), max(Const(-1.3763785), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(Const(8.641348), recip(add(Const(1.7208018), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(Const(1.1988422), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(Const(1.670574), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         let initial = logged_expr_scalar_output(initial);
@@ -836,13 +847,13 @@ mod tests {
     // register budget (it rejects them with an error). The aarch64 backend uses
     // linear-scan allocation with spilling, so it handles arbitrary depth.
     #[cfg(target_arch = "aarch64")]
-    fn test_seed_24042_t52_initial_jit_matches_scalar() {
+    fn seed_24042_t52_initial_jit_matches_scalar() {
         let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
     }
 
     #[test]
-    fn test_seed_24042_t52_initial_roundtrip_scalar_matches_tree_scalar() {
+    fn seed_24042_t52_initial_roundtrip_scalar_matches_tree_scalar() {
         let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         let tree = logged_expr_scalar_output(initial);
         let roundtrip = logged_expr_roundtrip_scalar_output(initial);
@@ -857,7 +868,7 @@ mod tests {
     // register budget (it rejects them with an error). The aarch64 backend uses
     // linear-scan allocation with spilling, so it handles arbitrary depth.
     #[cfg(target_arch = "aarch64")]
-    fn test_seed_24042_t52_final_jit_matches_scalar() {
+    fn seed_24042_t52_final_jit_matches_scalar() {
         let final_ = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(Const(0.12621832), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(Const(0.20414245), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(Const(0.093906365), Var(2)), mul(Const(0.093906365), Var(3))), max(Const(-1.3763785), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(Const(8.641348), recip(add(Const(1.7208018), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(Const(1.1988422), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(Const(1.670574), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         assert_scalar_and_jit_close(final_, 1e-3);
     }

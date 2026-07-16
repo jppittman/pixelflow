@@ -294,17 +294,37 @@ fn benchmark_exec_code(
             use pixelflow_ir::backend::emit::executable::KernelFn;
             let func: KernelFn = exec_code.as_fn();
 
-            let x = _mm_set1_ps(0.5);
-            let y = _mm_set1_ps(0.7);
-            let z = _mm_set1_ps(1.3);
-            let w = _mm_set1_ps(-0.2);
+            // Inputs at the KernelFn's SIMD width: __m512 under +avx512f, else
+            // __m128 (SSE2). eval100! is width-agnostic (just calls func).
+            #[cfg(target_feature = "avx512f")]
+            let (x, y, z, w) = (
+                _mm512_set1_ps(0.5),
+                _mm512_set1_ps(0.7),
+                _mm512_set1_ps(1.3),
+                _mm512_set1_ps(-0.2),
+            );
+            #[cfg(not(target_feature = "avx512f"))]
+            let (x, y, z, w) = (
+                _mm_set1_ps(0.5),
+                _mm_set1_ps(0.7),
+                _mm_set1_ps(1.3),
+                _mm_set1_ps(-0.2),
+            );
 
             for _ in 0..WARMUP_ITERS {
                 std::hint::black_box(func(x, y, z, w));
             }
 
             let out = func(x, y, z, w);
+            // BenchResult.output keeps the first 4 lanes regardless of width.
             let mut output = [0.0f32; 4];
+            #[cfg(target_feature = "avx512f")]
+            {
+                let mut wide = [0.0f32; 16];
+                _mm512_storeu_ps(wide.as_mut_ptr(), out);
+                output.copy_from_slice(&wide[..4]);
+            }
+            #[cfg(not(target_feature = "avx512f"))]
             _mm_storeu_ps(output.as_mut_ptr(), out);
 
             let mut times = [0u64; TIMED_RUNS];
@@ -351,10 +371,58 @@ pub fn benchmark_jit_arena_repeated(
     benchmark_exec_code(result.code, repeat_batches)
 }
 
+/// Convert nanoseconds to log-nanoseconds (floored at 1e-3ns, capped at 1s).
+///
+/// Relocated from the deleted `training::gen_es` (the ES-guided corpus-growth
+/// optimizer it lived in was RL-adjacent scaffolding removed per
+/// docs/plans/2026-07-07-guided-saturation-redesign.md); this conversion
+/// itself is just a unit change on a [`BenchResult::ns`] measurement, used by
+/// the surviving supervised extraction-head training path.
+///
+/// # Panics
+///
+/// Panics if `ns` is NaN.
+#[must_use]
+pub fn log_ns(ns: f64) -> f32 {
+    assert!(!ns.is_nan(), "log_ns called with NaN");
+    // NaN already rejected above, so clamp's total order is well-defined here.
+    let clamped = ns.clamp(1e-3, 1e9);
+    libm::logf(clamped as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pixelflow_ir::ExprArena;
+
+    #[test]
+    fn verify_log_ns() {
+        // log(1.0) = 0.0
+        let v = log_ns(1.0);
+        assert!(
+            libm::fabsf(v) < 0.001,
+            "log_ns(1.0) should be ~0.0, got {}",
+            v
+        );
+
+        // Values below 1e-3 should be floored to 1e-3.
+        let v_low = log_ns(0.0001);
+        let v_floor = log_ns(1e-3);
+        assert!(
+            libm::fabsf(v_low - v_floor) < 0.001,
+            "log_ns(0.0001) should equal log_ns(1e-3), got {} vs {}",
+            v_low,
+            v_floor
+        );
+
+        // log(e) ≈ 1.0
+        let v_e = log_ns(core::f64::consts::E);
+        assert!(
+            libm::fabsf(v_e - 1.0) < 0.01,
+            "log_ns(e) should be ~1.0, got {}",
+            v_e
+        );
+    }
 
     #[test]
     fn constant_expr_benchmarks_successfully() {

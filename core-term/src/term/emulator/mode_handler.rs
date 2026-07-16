@@ -125,8 +125,8 @@ impl TerminalEmulator {
                             AltScreenClear::Preserve
                         };
 
-                        if enable {
-                            if !self.dec_modes.using_alt_screen {
+                        match (enable, self.dec_modes.using_alt_screen) {
+                            (true, false) => {
                                 // Assuming this flag exists
                                 if mode_num == DecModeConstant::AltScreenBufferSaveRestore as u16 {
                                     self.save_cursor();
@@ -143,22 +143,24 @@ impl TerminalEmulator {
                                 self.screen.mark_all_dirty();
                                 action_to_return = Some(EmulatorAction::RequestRedraw);
                             }
-                        } else if self.dec_modes.using_alt_screen {
-                            self.screen.exit_alt_screen();
-                            self.dec_modes.using_alt_screen = false;
-                            if mode_num == DecModeConstant::AltScreenBufferSaveRestore as u16 {
-                                self.restore_cursor();
-                            } else {
-                                self.cursor_controller.move_to_logical(
-                                    0,
-                                    0,
-                                    &self.current_screen_context(),
-                                );
-                                self.screen.default_attributes =
-                                    self.cursor_controller.attributes();
+                            (false, true) => {
+                                self.screen.exit_alt_screen();
+                                self.dec_modes.using_alt_screen = false;
+                                if mode_num == DecModeConstant::AltScreenBufferSaveRestore as u16 {
+                                    self.restore_cursor();
+                                } else {
+                                    self.cursor_controller.move_to_logical(
+                                        0,
+                                        0,
+                                        &self.current_screen_context(),
+                                    );
+                                    self.screen.default_attributes =
+                                        self.cursor_controller.attributes();
+                                }
+                                self.screen.mark_all_dirty();
+                                action_to_return = Some(EmulatorAction::RequestRedraw);
                             }
-                            self.screen.mark_all_dirty();
-                            action_to_return = Some(EmulatorAction::RequestRedraw);
+                            _ => {}
                         }
                     }
                     Some(DecModeConstant::SaveRestoreCursor) => {

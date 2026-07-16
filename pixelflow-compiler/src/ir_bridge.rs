@@ -264,6 +264,16 @@ pub fn ast_to_runtime_arena(
             pixelflow_ir::arena::ExprNode::Param(i) => {
                 quote! { ::pixelflow_ir::arena::ExprNode::Param(#i) }
             }
+            // The `kernel!` macro has no buffer surface yet, so this is
+            // unreachable in practice; fail loud rather than emit a node that
+            // references a buffer table `from_raw` does not reconstruct.
+            pixelflow_ir::arena::ExprNode::Buffer(b) => {
+                panic!(
+                    "kernel! produced ExprNode::Buffer({}) — lattice parameters are not wired \
+                     into the compiler yet (KERNELS_AND_LATTICES.md M4)",
+                    b.0
+                )
+            }
             pixelflow_ir::arena::ExprNode::Unary(op, child) => {
                 let op_code = opkind_to_tokens(*op);
                 let child = child.0;

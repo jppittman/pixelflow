@@ -241,6 +241,9 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
                 }
             }
             ExprNode::Const(_) => Variance::CONST,
+            // A buffer leaf is constant; a Gather's variance is the union of
+            // its index expressions (handled by the Ternary arm below).
+            ExprNode::Buffer(_) => Variance::CONST,
             ExprNode::Param(_) => {
                 // Parameters are substituted before JIT compilation.
                 // If we see one here, treat conservatively as all-varying.
@@ -328,9 +331,13 @@ pub fn find_hoistable_arena_nodes(
         let id = ExprId(i as u32);
         let node = arena.node(id);
 
-        // Skip trivial nodes (Var, Const, Param) — not worth a register
+        // Skip trivial nodes (Var, Const, Param, Buffer) — not worth a register
         let priority = match node {
-            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => continue,
+            ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) => {
+                continue;
+            }
+            // A loop-invariant memory read is well worth a register.
+            ExprNode::Ternary(OpKind::Gather, _, _, _) => 2,
             ExprNode::Unary(
                 OpKind::Sin
                 | OpKind::Cos
@@ -371,7 +378,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_from_var() {
+    fn verify_from_var() {
         assert_eq!(Variance::from_var(0), Variance::X);
         assert_eq!(Variance::from_var(1), Variance::Y);
         assert_eq!(Variance::from_var(2), Variance::Z);
@@ -379,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_union() {
+    fn verify_union() {
         assert_eq!(Variance::X.union(Variance::Y), Variance::from_bits(0b0011));
         assert_eq!(Variance::CONST.union(Variance::Z), Variance::Z);
         assert_eq!(Variance::X.union(Variance::X), Variance::X);
@@ -390,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_meet() {
+    fn verify_meet() {
         // Fewer deps wins
         assert_eq!(Variance::CONST.meet(Variance::X), Variance::CONST);
         assert_eq!(Variance::X.meet(Variance::CONST), Variance::CONST);
@@ -405,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn test_queries() {
+    fn queries() {
         assert!(Variance::CONST.is_const());
         assert!(!Variance::X.is_const());
 
@@ -425,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_format() {
+    fn debug_format() {
         assert_eq!(format!("{:?}", Variance::CONST), "Variance(CONST)");
         assert_eq!(format!("{:?}", Variance::X), "Variance{X}");
         assert_eq!(
@@ -436,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_popcount() {
+    fn verify_popcount() {
         assert_eq!(Variance::CONST.popcount(), 0);
         assert_eq!(Variance::X.popcount(), 1);
         assert_eq!(Variance::X.union(Variance::Y).popcount(), 2);
@@ -444,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_arena_variance() {
+    fn verify_compute_arena_variance() {
         use crate::arena::ExprArena;
         use crate::kind::OpKind;
 
@@ -476,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_hoistable_arena_nodes() {
+    fn verify_find_hoistable_arena_nodes() {
         use crate::arena::ExprArena;
         use crate::kind::OpKind;
 
@@ -518,7 +525,7 @@ mod tests {
     /// (sin(Z*0.3) is used by the loop's multiply, and Z*0.3 is used by sin
     /// which is itself in setup, so only sin(Z*0.3) crosses).
     #[test]
-    fn test_hoisted_schedule_partitioning() {
+    fn hoisted_schedule_partitioning() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;
@@ -571,7 +578,9 @@ mod tests {
         for (vid, op) in &hoisted.schedule {
             let operands: alloc::vec::Vec<emit::regalloc::ValueId> = match op {
                 emit::ScheduledOp::Var(_) | emit::ScheduledOp::Const(_) => alloc::vec![],
-                emit::ScheduledOp::Unary(_, a) | emit::ScheduledOp::ShiftImm(_, a, _) => {
+                emit::ScheduledOp::Unary(_, a)
+                | emit::ScheduledOp::ShiftImm(_, a, _)
+                | emit::ScheduledOp::Gather(a, _) => {
                     alloc::vec![*a]
                 }
                 emit::ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
@@ -606,7 +615,7 @@ mod tests {
 
     /// Verify that a purely X-dependent expression produces an empty setup phase.
     #[test]
-    fn test_hoisted_schedule_no_setup_for_x_only() {
+    fn hoisted_schedule_no_setup_for_x_only() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;
@@ -636,7 +645,7 @@ mod tests {
 
     /// Verify that constants alone do not trigger hoisting (they are rematerialized).
     #[test]
-    fn test_hoisted_schedule_constants_not_hoisted() {
+    fn hoisted_schedule_constants_not_hoisted() {
         use crate::arena::ExprArena;
         use crate::backend::emit;
         use crate::kind::OpKind;

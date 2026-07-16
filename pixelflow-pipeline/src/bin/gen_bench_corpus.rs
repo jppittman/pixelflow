@@ -252,6 +252,7 @@ enum SigNode {
     Var(u8),
     Const(u32),
     Param(u8),
+    Buffer(u16),
     Unary(OpKind, u32),
     Binary(OpKind, u32, u32),
     Ternary(OpKind, u32, u32, u32),
@@ -286,6 +287,7 @@ fn arena_structural_key(arena: &ExprArena, root: ExprId) -> Vec<SigNode> {
                     ExprNode::Var(i) => SigNode::Var(*i),
                     ExprNode::Const(v) => SigNode::Const(v.to_bits()),
                     ExprNode::Param(i) => SigNode::Param(*i),
+                    ExprNode::Buffer(b) => SigNode::Buffer(b.0),
                     ExprNode::Unary(op, a) => SigNode::Unary(*op, ids[a]),
                     ExprNode::Binary(op, a, b) => SigNode::Binary(*op, ids[a], ids[b]),
                     ExprNode::Ternary(op, a, b, c) => SigNode::Ternary(*op, ids[a], ids[b], ids[c]),
@@ -308,7 +310,7 @@ fn arena_structural_key(arena: &ExprArena, root: ExprId) -> Vec<SigNode> {
 fn main() {
     let args = Args::parse();
 
-    let per_band = (args.target + BANDS.len() - 1) / BANDS.len();
+    let per_band = args.target.div_ceil(BANDS.len());
     let mut seen = HashSet::new();
     let mut entries: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = Vec::new();
     let mut skipped_too_large = 0usize;

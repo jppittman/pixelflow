@@ -519,11 +519,13 @@ impl AnsiCommand {
                 }
             }
         }
-        // Consolidate multiple Resets or Reset followed by nothing else into a single Reset.
-        if attrs.is_empty() || (attrs.len() == 1 && attrs[0] == Attribute::Reset) {
-            attrs.clear(); // Ensure it's clean if it was just a single reset
-            attrs.push(Attribute::Reset);
-        } else if attrs.iter().all(|&a| a == Attribute::Reset) && attrs.len() > 1 {
+        // Collapse a run of only-`Reset` attributes (e.g. `SGR 0;0`) into one.
+        // An *empty* result means every parameter was unrecognized: that must be
+        // a no-op, never a reset. The genuine reset — an empty parameter list
+        // (`ESC[m`) — is already handled at the top of this function, so an
+        // unknown code such as `ESC[73m` must not be allowed to fall through
+        // into a full attribute reset here.
+        if !attrs.is_empty() && attrs.iter().all(|&a| a == Attribute::Reset) {
             attrs.clear();
             attrs.push(Attribute::Reset);
         }
@@ -612,7 +614,7 @@ impl AnsiCommand {
                 shape: param_or(0, 1), // Default shape 1 (blinking block) or 0 (default)
             })),
             // Handle 't' for WindowManipulation, checking intermediates for safety
-            (_, _, b't') if intermediates.is_empty() || intermediates == b" " => {
+            (_, i, b't') if i.is_empty() || i == b" " => {
                 // Ensure 't' is not part of a more complex sequence like DECSTUI
                 let ps1 = param_or(0, 0);
                 let ps2 = params.get(1).copied();

@@ -108,8 +108,8 @@ impl<L> SpatialBSP<L> {
             return Self::single(items.into_iter().next().unwrap().leaf);
         }
 
-        let mut interiors = Vec::new();
-        let mut leaves = Vec::new();
+        let mut interiors = Vec::with_capacity(items.len().saturating_sub(1));
+        let mut leaves = Vec::with_capacity(items.len());
 
         // Recursively build the tree
         let _root = Self::build_tree(&mut interiors, &mut leaves, items);
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_leaf() {
+    fn single_leaf() {
         let bsp = SpatialBSP::single(SolidColor::new(255, 0, 0, 255));
 
         assert_eq!(
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_two_leaves() {
+    fn two_leaves() {
         let items = vec![
             Positioned {
                 bounds: (0.0, 0.0, 50.0, 100.0),
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_bsp() {
+    fn empty_bsp() {
         let bsp: SpatialBSP<SolidColor> = SpatialBSP::from_positioned(vec![]);
 
         assert_eq!(bsp.interior_count(), 0, "Empty BSP has no interior nodes");
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_four_leaves_grid() {
+    fn four_leaves_grid() {
         // 2x2 grid
         let items = vec![
             Positioned {
@@ -1611,8 +1611,8 @@ mod tests {
                 let axis = interior.axis;
 
                 // Collect centers from left and right subtrees
-                let mut left_centers = Vec::new();
-                let mut right_centers = Vec::new();
+                let mut left_centers = Vec::with_capacity(centers.len() / 2);
+                let mut right_centers = Vec::with_capacity(centers.len() / 2);
 
                 fn collect_centers<L>(
                     bsp: &SpatialBSP<L>,
@@ -1797,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_of_wide_strips() {
+    fn stack_of_wide_strips() {
         use pixelflow_core::{materialize_discrete, PARALLELISM};
 
         // Create 2 wide, short items, stacked vertically.

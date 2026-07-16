@@ -50,7 +50,7 @@ impl EigenStructure {
         Self {
             valence: 4,
             eigenvalues: vec![1.0, 0.25, 0.25, 0.0625],
-            eigenvectors: Vec::new(), // TODO: B-spline basis
+            eigenvectors: Vec::with_capacity(4), // TODO: B-spline basis
         }
     }
 
@@ -63,8 +63,8 @@ impl EigenStructure {
         // For now, return placeholder
         Self {
             valence,
-            eigenvalues: Vec::new(),
-            eigenvectors: Vec::new(),
+            eigenvalues: Vec::with_capacity(valence),
+            eigenvectors: Vec::with_capacity(valence),
         }
     }
 }
@@ -474,7 +474,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_regular_patch() {
+    fn regular_patch() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -491,7 +491,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn test_limit_eval() {
+    fn limit_eval() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0
@@ -518,7 +518,7 @@ f 1 2 3 4
     }
 
     #[test]
-    fn test_surface_stats() {
+    fn surface_stats() {
         let obj = "
 v 0.0 0.0 0.0
 v 1.0 0.0 0.0

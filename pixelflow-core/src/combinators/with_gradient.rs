@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_gradient_2d_distance() {
+    fn with_gradient_2d_distance() {
         // Distance from origin: sqrt(x² + y²)
         // At (3, 4): value = 5
         // Gradient: (x/r, y/r) = (3/5, 4/5) = (0.6, 0.8)
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_gradient_2d_quadratic() {
+    fn with_gradient_2d_quadratic() {
         // Quadratic: x² + y²
         // At (2, 3): value = 4 + 9 = 13
         // Gradient: (2x, 2y) = (4, 6)
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_gradient_2d_product() {
+    fn with_gradient_2d_product() {
         // Product: x * y
         // At (3, 5): value = 15
         // Gradient: (y, x) = (5, 3)
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_gradient_3d_distance() {
+    fn with_gradient_3d_distance() {
         // 3D distance from origin: sqrt(x² + y² + z²)
         // At (1, 2, 2): r = 3, value = 3
         // Gradient: (x/r, y/r, z/r) = (1/3, 2/3, 2/3)
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_gradient_3d_product() {
+    fn with_gradient_3d_product() {
         // 3D product: x * y * z
         // At (2, 3, 4): value = 24
         // Gradient: (yz, xz, xy) = (12, 8, 6)

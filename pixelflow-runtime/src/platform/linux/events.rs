@@ -102,40 +102,44 @@ unsafe fn handle_selection_request(event: &xlib::XEvent, window: &mut super::win
     response.time = req.time;
     response.property = req.property;
 
-    if req.target == window.atoms.targets {
-        let targets = [
-            window.atoms.targets,
-            window.atoms.utf8_string,
-            window.atoms.text,
-            window.atoms.xa_string,
-        ];
-        xlib::XChangeProperty(
-            window.display,
-            req.requestor,
-            req.property,
-            xlib::XA_ATOM,
-            32,
-            xlib::PropModeReplace,
-            targets.as_ptr() as *const u8,
-            targets.len() as i32,
-        );
-    } else if req.target == window.atoms.utf8_string
-        || req.target == window.atoms.text
-        || req.target == window.atoms.xa_string
-    {
-        let data = window.clipboard_data.as_bytes();
-        xlib::XChangeProperty(
-            window.display,
-            req.requestor,
-            req.property,
-            req.target,
-            8,
-            xlib::PropModeReplace,
-            data.as_ptr(),
-            data.len() as i32,
-        );
-    } else {
-        response.property = 0; // Reject
+    match req.target {
+        t if t == window.atoms.targets => {
+            let targets = [
+                window.atoms.targets,
+                window.atoms.utf8_string,
+                window.atoms.text,
+                window.atoms.xa_string,
+            ];
+            xlib::XChangeProperty(
+                window.display,
+                req.requestor,
+                req.property,
+                xlib::XA_ATOM,
+                32,
+                xlib::PropModeReplace,
+                targets.as_ptr() as *const u8,
+                targets.len() as i32,
+            );
+        }
+        t if t == window.atoms.utf8_string
+            || t == window.atoms.text
+            || t == window.atoms.xa_string =>
+        {
+            let data = window.clipboard_data.as_bytes();
+            xlib::XChangeProperty(
+                window.display,
+                req.requestor,
+                req.property,
+                req.target,
+                8,
+                xlib::PropModeReplace,
+                data.as_ptr(),
+                data.len() as i32,
+            );
+        }
+        _ => {
+            response.property = 0; // Reject
+        }
     }
     xlib::XSendEvent(
         window.display,
@@ -264,9 +268,11 @@ fn extract_modifiers(state: u32) -> Modifiers {
 
 fn xkeysym_to_keysymbol(keysym_val: xlib::KeySym, text: &str) -> KeySymbol {
     if !text.is_empty() {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() == 1 && chars[0] != '\u{FFFD}' {
-            return KeySymbol::Char(chars[0]);
+        let mut chars = text.chars();
+        if let Some(c) = chars.next() {
+            if chars.next().is_none() && c != '\u{FFFD}' {
+                return KeySymbol::Char(c);
+            }
         }
     }
     match keysym_val as u32 {
