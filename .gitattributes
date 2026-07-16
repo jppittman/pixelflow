@@ -28,9 +28,5 @@ pixelflow-graphics/assets/DejaVuSansMono-Fallback.ttf filter= diff= merge= -text
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.tar.gz filter=lfs diff=lfs merge=lfs -text
 *.tgz filter=lfs diff=lfs merge=lfs -text
-pixelflow-pipeline/data/guide_data_v2.json filter=lfs diff=lfs merge=lfs -text
 *.jsonl filter=lfs diff=lfs merge=lfs -text
 *.pt filter=lfs diff=lfs merge=lfs -text
-pixelflow-pipeline/src/bin/fast_kernels.rs filter=lfs diff=lfs merge=lfs -text
-pixelflow-pipeline/src/bin/bench_extracted.rs filter=lfs diff=lfs merge=lfs -text
-pixelflow-pipeline/benches/generated_kernels.rs filter=lfs diff=lfs merge=lfs -text
