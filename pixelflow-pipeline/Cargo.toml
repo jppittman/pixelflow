@@ -20,7 +20,6 @@ serde_json = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 criterion = "0.5"
 libc = "0.2.183"
-ureq = { version = "2.10", default-features = false, features = ["json"] }
 pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
@@ -45,11 +44,6 @@ required-features = ["training"]
 [[bin]]
 name = "gen_bench_corpus"
 path = "src/bin/gen_bench_corpus.rs"
-required-features = ["training"]
-
-[[bin]]
-name = "train_unified"
-path = "src/bin/train_unified.rs"
 required-features = ["training"]
 
 [[bin]]
