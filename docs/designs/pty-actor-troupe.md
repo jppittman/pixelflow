@@ -2,9 +2,31 @@
 
 ## Metadata
 - **Author**: Claude (requested by jppittman)
-- **Status**: Phase 1 implemented (hand-wired actors; troupe!/kubelet phases pending)
+- **Status**: Phases 1 & 2 implemented (troupe!-wired actors; kubelet supervision pending)
 - **Created**: 2026-07-16
 - **Reviewers**: —
+
+## Phase 2 implementation notes (troupe! wiring)
+
+Landed. One thing the original sketch missed: the `troupe!` macro only wired a
+`WakeHandler` to the `[main]` actor, but the PTY pipeline needs wakers on
+*two* actors (reader and writer both block in `park()`). Resolved by adding a
+`[waker]` attribute to the macro — any actor can now declare a waker slot; the
+generated `Wakers` struct carries one optional handle per slot, and
+`new_with_waker(main)`/`new()` remain as behavior-preserving shims (the engine
+troupe is unaffected, verified by its full test suite). This generalizes the
+prior "main gets the platform waker" special-case, which the X11/Cocoa drivers
+had effectively hard-coded.
+
+Resource delivery (`NixPty`, `FdWaker`, app `PtySender`s) uses the VsyncActor
+idiom: actors are constructed empty by `new(dir)`, then a `Bind` **management**
+message delivers resources once the troupe is running. Because Management
+drains before Data in every scheduler wake, an actor is always bound before its
+first byte. The writer additionally buffers pre-bind (a `Resize` on Control
+outranks `Bind` on Management, so it can arrive first — it is coalesced and
+applied at bind). The PTY troupe's `play()` runs on a dedicated thread spawned
+before the engine troupe blocks the main thread; `PtyTroupeHandle::drop` sends
+`Shutdown` to each actor and joins.
 
 ---
 

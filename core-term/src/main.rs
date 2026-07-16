@@ -204,7 +204,7 @@ fn main() -> anyhow::Result<()> {
     let unregistered_handle = troupe.engine_handle();
 
     {
-        use core_term::io::event_monitor_actor::EventMonitorBuilder;
+        use core_term::io::event_monitor_actor::PtyTroupe;
         use core_term::io::pty::{NixPty, PtyConfig};
         use core_term::terminal_app::{spawn_terminal_app, TerminalAppParams, TerminalAppSender};
 
@@ -219,16 +219,15 @@ fn main() -> anyhow::Result<()> {
         let pty = NixPty::spawn_with_config(&pty_config).context("Failed to create NixPty")?;
         info!("Spawned PTY");
 
-        // Phase 3a: Wire the PTY pipeline's channels (no threads yet) so the
-        // app can be handed its writer handle up front.
-        let mut pty_pipeline =
-            EventMonitorBuilder::new(pty).context("Failed to create PTY pipeline")?;
+        // Phase 3a: Wire the PTY troupe's channels and wakers (no threads yet)
+        // so the app can be handed its writer handle up front.
+        let mut pty_troupe = PtyTroupe::new(pty).context("Failed to create PTY troupe")?;
 
         // Phase 3b: Spawn terminal app with UNREGISTERED handle
         // The app will call register() during its initialization
         let params = TerminalAppParams {
             emulator: term_emulator,
-            pty_writer: pty_pipeline.writer_handle(),
+            pty_writer: pty_troupe.writer_handle(),
             config: core_term::config::Config::default(),
             unregistered_engine: unregistered_handle,
             window_config: engine_config.window.clone(),
@@ -236,16 +235,16 @@ fn main() -> anyhow::Result<()> {
         let (app_handle, parser_handle, reader_handle, _app_thread_handle) =
             spawn_terminal_app(params).context("Failed to spawn terminal app")?;
 
-        // Phase 3c: Start the PTY actors, routed to the app.
-        let _event_monitor_actor = pty_pipeline
+        // Phase 3c: Bind and start the PTY actors, routed to the app.
+        let _pty_troupe_handle = pty_troupe
             .spawn(
                 Box::new(TerminalAppSender::new(parser_handle)),
                 Box::new(TerminalAppSender::new(reader_handle)),
             )
-            .context("Failed to spawn PTY pipeline")?;
-        info!("PTY pipeline spawned successfully");
+            .context("Failed to spawn PTY troupe")?;
+        info!("PTY troupe spawned successfully");
 
-        // Phase 3d: Run troupe (blocks on main thread)
+        // Phase 3d: Run engine troupe (blocks on main thread)
         // The _app_handle keeps the terminal app channel alive
         let _ = app_handle; // Keep app_handle alive until troupe completes
         troupe.play().map_err(|e| anyhow::anyhow!("{}", e))?;

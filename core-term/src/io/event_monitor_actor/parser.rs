@@ -4,37 +4,48 @@
 //!
 //! Receives raw byte batches from the reader on its data lane, parses them
 //! into `AnsiCommand`s (the CPU-heavy step), forwards the commands to the app,
-//! and recycles the drained buffer back to the reader's data lane.
+//! and recycles the drained buffer back to the reader's data lane. Purely
+//! message-driven — no OS blocking, so no waker.
+//!
+//! The reader-recycle handle comes from the troupe `Directory`; the app sink
+//! arrives via the `Bind` management message.
 
-use super::{FilledBuf, NoControl, NoManagement, ParserControl};
+use super::{Directory, FilledBuf, NoControl, ParserControl, ParserManagement, ReaderManagement};
 use crate::ansi::{AnsiParser, AnsiProcessor};
 use crate::io::traits::PtySender;
 use actor_scheduler::{
-    Actor, ActorHandle, ActorStatus, HandlerError, HandlerResult, Message, SystemStatus,
+    Actor, ActorHandle, ActorStatus, ActorTypes, HandlerError, HandlerResult, Message,
+    SystemStatus, TroupeActor,
 };
 use log::*;
 
+/// Handle to the reader for buffer recycling (from the troupe `Directory`).
+type ReaderTx = ActorHandle<Vec<u8>, NoControl, ReaderManagement>;
+
 pub(super) struct PtyParser {
     parser: AnsiProcessor,
-    app_tx: Box<dyn PtySender>,
-    /// Recycler: drained buffers go back to the reader's pool.
-    reader_tx: ActorHandle<Vec<u8>, NoControl, NoManagement>,
+    reader_tx: ReaderTx,
+    /// App sink, delivered by `Bind`.
+    app_tx: Option<Box<dyn PtySender>>,
 }
 
-impl PtyParser {
-    pub(super) fn new(
-        app_tx: Box<dyn PtySender>,
-        reader_tx: ActorHandle<Vec<u8>, NoControl, NoManagement>,
-    ) -> Self {
+impl ActorTypes for PtyParser {
+    type Data = FilledBuf;
+    type Control = ParserControl;
+    type Management = ParserManagement;
+}
+
+impl TroupeActor<Directory> for PtyParser {
+    fn new(dir: Directory) -> Self {
         Self {
             parser: AnsiProcessor::new(),
-            app_tx,
-            reader_tx,
+            reader_tx: dir.reader,
+            app_tx: None,
         }
     }
 }
 
-impl Actor<FilledBuf, ParserControl, NoManagement> for PtyParser {
+impl Actor<FilledBuf, ParserControl, ParserManagement> for PtyParser {
     fn handle_data(&mut self, batch: FilledBuf) -> HandlerResult {
         let commands = self.parser.process_bytes(batch.bytes());
 
@@ -43,10 +54,17 @@ impl Actor<FilledBuf, ParserControl, NoManagement> for PtyParser {
             debug!("PTY parser: reader gone, dropping recycled buffer: {}", e);
         }
 
-        if !commands.is_empty() {
-            if let Err(e) = self.app_tx.send(commands) {
-                warn!("PTY parser: failed to send commands to app: {}", e);
+        if commands.is_empty() {
+            return Ok(());
+        }
+        match &self.app_tx {
+            // Bind (Management) always drains before Data, so this is set.
+            Some(app_tx) => {
+                if let Err(e) = app_tx.send(commands) {
+                    warn!("PTY parser: failed to send commands to app: {}", e);
+                }
             }
+            None => warn!("PTY parser: received data before Bind; dropping commands"),
         }
         Ok(())
     }
@@ -61,7 +79,9 @@ impl Actor<FilledBuf, ParserControl, NoManagement> for PtyParser {
         Ok(())
     }
 
-    fn handle_management(&mut self, _msg: NoManagement) -> HandlerResult {
+    fn handle_management(&mut self, msg: ParserManagement) -> HandlerResult {
+        let ParserManagement::Bind { app_tx } = msg;
+        self.app_tx = Some(app_tx);
         Ok(())
     }
 

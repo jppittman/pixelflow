@@ -1,43 +1,44 @@
 // src/io/event_monitor_actor/mod.rs
 
-//! # PTY Actor Pipeline
+//! # PTY Actor Troupe
 //!
-//! Three actors on the actor-scheduler, one per PTY concern:
+//! The PTY pipeline is an [`actor_scheduler`] troupe of three actors, wired by
+//! the [`troupe!`](actor_scheduler::troupe) macro:
 //!
 //! ```text
 //!                    recycled buffers (Data lane)
 //!            ┌──────────────────────────────────────┐
 //!            ▼                                      │
-//!      ┌───────────┐   raw bytes (Data)    ┌────────┴───┐   AnsiCommands
+//!      ┌───────────┐   FilledBuf (Data)    ┌────────┴───┐   AnsiCommands
 //!      │ PtyReader │──────────────────────▶│ PtyParser  │───────────────▶ app
-//!      │ park:     │                       │ (message-  │
-//!      │ epoll/    │── ChildExited ──────▶ │  driven)   │
-//!      │ kqueue    │              (to app) └────────────┘
-//!      └───────────┘
+//!      │ [main]    │                       │ (message-  │
+//!      │ epoll/kq  │── ChildExited ──────▶ │  driven)   │
+//!      └───────────┘              (to app) └────────────┘
 //!
 //!      ┌───────────┐   Data: Write(bytes)
 //!      │ PtyWriter │◀─────────────────────  app
-//!      │ owns PTY  │   Control: Resize      (resize preempts queued writes)
+//!      │ [expose]  │   Control: Resize      (resize preempts queued writes)
 //!      └───────────┘
 //! ```
 //!
-//! **Blocking model.** The reader and writer bridge to the OS inside `park()`:
-//! each blocks in `epoll_wait`/`kevent` on `{pty, waker}`, where the waker is
-//! an [`FdWaker`](crate::io::waker::FdWaker) wired into the actor's
-//! `ActorBuilder` — any message send interrupts the poll. The parser is purely
-//! message-driven and blocks on the scheduler doorbell like any other actor.
+//! **Cross-actor wiring** (reader→parser bytes, parser→reader recycle) comes
+//! from the generated `Directory`. **External resources** — the `NixPty`, the
+//! per-actor [`FdWaker`], and the app-facing [`PtySender`]s — can't ride the
+//! `Directory` (which only knows troupe-internal handles), so they arrive via
+//! a `Bind` management message once the troupe is running. This mirrors how
+//! `VsyncActor` is configured post-construction. Management drains before Data
+//! in every scheduler wake, so an actor is always bound before it handles its
+//! first byte.
 //!
-//! **Backpressure.** A fixed population of read buffers circulates
-//! reader → parser → reader on data lanes. When all buffers are in flight the
-//! reader stops reading; output accumulates in the kernel PTY buffer, which
-//! blocks the shell. Nothing allocates after spawn and nothing is dropped.
+//! **Blocking model.** The reader and writer bridge to the OS inside `park()`,
+//! blocking in `epoll_wait`/`kevent` on `{pty, waker}`; each is a `[waker]`
+//! slot so a send interrupts the poll. The parser is message-driven.
 //!
-//! **Lifecycle.** [`EventMonitorBuilder::new`] wires channels (no threads),
-//! [`EventMonitorBuilder::writer_handle`] mints the app's handle to the
-//! writer, and [`EventMonitorBuilder::spawn`] starts the three threads.
-//! Dropping [`EventMonitorActor`] sends `Message::Shutdown` to each actor
-//! (the waker interrupts any in-flight poll) and joins the threads. On PTY
-//! EOF the reader notifies the app via `PtySender::send_child_exited`.
+//! **Lifecycle.** [`PtyTroupe::new`] wires channels and wakers (no threads),
+//! [`PtyTroupe::writer_handle`] mints the app's handle to the writer, and
+//! [`PtyTroupe::spawn`] sends the `Bind`s and runs `play()` on a dedicated
+//! thread. Dropping the returned [`PtyTroupeHandle`] sends `Shutdown` to each
+//! actor (the waker interrupts any in-flight poll) and joins the thread.
 
 mod parser;
 mod reader;
@@ -47,33 +48,20 @@ use crate::io::pty::NixPty;
 use crate::io::traits::PtySender;
 use crate::io::waker::FdWaker;
 use crate::io::Resize;
+use actor_scheduler::{ActorHandle, Message, WakeHandler};
 use anyhow::{Context, Result};
-use actor_scheduler::{
-    ActorBuilder, ActorHandle, Message, ShutdownMode, WakeHandler,
-};
 use log::*;
 use parser::PtyParser;
-use reader::{PtyReader, POOL_SIZE, READ_BUFFER_SIZE};
+use reader::PtyReader;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 use writer::PtyWriter;
 
-/// Control messages for the PTY reader (none yet; `Pause`/`Resume` flow
-/// control is a planned extension).
+// ── Lane message types ──────────────────────────────────────────────────────
+
+/// Placeholder for the reader's unused control lane.
 #[derive(Debug, Clone)]
 pub struct NoControl;
-
-/// Placeholder for actors with no management lane.
-#[derive(Debug, Clone)]
-pub struct NoManagement;
-
-/// Control messages for the PTY parser.
-#[derive(Debug, Clone)]
-pub enum ParserControl {
-    /// Discard any half-parsed escape-sequence state.
-    Reset,
-}
 
 /// A read result flowing reader → parser: `data[..len]` holds PTY output.
 ///
@@ -93,6 +81,13 @@ impl FilledBuf {
     }
 }
 
+/// Control messages for the PTY parser.
+#[derive(Debug, Clone)]
+pub enum ParserControl {
+    /// Discard any half-parsed escape-sequence state.
+    Reset,
+}
+
 /// Control messages for the PTY writer. Drained before queued Data (writes),
 /// which is exactly the priority a resize wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,225 +96,197 @@ pub enum WriterControl {
     Resize(Resize),
 }
 
+// ── Bind (management) messages: deliver post-construction resources ──────────
+
+/// Reader management lane: resource delivery.
+pub enum ReaderManagement {
+    /// Hand the reader its PTY (a read clone), waker, and app sink. Builds the
+    /// event monitor and seeds the buffer pool.
+    Bind {
+        pty: NixPty,
+        waker: Arc<FdWaker>,
+        app_tx: Box<dyn PtySender>,
+    },
+}
+
+/// Parser management lane: resource delivery.
+pub enum ParserManagement {
+    /// Hand the parser its app sink for parsed commands.
+    Bind { app_tx: Box<dyn PtySender> },
+}
+
+/// Writer management lane: resource delivery.
+pub enum WriterManagement {
+    /// Hand the writer its primary PTY and waker. Builds the event monitor and
+    /// flushes anything the app queued before the bind landed.
+    Bind { pty: NixPty, waker: Arc<FdWaker> },
+}
+
+// Manual Debug: the payloads (NixPty, FdWaker, Box<dyn PtySender>) aren't all
+// Debug, and the scheduler never formats these anyway.
+impl std::fmt::Debug for ReaderManagement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReaderManagement::Bind")
+    }
+}
+impl std::fmt::Debug for ParserManagement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ParserManagement::Bind")
+    }
+}
+impl std::fmt::Debug for WriterManagement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriterManagement::Bind")
+    }
+}
+
 /// The app's handle to the PTY writer: `Data` = bytes for the shell,
 /// `Control` = resize.
-pub type PtyWriterHandle = ActorHandle<Vec<u8>, WriterControl, NoManagement>;
+pub type PtyWriterHandle = ActorHandle<Vec<u8>, WriterControl, WriterManagement>;
 
-/// Data-lane buffer size per producer. Must exceed [`POOL_SIZE`] so the
-/// bootstrap seeding and a full pool recycle never block.
-const READER_LANE_SIZE: usize = 16;
-/// Parser inbox size for raw byte batches (matches the previous design).
-const PARSER_LANE_SIZE: usize = 64;
-/// Parser batches drained per wake (matches the previous burst limit).
-const PARSER_BURST: usize = 10;
-/// Writer inbox size for pending write requests from the app.
-const WRITER_LANE_SIZE: usize = 128;
-/// Writer messages drained per wake.
-const WRITER_BURST: usize = 64;
-/// On shutdown, how long the parser/writer drain queued work before exiting.
-const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+// ── Troupe declaration ──────────────────────────────────────────────────────
 
-/// Phase 1 of PTY pipeline construction: channels exist, no threads yet.
+// All three are [expose] so `PtyTroupe` can mint handles to send Bind and
+// Shutdown. Reader and writer are [waker] because they block in park().
+actor_scheduler::troupe! {
+    reader: PtyReader [main, expose, waker],
+    parser: PtyParser [expose],
+    writer: PtyWriter [expose, waker],
+}
+
+// ── Public wrapper ──────────────────────────────────────────────────────────
+
+/// Phase 1 of PTY pipeline construction: channels and wakers exist, no threads.
 ///
-/// Exists so the app can be handed its writer handle *before* the pipeline
-/// threads start (the pipeline in turn needs `PtySender`s minted by the app's
-/// builder — a cycle that two-phase construction breaks).
-pub struct EventMonitorBuilder {
-    pty: NixPty,
-    reader_builder: ActorBuilder<Vec<u8>, NoControl, NoManagement>,
-    parser_builder: ActorBuilder<FilledBuf, ParserControl, NoManagement>,
-    writer_builder: ActorBuilder<Vec<u8>, WriterControl, NoManagement>,
+/// Two-phase so the app can be handed its writer handle before the pipeline
+/// starts (the pipeline in turn needs `PtySender`s minted by the app's builder
+/// — a cycle two-phase construction breaks).
+pub struct PtyTroupe {
+    troupe: Option<Troupe>,
+    pty: Option<NixPty>,
     reader_waker: Arc<FdWaker>,
     writer_waker: Arc<FdWaker>,
 }
 
-impl EventMonitorBuilder {
-    /// Creates the channel plumbing for the PTY pipeline.
+impl PtyTroupe {
+    /// Create the troupe scaffolding around a freshly spawned PTY.
     ///
-    /// `pty` is the primary master handle; the writer thread takes ownership
-    /// of it (RAII: closing it hangs up the child).
+    /// `pty` is the primary master handle; the writer actor takes ownership of
+    /// it (RAII: closing it hangs up the child).
     pub fn new(pty: NixPty) -> Result<Self> {
         let reader_waker = Arc::new(FdWaker::new().context("Failed to create reader waker")?);
         let writer_waker = Arc::new(FdWaker::new().context("Failed to create writer waker")?);
 
+        let troupe = Troupe::new_with_wakers(Wakers {
+            reader: Some(reader_waker.clone() as Arc<dyn WakeHandler>),
+            writer: Some(writer_waker.clone() as Arc<dyn WakeHandler>),
+        });
+
         Ok(Self {
-            pty,
-            reader_builder: ActorBuilder::new(
-                READER_LANE_SIZE,
-                Some(reader_waker.clone() as Arc<dyn WakeHandler>),
-            ),
-            parser_builder: ActorBuilder::new(PARSER_LANE_SIZE, None),
-            writer_builder: ActorBuilder::new(
-                WRITER_LANE_SIZE,
-                Some(writer_waker.clone() as Arc<dyn WakeHandler>),
-            ),
+            troupe: Some(troupe),
+            pty: Some(pty),
             reader_waker,
             writer_waker,
         })
     }
 
-    /// Mints a handle to the PTY writer for the app.
+    /// Mint a handle to the PTY writer for the app.
     pub fn writer_handle(&mut self) -> PtyWriterHandle {
-        self.writer_builder.add_producer()
+        self.troupe
+            .as_mut()
+            .expect("PtyTroupe already spawned")
+            .exposed()
+            .writer
     }
 
-    /// Spawns the reader, parser, and writer threads.
+    /// Bind the actors to their resources and run the troupe on a dedicated
+    /// thread.
     ///
-    /// # Arguments
-    ///
-    /// * `parser_sink` - The parser's route to the app (parsed `AnsiCommand`s)
-    /// * `reader_sink` - The reader's route to the app (`ChildExited`)
+    /// * `parser_sink` - the parser's route to the app (parsed `AnsiCommand`s)
+    /// * `reader_sink` - the reader's route to the app (`ChildExited`)
     pub fn spawn(
         mut self,
         parser_sink: Box<dyn PtySender>,
         reader_sink: Box<dyn PtySender>,
-    ) -> Result<EventMonitorActor> {
-        // Cross-actor handles.
-        let parser_tx = self.parser_builder.add_producer(); // reader → parser
-        let recycler_tx = self.reader_builder.add_producer(); // parser → reader
-        // Shutdown handles; the reader's doubles as the pool-seeding producer.
-        let reader_ctl = self.reader_builder.add_producer();
-        let parser_ctl = self.parser_builder.add_producer();
-        let writer_ctl = self.writer_builder.add_producer();
+    ) -> Result<PtyTroupeHandle> {
+        let mut troupe = self.troupe.take().expect("PtyTroupe already spawned");
+        let pty = self.pty.take().expect("PtyTroupe already spawned");
+        let pty_read = pty.try_clone().context("Failed to clone PTY for reader")?;
 
-        let mut reader_rx = self
-            .reader_builder
-            .build_with_burst(POOL_SIZE, ShutdownMode::Immediate);
-        let mut parser_rx = self.parser_builder.build_with_burst(
-            PARSER_BURST,
-            ShutdownMode::DrainAll {
-                timeout: DRAIN_TIMEOUT,
-            },
-        );
-        let mut writer_rx = self.writer_builder.build_with_burst(
-            WRITER_BURST,
-            ShutdownMode::DrainAll {
-                timeout: DRAIN_TIMEOUT,
-            },
-        );
+        // One handle set for both Bind delivery and later Shutdown.
+        let ctl = troupe.exposed();
 
-        let pty_read = self
-            .pty
-            .try_clone()
-            .context("Failed to clone PTY for read thread")?;
+        // Bind lands on the Management lane, drained before any Data, so each
+        // actor is fully configured before it processes its first byte.
+        ctl.reader
+            .send(Message::Management(ReaderManagement::Bind {
+                pty: pty_read,
+                waker: self.reader_waker.clone(),
+                app_tx: reader_sink,
+            }))
+            .context("Failed to bind PTY reader")?;
+        ctl.parser
+            .send(Message::Management(ParserManagement::Bind {
+                app_tx: parser_sink,
+            }))
+            .context("Failed to bind PTY parser")?;
+        ctl.writer
+            .send(Message::Management(WriterManagement::Bind {
+                pty,
+                waker: self.writer_waker.clone(),
+            }))
+            .context("Failed to bind PTY writer")?;
 
-        let mut actor = EventMonitorActor {
-            reader_ctl,
-            parser_ctl,
-            writer_ctl,
-            reader_join: None,
-            parser_join: None,
-            writer_join: None,
-        };
+        let join = std::thread::Builder::new()
+            .name("pty-troupe".to_string())
+            .spawn(move || {
+                if let Err(e) = troupe.play() {
+                    error!("PTY troupe exited with error: {}", e);
+                }
+            })
+            .context("Failed to spawn PTY troupe thread")?;
 
-        // Actors are constructed on their own threads: the event monitors
-        // (epoll/kqueue handles) never cross a thread boundary.
-        let reader_waker = self.reader_waker;
-        actor.reader_join = Some(
-            std::thread::Builder::new()
-                .name("pty-reader".to_string())
-                .spawn(move || {
-                    match PtyReader::new(pty_read, reader_waker, parser_tx, reader_sink) {
-                        Ok(mut reader) => {
-                            debug!("PTY reader started");
-                            reader_rx.run(&mut reader);
-                            debug!("PTY reader exited");
-                        }
-                        Err(e) => error!("PTY reader failed to initialize: {}", e),
-                    }
-                })
-                .context("Failed to spawn PTY reader thread")?,
-        );
-
-        actor.parser_join = Some(
-            std::thread::Builder::new()
-                .name("pty-parser".to_string())
-                .spawn(move || {
-                    debug!("PTY parser started");
-                    let mut parser = PtyParser::new(parser_sink, recycler_tx);
-                    parser_rx.run(&mut parser);
-                    debug!("PTY parser exited");
-                })
-                .context("Failed to spawn PTY parser thread")?,
-        );
-
-        let pty = self.pty;
-        let writer_waker = self.writer_waker;
-        actor.writer_join = Some(
-            std::thread::Builder::new()
-                .name("pty-writer".to_string())
-                .spawn(move || match PtyWriter::new(pty, writer_waker) {
-                    Ok(mut writer) => {
-                        debug!("PTY writer started");
-                        writer_rx.run(&mut writer);
-                        debug!("PTY writer exited - closing PTY");
-                    }
-                    Err(e) => error!("PTY writer failed to initialize: {}", e),
-                })
-                .context("Failed to spawn PTY writer thread")?,
-        );
-
-        // Seed the reader's buffer pool through its own data lane. These are
-        // the only buffer allocations the pipeline ever makes, and the first
-        // doorbell ring that moves the reader from its initial recv() into
-        // park()'s poll loop. Buffers ship at full length (see the pool
-        // invariant on PtyReader) so reads never resize them.
-        for _ in 0..POOL_SIZE {
-            actor
-                .reader_ctl
-                .send(Message::Data(vec![0u8; READ_BUFFER_SIZE]))
-                .context("Failed to seed PTY reader buffer pool")?;
-        }
-
-        info!("PTY pipeline spawned: reader, parser, and writer actors");
-        Ok(actor)
+        info!("PTY troupe spawned: reader, parser, writer");
+        Ok(PtyTroupeHandle {
+            ctl,
+            join: Some(join),
+        })
     }
 }
 
-/// Running PTY pipeline. Dropping it shuts the three actors down and joins
-/// their threads.
-pub struct EventMonitorActor {
-    reader_ctl: ActorHandle<Vec<u8>, NoControl, NoManagement>,
-    parser_ctl: ActorHandle<FilledBuf, ParserControl, NoManagement>,
-    writer_ctl: PtyWriterHandle,
-    reader_join: Option<JoinHandle<()>>,
-    parser_join: Option<JoinHandle<()>>,
-    writer_join: Option<JoinHandle<()>>,
+/// Running PTY troupe. Dropping it shuts the actors down and joins the thread.
+pub struct PtyTroupeHandle {
+    ctl: ExposedHandles,
+    join: Option<JoinHandle<()>>,
 }
 
-fn join_pty_thread(handle: Option<JoinHandle<()>>, name: &str) {
-    let Some(handle) = handle else { return };
-    if let Err(panic_payload) = handle.join() {
-        if std::thread::panicking() {
-            // Already unwinding — can't double-panic, just log.
-            eprintln!("{} thread panicked (during unwind): {:?}", name, panic_payload);
-        } else {
-            std::panic::resume_unwind(panic_payload);
-        }
-    }
-}
-
-impl Drop for EventMonitorActor {
+impl Drop for PtyTroupeHandle {
     fn drop(&mut self) {
-        debug!("EventMonitorActor dropped, shutting down PTY actors");
+        debug!("PtyTroupeHandle dropped, shutting down PTY actors");
 
-        // Explicit shutdown signals; each actor's waker interrupts any poll
-        // it is blocked in. Errors mean the actor already exited.
-        if let Err(e) = self.writer_ctl.send(Message::Shutdown) {
-            debug!("PTY writer already gone at shutdown: {}", e);
-        }
-        if let Err(e) = self.reader_ctl.send(Message::Shutdown) {
-            debug!("PTY reader already gone at shutdown: {}", e);
-        }
-        if let Err(e) = self.parser_ctl.send(Message::Shutdown) {
-            debug!("PTY parser already gone at shutdown: {}", e);
+        // Each Shutdown also rings that actor's waker, interrupting any poll.
+        // Errors mean the actor already exited.
+        for (name, result) in [
+            ("writer", self.ctl.writer.send(Message::Shutdown)),
+            ("reader", self.ctl.reader.send(Message::Shutdown)),
+            ("parser", self.ctl.parser.send(Message::Shutdown)),
+        ] {
+            if let Err(e) = result {
+                debug!("PTY {} already gone at shutdown: {}", name, e);
+            }
         }
 
-        join_pty_thread(self.writer_join.take(), "pty-writer");
-        join_pty_thread(self.reader_join.take(), "pty-reader");
-        join_pty_thread(self.parser_join.take(), "pty-parser");
+        if let Some(join) = self.join.take() {
+            if let Err(panic_payload) = join.join() {
+                if std::thread::panicking() {
+                    eprintln!("PTY troupe thread panicked (during unwind): {:?}", panic_payload);
+                } else {
+                    std::panic::resume_unwind(panic_payload);
+                }
+            }
+        }
 
-        debug!("EventMonitorActor cleanup complete");
+        debug!("PTY troupe cleanup complete");
     }
 }
 
@@ -375,10 +342,10 @@ mod tests {
         }
     }
 
-    fn spawn_pipeline(
+    fn spawn_troupe(
         command: &str,
         args: &[&str],
-    ) -> (CaptureSink, PtyWriterHandle, EventMonitorActor) {
+    ) -> (CaptureSink, PtyWriterHandle, PtyTroupeHandle) {
         let pty = NixPty::spawn_with_config(&PtyConfig {
             command_executable: command,
             args,
@@ -388,24 +355,22 @@ mod tests {
         .expect("Failed to spawn PTY");
 
         let sink = CaptureSink::default();
-        let mut builder = EventMonitorBuilder::new(pty).expect("builder");
-        let writer = builder.writer_handle();
-        let actor = builder
+        let mut troupe = PtyTroupe::new(pty).expect("troupe");
+        let writer = troupe.writer_handle();
+        let handle = troupe
             .spawn(Box::new(sink.clone()), Box::new(sink.clone()))
-            .expect("spawn pipeline");
-        (sink, writer, actor)
+            .expect("spawn troupe");
+        (sink, writer, handle)
     }
 
-    /// Shell output flows PTY → reader → parser → sink, and EOF is reported.
     #[test]
-    fn pipeline_delivers_output_and_child_exit() {
-        let (sink, writer, actor) =
-            spawn_pipeline("/bin/sh", &["-c", "printf 'hello-pipeline'"]);
+    fn troupe_delivers_output_and_child_exit() {
+        let (sink, writer, handle) = spawn_troupe("/bin/sh", &["-c", "printf 'hello-troupe'"]);
 
         assert!(
             sink.wait_for(Duration::from_secs(5), |s| s
                 .printed_text()
-                .contains("hello-pipeline")),
+                .contains("hello-troupe")),
             "expected shell output, got: {:?}",
             sink.printed_text()
         );
@@ -417,13 +382,12 @@ mod tests {
         );
 
         drop(writer);
-        drop(actor); // sends Shutdown x3 and joins all threads
+        drop(handle);
     }
 
-    /// Full loop: app → writer → PTY → child (cat) → reader → parser → sink.
     #[test]
-    fn pipeline_round_trips_writes_through_child() {
-        let (sink, writer, actor) = spawn_pipeline("/bin/cat", &[]);
+    fn troupe_round_trips_writes_through_child() {
+        let (sink, writer, handle) = spawn_troupe("/bin/cat", &[]);
 
         writer
             .send(Message::Data(b"echo-me".to_vec()))
@@ -438,24 +402,66 @@ mod tests {
         );
 
         drop(writer);
-        drop(actor);
+        drop(handle);
     }
 
-    /// Shutdown works even when the child is still alive and the reader is
-    /// blocked in its poll — the waker must interrupt it.
     #[test]
     fn shutdown_interrupts_blocked_reader() {
-        let (_sink, writer, actor) = spawn_pipeline("/bin/cat", &[]);
+        let (_sink, writer, handle) = spawn_troupe("/bin/cat", &[]);
 
         // Give the reader time to enter its epoll/kqueue wait.
         std::thread::sleep(Duration::from_millis(100));
 
         let start = Instant::now();
         drop(writer);
-        drop(actor); // must not hang
+        drop(handle); // must not hang
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "shutdown should not block on a live child"
         );
+    }
+
+    #[test]
+    fn resize_before_bind_is_applied() {
+        // A resize sent on the writer handle immediately (likely before the
+        // Bind lands, since Control outranks Management) must not be lost or
+        // panic — the writer coalesces it and applies it at Bind.
+        let pty = NixPty::spawn_with_config(&PtyConfig {
+            command_executable: "/bin/cat",
+            args: &[],
+            initial_cols: 80,
+            initial_rows: 24,
+        })
+        .expect("pty");
+        let sink = CaptureSink::default();
+        let mut troupe = PtyTroupe::new(pty).expect("troupe");
+        let writer = troupe.writer_handle();
+
+        // Fire a resize before spawn() even sends the Bind.
+        writer
+            .send(Message::Control(WriterControl::Resize(Resize {
+                cols: 100,
+                rows: 40,
+            })))
+            .expect("early resize");
+
+        let handle = troupe
+            .spawn(Box::new(sink.clone()), Box::new(sink.clone()))
+            .expect("spawn");
+
+        // If the early resize wedged the writer, a subsequent echo wouldn't
+        // round-trip. It does, so the writer survived the pre-bind resize.
+        writer
+            .send(Message::Data(b"after-resize".to_vec()))
+            .expect("write");
+        assert!(
+            sink.wait_for(Duration::from_secs(5), |s| s
+                .printed_text()
+                .contains("after-resize")),
+            "writer should work after a pre-bind resize"
+        );
+
+        drop(writer);
+        drop(handle);
     }
 }
