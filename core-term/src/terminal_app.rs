@@ -894,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_control_resize() {
+    fn handle_control_resize() {
         let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_management_keydown() {
+    fn handle_management_keydown() {
         let (mut app, pty_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
@@ -953,7 +953,7 @@ mod tests {
         // We expect 'a' to be sent to PTY wrapped in PtyCommand::Write
         let received = pty_rx.try_recv();
         assert!(received.is_ok(), "Should receive data on PTY channel");
-        let cmd = received.unwrap();
+        let cmd = received.expect("Should contain the command sent to the PTY channel");
         assert_eq!(cmd, PtyCommand::Write(vec![b'a']));
     }
 }

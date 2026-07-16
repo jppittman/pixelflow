@@ -190,6 +190,7 @@ mod tests {
     /// Dropping the JoinHandle does NOT stop the thread; you must call
     /// `kill.send(Message::Shutdown)` and then `join.join()` to cleanly
     /// terminate the pod and disconnect the SPSC channels.
+    #[allow(clippy::type_complexity)]
     fn spawn_pod() -> (
         ActorHandle<i32, i32, i32>, // svc: for ServiceHandle
         ActorHandle<i32, i32, i32>, // kill: send Shutdown to stop pod

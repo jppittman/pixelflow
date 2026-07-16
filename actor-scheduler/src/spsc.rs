@@ -526,6 +526,7 @@ mod tests {
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Counted(u32);
         impl Drop for Counted {
             fn drop(&mut self) {
