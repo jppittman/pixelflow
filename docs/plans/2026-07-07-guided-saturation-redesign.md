@@ -81,15 +81,21 @@ Each phase ends in a falsifiable, *recorded* result. Stop at any gate.
 **Phase 0 — Cleanup (done / in flight).** Loud NNUE failure (done); dead-code sweep (done);
 fail-loud extraction fixes (`unwrap_or(0)` missing-choice family); RL apparatus cut.
 
-**Phase 1 — Provenance.** Node origins (which rule application created each e-node), union
-journal (which rule caused each merge), hindsight labeler (transitive ancestors of the
-winning extraction). Bonus: "explain this optimization" derivation traces (egg-style proof
-production). Pure compiler infrastructure — valuable even if all ML dies.
+**Phase 1 — Provenance.** ✅ **DONE 2026-07-08.** Node origins, union journal,
+`derivation_ancestors`, hindsight labeler (`EpisodeLabels`/`run_episode`), derivation
+traces. Bonus find: a real silent-node-drop bug in `rebuild_budgeted`, fixed with a
+regression test. First rule report recorded (docs/results/2026-07-08-rule-report.md) —
+NOTE its ratios are corpus-conditioned (5 toy kernels); rule-triage decisions require the
+real kernel population. Known follow-up: tighten union-causality over-approximation before
+training the Guide on per-application labels.
 
-**Phase 2 — Judge offline.** Retrain on corpus → valid TRID weights → run the deferred
-extraction bench: **NNUE vs latency prior vs no-swap**, JIT-benched, numbers committed to
-docs/. *Gate:* if NNUE ≤ latency prior, port the prior into the static `CostModel` as the
-default and keep NNUE opt-in only.
+**Phase 2 — Judge offline.** ✅ **DECIDED 2026-07-08** (docs/results/2026-07-08-extraction-3way.md):
+Judge retrained (4k samples, 48s — the supervised core was never the slow part), bench run.
+**NNUE lost: 6.7% slower geomean than the latency prior at ~31x extraction cost**; extraction
+itself worth ~33% over no-swap. Per the gate: the static latency prior
+(`CostModel::latency_prior()`) is now the compiler's default extraction policy; NNUE is
+opt-in via `PIXELFLOW_NNUE_WEIGHTS` (hard-fails on bad weights). Cost-model research can
+resume any time by training better weights and re-running the same recorded bench.
 
 **Phase 3 — Greedy guided saturation (the thesis test).** Guide trained on provenance
 labels; budget-bounded greedy expansion; first calculus/trig rule batch. Run **the**

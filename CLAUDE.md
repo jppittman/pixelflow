@@ -42,9 +42,9 @@ Cargo workspace with 12 member crates:
 | `pixelflow-compiler` | Proc-macro compiler: `kernel!` macro, lexer, parser, sema, AST optimization, codegen. Edition 2024. |
 | `pixelflow-ir` | Shared IR. `ExprArena` (sole IR), OpKind enum, backend execution traits, JIT manifold. |
 | `pixelflow-graphics` | Font loading (TTF, SDF), colors (`Rgba8`, `Color`), rasterization, antialiasing, shapes. |
-| `pixelflow-ml` | Neural networks for compiler optimization. NNUE training, HCE extraction, e-graph training. |
-| `pixelflow-search` | E-graph optimization. Rewrite rules, saturation, cost extraction, NNUE-guided search. |
-| `pixelflow-pipeline` | Training orchestrator. Self-play, unified backward pass, critic server, hyperparameter sweep. |
+| `pixelflow-ml` | Graphics ML experiments (harmonic attention, SH feature maps). Not part of the compiler cost model. |
+| `pixelflow-search` | E-graph optimization. Rewrite rules, saturation, cost extraction (static latency prior default; NNUE opt-in), rule provenance + hindsight labeling. |
+| `pixelflow-pipeline` | Cost-model tooling. JIT bench harness, corpus generation, extraction-head bootstrap, extraction-policy benchmarks. |
 | `pixelflow-runtime` | Display drivers (macOS Cocoa, headless, Metal, Web WASM), input handling, vsync, render pool. |
 | `actor-scheduler` | Priority channels with `troupe!` macro. Control > Management > Data lanes. |
 | `actor-scheduler-macros` | Procedural macros for actor system. |
@@ -81,9 +81,17 @@ Source → Lexer → Parser → Sema → Optimize → Codegen → Rust TokenStre
 The compiler uses e-graphs (equality graphs) to find optimal instruction sequences:
 1. **Build e-graph** from expression AST
 2. **Saturate** by applying rewrite rules (associativity, FMA fusion, etc.)
-3. **Extract** minimum-cost implementation using NNUE-guided search
+3. **Extract** minimum-cost implementation using the **static latency-prior cost model**
+   (`CostModel::latency_prior()` — handwritten per-op cycle estimates, the DEFAULT)
 
-NNUE cost model is inspired by Stockfish: HalfEP features with incremental updates, making evaluation O(rewrite_size).
+A learned NNUE cost model exists as **opt-in only** (`PIXELFLOW_NNUE_WEIGHTS` env var, read
+at proc-macro expansion time; hard-fails on bad weights). The recorded 3-way benchmark
+(docs/results/2026-07-08-extraction-3way.md) measured NNUE extraction slower than the
+latency prior, so the handwritten model is the production default. The e-graph also records
+**rule provenance** (node origins + union journal, `pixelflow-search/src/egraph/provenance.rs`),
+enabling hindsight labeling of which rule applications were load-bearing for an extraction
+(`labeler.rs`) — the substrate for guided-saturation research
+(docs/plans/2026-07-07-guided-saturation-redesign.md).
 
 ### ExprArena
 
@@ -214,12 +222,19 @@ handle.send(Message::Data(MyDataMsg))?;           // Lowest (backpressure)
 - **Antialiasing:** Automatic differentiation via `Jet2` dual numbers
 - **Monomorphization:** Entire scene compiles to fused SIMD kernels
 
-## Training Pipeline
+## Cost-Model Training (offline, supervised)
 
-Unified self-play training loop for the NNUE cost model:
+The old AlphaZero-style self-play/critic/REINFORCE loop was removed in July 2026 after a
+four-agent audit found it methodologically unsound (deterministic policy under a REINFORCE
+estimator, advantage collapse, censored failures) and its trained policy unconsumed by the
+compiler. Full post-mortem and replacement architecture:
+docs/plans/2026-07-07-guided-saturation-redesign.md.
 
-```
-GENERATE (Rust self-play) → EXPORT (.pftraj) → CRITIQUE (Python Transformer) → UPDATE (Rust joint backprop) → CHECKPOINT
-```
-
-Key entry point: `pixelflow-pipeline/src/bin/train_unified.rs` (supports `--server` mode for fast Optuna trials via unix socket).
+What remains is simple and supervised:
+- `gen_bench_corpus` / `bootstrap_extraction_head` (pixelflow-pipeline, `--features training`):
+  mint (expression, measured-ns) pairs via the JIT bench harness (`jit_bench.rs`,
+  median-of-samples) and regress the extraction head on them. A full retrain is ~1 minute.
+- `bench_extraction_3way`: the recorded extraction-policy benchmark (NNUE vs latency prior
+  vs no-swap). Any new cost model must beat the latency prior here before becoming default.
+- Guided-saturation research (the Guide / rule-masking direction) trains on hindsight
+  provenance labels from `pixelflow-search`'s `egraph::labeler` — no critic, no RL.
