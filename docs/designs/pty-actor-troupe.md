@@ -2,7 +2,7 @@
 
 ## Metadata
 - **Author**: Claude (requested by jppittman)
-- **Status**: Draft
+- **Status**: Phase 1 implemented (hand-wired actors; troupe!/kubelet phases pending)
 - **Created**: 2026-07-16
 - **Reviewers**: —
 

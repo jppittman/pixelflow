@@ -135,4 +135,6 @@ pub enum TerminalData {
     Engine(EngineEventData),
     /// Data from the PTY (ANSI commands).
     Pty(Vec<AnsiCommand>),
+    /// The PTY child process exited (EOF on the master FD).
+    ChildExited,
 }
