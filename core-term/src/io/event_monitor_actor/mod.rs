@@ -75,6 +75,24 @@ pub enum ParserControl {
     Reset,
 }
 
+/// A read result flowing reader → parser: `data[..len]` holds PTY output.
+///
+/// The buffer itself always keeps `len() == READ_BUFFER_SIZE`; carrying the
+/// valid length out-of-band means buffers are never resized as they circulate,
+/// so a read never pays a re-zeroing memset and a recycle is a pure move.
+#[derive(Debug)]
+pub(crate) struct FilledBuf {
+    pub(crate) data: Vec<u8>,
+    pub(crate) len: usize,
+}
+
+impl FilledBuf {
+    /// The valid portion of the buffer.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
 /// Control messages for the PTY writer. Drained before queued Data (writes),
 /// which is exactly the priority a resize wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +127,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 pub struct EventMonitorBuilder {
     pty: NixPty,
     reader_builder: ActorBuilder<Vec<u8>, NoControl, NoManagement>,
-    parser_builder: ActorBuilder<Vec<u8>, ParserControl, NoManagement>,
+    parser_builder: ActorBuilder<FilledBuf, ParserControl, NoManagement>,
     writer_builder: ActorBuilder<Vec<u8>, WriterControl, NoManagement>,
     reader_waker: Arc<FdWaker>,
     writer_waker: Arc<FdWaker>,
@@ -244,11 +262,12 @@ impl EventMonitorBuilder {
         // Seed the reader's buffer pool through its own data lane. These are
         // the only buffer allocations the pipeline ever makes, and the first
         // doorbell ring that moves the reader from its initial recv() into
-        // park()'s poll loop.
+        // park()'s poll loop. Buffers ship at full length (see the pool
+        // invariant on PtyReader) so reads never resize them.
         for _ in 0..POOL_SIZE {
             actor
                 .reader_ctl
-                .send(Message::Data(Vec::with_capacity(READ_BUFFER_SIZE)))
+                .send(Message::Data(vec![0u8; READ_BUFFER_SIZE]))
                 .context("Failed to seed PTY reader buffer pool")?;
         }
 
@@ -261,7 +280,7 @@ impl EventMonitorBuilder {
 /// their threads.
 pub struct EventMonitorActor {
     reader_ctl: ActorHandle<Vec<u8>, NoControl, NoManagement>,
-    parser_ctl: ActorHandle<Vec<u8>, ParserControl, NoManagement>,
+    parser_ctl: ActorHandle<FilledBuf, ParserControl, NoManagement>,
     writer_ctl: PtyWriterHandle,
     reader_join: Option<JoinHandle<()>>,
     parser_join: Option<JoinHandle<()>>,

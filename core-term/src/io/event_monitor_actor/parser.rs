@@ -6,7 +6,7 @@
 //! into `AnsiCommand`s (the CPU-heavy step), forwards the commands to the app,
 //! and recycles the drained buffer back to the reader's data lane.
 
-use super::{NoControl, NoManagement, ParserControl};
+use super::{FilledBuf, NoControl, NoManagement, ParserControl};
 use crate::ansi::{AnsiParser, AnsiProcessor};
 use crate::io::traits::PtySender;
 use actor_scheduler::{
@@ -34,12 +34,12 @@ impl PtyParser {
     }
 }
 
-impl Actor<Vec<u8>, ParserControl, NoManagement> for PtyParser {
-    fn handle_data(&mut self, data: Vec<u8>) -> HandlerResult {
-        let commands = self.parser.process_bytes(&data);
+impl Actor<FilledBuf, ParserControl, NoManagement> for PtyParser {
+    fn handle_data(&mut self, batch: FilledBuf) -> HandlerResult {
+        let commands = self.parser.process_bytes(batch.bytes());
 
         // Recycle the buffer; if the reader is gone the buffer just drops.
-        if let Err(e) = self.reader_tx.send(Message::Data(data)) {
+        if let Err(e) = self.reader_tx.send(Message::Data(batch.data)) {
             debug!("PTY parser: reader gone, dropping recycled buffer: {}", e);
         }
 
