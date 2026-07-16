@@ -314,16 +314,7 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, _scratch: [Reg; 4]) {
 /// `reg` is the ModRM.reg operand (a register, or a `/digit` opcode extension
 /// passed as `Reg(digit)`); `vvvv` is the inverted extra source (pass `Reg(0)`
 /// when unused — that encodes the required `1111`); `rm` is the ModRM.rm reg.
-fn emit_vex(
-    code: &mut Vec<u8>,
-    pp: u8,
-    mmmmm: u8,
-    w: u8,
-    reg: Reg,
-    vvvv: Reg,
-    rm: Reg,
-    opcode: u8,
-) {
+fn emit_vex(code: &mut Vec<u8>, pp: u8, mmmmm: u8, w: u8, reg: Reg, vvvv: Reg, rm: Reg, opcode: u8) {
     let rbit = if reg.0 >= 8 { 0x00 } else { 0x80 };
     let xbit = 0x40;
     let bbit = if rm.0 >= 8 { 0x00 } else { 0x20 };

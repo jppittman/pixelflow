@@ -418,7 +418,9 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
     // Reserve xmm12..15 for scratch: any node that allocates a value register
     // (everything except a bare Var, which reuses an input register) must fit
     // below the scratch floor.
-    if !matches!(arena.node(id), ExprNode::Var(_)) && SCRATCH_BASE + depth > X86_MAX_VALUE_REG {
+    if !matches!(arena.node(id), ExprNode::Var(_))
+        && SCRATCH_BASE + depth > X86_MAX_VALUE_REG
+    {
         return Err("x86 JIT: expression too deep for SSE register budget");
     }
 
@@ -4049,100 +4051,25 @@ mod tests {
         // accuracy over a sensible input range; exact ops use tight bounds.
         // `rel_err = |jit - scalar| / (1 + |scalar|)`.
         let unary: &[(OpKind, fn(f32) -> f32, &[f32], f32)] = &[
-            (
-                OpKind::Sqrt,
-                |x| x.sqrt(),
-                &[0.25, 1.0, 2.0, 9.0, 100.0],
-                1e-5,
-            ),
+            (OpKind::Sqrt, |x| x.sqrt(), &[0.25, 1.0, 2.0, 9.0, 100.0], 1e-5),
             (OpKind::Abs, |x| x.abs(), &[-3.0, -0.5, 0.0, 2.5], 1e-6),
             (OpKind::Neg, |x| -x, &[-3.0, 0.5, 2.5], 1e-6),
-            (
-                OpKind::Floor,
-                |x| x.floor(),
-                &[-2.3, -0.1, 0.9, 1.5, 3.99],
-                1e-6,
-            ),
-            (
-                OpKind::Ceil,
-                |x| x.ceil(),
-                &[-2.3, -0.1, 0.9, 1.5, 3.01],
-                1e-6,
-            ),
-            (
-                OpKind::Round,
-                |x| x.round_ties_even(),
-                &[-2.4, -0.4, 0.4, 1.5, 2.6],
-                1e-6,
-            ),
-            (
-                OpKind::Fract,
-                |x| x - x.floor(),
-                &[-2.3, 0.1, 0.9, 3.75],
-                1e-5,
-            ),
+            (OpKind::Floor, |x| x.floor(), &[-2.3, -0.1, 0.9, 1.5, 3.99], 1e-6),
+            (OpKind::Ceil, |x| x.ceil(), &[-2.3, -0.1, 0.9, 1.5, 3.01], 1e-6),
+            (OpKind::Round, |x| x.round_ties_even(), &[-2.4, -0.4, 0.4, 1.5, 2.6], 1e-6),
+            (OpKind::Fract, |x| x - x.floor(), &[-2.3, 0.1, 0.9, 3.75], 1e-5),
             // sin/cos: 4-term Chebyshev — accurate well inside [-π, π].
-            (
-                OpKind::Sin,
-                |x| x.sin(),
-                &[-2.0, -1.0, -0.3, 0.0, 0.5, 1.5, 2.0],
-                6e-3,
-            ),
-            (
-                OpKind::Cos,
-                |x| x.cos(),
-                &[-1.0, -0.3, 0.0, 0.5, 1.0],
-                1.5e-2,
-            ),
-            (
-                OpKind::Tan,
-                |x| x.tan(),
-                &[-1.0, -0.3, 0.0, 0.3, 1.0],
-                2.5e-2,
-            ),
-            (
-                OpKind::Exp,
-                |x| x.exp(),
-                &[-2.0, -0.5, 0.0, 1.0, 2.0, 3.0],
-                5e-3,
-            ),
-            (
-                OpKind::Exp2,
-                |x| x.exp2(),
-                &[-3.0, -0.5, 0.0, 1.0, 4.0],
-                5e-3,
-            ),
+            (OpKind::Sin, |x| x.sin(), &[-2.0, -1.0, -0.3, 0.0, 0.5, 1.5, 2.0], 6e-3),
+            (OpKind::Cos, |x| x.cos(), &[-1.0, -0.3, 0.0, 0.5, 1.0], 1.5e-2),
+            (OpKind::Tan, |x| x.tan(), &[-1.0, -0.3, 0.0, 0.3, 1.0], 2.5e-2),
+            (OpKind::Exp, |x| x.exp(), &[-2.0, -0.5, 0.0, 1.0, 2.0, 3.0], 5e-3),
+            (OpKind::Exp2, |x| x.exp2(), &[-3.0, -0.5, 0.0, 1.0, 4.0], 5e-3),
             (OpKind::Ln, |x| x.ln(), &[0.25, 0.5, 1.0, 2.0, 10.0], 5e-3),
-            (
-                OpKind::Log2,
-                |x| x.log2(),
-                &[0.25, 0.5, 1.0, 2.0, 8.0],
-                5e-3,
-            ),
-            (
-                OpKind::Log10,
-                |x| x.log10(),
-                &[0.1, 0.5, 1.0, 10.0, 100.0],
-                5e-3,
-            ),
-            (
-                OpKind::Atan,
-                |x| x.atan(),
-                &[-5.0, -0.5, -0.2, 0.0, 0.2, 0.5, 5.0],
-                8e-3,
-            ),
-            (
-                OpKind::Asin,
-                |x| x.asin(),
-                &[-0.8, -0.5, 0.0, 0.5, 0.8],
-                1e-2,
-            ),
-            (
-                OpKind::Acos,
-                |x| x.acos(),
-                &[-0.8, -0.5, 0.0, 0.5, 0.8],
-                1e-2,
-            ),
+            (OpKind::Log2, |x| x.log2(), &[0.25, 0.5, 1.0, 2.0, 8.0], 5e-3),
+            (OpKind::Log10, |x| x.log10(), &[0.1, 0.5, 1.0, 10.0, 100.0], 5e-3),
+            (OpKind::Atan, |x| x.atan(), &[-5.0, -0.5, -0.2, 0.0, 0.2, 0.5, 5.0], 8e-3),
+            (OpKind::Asin, |x| x.asin(), &[-0.8, -0.5, 0.0, 0.5, 0.8], 1e-2),
+            (OpKind::Acos, |x| x.acos(), &[-0.8, -0.5, 0.0, 0.5, 0.8], 1e-2),
         ];
         for &(op, scalar, inputs, tol) in unary {
             let mut arena = ExprArena::new();
@@ -4174,14 +4101,7 @@ mod tests {
         }
 
         // atan2(y, x): arena Binary(Atan2, Y, X)  (op order: src1=y, src2=x)
-        let pts = [
-            (0.5, 2.0),
-            (2.0, 0.5),
-            (-0.5, 2.0),
-            (0.5, -2.0),
-            (-2.0, -0.5),
-            (3.0, -0.5),
-        ];
+        let pts = [(0.5, 2.0), (2.0, 0.5), (-0.5, 2.0), (0.5, -2.0), (-2.0, -0.5), (3.0, -0.5)];
         {
             let mut a = ExprArena::new();
             let y = a.push_var(1);
@@ -4190,10 +4110,7 @@ mod tests {
             for &(yv, xv) in &pts {
                 let got = unsafe { run2(&a, root, xv, yv) };
                 let want = yv.atan2(xv);
-                assert!(
-                    (got - want).abs() <= 1.5e-2,
-                    "atan2({yv},{xv}): {got} vs {want}"
-                );
+                assert!((got - want).abs() <= 1.5e-2, "atan2({yv},{xv}): {got} vs {want}");
             }
         }
         // pow(X, Y)
@@ -4218,10 +4135,7 @@ mod tests {
             for &(xv, yv) in &[(3.0f32, 4.0f32), (1.0, 1.0), (0.0, 2.0)] {
                 let got = unsafe { run2(&a, root, xv, yv) };
                 let want = xv.hypot(yv);
-                assert!(
-                    (got - want).abs() <= 1e-4,
-                    "hypot({xv},{yv}): {got} vs {want}"
-                );
+                assert!((got - want).abs() <= 1e-4, "hypot({xv},{yv}): {got} vs {want}");
             }
         }
         // Min / Max
@@ -4247,10 +4161,7 @@ mod tests {
             let root = a.push_ternary(OpKind::Clamp, x, lo, hi);
             for &xv in &[-0.5f32, 0.25, 0.9, 1.7] {
                 let got = run1(&a, root, xv);
-                assert!(
-                    (got - xv.clamp(0.0, 1.0)).abs() <= 1e-6,
-                    "clamp({xv})={got}"
-                );
+                assert!((got - xv.clamp(0.0, 1.0)).abs() <= 1e-6, "clamp({xv})={got}");
             }
         }
         // Select(X >= 0, 1.0, -1.0) == signum-ish
