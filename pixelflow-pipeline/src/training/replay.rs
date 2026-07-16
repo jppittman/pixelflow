@@ -123,9 +123,6 @@ impl MmapReplayBuffer {
     }
 
     /// Number of records in buffer.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -216,8 +213,7 @@ fn bytes_as_records(bytes: &[u8]) -> &[ReplayRecord] {
         bytes.len(),
     );
     assert!(
-        (bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<ReplayRecord>())
-            || bytes.is_empty(),
+        (bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<ReplayRecord>()) || bytes.is_empty(),
         "[REPLAY] Byte buffer is not aligned to ReplayRecord alignment",
     );
     unsafe {
