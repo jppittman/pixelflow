@@ -114,14 +114,17 @@ impl Actor<EngineData, EngineControl, AppManagement> for EngineHandler {
                 }
 
                 // Delegate rendering to rasterizer if we have a manifold and a window
-                if let Some(manifold) = self.pending_manifold.take() {
-                    if let Some(window) = self.window.take() {
-                        self.trigger_render_with_window(manifold, window);
-                    } else {
-                        // Window unavailable, keep manifold pending
-                        self.pending_manifold = Some(manifold);
-                    }
-                }
+                let Some(manifold) = self.pending_manifold.take() else {
+                    return Ok(());
+                };
+
+                let Some(window) = self.window.take() else {
+                    // Window unavailable, keep manifold pending
+                    self.pending_manifold = Some(manifold);
+                    return Ok(());
+                };
+
+                self.trigger_render_with_window(manifold, window);
             }
             EngineData::RenderComplete(response) => {
                 // Reconstruct Window from pending_render metadata + cooked frame
@@ -137,19 +140,22 @@ impl Actor<EngineData, EngineControl, AppManagement> for EngineHandler {
                         );
                         // Don't present the stale frame - just drop it.
                         // Now check if we have a pending manifold to render with correct dimensions.
-                        if let Some(manifold) = self.pending_manifold.take() {
-                            if let Some(window) = self.window.take() {
-                                log::debug!(
-                                    "Triggering render with correct dimensions after stale discard: {}x{}",
-                                    window.width_px,
-                                    window.height_px
-                                );
-                                self.trigger_render_with_window(manifold, window);
-                            } else {
-                                // Window not available yet - keep manifold pending
-                                self.pending_manifold = Some(manifold);
-                            }
-                        }
+                        let Some(manifold) = self.pending_manifold.take() else {
+                            return Ok(());
+                        };
+
+                        let Some(window) = self.window.take() else {
+                            // Window not available yet - keep manifold pending
+                            self.pending_manifold = Some(manifold);
+                            return Ok(());
+                        };
+
+                        log::debug!(
+                            "Triggering render with correct dimensions after stale discard: {}x{}",
+                            window.width_px,
+                            window.height_px
+                        );
+                        self.trigger_render_with_window(manifold, window);
                     } else {
                         let window = Window {
                             id: pending.id,
