@@ -224,6 +224,15 @@ mod tests {
     }
 
     #[test]
+    fn pod_gone_display_formats_each_variant() {
+        assert_eq!(PodGone::Stopped.to_string(), "pod permanently stopped");
+        assert_eq!(
+            PodGone::Timeout.to_string(),
+            "reconnect timed out waiting for pod restart"
+        );
+    }
+
+    #[test]
     fn reconnect_on_stopped_slot_returns_immediately() {
         let slot = PodSlot::<i32, i32, i32>::connected();
         slot.stop();

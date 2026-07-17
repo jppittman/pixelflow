@@ -137,4 +137,16 @@ mod tests {
         assert!(PodPhase::Completed.is_completed());
         assert!(!PodPhase::Failed("x".into()).is_completed());
     }
+
+    #[test]
+    fn pod_phase_display_formats_each_variant() {
+        assert_eq!(PodPhase::Pending.to_string(), "Pending");
+        assert_eq!(PodPhase::Running.to_string(), "Running");
+        assert_eq!(PodPhase::Terminating.to_string(), "Terminating");
+        assert_eq!(PodPhase::Completed.to_string(), "Completed");
+        assert_eq!(
+            PodPhase::Failed("boom".into()).to_string(),
+            "Failed(boom)"
+        );
+    }
 }
