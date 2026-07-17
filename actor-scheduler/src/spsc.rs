@@ -515,10 +515,6 @@ mod tests {
         assert!(!rx.is_empty(), "Buffer with a message should not be empty");
     }
 
-    // Kills: replace & with | in RingBuffer::drop (line 115)
-    // Kills: replace & with ^ in RingBuffer::drop (line 115)
-    // The mask used in drop must correctly compute slot index: idx = i & mask
-    // With | or ^: wrong slots are accessed → UB or double-free
     #[test]
     fn drop_cleans_up_buffered_messages() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -545,5 +541,48 @@ mod tests {
         drop(rx);
 
         assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 3);
+    }
+
+    // Kills: replace & with | / ^ in RingBuffer::drop (line 115).
+    //
+    // `head`/`tail` are raw monotonically-growing counters, not values already
+    // wrapped into [0, cap). `idx = i & mask` is what confines them to a valid
+    // slot. With `head`/`tail` still small (as in `drop_cleans_up_buffered_messages`
+    // above), `i | mask` happens to collapse to `mask` and `i ^ mask` stays in
+    // bounds too, so a dropped-item *count* can't distinguish the operators.
+    // Advancing head/tail past `cap` first means the raw counters carry bits
+    // above the mask, so a wrong operator produces an out-of-bounds index and
+    // panics instead of just miscounting.
+    #[test]
+    fn drop_cleans_up_buffered_messages_after_wraparound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct Counted;
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::Relaxed);
+
+        let (tx, mut rx) = spsc_channel::<Counted>(2);
+        // Push head and tail well past `cap` (2) so their bit patterns exceed
+        // the mask.
+        for _ in 0..10 {
+            tx.try_send(Counted).unwrap();
+            rx.try_recv().unwrap();
+        }
+        // Leave 2 messages buffered at drop time.
+        tx.try_send(Counted).unwrap();
+        tx.try_send(Counted).unwrap();
+
+        drop(tx);
+        drop(rx);
+
+        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 12);
     }
 }
