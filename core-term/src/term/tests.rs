@@ -188,7 +188,6 @@ fn assert_screen_state(
             s_col += char_width;
         }
 
-        // Check that remaining cells in the row are spaces (default fill)
         for c_fill in s_col..snapshot.dimensions.0 {
             let glyph_wrapper = get_glyph_from_snapshot(snapshot, r, c_fill)
                 .unwrap_or_else(|| panic!("Glyph ({}, {}) not found for fill check", r, c_fill));
@@ -248,7 +247,6 @@ fn newline_input() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     // With LNM ON, LF moves to next line AND performs carriage return. 'B' prints at (1,0), cursor moves to (1,1)
-    // Testing behavior: cursor should be at column 0 after LF (that's what LNM does)
     assert_screen_state(&snapshot, &["A         ", "B         "], Some((1, 1)));
 }
 
@@ -1305,7 +1303,6 @@ mod selection_logic_tests {
         let point1 = Point { x: 2, y: 1 };
         let point2 = Point { x: 5, y: 1 };
 
-        // Test click (no drag) - selection should be cleared
         emu.interpret_input(EmulatorInput::User(start_selection_at(2, 1)));
         let snapshot1 = emu.get_render_snapshot().expect("Snapshot was None");
         assert!(snapshot1.selection.is_active);
@@ -1321,7 +1318,6 @@ mod selection_logic_tests {
             "Selection should be inactive after click"
         );
 
-        // Test drag - selection should be maintained but deactivated
         emu.interpret_input(EmulatorInput::User(start_selection_at(2, 1)));
         emu.interpret_input(EmulatorInput::User(extend_selection_to(5, 1)));
         let snapshot3 = emu.get_render_snapshot().expect("Snapshot was None");
@@ -1442,7 +1438,6 @@ mod get_selected_text_tests {
             ],
         );
 
-        // Test single line selection
         send_mouse_input(&mut emu, start_selection_at(0, 1), MouseButton::Left);
         send_mouse_input(&mut emu, extend_selection_to(7, 1), MouseButton::Left);
         send_mouse_input(
@@ -1452,7 +1447,6 @@ mod get_selected_text_tests {
         );
         assert_eq!(emu.get_selected_text(), Some("Line Two".to_string()));
 
-        // Test multi-line selection
         send_mouse_input(&mut emu, start_selection_at(0, 0), MouseButton::Left);
         send_mouse_input(&mut emu, extend_selection_to(7, 1), MouseButton::Left);
         send_mouse_input(

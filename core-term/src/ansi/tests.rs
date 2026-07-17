@@ -911,7 +911,6 @@ mod unicode_wide_tests {
         let mut expected_commands = vec![
             AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For interrupted 0xE2
         ];
-        // Check how ESC 'A' is handled (assuming it's not a defined sequence, might print 'A')
         if AnsiCommand::from_esc('A').is_none() {
             expected_commands.push(AnsiCommand::Print('A'));
         } else {
@@ -1337,7 +1336,6 @@ fn it_should_process_charset_designator_boundary_high() {
 
 #[test]
 fn it_should_process_charset_special_designators() {
-    // Test special characters that are valid charset designators
     let test_cases = [
         (':', "colon"),
         (';', "semicolon"),
@@ -1678,7 +1676,6 @@ mod mutation_tests {
 
     #[test]
     fn sgr_fg_all_eight_normal_colors() {
-        // Tests every entry in map_basic_code_to_color for Normal intensity.
         // A mutation that shifts the base constant by ±1 would fail on Black or White.
         let cases: &[(u8, NamedColor)] = &[
             (30, NamedColor::Black),
@@ -2100,7 +2097,6 @@ mod mutation_tests {
         // All 16 must be collected and processed.
         let cmds = process_bytes(b"\x1b[1;2;0;0;0;0;0;0;0;0;0;0;0;0;0;0m");
         if let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() {
-            // Checking len kills mutations that reduce MAX_PARAMS below 16.
             assert_eq!(attrs.len(), 16, "all 16 params must be retained");
             assert_eq!(
                 attrs[0],
