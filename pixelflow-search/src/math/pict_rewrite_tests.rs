@@ -217,18 +217,22 @@ fn build_shape(a: &mut ExprArena, shape: usize, konst: f32) -> ExprId {
     }
 }
 
-fn build_expr(
-    a: &mut ExprArena,
+struct ExprParams {
     outer: OpKind,
     wrapper: Option<OpKind>,
     left: usize,
     right: usize,
     konst: f32,
+}
+
+fn build_expr(
+    a: &mut ExprArena,
+    params: &ExprParams,
 ) -> ExprId {
-    let l = build_shape(a, left, konst);
-    let r = build_shape(a, right, konst);
-    let inner = a.push_binary(outer, l, r);
-    match wrapper {
+    let l = build_shape(a, params.left, params.konst);
+    let r = build_shape(a, params.right, params.konst);
+    let inner = a.push_binary(params.outer, l, r);
+    match params.wrapper {
         None => inner,
         Some(op) => a.push_unary(op, inner),
     }
@@ -303,13 +307,16 @@ fn pict_rewrite_rules_preserve_semantics() {
     let mut changed = 0usize; // how many cases the optimizer actually rewrote
 
     for row in &rows {
-        let outer = OUTER_OPS[row[0]];
-        let wrapper = UNARY_WRAPPERS[row[1]];
-        let (left, right) = (row[2], row[3]);
-        let konst = CONSTS[row[4]];
+        let params = ExprParams {
+            outer: OUTER_OPS[row[0]],
+            wrapper: UNARY_WRAPPERS[row[1]],
+            left: row[2],
+            right: row[3],
+            konst: CONSTS[row[4]],
+        };
 
         let mut arena = ExprArena::new();
-        let root = build_expr(&mut arena, outer, wrapper, left, right, konst);
+        let root = build_expr(&mut arena, &params);
         let orig_str = arena.display(root).to_string();
 
         // Optimize the way the compiler does: build e-graph, saturate once,
