@@ -421,6 +421,28 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // Kills: replace SemanticAnalyzer::analyze_block -> syn::Result<()> with
+    // Ok(()) (sema.rs:314). block_scoping above only exercises the success
+    // path, so a stub that always returns Ok(()) survives it undetected.
+    #[test]
+    fn error_inside_block_propagates() {
+        // Named kernel: undefined symbols are errors (anonymous kernels treat
+        // them as captures, which would make this test pass for the wrong
+        // reason).
+        let input = quote! {
+            struct Test = |cx: f32| {
+                let dx = X - undefined_thing;
+                dx * dx
+            }
+        };
+        let kernel = parse(input).unwrap();
+        let result = analyze(kernel);
+        assert!(
+            result.is_err(),
+            "an undefined symbol inside a block must fail analysis, not be swallowed"
+        );
+    }
+
     #[test]
     fn typo_suggestion_for_intrinsic() {
         // Lowercase "x" should suggest uppercase "X" (named kernel rejects typos)
@@ -447,6 +469,30 @@ mod tests {
         // Similar names with 1-2 char difference should be suggested
     }
 
+    // Kills: replace == with != (sema.rs:237, same-length gate in
+    // find_similar_symbol), replace != with == (241, the char-diff filter),
+    // replace <= with > (243, the diff_count <= 2 threshold).
+    //
+    // "radiu" above differs in *length* from "radius" (missing a char), so it
+    // never reaches find_similar_symbol's same-length diff-count branch at
+    // all — it only proves an error occurs, not that the suggestion logic
+    // works. Use a same-length, 1-char substitution typo instead so the
+    // suggestion text itself is asserted.
+    #[test]
+    fn typo_suggestion_for_parameter_same_length() {
+        // "radiue" is the same length as "radius", differing in one char.
+        let input = quote! { struct Test = |radius: f32| X - radiue };
+        let kernel = parse(input).unwrap();
+        let result = analyze(kernel);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("did you mean 'radius'"),
+            "expected a same-length-typo suggestion, got: {err}"
+        );
+    }
+
     #[test]
     fn error_on_unknown_method() {
         let input = quote! { |r: f32| X.unknownmethod() };
@@ -468,6 +514,49 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("unknown method"));
+    }
+
+    // Kills: replace == with != (sema.rs:283, len-equal gate), replace &&
+    // with || (284), replace != with == (286, the char-diff filter), replace
+    // <= with > (288, the diff_count <= 2 threshold) in the same-length/
+    // char-diff branch of analyze_method_call's suggestion search.
+    //
+    // "sqrx" is deliberately NOT a case-insensitive match for any known
+    // method (so the `m_lower == name_lower` half of the `||` can't paper
+    // over a broken length/diff-count half), but is same-length/1-char-off
+    // from "sqrt".
+    #[test]
+    fn typo_suggestion_for_method_same_length_case_sensitive() {
+        let input = quote! { || X.sqrx() };
+        let kernel = parse(input).unwrap();
+        let result = analyze(kernel);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("did you mean 'sqrt'"),
+            "expected the length/diff-count branch to suggest 'sqrt', got: {err}"
+        );
+    }
+
+    // Kills: replace == with != (sema.rs:282, the case-insensitive gate),
+    // replace || with && (283) in analyze_method_call's suggestion search.
+    //
+    // "SQRT" differs from "sqrt" in all 4 characters, so the length/diff-count
+    // branch (diff_count <= 2) can't independently produce this suggestion —
+    // only the case-insensitive `m_lower == name_lower` branch can.
+    #[test]
+    fn typo_suggestion_for_method_case_insensitive() {
+        let input = quote! { || X.SQRT() };
+        let kernel = parse(input).unwrap();
+        let result = analyze(kernel);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("did you mean 'sqrt'"),
+            "expected the case-insensitive branch to suggest 'sqrt', got: {err}"
+        );
     }
 
     #[test]

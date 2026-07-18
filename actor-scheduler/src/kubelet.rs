@@ -769,13 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn kubelet_builder_default_poll_interval() {
-        let builder = KubeletBuilder::default();
-        let kubelet = builder.build();
-        assert_eq!(kubelet.poll_interval, DEFAULT_POLL_INTERVAL);
-    }
-
-    #[test]
     fn restart_count_incremented_on_each_restart() {
         let slot = make_slot();
         let restarts = Arc::new(AtomicU32::new(0));
@@ -835,53 +828,107 @@ mod tests {
             .expect("kubelet should exit after Never+Completed");
     }
 
-    // Verify the within_budget logic resets the window after restart_window expires.
+    // Kills: within_budget failing to reset restart_count/window_start once the
+    // restart window has elapsed (ManagedPod::within_budget, private).
+    //
+    // A restart budget of 1 within an 80ms window: if the window did NOT
+    // reset, a second restart after the budget is spent would be denied
+    // immediately (see kubelet_stops_slot_when_frequency_gate_exhausted for
+    // that behavior with max_restarts=0, i.e. the slot is stopped instead of
+    // reconnecting). Waiting out the window before the second exit proves the
+    // budget resets, observed purely through PodSlot's public reconnect()
+    // contract rather than by touching the private ManagedPod struct.
     #[test]
-    fn within_budget_resets_after_window_expires() {
-        let mut pod = ManagedPod {
-            exit_rx: mpsc::channel::<PodPhase>().1,
-            restart_policy: RestartPolicy::Always,
-            handler: Box::new(NoopHandler),
-            restart_count: 5,
-            window_start: Instant::now() - Duration::from_secs(120), // window already expired
-            max_restarts: 5,
-            restart_window: Duration::from_secs(60),
-        };
+    fn restart_budget_resets_after_window_expires() {
+        let slot = make_slot();
+        let pod = spawn_managed(vec![slot.clone()], 64, None, || Noop);
 
-        // Budget should be reset since window expired.
+        // First exit: consumes the only restart in the budget.
+        pod.handles[0]
+            .send(crate::Message::<i32, i32, i32>::Shutdown)
+            .unwrap();
+
+        let kubelet = KubeletBuilder::new()
+            .with_poll_interval(Duration::from_millis(1))
+            .add_pod_with_gate(pod, RestartPolicy::Always, 1, Duration::from_millis(80))
+            .build();
+
+        let _join = thread::spawn(move || kubelet.run());
+
+        let handle = slot
+            .reconnect(Duration::from_secs(2))
+            .expect("first restart should succeed (budget starts fresh)");
+
+        // Wait out the restart window before triggering the second exit.
+        thread::sleep(Duration::from_millis(150));
+        handle
+            .send(crate::Message::<i32, i32, i32>::Shutdown)
+            .unwrap();
+
+        let result = slot.reconnect(Duration::from_secs(2));
         assert!(
-            pod.within_budget(),
-            "budget should reset after window expires"
+            result.is_ok(),
+            "second restart after the window elapsed should succeed \
+             (budget should have reset), got {:?}",
+            result
         );
-        assert_eq!(pod.restart_count, 0);
-    }
-
-    struct NoopHandler;
-    impl PodHandler for NoopHandler {
-        fn restart(&mut self) -> Receiver<PodPhase> {
-            mpsc::channel::<PodPhase>().1
-        }
-        fn stop(&mut self) {}
     }
 
     // Kills: replace KubeletBuilder::with_poll_interval -> Self with Default::default() (line 321)
-    // With Default::default(): poll_interval is reset to the default instead of the given value.
+    // Kills: replace KubeletBuilder::new's/default's poll_interval initialization.
+    //
+    // poll_interval isn't exposed through any public getter, so it's verified
+    // through its documented effect: run() can't detect a pod's exit faster
+    // than roughly one poll_interval. Comparing the default against a
+    // deliberately large custom interval (rather than an absolute duration)
+    // keeps the test robust on slow CI machines.
     #[test]
-    fn with_poll_interval_sets_the_interval() {
-        let custom = Duration::from_millis(42);
-        let kubelet = KubeletBuilder::new().with_poll_interval(custom).build();
-        assert_eq!(
-            kubelet.poll_interval, custom,
-            "with_poll_interval must store the given interval, not the default"
+    fn poll_interval_governs_exit_detection_latency() {
+        let run_and_time = |kubelet: Kubelet| {
+            let start = Instant::now();
+            kubelet.run();
+            start.elapsed()
+        };
+
+        let slot = make_slot();
+        let pod = spawn_managed(vec![slot], 64, None, || Noop);
+        pod.handles[0]
+            .send(crate::Message::<i32, i32, i32>::Shutdown)
+            .unwrap();
+        let default_elapsed = run_and_time(
+            KubeletBuilder::default()
+                .add_pod(pod, RestartPolicy::Never)
+                .build(),
         );
-        assert_ne!(
-            kubelet.poll_interval, DEFAULT_POLL_INTERVAL,
-            "42ms differs from default poll interval"
+
+        let slot = make_slot();
+        let pod = spawn_managed(vec![slot], 64, None, || Noop);
+        pod.handles[0]
+            .send(crate::Message::<i32, i32, i32>::Shutdown)
+            .unwrap();
+        let custom_elapsed = run_and_time(
+            KubeletBuilder::new()
+                .with_poll_interval(Duration::from_millis(200))
+                .add_pod(pod, RestartPolicy::Never)
+                .build(),
+        );
+
+        assert!(
+            custom_elapsed > default_elapsed * 4,
+            "a 200ms poll interval ({custom_elapsed:?}) should take much longer \
+             to detect the exit than the default ({default_elapsed:?})"
         );
     }
 
     // Kills: replace KubeletBuilder::add_manual_pod -> Self with Default::default() (line 391)
-    // With Default::default(): the pod is NOT added; kubelet starts with 0 pods.
+    // With Default::default(): the pod is NOT added, so run() returns immediately
+    // (pods stays empty) and stop_fn is never called.
+    //
+    // Also proves RestartPolicy::Never is enforced without reading the private
+    // ManagedPod.restart_policy field: ManualStopHandler::restart() panics if
+    // ever invoked, so if add_manual_pod used any policy that restarts on
+    // Completed, this test would fail via that panic instead of observing
+    // stop_called.
     #[test]
     fn add_manual_pod_registers_the_pod() {
         let (tx, rx) = mpsc::channel::<PodPhase>();
@@ -893,16 +940,6 @@ mod tests {
                 stop_clone.store(true, Ordering::SeqCst);
             })
             .build();
-
-        // Kubelet should have exactly 1 pod registered.
-        assert_eq!(
-            kubelet.pods.len(),
-            1,
-            "add_manual_pod must register one pod"
-        );
-
-        // Verify the pod is a manual pod (RestartPolicy::Never).
-        assert_eq!(kubelet.pods[0].restart_policy, RestartPolicy::Never);
 
         // Signal exit so stop_fn is called and kubelet terminates.
         tx.send(PodPhase::Completed).unwrap();
