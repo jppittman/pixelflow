@@ -133,23 +133,10 @@ impl<T> ShardedInbox<T> {
         // Rotate starting shard for next drain
         self.round_robin = (self.round_robin + 1) % n;
 
-        if all_disconnected {
-            Ok(DrainStatus::Disconnected)
-        } else if total >= limit || !all_empty {
-            // We either hit the limit, or we had per-shard caps that stopped early
-            if total >= limit {
-                Ok(DrainStatus::More)
-            } else if all_empty {
-                Ok(DrainStatus::Empty)
-            } else {
-                // Some shards may have more, but we haven't proven it
-                // Re-check: did any shard actually hit its per-shard limit?
-                // If total < limit, we only stopped because of per-shard caps.
-                // That means there might be more in those shards.
-                Ok(DrainStatus::More)
-            }
-        } else {
-            Ok(DrainStatus::Empty)
+        match (all_disconnected, total >= limit, all_empty) {
+            (true, _, _) => Ok(DrainStatus::Disconnected),
+            (false, false, true) => Ok(DrainStatus::Empty),
+            _ => Ok(DrainStatus::More),
         }
     }
 
