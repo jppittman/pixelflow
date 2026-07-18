@@ -1013,17 +1013,22 @@ impl EdgeAccumulator {
             // Classify this node's variance if analysis is available
             if let Some(va) = variance_analysis {
                 let v = va.get(egraph, canonical);
-                if v.is_const() {
-                    n_const += 1;
-                } else if v.is_x_invariant() && !v.depends_on_y() {
-                    // Frame-uniform: depends only on Z/W (no X, no Y)
-                    n_frame += 1;
-                } else if v.is_x_invariant() {
-                    // Scanline-uniform: depends on Y (but not X)
-                    n_scanline += 1;
-                } else {
-                    // Pixel-varying: depends on X
-                    n_pixel += 1;
+                match (v.is_const(), v.is_x_invariant(), v.depends_on_y()) {
+                    (true, _, _) => {
+                        n_const += 1;
+                    }
+                    (false, true, false) => {
+                        // Frame-uniform: depends only on Z/W (no X, no Y)
+                        n_frame += 1;
+                    }
+                    (false, true, true) => {
+                        // Scanline-uniform: depends on Y (but not X)
+                        n_scanline += 1;
+                    }
+                    (false, false, _) => {
+                        // Pixel-varying: depends on X
+                        n_pixel += 1;
+                    }
                 }
             }
 
