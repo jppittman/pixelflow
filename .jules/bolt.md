@@ -30,3 +30,6 @@
 ## 2025-12-30 - Replace HashSet allocation with linear search in kqueue
 **Learning:** In hot loops handling small collections (e.g., N <= 32 elements), allocating a `HashSet` for deduplication incurs costly heap allocations that outweigh its O(1) lookup benefit.
 **Action:** Use a linear search (e.g., `.iter_mut().find()`) over a pre-existing vector instead of allocating a `HashSet` when deduplicating elements in a small collection.
+## 2025-01-01 - Optimizing vec allocation within map over iterators
+**Learning:** Initializing large multidimensional vectors using `.map(|_| vec![val; size])` triggers `size` allocations inside a loop, taking O(N) allocations.
+**Action:** Instead, pre-create the inner vector and use `.clone()` (or `Arc::new(vec)` when multiple ownership is desired) to share or efficiently clone it. For terminal screens where rows often contain identical default cells upon resize, creating a single `Arc<Vec<Glyph>>` and reusing it `n` times vastly reduces allocations. Using `std::iter::repeat(val).take(n)` (or `repeat_n`) provides a zero-allocation way to duplicate these Arcs.
