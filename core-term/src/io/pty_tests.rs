@@ -361,18 +361,18 @@ fn pty_spawn_invalid_command() {
             // We verify that the error is indeed related to the command not being found.
             // If it's wrapped in anyhow, we check the root cause.
             let root_cause = e.root_cause();
-            if let Some(io_err) = root_cause.downcast_ref::<std::io::Error>() {
-                assert_eq!(
-                    io_err.kind(),
-                    std::io::ErrorKind::NotFound,
-                    "Expected NotFound error, got {:?}",
-                    io_err.kind()
-                );
-            } else {
+            let Some(io_err) = root_cause.downcast_ref::<std::io::Error>() else {
                 log::warn!(
                     "Could not downcast error to std::io::Error to verify ErrorKind::NotFound, but an error occurred as expected."
                 );
-            }
+                return;
+            };
+            assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::NotFound,
+                "Expected NotFound error, got {:?}",
+                io_err.kind()
+            );
         }
     }
 }
