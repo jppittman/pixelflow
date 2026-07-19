@@ -384,4 +384,79 @@ mod tests {
             "Total should equal limit of 4"
         );
     }
+
+    // Kills: replace || with && / delete ! in `total >= limit || !all_empty`.
+    //
+    // With 2 shards and limit=10 (per_shard=5): shard A has exactly 5 messages
+    // (hits its own per-shard cap, so it's cut off with more potentially
+    // available), shard B has only 2 (drains naturally to Empty). Aggregate
+    // total is 7, which is < limit, so `total >= limit` alone is false — only
+    // `!all_empty` (true, because shard A was cut off) makes this an `Or` that
+    // must return `More`. `&&`, or dropping the `!`, wrongly returns `Empty`.
+    #[test]
+    fn shard_cut_off_by_its_own_quota_reports_more_even_when_total_is_under_limit() {
+        let mut builder = InboxBuilder::<u32>::new(64);
+        let tx_full = builder.add_producer();
+        let tx_short = builder.add_producer();
+        let mut inbox = builder.build();
+
+        for i in 0u32..5 {
+            tx_full.try_send(i).unwrap();
+        }
+        for i in 0u32..2 {
+            tx_short.try_send(100 + i).unwrap();
+        }
+
+        let mut received = Vec::new();
+        let status = inbox
+            .drain(10, |msg| {
+                received.push(msg);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(received.len(), 7, "total drained is under the limit of 10");
+        assert_eq!(
+            status,
+            DrainStatus::More,
+            "a shard cut off by its own per-shard quota may still have more \
+             queued, even though the aggregate total didn't reach the limit"
+        );
+    }
+
+    // Kills: replace + with * / replace % with + or / in the round-robin
+    // rotation (`self.round_robin = (self.round_robin + 1) % n`).
+    //
+    // Keep both shards topped up so whichever is visited first each call
+    // wins; correct rotation must alternate which shard answers first.
+    #[test]
+    fn round_robin_start_alternates_between_drain_calls() {
+        let mut builder = InboxBuilder::<u32>::new(16);
+        let tx0 = builder.add_producer();
+        let tx1 = builder.add_producer();
+        let mut inbox = builder.build();
+
+        for i in 0u32..4 {
+            tx0.try_send(i).unwrap();
+            tx1.try_send(100 + i).unwrap();
+        }
+
+        let mut shard_order = Vec::new();
+        for _ in 0..4 {
+            let mut received = Vec::new();
+            inbox
+                .drain(1, |msg| {
+                    received.push(msg);
+                    Ok(())
+                })
+                .unwrap();
+            shard_order.push(if received[0] < 100 { 0 } else { 1 });
+        }
+
+        assert_eq!(
+            shard_order,
+            vec![0, 1, 0, 1],
+            "round-robin start shard must advance every call, not stick to one shard"
+        );
+    }
 }

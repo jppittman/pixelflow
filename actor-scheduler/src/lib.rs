@@ -1185,6 +1185,123 @@ impl<D, C, M> ActorScheduler<D, C, M> {
     }
 }
 
+// Tests targeting missed mutations in handle_wake's `more_work` / status logic.
+#[cfg(test)]
+mod handle_wake_targeted_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    struct RecordingActor {
+        statuses: Arc<Mutex<Vec<SystemStatus>>>,
+    }
+
+    impl Actor<i32, i32, i32> for RecordingActor {
+        fn handle_data(&mut self, _: i32) -> HandlerResult {
+            Ok(())
+        }
+        fn handle_control(&mut self, _: i32) -> HandlerResult {
+            Ok(())
+        }
+        fn handle_management(&mut self, _: i32) -> HandlerResult {
+            Ok(())
+        }
+        fn park(&mut self, status: SystemStatus) -> Result<ActorStatus, HandlerError> {
+            self.statuses.lock().unwrap().push(status);
+            Ok(ActorStatus::Idle)
+        }
+    }
+
+    // Kills: replace || with && across the 4-way `more_work` OR (lines 971-973).
+    // With &&, `more_work` only becomes true when ALL FOUR lanes hit their burst
+    // limit simultaneously, instead of when any single one does.
+    #[test]
+    fn wake_reports_busy_when_only_one_lane_hits_its_burst_limit() {
+        let params = SchedulerParams {
+            control_mgmt_buffer_size: 10,
+            control_burst_multiplier: 1,
+            management_burst_multiplier: 1,
+            ..SchedulerParams::DEFAULT
+        };
+        let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new_with_params(50, 50, params);
+
+        // half_control = control_burst_limit / 2 = 10 / 2 = 5. Sending exactly 5
+        // control messages makes the *first* control drain hit its limit
+        // (DrainStatus::More) while management/second-control/data stay Empty.
+        for i in 0..5 {
+            tx.send(Message::Control(i)).unwrap();
+        }
+
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let mut actor = RecordingActor {
+            statuses: statuses.clone(),
+        };
+        rx.poll_once(&mut actor);
+
+        assert_eq!(
+            statuses.lock().unwrap().as_slice(),
+            &[SystemStatus::Busy],
+            "one lane hitting its burst limit must report Busy, not just when all four do"
+        );
+    }
+
+    // Kills: replace || with && / replace == with != in the final
+    // `more_work || returned_hint == ActorStatus::Busy` (line 983), which
+    // decides whether the scheduler keeps spinning after a wake.
+    #[test]
+    fn scheduler_keeps_spinning_when_actor_reports_busy_with_no_queued_work() {
+        let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new(50, 50);
+        // One message to get the loop going; no more will ever arrive, so
+        // every later wake sees no queued work on any lane (more_work == false).
+        tx.send(Message::Data(1)).unwrap();
+
+        struct BusyActor {
+            park_calls: Arc<AtomicUsize>,
+        }
+        impl Actor<i32, i32, i32> for BusyActor {
+            fn handle_data(&mut self, _: i32) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_control(&mut self, _: i32) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_management(&mut self, _: i32) -> HandlerResult {
+                Ok(())
+            }
+            fn park(&mut self, _: SystemStatus) -> Result<ActorStatus, HandlerError> {
+                self.park_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(ActorStatus::Busy)
+            }
+        }
+
+        let park_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_actor = park_calls.clone();
+        let handle = std::thread::spawn(move || {
+            let mut actor = BusyActor {
+                park_calls: calls_for_actor,
+            };
+            rx.run(&mut actor);
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        let calls = park_calls.load(Ordering::Relaxed);
+
+        // Disconnect so run() can exit now that we've taken our measurement.
+        drop(tx);
+        handle.join().unwrap();
+
+        assert!(
+            calls > 10,
+            "actor reporting Busy with no queued work should keep the scheduler \
+             spinning (SchedulerLoopStatus::Working) instead of going idle after \
+             one poll; got only {calls} park() calls"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,7 +1728,7 @@ mod drain_all_targeted_tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct FastCountActor {
         data: Arc<AtomicUsize>,
@@ -1673,6 +1790,45 @@ mod drain_all_targeted_tests {
             data_count.load(Ordering::Relaxed),
             30,
             "drain_all_with_timeout must process all 30 queued data messages"
+        );
+    }
+
+    // Kills: delete `!` on any of the three `all_done` terms (lines 915-917).
+    // With no control/management messages ever sent, `matches!(control_status,
+    // More)`/`matches!(mgmt_status, More)` are always false — so removing a `!`
+    // makes that raw (false) value one of the `&&` operands, pinning `all_done`
+    // to false forever. The loop then busy-spins until the deadline instead of
+    // returning as soon as the (already-empty) lanes are done.
+    #[test]
+    fn drain_all_returns_promptly_when_lanes_are_done_not_at_deadline() {
+        let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
+            100,
+            1000,
+            ShutdownMode::DrainAll {
+                timeout: Duration::from_secs(5), // Far future — should not be reached.
+            },
+        );
+
+        let data_count = Arc::new(AtomicUsize::new(0));
+        tx.send(Message::Shutdown).unwrap();
+        for i in 0..5i32 {
+            tx.send(Message::Data(i)).unwrap();
+        }
+
+        let data_clone = data_count.clone();
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let mut actor = FastCountActor { data: data_clone };
+            rx.run(&mut actor);
+        });
+        handle.join().unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(data_count.load(Ordering::Relaxed), 5);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "drain_all_with_timeout should return as soon as all lanes are \
+             done, not busy-spin until the 5s deadline (took {elapsed:?})"
         );
     }
 

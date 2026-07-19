@@ -326,6 +326,39 @@ mod tests {
     }
 
     #[test]
+    fn bounds_match_documented_dimension_ranges() {
+        let bounds = SchedulerParams::bounds();
+        assert_eq!(bounds.len(), SchedulerParams::NAMES.len());
+        assert_eq!(bounds[0], (4.0, 128.0), "control_mgmt_buffer_size");
+        assert_eq!(bounds[1], (1.0, 50.0), "control_burst_multiplier");
+        assert_eq!(bounds[2], (1.0, 10.0), "management_burst_multiplier");
+        assert_eq!(bounds[3], (16.0, 8192.0), "default_data_burst_limit");
+        assert_eq!(bounds[4], (0.0, 500.0), "spin_attempts");
+        assert_eq!(bounds[5], (0.0, 200.0), "yield_attempts");
+        assert_eq!(bounds[6], (10.0, 6_450.0), "min_backoff (us)");
+        assert_eq!(bounds[7], (100_000.0, 10_000_000.0), "max_backoff (us)");
+        assert_eq!(bounds[8], (5.0, 80.0), "jitter_min_pct");
+        assert_eq!(bounds[9], (20.0, 50.0), "jitter_range_pct");
+
+        for &(lower, upper) in &bounds {
+            assert!(lower < upper, "each dimension's lower bound must be < upper");
+        }
+    }
+
+    #[test]
+    fn default_params_fall_within_their_own_bounds() {
+        let bounds = SchedulerParams::bounds();
+        let vec = SchedulerParams::DEFAULT.to_vec();
+        for (i, (value, (lower, upper))) in vec.iter().zip(bounds.iter()).enumerate() {
+            assert!(
+                *value >= *lower && *value <= *upper,
+                "{} = {value} outside bounds [{lower}, {upper}]",
+                SchedulerParams::NAMES[i]
+            );
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "control_mgmt_buffer_size must be >= 1")]
     fn validates_buffer_size() {
         let p = SchedulerParams {

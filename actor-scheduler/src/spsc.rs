@@ -325,6 +325,31 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
+    // Kills: replace `tail - cached_head` with `tail + cached_head` in the
+    // post-refresh fullness recheck. Early on, tail and head are both small
+    // so `-` and `+` happen to agree; after many send/receive cycles they're
+    // both large while the buffer stays mostly empty, and only the *gap*
+    // between them (not their sum) reflects true occupancy. (The pre-refresh
+    // fast-path check uses the same expression but is purely a heuristic to
+    // skip an atomic load — the post-refresh recheck is what's authoritative,
+    // so a mutation there alone doesn't change observable behavior.)
+    #[test]
+    fn full_check_uses_the_gap_between_tail_and_head_not_their_sum() {
+        let (tx, mut rx) = spsc_channel::<u32>(2); // capacity rounds up to 2
+        for i in 0..20u32 {
+            tx.try_send(i).unwrap();
+            assert_eq!(rx.try_recv().unwrap(), i);
+        }
+        // Exactly 1 of the 2 slots is occupied now — room for one more.
+        tx.try_send(100).unwrap();
+        assert!(
+            tx.try_send(101).is_ok(),
+            "buffer has only 1 of 2 slots occupied after many prior \
+             send/receive cycles; fullness must be judged by the tail-head \
+             gap, not by tail+head"
+        );
+    }
+
     #[test]
     fn full_then_drain() {
         let (tx, mut rx) = spsc_channel::<u32>(2);
