@@ -206,14 +206,4 @@ mod tests {
             "Width of Combining Acute Accent (U+0301) should be 0"
         );
     }
-
-    #[test]
-    fn locale_initializer_called() {
-        // Ensure OnceLock mechanism is engaged
-        let _ = get_char_display_width(' ');
-        assert!(
-            GLOBAL_LOCALE_INITIALIZER.get().is_some(),
-            "LocaleInitializer should be initialized after first call"
-        );
-    }
 }

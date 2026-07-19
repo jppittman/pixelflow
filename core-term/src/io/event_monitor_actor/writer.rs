@@ -118,6 +118,17 @@ impl PtyWriter {
             debug!("PTY resized to {}x{}", resize.cols, resize.rows);
         }
     }
+
+    /// The pre-`Bind` state: no PTY yet, empty write queue.
+    fn unbound() -> Self {
+        Self {
+            bound: None,
+            pending: VecDeque::new(),
+            cursor: 0,
+            pending_resize: None,
+            broken: false,
+        }
+    }
 }
 
 impl ActorTypes for PtyWriter {
@@ -128,13 +139,7 @@ impl ActorTypes for PtyWriter {
 
 impl TroupeActor<Directory> for PtyWriter {
     fn new(_dir: Directory) -> Self {
-        Self {
-            bound: None,
-            pending: VecDeque::new(),
-            cursor: 0,
-            pending_resize: None,
-            broken: false,
-        }
+        Self::unbound()
     }
 }
 
@@ -216,13 +221,7 @@ mod tests {
     // A directly-driven writer (bypassing the troupe) for unit coverage of the
     // bind + flush logic.
     fn bound_writer(pty: NixPty) -> PtyWriter {
-        let mut w = PtyWriter {
-            bound: None,
-            pending: VecDeque::new(),
-            cursor: 0,
-            pending_resize: None,
-            broken: false,
-        };
+        let mut w = PtyWriter::unbound();
         let waker = Arc::new(FdWaker::new().expect("waker"));
         w.handle_management(WriterManagement::Bind { pty, waker })
             .expect("bind");
@@ -241,13 +240,7 @@ mod tests {
 
     #[test]
     fn write_before_bind_is_flushed_at_bind() {
-        let mut w = PtyWriter {
-            bound: None,
-            pending: VecDeque::new(),
-            cursor: 0,
-            pending_resize: None,
-            broken: false,
-        };
+        let mut w = PtyWriter::unbound();
         // Queue while unbound.
         w.handle_data(b"queued".to_vec()).expect("data");
         assert_eq!(w.pending.len(), 1, "unbound write should queue");
@@ -264,13 +257,7 @@ mod tests {
 
     #[test]
     fn resize_before_bind_is_coalesced() {
-        let mut w = PtyWriter {
-            bound: None,
-            pending: VecDeque::new(),
-            cursor: 0,
-            pending_resize: None,
-            broken: false,
-        };
+        let mut w = PtyWriter::unbound();
         w.handle_control(WriterControl::Resize(Resize { cols: 10, rows: 5 }))
             .expect("resize1");
         w.handle_control(WriterControl::Resize(Resize {

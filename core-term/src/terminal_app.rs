@@ -888,6 +888,11 @@ mod tests {
     // Helper to create a test instance
     // Returns scheduler to keep doorbell channel alive during test
     // Returns None if font is missing/invalid (e.g. LFS pointer), skipping the test.
+    //
+    // Deliberately uses the private `new_registered` rather than the public
+    // `spawn_terminal_app`: the public entry point spawns a real OS thread and
+    // registers with a live engine, which these tests don't want to drive just
+    // to exercise message-handling logic (STYLE.md "Flexibility" exception).
     fn create_test_app() -> Option<(
         TerminalApp,
         WriterScheduler,

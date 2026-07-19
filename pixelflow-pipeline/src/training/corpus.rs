@@ -466,13 +466,18 @@ mod tests {
     #[test]
     fn bad_magic_fails() {
         let data = b"BADMxxxxxxxx";
-        match read_corpus_bytes(data) {
+        let tmp = std::env::temp_dir().join("corpus_bad_magic.bin");
+        std::fs::write(&tmp, data).expect("write");
+
+        match read_corpus(&tmp) {
             Ok(_) => panic!("expected error for bad magic"),
             Err(e) => assert!(
                 e.to_string().contains("bad corpus magic"),
                 "unexpected error: {e}"
             ),
         }
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
@@ -481,13 +486,18 @@ mod tests {
         data.extend_from_slice(MAGIC);
         data.extend_from_slice(&99u32.to_le_bytes()); // bad version
         data.extend_from_slice(&0u32.to_le_bytes()); // count=0
-        match read_corpus_bytes(&data) {
+        let tmp = std::env::temp_dir().join("corpus_bad_version.bin");
+        std::fs::write(&tmp, &data).expect("write");
+
+        match read_corpus(&tmp) {
             Ok(_) => panic!("expected error for bad version"),
             Err(e) => assert!(
                 e.to_string().contains("unsupported corpus version"),
                 "unexpected error: {e}"
             ),
         }
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]

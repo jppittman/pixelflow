@@ -717,9 +717,9 @@ impl Field {
         Self(self.0.add_masked(val.0, mask.0.float_to_mask()))
     }
 
-    /// Apply a unary function to each lane.
-    /// Load from a slice.
-    #[allow(dead_code)]
+    /// Load from a slice. Test-only: production code has no need to build a
+    /// `Field` with independent per-lane values from a slice.
+    #[cfg(test)]
     #[inline(always)]
     fn from_slice(slice: &[f32]) -> Self {
         Self(NativeSimd::from_slice(slice))

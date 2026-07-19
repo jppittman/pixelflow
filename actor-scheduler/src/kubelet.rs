@@ -768,6 +768,10 @@ mod tests {
         assert_eq!(result.unwrap_err(), crate::PodGone::Stopped);
     }
 
+    // `poll_interval`/`pods`/`ManagedPod` have no public accessors — the only
+    // public surface is `Kubelet::run`, which blocks until all pods exit, so
+    // there's no non-blocking way to observe builder config through it. These
+    // tests read the private fields directly rather than add test-only API.
     #[test]
     fn kubelet_builder_default_poll_interval() {
         let builder = KubeletBuilder::default();

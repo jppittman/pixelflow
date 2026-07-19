@@ -1154,38 +1154,35 @@ impl Screen {
 // const SOME_REASONABLE_SLACK: usize = 20;
 
 #[cfg(test)]
+impl Screen {
+    /// Override the scrollback capacity for tests. `Screen::new` derives it
+    /// from the global `CONFIG`, which tests can't override per-instance.
+    fn set_scrollback_limit_for_test(&mut self, limit: usize) {
+        self.scrollback_limit = limit;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         Arc, Attributes, ContentCell, Glyph, Point, Screen, ScrollHistory, Selection,
         SelectionMode, SelectionRange,
     };
 
-    // Helper function for tests, using a fixed scrollback for test predictability
-    // or allowing tests to specify if some need to test scrollback behavior explicitly.
+    // Fixed scrollback limit for test predictability, independent of the
+    // global CONFIG that `Screen::new` otherwise derives it from.
     fn create_test_screen_with_scrollback(
         width: usize,
         height: usize,
         scrollback: usize,
     ) -> Screen {
-        // Temporarily override config for consistent tests if Screen::new now solely relies on CONFIG
-        // This is tricky. For now, let's assume tests might need to adapt or Screen::new might need
-        // a test-specific constructor or tests mock CONFIG (which is hard with static Lazy).
-        // For now, let's assume Screen::new is adapted and we pass what's needed.
-        // The current Screen::new was changed to NOT take scrollback_limit.
-        // So, test utility must change.
         let mut screen = Screen::new(width, height);
-        // If tests need to check scrollback functionality with specific limits,
-        // they might need to manipulate CONFIG or this helper needs to be very creative.
-        // For simplicity, we'll let it use the default from CONFIG for now,
-        // meaning scrollback related tests might become less predictable if CONFIG changes.
-        // OR, we acknowledge that create_test_screen was passing 0, so we can try to
-        // preserve that behavior if it's critical for existing tests not focusing on scrollback.
-        screen.scrollback_limit = scrollback; // Manually set for test purposes if needed.
+        screen.set_scrollback_limit_for_test(scrollback);
         screen
     }
 
     fn create_test_screen(width: usize, height: usize) -> Screen {
-        // Most tests used 0, implying scrollback wasn't their focus or they expected no scrollback.
+        // Most tests don't focus on scrollback, so default it to disabled.
         create_test_screen_with_scrollback(width, height, 0)
     }
 
