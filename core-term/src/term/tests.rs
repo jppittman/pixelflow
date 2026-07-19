@@ -205,20 +205,23 @@ fn assert_screen_state(
         }
     }
 
-    if let Some((r_expected, c_expected)) = expected_cursor_pos {
-        let cursor_state = snapshot.cursor_state.as_ref().unwrap_or_else(|| {
-            panic!(
-                "Expected cursor to be visible, but cursor_state is None. Expected pos: ({},{})",
-                r_expected, c_expected
+    match expected_cursor_pos {
+        Some((r_expected, c_expected)) => {
+            let cursor_state = snapshot.cursor_state.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "Expected cursor to be visible, but cursor_state is None. Expected pos: ({},{})",
+                        r_expected, c_expected
+                    );
+                });
+            assert_eq!(cursor_state.y, r_expected, "Cursor row mismatch");
+            assert_eq!(cursor_state.x, c_expected, "Cursor col mismatch");
+        }
+        None => {
+            assert!(
+                snapshot.cursor_state.is_none(),
+                "Expected cursor to be hidden, but cursor_state is Some"
             );
-        });
-        assert_eq!(cursor_state.y, r_expected, "Cursor row mismatch");
-        assert_eq!(cursor_state.x, c_expected, "Cursor col mismatch");
-    } else {
-        assert!(
-            snapshot.cursor_state.is_none(),
-            "Expected cursor to be hidden, but cursor_state is Some"
-        );
+        }
     }
 }
 

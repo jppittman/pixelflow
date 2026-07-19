@@ -104,10 +104,11 @@ fn build_case(factors: &[Vec<Level>], row: &[usize]) -> (Vec<u8>, Vec<Attribute>
     let mut expected: Vec<Attribute> = Vec::new();
     for (factor, &level_idx) in factors.iter().zip(row) {
         let level = &factor[level_idx];
-        if let Some(frag) = level.fragment {
-            fragments.push(frag);
-            expected.extend_from_slice(&level.expected);
-        }
+        let Some(frag) = level.fragment else {
+            continue;
+        };
+        fragments.push(frag);
+        expected.extend_from_slice(&level.expected);
     }
 
     let mut seq = b"\x1b[".to_vec();

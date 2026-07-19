@@ -2099,22 +2099,21 @@ mod mutation_tests {
         // SGR with 16 parameters: 1;2;0;0;... (14 zeros)
         // All 16 must be collected and processed.
         let cmds = process_bytes(b"\x1b[1;2;0;0;0;0;0;0;0;0;0;0;0;0;0;0m");
-        if let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() {
-            // Checking len kills mutations that reduce MAX_PARAMS below 16.
-            assert_eq!(attrs.len(), 16, "all 16 params must be retained");
-            assert_eq!(
-                attrs[0],
-                Attribute::Bold,
-                "first of 16 params should be Bold"
-            );
-            assert_eq!(
-                attrs[1],
-                Attribute::Faint,
-                "second of 16 params should be Faint"
-            );
-        } else {
+        let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() else {
             panic!("expected SetGraphicsRendition, got {:?}", cmds);
-        }
+        };
+        // Checking len kills mutations that reduce MAX_PARAMS below 16.
+        assert_eq!(attrs.len(), 16, "all 16 params must be retained");
+        assert_eq!(
+            attrs[0],
+            Attribute::Bold,
+            "first of 16 params should be Bold"
+        );
+        assert_eq!(
+            attrs[1],
+            Attribute::Faint,
+            "second of 16 params should be Faint"
+        );
     }
 
     #[test]
@@ -2123,16 +2122,15 @@ mod mutation_tests {
         // We send: ESC [ 0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m
         //          that's 16 zeros + 1 extra -> the 7 (Reverse) is the 17th and dropped.
         let cmds = process_bytes(b"\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m");
-        if let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() {
-            // Every kept attribute should be Reset (0); Reverse (7) must NOT appear.
-            assert!(
-                !attrs.contains(&Attribute::Reverse),
-                "17th param (Reverse) should have been dropped; got attrs: {:?}",
-                attrs
-            );
-        } else {
+        let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() else {
             panic!("expected SetGraphicsRendition, got {:?}", cmds);
-        }
+        };
+        // Every kept attribute should be Reset (0); Reverse (7) must NOT appear.
+        assert!(
+            !attrs.contains(&Attribute::Reverse),
+            "17th param (Reverse) should have been dropped; got attrs: {:?}",
+            attrs
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2279,14 +2277,10 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[99999A");
         // Should produce CursorUp with some value (saturated), not panic
         assert_eq!(cmds.len(), 1, "should produce exactly one command");
-        assert!(
-            matches!(cmds[0], AnsiCommand::Csi(CsiCommand::CursorUp(_))),
-            "should still produce CursorUp; got {:?}",
-            cmds
-        );
-        if let AnsiCommand::Csi(CsiCommand::CursorUp(n)) = cmds[0] {
-            assert_eq!(n, u16::MAX, "overflow must saturate to u16::MAX, got {}", n);
-        }
+        let AnsiCommand::Csi(CsiCommand::CursorUp(n)) = cmds[0] else {
+            panic!("should still produce CursorUp; got {:?}", cmds);
+        };
+        assert_eq!(n, u16::MAX, "overflow must saturate to u16::MAX, got {}", n);
     }
 
     // -----------------------------------------------------------------------
