@@ -533,7 +533,11 @@ impl Screen {
 
         // 3. Create new primary grid and copy content
         //    Content is anchored to the top-left.
-        let mut new_primary_grid: Grid = (0..nh).map(|_| Arc::new(vec![fill_glyph; nw])).collect();
+        // PERFORMANCE: Allocate the default row vector once and share it across all rows using Arc.
+        // This avoids `nh` heap allocations. Rows will only clone the vector when modified via Arc::make_mut.
+        let default_row = Arc::new(vec![fill_glyph; nw]);
+        #[allow(clippy::manual_repeat_n)]
+        let mut new_primary_grid: Grid = std::iter::repeat(default_row.clone()).take(nh).collect();
         for (y, row_slot) in new_primary_grid
             .iter_mut()
             .enumerate()
@@ -554,7 +558,9 @@ impl Screen {
         self.grid = new_primary_grid;
 
         // 4. Create new alternate grid and copy content (similarly)
-        let mut new_alt_grid: Grid = (0..nh).map(|_| Arc::new(vec![fill_glyph; nw])).collect();
+        // PERFORMANCE: Reuse the same default_row Arc to avoid allocations here as well.
+        #[allow(clippy::manual_repeat_n)]
+        let mut new_alt_grid: Grid = std::iter::repeat(default_row).take(nh).collect();
         for (y, row_slot) in new_alt_grid
             .iter_mut()
             .enumerate()
