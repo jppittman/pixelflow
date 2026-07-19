@@ -520,7 +520,10 @@ mod tests {
                 .filter(|&&l| l == Label::LoadBearing)
                 .count()
         );
-        assert_eq!(total_load_bearing, result.labels.load_bearing.len().min(total_load_bearing));
+        assert_eq!(
+            total_load_bearing,
+            result.labels.load_bearing.len().min(total_load_bearing)
+        );
 
         for stats in result.labels.rule_stats.values() {
             assert_eq!(stats.fired, stats.load_bearing + stats.wasted());

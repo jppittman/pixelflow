@@ -74,7 +74,9 @@ impl BoundReader {
         monitor.add(&*waker, TOKEN_WAKER, EventFlags::EPOLLIN)?;
         // Seed the pool. These are the only buffer allocations the pipeline
         // ever makes; they ship at full length so reads never resize them.
-        let pool = (0..POOL_SIZE).map(|_| vec![0u8; READ_BUFFER_SIZE]).collect();
+        let pool = (0..POOL_SIZE)
+            .map(|_| vec![0u8; READ_BUFFER_SIZE])
+            .collect();
         Ok(Self {
             pty,
             monitor,
@@ -115,7 +117,9 @@ impl PtyReader {
                 Ok(len) => {
                     // `bound` borrows self.bound; self.parser_tx is a disjoint
                     // field, so this send is allowed alongside the borrow.
-                    if let Err(e) = self.parser_tx.send(Message::Data(FilledBuf { data: buf, len }))
+                    if let Err(e) = self
+                        .parser_tx
+                        .send(Message::Data(FilledBuf { data: buf, len }))
                     {
                         warn!("PTY reader: parser channel closed: {}", e);
                         bound.mark_eof();
@@ -175,14 +179,14 @@ impl Actor<Vec<u8>, NoControl, ReaderManagement> for PtyReader {
     }
 
     fn handle_management(&mut self, msg: ReaderManagement) -> HandlerResult {
-        let ReaderManagement::Bind {
-            pty,
-            waker,
-            app_tx,
-        } = msg;
+        let ReaderManagement::Bind { pty, waker, app_tx } = msg;
         match BoundReader::bind(pty, waker, app_tx) {
             Ok(bound) => self.bound = Some(bound),
-            Err(e) => return Err(HandlerError::recoverable(format!("PTY reader bind failed: {e}"))),
+            Err(e) => {
+                return Err(HandlerError::recoverable(format!(
+                    "PTY reader bind failed: {e}"
+                )))
+            }
         }
         Ok(())
     }

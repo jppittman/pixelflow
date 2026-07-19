@@ -999,7 +999,9 @@ pub fn compile_arena_dag_scanline_hoisted(
             ScheduledOp::Gather(..) | ScheduledOp::Ternary(OpKind::Gather, ..)
         )
     }) {
-        return Err("aarch64 scanline: bound-memory gather not supported (per-batch ctx kernel only)");
+        return Err(
+            "aarch64 scanline: bound-memory gather not supported (per-batch ctx kernel only)",
+        );
     }
 
     // If nothing to hoist, fall back to the non-hoisted path (no overhead).
@@ -5577,12 +5579,8 @@ mod tests {
                 cy.copy_from_slice(&ys[batch * 4..batch * 4 + 4]);
                 let got = run4_ctx(&res, &ctx, cx, cy);
                 for i in 0..4 {
-                    let want = crate::eval::eval_scalar(
-                        arena,
-                        root,
-                        &[cx[i], cy[i], 0.0, 0.0],
-                        &bindings,
-                    );
+                    let want =
+                        crate::eval::eval_scalar(arena, root, &[cx[i], cy[i], 0.0, 0.0], &bindings);
                     assert_eq!(
                         got[i], want,
                         "{tag} batch {batch} lane {i} (x={}, y={})",

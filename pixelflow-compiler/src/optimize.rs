@@ -101,9 +101,7 @@ impl Extraction<'_> {
 
 fn get_extraction() -> Extraction<'static> {
     match std::env::var("PIXELFLOW_NNUE_WEIGHTS") {
-        Ok(path) => {
-            Extraction::Nnue(OPTIMIZATION_MODEL.get_or_init(|| load_opt_in_weights(&path)))
-        }
+        Ok(path) => Extraction::Nnue(OPTIMIZATION_MODEL.get_or_init(|| load_opt_in_weights(&path))),
         Err(_) => Extraction::Static(Box::new(CostModel::latency_prior())),
     }
 }

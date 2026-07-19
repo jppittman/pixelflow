@@ -279,7 +279,10 @@ impl Drop for PtyTroupeHandle {
         if let Some(join) = self.join.take() {
             if let Err(panic_payload) = join.join() {
                 if std::thread::panicking() {
-                    eprintln!("PTY troupe thread panicked (during unwind): {:?}", panic_payload);
+                    eprintln!(
+                        "PTY troupe thread panicked (during unwind): {:?}",
+                        panic_payload
+                    );
                 } else {
                     std::panic::resume_unwind(panic_payload);
                 }

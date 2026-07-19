@@ -161,7 +161,10 @@ impl TerminalApp {
     fn resize_pty(&self, cols: u16, rows: u16) {
         if let Err(e) = self
             .pty_writer
-            .send(Message::Control(WriterControl::Resize(Resize { cols, rows })))
+            .send(Message::Control(WriterControl::Resize(Resize {
+                cols,
+                rows,
+            })))
         {
             log::warn!("Failed to send PTY resize command: {}", e);
         }

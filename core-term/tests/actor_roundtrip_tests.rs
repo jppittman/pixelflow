@@ -790,10 +790,7 @@ impl Actor<Vec<u8>, WriterControl, ()> for WriterProbe {
     }
 }
 
-fn drain_probe(
-    rx: &mut ActorScheduler<Vec<u8>, WriterControl, ()>,
-    probe: &mut WriterProbe,
-) {
+fn drain_probe(rx: &mut ActorScheduler<Vec<u8>, WriterControl, ()>, probe: &mut WriterProbe) {
     for _ in 0..8 {
         if rx.poll_once(probe).is_some() {
             break;
@@ -904,7 +901,10 @@ fn pty_writer_completes_on_handle_drop() {
     };
 
     assert_eq!(phase, actor_scheduler::PodPhase::Completed);
-    assert_eq!(probe.received, vec![WriterEvent::Write(b"last words".to_vec())]);
+    assert_eq!(
+        probe.received,
+        vec![WriterEvent::Write(b"last words".to_vec())]
+    );
 }
 
 /// Resize survives boundary values.
