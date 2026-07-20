@@ -227,8 +227,7 @@ mod tests {
         assert!(!window.view.0.is_null());
 
         // Verify initial size
-        assert_eq!(window.current_width, 800);
-        assert_eq!(window.current_height, 600);
+        assert_eq!(window.size(), (800, 600));
     }
 
     #[test]
