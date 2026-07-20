@@ -195,3 +195,90 @@ impl From<Field> for Mask {
         Self::from_field(field)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Field is a SIMD type; extract lane 0 to check scalar results in tests.
+    fn lane0(f: Field) -> f32 {
+        unsafe { *(&f as *const Field as *const f32) }
+    }
+
+    #[test]
+    fn all_true_is_true_everywhere() {
+        let m = Mask::all_true();
+        assert!(m.all());
+        assert!(m.any());
+        assert!(!m.none());
+    }
+
+    #[test]
+    fn all_false_is_false_everywhere() {
+        let m = Mask::all_false();
+        assert!(!m.all());
+        assert!(!m.any());
+        assert!(m.none());
+    }
+
+    #[test]
+    fn not_inverts_all_true_and_all_false() {
+        assert!((!Mask::all_true()).none());
+        assert!((!Mask::all_false()).all());
+    }
+
+    #[test]
+    fn bitand_truth_table() {
+        assert!((Mask::all_true() & Mask::all_true()).all());
+        assert!((Mask::all_true() & Mask::all_false()).none());
+        assert!((Mask::all_false() & Mask::all_true()).none());
+        assert!((Mask::all_false() & Mask::all_false()).none());
+    }
+
+    #[test]
+    fn bitor_truth_table() {
+        assert!((Mask::all_true() | Mask::all_true()).all());
+        assert!((Mask::all_true() | Mask::all_false()).all());
+        assert!((Mask::all_false() | Mask::all_true()).all());
+        assert!((Mask::all_false() | Mask::all_false()).none());
+    }
+
+    #[test]
+    fn select_picks_if_true_when_mask_all_true() {
+        let result = Mask::all_true().select(Field::from(1.0), Field::from(2.0));
+        assert_eq!(lane0(result), 1.0);
+    }
+
+    #[test]
+    fn select_picks_if_false_when_mask_all_false() {
+        let result = Mask::all_false().select(Field::from(1.0), Field::from(2.0));
+        assert_eq!(lane0(result), 2.0);
+    }
+
+    #[test]
+    fn select_opt_matches_select_on_uniform_masks() {
+        assert_eq!(
+            lane0(Mask::all_true().select_opt(Field::from(1.0), Field::from(2.0))),
+            1.0
+        );
+        assert_eq!(
+            lane0(Mask::all_false().select_opt(Field::from(1.0), Field::from(2.0))),
+            2.0
+        );
+    }
+
+    #[test]
+    fn to_field_from_field_roundtrip() {
+        assert!(Mask::from_field(Mask::all_true().to_field()).all());
+        assert!(Mask::from_field(Mask::all_false().to_field()).none());
+        assert!(Mask::from(Mask::all_true().to_field()).all());
+        assert!(Mask::from(Mask::all_false().to_field()).none());
+    }
+
+    #[test]
+    fn from_field_into_mask_conversion() {
+        let field: Field = Mask::all_true().into();
+        let mask: Mask = field.into();
+        assert!(mask.all());
+    }
+}
