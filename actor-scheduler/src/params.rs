@@ -309,6 +309,21 @@ mod tests {
     }
 
     #[test]
+    fn bounds_are_ordered_and_contain_defaults() {
+        let bounds = SchedulerParams::bounds();
+        let defaults = SchedulerParams::default().to_vec();
+        for (i, &(lo, hi)) in bounds.iter().enumerate() {
+            assert!(lo < hi, "bounds[{i}] = ({lo}, {hi}) must have lo < hi");
+            assert!(
+                defaults[i] >= lo && defaults[i] <= hi,
+                "default {} for {} out of bounds ({lo}, {hi})",
+                defaults[i],
+                SchedulerParams::NAMES[i]
+            );
+        }
+    }
+
+    #[test]
     fn roundtrip_to_vec_from_vec() {
         let original = SchedulerParams::default();
         let vec = original.to_vec();
