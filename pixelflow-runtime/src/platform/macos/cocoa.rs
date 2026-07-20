@@ -136,10 +136,15 @@ impl NSApplication {
         }
     }
 
-    pub fn activate_ignoring_other_apps(&self, ignore: bool) {
+    pub fn activate_ignoring_other_apps_forcefully(&self) {
         unsafe {
-            let val = if ignore { YES } else { NO };
-            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), val);
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), YES);
+        }
+    }
+
+    pub fn activate_ignoring_other_apps_normally(&self) {
+        unsafe {
+            sys::send_1::<(), BOOL>(self.0, sys::sel(b"activateIgnoringOtherApps:\0"), NO);
         }
     }
 
