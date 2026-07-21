@@ -298,9 +298,16 @@ mod tests {
 
     #[test]
     fn elu_feature_positive() {
+        // x >= 0: ELU(x) + 1 = max(0, x) + exp(min(0, x)) = x + exp(0) = x + 1.
         let f = EluFeature;
-        let result = f.apply(Field::from(0.0));
-        let _ = result;
+        assert_field_approx_eq(f.apply(Field::from(2.0)), 3.0);
+    }
+
+    #[test]
+    fn elu_feature_negative() {
+        // x < 0: ELU(x) + 1 = max(0, x) + exp(min(0, x)) = 0 + exp(x).
+        let f = EluFeature;
+        assert_field_approx_eq(f.apply(Field::from(-1.0)), core::f32::consts::E.recip());
     }
 
     #[test]
@@ -332,6 +339,42 @@ mod tests {
         let mut output = [0.0f32; 3];
         attn.query(&key_sh, &mut output);
         assert!(output[0] > 0.5);
+    }
+
+    #[test]
+    fn harmonic_attention_accumulate_computes_outer_product() {
+        let mut attn: HarmonicAttention<9> = HarmonicAttention::new(1);
+        let mut coeffs = [0.0f32; 9];
+        coeffs[0] = 2.0;
+        let key_sh = Sh2 { coeffs };
+
+        attn.accumulate(&key_sh, &[3.0]);
+
+        // coeffs[j] += key_sh.coeffs[j] * v, not + or /.
+        assert_eq!(attn.accumulated[0].coeffs[0], 6.0);
+        // denominator.coeffs[j] += key_sh.coeffs[j], not -= or *=.
+        assert_eq!(attn.denominator.coeffs[0], 2.0);
+    }
+
+    #[test]
+    fn harmonic_attention_accumulate_ignores_values_past_value_dim() {
+        let mut attn: HarmonicAttention<9> = HarmonicAttention::new(1);
+        let key_sh = Sh2 { coeffs: [1.0; 9] };
+
+        // value has more entries than the attention layer has value slots for;
+        // the extra entry must be skipped, not indexed out of bounds.
+        attn.accumulate(&key_sh, &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn harmonic_attention_query_ignores_output_slots_past_value_dim() {
+        let attn: HarmonicAttention<9> = HarmonicAttention::new(1);
+        let query_sh = Sh2 { coeffs: [1.0; 9] };
+        let mut output = [0.0f32; 2];
+
+        // output has more slots than the attention layer accumulated values for;
+        // the extra slot must be skipped, not indexed out of bounds.
+        attn.query(&query_sh, &mut output);
     }
 
     #[test]
@@ -371,20 +414,23 @@ mod tests {
 
     #[test]
     fn sh_feature_map_matches_closed_form_sh_basis() {
-        // Unnormalized direction (1, 2, 2), |v| = 3 -> normalized (1/3, 2/3, 2/3).
+        // Unnormalized direction (1, 3, 4), |v| = sqrt(26) -> normalized
+        // (0.196116, 0.588348, 0.784465). Components are deliberately distinct
+        // and avoid 0 and 2 (where n*n and n+n coincide), so every multiply in
+        // the basis computation is distinguishable from a same-position add.
         // Expected values are the real SH basis Y_lm evaluated at that direction,
         // using the same SH_NORM constants as pixelflow-core's spherical.rs.
-        let result = ShFeatureMap::<9>::project(Field::from(1.0), Field::from(2.0), Field::from(2.0));
+        let result = ShFeatureMap::<9>::project(Field::from(1.0), Field::from(3.0), Field::from(4.0));
 
         assert_field_approx_eq(result[0], 0.282_095);
-        assert_field_approx_eq(result[1], 0.325_735);
-        assert_field_approx_eq(result[2], 0.325_735);
-        assert_field_approx_eq(result[3], 0.162_867);
-        assert_field_approx_eq(result[4], 0.121_394);
-        assert_field_approx_eq(result[5], 0.485_577);
-        assert_field_approx_eq(result[6], 0.105_131);
-        assert_field_approx_eq(result[7], 0.242_789);
-        assert_field_approx_eq(result[8], -0.182_091);
+        assert_field_approx_eq(result[1], 0.287_469);
+        assert_field_approx_eq(result[2], 0.383_291);
+        assert_field_approx_eq(result[3], 0.095_823);
+        assert_field_approx_eq(result[4], 0.063_032);
+        assert_field_approx_eq(result[5], 0.504_253);
+        assert_field_approx_eq(result[6], 0.266_870);
+        assert_field_approx_eq(result[7], 0.168_084);
+        assert_field_approx_eq(result[8], -0.168_084);
     }
 
     #[test]
