@@ -1632,25 +1632,42 @@ mod tests {
         }
 
         // expr_proj_w (value path)
+        //
+        // This block uses a larger step than the rest of the test. The forward
+        // pass is f32, so the central-difference numerator carries a constant
+        // absolute roundoff noise of ~ulp(loss)/(2*eps) (~1.5e-4 at eps=1e-3),
+        // which swamps small true gradients (~1.7e-4 for expr_proj_w[32][12])
+        // and made this assertion flaky (rel_err 0.086 in June 2026, 0.101 in
+        // July 2026; the June "fix" loosened the threshold instead of fixing
+        // the step size). With a frozen ReLU pattern the loss is exactly
+        // quadratic in any single weight, so the central difference has zero
+        // truncation error and a larger eps strictly improves the
+        // signal-to-roundoff ratio, provided no ReLU flips sign. An
+        // expr_proj_w perturbation only reaches the value-MLP ReLUs, and none
+        // flip at eps=1e-2 for this net/input (verified; unlike trunk_b,
+        // where eps=1e-2 does cross a kink, so the global eps stays 1e-3).
+        // Measured rel_err on the once-failing parameter:
+        // 0.38 @ eps=1e-4, 0.10 @ 1e-3, 0.005 @ 3e-3, 0.001 @ 1e-2.
+        let proj_eps = 1e-2f32;
         for j in [0, 32, 63] {
             for k in [0, 12, 23] {
                 let mut net_p = net.clone();
-                net_p.expr_proj_w[j][k] += eps;
+                net_p.expr_proj_w[j][k] += proj_eps;
                 let loss_plus =
                     value_loss(&net_p, &acc, &gacc, &rule_embed, target_cost, value_coeff);
 
                 let mut net_m = net.clone();
-                net_m.expr_proj_w[j][k] -= eps;
+                net_m.expr_proj_w[j][k] -= proj_eps;
                 let loss_minus =
                     value_loss(&net_m, &acc, &gacc, &rule_embed, target_cost, value_coeff);
 
-                let num_grad = (loss_plus - loss_minus) / (2.0 * eps as f64);
+                let num_grad = (loss_plus - loss_minus) / (2.0 * proj_eps as f64);
                 let (a, n, err) = check_gradient(grads.d_expr_proj_w[j][k], num_grad);
                 if err > max_err {
                     max_err = err;
                 }
                 assert!(
-                    err < 0.1,
+                    err < 0.05,
                     "expr_proj_w[{j}][{k}] (value): analytical={a:.8}, numerical={n:.8}, rel_err={err:.6}"
                 );
                 checked += 1;
