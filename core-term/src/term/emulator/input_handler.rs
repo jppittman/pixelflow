@@ -206,13 +206,15 @@ mod tests {
     #[test]
     fn paste_text_action_bracketed_on() {
         let mut emu = create_test_emu_for_input();
-        // Enable bracketed paste mode via public API (CSI ? 2004 h)
-        // This ensures we test the mode setting logic and state representation contract
-        // rather than modifying internal fields directly.
-        // TODO: Refactor to use the true public API (message passing via interpret_input) and
-        // consider restricting handle_set_mode visibility to pub(super) or private if feasible.
-        use crate::term::modes::{Mode, ModeAction};
-        emu.handle_set_mode(Mode::DecPrivate(2004), ModeAction::Enable);
+        // Enable bracketed paste mode the way a real client would: send the
+        // ANSI escape sequence (CSI ? 2004 h) through the same public
+        // interpret_input entry point the PTY reader uses, rather than
+        // calling the private mode handler directly.
+        use crate::ansi::commands::{AnsiCommand, CsiCommand};
+        use crate::term::EmulatorInput;
+        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+            CsiCommand::SetModePrivate(2004),
+        )));
 
         let text_to_paste = "Hello\nWorld".to_string();
         let action = UserInputAction::PasteText(text_to_paste.clone());
@@ -225,8 +227,10 @@ mod tests {
 
     #[test]
     fn paste_text_action_bracketed_off() {
+        // Bracketed paste mode is off by default (no CSI ? 2004 h was sent);
+        // the behavior asserted below - an unwrapped paste - is itself the
+        // proof of that, rather than reading internal mode state directly.
         let mut emu = create_test_emu_for_input();
-        assert!(!emu.dec_modes.bracketed_paste_mode);
 
         let text_to_paste = "Hello\nWorld".to_string();
         let action = UserInputAction::PasteText(text_to_paste.clone());
