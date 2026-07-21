@@ -102,7 +102,7 @@
 //! use pixelflow_graphics::GlyphCache;
 //!
 //! let mut cache = GlyphCache::new();
-//! let glyph = cache.get(&font, 'A', size)?;
+//! let glyph = cache.get(&font, 'A', size, 1.0)?;
 //! ```
 //!
 //! ### Text Layout and Rendering

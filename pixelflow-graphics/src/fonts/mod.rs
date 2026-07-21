@@ -86,9 +86,9 @@
 //!
 //! let font = Font::parse(font_data).unwrap();
 //! let mut cache = GlyphCache::new();
-//! cache.warm_ascii(&font, 16.0);
+//! cache.warm_ascii(&font, 16.0, 1.0);
 //!
-//! let text = CachedText::new(&font, &mut cache, "Hello, World!", 16.0);
+//! let text = CachedText::new(&font, &mut cache, "Hello, World!", 16.0, 1.0);
 //! ```
 //!
 //! Both produce **coverage** manifolds (`Output = Field`, values in

@@ -133,6 +133,10 @@ pub struct TerminalApp {
     /// Currently pressed mouse button, tracked for motion reporting.
     /// Set on MouseClick, cleared on MouseRelease.
     pressed_mouse_button: Option<pixelflow_runtime::input::MouseButton>,
+    /// Device pixels per point of the current display (backing scale).
+    /// The scene stays in point space; this is only a density hint for the
+    /// glyph cache so bakes match the platform's sample lattice.
+    density: f32,
 }
 
 /// Parameters for constructing a TerminalApp.
@@ -248,10 +252,11 @@ impl TerminalApp {
 
         let loaded_font = Arc::new(LoadedFont::new(source).expect("Failed to parse font"));
 
-        // Create glyph cache and pre-warm with ASCII
+        // Create glyph cache and pre-warm with ASCII. Density 1.0 until the
+        // platform reports the real backing scale via WindowCreated.
         let cell_height = params.config.appearance.cell_height_px as f32;
         let mut glyph_cache = GlyphCache::with_capacity(128);
-        glyph_cache.warm_ascii(&loaded_font.font(), cell_height);
+        glyph_cache.warm_ascii(&loaded_font.font(), cell_height, 1.0);
 
         Self {
             emulator: params.emulator,
@@ -261,7 +266,25 @@ impl TerminalApp {
             loaded_font,
             glyph_cache,
             pressed_mouse_button: None,
+            density: 1.0,
         }
+    }
+
+    /// Adopt a new display density (device pixels per point), re-baking the
+    /// warm glyph set so cached lattices match the platform's sample grid.
+    fn set_density(&mut self, scale: f64) {
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "invalid display scale: {scale}"
+        );
+        let density = scale as f32;
+        if density == self.density {
+            return;
+        }
+        self.density = density;
+        let cell_height = self.config.appearance.cell_height_px as f32;
+        self.glyph_cache
+            .warm_ascii(&self.loaded_font.font(), cell_height, density);
     }
 
     /// Build a render manifold from the current terminal state.
@@ -343,7 +366,7 @@ impl TerminalApp {
                 // Get cached glyph - glyph_scaled now accounts for descenders
                 if let Some(cached) =
                     self.glyph_cache
-                        .get(&self.loaded_font.font(), ch, cell_height)
+                        .get(&self.loaded_font.font(), ch, cell_height, self.density)
                 {
                     let (fg_r, fg_g, fg_b, fg_a) = fg_color.to_f32_rgba();
                     let (bg_r, bg_g, bg_b, bg_a) = cell_bg.to_f32_rgba();
@@ -482,12 +505,13 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 scale,
             } => {
                 log::info!(
-                    "[TERM] Window created: id={}, {}x{} pixels, scale={}",
+                    "[TERM] Window created: id={}, {}x{} points, scale={}",
                     id.0,
                     width_px,
                     height_px,
                     scale
                 );
+                self.set_density(scale);
 
                 // Window is now ready - send initial frame to start VSync loop
                 self.send_frame();
@@ -530,11 +554,11 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                     .expect("Failed to shutdown PTY writer on CloseRequested");
             }
             EngineEventControl::ScaleChanged { id, scale } => {
-                // Rendering is resolution-independent: the frame buffer is
-                // sized from the window's content bounds (points) and cell
-                // metrics come from config, so a backing-scale change needs no
-                // font adjustment — just a redraw on the new display.
+                // The scene stays in point space (grid, cell metrics, mouse
+                // math are all unchanged); only the glyph cache cares, since
+                // its baked lattices must match the new sample density.
                 log::info!("[TERM] Scale changed: id={}, scale={}", id.0, scale);
+                self.set_density(scale);
                 self.send_frame();
             }
         }
