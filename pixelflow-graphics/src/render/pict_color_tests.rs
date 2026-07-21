@@ -60,20 +60,31 @@ fn pict_pixel_packing_algebra() {
     };
 
     for row in &rows {
-        let (r, g, b, a) = (LEVELS[row[0]], LEVELS[row[1]], LEVELS[row[2]], LEVELS[row[3]]);
+        let (r, g, b, a) = (
+            LEVELS[row[0]],
+            LEVELS[row[1]],
+            LEVELS[row[2]],
+            LEVELS[row[3]],
+        );
 
         // Rgba8 construction and accessors round-trip.
         let rgba = Rgba8::new(r, g, b, a);
         check(
             (rgba.r(), rgba.g(), rgba.b(), rgba.a()) == (r, g, b, a),
-            format!("Rgba8::new accessors: ({r},{g},{b},{a}) -> {:?}", (rgba.r(), rgba.g(), rgba.b(), rgba.a())),
+            format!(
+                "Rgba8::new accessors: ({r},{g},{b},{a}) -> {:?}",
+                (rgba.r(), rgba.g(), rgba.b(), rgba.a())
+            ),
         );
 
         // Bgra8 stores the same logical channels (note the (b,g,r,a) arg order).
         let bgra = Bgra8::new(b, g, r, a);
         check(
             (bgra.r(), bgra.g(), bgra.b(), bgra.a()) == (r, g, b, a),
-            format!("Bgra8::new accessors: logical ({r},{g},{b},{a}) -> {:?}", (bgra.r(), bgra.g(), bgra.b(), bgra.a())),
+            format!(
+                "Bgra8::new accessors: logical ({r},{g},{b},{a}) -> {:?}",
+                (bgra.r(), bgra.g(), bgra.b(), bgra.a())
+            ),
         );
 
         // Rgba8 <-> Bgra8 preserves logical channels and is involutive.

@@ -1,175 +1,105 @@
 //! # Font Rendering Pipeline
 //!
-//! Bridges vector font formats (TTF/OTF) to rasterized glyphs as manifolds.
+//! Bridges vector font formats (TTF) to glyph coverage manifolds.
 //!
 //! ## Architecture: Four Layers
 //!
 //! ```text
-//! Application Layer (CachedText)
+//! Text Layer (text(), CachedText)
 //!      ↓
-//!      │  High-level text rendering with layout and caching
+//!      │  Layout: kerning, advances; Sum of positioned glyphs
 //!      │
-//! Rasterization Layer (GlyphCache)
+//! Cache Layer (GlyphCache, CachedGlyph)
 //!      ↓
-//!      │  Lazy glyph caching per size
+//!      │  Lattice-collapsed f32 AA coverage + bilinear read-back
 //!      │
 //! Font Layer (Font, Glyph)
 //!      ↓
-//!      │  TTF/OTF parsing and glyph decomposition
+//!      │  TTF parsing; glyphs as analytical curve manifolds
 //!      │
-//! Loading Layer (FontSource, LoadedFont)
+//! Loading Layer (loader: DataSource, EmbeddedSource, MmapSource, LoadedFont)
 //!      ↓
 //! In-Memory Font Data
 //! ```
 //!
-//! ## Layer 1: Font Loading (`loader` module)
+//! ## Coverage semantics: hard over `Field`, antialiased over `Jet2`
 //!
-//! The entry point for font data. Supports multiple sources:
+//! The whole analytical pipeline (`AnalyticalLine`/`AnalyticalQuad` crossing
+//! kernels, `Geometry` winding accumulation, affine transforms, `Glyph`,
+//! `Translate`, `Sum`) is generic over the evaluation domain:
 //!
-//! ### FontSource Variants
+//! - Over **`Field`** coordinates, derivatives are zero and every edge
+//!   crossing degenerates to a hard 0/1 step — the classic aliased
+//!   winding-number test.
+//! - Over **`Jet2`** coordinates (2D dual numbers), each crossing computes a
+//!   gradient-normalized ramp `clamp(d / (‖∇d‖ + ε) + 0.5, 0, 1)` that is
+//!   ~1 *screen* pixel wide at any glyph scale — the chain rule carries
+//!   ‖∇d‖ through every coordinate transform.
 //!
-//! - **Embedded**: Fonts baked into the binary (no I/O)
-//! - **Filesystem**: Load from disk at runtime
-//! - **Memory-mapped**: Zero-copy file access via mmap
+//! [`crate::render::aa::Antialiased`] (or the [`crate::render::aa::aa`]
+//! function) is the bridge: it wraps a domain-generic coverage manifold and
+//! seeds `Jet2` derivatives in screen space, exposing an antialiased
+//! `Manifold<(Field, Field, Field, Field), Output = Field>`.
 //!
 //! ```ignore
-//! use pixelflow_graphics::fonts::{Font, FontSource};
+//! use pixelflow_graphics::fonts::{text, Font};
+//! use pixelflow_graphics::render::aa::aa;
 //!
-//! // Load embedded font (fast, no I/O)
-//! let font = Font::from_source(FontSource::Embedded)?;
-//!
-//! // Load from file (slower, but flexible)
-//! let font = Font::from_source(FontSource::Filesystem {
-//!     path: "/path/to/font.ttf".into(),
-//! })?;
+//! let font = Font::parse(font_data).unwrap();
+//! let hard = text(&font, "Hello", 16.0);   // aliased coverage
+//! let smooth = aa(text(&font, "Hello", 16.0)); // antialiased coverage
 //! ```
+//!
+//! ## Layer 1: Font Loading (`loader` module)
+//!
+//! Font bytes come from a [`FontSource`]: [`DataSource`] (owned bytes),
+//! [`EmbeddedSource`] (bytes baked into the binary), or [`MmapSource`]
+//! (zero-copy memory-mapped file). [`LoadedFont`] owns the source and
+//! lends out parsed [`Font`] views.
 //!
 //! ## Layer 2: Glyph Decomposition (`ttf` module)
 //!
-//! Parses TTF/OTF files and decomposes glyphs into curves.
+//! [`Font::parse`] reads the TTF tables (cmap, glyf, loca, hmtx, kern).
+//! [`Font::glyph_scaled`] compiles a character's outline into a
+//! [`Glyph`]: lines and quadratic Béziers as analytical crossing kernels,
+//! composed with bounds checks and affine transforms. Metrics come from
+//! `advance`/`kern` and their `*_by_id`/`*_scaled` variants.
 //!
-//! ### Glyph Structure
+//! ## Layer 3: Glyph Caching (`cache` module)
 //!
-//! Each glyph contains:
-//! - **Contours**: Outlines composed of quadratic Bézier curves (TrueType) or cubic Bézier curves (PostScript)
-//! - **Metrics**: Advance width, bounding box, bearing
-//! - **Rasterization state**: Hints and grid-fitting instructions (optional)
-//!
-//! ### Font Trait
-//!
-//! ```ignore
-//! pub trait Font {
-//!     fn glyph(&self, codepoint: char) -> Option<Glyph>;
-//!     fn glyph_metrics(&self, codepoint: char) -> Option<Metrics>;
-//!     fn baseline_offset(&self) -> i32;
-//! }
-//! ```
-//!
-//! The `Font` trait provides:
-//! - **Glyph lookup**: Get the vector outline for a character
-//! - **Metrics**: Advance width and bounding box
-//! - **Baseline**: Vertical offset for proper alignment
-//!
-//! ## Layer 3: Glyph Rasterization (`cache` module)
-//!
-//! Glyphs are expensive to rasterize (curves → pixels). The cache stores rasterized glyphs per size.
-//!
-//! ### GlyphCache
-//!
-//! Stores a 2D grid of rasterized glyphs, keyed by character and size.
-//!
-//! ```ignore
-//! use pixelflow_graphics::GlyphCache;
-//!
-//! let cache = GlyphCache::new();
-//! let rasterized = cache.get_or_rasterize('A', &font, 16)?;
-//! // Returns: height_px, width_px, pixels
-//! ```
-//!
-//! ### Caching Strategy
-//!
-//! - **Lazy**: Glyphs are rasterized on first use
-//! - **Per-size**: Each font size gets its own cache (common for terminals)
-//! - **Exponential growth**: Cache grows as needed; never shrinks
-//! - **Memory-efficient**: Typical terminal use (ANSI colors + 100 glyphs) uses ~1MB per size
+//! Analytical evaluation walks every curve per sample. `GlyphCache` bakes
+//! glyphs once per (character, size bucket): `CachedGlyph::new` evaluates
+//! the glyph through `Antialiased` and collapses it over a `Lattice` into a
+//! `DiscreteManifold` of f32 coverage sampled at pixel centers. Read-back
+//! goes through the [`crate::render::bilinear::Bilinear`] combinator, so
+//! fractional positions interpolate the baked AA coverage smoothly. See the
+//! `cache` module docs for the half-pixel coordinate convention.
 //!
 //! ## Layer 4: Text Layout (`text` module and `CachedText`)
 //!
-//! Combines font, cache, and manifold composition for high-level text rendering.
-//!
-//! ### CachedText
-//!
-//! The primary interface for rendering text. It:
-//! - **Caches glyphs**: Via internal `GlyphCache`
-//! - **Composes manifolds**: Each glyph position gets a manifold that samples the cache
-//! - **Handles layout**: Advance widths, kerning (if available), baseline alignment
+//! [`text()`](text::text) lays out a string as a `Sum` of translated
+//! analytical glyphs (kerning-free advance layout). [`CachedText::new`]
+//! does the same over cached glyphs, with kerning:
 //!
 //! ```ignore
-//! use pixelflow_graphics::CachedText;
+//! use pixelflow_graphics::fonts::{CachedText, Font, GlyphCache};
 //!
-//! let text = CachedText::new(
-//!     "Hello, World!",
-//!     &font,
-//!     size,
-//!     foreground_color,
-//!     background_color,
-//! )?;
+//! let font = Font::parse(font_data).unwrap();
+//! let mut cache = GlyphCache::new();
+//! cache.warm_ascii(&font, 16.0);
 //!
-//! // Text is now a Manifold<Output = Discrete> (a color manifold)
-//! // Can be rendered directly or composed with other manifolds
+//! let text = CachedText::new(&font, &mut cache, "Hello, World!", 16.0);
 //! ```
 //!
-//! ## Rendering Pipeline
-//!
-//! Typical usage flow:
-//!
-//! 1. **Load font** (once): `Font::from_source(FontSource::...)?`
-//! 2. **Create text manifold** (per string): `CachedText::new(text, &font, ...)?`
-//! 3. **Render** (every frame): `execute(&text_manifold, &mut framebuffer, shape)`
-//!
-//! The glyph cache is shared across all `CachedText` instances using the same font and size,
-//! so repeated text doesn't re-rasterize glyphs.
-//!
-//! ## Integration with Colors
-//!
-//! `CachedText` produces manifolds with `Output = Discrete` (RGBA pixels), so they compose
-//! seamlessly with color manifolds and other effects:
-//!
-//! ```ignore
-//! use pixelflow_graphics::{CachedText, ColorCube};
-//! use pixelflow_core::combinators::At;
-//!
-//! let text = CachedText::new(...)?;
-//! let background = At { inner: ColorCube, x: 0.2, y: 0.2, z: 0.2, w: 1.0 };  // Dark gray
-//!
-//! // Compose: text over background
-//! let scene = text.select(background);  // TextOn{text, background}
-//! ```
-//!
-//! ## Performance Characteristics
-//!
-//! | Operation | Time | Cache Status |
-//! |-----------|------|--------------|
-//! | Load font | ~1-10ms | Single per app |
-//! | First render (new size) | ~10-50ms per unique char | Cache miss |
-//! | Second render (same size) | ~0.1ms per pixel | Cache hit (SIMD) |
-//!
-//! For a 1080p terminal with ~20 unique characters per frame, rasterization is negligible (<1% of frame time).
-//!
-//! ## Memory Layout: Glyphs as Manifolds
-//!
-//! A `CachedText` manifold doesn't store pixel data directly. Instead:
-//! 1. It stores the glyph cache (shared across all text instances)
-//! 2. At evaluation time, it samples the cache at the requested coordinates
-//! 3. The compiler fuses this sampling into the main SIMD loop
-//!
-//! Result: No intermediate framebuffer, no memory copies. Text is rasterized directly into the final output.
+//! Both produce **coverage** manifolds (`Output = Field`, values in
+//! `[0, 1]`), not colors. Map coverage to pixels with
+//! `render::color::Grayscale`, or blend foreground/background per channel
+//! the way `core-term`'s cell renderer does.
 //!
 //! ## Supported Formats
 //!
-//! - **TTF** (TrueType): Quadratic Bézier curves
-//! - **OTF** (OpenType): Cubic Bézier curves (via subsetting)
-//! - **Variable fonts**: Supported if font has variation axes
+//! - **TTF** (TrueType): quadratic Bézier outlines, cmap formats 4 and 12,
+//!   horizontal kerning (kern format 0).
 //!
 pub mod cache;
 pub mod loader;

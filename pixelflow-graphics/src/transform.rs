@@ -2,6 +2,8 @@
 //!
 //! Provides composable coordinate warping using the `At` combinator.
 
+use pixelflow_compiler::kernel;
+use pixelflow_core::jet::Jet2;
 use pixelflow_core::ops::{Div, Sub};
 use pixelflow_core::{At, Field, Manifold, W, X, Y, Z};
 
@@ -112,25 +114,38 @@ where
     }
 }
 
-impl<M> Manifold<Field4> for Translate<M>
-where
-    M: Manifold<Field4, Output = Field>,
-{
-    type Output = Field;
+// Translate is domain-generic (one kernel body per domain, see the note in
+// fonts/ttf_curve_analytical.rs): raw `f32` coordinate offsets always evaluate
+// to `Field`, so `X - offset` would be ill-typed over `Jet2`; the kernel lifts
+// the offset into the evaluation domain instead.
+macro_rules! impl_translate_manifold {
+    ($n:ty) => {
+        impl<M> Manifold<($n, $n, $n, $n)> for Translate<M>
+        where
+            M: Manifold<($n, $n, $n, $n), Output = Field>,
+        {
+            type Output = Field;
 
-    #[inline(always)]
-    fn eval(&self, p: Field4) -> Field {
-        // Create At combinator with coordinate expressions
-        let at = At {
-            inner: &self.manifold,
-            x: X - self.offset[0],
-            y: Y - self.offset[1],
-            z: Z,
-            w: W,
-        };
-        at.eval(p)
-    }
+            #[inline(always)]
+            fn eval(&self, p: ($n, $n, $n, $n)) -> Field {
+                let shift_x = kernel!(|d: f32| -> $n { X - d });
+                let shift_y = kernel!(|d: f32| -> $n { Y - d });
+                // Create At combinator with coordinate expressions
+                let at = At {
+                    inner: &self.manifold,
+                    x: shift_x(self.offset[0]),
+                    y: shift_y(self.offset[1]),
+                    z: Z,
+                    w: W,
+                };
+                at.eval(p)
+            }
+        }
+    };
 }
+
+impl_translate_manifold!(Field);
+impl_translate_manifold!(Jet2);
 
 #[cfg(test)]
 mod tests {

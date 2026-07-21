@@ -165,14 +165,36 @@ impl fmt::Display for BenchError {
 // Platform-specific high-resolution timing.
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
 }
 
 #[cfg(target_os = "macos")]
 fn nanos_now() -> u64 {
-    // On Apple Silicon, mach_absolute_time() ticks == nanoseconds (timebase 1:1).
-    unsafe { mach_absolute_time() }
+    // mach_absolute_time() ticks are NOT nanoseconds on native Apple Silicon:
+    // the timebase is 125/3 (one tick = 41.67ns; 1:1 only holds on Intel Macs
+    // and under Rosetta). Convert via mach_timebase_info, queried once.
+    // Verified empirically 2026-07-20: a 100ms sleep measured 2.47M raw ticks.
+    static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+        let rc = unsafe { mach_timebase_info(&mut info) };
+        assert_eq!(rc, 0, "mach_timebase_info failed with {}", rc);
+        assert_ne!(info.denom, 0, "mach_timebase_info returned denom=0");
+        (info.numer, info.denom)
+    });
+    let ticks = unsafe { mach_absolute_time() };
+    // u128 intermediate: ticks * numer overflows u64 after ~50 days of uptime
+    // at timebase 125/3.
+    ((ticks as u128 * numer as u128) / denom as u128) as u64
 }
 
 #[cfg(target_os = "linux")]
@@ -369,6 +391,101 @@ pub fn benchmark_jit_arena_repeated(
 ) -> Result<BenchResult, BenchError> {
     let result = compile_arena_dag(arena, root).map_err(BenchError::CompileFailed)?;
     benchmark_exec_code(result.code, repeat_batches)
+}
+
+// =============================================================================
+// Compile-cost benchmarking (kernel-unification Phase 0, gate G0)
+// =============================================================================
+
+/// Timed compile samples per measurement. A single compile costs microseconds,
+/// far above the ~1ns timer resolution, so one compile per sample is enough;
+/// the median over many samples rejects OS scheduling jitter.
+const COMPILE_TIMED_RUNS: usize = 101;
+
+/// Warmup compiles before timing. Warms the allocator, icache, and (on the
+/// fresh path) the kernel's VM-map fast paths so the timed samples measure
+/// steady-state cost, not cold-start page faults.
+const COMPILE_WARMUP_ITERS: usize = 16;
+
+/// Code-buffer capacity for the reused-buffer path. 256KB is generous for
+/// expressions up to ~2000 nodes (`CompileWorkspace` docs say 64KB covers
+/// ~500 nodes).
+#[cfg(target_arch = "aarch64")]
+const REUSED_CODE_CAPACITY: usize = 256 * 1024;
+
+/// Result of a compile-cost measurement.
+pub struct CompileCostResult {
+    /// Median ns for one complete compile.
+    pub ns: f64,
+    /// Emitted machine-code size in bytes.
+    pub code_bytes: usize,
+}
+
+/// Median wall-clock cost of one `compile_arena_dag` call, fresh-allocation
+/// path: every compile mmaps a new executable region and munmaps it on drop.
+/// Both syscalls are inside the timed window — this is the full per-compile
+/// lifecycle a naive per-kernel JIT would pay.
+pub fn benchmark_compile_fresh(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<CompileCostResult, BenchError> {
+    for _ in 0..COMPILE_WARMUP_ITERS {
+        let result = compile_arena_dag(arena, root).map_err(BenchError::CompileFailed)?;
+        std::hint::black_box(result.code.as_bytes().first());
+    }
+
+    let mut times = [0u64; COMPILE_TIMED_RUNS];
+    let mut code_bytes = 0usize;
+    for t in &mut times {
+        let start = nanos_now();
+        let result = compile_arena_dag(arena, root).map_err(BenchError::CompileFailed)?;
+        std::hint::black_box(result.code.as_bytes().first());
+        code_bytes = result.code.len();
+        drop(result); // munmap inside the timed window
+        *t = nanos_now() - start;
+    }
+
+    times.sort_unstable();
+    let median = times[COMPILE_TIMED_RUNS / 2] as f64;
+    validate_median(median).map(|ns| CompileCostResult { ns, code_bytes })
+}
+
+/// Median wall-clock cost of one compile into a reused
+/// [`CompileWorkspace`](pixelflow_ir::backend::emit::CompileWorkspace):
+/// the executable region is mmap'd once up front, and each compile pays only
+/// `pthread_jit_write_protect_np` toggles + icache invalidation (Apple
+/// Silicon) instead of mmap/munmap. This is the amortized cost gate G0 cares
+/// about. aarch64 only — `CompileWorkspace` has no x86-64 counterpart.
+///
+/// Returns median ns per compile. Note the workspace path skips the lowering
+/// passes (`expand_reduce`/`expand_gather`/`expand_transcendentals`), so the
+/// arena must contain only directly-emittable ops for the comparison against
+/// [`benchmark_compile_fresh`] to be apples-to-apples.
+#[cfg(target_arch = "aarch64")]
+pub fn benchmark_compile_reused(arena: &ExprArena, root: ExprId) -> Result<f64, BenchError> {
+    use pixelflow_ir::backend::emit::CompileWorkspace;
+
+    let mut ws = CompileWorkspace::new(REUSED_CODE_CAPACITY).map_err(BenchError::CompileFailed)?;
+
+    // SAFETY: the returned KernelFn is never called, and is discarded before
+    // the next compile_arena call overwrites the buffer.
+    for _ in 0..COMPILE_WARMUP_ITERS {
+        let func = unsafe { ws.compile_arena(arena, root) }.map_err(BenchError::CompileFailed)?;
+        std::hint::black_box(func);
+    }
+
+    let mut times = [0u64; COMPILE_TIMED_RUNS];
+    for t in &mut times {
+        let start = nanos_now();
+        // SAFETY: as above — pointer discarded, never called.
+        let func = unsafe { ws.compile_arena(arena, root) }.map_err(BenchError::CompileFailed)?;
+        std::hint::black_box(func);
+        *t = nanos_now() - start;
+    }
+
+    times.sort_unstable();
+    let median = times[COMPILE_TIMED_RUNS / 2] as f64;
+    validate_median(median)
 }
 
 /// Convert nanoseconds to log-nanoseconds (floored at 1e-3ns, capped at 1s).
