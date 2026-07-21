@@ -1,3 +1,3 @@
 pub mod mock_engine;
 
-pub use mock_engine::MockEngine;
+pub use mock_engine::{MockEngine, ReceivedMessage};

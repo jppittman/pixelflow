@@ -496,12 +496,11 @@ fn set_config_auto_starts_actor() {
     let self_handle = builder.add_producer();
     let mut rx = builder.build();
 
-    // We need a dummy engine handle for SetConfig - create but won't be used
-    let (engine_handle, _) = actor_scheduler::ActorScheduler::<
-        pixelflow_runtime::api::private::EngineData,
-        pixelflow_runtime::api::private::EngineControl,
-        pixelflow_runtime::api::public::AppManagement,
-    >::new(10, 100);
+    // We need a dummy engine handle for SetConfig - create but won't be used.
+    // Use the crate's sanctioned test double rather than reaching into
+    // api::private to hand-assemble an ActorScheduler directly.
+    let mut mock_engine = pixelflow_runtime::testing::MockEngine::new();
+    let engine_handle = mock_engine.take_handle();
 
     let handle = thread::spawn(move || {
         let mut actor = MockVsyncActor::new(log_clone);
