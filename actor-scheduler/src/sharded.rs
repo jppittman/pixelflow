@@ -107,8 +107,14 @@ impl<T> ShardedInbox<T> {
 
             loop {
                 if total >= limit || shard_count >= per_shard {
-                    // Hit per-shard or total limit — there might be more
+                    // Hit per-shard or total limit — there might be more.
+                    // This shard was NOT observed disconnected: we stopped
+                    // before polling it (again), so it must not count toward
+                    // all_disconnected. Otherwise a drain that exhausts its
+                    // limit early (or a limit of 0) reports Disconnected with
+                    // live producers, and the scheduler shuts the actor down.
                     all_empty = false;
+                    all_disconnected = false;
                     break;
                 }
 
@@ -301,6 +307,37 @@ mod tests {
         });
 
         assert!(result.is_err());
+    }
+
+    // Regression: a drain that never polls a shard (limit exhausted before the
+    // first try_recv — the degenerate case being limit == 0) must not report
+    // Disconnected. all_disconnected was vacuously true because no shard was
+    // observed, and the scheduler treats Disconnected-on-all-lanes as "actor
+    // is done", silently shutting it down with live producers.
+    #[test]
+    fn zero_limit_drain_does_not_report_disconnected() {
+        let mut builder = InboxBuilder::new(8);
+        let tx = builder.add_producer();
+        let mut inbox = builder.build();
+
+        tx.try_send(42u32).unwrap();
+
+        let status = inbox.drain(0, |_msg: u32| Ok(())).unwrap();
+        assert_ne!(
+            status,
+            DrainStatus::Disconnected,
+            "no shard was polled — reporting Disconnected is unsound"
+        );
+
+        // The queued message must still be deliverable afterwards.
+        let mut got = Vec::new();
+        inbox
+            .drain(10, |msg| {
+                got.push(msg);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(got, vec![42]);
     }
 
     #[test]
