@@ -1,20 +1,25 @@
 //! pixelflow-graphics/src/fonts/ttf.rs
 //!
-//! Pure Manifold TTF Parser with Analytical Loop-Blinn Rendering.
+//! Pure Manifold TTF Parser with analytical ray-crossing rendering.
 //!
-//! Glyphs use analytical curves with coverage-based antialiasing.
-//! All derivatives are precomputed polynomials - no Jets needed!
+//! The whole glyph pipeline (curves, geometry, affine transforms, glyphs) is
+//! generic over the evaluation domain:
+//!
+//! - Evaluated over `Field` coordinates, crossings are hard 0/1 steps
+//!   (the classic aliased winding test).
+//! - Evaluated over `Jet2` coordinates (see [`crate::render::aa::Antialiased`]),
+//!   each crossing becomes a gradient-normalized ramp ~1 screen pixel wide:
+//!   the derivatives chain through every affine transform, so antialiasing is
+//!   scale-invariant.
 
 use crate::shapes::{square, Bounded};
 use pixelflow_compiler::kernel;
-use pixelflow_core::{At, Field, Manifold, ManifoldCompat, ManifoldExt, W, Z};
+use pixelflow_core::jet::Jet2;
+use pixelflow_core::{At, Field, Manifold, ManifoldExt, W, Z};
 use std::sync::Arc;
 
 // Import analytical curve kernels
 use super::ttf_curve_analytical::{AnalyticalLine, AnalyticalQuad};
-
-/// The standard 4D Field domain type.
-type Field4 = (Field, Field, Field, Field);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Type Aliases for Concrete Kernel Types
@@ -30,12 +35,54 @@ pub type QuadKernel = AnalyticalQuad;
 // Combinators
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Affine coordinate transform kernel.
-// Computes: (X - tx) * a + (Y - ty) * b
-kernel!(
-    pub struct AffineTransform = |tx: f32, a: f32, ty: f32, b: f32|
-    (X - tx) * a + (Y - ty) * b
-);
+/// Affine coordinate transform kernel.
+///
+/// Computes: (X - tx) * a + (Y - ty) * b
+///
+/// Domain-generic: over `Jet2` the output carries the transform's Jacobian,
+/// which is what makes the crossing ramp scale-invariant in screen space.
+#[derive(Clone, Copy, Debug)]
+pub struct AffineTransform {
+    /// X translation (applied before the linear part).
+    pub tx: f32,
+    /// First row coefficient for X.
+    pub a: f32,
+    /// Y translation (applied before the linear part).
+    pub ty: f32,
+    /// First row coefficient for Y.
+    pub b: f32,
+}
+
+impl AffineTransform {
+    /// Create a new affine coordinate expression.
+    #[inline(always)]
+    #[must_use]
+    pub fn new(tx: f32, a: f32, ty: f32, b: f32) -> Self {
+        Self { tx, a, ty, b }
+    }
+}
+
+// One kernel body, stamped per evaluation domain: `kernel!` lifts scalar
+// params to a single concrete domain type chosen at expansion time, so a
+// named kernel struct cannot be polymorphic over the domain.
+macro_rules! impl_affine_transform_manifold {
+    ($n:ty) => {
+        impl Manifold<($n, $n, $n, $n)> for AffineTransform {
+            type Output = $n;
+
+            #[inline(always)]
+            fn eval(&self, p: ($n, $n, $n, $n)) -> $n {
+                let k = kernel!(|tx: f32, a: f32, ty: f32, b: f32| -> $n {
+                    (X - tx) * a + (Y - ty) * b
+                });
+                k(self.tx, self.a, self.ty, self.b).eval(p)
+            }
+        }
+    };
+}
+
+impl_affine_transform_manifold!(Field);
+impl_affine_transform_manifold!(Jet2);
 
 /// Affine transform combinator type alias.
 ///
@@ -70,20 +117,25 @@ pub fn affine<M>(inner: M, [a, b, c, d, tx, ty]: [f32; 6]) -> Affine<M> {
 #[derive(Clone, Debug)]
 pub struct Sum<M>(pub Arc<[M]>);
 
-impl<M: Manifold<Field4, Output = Field>> Manifold<Field4> for Sum<M> {
+// Domain-generic: the summands produce Field coverage in every domain, so the
+// accumulation itself is plain Field math.
+impl<P, M> Manifold<P> for Sum<M>
+where
+    P: Copy + Send + Sync,
+    M: Manifold<P, Output = Field>,
+{
     type Output = Field;
 
     #[inline(always)]
-    fn eval(&self, p: Field4) -> Field {
-        let (x, y, z, w) = p;
+    fn eval(&self, p: P) -> Field {
         if self.0.len() == 1 {
-            return self.0[0].eval_raw(x, y, z, w);
+            return self.0[0].eval(p);
         }
         // Build sum AST and evaluate - each iteration builds Add node, then evals
         let zero = Field::from(0.0);
         self.0.iter().fold(zero, |acc, m| {
-            let val = m.eval_raw(x, y, z, w);
-            (acc + val).eval_raw(zero, zero, zero, zero)
+            let val = m.eval(p);
+            (acc + val).eval(p)
         })
     }
 }
@@ -131,25 +183,31 @@ impl<K> Line<K> {
     }
 }
 
-// ─── Field Implementation (Winding Number Coverage) ────────────────────────
+// ─── Winding Number Coverage (generic over the evaluation domain) ──────────
 
-impl<K: Manifold<Field4, Output = Field>> Manifold<Field4> for Line<K> {
+impl<P, K> Manifold<P> for Line<K>
+where
+    P: Copy + Send + Sync,
+    K: Manifold<P, Output = Field>,
+{
     type Output = Field;
 
     #[inline(always)]
-    fn eval(&self, p: Field4) -> Field {
-        let (x, y, z, w) = p;
-        self.kernel.eval_raw(x, y, z, w)
+    fn eval(&self, p: P) -> Field {
+        self.kernel.eval(p)
     }
 }
 
-impl<K: Manifold<Field4, Output = Field>> Manifold<Field4> for Quad<K> {
+impl<P, K> Manifold<P> for Quad<K>
+where
+    P: Copy + Send + Sync,
+    K: Manifold<P, Output = Field>,
+{
     type Output = Field;
 
     #[inline(always)]
-    fn eval(&self, p: Field4) -> Field {
-        let (x, y, z, w) = p;
-        self.kernel.eval_raw(x, y, z, w)
+    fn eval(&self, p: P) -> Field {
+        self.kernel.eval(p)
     }
 }
 
@@ -164,49 +222,49 @@ pub struct Geometry<L, Q> {
     pub quads: Arc<[Q]>,
 }
 
-impl<L: Manifold<Field4, Output = Field>, Q: Manifold<Field4, Output = Field>> Manifold<Field4>
-    for Geometry<L, Q>
+// Domain-generic: segments produce Field coverage in every domain (the
+// crossing ramp projects derivatives away), so winding accumulation and the
+// non-zero fill rule are plain Field math.
+impl<P, L, Q> Manifold<P> for Geometry<L, Q>
+where
+    P: Copy + Send + Sync,
+    L: Manifold<P, Output = Field>,
+    Q: Manifold<P, Output = Field>,
 {
     type Output = Field;
 
     #[inline(always)]
-    fn eval(&self, p: Field4) -> Field {
-        let (x, y, z, w) = p;
+    fn eval(&self, p: P) -> Field {
         let fzero = Field::from(0.0);
 
         // Accumulate line and quad contributions into a single composite value.
         // Note: Field + Field produces Add<Field, Field> (a manifold), so we must
-        // evaluate to get back a scalar. This pattern is more efficient than the
-        // old code because we defer the final evaluation until after combining
-        // all contributions, rather than collapsing after each addition.
+        // evaluate to get back a scalar.
         let total = self
             .lines
             .iter()
-            .map(|l| l.eval_raw(x, y, z, w))
-            .chain(self.quads.iter().map(|q| q.eval_raw(x, y, z, w)))
+            .map(|l| l.eval(p))
+            .chain(self.quads.iter().map(|q| q.eval(p)))
             .fold(fzero, |acc, contrib| {
                 // Compose: acc + contrib produces Add<Field, Field>
                 // Evaluate the sum to collapse back to Field
-                (acc + contrib).eval_raw(fzero, fzero, fzero, fzero)
+                (acc + contrib).eval(p)
             });
 
         // Apply non-zero winding rule: |winding| becomes coverage (clamped to [0, 1])
-        total
-            .abs()
-            .min(Field::from(1.0))
-            .eval_raw(fzero, fzero, fzero, fzero)
+        total.abs().min(Field::from(1.0)).eval(p)
     }
 }
 
 /// A simple glyph: segments in unit space, bounded, then transformed.
 ///
 /// The composition is: Affine<Select<UnitSquare, Geometry, 0.0>>
-/// - Geometry: Optimized Sum of Lines and Quads (produces smooth 0.0-1.0 coverage)
+/// - Geometry: Optimized Sum of Lines and Quads
 /// - Select (via square): Bounds check with short-circuit
 /// - Affine: Restores to font coordinate space
 ///
-/// Note: Lines and Quads now produce analytically anti-aliased coverage directly,
-/// so Threshold is no longer needed.
+/// Coverage is hard 0/1 over `Field` coordinates; antialiased when the same
+/// pipeline is evaluated over `Jet2` coordinates (via `Antialiased`).
 pub type SimpleGlyph<L, Q> = Affine<Bounded<Geometry<L, Q>>>;
 
 /// A compound glyph: sum of transformed child glyphs.
@@ -233,57 +291,56 @@ impl<L, Q> core::fmt::Debug for Glyph<L, Q> {
     }
 }
 
-// Glyph evaluation - concrete impls because Line/Quad/Segment have
-// different implementations for Field (hard) vs Jet2 (anti-aliased).
+// Glyph evaluation - one body, stamped per evaluation domain (Field: hard
+// coverage, Jet2: antialiased). Concrete impls rather than a single generic
+// one because the inner `Select` (bounds check) only has per-domain Manifold
+// impls, and the compound arm recurses into `Glyph` itself, which a generic
+// impl could not express without a cyclic where-clause.
+macro_rules! impl_glyph_manifold {
+    ($n:ty) => {
+        impl<L, Q> Manifold<($n, $n, $n, $n)> for Glyph<L, Q>
+        where
+            L: Manifold<($n, $n, $n, $n), Output = Field>,
+            Q: Manifold<($n, $n, $n, $n), Output = Field>,
+        {
+            type Output = Field;
 
-impl<L, Q> Manifold<Field4> for Glyph<L, Q>
-where
-    L: ManifoldCompat<Field, Output = Field>,
-    Q: ManifoldCompat<Field, Output = Field>,
-{
-    type Output = Field;
-
-    #[inline(always)]
-    fn eval(&self, p: Field4) -> Field {
-        let (x, y, z, w) = p;
-        match self {
-            Self::Empty => Field::from(0.0),
-            Self::Simple(g) => {
-                // Inline the Affine<Bounded<Geometry>> evaluation
-                // The affine transform has been stored as At<AffineTransform, AffineTransform, Z, W, Select<..., Geometry, f32>>
-                // We need to evaluate the coordinate expressions and then call the inner manifold
-
-                // For SimpleGlyph, the structure is:
-                // At<trans_x, trans_y, Z, W, Select<UnitSquare, Geometry, 0.0>>
-                //
-                // We evaluate trans_x and trans_y at (x, y, z, w), then pass to inner
-                let tx = g.x.eval(p); // transformed x
-                let ty = g.y.eval(p); // transformed y
-                let tz = g.z.eval(p); // z (passthrough)
-                let tw = g.w.eval(p); // w (passthrough)
-
-                // Now evaluate the inner Select<UnitSquare, Geometry, 0.0>
-                g.inner.eval((tx, ty, tz, tw))
-            }
-            Self::Compound(sum) => {
-                // Compound glyphs are Sum<Affine<Glyph>>
-                // We need to evaluate each child and sum the results
-                let mut acc = Field::from(0.0);
-                for child in sum.0.iter() {
-                    // Each child is Affine<Glyph<L, Q>>
-                    // Inline the At evaluation
-                    let tx = child.x.eval(p);
-                    let ty = child.y.eval(p);
-                    let tz = child.z.eval(p);
-                    let tw = child.w.eval(p);
-                    let child_val = child.inner.eval((tx, ty, tz, tw));
-                    acc = (acc + child_val).at(x, y, z, w).collapse();
+            #[inline(always)]
+            fn eval(&self, p: ($n, $n, $n, $n)) -> Field {
+                match self {
+                    Self::Empty => Field::from(0.0),
+                    Self::Simple(g) => {
+                        // Inline the Affine<Bounded<Geometry>> evaluation:
+                        // evaluate the coordinate expressions, then the inner
+                        // Select<UnitSquare, Geometry, 0.0>.
+                        let tx = g.x.eval(p); // transformed x
+                        let ty = g.y.eval(p); // transformed y
+                        let tz = g.z.eval(p); // z (passthrough)
+                        let tw = g.w.eval(p); // w (passthrough)
+                        g.inner.eval((tx, ty, tz, tw))
+                    }
+                    Self::Compound(sum) => {
+                        // Compound glyphs are Sum<Affine<Glyph>>: evaluate each
+                        // child through its affine transform and sum.
+                        let mut acc = Field::from(0.0);
+                        for child in sum.0.iter() {
+                            let tx = child.x.eval(p);
+                            let ty = child.y.eval(p);
+                            let tz = child.z.eval(p);
+                            let tw = child.w.eval(p);
+                            let child_val = child.inner.eval((tx, ty, tz, tw));
+                            acc = (acc + child_val).eval(p);
+                        }
+                        acc
+                    }
                 }
-                acc
             }
         }
-    }
+    };
 }
+
+impl_glyph_manifold!(Field);
+impl_glyph_manifold!(Jet2);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Reader

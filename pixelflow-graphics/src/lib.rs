@@ -82,30 +82,33 @@
 //!
 //! ## Tier 2: Fonts
 //!
-//! Font rendering bridges vector glyphs (TTF/OTF) to pixels. Typically used in terminals for character rendering.
+//! Font rendering bridges vector glyphs (TTF) to coverage manifolds. Typically used in terminals for character rendering.
 //!
 //! ### Font Loading
-//! Fonts are loaded from multiple sources (embedded, filesystem, or memory-mapped):
+//! Fonts are parsed from bytes; the `fonts::loader` module provides sources
+//! (owned, embedded, or memory-mapped) via `LoadedFont`:
 //!
 //! ```ignore
-//! use pixelflow_graphics::fonts::{Font, FontSource, LoadedFont};
+//! use pixelflow_graphics::fonts::Font;
 //!
-//! // Load from memory
-//! let font = Font::from_source(FontSource::Embedded)?;
+//! let font = Font::parse(font_bytes)?;
 //! ```
 //!
 //! ### Glyph Caching
-//! Glyphs are **lazily cached** per size. A `GlyphCache` stores rasterized glyphs to avoid redundant computation.
+//! Glyphs are **lazily cached** per size bucket. A `GlyphCache` bakes each
+//! glyph's antialiased coverage to an f32 lattice (read back bilinearly):
 //!
 //! ```ignore
 //! use pixelflow_graphics::GlyphCache;
 //!
-//! let cache = GlyphCache::new();
-//! let glyph = cache.get_or_rasterize('A', font, size)?;
+//! let mut cache = GlyphCache::new();
+//! let glyph = cache.get(&font, 'A', size)?;
 //! ```
 //!
 //! ### Text Layout and Rendering
-//! `CachedText` combines font, cache, layout, and rendering into a single manifold.
+//! `fonts::text()` lays out uncached analytical text (wrap with `render::aa::aa`
+//! for antialiasing); `CachedText` composes cached glyphs with kerning.
+//! See the `fonts` module docs for the full pipeline.
 //!
 //! ## Tier 3: Materialization (Manifold → Pixels)
 //!

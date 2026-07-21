@@ -121,6 +121,125 @@ fn find_derivative_params_inner(
     }
 }
 
+/// Collect locals whose bound value (transitively) involves a manifold param.
+///
+/// Such locals are bound to non-Copy values — tap expressions like
+/// `tex.at(...)` capture `&self.tex`, and only fully-ZST expression trees are
+/// Copy. The e-graph optimizer is free to extract a form that references such
+/// a local more than once, so every use must clone instead of move (the clone
+/// copies coordinate ZSTs plus a reference — free).
+///
+/// Walks blocks in statement order so taint propagates through chains of
+/// lets (`let c = tex.at(...); let s = c + ...;` taints both `c` and `s`).
+fn find_manifold_tainted_locals(
+    expr: &Expr,
+    symbols: &crate::symbol::SymbolTable,
+) -> HashSet<String> {
+    let mut tainted = HashSet::new();
+    collect_tainted_locals(expr, symbols, &mut tainted);
+    tainted
+}
+
+fn collect_tainted_locals(
+    expr: &Expr,
+    symbols: &crate::symbol::SymbolTable,
+    tainted: &mut HashSet<String>,
+) {
+    match expr {
+        Expr::Block(block) => {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Let(let_stmt) => {
+                        // Nested blocks inside the init may bind their own locals.
+                        collect_tainted_locals(&let_stmt.init, symbols, tainted);
+                        if expr_touches_manifold(&let_stmt.init, symbols, tainted) {
+                            tainted.insert(let_stmt.name.to_string());
+                        }
+                    }
+                    Stmt::Expr(e) => collect_tainted_locals(e, symbols, tainted),
+                }
+            }
+            if let Some(e) = &block.expr {
+                collect_tainted_locals(e, symbols, tainted);
+            }
+        }
+        Expr::Binary(b) => {
+            collect_tainted_locals(&b.lhs, symbols, tainted);
+            collect_tainted_locals(&b.rhs, symbols, tainted);
+        }
+        Expr::Unary(u) => collect_tainted_locals(&u.operand, symbols, tainted),
+        Expr::Paren(p) => collect_tainted_locals(p, symbols, tainted),
+        Expr::MethodCall(c) => {
+            collect_tainted_locals(&c.receiver, symbols, tainted);
+            for arg in &c.args {
+                collect_tainted_locals(arg, symbols, tainted);
+            }
+        }
+        Expr::Call(c) => {
+            for arg in &c.args {
+                collect_tainted_locals(arg, symbols, tainted);
+            }
+        }
+        Expr::Tuple(t) => {
+            for elem in &t.elems {
+                collect_tainted_locals(elem, symbols, tainted);
+            }
+        }
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Verbatim(_) => {}
+    }
+}
+
+/// Does this expression reference a manifold param or an already-tainted
+/// local anywhere?
+fn expr_touches_manifold(
+    expr: &Expr,
+    symbols: &crate::symbol::SymbolTable,
+    tainted: &HashSet<String>,
+) -> bool {
+    match expr {
+        Expr::Ident(ident) => {
+            let name = ident.name.to_string();
+            if tainted.contains(&name) {
+                return true;
+            }
+            matches!(
+                symbols.lookup(&name).map(|s| &s.kind),
+                Some(SymbolKind::ManifoldParam)
+            )
+        }
+        Expr::Binary(b) => {
+            expr_touches_manifold(&b.lhs, symbols, tainted)
+                || expr_touches_manifold(&b.rhs, symbols, tainted)
+        }
+        Expr::Unary(u) => expr_touches_manifold(&u.operand, symbols, tainted),
+        Expr::Paren(p) => expr_touches_manifold(p, symbols, tainted),
+        Expr::MethodCall(c) => {
+            expr_touches_manifold(&c.receiver, symbols, tainted)
+                || c.args
+                    .iter()
+                    .any(|a| expr_touches_manifold(a, symbols, tainted))
+        }
+        Expr::Call(c) => c
+            .args
+            .iter()
+            .any(|a| expr_touches_manifold(a, symbols, tainted)),
+        Expr::Tuple(t) => t
+            .elems
+            .iter()
+            .any(|e| expr_touches_manifold(e, symbols, tainted)),
+        Expr::Block(b) => {
+            b.stmts.iter().any(|s| match s {
+                Stmt::Let(l) => expr_touches_manifold(&l.init, symbols, tainted),
+                Stmt::Expr(e) => expr_touches_manifold(e, symbols, tainted),
+            }) || b
+                .expr
+                .as_ref()
+                .is_some_and(|e| expr_touches_manifold(e, symbols, tainted))
+        }
+        Expr::Literal(_) | Expr::Verbatim(_) => false,
+    }
+}
+
 fn find_at_manifold_params_inner(
     expr: &Expr,
     symbols: &crate::symbol::SymbolTable,
@@ -196,6 +315,9 @@ pub struct CodeEmitter<'a> {
     manifold_indices: HashMap<String, usize>,
     /// Collected literals from annotation pass (for Let bindings in Jet mode).
     collected_literals: Vec<crate::annotate::CollectedLiteral>,
+    /// Locals whose bound value involves a manifold param (non-Copy);
+    /// every reference to these is emitted as a clone, never a move.
+    manifold_locals: HashSet<String>,
 }
 
 impl<'a> CodeEmitter<'a> {
@@ -231,11 +353,16 @@ impl<'a> CodeEmitter<'a> {
             manifold_indices.insert(param.name.to_string(), i);
         }
 
+        // The body here is post-optimization, so this also covers optimizer-
+        // introduced `__N` bindings whose value chains back to a manifold param.
+        let manifold_locals = find_manifold_tainted_locals(&analyzed.def.body, &analyzed.symbols);
+
         CodeEmitter {
             analyzed,
             param_indices,
             manifold_indices,
             collected_literals: Vec::new(),
+            manifold_locals,
         }
     }
 
@@ -789,6 +916,15 @@ impl<'a> CodeEmitter<'a> {
                 let name = &ident_expr.name;
                 let name_str = name.to_string();
 
+                // Locals bound to manifold-tapping expressions (user lets or
+                // optimizer-introduced `__N` bindings) are non-Copy: the
+                // extracted form may reference them more than once, so every
+                // use clones. UFCS keeps this valid for not-yet-inferred
+                // types; for ZST expression values the clone is free.
+                if self.manifold_locals.contains(&name_str) {
+                    return quote! { ::core::clone::Clone::clone(&#name) };
+                }
+
                 match self.analyzed.symbols.lookup(&name_str) {
                     Some(symbol) => match symbol.kind {
                         SymbolKind::Intrinsic => {
@@ -851,7 +987,31 @@ impl<'a> CodeEmitter<'a> {
                 if let Some(var_idx) = lit.var_index {
                     // Literals go at indices in the context array
                     // Use array-based indexing: CtxVar::<A0, INDEX>::new()
-                    quote! { CtxVar::<A0, #var_idx>::new() }
+                    let collected = self
+                        .collected_literals
+                        .iter()
+                        .find(|c| c.index == var_idx)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "literal with var_index {var_idx} was never collected \
+                                 by the annotation pass — annotation and emission are \
+                                 out of sync"
+                            )
+                        });
+                    match collected.space {
+                        // Domain-space: the A0 entry already has the domain
+                        // scalar type; reference it directly.
+                        crate::annotate::LiteralSpace::Domain => {
+                            quote! { CtxVar::<A0, #var_idx>::new() }
+                        }
+                        // Field-space (post-V/DX/DY math): re-project the
+                        // domain-lifted A0 entry back to Field, exactly like
+                        // user-written `V(literal)`. Keeps the tree ZST while
+                        // making optimizer-introduced literals type-stable.
+                        crate::annotate::LiteralSpace::Projected => {
+                            quote! { V(CtxVar::<A0, #var_idx>::new()) }
+                        }
+                    }
                 } else {
                     // Fallback: no var_index assigned (shouldn't happen after annotation)
                     // Emit as Field::from

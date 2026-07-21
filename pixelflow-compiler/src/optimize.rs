@@ -101,9 +101,7 @@ impl Extraction<'_> {
 
 fn get_extraction() -> Extraction<'static> {
     match std::env::var("PIXELFLOW_NNUE_WEIGHTS") {
-        Ok(path) => {
-            Extraction::Nnue(OPTIMIZATION_MODEL.get_or_init(|| load_opt_in_weights(&path)))
-        }
+        Ok(path) => Extraction::Nnue(OPTIMIZATION_MODEL.get_or_init(|| load_opt_in_weights(&path))),
         Err(_) => Extraction::Static(Box::new(CostModel::latency_prior())),
     }
 }
@@ -1048,7 +1046,14 @@ impl EGraphContext {
 
             // Only bind shared classes that aren't the root
             // (the root becomes the final expression, not a binding)
-            if dag.is_shared(canonical) && canonical != dag.root {
+            //
+            // Leaves (Var/Const) are never bound — they re-materialize at each
+            // use instead. Binding them is at best a no-op and at worst wrong:
+            // a `let __0 = ident;` moves non-Copy values (manifold-tapping
+            // locals), and a shared literal must be re-emitted per use so each
+            // occurrence gets its own type-space assignment (a constant can
+            // legitimately appear in both domain-space and Field-space math).
+            if dag.is_shared(canonical) && canonical != dag.root && !self.is_leaf(canonical, dag) {
                 let var_name = format!("__{}", binding_idx);
 
                 // Build the AST for this e-class
@@ -1080,6 +1085,19 @@ impl EGraphContext {
                 expr: Some(Box::new(root_expr)),
                 span,
             })
+        }
+    }
+
+    /// Is the extraction choice for this e-class a leaf (Var or Const)?
+    ///
+    /// Leaves are re-materialized at each use site rather than let-bound; see
+    /// the comment in [`Self::dag_to_expr`].
+    fn is_leaf(&self, canonical: EClassId, dag: &ExtractedDAG) -> bool {
+        match dag.best_node_idx(canonical) {
+            Some(node_idx) => !matches!(self.egraph.nodes(canonical)[node_idx], ENode::Op { .. }),
+            // No recorded choice: eclass_to_expr will fail loudly if this
+            // class is actually reachable; don't bind it here.
+            None => true,
         }
     }
 
