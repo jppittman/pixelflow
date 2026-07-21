@@ -1,13 +1,66 @@
 use crate::api::public::WindowDescriptor;
 use crate::error::RuntimeError;
 use crate::platform::macos::cocoa::{NSPoint, NSRect, NSSize, NSView, NSWindow};
-use crate::platform::macos::sys::{self, Id, BOOL, YES};
+use crate::platform::macos::sys::{self, Id, BOOL, NO, YES};
 use std::ffi::c_void;
+use std::sync::{Mutex, OnceLock};
+
+/// NSWindow pointers whose delegate received `windowWillClose:` and which the
+/// platform pump has not yet reported to the engine. AppKit invokes the
+/// delegate synchronously on the main thread while the pump routes the click
+/// through `sendEvent:`; the pump drains this queue at the end of the same
+/// park pass and emits `DisplayEvent::CloseRequested`.
+static CLOSED_WINDOWS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Take all windows closed since the last drain.
+pub(crate) fn drain_closed_windows() -> Vec<usize> {
+    std::mem::take(
+        &mut *CLOSED_WINDOWS
+            .lock()
+            .expect("closed-window queue poisoned"),
+    )
+}
+
+extern "C" fn window_will_close(_this: sys::Id, _cmd: sys::Sel, notification: sys::Id) {
+    unsafe {
+        let window: sys::Id = sys::send(notification, sys::sel(b"object\0"));
+        CLOSED_WINDOWS
+            .lock()
+            .expect("closed-window queue poisoned")
+            .push(window as usize);
+    }
+}
+
+/// The Objective-C delegate class, registered once per process.
+fn delegate_class() -> sys::Class {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let superclass = sys::class(b"NSObject\0");
+        let cls = sys::objc_allocateClassPair(superclass, b"PixelflowWindowDelegate\0".as_ptr(), 0);
+        assert!(
+            !cls.is_null(),
+            "failed to allocate PixelflowWindowDelegate class"
+        );
+        let added = sys::class_addMethod(
+            cls,
+            sys::sel(b"windowWillClose:\0"),
+            window_will_close as *const c_void,
+            // v@:@ — returns void, takes (self, _cmd, notification)
+            b"v@:@\0".as_ptr(),
+        );
+        assert!(added == YES, "failed to add windowWillClose: method");
+        sys::objc_registerClassPair(cls);
+        cls as usize
+    }) as sys::Class
+}
 
 pub struct MacWindow {
     pub(crate) window: NSWindow,
     pub(crate) view: NSView,
     pub(crate) layer: Id, // CAMetalLayer
+    /// Retained delegate instance; NSWindow's `delegate` property is weak.
+    #[allow(dead_code)]
+    delegate: Id,
     pub(crate) current_width: u32,
     pub(crate) current_height: u32,
 }
@@ -26,6 +79,22 @@ impl MacWindow {
 
         let window = NSWindow::alloc().init_with_content_rect(rect, style_mask, backing, false);
         window.set_title(&desc.title);
+
+        // We keep messaging this pointer (poll_resize, present) until the pump
+        // reports the close to the engine, so the window must outlive `close`.
+        // AppKit's default for titled windows is releasedWhenClosed = YES.
+        let delegate = unsafe {
+            sys::send_1::<(), BOOL>(window.0, sys::sel(b"setReleasedWhenClosed:\0"), NO);
+
+            let cls = delegate_class();
+            let instance: Id = sys::send(sys::send(cls, sys::sel(b"alloc\0")), sys::sel(b"init\0"));
+            assert!(
+                !instance.is_null(),
+                "failed to instantiate PixelflowWindowDelegate"
+            );
+            sys::send_1::<(), Id>(window.0, sys::sel(b"setDelegate:\0"), instance);
+            instance
+        };
 
         let view = NSView::alloc().init_with_frame(rect);
 
@@ -75,6 +144,7 @@ impl MacWindow {
             window,
             view,
             layer,
+            delegate,
             current_width: desc.width,
             current_height: desc.height,
         })
