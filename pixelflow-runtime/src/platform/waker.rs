@@ -26,6 +26,14 @@ impl EventLoopWaker for NoOpWaker {
 
 #[cfg(use_cocoa_display)]
 pub use cocoa_waker::CocoaWaker;
+#[cfg(use_cocoa_display)]
+pub(crate) use cocoa_waker::consume_wake_token;
+
+/// No-op fallback: the macOS platform module compiles whenever
+/// `target_os = "macos"`, even with a non-Cocoa display driver selected
+/// (e.g. headless), where no CocoaWaker exists to coalesce.
+#[cfg(all(target_os = "macos", not(use_cocoa_display)))]
+pub(crate) fn consume_wake_token() {}
 
 #[cfg(use_x11_display)]
 pub use x11_waker::X11Waker;
@@ -152,11 +160,32 @@ mod cocoa_waker {
     use super::super::macos::sys::{self, Id, BOOL, NO};
     use super::*;
     use std::ptr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// True while a wake NSEvent is sitting in the NSApp queue, not yet
+    /// dequeued by the platform pump. NSApp is process-global, so this is too.
+    ///
+    /// Without this token, every `ActorHandle::send()` to the driver posts a
+    /// fresh NSEvent. The doorbell coalesces bursts (bounded at 1), but the
+    /// NSEvent queue does not — under heavy data flow (e.g. a `yes` flood)
+    /// stale wake events accumulate faster than the pump dequeues them, and
+    /// real input events (a Ctrl-C KeyDown) are FIFO-queued behind thousands
+    /// of them. One outstanding wake event is all a wakeup needs.
+    static WAKE_EVENT_QUEUED: AtomicBool = AtomicBool::new(false);
+
+    /// Called by the macOS platform pump when it dequeues an
+    /// application-defined event: the queued token is spent, so the next
+    /// `wake()` must post again.
+    pub(crate) fn consume_wake_token() {
+        WAKE_EVENT_QUEUED.store(false, Ordering::SeqCst);
+    }
 
     /// macOS implementation of EventLoopWaker using NSEvent posting.
     ///
     /// Posts a dummy NSEventTypeApplicationDefined event to NSApplication's
     /// event queue, which wakes the runloop from [NSApp nextEventMatchingMask...].
+    /// Posts are coalesced: while one wake event is already queued, `wake()`
+    /// is a single atomic op and no Objective-C call.
     #[derive(Clone)]
     pub struct CocoaWaker;
 
@@ -174,6 +203,10 @@ mod cocoa_waker {
 
     impl EventLoopWaker for CocoaWaker {
         fn wake(&self) -> Result<(), RuntimeError> {
+            // Coalesce: a wake event is already queued, the pump will see it.
+            if WAKE_EVENT_QUEUED.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
             unsafe {
                 log::trace!("CocoaWaker: Waking up NSApp");
                 let app = NSApplication::shared();
@@ -213,6 +246,11 @@ mod cocoa_waker {
                 if !event.is_null() {
                     let sel_post = sys::sel(b"postEvent:atStart:\0");
                     sys::send_2::<(), Id, BOOL>(app.0, sel_post, event, NO);
+                } else {
+                    // Post failed: release the token or every future wake()
+                    // would be suppressed and the pump could sleep forever.
+                    WAKE_EVENT_QUEUED.store(false, Ordering::SeqCst);
+                    log::warn!("CocoaWaker: failed to construct wake NSEvent");
                 }
             }
             Ok(())

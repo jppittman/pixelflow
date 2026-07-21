@@ -183,7 +183,13 @@ impl PlatformOps for MetalOps {
         // Logic for event loop interaction
         // The CocoaWaker posts an NSEvent when messages arrive, so distantFuture is safe.
         unsafe {
-            let until_date = match status {
+            // Only the FIRST wait may block (when the scheduler says Idle).
+            // Everything already queued is then drained without blocking:
+            // a park pass must empty the NSEvent queue, or wake events pile
+            // up ahead of real input and a KeyDown can sit behind an
+            // unbounded backlog (the "can't Ctrl-C out of `yes`" wedge).
+            // This mirrors LinuxOps::park's `while XPending > 0` drain.
+            let first_until_date: sys::Id = match status {
                 SystemStatus::Idle => {
                     // Block until an event arrives (waker will post NSEvent when messages come)
                     let cls = sys::class(b"NSDate\0");
@@ -194,6 +200,10 @@ impl PlatformOps for MetalOps {
                     let cls = sys::class(b"NSDate\0");
                     sys::send(cls, sys::sel(b"distantPast\0"))
                 }
+            };
+            let distant_past: sys::Id = {
+                let cls = sys::class(b"NSDate\0");
+                sys::send(cls, sys::sel(b"distantPast\0"))
             };
 
             let mode = cocoa::make_nsstring("kCFRunLoopDefaultMode");
@@ -217,24 +227,34 @@ impl PlatformOps for MetalOps {
                 }
             }
 
-            // Use wrapper for next_event
-            let event = self.app.next_event(
-                u64::MAX,
-                until_date,
-                mode,
-                true, // dequeue
-            );
+            let mut until_date = first_until_date;
+            let mut processed_any = false;
 
-            // Release mode string
-            sys::send::<()>(mode, sys::sel(b"release\0"));
+            loop {
+                let event = self.app.next_event(
+                    u64::MAX,
+                    until_date,
+                    mode,
+                    true, // dequeue
+                );
+                // Subsequent iterations never block.
+                until_date = distant_past;
 
-            if !event.is_null() {
+                if event.is_null() {
+                    break;
+                }
+                processed_any = true;
+
                 let ty = event.type_();
                 match ty {
-                    event_type::APP_KIT_DEFINED
-                    | event_type::SYSTEM_DEFINED
-                    | event_type::APPLICATION_DEFINED => {
-                        log::trace!("MetalOps: Received Internal/WakeUp event");
+                    event_type::APPLICATION_DEFINED => {
+                        // A CocoaWaker wake token was just dequeued; allow the
+                        // next wake() to post a fresh one.
+                        crate::platform::waker::consume_wake_token();
+                        log::trace!("MetalOps: Received WakeUp event");
+                    }
+                    event_type::APP_KIT_DEFINED | event_type::SYSTEM_DEFINED => {
+                        log::trace!("MetalOps: Received internal AppKit/system event");
                     }
                     _ => {
                         let ns_win = event.window();
@@ -267,9 +287,19 @@ impl PlatformOps for MetalOps {
                     self.app.send_event(event);
                 }
             }
+
+            // Release mode string
+            sys::send::<()>(mode, sys::sel(b"release\0"));
+
+            // Busy after real work so the scheduler re-drains its lanes before
+            // blocking on the doorbell (a dequeued wake event usually means
+            // messages are waiting).
+            Ok(if processed_any {
+                ActorStatus::Busy
+            } else {
+                ActorStatus::Idle
+            })
         }
-        // Always return Idle since we block inside next_event when needed
-        Ok(ActorStatus::Idle)
     }
 }
 
