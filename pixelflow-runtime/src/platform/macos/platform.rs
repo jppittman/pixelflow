@@ -291,6 +291,23 @@ impl PlatformOps for MetalOps {
             // Release mode string
             sys::send::<()>(mode, sys::sel(b"release\0"));
 
+            // Report windows the user closed during event routing (the click
+            // on the close button runs windowWillClose: synchronously inside
+            // sendEvent: above). CloseRequested triggers the engine's full
+            // shutdown cascade — without this the process outlives its last
+            // window as an invisible zombie.
+            for ptr in crate::platform::macos::window::drain_closed_windows() {
+                if let Some(id) = self.window_map.remove(&ptr) {
+                    self.windows.remove(&id);
+                    processed_any = true;
+                    self.event_tx
+                        .send(Message::Data(EngineData::FromDriver(
+                            DisplayEvent::CloseRequested { id },
+                        )))
+                        .expect("Failed to send CloseRequested to engine");
+                }
+            }
+
             // Busy after real work so the scheduler re-drains its lanes before
             // blocking on the doorbell (a dequeued wake event usually means
             // messages are waiting).

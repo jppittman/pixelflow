@@ -519,7 +519,15 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 self.send_frame();
             }
             EngineEventControl::CloseRequested => {
-                unimplemented!("CloseRequested handler - need to cleanup and shutdown");
+                // The engine is already running its shutdown cascade (vsync,
+                // rasterizer, driver, itself). Our job is local cleanup: stop
+                // the PTY writer so no further writes race the teardown. The
+                // PTY master closes when the process exits, which delivers
+                // SIGHUP to the child shell.
+                log::info!("[TERM] Close requested; shutting down PTY writer");
+                self.pty_writer
+                    .send(Message::Shutdown)
+                    .expect("Failed to shutdown PTY writer on CloseRequested");
             }
             EngineEventControl::ScaleChanged { id, scale } => {
                 unimplemented!(

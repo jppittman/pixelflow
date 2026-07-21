@@ -85,6 +85,10 @@ extern "C" {
     pub fn objc_getClass(name: *const u8) -> Class;
     pub fn sel_registerName(name: *const u8) -> Sel;
     pub fn objc_msgSend(self_: Id, op: Sel, ...) -> Id;
+    pub fn objc_allocateClassPair(superclass: Class, name: *const u8, extra_bytes: usize)
+        -> Class;
+    pub fn objc_registerClassPair(cls: Class);
+    pub fn class_addMethod(cls: Class, name: Sel, imp: *const c_void, types: *const u8) -> BOOL;
 }
 
 // --- Inline Helpers ---
