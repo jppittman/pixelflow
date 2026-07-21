@@ -413,9 +413,8 @@ fn main() {
     eprintln!("=== Extraction 3-way bench: NNUE vs STATIC vs NO-SWAP ===");
     eprintln!("Loading Judge weights from {NNUE_WEIGHTS_PATH}");
 
-    let weights_bytes = std::fs::read(NNUE_WEIGHTS_PATH).unwrap_or_else(|e| {
-        panic!("failed to read Judge weights at {NNUE_WEIGHTS_PATH}: {e}")
-    });
+    let weights_bytes = std::fs::read(NNUE_WEIGHTS_PATH)
+        .unwrap_or_else(|e| panic!("failed to read Judge weights at {NNUE_WEIGHTS_PATH}: {e}"));
     let nnue = ExprNnue::from_bytes(&weights_bytes).unwrap_or_else(|e| {
         panic!(
             "ExprNnue::from_bytes rejected {NNUE_WEIGHTS_PATH}: {e}. \
@@ -468,7 +467,15 @@ fn main() {
     println!("\n=== RESULTS ===\n");
     println!(
         "{:<14} {:>6} {:>10} {:>10} {:>10} {:>9} {:>9} {:>8} {:>8}",
-        "kernel", "nodes", "ns_nnue", "ns_static", "ns_noswap", "nnue/stc", "stc/nosw", "ex_nnue", "ex_stc"
+        "kernel",
+        "nodes",
+        "ns_nnue",
+        "ns_static",
+        "ns_noswap",
+        "nnue/stc",
+        "stc/nosw",
+        "ex_nnue",
+        "ex_stc"
     );
     println!("{}", "-".repeat(14 + 6 + 10 * 3 + 9 * 2 + 8 * 2 + 16));
 
@@ -494,28 +501,51 @@ fn main() {
             fmt_opt(r.ns_nnue),
             fmt_opt(r.ns_static),
             r.ns_noswap,
-            ratio_ns.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
-            ratio_sn.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+            ratio_ns
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "-".into()),
+            ratio_sn
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "-".into()),
             r.extract_us_nnue,
             r.extract_us_static,
         );
     };
 
     for r in &named_results {
-        print_row(r, &mut all_nnue_static_ratios, &mut all_static_noswap_ratios);
+        print_row(
+            r,
+            &mut all_nnue_static_ratios,
+            &mut all_static_noswap_ratios,
+        );
     }
 
     println!("{}", "-".repeat(14 + 6 + 10 * 3 + 9 * 2 + 8 * 2 + 16));
 
     // Synthetic aggregate row (geomean ns per policy across the synthetic set).
     let syn_nnue_ns: Vec<f64> = synthetic_results.iter().filter_map(|r| r.ns_nnue).collect();
-    let syn_static_ns: Vec<f64> = synthetic_results.iter().filter_map(|r| r.ns_static).collect();
+    let syn_static_ns: Vec<f64> = synthetic_results
+        .iter()
+        .filter_map(|r| r.ns_static)
+        .collect();
     let syn_noswap_ns: Vec<f64> = synthetic_results.iter().map(|r| r.ns_noswap).collect();
-    let syn_extract_nnue: Vec<f64> = synthetic_results.iter().map(|r| r.extract_us_nnue).collect();
-    let syn_extract_static: Vec<f64> = synthetic_results.iter().map(|r| r.extract_us_static).collect();
+    let syn_extract_nnue: Vec<f64> = synthetic_results
+        .iter()
+        .map(|r| r.extract_us_nnue)
+        .collect();
+    let syn_extract_static: Vec<f64> = synthetic_results
+        .iter()
+        .map(|r| r.extract_us_static)
+        .collect();
 
-    let syn_nnue_fail = synthetic_results.iter().filter(|r| r.nnue_fail.is_some()).count();
-    let syn_static_fail = synthetic_results.iter().filter(|r| r.static_fail.is_some()).count();
+    let syn_nnue_fail = synthetic_results
+        .iter()
+        .filter(|r| r.nnue_fail.is_some())
+        .count();
+    let syn_static_fail = synthetic_results
+        .iter()
+        .filter(|r| r.static_fail.is_some())
+        .count();
 
     for r in &synthetic_results {
         let ratio_ns = match r.ns_nnue {
@@ -560,8 +590,14 @@ fn main() {
         geomean_static_noswap,
     );
 
-    let named_nnue_fail = named_results.iter().filter(|r| r.nnue_fail.is_some()).count();
-    let named_static_fail = named_results.iter().filter(|r| r.static_fail.is_some()).count();
+    let named_nnue_fail = named_results
+        .iter()
+        .filter(|r| r.nnue_fail.is_some())
+        .count();
+    let named_static_fail = named_results
+        .iter()
+        .filter(|r| r.static_fail.is_some())
+        .count();
     println!(
         "\nNamed-kernel failures: nnue={named_nnue_fail}/{}, static={named_static_fail}/{}",
         named_results.len(),

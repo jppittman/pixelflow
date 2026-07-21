@@ -226,7 +226,9 @@ pub fn run_episode(
     } else {
         0.0
     };
-    eprintln!("[REWRITE] {seed_name}: {speedup:.2}x ({initial_cost_ns:.1}ns -> {final_cost_ns:.1}ns)");
+    eprintln!(
+        "[REWRITE] {seed_name}: {speedup:.2}x ({initial_cost_ns:.1}ns -> {final_cost_ns:.1}ns)"
+    );
 
     Some(Episode {
         episode_id,
@@ -326,8 +328,15 @@ mod tests {
         let root = arena.push_binary(OpKind::Add, mul, x); // (x * 1.0) + x
 
         let model = ExprNnue::new();
-        let episode = run_episode(&arena, root, "smoke_seed", &model, 10, "smoke_0".to_string())
-            .expect("episode should complete for a small, well-defined seed expression");
+        let episode = run_episode(
+            &arena,
+            root,
+            "smoke_seed",
+            &model,
+            10,
+            "smoke_0".to_string(),
+        )
+        .expect("episode should complete for a small, well-defined seed expression");
 
         assert!(
             episode.initial_cost_ns.is_finite() && episode.initial_cost_ns >= 0.0,
@@ -339,8 +348,14 @@ mod tests {
             "final_cost_ns should be a finite non-negative measurement, got {}",
             episode.final_cost_ns
         );
-        assert!(episode.node_budget >= 50, "node_budget should respect the floor");
-        assert!(episode.epoch_budget >= 10, "epoch_budget should respect the floor");
+        assert!(
+            episode.node_budget >= 50,
+            "node_budget should respect the floor"
+        );
+        assert!(
+            episode.epoch_budget >= 10,
+            "epoch_budget should respect the floor"
+        );
     }
 
     #[test]
