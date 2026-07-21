@@ -5,10 +5,6 @@
 use pixelflow_pipeline::jit_bench::benchmark_jit_arena;
 use pixelflow_pipeline::training::factored::parse_kernel_code_arena;
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn mach_absolute_time() -> u64;
-}
 fn main() {
     // Load psychedelic expressions from file
     let content = std::fs::read_to_string("pixelflow-pipeline/data/psychedelic_full.jsonl")
@@ -31,6 +27,9 @@ fn main() {
     #[cfg(target_arch = "aarch64")]
     {
         use core::arch::aarch64::*;
+        use pixelflow_ir::ScanlineJitManifold;
+        use pixelflow_ir::backend::emit::compile_arena_dag_scanline;
+        use std::time::Instant;
 
         let scanline_result =
             compile_arena_dag_scanline(&arena, root).expect("scanline compile failed");
@@ -61,11 +60,11 @@ fn main() {
         let samples = 50;
         let mut times = vec![0u64; samples];
         for t in &mut times {
-            let start = nanos_now();
+            let start = Instant::now();
             unsafe {
                 scanline_jit.eval_scanline(&xs, y, z, w, &mut outputs);
             }
-            *t = nanos_now() - start;
+            *t = start.elapsed().as_nanos() as u64;
         }
         times.sort();
         let scanline_ns = times[samples / 2] as f64 / width as f64;
