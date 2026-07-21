@@ -1262,6 +1262,44 @@ mod tests {
         );
     }
 
+    // Regression: with a data burst limit of 0, the scheduler must neither
+    // spin forever (drain(0) reporting More every cycle) nor exit early by
+    // misreporting the lane as Disconnected and dropping queued messages.
+    // The drain clamps its budget to 1, so it makes progress and terminates.
+    #[test]
+    fn zero_data_burst_limit_processes_messages_and_exits() {
+        let (tx, mut rx) = ActorScheduler::<String, String, String>::new(0, 10);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = log.clone();
+
+        let scheduler = thread::spawn(move || {
+            let mut handler = TestHandler { log: log_clone };
+            rx.run(&mut handler);
+        });
+
+        tx.send(Message::Data("a".to_string())).unwrap();
+        tx.send(Message::Data("b".to_string())).unwrap();
+        drop(tx);
+
+        // Bounded join: the scheduler must exit once all handles are gone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !scheduler.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            scheduler.is_finished(),
+            "scheduler must terminate with a zero data burst limit"
+        );
+        scheduler.join().unwrap();
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.contains(&"Data: a".to_string()) && log.contains(&"Data: b".to_string()),
+            "queued messages must not be dropped on exit; got {:?}",
+            *log
+        );
+    }
+
     #[test]
     fn verify_data_lane_backpressure_contract() {
         let (tx, mut rx) = ActorScheduler::new(2, 1);
