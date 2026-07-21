@@ -530,11 +530,12 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                     .expect("Failed to shutdown PTY writer on CloseRequested");
             }
             EngineEventControl::ScaleChanged { id, scale } => {
-                unimplemented!(
-                    "ScaleChanged: id={}, scale={} - need to adjust font sizes and redraw",
-                    id.0,
-                    scale
-                );
+                // Rendering is resolution-independent: the frame buffer is
+                // sized from the window's content bounds (points) and cell
+                // metrics come from config, so a backing-scale change needs no
+                // font adjustment — just a redraw on the new display.
+                log::info!("[TERM] Scale changed: id={}, scale={}", id.0, scale);
+                self.send_frame();
             }
         }
         Ok(())
