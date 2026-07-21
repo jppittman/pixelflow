@@ -653,10 +653,13 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Lower reductions, memory reads, then transcendentals to primitives (one
-    // source of truth in `lowering`); the aarch64 emitter then never sees
-    // Reduce/Gather/Sin/Cos/etc. (aarch64 gather emission is a later slice.)
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    // Lower derivatives first (Dwrt -> ordinary arithmetic via the chain
+    // rule), then reductions, memory reads, and transcendentals to primitives
+    // (one source of truth in `lowering`); the aarch64 emitter then never sees
+    // Dwrt/Reduce/Gather/Sin/Cos/etc. (aarch64 gather emission is a later
+    // slice.)
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root).map_err(|e| e.as_static_str())?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
@@ -986,6 +989,11 @@ pub fn compile_arena_dag_scanline_hoisted(
     arena: &crate::arena::ExprArena,
     root: crate::arena::ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
+    // Derivative lowering is a precondition of scheduling on every entry:
+    // a `Dwrt` must never reach `arena_to_schedule`.
+    let (arena_owned, root) =
+        lowering::lower_dwrt_owned(arena, root).map_err(|e| e.as_static_str())?;
+    let arena = &arena_owned;
     let hoisted = arena_to_hoisted_schedule(arena, root, default_hoist_predicate);
 
     // The scanline ABI has no context argument — x0 is the X-array pointer —
@@ -999,7 +1007,9 @@ pub fn compile_arena_dag_scanline_hoisted(
             ScheduledOp::Gather(..) | ScheduledOp::Ternary(OpKind::Gather, ..)
         )
     }) {
-        return Err("aarch64 scanline: bound-memory gather not supported (per-batch ctx kernel only)");
+        return Err(
+            "aarch64 scanline: bound-memory gather not supported (per-batch ctx kernel only)",
+        );
     }
 
     // If nothing to hoist, fall back to the non-hoisted path (no overhead).
@@ -2512,16 +2522,14 @@ fn arena_to_schedule(
                 };
                 ScheduledOp::Gather(map_child(idx), slot)
             }
-            // A `Dwrt` (autodiff) node must be eliminated by the e-graph chain
-            // rule before codegen. Reaching here means a `D(expr, var)` survived
-            // saturation -- i.e. an operator with no differentiation rule -- and
-            // the jet fallback that would handle the residual is not yet wired.
-            // Fail loudly here rather than as a cryptic instruction-emit panic.
+            // Internal-error precondition: every public compile entry runs
+            // `lowering::lower_dwrt` before scheduling, so no `Dwrt` can reach
+            // this point. A survivor means an entry skipped the lowering pass —
+            // a bug in this module, not in the input expression.
             ExprNode::Binary(OpKind::Dwrt, _, _) => panic!(
-                "arena_to_schedule: a Dwrt (autodiff) node reached the JIT \
-                 emitter. It should have been rewritten away by the e-graph \
-                 chain rule; a survivor means an operator lacks a derivative \
-                 rule and the jet fallback is not yet implemented."
+                "arena_to_schedule: internal error — a Dwrt (autodiff) node \
+                 reached scheduling. Every compile entry must run \
+                 lowering::lower_dwrt first; this one did not."
             ),
             ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {
@@ -3289,13 +3297,16 @@ pub fn compile_arena_dag_with_ctx(
     // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
     // KernelFn ABI stay consistent with the selected width.
     //
-    // Lower, in order: reductions (unroll -> arithmetic + gathers), then memory
-    // reads (Gather -> index math + RawGather), then transcendentals. Each is a
-    // no-op when absent. Reduce runs first so the gathers it unrolls get lowered
-    // too. A kernel that reads bound memory takes its buffer bases from a context
+    // Lower, in order: derivatives (Dwrt -> ordinary arithmetic), then
+    // reductions (unroll -> arithmetic + gathers), then memory reads (Gather ->
+    // index math + RawGather), then transcendentals. Each is a no-op when
+    // absent. Dwrt runs first so derivative rules see the high-level ops;
+    // Reduce runs before Gather so the gathers it unrolls get lowered too. A
+    // kernel that reads bound memory takes its buffer bases from a context
     // pointer in rdi; the emitted body is identical either way, so the caller
     // invokes it as `CtxKernelFn` instead of `KernelFn`.
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root).map_err(|e| e.as_static_str())?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
@@ -3860,6 +3871,9 @@ pub fn compile_arena_dag_avx512(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<CompileResult, &'static str> {
+    // Derivative lowering is a precondition of scheduling on every entry.
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root).map_err(|e| e.as_static_str())?;
+    let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
     compile_dag_via_backend(schedule, uses, &mut Avx512Backend)
@@ -3882,7 +3896,8 @@ pub fn compile_collapse_avx512(
     root: ExprId,
 ) -> Result<CompileResult, &'static str> {
     // Same lowering pipeline as the per-batch path.
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root).map_err(|e| e.as_static_str())?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
@@ -3986,6 +4001,11 @@ pub fn compile_arena_dag_scanline(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
+    // Derivative lowering is a precondition of emission on every entry.
+    let (arena_owned, root) =
+        lowering::lower_dwrt_owned(arena, root).map_err(|e| e.as_static_str())?;
+    let arena = &arena_owned;
+
     const MAX_DEPTH: usize = 64;
     if arena.depth(root) > MAX_DEPTH {
         return Err("expression too deep");
@@ -4081,10 +4101,11 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     use crate::arena::ExprArena;
 
-    /// A `Dwrt` that reaches codegen (no differentiation rule eliminated it)
-    /// must fail loudly at the schedule boundary, not as a cryptic emit panic.
+    /// A `Dwrt` that reaches scheduling means a compile entry skipped
+    /// `lower_dwrt` — an internal error that must fail loudly at the schedule
+    /// boundary, not as a cryptic emit panic.
     #[test]
-    #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
+    #[should_panic(expected = "Dwrt (autodiff) node reached scheduling")]
     fn surviving_dwrt_fails_loudly() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -5577,12 +5598,8 @@ mod tests {
                 cy.copy_from_slice(&ys[batch * 4..batch * 4 + 4]);
                 let got = run4_ctx(&res, &ctx, cx, cy);
                 for i in 0..4 {
-                    let want = crate::eval::eval_scalar(
-                        arena,
-                        root,
-                        &[cx[i], cy[i], 0.0, 0.0],
-                        &bindings,
-                    );
+                    let want =
+                        crate::eval::eval_scalar(arena, root, &[cx[i], cy[i], 0.0, 0.0], &bindings);
                     assert_eq!(
                         got[i], want,
                         "{tag} batch {batch} lane {i} (x={}, y={})",

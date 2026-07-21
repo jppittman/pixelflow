@@ -17,11 +17,18 @@ use crate::kind::OpKind;
 /// Evaluate the subtree rooted at `root` at scalar coordinates `vars`
 /// (`[X, Y, Z, W]`), reading bound buffers through `bindings`.
 ///
+/// `Dwrt` (symbolic derivative) nodes are lowered first via
+/// [`lower_dwrt`](crate::backend::emit::lowering::lower_dwrt) — the same
+/// precondition every JIT compile entry runs — so the interpreter and the JIT
+/// agree on derivative semantics by construction.
+///
 /// # Panics
 ///
 /// Panics on a node the reference interpreter does not handle: a `Param`
-/// (substitute first), a bare `Buffer` outside a `Gather`, an `Nary`, or an
-/// op with no scalar evaluation. These are programming errors, not inputs.
+/// (substitute first), a bare `Buffer` outside a `Gather`, an `Nary`, an op
+/// with no scalar evaluation, or a `Dwrt` over an op with no derivative rule
+/// (the [`LowerError`](crate::backend::emit::lowering::LowerError) is
+/// reported). These are programming errors, not inputs.
 #[must_use]
 pub fn eval_scalar(
     arena: &ExprArena,
@@ -29,6 +36,28 @@ pub fn eval_scalar(
     vars: &[f32; 4],
     bindings: &BindingTable<'_>,
 ) -> f32 {
+    use crate::backend::emit::lowering::lower_dwrt_owned;
+
+    // Same precondition as the JIT compile entries: no Dwrt reaches
+    // evaluation. The presence check keeps the common (derivative-free) case
+    // allocation-free; the buffer table survives the clone, so `bindings`
+    // stays valid against the lowered arena.
+    let has_dwrt = arena
+        .nodes_raw()
+        .iter()
+        .any(|n| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)));
+    let lowered = if has_dwrt {
+        match lower_dwrt_owned(arena, root) {
+            Ok(ok) => Some(ok),
+            Err(e) => panic!("eval_scalar: {e}"),
+        }
+    } else {
+        None
+    };
+    let (arena, root) = match &lowered {
+        Some((a, r)) => (a, *r),
+        None => (arena, root),
+    };
     Env {
         arena,
         vars,

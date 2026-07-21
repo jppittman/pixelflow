@@ -212,6 +212,42 @@ fn ast_to_arena_inner(
             }
         }
 
+        // Derivative accessors: `V(e)` is the identity projection (the value
+        // of `e`), and `DX`/`DY`/`DZ` become symbolic-derivative `Dwrt` nodes
+        // that `pixelflow_ir`'s `lower_dwrt` pass rewrites into ordinary
+        // arithmetic before scheduling. Second-order accessors nest `Dwrt`
+        // (lowered innermost-first by the same pass).
+        Expr::Call(call) => {
+            let func = call.func.to_string();
+            if call.args.len() != 1 {
+                return Err(format!(
+                    "{} expects exactly one argument, got {}",
+                    func,
+                    call.args.len()
+                ));
+            }
+            let arg = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+            match func.as_str() {
+                "V" => Ok(arg),
+                "DX" => Ok(push_dwrt(arena, arg, 0)),
+                "DY" => Ok(push_dwrt(arena, arg, 1)),
+                "DZ" => Ok(push_dwrt(arena, arg, 2)),
+                "DXX" => {
+                    let dx = push_dwrt(arena, arg, 0);
+                    Ok(push_dwrt(arena, dx, 0))
+                }
+                "DXY" => {
+                    let dx = push_dwrt(arena, arg, 0);
+                    Ok(push_dwrt(arena, dx, 1))
+                }
+                "DYY" => {
+                    let dy = push_dwrt(arena, arg, 1);
+                    Ok(push_dwrt(arena, dy, 1))
+                }
+                _ => Err(format!("Unsupported function call: {}", func)),
+            }
+        }
+
         // Parentheses are transparent - just recurse into the inner expression
         Expr::Paren(inner) => ast_to_arena_inner(inner, param_indices, locals, arena),
 
@@ -316,6 +352,14 @@ pub fn ast_to_runtime_arena(
     }})
 }
 
+/// Push `Dwrt(expr, Const(var))` — the symbolic derivative of `expr` with
+/// respect to coordinate `var` (0=X, 1=Y, 2=Z), matching the operand encoding
+/// `pixelflow_ir::backend::emit::lowering::lower_dwrt` expects.
+fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
+    let v = arena.push_const(var as f32);
+    arena.push_binary(OpKind::Dwrt, expr, v)
+}
+
 /// Extract f64 from a syn::Lit.
 fn extract_f64_from_lit(lit: &Lit) -> Option<f64> {
     match lit {
@@ -366,6 +410,9 @@ fn opkind_to_tokens(kind: OpKind) -> TokenStream {
         OpKind::Ne => quote! { ::pixelflow_ir::OpKind::Ne },
         OpKind::Select => quote! { ::pixelflow_ir::OpKind::Select },
         OpKind::Clamp => quote! { ::pixelflow_ir::OpKind::Clamp },
+        // Symbolic derivative: lowered to ordinary arithmetic by the runtime
+        // compile entries (`lower_dwrt` runs before scheduling).
+        OpKind::Dwrt => quote! { ::pixelflow_ir::OpKind::Dwrt },
         _ => panic!("Unsupported OpKind for JIT: {:?}", kind),
     }
 }

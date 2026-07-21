@@ -28,6 +28,7 @@
 use crate::arena::{ExprArena, ExprId, ExprNode};
 use crate::kind::OpKind;
 use alloc::vec::Vec;
+use core::fmt;
 
 /// Whether `op` is a unary transcendental this pass expands.
 fn is_transcendental_unary(op: OpKind) -> bool {
@@ -65,6 +66,21 @@ fn rebuild_arena<F>(arena: &mut ExprArena, root: ExprId, mut lower: F) -> ExprId
 where
     F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Option<ExprId>,
 {
+    let result: Result<ExprId, core::convert::Infallible> =
+        try_rebuild_arena(arena, root, |arena, node, m| Ok(lower(arena, node, m)));
+    match result {
+        Ok(id) => id,
+        Err(never) => match never {},
+    }
+}
+
+/// Fallible variant of [`rebuild_arena`]: the `lower` hook may abort the whole
+/// rebuild with an error (used by [`lower_dwrt`], whose per-op derivative rules
+/// are partial). Same traversal, same dedup, same contract otherwise.
+fn try_rebuild_arena<F, E>(arena: &mut ExprArena, root: ExprId, mut lower: F) -> Result<ExprId, E>
+where
+    F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Result<Option<ExprId>, E>,
+{
     let old_len = arena.nodes_raw().len();
     let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
 
@@ -93,7 +109,7 @@ where
                 }
                 let node = arena.node(id).clone();
                 let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
-                let new_id = match lower(arena, &node, &m) {
+                let new_id = match lower(arena, &node, &m)? {
                     Some(new) => new,
                     None => copy_node(arena, &node, &m),
                 };
@@ -102,7 +118,7 @@ where
         }
     }
 
-    id_map[root.0 as usize].expect("root lowered")
+    Ok(id_map[root.0 as usize].expect("root lowered"))
 }
 
 /// Structural copy of `node` into `arena` with its children remapped by `m`.
@@ -618,4 +634,548 @@ fn expand_sin(arena: &mut ExprArena, x: ExprId) -> ExprId {
 fn horner_step(arena: &mut ExprArena, acc: ExprId, x: ExprId, add: ExprId) -> ExprId {
     let prod = arena.push_binary(OpKind::Mul, acc, x);
     arena.push_binary(OpKind::Add, prod, add)
+}
+
+// ────────────────────────────── Dwrt lowering ─────────────────────────────────
+
+/// Failure of a lowering pass whose per-op rules are partial (today: only
+/// [`lower_dwrt`]). Every variant is a loud, named failure — no rule ever
+/// silently produces a wrong-but-plausible expression.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LowerError {
+    /// `Dwrt` was applied over an op with no symbolic differentiation rule.
+    UnsupportedOp {
+        /// The op that has no derivative rule.
+        op: OpKind,
+    },
+    /// The `var` operand of a `Dwrt` node was not a `Const` coordinate index.
+    DwrtVarNotConst,
+    /// The `var` operand of a `Dwrt` was a `Const` outside `0..4` (X/Y/Z/W).
+    DwrtVarOutOfRange {
+        /// The out-of-range value found in the `Const` operand.
+        value: f32,
+    },
+    /// Differentiation recursed deeper than [`MAX_DERIV_DEPTH`] — either a
+    /// pathologically deep expression or runaway nesting. Erroring here is the
+    /// loud alternative to a stack overflow.
+    DepthExceeded {
+        /// The bound that was exceeded ([`MAX_DERIV_DEPTH`]).
+        limit: usize,
+    },
+}
+
+impl fmt::Display for LowerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedOp { op } => write!(
+                f,
+                "lower_dwrt: no symbolic derivative rule for op '{}'",
+                op.name()
+            ),
+            Self::DwrtVarNotConst => {
+                write!(f, "lower_dwrt: Dwrt var operand must be a Const index")
+            }
+            Self::DwrtVarOutOfRange { value } => write!(
+                f,
+                "lower_dwrt: Dwrt var index {value} out of range (must be 0..4 = X/Y/Z/W)"
+            ),
+            Self::DepthExceeded { limit } => write!(
+                f,
+                "lower_dwrt: differentiation exceeded the depth bound of {limit} nodes"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for LowerError {}
+
+impl LowerError {
+    /// Static rendering for the `Result<_, &'static str>` compile entries.
+    ///
+    /// The compile drivers return `&'static str` errors, which cannot carry a
+    /// formatted op name; this maps each error to the most specific static
+    /// message available. [`fmt::Display`] remains the precise form.
+    #[must_use]
+    pub fn as_static_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedOp { op } => match op {
+                OpKind::TruncToInt => "lower_dwrt: no derivative rule for 'trunc_to_int'",
+                OpKind::IntToFloat => "lower_dwrt: no derivative rule for 'int_to_float'",
+                OpKind::IAdd => "lower_dwrt: no derivative rule for 'iadd'",
+                OpKind::Shl => "lower_dwrt: no derivative rule for 'shl'",
+                OpKind::Shr => "lower_dwrt: no derivative rule for 'shr'",
+                OpKind::BitAnd => "lower_dwrt: no derivative rule for 'bitand'",
+                OpKind::BitOr => "lower_dwrt: no derivative rule for 'bitor'",
+                OpKind::Tuple => "lower_dwrt: no derivative rule for 'tuple'",
+                OpKind::Reduce => "lower_dwrt: no derivative rule for 'reduce'",
+                OpKind::Buffer => "lower_dwrt: no derivative rule for a bare 'buffer' leaf",
+                _ => "lower_dwrt: no derivative rule for this op",
+            },
+            Self::DwrtVarNotConst => "lower_dwrt: Dwrt var operand must be a Const index",
+            Self::DwrtVarOutOfRange { .. } => "lower_dwrt: Dwrt var index out of range (0..4)",
+            Self::DepthExceeded { .. } => "lower_dwrt: differentiation depth bound exceeded",
+        }
+    }
+}
+
+/// Recursion bound for [`lower_dwrt`]'s differentiation walk. Deeper
+/// expressions produce [`LowerError::DepthExceeded`] instead of a stack
+/// overflow. Real kernels are well under this; the scanline JIT rejects
+/// anything past depth 64 anyway.
+pub const MAX_DERIV_DEPTH: usize = 512;
+
+/// Eliminate every `Dwrt` node reachable from `root` by symbolic
+/// differentiation, returning the (possibly new) root in the same arena.
+///
+/// `Dwrt(expr, Const(i))` (the [`OpKind::Dwrt`] operator built by `D(expr,
+/// var)` / the `DX`/`DY`/`DZ` accessors) becomes an ordinary arithmetic
+/// expression in the same OpKinds — the derivative is just another kernel,
+/// scheduled and emitted by the same backend. This is the sanctioned
+/// replacement for the deleted emit-time jet mode (commit bd47aa7c): lowering
+/// happens *before* scheduling, not inside a special evaluator.
+///
+/// Nodes are rewritten post-order (innermost first), so nested `Dwrt` — second
+/// derivatives like `Dwrt(Dwrt(e, 0), 1)` — see an already-derivative-free
+/// operand and need no fixpoint iteration. Value subexpressions are referenced
+/// by their existing ids (never copied), and each `(node, var)` pair is
+/// differentiated once, so a DAG stays a DAG.
+///
+/// # Derivative conventions (matching `pixelflow_core::Jet2` semantics)
+///
+/// - `Gather`/`RawGather` differentiate to **0**: a buffer lookup is piecewise
+///   constant in its index (a hard step at every texel boundary), so 0 is the
+///   almost-everywhere derivative, exactly as `Floor` (which the index math is
+///   built from) differentiates to 0.
+/// - Comparisons (`Lt`..`Ne`) and `Floor`/`Ceil`/`Round` are step functions:
+///   derivative 0 almost everywhere.
+/// - `Abs`, `Min`/`Max`, `Clamp`, `Select` are piecewise: the derivative
+///   selects the active branch's derivative (`Select` on the same condition
+///   Jet2 uses: `Lt` for min, `Gt` for max).
+/// - `Param` is a bound scalar constant with respect to coordinates:
+///   derivative 0.
+///
+/// Any op with no rule — the integer/bit-manipulation ops, `Reduce`, `Tuple` —
+/// returns [`LowerError::UnsupportedOp`] naming the op. Never a silent 0.
+pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, LowerError> {
+    let new_root = try_rebuild_arena(arena, root, |arena, node, m| match node {
+        ExprNode::Binary(OpKind::Dwrt, expr, var) => {
+            let var = dwrt_var_index(arena, *var)?;
+            // `m(*expr)` is the already-lowered operand: post-order guarantees
+            // any inner `Dwrt` in it has been eliminated.
+            let mut memo = alloc::collections::BTreeMap::new();
+            let d = differentiate(arena, m(*expr), var, 0, &mut memo)?;
+            Ok(Some(d))
+        }
+        _ => Ok(None),
+    })?;
+
+    // Post-order elimination is total, so a surviving Dwrt is an internal
+    // logic error in this pass — check loudly rather than let it reach the
+    // scheduler's (now unreachable-precondition) assert.
+    debug_assert!(
+        !subtree_contains_dwrt(arena, new_root),
+        "lower_dwrt: internal error — a Dwrt survived lowering"
+    );
+    Ok(new_root)
+}
+
+/// Owned wrapper mirroring [`expand_transcendentals_owned`]: identity fast-path
+/// when the arena has no `Dwrt`, otherwise clone-and-lower. Every public
+/// compile entry calls this first, so no `Dwrt` ever reaches scheduling.
+pub fn lower_dwrt_owned(
+    arena: &ExprArena,
+    root: ExprId,
+) -> Result<(ExprArena, ExprId), LowerError> {
+    if !arena
+        .nodes_raw()
+        .iter()
+        .any(|n| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)))
+    {
+        return Ok((arena.clone(), root));
+    }
+    let mut owned = arena.clone();
+    let new_root = lower_dwrt(&mut owned, root)?;
+    Ok((owned, new_root))
+}
+
+/// Whether any `Dwrt` node is reachable from `root`.
+fn subtree_contains_dwrt(arena: &ExprArena, root: ExprId) -> bool {
+    let mut stack = alloc::vec![root];
+    let mut seen = alloc::vec![false; arena.len()];
+    while let Some(id) = stack.pop() {
+        if core::mem::replace(&mut seen[id.0 as usize], true) {
+            continue;
+        }
+        if matches!(arena.node(id), ExprNode::Binary(OpKind::Dwrt, _, _)) {
+            return true;
+        }
+        for c in arena.children(id) {
+            stack.push(c);
+        }
+    }
+    false
+}
+
+/// Read and validate the differentiation-variable operand of a `Dwrt` node.
+fn dwrt_var_index(arena: &ExprArena, var: ExprId) -> Result<u8, LowerError> {
+    let ExprNode::Const(v) = *arena.node(var) else {
+        return Err(LowerError::DwrtVarNotConst);
+    };
+    if v.fract() != 0.0 || !(0.0..4.0).contains(&v) {
+        return Err(LowerError::DwrtVarOutOfRange { value: v });
+    }
+    Ok(v as u8)
+}
+
+/// Is this node literally `Const(0.0)`?
+fn is_const_zero(arena: &ExprArena, id: ExprId) -> bool {
+    matches!(arena.node(id), ExprNode::Const(v) if *v == 0.0)
+}
+
+/// `a + b` with additive-identity folding (keeps derivative DAGs compact —
+/// most partials of most subtrees are statically zero).
+fn dadd(arena: &mut ExprArena, a: ExprId, b: ExprId) -> ExprId {
+    if is_const_zero(arena, a) {
+        return b;
+    }
+    if is_const_zero(arena, b) {
+        return a;
+    }
+    arena.push_binary(OpKind::Add, a, b)
+}
+
+/// `a - b` with identity folding.
+fn dsub(arena: &mut ExprArena, a: ExprId, b: ExprId) -> ExprId {
+    if is_const_zero(arena, b) {
+        return a;
+    }
+    if is_const_zero(arena, a) {
+        return arena.push_unary(OpKind::Neg, b);
+    }
+    arena.push_binary(OpKind::Sub, a, b)
+}
+
+/// `a * b` with annihilator folding (`0 * x = 0`).
+///
+/// This folds `0 * NaN`/`0 * inf` to `0`, i.e. the *strong* zero the selected
+/// piecewise rules already assume — the same choice `Jet2`'s statically-zero
+/// partials make.
+fn dmul(arena: &mut ExprArena, a: ExprId, b: ExprId) -> ExprId {
+    if is_const_zero(arena, a) || is_const_zero(arena, b) {
+        return arena.push_const(0.0);
+    }
+    if matches!(arena.node(a), ExprNode::Const(v) if *v == 1.0) {
+        return b;
+    }
+    if matches!(arena.node(b), ExprNode::Const(v) if *v == 1.0) {
+        return a;
+    }
+    arena.push_binary(OpKind::Mul, a, b)
+}
+
+/// `-a` with `-0 = 0` folding.
+fn dneg(arena: &mut ExprArena, a: ExprId) -> ExprId {
+    if is_const_zero(arena, a) {
+        return a;
+    }
+    arena.push_unary(OpKind::Neg, a)
+}
+
+/// `a / b` with a strong-zero numerator fold (see [`dmul`]).
+fn ddiv(arena: &mut ExprArena, a: ExprId, b: ExprId) -> ExprId {
+    if is_const_zero(arena, a) {
+        return a;
+    }
+    arena.push_binary(OpKind::Div, a, b)
+}
+
+/// Symbolic derivative of the (already `Dwrt`-free) subtree at `id` with
+/// respect to coordinate `var`, memoized per `(node, var)` so shared
+/// subexpressions differentiate once. `depth` is the recursion depth, bounded
+/// by [`MAX_DERIV_DEPTH`].
+fn differentiate(
+    arena: &mut ExprArena,
+    id: ExprId,
+    var: u8,
+    depth: usize,
+    memo: &mut alloc::collections::BTreeMap<(u32, u8), ExprId>,
+) -> Result<ExprId, LowerError> {
+    if depth > MAX_DERIV_DEPTH {
+        return Err(LowerError::DepthExceeded {
+            limit: MAX_DERIV_DEPTH,
+        });
+    }
+    if let Some(&d) = memo.get(&(id.0, var)) {
+        return Ok(d);
+    }
+
+    let node = arena.node(id).clone();
+    let d = match node {
+        // ── Leaves ──
+        ExprNode::Var(i) => {
+            let v = if i == var { 1.0 } else { 0.0 };
+            arena.push_const(v)
+        }
+        ExprNode::Const(_) => arena.push_const(0.0),
+        // A bound scalar parameter is constant with respect to coordinates.
+        ExprNode::Param(_) => arena.push_const(0.0),
+        // A bare Buffer is not a value (it only appears under Gather /
+        // RawGather, both handled below without recursing into it).
+        ExprNode::Buffer(_) => {
+            return Err(LowerError::UnsupportedOp { op: OpKind::Buffer });
+        }
+
+        ExprNode::Unary(op, a) => {
+            let du = differentiate(arena, a, var, depth + 1, memo)?;
+            match op {
+                OpKind::Neg => dneg(arena, du),
+                // (√u)' = u' · ½·rsqrt(u)   (Jet2's rsqrt form)
+                OpKind::Sqrt => {
+                    let r = arena.push_unary(OpKind::Rsqrt, a);
+                    let half = arena.push_const(0.5);
+                    let f = dmul(arena, half, r);
+                    dmul(arena, f, du)
+                }
+                // (u^-½)' = -½·u^-3/2 · u' = -½·rsqrt(u)³ · u'
+                OpKind::Rsqrt => {
+                    let r = arena.push_unary(OpKind::Rsqrt, a);
+                    let r2 = dmul(arena, r, r);
+                    let r3 = dmul(arena, r2, r);
+                    let neg_half = arena.push_const(-0.5);
+                    let f = dmul(arena, neg_half, r3);
+                    dmul(arena, f, du)
+                }
+                // |u|' : piecewise on sign — Select(u >= 0, u', -u').
+                OpKind::Abs => {
+                    let zero = arena.push_const(0.0);
+                    let nonneg = arena.push_binary(OpKind::Ge, a, zero);
+                    let ndu = dneg(arena, du);
+                    select_branch(arena, nonneg, du, ndu)
+                }
+                // (1/u)' = -u' / u²
+                OpKind::Recip => {
+                    let ndu = dneg(arena, du);
+                    let u2 = dmul(arena, a, a);
+                    ddiv(arena, ndu, u2)
+                }
+                // Step functions: derivative 0 almost everywhere.
+                OpKind::Floor | OpKind::Ceil | OpKind::Round => arena.push_const(0.0),
+                // fract(u) = u - floor(u): derivative u' almost everywhere.
+                OpKind::Fract => du,
+                OpKind::Sin => {
+                    let c = arena.push_unary(OpKind::Cos, a);
+                    dmul(arena, c, du)
+                }
+                OpKind::Cos => {
+                    let s = arena.push_unary(OpKind::Sin, a);
+                    let ns = dneg(arena, s);
+                    dmul(arena, ns, du)
+                }
+                // (tan u)' = u' / cos²u
+                OpKind::Tan => {
+                    let c = arena.push_unary(OpKind::Cos, a);
+                    let c2 = dmul(arena, c, c);
+                    ddiv(arena, du, c2)
+                }
+                // (asin u)' = u' / √(1-u²)
+                OpKind::Asin => {
+                    let s = one_minus_sq_sqrt(arena, a);
+                    ddiv(arena, du, s)
+                }
+                // (acos u)' = -u' / √(1-u²)
+                OpKind::Acos => {
+                    let s = one_minus_sq_sqrt(arena, a);
+                    let q = ddiv(arena, du, s);
+                    dneg(arena, q)
+                }
+                // (atan u)' = u' / (1+u²)
+                OpKind::Atan => {
+                    let one = arena.push_const(1.0);
+                    let u2 = dmul(arena, a, a);
+                    let den = dadd(arena, one, u2);
+                    ddiv(arena, du, den)
+                }
+                OpKind::Exp => {
+                    let e = arena.push_unary(OpKind::Exp, a);
+                    dmul(arena, e, du)
+                }
+                // (2^u)' = 2^u · ln2 · u'
+                OpKind::Exp2 => {
+                    let e = arena.push_unary(OpKind::Exp2, a);
+                    let ln2 = arena.push_const(core::f32::consts::LN_2);
+                    let f = dmul(arena, e, ln2);
+                    dmul(arena, f, du)
+                }
+                // (ln u)' = u' / u
+                OpKind::Ln => ddiv(arena, du, a),
+                // (log2 u)' = u' / (u·ln2)
+                OpKind::Log2 => {
+                    let ln2 = arena.push_const(core::f32::consts::LN_2);
+                    let den = dmul(arena, a, ln2);
+                    ddiv(arena, du, den)
+                }
+                // (log10 u)' = u' / (u·ln10)
+                OpKind::Log10 => {
+                    let ln10 = arena.push_const(core::f32::consts::LN_10);
+                    let den = dmul(arena, a, ln10);
+                    ddiv(arena, du, den)
+                }
+                // Integer/bit-domain ops have no derivative. Loud error.
+                _ => return Err(LowerError::UnsupportedOp { op }),
+            }
+        }
+
+        ExprNode::Binary(op, a, b) => match op {
+            // Nested derivative that this walk itself uncovered (a `Dwrt`
+            // stored behind a shared node the rebuild has not visited): take
+            // the inner derivative first, then differentiate the result.
+            OpKind::Dwrt => {
+                let inner_var = dwrt_var_index(arena, b)?;
+                let inner = differentiate(arena, a, inner_var, depth + 1, memo)?;
+                differentiate(arena, inner, var, depth + 1, memo)?
+            }
+            // Buffer reads are piecewise constant in their indices (a hard
+            // step at every texel): derivative 0, matching Floor. See module
+            // docs on `lower_dwrt`.
+            OpKind::RawGather => arena.push_const(0.0),
+            OpKind::Add | OpKind::Sub => {
+                let da = differentiate(arena, a, var, depth + 1, memo)?;
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                if op == OpKind::Add {
+                    dadd(arena, da, db)
+                } else {
+                    dsub(arena, da, db)
+                }
+            }
+            // Product rule.
+            OpKind::Mul => {
+                let da = differentiate(arena, a, var, depth + 1, memo)?;
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                let t1 = dmul(arena, da, b);
+                let t2 = dmul(arena, a, db);
+                dadd(arena, t1, t2)
+            }
+            // Quotient rule: (a/b)' = (a'·b - a·b') / b².
+            OpKind::Div => {
+                let da = differentiate(arena, a, var, depth + 1, memo)?;
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                let t1 = dmul(arena, da, b);
+                let t2 = dmul(arena, a, db);
+                let num = dsub(arena, t1, t2);
+                let den = dmul(arena, b, b);
+                ddiv(arena, num, den)
+            }
+            // min/max are piecewise: the active branch's derivative, selected
+            // on the same comparison Jet2 uses (Lt for min, Gt for max — ties
+            // take the right operand's derivative).
+            OpKind::Min | OpKind::Max => {
+                let da = differentiate(arena, a, var, depth + 1, memo)?;
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                let cmp = if op == OpKind::Min {
+                    OpKind::Lt
+                } else {
+                    OpKind::Gt
+                };
+                let mask = arena.push_binary(cmp, a, b);
+                select_branch(arena, mask, da, db)
+            }
+            // (a^b)' = a^b · (b'·ln a + b·a'/a). NaN for a ≤ 0 with varying b,
+            // exactly as the analytic derivative is.
+            OpKind::Pow => {
+                let da = differentiate(arena, a, var, depth + 1, memo)?;
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                let ln_a = arena.push_unary(OpKind::Ln, a);
+                let t1 = dmul(arena, db, ln_a);
+                let ratio = ddiv(arena, da, a);
+                let t2 = dmul(arena, b, ratio);
+                let sum = dadd(arena, t1, t2);
+                let p = arena.push_binary(OpKind::Pow, a, b);
+                dmul(arena, p, sum)
+            }
+            // hypot(a,b)' = (a·a' + b·b') / hypot(a,b).
+            OpKind::Hypot => {
+                let da = differentiate(arena, a, var, depth + 1, memo)?;
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                let t1 = dmul(arena, a, da);
+                let t2 = dmul(arena, b, db);
+                let num = dadd(arena, t1, t2);
+                let h = arena.push_binary(OpKind::Hypot, a, b);
+                ddiv(arena, num, h)
+            }
+            // atan2(y,x)' = (x·y' - y·x') / (x² + y²).
+            OpKind::Atan2 => {
+                let dy = differentiate(arena, a, var, depth + 1, memo)?;
+                let dx = differentiate(arena, b, var, depth + 1, memo)?;
+                let t1 = dmul(arena, b, dy);
+                let t2 = dmul(arena, a, dx);
+                let num = dsub(arena, t1, t2);
+                let y2 = dmul(arena, a, a);
+                let x2 = dmul(arena, b, b);
+                let den = dadd(arena, x2, y2);
+                ddiv(arena, num, den)
+            }
+            // Comparison masks are step functions: derivative 0 a.e.
+            OpKind::Lt | OpKind::Le | OpKind::Gt | OpKind::Ge | OpKind::Eq | OpKind::Ne => {
+                arena.push_const(0.0)
+            }
+            _ => return Err(LowerError::UnsupportedOp { op }),
+        },
+
+        ExprNode::Ternary(op, a, b, c) => match op {
+            // (a·b + c)' = a'·b + a·b' + c'.
+            OpKind::MulAdd => {
+                let da = differentiate(arena, a, var, depth + 1, memo)?;
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                let dc = differentiate(arena, c, var, depth + 1, memo)?;
+                let t1 = dmul(arena, da, b);
+                let t2 = dmul(arena, a, db);
+                let prod = dadd(arena, t1, t2);
+                dadd(arena, prod, dc)
+            }
+            // Select is a branch: the derivative follows the taken branch.
+            // The condition itself is a step function (derivative 0).
+            OpKind::Select => {
+                let db = differentiate(arena, b, var, depth + 1, memo)?;
+                let dc = differentiate(arena, c, var, depth + 1, memo)?;
+                select_branch(arena, a, db, dc)
+            }
+            // clamp(x, lo, hi) is piecewise: lo' below, hi' above, x' between
+            // (Jet2's convention: Lt-low then Gt-high).
+            OpKind::Clamp => {
+                let dx = differentiate(arena, a, var, depth + 1, memo)?;
+                let dlo = differentiate(arena, b, var, depth + 1, memo)?;
+                let dhi = differentiate(arena, c, var, depth + 1, memo)?;
+                let below = arena.push_binary(OpKind::Lt, a, b);
+                let above = arena.push_binary(OpKind::Gt, a, c);
+                let upper = select_branch(arena, above, dhi, dx);
+                select_branch(arena, below, dlo, upper)
+            }
+            // Buffer reads are piecewise constant in their indices: 0. See
+            // `lower_dwrt` docs.
+            OpKind::Gather => arena.push_const(0.0),
+            _ => return Err(LowerError::UnsupportedOp { op }),
+        },
+
+        ExprNode::Nary(op, _, _) => return Err(LowerError::UnsupportedOp { op }),
+    };
+
+    memo.insert((id.0, var), d);
+    Ok(d)
+}
+
+/// `Select(mask, a, b)`, folded to `a` when both branches are the same node
+/// (in particular when both derivatives are statically zero).
+fn select_branch(arena: &mut ExprArena, mask: ExprId, a: ExprId, b: ExprId) -> ExprId {
+    if a == b || (is_const_zero(arena, a) && is_const_zero(arena, b)) {
+        return a;
+    }
+    arena.push_ternary(OpKind::Select, mask, a, b)
+}
+
+/// `√(1 - u²)` — shared denominator of the asin/acos rules.
+fn one_minus_sq_sqrt(arena: &mut ExprArena, u: ExprId) -> ExprId {
+    let one = arena.push_const(1.0);
+    let u2 = dmul(arena, u, u);
+    let t = dsub(arena, one, u2);
+    arena.push_unary(OpKind::Sqrt, t)
 }
