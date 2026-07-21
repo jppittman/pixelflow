@@ -308,6 +308,20 @@ impl PlatformOps for MetalOps {
                 }
             }
 
+            // Report backing-scale changes (window dragged to a display with
+            // different DPI). Drained after closes: a window that closed this
+            // pass is already out of window_map, so its scale event is dropped.
+            for (ptr, scale) in crate::platform::macos::window::drain_scale_changes() {
+                if let Some(id) = self.window_map.get(&ptr) {
+                    processed_any = true;
+                    self.event_tx
+                        .send(Message::Data(EngineData::FromDriver(
+                            DisplayEvent::ScaleChanged { id: *id, scale },
+                        )))
+                        .expect("Failed to send ScaleChanged to engine");
+                }
+            }
+
             // Busy after real work so the scheduler re-drains its lanes before
             // blocking on the doorbell (a dequeued wake event usually means
             // messages are waiting).

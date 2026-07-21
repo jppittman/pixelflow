@@ -21,6 +21,20 @@ pub(crate) fn drain_closed_windows() -> Vec<usize> {
     )
 }
 
+/// (NSWindow pointer, new backingScaleFactor) pairs reported by
+/// `windowDidChangeBackingProperties:` and not yet drained by the pump.
+/// Fires when a window moves between displays with different DPI.
+static SCALE_CHANGES: Mutex<Vec<(usize, f64)>> = Mutex::new(Vec::new());
+
+/// Take all backing-scale changes since the last drain.
+pub(crate) fn drain_scale_changes() -> Vec<(usize, f64)> {
+    std::mem::take(
+        &mut *SCALE_CHANGES
+            .lock()
+            .expect("scale-change queue poisoned"),
+    )
+}
+
 extern "C" fn window_will_close(_this: sys::Id, _cmd: sys::Sel, notification: sys::Id) {
     unsafe {
         let window: sys::Id = sys::send(notification, sys::sel(b"object\0"));
@@ -28,6 +42,21 @@ extern "C" fn window_will_close(_this: sys::Id, _cmd: sys::Sel, notification: sy
             .lock()
             .expect("closed-window queue poisoned")
             .push(window as usize);
+    }
+}
+
+extern "C" fn window_did_change_backing_properties(
+    _this: sys::Id,
+    _cmd: sys::Sel,
+    notification: sys::Id,
+) {
+    unsafe {
+        let window: sys::Id = sys::send(notification, sys::sel(b"object\0"));
+        let scale: f64 = sys::send(window, sys::sel(b"backingScaleFactor\0"));
+        SCALE_CHANGES
+            .lock()
+            .expect("scale-change queue poisoned")
+            .push((window as usize, scale));
     }
 }
 
@@ -49,6 +78,16 @@ fn delegate_class() -> sys::Class {
             b"v@:@\0".as_ptr(),
         );
         assert!(added == YES, "failed to add windowWillClose: method");
+        let added = sys::class_addMethod(
+            cls,
+            sys::sel(b"windowDidChangeBackingProperties:\0"),
+            window_did_change_backing_properties as *const c_void,
+            b"v@:@\0".as_ptr(),
+        );
+        assert!(
+            added == YES,
+            "failed to add windowDidChangeBackingProperties: method"
+        );
         sys::objc_registerClassPair(cls);
         cls as usize
     }) as sys::Class
