@@ -161,7 +161,10 @@ impl TerminalApp {
     fn resize_pty(&self, cols: u16, rows: u16) {
         if let Err(e) = self
             .pty_writer
-            .send(Message::Control(WriterControl::Resize(Resize { cols, rows })))
+            .send(Message::Control(WriterControl::Resize(Resize {
+                cols,
+                rows,
+            })))
         {
             log::warn!("Failed to send PTY resize command: {}", e);
         }
@@ -980,6 +983,187 @@ mod tests {
                 rows: 50
             }],
             "PTY resize command should match new dimensions"
+        );
+    }
+
+    /// Engine double that discards every message, so the app's frame sends
+    /// never block. Runs on its own thread like the real engine actor.
+    struct EngineDiscard;
+
+    impl
+        Actor<
+            pixelflow_runtime::api::private::EngineData,
+            pixelflow_runtime::api::private::EngineControl,
+            pixelflow_runtime::api::public::AppManagement,
+        > for EngineDiscard
+    {
+        fn handle_data(
+            &mut self,
+            _msg: pixelflow_runtime::api::private::EngineData,
+        ) -> HandlerResult {
+            Ok(())
+        }
+        fn handle_control(
+            &mut self,
+            _msg: pixelflow_runtime::api::private::EngineControl,
+        ) -> HandlerResult {
+            Ok(())
+        }
+        fn handle_management(
+            &mut self,
+            _msg: pixelflow_runtime::api::public::AppManagement,
+        ) -> HandlerResult {
+            Ok(())
+        }
+        fn park(&mut self, _hint: SystemStatus) -> Result<ActorStatus, HandlerError> {
+            Ok(ActorStatus::Idle)
+        }
+    }
+
+    /// End-to-end regression for "can't Ctrl-C out of `yes`": real PTY troupe,
+    /// real TerminalApp actor on a real scheduler, production-shaped producer
+    /// set and burst limits. Floods the pipeline with `yes` output, then
+    /// injects the exact KeyDown the X11 mapper produces for Ctrl+C and
+    /// asserts the child dies (i.e. 0x03 reached the PTY line discipline).
+    #[test]
+    fn ctrl_c_interrupts_yes_flood() {
+        use crate::io::event_monitor_actor::PtyTroupe;
+        use crate::io::pty::{NixPty, PtyChannel, PtyConfig};
+        use std::time::{Duration, Instant};
+
+        let font_path = find_font_path();
+        if !font_path.exists()
+            || std::fs::metadata(&font_path)
+                .map(|m| m.len() < 1000)
+                .unwrap_or(true)
+        {
+            eprintln!(
+                "Test skipped: usable font not found at {}",
+                font_path.display()
+            );
+            return;
+        }
+
+        let pty = NixPty::spawn_with_config(&PtyConfig {
+            command_executable: "/bin/sh",
+            args: &["-c", "yes"],
+            initial_cols: 80,
+            initial_rows: 24,
+        })
+        .expect("spawn pty running yes");
+        let child = pty.child_pid();
+
+        let mut troupe = PtyTroupe::new(pty).expect("pty troupe");
+        let pty_writer = troupe.writer_handle();
+
+        // Engine double on its own thread (real engine drains fast; so does this).
+        let mut engine_builder = actor_scheduler::ActorBuilder::<
+            pixelflow_runtime::api::private::EngineData,
+            pixelflow_runtime::api::private::EngineControl,
+            pixelflow_runtime::api::public::AppManagement,
+        >::new(1024, None);
+        let engine_tx = engine_builder.add_producer();
+        let mut engine_rx = engine_builder.build();
+        let engine_thread = std::thread::spawn(move || {
+            engine_rx.run(&mut EngineDiscard);
+        });
+
+        // App channels mirror spawn_terminal_app: 4 producers, data burst 10.
+        let mut builder =
+            ActorBuilder::<TerminalData, EngineEventControl, EngineEventManagement>::new(128, None);
+        let key_tx = builder.add_producer(); // stands in for the engine adapter
+        let parser_handle = builder.add_producer();
+        let reader_handle = builder.add_producer();
+        let keepalive = builder.add_producer();
+        let mut app_rx = builder.build_with_burst(10, actor_scheduler::ShutdownMode::default());
+
+        let mut app = TerminalApp::new_registered(TerminalAppParamsRegistered {
+            emulator: TerminalEmulator::new(80, 24),
+            pty_writer,
+            config: Config::default(),
+            engine_tx: EngineHandle::new_for_test(engine_tx),
+        });
+        let app_thread = std::thread::spawn(move || {
+            app_rx.run(&mut app);
+        });
+
+        let troupe_handle = troupe
+            .spawn(
+                Box::new(TerminalAppSender::new(parser_handle)),
+                Box::new(TerminalAppSender::new(reader_handle)),
+            )
+            .expect("spawn pty troupe");
+
+        // Engine-adapter stand-in on its own thread (the handle is single-owner):
+        // hammers the adapter shard with RequestFrame at ~155Hz so the app is
+        // doing full-grid send_frame work, then injects Ctrl+C after 2s of
+        // flood WHILE the frame pressure keeps running — just like production,
+        // where vsync doesn't pause because a key was pressed.
+        //
+        // The KeyDown is exactly what platform/linux/events.rs reports for
+        // Ctrl+C: XLookupString applies the control translation, so text and
+        // symbol are both ETX.
+        let stop_vsync = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vsync_stop = stop_vsync.clone();
+        let adapter_thread = std::thread::spawn(move || {
+            use pixelflow_runtime::api::public::EngineEventData;
+            let interval = Duration::from_micros(6450);
+            let key_at = Instant::now() + Duration::from_secs(2);
+            let mut key_sent = false;
+            while !vsync_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = Instant::now();
+                key_tx
+                    .send(Message::Data(TerminalData::Engine(
+                        EngineEventData::RequestFrame {
+                            timestamp: now,
+                            target_timestamp: now + interval,
+                            refresh_interval: interval,
+                        },
+                    )))
+                    .expect("send RequestFrame");
+                if !key_sent && Instant::now() >= key_at {
+                    key_tx
+                        .send(Message::Management(EngineEventManagement::KeyDown {
+                            key: pixelflow_runtime::input::KeySymbol::Char('\u{3}'),
+                            mods: pixelflow_runtime::input::Modifiers::CONTROL,
+                            text: Some("\u{3}".to_string()),
+                        }))
+                        .expect("send ctrl-c keydown");
+                    key_sent = true;
+                }
+                std::thread::sleep(interval);
+            }
+        });
+
+        // The line discipline should SIGINT the foreground job promptly.
+        // (Key is injected ~2s in; allow generous slack on loaded CI.)
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut dead = false;
+        while Instant::now() < deadline {
+            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+            match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => std::thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    dead = true;
+                    break;
+                }
+            }
+        }
+
+        // Cleanup regardless of outcome so a failure doesn't leak `yes`.
+        if !dead {
+            let _killed = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+        }
+        stop_vsync.store(true, std::sync::atomic::Ordering::Relaxed);
+        adapter_thread.join().expect("adapter thread");
+        drop(troupe_handle); // shuts down reader/parser/writer, joins troupe thread
+        drop(keepalive);
+        app_thread.join().expect("app thread");
+        engine_thread.join().expect("engine thread");
+
+        assert!(
+            dead,
+            "Ctrl+C did not interrupt `yes` within 10s — input path is wedged"
         );
     }
 
