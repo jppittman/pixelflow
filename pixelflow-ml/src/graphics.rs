@@ -349,6 +349,19 @@ mod tests {
         }
     }
 
+    /// Asserts that a Field is approximately equal to a float value across all lanes.
+    ///
+    /// Mirrors the helper in `pixelflow-core/tests/unit_tests.rs`: uses only the
+    /// public `Field` API (`Sub`, `abs`, `lt`, `all`), never raw lane access.
+    fn assert_field_approx_eq(field: Field, expected: f32) {
+        let diff = (field - Field::from(expected)).abs();
+        let is_small = diff.lt(Field::from(1e-2)).constant();
+        assert!(
+            is_small.all(),
+            "expected ~{expected}, field differed by more than 1e-2"
+        );
+    }
+
     #[test]
     fn sh_feature_map_projects_direction() {
         let result =
@@ -357,10 +370,60 @@ mod tests {
     }
 
     #[test]
+    fn sh_feature_map_matches_closed_form_sh_basis() {
+        // Unnormalized direction (1, 2, 2), |v| = 3 -> normalized (1/3, 2/3, 2/3).
+        // Expected values are the real SH basis Y_lm evaluated at that direction,
+        // using the same SH_NORM constants as pixelflow-core's spherical.rs.
+        let result = ShFeatureMap::<9>::project(Field::from(1.0), Field::from(2.0), Field::from(2.0));
+
+        assert_field_approx_eq(result[0], 0.282_095);
+        assert_field_approx_eq(result[1], 0.325_735);
+        assert_field_approx_eq(result[2], 0.325_735);
+        assert_field_approx_eq(result[3], 0.162_867);
+        assert_field_approx_eq(result[4], 0.121_394);
+        assert_field_approx_eq(result[5], 0.485_577);
+        assert_field_approx_eq(result[6], 0.105_131);
+        assert_field_approx_eq(result[7], 0.242_789);
+        assert_field_approx_eq(result[8], -0.182_091);
+    }
+
+    #[test]
+    fn sh_feature_map_normalizes_unit_z_direction() {
+        // Direction along +z should light up only the m=0 harmonics (l=0, l=1 m=0,
+        // l=2 m=0) and leave every basis function that depends on nx or ny at zero.
+        let result =
+            ShFeatureMap::<9>::project(Field::from(0.0), Field::from(0.0), Field::from(5.0));
+
+        assert_field_approx_eq(result[0], 0.282_095);
+        assert_field_approx_eq(result[1], 0.0);
+        assert_field_approx_eq(result[2], 0.488_602_5);
+        assert_field_approx_eq(result[3], 0.0);
+        assert_field_approx_eq(result[4], 0.0);
+        assert_field_approx_eq(result[5], 0.0);
+        assert_field_approx_eq(result[6], 0.630_783);
+        assert_field_approx_eq(result[7], 0.0);
+        assert_field_approx_eq(result[8], 0.0);
+    }
+
+    #[test]
     fn linear_attention_new() {
         let attn = LinearAttention::new(EluFeature, 4, 3);
         assert_eq!(attn.feature_dim, 4);
         assert_eq!(attn.value_dim, 3);
+        assert!(attn.kv_state.iter().all(|&v| v == 0.0));
+        assert!(attn.k_state.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn linear_attention_reset_clears_accumulated_state() {
+        let mut attn = LinearAttention::new(EluFeature, 2, 3);
+        attn.kv_state.fill(7.0);
+        attn.k_state.fill(3.0);
+
+        attn.reset();
+
+        assert!(attn.kv_state.iter().all(|&v| v == 0.0));
+        assert!(attn.k_state.iter().all(|&v| v == 0.0));
     }
 
     #[test]
