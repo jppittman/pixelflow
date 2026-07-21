@@ -218,6 +218,20 @@ impl MacWindow {
         }
     }
 
+    /// Frame-buffer size in device pixels: content bounds (points) × backing
+    /// scale. This is the sample lattice the scene is rasterized onto; the
+    /// `Window`'s `width_px`/`height_px` stay in points for layout and input.
+    pub fn pixel_size(&self) -> (u32, u32) {
+        let scale = self.scale_factor();
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "invalid backingScaleFactor: {scale}"
+        );
+        let w = (self.current_width as f64 * scale).round() as u32;
+        let h = (self.current_height as f64 * scale).round() as u32;
+        (w, h)
+    }
+
     pub fn set_cursor(&mut self, icon: crate::api::public::CursorIcon) {
         use crate::api::public::CursorIcon;
         unsafe {

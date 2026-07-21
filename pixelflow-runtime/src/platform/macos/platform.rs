@@ -139,6 +139,9 @@ impl PlatformOps for MetalOps {
                         let width = win.current_width;
                         let height = win.current_height;
                         let scale = win.scale_factor();
+                        // Frame is device-pixel sized (the sample lattice);
+                        // width_px/height_px stay in points for layout/input.
+                        let (px_w, px_h) = win.pixel_size();
 
                         // Generate window ID from pointer (like Linux does)
                         let id = WindowId(ptr as u64);
@@ -149,7 +152,7 @@ impl PlatformOps for MetalOps {
                         // Create Window with initial frame buffer
                         let window = Window {
                             id,
-                            frame: Frame::<PlatformPixel>::new(width, height),
+                            frame: Frame::<PlatformPixel>::new(px_w, px_h),
                             width_px: width,
                             height_px: height,
                             scale,
@@ -212,9 +215,11 @@ impl PlatformOps for MetalOps {
             for (id, mac_window) in self.windows.iter_mut() {
                 if let Some((width, height)) = mac_window.poll_resize() {
                     // Create new Window with resized frame buffer
+                    // (device pixels; width_px/height_px are points)
+                    let (px_w, px_h) = mac_window.pixel_size();
                     let window = Window {
                         id: *id,
-                        frame: Frame::<PlatformPixel>::new(width, height),
+                        frame: Frame::<PlatformPixel>::new(px_w, px_h),
                         width_px: width,
                         height_px: height,
                         scale: mac_window.scale_factor(),
@@ -311,12 +316,35 @@ impl PlatformOps for MetalOps {
             // Report backing-scale changes (window dragged to a display with
             // different DPI). Drained after closes: a window that closed this
             // pass is already out of window_map, so its scale event is dropped.
+            //
+            // A scale change keeps the point-space bounds but changes the
+            // sample lattice, so the circulating frame has the wrong pixel
+            // density. Emit Resized with a fresh pixel-sized frame (the engine
+            // marks any in-flight render stale and swaps buffers), then
+            // ScaleChanged so the app can re-bake density-keyed resources.
             for (ptr, scale) in crate::platform::macos::window::drain_scale_changes() {
-                if let Some(id) = self.window_map.get(&ptr) {
+                if let Some(id) = self.window_map.get(&ptr).copied() {
+                    let win = self
+                        .windows
+                        .get(&id)
+                        .expect("window_map entry without a matching window");
+                    let (px_w, px_h) = win.pixel_size();
+                    let window = Window {
+                        id,
+                        frame: Frame::<PlatformPixel>::new(px_w, px_h),
+                        width_px: win.current_width,
+                        height_px: win.current_height,
+                        scale,
+                    };
                     processed_any = true;
                     self.event_tx
                         .send(Message::Data(EngineData::FromDriver(
-                            DisplayEvent::ScaleChanged { id: *id, scale },
+                            DisplayEvent::Resized { window },
+                        )))
+                        .expect("Failed to send Resized (scale change) to engine");
+                    self.event_tx
+                        .send(Message::Data(EngineData::FromDriver(
+                            DisplayEvent::ScaleChanged { id, scale },
                         )))
                         .expect("Failed to send ScaleChanged to engine");
                 }
