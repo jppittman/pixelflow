@@ -165,14 +165,36 @@ impl fmt::Display for BenchError {
 // Platform-specific high-resolution timing.
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
 }
 
 #[cfg(target_os = "macos")]
 fn nanos_now() -> u64 {
-    // On Apple Silicon, mach_absolute_time() ticks == nanoseconds (timebase 1:1).
-    unsafe { mach_absolute_time() }
+    // mach_absolute_time() ticks are NOT nanoseconds on native Apple Silicon:
+    // the timebase is 125/3 (one tick = 41.67ns; 1:1 only holds on Intel Macs
+    // and under Rosetta). Convert via mach_timebase_info, queried once.
+    // Verified empirically 2026-07-20: a 100ms sleep measured 2.47M raw ticks.
+    static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+        let rc = unsafe { mach_timebase_info(&mut info) };
+        assert_eq!(rc, 0, "mach_timebase_info failed with {}", rc);
+        assert_ne!(info.denom, 0, "mach_timebase_info returned denom=0");
+        (info.numer, info.denom)
+    });
+    let ticks = unsafe { mach_absolute_time() };
+    // u128 intermediate: ticks * numer overflows u64 after ~50 days of uptime
+    // at timebase 125/3.
+    ((ticks as u128 * numer as u128) / denom as u128) as u64
 }
 
 #[cfg(target_os = "linux")]

@@ -175,7 +175,12 @@ Training happens in a separate loop at the trajectory level, not in the per-step
 ### Benchmark Methodology
 - `eval100!` macro: 100 function calls fully unrolled, zero loop counter overhead
 - 20 timed samples, take median
-- `mach_absolute_time()` on macOS (1ns resolution on Apple Silicon)
+- `mach_absolute_time()` on macOS — **correction (2026-07-20): NOT 1:1 with
+  nanoseconds on native Apple Silicon.** The timebase is 125/3 (1 tick =
+  41.67ns; 1:1 only held on Intel Macs / under Rosetta). The shared harness
+  timer (`pixelflow-pipeline/src/jit_bench.rs::nanos_now`) now converts via
+  `mach_timebase_info`. Every absolute-ns figure below that predates this fix
+  is under-scaled 41.67x; see docs/results/2026-07-20-jit-compile-cost.md.
 - `benchmark_jit` divides by INNER_ITERS to return per-eval nanoseconds
 
 The loop counter bias (~0.3ns/iter) was corrupting the additive cost model — small expressions appeared proportionally more expensive. Full unrolling eliminates this.
@@ -187,6 +192,12 @@ Causal Decision Transformer with 3 layers, 4 attention heads, 128-dim. The `/ste
 Op weights match ShaderToy shader analysis: 36% mul, 18% add, 14% sub, 6% div, with moderate abs/sin/cos/clamp and rare exotic ops. Default depth 8, leaf probability 0.2.
 
 ## Results
+
+> **⚠ Correction (2026-07-20)**: the absolute ns figures below predate the
+> `nanos_now` timebase fix and are under-scaled 41.67x on native Apple
+> Silicon (e.g. "0.420ns/eval" was really ~17.5ns/eval). Ratios (speedups,
+> cross-channel CSE factor) are unaffected. See
+> docs/results/2026-07-20-jit-compile-cost.md.
 
 - **Synthetic expressions**: 95%+ achieve >1x speedup, median 1.05x
 - **Psychedelic shader (3-channel)**:
