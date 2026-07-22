@@ -587,7 +587,7 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let c3 = arena.push_const(-1.666_805_8e-1);
     let c2 = arena.push_const(2.000_071_5e-1);
     let c1 = arena.push_const(-2.499_999_4e-1);
-    let c0 = arena.push_const(3.333_333_1e-1);
+    let c0 = arena.push_const(3.333_333e-1);
     let p = horner_step(arena, c8, t, c7);
     let p = horner_step(arena, p, t, c6);
     let p = horner_step(arena, p, t, c5);
