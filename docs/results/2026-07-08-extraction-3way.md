@@ -1,5 +1,17 @@
 # Extraction 3-way bench: NNUE vs static latency prior vs no-swap (2026-07-08)
 
+> **⚠ Correction (2026-07-20): absolute ns columns under-scaled 41.67x.**
+> The harness timer (`pixelflow-pipeline/src/jit_bench.rs::nanos_now`) reported
+> raw `mach_absolute_time()` ticks as nanoseconds, but on native Apple Silicon
+> the timebase is 125/3 (one tick = 41.67ns; 1:1 holds only on Intel Macs and
+> under Rosetta). Every **`ns NNUE` / `ns static` / `ns no-swap`** figure below
+> is therefore 41.67x smaller than the true wall-clock time (e.g. swirl's
+> "0.290ns" is really ~12.1ns). Because the scale factor is uniform, **all
+> ratios, geomeans, orderings, and the Phase 2 gate verdict are unaffected**.
+> The `extract μs` columns were measured with `std::time::Instant` and were
+> always correct. See docs/results/2026-07-20-jit-compile-cost.md, "Timer
+> correction" section, for the fix and empirical verification.
+
 Phase 2 gate of `docs/plans/2026-07-07-guided-saturation-redesign.md` — the
 deferred February 3-way experiment (HCE vs Judge vs Guided), redone with the
 freshly retrained Judge and no HCE (deleted in the April squash; NNUE vs the
@@ -10,7 +22,9 @@ Reproduce: `cargo run --release -p pixelflow-pipeline --features training --bin 
 ## Setup
 
 - **Machine**: Apple M2 Max (Apple Silicon MacBook), aarch64, NEON JIT ABI.
-  `mach_absolute_time()` timing (1 tick = 1 ns on this hardware).
+  `mach_absolute_time()` timing (1 tick = 1 ns on this hardware). *[Correction
+  2026-07-20: this assumption was wrong — the timebase on this machine is
+  125/3, so 1 tick = 41.67ns. See the correction note at the top.]*
 - **Judge weights**: `pixelflow-pipeline/data/expr_nnue_trid.bin` (138,120
   bytes, TRID format), loaded via `ExprNnue::from_bytes` — the same loader
   verified by `pixelflow-pipeline/tests/judge_weights_load.rs`.
