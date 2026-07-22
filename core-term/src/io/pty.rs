@@ -21,6 +21,20 @@ const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
 #[cfg(not(target_os = "macos"))]
 use libc::POSIX_SPAWN_SETSID;
 
+/// Upholds [`NixPty::spawn_with_config`]'s single-threaded contract inside
+/// the test binary, where libtest runs the crate's PTY-spawning tests as
+/// parallel threads.
+///
+/// Test-only on purpose. Production honours the contract structurally —
+/// one PTY, spawned on the main thread — so shipping a lock for it would
+/// be machinery for a race that cannot occur. Every in-crate spawn site
+/// (`io::pty_tests`, `io::event_monitor_actor`, `terminal_app`) funnels
+/// through `spawn_with_config`, so gating it here covers them all; no
+/// integration test spawns a PTY, which is what makes `cfg(test)` a
+/// sufficient boundary.
+#[cfg(test)]
+static OPENPTY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Configuration for spawning a PTY.
 #[derive(Debug, Clone)]
 pub struct PtyConfig<'a> {
@@ -92,14 +106,34 @@ impl NixPty {
     ///   controlling terminal on both Linux and the BSDs
     /// - `dup2(0/1/2)` → file actions (`addopen` + `adddup2`)
     ///
+    /// # Threading
+    ///
+    /// **Call this from one thread.** It is not safe to call concurrently:
+    /// `openpty(3)` is not thread-safe on macOS, and racing calls fail
+    /// intermittently with a corrupted (negative) errno that surfaces as
+    /// `Errno::UnknownErrno` — 107 failures in 57,600 calls at 48 threads
+    /// on 12 cores, versus 0 when serialized. See
+    /// `docs/bugs/2026-07-21-openpty-not-thread-safe.md`.
+    ///
+    /// The terminal satisfies this structurally rather than by locking:
+    /// `main` spawns the single PTY before the troupe's threads exist and
+    /// hands it to `PtyTroupe::new`, which delivers it to the actors as a
+    /// `Bind` message. If a second PTY is ever needed (tabs, splits), give
+    /// spawning a single owner rather than making this function reentrant.
+    ///
     /// # Parameters
     /// * `config` - Configuration for the PTY and command.
     ///
     /// # Returns
     /// * A new `NixPty` instance in the parent process.
     pub fn spawn_with_config(config: &PtyConfig) -> Result<Self> {
-        let pty_results =
-            openpty(None, None).with_context(|| "Failed to open PTY (nix::pty::openpty call)")?;
+        let pty_results = {
+            #[cfg(test)]
+            let _guard = OPENPTY_TEST_LOCK.lock().expect(
+                "OPENPTY_TEST_LOCK poisoned: a prior openpty call panicked while holding it",
+            );
+            openpty(None, None).with_context(|| "Failed to open PTY (nix::pty::openpty call)")?
+        };
         let master_fd = pty_results.master;
         let slave_fd = pty_results.slave;
 
