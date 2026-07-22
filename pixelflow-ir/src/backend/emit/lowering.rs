@@ -538,10 +538,18 @@ fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
 
 /// `log2(x)` as a primitive subgraph (x > 0).
 ///
-/// `log2(x) = e + log2(m)` where `e` is the unbiased exponent and `m ∈ [1,2)` is
-/// the mantissa. Extract `e` by shifting the exponent field down; rebuild `m` by
-/// masking the mantissa bits and OR-ing in exponent bias 127 (= 1.0). Then a
-/// degree-4 polynomial for `log2(m)` on `[1,2)`.
+/// Cephes `log2f` algorithm. `log2(x) = e + log2(m)` where `e` is the unbiased
+/// exponent and `m ∈ [1,2)` is the mantissa. Extract `e` by shifting the
+/// exponent field down; rebuild `m` by masking the mantissa bits and OR-ing in
+/// exponent bias 127 (= 1.0). When `m ≥ √2`, halve `m` and bump `e` so the
+/// polynomial argument `t = m − 1` stays in `[√2/2 − 1, √2 − 1]` — a degree-4
+/// polynomial on the full `[1,2)` peaks at ~0.1 absolute error near `m → 2`.
+/// Then `ln(1+t) = t − t²/2 + t³·P(t)` (degree-8 minimax `P`), scaled to base 2
+/// via the split constant `log2 e = 1 + LOG2EA` to avoid the rounding from one
+/// full-width multiply. Accurate to ~1 ulp over the reduced range.
+///
+/// Uses `Select` on a `Ge` mask for the range reduction, so (like the other
+/// bit-manipulating expansions) this is value-path only.
 fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     // Reinterpret x's bits as int (free) and extract exponent: e = (bits >> 23) - 127.
     // Shift amount read by value -> plain 23.0.
@@ -557,19 +565,55 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let mant = arena.push_binary(OpKind::BitAnd, x, mant_mask);
     let m = arena.push_binary(OpKind::BitOr, mant, one_bits);
 
-    // log2(m) on [1,2): polynomial in (m - 1).
+    // Range-reduce: if m ≥ √2 { m /= 2; e += 1 } so t = m − 1 ∈ [−0.293, 0.414].
+    let sqrt2 = arena.push_const(core::f32::consts::SQRT_2);
+    let reduce = arena.push_binary(OpKind::Ge, m, sqrt2);
+    let half = arena.push_const(0.5);
+    let m_halved = arena.push_binary(OpKind::Mul, m, half);
+    let m = arena.push_ternary(OpKind::Select, reduce, m_halved, m);
     let one = arena.push_const(1.0);
+    let e_bumped = arena.push_binary(OpKind::Add, e, one);
+    let e = arena.push_ternary(OpKind::Select, reduce, e_bumped, e);
+
     let t = arena.push_binary(OpKind::Sub, m, one);
-    let c1 = arena.push_const(core::f32::consts::LOG2_E);
-    let c2 = arena.push_const(-0.721_347_5);
-    let c3 = arena.push_const(0.479_924_46);
-    let c4 = arena.push_const(-0.298_768_3);
-    let p = horner_step(arena, c4, t, c3);
+
+    // P(t): Cephes lnf/log2f degree-8 minimax numerator for
+    // (ln(1+t) − t + t²/2) / t³ on the reduced range.
+    let c8 = arena.push_const(7.037_683_6e-2);
+    let c7 = arena.push_const(-1.151_461e-1);
+    let c6 = arena.push_const(1.167_699_9e-1);
+    let c5 = arena.push_const(-1.242_014_1e-1);
+    let c4 = arena.push_const(1.424_932_3e-1);
+    let c3 = arena.push_const(-1.666_805_8e-1);
+    let c2 = arena.push_const(2.000_071_5e-1);
+    let c1 = arena.push_const(-2.499_999_4e-1);
+    let c0 = arena.push_const(3.333_333_1e-1);
+    let p = horner_step(arena, c8, t, c7);
+    let p = horner_step(arena, p, t, c6);
+    let p = horner_step(arena, p, t, c5);
+    let p = horner_step(arena, p, t, c4);
+    let p = horner_step(arena, p, t, c3);
     let p = horner_step(arena, p, t, c2);
     let p = horner_step(arena, p, t, c1);
-    let log2_m = arena.push_binary(OpKind::Mul, p, t);
+    let p = horner_step(arena, p, t, c0);
 
-    arena.push_binary(OpKind::Add, e, log2_m)
+    // y = t³·P(t) − t²/2, so ln(1+t) = t + y.
+    let t2 = arena.push_binary(OpKind::Mul, t, t);
+    let t3 = arena.push_binary(OpKind::Mul, t2, t);
+    let t3p = arena.push_binary(OpKind::Mul, t3, p);
+    let half_t2 = arena.push_binary(OpKind::Mul, t2, half);
+    let y = arena.push_binary(OpKind::Sub, t3p, half_t2);
+
+    // log2(m) = (t + y)·log2(e), with log2(e) split as 1 + LOG2EA and the
+    // pieces summed smallest-first (Cephes ordering) to keep full precision:
+    // e + t + y + y·LOG2EA + t·LOG2EA.
+    let log2ea = arena.push_const(0.442_695_04); // log2(e) − 1
+    let y_ea = arena.push_binary(OpKind::Mul, y, log2ea);
+    let t_ea = arena.push_binary(OpKind::Mul, t, log2ea);
+    let z = arena.push_binary(OpKind::Add, y_ea, t_ea);
+    let z = arena.push_binary(OpKind::Add, z, y);
+    let z = arena.push_binary(OpKind::Add, z, t);
+    arena.push_binary(OpKind::Add, z, e)
 }
 
 /// `sin(x)` as a primitive subgraph (Chebyshev, matching the runtime path).
