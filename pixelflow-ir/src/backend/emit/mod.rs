@@ -653,10 +653,13 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Lower reductions, memory reads, then transcendentals to primitives (one
-    // source of truth in `lowering`); the aarch64 emitter then never sees
-    // Reduce/Gather/Sin/Cos/etc. (aarch64 gather emission is a later slice.)
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    // Lower derivatives, reductions, memory reads, then transcendentals to
+    // primitives (one source of truth in `lowering`); the aarch64 emitter then
+    // never sees Dwrt/Reduce/Gather/Sin/Cos/etc. Dwrt runs first: its chain
+    // rule emits Sin/Cos/Exp nodes that the transcendental pass must still
+    // lower. (aarch64 gather emission is a later slice.)
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root)?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
@@ -2512,16 +2515,17 @@ fn arena_to_schedule(
                 };
                 ScheduledOp::Gather(map_child(idx), slot)
             }
-            // A `Dwrt` (autodiff) node must be eliminated by the e-graph chain
-            // rule before codegen. Reaching here means a `D(expr, var)` survived
-            // saturation -- i.e. an operator with no differentiation rule -- and
-            // the jet fallback that would handle the residual is not yet wired.
-            // Fail loudly here rather than as a cryptic instruction-emit panic.
+            // Unreachable precondition: every compile entry point runs
+            // `lowering::lower_dwrt` before scheduling, which either rewrites
+            // all `Dwrt` (autodiff) nodes into chain-rule arithmetic or errors
+            // loudly on an op it cannot differentiate. A `Dwrt` here means a
+            // caller bypassed that pipeline. Fail loudly rather than as a
+            // cryptic instruction-emit panic.
             ExprNode::Binary(OpKind::Dwrt, _, _) => panic!(
                 "arena_to_schedule: a Dwrt (autodiff) node reached the JIT \
-                 emitter. It should have been rewritten away by the e-graph \
-                 chain rule; a survivor means an operator lacks a derivative \
-                 rule and the jet fallback is not yet implemented."
+                 emitter. lower_dwrt runs in every compile entry point and \
+                 either eliminates Dwrt or refuses to compile, so a survivor \
+                 means this schedule was built without the lowering pipeline."
             ),
             ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {
@@ -3289,13 +3293,16 @@ pub fn compile_arena_dag_with_ctx(
     // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
     // KernelFn ABI stay consistent with the selected width.
     //
-    // Lower, in order: reductions (unroll -> arithmetic + gathers), then memory
-    // reads (Gather -> index math + RawGather), then transcendentals. Each is a
-    // no-op when absent. Reduce runs first so the gathers it unrolls get lowered
-    // too. A kernel that reads bound memory takes its buffer bases from a context
-    // pointer in rdi; the emitted body is identical either way, so the caller
-    // invokes it as `CtxKernelFn` instead of `KernelFn`.
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    // Lower, in order: derivatives (Dwrt -> chain-rule arithmetic), reductions
+    // (unroll -> arithmetic + gathers), then memory reads (Gather -> index math
+    // + RawGather), then transcendentals. Each is a no-op when absent. Dwrt runs
+    // first because its rules emit Sin/Cos/Exp nodes the transcendental pass
+    // must still lower; Reduce runs before Gather so the gathers it unrolls get
+    // lowered too. A kernel that reads bound memory takes its buffer bases from
+    // a context pointer in rdi; the emitted body is identical either way, so the
+    // caller invokes it as `CtxKernelFn` instead of `KernelFn`.
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root)?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
@@ -3882,7 +3889,8 @@ pub fn compile_collapse_avx512(
     root: ExprId,
 ) -> Result<CompileResult, &'static str> {
     // Same lowering pipeline as the per-batch path.
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root)?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
     let arena = &arena;
@@ -4081,8 +4089,10 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     use crate::arena::ExprArena;
 
-    /// A `Dwrt` that reaches codegen (no differentiation rule eliminated it)
-    /// must fail loudly at the schedule boundary, not as a cryptic emit panic.
+    /// A `Dwrt` that reaches the scheduler (a caller bypassed the lowering
+    /// pipeline) must fail loudly at the schedule boundary, not as a cryptic
+    /// emit panic. The compile entry points run `lower_dwrt` first, so this
+    /// exercises calling `arena_to_schedule` directly.
     #[test]
     #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
     fn surviving_dwrt_fails_loudly() {
@@ -4976,6 +4986,52 @@ mod tests {
             let z = _mm_set1_ps(0.0);
             _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
         }
+    }
+
+    /// A `Dwrt`-carrying arena must JIT-compile end-to-end: the compile entry
+    /// runs `lower_dwrt`, so `D(√(x²+y²), x)` compiles to `x / √(x²+y²)`
+    /// without the caller ever seeing the derivative machinery.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    fn dwrt_compiles_to_analytic_derivative() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let x2 = a.push_binary(OpKind::Mul, x, x);
+        let y2 = a.push_binary(OpKind::Mul, y, y);
+        let sum = a.push_binary(OpKind::Add, x2, y2);
+        let dist = a.push_unary(OpKind::Sqrt, sum);
+        let v0 = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, dist, v0);
+
+        for (px, py) in [(3.0f32, 4.0f32), (1.0, 1.0), (-2.0, 5.0)] {
+            let got = run_xy(&a, root, px, py);
+            let want = px / (px * px + py * py).sqrt();
+            assert!(
+                (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                "d/dx dist at ({px},{py}): got {got}, want {want}"
+            );
+        }
+    }
+
+    /// A `Dwrt` over an op with no derivative rule must surface as a compile
+    /// error (loud refusal), not a miscompile or a scheduler panic.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn dwrt_of_gather_refuses_to_compile() {
+        use crate::arena::BufferDecl;
+        let mut a = ExprArena::new();
+        let buf = a.declare_buffer(BufferDecl {
+            width: 2,
+            height: 1,
+        });
+        let bufleaf = a.push_buffer(buf);
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let g = a.push_ternary(OpKind::Gather, bufleaf, x, y);
+        let v0 = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, g, v0);
+        assert!(compile_arena_dag(&a, root).is_err());
     }
 
     /// Every x86-64 unary transcendental/round op must match its scalar
