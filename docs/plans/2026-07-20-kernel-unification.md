@@ -54,12 +54,15 @@ to-be-retired backend, tracked until that backend dies.
   non-Copy manifold-param subexpressions. Prerequisite for fonts on `kernel!`;
   the defect class itself dies with the emitter, but fonts run on the emitter
   until parity lands.
-- **P2 — `lower_dwrt` in pixelflow-ir**: symbolic-differentiation lowering pass
+- **P2 — `lower_dwrt` in pixelflow-ir** *(landed 2026-07-22)*:
+  symbolic-differentiation lowering pass
   (peer of `expand_gather`/`expand_reduce`); ir_bridge maps V/DX/DY/DZ →
-  `Dwrt` nodes; the codegen panic at a surviving `Dwrt` becomes an unreachable
+  `Dwrt` nodes (plus DXX/DXY/DYY as nested `Dwrt`); the codegen panic at a
+  surviving `Dwrt` becomes an unreachable
   precondition. Errors loudly on unsupported ops. Acceptance: font-shaped
   coverage expressions JIT-compile and match combinator-over-Jet2 within
-  tolerance.
+  tolerance — see `jit_font_coverage_matches_*` in
+  pixelflow-compiler/tests/jit_parity.rs.
 - **P3 — routing scaffolding**: `kernel!` routes eligible bodies through the
   arena backend behind a cargo feature; parity suite runs both ways. This is
   transition scaffolding, not an end-state decision — default flips when the

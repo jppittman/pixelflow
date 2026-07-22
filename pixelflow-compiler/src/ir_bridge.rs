@@ -128,6 +128,11 @@ fn ast_to_arena_inner(
             let receiver = ast_to_arena_inner(&call.receiver, param_indices, locals, arena)?;
 
             match (method.as_str(), call.args.len()) {
+                // Arena expressions are values; `.clone()` (needed by the
+                // combinator backend for non-Copy trees) is the identity here,
+                // so one kernel body compiles under both backends.
+                ("clone", 0) => Ok(receiver),
+
                 // Unary methods - primitives
                 ("sqrt", 0) => Ok(arena.push_unary(OpKind::Sqrt, receiver)),
                 ("abs", 0) => Ok(arena.push_unary(OpKind::Abs, receiver)),
@@ -209,6 +214,42 @@ fn ast_to_arena_inner(
                 }
 
                 _ => Err(format!("Unsupported method: {}", method)),
+            }
+        }
+
+        // Derivative projections (V/DX/DY/DZ and the Hessian family) map to
+        // `Dwrt` nodes: the runtime `lower_dwrt` pass (pixelflow-ir) rewrites
+        // them into chain-rule arithmetic before codegen, replacing the
+        // combinator backend's Jet2/Jet3 forward-mode evaluation. `V` is the
+        // identity — every arena expression is already value-space.
+        Expr::Call(call) => {
+            let func = call.func.to_string();
+            if call.args.len() != 1 {
+                return Err(format!(
+                    "Unsupported call: {}/{} (projections take one argument)",
+                    func,
+                    call.args.len()
+                ));
+            }
+            let inner = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+            match func.as_str() {
+                "V" => Ok(inner),
+                "DX" => Ok(push_dwrt(arena, inner, 0)),
+                "DY" => Ok(push_dwrt(arena, inner, 1)),
+                "DZ" => Ok(push_dwrt(arena, inner, 2)),
+                "DXX" => {
+                    let d = push_dwrt(arena, inner, 0);
+                    Ok(push_dwrt(arena, d, 0))
+                }
+                "DXY" => {
+                    let d = push_dwrt(arena, inner, 0);
+                    Ok(push_dwrt(arena, d, 1))
+                }
+                "DYY" => {
+                    let d = push_dwrt(arena, inner, 1);
+                    Ok(push_dwrt(arena, d, 1))
+                }
+                _ => Err(format!("Unsupported call: {}", func)),
             }
         }
 
@@ -316,6 +357,13 @@ pub fn ast_to_runtime_arena(
     }})
 }
 
+/// Push `Dwrt(expr, var)` — the variable index rides as a `Const` operand,
+/// matching the encoding the e-graph `ChainRule` and `lower_dwrt` read.
+fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
+    let v = arena.push_const(var as f32);
+    arena.push_binary(OpKind::Dwrt, expr, v)
+}
+
 /// Extract f64 from a syn::Lit.
 fn extract_f64_from_lit(lit: &Lit) -> Option<f64> {
     match lit {
@@ -366,6 +414,8 @@ fn opkind_to_tokens(kind: OpKind) -> TokenStream {
         OpKind::Ne => quote! { ::pixelflow_ir::OpKind::Ne },
         OpKind::Select => quote! { ::pixelflow_ir::OpKind::Select },
         OpKind::Clamp => quote! { ::pixelflow_ir::OpKind::Clamp },
+        // Lowered at runtime by pixelflow-ir's `lower_dwrt` before codegen.
+        OpKind::Dwrt => quote! { ::pixelflow_ir::OpKind::Dwrt },
         _ => panic!("Unsupported OpKind for JIT: {:?}", kind),
     }
 }
