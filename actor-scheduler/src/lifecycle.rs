@@ -144,9 +144,6 @@ mod tests {
         assert_eq!(PodPhase::Running.to_string(), "Running");
         assert_eq!(PodPhase::Terminating.to_string(), "Terminating");
         assert_eq!(PodPhase::Completed.to_string(), "Completed");
-        assert_eq!(
-            PodPhase::Failed("boom".into()).to_string(),
-            "Failed(boom)"
-        );
+        assert_eq!(PodPhase::Failed("boom".into()).to_string(), "Failed(boom)");
     }
 }

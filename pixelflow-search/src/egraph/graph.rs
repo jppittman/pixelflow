@@ -384,7 +384,12 @@ impl EGraph {
             }
             Vec::new()
         };
-        super::provenance::derivation_ancestors(&tags_of, &children_of, &self.provenance, chosen_nodes)
+        super::provenance::derivation_ancestors(
+            &tags_of,
+            &children_of,
+            &self.provenance,
+            chosen_nodes,
+        )
     }
 
     /// Render a human-readable derivation trace for the given ancestry set
@@ -2333,7 +2338,11 @@ mod tests {
         eg.union(b, c);
         eg.rebuild();
 
-        assert_eq!(eg.find(nb), eg.find(nc), "Neg(b) and Neg(c) should have merged");
+        assert_eq!(
+            eg.find(nb),
+            eg.find(nc),
+            "Neg(b) and Neg(c) should have merged"
+        );
 
         // At least one recorded union event must have rule_idx = None
         // (the direct union(b, c) and/or the congruence-closure union that

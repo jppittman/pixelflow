@@ -113,7 +113,10 @@ impl PtyWriter {
         };
         // Resize failures are non-fatal (child may have exited).
         if let Err(e) = bound.pty.resize(resize.cols, resize.rows) {
-            warn!("Failed to resize PTY to {}x{}: {}", resize.cols, resize.rows, e);
+            warn!(
+                "Failed to resize PTY to {}x{}: {}",
+                resize.cols, resize.rows, e
+            );
         } else {
             debug!("PTY resized to {}x{}", resize.cols, resize.rows);
         }
@@ -160,7 +163,11 @@ impl Actor<Vec<u8>, WriterControl, WriterManagement> for PtyWriter {
         let WriterManagement::Bind { pty, waker } = msg;
         match BoundWriter::bind(pty, waker) {
             Ok(bound) => self.bound = Some(bound),
-            Err(e) => return Err(HandlerError::recoverable(format!("PTY writer bind failed: {e}"))),
+            Err(e) => {
+                return Err(HandlerError::recoverable(format!(
+                    "PTY writer bind failed: {e}"
+                )))
+            }
         }
         // Apply anything queued before the bind.
         if let Some(resize) = self.pending_resize.take() {

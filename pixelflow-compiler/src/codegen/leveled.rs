@@ -495,7 +495,8 @@ pub fn emit_leveled(
         for (node_idx, node) in level.iter().enumerate() {
             let var_name = NodeRef::new(level_idx, node_idx).var_name();
 
-            let value = emit_node(node, use_jet_wrapper);
+            let mode = if use_jet_wrapper { WrapperMode::Jet } else { WrapperMode::Standard };
+            let value = emit_node(node, mode);
             stmts.push(quote! { let #var_name = #value; });
         }
     }
@@ -511,7 +512,12 @@ pub fn emit_leveled(
 }
 
 /// Emit code for a single node
-fn emit_node(node: &LeveledNode, use_jet_wrapper: bool) -> TokenStream {
+enum WrapperMode {
+    Jet,
+    Standard,
+}
+
+fn emit_node(node: &LeveledNode, wrapper_mode: WrapperMode) -> TokenStream {
     match &node.kind {
         LeveledNodeKind::Param { name, kind } => {
             let name_ident = format_ident!("{}", name);
@@ -521,7 +527,7 @@ fn emit_node(node: &LeveledNode, use_jet_wrapper: bool) -> TokenStream {
                     quote! { #name_ident.eval(__p) }
                 }
                 ParamKind::Scalar(_) => {
-                    if use_jet_wrapper {
+                    if matches!(wrapper_mode, WrapperMode::Jet) {
                         quote! { __ScalarType::from_f32(#name_ident) }
                     } else {
                         quote! { ::pixelflow_core::Field::from(#name_ident) }
@@ -532,7 +538,7 @@ fn emit_node(node: &LeveledNode, use_jet_wrapper: bool) -> TokenStream {
 
         LeveledNodeKind::Literal { value } => {
             let lit = *value as f32;
-            if use_jet_wrapper {
+            if matches!(wrapper_mode, WrapperMode::Jet) {
                 quote! { __ScalarType::from_f32(#lit) }
             } else {
                 quote! { ::pixelflow_core::Field::from(#lit) }

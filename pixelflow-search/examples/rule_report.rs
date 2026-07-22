@@ -127,8 +127,15 @@ fn main() {
 
     println!("=== AGGREGATE over {} episodes ===", cases.len());
     let mut rows: Vec<_> = agg.into_iter().collect();
-    rows.sort_by(|a, b| (b.1.1 * a.1.0).cmp(&(a.1.1 * b.1.0)).then(b.1.0.cmp(&a.1.0)));
-    println!("{:<40} {:>7} {:>7} {:>7}", "rule", "fired", "l-bear", "ratio");
+    rows.sort_by(|a, b| {
+        (b.1.1 * a.1.0)
+            .cmp(&(a.1.1 * b.1.0))
+            .then(b.1.0.cmp(&a.1.0))
+    });
+    println!(
+        "{:<40} {:>7} {:>7} {:>7}",
+        "rule", "fired", "l-bear", "ratio"
+    );
     for (name, (fired, lb)) in rows {
         let ratio = if fired > 0 {
             lb as f64 / fired as f64

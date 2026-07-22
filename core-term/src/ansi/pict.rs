@@ -98,7 +98,10 @@ pub fn pairwise(level_counts: &[usize]) -> Vec<Vec<usize>> {
             row[f] = Some(best_level);
         }
 
-        let row: Vec<usize> = row.into_iter().map(|v| v.expect("row fully assigned")).collect();
+        let row: Vec<usize> = row
+            .into_iter()
+            .map(|v| v.expect("row fully assigned"))
+            .collect();
 
         // Mark every pair this row realizes as covered.
         for i in 0..n {

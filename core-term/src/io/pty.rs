@@ -191,12 +191,12 @@ impl NixPty {
         use std::os::unix::ffi::OsStringExt;
 
         // All heap work happens here in the parent, before the spawn call.
-        let slave_path = nix::unistd::ttyname(slave_fd.as_fd())
-            .context("Failed to resolve PTY slave path")?;
+        let slave_path =
+            nix::unistd::ttyname(slave_fd.as_fd()).context("Failed to resolve PTY slave path")?;
         let slave_path = CString::new(slave_path.into_os_string().into_vec())
             .context("PTY slave path contains NUL")?;
-        let exe = CString::new(config.command_executable)
-            .context("Command executable contains NUL")?;
+        let exe =
+            CString::new(config.command_executable).context("Command executable contains NUL")?;
         let mut argv: Vec<CString> = Vec::with_capacity(config.args.len() + 1);
         argv.push(exe.clone());
         for arg in config.args {
@@ -264,9 +264,8 @@ impl NixPty {
             libc::posix_spawnattr_setsigmask(&mut attr, &empty_mask);
             libc::posix_spawnattr_setflags(
                 &mut attr,
-                (POSIX_SPAWN_SETSID
-                    | libc::POSIX_SPAWN_SETSIGDEF
-                    | libc::POSIX_SPAWN_SETSIGMASK) as libc::c_short,
+                (POSIX_SPAWN_SETSID | libc::POSIX_SPAWN_SETSIGDEF | libc::POSIX_SPAWN_SETSIGMASK)
+                    as libc::c_short,
             );
 
             let rc = libc::posix_spawnp(

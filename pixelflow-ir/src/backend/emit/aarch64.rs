@@ -503,7 +503,10 @@ pub fn emit_ldr_x_imm(code: &mut Vec<u8>, gpr_dst: u8, gpr_base: u8, offset: u32
         "pointer load offset {offset} not 8-byte aligned"
     );
     let imm12 = offset / 8;
-    assert!(imm12 < 4096, "pointer load offset {offset} exceeds LDR imm12 range");
+    assert!(
+        imm12 < 4096,
+        "pointer load offset {offset} exceeds LDR imm12 range"
+    );
     emit32(
         code,
         0xF9400000 | (imm12 << 10) | ((gpr_base as u32) << 5) | (gpr_dst as u32),
@@ -514,10 +517,7 @@ pub fn emit_ldr_x_imm(code: &mut Vec<u8>, gpr_dst: u8, gpr_base: u8, offset: u32
 pub fn emit_ldr_w_uxtw2(code: &mut Vec<u8>, gpr_dst: u8, gpr_base: u8, gpr_index: u8) {
     emit32(
         code,
-        0xB8605800
-            | ((gpr_index as u32) << 16)
-            | ((gpr_base as u32) << 5)
-            | (gpr_dst as u32),
+        0xB8605800 | ((gpr_index as u32) << 16) | ((gpr_base as u32) << 5) | (gpr_dst as u32),
     );
 }
 

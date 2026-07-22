@@ -447,9 +447,8 @@ mod tests {
         let a0 = p.record_application(app(0, 0, EClassId(0)));
         p.record_origin(n1, Origin::Rule(a0));
 
-        let tags_of = |c: EClassId| -> Vec<ENodeId> {
-            if c == EClassId(0) { vec![n0] } else { vec![] }
-        };
+        let tags_of =
+            |c: EClassId| -> Vec<ENodeId> { if c == EClassId(0) { vec![n0] } else { vec![] } };
         let children_of = |_n: ENodeId| -> Vec<EClassId> { vec![] };
 
         let ancestors = derivation_ancestors(&tags_of, &children_of, &p, &[(EClassId(1), n1)]);
@@ -473,9 +472,8 @@ mod tests {
                 _ => vec![],
             }
         };
-        let children_of = |n: ENodeId| -> Vec<EClassId> {
-            if n == n2 { vec![EClassId(1)] } else { vec![] }
-        };
+        let children_of =
+            |n: ENodeId| -> Vec<EClassId> { if n == n2 { vec![EClassId(1)] } else { vec![] } };
 
         let ancestors = derivation_ancestors(&tags_of, &children_of, &p, &[(EClassId(2), n2)]);
         assert_eq!(ancestors, BTreeSet::from([a0, a1]));
