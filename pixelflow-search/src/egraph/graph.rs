@@ -1503,6 +1503,81 @@ impl EGraph {
                 let sign = op2(self, &ops::Div, u, au);
                 op2(self, &ops::Mul, sign, du)
             }
+            // d(rsqrt u) = -0.5 * rsqrt(u) * recip(u) * u'.
+            OpKind::Rsqrt => {
+                let u = children[0];
+                let du = dwrt(self, u);
+                let neg_half = cst(self, -0.5);
+                let rs = un(self, &ops::Rsqrt, u);
+                let rc = un(self, &ops::Recip, u);
+                let t = op2(self, &ops::Mul, rs, rc);
+                let factor = op2(self, &ops::Mul, neg_half, t);
+                op2(self, &ops::Mul, factor, du)
+            }
+            // Piecewise: derivative of the branch the primal takes. Masks and
+            // tie behavior mirror Jet2 (and the runtime `lower_dwrt` pass).
+            OpKind::Min => {
+                let (a, b) = (children[0], children[1]);
+                let da = dwrt(self, a);
+                let db = dwrt(self, b);
+                let mask = op2(self, &ops::Lt, a, b);
+                self.add(ENode::Op {
+                    op: &ops::Select,
+                    children: vec![mask, da, db],
+                })
+            }
+            OpKind::Max => {
+                let (a, b) = (children[0], children[1]);
+                let da = dwrt(self, a);
+                let db = dwrt(self, b);
+                let mask = op2(self, &ops::Gt, a, b);
+                self.add(ENode::Op {
+                    op: &ops::Select,
+                    children: vec![mask, da, db],
+                })
+            }
+            // Blend the branch derivatives on the primal mask; the mask itself
+            // is not differentiated.
+            OpKind::Select => {
+                let (m, t, f) = (children[0], children[1], children[2]);
+                let dt = dwrt(self, t);
+                let df = dwrt(self, f);
+                self.add(ENode::Op {
+                    op: &ops::Select,
+                    children: vec![m, dt, df],
+                })
+            }
+            // clamp(x, lo, hi) = min(max(x, lo), hi); differentiate that exact
+            // composition so masks (and ties) match the Jet2 chain.
+            OpKind::Clamp => {
+                let (x, lo, hi) = (children[0], children[1], children[2]);
+                let dx = dwrt(self, x);
+                let dlo = dwrt(self, lo);
+                let dhi = dwrt(self, hi);
+                let gt = op2(self, &ops::Gt, x, lo);
+                let dm = self.add(ENode::Op {
+                    op: &ops::Select,
+                    children: vec![gt, dx, dlo],
+                });
+                let m = op2(self, &ops::Max, x, lo);
+                let lt = op2(self, &ops::Lt, m, hi);
+                self.add(ENode::Op {
+                    op: &ops::Select,
+                    children: vec![lt, dm, dhi],
+                })
+            }
+            // Masks and rounding are step functions: zero almost everywhere.
+            OpKind::Lt
+            | OpKind::Le
+            | OpKind::Gt
+            | OpKind::Ge
+            | OpKind::Eq
+            | OpKind::Ne
+            | OpKind::Floor
+            | OpKind::Ceil
+            | OpKind::Round => self.add(ENode::constant(0.0)),
+            // fract(u) = u - floor(u), so d = u' almost everywhere.
+            OpKind::Fract => dwrt(self, children[0]),
             // d(sin u) = cos(u) * u'.
             OpKind::Sin => {
                 let u = children[0];
@@ -1563,11 +1638,73 @@ impl EGraph {
                 let e = un(self, &ops::Exp, u);
                 op2(self, &ops::Mul, e, du)
             }
+            // d(2^u) = 2^u * ln2 * u'.
+            OpKind::Exp2 => {
+                let u = children[0];
+                let du = dwrt(self, u);
+                let e = un(self, &ops::Exp2, u);
+                let ln2 = cst(self, core::f32::consts::LN_2);
+                let factor = op2(self, &ops::Mul, e, ln2);
+                op2(self, &ops::Mul, factor, du)
+            }
             // d(ln u) = u' / u.
             OpKind::Ln => {
                 let u = children[0];
                 let du = dwrt(self, u);
                 op2(self, &ops::Div, du, u)
+            }
+            // d(log2 u) = u' / (u * ln2).
+            OpKind::Log2 => {
+                let u = children[0];
+                let du = dwrt(self, u);
+                let ln2 = cst(self, core::f32::consts::LN_2);
+                let den = op2(self, &ops::Mul, u, ln2);
+                op2(self, &ops::Div, du, den)
+            }
+            // d(log10 u) = u' / (u * ln10).
+            OpKind::Log10 => {
+                let u = children[0];
+                let du = dwrt(self, u);
+                let ln10 = cst(self, core::f32::consts::LN_10);
+                let den = op2(self, &ops::Mul, u, ln10);
+                op2(self, &ops::Div, du, den)
+            }
+            // d(atan2(y, x)) = (x*y' - y*x') / (x² + y²).
+            OpKind::Atan2 => {
+                let (y, x) = (children[0], children[1]);
+                let dy = dwrt(self, y);
+                let dx = dwrt(self, x);
+                let t1 = op2(self, &ops::Mul, x, dy);
+                let t2 = op2(self, &ops::Mul, y, dx);
+                let num = op2(self, &ops::Sub, t1, t2);
+                let x2 = op2(self, &ops::Mul, x, x);
+                let y2 = op2(self, &ops::Mul, y, y);
+                let den = op2(self, &ops::Add, x2, y2);
+                op2(self, &ops::Div, num, den)
+            }
+            // d(hypot(a, b)) = (a*a' + b*b') / hypot(a, b).
+            OpKind::Hypot => {
+                let (a, b) = (children[0], children[1]);
+                let da = dwrt(self, a);
+                let db = dwrt(self, b);
+                let t1 = op2(self, &ops::Mul, a, da);
+                let t2 = op2(self, &ops::Mul, b, db);
+                let num = op2(self, &ops::Add, t1, t2);
+                let h = op2(self, &ops::Hypot, a, b);
+                op2(self, &ops::Div, num, h)
+            }
+            // d(f^g) = f^g * (g'*ln f + g*f'/f)  (Jet2's rule).
+            OpKind::Pow => {
+                let (f, g) = (children[0], children[1]);
+                let df = dwrt(self, f);
+                let dg = dwrt(self, g);
+                let lnf = un(self, &ops::Ln, f);
+                let t1 = op2(self, &ops::Mul, dg, lnf);
+                let g_over_f = op2(self, &ops::Div, g, f);
+                let t2 = op2(self, &ops::Mul, g_over_f, df);
+                let inner = op2(self, &ops::Add, t1, t2);
+                let p = op2(self, &ops::Pow, f, g);
+                op2(self, &ops::Mul, p, inner)
             }
             // Unknown derivative: reconstruct the Dwrt and let it survive.
             _ => {

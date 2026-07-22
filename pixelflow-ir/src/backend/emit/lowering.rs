@@ -451,33 +451,91 @@ pub fn lower_dwrt_owned(
 /// subgraph by id. Memoized per node, so a DAG differentiates once per shared
 /// subexpression (forward-mode on the DAG, like `Jet2` carries one derivative
 /// lane alongside the value).
+///
+/// Fully iterative — no recursion over expression depth, so arbitrarily deep
+/// kernels cannot overflow the stack. Two passes: (1) mark the nodes whose
+/// derivative a rule actually consumes (lazy per op: `Select` masks and
+/// comparison operands are never differentiated), walking an explicit stack;
+/// (2) compute marked derivatives in ascending id order — the arena is
+/// append-only, so children always precede parents.
 fn differentiate(arena: &mut ExprArena, expr: ExprId, var: u8) -> Result<ExprId, &'static str> {
-    let mut memo: Vec<Option<ExprId>> = alloc::vec![None; arena.nodes_raw().len()];
-    diff_rec(arena, expr, var, &mut memo)
-}
+    let entry_len = arena.nodes_raw().len();
 
-fn diff_rec(
-    arena: &mut ExprArena,
-    id: ExprId,
-    var: u8,
-    memo: &mut Vec<Option<ExprId>>,
-) -> Result<ExprId, &'static str> {
-    let idx = id.0 as usize;
-    if let Some(Some(d)) = memo.get(idx) {
-        return Ok(*d);
+    // Pass 1: mark derivative-needed nodes.
+    let mut need = alloc::vec![false; entry_len];
+    let mut stack: Vec<ExprId> = alloc::vec![expr];
+    while let Some(id) = stack.pop() {
+        if core::mem::replace(&mut need[id.0 as usize], true) {
+            continue;
+        }
+        push_deriv_children(arena.node(id), &mut stack);
     }
-    let d = diff_node(arena, id, var, memo)?;
-    if idx < memo.len() {
+
+    // Pass 2: bottom-up compute in topological (id) order.
+    let mut memo: Vec<Option<ExprId>> = alloc::vec![None; entry_len];
+    for idx in 0..entry_len {
+        if !need[idx] {
+            continue;
+        }
+        let d = diff_node(arena, ExprId(idx as u32), var, &memo)?;
         memo[idx] = Some(d);
     }
-    Ok(d)
+    Ok(memo[expr.0 as usize].expect("derivative of the root was computed"))
+}
+
+/// Which children's derivatives the rule for `node` consumes. Must stay in
+/// lockstep with [`diff_node`]: a child pushed here is differentiated eagerly;
+/// a child omitted here must not be read from the memo there. Ops with no
+/// rule push nothing — [`diff_node`] raises the error for the node itself.
+fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
+    match *node {
+        ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) => {}
+        ExprNode::Unary(op, a) => match op {
+            // d = 0 without touching the operand.
+            OpKind::Floor | OpKind::Ceil | OpKind::Round => {}
+            // No rule: the error surfaces at the node, not its children.
+            OpKind::TruncToInt | OpKind::IntToFloat => {}
+            _ => stack.push(a),
+        },
+        ExprNode::Binary(op, a, b) => match op {
+            OpKind::Add
+            | OpKind::Sub
+            | OpKind::Mul
+            | OpKind::Div
+            | OpKind::Min
+            | OpKind::Max
+            | OpKind::Atan2
+            | OpKind::Hypot
+            | OpKind::Pow => {
+                stack.push(a);
+                stack.push(b);
+            }
+            // Masks: d = 0 without touching the operands.
+            OpKind::Lt | OpKind::Le | OpKind::Gt | OpKind::Ge | OpKind::Eq | OpKind::Ne => {}
+            _ => {}
+        },
+        ExprNode::Ternary(op, a, b, c) => match op {
+            OpKind::MulAdd | OpKind::Clamp => {
+                stack.push(a);
+                stack.push(b);
+                stack.push(c);
+            }
+            // The mask is never differentiated.
+            OpKind::Select => {
+                stack.push(b);
+                stack.push(c);
+            }
+            _ => {}
+        },
+        ExprNode::Nary(_, _, _) => {}
+    }
 }
 
 fn diff_node(
     arena: &mut ExprArena,
     id: ExprId,
     var: u8,
-    memo: &mut Vec<Option<ExprId>>,
+    memo: &[Option<ExprId>],
 ) -> Result<ExprId, &'static str> {
     match arena.node(id).clone() {
         ExprNode::Var(i) => Ok(arena.push_const(if i == var { 1.0 } else { 0.0 })),
@@ -487,7 +545,19 @@ fn diff_node(
         ExprNode::Buffer(_) => Err("lower_dwrt: cannot differentiate a bound-memory read"),
 
         ExprNode::Unary(op, a) => {
-            let du = diff_rec(arena, a, var, memo)?;
+            // Step functions and int-domain ops never mark their operand in
+            // pass 1, so the memo read must stay behind the match.
+            match op {
+                // Step functions: zero derivative almost everywhere.
+                OpKind::Floor | OpKind::Ceil | OpKind::Round => {
+                    return Ok(arena.push_const(0.0));
+                }
+                OpKind::TruncToInt | OpKind::IntToFloat => {
+                    return Err("lower_dwrt: cannot differentiate integer/bit-manipulation ops");
+                }
+                _ => {}
+            }
+            let du = dchild(memo, a);
             match op {
                 OpKind::Neg => Ok(d_neg(arena, du)),
                 // d(√u) = 0.5·rsqrt(u)·u'  (Jet2 computes the same rsqrt form).
@@ -518,8 +588,6 @@ fn diff_node(
                     let sign = arena.push_binary(OpKind::Div, a, au);
                     Ok(d_mul(arena, sign, du))
                 }
-                // Step functions: zero derivative almost everywhere.
-                OpKind::Floor | OpKind::Ceil | OpKind::Round => Ok(arena.push_const(0.0)),
                 // fract(u) = u − floor(u), so d = u' a.e.
                 OpKind::Fract => Ok(du),
                 OpKind::Sin => {
@@ -580,36 +648,33 @@ fn diff_node(
                     let den = arena.push_binary(OpKind::Mul, a, ln10);
                     Ok(arena.push_binary(OpKind::Div, du, den))
                 }
-                OpKind::TruncToInt | OpKind::IntToFloat => {
-                    Err("lower_dwrt: cannot differentiate integer/bit-manipulation ops")
-                }
                 _ => Err("lower_dwrt: no derivative rule for this unary op"),
             }
         }
 
         ExprNode::Binary(op, a, b) => match op {
             OpKind::Add => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
                 Ok(d_add(arena, da, db))
             }
             OpKind::Sub => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
                 Ok(d_sub(arena, da, db))
             }
             // Product rule.
             OpKind::Mul => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
                 let t1 = d_mul(arena, da, b);
                 let t2 = d_mul(arena, a, db);
                 Ok(d_add(arena, t1, t2))
             }
             // Quotient rule: (a'b − ab') / b².
             OpKind::Div => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
                 let t1 = d_mul(arena, da, b);
                 let t2 = d_mul(arena, a, db);
                 let num = d_sub(arena, t1, t2);
@@ -622,14 +687,14 @@ fn diff_node(
             // Piecewise: derivative of the branch the primal takes (Jet2's
             // lt/gt masks, ties included).
             OpKind::Min => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
                 let mask = arena.push_binary(OpKind::Lt, a, b);
                 Ok(arena.push_ternary(OpKind::Select, mask, da, db))
             }
             OpKind::Max => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
                 let mask = arena.push_binary(OpKind::Gt, a, b);
                 Ok(arena.push_ternary(OpKind::Select, mask, da, db))
             }
@@ -639,8 +704,8 @@ fn diff_node(
             }
             // d(atan2(y, x)) = (x·y' − y·x') / (x² + y²).
             OpKind::Atan2 => {
-                let dy = diff_rec(arena, a, var, memo)?;
-                let dx = diff_rec(arena, b, var, memo)?;
+                let dy = dchild(memo, a);
+                let dx = dchild(memo, b);
                 let t1 = d_mul(arena, b, dy);
                 let t2 = d_mul(arena, a, dx);
                 let num = d_sub(arena, t1, t2);
@@ -654,8 +719,8 @@ fn diff_node(
             }
             // d(hypot(a, b)) = (a·a' + b·b') / hypot(a, b).
             OpKind::Hypot => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
                 let t1 = d_mul(arena, a, da);
                 let t2 = d_mul(arena, b, db);
                 let num = d_add(arena, t1, t2);
@@ -667,8 +732,8 @@ fn diff_node(
             }
             // d(f^g) = f^g · (g'·ln f + g·f'/f)  (Jet2's rule).
             OpKind::Pow => {
-                let df = diff_rec(arena, a, var, memo)?;
-                let dg = diff_rec(arena, b, var, memo)?;
+                let df = dchild(memo, a);
+                let dg = dchild(memo, b);
                 let lnf = arena.push_unary(OpKind::Ln, a);
                 let t1 = d_mul(arena, dg, lnf);
                 let g_over_f = arena.push_binary(OpKind::Div, b, a);
@@ -691,9 +756,9 @@ fn diff_node(
         ExprNode::Ternary(op, a, b, c) => match op {
             // d(a·b + c) = a'·b + a·b' + c'.
             OpKind::MulAdd => {
-                let da = diff_rec(arena, a, var, memo)?;
-                let db = diff_rec(arena, b, var, memo)?;
-                let dc = diff_rec(arena, c, var, memo)?;
+                let da = dchild(memo, a);
+                let db = dchild(memo, b);
+                let dc = dchild(memo, c);
                 let t1 = d_mul(arena, da, b);
                 let t2 = d_mul(arena, a, db);
                 let prod = d_add(arena, t1, t2);
@@ -701,16 +766,16 @@ fn diff_node(
             }
             // Blend the branch derivatives on the primal mask (Jet2 select).
             OpKind::Select => {
-                let db = diff_rec(arena, b, var, memo)?;
-                let dc = diff_rec(arena, c, var, memo)?;
+                let db = dchild(memo, b);
+                let dc = dchild(memo, c);
                 Ok(arena.push_ternary(OpKind::Select, a, db, dc))
             }
             // clamp(x, lo, hi) = min(max(x, lo), hi); differentiate that exact
             // composition so masks (and tie behavior) match the Jet2 chain.
             OpKind::Clamp => {
-                let dx = diff_rec(arena, a, var, memo)?;
-                let dlo = diff_rec(arena, b, var, memo)?;
-                let dhi = diff_rec(arena, c, var, memo)?;
+                let dx = dchild(memo, a);
+                let dlo = dchild(memo, b);
+                let dhi = dchild(memo, c);
                 let gt = arena.push_binary(OpKind::Gt, a, b);
                 let dm = arena.push_ternary(OpKind::Select, gt, dx, dlo);
                 let m = arena.push_binary(OpKind::Max, a, b);
@@ -725,6 +790,13 @@ fn diff_node(
             Err("lower_dwrt: cannot differentiate an Nary op (Reduce/Tuple)")
         }
     }
+}
+
+/// Read a child's already-computed derivative. Pass 1 marks exactly the
+/// children each rule consumes and pass 2 runs bottom-up, so the entry is
+/// always populated when the parent's rule fires.
+fn dchild(memo: &[Option<ExprId>], child: ExprId) -> ExprId {
+    memo[child.0 as usize].expect("child derivative marked and computed before parent")
 }
 
 /// `√(1 − u²)` — shared by the asin/acos rules.
@@ -1314,6 +1386,28 @@ mod dwrt_tests {
         let (out, root) = lower_dwrt_owned(&a, e).expect("lower_dwrt");
         assert_eq!(out.nodes_raw().len(), a.nodes_raw().len());
         assert_eq!(root, e);
+    }
+
+    /// A pathologically deep expression must lower without stack overflow —
+    /// both the rebuild and the differentiation are iterative.
+    #[test]
+    fn deep_chain_does_not_overflow_the_stack() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let one = a.push_const(1.0);
+        let mut e = x;
+        for i in 0..100_000u32 {
+            e = match i % 3 {
+                0 => a.push_binary(OpKind::Add, e, one),
+                1 => a.push_binary(OpKind::Mul, e, x),
+                _ => a.push_unary(OpKind::Sqrt, e),
+            };
+        }
+        let v0 = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, e, v0);
+        let (out, out_root) = lower_dwrt_owned(&a, root).expect("lower_dwrt");
+        assert!(out.nodes_raw().len() > a.nodes_raw().len());
+        assert!((out_root.0 as usize) < out.nodes_raw().len());
     }
 
     #[test]

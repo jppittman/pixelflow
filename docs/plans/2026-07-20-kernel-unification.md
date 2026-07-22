@@ -63,6 +63,14 @@ to-be-retired backend, tracked until that backend dies.
   coverage expressions JIT-compile and match combinator-over-Jet2 within
   tolerance — see `jit_font_coverage_matches_*` in
   pixelflow-compiler/tests/jit_parity.rs.
+  **Tiering (2026-07-22):** the calculus runs in the optimizer first — the
+  e-graph `ChainRule` (plus piecewise rules mirroring Jet2 semantics) expands
+  and simplifies `Dwrt` at macro-expansion time in ir_bridge, with scalar
+  params round-tripped as reserved `Var` indices. `lower_dwrt` is the fallback
+  tier for residual `Dwrt` (budget miss / runtime-composed kernels) and errors
+  loudly on genuinely non-differentiable ops. Jets are not a fallback: they
+  would reintroduce the jet ABI this plan retires, and remain
+  combinator-backend-only until P6.
 - **P3 — routing scaffolding**: `kernel!` routes eligible bodies through the
   arena backend behind a cargo feature; parity suite runs both ways. This is
   transition scaffolding, not an end-state decision — default flips when the

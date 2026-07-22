@@ -86,9 +86,10 @@ pub enum OpKind {
     // --- Differentiation ---
     /// Symbolic derivative `∂(child0)/∂(var)` where `child1` is a `Const` whose
     /// value is the variable index (0=X, 1=Y, 2=Z, 3=W). The e-graph pushes
-    /// `Dwrt` toward the leaves via the chain rule, computing the derivative
-    /// analytically; whatever cannot be decomposed survives as a residual `Dwrt`
-    /// (the jet fallback — not yet wired). It must never reach a backend.
+    /// `Dwrt` toward the leaves via the chain rule at optimization time;
+    /// whatever survives (budget miss, unsupported op) falls to the runtime
+    /// `lower_dwrt` pass, which either eliminates it or refuses to compile.
+    /// It must never reach a backend.
     Dwrt = 48,
 
     // --- Bound memory (lattices) ---

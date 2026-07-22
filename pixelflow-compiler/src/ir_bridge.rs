@@ -284,12 +284,23 @@ fn ast_to_arena_inner(
 }
 
 /// Generate runtime arena-construction code from macro AST.
+///
+/// Derivatives are eliminated here, at macro-expansion time, when possible:
+/// see [`differentiate_in_optimizer`]. Kernels whose `Dwrt` nodes survive (an
+/// op the e-graph cannot differentiate, or a saturation budget miss) emit the
+/// `Dwrt`-carrying arena unchanged — the runtime `lower_dwrt` pass in
+/// pixelflow-ir is the fallback tier and errors loudly only on genuinely
+/// non-differentiable ops.
 pub fn ast_to_runtime_arena(
     expr: &Expr,
     param_indices: &HashMap<String, u8>,
 ) -> Result<TokenStream, String> {
     let mut arena = ExprArena::new();
-    let root = ast_to_arena(expr, param_indices, &mut arena)?;
+    let mut root = ast_to_arena(expr, param_indices, &mut arena)?;
+    if let Some((optimized, optimized_root)) = differentiate_in_optimizer(&arena, root) {
+        arena = optimized;
+        root = optimized_root;
+    }
     let nodes = arena.nodes_raw();
     let nary_children = arena.nary_children_raw();
 
@@ -364,6 +375,102 @@ fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
     arena.push_binary(OpKind::Dwrt, expr, v)
 }
 
+// ============================================================================
+// Expansion-time differentiation (calculus in the optimizer)
+// ============================================================================
+
+/// Base `Var` index used to carry `Param(i)` leaves through the e-graph, which
+/// has no Param representation: indices 0..4 are coordinates and 4..8 are
+/// reduction indices, so params ride at 16+ and are mapped back after
+/// extraction. To every rewrite rule they are opaque leaves — exactly the
+/// semantics of an unbound scalar — and the chain rule gives them derivative
+/// zero like any non-differentiation variable.
+const PARAM_VAR_BASE: u8 = 16;
+
+/// Run the AOT-tier e-graph (full rule set: derivative + algebra + fusion,
+/// generous budget) over a `Dwrt`-carrying expansion arena, so derivatives are
+/// expanded *and simplified* at macro-expansion time and the runtime never
+/// sees the calculus.
+///
+/// Returns `None` when there is nothing to do (no `Dwrt`) or when the result
+/// still contains a `Dwrt` (unsupported op / budget miss) — the caller then
+/// emits the original arena and the runtime `lower_dwrt` pass takes over.
+fn differentiate_in_optimizer(arena: &ExprArena, root: ExprId) -> Option<(ExprArena, ExprId)> {
+    use pixelflow_ir::arena::ExprNode;
+    use pixelflow_search::egraph::{CostModel, EGraph, extract};
+
+    if !contains_dwrt(arena) {
+        return None;
+    }
+
+    // Every op must be representable in the e-graph (`add_arena` panics on
+    // ops with no rewrite-rule `Op`, e.g. the bit-manip primitives). The
+    // kernel surface cannot produce those today, but fall back rather than
+    // panic if that ever changes.
+    let representable = arena.nodes_raw().iter().all(|n| match n {
+        ExprNode::Unary(op, _)
+        | ExprNode::Binary(op, _, _)
+        | ExprNode::Ternary(op, _, _, _)
+        | ExprNode::Nary(op, _, _) => pixelflow_search::egraph::ops::op_from_kind(*op).is_some(),
+        ExprNode::Buffer(_) => false,
+        ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => true,
+    });
+    if !representable {
+        return None;
+    }
+
+    // Param(i) -> Var(16+i) for the round-trip.
+    let encoded_nodes: Vec<ExprNode> = arena
+        .nodes_raw()
+        .iter()
+        .map(|n| match n {
+            ExprNode::Param(i) => {
+                assert!(
+                    *i < u8::MAX - PARAM_VAR_BASE,
+                    "kernel has too many scalar params to encode for the e-graph"
+                );
+                ExprNode::Var(PARAM_VAR_BASE + i)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let encoded = ExprArena::from_raw(encoded_nodes, arena.nary_children_raw().to_vec());
+
+    let mut eg = EGraph::with_rules(crate::optimize::standard_rules());
+    let root_class = eg.add_arena(&encoded, root);
+    // AOT tier: generous saturation budget (default limits: 100 iters, 10k
+    // classes, 500ms) — this runs once per kernel at macro expansion.
+    eg.saturate();
+
+    let (out, out_root, _cost) = extract(&eg, root_class, &CostModel::default());
+    if contains_dwrt(&out) {
+        return None;
+    }
+
+    // Var(16+i) -> Param(i).
+    let decoded_nodes: Vec<ExprNode> = out
+        .nodes_raw()
+        .iter()
+        .map(|n| match n {
+            ExprNode::Var(i) if *i >= PARAM_VAR_BASE => ExprNode::Param(i - PARAM_VAR_BASE),
+            other => other.clone(),
+        })
+        .collect();
+    let decoded = ExprArena::from_raw(decoded_nodes, out.nary_children_raw().to_vec());
+    Some((decoded, out_root))
+}
+
+fn contains_dwrt(arena: &ExprArena) -> bool {
+    arena.nodes_raw().iter().any(|n| {
+        matches!(
+            n,
+            pixelflow_ir::arena::ExprNode::Binary(OpKind::Dwrt, _, _)
+                | pixelflow_ir::arena::ExprNode::Unary(OpKind::Dwrt, _)
+                | pixelflow_ir::arena::ExprNode::Ternary(OpKind::Dwrt, _, _, _)
+        )
+    })
+}
+
 /// Extract f64 from a syn::Lit.
 fn extract_f64_from_lit(lit: &Lit) -> Option<f64> {
     match lit {
@@ -417,5 +524,101 @@ fn opkind_to_tokens(kind: OpKind) -> TokenStream {
         // Lowered at runtime by pixelflow-ir's `lower_dwrt` before codegen.
         OpKind::Dwrt => quote! { ::pixelflow_ir::OpKind::Dwrt },
         _ => panic!("Unsupported OpKind for JIT: {:?}", kind),
+    }
+}
+
+#[cfg(test)]
+mod expansion_derivative_tests {
+    use super::*;
+    use pixelflow_ir::arena::ExprNode;
+    use pixelflow_ir::binding::BindingTable;
+    use pixelflow_ir::eval::eval_scalar;
+
+    /// `Dwrt` with a scalar param in the differentiand: the optimizer must
+    /// eliminate the derivative at expansion time AND round-trip the param
+    /// (Param -> Var(16+) -> Param) so runtime substitution still works.
+    /// d/dx (p0 * sqrt(x² + y²)) = p0 * x / sqrt(x² + y²).
+    #[test]
+    fn eliminates_dwrt_and_preserves_params() {
+        let mut a = ExprArena::new();
+        let p0 = a.push_param(0);
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let x2 = a.push_binary(OpKind::Mul, x, x);
+        let y2 = a.push_binary(OpKind::Mul, y, y);
+        let sum = a.push_binary(OpKind::Add, x2, y2);
+        let dist = a.push_unary(OpKind::Sqrt, sum);
+        let e = a.push_binary(OpKind::Mul, p0, dist);
+        let root = push_dwrt(&mut a, e, 0);
+
+        let (out, out_root) =
+            differentiate_in_optimizer(&a, root).expect("optimizer should eliminate Dwrt");
+
+        assert!(!super::contains_dwrt(&out), "residual Dwrt after extraction");
+        assert!(
+            out.nodes_raw()
+                .iter()
+                .any(|n| matches!(n, ExprNode::Param(0))),
+            "Param(0) lost in the e-graph round-trip"
+        );
+
+        let mut sub = out.clone();
+        let sub_root = sub.substitute_params(out_root, &[2.0]);
+        for (px, py) in [(3.0f32, 4.0f32), (1.0, 1.0), (-2.0, 5.0)] {
+            let got = eval_scalar(&sub, sub_root, &[px, py, 0.0, 0.0], &BindingTable::empty());
+            let want = 2.0 * px / (px * px + py * py).sqrt();
+            let tol = 1e-3 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "at ({px},{py}): got {got}, want {want}"
+            );
+        }
+    }
+
+    /// The piecewise font ramp (min/max over a derivative ratio) must also
+    /// resolve at expansion time now that the e-graph carries piecewise rules.
+    #[test]
+    fn eliminates_dwrt_through_min_max() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let d = a.push_binary(OpKind::Sub, x, y);
+        let dx = push_dwrt(&mut a, d, 0);
+        let dy = push_dwrt(&mut a, d, 1);
+        let dx2 = a.push_binary(OpKind::Mul, dx, dx);
+        let dy2 = a.push_binary(OpKind::Mul, dy, dy);
+        let s = a.push_binary(OpKind::Add, dx2, dy2);
+        let grad = a.push_unary(OpKind::Sqrt, s);
+        let ratio = a.push_binary(OpKind::Div, d, grad);
+        let zero = a.push_const(0.0);
+        let one = a.push_const(1.0);
+        let mx = a.push_binary(OpKind::Max, ratio, zero);
+        let root = a.push_binary(OpKind::Min, mx, one);
+
+        let (out, out_root) =
+            differentiate_in_optimizer(&a, root).expect("optimizer should eliminate Dwrt");
+        assert!(!super::contains_dwrt(&out));
+
+        // clamp((x-y)/√2, 0, 1)
+        for (px, py) in [(2.0f32, 1.0f32), (0.5, 0.2), (-1.0, 1.0)] {
+            let got = eval_scalar(&out, out_root, &[px, py, 0.0, 0.0], &BindingTable::empty());
+            let want = ((px - py) / 2.0f32.sqrt()).clamp(0.0, 1.0);
+            let tol = 1e-3 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "at ({px},{py}): got {got}, want {want}"
+            );
+        }
+    }
+
+    /// No `Dwrt` -> nothing to do; the caller keeps the original arena (and
+    /// the AST-level optimizer's existing output is not perturbed).
+    #[test]
+    fn no_dwrt_is_untouched() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let _root = a.push_binary(OpKind::Add, x, y);
+        assert!(differentiate_in_optimizer(&a, _root).is_none());
     }
 }
