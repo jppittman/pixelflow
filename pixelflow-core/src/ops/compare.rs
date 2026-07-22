@@ -266,3 +266,134 @@ where
         false_val + mask_val * (true_val - false_val)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Field, Mask, PARALLELISM};
+
+    type Field4 = (Field, Field, Field, Field);
+    type Jet2_4 = (Jet2, Jet2, Jet2, Jet2);
+
+    fn first_lane(f: Field) -> f32 {
+        let mut buf = [0.0f32; PARALLELISM];
+        f.store(&mut buf);
+        buf[0]
+    }
+
+    /// Comparisons produce a `Field` mask; `Mask::from` is the crate's
+    /// public bridge from that mask-as-Field back to boolean truth.
+    fn eval_bool<M: Manifold<Field4, Output = Field>>(cond: M) -> bool {
+        let result = cond.eval((
+            Field::from(0.0),
+            Field::from(0.0),
+            Field::from(0.0),
+            Field::from(0.0),
+        ));
+        Mask::from(result).all()
+    }
+
+    // Constructed directly as `Le(l, r)` / `Ge(l, r)` / etc. (this file's
+    // own tuple structs, re-exported at the crate root) rather than via
+    // `Field`'s inherent `Algebra` comparison methods of the same name,
+    // so these tests exercise the `Manifold::eval` bodies defined above.
+
+    #[test]
+    fn le_covers_less_equal_and_greater() {
+        assert!(eval_bool(Le(Field::from(1.0), Field::from(2.0))));
+        assert!(eval_bool(Le(Field::from(2.0), Field::from(2.0))));
+        assert!(!eval_bool(Le(Field::from(3.0), Field::from(2.0))));
+    }
+
+    #[test]
+    fn ge_covers_greater_equal_and_less() {
+        assert!(eval_bool(Ge(Field::from(3.0), Field::from(2.0))));
+        assert!(eval_bool(Ge(Field::from(2.0), Field::from(2.0))));
+        assert!(!eval_bool(Ge(Field::from(1.0), Field::from(2.0))));
+    }
+
+    #[test]
+    fn eq_covers_equal_and_unequal() {
+        assert!(eval_bool(Eq(Field::from(2.0), Field::from(2.0))));
+        assert!(!eval_bool(Eq(Field::from(2.0), Field::from(3.0))));
+    }
+
+    #[test]
+    fn ne_covers_unequal_and_equal() {
+        assert!(eval_bool(Ne(Field::from(2.0), Field::from(3.0))));
+        assert!(!eval_bool(Ne(Field::from(2.0), Field::from(2.0))));
+    }
+
+    fn jet_domain(val: f32) -> Jet2_4 {
+        let jet = Jet2::constant(Field::from(val));
+        (jet, jet, jet, jet)
+    }
+
+    #[test]
+    fn soft_gt_saturates_above_and_below_boundary() {
+        let far_above = SoftGt {
+            left: Jet2::constant(Field::from(10.0)),
+            right: Jet2::constant(Field::from(0.0)),
+            sharpness: 0.5,
+        };
+        let far_below = SoftGt {
+            left: Jet2::constant(Field::from(-10.0)),
+            right: Jet2::constant(Field::from(0.0)),
+            sharpness: 0.5,
+        };
+        assert!((first_lane(far_above.eval(jet_domain(0.0)).val) - 1.0).abs() < 1e-3);
+        assert!(first_lane(far_below.eval(jet_domain(0.0)).val).abs() < 1e-3);
+    }
+
+    #[test]
+    fn soft_gt_at_boundary_is_half() {
+        let at_boundary = SoftGt {
+            left: Jet2::constant(Field::from(5.0)),
+            right: Jet2::constant(Field::from(5.0)),
+            sharpness: 0.5,
+        };
+        assert!((first_lane(at_boundary.eval(jet_domain(0.0)).val) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn soft_lt_saturates_above_and_below_boundary() {
+        let far_above = SoftLt {
+            left: Jet2::constant(Field::from(10.0)),
+            right: Jet2::constant(Field::from(0.0)),
+            sharpness: 0.5,
+        };
+        let far_below = SoftLt {
+            left: Jet2::constant(Field::from(-10.0)),
+            right: Jet2::constant(Field::from(0.0)),
+            sharpness: 0.5,
+        };
+        assert!(first_lane(far_above.eval(jet_domain(0.0)).val).abs() < 1e-3);
+        assert!((first_lane(far_below.eval(jet_domain(0.0)).val) - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn soft_select_picks_true_and_false_branches() {
+        let pick_true = SoftSelect {
+            mask: Jet2::constant(Field::from(1.0)),
+            if_true: Jet2::constant(Field::from(7.0)),
+            if_false: Jet2::constant(Field::from(3.0)),
+        };
+        let pick_false = SoftSelect {
+            mask: Jet2::constant(Field::from(0.0)),
+            if_true: Jet2::constant(Field::from(7.0)),
+            if_false: Jet2::constant(Field::from(3.0)),
+        };
+        assert!((first_lane(pick_true.eval(jet_domain(0.0)).val) - 7.0).abs() < 1e-6);
+        assert!((first_lane(pick_false.eval(jet_domain(0.0)).val) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn soft_select_blends_at_half_mask() {
+        let blended = SoftSelect {
+            mask: Jet2::constant(Field::from(0.5)),
+            if_true: Jet2::constant(Field::from(10.0)),
+            if_false: Jet2::constant(Field::from(0.0)),
+        };
+        assert!((first_lane(blended.eval(jet_domain(0.0)).val) - 5.0).abs() < 1e-6);
+    }
+}

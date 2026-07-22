@@ -419,10 +419,11 @@ impl SimdOps for F32x4 {
             let x = vsubq_f32(self.0, vmulq_f32(k, vdupq_n_f32(TWO_PI)));
             let t = vmulq_f32(x, vdupq_n_f32(PI_INV));
 
-            let c1 = vdupq_n_f32(1.671_997_1);
-            let c3 = vdupq_n_f32(-0.645_963_55);
-            let c5 = vdupq_n_f32(0.079_689_45);
-            let c7 = vdupq_n_f32(-0.004_681_754);
+            // Minimax coefficients for sin(pi*t), t in [-1,1] (max abs err ~2.6e-4)
+            let c1 = vdupq_n_f32(3.139_275_7);
+            let c3 = vdupq_n_f32(-5.136_387);
+            let c5 = vdupq_n_f32(2.434_668_3);
+            let c7 = vdupq_n_f32(-0.437_801_8);
 
             let t2 = vmulq_f32(t, t);
             let poly = vfmaq_f32(c5, c7, t2);
@@ -447,10 +448,11 @@ impl SimdOps for F32x4 {
             let x = vsubq_f32(self.0, vmulq_f32(k, vdupq_n_f32(TWO_PI)));
             let t = vmulq_f32(x, vdupq_n_f32(PI_INV));
 
-            let c0 = vdupq_n_f32(core::f32::consts::FRAC_PI_2);
-            let c2 = vdupq_n_f32(-2.467_401_3);
-            let c4 = vdupq_n_f32(0.609_469_35);
-            let c6 = vdupq_n_f32(-0.038854038);
+            // Minimax coefficients for cos(pi*t), t in [-1,1] (max abs err ~1.4e-3)
+            let c0 = vdupq_n_f32(0.998_564_9);
+            let c2 = vdupq_n_f32(-4.888_198_6);
+            let c4 = vdupq_n_f32(3.819_262_7);
+            let c6 = vdupq_n_f32(-0.930_980_2);
 
             let t2 = vmulq_f32(t, t);
             let poly = vfmaq_f32(c4, c6, t2);
@@ -471,34 +473,45 @@ impl SimdOps for F32x4 {
             let r = vdivq_f32(y, x_val);
             let r_abs = vabsq_f32(r);
 
-            let c1 = vdupq_n_f32(0.999999999);
-            let c3 = vdupq_n_f32(-0.333_333_34);
-            let c5 = vdupq_n_f32(0.2);
-            let c7 = vdupq_n_f32(-0.142_857_15);
+            // Minimax coefficients for atan(t) on [0, 1] (max abs err ~8.7e-5)
+            let c1 = vdupq_n_f32(0.999_268_04);
+            let c3 = vdupq_n_f32(-0.321_431_33);
+            let c5 = vdupq_n_f32(0.146_614_41);
+            let c7 = vdupq_n_f32(-0.039_132_48);
 
-            let t = r_abs;
-            let t2 = vmulq_f32(t, t);
-            let poly = vfmaq_f32(c5, c7, t2);
-            let poly = vfmaq_f32(c3, poly, t2);
-            let poly = vfmaq_f32(c1, poly, t2);
-            let atan_approx = vmulq_f32(poly, t);
+            let atan_poly = |t: float32x4_t| -> float32x4_t {
+                let t2 = vmulq_f32(t, t);
+                let poly = vfmaq_f32(c5, c7, t2);
+                let poly = vfmaq_f32(c3, poly, t2);
+                let poly = vfmaq_f32(c1, poly, t2);
+                vmulq_f32(poly, t)
+            };
 
+            // |r| > 1: atan(r) = π/2 - atan(1/r), evaluating the polynomial
+            // at the reciprocal (not `atan(|r|)` rescaled by 1/|r|).
+            let atan_small = atan_poly(r_abs);
             let one = vdupq_n_f32(1.0);
-            let mask_large = vcgtq_f32(r_abs, one);
             let recip_r = vdivq_f32(one, r_abs);
-            let atan_large = vsubq_f32(vdupq_n_f32(PI_2), vmulq_f32(recip_r, atan_approx));
-            let atan_val = vbslq_f32(mask_large, atan_large, atan_approx);
+            let atan_large = vsubq_f32(vdupq_n_f32(PI_2), atan_poly(recip_r));
+            let mask_large = vcgtq_f32(r_abs, one);
+            let atan_val = vbslq_f32(mask_large, atan_large, atan_small);
 
-            let y_abs = vabsq_f32(y);
-            let sign_y = vdivq_f32(y_abs, y);
+            // Sign of y via comparison (not y_abs/y, which is 0/0 = NaN at y == 0).
+            let zero = vdupq_n_f32(0.0);
+            let neg_one = vdupq_n_f32(-1.0);
+            let mask_y_neg = vcltq_f32(y, zero);
+            let sign_y = vbslq_f32(mask_y_neg, neg_one, one);
             let atan_signed = vmulq_f32(atan_val, sign_y);
 
-            let zero = vdupq_n_f32(0.0);
+            // Handle negative x (quadrant correction). For x < 0, dividing by
+            // a negative x flips the ratio's sign on top of sign_y, so the
+            // correct combination is `correction - atan_signed` (see
+            // pixelflow-core::ops::trig::cheby_atan2 for the derivation).
             let mask_neg_x = vcltq_f32(x_val, zero);
             let correction = vmulq_f32(vdupq_n_f32(PI), sign_y);
             Self(vbslq_f32(
                 mask_neg_x,
-                vsubq_f32(atan_signed, correction),
+                vsubq_f32(correction, atan_signed),
                 atan_signed,
             ))
         }

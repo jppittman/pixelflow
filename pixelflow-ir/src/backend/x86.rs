@@ -414,11 +414,11 @@ impl SimdOps for F32x4 {
             // Normalize to [-1, 1] for Chebyshev basis
             let t = _mm_mul_ps(x, _mm_set1_ps(PI_INV));
 
-            // Chebyshev coefficients for sin
-            let c1 = _mm_set1_ps(1.671_997_1);
-            let c3 = _mm_set1_ps(-0.645_963_55);
-            let c5 = _mm_set1_ps(0.079_689_45);
-            let c7 = _mm_set1_ps(-0.004_681_754);
+            // Minimax coefficients for sin(pi*t), t in [-1,1] (max abs err ~2.6e-4)
+            let c1 = _mm_set1_ps(3.139_275_7);
+            let c3 = _mm_set1_ps(-5.136_387);
+            let c5 = _mm_set1_ps(2.434_668_3);
+            let c7 = _mm_set1_ps(-0.437_801_8);
 
             // Horner's method: ((C7*t² + C5)*t² + C3)*t² + C1)*t
             let t2 = _mm_mul_ps(t, t);
@@ -448,41 +448,50 @@ impl SimdOps for F32x4 {
             let r = _mm_div_ps(y, x_val);
             let r_abs = _mm_and_ps(r, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
 
-            // Chebyshev coefficients for atan on [0, 1]
-            let c1 = _mm_set1_ps(0.999999999);
-            let c3 = _mm_set1_ps(-0.333_333_34);
-            let c5 = _mm_set1_ps(0.2);
-            let c7 = _mm_set1_ps(-0.142_857_15);
+            // Minimax coefficients for atan(t) on [0, 1] (max abs err ~8.7e-5)
+            let c1 = _mm_set1_ps(0.999_268_04);
+            let c3 = _mm_set1_ps(-0.321_431_33);
+            let c5 = _mm_set1_ps(0.146_614_41);
+            let c7 = _mm_set1_ps(-0.039_132_48);
 
-            // Horner's method
-            let t = r_abs;
-            let t2 = _mm_mul_ps(t, t);
-            let mut poly = _mm_add_ps(_mm_mul_ps(c7, t2), c5);
-            poly = _mm_add_ps(_mm_mul_ps(poly, t2), c3);
-            poly = _mm_add_ps(_mm_mul_ps(poly, t2), c1);
-            let atan_approx = _mm_mul_ps(poly, t);
+            let atan_poly = |t: __m128| -> __m128 {
+                let t2 = _mm_mul_ps(t, t);
+                let mut poly = _mm_add_ps(_mm_mul_ps(c7, t2), c5);
+                poly = _mm_add_ps(_mm_mul_ps(poly, t2), c3);
+                poly = _mm_add_ps(_mm_mul_ps(poly, t2), c1);
+                _mm_mul_ps(poly, t)
+            };
 
-            // Handle |r| > 1: atan(r) = π/2 - atan(1/r)
+            // |r| > 1: atan(r) = π/2 - atan(1/r), evaluating the polynomial
+            // at the reciprocal (not `atan(|r|)` rescaled by 1/|r|).
+            let atan_small = atan_poly(r_abs);
             let one = _mm_set1_ps(1.0);
-            let mask_large = _mm_cmpgt_ps(r_abs, one);
             let recip_r = _mm_div_ps(one, r_abs);
-            let atan_large = _mm_sub_ps(_mm_set1_ps(PI_2), _mm_mul_ps(recip_r, atan_approx));
+            let atan_large = _mm_sub_ps(_mm_set1_ps(PI_2), atan_poly(recip_r));
+            let mask_large = _mm_cmpgt_ps(r_abs, one);
             let atan_val = _mm_or_ps(
                 _mm_and_ps(mask_large, atan_large),
-                _mm_andnot_ps(mask_large, atan_approx),
+                _mm_andnot_ps(mask_large, atan_small),
             );
 
-            // Apply sign of y
-            let y_abs = _mm_and_ps(y, _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
-            let sign_y = _mm_div_ps(y_abs, y);
+            // Sign of y via comparison (not y_abs/y, which is 0/0 = NaN at y == 0).
+            let zero = _mm_setzero_ps();
+            let neg_one = _mm_set1_ps(-1.0);
+            let mask_y_neg = _mm_cmplt_ps(y, zero);
+            let sign_y = _mm_or_ps(
+                _mm_and_ps(mask_y_neg, neg_one),
+                _mm_andnot_ps(mask_y_neg, one),
+            );
             let atan_signed = _mm_mul_ps(atan_val, sign_y);
 
-            // Handle negative x (quadrant correction)
-            let zero = _mm_setzero_ps();
+            // Handle negative x (quadrant correction). For x < 0, dividing by
+            // a negative x flips the ratio's sign on top of sign_y, so the
+            // correct combination is `correction - atan_signed` (see
+            // pixelflow-core::ops::trig::cheby_atan2 for the derivation).
             let mask_neg_x = _mm_cmplt_ps(x_val, zero);
             let correction = _mm_mul_ps(_mm_set1_ps(PI), sign_y);
             let result = _mm_or_ps(
-                _mm_and_ps(mask_neg_x, _mm_sub_ps(atan_signed, correction)),
+                _mm_and_ps(mask_neg_x, _mm_sub_ps(correction, atan_signed)),
                 _mm_andnot_ps(mask_neg_x, atan_signed),
             );
 
@@ -1118,10 +1127,11 @@ impl SimdOps for F32x8 {
             let x = _mm256_sub_ps(self.0, _mm256_mul_ps(k, _mm256_set1_ps(TWO_PI)));
             let t = _mm256_mul_ps(x, _mm256_set1_ps(PI_INV));
 
-            let c1 = _mm256_set1_ps(1.6719970703125);
-            let c3 = _mm256_set1_ps(-0.645963541666667);
-            let c5 = _mm256_set1_ps(0.079689450);
-            let c7 = _mm256_set1_ps(-0.0046817541);
+            // Minimax coefficients for sin(pi*t), t in [-1,1] (max abs err ~2.6e-4)
+            let c1 = _mm256_set1_ps(3.1392757);
+            let c3 = _mm256_set1_ps(-5.136_387);
+            let c5 = _mm256_set1_ps(2.4346683);
+            let c7 = _mm256_set1_ps(-0.4378018);
 
             let t2 = _mm256_mul_ps(t, t);
             #[cfg(target_feature = "fma")]
@@ -1158,46 +1168,55 @@ impl SimdOps for F32x8 {
             let r = _mm256_div_ps(y, x_val);
             let r_abs = _mm256_and_ps(r, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF)));
 
-            let c1 = _mm256_set1_ps(0.999999999);
-            let c3 = _mm256_set1_ps(-0.333333333);
-            let c5 = _mm256_set1_ps(0.2);
-            let c7 = _mm256_set1_ps(-0.142857143);
+            // Minimax coefficients for atan(t) on [0, 1] (max abs err ~8.7e-5)
+            let c1 = _mm256_set1_ps(0.99926804);
+            let c3 = _mm256_set1_ps(-0.32143133);
+            let c5 = _mm256_set1_ps(0.14661441);
+            let c7 = _mm256_set1_ps(-0.03913248);
 
-            let t = r_abs;
-            let t2 = _mm256_mul_ps(t, t);
-
-            #[cfg(target_feature = "fma")]
-            let atan_approx = {
-                let mut poly = _mm256_fmadd_ps(c7, t2, c5);
-                poly = _mm256_fmadd_ps(poly, t2, c3);
-                poly = _mm256_fmadd_ps(poly, t2, c1);
-                _mm256_mul_ps(poly, t)
+            let atan_poly = |t: __m256| -> __m256 {
+                let t2 = _mm256_mul_ps(t, t);
+                #[cfg(target_feature = "fma")]
+                {
+                    let mut poly = _mm256_fmadd_ps(c7, t2, c5);
+                    poly = _mm256_fmadd_ps(poly, t2, c3);
+                    poly = _mm256_fmadd_ps(poly, t2, c1);
+                    _mm256_mul_ps(poly, t)
+                }
+                #[cfg(not(target_feature = "fma"))]
+                {
+                    let mut poly = _mm256_add_ps(_mm256_mul_ps(c7, t2), c5);
+                    poly = _mm256_add_ps(_mm256_mul_ps(poly, t2), c3);
+                    poly = _mm256_add_ps(_mm256_mul_ps(poly, t2), c1);
+                    _mm256_mul_ps(poly, t)
+                }
             };
-            #[cfg(not(target_feature = "fma"))]
-            let atan_approx = {
-                let mut poly = _mm256_add_ps(_mm256_mul_ps(c7, t2), c5);
-                poly = _mm256_add_ps(_mm256_mul_ps(poly, t2), c3);
-                poly = _mm256_add_ps(_mm256_mul_ps(poly, t2), c1);
-                _mm256_mul_ps(poly, t)
-            };
 
+            // |r| > 1: atan(r) = π/2 - atan(1/r), evaluating the polynomial
+            // at the reciprocal (not `atan(|r|)` rescaled by 1/|r|).
+            let atan_small = atan_poly(r_abs);
             let one = _mm256_set1_ps(1.0);
-            let mask_large = _mm256_cmp_ps::<_CMP_GT_OQ>(r_abs, one);
             let recip_r = _mm256_div_ps(one, r_abs);
-            let atan_large =
-                _mm256_sub_ps(_mm256_set1_ps(PI_2), _mm256_mul_ps(recip_r, atan_approx));
-            let atan_val = _mm256_blendv_ps(atan_approx, atan_large, mask_large);
+            let atan_large = _mm256_sub_ps(_mm256_set1_ps(PI_2), atan_poly(recip_r));
+            let mask_large = _mm256_cmp_ps::<_CMP_GT_OQ>(r_abs, one);
+            let atan_val = _mm256_blendv_ps(atan_small, atan_large, mask_large);
 
-            let y_abs = _mm256_and_ps(y, _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF)));
-            let sign_y = _mm256_div_ps(y_abs, y);
+            // Sign of y via comparison (not y_abs/y, which is 0/0 = NaN at y == 0).
+            let zero = _mm256_setzero_ps();
+            let neg_one = _mm256_set1_ps(-1.0);
+            let mask_y_neg = _mm256_cmp_ps::<_CMP_LT_OQ>(y, zero);
+            let sign_y = _mm256_blendv_ps(one, neg_one, mask_y_neg);
             let atan_signed = _mm256_mul_ps(atan_val, sign_y);
 
-            let zero = _mm256_setzero_ps();
+            // Handle negative x (quadrant correction). For x < 0, dividing by
+            // a negative x flips the ratio's sign on top of sign_y, so the
+            // correct combination is `correction - atan_signed` (see
+            // pixelflow-core::ops::trig::cheby_atan2 for the derivation).
             let mask_neg_x = _mm256_cmp_ps::<_CMP_LT_OQ>(x_val, zero);
             let correction = _mm256_mul_ps(_mm256_set1_ps(PI), sign_y);
             Self(_mm256_blendv_ps(
                 atan_signed,
-                _mm256_sub_ps(atan_signed, correction),
+                _mm256_sub_ps(correction, atan_signed),
                 mask_neg_x,
             ))
         }
@@ -1817,10 +1836,11 @@ impl SimdOps for F32x16 {
             let x = _mm512_sub_ps(self.0, _mm512_mul_ps(k, _mm512_set1_ps(TWO_PI)));
             let t = _mm512_mul_ps(x, _mm512_set1_ps(PI_INV));
 
-            let c1 = _mm512_set1_ps(1.6719970703125);
-            let c3 = _mm512_set1_ps(-0.645963541666667);
-            let c5 = _mm512_set1_ps(0.079689450);
-            let c7 = _mm512_set1_ps(-0.0046817541);
+            // Minimax coefficients for sin(pi*t), t in [-1,1] (max abs err ~2.6e-4)
+            let c1 = _mm512_set1_ps(3.1392757);
+            let c3 = _mm512_set1_ps(-5.136_387);
+            let c5 = _mm512_set1_ps(2.4346683);
+            let c7 = _mm512_set1_ps(-0.4378018);
 
             let t2 = _mm512_mul_ps(t, t);
             let mut poly = _mm512_fmadd_ps(c7, t2, c5);
@@ -1847,36 +1867,46 @@ impl SimdOps for F32x16 {
             let r = _mm512_div_ps(y, x_val);
             let r_abs = _mm512_abs_ps(r);
 
-            let c1 = _mm512_set1_ps(0.999999999);
-            let c3 = _mm512_set1_ps(-0.333333333);
-            let c5 = _mm512_set1_ps(0.2);
-            let c7 = _mm512_set1_ps(-0.142857143);
+            // Minimax coefficients for atan(t) on [0, 1] (max abs err ~8.7e-5)
+            let c1 = _mm512_set1_ps(0.99926804);
+            let c3 = _mm512_set1_ps(-0.32143133);
+            let c5 = _mm512_set1_ps(0.14661441);
+            let c7 = _mm512_set1_ps(-0.03913248);
 
-            let t = r_abs;
-            let t2 = _mm512_mul_ps(t, t);
-            let mut poly = _mm512_fmadd_ps(c7, t2, c5);
-            poly = _mm512_fmadd_ps(poly, t2, c3);
-            poly = _mm512_fmadd_ps(poly, t2, c1);
-            let atan_approx = _mm512_mul_ps(poly, t);
+            let atan_poly = |t: __m512| -> __m512 {
+                let t2 = _mm512_mul_ps(t, t);
+                let mut poly = _mm512_fmadd_ps(c7, t2, c5);
+                poly = _mm512_fmadd_ps(poly, t2, c3);
+                poly = _mm512_fmadd_ps(poly, t2, c1);
+                _mm512_mul_ps(poly, t)
+            };
 
+            // |r| > 1: atan(r) = π/2 - atan(1/r), evaluating the polynomial
+            // at the reciprocal (not `atan(|r|)` rescaled by 1/|r|).
+            let atan_small = atan_poly(r_abs);
             let one = _mm512_set1_ps(1.0);
-            let mask_large = _mm512_cmp_ps_mask::<_CMP_GT_OQ>(r_abs, one);
             let recip_r = _mm512_div_ps(one, r_abs);
-            let atan_large =
-                _mm512_sub_ps(_mm512_set1_ps(PI_2), _mm512_mul_ps(recip_r, atan_approx));
-            let atan_val = _mm512_mask_blend_ps(mask_large, atan_approx, atan_large);
+            let atan_large = _mm512_sub_ps(_mm512_set1_ps(PI_2), atan_poly(recip_r));
+            let mask_large = _mm512_cmp_ps_mask::<_CMP_GT_OQ>(r_abs, one);
+            let atan_val = _mm512_mask_blend_ps(mask_large, atan_small, atan_large);
 
-            let y_abs = _mm512_abs_ps(y);
-            let sign_y = _mm512_div_ps(y_abs, y);
+            // Sign of y via comparison (not y_abs/y, which is 0/0 = NaN at y == 0).
+            let zero = _mm512_setzero_ps();
+            let neg_one = _mm512_set1_ps(-1.0);
+            let mask_y_neg = _mm512_cmp_ps_mask::<_CMP_LT_OQ>(y, zero);
+            let sign_y = _mm512_mask_blend_ps(mask_y_neg, one, neg_one);
             let atan_signed = _mm512_mul_ps(atan_val, sign_y);
 
-            let zero = _mm512_setzero_ps();
+            // Handle negative x (quadrant correction). For x < 0, dividing by
+            // a negative x flips the ratio's sign on top of sign_y, so the
+            // correct combination is `correction - atan_signed` (see
+            // pixelflow-core::ops::trig::cheby_atan2 for the derivation).
             let mask_neg_x = _mm512_cmp_ps_mask::<_CMP_LT_OQ>(x_val, zero);
             let correction = _mm512_mul_ps(_mm512_set1_ps(PI), sign_y);
             Self(_mm512_mask_blend_ps(
                 mask_neg_x,
                 atan_signed,
-                _mm512_sub_ps(atan_signed, correction),
+                _mm512_sub_ps(correction, atan_signed),
             ))
         }
     }
