@@ -6,14 +6,37 @@ use pixelflow_compiler::{kernel, kernel_jit, kernel_raw};
 use pixelflow_core::{Field, Manifold, PARALLELISM};
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
 fn nanos_now() -> u64 {
     #[cfg(target_os = "macos")]
-    unsafe {
-        mach_absolute_time()
+    {
+        // mach_absolute_time() ticks are NOT nanoseconds on native Apple
+        // Silicon: the timebase is 125/3 (one tick = 41.67ns; 1:1 only holds
+        // on Intel Macs and under Rosetta). Convert via mach_timebase_info,
+        // queried once. See pixelflow-pipeline/src/jit_bench.rs::nanos_now
+        // and docs/results/2026-07-20-jit-compile-cost.md for the same fix
+        // applied to the shared JIT bench harness.
+        static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+        let (numer, denom) = *TIMEBASE.get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+            let rc = unsafe { mach_timebase_info(&mut info) };
+            assert_eq!(rc, 0, "mach_timebase_info failed with {}", rc);
+            assert_ne!(info.denom, 0, "mach_timebase_info returned denom=0");
+            (info.numer, info.denom)
+        });
+        let ticks = unsafe { mach_absolute_time() };
+        ((ticks as u128 * numer as u128) / denom as u128) as u64
     }
     #[cfg(not(target_os = "macos"))]
     {

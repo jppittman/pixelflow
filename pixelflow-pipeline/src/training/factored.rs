@@ -679,7 +679,6 @@ mod tests {
                     .unwrap_or_else(|| panic!("eval_ternary failed for {op:?}"))
             }
             ExprNode::Nary(kind, _, _) => panic!("Nary in eval_arena_scalar: {kind:?}"),
-            ExprNode::Buffer(_) => panic!("Buffer node not supported in scalar eval"),
         }
     }
 

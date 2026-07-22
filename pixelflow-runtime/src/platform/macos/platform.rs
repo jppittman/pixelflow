@@ -139,6 +139,9 @@ impl PlatformOps for MetalOps {
                         let width = win.current_width;
                         let height = win.current_height;
                         let scale = win.scale_factor();
+                        // Frame is device-pixel sized (the sample lattice);
+                        // width_px/height_px stay in points for layout/input.
+                        let (px_w, px_h) = win.pixel_size();
 
                         // Generate window ID from pointer (like Linux does)
                         let id = WindowId(ptr as u64);
@@ -149,7 +152,7 @@ impl PlatformOps for MetalOps {
                         // Create Window with initial frame buffer
                         let window = Window {
                             id,
-                            frame: Frame::<PlatformPixel>::new(width, height),
+                            frame: Frame::<PlatformPixel>::new(px_w, px_h),
                             width_px: width,
                             height_px: height,
                             scale,
@@ -183,7 +186,13 @@ impl PlatformOps for MetalOps {
         // Logic for event loop interaction
         // The CocoaWaker posts an NSEvent when messages arrive, so distantFuture is safe.
         unsafe {
-            let until_date = match status {
+            // Only the FIRST wait may block (when the scheduler says Idle).
+            // Everything already queued is then drained without blocking:
+            // a park pass must empty the NSEvent queue, or wake events pile
+            // up ahead of real input and a KeyDown can sit behind an
+            // unbounded backlog (the "can't Ctrl-C out of `yes`" wedge).
+            // This mirrors LinuxOps::park's `while XPending > 0` drain.
+            let first_until_date: sys::Id = match status {
                 SystemStatus::Idle => {
                     // Block until an event arrives (waker will post NSEvent when messages come)
                     let cls = sys::class(b"NSDate\0");
@@ -195,6 +204,10 @@ impl PlatformOps for MetalOps {
                     sys::send(cls, sys::sel(b"distantPast\0"))
                 }
             };
+            let distant_past: sys::Id = {
+                let cls = sys::class(b"NSDate\0");
+                sys::send(cls, sys::sel(b"distantPast\0"))
+            };
 
             let mode = cocoa::make_nsstring("kCFRunLoopDefaultMode");
 
@@ -202,9 +215,11 @@ impl PlatformOps for MetalOps {
             for (id, mac_window) in self.windows.iter_mut() {
                 if let Some((width, height)) = mac_window.poll_resize() {
                     // Create new Window with resized frame buffer
+                    // (device pixels; width_px/height_px are points)
+                    let (px_w, px_h) = mac_window.pixel_size();
                     let window = Window {
                         id: *id,
-                        frame: Frame::<PlatformPixel>::new(width, height),
+                        frame: Frame::<PlatformPixel>::new(px_w, px_h),
                         width_px: width,
                         height_px: height,
                         scale: mac_window.scale_factor(),
@@ -217,24 +232,34 @@ impl PlatformOps for MetalOps {
                 }
             }
 
-            // Use wrapper for next_event
-            let event = self.app.next_event(
-                u64::MAX,
-                until_date,
-                mode,
-                true, // dequeue
-            );
+            let mut until_date = first_until_date;
+            let mut processed_any = false;
 
-            // Release mode string
-            sys::send::<()>(mode, sys::sel(b"release\0"));
+            loop {
+                let event = self.app.next_event(
+                    u64::MAX,
+                    until_date,
+                    mode,
+                    true, // dequeue
+                );
+                // Subsequent iterations never block.
+                until_date = distant_past;
 
-            if !event.is_null() {
+                if event.is_null() {
+                    break;
+                }
+                processed_any = true;
+
                 let ty = event.type_();
                 match ty {
-                    event_type::APP_KIT_DEFINED
-                    | event_type::SYSTEM_DEFINED
-                    | event_type::APPLICATION_DEFINED => {
-                        log::trace!("MetalOps: Received Internal/WakeUp event");
+                    event_type::APPLICATION_DEFINED => {
+                        // A CocoaWaker wake token was just dequeued; allow the
+                        // next wake() to post a fresh one.
+                        crate::platform::waker::consume_wake_token();
+                        log::trace!("MetalOps: Received WakeUp event");
+                    }
+                    event_type::APP_KIT_DEFINED | event_type::SYSTEM_DEFINED => {
+                        log::trace!("MetalOps: Received internal AppKit/system event");
                     }
                     _ => {
                         let ns_win = event.window();
@@ -267,9 +292,73 @@ impl PlatformOps for MetalOps {
                     self.app.send_event(event);
                 }
             }
+
+            // Release mode string
+            sys::send::<()>(mode, sys::sel(b"release\0"));
+
+            // Report windows the user closed during event routing (the click
+            // on the close button runs windowWillClose: synchronously inside
+            // sendEvent: above). CloseRequested triggers the engine's full
+            // shutdown cascade — without this the process outlives its last
+            // window as an invisible zombie.
+            for ptr in crate::platform::macos::window::drain_closed_windows() {
+                if let Some(id) = self.window_map.remove(&ptr) {
+                    self.windows.remove(&id);
+                    processed_any = true;
+                    self.event_tx
+                        .send(Message::Data(EngineData::FromDriver(
+                            DisplayEvent::CloseRequested { id },
+                        )))
+                        .expect("Failed to send CloseRequested to engine");
+                }
+            }
+
+            // Report backing-scale changes (window dragged to a display with
+            // different DPI). Drained after closes: a window that closed this
+            // pass is already out of window_map, so its scale event is dropped.
+            //
+            // A scale change keeps the point-space bounds but changes the
+            // sample lattice, so the circulating frame has the wrong pixel
+            // density. Emit Resized with a fresh pixel-sized frame (the engine
+            // marks any in-flight render stale and swaps buffers), then
+            // ScaleChanged so the app can re-bake density-keyed resources.
+            for (ptr, scale) in crate::platform::macos::window::drain_scale_changes() {
+                if let Some(id) = self.window_map.get(&ptr).copied() {
+                    let win = self
+                        .windows
+                        .get(&id)
+                        .expect("window_map entry without a matching window");
+                    let (px_w, px_h) = win.pixel_size();
+                    let window = Window {
+                        id,
+                        frame: Frame::<PlatformPixel>::new(px_w, px_h),
+                        width_px: win.current_width,
+                        height_px: win.current_height,
+                        scale,
+                    };
+                    processed_any = true;
+                    self.event_tx
+                        .send(Message::Data(EngineData::FromDriver(
+                            DisplayEvent::Resized { window },
+                        )))
+                        .expect("Failed to send Resized (scale change) to engine");
+                    self.event_tx
+                        .send(Message::Data(EngineData::FromDriver(
+                            DisplayEvent::ScaleChanged { id, scale },
+                        )))
+                        .expect("Failed to send ScaleChanged to engine");
+                }
+            }
+
+            // Busy after real work so the scheduler re-drains its lanes before
+            // blocking on the doorbell (a dequeued wake event usually means
+            // messages are waiting).
+            Ok(if processed_any {
+                ActorStatus::Busy
+            } else {
+                ActorStatus::Idle
+            })
         }
-        // Always return Idle since we block inside next_event when needed
-        Ok(ActorStatus::Idle)
     }
 }
 

@@ -196,7 +196,6 @@ mod tests {
         tex.data()[0]
     }
 
-
     #[test]
     fn composition_works() {
         // circle inside square

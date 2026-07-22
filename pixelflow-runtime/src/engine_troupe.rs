@@ -19,7 +19,7 @@ use actor_scheduler::{
     Actor, ActorHandle, ActorStatus, ActorTypes, HandlerError, HandlerResult, Message,
     SystemStatus, TroupeActor,
 };
-use pixelflow_core::{Discrete, Manifold};
+use pixelflow_core::{At, Discrete, Manifold, W, X, Y, Z};
 use pixelflow_graphics::render::rasterizer::{
     RasterizerActor, RasterizerHandle, RenderRequest, RenderResponse,
 };
@@ -429,6 +429,32 @@ impl EngineHandler {
             scale,
             stale: false,
         });
+
+        // The scene is authored in point space; the frame is the platform's
+        // sample lattice and may be denser (device pixels on HiDPI displays).
+        // The lattice embedding is the measured ratio points/pixels per axis —
+        // identity when the platform samples 1:1 (X11, non-Retina macOS).
+        // Contramapping here keeps the app scale-agnostic: platform = dimap.
+        assert!(
+            frame.width > 0 && frame.height > 0,
+            "cannot render into an empty frame ({}x{})",
+            frame.width,
+            frame.height
+        );
+        let point_per_px_x = width_px as f32 / frame.width as f32;
+        let point_per_px_y = height_px as f32 / frame.height as f32;
+        let manifold: Arc<dyn Manifold<Output = Discrete> + Send + Sync> =
+            if point_per_px_x == 1.0 && point_per_px_y == 1.0 {
+                manifold
+            } else {
+                Arc::new(At {
+                    inner: manifold,
+                    x: X * point_per_px_x,
+                    y: Y * point_per_px_y,
+                    z: Z,
+                    w: W,
+                })
+            };
 
         // Build render request (no response_tx - rasterizer uses registered channel)
         let request = RenderRequest { manifold, frame };

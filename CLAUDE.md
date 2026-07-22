@@ -109,8 +109,8 @@ cargo test --workspace            # All tests
 cargo test -p pixelflow-core      # Single crate
 cargo bench -p pixelflow-core     # Benchmarks
 cargo run --release -p core-term  # Run terminal directly
-cargo xtask bundle-run            # macOS bundled app
-cargo xtask bundle-run --features profiling  # Flamegraph on exit
+cargo bundle-run            # macOS bundled app
+cargo bundle-run --features profiling  # Flamegraph on exit
 ```
 
 ### Build Profiles
@@ -198,7 +198,7 @@ handle.send(Message::Data(MyDataMsg))?;           // Lowest (backpressure)
 
 ### macOS
 - Cocoa MUST run on main thread
-- `cargo xtask bundle-run` creates `CoreTerm.app`
+- `cargo bundle-run` creates `CoreTerm.app`
 - PTY I/O: kqueue-based on dedicated thread
 
 ### Linux

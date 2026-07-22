@@ -4,6 +4,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pixelflow_graphics::fonts::{text, CachedText, Font, GlyphCache};
+use pixelflow_graphics::render::aa::aa;
 use pixelflow_graphics::render::color::{Grayscale, Rgba8};
 use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
@@ -43,6 +44,31 @@ fn bench_pixelflow_text_sizes(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
             let glyph = text(&font, &text_str, 16.0);
+            let colored = Grayscale(glyph);
+            let width = (length as u32) * 15;
+            let mut frame = Frame::<Rgba8>::new(width, 24);
+
+            b.iter(|| {
+                rasterize(black_box(&colored), black_box(&mut frame), 1);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_pixelflow_aa_text(c: &mut Criterion) {
+    // Antialiased uncached path: same pipeline as `text`, evaluated over Jet2
+    // coordinates (gradient-normalized crossing ramps). Measures the cost of
+    // Jet2 autodiff evaluation relative to the hard Field path above.
+    let mut group = c.benchmark_group("pixelflow_aa_text");
+    let font = Font::parse(FONT_DATA).unwrap();
+
+    for length in [5, 10, 26, 50] {
+        let text_str: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().take(length).collect();
+
+        group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
+            let glyph = aa(text(&font, &text_str, 16.0));
             let colored = Grayscale(glyph);
             let width = (length as u32) * 15;
             let mut frame = Frame::<Rgba8>::new(width, 24);
@@ -97,7 +123,7 @@ fn bench_pixelflow_with_caching(c: &mut Criterion) {
 
     group.bench_function("cached_HELLO", |b| {
         let mut cache = GlyphCache::new();
-        let cached = CachedText::new(&font, &mut cache, "HELLO", 20.0);
+        let cached = CachedText::new(&font, &mut cache, "HELLO", 20.0, 1.0);
         let colored = Grayscale(cached);
 
         b.iter(|| {
@@ -111,7 +137,7 @@ fn bench_pixelflow_with_caching(c: &mut Criterion) {
         b.iter(|| {
             let mut cache = GlyphCache::new();
             for ch in 'A'..='Z' {
-                black_box(CachedText::new(&font, &mut cache, &ch.to_string(), 16.0));
+                black_box(CachedText::new(&font, &mut cache, &ch.to_string(), 16.0, 1.0));
             }
         });
     });
@@ -182,6 +208,7 @@ criterion_group!(
     pixelflow_benches,
     bench_pixelflow_single_char,
     bench_pixelflow_text_sizes,
+    bench_pixelflow_aa_text,
     bench_pixelflow_threading,
     bench_pixelflow_with_caching,
 );

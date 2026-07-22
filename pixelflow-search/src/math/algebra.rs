@@ -358,18 +358,16 @@ impl Rewrite for Associative {
         let (left, right) = node.binary_operands()?;
 
         for child in egraph.nodes(left) {
-            if let Some(child_op) = child.op() {
-                if child_op.kind() == self.op.kind() {
-                    if let Some((a, b)) = child.binary_operands() {
-                        return Some(RewriteAction::Associate {
-                            op: self.op,
-                            a,
-                            b,
-                            c: right,
-                        });
-                    }
-                }
-            }
+            let Some(child_op) = child.op() else { continue };
+            if child_op.kind() != self.op.kind() { continue }
+            let Some((a, b)) = child.binary_operands() else { continue };
+
+            return Some(RewriteAction::Associate {
+                op: self.op,
+                a,
+                b,
+                c: right,
+            });
         }
         None
     }
@@ -413,18 +411,16 @@ impl Rewrite for ReverseAssociative {
 
         // Check if the right child has a node with the same op
         for child in egraph.nodes(right) {
-            if let Some(child_op) = child.op() {
-                if child_op.kind() == self.op.kind() {
-                    if let Some((b, c)) = child.binary_operands() {
-                        return Some(RewriteAction::ReverseAssociate {
-                            op: self.op,
-                            a: left,
-                            b,
-                            c,
-                        });
-                    }
-                }
-            }
+            let Some(child_op) = child.op() else { continue };
+            if child_op.kind() != self.op.kind() { continue }
+            let Some((b, c)) = child.binary_operands() else { continue };
+
+            return Some(RewriteAction::ReverseAssociate {
+                op: self.op,
+                a: left,
+                b,
+                c,
+            });
         }
         None
     }
@@ -511,19 +507,17 @@ impl Rewrite for Distributive {
         let (a, other) = node.binary_operands()?;
 
         for child_node in egraph.nodes(other) {
-            if let Some(child_op) = child_node.op() {
-                if child_op.kind() == self.inner.kind() {
-                    if let Some((b, c)) = child_node.binary_operands() {
-                        return Some(RewriteAction::Distribute {
-                            outer: self.outer,
-                            inner: self.inner,
-                            a,
-                            b,
-                            c,
-                        });
-                    }
-                }
-            }
+            let Some(child_op) = child_node.op() else { continue };
+            if child_op.kind() != self.inner.kind() { continue }
+            let Some((b, c)) = child_node.binary_operands() else { continue };
+
+            return Some(RewriteAction::Distribute {
+                outer: self.outer,
+                inner: self.inner,
+                a,
+                b,
+                c,
+            });
         }
         None
     }

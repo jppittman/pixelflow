@@ -29,8 +29,8 @@ fn judge_weights_round_trip_via_trid() {
         .save(&path)
         .unwrap_or_else(|e| panic!("ExprNnue::save failed for {}: {e}", path.display()));
 
-    let bytes = std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     let _ = std::fs::remove_file(&path);
 
     // The magic must be TRID (not a stale TRIC/TRIB), and the loader must accept it.

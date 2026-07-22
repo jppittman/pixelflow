@@ -934,8 +934,10 @@ impl<D, C, M> ActorScheduler<D, C, M> {
         A: Actor<D, C, M>,
     {
         // Drain Control → Mgmt → Control → Data
-        // Control budget is split evenly between the two control runs to prevent double priority
-        let half_control = self.control_burst_limit / 2;
+        // Control budget is split evenly between the two control runs to prevent double priority.
+        // Floor at 1: integer halving would otherwise zero the budget when the
+        // limit is 1, and a zero-budget drain can never make progress.
+        let half_control = (self.control_burst_limit / 2).max(1);
 
         let control1 = self
             .rx_control
@@ -1213,6 +1215,89 @@ mod tests {
         fn park(&mut self, _hint: SystemStatus) -> Result<ActorStatus, HandlerError> {
             Ok(ActorStatus::Idle)
         }
+    }
+
+    // Regression: control_burst_limit of 1 used to halve to a zero drain
+    // budget (1 / 2 == 0), so the control lane could never make progress —
+    // and a zero-limit drain misreported the lane as Disconnected.
+    #[test]
+    fn control_lane_progresses_with_burst_limit_one() {
+        let params = SchedulerParams {
+            control_mgmt_buffer_size: 1,
+            control_burst_multiplier: 1, // control_burst_limit == 1
+            ..SchedulerParams::DEFAULT
+        };
+        assert_eq!(params.control_burst_limit(), 1);
+
+        let (tx, mut rx) = ActorScheduler::<String, String, String>::new_with_params(4, 4, params);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = log.clone();
+
+        let scheduler = thread::spawn(move || {
+            let mut handler = TestHandler { log: log_clone };
+            rx.run(&mut handler);
+        });
+
+        tx.send(Message::Control("ping".to_string())).unwrap();
+
+        // Must be observed BEFORE shutdown: shutdown-time draining would mask
+        // a broken steady-state control path.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let processed = loop {
+            if log.lock().unwrap().contains(&"Ctrl: ping".to_string()) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        tx.send(Message::Shutdown).unwrap();
+        scheduler.join().unwrap();
+
+        assert!(
+            processed,
+            "control message was never processed with control_burst_limit == 1"
+        );
+    }
+
+    // Regression: with a data burst limit of 0, the scheduler must neither
+    // spin forever (drain(0) reporting More every cycle) nor exit early by
+    // misreporting the lane as Disconnected and dropping queued messages.
+    // The drain clamps its budget to 1, so it makes progress and terminates.
+    #[test]
+    fn zero_data_burst_limit_processes_messages_and_exits() {
+        let (tx, mut rx) = ActorScheduler::<String, String, String>::new(0, 10);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = log.clone();
+
+        let scheduler = thread::spawn(move || {
+            let mut handler = TestHandler { log: log_clone };
+            rx.run(&mut handler);
+        });
+
+        tx.send(Message::Data("a".to_string())).unwrap();
+        tx.send(Message::Data("b".to_string())).unwrap();
+        drop(tx);
+
+        // Bounded join: the scheduler must exit once all handles are gone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !scheduler.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            scheduler.is_finished(),
+            "scheduler must terminate with a zero data burst limit"
+        );
+        scheduler.join().unwrap();
+
+        let log = log.lock().unwrap();
+        assert!(
+            log.contains(&"Data: a".to_string()) && log.contains(&"Data: b".to_string()),
+            "queued messages must not be dropped on exit; got {:?}",
+            *log
+        );
     }
 
     #[test]

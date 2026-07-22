@@ -41,17 +41,19 @@ fn field_val(f: Field) -> f32 {
     // Use the Debug representation to extract value
     let debug = format!("{:?}", f);
     // Parse "Field(F32x16([1.0, 1.0, ...]))" or similar
-    if let Some(start) = debug.find('[') {
-        if let Some(end) = debug.find(',') {
-            if let Ok(v) = debug[start + 1..end].trim().parse::<f32>() {
-                return v;
-            }
+    let Some(start) = debug.find('[') else {
+        panic!("Failed to parse Field value from: {}", debug);
+    };
+
+    if let Some(end) = debug.find(',') {
+        if let Ok(v) = debug[start + 1..end].trim().parse::<f32>() {
+            return v;
         }
-        // Single value case
-        if let Some(end) = debug.find(']') {
-            if let Ok(v) = debug[start + 1..end].trim().parse::<f32>() {
-                return v;
-            }
+    }
+    // Single value case
+    if let Some(end) = debug.find(']') {
+        if let Ok(v) = debug[start + 1..end].trim().parse::<f32>() {
+            return v;
         }
     }
     panic!("Failed to parse Field value from: {}", debug);
