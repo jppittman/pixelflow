@@ -2,13 +2,14 @@
 //!
 //! cargo run --release -p pixelflow-pipeline --features training --bin bench_scanline_jit
 
-use pixelflow_pipeline::jit_bench::benchmark_jit_arena;
+use pixelflow_pipeline::jit_bench::{benchmark_jit_arena, nanos_now};
 use pixelflow_pipeline::training::factored::parse_kernel_code_arena;
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn mach_absolute_time() -> u64;
-}
+#[cfg(target_arch = "aarch64")]
+use pixelflow_ir::ScanlineJitManifold;
+#[cfg(target_arch = "aarch64")]
+use pixelflow_ir::backend::emit::compile_arena_dag_scanline;
+
 fn main() {
     // Load psychedelic expressions from file
     let content = std::fs::read_to_string("pixelflow-pipeline/data/psychedelic_full.jsonl")

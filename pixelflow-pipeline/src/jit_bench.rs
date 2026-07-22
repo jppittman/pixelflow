@@ -170,13 +170,13 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-fn nanos_now() -> u64 {
+pub fn nanos_now() -> u64 {
     // On Apple Silicon, mach_absolute_time() ticks == nanoseconds (timebase 1:1).
     unsafe { mach_absolute_time() }
 }
 
 #[cfg(target_os = "linux")]
-fn nanos_now() -> u64 {
+pub fn nanos_now() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -188,7 +188,7 @@ fn nanos_now() -> u64 {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn nanos_now() -> u64 {
+pub fn nanos_now() -> u64 {
     use std::time::Instant;
     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
