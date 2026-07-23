@@ -46,7 +46,7 @@ pub fn is_jit_eligible(analyzed: &AnalyzedKernel) -> bool {
 
 /// `None` (the default `Field` domain/return) or an explicit `Field` annotation.
 /// Anything else (`Jet2`, `Jet3`, `Discrete`, tuples) is not the JIT's lane.
-fn is_field_ty(ty: &Option<syn::Type>) -> bool {
+pub(crate) fn is_field_ty(ty: &Option<syn::Type>) -> bool {
     match ty {
         None => true,
         // Compare on the type's final path segment so both `Field` and
@@ -212,7 +212,7 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
 
     let param_map = ir_bridge::scalar_param_indices(analyzed);
     let manifold_map = ir_bridge::manifold_param_indices(analyzed);
-    let arena_code =
+    let (arena_code, plan) =
         ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map, &manifold_map)?;
     let wrapper = jit_wrapper_tokens();
 
@@ -255,20 +255,17 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
             })
             .collect();
 
-        // Splice each manifold argument and substitute its slot variable.
-        let manifold_names: Vec<proc_macro2::Ident> =
-            manifold_params.iter().map(|p| p.name.clone()).collect();
-        let splice_stmts: Vec<TokenStream> = manifold_names
+        // Composition: splice bare fragments and per-`.at()`-site warped
+        // fragments, then substitute every slot (shared logic with named
+        // kernel structs — see `ir_bridge::composition_stmts`).
+        let manifold_accessors: Vec<TokenStream> = manifold_params
             .iter()
-            .enumerate()
-            .map(|(k, name)| {
-                let slot = ir_bridge::MANIFOLD_SLOT_BASE + k as u8;
-                quote! {
-                    let __frag = ::pixelflow_core::__ir::HasIr::splice_into(&#name, &mut __arena);
-                    __subs.push((#slot, __frag));
-                }
+            .map(|p| {
+                let name = &p.name;
+                quote! { #name }
             })
             .collect();
+        let compose = ir_bridge::composition_stmts(&plan, &manifold_accessors);
 
         // Scalar values, dense in scalar declaration order (matches the
         // `Param(i)` numbering from `scalar_param_indices`).
@@ -279,12 +276,7 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
         Ok(quote! {
             move | #( #arg_tokens ),* | {
                 let (mut __arena, mut __root) = #arena_code;
-                let mut __subs: ::std::vec::Vec<(u8, ::pixelflow_core::__ir::ExprId)> =
-                    ::std::vec::Vec::new();
-                #( #splice_stmts )*
-                if !__subs.is_empty() {
-                    __root = __arena.substitute_vars_with(__root, &__subs);
-                }
+                #compose
                 __root = __arena.substitute_params(__root, #param_slice);
                 let __code = ::pixelflow_core::__ir::backend::emit::compile_arena_dag(&__arena, __root)
                     .map(|r| r.code)

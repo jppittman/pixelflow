@@ -106,3 +106,57 @@ fn manifold_param_used_multiple_times() {
         check("multi_use", eval(&combined, x, y), v * v + v);
     }
 }
+
+/// `.at()` samples a manifold param at warped coordinates — each site gets
+/// its own warped splice. Central difference of f = x²·y is 2xy exactly
+/// (the quadratic's second differences cancel).
+#[test]
+fn at_sites_warp_coordinates_per_site() {
+    let f = kernel_jit!(|| X * X * Y);
+
+    let central_dx = kernel_jit!(|tex: kernel| {
+        (tex.at(X + 1.0, Y, Z, W) - tex.at(X - 1.0, Y, Z, W)) * 0.5
+    })(f);
+
+    for (x, y) in [(2.0f32, 3.0f32), (-1.5, 0.5), (0.0, 4.0)] {
+        check("central_dx", eval(&central_dx, x, y), 2.0 * x * y);
+    }
+}
+
+/// Bare references and `.at()` sites of the same param coexist: the bare use
+/// shares one fragment, each site gets its own warp.
+#[test]
+fn bare_and_at_sites_mix() {
+    let f = kernel_jit!(|| X + Y * 10.0);
+
+    let m = kernel_jit!(|g: kernel| V(g) + g.at(Y, X, Z, W))(f);
+
+    for (x, y) in [(1.0f32, 2.0f32), (-3.0, 0.5)] {
+        let want = (x + y * 10.0) + (y + x * 10.0);
+        check("bare_plus_at", eval(&m, x, y), want);
+    }
+}
+
+
+/// Named `kernel!` structs are spliceable leaves: the combinator ZST stays
+/// the direct-eval path, but `HasIr` lets a fused JIT root absorb it — its
+/// manifold fields (themselves `HasIr`) splice recursively and its scalar
+/// fields bake. This is the P4 answer to "named structs can't own JIT
+/// memory": they don't need to.
+#[test]
+fn named_struct_splices_into_jit_host() {
+    use pixelflow_compiler::kernel;
+
+    kernel!(
+        struct Offset = |m: kernel, dx: f32| { m + dx }
+    );
+
+    let base = kernel_jit!(|| X * Y);
+    let offset = Offset { m: base, dx: 7.0 };
+
+    let host = kernel_jit!(|f: kernel| V(f) * 2.0)(offset);
+
+    for (x, y) in [(2.0f32, 3.0f32), (-1.0, 4.0)] {
+        check("named_splice", eval(&host, x, y), (x * y + 7.0) * 2.0);
+    }
+}

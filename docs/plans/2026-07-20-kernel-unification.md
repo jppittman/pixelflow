@@ -94,11 +94,22 @@ to-be-retired backend, tracked until that backend dies.
   reserved slot variables (`Var(8+k)`) and compiles ONE fused kernel, with
   derivative projections resolving post-splice in the runtime `lower_dwrt`
   tier (see tests/kernel_composition.rs: the AA-ramp-over-SDF font
-  architecture as pure arena composition). Still open: named kernel structs
-  (need a construction API for owned JIT memory), `.at()`/warp surface
-  syntax over `substitute_vars_with`, and `HasIr` for combinator/routed
-  `kernel!` results (which is what would let transparent routing accept
-  manifold params).
+  architecture as pure arena composition).
+  **Tail landed 2026-07-23:** `.at(x, y, z, w)` on manifold params — each
+  site gets its own slot (`Var(192+s)`) substituted with a fresh splice
+  warped by the site's coordinate expressions; bare references share one
+  fragment per param (`Var(128+k)`). Named `kernel!` structs get a
+  conditional `HasIr` impl (`Mi: HasIr` bounds; `Field` domain/return only;
+  skipped when the arena can't express the body): they stay combinator
+  kernels for direct eval and never own JIT memory — a fused root absorbs
+  them by splicing, which dissolves the "named structs need a construction
+  API" problem. Known limitation: `.at()` through a manifold-bound local
+  (`let t = tex; t.at(..)`) is rejected — the AST optimizer eliminates the
+  binding while restoring the opaque call. `HasIr` for *anonymous*
+  combinator results stays out (unnameable closure types); anonymous
+  composition is arena-native via `kernel_jit!`/routing.
+  See docs/designs/2026-07-23-jit-orthodoxy-survey.md for the architecture
+  survey against V8/LuaJIT/HotSpot/Halide-class compilers.
 - **P5 — JIT at the root**: glyph bake through the fused arena
   (`CachedGlyph::new`), then `Lattice::collapse` JIT fast path → frame as one
   bound kernel (M4 in docs/designs/KERNELS_AND_LATTICES.md). Interpreter/
