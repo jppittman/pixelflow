@@ -85,10 +85,20 @@ to-be-retired backend, tracked until that backend dies.
   need no pixelflow-ir dependency. This is transition scaffolding, not an
   end-state decision — default flips when the parity suite + font goldens say
   so.
-- **P4 — IR-carrying kernels + arena splicing**: `HasIr`-style fragment
-  accessor emitted by the macro; splice/substitute APIs on `ExprArena`. This is
-  what shrinks `is_jit_eligible`'s ineligible set toward zero (named structs,
-  manifold params, composition).
+- **P4 — IR-carrying kernels + arena splicing** *(first slice landed
+  2026-07-23)*: `ExprArena::splice` + `substitute_vars_with` (the generic
+  contramap — manifold-slot substitution now, coordinate warps later);
+  `HasIr { splice_into }` in pixelflow-ir; `kernel_jit!` wrappers carry their
+  composed pre-lowering arena and implement `HasIr`; manifold-typed params
+  are JIT-eligible — the builder splices each argument's fragment over
+  reserved slot variables (`Var(8+k)`) and compiles ONE fused kernel, with
+  derivative projections resolving post-splice in the runtime `lower_dwrt`
+  tier (see tests/kernel_composition.rs: the AA-ramp-over-SDF font
+  architecture as pure arena composition). Still open: named kernel structs
+  (need a construction API for owned JIT memory), `.at()`/warp surface
+  syntax over `substitute_vars_with`, and `HasIr` for combinator/routed
+  `kernel!` results (which is what would let transparent routing accept
+  manifold params).
 - **P5 — JIT at the root**: glyph bake through the fused arena
   (`CachedGlyph::new`), then `Lattice::collapse` JIT fast path → frame as one
   bound kernel (M4 in docs/designs/KERNELS_AND_LATTICES.md). Interpreter/

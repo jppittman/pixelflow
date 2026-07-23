@@ -21,7 +21,7 @@ pub use variance::Variance;
 pub use variance::{compute_arena_variance, find_hoistable_arena_nodes};
 
 pub mod arena;
-pub use arena::{ExprArena, ExprId, ExprNode};
+pub use arena::{ExprArena, ExprId, ExprNode, HasIr};
 
 pub mod binding;
 pub use binding::{BindError, BindingTable};

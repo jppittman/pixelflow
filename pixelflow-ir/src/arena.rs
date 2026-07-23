@@ -724,6 +724,162 @@ impl ExprArena {
         id_map[root.0 as usize].expect("substitute_params: root was never mapped")
     }
 
+    // ───────────────────── composition (P4: arena splicing) ─────────────────
+
+    /// Copy the fragment reachable from `root` in `other` into this arena,
+    /// returning the fragment's new root here. Shared subexpressions are
+    /// copied once, so a DAG stays a DAG. This is the substrate of kernel
+    /// composition: the spliced fragment reads this arena's coordinate
+    /// variables directly (an identity contramap); warp it afterwards with
+    /// [`ExprArena::substitute_vars_with`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fragment references bound memory (`Buffer` leaves) —
+    /// merging buffer tables is not supported yet, and no kernel surface can
+    /// produce buffers today.
+    pub fn splice(&mut self, other: &ExprArena, root: ExprId) -> ExprId {
+        let mut id_map: Vec<Option<ExprId>> = vec![None; other.nodes.len()];
+
+        enum Task {
+            Descend(ExprId),
+            Emit(ExprId),
+        }
+        let mut work: Vec<Task> = vec![Task::Descend(root)];
+
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Descend(id) => {
+                    if id_map[id.0 as usize].is_some() {
+                        continue;
+                    }
+                    work.push(Task::Emit(id));
+                    let children: Vec<ExprId> = other.children(id).collect();
+                    for child in children.into_iter().rev() {
+                        work.push(Task::Descend(child));
+                    }
+                }
+                Task::Emit(id) => {
+                    if id_map[id.0 as usize].is_some() {
+                        continue;
+                    }
+                    let m = |old: ExprId| {
+                        id_map[old.0 as usize].expect("splice: child copied before parent")
+                    };
+                    let new_id = match other.nodes[id.0 as usize].clone() {
+                        ExprNode::Var(i) => self.push_var(i),
+                        ExprNode::Const(v) => self.push_const(v),
+                        ExprNode::Param(i) => self.push_param(i),
+                        ExprNode::Buffer(b) => panic!(
+                            "splice: fragment references Buffer({}) — buffer-table merging \
+                             is not supported",
+                            b.0
+                        ),
+                        ExprNode::Unary(op, a) => {
+                            let a = m(a);
+                            self.push_unary(op, a)
+                        }
+                        ExprNode::Binary(op, a, b) => {
+                            let (a, b) = (m(a), m(b));
+                            self.push_binary(op, a, b)
+                        }
+                        ExprNode::Ternary(op, a, b, c) => {
+                            let (a, b, c) = (m(a), m(b), m(c));
+                            self.push_ternary(op, a, b, c)
+                        }
+                        ExprNode::Nary(op, start, len) => {
+                            let (s, l) = (start as usize, len as usize);
+                            let mapped: Vec<ExprId> =
+                                other.nary_children[s..s + l].iter().map(|c| m(*c)).collect();
+                            self.push_nary(op, &mapped)
+                        }
+                    };
+                    id_map[id.0 as usize] = Some(new_id);
+                }
+            }
+        }
+
+        id_map[root.0 as usize].expect("splice: root was never copied")
+    }
+
+    /// Rebuild the subgraph at `root`, replacing every `Var(i)` for which
+    /// `subs` has an entry with the given (already existing) node — the
+    /// generic contramap. Manifold-param composition substitutes the reserved
+    /// slot variables with spliced kernel fragments; a coordinate warp
+    /// substitutes `Var(0..4)` with coordinate expressions.
+    ///
+    /// Entries must reference nodes already in this arena (e.g. from
+    /// [`ExprArena::splice`]). Unlisted variables are preserved. Returns the
+    /// new root in the same arena; old nodes become unreachable garbage, as
+    /// with [`ExprArena::substitute_params`].
+    pub fn substitute_vars_with(&mut self, root: ExprId, subs: &[(u8, ExprId)]) -> ExprId {
+        let lookup = |i: u8| subs.iter().find(|(v, _)| *v == i).map(|(_, id)| *id);
+
+        let old_len = self.nodes.len();
+        let mut id_map: Vec<Option<ExprId>> = vec![None; old_len];
+
+        enum Task {
+            Descend(ExprId),
+            Emit(ExprId),
+        }
+        let mut work: Vec<Task> = vec![Task::Descend(root)];
+
+        while let Some(task) = work.pop() {
+            match task {
+                Task::Descend(id) => {
+                    if id_map[id.0 as usize].is_some() {
+                        continue;
+                    }
+                    work.push(Task::Emit(id));
+                    let children: Vec<ExprId> = self.children(id).collect();
+                    for child in children.into_iter().rev() {
+                        work.push(Task::Descend(child));
+                    }
+                }
+                Task::Emit(id) => {
+                    if id_map[id.0 as usize].is_some() {
+                        continue;
+                    }
+                    let m = |old: ExprId| {
+                        id_map[old.0 as usize]
+                            .expect("substitute_vars_with: child rebuilt before parent")
+                    };
+                    let new_id = match self.nodes[id.0 as usize].clone() {
+                        ExprNode::Var(i) => match lookup(i) {
+                            Some(replacement) => replacement,
+                            None => self.push_var(i),
+                        },
+                        ExprNode::Const(v) => self.push_const(v),
+                        ExprNode::Param(i) => self.push_param(i),
+                        ExprNode::Buffer(b) => self.push_node(ExprNode::Buffer(b)),
+                        ExprNode::Unary(op, a) => {
+                            let a = m(a);
+                            self.push_unary(op, a)
+                        }
+                        ExprNode::Binary(op, a, b) => {
+                            let (a, b) = (m(a), m(b));
+                            self.push_binary(op, a, b)
+                        }
+                        ExprNode::Ternary(op, a, b, c) => {
+                            let (a, b, c) = (m(a), m(b), m(c));
+                            self.push_ternary(op, a, b, c)
+                        }
+                        ExprNode::Nary(op, start, len) => {
+                            let (s, l) = (start as usize, len as usize);
+                            let child_ids: Vec<ExprId> = self.nary_children[s..s + l].to_vec();
+                            let mapped: Vec<ExprId> =
+                                child_ids.into_iter().map(m).collect();
+                            self.push_nary(op, &mapped)
+                        }
+                    };
+                    id_map[id.0 as usize] = Some(new_id);
+                }
+            }
+        }
+
+        id_map[root.0 as usize].expect("substitute_vars_with: root was never rebuilt")
+    }
+
     // ───────────────────── display ───────────────────────────
 
     /// Format the subtree rooted at `root` as an S-expression, matching the
@@ -891,6 +1047,21 @@ impl fmt::Display for DisplayExpr<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.arena.fmt_expr(self.root, f)
     }
+}
+
+// ───────────────────────────────────── HasIr ─────────────────────────────────
+
+/// A kernel that can contribute its expression fragment to a host arena —
+/// the substrate of composition on the arena backend (kernel-unification P4).
+///
+/// The macro backends implement this on their emitted kernel wrappers: the
+/// wrapper keeps the (pre-lowering) arena it was built from and
+/// [`ExprArena::splice`]s it into the host on demand. The returned id
+/// computes this kernel's value at the host's coordinate variables; hosts
+/// that need it elsewhere warp it with [`ExprArena::substitute_vars_with`].
+pub trait HasIr {
+    /// Append this kernel's fragment into `arena`, returning its root there.
+    fn splice_into(&self, arena: &mut ExprArena) -> ExprId;
 }
 
 // ───────────────────────────────────── Tests ─────────────────────────────────
@@ -1129,5 +1300,124 @@ mod tests {
 
         assert_eq!(arena.children(v).len(), 0);
         assert_eq!(arena.children(bin).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+    use crate::binding::BindingTable;
+    use crate::eval::eval_scalar;
+    use crate::kind::OpKind;
+
+    fn eval(a: &ExprArena, root: ExprId, vars: &[f32; 4]) -> f32 {
+        eval_scalar(a, root, vars, &BindingTable::empty())
+    }
+
+    #[test]
+    fn splice_copies_reachable_fragment_only() {
+        let mut donor = ExprArena::new();
+        let x = donor.push_var(0);
+        let _dead = donor.push_const(99.0);
+        let y = donor.push_var(1);
+        let frag = donor.push_binary(OpKind::Mul, x, y);
+
+        let mut host = ExprArena::new();
+        let hx = host.push_var(0);
+        let spliced = host.splice(&donor, frag);
+        let root = host.push_binary(OpKind::Add, hx, spliced);
+
+        // x + x*y, and the donor's dead node did not come along.
+        assert_eq!(eval(&host, root, &[3.0, 4.0, 0.0, 0.0]), 3.0 + 12.0);
+        assert!(
+            !host
+                .nodes_raw()
+                .iter()
+                .any(|n| matches!(n, ExprNode::Const(v) if *v == 99.0)),
+            "unreachable donor node was copied"
+        );
+    }
+
+    #[test]
+    fn splice_preserves_dag_sharing() {
+        // Donor: s = x*y used twice — must stay shared after splicing.
+        let mut donor = ExprArena::new();
+        let x = donor.push_var(0);
+        let y = donor.push_var(1);
+        let s = donor.push_binary(OpKind::Mul, x, y);
+        let frag = donor.push_binary(OpKind::Add, s, s);
+
+        let mut host = ExprArena::new();
+        let before = host.nodes_raw().len();
+        let spliced = host.splice(&donor, frag);
+        // x, y, s, add = 4 nodes — not 6 (s duplicated).
+        assert_eq!(host.nodes_raw().len() - before, 4);
+        assert_eq!(eval(&host, spliced, &[3.0, 2.0, 0.0, 0.0]), 12.0);
+    }
+
+    #[test]
+    fn substitute_vars_with_replaces_slot_with_fragment() {
+        // Body template: sqrt(Var(8)) + X, where Var(8) is a manifold slot.
+        let mut a = ExprArena::new();
+        let slot = a.push_var(8);
+        let sq = a.push_unary(OpKind::Sqrt, slot);
+        let x = a.push_var(0);
+        let root = a.push_binary(OpKind::Add, sq, x);
+
+        // Fragment: x*x + y*y.
+        let fx = a.push_var(0);
+        let fy = a.push_var(1);
+        let fx2 = a.push_binary(OpKind::Mul, fx, fx);
+        let fy2 = a.push_binary(OpKind::Mul, fy, fy);
+        let frag = a.push_binary(OpKind::Add, fx2, fy2);
+
+        let root = a.substitute_vars_with(root, &[(8, frag)]);
+        // sqrt(x²+y²) + x at (3,4) = 5 + 3.
+        assert_eq!(eval(&a, root, &[3.0, 4.0, 0.0, 0.0]), 8.0);
+    }
+
+    #[test]
+    fn substitute_vars_with_as_coordinate_warp() {
+        // Warp: evaluate x*y at (x+1, 2y) — the contramap use of the same API.
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let body = a.push_binary(OpKind::Mul, x, y);
+
+        let one = a.push_const(1.0);
+        let two = a.push_const(2.0);
+        let wx = a.push_binary(OpKind::Add, x, one);
+        let wy = a.push_binary(OpKind::Mul, y, two);
+
+        let warped = a.substitute_vars_with(body, &[(0, wx), (1, wy)]);
+        // (x+1) * 2y at (3, 4) = 4 * 8 = 32.
+        assert_eq!(eval(&a, warped, &[3.0, 4.0, 0.0, 0.0]), 32.0);
+
+        // The warp expressions' own Var(0)/Var(1) still read raw coordinates.
+        assert_eq!(eval(&a, warped, &[0.0, 1.0, 0.0, 0.0]), 2.0);
+    }
+
+    #[test]
+    fn spliced_fragment_differentiates_in_host() {
+        // The composition story end-to-end at the arena level: splice a
+        // distance fragment under a Dwrt and lower — d/dx √(x²+y²) = x/r.
+        use crate::backend::emit::lowering::lower_dwrt_owned;
+
+        let mut donor = ExprArena::new();
+        let x = donor.push_var(0);
+        let y = donor.push_var(1);
+        let x2 = donor.push_binary(OpKind::Mul, x, x);
+        let y2 = donor.push_binary(OpKind::Mul, y, y);
+        let sum = donor.push_binary(OpKind::Add, x2, y2);
+        let dist = donor.push_unary(OpKind::Sqrt, sum);
+
+        let mut host = ExprArena::new();
+        let frag = host.splice(&donor, dist);
+        let v0 = host.push_const(0.0);
+        let root = host.push_binary(OpKind::Dwrt, frag, v0);
+
+        let (out, out_root) = lower_dwrt_owned(&host, root).expect("lower_dwrt");
+        let got = eval(&out, out_root, &[3.0, 4.0, 0.0, 0.0]);
+        assert!((got - 0.6).abs() < 1e-4, "d/dx dist at (3,4): got {got}");
     }
 }

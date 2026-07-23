@@ -18,20 +18,45 @@ use syn::Lit;
 // AST → Arena IR Conversion
 // ============================================================================
 
-/// Build a `param_name → index` map from an analyzed kernel.
+/// Base `Var` index for manifold-param slots in an expansion arena: a kernel
+/// body's reference to a manifold param `k` becomes `Var(8 + k)` (0..4 are
+/// coordinates, 4..8 reduction indices), and the builder closure substitutes
+/// the slot with the argument kernel's spliced fragment at construction time.
+/// Distinct from the e-graph's scalar-param encoding at 16+ — slots are gone
+/// (substituted) before any arena reaches the optimizer or a backend.
+pub const MANIFOLD_SLOT_BASE: u8 = 8;
+
+/// Maximum manifold params per kernel (slots 8..16).
+pub const MAX_MANIFOLD_PARAMS: usize = 8;
+
+/// Build a `param_name → index` map over the *scalar* params of a kernel.
 ///
-/// Index is declaration order: first scalar param = 0, second = 1, etc.
-/// Only scalar params are included — manifold params cannot be constant-folded.
+/// Indices are dense over scalars in declaration order (manifold params do
+/// not consume an index): they become `Param(i)` arena nodes, substituted by
+/// `substitute_params` with the builder closure's scalar arguments in the
+/// same dense order.
 pub fn scalar_param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, u8> {
     analyzed
         .def
         .params
         .iter()
+        .filter(|p| matches!(p.kind, crate::ast::ParamKind::Scalar(_)))
         .enumerate()
-        .filter_map(|(i, p)| match &p.kind {
-            crate::ast::ParamKind::Scalar(_) => Some((p.name.to_string(), i as u8)),
-            crate::ast::ParamKind::Manifold => None,
-        })
+        .map(|(i, p)| (p.name.to_string(), i as u8))
+        .collect()
+}
+
+/// Build a `param_name → slot` map over the *manifold* params of a kernel,
+/// dense in declaration order. Slot `k` appears in the arena as
+/// `Var(MANIFOLD_SLOT_BASE + k)`.
+pub fn manifold_param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, u8> {
+    analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, crate::ast::ParamKind::Manifold))
+        .enumerate()
+        .map(|(i, p)| (p.name.to_string(), i as u8))
         .collect()
 }
 
@@ -46,10 +71,21 @@ pub fn scalar_param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<S
 pub fn ast_to_arena(
     expr: &Expr,
     param_indices: &HashMap<String, u8>,
+    manifold_indices: &HashMap<String, u8>,
     arena: &mut ExprArena,
 ) -> Result<ExprId, String> {
     let mut locals: HashMap<String, ExprId> = HashMap::new();
-    ast_to_arena_inner(expr, param_indices, &mut locals, arena)
+    let ctx = Ctx {
+        param_indices,
+        manifold_indices,
+    };
+    ast_to_arena_inner(expr, &ctx, &mut locals, arena)
+}
+
+/// Name-resolution context for the AST → arena walk.
+struct Ctx<'a> {
+    param_indices: &'a HashMap<String, u8>,
+    manifold_indices: &'a HashMap<String, u8>,
 }
 
 /// Translate an AST node into the arena, resolving `let`-bound locals via
@@ -59,7 +95,7 @@ pub fn ast_to_arena(
 /// subtrees.
 fn ast_to_arena_inner(
     expr: &Expr,
-    param_indices: &HashMap<String, u8>,
+    ctx: &Ctx<'_>,
     locals: &mut HashMap<String, ExprId>,
     arena: &mut ExprArena,
 ) -> Result<ExprId, String> {
@@ -74,8 +110,13 @@ fn ast_to_arena_inner(
                 _ => {
                     if let Some(&id) = locals.get(&name) {
                         Ok(id)
-                    } else if let Some(&idx) = param_indices.get(&name) {
+                    } else if let Some(&idx) = ctx.param_indices.get(&name) {
                         Ok(arena.push_param(idx))
+                    } else if let Some(&slot) = ctx.manifold_indices.get(&name) {
+                        // Manifold param: a reserved slot variable, replaced
+                        // by the argument kernel's spliced fragment when the
+                        // builder closure runs.
+                        Ok(arena.push_var(MANIFOLD_SLOT_BASE + slot))
                     } else {
                         Err(format!("Unknown identifier: {}", name))
                     }
@@ -92,8 +133,8 @@ fn ast_to_arena_inner(
         }
 
         Expr::Binary(binary) => {
-            let lhs = ast_to_arena_inner(&binary.lhs, param_indices, locals, arena)?;
-            let rhs = ast_to_arena_inner(&binary.rhs, param_indices, locals, arena)?;
+            let lhs = ast_to_arena_inner(&binary.lhs, ctx, locals, arena)?;
+            let rhs = ast_to_arena_inner(&binary.rhs, ctx, locals, arena)?;
 
             let op = match binary.op {
                 BinaryOp::Add => OpKind::Add,
@@ -113,7 +154,7 @@ fn ast_to_arena_inner(
         }
 
         Expr::Unary(unary) => {
-            let operand = ast_to_arena_inner(&unary.operand, param_indices, locals, arena)?;
+            let operand = ast_to_arena_inner(&unary.operand, ctx, locals, arena)?;
 
             let op = match unary.op {
                 UnaryOp::Neg => OpKind::Neg,
@@ -125,7 +166,7 @@ fn ast_to_arena_inner(
 
         Expr::MethodCall(call) => {
             let method = call.method.to_string();
-            let receiver = ast_to_arena_inner(&call.receiver, param_indices, locals, arena)?;
+            let receiver = ast_to_arena_inner(&call.receiver, ctx, locals, arena)?;
 
             match (method.as_str(), call.args.len()) {
                 // Arena expressions are values; `.clone()` (needed by the
@@ -158,58 +199,58 @@ fn ast_to_arena_inner(
 
                 // Binary methods
                 ("min", 1) => {
-                    let arg = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let arg = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Min, receiver, arg))
                 }
                 ("max", 1) => {
-                    let arg = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let arg = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Max, receiver, arg))
                 }
                 ("atan2", 1) => {
-                    let arg = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let arg = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Atan2, receiver, arg))
                 }
 
                 // Ternary methods
                 ("mul_add", 2) => {
-                    let b = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
-                    let c = ast_to_arena_inner(&call.args[1], param_indices, locals, arena)?;
+                    let b = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
+                    let c = ast_to_arena_inner(&call.args[1], ctx, locals, arena)?;
                     Ok(arena.push_ternary(OpKind::MulAdd, receiver, b, c))
                 }
                 ("select", 2) => {
-                    let if_true = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
-                    let if_false = ast_to_arena_inner(&call.args[1], param_indices, locals, arena)?;
+                    let if_true = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
+                    let if_false = ast_to_arena_inner(&call.args[1], ctx, locals, arena)?;
                     Ok(arena.push_ternary(OpKind::Select, receiver, if_true, if_false))
                 }
                 ("clamp", 2) => {
-                    let lo = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
-                    let hi = ast_to_arena_inner(&call.args[1], param_indices, locals, arena)?;
+                    let lo = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
+                    let hi = ast_to_arena_inner(&call.args[1], ctx, locals, arena)?;
                     Ok(arena.push_ternary(OpKind::Clamp, receiver, lo, hi))
                 }
 
                 // Comparison methods (emitted by e-graph extraction)
                 ("lt", 1) => {
-                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let a = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Lt, receiver, a))
                 }
                 ("le", 1) => {
-                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let a = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Le, receiver, a))
                 }
                 ("gt", 1) => {
-                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let a = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Gt, receiver, a))
                 }
                 ("ge", 1) => {
-                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let a = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Ge, receiver, a))
                 }
                 ("eq", 1) => {
-                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let a = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Eq, receiver, a))
                 }
                 ("ne", 1) => {
-                    let a = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+                    let a = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
                     Ok(arena.push_binary(OpKind::Ne, receiver, a))
                 }
 
@@ -231,7 +272,7 @@ fn ast_to_arena_inner(
                     call.args.len()
                 ));
             }
-            let inner = ast_to_arena_inner(&call.args[0], param_indices, locals, arena)?;
+            let inner = ast_to_arena_inner(&call.args[0], ctx, locals, arena)?;
             match func.as_str() {
                 "V" => Ok(inner),
                 "DX" => Ok(push_dwrt(arena, inner, 0)),
@@ -254,7 +295,7 @@ fn ast_to_arena_inner(
         }
 
         // Parentheses are transparent - just recurse into the inner expression
-        Expr::Paren(inner) => ast_to_arena_inner(inner, param_indices, locals, arena),
+        Expr::Paren(inner) => ast_to_arena_inner(inner, ctx, locals, arena),
 
         // Blocks carry the optimizer's CSE: each `let __n = <expr>;` binds a
         // shared subexpression to a single arena node, and the final expression
@@ -263,18 +304,18 @@ fn ast_to_arena_inner(
             for stmt in &block.stmts {
                 match stmt {
                     crate::ast::Stmt::Let(let_stmt) => {
-                        let id = ast_to_arena_inner(&let_stmt.init, param_indices, locals, arena)?;
+                        let id = ast_to_arena_inner(&let_stmt.init, ctx, locals, arena)?;
                         locals.insert(let_stmt.name.to_string(), id);
                     }
                     // A non-binding statement has no value to thread; evaluate
                     // it so any nested error surfaces, then discard the id.
                     crate::ast::Stmt::Expr(e) => {
-                        let _ = ast_to_arena_inner(e, param_indices, locals, arena)?;
+                        let _ = ast_to_arena_inner(e, ctx, locals, arena)?;
                     }
                 }
             }
             match &block.expr {
-                Some(final_expr) => ast_to_arena_inner(final_expr, param_indices, locals, arena),
+                Some(final_expr) => ast_to_arena_inner(final_expr, ctx, locals, arena),
                 None => Err("Block has no final expression".to_string()),
             }
         }
@@ -294,9 +335,10 @@ fn ast_to_arena_inner(
 pub fn ast_to_runtime_arena(
     expr: &Expr,
     param_indices: &HashMap<String, u8>,
+    manifold_indices: &HashMap<String, u8>,
 ) -> Result<TokenStream, String> {
     let mut arena = ExprArena::new();
-    let mut root = ast_to_arena(expr, param_indices, &mut arena)?;
+    let mut root = ast_to_arena(expr, param_indices, manifold_indices, &mut arena)?;
     if let Some((optimized, optimized_root)) = differentiate_in_optimizer(&arena, root) {
         arena = optimized;
         root = optimized_root;
@@ -402,6 +444,17 @@ fn differentiate_in_optimizer(arena: &ExprArena, root: ExprId) -> Option<(ExprAr
     use pixelflow_search::egraph::{CostModel, EGraph, extract};
 
     if !contains_dwrt(arena) {
+        return None;
+    }
+
+    // Manifold-param slots (`Var(8..16)`) stand for whole kernel expressions
+    // that are spliced in at construction time — differentiating one as if it
+    // were an independent variable (derivative 0) would be wrong. The
+    // calculus for composed kernels resolves after splicing, in the runtime
+    // `lower_dwrt` tier.
+    if arena.nodes_raw().iter().any(
+        |n| matches!(n, ExprNode::Var(i) if (MANIFOLD_SLOT_BASE..PARAM_VAR_BASE).contains(i)),
+    ) {
         return None;
     }
 
