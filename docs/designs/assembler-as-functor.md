@@ -292,11 +292,12 @@ Scoped down to one step by the feasibility verdict (§5b):
    is untouched. `optimize`'s numeric path becomes an `ExprArena → ExprArena`
    core. This is the viable, worthwhile part.
 
-   ~~7. Codegen on arena~~ / ~~8. Delete `dag_to_expr`~~ — **not advised**
-   (§5b). Would require extending `ExprArena` with opaque-manifold, symbolic
-   method-call, and verbatim node kinds plus param-kind/domain metadata —
-   turning the numeric IR into a second source AST — for little gain. The
-   syn-`Expr` codegen path stays for the manifold/verbatim superset.
+   Steps 7–8 (arena-native codegen, delete `dag_to_expr`, retire the
+   combinator emitter) are **not owned by this doc** — they are the plan of
+   record `docs/plans/2026-07-20-kernel-unification.md` (P2–P6), which resolves
+   the opaque surface via arena splicing + Gather + `Dwrt` lowering rather than
+   source-AST node bloat (§5b). Track B here stops at step 6; the emitter's
+   retirement is tracked there.
 
 ## 5b. Feasibility verdict: the arena is a *numeric* IR (Track B step 7 is not viable as stated)
 
@@ -324,34 +325,42 @@ as numeric scalars. It has **no vocabulary** for the cases codegen depends on:
 | Symbol-kind decisions (manifold taint → `Clone`, `.at`/derivative trait-bound synthesis, `ManifoldBind` vs `Computed`) | none (arena erases scalar-vs-manifold) |
 | Literal space (Domain vs Projected → `CtxVar` vs `V(CtxVar)`) | none |
 
-**Verdict.** The arena is sufficient for the **numeric spine** (arithmetic,
-comparisons-as-methods, literals, scalar params, X/Y/Z/W) — the subset that is
-already JIT-assembled and already goes through the e-graph. It is *not*
-sufficient for opaque-manifold / verbatim kernels. Making codegen
-arena-native (Track B steps 7–8) would require extending `ExprArena` with
-opaque-manifold, symbolic-method-call, and verbatim node kinds plus retained
-param-kind/domain/literal-space metadata — i.e. **turning the numeric IR into
-a second source-level AST.** That contradicts the arena's identity as a
-numeric SIMD algebra and buys little: the `dag_to_expr` round-trip it would
-delete is cheap, since codegen is a transliteration `rustc` finishes anyway.
+**What this rules out — and what it doesn't.** The *naive* codegen-on-arena
+port is not viable: you cannot make the arena hold opaque manifold params,
+symbolic method-call chains, and `Expr::Verbatim` syn as **expression node
+kinds** without turning the numeric IR into a second source-level AST. That
+much stands.
 
-**Revised target.** The realistic end state is a **hybrid**, and it is
-philosophically clean:
+But "keep the combinator emitter forever as a hybrid" — an earlier draft's
+conclusion — is *wrong*, and contradicts the plan of record
+(`docs/plans/2026-07-20-kernel-unification.md`, "One Kernel Language"). That
+plan retires the combinator emitter (P6) and resolves the opaque surface
+**without** source-AST node bloat, by routing each opaque case through a
+*composition mechanism* rather than an expression node:
 
-- `ExprArena` is the **sole IR for the numeric core** — the optimizable,
-  JIT-able, assemblable subset. Track B **step 6** (optimizer *ingestion* on
-  the arena) is viable and worthwhile: the e-graph path is *already*
-  numeric-only (`optimize_via_model`), and opaque-manifold blocks *already*
-  bypass it (`optimize_block_preserving_structure`). Feeding `ast_to_arena`
-  into the e-graph instead of `expr_to_egraph(&Expr)` kills the front
-  conversion and makes `optimize`'s numeric path an `ExprArena → ExprArena`
-  core, without touching the opaque path.
-- **Manifold-parametric / verbatim kernels** stay on the syn-`Expr` codegen
-  path. They are a *composition layer* that wraps numeric arena kernels in
-  Rust type-tree plumbing — not numeric assembly, and not the assembler's job.
+| Opaque case | Plan's mechanism (keeps the arena numeric) |
+|-------------|--------------------------------------------|
+| Manifold params, `.at()`, composition, named structs | **Arena splicing** — `HasIr` fragment accessors; contramap = Var substitution, `Sum` = chained `Add` (P4) |
+| Opaque *Rust* manifolds (DiscreteManifold, CachedGlyph) | **Bound buffers / ctx-pointer calls** — the existing Gather pattern, not expressions |
+| Jet2/Jet3 (font AA, 3D normals) | **`Dwrt`** symbolic-differentiation lowering in pixelflow-ir (P2) — a numeric op lowered like `expand_transcendentals` |
+| Portable / reference semantics | The IR interpreter (`eval.rs`) |
 
-So Track B collapses to **step 6 only**; steps 7–8 are reclassified as "would
-require making the arena a full source IR — not advised." `dag_to_expr` stays.
+So the arena stays a numeric algebra *and* the emitter still dies — the
+opaque surface enters through splicing/Gather/Dwrt, never as source-level
+method-call nodes. The full collapse the user asked for is real; it is the
+kernel-unification plan's phased **P2–P6**, gated on P0 golden fixtures and
+P0.5 e-graph type-stability (both in flight).
+
+**Where this doc sits.** "Assembler as a functor" is about the **back-end**
+(`ExprArena → bytes`) that those phases feed. Its concrete near-term
+increment, **Track B step 6** (optimizer *ingestion* on the arena), aligns
+with the unification plan's `parse → sema → e-graph → ExprArena` pipeline: the
+e-graph path is *already* numeric-only (`optimize_via_model`), opaque blocks
+*already* bypass it (`optimize_block_preserving_structure`), so feeding
+`ast_to_arena` into the e-graph instead of `expr_to_egraph(&Expr)` is a safe,
+plan-aligned step. Steps 7–8 (arena-native codegen, delete `dag_to_expr`) are
+not a separate track — they are subsumed by kernel-unification P2–P6, which is
+the authority on that work. This doc defers to it there.
 
 ## 6. Resolved decisions
 
