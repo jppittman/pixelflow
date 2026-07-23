@@ -58,6 +58,55 @@ here for completeness and to prevent the (tempting, wrong) collapse of
 `optimize` into the arena passes — they are at a different altitude, on a
 different type, in a different crate.
 
+### 2.0 Current vs. target: the optimizer belongs on the IR
+
+The two-monoid structure above is the **current** state, and it is a wart, not
+a law. The optimizer lives on the source AST for historical reasons only:
+
+- `optimize`'s input/output is `AnalyzedKernel.def.body: Expr` (syn AST).
+- But e-graph extraction *already builds an arena internally*
+  (`choices_to_arena` / `ExtractedDAG` in `pixelflow-search`), then
+  `dag_to_expr` (`optimize.rs`) converts it **back** to syn `Expr` — purely so
+  the proc-macro `codegen::emit(AnalyzedKernel)` can consume it.
+
+So syn-`Expr` is the handoff between `optimize` and `codegen`, and
+`dag_to_expr` is a round-trip that exists only because codegen speaks AST
+instead of IR. The arena we want is created and then discarded on every
+compile.
+
+**Target architecture** (what `CLAUDE.md`'s "ExprArena is the sole IR
+representation everywhere" actually asks for): move the bridge up to right
+after sema, and everything downstream is one representation.
+
+```mermaid
+graph LR
+    T[kernel! text] -- parse+sema --> E[Expr syn AST]
+    E -- ast_to_arena: BRIDGE --> A0[ExprArena]
+    A0 -- optimize: Arena endo --> A1[ExprArena]
+    A1 -- expand_*: Arena endo --> A2[ExprArena]
+    A2 -- codegen FUNCTOR --> Out[TokenStream / bytes]
+```
+
+Then `optimize` and `expand_*` are a **single** `ExprArena → ExprArena`
+endomorphism monoid, `dag_to_expr` is deleted, and the source AST exists only
+between parse and the bridge. This subsumes `ArenaPass`: `optimize` becomes a
+member of the same monoid rather than a separate altitude.
+
+The cost is not uniform across the two consumers of the handoff:
+
+- **Optimizer ingestion** (syn `Expr` → e-graph): *moderate*. Replace
+  `expr_to_egraph(&Expr)` with arena ingestion; the DAG/arena machinery
+  already exists. Kills `dag_to_expr`.
+- **Proc-macro codegen** (`codegen::emit` + `codegen/emitter.rs`, ~1200 LOC):
+  *large*. It emits the Manifold **type-tree** TokenStream (`Sqrt<Add<…>>`)
+  by walking syn `Expr`; consuming the arena means re-targeting that walk. This
+  is the real cost center and deserves its own design pass.
+
+Because syn-`Expr` is the *shared* handoff, you cannot move the optimizer onto
+the IR without also moving codegen — otherwise `dag_to_expr` stays. So this is
+staged (see §5): land the back-end `ArenaPass` first, then optimizer
+ingestion, then codegen-on-arena last.
+
 ### 2.1 The back-end endomorphisms are already abstracted
 
 `rebuild_arena` (`pixelflow-ir/src/backend/emit/lowering.rs`) is a
@@ -231,9 +280,22 @@ revertible:
    so downstream code (and benches) migrate incrementally.
 5. **Delete the shims** once no caller remains, leaving one builder.
 
-Non-goals: no change to instruction encodings, register allocation, the
-Select short-circuit, or the front-end parse. This is a re-surfacing of the
-existing pipeline, not a rewrite of any stage.
+Steps 1–5 are **Track A** (re-surface the back-end pipeline as a value): no
+change to instruction encodings, register allocation, the Select
+short-circuit, or the front-end parse.
+
+**Track B — move the optimizer onto the IR** (§2.0). Independent of Track A,
+larger, and worth its own design pass before step 8:
+
+6. **Optimizer ingestion on arena** — feed `ast_to_arena` output to the
+   e-graph instead of `expr_to_egraph(&Expr)`; keep `dag_to_expr` as a
+   temporary adapter so codegen is untouched. `optimize` now has an
+   `ExprArena → ExprArena` core.
+7. **Codegen on arena** — re-target `codegen::emit` / `codegen/emitter.rs` to
+   walk `ExprArena` for the Manifold type-tree TokenStream. This is the large
+   step and the one that actually deletes the round-trip.
+8. **Delete `dag_to_expr`** and drop syn-`Expr` from everything downstream of
+   the bridge. `optimize` joins `expand_*` in the single `ArenaPass` monoid.
 
 ## 6. Resolved decisions
 
