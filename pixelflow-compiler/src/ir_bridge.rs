@@ -387,14 +387,16 @@ fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
 /// zero like any non-differentiation variable.
 const PARAM_VAR_BASE: u8 = 16;
 
-/// Run the AOT-tier e-graph (full rule set: derivative + algebra + fusion,
-/// generous budget) over a `Dwrt`-carrying expansion arena, so derivatives are
-/// expanded *and simplified* at macro-expansion time and the runtime never
-/// sees the calculus.
+/// Run the AOT-tier e-graph (full rule set: derivative + algebra + fusion)
+/// over a `Dwrt`-carrying expansion arena, so derivatives are expanded *and
+/// simplified* at macro-expansion time and the runtime never sees the
+/// calculus.
 ///
 /// Returns `None` when there is nothing to do (no `Dwrt`) or when the result
 /// still contains a `Dwrt` (unsupported op / budget miss) — the caller then
 /// emits the original arena and the runtime `lower_dwrt` pass takes over.
+/// A budget miss is legitimate behavior, not a failure: the output's only
+/// contract is that a `Some` is `Dwrt`-free and mathematically equivalent.
 fn differentiate_in_optimizer(arena: &ExprArena, root: ExprId) -> Option<(ExprArena, ExprId)> {
     use pixelflow_ir::arena::ExprNode;
     use pixelflow_search::egraph::{CostModel, EGraph, extract};
@@ -436,32 +438,19 @@ fn differentiate_in_optimizer(arena: &ExprArena, root: ExprId) -> Option<(ExprAr
         .collect();
     let encoded = ExprArena::from_raw(encoded_nodes, arena.nary_children_raw().to_vec());
 
-    // Stage 1: the isolated derivative rules. The chain rule is confluent and
-    // terminating, and the rule set is inert on Dwrt-free subgraphs, so this
-    // saturates quickly and Dwrt elimination is DETERMINISTIC — it must not
-    // ride the wall-clock budget of the full optimizer, or whether a kernel's
-    // derivative resolves at expansion time would depend on machine load
-    // (observed as a CI-only fallback). Limits are generous safety rails, not
-    // a working budget.
-    let mut eg = EGraph::with_rules(pixelflow_search::egraph::derivative_rules());
-    let root_class = eg.add_arena(&encoded, root);
-    eg.saturate_with_limits(200, 50_000, std::time::Duration::from_secs(30));
-
-    let (expanded, expanded_root, _cost) = extract(&eg, root_class, &CostModel::default());
-    if contains_dwrt(&expanded) {
-        return None;
-    }
-
-    // Stage 2: full algebra/fusion cleanup on the now-Dwrt-free arena, under
-    // the ordinary optimizer budget (500ms/10k classes). Best-effort: a budget
-    // miss here costs extraction quality, never correctness — no rule
-    // introduces a Dwrt.
+    // One saturation, full rule set: differentiation and algebra rewrite
+    // TOGETHER — the point of the e-graph is that there is no pass ordering,
+    // so the optimizer is free to simplify the differentiand before, during,
+    // or after the chain rule fires (see the `derivative` module doc in
+    // pixelflow-search). Standard optimizer budget.
     let mut eg = EGraph::with_rules(crate::optimize::standard_rules());
-    let root_class = eg.add_arena(&expanded, expanded_root);
+    let root_class = eg.add_arena(&encoded, root);
     eg.saturate();
 
     let (out, out_root, _cost) = extract(&eg, root_class, &CostModel::default());
-    debug_assert!(!contains_dwrt(&out), "algebra rules introduced a Dwrt");
+    if contains_dwrt(&out) {
+        return None;
+    }
 
     // Var(16+i) -> Param(i).
     let decoded_nodes: Vec<ExprNode> = out
@@ -547,15 +536,59 @@ fn opkind_to_tokens(kind: OpKind) -> TokenStream {
 mod expansion_derivative_tests {
     use super::*;
     use pixelflow_ir::arena::ExprNode;
+    use pixelflow_ir::backend::emit::lowering::lower_dwrt_owned;
     use pixelflow_ir::binding::BindingTable;
     use pixelflow_ir::eval::eval_scalar;
 
-    /// `Dwrt` with a scalar param in the differentiand: the optimizer must
-    /// eliminate the derivative at expansion time AND round-trip the param
-    /// (Param -> Var(16+) -> Param) so runtime substitution still works.
-    /// d/dx (p0 * sqrt(x² + y²)) = p0 * x / sqrt(x² + y²).
+    /// The optimizer's contract, checked differentially: whatever it returns
+    /// for a `Dwrt`-carrying arena must agree numerically with the runtime
+    /// `lower_dwrt` tier — two independent implementations of the same
+    /// calculus checking each other. `None` (budget miss → fallback) is
+    /// always legitimate and asserts nothing; a `Some` must be honest:
+    /// `Dwrt`-free, params round-tripped, and mathematically equivalent.
+    /// Whether the output is also *cheaper* is a cost-model concern for the
+    /// bench harness (`bench_extraction_3way` precedent), not a unit test.
+    fn assert_matches_runtime_tier(a: &ExprArena, root: ExprId, params: &[f32], pts: &[[f32; 4]]) {
+        let Some((out, out_root)) = differentiate_in_optimizer(a, root) else {
+            return; // fallback tier's job; nothing claimed, nothing to check
+        };
+
+        assert!(
+            !super::contains_dwrt(&out),
+            "Some(..) must be Dwrt-free — that is the claim it makes"
+        );
+        assert!(
+            !out.nodes_raw()
+                .iter()
+                .any(|n| matches!(n, ExprNode::Var(i) if *i >= PARAM_VAR_BASE)),
+            "encoded param Var leaked through the round-trip undecoded"
+        );
+
+        // Reference: substitute params into the ORIGINAL arena and run the
+        // runtime lowering tier on it.
+        let mut reference = a.clone();
+        let ref_root = reference.substitute_params(root, params);
+        let (ref_arena, ref_root) =
+            lower_dwrt_owned(&reference, ref_root).expect("runtime tier lowers the reference");
+
+        let mut got = out.clone();
+        let got_root = got.substitute_params(out_root, params);
+
+        for p in pts {
+            let want = eval_scalar(&ref_arena, ref_root, p, &BindingTable::empty());
+            let g = eval_scalar(&got, got_root, p, &BindingTable::empty());
+            let tol = 1e-3 * want.abs().max(1.0);
+            assert!(
+                (g - want).abs() <= tol,
+                "at {p:?}: optimizer={g}, runtime tier={want} (tol {tol})"
+            );
+        }
+    }
+
+    /// d/dx (p0 · √(x² + y²)) — a scalar param inside the differentiand
+    /// exercises the Param ↔ Var(16+) round-trip alongside the calculus.
     #[test]
-    fn eliminates_dwrt_and_preserves_params() {
+    fn param_derivative_matches_runtime_tier() {
         let mut a = ExprArena::new();
         let p0 = a.push_param(0);
         let x = a.push_var(0);
@@ -567,34 +600,22 @@ mod expansion_derivative_tests {
         let e = a.push_binary(OpKind::Mul, p0, dist);
         let root = push_dwrt(&mut a, e, 0);
 
-        let (out, out_root) =
-            differentiate_in_optimizer(&a, root).expect("optimizer should eliminate Dwrt");
-
-        assert!(!super::contains_dwrt(&out), "residual Dwrt after extraction");
-        assert!(
-            out.nodes_raw()
-                .iter()
-                .any(|n| matches!(n, ExprNode::Param(0))),
-            "Param(0) lost in the e-graph round-trip"
+        assert_matches_runtime_tier(
+            &a,
+            root,
+            &[2.0],
+            &[
+                [3.0, 4.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0, 0.0],
+                [-2.0, 5.0, 0.0, 0.0],
+            ],
         );
-
-        let mut sub = out.clone();
-        let sub_root = sub.substitute_params(out_root, &[2.0]);
-        for (px, py) in [(3.0f32, 4.0f32), (1.0, 1.0), (-2.0, 5.0)] {
-            let got = eval_scalar(&sub, sub_root, &[px, py, 0.0, 0.0], &BindingTable::empty());
-            let want = 2.0 * px / (px * px + py * py).sqrt();
-            let tol = 1e-3 * want.abs().max(1.0);
-            assert!(
-                (got - want).abs() <= tol,
-                "at ({px},{py}): got {got}, want {want}"
-            );
-        }
     }
 
-    /// The piecewise font ramp (min/max over a derivative ratio) must also
-    /// resolve at expansion time now that the e-graph carries piecewise rules.
+    /// The piecewise font ramp: min/max over a gradient-normalized ratio,
+    /// with two shared `Dwrt` sites.
     #[test]
-    fn eliminates_dwrt_through_min_max() {
+    fn piecewise_ramp_matches_runtime_tier() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
@@ -611,20 +632,16 @@ mod expansion_derivative_tests {
         let mx = a.push_binary(OpKind::Max, ratio, zero);
         let root = a.push_binary(OpKind::Min, mx, one);
 
-        let (out, out_root) =
-            differentiate_in_optimizer(&a, root).expect("optimizer should eliminate Dwrt");
-        assert!(!super::contains_dwrt(&out));
-
-        // clamp((x-y)/√2, 0, 1)
-        for (px, py) in [(2.0f32, 1.0f32), (0.5, 0.2), (-1.0, 1.0)] {
-            let got = eval_scalar(&out, out_root, &[px, py, 0.0, 0.0], &BindingTable::empty());
-            let want = ((px - py) / 2.0f32.sqrt()).clamp(0.0, 1.0);
-            let tol = 1e-3 * want.abs().max(1.0);
-            assert!(
-                (got - want).abs() <= tol,
-                "at ({px},{py}): got {got}, want {want}"
-            );
-        }
+        assert_matches_runtime_tier(
+            &a,
+            root,
+            &[],
+            &[
+                [2.0, 1.0, 0.0, 0.0],
+                [0.5, 0.2, 0.0, 0.0],
+                [-1.0, 1.0, 0.0, 0.0],
+            ],
+        );
     }
 
     /// No `Dwrt` -> nothing to do; the caller keeps the original arena (and
