@@ -114,18 +114,34 @@ pub fn kernel(input: TokenStream) -> TokenStream {
 
     // Phase 5: Code generation.
     //
-    // NOTE: `kernel!` stays on the combinator backend. We cannot transparently
-    // route the "scalar `Field`" subset to the JIT, because combinator kernels
-    // are polymorphic over the *evaluation domain*: a kernel declared `-> Field`
-    // is still routinely evaluated over `Jet2`/`Jet3` domains for antialiasing
-    // and 3D surfaces (see `pixelflow-core/tests/test_sphere_debug.rs`). The JIT
-    // wrapper is monomorphic to `Manifold<(Field, Field, Field, Field)>`, so
-    // swapping it in drops that polymorphism. Making the swap transparent
-    // requires a dual-backend wrapper (JIT for the `Field` fast path, combinator
-    // for the jet paths); until then the JIT is reached only via `kernel_jit!`.
+    // NOTE: `kernel!` defaults to the combinator backend. We cannot yet
+    // transparently route the "scalar `Field`" subset to the JIT, because
+    // combinator kernels are polymorphic over the *evaluation domain*: a
+    // kernel declared `-> Field` is still routinely evaluated over
+    // `Jet2`/`Jet3` domains for antialiasing and 3D surfaces (see
+    // `pixelflow-core/tests/test_sphere_debug.rs`). The JIT wrapper is
+    // monomorphic to `Manifold<(Field, Field, Field, Field)>`, so swapping it
+    // in drops that polymorphism, and it is `Clone` where combinator kernels
+    // are `Copy` ZSTs.
     //
-    // The eligibility gate and shared codegen live in `jit_backend` and are
-    // exercised by `kernel_jit!`.
+    // P3 transition scaffolding (docs/plans/2026-07-20-kernel-unification.md):
+    // under `feature = "arena-backend"`, eligible bodies route to the arena
+    // backend so the parity suite (and a full workspace build) can measure
+    // exactly what still depends on the combinator emitter. Consumers that
+    // fail to build under the feature are the P4/P5 work list. Routing
+    // excludes derivative projections (see `is_transparent_routing_safe`) —
+    // their `Field`-domain semantics intentionally differ between backends.
+    // The default flips when the parity suite + font goldens say so.
+    #[cfg(feature = "arena-backend")]
+    {
+        // A body the bridge cannot lower (Err) falls back to the combinator
+        // backend, same as ineligible signatures.
+        if jit_backend::is_transparent_routing_safe(&optimized)
+            && let Ok(tokens) = jit_backend::emit_jit(&optimized, jit_backend::ZeroParam::Closure)
+        {
+            return tokens.into();
+        }
+    }
     codegen::emit(optimized).into()
 }
 

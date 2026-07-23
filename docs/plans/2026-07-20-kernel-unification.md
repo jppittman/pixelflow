@@ -71,10 +71,20 @@ to-be-retired backend, tracked until that backend dies.
   loudly on genuinely non-differentiable ops. Jets are not a fallback: they
   would reintroduce the jet ABI this plan retires, and remain
   combinator-backend-only until P6.
-- **P3 — routing scaffolding**: `kernel!` routes eligible bodies through the
-  arena backend behind a cargo feature; parity suite runs both ways. This is
-  transition scaffolding, not an end-state decision — default flips when the
-  parity suite says so.
+- **P3 — routing scaffolding** *(landed 2026-07-23)*: `kernel!` routes
+  eligible bodies through the arena backend behind
+  `pixelflow-compiler/arena-backend`; the routing parity suite
+  (tests/kernel_routing_parity.rs) runs both ways, and the full workspace is
+  green with the feature on. Routing is gated by `is_transparent_routing_safe`:
+  signature-eligible AND no derivative projections (their `Field`-domain
+  semantics intentionally differ between backends — combinator `DX` over
+  `Field` is the fonts' load-bearing "hard step" 0) AND the body references
+  coordinates (constant kernels rely on combinator domain polymorphism, e.g.
+  scalar-param expressions evaluated over `Jet3`). Emitted JIT paths go
+  through a `#[doc(hidden)]` `pixelflow_core::__ir` re-export so consumers
+  need no pixelflow-ir dependency. This is transition scaffolding, not an
+  end-state decision — default flips when the parity suite + font goldens say
+  so.
 - **P4 — IR-carrying kernels + arena splicing**: `HasIr`-style fragment
   accessor emitted by the macro; splice/substitute APIs on `ExprArena`. This is
   what shrinks `is_jit_eligible`'s ineligible set toward zero (named structs,

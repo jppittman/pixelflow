@@ -71,6 +71,89 @@ fn is_field_ty(ty: &Option<syn::Type>) -> bool {
     }
 }
 
+/// Whether `kernel!` may transparently route this kernel to the arena backend
+/// (the P3 `arena-backend` feature) without changing observable behavior.
+///
+/// Stricter than [`is_jit_eligible`]: bodies containing derivative
+/// projections (`DX`/`DY`/`DZ`/`DXX`/`DXY`/`DYY`) are excluded even though
+/// the JIT compiles them, because the two backends *intentionally* disagree
+/// about them on a `Field` domain. The combinator backend evaluates the body
+/// in the caller's domain — projections yield 0 over `Field` (the fonts'
+/// "hard step" degenerate case) and true derivatives only over jets — while
+/// the arena backend computes symbolic derivatives unconditionally. Kernels
+/// that want the symbolic semantics ask for them via `kernel_jit!`.
+///
+/// `V` is not excluded: it is the identity in both backends' `Field` lanes.
+/// Coordinate-free (constant) bodies are also excluded: they exist to be
+/// evaluated in *any* domain (e.g. a scalar-param expression used over
+/// `Jet3`), which the combinator's domain polymorphism provides and the
+/// monomorphic JIT wrapper cannot — and JIT-compiling a constant buys
+/// nothing per pixel anyway.
+#[allow(dead_code)] // referenced by `kernel!` only under feature = "arena-backend"
+pub fn is_transparent_routing_safe(analyzed: &AnalyzedKernel) -> bool {
+    is_jit_eligible(analyzed)
+        && !uses_derivative_projections(&analyzed.def.body)
+        && references_coordinates(&analyzed.def.body)
+}
+
+/// Whether the body reads any coordinate variable (`X`/`Y`/`Z`/`W`). Sema
+/// rejects shadowing of the coordinate intrinsics, so an ident match is exact.
+fn references_coordinates(expr: &crate::ast::Expr) -> bool {
+    use crate::ast::{Expr, Stmt};
+    match expr {
+        Expr::Ident(id) => matches!(id.name.to_string().as_str(), "X" | "Y" | "Z" | "W"),
+        Expr::Literal(_) | Expr::Verbatim(_) => false,
+        Expr::Binary(b) => references_coordinates(&b.lhs) || references_coordinates(&b.rhs),
+        Expr::Unary(u) => references_coordinates(&u.operand),
+        Expr::MethodCall(m) => {
+            references_coordinates(&m.receiver) || m.args.iter().any(references_coordinates)
+        }
+        Expr::Call(c) => c.args.iter().any(references_coordinates),
+        Expr::Block(block) => {
+            block.stmts.iter().any(|s| match s {
+                Stmt::Let(l) => references_coordinates(&l.init),
+                Stmt::Expr(e) => references_coordinates(e),
+            }) || block.expr.as_deref().is_some_and(references_coordinates)
+        }
+        Expr::Tuple(t) => t.elems.iter().any(references_coordinates),
+        Expr::Paren(inner) => references_coordinates(inner),
+    }
+}
+
+/// AST scan for the derivative projections whose semantics are
+/// domain-dependent under the combinator backend.
+fn uses_derivative_projections(expr: &crate::ast::Expr) -> bool {
+    use crate::ast::{Expr, Stmt};
+    match expr {
+        Expr::Call(call) => {
+            matches!(
+                call.func.to_string().as_str(),
+                "DX" | "DY" | "DZ" | "DXX" | "DXY" | "DYY"
+            ) || call.args.iter().any(uses_derivative_projections)
+        }
+        Expr::Binary(b) => {
+            uses_derivative_projections(&b.lhs) || uses_derivative_projections(&b.rhs)
+        }
+        Expr::Unary(u) => uses_derivative_projections(&u.operand),
+        Expr::MethodCall(m) => {
+            uses_derivative_projections(&m.receiver)
+                || m.args.iter().any(uses_derivative_projections)
+        }
+        Expr::Block(block) => {
+            block.stmts.iter().any(|s| match s {
+                Stmt::Let(l) => uses_derivative_projections(&l.init),
+                Stmt::Expr(e) => uses_derivative_projections(e),
+            }) || block
+                .expr
+                .as_deref()
+                .is_some_and(uses_derivative_projections)
+        }
+        Expr::Tuple(t) => t.elems.iter().any(uses_derivative_projections),
+        Expr::Paren(inner) => uses_derivative_projections(inner),
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Verbatim(_) => false,
+    }
+}
+
 /// How the zero-parameter case is surfaced — the two macros disagree.
 ///
 /// `kernel!` emits a closure for *every* anonymous kernel (zero-param results
@@ -123,10 +206,10 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
         let build = quote! {
             {
                 let (__arena, __root) = #arena_code;
-                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root)
+                let __code = ::pixelflow_core::__ir::backend::emit::compile_arena_dag(&__arena, __root)
                     .map(|r| r.code)
                     .expect("kernel JIT compilation failed");
-                let __jit = ::pixelflow_ir::JitManifold::new(__code);
+                let __jit = ::pixelflow_core::__ir::JitManifold::new(__code);
                 #wrapper
                 __JitWrapper(::std::sync::Arc::new(__jit))
             }
@@ -147,10 +230,10 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
             move | #( #param_names : #param_types ),* | {
                 let (mut __arena, __root) = #arena_code;
                 let __root = __arena.substitute_params(__root, #param_slice);
-                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root)
+                let __code = ::pixelflow_core::__ir::backend::emit::compile_arena_dag(&__arena, __root)
                     .map(|r| r.code)
                     .expect("kernel JIT compilation failed");
-                let __jit = ::pixelflow_ir::JitManifold::new(__code);
+                let __jit = ::pixelflow_core::__ir::JitManifold::new(__code);
                 #wrapper
                 __JitWrapper(::std::sync::Arc::new(__jit))
             }
@@ -167,14 +250,14 @@ fn jit_wrapper_tokens() -> TokenStream {
         // a JIT kernel owns executable memory). `Send`/`Sync` are auto-derived
         // because `JitManifold` is `Send + Sync`.
         #[derive(Clone)]
-        struct __JitWrapper(::std::sync::Arc<::pixelflow_ir::JitManifold>);
+        struct __JitWrapper(::std::sync::Arc<::pixelflow_core::__ir::JitManifold>);
         // The JIT emits and is called at `pixelflow_ir::JIT_VECTOR_BYTES` width;
         // `eval` transmutes `Field` to that ABI. If this build selected a `Field`
         // whose width the JIT does not emit (e.g. an AVX-512 `Field` while the
         // JIT still emits 128-bit), fail at compile time with a clear message
         // rather than a raw transmute size error or a silent miscompile.
         const _: () = assert!(
-            ::core::mem::size_of::<::pixelflow_core::Field>() == ::pixelflow_ir::JIT_VECTOR_BYTES,
+            ::core::mem::size_of::<::pixelflow_core::Field>() == ::pixelflow_core::__ir::JIT_VECTOR_BYTES,
             "kernel_jit!: pixelflow-core Field width does not match the JIT's emitted \
              vector width (pixelflow_ir::JIT_VECTOR_BYTES) — the JIT does not yet emit \
              this SIMD width",
