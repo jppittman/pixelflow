@@ -202,7 +202,9 @@ mod tests {
 
     // Field is a SIMD type; extract lane 0 to check scalar results in tests.
     fn lane0(f: Field) -> f32 {
-        unsafe { *(&f as *const Field as *const f32) }
+        let mut buf = [0.0f32; crate::PARALLELISM];
+        f.store(&mut buf);
+        buf[0]
     }
 
     #[test]
