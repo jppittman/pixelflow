@@ -199,7 +199,7 @@ pub use ext::*;
 pub use mask::Mask;
 
 pub mod lower;
-pub use pixelflow_ir::{Lower, LowerEnv};
+pub use pixelflow_ir::{Kernel, Lower, LowerEnv};
 pub use storage::{FieldStorage, NativeMaskStorage};
 // Jet2/Jet3 accessible via pixelflow_core::jet::{Jet2, Jet3} for internal use
 pub use manifold::*;

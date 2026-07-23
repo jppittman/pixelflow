@@ -4,6 +4,29 @@
 **Status:** Plan of record
 **Supersedes:** the dual-backend framing of the 2025-02-21 kernel-jit-feature-parity plan (whose param-baking scope is done).
 
+## Course correction (2026-07-23): JIT-first, `Kernel` is the value
+
+"Types are the AST" was JIT-*second*: encode the program in Rust's type system
+(ZST combinator/expression templates), lean on rustc for typecheck and
+monomorphization, treat the arena as a lowering target. It compiles slowly,
+fights the borrow checker, and forces a `Lower`-per-generator bridge that leaks
+compiler concepts into consumers (a graphics author should never see
+`ExprArena`). **We are inverting to JIT-first:** the arena *is* the program.
+The front end (`kernel!`) parses straight to it; our compiler does the
+typecheck and monomorphization at codegen; Rust just hosts the compiler and
+holds handles.
+
+The consumer value is [`Kernel`](../../pixelflow-ir/src/kernel.rs): a handle
+over an arena fragment with a fluent composition surface (`add`/`sqrt`/`min`,
+`sum` (variadic), `select`, `at`, `dx`/`dy`) that hides the arena completely.
+Graphics builds scene graphs as `Kernel` values — never combinator types,
+never `Lower`, never IR. `Lattice::bake(&Kernel)` JIT-compiles once (cache) and
+tabulates; `Dwrt` derivatives resolve during codegen (screen-space AA with no
+jet domain). This subsumes `Lower` (the ZST→arena bridge is moot when there is
+no ZST layer) and, at the end, the ZST combinator library itself. Landed so
+far: the `Kernel` value + composition surface + `bake`, proven end to end.
+The `2026-07-23-lower-realize-boundary.md` note is superseded by this.
+
 ## North star
 
 We don't want two languages. There is one kernel language with one pipeline:

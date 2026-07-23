@@ -404,6 +404,27 @@ impl Lattice {
         self.collapse(manifold)
     }
 
+    /// Bake a [`Kernel`](pixelflow_ir::Kernel) — the front-end value — over the
+    /// domain: JIT-compile it once (through the global cache) and tabulate. The
+    /// JIT-first path: no combinator manifold, no `Lower`, just the arena the
+    /// `Kernel` already carries. Its `Dwrt` derivatives are resolved by the
+    /// compiler during codegen. Falls back to nothing — a `Kernel` is always
+    /// an arena, always compilable — except when this build's `Field` width is
+    /// not the JIT's, where it panics rather than silently mis-tabulating.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[must_use]
+    pub fn bake(&self, kernel: &pixelflow_ir::Kernel) -> DiscreteManifold {
+        assert_eq!(
+            core::mem::size_of::<Field>(),
+            pixelflow_ir::JIT_VECTOR_BYTES,
+            "Lattice::bake: Field width does not match the JIT's emitted width"
+        );
+        let (arena, root) = kernel.parts();
+        let jit = pixelflow_ir::jit_cache::compile_cached(arena, root)
+            .expect("kernel failed to compile");
+        self.collapse(&RealizedKernel(jit))
+    }
+
     /// Fold all points of the lattice into a per-lane SIMD accumulator.
     ///
     /// Each SIMD lane folds an independent stripe of X; the lanes are NOT
