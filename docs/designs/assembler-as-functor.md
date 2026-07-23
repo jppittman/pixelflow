@@ -20,39 +20,67 @@ The claim is narrow and checkable:
   language" is `OpKind`/`ScheduledOp` enums and the output is `Vec<u8>` flipped
   to `PROT_EXEC`. There is no textual round-trip and no re-parse.
 
-## 2. The three arrow classes
+## 2. The arrow classes
+
+There are **two endomorphism monoids at two different altitudes**, separated
+by a bridge functor, then the codegen functor, then the terminal mmap. The
+three representations are distinct and must not be conflated:
+
+1. **Source AST `Expr`** (`syn`-based, `pixelflow-compiler/src/ast.rs`) — what
+   the parser, sema, and `optimize` operate on.
+2. **`ExprArena`** (`pixelflow-ir/src/arena.rs`) — the codegen IR the
+   *assembler* operates on. (The e-graph uses its own internal
+   representation, bridged in and out of `Expr` at the optimizer boundary.)
+3. **Machine code** `Vec<u8>` → `KernelFn`.
 
 ```mermaid
 graph LR
-    T[kernel! text] -- parse morphism --> A0[ExprArena]
-    A0 -- optimize: endo --> A1[ExprArena]
-    A1 -- lower: endo --> A2[ExprArena]
-    A2 -- FUNCTOR --> C[Vec u8]
+    T[kernel! text] -- parse --> E0[Expr syn AST]
+    E0 -- optimize: Expr endo --> E1[Expr]
+    E1 -- ast_to_arena: BRIDGE FUNCTOR --> A0[ExprArena]
+    A0 -- expand_*: Arena endo --> A1[ExprArena]
+    A1 -- CODEGEN FUNCTOR --> C[Vec u8]
     C -- from_code: terminal --> K[KernelFn]
 ```
 
 | Class | Stages | Signature | Composition law |
 |-------|--------|-----------|-----------------|
-| **Parse morphism** (one-way) | lexer → parser → sema | `Text → Arena` | The only place strings exist |
-| **Endomorphism on `Arena`** | e-graph optimize; transcendental / gather / reduce lowering | `Arena → Arena` (root ↦ root) | Free monoid: order matters, object type is invariant |
-| **The functor** (changes category) | `arena_to_schedule` → `regalloc::linear_scan` → `emit_*` | `Arena → [ScheduledOp] → Vec<u8>` | One functor; ISAs are its *components* |
+| **Parse morphism** (one-way) | lexer → parser → sema | `Text → Expr` | The only place strings exist |
+| **Front-end endomorphism** on `Expr` | `optimize` (structural + e-graph) | `Expr → Expr` | Free monoid at the source-AST altitude |
+| **Bridge functor** (changes category) | `ir_bridge::ast_to_arena` | `Expr → ExprArena` | Lowers source AST into codegen IR |
+| **Back-end endomorphism** on `Arena` | `expand_transcendentals` / `expand_gather` / `expand_reduce` | `Arena → Arena` (root ↦ root) | Free monoid at the IR altitude; sharing-preserving |
+| **Codegen functor** (changes category) | `arena_to_schedule` → `regalloc::linear_scan` → `emit_*` | `Arena → [ScheduledOp] → Vec<u8>` | One functor; ISAs are its *components* |
 | **Terminal morphism** (effectful) | `ExecutableCode::from_code` | `Vec<u8> → KernelFn` | mmap + mprotect; no inverse |
 
-### 2.1 The endomorphisms are already abstracted
+The "assembler" this doc is about is the **back-end**: everything from
+`ExprArena` rightward. The front-end `Expr` monoid and the bridge are named
+here for completeness and to prevent the (tempting, wrong) collapse of
+`optimize` into the arena passes — they are at a different altitude, on a
+different type, in a different crate.
+
+### 2.1 The back-end endomorphisms are already abstracted
 
 `rebuild_arena` (`pixelflow-ir/src/backend/emit/lowering.rs`) is a
 post-order DAG rebuild whose only parameter is a `lower` hook; it is the
 shared skeleton behind `expand_transcendentals`, `expand_gather`, and
-`expand_reduce`. Each pass is an `Arena → Arena` map that preserves sharing
-(a DAG stays a DAG). The e-graph optimizer (`pixelflow-compiler/src/optimize.rs`)
-is the same shape at a coarser grain: equality-saturation rewrites morphisms
-while the object type stays `ExprArena`.
+`expand_reduce`. Each pass is an `ExprArena → ExprArena` map that preserves
+sharing (a DAG stays a DAG). These three — and *only* these three — are the
+back-end endomorphism monoid that `ArenaPass` (§4) unifies.
 
-That these are endomorphisms is *why* their ordering is the only thing that
-matters and *why* they compose freely — a fact the lowering module already
-depends on: the optimizer runs first (still reasoning about `sin`/`cos`
-algebraically), then transcendental lowering expands `Sin` into
-`Mul`/`Add`/… primitives, all without ever leaving the arena.
+That they are endomorphisms is *why* their ordering is the only thing that
+matters and *why* they compose freely. Note the front-end `optimize` runs
+*before* the bridge (still reasoning about `sin`/`cos` algebraically on the
+source AST); transcendental lowering then expands `Sin` into `Mul`/`Add`/…
+primitives *after* the arena exists. The two never share an altitude, which
+is exactly why they are two monoids and not one.
+
+> **Correction (during design):** an earlier draft lumped `optimize` in with
+> the `expand_*` passes as "endomorphisms on `Arena`." That was wrong.
+> `optimize`'s public boundary is `AnalyzedKernel` and it transforms
+> `def.body: Expr` — the source AST — not `ExprArena`. Reading the code
+> caught it before any trait was cut. The corrected model is strictly better:
+> `ArenaPass` is now a tight, single-crate (`pixelflow-ir`) abstraction over
+> the three `expand_*` passes, with no compiler-crate entanglement.
 
 ### 2.2 The functor already has a single definition
 
@@ -153,9 +181,11 @@ Compile::<Scanline, Aarch64>::new()
   bound-memory Gather). Composes with `Isa` in the driver:
   `run<A: Abi, B: IsaBackend>`. The `_scanline` suffix becomes the type
   argument `Scanline`; the per-batch ctx kernel is the default ABI type.
-- **`ArenaPass`** — one trait for the endomorphisms, generalizing
-  `rebuild_arena`'s hook. `optimize` and each `expand_*` are instances;
-  composition is `.then()`. This makes the free-monoid structure a value.
+- **`ArenaPass`** — one trait for the **back-end** endomorphisms, generalizing
+  `rebuild_arena`'s hook. The three `expand_*` passes are its instances;
+  composition is `.then()`. This makes the free-monoid structure a value. It
+  lives entirely in `pixelflow-ir` and does *not* include the front-end
+  `optimize` (which is `Expr → Expr`, a different altitude — see §2).
 - **`ScopePartition`** — the schedule-partition predicate
   (`Variance → bool`) fed to the schedule step. Flat scheduling is the empty
   partition; `hoist(pred)` is the two-phase setup/loop split. The `_hoisted`
@@ -185,9 +215,11 @@ Compile::<Scanline, Aarch64>::new()
 Staged so each step keeps `cargo test --workspace` green and is independently
 revertible:
 
-1. **Introduce `ArenaPass`** — a trait (or type alias) for `Arena → Arena`
-   with `.then()` composition; retrofit `optimize` and the `expand_*` passes
-   as instances. No call-site changes yet.
+1. **Introduce `ArenaPass`** — a trait (or type alias) for
+   `ExprArena → ExprArena` with `.then()` composition; retrofit the three
+   `expand_*` passes as instances (pure `pixelflow-ir`, no compiler crate).
+   The front-end `optimize` is out of scope — it is `Expr → Expr`. No
+   call-site changes yet.
 2. **Introduce `ScheduleStrategy`** — a struct holding `{ abi, scope
    partition, EmitCtx }`. Route `arena_to_schedule` and
    `arena_to_hoisted_schedule` behind it, with flat = empty partition.
