@@ -80,9 +80,11 @@ pub(crate) fn is_field_ty(ty: &Option<syn::Type>) -> bool {
 /// nothing per pixel anyway.
 ///
 /// Manifold-typed params are excluded from *transparent* routing even though
-/// `kernel_jit!` composes them via `HasIr` splicing: a routed builder would
+/// `kernel_jit!` composes them via `Lower` splicing: a routed builder would
 /// require its kernel arguments to implement `HasIr`, which combinator
-/// kernels at the call sites do not.
+/// kernels at the call sites do not (yet — their trees now implement
+/// `Lower` compositionally, so this restriction lifts once routing learns
+/// to require it).
 #[allow(dead_code)] // referenced by `kernel!` only under feature = "arena-backend"
 pub fn is_transparent_routing_safe(analyzed: &AnalyzedKernel) -> bool {
     is_jit_eligible(analyzed)
@@ -313,12 +315,13 @@ fn jit_wrapper_tokens() -> TokenStream {
                 })
             }
         }
-        impl ::pixelflow_core::__ir::HasIr for __JitWrapper {
-            fn splice_into(
+        impl ::pixelflow_core::Lower for __JitWrapper {
+            fn lower(
                 &self,
                 arena: &mut ::pixelflow_core::__ir::ExprArena,
-            ) -> ::pixelflow_core::__ir::ExprId {
-                arena.splice(&self.ir.0, self.ir.1)
+                _env: &mut ::pixelflow_core::LowerEnv,
+            ) -> ::core::option::Option<::pixelflow_core::__ir::ExprId> {
+                ::core::option::Option::Some(arena.splice(&self.ir.0, self.ir.1))
             }
         }
         // The JIT emits and is called at `pixelflow_ir::JIT_VECTOR_BYTES` width;

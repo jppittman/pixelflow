@@ -114,6 +114,22 @@ to-be-retired backend, tracked until that backend dies.
   (`CachedGlyph::new`), then `Lattice::collapse` JIT fast path → frame as one
   bound kernel (M4 in docs/designs/KERNELS_AND_LATTICES.md). Interpreter/
   combinator path remains the fallback until goldens pass.
+  **Boundary landed 2026-07-23** (docs/designs/2026-07-23-lower-realize-boundary.md):
+  `Lower` (Option-returning, `LowerEnv` for De Bruijn `Let` scopes) is
+  implemented per core generator beside each `Manifold` impl — coordinates,
+  constants, all unary/binary/ternary ops, comparisons, mask `And`/`Or`,
+  `Select`, `Let`/`Var`, `WithContext`/`CtxVar` (splat `Field` contexts baked
+  back to consts via a uniformity check), derivative projections (`Dwrt`),
+  and `At` (contramap = `substitute_vars_with`) — so **everything the macros
+  build lowers by composition**. `Lattice::realize` is the consumer verb:
+  lower → global compile cache → collapse via the fused kernel, silent
+  generic-collapse fallback when any node declines. `HasIr` is absorbed and
+  renamed away; macro wrappers/named structs implement `Lower`; x86 spill
+  frames beyond the red zone unblock glyph-scale kernels; JIT wrappers
+  compile lazily (spliced-only leaves never pay codegen). Remaining for P5
+  proper: restructure `Sum`/`Geometry`/`Glyph` as combinator compositions
+  (per the stated end goal — zero hand-written `Manifold` evals in graphics),
+  switch `CachedGlyph::new` to `realize`, fused-vs-combinator golden.
 - **P6 — deprecate and delete** the combinator emitter once P2–P5 cover the
   surface (parity suite + goldens green on arena-only).
 

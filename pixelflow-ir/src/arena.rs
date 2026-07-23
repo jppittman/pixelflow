@@ -1049,21 +1049,6 @@ impl fmt::Display for DisplayExpr<'_> {
     }
 }
 
-// ───────────────────────────────────── HasIr ─────────────────────────────────
-
-/// A kernel that can contribute its expression fragment to a host arena —
-/// the substrate of composition on the arena backend (kernel-unification P4).
-///
-/// The macro backends implement this on their emitted kernel wrappers: the
-/// wrapper keeps the (pre-lowering) arena it was built from and
-/// [`ExprArena::splice`]s it into the host on demand. The returned id
-/// computes this kernel's value at the host's coordinate variables; hosts
-/// that need it elsewhere warp it with [`ExprArena::substitute_vars_with`].
-pub trait HasIr {
-    /// Append this kernel's fragment into `arena`, returning its root there.
-    fn splice_into(&self, arena: &mut ExprArena) -> ExprId;
-}
-
 // ───────────────────────────────────── Tests ─────────────────────────────────
 
 #[cfg(test)]

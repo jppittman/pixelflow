@@ -776,7 +776,7 @@ impl<'a> CodeEmitter<'a> {
 
         let struct_tokens = emitter.build();
         let has_ir_impl =
-            named_struct_has_ir_impl(self.analyzed, &struct_name_for_has_ir, &generic_names);
+            named_struct_lower_impl(self.analyzed, &struct_name_for_has_ir, &generic_names);
         quote! {
             #struct_tokens
             #has_ir_impl
@@ -1216,13 +1216,13 @@ impl<'a> CodeEmitter<'a> {
     }
 }
 
-/// `HasIr` impl tokens for a named kernel struct — a spliceable IR fragment
-/// (kernel-unification P4): `splice_into` reconstructs the body's arena
-/// template, composes the struct's manifold fields (which must themselves be
-/// `HasIr`), bakes its scalar fields, and splices the result into the host.
+/// `Lower` impl tokens for a named kernel struct — a spliceable IR fragment
+/// (kernel-unification P4): `lower` reconstructs the body's arena template,
+/// composes the struct's manifold fields (which must themselves be `Lower`),
+/// bakes its scalar fields, and splices the result into the host.
 ///
 /// Named structs stay combinator kernels for direct evaluation — they never
-/// own JIT memory; `HasIr` only lets a fused root absorb them. Emitted
+/// own JIT memory; `Lower` only lets a fused root absorb them. Emitted
 /// conservatively: `Field` domain/return only (jet-domain and `Discrete`
 /// kernels are skipped until P5 needs them), and only when the arena can
 /// express the whole body; otherwise this returns no tokens and the struct is
@@ -1231,7 +1231,7 @@ impl<'a> CodeEmitter<'a> {
 /// A free function on purpose: it is a pure `AnalyzedKernel -> TokenStream`
 /// arrow with no emitter state, in keeping with the phases-are-morphisms
 /// direction for the compiler.
-fn named_struct_has_ir_impl(
+fn named_struct_lower_impl(
     analyzed: &AnalyzedKernel,
     name: &syn::Ident,
     generic_names: &[syn::Ident],
@@ -1271,20 +1271,21 @@ fn named_struct_has_ir_impl(
         .collect();
 
     quote! {
-        impl<#(#generic_names: ::pixelflow_core::__ir::HasIr),*>
-            ::pixelflow_core::__ir::HasIr for #name<#(#generic_names),*>
+        impl<#(#generic_names: ::pixelflow_core::Lower),*>
+            ::pixelflow_core::Lower for #name<#(#generic_names),*>
         {
-            fn splice_into(
+            fn lower(
                 &self,
                 __host: &mut ::pixelflow_core::__ir::ExprArena,
-            ) -> ::pixelflow_core::__ir::ExprId {
+                _env: &mut ::pixelflow_core::LowerEnv,
+            ) -> ::core::option::Option<::pixelflow_core::__ir::ExprId> {
                 let (mut __arena, mut __root) = #arena_code;
                 #compose
                 __root = __arena.substitute_params(
                     __root,
                     &[ #( self.#scalar_names as f32 ),* ],
                 );
-                __host.splice(&__arena, __root)
+                ::core::option::Option::Some(__host.splice(&__arena, __root))
             }
         }
     }

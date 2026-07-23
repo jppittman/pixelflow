@@ -554,7 +554,7 @@ pub fn ast_to_runtime_arena(
 /// site, then substitute every slot in one pass. Expects `__arena: ExprArena`
 /// and `__root: ExprId` (mut) in scope; `accessors[k]` is the expression for
 /// manifold param `k` (a builder-closure argument or a struct field), which
-/// must implement `HasIr`.
+/// must implement `Lower`.
 pub fn composition_stmts(plan: &CompositionPlan, accessors: &[TokenStream]) -> TokenStream {
     if plan.is_empty() {
         return quote! {};
@@ -568,8 +568,12 @@ pub fn composition_stmts(plan: &CompositionPlan, accessors: &[TokenStream]) -> T
             let slot = MANIFOLD_SLOT_BASE + k;
             quote! {
                 {
-                    let __frag =
-                        ::pixelflow_core::__ir::HasIr::splice_into(&#acc, &mut __arena);
+                    let __frag = ::pixelflow_core::Lower::lower(
+                        &#acc,
+                        &mut __arena,
+                        &mut ::pixelflow_core::LowerEnv::default(),
+                    )
+                    .expect("kernel argument does not lower to IR");
                     __subs.push((#slot, __frag));
                 }
             }
@@ -586,8 +590,12 @@ pub fn composition_stmts(plan: &CompositionPlan, accessors: &[TokenStream]) -> T
             let [cx, cy, cz, cw] = site.coords.map(|c| c.0);
             quote! {
                 {
-                    let __frag =
-                        ::pixelflow_core::__ir::HasIr::splice_into(&#acc, &mut __arena);
+                    let __frag = ::pixelflow_core::Lower::lower(
+                        &#acc,
+                        &mut __arena,
+                        &mut ::pixelflow_core::LowerEnv::default(),
+                    )
+                    .expect("kernel argument does not lower to IR");
                     let __warped = __arena.substitute_vars_with(
                         __frag,
                         &[

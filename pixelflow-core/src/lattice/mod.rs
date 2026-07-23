@@ -375,6 +375,35 @@ impl Lattice {
         }
     }
 
+    /// Tabulate `manifold` over the domain through the compiler when it can:
+    /// lower the whole tree to IR, JIT-compile ONE fused kernel (through the
+    /// global compile cache), and collapse that. Falls back to the generic
+    /// [`Lattice::collapse`] when any node declines to lower, the backend
+    /// refuses the kernel, or this build's `Field` width is not the JIT's.
+    /// The consumer cannot observe which path ran except by speed.
+    ///
+    /// This is the boundary verb of the kernel-unification design
+    /// (docs/designs/2026-07-23-lower-realize-boundary.md): `Lower` rides as
+    /// a bound the way `Send` does — callers neither implement nor invoke it.
+    pub fn realize<M>(&self, manifold: &M) -> DiscreteManifold
+    where
+        M: Manifold<(Field, Field, Field, Field), Output = Field> + pixelflow_ir::Lower,
+    {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            if core::mem::size_of::<Field>() == pixelflow_ir::JIT_VECTOR_BYTES {
+                let mut arena = pixelflow_ir::ExprArena::new();
+                let mut env = pixelflow_ir::LowerEnv::default();
+                if let Some(root) = manifold.lower(&mut arena, &mut env)
+                    && let Ok(jit) = pixelflow_ir::jit_cache::compile_cached(&arena, root)
+                {
+                    return self.collapse(&RealizedKernel(jit));
+                }
+            }
+        }
+        self.collapse(manifold)
+    }
+
     /// Fold all points of the lattice into a per-lane SIMD accumulator.
     ///
     /// Each SIMD lane folds an independent stripe of X; the lanes are NOT
@@ -566,3 +595,36 @@ impl Lattice {
 
 #[cfg(test)]
 mod tests;
+
+/// A JIT-compiled kernel driving the generic collapse loop — the fast path
+/// of [`Lattice::realize`]. `Field` is transmuted to the emitter's vector
+/// ABI; `realize` guards the width match before constructing one.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct RealizedKernel(alloc::sync::Arc<pixelflow_ir::JitManifold>);
+
+/// The vector type of the JIT's call ABI on this build.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+type JitVec = core::arch::x86_64::__m128;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+type JitVec = core::arch::x86_64::__m512;
+#[cfg(target_arch = "aarch64")]
+type JitVec = core::arch::aarch64::float32x4_t;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl Manifold<(Field, Field, Field, Field)> for RealizedKernel {
+    type Output = Field;
+
+    #[inline(always)]
+    fn eval(&self, (x, y, z, w): (Field, Field, Field, Field)) -> Field {
+        // SAFETY: realize checked size_of::<Field>() == JIT_VECTOR_BYTES, and
+        // the code was emitted by our own backend for exactly that ABI.
+        unsafe {
+            core::mem::transmute::<JitVec, Field>(self.0.call(
+                core::mem::transmute::<Field, JitVec>(x),
+                core::mem::transmute::<Field, JitVec>(y),
+                core::mem::transmute::<Field, JitVec>(z),
+                core::mem::transmute::<Field, JitVec>(w),
+            ))
+        }
+    }
+}

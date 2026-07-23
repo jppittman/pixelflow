@@ -64,6 +64,15 @@ pub fn compile_cached(
     Ok(guard.entry(key).or_insert(compiled).clone())
 }
 
+/// Number of distinct kernels interned so far (test/telemetry hook).
+#[must_use]
+pub fn entry_count() -> usize {
+    CACHE
+        .get()
+        .map(|c| c.lock().expect("jit_cache: lock poisoned").len())
+        .unwrap_or(0)
+}
+
 /// Canonical serialization of the subgraph reachable from `root`: nodes in
 /// ascending original id order (the arena is append-only, so children always
 /// precede parents), child references remapped to dense indices. `None` if
