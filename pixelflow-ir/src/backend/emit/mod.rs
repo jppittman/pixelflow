@@ -1935,6 +1935,12 @@ trait IsaBackend {
     /// Per-compile setup before any code is emitted (e.g. seed a constant pool).
     fn begin(&mut self, schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str>;
 
+    /// Called once the frame layout is known, BEFORE any body instruction is
+    /// emitted. Backends whose spill addressing depends on the frame mode
+    /// (x86: red zone vs allocated frame) latch it here; `prologue` runs
+    /// after the body is produced and can only prepend bytes.
+    fn frame_ready(&mut self, _frame_size: u32) {}
+
     /// Function prologue (allocate the spill frame, set up any pool anchor).
     fn prologue(&mut self, code: &mut Vec<u8>, frame_size: u32);
 
@@ -2017,6 +2023,7 @@ fn emit_dag_body<B: IsaBackend>(
         SCRATCH_BASE,
     );
     let layout = FrameLayout::from_allocation(&allocation.spilled)?;
+    backend.frame_ready(layout.frame_size);
 
     // Select short-circuit guards.
     let select_guards = analyze_select_guards(&schedule);
@@ -3314,7 +3321,7 @@ pub fn compile_arena_dag_with_ctx(
     }
     #[cfg(not(target_feature = "avx512f"))]
     {
-        compile_dag_via_backend(schedule, uses, &mut X86Backend)
+        compile_dag_via_backend(schedule, uses, &mut X86Backend::default())
     }
 }
 
@@ -3327,8 +3334,11 @@ pub fn compile_arena_dag_with_ctx(
 // x86 instruction encoding behind that seam, so x86 and aarch64 run the same
 // driver (no "works on my machine" divergence between them).
 //
-// Spills go to the System V red zone (the kernel is a leaf): a `FrameLayout`
-// slot at byte `offset` maps to `[rsp - (offset + 16)]`.
+// Spills go to the System V red zone when the frame fits (the kernel is a
+// leaf): a `FrameLayout` slot at byte `offset` maps to `[rsp - (offset + 16)]`.
+// Larger frames (glyph-scale fused kernels) allocate a real frame in the
+// prologue (`sub rsp, N`); slots then live at `[rsp + offset]` and the
+// epilogue releases the frame before `ret`.
 //
 // Register roles: xmm0-3 inputs (precolored), xmm4-9 allocatable (6),
 // xmm10 fixed scratch (binary two-operand hazard + select temp), xmm11-12
@@ -3354,9 +3364,12 @@ const X86_BUILTIN_SCRATCH: [Reg; 4] = [Reg(10), Reg(13), Reg(14), Reg(15)];
 #[cfg(target_arch = "x86_64")]
 fn x86_redzone_disp(offset: u32) -> Result<i8, &'static str> {
     // Slots live below rsp: offset 0 -> [rsp-16], 16 -> [rsp-32], ...
+    // Only called in red-zone mode (the prologue switches to an allocated
+    // frame when the layout exceeds the zone), so overflow here is an
+    // internal invariant violation, not a kernel-size limit.
     let disp = -(offset as i64 + 16);
     if disp < -128 {
-        return Err("x86 scheduled: spill frame exceeds 128-byte red zone");
+        return Err("x86 spill: red-zone displacement out of range (prologue mode bug)");
     }
     Ok(disp as i8)
 }
@@ -3387,8 +3400,36 @@ fn emit_binary_safe(code: &mut Vec<u8>, op: OpKind, dst: Reg, left: Reg, right: 
 }
 
 /// x86-64 implementation of the shared driver's leaf operations.
+///
+/// `frame_bytes` is set by `prologue`: 0 = spills fit the 128-byte red zone
+/// (no frame is allocated), otherwise the size of the allocated frame and
+/// spill slots are `[rsp + offset]`.
 #[cfg(target_arch = "x86_64")]
-struct X86Backend;
+#[derive(Default)]
+struct X86Backend {
+    frame_bytes: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl X86Backend {
+    fn spill_store(&self, code: &mut Vec<u8>, src: Reg, offset: u32) {
+        if self.frame_bytes == 0 {
+            let disp = x86_redzone_disp(offset).expect("red-zone mode implies fitting offsets");
+            x86_64::emit_movups_store_rsp(code, src, disp);
+        } else {
+            x86_64::emit_movups_store_rsp32(code, src, offset as i32);
+        }
+    }
+
+    fn spill_load(&self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
+        if self.frame_bytes == 0 {
+            let disp = x86_redzone_disp(offset).expect("red-zone mode implies fitting offsets");
+            x86_64::emit_movups_load_rsp(code, dst, disp);
+        } else {
+            x86_64::emit_movups_load_rsp32(code, dst, offset as i32);
+        }
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 impl IsaBackend for X86Backend {
@@ -3406,8 +3447,20 @@ impl IsaBackend for X86Backend {
         Ok(()) // x86 const loads are self-contained; no pool.
     }
 
-    fn prologue(&mut self, _code: &mut Vec<u8>, _frame_size: u32) {
-        // Spills use the red zone; no frame to set up for a leaf.
+    fn frame_ready(&mut self, frame_size: u32) {
+        // Red zone when it fits (max slot offset frame_size-16 maps to disp
+        // -(frame_size) >= -128); otherwise an allocated frame, with slots at
+        // [rsp + offset]. Latched here so the body's spill addressing agrees
+        // with the prologue emitted afterwards.
+        self.frame_bytes = if frame_size <= 128 { 0 } else { frame_size };
+    }
+
+    fn prologue(&mut self, code: &mut Vec<u8>, _frame_size: u32) {
+        // movups is alignment-agnostic, so the frame only needs its
+        // 16-multiple size; red-zone mode needs no setup for a leaf.
+        if self.frame_bytes > 0 {
+            x86_64::emit_sub_rsp(code, self.frame_bytes);
+        }
     }
 
     fn emit_plan(
@@ -3419,7 +3472,7 @@ impl IsaBackend for X86Backend {
         for reload in &plan.reloads {
             match reload {
                 Reload::FromStack { target, offset } => {
-                    emit_movups_load_rsp(code, *target, x86_redzone_disp(*offset)?);
+                    self.spill_load(code, *target, *offset);
                 }
                 Reload::Const { target, val_bits } => {
                     emit_const(
@@ -3494,7 +3547,7 @@ impl IsaBackend for X86Backend {
                 emit_binary_safe(code, OpKind::Mul, *dst, *a, *b);
                 match c_deferred {
                     Some(DeferredReload::FromStack(off)) => {
-                        emit_movups_load_rsp(code, *c, x86_redzone_disp(*off)?);
+                        self.spill_load(code, *c, *off);
                     }
                     Some(DeferredReload::Const(bits)) => {
                         emit_const(code, *c, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
@@ -3514,7 +3567,7 @@ impl IsaBackend for X86Backend {
                 emit_binary_safe(code, OpKind::Min, *dst, *val, *hi);
                 match lo_deferred {
                     Some(DeferredReload::FromStack(off)) => {
-                        emit_movups_load_rsp(code, *lo, x86_redzone_disp(*off)?);
+                        self.spill_load(code, *lo, *off);
                     }
                     Some(DeferredReload::Const(bits)) => {
                         emit_const(code, *lo, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
@@ -3525,7 +3578,7 @@ impl IsaBackend for X86Backend {
             }
         }
         if let Some(store) = &plan.store {
-            emit_movups_store_rsp(code, store.src, x86_redzone_disp(store.offset)?);
+            self.spill_store(code, store.src, store.offset);
         }
         Ok(())
     }
@@ -3540,7 +3593,7 @@ impl IsaBackend for X86Backend {
         src: Reg,
         offset: u32,
     ) -> Result<(), &'static str> {
-        x86_64::emit_movups_store_rsp(code, src, x86_redzone_disp(offset)?);
+        self.spill_store(code, src, offset);
         Ok(())
     }
 
@@ -3560,9 +3613,7 @@ impl IsaBackend for X86Backend {
             x86_64::emit_const(code, target, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
             target
         } else if let Some(Some(offset)) = spill_for.get(idx) {
-            // Resolve is on a hot path with a known-valid frame; offset fits.
-            let disp = x86_redzone_disp(*offset).expect("spill offset within red zone");
-            x86_64::emit_movups_load_rsp(code, target, disp);
+            self.spill_load(code, target, *offset);
             target
         } else {
             panic!(
@@ -3595,6 +3646,9 @@ impl IsaBackend for X86Backend {
     fn epilogue(&mut self, code: &mut Vec<u8>, result_reg: Reg, _frame_size: u32) {
         if result_reg.0 != 0 {
             x86_64::emit_movaps(code, Reg(0), result_reg);
+        }
+        if self.frame_bytes > 0 {
+            x86_64::emit_add_rsp(code, self.frame_bytes);
         }
         code.push(0xC3); // RET
     }
@@ -5032,6 +5086,49 @@ mod tests {
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, g, v0);
         assert!(compile_arena_dag(&a, root).is_err());
+    }
+
+    /// A spill frame past the 128-byte red zone must allocate a real frame
+    /// (`sub rsp`) and produce correct results — the glyph-scale-kernel case
+    /// that used to refuse with "exceeds 128-byte red zone". 40 products are
+    /// all pushed before any is consumed, so dozens are simultaneously live
+    /// against 6 allocatable registers.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    fn spill_frame_beyond_red_zone_compiles_correctly() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let mut products = alloc::vec::Vec::new();
+        for i in 0..40u32 {
+            let c = a.push_const(i as f32 + 1.0);
+            let xa = a.push_binary(OpKind::Add, x, c);
+            let yb = a.push_binary(OpKind::Add, y, c);
+            products.push(a.push_binary(OpKind::Mul, xa, yb));
+        }
+        let mut root = products[0];
+        for p in &products[1..] {
+            root = a.push_binary(OpKind::Add, root, *p);
+        }
+
+        let result = compile_arena_dag(&a, root).expect("large spill frame must compile");
+        assert!(
+            result.spill_bytes > 128,
+            "test did not force a frame beyond the red zone (spill_bytes = {})",
+            result.spill_bytes
+        );
+
+        for (px, py) in [(1.5f32, -2.0f32), (0.0, 0.0), (3.0, 4.0)] {
+            let got = run_xy(&a, root, px, py);
+            let want: f32 = (0..40)
+                .map(|i| (px + i as f32 + 1.0) * (py + i as f32 + 1.0))
+                .sum();
+            let tol = 1e-3 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "at ({px},{py}): jit {got}, scalar {want}"
+            );
+        }
     }
 
     /// Every x86-64 unary transcendental/round op must match its scalar

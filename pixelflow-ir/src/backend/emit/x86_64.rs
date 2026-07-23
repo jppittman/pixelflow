@@ -484,6 +484,43 @@ pub fn emit_movups_store_rsp(code: &mut Vec<u8>, src: Reg, disp: i8) {
     code.push(disp as u8);
 }
 
+/// MOVUPS [rsp+disp32], xmm — spill store into an allocated frame.
+pub fn emit_movups_store_rsp32(code: &mut Vec<u8>, src: Reg, disp: i32) {
+    if src.0 >= 8 {
+        code.push(0x44); // REX.R
+    }
+    code.push(0x0F);
+    code.push(0x11);
+    code.push(0x84 | ((src.0 & 7) << 3)); // mod=10, reg=src, rm=100 (SIB)
+    code.push(0x24); // SIB: base=rsp, no index
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+/// MOVUPS xmm, [rsp+disp32] — reload from an allocated frame.
+pub fn emit_movups_load_rsp32(code: &mut Vec<u8>, dst: Reg, disp: i32) {
+    if dst.0 >= 8 {
+        code.push(0x44); // REX.R
+    }
+    code.push(0x0F);
+    code.push(0x10);
+    code.push(0x84 | ((dst.0 & 7) << 3)); // mod=10, reg=dst, rm=100 (SIB)
+    code.push(0x24); // SIB: base=rsp, no index
+    code.extend_from_slice(&disp.to_le_bytes());
+}
+
+/// `sub rsp, imm32` — allocate a spill frame (kernels stay leaf functions;
+/// no base pointer, offsets are rsp-relative).
+pub fn emit_sub_rsp(code: &mut Vec<u8>, size: u32) {
+    code.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    code.extend_from_slice(&size.to_le_bytes());
+}
+
+/// `add rsp, imm32` — release the spill frame before `ret`.
+pub fn emit_add_rsp(code: &mut Vec<u8>, size: u32) {
+    code.extend_from_slice(&[0x48, 0x81, 0xC4]);
+    code.extend_from_slice(&size.to_le_bytes());
+}
+
 /// MOVUPS xmm, [rsp+disp8] — red-zone reload (unaligned, leaf-safe).
 pub fn emit_movups_load_rsp(code: &mut Vec<u8>, dst: Reg, disp: i8) {
     if dst.0 >= 8 {
