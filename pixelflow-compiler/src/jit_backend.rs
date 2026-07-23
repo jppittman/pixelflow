@@ -222,13 +222,11 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
         let build = quote! {
             {
                 let (__arena, __root) = #arena_code;
-                let __code = ::pixelflow_core::__ir::backend::emit::compile_arena_dag(&__arena, __root)
-                    .map(|r| r.code)
+                let __jit = ::pixelflow_core::__ir::jit_cache::compile_cached(&__arena, __root)
                     .expect("kernel JIT compilation failed");
-                let __jit = ::pixelflow_core::__ir::JitManifold::new(__code);
                 #wrapper
                 __JitWrapper {
-                    jit: ::std::sync::Arc::new(__jit),
+                    jit: __jit,
                     ir: ::std::sync::Arc::new((__arena, __root)),
                 }
             }
@@ -278,13 +276,11 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
                 let (mut __arena, mut __root) = #arena_code;
                 #compose
                 __root = __arena.substitute_params(__root, #param_slice);
-                let __code = ::pixelflow_core::__ir::backend::emit::compile_arena_dag(&__arena, __root)
-                    .map(|r| r.code)
+                let __jit = ::pixelflow_core::__ir::jit_cache::compile_cached(&__arena, __root)
                     .expect("kernel JIT compilation failed");
-                let __jit = ::pixelflow_core::__ir::JitManifold::new(__code);
                 #wrapper
                 __JitWrapper {
-                    jit: ::std::sync::Arc::new(__jit),
+                    jit: __jit,
                     ir: ::std::sync::Arc::new((__arena, __root)),
                 }
             }
