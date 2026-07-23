@@ -436,16 +436,32 @@ fn differentiate_in_optimizer(arena: &ExprArena, root: ExprId) -> Option<(ExprAr
         .collect();
     let encoded = ExprArena::from_raw(encoded_nodes, arena.nary_children_raw().to_vec());
 
-    let mut eg = EGraph::with_rules(crate::optimize::standard_rules());
+    // Stage 1: the isolated derivative rules. The chain rule is confluent and
+    // terminating, and the rule set is inert on Dwrt-free subgraphs, so this
+    // saturates quickly and Dwrt elimination is DETERMINISTIC — it must not
+    // ride the wall-clock budget of the full optimizer, or whether a kernel's
+    // derivative resolves at expansion time would depend on machine load
+    // (observed as a CI-only fallback). Limits are generous safety rails, not
+    // a working budget.
+    let mut eg = EGraph::with_rules(pixelflow_search::egraph::derivative_rules());
     let root_class = eg.add_arena(&encoded, root);
-    // AOT tier: generous saturation budget (default limits: 100 iters, 10k
-    // classes, 500ms) — this runs once per kernel at macro expansion.
+    eg.saturate_with_limits(200, 50_000, std::time::Duration::from_secs(30));
+
+    let (expanded, expanded_root, _cost) = extract(&eg, root_class, &CostModel::default());
+    if contains_dwrt(&expanded) {
+        return None;
+    }
+
+    // Stage 2: full algebra/fusion cleanup on the now-Dwrt-free arena, under
+    // the ordinary optimizer budget (500ms/10k classes). Best-effort: a budget
+    // miss here costs extraction quality, never correctness — no rule
+    // introduces a Dwrt.
+    let mut eg = EGraph::with_rules(crate::optimize::standard_rules());
+    let root_class = eg.add_arena(&expanded, expanded_root);
     eg.saturate();
 
     let (out, out_root, _cost) = extract(&eg, root_class, &CostModel::default());
-    if contains_dwrt(&out) {
-        return None;
-    }
+    debug_assert!(!contains_dwrt(&out), "algebra rules introduced a Dwrt");
 
     // Var(16+i) -> Param(i).
     let decoded_nodes: Vec<ExprNode> = out
