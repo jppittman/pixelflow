@@ -211,6 +211,28 @@ where
     }
 }
 
+// Lowering delegates to the crossing kernel — a `Line`/`Quad` is a thin
+// domain wrapper, so its IR is exactly its kernel's (kernel-unification P5).
+impl<K: pixelflow_core::Lower> pixelflow_core::Lower for Line<K> {
+    fn lower(
+        &self,
+        arena: &mut pixelflow_ir::arena::ExprArena,
+        env: &mut pixelflow_ir::LowerEnv,
+    ) -> Option<pixelflow_ir::arena::ExprId> {
+        self.kernel.lower(arena, env)
+    }
+}
+
+impl<K: pixelflow_core::Lower> pixelflow_core::Lower for Quad<K> {
+    fn lower(
+        &self,
+        arena: &mut pixelflow_ir::arena::ExprArena,
+        env: &mut pixelflow_ir::LowerEnv,
+    ) -> Option<pixelflow_ir::arena::ExprId> {
+        self.kernel.lower(arena, env)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Glyph (Compositional Scene Graph)
 // ═══════════════════════════════════════════════════════════════════════════

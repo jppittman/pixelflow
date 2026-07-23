@@ -107,18 +107,55 @@ impl AnalyticalLine {
     }
 }
 
-// One kernel body, stamped per evaluation domain. The `kernel!` macro lifts
-// scalar params and literals to a single concrete domain type chosen at
-// expansion time (`-> $n`), so a named kernel struct cannot be polymorphic
-// over the domain; the macro_rules wrapper keeps a single source of truth.
+// One kernel body, stamped per evaluation domain, and — via the same body
+// macro — lowered domain-free to IR. `V`/`DX`/`DY` project a domain-valued
+// subexpression to its `Field` value/derivative components; over `Field` the
+// gradient is zero (hard step), over `Jet2` it is the screen-space ramp, and
+// under `Lower` it becomes `Dwrt` that the runtime calculus resolves to the
+// same ramp. The `kernel!` macro lifts scalar params/literals to one concrete
+// domain per expansion, so a named struct cannot be domain-polymorphic; the
+// body macro keeps a single source of truth across all three uses.
 //
-// Inside the body, `V`/`DX`/`DY` project a domain-valued subexpression to its
-// `Field` value/derivative components, so the coverage ramp is Field math in
-// every domain. `V(literal)` re-projects a domain-lifted constant back to
-// `Field` for use in that ramp. The optimizer is type-space aware across the
-// projection boundary: fresh literals introduced by rewrites (e.g.
-// `a/b + c -> mul_add(a, 1/b, c)`) are emitted in the space of the math they
-// join, so the extracted form stays well-typed in every domain.
+// The coverage body, defined ONCE. Both the per-domain `Manifold` stamps and
+// the domain-free `Lower` impl expand this same source at a chosen scalar
+// domain `$n`, so there is no twin to drift: eval calls `.eval(p)`, lower
+// calls `.lower(..)` on the identical kernel.
+macro_rules! analytical_line_kernel {
+    ($self:expr, $n:ty) => {
+        kernel!(|x0: f32,
+                 y0: f32,
+                 dx_over_dy: f32,
+                 dir: f32,
+                 y_min: f32,
+                 y_max: f32,
+                 min_grad: f32|
+         -> $n {
+            // Early rejection: only contributes when Y is in the segment's
+            // vertical range. Masks carry no derivatives.
+            let in_y = (Y >= y_min) & (Y < y_max);
+
+            // Signed crossing distance in the evaluation domain. Over Jet2 its
+            // derivatives chain through every enclosing coordinate transform.
+            let d = X - ((Y - y0) * dx_over_dy + x0);
+
+            // Gradient-normalized ramp: hard step over Field (zero gradient),
+            // ~1 screen pixel wide over Jet2 / after `lower_dwrt`.
+            let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+            let coverage = (V(d) / (grad + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+
+            in_y.select(coverage * V(dir), V(0.0))
+        })(
+            $self.x0,
+            $self.y0,
+            $self.dx_over_dy,
+            $self.dir,
+            $self.y_min,
+            $self.y_max,
+            MIN_GRADIENT,
+        )
+    };
+}
+
 macro_rules! impl_analytical_line_manifold {
     ($n:ty) => {
         impl Manifold<($n, $n, $n, $n)> for AnalyticalLine {
@@ -126,46 +163,20 @@ macro_rules! impl_analytical_line_manifold {
 
             #[inline(always)]
             fn eval(&self, p: ($n, $n, $n, $n)) -> Field {
-                let k = kernel!(|x0: f32,
-                                 y0: f32,
-                                 dx_over_dy: f32,
-                                 dir: f32,
-                                 y_min: f32,
-                                 y_max: f32,
-                                 min_grad: f32|
-                 -> $n {
-                    // Early rejection: only contributes when Y is in the
-                    // segment's vertical range. Masks carry no derivatives.
-                    let in_y = (Y >= y_min) & (Y < y_max);
-
-                    // Signed crossing distance in the evaluation domain. Over
-                    // Jet2 its derivatives chain through every enclosing
-                    // coordinate transform.
-                    let d = X - ((Y - y0) * dx_over_dy + x0);
-
-                    // Gradient-normalized ramp: hard step over Field
-                    // (zero gradient), ~1 screen pixel wide over Jet2.
-                    let grad =
-                        (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
-                    let coverage = (V(d) / (grad + V(min_grad)) + V(0.5))
-                        .max(V(0.0))
-                        .min(V(1.0));
-
-                    in_y.select(coverage * V(dir), V(0.0))
-                });
-                k(
-                    self.x0,
-                    self.y0,
-                    self.dx_over_dy,
-                    self.dir,
-                    self.y_min,
-                    self.y_max,
-                    MIN_GRADIENT,
-                )
-                .eval(p)
+                analytical_line_kernel!(self, $n).eval(p)
             }
         }
     };
+}
+
+impl pixelflow_core::Lower for AnalyticalLine {
+    fn lower(
+        &self,
+        arena: &mut pixelflow_ir::arena::ExprArena,
+        env: &mut pixelflow_ir::LowerEnv,
+    ) -> Option<pixelflow_ir::arena::ExprId> {
+        pixelflow_core::Lower::lower(&analytical_line_kernel!(self, Field), arena, env)
+    }
 }
 
 impl_analytical_line_manifold!(Field);
@@ -237,8 +248,106 @@ impl AnalyticalQuad {
     }
 }
 
-// One kernel body per case (degenerate line / true quadratic), stamped per
-// evaluation domain — see the note on `impl_analytical_line_manifold`.
+// Two coverage bodies (degenerate line / true quadratic), each defined ONCE
+// and expanded at a chosen scalar domain by both the `Manifold` stamps and
+// the `Lower` impl — no twin to drift, mirroring the line above.
+macro_rules! quad_linear_kernel {
+    ($self:expr, $n:ty) => {
+        kernel!(|ax: f32, bx: f32, cx: f32, by: f32, cy: f32, dir: f32, min_grad: f32| -> $n {
+            let t = (Y - cy) / by;
+            let in_t = t.clone().ge(0.0) & t.clone().le(1.0);
+
+            // Signed crossing distance at the intersection.
+            let d = X - (t.clone() * t.clone() * ax + t * bx + cx);
+
+            // Gradient-normalized ramp (hard over Field).
+            let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+            let coverage = (V(d) / (grad + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+
+            in_t.select(coverage * V(dir), V(0.0))
+        })(
+            $self.ax,
+            $self.bx,
+            $self.cx,
+            $self.by,
+            $self.cy,
+            if $self.by > 0.0 { -1.0 } else { 1.0 },
+            MIN_GRADIENT,
+        )
+    };
+}
+
+macro_rules! quad_curve_kernel {
+    ($self:expr, $n:ty) => {
+        kernel!(|ax: f32,
+                 bx: f32,
+                 cx: f32,
+                 ay: f32,
+                 by: f32,
+                 inv_2a: f32,
+                 neg_b_2a: f32,
+                 disc_const: f32,
+                 disc_slope: f32,
+                 min_grad: f32,
+                 min_disc: f32|
+         -> $n {
+            let disc = Y * disc_slope + disc_const;
+            // max(min_disc) keeps sqrt finite (value AND derivative) at the
+            // tangent point; disc >= 0 below still gates validity.
+            let sqrt_disc = disc.clone().max(min_disc).sqrt();
+
+            // Two roots: t = (-by +/- sqrt(disc)) / (2*ay)
+            let t_plus = sqrt_disc.clone() * inv_2a + neg_b_2a;
+            let t_minus = sqrt_disc * -inv_2a + neg_b_2a;
+
+            // Signed crossing distances at the intersection points.
+            let d_plus = X - (t_plus.clone() * t_plus.clone() * ax + t_plus.clone() * bx + cx);
+            let d_minus = X - (t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx);
+
+            // Tangent dy/dt at each root for winding direction.
+            let dy_plus = t_plus.clone() * (ay * 2.0) + by;
+            let dy_minus = t_minus.clone() * (ay * 2.0) + by;
+
+            // Gradient-normalized ramps (hard over Field).
+            let grad_plus =
+                (DX(d_plus.clone()) * DX(d_plus.clone()) + DY(d_plus.clone()) * DY(d_plus.clone()))
+                    .sqrt();
+            let cov_plus = (V(d_plus) / (grad_plus + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+            let grad_minus = (DX(d_minus.clone()) * DX(d_minus.clone())
+                + DY(d_minus.clone()) * DY(d_minus.clone()))
+            .sqrt();
+            let cov_minus =
+                (V(d_minus) / (grad_minus + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+
+            // Validity: only count roots with t in [0, 1].
+            let valid_plus = t_plus.clone().ge(0.0) & t_plus.le(1.0);
+            let valid_minus = t_minus.clone().ge(0.0) & t_minus.le(1.0);
+
+            // Winding sign from tangent direction.
+            let sign_plus = dy_plus.gt(0.0).select(V(-1.0), V(1.0));
+            let sign_minus = dy_minus.gt(0.0).select(V(-1.0), V(1.0));
+
+            // Valid roots contribute signed coverage, masked by the
+            // (unclamped) discriminant.
+            let contrib_plus = valid_plus.select(cov_plus * sign_plus, V(0.0));
+            let contrib_minus = valid_minus.select(cov_minus * sign_minus, V(0.0));
+            disc.ge(0.0).select(contrib_plus + contrib_minus, V(0.0))
+        })(
+            $self.ax,
+            $self.bx,
+            $self.cx,
+            $self.ay,
+            $self.by,
+            $self.inv_2ay,
+            $self.neg_b_2a,
+            $self.disc_const,
+            $self.disc_slope,
+            MIN_GRADIENT,
+            MIN_DISC,
+        )
+    };
+}
+
 macro_rules! impl_analytical_quad_manifold {
     ($n:ty) => {
         impl Manifold<($n, $n, $n, $n)> for AnalyticalQuad {
@@ -247,122 +356,27 @@ macro_rules! impl_analytical_quad_manifold {
             #[inline(always)]
             fn eval(&self, p: ($n, $n, $n, $n)) -> Field {
                 if self.is_linear {
-                    // Degenerate: quadratic is a line. Solve by*t + (cy - Y) = 0
-                    let k = kernel!(|ax: f32,
-                                     bx: f32,
-                                     cx: f32,
-                                     by: f32,
-                                     cy: f32,
-                                     dir: f32,
-                                     min_grad: f32|
-                     -> $n {
-                        let t = (Y - cy) / by;
-                        let in_t = t.clone().ge(0.0) & t.clone().le(1.0);
-
-                        // Signed crossing distance at the intersection.
-                        let d = X - (t.clone() * t.clone() * ax + t * bx + cx);
-
-                        // Gradient-normalized ramp (hard over Field).
-                        let grad =
-                            (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
-                        let coverage = (V(d) / (grad + V(min_grad)) + V(0.5))
-                            .max(V(0.0))
-                            .min(V(1.0));
-
-                        in_t.select(coverage * V(dir), V(0.0))
-                    });
-                    let dir = if self.by > 0.0 { -1.0 } else { 1.0 };
-                    return k(
-                        self.ax,
-                        self.bx,
-                        self.cx,
-                        self.by,
-                        self.cy,
-                        dir,
-                        MIN_GRADIENT,
-                    )
-                    .eval(p);
+                    quad_linear_kernel!(self, $n).eval(p)
+                } else {
+                    quad_curve_kernel!(self, $n).eval(p)
                 }
-
-                // True quadratic: solve ay*t^2 + by*t + (cy - Y) = 0
-                // discriminant = by^2 - 4*ay*(cy - Y) = disc_const + disc_slope*Y
-                let k = kernel!(|ax: f32,
-                                 bx: f32,
-                                 cx: f32,
-                                 ay: f32,
-                                 by: f32,
-                                 inv_2a: f32,
-                                 neg_b_2a: f32,
-                                 disc_const: f32,
-                                 disc_slope: f32,
-                                 min_grad: f32,
-                                 min_disc: f32|
-                 -> $n {
-                    let disc = Y * disc_slope + disc_const;
-                    // max(min_disc) keeps sqrt finite (value AND derivative) at
-                    // the tangent point; disc >= 0 below still gates validity.
-                    let sqrt_disc = disc.clone().max(min_disc).sqrt();
-
-                    // Two roots: t = (-by +/- sqrt(disc)) / (2*ay)
-                    let t_plus = sqrt_disc.clone() * inv_2a + neg_b_2a;
-                    let t_minus = sqrt_disc * -inv_2a + neg_b_2a;
-
-                    // Signed crossing distances at the intersection points.
-                    let d_plus =
-                        X - (t_plus.clone() * t_plus.clone() * ax + t_plus.clone() * bx + cx);
-                    let d_minus =
-                        X - (t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx);
-
-                    // Tangent dy/dt at each root for winding direction
-                    let dy_plus = t_plus.clone() * (ay * 2.0) + by;
-                    let dy_minus = t_minus.clone() * (ay * 2.0) + by;
-
-                    // Gradient-normalized ramps (hard over Field).
-                    let grad_plus = (DX(d_plus.clone()) * DX(d_plus.clone())
-                        + DY(d_plus.clone()) * DY(d_plus.clone()))
-                    .sqrt();
-                    let cov_plus = (V(d_plus) / (grad_plus + V(min_grad)) + V(0.5))
-                        .max(V(0.0))
-                        .min(V(1.0));
-                    let grad_minus = (DX(d_minus.clone()) * DX(d_minus.clone())
-                        + DY(d_minus.clone()) * DY(d_minus.clone()))
-                    .sqrt();
-                    let cov_minus = (V(d_minus) / (grad_minus + V(min_grad)) + V(0.5))
-                        .max(V(0.0))
-                        .min(V(1.0));
-
-                    // Validity: only count roots with t in [0, 1]
-                    let valid_plus = t_plus.clone().ge(0.0) & t_plus.le(1.0);
-                    let valid_minus = t_minus.clone().ge(0.0) & t_minus.le(1.0);
-
-                    // Winding sign from tangent direction
-                    let sign_plus = dy_plus.gt(0.0).select(V(-1.0), V(1.0));
-                    let sign_minus = dy_minus.gt(0.0).select(V(-1.0), V(1.0));
-
-                    // Combine: valid roots contribute signed coverage,
-                    // masked by the (unclamped) discriminant.
-                    let contrib_plus = valid_plus.select(cov_plus * sign_plus, V(0.0));
-                    let contrib_minus = valid_minus.select(cov_minus * sign_minus, V(0.0));
-                    disc.ge(0.0).select(contrib_plus + contrib_minus, V(0.0))
-                });
-
-                k(
-                    self.ax,
-                    self.bx,
-                    self.cx,
-                    self.ay,
-                    self.by,
-                    self.inv_2ay,
-                    self.neg_b_2a,
-                    self.disc_const,
-                    self.disc_slope,
-                    MIN_GRADIENT,
-                    MIN_DISC,
-                )
-                .eval(p)
             }
         }
     };
+}
+
+impl pixelflow_core::Lower for AnalyticalQuad {
+    fn lower(
+        &self,
+        arena: &mut pixelflow_ir::arena::ExprArena,
+        env: &mut pixelflow_ir::LowerEnv,
+    ) -> Option<pixelflow_ir::arena::ExprId> {
+        if self.is_linear {
+            pixelflow_core::Lower::lower(&quad_linear_kernel!(self, Field), arena, env)
+        } else {
+            pixelflow_core::Lower::lower(&quad_curve_kernel!(self, Field), arena, env)
+        }
+    }
 }
 
 impl_analytical_quad_manifold!(Field);

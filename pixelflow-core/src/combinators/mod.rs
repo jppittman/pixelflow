@@ -8,6 +8,7 @@ pub mod block;
 pub mod computed;
 pub mod context; // Flat context tuple prototype
 pub mod fix;
+pub mod fold;
 pub mod map;
 pub mod pack;
 pub mod project;
@@ -28,6 +29,7 @@ pub use context::{
     WithContext,
 }; // Array-based context
 pub use fix::{Fix, RecDomain, RecFix, Recurse};
+pub use fold::Sum;
 pub use map::{ClosureMap, Map};
 pub use pack::Pack;
 pub use project::Project;

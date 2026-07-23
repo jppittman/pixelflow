@@ -18,6 +18,7 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 # SIMD library for optimized rendering
 pixelflow-core = { path = "../pixelflow-core" }
 pixelflow-compiler = { path = "../pixelflow-compiler" }
+pixelflow-ir = { path = "../pixelflow-ir" }
 
 # Actor system for async rendering
 actor-scheduler = { path = "../actor-scheduler" }
@@ -36,6 +37,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.4"
 tempfile = "3.10"
 pixelflow-compiler = { path = "../pixelflow-compiler" }
+pixelflow-ir = { path = "../pixelflow-ir" }
 
 [[bench]]
 name = "font_rendering"
