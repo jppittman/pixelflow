@@ -60,6 +60,48 @@ semantics) is a conventional AOT/JIT split keyed on *when code is known*
 rather than *how hot it is* — appropriate because kernels are born at load
 and composition time, not discovered hot mid-frame.
 
+## The Halide comparison, specifically
+
+Halide is the project's own stated reference ("writing it should look like
+Halide"), so this is the comparison that decides orthodoxy. Concept by
+concept:
+
+| Halide | PixelFlow | Notes |
+|---|---|---|
+| `Func`: a pure function from coordinates to values, defined over an infinite grid | `Manifold`: pull-based, "pixels are sampled, not pushed" | Same founding idea. Halide realizes a `Func` over a requested region; we evaluate at requested coordinates. |
+| `Expr`: scalar value IR, `select` instead of branches, no general control flow | `ExprArena`: identical shape (`Select`, no loops, no calls) | Both deliberately sub-Turing per point so the compiler owns all structure. |
+| Staging: C++ operator overloading builds the IR at generator-run time | `kernel!` proc macro builds the arena at *Rust compile time*; params/fragments bind at construction | Same two-stage architecture, shifted one stage earlier. Our builder closures (param baking + `HasIr` splicing, then one codegen) are Halide's parameterized generators. |
+| JIT mode: compile at pipeline-construction, `realize` many times | Kernels constructed at load time (project law), evaluated per pixel per frame | Same contract. Halide JIT compiles in ms–s (LLVM); ours in µs (direct emission) — see below. |
+| Simplifier: a large handwritten term-rewriting system (its maintenance burden is well studied — Newcomb et al.) | E-graph equality saturation with provenance | We are on the *modern* side of this one: e-graphs are the literature's answer to exactly Halide's simplifier-maintenance problem. |
+| Autoschedulers search schedule space with cost models; the learned-cost-model generation (Adams 2019) is notoriously hard to train well | E-graph extraction with a handwritten latency prior; NNUE learned model measured, lost, and shelved (opt-in) | Same architecture — search + cost model — and our 3-way bench conclusion (handwritten prior beats the learned model until proven otherwise) recapitulates the field's experience. |
+| Gradient Halide (Li et al. 2018): derivatives as ordinary Halide exprs, differentiated at the IR level, optimized by the same compiler | `Dwrt` symbolic differentiation in the e-graph + `lower_dwrt`; derivatives are ordinary arena expressions | Philosophically identical (reverse-mode for training there, forward-mode for screen-space AA here — dictated by use, not architecture). |
+| Bounds inference: interval analysis from consumer to producer | Declared static extents (`BufferDecl`) + clamped sampling | We sidestep general bounds inference; clamp-at-edge is Halide's `BoundaryConditions::repeat_edge` baked in as the only policy. Sound while lattices are the only bounded storage. |
+| LLVM backend | Handwritten per-ISA emitters (LuaJIT-family) | The real tradeoff: Halide inherits LLVM's instruction selection and vector maturity, and pays ms–s compiles; we pay per-ISA emitter maintenance and get µs compiles, which P0 showed is the budget that makes load/composition-time specialization viable at all. |
+
+**The one structural thing Halide has that we do not: the schedule
+language.** Halide's thesis is algorithm/schedule separation — the same pure
+`Func` can be tiled, vectorized, parallelized, computed-at or stored-at any
+granularity, and the *scheduling* choices are where the performance lives.
+PixelFlow has scheduling decisions, but they are baked policy rather than a
+language:
+
+- SIMD width = `Field` lanes (a fixed `vectorize`);
+- scanline emission with variance-based hoisting = a fixed loop-invariant
+  `compute_at` policy;
+- the actor render pool = a fixed `parallel` over rows;
+- and most importantly, **bake vs. fuse** — materialize a kernel into a
+  lattice (`CachedGlyph`, collapse) or splice its IR into the consumer
+  (`HasIr`) — *is* our `compute_root` vs. `inline` axis, chosen per kernel by
+  the author.
+
+For a terminal emulator — one workload class, one target family — baked
+policy is defensible; Halide needed a schedule language because image
+pipelines' optimal loop nests vary wildly. But the mapping is worth keeping
+explicit, because if per-kernel scheduling ever becomes necessary (tile sizes
+for large blurs, fusion granularity in lattice collapse), the orthodox move
+is Halide's: keep the algebra pure and grow the bake/fuse choice into a small
+scheduling vocabulary, rather than baking more policy into the emitters.
+
 ## Deliberate departures worth defending
 
 1. **No jet (dual-number) runtime for derivatives.** Forward-mode AD via

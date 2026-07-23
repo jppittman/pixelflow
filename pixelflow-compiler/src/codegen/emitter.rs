@@ -775,85 +775,15 @@ impl<'a> CodeEmitter<'a> {
         );
 
         let struct_tokens = emitter.build();
-        let has_ir_impl = self.emit_has_ir_impl(&struct_name_for_has_ir, &generic_names);
+        let has_ir_impl =
+            named_struct_has_ir_impl(self.analyzed, &struct_name_for_has_ir, &generic_names);
         quote! {
             #struct_tokens
             #has_ir_impl
         }
     }
 
-    /// Emit a `HasIr` impl for a named kernel struct, making it a spliceable
-    /// IR fragment (kernel-unification P4): `splice_into` reconstructs the
-    /// body's arena template, composes the struct's manifold fields (which
-    /// must themselves be `HasIr`), bakes its scalar fields, and splices the
-    /// result into the host.
-    ///
-    /// Named structs stay combinator kernels for direct evaluation — they
-    /// never own JIT memory. `HasIr` only lets a fused root absorb them.
-    /// Emitted conservatively: `Field` domain/return only (jet-domain and
-    /// `Discrete` kernels are skipped until P5 needs them), and only when the
-    /// arena can express the whole body; otherwise this returns no tokens and
-    /// the struct is simply not spliceable yet.
-    fn emit_has_ir_impl(
-        &self,
-        name: &syn::Ident,
-        generic_names: &[syn::Ident],
-    ) -> TokenStream {
-        if !crate::jit_backend::is_field_ty(&self.analyzed.def.domain_ty)
-            || !crate::jit_backend::is_field_ty(&self.analyzed.def.return_ty)
-        {
-            return quote! {};
-        }
 
-        let param_map = ir_bridge::scalar_param_indices(self.analyzed);
-        let manifold_map = ir_bridge::manifold_param_indices(self.analyzed);
-        let Ok((arena_code, plan)) =
-            ir_bridge::ast_to_runtime_arena(&self.analyzed.def.body, &param_map, &manifold_map)
-        else {
-            return quote! {};
-        };
-
-        let manifold_accessors: Vec<TokenStream> = self
-            .analyzed
-            .def
-            .params
-            .iter()
-            .filter(|p| matches!(p.kind, ParamKind::Manifold))
-            .map(|p| {
-                let n = &p.name;
-                quote! { self.#n }
-            })
-            .collect();
-        let compose = ir_bridge::composition_stmts(&plan, &manifold_accessors);
-
-        let scalar_names: Vec<_> = self
-            .analyzed
-            .def
-            .params
-            .iter()
-            .filter(|p| matches!(p.kind, ParamKind::Scalar(_)))
-            .map(|p| p.name.clone())
-            .collect();
-
-        quote! {
-            impl<#(#generic_names: ::pixelflow_core::__ir::HasIr),*>
-                ::pixelflow_core::__ir::HasIr for #name<#(#generic_names),*>
-            {
-                fn splice_into(
-                    &self,
-                    __host: &mut ::pixelflow_core::__ir::ExprArena,
-                ) -> ::pixelflow_core::__ir::ExprId {
-                    let (mut __arena, mut __root) = #arena_code;
-                    #compose
-                    __root = __arena.substitute_params(
-                        __root,
-                        &[ #( self.#scalar_names as f32 ),* ],
-                    );
-                    __host.splice(&__arena, __root)
-                }
-            }
-        }
-    }
 
     /// Emit imports for array-based context system.
     ///
@@ -1282,6 +1212,80 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
             _ => self.emit_annotated_expr(expr),
+        }
+    }
+}
+
+/// `HasIr` impl tokens for a named kernel struct — a spliceable IR fragment
+/// (kernel-unification P4): `splice_into` reconstructs the body's arena
+/// template, composes the struct's manifold fields (which must themselves be
+/// `HasIr`), bakes its scalar fields, and splices the result into the host.
+///
+/// Named structs stay combinator kernels for direct evaluation — they never
+/// own JIT memory; `HasIr` only lets a fused root absorb them. Emitted
+/// conservatively: `Field` domain/return only (jet-domain and `Discrete`
+/// kernels are skipped until P5 needs them), and only when the arena can
+/// express the whole body; otherwise this returns no tokens and the struct is
+/// simply not spliceable yet.
+///
+/// A free function on purpose: it is a pure `AnalyzedKernel -> TokenStream`
+/// arrow with no emitter state, in keeping with the phases-are-morphisms
+/// direction for the compiler.
+fn named_struct_has_ir_impl(
+    analyzed: &AnalyzedKernel,
+    name: &syn::Ident,
+    generic_names: &[syn::Ident],
+) -> TokenStream {
+    if !crate::jit_backend::is_field_ty(&analyzed.def.domain_ty)
+        || !crate::jit_backend::is_field_ty(&analyzed.def.return_ty)
+    {
+        return quote! {};
+    }
+
+    let param_map = ir_bridge::scalar_param_indices(analyzed);
+    let manifold_map = ir_bridge::manifold_param_indices(analyzed);
+    let Ok((arena_code, plan)) =
+        ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map, &manifold_map)
+    else {
+        return quote! {};
+    };
+
+    let manifold_accessors: Vec<TokenStream> = analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Manifold))
+        .map(|p| {
+            let n = &p.name;
+            quote! { self.#n }
+        })
+        .collect();
+    let compose = ir_bridge::composition_stmts(&plan, &manifold_accessors);
+
+    let scalar_names: Vec<_> = analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Scalar(_)))
+        .map(|p| p.name.clone())
+        .collect();
+
+    quote! {
+        impl<#(#generic_names: ::pixelflow_core::__ir::HasIr),*>
+            ::pixelflow_core::__ir::HasIr for #name<#(#generic_names),*>
+        {
+            fn splice_into(
+                &self,
+                __host: &mut ::pixelflow_core::__ir::ExprArena,
+            ) -> ::pixelflow_core::__ir::ExprId {
+                let (mut __arena, mut __root) = #arena_code;
+                #compose
+                __root = __arena.substitute_params(
+                    __root,
+                    &[ #( self.#scalar_names as f32 ),* ],
+                );
+                __host.splice(&__arena, __root)
+            }
         }
     }
 }
