@@ -235,6 +235,11 @@ fn ast_to_arena_inner(
                 BinaryOp::Ge => OpKind::Ge,
                 BinaryOp::Eq => OpKind::Eq,
                 BinaryOp::Ne => OpKind::Ne,
+                // Mask combination: comparison results are canonical masks in
+                // both tiers (all-ones SIMD lanes in the JIT, 1.0/0.0 in the
+                // interpreter), so bitwise AND/OR is logical AND/OR exactly.
+                BinaryOp::BitAnd => OpKind::BitAnd,
+                BinaryOp::BitOr => OpKind::BitOr,
                 _ => return Err(format!("Unsupported binary op: {:?}", binary.op)),
             };
 
@@ -778,6 +783,9 @@ fn opkind_to_tokens(kind: OpKind) -> TokenStream {
         OpKind::Ne => quote! { ::pixelflow_core::__ir::OpKind::Ne },
         OpKind::Select => quote! { ::pixelflow_core::__ir::OpKind::Select },
         OpKind::Clamp => quote! { ::pixelflow_core::__ir::OpKind::Clamp },
+        // Mask combination (canonical masks in both tiers).
+        OpKind::BitAnd => quote! { ::pixelflow_core::__ir::OpKind::BitAnd },
+        OpKind::BitOr => quote! { ::pixelflow_core::__ir::OpKind::BitOr },
         // Lowered at runtime by pixelflow-ir's `lower_dwrt` before codegen.
         OpKind::Dwrt => quote! { ::pixelflow_core::__ir::OpKind::Dwrt },
         _ => panic!("Unsupported OpKind for JIT: {:?}", kind),

@@ -222,12 +222,10 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
         let build = quote! {
             {
                 let (__arena, __root) = #arena_code;
-                let __jit = ::pixelflow_core::__ir::jit_cache::compile_cached(&__arena, __root)
-                    .expect("kernel JIT compilation failed");
                 #wrapper
                 __JitWrapper {
-                    jit: __jit,
                     ir: ::std::sync::Arc::new((__arena, __root)),
+                    jit: ::std::sync::OnceLock::new(),
                 }
             }
         };
@@ -276,12 +274,10 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
                 let (mut __arena, mut __root) = #arena_code;
                 #compose
                 __root = __arena.substitute_params(__root, #param_slice);
-                let __jit = ::pixelflow_core::__ir::jit_cache::compile_cached(&__arena, __root)
-                    .expect("kernel JIT compilation failed");
                 #wrapper
                 __JitWrapper {
-                    jit: __jit,
                     ir: ::std::sync::Arc::new((__arena, __root)),
+                    jit: ::std::sync::OnceLock::new(),
                 }
             }
         })
@@ -293,19 +289,29 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
 /// it is defined once here and interpolated.
 fn jit_wrapper_tokens() -> TokenStream {
     quote! {
-        // `Arc` so the wrapper is `Clone` (combinator kernels are `Copy` ZSTs;
-        // a JIT kernel owns executable memory). `Send`/`Sync` are auto-derived
-        // because `JitManifold` is `Send + Sync`. Alongside the compiled code
-        // the wrapper keeps the (composed, pre-lowering) arena it was built
-        // from, so the kernel is IR-carrying: `HasIr::splice_into` lets a host
-        // kernel absorb it as a fragment (kernel-unification P4).
+        // IR-carrying and LAZILY compiled (kernel-unification P5): the wrapper
+        // holds the composed, pre-lowering arena; machine code is produced on
+        // first evaluation, through the global compile cache. A kernel that is
+        // only ever *spliced* into a host (`HasIr`) never pays codegen — the
+        // plan's "leaves are bake-time-only, fuse at roots" constraint. `Arc`
+        // so the wrapper is `Clone` (combinator kernels are `Copy` ZSTs; a JIT
+        // kernel shares executable memory).
         #[derive(Clone)]
         struct __JitWrapper {
-            jit: ::std::sync::Arc<::pixelflow_core::__ir::JitManifold>,
             ir: ::std::sync::Arc<(
                 ::pixelflow_core::__ir::ExprArena,
                 ::pixelflow_core::__ir::ExprId,
             )>,
+            jit: ::std::sync::OnceLock<::std::sync::Arc<::pixelflow_core::__ir::JitManifold>>,
+        }
+        impl __JitWrapper {
+            #[inline]
+            fn __compiled(&self) -> &::std::sync::Arc<::pixelflow_core::__ir::JitManifold> {
+                self.jit.get_or_init(|| {
+                    ::pixelflow_core::__ir::jit_cache::compile_cached(&self.ir.0, self.ir.1)
+                        .expect("kernel JIT compilation failed")
+                })
+            }
         }
         impl ::pixelflow_core::__ir::HasIr for __JitWrapper {
             fn splice_into(
@@ -342,7 +348,7 @@ fn jit_wrapper_tokens() -> TokenStream {
             )) -> ::pixelflow_core::Field {
                 unsafe {
                     ::core::mem::transmute(
-                        self.jit.call(
+                        self.__compiled().call(
                             ::core::mem::transmute(x),
                             ::core::mem::transmute(y),
                             ::core::mem::transmute(z),

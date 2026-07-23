@@ -603,6 +603,11 @@ impl OpKind {
             } else {
                 0.0
             }),
+            // Bitwise on lane bit patterns, matching the SIMD backends. On
+            // canonical masks (1.0/0.0 here, all-ones/zero in the JIT) this
+            // is logical AND/OR in both representations.
+            Self::BitAnd => Some(f32::from_bits(x.to_bits() & y.to_bits())),
+            Self::BitOr => Some(f32::from_bits(x.to_bits() | y.to_bits())),
             _ => None,
         }
     }
