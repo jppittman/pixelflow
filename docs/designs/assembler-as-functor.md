@@ -284,18 +284,74 @@ Steps 1–5 are **Track A** (re-surface the back-end pipeline as a value): no
 change to instruction encodings, register allocation, the Select
 short-circuit, or the front-end parse.
 
-**Track B — move the optimizer onto the IR** (§2.0). Independent of Track A,
-larger, and worth its own design pass before step 8:
+**Track B — move the optimizer onto the IR** (§2.0). Independent of Track A.
+Scoped down to one step by the feasibility verdict (§5b):
 
 6. **Optimizer ingestion on arena** — feed `ast_to_arena` output to the
-   e-graph instead of `expr_to_egraph(&Expr)`; keep `dag_to_expr` as a
-   temporary adapter so codegen is untouched. `optimize` now has an
-   `ExprArena → ExprArena` core.
-7. **Codegen on arena** — re-target `codegen::emit` / `codegen/emitter.rs` to
-   walk `ExprArena` for the Manifold type-tree TokenStream. This is the large
-   step and the one that actually deletes the round-trip.
-8. **Delete `dag_to_expr`** and drop syn-`Expr` from everything downstream of
-   the bridge. `optimize` joins `expand_*` in the single `ArenaPass` monoid.
+   e-graph instead of `expr_to_egraph(&Expr)`; keep `dag_to_expr` so codegen
+   is untouched. `optimize`'s numeric path becomes an `ExprArena → ExprArena`
+   core. This is the viable, worthwhile part.
+
+   ~~7. Codegen on arena~~ / ~~8. Delete `dag_to_expr`~~ — **not advised**
+   (§5b). Would require extending `ExprArena` with opaque-manifold, symbolic
+   method-call, and verbatim node kinds plus param-kind/domain metadata —
+   turning the numeric IR into a second source AST — for little gain. The
+   syn-`Expr` codegen path stays for the manifold/verbatim superset.
+
+## 5b. Feasibility verdict: the arena is a *numeric* IR (Track B step 7 is not viable as stated)
+
+Before cutting codegen over to the arena, a read of `codegen/emitter.rs`
+(~1200 LOC) plus `ir_bridge::ast_to_arena` settled the question. Two facts:
+
+**1. Codegen does not build the type-tree — it transliterates to Rust
+expression tokens.** The emitter emits `(a + b)`, `x.sqrt()`,
+`inner.warp(...)` as ordinary Rust *expressions*; the `Sqrt<Add<…>>` type
+only ever materializes as an `rustc`-inferred type via operator/method
+overloading on the combinator types. It is never named in the generated
+tokens. So "codegen builds the shader type-tree" was itself a
+misconception — `rustc` does, from a transliterated expression tree.
+
+**2. Codegen consumes a strict *superset* of what `ExprArena` can represent.**
+`ast_to_arena` maps every method to a numeric `OpKind` or errors
+(`"Unsupported method"` / `"Unsupported expression type"`), and treats params
+as numeric scalars. It has **no vocabulary** for the cases codegen depends on:
+
+| Codegen construct | Arena representation? |
+|-------------------|-----------------------|
+| Opaque manifold param → generic `M0/M1` + `ContextFree` capture | none (`Var/Const/Param/Buffer` are numeric leaves) |
+| Method call on a manifold (`inner.warp(...)`, `mask.select(a,b)`, `.at(...)`) — method *name* + opaque receiver | none (no symbolic-method node) |
+| `Expr::Verbatim` — arbitrary syn passthrough (`Foo::default().at(...)`) | none |
+| Symbol-kind decisions (manifold taint → `Clone`, `.at`/derivative trait-bound synthesis, `ManifoldBind` vs `Computed`) | none (arena erases scalar-vs-manifold) |
+| Literal space (Domain vs Projected → `CtxVar` vs `V(CtxVar)`) | none |
+
+**Verdict.** The arena is sufficient for the **numeric spine** (arithmetic,
+comparisons-as-methods, literals, scalar params, X/Y/Z/W) — the subset that is
+already JIT-assembled and already goes through the e-graph. It is *not*
+sufficient for opaque-manifold / verbatim kernels. Making codegen
+arena-native (Track B steps 7–8) would require extending `ExprArena` with
+opaque-manifold, symbolic-method-call, and verbatim node kinds plus retained
+param-kind/domain/literal-space metadata — i.e. **turning the numeric IR into
+a second source-level AST.** That contradicts the arena's identity as a
+numeric SIMD algebra and buys little: the `dag_to_expr` round-trip it would
+delete is cheap, since codegen is a transliteration `rustc` finishes anyway.
+
+**Revised target.** The realistic end state is a **hybrid**, and it is
+philosophically clean:
+
+- `ExprArena` is the **sole IR for the numeric core** — the optimizable,
+  JIT-able, assemblable subset. Track B **step 6** (optimizer *ingestion* on
+  the arena) is viable and worthwhile: the e-graph path is *already*
+  numeric-only (`optimize_via_model`), and opaque-manifold blocks *already*
+  bypass it (`optimize_block_preserving_structure`). Feeding `ast_to_arena`
+  into the e-graph instead of `expr_to_egraph(&Expr)` kills the front
+  conversion and makes `optimize`'s numeric path an `ExprArena → ExprArena`
+  core, without touching the opaque path.
+- **Manifold-parametric / verbatim kernels** stay on the syn-`Expr` codegen
+  path. They are a *composition layer* that wraps numeric arena kernels in
+  Rust type-tree plumbing — not numeric assembly, and not the assembler's job.
+
+So Track B collapses to **step 6 only**; steps 7–8 are reclassified as "would
+require making the arena a full source IR — not advised." `dag_to_expr` stays.
 
 ## 6. Resolved decisions
 
