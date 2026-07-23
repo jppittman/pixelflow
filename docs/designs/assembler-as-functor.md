@@ -121,34 +121,50 @@ should be a builder, not a function-per-point.
 
 ## 4. The proposal: make the pipeline a value
 
+Two of the four axes are resolved at **compile time** (monomorphized, no
+runtime dispatch — consistent with "types are shaders"); two are runtime
+values:
+
 ```
-Pipeline  =  [ArenaPass]          ×  ScheduleStrategy        ×  Backend
-              (endomorphisms)         (ABI + scope partition     (IsaBackend
-              compose with .then()    + register budget)          component)
+Pipeline  =  Compile<Abi, Isa>        // compile-time: monomorphized, no dispatch
+                × [ArenaPass]          // runtime: arena endomorphisms, composed
+                × ScopePartition       // runtime: schedule partition predicate
+                × EmitCtx              // runtime: register budget (own axis)
 ```
 
-Concretely, a builder over the three orthogonal axes replaces the name
-suffixes:
+Concretely, a builder whose ABI and ISA are **type parameters** replaces the
+name suffixes:
 
 ```rust
 // Illustrative shape, not final API.
-Compile::new()
-    .pass(optimize)               // ArenaPass: Arena -> Arena (endomorphism)
-    .pass(expand_transcendentals) // another endomorphism, composed
-    .abi(Abi::Scanline)           // was the `_scanline` suffix
+// Abi and Isa are type parameters — monomorphized, exactly like the existing
+// `compile_dag_via_backend<B: IsaBackend>`. No runtime `match` on ABI.
+Compile::<Scanline, Aarch64>::new()
+    .pass(optimize)                                  // ArenaPass: endomorphism
+    .pass(expand_transcendentals)                    // another, composed
     .scope(ScopePartition::hoist(default_hoist_predicate)) // was `_hoisted`
     .budget(EmitCtx::with_max_regs(10))                    // was `_with_ctx`
     .run(&arena, root)            // drives schedule -> regalloc -> emit -> from_code
 ```
 
+- **`Abi`** — a **trait**, resolved at compile time (decided: see §6). It
+  supplies the calling-convention-specific pieces — input-register mapping,
+  prologue/epilogue shape, and op legality (e.g. scanline forbids
+  bound-memory Gather). Composes with `Isa` in the driver:
+  `run<A: Abi, B: IsaBackend>`. The `_scanline` suffix becomes the type
+  argument `Scanline`; the per-batch ctx kernel is the default ABI type.
 - **`ArenaPass`** — one trait for the endomorphisms, generalizing
   `rebuild_arena`'s hook. `optimize` and each `expand_*` are instances;
   composition is `.then()`. This makes the free-monoid structure a value.
-- **`ScheduleStrategy`** — bundles the ABI choice, the scope-partition
-  predicate, and the register budget. The `_scanline` / `_hoisted` /
-  `_with_ctx` axes become fields, not suffixes.
-- **`Backend`** — unchanged. `IsaBackend` already is the functor component;
-  it stays exactly as is.
+- **`ScopePartition`** — the schedule-partition predicate
+  (`Variance → bool`) fed to the schedule step. Flat scheduling is the empty
+  partition; `hoist(pred)` is the two-phase setup/loop split. The `_hoisted`
+  suffix becomes this runtime value.
+- **`EmitCtx`** — its **own** runtime axis (`.budget(...)`), *not* folded into
+  scheduling (decided: see §6). It parameterizes regalloc/spilling and is the
+  ML tuning knob. The `_with_ctx` suffix becomes this value.
+- **`Isa` / `IsaBackend`** — unchanged. Already the functor component; stays
+  exactly as is.
 
 ### 4.1 What this buys
 
@@ -187,15 +203,29 @@ Non-goals: no change to instruction encodings, register allocation, the
 Select short-circuit, or the front-end parse. This is a re-surfacing of the
 existing pipeline, not a rewrite of any stage.
 
-## 6. Open questions
+## 6. Resolved decisions
 
-- **Does `EmitCtx` belong in `ScheduleStrategy` or beside it?** It is a
-  parameter of the regalloc/emit step, not scheduling. It may read cleaner as
-  its own `.budget()` axis (as sketched) rather than folded into
-  `ScheduleStrategy`. Low stakes; decide when the builder takes shape.
-- **Is `Abi` a `Backend` concern or a `ScheduleStrategy` concern?** The
-  scanline ABI forbids bound-memory Gather and changes which register holds
-  the coordinate pointer — that touches both the schedule (what ops are legal)
-  and the backend (prologue/ABI). Modeled here as a `ScheduleStrategy` field
-  that the driver validates, but it is the one axis that genuinely straddles
-  two arrows and deserves care.
+- **`EmitCtx` is its own axis.** It parameterizes the regalloc/spill step, not
+  scheduling, so it stands beside `ScopePartition` as `.budget(...)` rather
+  than being folded into a scheduling struct. It stays the ML register-budget
+  knob.
+- **`Abi` is a trait, resolved at compile time.** We want compile-time
+  polymorphism (monomorphization, no runtime dispatch), mirroring the existing
+  `compile_dag_via_backend<B: IsaBackend>`. So the driver is generic over both
+  `Abi` and `Isa` (`run<A: Abi, B: IsaBackend>`); the ABI's op-legality checks,
+  input-register mapping, and prologue/epilogue become associated behavior on
+  the `Abi` type rather than a runtime `match`. `Scanline` and the per-batch
+  ctx kernel are distinct `Abi` types. This is the one axis that touches both
+  the schedule (legal ops) and the backend (prologue/ABI), so keeping it a
+  compile-time type — not a runtime field — is what lets the driver reject
+  illegal combinations at monomorphization time instead of at runtime.
+
+## 7. Remaining open question
+
+- **Does `Abi` subsume the ABI-specific parts currently inside `IsaBackend`
+  (prologue/epilogue), or sit orthogonal to it?** Scanline is presently
+  aarch64-only (`#[cfg(target_arch = "aarch64")]`) and its prologue/epilogue
+  lives in the backend. When `Abi` becomes its own trait, the prologue/epilogue
+  responsibility should move to (or be shared with) `Abi`, since it is a
+  calling-convention property, not an instruction-encoding one. Settle the
+  exact `Abi` / `IsaBackend` boundary when the trait is cut.
