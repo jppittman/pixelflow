@@ -1416,6 +1416,62 @@ mod tests {
         handle.join().unwrap();
         assert!(exited.load(Ordering::SeqCst), "should have exited");
     }
+
+    // Kills: replace `/` with `%` or `*` in handle_wake's `half_control`
+    // calculation (line 940).
+    //
+    // With control_burst_limit == 10, the correct `half_control` is 5: the
+    // first of the two control drains in one handle_wake pass stops after
+    // exactly 5 messages, letting the queued management message run before
+    // the remaining 5 control messages. A `%` mutant collapses half_control
+    // to 1 (mgmt would run after just 1 control message); a `*` mutant
+    // inflates it to 20, large enough to drain all 10 control messages
+    // before mgmt gets a turn. Either mutant shifts "Mgmt: m0"'s position in
+    // the log away from index 5.
+    #[test]
+    fn handle_wake_splits_control_burst_in_half_before_management() {
+        let params = SchedulerParams {
+            control_mgmt_buffer_size: 10,
+            control_burst_multiplier: 1, // control_burst_limit == 10
+            management_burst_multiplier: 1,
+            ..SchedulerParams::DEFAULT
+        };
+        assert_eq!(params.control_burst_limit(), 10);
+
+        let (tx, mut rx) = ActorScheduler::<String, String, String>::new_with_params(4, 4, params);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = log.clone();
+
+        // Queue before the scheduler starts, so a single handle_wake call
+        // sees all 10 control messages and the 1 management message at once.
+        for i in 0..10 {
+            tx.send(Message::Control(format!("c{i}"))).unwrap();
+        }
+        tx.send(Message::Management("m0".to_string())).unwrap();
+
+        let scheduler = thread::spawn(move || {
+            let mut handler = TestHandler { log: log_clone };
+            rx.run(&mut handler);
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while log.lock().unwrap().len() < 11 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        tx.send(Message::Shutdown).unwrap();
+        scheduler.join().unwrap();
+
+        let log = log.lock().unwrap();
+        let mgmt_pos = log.iter().position(|e| e == "Mgmt: m0");
+        assert_eq!(
+            mgmt_pos,
+            Some(5),
+            "management message should run after exactly half_control (5) \
+             control messages, got log: {:?}",
+            *log
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1892,6 +1948,118 @@ mod drain_all_targeted_tests {
             mgmt_count.load(Ordering::Relaxed),
             25,
             "DrainControl must drain all 25 management messages"
+        );
+    }
+
+    // Kills: delete `!` on the control term of `all_done` (line 915).
+    //
+    // Queue only control messages (mgmt/data stay empty every iteration).
+    // Correct code: `all_done` requires control to also be non-More, so the
+    // loop keeps batching until all 25 are drained. With the control `!`
+    // deleted, `all_done` becomes true as soon as control IS More (i.e.
+    // immediately, after the very first batch) since the untouched mgmt/data
+    // terms are trivially satisfied — the loop exits after only 10 of 25.
+    #[test]
+    fn drain_all_requires_control_lane_fully_drained() {
+        let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
+            100,
+            1000,
+            ShutdownMode::DrainAll {
+                timeout: Duration::from_secs(2),
+            },
+        );
+
+        tx.send(Message::Shutdown).unwrap();
+        for _ in 0..25 {
+            tx.send(Message::Control(())).unwrap();
+        }
+
+        let ctrl_count = Arc::new(AtomicUsize::new(0));
+
+        struct CtrlOnlyActor {
+            ctrl: Arc<AtomicUsize>,
+        }
+        impl Actor<(), (), ()> for CtrlOnlyActor {
+            fn handle_data(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_control(&mut self, _: ()) -> HandlerResult {
+                self.ctrl.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn handle_management(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn park(&mut self, _: SystemStatus) -> Result<ActorStatus, HandlerError> {
+                Ok(ActorStatus::Idle)
+            }
+        }
+
+        let ctrl_clone = ctrl_count.clone();
+        let handle = std::thread::spawn(move || {
+            let mut actor = CtrlOnlyActor { ctrl: ctrl_clone };
+            rx.run(&mut actor);
+        });
+
+        handle.join().unwrap();
+        assert_eq!(
+            ctrl_count.load(Ordering::Relaxed),
+            25,
+            "drain_all_with_timeout must not report all_done while control still has queued messages"
+        );
+    }
+
+    // Kills: delete `!` on the management term of `all_done` (line 916).
+    // Mirrors `drain_all_requires_control_lane_fully_drained` but floods the
+    // management lane instead, since the mgmt `!` and control `!` are deleted
+    // independently by cargo-mutants.
+    #[test]
+    fn drain_all_requires_management_lane_fully_drained() {
+        let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
+            100,
+            1000,
+            ShutdownMode::DrainAll {
+                timeout: Duration::from_secs(2),
+            },
+        );
+
+        tx.send(Message::Shutdown).unwrap();
+        for _ in 0..25 {
+            tx.send(Message::Management(())).unwrap();
+        }
+
+        let mgmt_count = Arc::new(AtomicUsize::new(0));
+
+        struct MgmtOnlyActor {
+            mgmt: Arc<AtomicUsize>,
+        }
+        impl Actor<(), (), ()> for MgmtOnlyActor {
+            fn handle_data(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_control(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_management(&mut self, _: ()) -> HandlerResult {
+                self.mgmt.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn park(&mut self, _: SystemStatus) -> Result<ActorStatus, HandlerError> {
+                Ok(ActorStatus::Idle)
+            }
+        }
+
+        let mgmt_clone = mgmt_count.clone();
+        let handle = std::thread::spawn(move || {
+            let mut actor = MgmtOnlyActor { mgmt: mgmt_clone };
+            rx.run(&mut actor);
+        });
+
+        handle.join().unwrap();
+        assert_eq!(
+            mgmt_count.load(Ordering::Relaxed),
+            25,
+            "drain_all_with_timeout must not report all_done while management still has queued messages"
         );
     }
 }
