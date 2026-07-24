@@ -78,19 +78,24 @@ fn simple_glyph_bake_matches_combinator_cache() {
     golden_for('A', 32);
 }
 
-// 'O' — exercises quadratic Bezier leaves through the whole path. The fused
-// arena is CORRECT (the IR interpreter reproduces the combinator coverage
-// exactly, hole and all), but the JIT backend cannot yet compile it: a fused
-// quad glyph is register-heavy enough that a `Select` lands with BOTH branches
-// spilled, which the x86/aarch64 emitter rejects
-// ("Select with both if_true and if_false spilled not supported"). This is a
-// JIT codegen robustness gap, not a defect in the glyph→Kernel rewrite, and it
-// is the concrete blocker for retiring the combinator glyph path (P5/P6). The
-// correct fix reads the spilled branches straight from their stack slots as
-// memory operands to the blend (vandps/vandnps accept a memory source), needing
-// no extra scratch registers. Un-ignore once that lands.
 #[test]
-#[ignore = "JIT: fused quad glyph hits Select-with-both-branches-spilled (arena is correct; see comment)"]
 fn round_glyph_bake_matches_combinator_cache() {
+    // 'O' — exercises quadratic Bezier leaves through the whole path. This was
+    // the test that exposed two JIT codegen soundness bugs (the select-guard
+    // mask-before-range assumption and the unsorted Clamp decomposition — see
+    // pixelflow-ir/tests/spill_pressure.rs); it guards them now.
     golden_for('O', 32);
+}
+
+#[test]
+fn descender_glyph_bake_matches_combinator_cache() {
+    // 'g' — descender, multiple contours, quad-heavy.
+    golden_for('g', 32);
+}
+
+#[test]
+fn double_counter_glyph_bake_matches_combinator_cache() {
+    // '8' — two enclosed counters: the winding sum crosses zero twice per
+    // scanline, stressing the sign bookkeeping of the fused contributions.
+    golden_for('8', 32);
 }

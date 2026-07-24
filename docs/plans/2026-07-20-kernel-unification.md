@@ -199,20 +199,43 @@ to-be-retired backend, tracked until that backend dies.
 - **P6 — deprecate and delete** the combinator emitter once P2–P5 cover the
   surface (parity suite + goldens green on arena-only).
 
-  **P5 glyph→Kernel landed 2026-07-24 (partial):** `kernel_value!` produces a
-  `Kernel` value (front end straight to arena, no combinator ZST, no eager JIT);
+  **P5 glyph→Kernel landed 2026-07-24:** `kernel_value!` produces a `Kernel`
+  value (front end straight to arena, no combinator ZST, no eager JIT);
   `AnalyticalLine`/`AnalyticalQuad` gained `.kernel()`; `glyph_to_kernel` walks
   the parsed glyph into one coverage `Kernel` (`Sum`/`Affine`/`Bounded`/
   `Geometry` all dissolve into `sum`/`at`/`select`); `Font::glyph_kernel*`
-  expose it. Golden vs the combinator `CachedGlyph` (Jet2 AA) matches for line
-  glyphs ('A'). **Blocker:** a fused *quad* glyph ('O') is register-heavy enough
-  that a `Select` lands with both branches spilled, which the JIT emitter
-  rejects — the arena is correct (IR interpreter reproduces the combinator
-  coverage exactly), so this is a JIT codegen gap, not a rewrite defect. Fix:
-  blend spilled branches from their stack slots as memory operands (no extra
-  scratch); also fix the latent mask-spilled+one-branch-spilled reload clobber.
-  Until then the combinator path stays; `CachedGlyph::new`-via-`bake` and the
-  combinator deletions wait on it.
+  expose it. Goldens vs the combinator `CachedGlyph` (Jet2 AA): 'A', 'O', 'g',
+  '8' at 32px all match (mean |Δcoverage| < 0.02, zero inside/outside flips).
+
+  Getting quad glyphs green surfaced and fixed **two JIT soundness bugs** —
+  both pre-existing, exposed by arena-composed (spliced) kernels whose schedule
+  order differs from ir_bridge's AST order:
+  1. **Select-guard mask-before-range hole:** the uniform-mask short-circuit
+     guard emits its test at the skipped range's START, reading the mask
+     register there — but nothing required the mask to be *computed* by then.
+     Arena-composed kernels can schedule an arm before its mask; the guard then
+     branched on an uninitialized register (region-shaped garbage in 'O').
+     Fixed: an arm is only guarded when the mask's schedule index precedes the
+     range (`analyze_select_guards`).
+  2. **Unsorted Clamp decomposition:** every emitter inlined
+     `max(lo, min(x, hi))`, but the reference semantics
+     (`OpKind::eval_ternary`) SORT the bounds first — degenerate `lo > hi`
+     ranges (which e-graph extraction and composed kernels produce) silently
+     diverged from the interpreter. Fixed by `lowering::expand_clamp`: Clamp
+     lowers to the bound-sorting min/max sequence as the last pass of every
+     compile entry's lowering chain (per-batch x86/aarch64/avx512 + both
+     scanline paths), and the per-ISA Clamp emissions are deleted — a Clamp
+     reaching an emitter is now a loud error.
+  Also landed: Select with BOTH branches spilled resolves via the two reload
+  registers (mask reloads straight into `dst`), replacing the old hard error —
+  and fixing its latent mask-reload clobber. The whole class is guarded by
+  `pixelflow-ir/tests/spill_pressure.rs` (JIT-vs-interpreter equivalence under
+  forced register pressure: both-spilled selects, glyph-shaped sums, nested
+  selects, decomposed MulAdd/Clamp, beyond-red-zone frames).
+
+  Remaining for P5 proper: switch `CachedGlyph::new` to `Lattice::bake` on the
+  glyph `Kernel`, then delete the combinator glyph pipeline (`Glyph`/`Geometry`/
+  `Sum`/`Affine` + leaf `Manifold`/`Lower` impls + graphics' pixelflow-ir dep).
 
 ## Beyond P6 — the language the totality axiom demands
 

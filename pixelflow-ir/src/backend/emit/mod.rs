@@ -234,15 +234,6 @@ pub enum ResolvedOp {
         if_true: Reg,
         if_false: Reg,
     },
-    /// Clamp: FMIN(dst, val, hi), then reload lo, then FMAX(dst, dst, lo).
-    /// `lo_deferred`: if Some, lo must be reloaded *after* FMIN.
-    Clamp {
-        dst: Reg,
-        val: Reg,
-        lo: Reg,
-        hi: Reg,
-        lo_deferred: Option<DeferredReload>,
-    },
     /// Bound-memory gather: `dst = buffer[slot][idx_lane]`. Emitted only on the
     /// AVX-512 backend (native `vgatherdps`); other backends reject it. The
     /// buffer base pointer is loaded from the context struct (rdi) at
@@ -573,15 +564,10 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
                 }
 
                 OpKind::Clamp => {
-                    // clamp(a, lo, hi) = max(min(a, hi), lo)
-                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
-                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
-                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
-                    code.extend(b_code);
-                    code.extend(c_code);
-                    emit_binary(&mut code, OpKind::Min, dst, a_reg, c_reg);
-                    emit_binary(&mut code, OpKind::Max, dst, dst, b_reg);
-                    Ok((code, dst))
+                    // See lowering::expand_clamp — the unsorted inline
+                    // decomposition disagreed with the interpreter on
+                    // degenerate bounds, so Clamp never reaches emitters.
+                    Err("Clamp must be expanded before emission (lowering::expand_clamp)")
                 }
 
                 OpKind::Select => {
@@ -662,6 +648,7 @@ pub fn compile_arena_dag_with_ctx(
     let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let (arena, root) = lowering::expand_clamp_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses_map = arena_to_uses(&schedule);
@@ -989,6 +976,12 @@ pub fn compile_arena_dag_scanline_hoisted(
     arena: &crate::arena::ExprArena,
     root: crate::arena::ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
+    // This path runs none of the per-batch lowering chain, but Clamp must not
+    // reach the emitters (its inline decompositions are gone — see
+    // lowering::expand_clamp), so expand it here. Identity fast-path when the
+    // arena has no Clamp.
+    let (arena_owned, root) = lowering::expand_clamp_owned(arena, root);
+    let arena = &arena_owned;
     let hoisted = arena_to_hoisted_schedule(arena, root, default_hoist_predicate);
 
     // The scanline ABI has no context argument — x0 is the X-array pointer —
@@ -2741,6 +2734,19 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                 })
                 .collect();
 
+            // The guard's uniformity test is emitted at the range START and
+            // reads the mask's register there, so the mask must already be
+            // computed by then. Schedules from the macro pipeline emit the mask
+            // before both arms, but arena-composed kernels (`Kernel::select`
+            // splicing arbitrary fragments) may schedule an arm BEFORE the
+            // mask — guarding such an arm would branch on an uninitialized
+            // register. No guard in that case; the select still evaluates
+            // correctly through the unconditional BSL/blend path.
+            let mask_idx = vid_to_sched_idx
+                .get(mask_vid.0 as usize)
+                .copied()
+                .unwrap_or(usize::MAX);
+
             // Get contiguous ranges (min..max+1)
             let true_range = if true_indices.is_empty() {
                 (i, i) // empty range
@@ -2760,7 +2766,11 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                 // or a false-exclusive node, skipping it would leave a value some
                 // other expression reads uninitialized — fall back to BSL.
                 let all_exclusive = (start..end).all(|idx| true_indices.contains(&idx));
-                if all_exclusive { (start, end) } else { (i, i) }
+                if all_exclusive && mask_idx < start {
+                    (start, end)
+                } else {
+                    (i, i)
+                }
             };
 
             let false_range = if false_indices.is_empty() {
@@ -2776,7 +2786,11 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                     .expect("non-empty set has last element")
                     + 1;
                 let all_exclusive = (start..end).all(|idx| false_indices.contains(&idx));
-                if all_exclusive { (start, end) } else { (i, i) }
+                if all_exclusive && mask_idx < start {
+                    (start, end)
+                } else {
+                    (i, i)
+                }
             };
 
             // Only create a guard if at least one arm has exclusive nodes
@@ -2969,17 +2983,38 @@ pub fn resolve_operands(
                     }
                 }
                 OpKind::Select => {
-                    // BSL: dst must hold mask (a).
-                    // BSL is 3-input RMW: b and c must not alias each other.
-                    if b_spilled && !assignment.contains_key(c) {
-                        return Err("Select with both if_true and if_false spilled not supported");
-                    }
-                    let a_reg = resolve(*a, tmp_op, &mut reloads);
+                    // BSL/blend is a 3-input RMW: the mask must end up in `dst`,
+                    // and if_true / if_false each need their own live register.
+                    //
+                    // Reload a spilled mask STRAIGHT into `dst` — never via
+                    // tmp_op. Reloads all emit before `setup_mov`, so routing the
+                    // mask through tmp_op while a spilled branch also reloads
+                    // into tmp_op would overwrite the mask before it reaches
+                    // `dst`. Going straight to `dst` also frees tmp_op and
+                    // RELOAD_REGS[0] as two independent slots for the branches.
+                    let c_spilled = !assignment.contains_key(c);
+                    let a_reg = resolve(*a, dst, &mut reloads);
                     if dst.0 != a_reg.0 {
                         setup_mov = Some((dst, a_reg));
                     }
                     let b_reg = resolve(*b, tmp_op, &mut reloads);
-                    let c_reg = resolve(*c, tmp_op, &mut reloads);
+                    let c_reg = if b_spilled && c_spilled {
+                        // Both branches spilled → two DISTINCT reload targets.
+                        // tmp_op (RELOAD_REGS[1]) holds if_true; if_false takes
+                        // RELOAD_REGS[0], which is free whenever `dst` is a real
+                        // register (reload regs are never in the allocator
+                        // pool). Only a spilled *result* (dst == RELOAD_REGS[0])
+                        // leaves too few registers.
+                        if dst.0 == RELOAD_REGS[0].0 {
+                            return Err(
+                                "Select with a spilled result and both branches spilled not supported",
+                            );
+                        }
+                        resolve(*c, RELOAD_REGS[0], &mut reloads)
+                    } else {
+                        // At most one branch spilled → tmp_op suffices for it.
+                        resolve(*c, tmp_op, &mut reloads)
+                    };
                     ResolvedOp::Select {
                         dst,
                         if_true: b_reg,
@@ -2987,41 +3022,14 @@ pub fn resolve_operands(
                     }
                 }
                 OpKind::Clamp => {
-                    // clamp(a, lo=b, hi=c) = max(lo, min(a, c))
-                    // Decomposed: FMIN(dst, val, hi) then FMAX(dst, dst, lo).
-                    // val and hi loaded upfront; lo is deferred (loaded after FMIN).
-                    let c_spilled = !assignment.contains_key(c);
-                    let (val_reg, hi_reg) = if a_spilled && c_spilled {
-                        // Both need reload — use dst-as-temp for val, tmp_op for hi.
-                        let a_reg = resolve(*a, dst, &mut reloads);
-                        let c_reg = resolve(*c, tmp_op, &mut reloads);
-                        (a_reg, c_reg)
-                    } else {
-                        // At most one spilled — tmp_op suffices.
-                        let a_reg = resolve(*a, tmp_op, &mut reloads);
-                        let c_reg = resolve(*c, tmp_op, &mut reloads);
-                        (a_reg, c_reg)
-                    };
-                    // lo is deferred — loaded after FMIN.
-                    let (lo_reg, lo_deferred) = if let Some(&reg) = assignment.get(b) {
-                        (reg, None)
-                    } else if let Some(&bits) = rematerialize.get(b) {
-                        (tmp_op, Some(DeferredReload::Const(bits)))
-                    } else if let Some(&offset) = spill_slots.get(b) {
-                        (tmp_op, Some(DeferredReload::FromStack(offset)))
-                    } else {
-                        panic!(
-                            "value {:?} not found in assignment, spill slots, or rematerialize",
-                            b
-                        );
-                    };
-                    ResolvedOp::Clamp {
-                        dst,
-                        val: val_reg,
-                        lo: lo_reg,
-                        hi: hi_reg,
-                        lo_deferred,
-                    }
+                    // Never reaches the emitters: `lowering::expand_clamp`
+                    // (last pass in every compile entry's lowering chain)
+                    // rewrites Clamp into the bound-sorting min/max sequence
+                    // that matches `OpKind::eval_ternary`. The inline
+                    // decomposition this arm used to build did NOT sort the
+                    // bounds, silently disagreeing with the interpreter on
+                    // degenerate (lo > hi) ranges.
+                    return Err("Clamp must be expanded before emission (lowering::expand_clamp)");
                 }
                 _ => return Err("unsupported ternary op in DAG compilation"),
             }
@@ -3156,20 +3164,6 @@ fn emit_instruction_plan(
         } => {
             // setup_mov already placed mask into dst
             emit_bsl(code, *dst, *if_true, *if_false);
-        }
-        ResolvedOp::Clamp {
-            dst,
-            val,
-            lo,
-            hi,
-            lo_deferred,
-        } => {
-            // FMIN(dst, val, hi) — consumes val and hi (loaded upfront).
-            emit_fmin(code, *dst, *val, *hi);
-            // Reload lo after FMIN (lo may reuse tmp_op which held val or hi).
-            emit_deferred(code, *lo, lo_deferred.as_ref(), pool);
-            // FMAX(dst, dst, lo)
-            emit_fmax(code, *dst, *dst, *lo);
         }
     }
 
@@ -3312,6 +3306,7 @@ pub fn compile_arena_dag_with_ctx(
     let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let (arena, root) = lowering::expand_clamp_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
@@ -3556,26 +3551,6 @@ impl IsaBackend for X86Backend {
                 }
                 emit_binary_safe(code, OpKind::Add, *dst, *dst, *c);
             }
-            ResolvedOp::Clamp {
-                dst,
-                val,
-                lo,
-                hi,
-                lo_deferred,
-            } => {
-                // clamp(val, lo, hi) = max(min(val, hi), lo).
-                emit_binary_safe(code, OpKind::Min, *dst, *val, *hi);
-                match lo_deferred {
-                    Some(DeferredReload::FromStack(off)) => {
-                        self.spill_load(code, *lo, *off);
-                    }
-                    Some(DeferredReload::Const(bits)) => {
-                        emit_const(code, *lo, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
-                    }
-                    None => {}
-                }
-                emit_binary_safe(code, OpKind::Max, *dst, *dst, *lo);
-            }
         }
         if let Some(store) = &plan.store {
             self.spill_store(code, store.src, store.offset);
@@ -3815,26 +3790,6 @@ impl IsaBackend for Avx512Backend {
                 // setup_mov already placed the vector mask in dst; one vpternlogd.
                 avx512::emit_select(code, *dst, *if_true, *if_false);
             }
-            ResolvedOp::Clamp {
-                dst,
-                val,
-                lo,
-                hi,
-                lo_deferred,
-            } => {
-                // clamp(val, lo, hi) = max(min(val, hi), lo). No mask needed.
-                avx512::emit_binary(code, OpKind::Min, *dst, *val, *hi)?;
-                match lo_deferred {
-                    Some(DeferredReload::FromStack(off)) => {
-                        avx512::emit_load_rsp(code, *lo, avx512_slot_disp(*off));
-                    }
-                    Some(DeferredReload::Const(bits)) => {
-                        avx512::emit_const(code, *lo, f32::from_bits(*bits));
-                    }
-                    None => {}
-                }
-                avx512::emit_binary(code, OpKind::Max, *dst, *dst, *lo)?;
-            }
         }
         if let Some(store) = &plan.store {
             avx512::emit_store_rsp(code, store.src, avx512_slot_disp(store.offset));
@@ -3947,6 +3902,7 @@ pub fn compile_collapse_avx512(
     let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let (arena, root) = lowering::expand_clamp_owned(&arena, root);
     let arena = &arena;
 
     let schedule = arena_to_schedule(arena, root);
@@ -4048,6 +4004,12 @@ pub fn compile_arena_dag_scanline(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
+    // This path runs none of the per-batch lowering chain, but Clamp must not
+    // reach the tree emitter (its inline decomposition is gone — see
+    // lowering::expand_clamp), so expand it here. Identity fast-path when the
+    // arena has no Clamp.
+    let (arena_owned, root) = lowering::expand_clamp_owned(arena, root);
+    let arena = &arena_owned;
     const MAX_DEPTH: usize = 64;
     if arena.depth(root) > MAX_DEPTH {
         return Err("expression too deep");

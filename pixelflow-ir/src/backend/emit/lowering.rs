@@ -217,6 +217,49 @@ pub fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprI
     (owned, new_root)
 }
 
+// ─────────────────────────────── Clamp lowering ──────────────────────────────
+
+/// Lower every `Clamp(x, b, c)` reachable from `root` into the min/max
+/// sequence matching the reference semantics ([`OpKind::eval_ternary`]):
+/// bounds are SORTED first (`lo = min(b, c)`, `hi = max(b, c)`), then
+/// `min(max(x, lo), hi)`. Degenerate swapped bounds arise from e-graph
+/// extraction and from arena-composed kernels; the unsorted decomposition
+/// `max(b, min(x, c))` the emitters used to inline disagrees with the
+/// interpreter exactly there (it returns `b` whenever `b > c`), which is a
+/// silent JIT-vs-interpreter divergence. Expanding here gives every backend
+/// the sorted semantics and retires the per-ISA `Clamp` emission entirely.
+///
+/// Runs LAST in the lowering chain: [`lower_gather`] itself emits `Clamp`
+/// nodes for its index arithmetic, and those must expand too.
+pub fn expand_clamp(arena: &mut ExprArena, root: ExprId) -> ExprId {
+    rebuild_arena(arena, root, |arena, node, m| match node {
+        ExprNode::Ternary(OpKind::Clamp, x, b, c) => {
+            let (x, b, c) = (m(*x), m(*b), m(*c));
+            let lo = arena.push_binary(OpKind::Min, b, c);
+            let hi = arena.push_binary(OpKind::Max, b, c);
+            let floored = arena.push_binary(OpKind::Max, x, lo);
+            Some(arena.push_binary(OpKind::Min, floored, hi))
+        }
+        _ => None,
+    })
+}
+
+/// Owned wrapper mirroring [`expand_gather_owned`]: identity fast-path when
+/// the arena has no `Clamp`, otherwise clone-and-lower.
+#[must_use]
+pub fn expand_clamp_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+    if !arena
+        .nodes_raw()
+        .iter()
+        .any(|n| matches!(n, ExprNode::Ternary(OpKind::Clamp, _, _, _)))
+    {
+        return (arena.clone(), root);
+    }
+    let mut owned = arena.clone();
+    let new_root = expand_clamp(&mut owned, root);
+    (owned, new_root)
+}
+
 /// Build the index arithmetic for one gather and wrap it in a `RawGather`.
 ///
 /// `buf`/`x`/`y` are already lowered nodes in `arena`; `buf` is a `Buffer` leaf.
