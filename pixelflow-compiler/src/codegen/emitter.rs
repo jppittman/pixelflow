@@ -6,6 +6,7 @@ use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote};
 
 use crate::annotate::{AnnotationCtx, annotate};
+use crate::ir_bridge;
 use crate::ast::{BinaryOp, Expr, ParamKind, Stmt, UnaryOp};
 use crate::sema::AnalyzedKernel;
 use crate::symbol::SymbolKind;
@@ -751,6 +752,7 @@ impl<'a> CodeEmitter<'a> {
         };
 
         // Build the emitter
+        let struct_name_for_has_ir = name.clone();
         let mut emitter = StructEmitter::new(visibility, name)
             .with_generics(generic_names.clone())
             .with_derives(derives)
@@ -772,8 +774,16 @@ impl<'a> CodeEmitter<'a> {
             at_binding,
         );
 
-        emitter.build()
+        let struct_tokens = emitter.build();
+        let has_ir_impl =
+            named_struct_lower_impl(self.analyzed, &struct_name_for_has_ir, &generic_names);
+        quote! {
+            #struct_tokens
+            #has_ir_impl
+        }
     }
+
+
 
     /// Emit imports for array-based context system.
     ///
@@ -1202,6 +1212,81 @@ impl<'a> CodeEmitter<'a> {
                 }
             }
             _ => self.emit_annotated_expr(expr),
+        }
+    }
+}
+
+/// `Lower` impl tokens for a named kernel struct — a spliceable IR fragment
+/// (kernel-unification P4): `lower` reconstructs the body's arena template,
+/// composes the struct's manifold fields (which must themselves be `Lower`),
+/// bakes its scalar fields, and splices the result into the host.
+///
+/// Named structs stay combinator kernels for direct evaluation — they never
+/// own JIT memory; `Lower` only lets a fused root absorb them. Emitted
+/// conservatively: `Field` domain/return only (jet-domain and `Discrete`
+/// kernels are skipped until P5 needs them), and only when the arena can
+/// express the whole body; otherwise this returns no tokens and the struct is
+/// simply not spliceable yet.
+///
+/// A free function on purpose: it is a pure `AnalyzedKernel -> TokenStream`
+/// arrow with no emitter state, in keeping with the phases-are-morphisms
+/// direction for the compiler.
+fn named_struct_lower_impl(
+    analyzed: &AnalyzedKernel,
+    name: &syn::Ident,
+    generic_names: &[syn::Ident],
+) -> TokenStream {
+    if !crate::jit_backend::is_field_ty(&analyzed.def.domain_ty)
+        || !crate::jit_backend::is_field_ty(&analyzed.def.return_ty)
+    {
+        return quote! {};
+    }
+
+    let param_map = ir_bridge::scalar_param_indices(analyzed);
+    let manifold_map = ir_bridge::manifold_param_indices(analyzed);
+    let Ok((arena_code, plan)) =
+        ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map, &manifold_map)
+    else {
+        return quote! {};
+    };
+
+    let manifold_accessors: Vec<TokenStream> = analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Manifold))
+        .map(|p| {
+            let n = &p.name;
+            quote! { self.#n }
+        })
+        .collect();
+    let compose = ir_bridge::composition_stmts(&plan, &manifold_accessors);
+
+    let scalar_names: Vec<_> = analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Scalar(_)))
+        .map(|p| p.name.clone())
+        .collect();
+
+    quote! {
+        impl<#(#generic_names: ::pixelflow_core::Lower),*>
+            ::pixelflow_core::Lower for #name<#(#generic_names),*>
+        {
+            fn lower(
+                &self,
+                __host: &mut ::pixelflow_core::__ir::ExprArena,
+                _env: &mut ::pixelflow_core::LowerEnv,
+            ) -> ::core::option::Option<::pixelflow_core::__ir::ExprId> {
+                let (mut __arena, mut __root) = #arena_code;
+                #compose
+                __root = __arena.substitute_params(
+                    __root,
+                    &[ #( self.#scalar_names as f32 ),* ],
+                );
+                ::core::option::Option::Some(__host.splice(&__arena, __root))
+            }
         }
     }
 }

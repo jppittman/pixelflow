@@ -23,14 +23,23 @@ pub use variance::{compute_arena_variance, find_hoistable_arena_nodes};
 pub mod arena;
 pub use arena::{ExprArena, ExprId, ExprNode};
 
+pub mod lower;
+pub use lower::{Lower, LowerEnv};
+
 pub mod binding;
 pub use binding::{BindError, BindingTable};
 
 pub mod eval;
 pub use eval::eval_scalar;
 
+pub mod kernel;
+pub use kernel::Kernel;
+
 pub mod jit_manifold;
 pub use jit_manifold::{JitManifold, ScanlineJitManifold};
+
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod jit_cache;
 
 pub use kind::OpKind;
 pub use ops::{ALL_OPS, OP_COUNT, known_method_names, op_by_index, op_by_name};

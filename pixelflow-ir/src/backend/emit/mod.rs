@@ -234,15 +234,6 @@ pub enum ResolvedOp {
         if_true: Reg,
         if_false: Reg,
     },
-    /// Clamp: FMIN(dst, val, hi), then reload lo, then FMAX(dst, dst, lo).
-    /// `lo_deferred`: if Some, lo must be reloaded *after* FMIN.
-    Clamp {
-        dst: Reg,
-        val: Reg,
-        lo: Reg,
-        hi: Reg,
-        lo_deferred: Option<DeferredReload>,
-    },
     /// Bound-memory gather: `dst = buffer[slot][idx_lane]`. Emitted only on the
     /// AVX-512 backend (native `vgatherdps`); other backends reject it. The
     /// buffer base pointer is loaded from the context struct (rdi) at
@@ -573,15 +564,10 @@ fn emit_arena(arena: &ExprArena, id: ExprId, depth: u8) -> Result<(Vec<u8>, Reg)
                 }
 
                 OpKind::Clamp => {
-                    // clamp(a, lo, hi) = max(min(a, hi), lo)
-                    let (mut code, a_reg) = emit_arena(arena, *a, depth)?;
-                    let (b_code, b_reg) = emit_arena(arena, *b, depth + 1)?;
-                    let (c_code, c_reg) = emit_arena(arena, *c, depth + 2)?;
-                    code.extend(b_code);
-                    code.extend(c_code);
-                    emit_binary(&mut code, OpKind::Min, dst, a_reg, c_reg);
-                    emit_binary(&mut code, OpKind::Max, dst, dst, b_reg);
-                    Ok((code, dst))
+                    // See lowering::expand_clamp — the unsorted inline
+                    // decomposition disagreed with the interpreter on
+                    // degenerate bounds, so Clamp never reaches emitters.
+                    Err("Clamp must be expanded before emission (lowering::expand_clamp)")
                 }
 
                 OpKind::Select => {
@@ -653,12 +639,16 @@ pub fn compile_arena_dag_with_ctx(
     root: crate::arena::ExprId,
     ctx: EmitCtx,
 ) -> Result<CompileResult, &'static str> {
-    // Lower reductions, memory reads, then transcendentals to primitives (one
-    // source of truth in `lowering`); the aarch64 emitter then never sees
-    // Reduce/Gather/Sin/Cos/etc. (aarch64 gather emission is a later slice.)
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    // Lower derivatives, reductions, memory reads, then transcendentals to
+    // primitives (one source of truth in `lowering`); the aarch64 emitter then
+    // never sees Dwrt/Reduce/Gather/Sin/Cos/etc. Dwrt runs first: its chain
+    // rule emits Sin/Cos/Exp nodes that the transcendental pass must still
+    // lower. (aarch64 gather emission is a later slice.)
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root)?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let (arena, root) = lowering::expand_clamp_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses_map = arena_to_uses(&schedule);
@@ -986,6 +976,12 @@ pub fn compile_arena_dag_scanline_hoisted(
     arena: &crate::arena::ExprArena,
     root: crate::arena::ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
+    // This path runs none of the per-batch lowering chain, but Clamp must not
+    // reach the emitters (its inline decompositions are gone — see
+    // lowering::expand_clamp), so expand it here. Identity fast-path when the
+    // arena has no Clamp.
+    let (arena_owned, root) = lowering::expand_clamp_owned(arena, root);
+    let arena = &arena_owned;
     let hoisted = arena_to_hoisted_schedule(arena, root, default_hoist_predicate);
 
     // The scanline ABI has no context argument — x0 is the X-array pointer —
@@ -1932,6 +1928,12 @@ trait IsaBackend {
     /// Per-compile setup before any code is emitted (e.g. seed a constant pool).
     fn begin(&mut self, schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Result<(), &'static str>;
 
+    /// Called once the frame layout is known, BEFORE any body instruction is
+    /// emitted. Backends whose spill addressing depends on the frame mode
+    /// (x86: red zone vs allocated frame) latch it here; `prologue` runs
+    /// after the body is produced and can only prepend bytes.
+    fn frame_ready(&mut self, _frame_size: u32) {}
+
     /// Function prologue (allocate the spill frame, set up any pool anchor).
     fn prologue(&mut self, code: &mut Vec<u8>, frame_size: u32);
 
@@ -2014,6 +2016,7 @@ fn emit_dag_body<B: IsaBackend>(
         SCRATCH_BASE,
     );
     let layout = FrameLayout::from_allocation(&allocation.spilled)?;
+    backend.frame_ready(layout.frame_size);
 
     // Select short-circuit guards.
     let select_guards = analyze_select_guards(&schedule);
@@ -2512,16 +2515,17 @@ fn arena_to_schedule(
                 };
                 ScheduledOp::Gather(map_child(idx), slot)
             }
-            // A `Dwrt` (autodiff) node must be eliminated by the e-graph chain
-            // rule before codegen. Reaching here means a `D(expr, var)` survived
-            // saturation -- i.e. an operator with no differentiation rule -- and
-            // the jet fallback that would handle the residual is not yet wired.
-            // Fail loudly here rather than as a cryptic instruction-emit panic.
+            // Unreachable precondition: every compile entry point runs
+            // `lowering::lower_dwrt` before scheduling, which either rewrites
+            // all `Dwrt` (autodiff) nodes into chain-rule arithmetic or errors
+            // loudly on an op it cannot differentiate. A `Dwrt` here means a
+            // caller bypassed that pipeline. Fail loudly rather than as a
+            // cryptic instruction-emit panic.
             ExprNode::Binary(OpKind::Dwrt, _, _) => panic!(
                 "arena_to_schedule: a Dwrt (autodiff) node reached the JIT \
-                 emitter. It should have been rewritten away by the e-graph \
-                 chain rule; a survivor means an operator lacks a derivative \
-                 rule and the jet fallback is not yet implemented."
+                 emitter. lower_dwrt runs in every compile entry point and \
+                 either eliminates Dwrt or refuses to compile, so a survivor \
+                 means this schedule was built without the lowering pipeline."
             ),
             ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {
@@ -2730,6 +2734,19 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                 })
                 .collect();
 
+            // The guard's uniformity test is emitted at the range START and
+            // reads the mask's register there, so the mask must already be
+            // computed by then. Schedules from the macro pipeline emit the mask
+            // before both arms, but arena-composed kernels (`Kernel::select`
+            // splicing arbitrary fragments) may schedule an arm BEFORE the
+            // mask — guarding such an arm would branch on an uninitialized
+            // register. No guard in that case; the select still evaluates
+            // correctly through the unconditional BSL/blend path.
+            let mask_idx = vid_to_sched_idx
+                .get(mask_vid.0 as usize)
+                .copied()
+                .unwrap_or(usize::MAX);
+
             // Get contiguous ranges (min..max+1)
             let true_range = if true_indices.is_empty() {
                 (i, i) // empty range
@@ -2749,7 +2766,11 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                 // or a false-exclusive node, skipping it would leave a value some
                 // other expression reads uninitialized — fall back to BSL.
                 let all_exclusive = (start..end).all(|idx| true_indices.contains(&idx));
-                if all_exclusive { (start, end) } else { (i, i) }
+                if all_exclusive && mask_idx < start {
+                    (start, end)
+                } else {
+                    (i, i)
+                }
             };
 
             let false_range = if false_indices.is_empty() {
@@ -2765,7 +2786,11 @@ fn analyze_select_guards(schedule: &[(regalloc::ValueId, ScheduledOp)]) -> Vec<S
                     .expect("non-empty set has last element")
                     + 1;
                 let all_exclusive = (start..end).all(|idx| false_indices.contains(&idx));
-                if all_exclusive { (start, end) } else { (i, i) }
+                if all_exclusive && mask_idx < start {
+                    (start, end)
+                } else {
+                    (i, i)
+                }
             };
 
             // Only create a guard if at least one arm has exclusive nodes
@@ -2958,17 +2983,38 @@ pub fn resolve_operands(
                     }
                 }
                 OpKind::Select => {
-                    // BSL: dst must hold mask (a).
-                    // BSL is 3-input RMW: b and c must not alias each other.
-                    if b_spilled && !assignment.contains_key(c) {
-                        return Err("Select with both if_true and if_false spilled not supported");
-                    }
-                    let a_reg = resolve(*a, tmp_op, &mut reloads);
+                    // BSL/blend is a 3-input RMW: the mask must end up in `dst`,
+                    // and if_true / if_false each need their own live register.
+                    //
+                    // Reload a spilled mask STRAIGHT into `dst` — never via
+                    // tmp_op. Reloads all emit before `setup_mov`, so routing the
+                    // mask through tmp_op while a spilled branch also reloads
+                    // into tmp_op would overwrite the mask before it reaches
+                    // `dst`. Going straight to `dst` also frees tmp_op and
+                    // RELOAD_REGS[0] as two independent slots for the branches.
+                    let c_spilled = !assignment.contains_key(c);
+                    let a_reg = resolve(*a, dst, &mut reloads);
                     if dst.0 != a_reg.0 {
                         setup_mov = Some((dst, a_reg));
                     }
                     let b_reg = resolve(*b, tmp_op, &mut reloads);
-                    let c_reg = resolve(*c, tmp_op, &mut reloads);
+                    let c_reg = if b_spilled && c_spilled {
+                        // Both branches spilled → two DISTINCT reload targets.
+                        // tmp_op (RELOAD_REGS[1]) holds if_true; if_false takes
+                        // RELOAD_REGS[0], which is free whenever `dst` is a real
+                        // register (reload regs are never in the allocator
+                        // pool). Only a spilled *result* (dst == RELOAD_REGS[0])
+                        // leaves too few registers.
+                        if dst.0 == RELOAD_REGS[0].0 {
+                            return Err(
+                                "Select with a spilled result and both branches spilled not supported",
+                            );
+                        }
+                        resolve(*c, RELOAD_REGS[0], &mut reloads)
+                    } else {
+                        // At most one branch spilled → tmp_op suffices for it.
+                        resolve(*c, tmp_op, &mut reloads)
+                    };
                     ResolvedOp::Select {
                         dst,
                         if_true: b_reg,
@@ -2976,41 +3022,14 @@ pub fn resolve_operands(
                     }
                 }
                 OpKind::Clamp => {
-                    // clamp(a, lo=b, hi=c) = max(lo, min(a, c))
-                    // Decomposed: FMIN(dst, val, hi) then FMAX(dst, dst, lo).
-                    // val and hi loaded upfront; lo is deferred (loaded after FMIN).
-                    let c_spilled = !assignment.contains_key(c);
-                    let (val_reg, hi_reg) = if a_spilled && c_spilled {
-                        // Both need reload — use dst-as-temp for val, tmp_op for hi.
-                        let a_reg = resolve(*a, dst, &mut reloads);
-                        let c_reg = resolve(*c, tmp_op, &mut reloads);
-                        (a_reg, c_reg)
-                    } else {
-                        // At most one spilled — tmp_op suffices.
-                        let a_reg = resolve(*a, tmp_op, &mut reloads);
-                        let c_reg = resolve(*c, tmp_op, &mut reloads);
-                        (a_reg, c_reg)
-                    };
-                    // lo is deferred — loaded after FMIN.
-                    let (lo_reg, lo_deferred) = if let Some(&reg) = assignment.get(b) {
-                        (reg, None)
-                    } else if let Some(&bits) = rematerialize.get(b) {
-                        (tmp_op, Some(DeferredReload::Const(bits)))
-                    } else if let Some(&offset) = spill_slots.get(b) {
-                        (tmp_op, Some(DeferredReload::FromStack(offset)))
-                    } else {
-                        panic!(
-                            "value {:?} not found in assignment, spill slots, or rematerialize",
-                            b
-                        );
-                    };
-                    ResolvedOp::Clamp {
-                        dst,
-                        val: val_reg,
-                        lo: lo_reg,
-                        hi: hi_reg,
-                        lo_deferred,
-                    }
+                    // Never reaches the emitters: `lowering::expand_clamp`
+                    // (last pass in every compile entry's lowering chain)
+                    // rewrites Clamp into the bound-sorting min/max sequence
+                    // that matches `OpKind::eval_ternary`. The inline
+                    // decomposition this arm used to build did NOT sort the
+                    // bounds, silently disagreeing with the interpreter on
+                    // degenerate (lo > hi) ranges.
+                    return Err("Clamp must be expanded before emission (lowering::expand_clamp)");
                 }
                 _ => return Err("unsupported ternary op in DAG compilation"),
             }
@@ -3146,20 +3165,6 @@ fn emit_instruction_plan(
             // setup_mov already placed mask into dst
             emit_bsl(code, *dst, *if_true, *if_false);
         }
-        ResolvedOp::Clamp {
-            dst,
-            val,
-            lo,
-            hi,
-            lo_deferred,
-        } => {
-            // FMIN(dst, val, hi) — consumes val and hi (loaded upfront).
-            emit_fmin(code, *dst, *val, *hi);
-            // Reload lo after FMIN (lo may reuse tmp_op which held val or hi).
-            emit_deferred(code, *lo, lo_deferred.as_ref(), pool);
-            // FMAX(dst, dst, lo)
-            emit_fmax(code, *dst, *dst, *lo);
-        }
     }
 
     // 4. Emit store
@@ -3289,15 +3294,19 @@ pub fn compile_arena_dag_with_ctx(
     // SSE2 (128-bit xmm). Both implement `IsaBackend`, so the driver and the
     // KernelFn ABI stay consistent with the selected width.
     //
-    // Lower, in order: reductions (unroll -> arithmetic + gathers), then memory
-    // reads (Gather -> index math + RawGather), then transcendentals. Each is a
-    // no-op when absent. Reduce runs first so the gathers it unrolls get lowered
-    // too. A kernel that reads bound memory takes its buffer bases from a context
-    // pointer in rdi; the emitted body is identical either way, so the caller
-    // invokes it as `CtxKernelFn` instead of `KernelFn`.
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    // Lower, in order: derivatives (Dwrt -> chain-rule arithmetic), reductions
+    // (unroll -> arithmetic + gathers), then memory reads (Gather -> index math
+    // + RawGather), then transcendentals. Each is a no-op when absent. Dwrt runs
+    // first because its rules emit Sin/Cos/Exp nodes the transcendental pass
+    // must still lower; Reduce runs before Gather so the gathers it unrolls get
+    // lowered too. A kernel that reads bound memory takes its buffer bases from
+    // a context pointer in rdi; the emitted body is identical either way, so the
+    // caller invokes it as `CtxKernelFn` instead of `KernelFn`.
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root)?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let (arena, root) = lowering::expand_clamp_owned(&arena, root);
     let arena = &arena;
     let schedule = arena_to_schedule(arena, root);
     let uses = arena_to_uses(&schedule);
@@ -3307,7 +3316,7 @@ pub fn compile_arena_dag_with_ctx(
     }
     #[cfg(not(target_feature = "avx512f"))]
     {
-        compile_dag_via_backend(schedule, uses, &mut X86Backend)
+        compile_dag_via_backend(schedule, uses, &mut X86Backend::default())
     }
 }
 
@@ -3320,8 +3329,11 @@ pub fn compile_arena_dag_with_ctx(
 // x86 instruction encoding behind that seam, so x86 and aarch64 run the same
 // driver (no "works on my machine" divergence between them).
 //
-// Spills go to the System V red zone (the kernel is a leaf): a `FrameLayout`
-// slot at byte `offset` maps to `[rsp - (offset + 16)]`.
+// Spills go to the System V red zone when the frame fits (the kernel is a
+// leaf): a `FrameLayout` slot at byte `offset` maps to `[rsp - (offset + 16)]`.
+// Larger frames (glyph-scale fused kernels) allocate a real frame in the
+// prologue (`sub rsp, N`); slots then live at `[rsp + offset]` and the
+// epilogue releases the frame before `ret`.
 //
 // Register roles: xmm0-3 inputs (precolored), xmm4-9 allocatable (6),
 // xmm10 fixed scratch (binary two-operand hazard + select temp), xmm11-12
@@ -3347,9 +3359,12 @@ const X86_BUILTIN_SCRATCH: [Reg; 4] = [Reg(10), Reg(13), Reg(14), Reg(15)];
 #[cfg(target_arch = "x86_64")]
 fn x86_redzone_disp(offset: u32) -> Result<i8, &'static str> {
     // Slots live below rsp: offset 0 -> [rsp-16], 16 -> [rsp-32], ...
+    // Only called in red-zone mode (the prologue switches to an allocated
+    // frame when the layout exceeds the zone), so overflow here is an
+    // internal invariant violation, not a kernel-size limit.
     let disp = -(offset as i64 + 16);
     if disp < -128 {
-        return Err("x86 scheduled: spill frame exceeds 128-byte red zone");
+        return Err("x86 spill: red-zone displacement out of range (prologue mode bug)");
     }
     Ok(disp as i8)
 }
@@ -3380,8 +3395,36 @@ fn emit_binary_safe(code: &mut Vec<u8>, op: OpKind, dst: Reg, left: Reg, right: 
 }
 
 /// x86-64 implementation of the shared driver's leaf operations.
+///
+/// `frame_bytes` is set by `prologue`: 0 = spills fit the 128-byte red zone
+/// (no frame is allocated), otherwise the size of the allocated frame and
+/// spill slots are `[rsp + offset]`.
 #[cfg(target_arch = "x86_64")]
-struct X86Backend;
+#[derive(Default)]
+struct X86Backend {
+    frame_bytes: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl X86Backend {
+    fn spill_store(&self, code: &mut Vec<u8>, src: Reg, offset: u32) {
+        if self.frame_bytes == 0 {
+            let disp = x86_redzone_disp(offset).expect("red-zone mode implies fitting offsets");
+            x86_64::emit_movups_store_rsp(code, src, disp);
+        } else {
+            x86_64::emit_movups_store_rsp32(code, src, offset as i32);
+        }
+    }
+
+    fn spill_load(&self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
+        if self.frame_bytes == 0 {
+            let disp = x86_redzone_disp(offset).expect("red-zone mode implies fitting offsets");
+            x86_64::emit_movups_load_rsp(code, dst, disp);
+        } else {
+            x86_64::emit_movups_load_rsp32(code, dst, offset as i32);
+        }
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 impl IsaBackend for X86Backend {
@@ -3399,8 +3442,20 @@ impl IsaBackend for X86Backend {
         Ok(()) // x86 const loads are self-contained; no pool.
     }
 
-    fn prologue(&mut self, _code: &mut Vec<u8>, _frame_size: u32) {
-        // Spills use the red zone; no frame to set up for a leaf.
+    fn frame_ready(&mut self, frame_size: u32) {
+        // Red zone when it fits (max slot offset frame_size-16 maps to disp
+        // -(frame_size) >= -128); otherwise an allocated frame, with slots at
+        // [rsp + offset]. Latched here so the body's spill addressing agrees
+        // with the prologue emitted afterwards.
+        self.frame_bytes = if frame_size <= 128 { 0 } else { frame_size };
+    }
+
+    fn prologue(&mut self, code: &mut Vec<u8>, _frame_size: u32) {
+        // movups is alignment-agnostic, so the frame only needs its
+        // 16-multiple size; red-zone mode needs no setup for a leaf.
+        if self.frame_bytes > 0 {
+            x86_64::emit_sub_rsp(code, self.frame_bytes);
+        }
     }
 
     fn emit_plan(
@@ -3412,7 +3467,7 @@ impl IsaBackend for X86Backend {
         for reload in &plan.reloads {
             match reload {
                 Reload::FromStack { target, offset } => {
-                    emit_movups_load_rsp(code, *target, x86_redzone_disp(*offset)?);
+                    self.spill_load(code, *target, *offset);
                 }
                 Reload::Const { target, val_bits } => {
                     emit_const(
@@ -3487,7 +3542,7 @@ impl IsaBackend for X86Backend {
                 emit_binary_safe(code, OpKind::Mul, *dst, *a, *b);
                 match c_deferred {
                     Some(DeferredReload::FromStack(off)) => {
-                        emit_movups_load_rsp(code, *c, x86_redzone_disp(*off)?);
+                        self.spill_load(code, *c, *off);
                     }
                     Some(DeferredReload::Const(bits)) => {
                         emit_const(code, *c, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
@@ -3496,29 +3551,9 @@ impl IsaBackend for X86Backend {
                 }
                 emit_binary_safe(code, OpKind::Add, *dst, *dst, *c);
             }
-            ResolvedOp::Clamp {
-                dst,
-                val,
-                lo,
-                hi,
-                lo_deferred,
-            } => {
-                // clamp(val, lo, hi) = max(min(val, hi), lo).
-                emit_binary_safe(code, OpKind::Min, *dst, *val, *hi);
-                match lo_deferred {
-                    Some(DeferredReload::FromStack(off)) => {
-                        emit_movups_load_rsp(code, *lo, x86_redzone_disp(*off)?);
-                    }
-                    Some(DeferredReload::Const(bits)) => {
-                        emit_const(code, *lo, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
-                    }
-                    None => {}
-                }
-                emit_binary_safe(code, OpKind::Max, *dst, *dst, *lo);
-            }
         }
         if let Some(store) = &plan.store {
-            emit_movups_store_rsp(code, store.src, x86_redzone_disp(store.offset)?);
+            self.spill_store(code, store.src, store.offset);
         }
         Ok(())
     }
@@ -3533,7 +3568,7 @@ impl IsaBackend for X86Backend {
         src: Reg,
         offset: u32,
     ) -> Result<(), &'static str> {
-        x86_64::emit_movups_store_rsp(code, src, x86_redzone_disp(offset)?);
+        self.spill_store(code, src, offset);
         Ok(())
     }
 
@@ -3553,9 +3588,7 @@ impl IsaBackend for X86Backend {
             x86_64::emit_const(code, target, f32::from_bits(*bits), X86_BUILTIN_SCRATCH);
             target
         } else if let Some(Some(offset)) = spill_for.get(idx) {
-            // Resolve is on a hot path with a known-valid frame; offset fits.
-            let disp = x86_redzone_disp(*offset).expect("spill offset within red zone");
-            x86_64::emit_movups_load_rsp(code, target, disp);
+            self.spill_load(code, target, *offset);
             target
         } else {
             panic!(
@@ -3588,6 +3621,9 @@ impl IsaBackend for X86Backend {
     fn epilogue(&mut self, code: &mut Vec<u8>, result_reg: Reg, _frame_size: u32) {
         if result_reg.0 != 0 {
             x86_64::emit_movaps(code, Reg(0), result_reg);
+        }
+        if self.frame_bytes > 0 {
+            x86_64::emit_add_rsp(code, self.frame_bytes);
         }
         code.push(0xC3); // RET
     }
@@ -3754,26 +3790,6 @@ impl IsaBackend for Avx512Backend {
                 // setup_mov already placed the vector mask in dst; one vpternlogd.
                 avx512::emit_select(code, *dst, *if_true, *if_false);
             }
-            ResolvedOp::Clamp {
-                dst,
-                val,
-                lo,
-                hi,
-                lo_deferred,
-            } => {
-                // clamp(val, lo, hi) = max(min(val, hi), lo). No mask needed.
-                avx512::emit_binary(code, OpKind::Min, *dst, *val, *hi)?;
-                match lo_deferred {
-                    Some(DeferredReload::FromStack(off)) => {
-                        avx512::emit_load_rsp(code, *lo, avx512_slot_disp(*off));
-                    }
-                    Some(DeferredReload::Const(bits)) => {
-                        avx512::emit_const(code, *lo, f32::from_bits(*bits));
-                    }
-                    None => {}
-                }
-                avx512::emit_binary(code, OpKind::Max, *dst, *dst, *lo)?;
-            }
         }
         if let Some(store) = &plan.store {
             avx512::emit_store_rsp(code, store.src, avx512_slot_disp(store.offset));
@@ -3882,9 +3898,11 @@ pub fn compile_collapse_avx512(
     root: ExprId,
 ) -> Result<CompileResult, &'static str> {
     // Same lowering pipeline as the per-batch path.
-    let (arena, root) = lowering::expand_reduce_owned(arena, root);
+    let (arena, root) = lowering::lower_dwrt_owned(arena, root)?;
+    let (arena, root) = lowering::expand_reduce_owned(&arena, root);
     let (arena, root) = lowering::expand_gather_owned(&arena, root);
     let (arena, root) = lowering::expand_transcendentals_owned(&arena, root);
+    let (arena, root) = lowering::expand_clamp_owned(&arena, root);
     let arena = &arena;
 
     let schedule = arena_to_schedule(arena, root);
@@ -3986,6 +4004,12 @@ pub fn compile_arena_dag_scanline(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<ScanlineCompileResult, &'static str> {
+    // This path runs none of the per-batch lowering chain, but Clamp must not
+    // reach the tree emitter (its inline decomposition is gone — see
+    // lowering::expand_clamp), so expand it here. Identity fast-path when the
+    // arena has no Clamp.
+    let (arena_owned, root) = lowering::expand_clamp_owned(arena, root);
+    let arena = &arena_owned;
     const MAX_DEPTH: usize = 64;
     if arena.depth(root) > MAX_DEPTH {
         return Err("expression too deep");
@@ -4081,8 +4105,10 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     use crate::arena::ExprArena;
 
-    /// A `Dwrt` that reaches codegen (no differentiation rule eliminated it)
-    /// must fail loudly at the schedule boundary, not as a cryptic emit panic.
+    /// A `Dwrt` that reaches the scheduler (a caller bypassed the lowering
+    /// pipeline) must fail loudly at the schedule boundary, not as a cryptic
+    /// emit panic. The compile entry points run `lower_dwrt` first, so this
+    /// exercises calling `arena_to_schedule` directly.
     #[test]
     #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
     fn surviving_dwrt_fails_loudly() {
@@ -4975,6 +5001,95 @@ mod tests {
             let f: executable::KernelFn = r.code.as_fn();
             let z = _mm_set1_ps(0.0);
             _mm_cvtss_f32(f(_mm_set1_ps(x), _mm_set1_ps(y), z, z))
+        }
+    }
+
+    /// A `Dwrt`-carrying arena must JIT-compile end-to-end: the compile entry
+    /// runs `lower_dwrt`, so `D(√(x²+y²), x)` compiles to `x / √(x²+y²)`
+    /// without the caller ever seeing the derivative machinery.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    fn dwrt_compiles_to_analytic_derivative() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let x2 = a.push_binary(OpKind::Mul, x, x);
+        let y2 = a.push_binary(OpKind::Mul, y, y);
+        let sum = a.push_binary(OpKind::Add, x2, y2);
+        let dist = a.push_unary(OpKind::Sqrt, sum);
+        let v0 = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, dist, v0);
+
+        for (px, py) in [(3.0f32, 4.0f32), (1.0, 1.0), (-2.0, 5.0)] {
+            let got = run_xy(&a, root, px, py);
+            let want = px / (px * px + py * py).sqrt();
+            assert!(
+                (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                "d/dx dist at ({px},{py}): got {got}, want {want}"
+            );
+        }
+    }
+
+    /// A `Dwrt` over an op with no derivative rule must surface as a compile
+    /// error (loud refusal), not a miscompile or a scheduler panic.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn dwrt_of_gather_refuses_to_compile() {
+        use crate::arena::BufferDecl;
+        let mut a = ExprArena::new();
+        let buf = a.declare_buffer(BufferDecl {
+            width: 2,
+            height: 1,
+        });
+        let bufleaf = a.push_buffer(buf);
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let g = a.push_ternary(OpKind::Gather, bufleaf, x, y);
+        let v0 = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, g, v0);
+        assert!(compile_arena_dag(&a, root).is_err());
+    }
+
+    /// A spill frame past the 128-byte red zone must allocate a real frame
+    /// (`sub rsp`) and produce correct results — the glyph-scale-kernel case
+    /// that used to refuse with "exceeds 128-byte red zone". 40 products are
+    /// all pushed before any is consumed, so dozens are simultaneously live
+    /// against 6 allocatable registers.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    fn spill_frame_beyond_red_zone_compiles_correctly() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let mut products = alloc::vec::Vec::new();
+        for i in 0..40u32 {
+            let c = a.push_const(i as f32 + 1.0);
+            let xa = a.push_binary(OpKind::Add, x, c);
+            let yb = a.push_binary(OpKind::Add, y, c);
+            products.push(a.push_binary(OpKind::Mul, xa, yb));
+        }
+        let mut root = products[0];
+        for p in &products[1..] {
+            root = a.push_binary(OpKind::Add, root, *p);
+        }
+
+        let result = compile_arena_dag(&a, root).expect("large spill frame must compile");
+        assert!(
+            result.spill_bytes > 128,
+            "test did not force a frame beyond the red zone (spill_bytes = {})",
+            result.spill_bytes
+        );
+
+        for (px, py) in [(1.5f32, -2.0f32), (0.0, 0.0), (3.0, 4.0)] {
+            let got = run_xy(&a, root, px, py);
+            let want: f32 = (0..40)
+                .map(|i| (px + i as f32 + 1.0) * (py + i as f32 + 1.0))
+                .sum();
+            let tol = 1e-3 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tol,
+                "at ({px},{py}): jit {got}, scalar {want}"
+            );
         }
     }
 

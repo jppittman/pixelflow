@@ -9,6 +9,13 @@ license = "Apache-2.0"
 [lib]
 proc-macro = true
 
+[features]
+# P3 transition scaffolding (docs/plans/2026-07-20-kernel-unification.md):
+# route eligible `kernel!` bodies through the arena/JIT backend instead of the
+# combinator emitter. Not the default until the parity suite and font goldens
+# say so — see the routing note in `kernel`.
+arena-backend = []
+
 [dependencies]
 syn = { version = "2", features = ["full", "fold", "extra-traits", "parsing"] }
 quote = "1"

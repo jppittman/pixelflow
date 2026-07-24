@@ -39,17 +39,6 @@ pub fn is_jit_eligible(analyzed: &AnalyzedKernel) -> bool {
         return false;
     }
 
-    // Manifold-typed params imply `.at()` composition, which the arena can't
-    // splice yet.
-    if analyzed
-        .def
-        .params
-        .iter()
-        .any(|p| matches!(p.kind, ParamKind::Manifold))
-    {
-        return false;
-    }
-
     // Domain and return must be the default scalar `Field`. Any explicit
     // annotation (`-> Jet3`, `Field -> Discrete`, ...) leaves the JIT's lane.
     is_field_ty(&analyzed.def.domain_ty) && is_field_ty(&analyzed.def.return_ty)
@@ -57,7 +46,7 @@ pub fn is_jit_eligible(analyzed: &AnalyzedKernel) -> bool {
 
 /// `None` (the default `Field` domain/return) or an explicit `Field` annotation.
 /// Anything else (`Jet2`, `Jet3`, `Discrete`, tuples) is not the JIT's lane.
-fn is_field_ty(ty: &Option<syn::Type>) -> bool {
+pub(crate) fn is_field_ty(ty: &Option<syn::Type>) -> bool {
     match ty {
         None => true,
         // Compare on the type's final path segment so both `Field` and
@@ -68,6 +57,101 @@ fn is_field_ty(ty: &Option<syn::Type>) -> bool {
             .last()
             .is_some_and(|seg| seg.ident == "Field"),
         Some(_) => false,
+    }
+}
+
+/// Whether `kernel!` may transparently route this kernel to the arena backend
+/// (the P3 `arena-backend` feature) without changing observable behavior.
+///
+/// Stricter than [`is_jit_eligible`]: bodies containing derivative
+/// projections (`DX`/`DY`/`DZ`/`DXX`/`DXY`/`DYY`) are excluded even though
+/// the JIT compiles them, because the two backends *intentionally* disagree
+/// about them on a `Field` domain. The combinator backend evaluates the body
+/// in the caller's domain — projections yield 0 over `Field` (the fonts'
+/// "hard step" degenerate case) and true derivatives only over jets — while
+/// the arena backend computes symbolic derivatives unconditionally. Kernels
+/// that want the symbolic semantics ask for them via `kernel_jit!`.
+///
+/// `V` is not excluded: it is the identity in both backends' `Field` lanes.
+/// Coordinate-free (constant) bodies are also excluded: they exist to be
+/// evaluated in *any* domain (e.g. a scalar-param expression used over
+/// `Jet3`), which the combinator's domain polymorphism provides and the
+/// monomorphic JIT wrapper cannot — and JIT-compiling a constant buys
+/// nothing per pixel anyway.
+///
+/// Manifold-typed params are excluded from *transparent* routing even though
+/// `kernel_jit!` composes them via `Lower` splicing: a routed builder would
+/// require its kernel arguments to implement `HasIr`, which combinator
+/// kernels at the call sites do not (yet — their trees now implement
+/// `Lower` compositionally, so this restriction lifts once routing learns
+/// to require it).
+#[allow(dead_code)] // referenced by `kernel!` only under feature = "arena-backend"
+pub fn is_transparent_routing_safe(analyzed: &AnalyzedKernel) -> bool {
+    is_jit_eligible(analyzed)
+        && !analyzed
+            .def
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ParamKind::Manifold))
+        && !uses_derivative_projections(&analyzed.def.body)
+        && references_coordinates(&analyzed.def.body)
+}
+
+/// Whether the body reads any coordinate variable (`X`/`Y`/`Z`/`W`). Sema
+/// rejects shadowing of the coordinate intrinsics, so an ident match is exact.
+fn references_coordinates(expr: &crate::ast::Expr) -> bool {
+    use crate::ast::{Expr, Stmt};
+    match expr {
+        Expr::Ident(id) => matches!(id.name.to_string().as_str(), "X" | "Y" | "Z" | "W"),
+        Expr::Literal(_) | Expr::Verbatim(_) => false,
+        Expr::Binary(b) => references_coordinates(&b.lhs) || references_coordinates(&b.rhs),
+        Expr::Unary(u) => references_coordinates(&u.operand),
+        Expr::MethodCall(m) => {
+            references_coordinates(&m.receiver) || m.args.iter().any(references_coordinates)
+        }
+        Expr::Call(c) => c.args.iter().any(references_coordinates),
+        Expr::Block(block) => {
+            block.stmts.iter().any(|s| match s {
+                Stmt::Let(l) => references_coordinates(&l.init),
+                Stmt::Expr(e) => references_coordinates(e),
+            }) || block.expr.as_deref().is_some_and(references_coordinates)
+        }
+        Expr::Tuple(t) => t.elems.iter().any(references_coordinates),
+        Expr::Paren(inner) => references_coordinates(inner),
+    }
+}
+
+/// AST scan for the derivative projections whose semantics are
+/// domain-dependent under the combinator backend.
+fn uses_derivative_projections(expr: &crate::ast::Expr) -> bool {
+    use crate::ast::{Expr, Stmt};
+    match expr {
+        Expr::Call(call) => {
+            matches!(
+                call.func.to_string().as_str(),
+                "DX" | "DY" | "DZ" | "DXX" | "DXY" | "DYY"
+            ) || call.args.iter().any(uses_derivative_projections)
+        }
+        Expr::Binary(b) => {
+            uses_derivative_projections(&b.lhs) || uses_derivative_projections(&b.rhs)
+        }
+        Expr::Unary(u) => uses_derivative_projections(&u.operand),
+        Expr::MethodCall(m) => {
+            uses_derivative_projections(&m.receiver)
+                || m.args.iter().any(uses_derivative_projections)
+        }
+        Expr::Block(block) => {
+            block.stmts.iter().any(|s| match s {
+                Stmt::Let(l) => uses_derivative_projections(&l.init),
+                Stmt::Expr(e) => uses_derivative_projections(e),
+            }) || block
+                .expr
+                .as_deref()
+                .is_some_and(uses_derivative_projections)
+        }
+        Expr::Tuple(t) => t.elems.iter().any(uses_derivative_projections),
+        Expr::Paren(inner) => uses_derivative_projections(inner),
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Verbatim(_) => false,
     }
 }
 
@@ -104,8 +188,143 @@ pub enum ZeroParam {
 /// Returns `Err` if the body contains an operation the IR bridge cannot lower;
 /// callers should fall back to the combinator backend in that case.
 pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStream, String> {
-    // Scalar params, in declaration order, become `Param(i)` arena nodes that
-    // are constant-folded at build time.
+    // Scalar params (dense over scalars, declaration order) become `Param(i)`
+    // arena nodes constant-folded at build time; manifold params become
+    // reserved slot variables (`Var(8+k)`) substituted with the argument
+    // kernels' spliced fragments at build time.
+    let scalar_params: Vec<_> = analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Scalar(_)))
+        .collect();
+    let manifold_params: Vec<_> = analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Manifold))
+        .collect();
+    if manifold_params.len() > ir_bridge::MAX_MANIFOLD_PARAMS {
+        return Err(format!(
+            "kernel has {} manifold params; the arena backend supports at most {}",
+            manifold_params.len(),
+            ir_bridge::MAX_MANIFOLD_PARAMS
+        ));
+    }
+
+    let param_map = ir_bridge::scalar_param_indices(analyzed);
+    let manifold_map = ir_bridge::manifold_param_indices(analyzed);
+    let (arena_code, plan) =
+        ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map, &manifold_map)?;
+    let wrapper = jit_wrapper_tokens();
+
+    if scalar_params.is_empty() && manifold_params.is_empty() {
+        // Zero-param: compile and wrap. Combinators always hand `kernel!` a
+        // closure, so match that under `ZeroParam::Closure`.
+        let build = quote! {
+            {
+                let (__arena, __root) = #arena_code;
+                #wrapper
+                __JitWrapper {
+                    ir: ::std::sync::Arc::new((__arena, __root)),
+                    jit: ::std::sync::OnceLock::new(),
+                }
+            }
+        };
+        Ok(match conv {
+            ZeroParam::Closure => quote! { move || #build },
+            ZeroParam::Value => build,
+        })
+    } else {
+        // Builder closure that composes and JITs on call. Args appear in
+        // declaration order; scalar params are typed `f32`, manifold params
+        // are untyped (closures cannot be generic — the single call site's
+        // inference binds each to any `HasIr` kernel).
+        let arg_tokens: Vec<TokenStream> = analyzed
+            .def
+            .params
+            .iter()
+            .map(|p| {
+                let name = &p.name;
+                match p.kind {
+                    ParamKind::Scalar(_) => quote! { #name: f32 },
+                    ParamKind::Manifold => quote! { #name },
+                }
+            })
+            .collect();
+
+        // Composition: splice bare fragments and per-`.at()`-site warped
+        // fragments, then substitute every slot (shared logic with named
+        // kernel structs — see `ir_bridge::composition_stmts`).
+        let manifold_accessors: Vec<TokenStream> = manifold_params
+            .iter()
+            .map(|p| {
+                let name = &p.name;
+                quote! { #name }
+            })
+            .collect();
+        let compose = ir_bridge::composition_stmts(&plan, &manifold_accessors);
+
+        // Scalar values, dense in scalar declaration order (matches the
+        // `Param(i)` numbering from `scalar_param_indices`).
+        let scalar_names: Vec<proc_macro2::Ident> =
+            scalar_params.iter().map(|p| p.name.clone()).collect();
+        let param_slice = quote! { &[ #( #scalar_names as f32 ),* ] };
+
+        Ok(quote! {
+            move | #( #arg_tokens ),* | {
+                let (mut __arena, mut __root) = #arena_code;
+                #compose
+                __root = __arena.substitute_params(__root, #param_slice);
+                #wrapper
+                __JitWrapper {
+                    ir: ::std::sync::Arc::new((__arena, __root)),
+                    jit: ::std::sync::OnceLock::new(),
+                }
+            }
+        })
+    }
+}
+
+/// Emit code that builds a [`Kernel`](pixelflow_core::Kernel) *value* — an
+/// uncompiled arena fragment — rather than a JIT-compiled manifold.
+///
+/// This is the "JIT-first" front-end surface: the result is the language value
+/// that consumers *compose* (`Kernel::sum`/`at`/`select`/arithmetic) and bake
+/// once at a root, never a per-instance JIT (the plan's "leaves are
+/// bake-time-only, fuse at roots" constraint — a font glyph builds thousands of
+/// leaf kernels but compiles one fused arena). Scalar params are constant-folded
+/// into the fragment at build time; manifold params are unsupported here on
+/// purpose — composition happens at the `Kernel` value level, not through macro
+/// slots.
+///
+/// Zero scalar params → a `Kernel` value directly. N scalar params → a builder
+/// closure `move |p0: f32, ...| -> Kernel`.
+///
+/// Returns `Err` if the body needs a construct outside this lane (named struct,
+/// non-`Field` domain/return, manifold params, or an op the IR bridge rejects).
+pub fn emit_kernel_value(analyzed: &AnalyzedKernel) -> Result<TokenStream, String> {
+    if analyzed.def.struct_decl.is_some() {
+        return Err("kernel_value! does not support named struct kernels; \
+                    build the fragment anonymously and compose Kernel values"
+            .into());
+    }
+    if !is_field_ty(&analyzed.def.domain_ty) || !is_field_ty(&analyzed.def.return_ty) {
+        return Err("kernel_value! supports only the Field domain/return; \
+                    derivatives are resolved symbolically at bake, not via a jet domain"
+            .into());
+    }
+    if analyzed
+        .def
+        .params
+        .iter()
+        .any(|p| matches!(p.kind, ParamKind::Manifold))
+    {
+        return Err("kernel_value! does not support manifold params; \
+                    compose Kernel values with Kernel::at/sum/select instead"
+            .into());
+    }
+
     let scalar_params: Vec<_> = analyzed
         .def
         .params
@@ -114,45 +333,35 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
         .collect();
 
     let param_map = ir_bridge::scalar_param_indices(analyzed);
-    let arena_code = ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map)?;
-    let wrapper = jit_wrapper_tokens();
+    let manifold_map = ir_bridge::manifold_param_indices(analyzed); // empty by the gate above
+    let (arena_code, _plan) =
+        ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map, &manifold_map)?;
 
     if scalar_params.is_empty() {
-        // Zero-param: compile and wrap. Combinators always hand `kernel!` a
-        // closure, so match that under `ZeroParam::Closure`.
-        let build = quote! {
+        Ok(quote! {
             {
                 let (__arena, __root) = #arena_code;
-                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root)
-                    .map(|r| r.code)
-                    .expect("kernel JIT compilation failed");
-                let __jit = ::pixelflow_ir::JitManifold::new(__code);
-                #wrapper
-                __JitWrapper(::std::sync::Arc::new(__jit))
+                ::pixelflow_core::Kernel::from_parts(__arena, __root)
             }
-        };
-        Ok(match conv {
-            ZeroParam::Closure => quote! { move || #build },
-            ZeroParam::Value => build,
         })
     } else {
-        // N-param: emit a builder closure that JITs on call.
-        let param_names: Vec<proc_macro2::Ident> =
+        let arg_tokens: Vec<TokenStream> = scalar_params
+            .iter()
+            .map(|p| {
+                let name = &p.name;
+                quote! { #name: f32 }
+            })
+            .collect();
+        // Scalar values, dense in scalar declaration order (matches the
+        // `Param(i)` numbering from `scalar_param_indices`).
+        let scalar_names: Vec<proc_macro2::Ident> =
             scalar_params.iter().map(|p| p.name.clone()).collect();
-        let param_types: Vec<TokenStream> = scalar_params.iter().map(|_| quote! { f32 }).collect();
-        // Params slice in declaration order: first param = index 0.
-        let param_slice = quote! { &[ #( #param_names as f32 ),* ] };
-
+        let param_slice = quote! { &[ #( #scalar_names as f32 ),* ] };
         Ok(quote! {
-            move | #( #param_names : #param_types ),* | {
+            move | #( #arg_tokens ),* | {
                 let (mut __arena, __root) = #arena_code;
                 let __root = __arena.substitute_params(__root, #param_slice);
-                let __code = ::pixelflow_ir::backend::emit::compile_arena_dag(&__arena, __root)
-                    .map(|r| r.code)
-                    .expect("kernel JIT compilation failed");
-                let __jit = ::pixelflow_ir::JitManifold::new(__code);
-                #wrapper
-                __JitWrapper(::std::sync::Arc::new(__jit))
+                ::pixelflow_core::Kernel::from_parts(__arena, __root)
             }
         })
     }
@@ -163,18 +372,46 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
 /// it is defined once here and interpolated.
 fn jit_wrapper_tokens() -> TokenStream {
     quote! {
-        // `Arc` so the wrapper is `Clone` (combinator kernels are `Copy` ZSTs;
-        // a JIT kernel owns executable memory). `Send`/`Sync` are auto-derived
-        // because `JitManifold` is `Send + Sync`.
+        // IR-carrying and LAZILY compiled (kernel-unification P5): the wrapper
+        // holds the composed, pre-lowering arena; machine code is produced on
+        // first evaluation, through the global compile cache. A kernel that is
+        // only ever *spliced* into a host (`HasIr`) never pays codegen — the
+        // plan's "leaves are bake-time-only, fuse at roots" constraint. `Arc`
+        // so the wrapper is `Clone` (combinator kernels are `Copy` ZSTs; a JIT
+        // kernel shares executable memory).
         #[derive(Clone)]
-        struct __JitWrapper(::std::sync::Arc<::pixelflow_ir::JitManifold>);
+        struct __JitWrapper {
+            ir: ::std::sync::Arc<(
+                ::pixelflow_core::__ir::ExprArena,
+                ::pixelflow_core::__ir::ExprId,
+            )>,
+            jit: ::std::sync::OnceLock<::std::sync::Arc<::pixelflow_core::__ir::JitManifold>>,
+        }
+        impl __JitWrapper {
+            #[inline]
+            fn __compiled(&self) -> &::std::sync::Arc<::pixelflow_core::__ir::JitManifold> {
+                self.jit.get_or_init(|| {
+                    ::pixelflow_core::__ir::jit_cache::compile_cached(&self.ir.0, self.ir.1)
+                        .expect("kernel JIT compilation failed")
+                })
+            }
+        }
+        impl ::pixelflow_core::Lower for __JitWrapper {
+            fn lower(
+                &self,
+                arena: &mut ::pixelflow_core::__ir::ExprArena,
+                _env: &mut ::pixelflow_core::LowerEnv,
+            ) -> ::core::option::Option<::pixelflow_core::__ir::ExprId> {
+                ::core::option::Option::Some(arena.splice(&self.ir.0, self.ir.1))
+            }
+        }
         // The JIT emits and is called at `pixelflow_ir::JIT_VECTOR_BYTES` width;
         // `eval` transmutes `Field` to that ABI. If this build selected a `Field`
         // whose width the JIT does not emit (e.g. an AVX-512 `Field` while the
         // JIT still emits 128-bit), fail at compile time with a clear message
         // rather than a raw transmute size error or a silent miscompile.
         const _: () = assert!(
-            ::core::mem::size_of::<::pixelflow_core::Field>() == ::pixelflow_ir::JIT_VECTOR_BYTES,
+            ::core::mem::size_of::<::pixelflow_core::Field>() == ::pixelflow_core::__ir::JIT_VECTOR_BYTES,
             "kernel_jit!: pixelflow-core Field width does not match the JIT's emitted \
              vector width (pixelflow_ir::JIT_VECTOR_BYTES) — the JIT does not yet emit \
              this SIMD width",
@@ -195,7 +432,7 @@ fn jit_wrapper_tokens() -> TokenStream {
             )) -> ::pixelflow_core::Field {
                 unsafe {
                     ::core::mem::transmute(
-                        self.0.call(
+                        self.__compiled().call(
                             ::core::mem::transmute(x),
                             ::core::mem::transmute(y),
                             ::core::mem::transmute(z),

@@ -114,18 +114,34 @@ pub fn kernel(input: TokenStream) -> TokenStream {
 
     // Phase 5: Code generation.
     //
-    // NOTE: `kernel!` stays on the combinator backend. We cannot transparently
-    // route the "scalar `Field`" subset to the JIT, because combinator kernels
-    // are polymorphic over the *evaluation domain*: a kernel declared `-> Field`
-    // is still routinely evaluated over `Jet2`/`Jet3` domains for antialiasing
-    // and 3D surfaces (see `pixelflow-core/tests/test_sphere_debug.rs`). The JIT
-    // wrapper is monomorphic to `Manifold<(Field, Field, Field, Field)>`, so
-    // swapping it in drops that polymorphism. Making the swap transparent
-    // requires a dual-backend wrapper (JIT for the `Field` fast path, combinator
-    // for the jet paths); until then the JIT is reached only via `kernel_jit!`.
+    // NOTE: `kernel!` defaults to the combinator backend. We cannot yet
+    // transparently route the "scalar `Field`" subset to the JIT, because
+    // combinator kernels are polymorphic over the *evaluation domain*: a
+    // kernel declared `-> Field` is still routinely evaluated over
+    // `Jet2`/`Jet3` domains for antialiasing and 3D surfaces (see
+    // `pixelflow-core/tests/test_sphere_debug.rs`). The JIT wrapper is
+    // monomorphic to `Manifold<(Field, Field, Field, Field)>`, so swapping it
+    // in drops that polymorphism, and it is `Clone` where combinator kernels
+    // are `Copy` ZSTs.
     //
-    // The eligibility gate and shared codegen live in `jit_backend` and are
-    // exercised by `kernel_jit!`.
+    // P3 transition scaffolding (docs/plans/2026-07-20-kernel-unification.md):
+    // under `feature = "arena-backend"`, eligible bodies route to the arena
+    // backend so the parity suite (and a full workspace build) can measure
+    // exactly what still depends on the combinator emitter. Consumers that
+    // fail to build under the feature are the P4/P5 work list. Routing
+    // excludes derivative projections (see `is_transparent_routing_safe`) —
+    // their `Field`-domain semantics intentionally differ between backends.
+    // The default flips when the parity suite + font goldens say so.
+    #[cfg(feature = "arena-backend")]
+    {
+        // A body the bridge cannot lower (Err) falls back to the combinator
+        // backend, same as ineligible signatures.
+        if jit_backend::is_transparent_routing_safe(&optimized)
+            && let Ok(tokens) = jit_backend::emit_jit(&optimized, jit_backend::ZeroParam::Closure)
+        {
+            return tokens.into();
+        }
+    }
     codegen::emit(optimized).into()
 }
 
@@ -172,6 +188,58 @@ pub fn kernel_raw(input: TokenStream) -> TokenStream {
 
     // Phase 5: Code generation
     codegen::emit(analyzed).into()
+}
+
+/// The `kernel_value!` macro: build a [`Kernel`](pixelflow_core::Kernel) value.
+///
+/// Same front-end pipeline as `kernel!`/`kernel_jit!` (parse → sema → e-graph
+/// optimize), but the result is the language's *runtime value* — an uncompiled
+/// arena fragment — not a JIT-compiled or combinator manifold. This is the
+/// JIT-first surface: produce `Kernel` values, compose them
+/// (`Kernel::sum`/`at`/`select`/arithmetic), and bake once at a root
+/// (`Lattice::bake`). Derivatives (`DX`/`DY`) become symbolic `Dwrt` nodes
+/// resolved at bake — no jet domain.
+///
+/// - Zero params → a `Kernel` value directly.
+/// - N scalar params → a builder closure `move |p0: f32, ...| -> Kernel` that
+///   constant-folds the params into the fragment (no JIT — leaves are
+///   bake-time-only, fused at the root).
+///
+/// Manifold params are unsupported: compose `Kernel` values instead of
+/// splicing through macro slots.
+///
+/// # Example
+///
+/// ```ignore
+/// use pixelflow_compiler::kernel_value;
+/// use pixelflow_core::Kernel;
+///
+/// let leaf = kernel_value!(|cx: f32, r: f32| (X - cx) * r);
+/// let a = leaf(1.0, 2.0);          // a Kernel value, not compiled
+/// let scene = Kernel::sum(&[a, leaf(3.0, 0.5)]);
+/// // lattice.bake(&scene) compiles the fused arena once.
+/// ```
+#[proc_macro]
+pub fn kernel_value(input: TokenStream) -> TokenStream {
+    let tokens = proc_macro2::TokenStream::from(input);
+    let kernel_ast = match parser::parse(tokens) {
+        Ok(ast) => ast,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let analyzed = match sema::analyze(kernel_ast) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    // Same e-graph optimization as the other macros; the only difference is the
+    // backend that consumes the optimized AST.
+    let analyzed = optimize::optimize(analyzed);
+
+    match jit_backend::emit_kernel_value(&analyzed) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => syn::Error::new(proc_macro2::Span::call_site(), e)
+            .to_compile_error()
+            .into(),
+    }
 }
 
 /// The `kernel_jit!` macro: JIT-compiled kernels that bypass LLVM.

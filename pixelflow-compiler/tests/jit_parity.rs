@@ -251,3 +251,149 @@ fn jit_noncommutative_heavy_right() {
         1e-4
     );
 }
+
+// ═══════════════════════════ Derivative projections ═══════════════════════════
+//
+// `V`/`DX`/`DY` (and the Hessian family) lower to `Dwrt` arena nodes that
+// pixelflow-ir's `lower_dwrt` rewrites into chain-rule arithmetic at JIT
+// compile time. Ground truth is the closed-form derivative; the font-shaped
+// coverage ramp is additionally cross-checked against the combinator backend
+// evaluated over `Jet2` — the exact path these kernels replace (P2 acceptance
+// in docs/plans/2026-07-20-kernel-unification.md).
+
+#[test]
+fn jit_v_is_identity() {
+    jit_truth!(
+        "v_identity",
+        kernel_jit!(|| V(X * Y + Z)),
+        |x: f32, y: f32, z: f32, _w| x * y + z,
+        1e-4,
+        1e-4
+    );
+}
+
+#[test]
+fn jit_dx_dy_of_distance_field() {
+    // ∂/∂x √(x²+y²) = x/r, ∂/∂y = y/r. Sample away from the r=0 singularity.
+    const PTS: &[(f32, f32, f32, f32)] = &[
+        (3.0, 4.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0, 0.0),
+        (-2.0, 5.0, 0.0, 0.0),
+        (0.5, -0.25, 0.0, 0.0),
+        (10.0, -10.0, 0.0, 0.0),
+    ];
+    jit_truth!(
+        "dx_dist",
+        kernel_jit!(|| DX((X * X + Y * Y).sqrt())),
+        |x: f32, y: f32, _z, _w| x / (x * x + y * y).sqrt(),
+        1e-4,
+        1e-3,
+        PTS
+    );
+    jit_truth!(
+        "dy_dist",
+        kernel_jit!(|| DY((X * X + Y * Y).sqrt())),
+        |x: f32, y: f32, _z, _w| y / (x * x + y * y).sqrt(),
+        1e-4,
+        1e-3,
+        PTS
+    );
+}
+
+#[test]
+fn jit_dxx_is_second_derivative() {
+    // d²/dx² x³ = 6x, via nested Dwrt.
+    jit_truth!(
+        "dxx_cubic",
+        kernel_jit!(|| DXX(X * X * X)),
+        |x: f32, _y, _z, _w| 6.0 * x,
+        1e-3,
+        1e-3
+    );
+}
+
+/// The font coverage body (`ttf_curve_analytical.rs` minus the Y-range mask,
+/// which carries no derivative content), stamped for both backends by one
+/// macro so the two tests below compile the *same* source.
+macro_rules! coverage_body {
+    ($k:ident) => {
+        $k!(|x0: f32, y0: f32, dx_over_dy: f32, dir: f32, min_grad: f32| {
+            let d = X - ((Y - y0) * dx_over_dy + x0);
+            let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+            let coverage = (V(d) / (grad + V(min_grad)) + V(0.5))
+                .max(V(0.0))
+                .min(V(1.0));
+            coverage * V(dir)
+        })
+    };
+}
+
+const COVERAGE_PARAMS: (f32, f32, f32, f32, f32) = (0.3, -0.2, 0.7, -1.0, 0.001);
+
+/// Closed-form reference: d = x − ((y−y0)k + x0), |∇d| = √(1+k²).
+fn coverage_truth(x: f32, y: f32) -> f32 {
+    let (x0, y0, k, dir, mg) = COVERAGE_PARAMS;
+    let d = x - ((y - y0) * k + x0);
+    let grad = (1.0 + k * k).sqrt();
+    (d / (grad + mg) + 0.5).clamp(0.0, 1.0) * dir
+}
+
+/// P2 acceptance (part 1): the font-shaped coverage expression JIT-compiles
+/// and matches the analytic ground truth.
+#[test]
+fn jit_font_coverage_matches_truth() {
+    let (x0, y0, k, dir, mg) = COVERAGE_PARAMS;
+    let m = coverage_body!(kernel_jit)(x0, y0, k, dir, mg);
+    for &(x, y) in COVERAGE_GRID {
+        let p = (x, y, 0.0, 0.0);
+        check("font_coverage", eval(&m, p), coverage_truth(x, y), 1e-4, 1e-4);
+    }
+}
+
+/// P2 acceptance (part 2): the JIT'd `Dwrt` kernel matches the combinator
+/// backend evaluating the same source over `Jet2` (forward-mode autodiff with
+/// unit screen-space seeds) — the path `lower_dwrt` replaces.
+#[test]
+fn jit_font_coverage_matches_combinator_over_jet2() {
+    use pixelflow_core::jet::Jet2;
+    use pixelflow_compiler::kernel;
+
+    let (x0, y0, k, dir, mg) = COVERAGE_PARAMS;
+    let jit = coverage_body!(kernel_jit)(x0, y0, k, dir, mg);
+
+    // Same body, combinator backend, stamped for the Jet2 domain like the
+    // fonts do (`-> Jet2`).
+    let comb = kernel!(|x0: f32, y0: f32, dx_over_dy: f32, dir: f32, min_grad: f32| -> Jet2 {
+        let d = X - ((Y - y0) * dx_over_dy + x0);
+        let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+        let coverage = (V(d) / (grad + V(min_grad)) + V(0.5))
+            .max(V(0.0))
+            .min(V(1.0));
+        coverage * V(dir)
+    })(x0, y0, k, dir, mg);
+
+    for &(x, y) in COVERAGE_GRID {
+        let got = eval(&jit, (x, y, 0.0, 0.0));
+        let want = lane0(comb.eval((
+            Jet2::x(Field::from(x)),
+            Jet2::y(Field::from(y)),
+            Jet2::constant(Field::from(0.0)),
+            Jet2::constant(Field::from(0.0)),
+        )));
+        check("font_coverage_vs_jet2", got, want, 1e-4, 1e-4);
+    }
+}
+
+/// (x, y) grid spanning both sides of the coverage ramp, its interior, and
+/// points far into each saturated region.
+const COVERAGE_GRID: &[(f32, f32)] = &[
+    (0.0, 0.0),
+    (0.3, -0.2),
+    (0.31, -0.2),
+    (0.29, -0.2),
+    (1.5, 0.5),
+    (-1.5, 0.5),
+    (0.8, 1.0),
+    (-0.4, -1.0),
+    (2.0, -2.0),
+];

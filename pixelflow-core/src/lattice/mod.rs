@@ -375,6 +375,27 @@ impl Lattice {
         }
     }
 
+    /// Bake a [`Kernel`](pixelflow_ir::Kernel) — the front-end value — over the
+    /// domain: JIT-compile it once (through the global cache) and tabulate. The
+    /// JIT-first path: no combinator manifold, no `Lower`, just the arena the
+    /// `Kernel` already carries. Its `Dwrt` derivatives are resolved by the
+    /// compiler during codegen. Falls back to nothing — a `Kernel` is always
+    /// an arena, always compilable — except when this build's `Field` width is
+    /// not the JIT's, where it panics rather than silently mis-tabulating.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[must_use]
+    pub fn bake(&self, kernel: &pixelflow_ir::Kernel) -> DiscreteManifold {
+        assert_eq!(
+            core::mem::size_of::<Field>(),
+            pixelflow_ir::JIT_VECTOR_BYTES,
+            "Lattice::bake: Field width does not match the JIT's emitted width"
+        );
+        let (arena, root) = kernel.parts();
+        let jit = pixelflow_ir::jit_cache::compile_cached(arena, root)
+            .expect("kernel failed to compile");
+        self.collapse(&RealizedKernel(jit))
+    }
+
     /// Fold all points of the lattice into a per-lane SIMD accumulator.
     ///
     /// Each SIMD lane folds an independent stripe of X; the lanes are NOT
@@ -566,3 +587,36 @@ impl Lattice {
 
 #[cfg(test)]
 mod tests;
+
+/// A JIT-compiled kernel driving the generic collapse loop — the fast path
+/// of [`Lattice::bake`]. `Field` is transmuted to the emitter's vector ABI;
+/// `bake` guards the width match before constructing one.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct RealizedKernel(alloc::sync::Arc<pixelflow_ir::JitManifold>);
+
+/// The vector type of the JIT's call ABI on this build.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+type JitVec = core::arch::x86_64::__m128;
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+type JitVec = core::arch::x86_64::__m512;
+#[cfg(target_arch = "aarch64")]
+type JitVec = core::arch::aarch64::float32x4_t;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl Manifold<(Field, Field, Field, Field)> for RealizedKernel {
+    type Output = Field;
+
+    #[inline(always)]
+    fn eval(&self, (x, y, z, w): (Field, Field, Field, Field)) -> Field {
+        // SAFETY: realize checked size_of::<Field>() == JIT_VECTOR_BYTES, and
+        // the code was emitted by our own backend for exactly that ABI.
+        unsafe {
+            core::mem::transmute::<JitVec, Field>(self.0.call(
+                core::mem::transmute::<Field, JitVec>(x),
+                core::mem::transmute::<Field, JitVec>(y),
+                core::mem::transmute::<Field, JitVec>(z),
+                core::mem::transmute::<Field, JitVec>(w),
+            ))
+        }
+    }
+}

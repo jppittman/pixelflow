@@ -9,9 +9,10 @@
 //! FMA fusion saturate together.
 //!
 //! A `Dwrt` that survives saturation (an operator with no differentiation
-//! rule) is the jet fallback: it is left in the graph with a prohibitive cost
-//! so the extractor never prefers it, and lowering rejects it loudly until the
-//! jet path is wired.
+//! rule, or a budget miss) is left in the graph with a prohibitive cost so the
+//! extractor never prefers it. The fallback tier is the runtime `lower_dwrt`
+//! pass in pixelflow-ir — the same algebra applied directly to the arena —
+//! which errors loudly on genuinely non-differentiable ops.
 //!
 //! The actual derivative construction lives in `EGraph::build_derivative`,
 //! reached through [`RewriteAction::Differentiate`]; this rule only recognises
@@ -233,5 +234,113 @@ mod tests {
         ] {
             assert_close(eval(&out, root, p), p[0].cos(), p);
         }
+    }
+}
+
+#[cfg(test)]
+mod piecewise_tests {
+    use super::super::CostModel;
+    use super::super::extract::extract;
+    use super::*;
+    use crate::arena_pat;
+    use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+
+    // Reuse the sibling module's helpers via a local copy of the entry point:
+    // saturate D(e, var) with the derivative rules only, extract, assert
+    // Dwrt-free. (The helpers in `tests` are `#[cfg(test)]`-private to it.)
+    fn differentiate(arena: &ExprArena, differentiand: ExprId, var: u8) -> (ExprArena, ExprId) {
+        let mut a = arena.clone();
+        let v = a.push_const(var as f32);
+        let root = a.push_binary(OpKind::Dwrt, differentiand, v);
+        let mut eg = EGraph::with_rules(derivative_rules());
+        let root_class = eg.add_arena(&a, root);
+        eg.saturate_with_limit(60);
+        let (out, out_root, _cost) = extract(&eg, root_class, &CostModel::default());
+        assert!(
+            !(0..out.len()).any(|i| matches!(
+                out.node(ExprId(i as u32)),
+                ExprNode::Binary(OpKind::Dwrt, _, _)
+            )),
+            "extracted derivative still contains Dwrt: {}",
+            out.display(out_root),
+        );
+        (out, out_root)
+    }
+
+    fn eval(arena: &ExprArena, id: ExprId, vars: &[f32; 4]) -> f32 {
+        match *arena.node(id) {
+            ExprNode::Var(i) => vars[i as usize],
+            ExprNode::Const(c) => c,
+            ExprNode::Unary(op, a) => {
+                let a = eval(arena, a, vars);
+                op.eval_unary(a).unwrap()
+            }
+            ExprNode::Binary(op, a, b) => {
+                let a = eval(arena, a, vars);
+                let b = eval(arena, b, vars);
+                op.eval_binary(a, b).unwrap()
+            }
+            ExprNode::Ternary(op, a, b, c) => {
+                let a = eval(arena, a, vars);
+                let b = eval(arena, b, vars);
+                let c = eval(arena, c, vars);
+                op.eval_ternary(a, b, c).unwrap()
+            }
+            ref other => panic!("unexpected node in extracted derivative: {other:?}"),
+        }
+    }
+
+    fn assert_close(got: f32, want: f32, pt: &[f32; 4]) {
+        let tol = 1e-3 * want.abs().max(1.0);
+        assert!(
+            (got - want).abs() <= tol,
+            "at {pt:?}: got {got}, want {want} (tol {tol})"
+        );
+    }
+
+    #[test]
+    fn d_min_picks_branch_derivative() {
+        // d/dx min(x·2, y·3): 2 where x·2 < y·3, else 0.
+        let mut a = ExprArena::new();
+        let e = arena_pat!(&mut a, bin OpKind::Min,
+            (bin OpKind::Mul, (var 0), (cst 2.0)),
+            (bin OpKind::Mul, (var 1), (cst 3.0)));
+        let (out, root) = differentiate(&a, e, 0);
+        assert_close(eval(&out, root, &[1.0, 5.0, 0.0, 0.0]), 2.0, &[1.0, 5.0, 0.0, 0.0]);
+        assert_close(eval(&out, root, &[9.0, 1.0, 0.0, 0.0]), 0.0, &[9.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn d_select_blends_branch_derivatives() {
+        // d/dx select(y > 0, x·x, x·5): 2x above the axis, 5 below.
+        let mut a = ExprArena::new();
+        let e = arena_pat!(&mut a, tern OpKind::Select,
+            (bin OpKind::Gt, (var 1), (cst 0.0)),
+            (bin OpKind::Mul, (var 0), (var 0)),
+            (bin OpKind::Mul, (var 0), (cst 5.0)));
+        let (out, root) = differentiate(&a, e, 0);
+        assert_close(eval(&out, root, &[3.0, 1.0, 0.0, 0.0]), 6.0, &[3.0, 1.0, 0.0, 0.0]);
+        assert_close(eval(&out, root, &[3.0, -1.0, 0.0, 0.0]), 5.0, &[3.0, -1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn d_clamp_saturates() {
+        // d/dx clamp(x·x, 0, 10): 2x inside, 0 saturated.
+        let mut a = ExprArena::new();
+        let e = arena_pat!(&mut a, tern OpKind::Clamp,
+            (bin OpKind::Mul, (var 0), (var 0)),
+            (cst 0.0),
+            (cst 10.0));
+        let (out, root) = differentiate(&a, e, 0);
+        assert_close(eval(&out, root, &[2.0, 0.0, 0.0, 0.0]), 4.0, &[2.0, 0.0, 0.0, 0.0]);
+        assert_close(eval(&out, root, &[5.0, 0.0, 0.0, 0.0]), 0.0, &[5.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn d_comparison_is_zero() {
+        let mut a = ExprArena::new();
+        let e = arena_pat!(&mut a, bin OpKind::Lt, (var 0), (var 1));
+        let (out, root) = differentiate(&a, e, 0);
+        assert_close(eval(&out, root, &[3.0, 5.0, 0.0, 0.0]), 0.0, &[3.0, 5.0, 0.0, 0.0]);
     }
 }
