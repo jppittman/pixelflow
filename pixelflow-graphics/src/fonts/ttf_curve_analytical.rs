@@ -26,9 +26,9 @@
 //! `Geometry::eval` applies `abs().min(1.0)` to convert the summed winding
 //! contributions to inside/outside coverage.
 
-use pixelflow_compiler::kernel;
+use pixelflow_compiler::{kernel, kernel_value};
 use pixelflow_core::jet::Jet2;
-use pixelflow_core::{Field, Manifold};
+use pixelflow_core::{Field, Kernel, Manifold};
 
 /// Gradient floor for the crossing ramp. In the `Field` domain the gradient is
 /// identically zero, so `d / MIN_GRADIENT` saturates the clamp and reproduces
@@ -86,6 +86,42 @@ impl AnalyticalLine {
             y_min,
             y_max,
         }
+    }
+
+    /// The segment's winding contribution as a [`Kernel`] value — the JIT-first
+    /// path. The gradient-normalized ramp's `DX`/`DY` become symbolic `Dwrt`
+    /// resolved at bake, so this is the antialiased path with no jet domain.
+    /// Composed into a glyph via [`Kernel::sum`] and baked once at the root.
+    ///
+    // Same coverage body as the combinator stamp above. The two coexist only
+    // through the transition: `kernel!` and `kernel_value!` are distinct
+    // proc-macros, so the DSL body cannot be factored across them (a macro name
+    // can't be a metavariable). The combinator stamp + `Lower` impl retire when
+    // the glyph composes `Kernel` values, leaving this the single source.
+    #[must_use]
+    pub fn kernel(&self) -> Kernel {
+        kernel_value!(|x0: f32,
+                       y0: f32,
+                       dx_over_dy: f32,
+                       dir: f32,
+                       y_min: f32,
+                       y_max: f32,
+                       min_grad: f32|
+         -> Field {
+            let in_y = (Y >= y_min) & (Y < y_max);
+            let d = X - ((Y - y0) * dx_over_dy + x0);
+            let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+            let coverage = (V(d) / (grad + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+            in_y.select(coverage * V(dir), V(0.0))
+        })(
+            self.x0,
+            self.y0,
+            self.dx_over_dy,
+            self.dir,
+            self.y_min,
+            self.y_max,
+            MIN_GRADIENT,
+        )
     }
 
     /// Create from two endpoints. Returns None for horizontal/degenerate lines.
@@ -244,6 +280,85 @@ impl AnalyticalQuad {
             disc_const,
             disc_slope,
             is_linear,
+        }
+    }
+
+    /// The curve's winding contribution as a [`Kernel`] value — the JIT-first
+    /// path (see [`AnalyticalLine::kernel`]). The degenerate linear branch and
+    /// the true-quadratic branch each build the same coverage body their
+    /// combinator stamps do; `DX`/`DY` become `Dwrt` resolved at bake.
+    #[must_use]
+    pub fn kernel(&self) -> Kernel {
+        if self.is_linear {
+            kernel_value!(|ax: f32, bx: f32, cx: f32, by: f32, cy: f32, dir: f32, min_grad: f32|
+             -> Field {
+                let t = (Y - cy) / by;
+                let in_t = t.clone().ge(0.0) & t.clone().le(1.0);
+                let d = X - (t.clone() * t.clone() * ax + t * bx + cx);
+                let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+                let coverage = (V(d) / (grad + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+                in_t.select(coverage * V(dir), V(0.0))
+            })(
+                self.ax,
+                self.bx,
+                self.cx,
+                self.by,
+                self.cy,
+                if self.by > 0.0 { -1.0 } else { 1.0 },
+                MIN_GRADIENT,
+            )
+        } else {
+            kernel_value!(|ax: f32,
+                           bx: f32,
+                           cx: f32,
+                           ay: f32,
+                           by: f32,
+                           inv_2a: f32,
+                           neg_b_2a: f32,
+                           disc_const: f32,
+                           disc_slope: f32,
+                           min_grad: f32,
+                           min_disc: f32|
+             -> Field {
+                let disc = Y * disc_slope + disc_const;
+                let sqrt_disc = disc.clone().max(min_disc).sqrt();
+                let t_plus = sqrt_disc.clone() * inv_2a + neg_b_2a;
+                let t_minus = sqrt_disc * -inv_2a + neg_b_2a;
+                let d_plus = X - (t_plus.clone() * t_plus.clone() * ax + t_plus.clone() * bx + cx);
+                let d_minus =
+                    X - (t_minus.clone() * t_minus.clone() * ax + t_minus.clone() * bx + cx);
+                let dy_plus = t_plus.clone() * (ay * 2.0) + by;
+                let dy_minus = t_minus.clone() * (ay * 2.0) + by;
+                let grad_plus = (DX(d_plus.clone()) * DX(d_plus.clone())
+                    + DY(d_plus.clone()) * DY(d_plus.clone()))
+                .sqrt();
+                let cov_plus =
+                    (V(d_plus) / (grad_plus + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+                let grad_minus = (DX(d_minus.clone()) * DX(d_minus.clone())
+                    + DY(d_minus.clone()) * DY(d_minus.clone()))
+                .sqrt();
+                let cov_minus =
+                    (V(d_minus) / (grad_minus + V(min_grad)) + V(0.5)).max(V(0.0)).min(V(1.0));
+                let valid_plus = t_plus.clone().ge(0.0) & t_plus.le(1.0);
+                let valid_minus = t_minus.clone().ge(0.0) & t_minus.le(1.0);
+                let sign_plus = dy_plus.gt(0.0).select(V(-1.0), V(1.0));
+                let sign_minus = dy_minus.gt(0.0).select(V(-1.0), V(1.0));
+                let contrib_plus = valid_plus.select(cov_plus * sign_plus, V(0.0));
+                let contrib_minus = valid_minus.select(cov_minus * sign_minus, V(0.0));
+                disc.ge(0.0).select(contrib_plus + contrib_minus, V(0.0))
+            })(
+                self.ax,
+                self.bx,
+                self.cx,
+                self.ay,
+                self.by,
+                self.inv_2ay,
+                self.neg_b_2a,
+                self.disc_const,
+                self.disc_slope,
+                MIN_GRADIENT,
+                MIN_DISC,
+            )
         }
     }
 }

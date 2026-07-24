@@ -209,12 +209,32 @@ impl Kernel {
 
     /// `Σ kernels`, empty summing to `0` — the variadic monoid fold the
     /// fixed-arity operators cannot express (glyph outlines, text runs).
+    ///
+    /// Builds into ONE arena in a single pass: clone the first term's arena
+    /// once, then splice each remaining term once and chain an `Add`. A naive
+    /// `fold(acc.add(k))` would re-clone the *growing* accumulator arena every
+    /// step — O(n²) for a glyph's thousands of leaves — so the fold is written
+    /// out explicitly to stay O(total nodes).
+    ///
+    // DEFERRED (shared-store direction): the deeper fix is one hash-consed arena
+    // that all `Kernel`s index by `ExprId`, so composition interns instead of
+    // splicing (copies vanish, structural sharing is automatic). Not taken yet:
+    // it changes the `Kernel` representation and wants the same store P7–P9's
+    // discrete domains/typed fields will live in — land it there, deliberately,
+    // rather than as a silent representation swap. The compile cache already
+    // dedups at the compile boundary, so only construction-time copies remain.
     #[must_use]
     pub fn sum(kernels: &[Kernel]) -> Self {
-        match kernels.split_first() {
-            None => Self::constant(0.0),
-            Some((head, tail)) => tail.iter().fold(head.clone(), |acc, k| acc.add(k)),
+        let Some((head, tail)) = kernels.split_first() else {
+            return Self::constant(0.0);
+        };
+        let mut arena = head.inner.arena.clone();
+        let mut root = head.inner.root;
+        for k in tail {
+            let rhs = arena.splice(&k.inner.arena, k.inner.root);
+            root = arena.push_binary(OpKind::Add, root, rhs);
         }
+        Self::wrap(arena, root)
     }
 
     /// Sample `self` at warped coordinates — contramap / `.at()`. Each of

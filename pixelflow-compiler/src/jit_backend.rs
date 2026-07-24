@@ -286,6 +286,87 @@ pub fn emit_jit(analyzed: &AnalyzedKernel, conv: ZeroParam) -> Result<TokenStrea
     }
 }
 
+/// Emit code that builds a [`Kernel`](pixelflow_core::Kernel) *value* — an
+/// uncompiled arena fragment — rather than a JIT-compiled manifold.
+///
+/// This is the "JIT-first" front-end surface: the result is the language value
+/// that consumers *compose* (`Kernel::sum`/`at`/`select`/arithmetic) and bake
+/// once at a root, never a per-instance JIT (the plan's "leaves are
+/// bake-time-only, fuse at roots" constraint — a font glyph builds thousands of
+/// leaf kernels but compiles one fused arena). Scalar params are constant-folded
+/// into the fragment at build time; manifold params are unsupported here on
+/// purpose — composition happens at the `Kernel` value level, not through macro
+/// slots.
+///
+/// Zero scalar params → a `Kernel` value directly. N scalar params → a builder
+/// closure `move |p0: f32, ...| -> Kernel`.
+///
+/// Returns `Err` if the body needs a construct outside this lane (named struct,
+/// non-`Field` domain/return, manifold params, or an op the IR bridge rejects).
+pub fn emit_kernel_value(analyzed: &AnalyzedKernel) -> Result<TokenStream, String> {
+    if analyzed.def.struct_decl.is_some() {
+        return Err("kernel_value! does not support named struct kernels; \
+                    build the fragment anonymously and compose Kernel values"
+            .into());
+    }
+    if !is_field_ty(&analyzed.def.domain_ty) || !is_field_ty(&analyzed.def.return_ty) {
+        return Err("kernel_value! supports only the Field domain/return; \
+                    derivatives are resolved symbolically at bake, not via a jet domain"
+            .into());
+    }
+    if analyzed
+        .def
+        .params
+        .iter()
+        .any(|p| matches!(p.kind, ParamKind::Manifold))
+    {
+        return Err("kernel_value! does not support manifold params; \
+                    compose Kernel values with Kernel::at/sum/select instead"
+            .into());
+    }
+
+    let scalar_params: Vec<_> = analyzed
+        .def
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Scalar(_)))
+        .collect();
+
+    let param_map = ir_bridge::scalar_param_indices(analyzed);
+    let manifold_map = ir_bridge::manifold_param_indices(analyzed); // empty by the gate above
+    let (arena_code, _plan) =
+        ir_bridge::ast_to_runtime_arena(&analyzed.def.body, &param_map, &manifold_map)?;
+
+    if scalar_params.is_empty() {
+        Ok(quote! {
+            {
+                let (__arena, __root) = #arena_code;
+                ::pixelflow_core::Kernel::from_parts(__arena, __root)
+            }
+        })
+    } else {
+        let arg_tokens: Vec<TokenStream> = scalar_params
+            .iter()
+            .map(|p| {
+                let name = &p.name;
+                quote! { #name: f32 }
+            })
+            .collect();
+        // Scalar values, dense in scalar declaration order (matches the
+        // `Param(i)` numbering from `scalar_param_indices`).
+        let scalar_names: Vec<proc_macro2::Ident> =
+            scalar_params.iter().map(|p| p.name.clone()).collect();
+        let param_slice = quote! { &[ #( #scalar_names as f32 ),* ] };
+        Ok(quote! {
+            move | #( #arg_tokens ),* | {
+                let (mut __arena, __root) = #arena_code;
+                let __root = __arena.substitute_params(__root, #param_slice);
+                ::pixelflow_core::Kernel::from_parts(__arena, __root)
+            }
+        })
+    }
+}
+
 /// The `Manifold` wrapper around a `JitManifold`, emitted into the user's crate
 /// (the IR crate can't depend on `pixelflow_core`). Identical in both arms, so
 /// it is defined once here and interpolated.
