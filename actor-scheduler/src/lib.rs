@@ -1688,6 +1688,182 @@ mod backoff_unit_tests {
     }
 }
 
+// Tests targeting missed mutations in handle_wake, exercised entirely through the
+// public ActorScheduler/ActorHandle surface (new_with_params, send, poll_once, run).
+#[cfg(test)]
+mod handle_wake_targeted_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    // An actor that records the last `SystemStatus` handed to `park`. Since `park`
+    // is called unconditionally at the end of every `handle_wake`, its argument is
+    // an observable proxy for the private `more_work` computation.
+    struct StatusRecorder {
+        last_status: Option<SystemStatus>,
+    }
+    impl Actor<i32, i32, i32> for StatusRecorder {
+        fn handle_data(&mut self, _: i32) -> HandlerResult {
+            Ok(())
+        }
+        fn handle_control(&mut self, _: i32) -> HandlerResult {
+            Ok(())
+        }
+        fn handle_management(&mut self, _: i32) -> HandlerResult {
+            Ok(())
+        }
+        fn park(&mut self, status: SystemStatus) -> Result<ActorStatus, HandlerError> {
+            self.last_status = Some(status);
+            Ok(ActorStatus::Idle)
+        }
+    }
+
+    // Kills: replace || with && at each of the three operators joining
+    // matches!(control1|mgmt|control2|data, DrainStatus::More) into `more_work` (lines 973-975).
+    //
+    // Setup: half_control = 2 (control_burst_limit=4). Send 3 control messages so
+    // control1 drains 2 (1 remains -> More), mgmt is empty (not More), control2 then
+    // drains the last 1 (0 remain -> not More), data is empty (not More). Only the
+    // *first* term is More, so more_work is true iff the chain is a plain OR — any
+    // of the three `||`s replaced by `&&` collapses the result to false, flipping
+    // the SystemStatus handed to `park` from Busy to Idle.
+    #[test]
+    fn more_work_is_true_when_only_first_control_pass_hits_burst_limit() {
+        let params = SchedulerParams {
+            control_mgmt_buffer_size: 4,
+            control_burst_multiplier: 1,
+            ..SchedulerParams::DEFAULT
+        };
+        let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new_with_params(100, 100, params);
+        for _ in 0..3 {
+            tx.send(Message::Control(0)).unwrap();
+        }
+
+        let mut actor = StatusRecorder { last_status: None };
+        rx.poll_once(&mut actor);
+
+        assert_eq!(
+            actor.last_status,
+            Some(SystemStatus::Busy),
+            "control1 alone hitting the burst limit must make more_work true"
+        );
+    }
+
+    // Kills: replace / with * and replace / with % in
+    // `half_control = (control_burst_limit / 2).max(1)` (line 940).
+    //
+    // control_burst_limit=16 -> correct half_control=8. Sending 9 messages makes
+    // control1 (limit 8) leave exactly 1 behind (More); a `*` mutant inflates
+    // half_control to 32 and drains all 9 in one pass (not More).
+    #[test]
+    fn half_control_division_not_multiplication() {
+        let params = SchedulerParams {
+            control_mgmt_buffer_size: 16,
+            control_burst_multiplier: 1,
+            ..SchedulerParams::DEFAULT
+        };
+        let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new_with_params(100, 100, params);
+        for _ in 0..9 {
+            tx.send(Message::Control(0)).unwrap();
+        }
+
+        let mut actor = StatusRecorder { last_status: None };
+        rx.poll_once(&mut actor);
+
+        assert_eq!(
+            actor.last_status,
+            Some(SystemStatus::Busy),
+            "9 messages against half_control=8 must leave one behind (More)"
+        );
+    }
+
+    // Same setup, but with 5 messages: correct half_control=8 drains all 5 (not
+    // More). A `%` mutant collapses half_control to (16 % 2).max(1) == 1, so
+    // control1 only drains 1 of 5 and reports More instead.
+    #[test]
+    fn half_control_division_not_modulo() {
+        let params = SchedulerParams {
+            control_mgmt_buffer_size: 16,
+            control_burst_multiplier: 1,
+            ..SchedulerParams::DEFAULT
+        };
+        let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new_with_params(100, 100, params);
+        for _ in 0..5 {
+            tx.send(Message::Control(0)).unwrap();
+        }
+
+        let mut actor = StatusRecorder { last_status: None };
+        rx.poll_once(&mut actor);
+
+        assert_eq!(
+            actor.last_status,
+            Some(SystemStatus::Idle),
+            "5 messages against half_control=8 must drain fully (not More)"
+        );
+    }
+
+    // Kills: replace || with && (line 985:35) and replace == with != (line 985:52) in
+    // `let status = if more_work || returned_hint == ActorStatus::Busy { Working } else { Idle }`.
+    //
+    // `more_work` is false throughout (a single control message, nowhere near any
+    // burst limit). `park` returns Busy on its first call only. Correct code: the
+    // Busy hint alone makes the first handle_wake report Working, so run_inner
+    // retries without blocking and calls handle_wake (and therefore park) a second
+    // time before it finally blocks on the doorbell — park called exactly twice.
+    // Under either mutant, `more_work || <busy-check>` collapses to false on the
+    // first call, handle_wake reports Idle immediately, and run_inner blocks
+    // before ever calling park a second time.
+    #[test]
+    fn busy_park_hint_forces_one_extra_wake_before_blocking() {
+        let (tx, mut rx) = ActorScheduler::<i32, i32, i32>::new(100, 100);
+
+        struct BusyOnceActor {
+            park_calls: Arc<AtomicUsize>,
+        }
+        impl Actor<i32, i32, i32> for BusyOnceActor {
+            fn handle_data(&mut self, _: i32) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_control(&mut self, _: i32) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_management(&mut self, _: i32) -> HandlerResult {
+                Ok(())
+            }
+            fn park(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
+                let n = self.park_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(ActorStatus::Busy)
+                } else {
+                    Ok(ActorStatus::Idle)
+                }
+            }
+        }
+
+        tx.send(Message::Control(0)).unwrap();
+
+        let park_calls = Arc::new(AtomicUsize::new(0));
+        let pc = park_calls.clone();
+        let handle = std::thread::spawn(move || {
+            let mut actor = BusyOnceActor { park_calls: pc };
+            rx.run(&mut actor);
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            park_calls.load(Ordering::SeqCst),
+            2,
+            "Busy park hint alone should force exactly one extra non-blocking wake"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+    }
+}
+
 // Tests targeting missed mutations in drain_all_with_timeout.
 #[cfg(test)]
 mod drain_all_targeted_tests {
@@ -1892,6 +2068,111 @@ mod drain_all_targeted_tests {
             mgmt_count.load(Ordering::Relaxed),
             25,
             "DrainControl must drain all 25 management messages"
+        );
+    }
+
+    // Kills: delete `!` on the control term of `all_done` (line 915):
+    // `!matches!(control_status, More) && !matches!(mgmt, More) && !matches!(data, More)`.
+    // With the `!` deleted, `all_done` becomes true as soon as control alone is More
+    // (mgmt/data are never sent here, so they're always "not More"), and
+    // drain_all_with_timeout returns after just the first 10-message batch.
+    #[test]
+    fn drain_all_finishes_control_only_backlog_past_first_batch() {
+        let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
+            100,
+            1000,
+            ShutdownMode::DrainAll {
+                timeout: Duration::from_secs(10),
+            },
+        );
+
+        tx.send(Message::Shutdown).unwrap();
+        for _ in 0..25 {
+            tx.send(Message::Control(())).unwrap();
+        }
+
+        let ctrl_count = Arc::new(AtomicUsize::new(0));
+        struct ControlOnlyActor {
+            ctrl: Arc<AtomicUsize>,
+        }
+        impl Actor<(), (), ()> for ControlOnlyActor {
+            fn handle_data(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_control(&mut self, _: ()) -> HandlerResult {
+                self.ctrl.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn handle_management(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn park(&mut self, _: SystemStatus) -> Result<ActorStatus, HandlerError> {
+                Ok(ActorStatus::Idle)
+            }
+        }
+
+        let ctrl_clone = ctrl_count.clone();
+        let handle = std::thread::spawn(move || {
+            let mut actor = ControlOnlyActor { ctrl: ctrl_clone };
+            rx.run(&mut actor);
+        });
+
+        handle.join().unwrap();
+        assert_eq!(
+            ctrl_count.load(Ordering::Relaxed),
+            25,
+            "drain_all_with_timeout must not stop after the first control batch"
+        );
+    }
+
+    // Kills: delete `!` on the mgmt term of `all_done` (line 916), symmetric to the
+    // control-only test above.
+    #[test]
+    fn drain_all_finishes_management_only_backlog_past_first_batch() {
+        let (tx, mut rx) = ActorScheduler::new_with_shutdown_mode(
+            100,
+            1000,
+            ShutdownMode::DrainAll {
+                timeout: Duration::from_secs(10),
+            },
+        );
+
+        tx.send(Message::Shutdown).unwrap();
+        for _ in 0..25 {
+            tx.send(Message::Management(())).unwrap();
+        }
+
+        let mgmt_count = Arc::new(AtomicUsize::new(0));
+        struct ManagementOnlyActor {
+            mgmt: Arc<AtomicUsize>,
+        }
+        impl Actor<(), (), ()> for ManagementOnlyActor {
+            fn handle_data(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_control(&mut self, _: ()) -> HandlerResult {
+                Ok(())
+            }
+            fn handle_management(&mut self, _: ()) -> HandlerResult {
+                self.mgmt.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn park(&mut self, _: SystemStatus) -> Result<ActorStatus, HandlerError> {
+                Ok(ActorStatus::Idle)
+            }
+        }
+
+        let mgmt_clone = mgmt_count.clone();
+        let handle = std::thread::spawn(move || {
+            let mut actor = ManagementOnlyActor { mgmt: mgmt_clone };
+            rx.run(&mut actor);
+        });
+
+        handle.join().unwrap();
+        assert_eq!(
+            mgmt_count.load(Ordering::Relaxed),
+            25,
+            "drain_all_with_timeout must not stop after the first management batch"
         );
     }
 }
