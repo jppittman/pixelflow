@@ -179,6 +179,38 @@ impl CachedGlyph {
     pub fn coverage(&self) -> &DiscreteManifold {
         &self.sampler.tex
     }
+
+    /// Create a cached glyph by baking a glyph coverage [`Kernel`] — the
+    /// JIT-first path ([`Font::glyph_kernel_scaled`] → one fused arena,
+    /// compiled once through the global cache, tabulated by
+    /// [`Lattice::bake`]). Antialiasing comes from the kernel's symbolic
+    /// `Dwrt` ramps resolved at compile time, so no `Jet2` evaluation is
+    /// involved; the fused-vs-combinator goldens
+    /// (tests/kernel_glyph_golden.rs) pin this path to [`CachedGlyph::new`]'s
+    /// output. Same conventions as `new`: the kernel's outline is scaled to
+    /// `size × density` pixels, texels sample at centers, and the result
+    /// takes point-space coordinates.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[must_use]
+    pub fn from_kernel(kernel: &pixelflow_core::Kernel, size: usize, density: f32) -> Self {
+        assert!(
+            density.is_finite() && density > 0.0,
+            "invalid bake density: {density}"
+        );
+        let px = px_extent(size, density);
+        let lattice = Lattice {
+            extent: [px as u32, px as u32, 1, 1],
+            origin: [TEXEL_CENTER, TEXEL_CENTER, 0.0, 0.0],
+        };
+        let baked = lattice.bake(kernel);
+
+        Self {
+            sampler: Arc::new(Bilinear::new(baked)),
+            width: size,
+            height: size,
+            density,
+        }
+    }
 }
 
 impl Manifold<Field4> for CachedGlyph {
@@ -311,8 +343,20 @@ impl GlyphCache {
         // Bake at the quantized density so the key and the lattice agree.
         let density = density_q as f32 / DENSITY_STEPS;
         let px = px_extent(bucket, density);
-        let glyph = font.glyph_scaled(ch, px as f32)?;
-        let cached = CachedGlyph::new(&glyph, bucket, density);
+        // JIT-first on architectures with an arena backend: the glyph as ONE
+        // fused coverage Kernel, compiled once, tabulated by Lattice::bake.
+        // The combinator/Jet2 path remains the portable fallback (WASM,
+        // scalar) until the interpreter-collapse path replaces it (P6).
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let cached = {
+            let kernel = font.glyph_kernel_scaled(ch, px as f32)?;
+            CachedGlyph::from_kernel(&kernel, bucket, density)
+        };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let cached = {
+            let glyph = font.glyph_scaled(ch, px as f32)?;
+            CachedGlyph::new(&glyph, bucket, density)
+        };
         self.entries.insert(key, cached.clone());
         Some(cached)
     }
