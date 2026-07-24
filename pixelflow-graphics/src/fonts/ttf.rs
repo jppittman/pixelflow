@@ -15,7 +15,7 @@
 use crate::shapes::{square, Bounded};
 use pixelflow_compiler::kernel;
 use pixelflow_core::jet::Jet2;
-use pixelflow_core::{At, Field, Manifold, ManifoldExt, W, Z};
+use pixelflow_core::{At, Field, Kernel, Manifold, ManifoldExt, W, Z};
 use std::sync::Arc;
 
 // Import analytical curve kernels
@@ -309,6 +309,83 @@ impl<L, Q> core::fmt::Debug for Glyph<L, Q> {
             Self::Empty => write!(f, "Glyph::Empty"),
             Self::Simple(_) => write!(f, "Glyph::Simple(...)"),
             Self::Compound(_) => write!(f, "Glyph::Compound(...)"),
+        }
+    }
+}
+
+// ─── Glyph as a Kernel value (the JIT-first path) ──────────────────────────
+//
+// The whole combinator scene graph — `Sum`, `Affine` (`At`), `Bounded`
+// (`Select`), `Geometry`, `Line`/`Quad` — dissolves into `Kernel` composition:
+// a glyph is one coverage kernel of the coordinates, baked once at a root. This
+// walks the parsed `Glyph` tree (no re-parse) and emits the equivalent
+// composition; the leaves' `DX`/`DY` become symbolic `Dwrt` resolved at bake,
+// so antialiasing needs no `Jet2` domain. It supersedes the per-domain
+// `Manifold` stamps above, which retire once every consumer takes the kernel.
+
+/// `Kernel::constant` shorthand for this module's builders.
+fn kc(v: f32) -> Kernel {
+    Kernel::constant(v)
+}
+
+/// The coordinate kernel an [`AffineTransform`] denotes: `(X - tx)*a + (Y - ty)*b`.
+/// A pair of these (for x and y) is the inverse-matrix warp `affine` applies via
+/// `At`; on a `Kernel` that warp is `inner.at(wx, wy, Z, W)`.
+fn affine_coord(t: &AffineTransform) -> Kernel {
+    Kernel::x()
+        .sub(&kc(t.tx))
+        .mul(&kc(t.a))
+        .add(&Kernel::y().sub(&kc(t.ty)).mul(&kc(t.b)))
+}
+
+/// The unit-square bounds mask `X≥0 & X≤1 & Y≥0 & Y≤1` — the `square`/`Bounded`
+/// short-circuit as a Kernel mask.
+fn unit_square_mask() -> Kernel {
+    Kernel::x()
+        .ge(&kc(0.0))
+        .and(&Kernel::x().le(&kc(1.0)))
+        .and(&Kernel::y().ge(&kc(0.0)))
+        .and(&Kernel::y().le(&kc(1.0)))
+}
+
+/// A parsed [`Geometry`]'s winding coverage as a Kernel: `min(|Σ leaves|, 1)`
+/// (the non-zero fill rule over the summed line/quad contributions).
+fn geometry_to_kernel(g: &Geometry<Line<LineKernel>, Quad<QuadKernel>>) -> Kernel {
+    let segs: Vec<Kernel> = g
+        .lines
+        .iter()
+        .map(|l| l.kernel.kernel())
+        .chain(g.quads.iter().map(|q| q.kernel.kernel()))
+        .collect();
+    Kernel::sum(&segs).abs().min(&kc(1.0))
+}
+
+/// The whole glyph as a coverage [`Kernel`]. `Empty → 0`; `Simple` is bounded
+/// geometry warped by its restore transform; `Compound` sums its affine-warped
+/// children.
+pub(crate) fn glyph_to_kernel(g: &Glyph<Line<LineKernel>, Quad<QuadKernel>>) -> Kernel {
+    match g {
+        Glyph::Empty => kc(0.0),
+        Glyph::Simple(at) => {
+            // `at.inner` is `Bounded<Geometry>` = `Select<unit square, Geometry, 0.0>`.
+            let geom = geometry_to_kernel(&at.inner.if_true);
+            let bounded = unit_square_mask().select(&geom, &kc(at.inner.if_false));
+            bounded.at(&affine_coord(&at.x), &affine_coord(&at.y), &Kernel::z(), &Kernel::w())
+        }
+        Glyph::Compound(sum) => {
+            let children: Vec<Kernel> = sum
+                .0
+                .iter()
+                .map(|at| {
+                    glyph_to_kernel(&at.inner).at(
+                        &affine_coord(&at.x),
+                        &affine_coord(&at.y),
+                        &Kernel::z(),
+                        &Kernel::w(),
+                    )
+                })
+                .collect();
+            Kernel::sum(&children)
         }
     }
 }
@@ -701,6 +778,32 @@ impl<'a> Font<'a> {
             [scale, 0.0, 0.0, -scale, 0.0, ascent_px],
         )]
         .into())))
+    }
+
+    /// The glyph for `ch` as a coverage [`Kernel`] — the JIT-first path. Bake it
+    /// once (`Lattice::bake`) or compose it into a scene; antialiasing resolves
+    /// from `Dwrt` at bake with no `Jet2` domain.
+    #[must_use]
+    pub fn glyph_kernel(&self, ch: char) -> Option<Kernel> {
+        Some(glyph_to_kernel(&self.glyph(ch)?))
+    }
+
+    /// [`Font::glyph_kernel`] by pre-looked-up glyph ID.
+    #[must_use]
+    pub fn glyph_kernel_by_id(&self, id: u16) -> Option<Kernel> {
+        Some(glyph_to_kernel(&self.glyph_by_id(id)?))
+    }
+
+    /// The `size`-scaled glyph for `ch` as a coverage [`Kernel`].
+    #[must_use]
+    pub fn glyph_kernel_scaled(&self, ch: char, size: f32) -> Option<Kernel> {
+        Some(glyph_to_kernel(&self.glyph_scaled(ch, size)?))
+    }
+
+    /// [`Font::glyph_kernel_scaled`] by pre-looked-up glyph ID.
+    #[must_use]
+    pub fn glyph_kernel_scaled_by_id(&self, id: u16, size: f32) -> Option<Kernel> {
+        Some(glyph_to_kernel(&self.glyph_scaled_by_id(id, size)?))
     }
 
     #[must_use]

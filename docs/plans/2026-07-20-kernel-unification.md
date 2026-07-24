@@ -199,6 +199,21 @@ to-be-retired backend, tracked until that backend dies.
 - **P6 — deprecate and delete** the combinator emitter once P2–P5 cover the
   surface (parity suite + goldens green on arena-only).
 
+  **P5 glyph→Kernel landed 2026-07-24 (partial):** `kernel_value!` produces a
+  `Kernel` value (front end straight to arena, no combinator ZST, no eager JIT);
+  `AnalyticalLine`/`AnalyticalQuad` gained `.kernel()`; `glyph_to_kernel` walks
+  the parsed glyph into one coverage `Kernel` (`Sum`/`Affine`/`Bounded`/
+  `Geometry` all dissolve into `sum`/`at`/`select`); `Font::glyph_kernel*`
+  expose it. Golden vs the combinator `CachedGlyph` (Jet2 AA) matches for line
+  glyphs ('A'). **Blocker:** a fused *quad* glyph ('O') is register-heavy enough
+  that a `Select` lands with both branches spilled, which the JIT emitter
+  rejects — the arena is correct (IR interpreter reproduces the combinator
+  coverage exactly), so this is a JIT codegen gap, not a rewrite defect. Fix:
+  blend spilled branches from their stack slots as memory operands (no extra
+  scratch); also fix the latent mask-spilled+one-branch-spilled reload clobber.
+  Until then the combinator path stays; `CachedGlyph::new`-via-`bake` and the
+  combinator deletions wait on it.
+
 ## Beyond P6 — the language the totality axiom demands
 
 P0–P6 unify the *pipeline*. These phases grow the *language* to cover the AO /
