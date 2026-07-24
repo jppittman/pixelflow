@@ -1,345 +1,34 @@
 //! pixelflow-graphics/src/fonts/ttf.rs
 //!
-//! Pure Manifold TTF Parser with analytical ray-crossing rendering.
+//! TTF parser producing glyph coverage [`Kernel`]s.
 //!
-//! The whole glyph pipeline (curves, geometry, affine transforms, glyphs) is
-//! generic over the evaluation domain:
+//! A glyph is ONE fused coverage kernel: outline segments become leaf kernels
+//! ([`AnalyticalLine::kernel`] / [`AnalyticalQuad::kernel`]), the winding rule
+//! is `sum(...).abs().min(1)`, bounds are a unit-square mask `select`, and
+//! every transform (glyph restore, compound children, scaling) is a coordinate
+//! warp via [`Kernel::at`]. Nothing here is a scene graph of Rust types — the
+//! arena is the program, composed at parse time and compiled once at bake.
 //!
-//! - Evaluated over `Field` coordinates, crossings are hard 0/1 steps
-//!   (the classic aliased winding test).
-//! - Evaluated over `Jet2` coordinates (see [`crate::render::aa::Antialiased`]),
-//!   each crossing becomes a gradient-normalized ramp ~1 screen pixel wide:
-//!   the derivatives chain through every affine transform, so antialiasing is
-//!   scale-invariant.
+//! Antialiasing comes from the leaf kernels' symbolic `Dwrt` ramps: the
+//! derivatives chain through every `at` warp, so the crossing ramp is ~1
+//! *screen* pixel wide at any glyph scale. No jet domain.
 
-use crate::shapes::{square, Bounded};
-use pixelflow_compiler::kernel;
-use pixelflow_core::jet::Jet2;
-use pixelflow_core::{At, Field, Kernel, Manifold, ManifoldExt, W, Z};
-use std::sync::Arc;
+use pixelflow_core::Kernel;
 
-// Import analytical curve kernels
+// Import analytical curve leaf kernels
 use super::ttf_curve_analytical::{AnalyticalLine, AnalyticalQuad};
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Type Aliases for Concrete Kernel Types
+// Kernel composition helpers
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// Analytical line kernel (replaces TAIT opaque type).
-pub type LineKernel = AnalyticalLine;
-
-/// Analytical quad kernel (replaces TAIT opaque type).
-pub type QuadKernel = AnalyticalQuad;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Combinators
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Affine coordinate transform kernel.
-///
-/// Computes: (X - tx) * a + (Y - ty) * b
-///
-/// Domain-generic: over `Jet2` the output carries the transform's Jacobian,
-/// which is what makes the crossing ramp scale-invariant in screen space.
-#[derive(Clone, Copy, Debug)]
-pub struct AffineTransform {
-    /// X translation (applied before the linear part).
-    pub tx: f32,
-    /// First row coefficient for X.
-    pub a: f32,
-    /// Y translation (applied before the linear part).
-    pub ty: f32,
-    /// First row coefficient for Y.
-    pub b: f32,
-}
-
-impl AffineTransform {
-    /// Create a new affine coordinate expression.
-    #[inline(always)]
-    #[must_use]
-    pub fn new(tx: f32, a: f32, ty: f32, b: f32) -> Self {
-        Self { tx, a, ty, b }
-    }
-}
-
-// One kernel body, stamped per evaluation domain: `kernel!` lifts scalar
-// params to a single concrete domain type chosen at expansion time, so a
-// named kernel struct cannot be polymorphic over the domain.
-macro_rules! impl_affine_transform_manifold {
-    ($n:ty) => {
-        impl Manifold<($n, $n, $n, $n)> for AffineTransform {
-            type Output = $n;
-
-            #[inline(always)]
-            fn eval(&self, p: ($n, $n, $n, $n)) -> $n {
-                let k = kernel!(|tx: f32, a: f32, ty: f32, b: f32| -> $n {
-                    (X - tx) * a + (Y - ty) * b
-                });
-                k(self.tx, self.a, self.ty, self.b).eval(p)
-            }
-        }
-    };
-}
-
-impl_affine_transform_manifold!(Field);
-impl_affine_transform_manifold!(Jet2);
-
-/// Affine transform combinator type alias.
-///
-/// Transforms coordinates via inverse matrix before sampling inner manifold.
-/// x' = (x - tx) * a + (y - ty) * b
-/// y' = (x - tx) * c + (y - ty) * d
-pub type Affine<M> = At<AffineTransform, AffineTransform, Z, W, M>;
-
-/// Create an affine-transformed manifold.
-pub fn affine<M>(inner: M, [a, b, c, d, tx, ty]: [f32; 6]) -> Affine<M> {
-    let det = a * d - b * c;
-    let inv_det = if det.abs() < 1e-6 { 0.0 } else { 1.0 / det };
-
-    let inv_a = d * inv_det;
-    let inv_b = -b * inv_det;
-    let inv_c = -c * inv_det;
-    let inv_d = a * inv_det;
-    let inv_tx = tx;
-    let inv_ty = ty;
-
-    // Construct At directly to avoid requiring M: Manifold bound for the type alias if it were a function
-    At {
-        inner,
-        x: AffineTransform::new(inv_tx, inv_a, inv_ty, inv_b),
-        y: AffineTransform::new(inv_tx, inv_c, inv_ty, inv_d),
-        z: Z,
-        w: W,
-    }
-}
-
-/// Monoid sum - accumulates winding numbers from multiple segments/glyphs.
-#[derive(Clone, Debug)]
-pub struct Sum<M>(pub Arc<[M]>);
-
-// Domain-generic: the summands produce Field coverage in every domain, so the
-// accumulation itself is plain Field math.
-impl<P, M> Manifold<P> for Sum<M>
-where
-    P: Copy + Send + Sync,
-    M: Manifold<P, Output = Field>,
-{
-    type Output = Field;
-
-    #[inline(always)]
-    fn eval(&self, p: P) -> Field {
-        if self.0.len() == 1 {
-            return self.0[0].eval(p);
-        }
-        // Build sum AST and evaluate - each iteration builds Add node, then evals
-        let zero = Field::from(0.0);
-        self.0.iter().fold(zero, |acc, m| {
-            let val = m.eval(p);
-            (acc + val).eval(p)
-        })
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Geometry
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Quadratic Bézier curve with baked Loop-Blinn kernel.
-/// All control point computations happen at load time.
-/// Derivatives are computed analytically inside the kernel.
-#[derive(Clone)]
-pub struct Quad<K> {
-    kernel: K,
-}
-
-/// Create a quad with analytical Loop-Blinn kernel from control points.
-#[inline(always)]
-#[must_use]
-pub fn make_quad(points: [[f32; 2]; 3]) -> Quad<QuadKernel> {
-    let kernel = AnalyticalQuad::new(points[0], points[1], points[2]);
-    Quad { kernel }
-}
-
-/// Line segment with baked winding kernel.
-/// All control point computations happen at load time.
-#[derive(Clone)]
-pub struct Line<K> {
-    kernel: K,
-}
-
-/// Create a line with analytical kernel from control points.
-#[inline(always)]
-#[must_use]
-pub fn make_line(points: [[f32; 2]; 2]) -> Option<Line<LineKernel>> {
-    let kernel = AnalyticalLine::from_points(points[0], points[1])?;
-    Some(Line { kernel })
-}
-
-impl<K> Line<K> {
-    /// Create a line with explicit kernel (for advanced use).
-    #[inline(always)]
-    pub fn with_kernel(kernel: K) -> Self {
-        Self { kernel }
-    }
-}
-
-// ─── Winding Number Coverage (generic over the evaluation domain) ──────────
-
-impl<P, K> Manifold<P> for Line<K>
-where
-    P: Copy + Send + Sync,
-    K: Manifold<P, Output = Field>,
-{
-    type Output = Field;
-
-    #[inline(always)]
-    fn eval(&self, p: P) -> Field {
-        self.kernel.eval(p)
-    }
-}
-
-impl<P, K> Manifold<P> for Quad<K>
-where
-    P: Copy + Send + Sync,
-    K: Manifold<P, Output = Field>,
-{
-    type Output = Field;
-
-    #[inline(always)]
-    fn eval(&self, p: P) -> Field {
-        self.kernel.eval(p)
-    }
-}
-
-// Lowering delegates to the crossing kernel — a `Line`/`Quad` is a thin
-// domain wrapper, so its IR is exactly its kernel's (kernel-unification P5).
-impl<K: pixelflow_core::Lower> pixelflow_core::Lower for Line<K> {
-    fn lower(
-        &self,
-        arena: &mut pixelflow_ir::arena::ExprArena,
-        env: &mut pixelflow_ir::LowerEnv,
-    ) -> Option<pixelflow_ir::arena::ExprId> {
-        self.kernel.lower(arena, env)
-    }
-}
-
-impl<K: pixelflow_core::Lower> pixelflow_core::Lower for Quad<K> {
-    fn lower(
-        &self,
-        arena: &mut pixelflow_ir::arena::ExprArena,
-        env: &mut pixelflow_ir::LowerEnv,
-    ) -> Option<pixelflow_ir::arena::ExprId> {
-        self.kernel.lower(arena, env)
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Glyph (Compositional Scene Graph)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Optimized geometry storage separating lines and quads to avoid enum dispatch.
-#[derive(Clone)]
-pub struct Geometry<L, Q> {
-    pub lines: Arc<[L]>,
-    pub quads: Arc<[Q]>,
-}
-
-// Domain-generic: segments produce Field coverage in every domain (the
-// crossing ramp projects derivatives away), so winding accumulation and the
-// non-zero fill rule are plain Field math.
-impl<P, L, Q> Manifold<P> for Geometry<L, Q>
-where
-    P: Copy + Send + Sync,
-    L: Manifold<P, Output = Field>,
-    Q: Manifold<P, Output = Field>,
-{
-    type Output = Field;
-
-    #[inline(always)]
-    fn eval(&self, p: P) -> Field {
-        let fzero = Field::from(0.0);
-
-        // Accumulate line and quad contributions into a single composite value.
-        // Note: Field + Field produces Add<Field, Field> (a manifold), so we must
-        // evaluate to get back a scalar.
-        let total = self
-            .lines
-            .iter()
-            .map(|l| l.eval(p))
-            .chain(self.quads.iter().map(|q| q.eval(p)))
-            .fold(fzero, |acc, contrib| {
-                // Compose: acc + contrib produces Add<Field, Field>
-                // Evaluate the sum to collapse back to Field
-                (acc + contrib).eval(p)
-            });
-
-        // Apply non-zero winding rule: |winding| becomes coverage (clamped to [0, 1])
-        total.abs().min(Field::from(1.0)).eval(p)
-    }
-}
-
-/// A simple glyph: segments in unit space, bounded, then transformed.
-///
-/// The composition is: Affine<Select<UnitSquare, Geometry, 0.0>>
-/// - Geometry: Optimized Sum of Lines and Quads
-/// - Select (via square): Bounds check with short-circuit
-/// - Affine: Restores to font coordinate space
-///
-/// Coverage is hard 0/1 over `Field` coordinates; antialiased when the same
-/// pipeline is evaluated over `Jet2` coordinates (via `Antialiased`).
-pub type SimpleGlyph<L, Q> = Affine<Bounded<Geometry<L, Q>>>;
-
-/// A compound glyph: sum of transformed child glyphs.
-pub type CompoundGlyph<L, Q> = Sum<Affine<Glyph<L, Q>>>;
-
-/// A glyph is either empty, a simple outline, or a compound of sub-glyphs.
-#[derive(Clone)]
-pub enum Glyph<L, Q> {
-    /// No geometry - evaluates to 0.
-    Empty,
-    /// Simple glyph: bounded, thresholded segments in unit space.
-    Simple(SimpleGlyph<L, Q>),
-    /// Compound glyph: sum of transformed child glyphs.
-    Compound(Sum<Affine<Glyph<L, Q>>>),
-}
-
-impl<L, Q> core::fmt::Debug for Glyph<L, Q> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "Glyph::Empty"),
-            Self::Simple(_) => write!(f, "Glyph::Simple(...)"),
-            Self::Compound(_) => write!(f, "Glyph::Compound(...)"),
-        }
-    }
-}
-
-// ─── Glyph as a Kernel value (the JIT-first path) ──────────────────────────
-//
-// The whole combinator scene graph — `Sum`, `Affine` (`At`), `Bounded`
-// (`Select`), `Geometry`, `Line`/`Quad` — dissolves into `Kernel` composition:
-// a glyph is one coverage kernel of the coordinates, baked once at a root. This
-// walks the parsed `Glyph` tree (no re-parse) and emits the equivalent
-// composition; the leaves' `DX`/`DY` become symbolic `Dwrt` resolved at bake,
-// so antialiasing needs no `Jet2` domain. It supersedes the per-domain
-// `Manifold` stamps above, which retire once every consumer takes the kernel.
 
 /// `Kernel::constant` shorthand for this module's builders.
 fn kc(v: f32) -> Kernel {
     Kernel::constant(v)
 }
 
-/// The coordinate kernel an [`AffineTransform`] denotes: `(X - tx)*a + (Y - ty)*b`.
-/// A pair of these (for x and y) is the inverse-matrix warp `affine` applies via
-/// `At`; on a `Kernel` that warp is `inner.at(wx, wy, Z, W)`.
-fn affine_coord(t: &AffineTransform) -> Kernel {
-    Kernel::x()
-        .sub(&kc(t.tx))
-        .mul(&kc(t.a))
-        .add(&Kernel::y().sub(&kc(t.ty)).mul(&kc(t.b)))
-}
-
-/// The unit-square bounds mask `X≥0 & X≤1 & Y≥0 & Y≤1` — the `square`/`Bounded`
-/// short-circuit as a Kernel mask.
+/// The unit-square bounds mask `X≥0 & X≤1 & Y≥0 & Y≤1` — the glyph's
+/// short-circuit bounds check as a Kernel mask.
 fn unit_square_mask() -> Kernel {
     Kernel::x()
         .ge(&kc(0.0))
@@ -348,98 +37,38 @@ fn unit_square_mask() -> Kernel {
         .and(&Kernel::y().le(&kc(1.0)))
 }
 
-/// A parsed [`Geometry`]'s winding coverage as a Kernel: `min(|Σ leaves|, 1)`
-/// (the non-zero fill rule over the summed line/quad contributions).
-fn geometry_to_kernel(g: &Geometry<Line<LineKernel>, Quad<QuadKernel>>) -> Kernel {
-    let segs: Vec<Kernel> = g
-        .lines
-        .iter()
-        .map(|l| l.kernel.kernel())
-        .chain(g.quads.iter().map(|q| q.kernel.kernel()))
-        .collect();
-    Kernel::sum(&segs).abs().min(&kc(1.0))
-}
+/// Sample `inner` through the affine transform `[a, b, c, d, tx, ty]` — the
+/// forward map `x' = a·x + b·y + tx, y' = c·x + d·y + ty` — by warping
+/// coordinates with the INVERSE matrix:
+/// `u = (X - tx)·inv_a + (Y - ty)·inv_b`, `v = (X - tx)·inv_c + (Y - ty)·inv_d`.
+pub(crate) fn affine_kernel(inner: &Kernel, [a, b, c, d, tx, ty]: [f32; 6]) -> Kernel {
+    let det = a * d - b * c;
+    let inv_det = if det.abs() < 1e-6 { 0.0 } else { 1.0 / det };
 
-/// The whole glyph as a coverage [`Kernel`]. `Empty → 0`; `Simple` is bounded
-/// geometry warped by its restore transform; `Compound` sums its affine-warped
-/// children.
-pub(crate) fn glyph_to_kernel(g: &Glyph<Line<LineKernel>, Quad<QuadKernel>>) -> Kernel {
-    match g {
-        Glyph::Empty => kc(0.0),
-        Glyph::Simple(at) => {
-            // `at.inner` is `Bounded<Geometry>` = `Select<unit square, Geometry, 0.0>`.
-            let geom = geometry_to_kernel(&at.inner.if_true);
-            let bounded = unit_square_mask().select(&geom, &kc(at.inner.if_false));
-            bounded.at(&affine_coord(&at.x), &affine_coord(&at.y), &Kernel::z(), &Kernel::w())
-        }
-        Glyph::Compound(sum) => {
-            let children: Vec<Kernel> = sum
-                .0
-                .iter()
-                .map(|at| {
-                    glyph_to_kernel(&at.inner).at(
-                        &affine_coord(&at.x),
-                        &affine_coord(&at.y),
-                        &Kernel::z(),
-                        &Kernel::w(),
-                    )
-                })
-                .collect();
-            Kernel::sum(&children)
-        }
-    }
-}
+    let inv_a = d * inv_det;
+    let inv_b = -b * inv_det;
+    let inv_c = -c * inv_det;
+    let inv_d = a * inv_det;
 
-// Glyph evaluation - one body, stamped per evaluation domain (Field: hard
-// coverage, Jet2: antialiased). Concrete impls rather than a single generic
-// one because the inner `Select` (bounds check) only has per-domain Manifold
-// impls, and the compound arm recurses into `Glyph` itself, which a generic
-// impl could not express without a cyclic where-clause.
-macro_rules! impl_glyph_manifold {
-    ($n:ty) => {
-        impl<L, Q> Manifold<($n, $n, $n, $n)> for Glyph<L, Q>
-        where
-            L: Manifold<($n, $n, $n, $n), Output = Field>,
-            Q: Manifold<($n, $n, $n, $n), Output = Field>,
-        {
-            type Output = Field;
-
-            #[inline(always)]
-            fn eval(&self, p: ($n, $n, $n, $n)) -> Field {
-                match self {
-                    Self::Empty => Field::from(0.0),
-                    Self::Simple(g) => {
-                        // Inline the Affine<Bounded<Geometry>> evaluation:
-                        // evaluate the coordinate expressions, then the inner
-                        // Select<UnitSquare, Geometry, 0.0>.
-                        let tx = g.x.eval(p); // transformed x
-                        let ty = g.y.eval(p); // transformed y
-                        let tz = g.z.eval(p); // z (passthrough)
-                        let tw = g.w.eval(p); // w (passthrough)
-                        g.inner.eval((tx, ty, tz, tw))
-                    }
-                    Self::Compound(sum) => {
-                        // Compound glyphs are Sum<Affine<Glyph>>: evaluate each
-                        // child through its affine transform and sum.
-                        let mut acc = Field::from(0.0);
-                        for child in sum.0.iter() {
-                            let tx = child.x.eval(p);
-                            let ty = child.y.eval(p);
-                            let tz = child.z.eval(p);
-                            let tw = child.w.eval(p);
-                            let child_val = child.inner.eval((tx, ty, tz, tw));
-                            acc = (acc + child_val).eval(p);
-                        }
-                        acc
-                    }
-                }
-            }
-        }
+    let coord = |ca: f32, cb: f32| {
+        Kernel::x()
+            .sub(&kc(tx))
+            .mul(&kc(ca))
+            .add(&Kernel::y().sub(&kc(ty)).mul(&kc(cb)))
     };
+    inner.at(
+        &coord(inv_a, inv_b),
+        &coord(inv_c, inv_d),
+        &Kernel::z(),
+        &Kernel::w(),
+    )
 }
 
-impl_glyph_manifold!(Field);
-impl_glyph_manifold!(Jet2);
+/// Winding coverage for a set of segment kernels: `min(|Σ|, 1)` — the
+/// non-zero fill rule over the summed line/quad contributions.
+fn coverage(segments: &[Kernel]) -> Kernel {
+    Kernel::sum(segments).abs().min(&kc(1.0))
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Reader
@@ -733,77 +362,41 @@ impl<'a> Font<'a> {
         self.cmap.lookup(ch as u32)
     }
 
-    #[must_use]
-    pub fn glyph(&self, ch: char) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
-        self.compile(self.cmap.lookup(ch as u32)?)
-    }
-
-    /// Get glyph by pre-looked-up glyph ID (avoids redundant CMAP lookup).
-    #[inline]
-    #[must_use]
-    pub fn glyph_by_id(&self, id: u16) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
-        self.compile(id)
-    }
-
-    #[must_use]
-    pub fn glyph_scaled(
-        &self,
-        ch: char,
-        size: f32,
-    ) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
-        let id = self.cmap.lookup(ch as u32)?;
-        self.glyph_scaled_by_id(id, size)
-    }
-
-    /// Get scaled glyph by pre-looked-up glyph ID.
-    ///
-    /// Avoids redundant CMAP lookup when you already have the glyph ID.
-    #[must_use]
-    pub fn glyph_scaled_by_id(
-        &self,
-        id: u16,
-        size: f32,
-    ) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
-        let g = self.glyph_by_id(id)?;
-        // Scale based on total font height (ascent + |descent|) to fit within `size` pixels.
-        let total_height = self.ascent as f32 + self.descent.abs() as f32;
-        let scale = size / total_height;
-        // Y-flip: screen Y increases downward, font Y increases upward.
-        // Forward transform: font_x = scale * screen_x,
-        //                    font_y = ascent*scale - scale * screen_y
-        // This places the ascent line at screen_y=0 (top) and the descent at screen_y=size.
-        let ascent_px = self.ascent as f32 * scale;
-        Some(Glyph::Compound(Sum([affine(
-            g,
-            [scale, 0.0, 0.0, -scale, 0.0, ascent_px],
-        )]
-        .into())))
-    }
-
-    /// The glyph for `ch` as a coverage [`Kernel`] — the JIT-first path. Bake it
-    /// once (`Lattice::bake`) or compose it into a scene; antialiasing resolves
-    /// from `Dwrt` at bake with no `Jet2` domain.
+    /// The glyph for `ch` as a coverage [`Kernel`] in font units. Bake it once
+    /// (`Lattice::bake`) or compose it into a scene; antialiasing resolves
+    /// from `Dwrt` at bake.
     #[must_use]
     pub fn glyph_kernel(&self, ch: char) -> Option<Kernel> {
-        Some(glyph_to_kernel(&self.glyph(ch)?))
+        self.compile(self.cmap.lookup(ch as u32)?)
     }
 
     /// [`Font::glyph_kernel`] by pre-looked-up glyph ID.
     #[must_use]
     pub fn glyph_kernel_by_id(&self, id: u16) -> Option<Kernel> {
-        Some(glyph_to_kernel(&self.glyph_by_id(id)?))
+        self.compile(id)
     }
 
-    /// The `size`-scaled glyph for `ch` as a coverage [`Kernel`].
+    /// The `size`-scaled glyph for `ch` as a coverage [`Kernel`]: the ascent
+    /// line sits at screen y=0 (top) and the descent at y=`size`, with
+    /// screen Y increasing downward.
     #[must_use]
     pub fn glyph_kernel_scaled(&self, ch: char, size: f32) -> Option<Kernel> {
-        Some(glyph_to_kernel(&self.glyph_scaled(ch, size)?))
+        let id = self.cmap.lookup(ch as u32)?;
+        self.glyph_kernel_scaled_by_id(id, size)
     }
 
     /// [`Font::glyph_kernel_scaled`] by pre-looked-up glyph ID.
     #[must_use]
     pub fn glyph_kernel_scaled_by_id(&self, id: u16, size: f32) -> Option<Kernel> {
-        Some(glyph_to_kernel(&self.glyph_scaled_by_id(id, size)?))
+        let g = self.compile(id)?;
+        // Scale based on total font height (ascent + |descent|) to fit within
+        // `size` pixels; Y-flip because screen Y increases downward while font
+        // Y increases upward. Forward: screen = [scale, 0, 0, -scale] · font
+        // + (0, ascent_px).
+        let total_height = self.ascent as f32 + self.descent.abs() as f32;
+        let scale = size / total_height;
+        let ascent_px = self.ascent as f32 * scale;
+        Some(affine_kernel(&g, [scale, 0.0, 0.0, -scale, 0.0, ascent_px]))
     }
 
     #[must_use]
@@ -858,10 +451,16 @@ impl<'a> Font<'a> {
         self.kern(left, right) * size / self.units_per_em as f32
     }
 
-    fn compile(&self, id: u16) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
+    /// Compile a glyph to its coverage [`Kernel`] in font units.
+    ///
+    /// Simple glyphs: parse segments in normalized [0,1] space, apply the
+    /// winding rule + unit-square bounds, then warp back to font units.
+    /// Compound glyphs: recursively compile children and sum them through
+    /// their affine transforms. Empty glyphs are the constant 0.
+    fn compile(&self, id: u16) -> Option<Kernel> {
         let (a, b) = (self.loca.get(id as usize)?, self.loca.get(id as usize + 1)?);
         if a == b {
-            return Some(Glyph::Empty);
+            return Some(kc(0.0));
         }
         let mut r = R(self.data, self.glyf + a);
         let n = r.i16()?;
@@ -891,28 +490,22 @@ impl<'a> Font<'a> {
                 tx: norm_tx,
                 ty: norm_ty,
             };
-            let sum_segs = self.simple(&mut r, n as usize, normalization)?;
+            let segments = self.simple(&mut r, n as usize, normalization)?;
 
-            // Compose: Geometry (smooth AA coverage) -> Bounded (via square) -> Affine
-            let bounded = square(sum_segs, 0.0f32);
-            Some(Glyph::Simple(affine(bounded, restore)))
+            // Compose: winding coverage -> unit-square bounds -> font units.
+            let bounded = unit_square_mask().select(&coverage(&segments), &kc(0.0));
+            Some(affine_kernel(&bounded, restore))
         } else {
             // Compound glyphs: children are already fully composed with their own bounds
             self.compound(&mut r)
         }
     }
 
-    fn simple(
-        &self,
-        r: &mut R,
-        n: usize,
-        norm: Normalization,
-    ) -> Option<Geometry<Line<LineKernel>, Quad<QuadKernel>>> {
+    /// Parse a simple glyph's outline into per-segment winding kernels in
+    /// normalized [0,1] space.
+    fn simple(&self, r: &mut R, n: usize, norm: Normalization) -> Option<Vec<Kernel>> {
         if n == 0 {
-            return Some(Geometry {
-                lines: vec![].into(),
-                quads: vec![].into(),
-            });
+            return Some(Vec::new());
         }
         let ends: Vec<_> = (0..n)
             .map(|_| r.u16().map(|v| v as usize))
@@ -960,24 +553,19 @@ impl<'a> Font<'a> {
             })
             .collect();
 
-        // Partition segments into lines and quads
-        let mut lines = Vec::new();
-        let mut quads = Vec::new();
-
+        // Each contour contributes line/quad segment kernels.
+        let mut segments = Vec::new();
         let mut start = 0;
         for &e in ends.iter() {
             let c = &pts[start..=e];
             start = e + 1;
-            push_segs(c, &mut lines, &mut quads);
+            push_segs(c, &mut segments);
         }
 
-        Some(Geometry {
-            lines: lines.into(),
-            quads: quads.into(),
-        })
+        Some(segments)
     }
 
-    fn compound(&self, r: &mut R) -> Option<Glyph<Line<LineKernel>, Quad<QuadKernel>>> {
+    fn compound(&self, r: &mut R) -> Option<Kernel> {
         let mut kids = vec![];
         loop {
             let fl = r.u16()?;
@@ -1007,21 +595,18 @@ impl<'a> Font<'a> {
                 m[3] = r.i16()? as f32 / 16384.0;
             }
             if let Some(g) = self.compile(id) {
-                kids.push(affine(g, m));
+                kids.push(affine_kernel(&g, m));
             }
             if fl & 0x20 == 0 {
                 break;
             }
         }
-        Some(Glyph::Compound(Sum(kids.into())))
+        Some(Kernel::sum(&kids))
     }
 }
 
-fn push_segs(
-    pts: &[(f32, f32, bool)],
-    lines: &mut Vec<Line<LineKernel>>,
-    quads: &mut Vec<Quad<QuadKernel>>,
-) {
+/// Convert one contour's point list into line/quad winding kernels.
+fn push_segs(pts: &[(f32, f32, bool)], segments: &mut Vec<Kernel>) {
     if pts.is_empty() {
         return;
     }
@@ -1050,12 +635,12 @@ fn push_segs(
             [x, y]
         };
         if exp[(start + i + 1) % exp.len()].2 {
-            if let Some(line) = make_line([p(i), p(i + 1)]) {
-                lines.push(line);
+            if let Some(line) = AnalyticalLine::from_points(p(i), p(i + 1)) {
+                segments.push(line.kernel());
             }
             i += 1;
         } else {
-            quads.push(make_quad([p(i), p(i + 1), p(i + 2)]));
+            segments.push(AnalyticalQuad::new(p(i), p(i + 1), p(i + 2)).kernel());
             i += 2;
         }
     }

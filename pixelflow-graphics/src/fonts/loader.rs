@@ -398,7 +398,7 @@ mod tests {
 
         let loaded = LoadedFont::new(source).expect("should parse font");
         let font = loaded.font();
-        assert!(font.glyph('A').is_some());
+        assert!(font.glyph_kernel('A').is_some());
     }
 
     #[test]
@@ -419,7 +419,7 @@ mod tests {
         let loaded = LoadedFont::new(source).expect("should parse font");
 
         let font = loaded.font();
-        let glyph = font.glyph_scaled('A', 16.0);
+        let glyph = font.glyph_kernel_scaled('A', 16.0);
         assert!(glyph.is_some());
 
         let advance = font.advance_scaled('A', 16.0);
@@ -442,6 +442,6 @@ mod tests {
 
         let loaded = LoadedFont::new(source).expect("should parse font");
         let font = loaded.font();
-        assert!(font.glyph('A').is_some());
+        assert!(font.glyph_kernel('A').is_some());
     }
 }

@@ -5,16 +5,17 @@
 //! ## Categorical Semantics
 //!
 //! Caching is a **morphism between evaluation strategies**:
-//! - `Glyph` evaluates mathematically (winding numbers, infinite resolution)
-//! - `CachedGlyph` evaluates from a baked lattice (SIMD gather, fixed resolution)
+//! - a glyph `Kernel` evaluates mathematically (winding numbers, infinite
+//!   resolution)
+//! - `CachedGlyph` evaluates from a baked lattice (SIMD gather, fixed
+//!   resolution)
 //!
-//! Both implement `Manifold`, preserving composition. The cache is a functor
-//! that transforms evaluation strategy while maintaining the algebraic
-//! interface. The bake evaluates the glyph through [`Antialiased`] (`Jet2`
-//! autodiff coordinates, gradient-normalized crossing ramps) and tabulates
-//! the result via `Lattice::collapse`; the read-back is `DiscreteManifold`
-//! (index) smoothed by the [`Bilinear`] combinator. Texels therefore store
-//! *antialiased* coverage — no post-hoc filtering of hard 0/1 samples.
+//! The bake JIT-compiles the fused glyph kernel once (`Lattice::bake`,
+//! global compile cache) and tabulates it; antialiasing is intrinsic to the
+//! kernel (symbolic `Dwrt` crossing ramps resolved at compile time). The
+//! read-back is `DiscreteManifold` (index) smoothed by the [`Bilinear`]
+//! combinator. Texels therefore store *antialiased* coverage — no post-hoc
+//! filtering of hard 0/1 samples.
 //!
 //! ```text
 //!            cache_at(size)
@@ -54,11 +55,9 @@
 //! let uncached = font.glyph_scaled('A', 17.3);
 //! ```
 
-use crate::render::aa::Antialiased;
 use crate::render::bilinear::Bilinear;
-use pixelflow_core::jet::Jet2;
 use pixelflow_core::{
-    At, DiscreteManifold, Field, Lattice, Manifold, ManifoldCompat, ManifoldExt, Select, W, X, Y, Z,
+    At, DiscreteManifold, Field, Kernel, Lattice, Manifold, ManifoldExt, Select, W, X, Y, Z,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,10 +65,7 @@ use std::sync::Arc;
 /// The standard 4D Field domain type.
 type Field4 = (Field, Field, Field, Field);
 
-/// The 4D Jet2 domain type (2D autodiff seeded in screen space).
-type Jet2x4 = (Jet2, Jet2, Jet2, Jet2);
-
-use super::ttf::{affine, Affine, Font, Glyph, Sum};
+use super::ttf::Font;
 
 /// Offset of a texel's sampling point from its integer index.
 ///
@@ -87,15 +83,15 @@ const TEXEL_CENTER: f32 = 0.5;
 ///
 /// This is the output of the caching morphism: a glyph that evaluates from
 /// memory rather than computing winding numbers. The lattice stores f32
-/// *antialiased* coverage values (0.0 to 1.0) — baked through [`Antialiased`],
-/// no u8 quantization roundtrip — sampled back via SIMD gather with bilinear
-/// interpolation.
+/// *antialiased* coverage values (0.0 to 1.0) — no u8 quantization roundtrip
+/// — sampled back via SIMD gather with bilinear interpolation.
 ///
 /// # Resolution
 ///
-/// Unlike raw `Glyph` which has infinite resolution, `CachedGlyph` is baked
-/// at a fixed size. For best quality, cache at the exact render size.
-/// The cache uses size buckets (multiples of 4) to balance memory with reuse.
+/// Unlike the analytical glyph kernel, which has infinite resolution,
+/// `CachedGlyph` is baked at a fixed size. For best quality, cache at the
+/// exact render size. The cache uses size buckets (multiples of 4) to
+/// balance memory with reuse.
 #[derive(Clone)]
 pub struct CachedGlyph {
     /// Bilinear sampler over the baked coverage lattice.
@@ -116,49 +112,6 @@ fn px_extent(size: usize, density: f32) -> usize {
 }
 
 impl CachedGlyph {
-    /// Create a cached glyph by collapsing a glyph manifold over a lattice.
-    ///
-    /// The glyph's *antialiased* coverage is tabulated at
-    /// `(size × density)²` texels, at texel centers (see the module docs for
-    /// the coordinate convention). The bake evaluates the glyph through
-    /// [`Antialiased`], so every texel stores a gradient-normalized crossing
-    /// ramp value — the bilinear read-back then interpolates already-smooth
-    /// coverage.
-    ///
-    /// `density` is the sample density in texels per point (a display's
-    /// backing scale). The caller must supply a `glyph` whose outline is
-    /// scaled to `size × density` pixels, so the analytic curves are truly
-    /// sampled denser — not upscaled. The resulting manifold still takes
-    /// point-space coordinates and occupies `size × size` points.
-    #[must_use]
-    pub fn new<L, Q>(glyph: &Glyph<L, Q>, size: usize, density: f32) -> Self
-    where
-        Glyph<L, Q>: Manifold<Jet2x4, Output = Field>,
-    {
-        assert!(
-            density.is_finite() && density > 0.0,
-            "invalid bake density: {density}"
-        );
-        // Antialiased coverage: seed Jet2 screen-space derivatives so each
-        // edge crossing bakes as a ~1-texel gradient-normalized ramp.
-        let coverage = Antialiased::new(glyph);
-
-        // Tabulate at texel centers: texel (i, j) = coverage(i+0.5, j+0.5).
-        let px = px_extent(size, density);
-        let lattice = Lattice {
-            extent: [px as u32, px as u32, 1, 1],
-            origin: [TEXEL_CENTER, TEXEL_CENTER, 0.0, 0.0],
-        };
-        let baked = lattice.collapse(&coverage);
-
-        Self {
-            sampler: Arc::new(Bilinear::new(baked)),
-            width: size,
-            height: size,
-            density,
-        }
-    }
-
     /// Get the cache width.
     #[inline]
     #[must_use]
@@ -180,19 +133,16 @@ impl CachedGlyph {
         &self.sampler.tex
     }
 
-    /// Create a cached glyph by baking a glyph coverage [`Kernel`] — the
-    /// JIT-first path ([`Font::glyph_kernel_scaled`] → one fused arena,
-    /// compiled once through the global cache, tabulated by
-    /// [`Lattice::bake`]). Antialiasing comes from the kernel's symbolic
-    /// `Dwrt` ramps resolved at compile time, so no `Jet2` evaluation is
-    /// involved; the fused-vs-combinator goldens
-    /// (tests/kernel_glyph_golden.rs) pin this path to [`CachedGlyph::new`]'s
-    /// output. Same conventions as `new`: the kernel's outline is scaled to
-    /// `size × density` pixels, texels sample at centers, and the result
-    /// takes point-space coordinates.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    /// Create a cached glyph by baking a glyph coverage [`Kernel`]
+    /// ([`Font::glyph_kernel_scaled`] → one fused arena, compiled once
+    /// through the global cache, tabulated by [`Lattice::bake`]).
+    /// Antialiasing comes from the kernel's symbolic `Dwrt` ramps resolved
+    /// at compile time. The JIT-vs-interpreter goldens
+    /// (tests/kernel_glyph_golden.rs) guard this path. The kernel's outline
+    /// must be scaled to `size × density` pixels; texels sample at centers,
+    /// and the result takes point-space coordinates.
     #[must_use]
-    pub fn from_kernel(kernel: &pixelflow_core::Kernel, size: usize, density: f32) -> Self {
+    pub fn from_kernel(kernel: &Kernel, size: usize, density: f32) -> Self {
         assert!(
             density.is_finite() && density > 0.0,
             "invalid bake density: {density}"
@@ -343,20 +293,11 @@ impl GlyphCache {
         // Bake at the quantized density so the key and the lattice agree.
         let density = density_q as f32 / DENSITY_STEPS;
         let px = px_extent(bucket, density);
-        // JIT-first on architectures with an arena backend: the glyph as ONE
-        // fused coverage Kernel, compiled once, tabulated by Lattice::bake.
-        // The combinator/Jet2 path remains the portable fallback (WASM,
-        // scalar) until the interpreter-collapse path replaces it (P6).
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        let cached = {
-            let kernel = font.glyph_kernel_scaled(ch, px as f32)?;
-            CachedGlyph::from_kernel(&kernel, bucket, density)
-        };
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let cached = {
-            let glyph = font.glyph_scaled(ch, px as f32)?;
-            CachedGlyph::new(&glyph, bucket, density)
-        };
+        // The glyph as ONE fused coverage Kernel, compiled once, tabulated by
+        // Lattice::bake. There is no fallback path: an architecture without an
+        // arena backend fails to build, loudly, rather than rendering slowly.
+        let kernel = font.glyph_kernel_scaled(ch, px as f32)?;
+        let cached = CachedGlyph::from_kernel(&kernel, bucket, density);
         self.entries.insert(key, cached.clone());
         Some(cached)
     }
@@ -448,8 +389,19 @@ impl Default for GlyphCache {
 /// ```
 #[derive(Clone)]
 pub struct CachedText {
-    /// Composed cached glyphs.
-    inner: Sum<Affine<CachedGlyph>>,
+    /// Positioned cached glyphs: each sampled at `((x - dx) * inv_scale, y * inv_scale)`.
+    glyphs: Vec<PlacedGlyph>,
+}
+
+/// One laid-out glyph: a baked sampler plus its pen translation and the
+/// bucket→request scale. Runtime composition of opaque baked textures — the
+/// one place composition legitimately stays in `Manifold` land (the samplers
+/// enter the language as bound buffers, not expressions).
+#[derive(Clone)]
+struct PlacedGlyph {
+    glyph: CachedGlyph,
+    dx: f32,
+    inv_scale: f32,
 }
 
 impl CachedText {
@@ -477,12 +429,14 @@ impl CachedText {
                 cursor_x += font.kern_by_ids(prev, id) * inv_em;
             }
 
-            // Get cached glyph
+            // Get cached glyph; the bake is at bucket size, so queries scale
+            // from request space into bucket space.
             if let Some(cached) = cache.get(font, ch, size, density) {
-                // Scale and translate to cursor position
-                // The cached glyph is at bucket size, so we need to scale it
-                let transform = [scale, 0.0, 0.0, scale, cursor_x, 0.0];
-                glyphs.push(affine(cached, transform));
+                glyphs.push(PlacedGlyph {
+                    glyph: cached,
+                    dx: cursor_x,
+                    inv_scale: 1.0 / scale,
+                });
             }
 
             // Advance cursor using pre-looked-up glyph ID
@@ -493,15 +447,7 @@ impl CachedText {
             prev_id = Some(id);
         }
 
-        Self {
-            inner: Sum(glyphs.into()),
-        }
-    }
-
-    /// Get the composed glyph structure.
-    #[must_use]
-    pub fn inner(&self) -> &Sum<Affine<CachedGlyph>> {
-        &self.inner
+        Self { glyphs }
     }
 }
 
@@ -511,8 +457,15 @@ impl Manifold<Field4> for CachedText {
     #[inline(always)]
     fn eval(&self, p: Field4) -> Field {
         let (x, y, z, w) = p;
-        // Sum of cached glyph coverages (just like Text)
-        self.inner.eval_raw(x, y, z, w)
+        let mut acc = Field::from(0.0);
+        for pg in &self.glyphs {
+            let s = Field::from(pg.inv_scale);
+            let u = ((x - Field::from(pg.dx)) * s).eval(p);
+            let v = (y * s).eval(p);
+            let cov = pg.glyph.eval((u, v, z, w));
+            acc = (acc + cov).eval(p);
+        }
+        acc
     }
 }
 
@@ -523,6 +476,7 @@ impl Manifold<Field4> for CachedText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pixelflow_core::ManifoldCompat;
 
     // Use the fallback font, which is committed directly (not Git-LFS) so the
     // tests run without `git lfs pull`. NotoSansMono is an LFS pointer.
@@ -587,8 +541,8 @@ mod tests {
     #[test]
     fn cached_glyph_creation() {
         let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
-        let cached = CachedGlyph::new(&glyph, 32, 1.0);
+        let glyph = font.glyph_kernel_scaled('A', 32.0).unwrap();
+        let cached = CachedGlyph::from_kernel(&glyph, 32, 1.0);
 
         assert_eq!(cached.width(), 32);
         assert_eq!(cached.height(), 32);
@@ -597,8 +551,8 @@ mod tests {
     #[test]
     fn baked_coverage_dimensions_range_and_ink() {
         let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
-        let cached = CachedGlyph::new(&glyph, 32, 1.0);
+        let glyph = font.glyph_kernel_scaled('A', 32.0).unwrap();
+        let cached = CachedGlyph::from_kernel(&glyph, 32, 1.0);
 
         let coverage = cached.coverage();
         assert_eq!(coverage.width(), 32);
@@ -625,20 +579,19 @@ mod tests {
     #[test]
     fn cached_glyph_matches_analytical_at_pixel_centers() {
         // At pixel centers the bilinear weights vanish, so the cached glyph
-        // must reproduce the analytical *antialiased* glyph exactly (up to
-        // f32 noise) — the bake stores Antialiased coverage.
+        // must reproduce the analytical coverage kernel exactly (up to f32
+        // noise) — the bake tabulates the same fused kernel.
         let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
-        let smooth = Antialiased::new(&glyph);
-        let cached = CachedGlyph::new(&glyph, 32, 1.0);
+        let kernel = font.glyph_kernel_scaled('A', 32.0).unwrap();
+        let cached = CachedGlyph::from_kernel(&kernel, 32, 1.0);
 
         for &(i, j) in &[(4usize, 4usize), (10, 16), (16, 8), (16, 20), (24, 28)] {
             let (x, y) = (i as f32 + 0.5, j as f32 + 0.5);
-            let direct = sample(&smooth, x, y);
+            let direct = Lattice::point(x, y, 0.0, 0.0).bake(&kernel).into_buffer()[0];
             let baked = sample(&cached, x, y);
             assert!(
                 (direct - baked).abs() < 1e-5,
-                "cached glyph diverges from analytical AA at pixel center ({x}, {y}): \
+                "cached glyph diverges from the analytical kernel at pixel center ({x}, {y}): \
                  direct {direct}, baked {baked}"
             );
         }
@@ -651,21 +604,20 @@ mod tests {
         // convention error here shows up as a ~0.5px center-of-mass shift.
         let size = 32usize;
         let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', size as f32).unwrap();
+        let kernel = font.glyph_kernel_scaled('A', size as f32).unwrap();
 
-        // Direct analytical AA tabulation at pixel centers (the rasterizer's
-        // sampling convention, without the u8 quantization of the old path).
-        // Antialiased to match what the bake stores.
+        // Direct analytical tabulation at pixel centers (the rasterizer's
+        // sampling convention).
         let direct = Lattice {
             extent: [size as u32, size as u32, 1, 1],
             origin: [0.5, 0.5, 0.0, 0.0],
         }
-        .collapse(&Antialiased::new(&glyph));
+        .bake(&kernel);
         let (dx, dy) = center_of_mass(direct.buffer(), size);
 
         // Cached glyph sampled at pixel centers through the full
         // bake -> bilinear -> half-pixel-shift chain.
-        let cached = CachedGlyph::new(&glyph, size, 1.0);
+        let cached = CachedGlyph::from_kernel(&kernel, size, 1.0);
         let resampled = Lattice {
             extent: [size as u32, size as u32, 1, 1],
             origin: [0.5, 0.5, 0.0, 0.0],
@@ -685,8 +637,8 @@ mod tests {
         // filtering a quarter-pixel step can change coverage by at most
         // ~0.25 (texels are in [0,1]); nearest-neighbor jumps by up to 1.0.
         let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
-        let cached = CachedGlyph::new(&glyph, 32, 1.0);
+        let glyph = font.glyph_kernel_scaled('A', 32.0).unwrap();
+        let cached = CachedGlyph::from_kernel(&glyph, 32, 1.0);
 
         let step = 0.25;
         for &y in &[8.5f32, 16.5, 24.5] {
@@ -747,8 +699,8 @@ mod tests {
         use pixelflow_core::Field;
 
         let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_scaled('A', 32.0).unwrap();
-        let cached = CachedGlyph::new(&glyph, 32, 1.0);
+        let glyph = font.glyph_kernel_scaled('A', 32.0).unwrap();
+        let cached = CachedGlyph::from_kernel(&glyph, 32, 1.0);
 
         // Evaluate coverage at multiple coordinates - should not panic
         for x in [2.0, 8.0, 16.0, 24.0] {

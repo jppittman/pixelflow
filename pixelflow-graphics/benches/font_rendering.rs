@@ -1,10 +1,10 @@
-//! Font rendering benchmarks comparing PixelFlow analytical rendering with FreeType.
+//! Font rendering benchmarks comparing PixelFlow kernel rendering with FreeType.
 //!
 //! Run with: cargo bench -p pixelflow-graphics
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use pixelflow_core::Lattice;
 use pixelflow_graphics::fonts::{text, CachedText, Font, GlyphCache};
-use pixelflow_graphics::render::aa::aa;
 use pixelflow_graphics::render::color::{Grayscale, Rgba8};
 use pixelflow_graphics::render::frame::Frame;
 use pixelflow_graphics::render::rasterizer::rasterize;
@@ -12,23 +12,25 @@ use pixelflow_graphics::render::rasterizer::rasterize;
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
 // ============================================================================
-// PixelFlow Analytical Rendering Benchmarks
+// PixelFlow Kernel Rendering Benchmarks
 // ============================================================================
 
 fn bench_pixelflow_single_char(c: &mut Criterion) {
     let mut group = c.benchmark_group("pixelflow_single_char");
     let font = Font::parse(FONT_DATA).unwrap();
 
-    // Benchmark different characters to test linear vs quadratic curves
+    // Different characters exercise linear vs quadratic curve solvers. The
+    // glyph is one fused kernel; the JIT compile is cached, so iterations
+    // measure the tabulation (the per-frame cost).
     for (label, ch) in [("A_linear", 'A'), ("O_quadratic", 'O'), ("S_complex", 'S')] {
         group.bench_function(label, |b| {
-            let glyph = text(&font, &ch.to_string(), 32.0);
-            let colored = Grayscale(glyph);
-            let mut frame = Frame::<Rgba8>::new(40, 45);
+            let kernel = text(&font, &ch.to_string(), 32.0);
+            let lattice = Lattice {
+                extent: [40, 45, 1, 1],
+                origin: [0.5, 0.5, 0.0, 0.0],
+            };
 
-            b.iter(|| {
-                rasterize(black_box(&colored), black_box(&mut frame), 1);
-            });
+            b.iter(|| black_box(lattice.bake(black_box(&kernel))));
         });
     }
 
@@ -43,65 +45,14 @@ fn bench_pixelflow_text_sizes(c: &mut Criterion) {
         let text_str: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().take(length).collect();
 
         group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
-            let glyph = text(&font, &text_str, 16.0);
-            let colored = Grayscale(glyph);
-            let width = (length as u32) * 15;
-            let mut frame = Frame::<Rgba8>::new(width, 24);
+            let kernel = text(&font, &text_str, 16.0);
+            let lattice = Lattice {
+                extent: [(length as u32) * 15, 24, 1, 1],
+                origin: [0.5, 0.5, 0.0, 0.0],
+            };
 
-            b.iter(|| {
-                rasterize(black_box(&colored), black_box(&mut frame), 1);
-            });
+            b.iter(|| black_box(lattice.bake(black_box(&kernel))));
         });
-    }
-
-    group.finish();
-}
-
-fn bench_pixelflow_aa_text(c: &mut Criterion) {
-    // Antialiased uncached path: same pipeline as `text`, evaluated over Jet2
-    // coordinates (gradient-normalized crossing ramps). Measures the cost of
-    // Jet2 autodiff evaluation relative to the hard Field path above.
-    let mut group = c.benchmark_group("pixelflow_aa_text");
-    let font = Font::parse(FONT_DATA).unwrap();
-
-    for length in [5, 10, 26, 50] {
-        let text_str: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().take(length).collect();
-
-        group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
-            let glyph = aa(text(&font, &text_str, 16.0));
-            let colored = Grayscale(glyph);
-            let width = (length as u32) * 15;
-            let mut frame = Frame::<Rgba8>::new(width, 24);
-
-            b.iter(|| {
-                rasterize(black_box(&colored), black_box(&mut frame), 1);
-            });
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_pixelflow_threading(c: &mut Criterion) {
-    let mut group = c.benchmark_group("pixelflow_threading");
-    let font = Font::parse(FONT_DATA).unwrap();
-
-    let text_str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let glyph = text(&font, text_str, 16.0);
-    let colored = Grayscale(glyph);
-
-    for threads in [1, 2, 4, 8] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(threads),
-            &threads,
-            |b, &threads| {
-                let mut frame = Frame::<Rgba8>::new(360, 24);
-
-                b.iter(|| {
-                    rasterize(black_box(&colored), black_box(&mut frame), threads);
-                });
-            },
-        );
     }
 
     group.finish();
@@ -111,16 +62,21 @@ fn bench_pixelflow_with_caching(c: &mut Criterion) {
     let mut group = c.benchmark_group("pixelflow_caching");
     let font = Font::parse(FONT_DATA).unwrap();
 
-    // Compare cached vs uncached text rendering
+    // Uncached: compose the text kernel and bake it (compile is cached across
+    // iterations; construction + tabulation dominate).
     group.bench_function("uncached_HELLO", |b| {
+        let lattice = Lattice {
+            extent: [100, 30, 1, 1],
+            origin: [0.5, 0.5, 0.0, 0.0],
+        };
         b.iter(|| {
-            let glyph = text(&font, "HELLO", 20.0);
-            let colored = Grayscale(glyph);
-            let mut frame = Frame::<Rgba8>::new(100, 30);
-            rasterize(&colored, &mut frame, 1);
+            let kernel = text(&font, "HELLO", 20.0);
+            black_box(lattice.bake(&kernel));
         });
     });
 
+    // Cached: CachedText composes baked glyph samplers and rasterizes as an
+    // ordinary manifold.
     group.bench_function("cached_HELLO", |b| {
         let mut cache = GlyphCache::new();
         let cached = CachedText::new(&font, &mut cache, "HELLO", 20.0, 1.0);
@@ -132,7 +88,7 @@ fn bench_pixelflow_with_caching(c: &mut Criterion) {
         });
     });
 
-    // Measure cache warm-up overhead
+    // Measure cache warm-up overhead (bakes one fused kernel per glyph).
     group.bench_function("cache_warmup_alphabet", |b| {
         b.iter(|| {
             let mut cache = GlyphCache::new();
@@ -208,8 +164,6 @@ criterion_group!(
     pixelflow_benches,
     bench_pixelflow_single_char,
     bench_pixelflow_text_sizes,
-    bench_pixelflow_aa_text,
-    bench_pixelflow_threading,
     bench_pixelflow_with_caching,
 );
 

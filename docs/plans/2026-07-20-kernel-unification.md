@@ -233,9 +233,30 @@ to-be-retired backend, tracked until that backend dies.
   forced register pressure: both-spilled selects, glyph-shaped sums, nested
   selects, decomposed MulAdd/Clamp, beyond-red-zone frames).
 
-  Remaining for P5 proper: switch `CachedGlyph::new` to `Lattice::bake` on the
-  glyph `Kernel`, then delete the combinator glyph pipeline (`Glyph`/`Geometry`/
-  `Sum`/`Affine` + leaf `Manifold`/`Lower` impls + graphics' pixelflow-ir dep).
+  **Combinator glyph pipeline DELETED 2026-07-24.** There is no portable
+  fallback and no interpreter tier (decision: kill it — an architecture
+  without an arena backend fails to *build* the font path, loudly, rather
+  than rendering through a slow secret code path). What changed:
+  - `ttf.rs` compiles a glyph straight to a coverage `Kernel` during parse:
+    `Glyph`/`Geometry`/`Sum`/`Affine`/`Line`/`Quad` and every `Manifold`/
+    `Lower` impl are gone; `Font::glyph_kernel*` is the only glyph surface.
+  - `ttf_curve_analytical.rs` keeps only the coefficient structs + their
+    `kernel_value!`-built `.kernel()`; the per-domain `kernel!` stamps and
+    `Lower` impls are deleted.
+  - `text()` returns one fused `Kernel` (sum of advance-translated glyph
+    kernels). `CachedText` composes baked *samplers* directly (a plain
+    positioned-glyph struct — the one place composition legitimately stays
+    in `Manifold` land, per the opaque-manifolds row above).
+  - `CachedGlyph::new` (Jet2/`Antialiased` bake) deleted; `from_kernel` is
+    the only bake. `render/aa.rs` (`Antialiased`) deleted — AA is intrinsic
+    to the kernels (`Dwrt`), not a wrapper. Graphics' pixelflow-ir main
+    dependency dropped (dev-dep only, for the interpreter-reference golden).
+  - Goldens are now JIT-vs-interpreter on the same arena ('A','O','g','8');
+    the AA behavioral guarantees (ramp width, scale invariance, tangent
+    finiteness) are asserted on the kernel path.
+  What remains of P6: delete the combinator *emitter* in pixelflow-compiler
+  (and the ZST expression-template layer in core) once the remaining
+  `kernel!` consumers migrate — fonts no longer depend on it.
 
 ## Beyond P6 — the language the totality axiom demands
 

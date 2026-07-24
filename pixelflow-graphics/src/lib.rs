@@ -181,8 +181,8 @@ pub use spatial_bsp::{Positioned, SpatialBSP};
 pub use baked::Baked;
 pub use transform::Scale;
 
-// Re-export fonts (user-facing types only; internal combinators like Affine/Sum stay in fonts::ttf)
-pub use fonts::{CachedGlyph, CachedText, Font, Glyph, GlyphCache};
+// Re-export fonts (user-facing types only)
+pub use fonts::{CachedGlyph, CachedText, Font, GlyphCache};
 
 // Re-export render
 pub use render::color::{
