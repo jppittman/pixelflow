@@ -2,9 +2,16 @@
 
 ## Metadata
 - **Author**: jppittman
-- **Status**: Draft
+- **Status**: Superseded by `docs/designs/actor-scheduler-mealy-transducer.md`
 - **Created**: 2026-02-20
 - **Reviewers**: —
+
+> **Superseded (2026-07-24).** The Kubernetes framing here was a supervision metaphor wearing a
+> scheduling costume: it welded *actor* to *OS thread* and explicitly punted on preemption. The
+> replacement models an actor as a Mealy machine whose handler *returns* its output instead of
+> calling `send`, which makes scheduling a property of the primitive rather than of a cluster.
+> Kept for history and for the restart/frequency-gate mechanics, which survive as a plain
+> supervisor. See the Mealy-transducer doc.
 
 ---
 
