@@ -375,35 +375,6 @@ impl Lattice {
         }
     }
 
-    /// Tabulate `manifold` over the domain through the compiler when it can:
-    /// lower the whole tree to IR, JIT-compile ONE fused kernel (through the
-    /// global compile cache), and collapse that. Falls back to the generic
-    /// [`Lattice::collapse`] when any node declines to lower, the backend
-    /// refuses the kernel, or this build's `Field` width is not the JIT's.
-    /// The consumer cannot observe which path ran except by speed.
-    ///
-    /// This is the boundary verb of the kernel-unification design
-    /// (docs/designs/2026-07-23-lower-realize-boundary.md): `Lower` rides as
-    /// a bound the way `Send` does — callers neither implement nor invoke it.
-    pub fn realize<M>(&self, manifold: &M) -> DiscreteManifold
-    where
-        M: Manifold<(Field, Field, Field, Field), Output = Field> + pixelflow_ir::Lower,
-    {
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        {
-            if core::mem::size_of::<Field>() == pixelflow_ir::JIT_VECTOR_BYTES {
-                let mut arena = pixelflow_ir::ExprArena::new();
-                let mut env = pixelflow_ir::LowerEnv::default();
-                if let Some(root) = manifold.lower(&mut arena, &mut env)
-                    && let Ok(jit) = pixelflow_ir::jit_cache::compile_cached(&arena, root)
-                {
-                    return self.collapse(&RealizedKernel(jit));
-                }
-            }
-        }
-        self.collapse(manifold)
-    }
-
     /// Bake a [`Kernel`](pixelflow_ir::Kernel) — the front-end value — over the
     /// domain: JIT-compile it once (through the global cache) and tabulate. The
     /// JIT-first path: no combinator manifold, no `Lower`, just the arena the
@@ -618,8 +589,8 @@ impl Lattice {
 mod tests;
 
 /// A JIT-compiled kernel driving the generic collapse loop — the fast path
-/// of [`Lattice::realize`]. `Field` is transmuted to the emitter's vector
-/// ABI; `realize` guards the width match before constructing one.
+/// of [`Lattice::bake`]. `Field` is transmuted to the emitter's vector ABI;
+/// `bake` guards the width match before constructing one.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 struct RealizedKernel(alloc::sync::Arc<pixelflow_ir::JitManifold>);
 
