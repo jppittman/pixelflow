@@ -14,7 +14,6 @@ pub mod project;
 pub mod select;
 pub mod spherical;
 pub mod texture;
-pub mod with_gradient;
 
 pub use at::{At, AtArray};
 pub use binding::{
@@ -36,4 +35,3 @@ pub use spherical::{
     SH_NORM, Sh1, Sh2, Sh3, ShCoeffs, ShProject, ShReconstruct, SphericalHarmonic, ZonalHarmonic,
 };
 pub use texture::Texture;
-pub use with_gradient::{WithGradient, WithGradient2D, WithGradient3D};
