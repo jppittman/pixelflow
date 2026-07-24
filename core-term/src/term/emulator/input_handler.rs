@@ -198,6 +198,7 @@ pub(super) fn process_control_event(
 mod tests {
     use super::*;
     use crate::term::emulator::TerminalEmulator;
+    use crate::term::EmulatorInput;
 
     fn create_test_emu_for_input() -> TerminalEmulator {
         TerminalEmulator::new(80, 24)
@@ -217,7 +218,7 @@ mod tests {
         let text_to_paste = "Hello\nWorld".to_string();
         let action = UserInputAction::PasteText(text_to_paste.clone());
 
-        let result = process_user_input_action(&mut emu, action);
+        let result = emu.interpret_input(EmulatorInput::User(action));
 
         let expected_bytes = format!("\x1b[200~{}\x1b[201~", text_to_paste).into_bytes();
         assert_eq!(result, Some(EmulatorAction::WritePty(expected_bytes)));
@@ -231,7 +232,7 @@ mod tests {
         let text_to_paste = "Hello\nWorld".to_string();
         let action = UserInputAction::PasteText(text_to_paste.clone());
 
-        let result = process_user_input_action(&mut emu, action);
+        let result = emu.interpret_input(EmulatorInput::User(action));
         assert_eq!(result, Some(EmulatorAction::RequestRedraw));
 
         let snapshot_option = emu.get_render_snapshot();
@@ -303,7 +304,7 @@ mod tests {
             height_px: 800,
         };
 
-        let result = process_control_event(&mut emu, resize_event);
+        let result = emu.interpret_input(EmulatorInput::Control(resize_event));
 
         // Should return ResizePty action with calculated dimensions
         assert_eq!(
@@ -334,7 +335,7 @@ mod tests {
             height_px: 1,
         };
 
-        let result = process_control_event(&mut emu, resize_event);
+        let result = emu.interpret_input(EmulatorInput::Control(resize_event));
 
         // Should clamp to minimum dimensions
         match result {
@@ -360,7 +361,7 @@ mod tests {
     fn control_event_request_snapshot_returns_none() {
         let mut emu = create_test_emu_for_input();
 
-        let result = process_control_event(&mut emu, ControlEvent::RequestSnapshot);
+        let result = emu.interpret_input(EmulatorInput::Control(ControlEvent::RequestSnapshot));
 
         assert_eq!(result, None, "RequestSnapshot should return None");
     }
@@ -369,7 +370,7 @@ mod tests {
     fn control_event_pty_data_ready_returns_none() {
         let mut emu = create_test_emu_for_input();
 
-        let result = process_control_event(&mut emu, ControlEvent::PtyDataReady);
+        let result = emu.interpret_input(EmulatorInput::Control(ControlEvent::PtyDataReady));
 
         assert_eq!(result, None, "PtyDataReady should return None");
     }
