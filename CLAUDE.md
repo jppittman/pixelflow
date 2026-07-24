@@ -17,7 +17,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **NO PUBLIC raw_mul, raw_select, raw_add ETC USAGE** NONE. ZERO. Do not perform raw operations on fields/jets without explicit direction. ALWAYS construct the AST, then use the nested contramap pattern to evaluate it.
 - **SIMD is an implementation detail.** `Batch::splat` and `Field::splat` are `pub(crate)`. Do NOT expose them. Do not expose `SimdVec`s. Do not expose anything that hints at lanes. pixelflow-core is an algebra; writing it should look like Halide, not assembly.
 - **Minimal public API** - Do NOT change visibility of internal APIs without explicit permission. Keep `pub(crate)` and private items encapsulated. Use Manifold composition instead of exposing internals.
-- **Suckless Dependencies**: Keep dependencies to the bare, bare minimum. (no crossbeam)
 
 ### Philosophy
 
