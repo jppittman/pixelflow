@@ -51,10 +51,18 @@ use pixelflow_ir::{ExprArena, ExprId, LatticeShape};
 
 use super::cost::CostModel;
 use super::extract::{Extraction, IncrementalExtractor, Reranker, choices_to_arena};
-use super::graph::{EGraph, SaturationStop};
+use super::graph::{Congruence, EGraph, SaturationStop};
 use super::node::EClassId;
 use super::provenance::ApplicationRecord;
 use super::rules::{Fingerprint, RuleSet};
+
+/// **The production congruence direction.** Named as a constant so that
+/// "what ships" is something to read rather than a default to infer from a
+/// builder body.
+///
+/// See `docs/results/2026-09-02-upward-congruence-ab.md` for the A/B this
+/// value is set from.
+pub const PRODUCTION_CONGRUENCE: Congruence = Congruence::Downward;
 
 /// A sink for what saturation did.
 ///
@@ -228,6 +236,7 @@ pub struct Optimizer {
     rerank: Option<Box<dyn Reranker>>,
     observer: Option<Box<dyn Observer>>,
     hard_ceiling: Option<core::time::Duration>,
+    congruence: Congruence,
 }
 
 /// How many alternatives per e-class the reranking search evaluates. Matches
@@ -248,6 +257,7 @@ impl Optimizer {
             rerank: None,
             observer: None,
             hard_ceiling: None,
+            congruence: PRODUCTION_CONGRUENCE,
         }
     }
 
@@ -344,12 +354,20 @@ impl Optimizer {
         &self.rules
     }
 
-    /// An empty e-graph carrying this optimizer's rule set. Insert your term
-    /// into it and hand it to [`Optimizer::run`].
+    /// Repair congruence in the given direction. See [`Congruence`]; the
+    /// production choice is [`PRODUCTION_CONGRUENCE`].
+    #[must_use]
+    pub fn congruence(mut self, congruence: Congruence) -> Self {
+        self.congruence = congruence;
+        self
+    }
+
+    /// An empty e-graph carrying this optimizer's rule set and congruence
+    /// direction. Insert your term into it and hand it to [`Optimizer::run`].
     #[must_use]
     pub fn egraph(&self) -> EGraph {
         let (rules, ids) = self.rules.shared();
-        EGraph::with_shared_rules(rules, ids)
+        EGraph::with_shared_rules(rules, ids).with_congruence(self.congruence)
     }
 
     /// Saturate `egraph` from `root` under this configuration, and extract.

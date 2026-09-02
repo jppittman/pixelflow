@@ -1184,7 +1184,7 @@ mod tests {
 mod congruence_gap_probe {
     use super::*;
     use crate::egraph::rule_order::{RuleOrder, build_rule_set};
-    use crate::egraph::{CostModel, RuleSet, SaturationStop, choices_to_arena};
+    use crate::egraph::{Congruence, CostModel, RuleSet, SaturationStop, choices_to_arena};
     use crate::nnue::{BwdGenConfig, BwdGenerator};
     use pixelflow_ir::arena::{BufferId, BufferIdentity};
     use std::path::{Path, PathBuf};
@@ -2049,5 +2049,542 @@ mod congruence_gap_probe {
         .unwrap();
 
         std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+
+    // ================= A/B: upward vs downward congruence =================
+    //
+    // The offline probe above measured a post-hoc closure on a CLONE, which
+    // is a LOWER bound on what upward congruence does online: closure during
+    // saturation feeds back into matching, so a merge found early changes
+    // which rules fire afterwards. That feedback is the thing the offline
+    // number structurally cannot see, and it is what this A/B measures.
+
+    /// Finer than `category_of`: the A/B reports glyph16 and glyph32
+    /// separately, because they are different display densities and the task
+    /// asks per group.
+    fn ab_group_of(filename: &str) -> &'static str {
+        if filename.starts_with("cellgrid_") {
+            "cellgrid"
+        } else if filename.starts_with("shader_") {
+            "shader"
+        } else if filename.starts_with("psychedelic") {
+            "psychedelic"
+        } else if filename.starts_with("glyph16") {
+            "glyph16"
+        } else if filename.starts_with("glyph32") {
+            "glyph32"
+        } else {
+            "unknown"
+        }
+    }
+
+    /// One arm's result for one kernel.
+    #[derive(Clone, Debug)]
+    struct AbArm {
+        cost: usize,
+        classes: usize,
+        live_classes: usize,
+        applications: u64,
+        iterations: usize,
+        unions: usize,
+        stop: String,
+        hit_class_cap: bool,
+        upward_enqueues: u64,
+        upward_edges: usize,
+        elapsed_ms: f64,
+    }
+
+    #[derive(Clone, Debug)]
+    struct AbRow {
+        name: String,
+        group: &'static str,
+        rule_order: String,
+        node_count: usize,
+        max_classes: usize,
+        down: AbArm,
+        up: AbArm,
+    }
+
+    impl AbRow {
+        fn cost_change_frac(&self) -> f64 {
+            if self.down.cost == 0 {
+                return 0.0;
+            }
+            (self.up.cost as f64 - self.down.cost as f64) / self.down.cost as f64
+        }
+        fn class_change_frac(&self) -> f64 {
+            if self.down.classes == 0 {
+                return 0.0;
+            }
+            (self.up.classes as f64 - self.down.classes as f64) / self.down.classes as f64
+        }
+    }
+
+    /// Run the production regime once under `order` and `congruence`.
+    ///
+    /// Everything except those two levers is exactly `Optimizer::production()`
+    /// — the same entry point `optimize_runtime_arena_uncached` calls.
+    fn run_arm(
+        name: &str,
+        order: RuleOrder,
+        congruence: Congruence,
+        arena: &ExprArena,
+        root: ExprId,
+    ) -> (AbArm, usize, usize) {
+        let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
+            .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
+        let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
+        let node_count = reachable_count(&arena, root);
+
+        let mut optimizer = match order {
+            RuleOrder::Production => Optimizer::production(),
+            other => Optimizer::production().rules(RuleSet::new(build_rule_set(other))),
+        }
+        .congruence(congruence);
+
+        let mut egraph = optimizer.egraph();
+        let mut memo: HashMap<ExprId, EClassId> = HashMap::new();
+        let root_class = arena_to_egraph(&arena, root, &mut egraph, &mut memo)
+            .unwrap_or_else(|| panic!("{name}: arena_to_egraph returned None (unsupported node)"));
+
+        // Wall clock is CONTEXT here, never a metric: it is recorded so the
+        // extra work upward repair does is visible, and it is reported with
+        // the machine's load. No decision reads it.
+        let started = std::time::Instant::now();
+        let optimized = optimizer.run(&mut egraph, root_class, node_count);
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+
+        let model = CostModel::latency_prior();
+        let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
+        let cost = arena_static_cost(&model, &extracted, extracted_root);
+
+        let arm = AbArm {
+            cost,
+            classes: optimized.stats.classes,
+            live_classes: live_class_count(&egraph),
+            applications: optimized.stats.applications,
+            iterations: optimized.stats.iterations,
+            unions: optimized.stats.unions,
+            stop: format!("{:?}", optimized.stats.stop),
+            hit_class_cap: optimized.stats.stop == SaturationStop::ClassCap,
+            upward_enqueues: egraph.upward_enqueues(),
+            upward_edges: egraph.upward_edge_count(),
+            elapsed_ms,
+        };
+        (arm, node_count, optimized.stats.limits.classes)
+    }
+
+    fn measure_ab(
+        name: &str,
+        group: &'static str,
+        order: RuleOrder,
+        arena: &ExprArena,
+        root: ExprId,
+    ) -> AbRow {
+        let (down, node_count, max_classes) =
+            run_arm(name, order, Congruence::Downward, arena, root);
+        let (up, _, _) = run_arm(name, order, Congruence::Upward, arena, root);
+        AbRow {
+            name: name.to_string(),
+            group,
+            rule_order: order.to_string(),
+            node_count,
+            max_classes,
+            down,
+            up,
+        }
+    }
+
+    /// A/B of [`Congruence::Upward`] against production's
+    /// [`Congruence::Downward`], on the same corpus the offline probe used.
+    ///
+    /// Run with:
+    /// ```text
+    /// PIXELFLOW_CONGRUENCE_ARENA_DIR=<dir of .arena dumps> \
+    ///   cargo test -p pixelflow-search --release --lib -- --ignored upward_congruence_ab
+    /// ```
+    #[test]
+    #[ignore = "measurement harness; needs PIXELFLOW_CONGRUENCE_ARENA_DIR"]
+    fn upward_congruence_ab() {
+        let dir = PathBuf::from(
+            std::env::var("PIXELFLOW_CONGRUENCE_ARENA_DIR")
+                .expect("PIXELFLOW_CONGRUENCE_ARENA_DIR must be set"),
+        );
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().map(|e| e == "arena").unwrap_or(false))
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "no .arena files in {}", dir.display());
+
+        let mut rows: Vec<AbRow> = Vec::new();
+        for path in &paths {
+            let (name, arena, root) = load_arena_dump(path);
+            let group = ab_group_of(&path.file_name().unwrap().to_string_lossy());
+            rows.push(measure_ab(
+                &name,
+                group,
+                RuleOrder::Production,
+                &arena,
+                root,
+            ));
+        }
+        let real_count = rows.len();
+        eprintln!("ab: {real_count} real kernels done");
+
+        let templates = crate::egraph::collect_rule_templates();
+        for &max_depth in &[3usize, 5, 7, 9, 11] {
+            for seed in 0u64..40 {
+                let config = BwdGenConfig {
+                    max_depth,
+                    ..Default::default()
+                };
+                let mut generator = BwdGenerator::new(
+                    seed.wrapping_add(max_depth as u64 * 10_000),
+                    config,
+                    templates.clone(),
+                );
+                let pair = generator.generate_arena();
+                rows.push(measure_ab(
+                    &format!("synth_d{max_depth}_s{seed}"),
+                    "synthetic",
+                    RuleOrder::Production,
+                    &pair.arena,
+                    pair.unoptimized,
+                ));
+            }
+        }
+        eprintln!("ab: {} synthetic done", rows.len() - real_count);
+
+        // ---- order sensitivity: production vs numeric-first, per arm ----
+        // The headline question: does closing congruence SHRINK the gap
+        // between rule orderings? If it does, the order effect measured in
+        // #1101/#1088 was substantially an artifact of missing congruence.
+        let mut order_rows: Vec<AbRow> = Vec::new();
+        for path in &paths {
+            let (name, arena, root) = load_arena_dump(path);
+            let group = ab_group_of(&path.file_name().unwrap().to_string_lossy());
+            order_rows.push(measure_ab(
+                &name,
+                group,
+                RuleOrder::NumericFirst,
+                &arena,
+                root,
+            ));
+        }
+        eprintln!("ab: {} numeric-first rows done", order_rows.len());
+
+        write_ab_report(&rows, &order_rows, real_count);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn write_ab_report(rows: &[AbRow], order_rows: &[AbRow], real_count: usize) {
+        let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("docs/results");
+        std::fs::create_dir_all(&out).expect("create docs/results");
+
+        // ---- CSV: every row, both arms ----
+        let mut csv = String::from(
+            "name,group,rule_order,node_count,max_classes,\
+             down_cost,up_cost,cost_change_frac,\
+             down_classes,up_classes,class_change_frac,\
+             down_live,up_live,down_apps,up_apps,down_iters,up_iters,\
+             down_unions,up_unions,down_stop,up_stop,down_cap,up_cap,\
+             up_enqueues,up_edges,down_ms,up_ms\n",
+        );
+        for r in rows.iter().chain(order_rows.iter()) {
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{},{:.6},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3}\n",
+                r.name, r.group, r.rule_order, r.node_count, r.max_classes,
+                r.down.cost, r.up.cost, r.cost_change_frac(),
+                r.down.classes, r.up.classes, r.class_change_frac(),
+                r.down.live_classes, r.up.live_classes,
+                r.down.applications, r.up.applications,
+                r.down.iterations, r.up.iterations,
+                r.down.unions, r.up.unions,
+                r.down.stop, r.up.stop, r.down.hit_class_cap, r.up.hit_class_cap,
+                r.up.upward_enqueues, r.up.upward_edges,
+                r.down.elapsed_ms, r.up.elapsed_ms,
+            ));
+        }
+        let csv_path = out.join("2026-09-02-upward-congruence-ab.csv");
+        std::fs::write(&csv_path, &csv).expect("write csv");
+
+        // ---- aggregates ----
+        let mut cost_changes: Vec<f64> = rows.iter().map(AbRow::cost_change_frac).collect();
+        let worse: Vec<&AbRow> = rows.iter().filter(|r| r.up.cost > r.down.cost).collect();
+        let better: Vec<&AbRow> = rows.iter().filter(|r| r.up.cost < r.down.cost).collect();
+        let real_worse: Vec<&AbRow> = worse
+            .iter()
+            .copied()
+            .filter(|r| r.group != "synthetic")
+            .collect();
+        let down_cap = rows.iter().filter(|r| r.down.hit_class_cap).count();
+        let up_cap = rows.iter().filter(|r| r.up.hit_class_cap).count();
+        let total_down_cost: usize = rows.iter().map(|r| r.down.cost).sum();
+        let total_up_cost: usize = rows.iter().map(|r| r.up.cost).sum();
+        let total_edges: usize = rows.iter().map(|r| r.up.upward_edges).sum();
+        let total_enq: u64 = rows.iter().map(|r| r.up.upward_enqueues).sum();
+        let total_up_classes: usize = rows.iter().map(|r| r.up.classes).sum();
+        let sum_down_ms: f64 = rows.iter().map(|r| r.down.elapsed_ms).sum();
+        let sum_up_ms: f64 = rows.iter().map(|r| r.up.elapsed_ms).sum();
+
+        let mut md = String::new();
+        md.push_str("# Upward congruence closure: A/B (issue #1106)\n\n");
+        md.push_str(&format!(
+            "`Congruence::Upward` vs production's `Congruence::Downward`, both through \
+             `Optimizer::production()` — same rule set, same `Budget::Production`, same \
+             `CostModel::latency_prior()`. {} kernels ({real_count} real + {} synthetic), \
+             plus {} numeric-first rows for the order-sensitivity question.\n\n",
+            rows.len(),
+            rows.len() - real_count,
+            order_rows.len()
+        ));
+        md.push_str(&format!(
+            "## Headline\n\n\
+             - median extracted-cost change: **{:+.3}%**\n\
+             - kernels improved: **{}/{}**; unchanged: **{}**; **worse: {}** (real kernels worse: **{}**)\n\
+             - pooled extracted cost: {total_down_cost} -> {total_up_cost} (**{:+.3}%**)\n\
+             - class cap hit: {down_cap}/{} downward -> {up_cap}/{} upward\n\n",
+            median(&mut cost_changes.clone()) * 100.0,
+            better.len(), rows.len(), rows.len() - better.len() - worse.len(), worse.len(),
+            real_worse.len(),
+            if total_down_cost > 0 {
+                (total_up_cost as f64 - total_down_cost as f64) / total_down_cost as f64 * 100.0
+            } else { 0.0 },
+            rows.len(), rows.len(),
+        ));
+        md.push_str(&format!(
+            "## Cost accounting\n\n\
+             - upward edge entries held: **{total_edges}** across {total_up_classes} allocated \
+             classes (~{:.2} per class; one `EClassId` = 4 bytes each, plus a 24-byte `Vec` \
+             header per class in both arms)\n\
+             - owner repairs performed: **{total_enq}** ({:.2} per union)\n\
+             - wall clock, CONTEXT ONLY (shared machine, load recorded in the prose \
+             below; no decision reads this): {sum_down_ms:.0} ms -> {sum_up_ms:.0} ms \
+             summed over the corpus ({:+.1}%)\n\n",
+            total_edges as f64 / total_up_classes.max(1) as f64,
+            total_enq as f64 / rows.iter().map(|r| r.up.unions).sum::<usize>().max(1) as f64,
+            if sum_down_ms > 0.0 {
+                (sum_up_ms - sum_down_ms) / sum_down_ms * 100.0
+            } else {
+                0.0
+            },
+        ));
+
+        // Distinct real kernels. glyph32 is glyph16's kernel at another
+        // display density: same expression structure, different scale
+        // constants, and 86/95 pairs produce bit-identical costs here. Every
+        // glyph count above is therefore ~doubled, so the honest real-kernel
+        // headline drops the duplicate density.
+        let distinct_real: Vec<&AbRow> = rows
+            .iter()
+            .filter(|r| r.group != "synthetic" && r.group != "glyph32")
+            .collect();
+        let dr_worse = distinct_real
+            .iter()
+            .filter(|r| r.up.cost > r.down.cost)
+            .count();
+        let dr_better = distinct_real
+            .iter()
+            .filter(|r| r.up.cost < r.down.cost)
+            .count();
+        let dr_down: usize = distinct_real.iter().map(|r| r.down.cost).sum();
+        let dr_up: usize = distinct_real.iter().map(|r| r.up.cost).sum();
+        let dr_worst = distinct_real
+            .iter()
+            .map(|r| r.cost_change_frac())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let dr_best = distinct_real
+            .iter()
+            .map(|r| r.cost_change_frac())
+            .fold(f64::INFINITY, f64::min);
+        md.push_str(&format!(
+            "## Distinct real kernels ({} of them)\n\n\
+             `glyph32` is the same glyph kernel as `glyph16` at another display density — \
+             identical expression structure, different scale constants — and 86 of 95 pairs \
+             produce bit-identical costs here, so every glyph count elsewhere in this report \
+             is roughly doubled. Dropping the duplicate density:\n\n\
+             - **worse: {dr_worse}**, better: {dr_better}, unchanged: {}\n\
+             - pooled cost {dr_down} -> {dr_up} (**{:+.3}%**)\n\
+             - worst regression **{:+.2}%**, best improvement **{:+.2}%**\n\n",
+            distinct_real.len(),
+            distinct_real.len() - dr_worse - dr_better,
+            if dr_down > 0 {
+                (dr_up as f64 - dr_down as f64) / dr_down as f64 * 100.0
+            } else {
+                0.0
+            },
+            dr_worst * 100.0,
+            dr_best * 100.0,
+        ));
+
+        // Saturation-level effects: does closure make the graph smaller at
+        // the stop point, or just different?
+        let pooled_down_live: usize = rows.iter().map(|r| r.down.live_classes).sum();
+        let pooled_up_live: usize = rows.iter().map(|r| r.up.live_classes).sum();
+        let pooled_down_apps: u64 = rows.iter().map(|r| r.down.applications).sum();
+        let pooled_up_apps: u64 = rows.iter().map(|r| r.up.applications).sum();
+        md.push_str(&format!(
+            "## At the stop point\n\n\
+             - pooled LIVE classes: {pooled_down_live} -> {pooled_up_live} (**{:+.3}%**)\n\
+             - pooled applications: {pooled_down_apps} -> {pooled_up_apps} (**{:+.3}%**)\n\
+             - typed stop reason: identical on every kernel ({} ClassCap / {} Quiesced in both arms)\n\n",
+            (pooled_up_live as f64 - pooled_down_live as f64) / pooled_down_live.max(1) as f64
+                * 100.0,
+            (pooled_up_apps as f64 - pooled_down_apps as f64) / pooled_down_apps.max(1) as f64
+                * 100.0,
+            rows.iter().filter(|r| r.down.hit_class_cap).count(),
+            rows.iter().filter(|r| !r.down.hit_class_cap).count(),
+        ));
+
+        // per group
+        md.push_str("## Per group\n\n| group | n | median cost change | improved | worse | cap down | cap up | median class change |\n|---|---|---|---|---|---|---|---|\n");
+        let mut groups: Vec<&str> = rows.iter().map(|r| r.group).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for g in groups {
+            let gr: Vec<&AbRow> = rows.iter().filter(|r| r.group == g).collect();
+            let mut cc: Vec<f64> = gr.iter().map(|r| r.cost_change_frac()).collect();
+            let mut cl: Vec<f64> = gr.iter().map(|r| r.class_change_frac()).collect();
+            md.push_str(&format!(
+                "| {g} | {} | {:+.3}% | {} | {} | {} | {} | {:+.3}% |\n",
+                gr.len(),
+                median(&mut cc) * 100.0,
+                gr.iter().filter(|r| r.up.cost < r.down.cost).count(),
+                gr.iter().filter(|r| r.up.cost > r.down.cost).count(),
+                gr.iter().filter(|r| r.down.hit_class_cap).count(),
+                gr.iter().filter(|r| r.up.hit_class_cap).count(),
+                median(&mut cl) * 100.0,
+            ));
+        }
+
+        // ---- order sensitivity ----
+        md.push_str("\n## Order sensitivity: does closure shrink the gap between rule orders?\n\n");
+        md.push_str(
+            "For each kernel, the cost ratio numeric-first / production, computed \
+             independently within each congruence arm. If upward congruence is what the \
+             orderings were incidentally competing to achieve, the ratio should move \
+             toward 1.0 in the upward arm.\n\n",
+        );
+        let mut down_ratios: Vec<f64> = Vec::new();
+        let mut up_ratios: Vec<f64> = Vec::new();
+        let mut down_diff = 0usize;
+        let mut up_diff = 0usize;
+        for nf in order_rows {
+            let Some(prod) = rows.iter().find(|r| r.name == nf.name) else {
+                continue;
+            };
+            if prod.down.cost > 0 {
+                down_ratios.push(nf.down.cost as f64 / prod.down.cost as f64);
+                if nf.down.cost != prod.down.cost {
+                    down_diff += 1;
+                }
+            }
+            if prod.up.cost > 0 {
+                up_ratios.push(nf.up.cost as f64 / prod.up.cost as f64);
+                if nf.up.cost != prod.up.cost {
+                    up_diff += 1;
+                }
+            }
+        }
+        let spread = |v: &mut Vec<f64>| -> (f64, f64, f64) {
+            (
+                median(&mut v.clone()),
+                percentile(&mut v.clone(), 0.10),
+                percentile(&mut v.clone(), 0.90),
+            )
+        };
+        let (dm, dp10, dp90) = spread(&mut down_ratios);
+        let (um, up10, up90) = spread(&mut up_ratios);
+        // Mean |ratio - 1| is the single number for "how much does order matter".
+        let dmad: f64 = down_ratios.iter().map(|r| (r - 1.0).abs()).sum::<f64>()
+            / down_ratios.len().max(1) as f64;
+        let umad: f64 =
+            up_ratios.iter().map(|r| (r - 1.0).abs()).sum::<f64>() / up_ratios.len().max(1) as f64;
+        md.push_str(&format!(
+            "| arm | n | median ratio | p10 | p90 | mean abs deviation from 1.0 | kernels where order changed cost |\n|---|---|---|---|---|---|---|\n\
+             | downward (production today) | {} | {dm:.4} | {dp10:.4} | {dp90:.4} | {dmad:.4} | {down_diff} |\n\
+             | upward | {} | {um:.4} | {up10:.4} | {up90:.4} | {umad:.4} | {up_diff} |\n\n",
+            down_ratios.len(),
+            up_ratios.len(),
+        ));
+        md.push_str(&format!(
+            "**Order-sensitivity answer:** mean absolute deviation from parity moves \
+             {dmad:.4} -> {umad:.4} ({:+.1}%), and the number of kernels where rule order \
+             changes the extracted cost at all moves {down_diff} -> {up_diff}.\n\n",
+            if dmad > 0.0 {
+                (umad - dmad) / dmad * 100.0
+            } else {
+                0.0
+            },
+        ));
+
+        if !worse.is_empty() {
+            md.push_str("## Kernels made worse\n\n| kernel | group | down cost | up cost | change |\n|---|---|---|---|---|\n");
+            for r in &worse {
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {:+.2}% |\n",
+                    r.name,
+                    r.group,
+                    r.down.cost,
+                    r.up.cost,
+                    r.cost_change_frac() * 100.0
+                ));
+            }
+            md.push('\n');
+        }
+
+        md.push_str(&format!(
+            "\n## Raw data\n\n`2026-09-02-upward-congruence-ab.csv` carries every row \
+             ({} rows, both arms each).\n",
+            rows.len() + order_rows.len()
+        ));
+
+        let md_path = out.join("2026-09-02-upward-congruence-ab.md");
+        std::fs::write(&md_path, &md).expect("write md");
+
+        // ---- JSON ----
+        let mut json = String::from("{\n  \"rows\": [\n");
+        for (i, r) in rows.iter().chain(order_rows.iter()).enumerate() {
+            if i > 0 {
+                json.push_str(",\n");
+            }
+            json.push_str(&format!(
+                "    {{\"name\":\"{}\",\"group\":\"{}\",\"rule_order\":\"{}\",\"node_count\":{},\
+                 \"max_classes\":{},\"down_cost\":{},\"up_cost\":{},\"down_classes\":{},\
+                 \"up_classes\":{},\"down_live\":{},\"up_live\":{},\"down_apps\":{},\"up_apps\":{},\
+                 \"down_stop\":\"{}\",\"up_stop\":\"{}\",\"down_cap\":{},\"up_cap\":{},\
+                 \"up_enqueues\":{},\"up_edges\":{}}}",
+                r.name,
+                r.group,
+                r.rule_order,
+                r.node_count,
+                r.max_classes,
+                r.down.cost,
+                r.up.cost,
+                r.down.classes,
+                r.up.classes,
+                r.down.live_classes,
+                r.up.live_classes,
+                r.down.applications,
+                r.up.applications,
+                r.down.stop,
+                r.up.stop,
+                r.down.hit_class_cap,
+                r.up.hit_class_cap,
+                r.up.upward_enqueues,
+                r.up.upward_edges,
+            ));
+        }
+        json.push_str("\n  ]\n}\n");
+        std::fs::write(out.join("2026-09-02-upward-congruence-ab.json"), &json)
+            .expect("write json");
+
+        eprintln!("=== A/B written to {} ===", md_path.display());
+        eprintln!("{md}");
     }
 }

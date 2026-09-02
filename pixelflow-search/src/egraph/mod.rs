@@ -49,13 +49,15 @@ pub use extract::{
     compute_ref_counts, extract, extract_dag,
 };
 pub use graph::{
-    ApplyResult, EGraph, EGraphBatch, HARD_CLASS_LIMIT, RewriteTarget, SaturationStats,
+    ApplyResult, Congruence, EGraph, EGraphBatch, HARD_CLASS_LIMIT, RewriteTarget, SaturationStats,
     SaturationStop, ScanStop,
 };
 pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
 pub use node::{EClassId, ENode};
 pub use ops::Op;
-pub use optimizer::{Budget, Limits, Observer, Optimized, Optimizer, OptimizerStats};
+pub use optimizer::{
+    Budget, Limits, Observer, Optimized, Optimizer, OptimizerStats, PRODUCTION_CONGRUENCE,
+};
 pub use provenance::{
     ApplicationId, ApplicationRecord, ENodeId, Origin, Provenance, UnionEvent,
     derivation_ancestors, format_derivation_trace,

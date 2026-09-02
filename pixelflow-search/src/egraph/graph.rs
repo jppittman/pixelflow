@@ -41,11 +41,62 @@ struct ActiveApplication {
     application_id: super::provenance::ApplicationId,
 }
 
+/// Which direction `rebuild` repairs congruence in.
+///
+/// An e-graph is a congruence closure: if `x = y` then `f(x) = f(y)` for
+/// every `f` the graph holds. `union` establishes `x = y` and pushes the
+/// merged class; [`Downward`](Congruence::Downward) then re-canonicalizes
+/// *that class's own* e-nodes and dedups them through the memo. Nothing looks
+/// at the e-nodes that reference the merged class as a **child**, so
+/// `Add(x, z)` and `Add(y, z)` merge only if a later rule sweep happens to
+/// re-walk them.
+///
+/// That under-merges. It is sound — every class still holds only
+/// provably-equal terms, so law L1 holds and L2 explicitly permits a graph
+/// with fewer equalities than an exhaustive run would hold — but it costs
+/// CSE, and it makes *which* equalities the graph finds depend on rule order.
+///
+/// [`Upward`](Congruence::Upward) closes it the standard way: each class
+/// records the classes owning an e-node that references it, and repairing a
+/// class re-enqueues those owners so their now-stale forms are
+/// re-canonicalized and merged through the memo.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Congruence {
+    /// Repair only the merged class's own e-nodes. What this graph has always
+    /// done, and the default so that constructing an `EGraph` directly is not
+    /// silently a different algorithm than it was.
+    #[default]
+    Downward,
+    /// Also repair the e-nodes that reference the merged class (upward
+    /// merging), to fixpoint within the rebuild budget.
+    Upward,
+}
+
 pub struct EGraph {
     pub(crate) classes: Vec<EClass>,
     pub(crate) parent: Vec<EClassId>,
     memo: HashMap<ENode, EClassId>,
     worklist: Vec<EClassId>,
+    /// Which direction [`EGraph::rebuild_budgeted`] repairs congruence in.
+    congruence: Congruence,
+    /// For each class, the classes owning an e-node that names it as a child.
+    /// Populated only under [`Congruence::Upward`] — the entry exists for
+    /// every class either way (it indexes by class id) but stays empty under
+    /// [`Congruence::Downward`], so that arm pays 24 bytes a class and no
+    /// work.
+    ///
+    /// Owner ids, not the `(ENode, EClassId)` pairs egg stores. Re-enqueueing
+    /// the owning *class* routes repair through the existing downward loop,
+    /// which already canonicalizes a class's nodes and merges memo duplicates
+    /// — so the node copy is not needed to find the congruence. egg keeps it
+    /// to evict the stale memo key; here that key is unreachable rather than
+    /// wrong, because a class merged away never becomes canonical again and
+    /// so no canonicalized lookup can ever name it. The entry is garbage that
+    /// costs memory, not a result anything can read.
+    parents: Vec<Vec<EClassId>>,
+    /// Owner classes re-enqueued by upward repair. Cost accounting only —
+    /// nothing reads it to decide anything.
+    upward_enqueues: u64,
     /// Rules are shared via Arc so EGraph can be cloned for search branching.
     rules: std::sync::Arc<Vec<Box<dyn Rewrite>>>,
     /// Stable id per rule, parallel to `rules`. Kept so the graph can name a
@@ -111,6 +162,9 @@ impl Clone for EGraph {
             parent: self.parent.clone(),
             memo: self.memo.clone(),
             worklist: self.worklist.clone(),
+            congruence: self.congruence,
+            parents: self.parents.clone(),
+            upward_enqueues: self.upward_enqueues,
             rules: self.rules.clone(), // Arc clone - cheap, shares rules
             rule_ids: self.rule_ids.clone(),
             match_counts: self.match_counts.clone(),
@@ -251,6 +305,9 @@ impl EGraph {
             parent: Vec::new(),
             memo: HashMap::new(),
             worklist: Vec::new(),
+            congruence: Congruence::Downward,
+            parents: Vec::new(),
+            upward_enqueues: 0,
             rules: std::sync::Arc::new(Vec::new()),
             rule_ids: std::sync::Arc::new(Vec::new()),
             match_counts: HashMap::new(),
@@ -276,6 +333,9 @@ impl EGraph {
             parent: Vec::new(),
             memo: HashMap::new(),
             worklist: Vec::new(),
+            congruence: Congruence::Downward,
+            parents: Vec::new(),
+            upward_enqueues: 0,
             rules: std::sync::Arc::new(rules),
             rule_ids: std::sync::Arc::new(ids),
             match_counts: HashMap::new(),
@@ -334,6 +394,37 @@ impl EGraph {
         eg.rules = rules;
         eg.rule_ids = rule_ids;
         eg
+    }
+
+    /// Choose which direction [`rebuild_budgeted`](EGraph::rebuild_budgeted)
+    /// repairs congruence in. See [`Congruence`].
+    ///
+    /// # Panics
+    ///
+    /// Panics unless the graph is still empty. The upward edge list is built
+    /// incrementally by [`add`](EGraph::add), so switching to
+    /// [`Congruence::Upward`] on a populated graph would leave every existing
+    /// e-node unregistered — an upward repair that silently skips most of the
+    /// graph, which is the one failure mode this whole change exists to
+    /// remove. Choose at construction.
+    #[must_use]
+    pub fn with_congruence(mut self, congruence: Congruence) -> Self {
+        assert!(
+            self.classes.is_empty(),
+            "EGraph::with_congruence must be chosen before the first add(): \
+             the upward edge list is built by add(), so switching on a graph \
+             that already holds {} classes would repair only the nodes added \
+             afterwards",
+            self.classes.len()
+        );
+        self.congruence = congruence;
+        self
+    }
+
+    /// Which direction this graph repairs congruence in.
+    #[must_use]
+    pub fn congruence(&self) -> Congruence {
+        self.congruence
     }
 
     /// The stable id of the rule at `idx`, if there is one.
@@ -435,6 +526,26 @@ impl EGraph {
             tags: vec![enode_id],
         });
         self.parent.push(id);
+        self.parents.push(Vec::new());
+        // Register the upward edges before `memo.insert` consumes `node`.
+        // `children()` returns an owned Vec, so this holds no borrow of
+        // `node` across the `&mut self` accesses below.
+        if self.congruence == Congruence::Upward {
+            let mut registered: Vec<EClassId> = Vec::new();
+            for child in node.children() {
+                let child = self.find(child);
+                // Dedup within this node's own children only (arity is 1–3):
+                // `Mul(x, x)` must not enqueue its owner twice. Deduping
+                // against the whole list would be quadratic in a class's
+                // fan-in, and entries from *different* nodes are legitimate
+                // duplicates anyway.
+                if registered.contains(&child) {
+                    continue;
+                }
+                registered.push(child);
+                self.parents[child.index()].push(id);
+            }
+        }
         self.memo.insert(node, id);
         id
     }
@@ -508,6 +619,14 @@ impl EGraph {
         }
         let (parent, child) = if a.0 < b.0 { (a, b) } else { (b, a) };
         self.parent[child.index()] = parent;
+        // The e-nodes that referenced `child` now reference `parent`. Their
+        // owners must be reachable from `parent`, or the upward repair that
+        // runs when `parent` comes off the worklist would miss exactly the
+        // nodes this union just invalidated.
+        if self.congruence == Congruence::Upward {
+            let child_parents = std::mem::take(&mut self.parents[child.index()]);
+            self.parents[parent.index()].extend(child_parents);
+        }
         let child_nodes = std::mem::take(&mut self.classes[child.index()].nodes);
         let child_tags = std::mem::take(&mut self.classes[child.index()].tags);
         self.classes[parent.index()].nodes.extend(child_nodes);
@@ -584,68 +703,134 @@ impl EGraph {
             };
             processed += 1;
             let id = self.find(id);
-            let nodes = std::mem::take(&mut self.classes[id.index()].nodes);
-            // `tags` must stay zipped with `nodes` through this loop: no
-            // reordering happens (nodes are only appended to `new_nodes` in
-            // the same order they're drained from `nodes`), so zipping by
-            // index here and pushing to `new_tags` in lockstep with
-            // `new_nodes` keeps every tag pointed at the right node.
-            let tags = std::mem::take(&mut self.classes[id.index()].tags);
-            debug_assert_eq!(
-                nodes.len(),
-                tags.len(),
-                "EClass.nodes and EClass.tags must never desync"
-            );
-            let mut new_nodes = Vec::new();
-            let mut new_tags = Vec::new();
-            for (mut node, tag) in nodes.into_iter().zip(tags) {
-                self.canonicalize_node(&mut node);
-                if let Some(&existing) = self.memo.get(&node) {
-                    let existing = self.find(existing);
-                    if existing != id {
-                        // `union` may pick either `id` or `existing` as the
-                        // surviving parent. If `id` survives, `union`'s
-                        // extend() appends `existing`'s nodes (and tags)
-                        // directly onto `self.classes[id.index()]` — which we
-                        // just emptied via mem::take above. We MUST extend
-                        // (not overwrite) below, or those appended
-                        // nodes/tags are silently dropped when we write
-                        // `new_nodes`/`new_tags` back. This is a rebuild-time
-                        // congruence-closure union, not a rule firing, so it
-                        // carries no rule_idx in the provenance journal
-                        // (`active_application` is whatever the caller left
-                        // it as — normally `None` outside rule application).
-                        self.union(id, existing);
-
-                        // `union` REFUSES a merge that would assert two
-                        // unequal constants equal, and a refusal here needs
-                        // handling that a rule-driven refusal does not: the
-                        // node below would be pushed back into `id` while
-                        // `memo` names `existing`, leaving ONE ENode in two
-                        // contradictory classes with only one of them
-                        // reachable by lookup — later matching or extraction
-                        // could then give the same expression different
-                        // values. Leave the node with the class memo already
-                        // names. `id` loses a node congruent to one it can no
-                        // longer be merged with, which is under-merging: it
-                        // costs CSE, not correctness.
-                        if self.find(id) != self.find(existing) {
-                            continue;
-                        }
-                    }
-                } else {
-                    self.memo.insert(node.clone(), id);
-                }
-                new_nodes.push(node);
-                new_tags.push(tag);
-            }
-            // Extend, not assign: a mid-loop union() above may have already
-            // pushed nodes/tags onto classes[id.index()] (see comment above).
-            // Overwriting here would silently discard them.
-            self.classes[id.index()].nodes.extend(new_nodes);
-            self.classes[id.index()].tags.extend(new_tags);
+            self.repair_class(id);
+            self.repair_users_of(id);
         }
         self.worklist.len()
+    }
+
+    /// Upward repair: re-canonicalize the e-nodes that name `id` as a child
+    /// and merge the memo duplicates among them.
+    ///
+    /// This is the half `union` never performs. `id` is on the worklist
+    /// because its membership just changed, so every e-node holding it as a
+    /// child now has a stale form — and two such nodes that differed only in
+    /// naming the two classes this union joined are now *the same node*.
+    /// [`repair_class`](EGraph::repair_class) is what notices that, through
+    /// the memo, so there is one congruence rule in this file rather than a
+    /// second copy here.
+    ///
+    /// **Termination**, on a graph that saturation has made cyclic: this adds
+    /// no worklist items of its own. Items come only from `union`, and unions
+    /// are bounded by the class count because each one strictly reduces the
+    /// number of live classes. Repairing a user may union, which enqueues the
+    /// survivor, whose own users are repaired when that item is processed —
+    /// so the cascade is carried by the worklist and bounded with it.
+    fn repair_users_of(&mut self, id: EClassId) {
+        if self.congruence != Congruence::Upward {
+            return;
+        }
+        // `find(id)`: repairing `id` above may have merged it away, in which
+        // case `union` has already moved its user list onto the survivor.
+        let canonical = self.find(id);
+        let mut owners = std::mem::take(&mut self.parents[canonical.index()]);
+        for owner in &mut owners {
+            *owner = self.find(*owner);
+        }
+        owners.sort_unstable();
+        owners.dedup();
+        for &owner in &owners {
+            if owner != self.find(canonical) {
+                self.repair_class(owner);
+                self.upward_enqueues += 1;
+            }
+        }
+        // Extend rather than assign, and re-`find` the slot: a repair above
+        // may have merged `canonical` away, and `union` would then have moved
+        // fresh users onto the survivor's list.
+        let slot = self.find(canonical);
+        self.parents[slot.index()].extend(owners);
+    }
+
+    /// Canonicalize one e-class's own e-nodes and merge memo duplicates.
+    /// Downward repair — what `rebuild` has always done per worklist item.
+    fn repair_class(&mut self, id: EClassId) {
+        let nodes = std::mem::take(&mut self.classes[id.index()].nodes);
+        // `tags` must stay zipped with `nodes` through this loop: no
+        // reordering happens (nodes are only appended to `new_nodes` in
+        // the same order they're drained from `nodes`), so zipping by
+        // index here and pushing to `new_tags` in lockstep with
+        // `new_nodes` keeps every tag pointed at the right node.
+        let tags = std::mem::take(&mut self.classes[id.index()].tags);
+        debug_assert_eq!(
+            nodes.len(),
+            tags.len(),
+            "EClass.nodes and EClass.tags must never desync"
+        );
+        let mut new_nodes = Vec::new();
+        let mut new_tags = Vec::new();
+        for (mut node, tag) in nodes.into_iter().zip(tags) {
+            self.canonicalize_node(&mut node);
+            if let Some(&existing) = self.memo.get(&node) {
+                let existing = self.find(existing);
+                if existing != id {
+                    // `union` may pick either `id` or `existing` as the
+                    // surviving parent. If `id` survives, `union`'s
+                    // extend() appends `existing`'s nodes (and tags)
+                    // directly onto `self.classes[id.index()]` — which we
+                    // just emptied via mem::take above. We MUST extend
+                    // (not overwrite) below, or those appended
+                    // nodes/tags are silently dropped when we write
+                    // `new_nodes`/`new_tags` back. This is a rebuild-time
+                    // congruence-closure union, not a rule firing, so it
+                    // carries no rule_idx in the provenance journal
+                    // (`active_application` is whatever the caller left
+                    // it as — normally `None` outside rule application).
+                    self.union(id, existing);
+
+                    // `union` REFUSES a merge that would assert two
+                    // unequal constants equal, and a refusal here needs
+                    // handling that a rule-driven refusal does not: the
+                    // node below would be pushed back into `id` while
+                    // `memo` names `existing`, leaving ONE ENode in two
+                    // contradictory classes with only one of them
+                    // reachable by lookup — later matching or extraction
+                    // could then give the same expression different
+                    // values. Leave the node with the class memo already
+                    // names. `id` loses a node congruent to one it can no
+                    // longer be merged with, which is under-merging: it
+                    // costs CSE, not correctness.
+                    if self.find(id) != self.find(existing) {
+                        continue;
+                    }
+                }
+            } else {
+                self.memo.insert(node.clone(), id);
+            }
+            new_nodes.push(node);
+            new_tags.push(tag);
+        }
+        // Extend, not assign: a mid-loop union() above may have already
+        // pushed nodes/tags onto classes[id.index()] (see comment above).
+        // Overwriting here would silently discard them.
+        self.classes[id.index()].nodes.extend(new_nodes);
+        self.classes[id.index()].tags.extend(new_tags);
+    }
+
+    /// Owner classes re-enqueued by upward congruence repair since this graph
+    /// was created. Zero under [`Congruence::Downward`]. Cost accounting for
+    /// the A/B in `docs/results/2026-09-02-upward-congruence-ab.md`.
+    #[must_use]
+    pub fn upward_enqueues(&self) -> u64 {
+        self.upward_enqueues
+    }
+
+    /// Total upward-edge entries held across all classes — the memory this
+    /// bookkeeping costs, in units of one `EClassId` (4 bytes) each, plus one
+    /// `Vec` header per class. Zero under [`Congruence::Downward`].
+    #[must_use]
+    pub fn upward_edge_count(&self) -> usize {
+        self.parents.iter().map(Vec::len).sum()
     }
 
     /// Number of pending worklist items (classes needing rebuild).
@@ -3301,5 +3486,162 @@ impl Drop for EGraphBatch<'_> {
         if self.any_changes {
             self.graph.rebuild();
         }
+    }
+}
+
+/// Congruence closure: does `x = y` give `f(x) = f(y)`?
+///
+/// This is the property [`Congruence`] names, isolated from saturation so a
+/// failure points at `union`/`rebuild` and nothing else. The
+/// [`Congruence::Downward`] test is not an aspiration written backwards — it
+/// pins the gap that exists today, so that flipping
+/// [`PRODUCTION_CONGRUENCE`](super::optimizer::PRODUCTION_CONGRUENCE) has to
+/// come with a deliberate edit here.
+#[cfg(test)]
+mod congruence_closure {
+    use super::*;
+    use crate::egraph::ops;
+
+    /// `Add(x, z)` and `Add(y, z)` as two distinct classes, plus the classes
+    /// of `x` and `y`.
+    fn users_of_two_leaves(
+        congruence: Congruence,
+    ) -> (EGraph, EClassId, EClassId, EClassId, EClassId) {
+        let mut eg = EGraph::new().with_congruence(congruence);
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let z = eg.add(ENode::Var(2));
+        let fx = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, z],
+        });
+        let fy = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![y, z],
+        });
+        assert_ne!(eg.find(fx), eg.find(fy), "distinct before any union");
+        (eg, x, y, fx, fy)
+    }
+
+    #[test]
+    fn upward_merges_the_users_of_a_merged_class() {
+        let (mut eg, x, y, fx, fy) = users_of_two_leaves(Congruence::Upward);
+        eg.union(x, y);
+        eg.rebuild();
+        assert_eq!(
+            eg.find(fx),
+            eg.find(fy),
+            "x = y must give Add(x, z) = Add(y, z): that is what makes the \
+             e-graph a congruence closure, and no rule fires to establish it"
+        );
+    }
+
+    /// The defect, pinned. Not a wish — a record of what the shipped default
+    /// does, so the A/B has a baseline and the flip is deliberate.
+    #[test]
+    fn downward_leaves_the_users_unmerged() {
+        let (mut eg, x, y, fx, fy) = users_of_two_leaves(Congruence::Downward);
+        eg.union(x, y);
+        eg.rebuild();
+        assert_ne!(
+            eg.find(fx),
+            eg.find(fy),
+            "downward repair walks only the merged class's own nodes, so the \
+             users stay split — issue #1106"
+        );
+    }
+
+    /// Two levels up, and through a cycle-prone shape: the repair must reach
+    /// transitively, not just one hop.
+    #[test]
+    fn upward_repair_reaches_transitively() {
+        let mut eg = EGraph::new().with_congruence(Congruence::Upward);
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let z = eg.add(ENode::Var(2));
+        let inner_x = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, z],
+        });
+        let inner_y = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![y, z],
+        });
+        let outer_x = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![inner_x, z],
+        });
+        let outer_y = eg.add(ENode::Op {
+            op: &ops::Mul,
+            children: vec![inner_y, z],
+        });
+        eg.union(x, y);
+        eg.rebuild();
+        assert_eq!(eg.find(inner_x), eg.find(inner_y), "one hop up");
+        assert_eq!(
+            eg.find(outer_x),
+            eg.find(outer_y),
+            "two hops up — the repair must re-enqueue owners of a class that \
+             was itself merged by an earlier repair"
+        );
+    }
+
+    /// A cyclic e-graph (what saturation always produces) must still
+    /// terminate. `rebuild` is unbudgeted here on purpose: if the
+    /// changed-only enqueue guard were wrong, this hangs rather than fails.
+    #[test]
+    fn upward_repair_terminates_on_a_cyclic_graph() {
+        let mut eg = EGraph::new().with_congruence(Congruence::Upward);
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let f = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, y],
+        });
+        let g = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![y, x],
+        });
+        // Close the cycle: the class of `f` contains a node whose child is
+        // `f`'s own class after this union.
+        eg.union(f, x);
+        eg.rebuild();
+        eg.union(g, y);
+        eg.rebuild();
+        assert_eq!(eg.find(f), eg.find(x));
+    }
+
+    /// Partial rebuild must leave a consistent graph — the guarantee
+    /// `rebuild_budgeted` documents. Upward repair adds worklist items, so
+    /// the budget now bounds strictly more work; it must still stop.
+    #[test]
+    fn upward_repair_respects_the_rebuild_budget() {
+        let (mut eg, x, y, _fx, _fy) = users_of_two_leaves(Congruence::Upward);
+        eg.union(x, y);
+        let remaining = eg.rebuild_budgeted(1);
+        // One item processed; whatever is left is still a valid worklist.
+        assert_eq!(remaining, eg.pending_rebuilds());
+        eg.rebuild();
+        assert_eq!(eg.pending_rebuilds(), 0);
+    }
+
+    /// Switching direction after the graph is populated cannot silently
+    /// half-work.
+    #[test]
+    #[should_panic(expected = "must be chosen before the first add()")]
+    fn congruence_cannot_be_switched_on_a_populated_graph() {
+        let mut eg = EGraph::new();
+        let _ = eg.add(ENode::Var(0));
+        let _ = eg.with_congruence(Congruence::Upward);
+    }
+
+    /// The downward arm pays nothing for machinery it does not use.
+    #[test]
+    fn downward_records_no_upward_edges() {
+        let (mut eg, x, y, _, _) = users_of_two_leaves(Congruence::Downward);
+        eg.union(x, y);
+        eg.rebuild();
+        assert_eq!(eg.upward_edge_count(), 0);
+        assert_eq!(eg.upward_enqueues(), 0);
     }
 }
