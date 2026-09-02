@@ -36,6 +36,13 @@
 //! matter, but must never omit one that does. See its doc comment for the
 //! exact over-approximation made and why it is safe.
 //!
+//! [`derivation_ancestors_tight`] is a second, narrower walk over the same
+//! records (`docs/plans/2026-08-31-guide-design-revision.md` §3, option 3):
+//! it exists **alongside** `derivation_ancestors`, not in place of it, so both
+//! can be computed on the same episode and compared. It narrows all three
+//! named over-approximation axes but does not eliminate them — see its doc
+//! comment for exactly what changed and what didn't.
+//!
 //! # Overhead
 //!
 //! Every hook (`record_origin`, `record_application`, `record_union`) is an
@@ -120,6 +127,20 @@ pub struct UnionEvent {
     /// The rule that caused this union, if any (`None` for congruence
     /// closure unions found during rebuild).
     pub rule_idx: Option<usize>,
+    /// The exact firing that caused this union, if any — `Some` iff
+    /// `rule_idx` is `Some` (both come from the same `active_application`
+    /// read at the `EGraph::union` call site; `None` for congruence-closure
+    /// unions found during rebuild, which have no active rule application).
+    ///
+    /// Purely additive: recorded because the information is already in hand
+    /// (`EGraph::union` reads `self.active_application`, which carries both
+    /// `rule_idx` and `application_id`) at zero extra cost, and exists to let
+    /// [`derivation_ancestors_tight`] credit the *one* application that
+    /// actually caused a union instead of `derivation_ancestors`'s
+    /// `rule_idx` + `step <=` superset match. Does not change what
+    /// `rule_idx` means or how the existing (loose) `derivation_ancestors`
+    /// uses this event — that function never reads this field.
+    pub application_id: Option<ApplicationId>,
     /// Saturation-iteration counter at the time of the union.
     pub step: usize,
     /// One of the two canonical class ids being merged (pre-merge).
@@ -356,6 +377,200 @@ pub fn derivation_ancestors(
     result
 }
 
+/// A second, narrower ancestry walk over the same provenance records as
+/// [`derivation_ancestors`] — additive, not a replacement. Both functions are
+/// meant to be run on the *same* episode so their outputs can be compared
+/// directly; this one changes only what gets *credited*, not what
+/// `Provenance` records or how `derivation_ancestors` computes its own
+/// (unchanged) result.
+///
+/// # What's tightened, and what isn't
+///
+/// `derivation_ancestors`'s doc comment names three over-approximation axes.
+/// This function narrows all three, but by construction rather than by a
+/// true minimality/necessity proof (which would require replaying the
+/// episode to ask "does removing application X still leave the chosen node
+/// reachable" — out of scope for a "narrow, don't redesign" follow-up):
+///
+/// 1. **Child *nodes*, not child classes, wherever the choice is known.**
+///    `chosen_nodes` is expected to be a *complete* per-class map — exactly
+///    what `labeler::chosen_tagged_nodes` already builds by
+///    recursively walking every class the winning extraction actually
+///    visits, one entry per class. Given that map, whenever this walk
+///    reaches a class it already has a known choice for (via
+///    `children_of`'s class result, or via a union event's far side — see
+///    axis 3 below), it follows *only* that one node instead of pulling
+///    every node [`Provenance`] ever tagged into the class. For a class with
+///    no known choice (the two hand-derivable unit tests below only supply a
+///    partial map, on purpose, to exercise this path) it falls back to the
+///    same "every tagged node" behavior `derivation_ancestors` always uses —
+///    still safe, just not tightened for that class.
+/// 2. **The exact firing, not every same-rule firing.** A [`UnionEvent`]'s
+///    `application_id` (recorded for real at `EGraph::union`'s
+///    call site, from the same `active_application` state that already
+///    supplies `rule_idx` — see the field's doc comment) names the *one*
+///    application that caused that merge. This walk credits exactly that
+///    application; `derivation_ancestors` still credits every application
+///    sharing the event's `rule_idx` with `step <= event.step`, unchanged.
+/// 3. **Fixed-point pruning, as a consequence of #1, not a separate proof.**
+///    Because a known-choice class only ever contributes its one node (#1),
+///    the reachable set this walk explores is a strict subset of what
+///    `derivation_ancestors` explores from the same input — it terminates on
+///    a tighter fixed point without an explicit "was this merge necessary"
+///    analysis. Union events are still walked outward from every visited
+///    class exactly as `derivation_ancestors` does (a `Union`-shaped
+///    `RewriteAction` creates no node of its
+///    own, so union-event crediting is the *only* way such an application
+///    can ever be labeled load-bearing at all — dropping it would violate
+///    the safety property, not just tighten it).
+///
+/// # Safety (still an over-approximation, never omits a true ancestor)
+///
+/// Every application `derivation_ancestors` would credit via a node whose
+/// class has a known choice is still credited here — the known-choice node
+/// *is* the node that walk would eventually reach through that class's tags,
+/// since `chosen_nodes` (as `labeler::chosen_tagged_nodes` builds it) always
+/// includes the actually-extracted node. Every application credited via a
+/// union event here is credited under a strictly narrower (exact-application)
+/// condition than `derivation_ancestors`'s (same-`rule_idx`-and-earlier)
+/// condition, which only shrinks the credited set for congruence-driven and
+/// unrelated same-rule events, never a true one. Classes with no known choice
+/// fall back to the identical unpruned behavior. So this function's result is
+/// always a subset of `derivation_ancestors`'s result on the same inputs
+/// (enforced at measurement time by an assertion analogous to
+/// `guide_headroom`'s existing `strict_lb <= labeler_lb` check) and always a
+/// superset of the strict bound
+/// (every node directly on the chosen path is, by definition, in a
+/// known-choice class, so #1 alone reduces to the strict node-level walk for
+/// it; the only additions beyond strict are exact-application union credits,
+/// which strict does not attempt at all).
+///
+/// # Panics
+///
+/// Panics if `chosen_nodes` names the same `EClassId` twice with two
+/// *different* `ENodeId`s — a caller contract violation (the map is supposed
+/// to name one chosen node per class), not a condition to paper over by
+/// picking one arbitrarily.
+pub fn derivation_ancestors_tight(
+    tags_of: &impl Fn(EClassId) -> Vec<ENodeId>,
+    children_of: &impl Fn(ENodeId) -> Vec<EClassId>,
+    provenance: &Provenance,
+    chosen_nodes: &[(EClassId, ENodeId)],
+) -> BTreeSet<ApplicationId> {
+    let mut chosen_map: HashMap<EClassId, ENodeId> = HashMap::new();
+    for &(class, node) in chosen_nodes {
+        match chosen_map.entry(class) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(node);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                assert_eq!(
+                    *e.get(),
+                    node,
+                    "derivation_ancestors_tight: class {class:?} was given two different \
+                     chosen nodes ({:?} and {node:?}) — `chosen_nodes` must name at most one \
+                     node per class",
+                    e.get()
+                );
+            }
+        }
+    }
+
+    // Axis 1: known-choice short-circuit. Falls back to `tags_of` (identical
+    // to `derivation_ancestors`) for a class with no recorded choice.
+    let nodes_to_follow = |class: EClassId| -> Vec<ENodeId> {
+        match chosen_map.get(&class) {
+            Some(&node) => vec![node],
+            None => tags_of(class),
+        }
+    };
+
+    let mut result = BTreeSet::new();
+    let mut visited_classes: BTreeSet<EClassId> = BTreeSet::new();
+    let mut visited_nodes: BTreeSet<ENodeId> = BTreeSet::new();
+    let mut class_stack: Vec<EClassId> = Vec::new();
+    let mut node_stack: Vec<ENodeId> = chosen_nodes.iter().map(|&(_, n)| n).collect();
+    for &(class, _) in chosen_nodes {
+        if visited_classes.insert(class) {
+            class_stack.push(class);
+        }
+    }
+
+    // Follow one node's own creation + structural children — identical logic
+    // to `derivation_ancestors`'s node walk (axis 1 only changes *which*
+    // nodes get pushed onto `node_stack` in the first place, via
+    // `nodes_to_follow` below).
+    let follow_node = |node: ENodeId,
+                       result: &mut BTreeSet<ApplicationId>,
+                       visited_nodes: &mut BTreeSet<ENodeId>,
+                       visited_classes: &mut BTreeSet<EClassId>,
+                       class_stack: &mut Vec<EClassId>| {
+        if !visited_nodes.insert(node) {
+            return;
+        }
+        if let Some(Origin::Rule(app_id)) = provenance.origin(node) {
+            result.insert(app_id);
+            if let Some(record) = provenance.application(app_id) {
+                if visited_classes.insert(record.match_root) {
+                    class_stack.push(record.match_root);
+                }
+            }
+        }
+        for child_class in children_of(node) {
+            if visited_classes.insert(child_class) {
+                class_stack.push(child_class);
+            }
+        }
+    };
+
+    while let Some(node) = node_stack.pop() {
+        follow_node(
+            node,
+            &mut result,
+            &mut visited_nodes,
+            &mut visited_classes,
+            &mut class_stack,
+        );
+    }
+
+    while let Some(class) = class_stack.pop() {
+        for node in nodes_to_follow(class) {
+            if !visited_nodes.contains(&node) {
+                node_stack.push(node);
+            }
+        }
+        while let Some(node) = node_stack.pop() {
+            follow_node(
+                node,
+                &mut result,
+                &mut visited_nodes,
+                &mut visited_classes,
+                &mut class_stack,
+            );
+        }
+
+        for event in provenance.union_events() {
+            if event.class_a == class || event.class_b == class {
+                // Axis 2: credit the exact firing, not every same-rule_idx
+                // application at or before this event's step.
+                if let Some(app_id) = event.application_id {
+                    result.insert(app_id);
+                }
+                let other = if event.class_a == class {
+                    event.class_b
+                } else {
+                    event.class_a
+                };
+                if visited_classes.insert(other) {
+                    class_stack.push(other);
+                }
+            }
+        }
+    }
+
+    result
+}
+
 /// Render a human-readable derivation trace: one line per application,
 /// ordered by `step` then `ApplicationId`, in the form:
 ///
@@ -471,6 +686,158 @@ mod tests {
 
         let ancestors = derivation_ancestors(&tags_of, &children_of, &p, &[(EClassId(2), n2)]);
         assert_eq!(ancestors, BTreeSet::from([a0, a1]));
+    }
+
+    /// `derivation_ancestors_tight` on the same two hand-derivable inputs
+    /// above must agree with `derivation_ancestors` — with only one tagged
+    /// node per relevant class, axis 1's short-circuit changes nothing.
+    #[test]
+    fn tight_matches_loose_when_no_sibling_nodes() {
+        let mut p = Provenance::new();
+        let n0 = ENodeId(0);
+        let n1 = ENodeId(1);
+        p.record_origin(n0, Origin::Seed);
+        let a0 = p.record_application(app(0, 0, EClassId(0)));
+        p.record_origin(n1, Origin::Rule(a0));
+
+        let tags_of =
+            |c: EClassId| -> Vec<ENodeId> { if c == EClassId(0) { vec![n0] } else { vec![] } };
+        let children_of = |_n: ENodeId| -> Vec<EClassId> { vec![] };
+
+        let loose = derivation_ancestors(&tags_of, &children_of, &p, &[(EClassId(1), n1)]);
+        let tight = derivation_ancestors_tight(&tags_of, &children_of, &p, &[(EClassId(1), n1)]);
+        assert_eq!(loose, BTreeSet::from([a0]));
+        assert_eq!(tight, loose);
+    }
+
+    /// Axis 1: a class holding the chosen node *and* an unrelated sibling
+    /// node (from a totally disjoint derivation) is over-credited by the
+    /// loose walk — which pulls every tag in a visited class — but not by
+    /// the tight one, which follows only the class's known choice.
+    #[test]
+    fn tight_excludes_unrelated_sibling_in_same_class() {
+        let mut p = Provenance::new();
+        let root = EClassId(0);
+        let n_chosen = ENodeId(0);
+        let n_sibling = ENodeId(1);
+
+        let a_good = p.record_application(app(1, 0, EClassId(5)));
+        p.record_origin(n_chosen, Origin::Rule(a_good));
+        let a_bad = p.record_application(app(2, 0, EClassId(6)));
+        p.record_origin(n_sibling, Origin::Rule(a_bad));
+
+        // Both nodes live tagged in `root`'s class, but only `n_chosen` is
+        // what the extraction actually picked.
+        let tags_of = |c: EClassId| -> Vec<ENodeId> {
+            if c == root {
+                vec![n_chosen, n_sibling]
+            } else {
+                vec![]
+            }
+        };
+        let children_of = |_n: ENodeId| -> Vec<EClassId> { vec![] };
+
+        let chosen = [(root, n_chosen)];
+        let loose = derivation_ancestors(&tags_of, &children_of, &p, &chosen);
+        let tight = derivation_ancestors_tight(&tags_of, &children_of, &p, &chosen);
+
+        assert_eq!(
+            loose,
+            BTreeSet::from([a_good, a_bad]),
+            "loose must over-credit the sibling application via axis 1 (all tags of a \
+             visited class), exactly as documented"
+        );
+        assert_eq!(
+            tight,
+            BTreeSet::from([a_good]),
+            "tight must follow only the known-choice node, excluding the unrelated sibling"
+        );
+    }
+
+    /// Axis 2: two applications of the same rule (different firings)
+    /// produce a `UnionEvent` each; only one of them is the actual cause of
+    /// the union that connects the chosen class to another. The loose walk
+    /// credits both (`rule_idx` match + `step <=`, a superset); the tight
+    /// walk credits only the `application_id` recorded on the event.
+    #[test]
+    fn tight_credits_exact_union_application_not_every_same_rule_firing() {
+        let mut p = Provenance::new();
+        const RULE: usize = 5;
+        let a_earlier = p.record_application(app(RULE, 0, EClassId(0)));
+        let a_actual = p.record_application(app(RULE, 1, EClassId(1)));
+
+        let root = EClassId(2);
+        let other = EClassId(9);
+        let n0 = ENodeId(0);
+        p.record_origin(n0, Origin::Seed);
+        p.record_union(UnionEvent {
+            rule_idx: Some(RULE),
+            application_id: Some(a_actual),
+            step: 2,
+            class_a: root,
+            class_b: other,
+        });
+
+        let tags_of = |c: EClassId| -> Vec<ENodeId> { if c == root { vec![n0] } else { vec![] } };
+        let children_of = |_n: ENodeId| -> Vec<EClassId> { vec![] };
+
+        let chosen = [(root, n0)];
+        let loose = derivation_ancestors(&tags_of, &children_of, &p, &chosen);
+        let tight = derivation_ancestors_tight(&tags_of, &children_of, &p, &chosen);
+
+        assert_eq!(
+            loose,
+            BTreeSet::from([a_earlier, a_actual]),
+            "loose credits every same-rule_idx application at or before the event's step"
+        );
+        assert_eq!(
+            tight,
+            BTreeSet::from([a_actual]),
+            "tight credits exactly the application recorded on the union event"
+        );
+    }
+
+    /// A `Union`-shaped rewrite action creates no node, so the only way it
+    /// can ever be labeled load-bearing — under either walk — is via the
+    /// union event it produces. Confirms the tight walk still catches this
+    /// case (narrowing axis 2 must not accidentally drop it to zero).
+    #[test]
+    fn tight_still_credits_union_only_application() {
+        let mut p = Provenance::new();
+        let a_union_only = p.record_application(app(3, 0, EClassId(0)));
+        let root = EClassId(1);
+        let other = EClassId(2);
+        let n0 = ENodeId(0);
+        p.record_origin(n0, Origin::Seed);
+        p.record_union(UnionEvent {
+            rule_idx: Some(3),
+            application_id: Some(a_union_only),
+            step: 0,
+            class_a: root,
+            class_b: other,
+        });
+
+        let tags_of = |c: EClassId| -> Vec<ENodeId> { if c == root { vec![n0] } else { vec![] } };
+        let children_of = |_n: ENodeId| -> Vec<EClassId> { vec![] };
+        let chosen = [(root, n0)];
+
+        let tight = derivation_ancestors_tight(&tags_of, &children_of, &p, &chosen);
+        assert_eq!(tight, BTreeSet::from([a_union_only]));
+    }
+
+    /// `chosen_nodes` naming the same class twice with two different nodes
+    /// is a caller contract violation — must panic loudly, not silently pick
+    /// one.
+    #[test]
+    #[should_panic(expected = "two different chosen nodes")]
+    fn tight_panics_on_conflicting_chosen_nodes_for_one_class() {
+        let p = Provenance::new();
+        let c = EClassId(0);
+        let n_a = ENodeId(0);
+        let n_b = ENodeId(1);
+        let tags_of = |_: EClassId| -> Vec<ENodeId> { vec![] };
+        let children_of = |_: ENodeId| -> Vec<EClassId> { vec![] };
+        let _ = derivation_ancestors_tight(&tags_of, &children_of, &p, &[(c, n_a), (c, n_b)]);
     }
 
     #[test]

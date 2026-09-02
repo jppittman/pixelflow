@@ -107,17 +107,73 @@ impl Clone for EGraph {
 pub struct ApplyResult {
     pub changes: usize,
     pub evals: usize,
+    /// The scan stopped before visiting every match because the class
+    /// budget or the deadline was hit. Whatever remained is unknown, so
+    /// `changes == 0` with this set is a truncated sweep, not quiescence.
+    pub truncated: bool,
+}
+
+/// Why an [`EGraph::saturate_with_limits`] call stopped — an explicit stop
+/// reason instead of the `SaturationStats` proxy game every measurement
+/// harness had to play (`iterations < max_iters && classes <= cap` ≈
+/// "probably quiesced"; `pixelflow-pipeline/src/bin/guide_headroom.rs` names
+/// it as the one ambiguity that proxy can't resolve). Read off the loop that
+/// decides when to stop, never inferred from the counts afterwards.
+/// Budget-only framing: none of these certify a fixpoint;
+/// [`SaturationStop::Quiesced`] is a diagnostic condition (one full rule
+/// sweep ran to completion and produced zero unions), never a closure claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaturationStop {
+    /// A full rule sweep completed with zero unions. Diagnostic, not a
+    /// certified fixpoint.
+    Quiesced,
+    /// The cumulative provenance application count reached the requested
+    /// budget ([`EGraph::saturate_until_applications`] only). Granularity is
+    /// one rule sweep: the count may overshoot the budget by however many
+    /// matches the final sweep committed, and the caller reads the exact
+    /// count from [`AppBudgetSaturationStats::applications`].
+    ApplicationBudget,
+    /// The class budget `max_classes` stopped the run (memory protection) —
+    /// either the count exceeded it outright, or a sweep produced zero
+    /// unions only because every remaining action was discarded for budget.
+    ClassCap,
+    /// `max_iters` sweeps completed without any other condition firing.
+    IterationCeiling,
+    /// The wall-clock safety ceiling elapsed. Offline measurement callers
+    /// should treat this as a hard error (fail loud), never as data.
+    Timeout,
 }
 
 /// Result of one [`EGraph::saturate_with_limits`] run: how many rounds it
 /// took and how many rule applications fired in total, whichever limit
 /// (iteration count, class count, timeout, or convergence) ended the run.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// Deliberately not `Default`: a defaulted `stop` would be an invented
+/// stop reason, and nothing constructs an empty stats value.
+#[derive(Clone, Copy, Debug)]
 pub struct SaturationStats {
     /// Number of rewrite rounds completed before the run stopped.
     pub iterations: usize,
     /// Sum of `ApplyResult::changes` across every round.
     pub total_unions: usize,
+    /// Which condition ended the run — READ from the loop that stopped, so a
+    /// caller never has to infer "quiesced" from `iterations < max_iters`
+    /// (which conflates a timeout or class cap with quiescence).
+    pub stop: SaturationStop,
+}
+
+/// Result of one [`EGraph::saturate_until_applications`] run.
+#[derive(Clone, Copy, Debug)]
+pub struct AppBudgetSaturationStats {
+    /// Rewrite sweeps completed by THIS call.
+    pub iterations: usize,
+    /// Sum of `ApplyResult::changes` across this call's sweeps.
+    pub total_unions: usize,
+    /// Cumulative provenance application count at stop (across the whole
+    /// e-graph lifetime, not just this call) — the anytime x-axis value.
+    pub applications: usize,
+    /// Which condition ended this call.
+    pub stop: SaturationStop,
 }
 
 impl EGraph {
@@ -316,6 +372,7 @@ impl EGraph {
         self.worklist.push(parent);
         self.provenance.record_union(UnionEvent {
             rule_idx: self.active_application.map(|a| a.rule_idx),
+            application_id: self.active_application.map(|a| a.application_id),
             step: self.step,
             class_a: parent,
             class_b: child,
@@ -498,6 +555,34 @@ impl EGraph {
             Vec::new()
         };
         super::provenance::derivation_ancestors(
+            &tags_of,
+            &children_of,
+            &self.provenance,
+            chosen_nodes,
+        )
+    }
+
+    /// The tightened counterpart to [`EGraph::derivation_ancestors`] — see
+    /// [`super::provenance::derivation_ancestors_tight`] for exactly which
+    /// over-approximation axes are narrowed and why the result is still safe
+    /// (a subset of `derivation_ancestors`'s result, a superset of the
+    /// strict node-on-path bound). Additive: does not change what
+    /// `derivation_ancestors` computes, so both can be run on the same
+    /// episode for comparison.
+    pub fn derivation_ancestors_tight(
+        &self,
+        chosen_nodes: &[(EClassId, ENodeId)],
+    ) -> std::collections::BTreeSet<super::provenance::ApplicationId> {
+        let tags_of = |class: EClassId| -> Vec<ENodeId> { self.tags(class).to_vec() };
+        let children_of = |tag: ENodeId| -> Vec<EClassId> {
+            for class in self.classes.iter() {
+                if let Some(idx) = class.tags.iter().position(|&t| t == tag) {
+                    return class.nodes[idx].children();
+                }
+            }
+            Vec::new()
+        };
+        super::provenance::derivation_ancestors_tight(
             &tags_of,
             &children_of,
             &self.provenance,
@@ -842,12 +927,17 @@ impl EGraph {
         let deadline = start + timeout;
         let mut iterations = 0;
         let mut total_unions = 0;
+        // Recorded at the point the loop decides to stop — never inferred
+        // afterwards from the counters.
+        let mut stop = SaturationStop::IterationCeiling;
 
         for _ in 0..max_iters {
             if start.elapsed() >= timeout {
+                stop = SaturationStop::Timeout;
                 break;
             }
             if self.classes.len() > max_classes {
+                stop = SaturationStop::ClassCap;
                 break;
             }
             iterations += 1;
@@ -858,12 +948,123 @@ impl EGraph {
             self.step += 1;
 
             // Apply all rules in a single batch — one rebuild per iteration
+            let (unions, truncated) = {
+                let mut batch = self.batch();
+                let n_rules = batch.graph.rules.len();
+                let mut total = 0;
+                let mut truncated = false;
+                for rule_idx in 0..n_rules {
+                    if batch.node_count() > max_classes {
+                        truncated = true;
+                        break;
+                    }
+                    let result = batch.apply_rule(rule_idx, max_classes, Some(deadline));
+                    total += result.changes;
+                    truncated |= result.truncated;
+                }
+                (total, truncated)
+                // rebuild happens here on drop
+            };
+            total_unions += unions;
+            if unions == 0 {
+                // A zero-union sweep is quiescence only if every rule scanned
+                // to completion. `apply_rule` truncates its own scan at the
+                // class budget or the deadline, and that budget scan keeps
+                // `classes.len()` at or under `max_classes` — so the class-cap
+                // check at the top of this loop can never see a capped run,
+                // and without `truncated` every one of them reads as quiesced.
+                stop = if !truncated {
+                    SaturationStop::Quiesced
+                } else if std::time::Instant::now() > deadline {
+                    SaturationStop::Timeout
+                } else {
+                    SaturationStop::ClassCap
+                };
+                break;
+            }
+        }
+
+        SaturationStats {
+            iterations,
+            total_unions,
+            stop,
+        }
+    }
+
+    /// Saturate until the cumulative provenance application count reaches
+    /// `max_total_applications` — the budget-only anytime loop, denominated
+    /// in rule applications rather than sweeps.
+    ///
+    /// This is `saturate_with_limits` with one extra stopping condition and
+    /// an explicit stop reason. The rewrite budget the guided-saturation
+    /// program registers experiments against is denominated in rule
+    /// applications performed (docs/plans/2026-08-31-guide-design-revision.md
+    /// §5) — a deterministic count, unlike sweeps, whose per-sweep
+    /// application volume varies by orders of magnitude across expressions.
+    /// The budget is checked against `provenance().application_count()`
+    /// (cumulative over the e-graph's lifetime), so a caller sampling an
+    /// anytime curve calls this repeatedly with an increasing target and the
+    /// graph resumes where it left off.
+    ///
+    /// Two semantics to be aware of, both deliberate:
+    ///
+    /// - **Sweep granularity.** The budget check runs between per-rule
+    ///   sweeps, not between individual matches — a single
+    ///   `apply_rule_at_index_timed` commits all of one rule's matches at
+    ///   once. The returned `applications` reports the exact count at stop,
+    ///   which may overshoot the target by up to one sweep's worth of
+    ///   matches. Callers plot against the actual count, never the target.
+    /// - **Resume restarts the sweep.** A resumed call begins a fresh sweep
+    ///   at rule 0, so rules already swept before the previous stop are
+    ///   re-scanned; their idempotent re-matches are recorded as
+    ///   applications like any other (production sweeps re-record them every
+    ///   iteration too — 91% of all recorded applications are exact no-ops,
+    ///   per docs/results/2026-08-30-guide-scope-saturation-delta.md). The
+    ///   x-axis stays honest because it counts what was actually done.
+    pub fn saturate_until_applications(
+        &mut self,
+        max_total_applications: usize,
+        max_iters: usize,
+        max_classes: usize,
+        timeout: std::time::Duration,
+    ) -> AppBudgetSaturationStats {
+        let start = std::time::Instant::now();
+        let deadline = start + timeout;
+        let mut iterations = 0;
+        let mut total_unions = 0;
+
+        let stop = 'outer: loop {
+            if self.provenance.application_count() >= max_total_applications {
+                break SaturationStop::ApplicationBudget;
+            }
+            if iterations >= max_iters {
+                break SaturationStop::IterationCeiling;
+            }
+            if start.elapsed() >= timeout {
+                break SaturationStop::Timeout;
+            }
+            if self.classes.len() > max_classes {
+                break SaturationStop::ClassCap;
+            }
+            iterations += 1;
+            self.step += 1;
+
+            // One batched sweep, mirroring `saturate_with_limits` exactly
+            // (same per-rule class-cap check, same interleaved partial
+            // rebuild via `batch`, full rebuild on batch drop), plus the
+            // application-budget check between rules.
+            let mut mid_sweep_stop: Option<SaturationStop> = None;
             let unions = {
                 let mut batch = self.batch();
                 let n_rules = batch.graph.rules.len();
                 let mut total = 0;
                 for rule_idx in 0..n_rules {
+                    if batch.graph.provenance.application_count() >= max_total_applications {
+                        mid_sweep_stop = Some(SaturationStop::ApplicationBudget);
+                        break;
+                    }
                     if batch.node_count() > max_classes {
+                        mid_sweep_stop = Some(SaturationStop::ClassCap);
                         break;
                     }
                     let result = batch.apply_rule(rule_idx, max_classes, Some(deadline));
@@ -873,14 +1074,31 @@ impl EGraph {
                 // rebuild happens here on drop
             };
             total_unions += unions;
-            if unions == 0 {
-                break; // Saturated
+            if let Some(stop) = mid_sweep_stop {
+                break stop;
             }
-        }
+            // A COMPLETE sweep with zero unions is quiescence. A sweep cut
+            // short by the budget or class-cap check above never reaches
+            // here (both record a `mid_sweep_stop`), so this cannot
+            // mislabel a truncated sweep as quiesced — the same
+            // cap-vs-quiescence distinction the 2026-09-01 review round
+            // fixed in `guide_scope_saturation_delta`.
+            if unions == 0 {
+                // `apply_rule_at_index_timed` truncates its own scan when
+                // the deadline passes mid-sweep, so a zero-union sweep with
+                // the deadline expired is a truncated scan, not quiescence.
+                if start.elapsed() >= timeout {
+                    break 'outer SaturationStop::Timeout;
+                }
+                break 'outer SaturationStop::Quiesced;
+            }
+        };
 
-        SaturationStats {
+        AppBudgetSaturationStats {
             iterations,
             total_unions,
+            applications: self.provenance.application_count(),
+            stop,
         }
     }
 
@@ -923,6 +1141,7 @@ impl EGraph {
             return ApplyResult {
                 changes: 0,
                 evals: 0,
+                truncated: false,
             };
         }
 
@@ -930,17 +1149,20 @@ impl EGraph {
         let mut evals = 0usize;
         let mut updates: Vec<(EClassId, RewriteAction)> = Vec::new();
         let mut estimated_new_nodes: usize = 0;
+        let mut truncated = false;
 
         let canonical_ids = self.canonical_class_ids();
         'scan: for canonical in canonical_ids {
             // Budget check: current graph + pending creates must stay under limit
             if self.classes.len() + estimated_new_nodes > max_nodes {
+                truncated = true;
                 break;
             }
             // Deadline check
             if evals & 1023 == 0 {
                 if let Some(dl) = deadline {
                     if std::time::Instant::now() > dl {
+                        truncated = true;
                         break;
                     }
                 }
@@ -963,6 +1185,7 @@ impl EGraph {
                     // If this action would push us over budget, stop scanning
                     if self.classes.len() + estimated_new_nodes > max_nodes {
                         // Don't add this action — discard it and stop
+                        truncated = true;
                         break 'scan;
                     }
 
@@ -985,6 +1208,7 @@ impl EGraph {
         ApplyResult {
             changes: unions,
             evals,
+            truncated,
         }
     }
 

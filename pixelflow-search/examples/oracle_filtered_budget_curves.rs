@@ -13,20 +13,36 @@
 //! recursion) and the optimizer inherits that stance: saturation runs under a
 //! budget tier and spends it, full stop — it does not detect or rely on
 //! reaching a fixed point, and a fixed point is not a certified state
-//! anywhere in this pipeline (`EGraph::saturate_with_limits` stops on
-//! iteration count, class count, timeout, OR convergence — whichever comes
-//! first — and production callers never distinguish which one fired). So
-//! there is no privileged "C_full" to call the reference and everything else
-//! "regret against". This harness instead runs ONE thing per rule set: a
-//! single incremental saturation from empty to a generous ceiling (3x the
-//! expression's own production tier budget — see [`FRACS`]), sampling
-//! extraction cost at standardized work fractions along the way. That is the
-//! anytime curve. Two curves are run per expression — **unguided** (the full
-//! 62-rule library, `pixelflow_search::math::all_rules()`) and
-//! **oracle-filtered** (only the rules a hindsight pass over the
-//! unguided run's best-found extraction marked load-bearing) — and the
-//! reference for regret at any work level is the lowest cost either curve
-//! ever reaches, empirically, never a claimed optimum.
+//! anywhere in this pipeline. So there is no privileged "C_full" to call the
+//! reference and everything else "regret against". This harness instead runs
+//! ONE thing per rule set: a single incremental saturation from empty,
+//! sampling extraction cost at standardized work checkpoints along the way.
+//! That is the anytime curve. Two curves are run per expression —
+//! **unguided** (the full 62-rule library,
+//! `pixelflow_search::math::all_rules()`) and **oracle-filtered** (only the
+//! rules a hindsight pass over the unguided run's best-found extraction
+//! marked load-bearing) — and the reference for regret at any work level is
+//! the lowest cost either curve ever reaches, empirically, never a claimed
+//! optimum.
+//!
+//! # Checkpoint grid: applications, not sweep fractions (2026-09-01 recalibration)
+//!
+//! The 2026-08-30 run of this harness came back null: its grid (fractions
+//! 0.25x..3x of the per-tier nominal *iteration* budget) started past the
+//! point where 97.8% of expressions had already quiesced or hit their class
+//! cap, so every curve was flat before the first sample
+//! (docs/results/2026-08-30-oracle-filtered-budget-curves.md). Checkpoints
+//! are now denominated in **cumulative rule applications** — the same unit
+//! the Phase 3 registration denominates budgets in — on a geometric grid
+//! ([`pixelflow_search::egraph::APP_CHECKPOINT_GRID`]) that resolves both
+//! the median-~195-applications regime and the heavy tail. The curve loop
+//! itself lives in `pixelflow_search::egraph::anytime` (one definition,
+//! imported — the pipeline's baseline binary uses the identical loop), and
+//! the class cap is the production tier's fixed memory-protection cap: under
+//! application denomination the x-axis measures work actually done, so the
+//! per-checkpoint class-cap scaling the PR #1067 review demanded of the old
+//! fraction grid is superseded, not dropped — see the module doc of
+//! `anytime.rs` for the argument.
 //!
 //! # Oracle replay: the approximation actually taken
 //!
@@ -108,14 +124,14 @@
 //! synthetic shapes.
 //!
 //! All measurements are deterministic counts and static-latency-prior cost
-//! units (`CostModel::latency_prior()`). The only `Duration` ever passed to
-//! `saturate_with_limits` is a 300s safety ceiling no expression here comes
-//! close to — wall-clock plays no role in any reported number.
+//! units (`CostModel::latency_prior()`). The only `Duration` in play is a
+//! 300s per-curve safety ceiling that PANICS if it ever binds (inside
+//! `run_anytime_curve`) — wall-clock plays no role in any reported number.
 //!
 //! Run: `cargo run --release -p pixelflow-search --example oracle_filtered_budget_curves`
 //! Output: prints a summary to stdout and writes a full per-expression,
-//! per-curve, per-work-fraction CSV to `--out` (default
-//! `docs/results/2026-08-30-oracle-filtered-budget-curves.csv`).
+//! per-curve, per-checkpoint CSV to `--out` (default
+//! `docs/results/2026-09-01-oracle-filtered-budget-curves.csv`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
@@ -125,26 +141,23 @@ use std::time::Duration;
 use pixelflow_ir::arena::ExprNode;
 use pixelflow_ir::{ExprArena, ExprId, OpKind};
 use pixelflow_search::egraph::{
-    CostModel, EClassId, EGraph, ENodeId, EpisodeLabels, ExtractedDAG, Origin, Rewrite, all_rules,
-    collect_rule_templates, config_for_node_count, extract_dag,
+    APP_CHECKPOINT_GRID, AnytimeCurveOutput, CostModel, EClassId, EGraph, ENodeId, EpisodeLabels,
+    Origin, Rewrite, SaturationStop, all_rules, collect_rule_templates, config_for_node_count,
+    run_anytime_curve,
 };
 use pixelflow_search::nnue::{BwdGenConfig, BwdGenerator};
 
-/// Safety ceiling only — see module docs. Never approached by anything here.
-/// Applies to one expression's WHOLE curve (`run_anytime_curve`'s single-
-/// iteration `saturate_with_limits` calls each pass the *remaining* duration
-/// against one deadline computed once, not this constant re-passed fresh —
-/// `saturate_with_limits` starts its own `Instant::now()` clock on every
-/// call, so re-passing the constant would let a `ceiling_iters`-long curve
-/// run for up to `ceiling_iters * SAFETY_TIMEOUT`, not `SAFETY_TIMEOUT`).
+/// Safety ceiling only — applies to one expression's WHOLE curve (the
+/// `anytime` module computes one deadline per curve and passes the remaining
+/// duration to each saturation call, then PANICS if it ever binds — offline
+/// measurement fails loud, never silently truncates).
 const SAFETY_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Standardized work-fraction grid, expressed as a multiple of the
-/// expression's own production tier budget (`config_for_node_count`).
-/// 0.25/0.5 stand in for the task's "truncated budget" regimes; 1.0 is the
-/// tier's nominal budget; 2.0/3.0 probe beyond it for the
-/// better-forms-at-max-budget observation.
-const FRACS: &[f64] = &[0.25, 0.5, 1.0, 2.0, 3.0];
+/// Generous safety ceiling on total sweeps per curve. With the budget
+/// denominated in applications, sweeps are bounded by quiescence/class-cap in
+/// practice; this only exists so a pathological expression cannot loop
+/// unboundedly, and hitting it is reported as a distinct stop reason.
+const SWEEP_SAFETY_CEILING: usize = 10_000;
 
 // ============================================================================
 // Corpus generation
@@ -452,142 +465,18 @@ fn chosen_tags(egraph: &EGraph, root: EClassId, choices: &[Option<usize>]) -> BT
 }
 
 // ============================================================================
-// Anytime curve
+// Per-expression measurement (curve loop imported from `egraph::anytime`)
 // ============================================================================
 
-#[derive(Clone, Debug)]
-struct Checkpoint {
-    frac: f64,
-    iteration: usize,
-    applications: usize,
-    classes: usize,
-    nodes: usize,
-    cost: usize,
-}
-
-fn make_checkpoint(
-    egraph: &EGraph,
-    extraction: &ExtractedDAG,
-    iteration: usize,
-    frac: f64,
-) -> Checkpoint {
-    Checkpoint {
-        frac,
-        iteration,
-        applications: egraph.provenance().application_count(),
-        classes: egraph.num_classes(),
-        nodes: egraph.node_count(),
-        cost: extraction.total_cost,
+fn stop_name(stop: SaturationStop) -> &'static str {
+    match stop {
+        SaturationStop::Quiesced => "quiesced",
+        SaturationStop::ApplicationBudget => "app_budget",
+        SaturationStop::ClassCap => "class_cap",
+        SaturationStop::IterationCeiling => "sweep_ceiling",
+        SaturationStop::Timeout => "timeout",
     }
 }
-
-/// Run one incremental saturation from empty to `FRACS.last() * n_iters_nominal`
-/// iterations, sampling extraction cost at each fraction in `FRACS`. Returns
-/// the checkpoints, the iteration at which the run stopped producing new
-/// nodes (`None` if it never did, within the tested ceiling), and the final
-/// e-graph + extraction (whichever iteration the loop actually stopped at) —
-/// the latter two feed hindsight labeling for the caller that runs the
-/// unguided curve.
-fn run_anytime_curve(
-    arena: &ExprArena,
-    root: ExprId,
-    rules: Vec<Box<dyn Rewrite>>,
-    n_iters_nominal: usize,
-    n_classes_nominal: usize,
-) -> (Vec<Checkpoint>, Option<usize>, EGraph, ExtractedDAG) {
-    let costs = CostModel::latency_prior();
-    let target_iters: Vec<usize> = FRACS
-        .iter()
-        .map(|f| ((*f * n_iters_nominal as f64).round() as usize).max(1))
-        .collect();
-    assert!(
-        target_iters.windows(2).all(|w| w[0] < w[1]),
-        "FRACS must produce strictly increasing iteration targets for n_iters_nominal={n_iters_nominal}, got {target_iters:?}"
-    );
-    let ceiling_iters = *target_iters.last().expect("FRACS must be non-empty");
-    // Per-checkpoint class caps (parallel to `target_iters`), not one fixed
-    // `ceiling_classes` reused for the whole curve. A PR review caught this:
-    // reusing the final (3x) class cap throughout meant a checkpoint labeled
-    // "frac=1.0" could actually reflect an e-graph that grew to the 3x class
-    // allowance -- iteration count alone doesn't bound class growth, since a
-    // rule sweep can pack far more class growth into few iterations than the
-    // nominal tier budget intends. Verified against the committed data: 59
-    // of 225 unguided rows exceeded their tier's nominal class cap at
-    // frac=1.0, some reaching close to 3x it.
-    let target_classes: Vec<usize> = FRACS
-        .iter()
-        .map(|f| ((*f * n_classes_nominal as f64).round() as usize).max(1))
-        .collect();
-
-    let mut egraph = EGraph::with_rules(rules);
-    let root_class = egraph.add_arena(arena, root);
-
-    let mut checkpoints: Vec<Checkpoint> = Vec::with_capacity(FRACS.len());
-    let mut quiesced_at: Option<usize> = None;
-    let mut target_idx = 0;
-    // One deadline for the whole curve, not one per single-iteration call
-    // (see `SAFETY_TIMEOUT`'s doc comment for why re-passing the constant
-    // would let this loop run far longer than the documented ceiling).
-    let curve_deadline = std::time::Instant::now() + SAFETY_TIMEOUT;
-
-    for iter in 1..=ceiling_iters {
-        let remaining = curve_deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "oracle_filtered_budget_curves: one expression's curve ran past the \
-             {SAFETY_TIMEOUT:?} safety ceiling (iteration {iter}/{ceiling_iters}) -- this \
-             was expected to never bind at this corpus's scale; fail loud rather than \
-             silently truncate and report a partial curve"
-        );
-        // Cap growth at the class budget of the NEXT checkpoint not yet
-        // reached -- once that checkpoint is sampled below, `target_idx`
-        // advances and the cap grows for the next one.
-        let active_class_cap = target_classes[target_idx.min(target_classes.len() - 1)];
-        let stats = egraph.saturate_with_limits(1, active_class_cap, remaining);
-        if target_idx < target_iters.len() && iter == target_iters[target_idx] {
-            let extraction = extract_dag(&egraph, root_class, &costs);
-            checkpoints.push(make_checkpoint(
-                &egraph,
-                &extraction,
-                iter,
-                FRACS[target_idx],
-            ));
-            target_idx += 1;
-        }
-        // `stats.iterations == 0` means the ACTIVE checkpoint's class cap
-        // was already exceeded before this round could run at all -- not
-        // genuine quiescence (the next checkpoint's larger cap may still
-        // allow growth once `target_idx` advances past it). Only a round
-        // that actually ran and found nothing (`iterations > 0 &&
-        // total_unions == 0`) is real quiescence -- the same distinction
-        // `guide_scope_saturation_delta.rs` makes for its own class-cap
-        // guard, for the same underlying reason (allocated vs. requested
-        // class count are different quantities `saturate_with_limits`
-        // enforces internally).
-        if stats.iterations > 0 && stats.total_unions == 0 {
-            quiesced_at = Some(iter);
-            break;
-        }
-    }
-
-    let final_extraction = extract_dag(&egraph, root_class, &costs);
-    let final_iter = quiesced_at.unwrap_or(ceiling_iters);
-    while target_idx < target_iters.len() {
-        checkpoints.push(make_checkpoint(
-            &egraph,
-            &final_extraction,
-            final_iter,
-            FRACS[target_idx],
-        ));
-        target_idx += 1;
-    }
-
-    (checkpoints, quiesced_at, egraph, final_extraction)
-}
-
-// ============================================================================
-// Per-expression measurement
-// ============================================================================
 
 #[derive(Clone, Debug)]
 struct CurveRow {
@@ -595,23 +484,33 @@ struct CurveRow {
     tier: &'static str,
     node_count: usize,
     curve: &'static str, // "unguided" | "oracle"
-    frac: f64,
-    iteration: usize,
+    app_target: usize,
+    app_actual: usize,
+    sweeps: usize,
     rules_allowed: usize,
-    applications: usize,
     classes: usize,
     nodes: usize,
     cost: usize,
+    stop: &'static str,
+    clamped: bool,
     regret_pct: f64,
 }
 
 struct ExprMeasurement {
     rows: Vec<CurveRow>,
-    unguided_quiesced_before_nominal: bool,
-    oracle_quiesced_before_nominal: bool,
-    /// unguided cost at frac=1.0 minus unguided cost at frac=3.0 (>=0 if a
-    /// strictly cheaper form existed beyond the nominal budget).
-    better_form_gap_pct: f64,
+    /// How each curve's run ended (quiesced / class cap / grid exhausted /
+    /// sweep ceiling) — a distinct status per the 2026-08-30 report's
+    /// design-implication #3, no longer inferred from class-count forensics.
+    unguided_ended: SaturationStop,
+    oracle_ended: SaturationStop,
+    unguided_ended_at_apps: usize,
+    /// Number of distinct cost values along the unguided curve — the direct
+    /// "did the grid see any curve shape at all" recalibration check (the
+    /// 2026-08-30 run had 1 everywhere).
+    unguided_distinct_costs: usize,
+    /// Relative gap between the first checkpoint's cost and the final cost
+    /// on the unguided curve (>0 means the curve has shape).
+    first_to_final_gap_pct: f64,
     load_bearing: usize,
     total_applications: usize,
     credited_non_direct: usize,
@@ -620,19 +519,34 @@ struct ExprMeasurement {
 fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
     let tier = tier_name(item.node_count);
     let config = config_for_node_count(item.node_count);
-    let n_iters = config.max_iterations;
-    let n_classes = config.max_classes;
+    // Fixed environment cap (production tier value) for the whole curve —
+    // see the module doc's recalibration section for why this replaces the
+    // old per-checkpoint class-cap scaling.
+    let class_cap = config.max_classes;
+    let costs = CostModel::latency_prior();
 
     let full_rules = all_rules();
     let full_rules_count = full_rules.len();
-    let (uc_checkpoints, uc_quiesced, uc_egraph, uc_extraction) =
-        run_anytime_curve(&item.arena, item.root, full_rules, n_iters, n_classes);
+    let unguided: AnytimeCurveOutput = run_anytime_curve(
+        &item.arena,
+        item.root,
+        full_rules,
+        APP_CHECKPOINT_GRID,
+        class_cap,
+        SWEEP_SAFETY_CEILING,
+        SAFETY_TIMEOUT,
+        &costs,
+    );
 
-    let labels = EpisodeLabels::compute(&uc_egraph, uc_extraction.root, &uc_extraction.choices);
+    let labels = EpisodeLabels::compute(
+        &unguided.egraph,
+        unguided.extraction.root,
+        &unguided.extraction.choices,
+    );
     let oracle_rule_idxs: BTreeSet<usize> = labels
         .load_bearing
         .iter()
-        .filter_map(|app_id| uc_egraph.provenance().application(*app_id))
+        .filter_map(|app_id| unguided.egraph.provenance().application(*app_id))
         .map(|record| record.rule_idx)
         .collect();
     let oracle_rules: Vec<Box<dyn Rewrite>> = all_rules()
@@ -643,13 +557,25 @@ fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
         .collect();
     let oracle_rules_len = oracle_rules.len();
 
-    let (oc_checkpoints, oc_quiesced, _oc_egraph, _oc_extraction) =
-        run_anytime_curve(&item.arena, item.root, oracle_rules, n_iters, n_classes);
+    let oracle: AnytimeCurveOutput = run_anytime_curve(
+        &item.arena,
+        item.root,
+        oracle_rules,
+        APP_CHECKPOINT_GRID,
+        class_cap,
+        SWEEP_SAFETY_CEILING,
+        SAFETY_TIMEOUT,
+        &costs,
+    );
 
     // Over-approximation looseness.
-    let chosen = chosen_tags(&uc_egraph, uc_extraction.root, &uc_extraction.choices);
+    let chosen = chosen_tags(
+        &unguided.egraph,
+        unguided.extraction.root,
+        &unguided.extraction.choices,
+    );
     let mut created_by: HashMap<u64, Vec<ENodeId>> = HashMap::new();
-    for (enode_id, origin) in uc_egraph.provenance().origins() {
+    for (enode_id, origin) in unguided.egraph.provenance().origins() {
         if let Origin::Rule(app_id) = origin {
             created_by
                 .entry(app_id.as_u64())
@@ -668,26 +594,21 @@ fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
         }
     }
 
-    let global_best = uc_checkpoints
+    let uc = &unguided.curve.checkpoints;
+    let oc = &oracle.curve.checkpoints;
+    let global_best = uc
         .iter()
-        .chain(oc_checkpoints.iter())
+        .chain(oc.iter())
         .map(|c| c.cost)
         .min()
-        .expect("FRACS non-empty => at least one checkpoint per curve");
+        .expect("grid non-empty => at least one checkpoint per curve");
 
-    // `global_best == 0` means SOME checkpoint (either curve, any frac)
+    // `global_best == 0` means SOME checkpoint (either curve, any target)
     // extracted to a free `Const`/`Var`. A checkpoint that matches that
     // (cost == 0 too) is exactly as good -- 0% regret, correct. A checkpoint
     // with positive cost is not "equally good relative to a free reference"
-    // -- (cost - 0) / 0 is not 0, it is unboundedly worse, since ANY nonzero
-    // cost is infinitely far from free. Reporting 0.0 there (the previous
-    // behavior) silently erased a real regret signal for any expression
-    // whose curve simplifies to zero-cost only at a LATER checkpoint than
-    // an earlier positive-cost one -- not observed in this corpus's current
-    // checkpoint grid (see the report's "checkpoint-grid miscalibration"
-    // finding: costs are flat across checkpoints for every sampled
-    // expression here), but exactly the failure mode a recalibrated,
-    // finer-grained rerun would be vulnerable to.
+    // -- ANY nonzero cost is unboundedly worse than free, so report INF
+    // rather than silently erasing the regret (PR #1067 finding, kept).
     let regret = |cost: usize| -> f64 {
         if global_best == 0 {
             if cost == 0 { 0.0 } else { f64::INFINITY }
@@ -696,63 +617,52 @@ fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
         }
     };
 
-    let mut rows = Vec::with_capacity(uc_checkpoints.len() + oc_checkpoints.len());
-    let uc_nominal_cost = uc_checkpoints
-        .iter()
-        .find(|c| (c.frac - 1.0).abs() < 1e-9)
-        .expect("frac=1.0 checkpoint always recorded")
-        .cost;
-    let uc_max_cost = uc_checkpoints
-        .iter()
-        .find(|c| (c.frac - *FRACS.last().unwrap()).abs() < 1e-9)
-        .expect("max-frac checkpoint always recorded")
-        .cost;
-    let better_form_gap_pct = if uc_nominal_cost == 0 {
+    let first_cost = uc.first().expect("non-empty grid").cost;
+    let final_cost = uc.last().expect("non-empty grid").cost;
+    let first_to_final_gap_pct = if first_cost == 0 {
         0.0
     } else {
-        (uc_nominal_cost as f64 - uc_max_cost as f64) / uc_nominal_cost as f64 * 100.0
+        (first_cost as f64 - final_cost as f64) / first_cost as f64 * 100.0
+    };
+    let unguided_distinct_costs = {
+        let set: BTreeSet<usize> = uc.iter().map(|c| c.cost).collect();
+        set.len()
     };
 
-    for c in &uc_checkpoints {
-        rows.push(CurveRow {
-            expr_name: item.name.clone(),
-            tier,
-            node_count: item.node_count,
-            curve: "unguided",
-            frac: c.frac,
-            iteration: c.iteration,
-            rules_allowed: full_rules_count,
-            applications: c.applications,
-            classes: c.classes,
-            nodes: c.nodes,
-            cost: c.cost,
-            regret_pct: regret(c.cost),
-        });
-    }
-    for c in &oc_checkpoints {
-        rows.push(CurveRow {
-            expr_name: item.name.clone(),
-            tier,
-            node_count: item.node_count,
-            curve: "oracle",
-            frac: c.frac,
-            iteration: c.iteration,
-            rules_allowed: oracle_rules_len,
-            applications: c.applications,
-            classes: c.classes,
-            nodes: c.nodes,
-            cost: c.cost,
-            regret_pct: regret(c.cost),
-        });
+    let mut rows = Vec::with_capacity(uc.len() + oc.len());
+    for (curve_name, rules_allowed, cps) in [
+        ("unguided", full_rules_count, uc),
+        ("oracle", oracle_rules_len, oc),
+    ] {
+        for c in cps.iter() {
+            rows.push(CurveRow {
+                expr_name: item.name.clone(),
+                tier,
+                node_count: item.node_count,
+                curve: curve_name,
+                app_target: c.app_target,
+                app_actual: c.app_actual,
+                sweeps: c.sweeps,
+                rules_allowed,
+                classes: c.classes,
+                nodes: c.nodes,
+                cost: c.cost,
+                stop: stop_name(c.stop),
+                clamped: c.clamped,
+                regret_pct: regret(c.cost),
+            });
+        }
     }
 
     ExprMeasurement {
         rows,
-        unguided_quiesced_before_nominal: uc_quiesced.map(|q| q < n_iters).unwrap_or(false),
-        oracle_quiesced_before_nominal: oc_quiesced.map(|q| q < n_iters).unwrap_or(false),
-        better_form_gap_pct,
+        unguided_ended: unguided.curve.ended,
+        oracle_ended: oracle.curve.ended,
+        unguided_ended_at_apps: unguided.curve.ended_at_apps,
+        unguided_distinct_costs,
+        first_to_final_gap_pct,
         load_bearing: labels.load_bearing.len(),
-        total_applications: uc_egraph.provenance().application_count(),
+        total_applications: unguided.egraph.provenance().application_count(),
         credited_non_direct,
     }
 }
@@ -769,11 +679,12 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from("docs/results/2026-08-30-oracle-filtered-budget-curves.csv")
+            PathBuf::from("docs/results/2026-09-01-oracle-filtered-budget-curves.csv")
         });
 
     let rule_count = all_rules().len();
     println!("rule library size: {rule_count} rules");
+    println!("checkpoint grid (applications): {APP_CHECKPOINT_GRID:?}");
 
     let mut corpus = build_synthetic_corpus();
     let synthetic_count = corpus.len();
@@ -791,22 +702,28 @@ fn main() {
     );
 
     let mut all_rows: Vec<CurveRow> = Vec::new();
-    let mut quiesce_diag: Vec<(String, &'static str, usize, bool, bool)> = Vec::new();
-    let mut better_form_diag: Vec<(String, &'static str, f64)> = Vec::new();
+    let mut end_diag: Vec<(String, &'static str, SaturationStop, SaturationStop, usize)> =
+        Vec::new();
+    let mut shape_diag: Vec<(String, &'static str, usize, f64)> = Vec::new();
     let mut looseness_diag: Vec<(String, &'static str, usize, usize, usize)> = Vec::new();
 
     for (i, item) in corpus.iter().enumerate() {
         let m = measure_expression(item);
         all_rows.extend(m.rows);
         let tier = tier_name(item.node_count);
-        quiesce_diag.push((
+        end_diag.push((
             item.name.clone(),
             tier,
-            item.node_count,
-            m.unguided_quiesced_before_nominal,
-            m.oracle_quiesced_before_nominal,
+            m.unguided_ended,
+            m.oracle_ended,
+            m.unguided_ended_at_apps,
         ));
-        better_form_diag.push((item.name.clone(), tier, m.better_form_gap_pct));
+        shape_diag.push((
+            item.name.clone(),
+            tier,
+            m.unguided_distinct_costs,
+            m.first_to_final_gap_pct,
+        ));
         looseness_diag.push((
             item.name.clone(),
             tier,
@@ -828,24 +745,26 @@ fn main() {
     let mut f = std::fs::File::create(&out_path).expect("create output CSV");
     writeln!(
         f,
-        "expr_name,tier,node_count,curve,frac,iteration,rules_allowed,applications,classes,nodes,cost,regret_pct"
+        "expr_name,tier,node_count,curve,app_target,app_actual,sweeps,rules_allowed,classes,nodes,cost,stop,clamped,regret_pct"
     )
     .unwrap();
     for r in &all_rows {
         writeln!(
             f,
-            "{},{},{},{},{},{},{},{},{},{},{},{:.4}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4}",
             r.expr_name,
             r.tier,
             r.node_count,
             r.curve,
-            r.frac,
-            r.iteration,
+            r.app_target,
+            r.app_actual,
+            r.sweeps,
             r.rules_allowed,
-            r.applications,
             r.classes,
             r.nodes,
             r.cost,
+            r.stop,
+            r.clamped,
             r.regret_pct,
         )
         .unwrap();
@@ -853,8 +772,8 @@ fn main() {
     println!("wrote {} rows to {}", all_rows.len(), out_path.display());
 
     // ------------------------------------------------------------------
-    // Summary: regret% and work (applications) by curve x frac, overall and
-    // per tier. Synthetic corpus only (named shaders reported separately).
+    // Summary: regret% by curve x application target, overall and per tier.
+    // Synthetic corpus only (named shaders reported separately).
     // ------------------------------------------------------------------
     let synthetic_names: BTreeSet<&str> = corpus
         .iter()
@@ -863,48 +782,46 @@ fn main() {
         .collect();
     let tiers = ["blitz", "rapid", "classical"];
 
-    println!("\n=== anytime curves: regret% vs work, synthetic corpus (n={synthetic_count}) ===");
+    println!(
+        "\n=== anytime curves: regret% vs applications, synthetic corpus (n={synthetic_count}) ==="
+    );
     for scope in ["ALL"].iter().chain(tiers.iter()) {
         println!("--- scope: {scope} ---");
         for curve in ["unguided", "oracle"] {
-            for &frac in FRACS {
+            for &target in APP_CHECKPOINT_GRID {
                 let mut regrets: Vec<f64> = Vec::new();
-                let mut apps: Vec<f64> = Vec::new();
+                let mut live = 0usize;
                 for r in all_rows.iter().filter(|r| {
                     r.curve == curve
-                        && (r.frac - frac).abs() < 1e-9
+                        && r.app_target == target
                         && synthetic_names.contains(r.expr_name.as_str())
                         && (*scope == "ALL" || r.tier == *scope)
                 }) {
                     regrets.push(r.regret_pct);
-                    apps.push(r.applications as f64);
+                    if !r.clamped {
+                        live += 1;
+                    }
                 }
                 if regrets.is_empty() {
                     continue;
                 }
                 regrets.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                apps.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-                let median = |v: &[f64]| v[v.len() / 2];
+                let mean = regrets.iter().sum::<f64>() / regrets.len() as f64;
+                let median = regrets[regrets.len() / 2];
                 println!(
-                    "  {curve:<9} frac={frac:<4.2} n={:<4} regret%: mean={:>7.2} median={:>7.2} | \
-                     applications: mean={:>8.1} median={:>8.1}",
+                    "  {curve:<9} B={target:<7} n={:<4} live={live:<4} regret%: mean={mean:>8.2} median={median:>7.2}",
                     regrets.len(),
-                    mean(&regrets),
-                    median(&regrets),
-                    mean(&apps),
-                    median(&apps),
                 );
             }
         }
     }
 
     // ------------------------------------------------------------------
-    // Diagnostic: quiesced before nominal cap (NOT an organizing axis).
+    // Diagnostic: how runs ended (explicit stop reasons, not forensics).
     // ------------------------------------------------------------------
-    println!("\n=== diagnostic: quiesced before nominal (frac=1.0) budget ===");
+    println!("\n=== diagnostic: run end status (unguided curve) ===");
     for scope in ["ALL"].iter().chain(tiers.iter()) {
-        let rows: Vec<_> = quiesce_diag
+        let rows: Vec<_> = end_diag
             .iter()
             .filter(|(name, t, ..)| {
                 synthetic_names.contains(name.as_str()) && (*scope == "ALL" || t == scope)
@@ -914,44 +831,47 @@ fn main() {
             continue;
         }
         let n = rows.len();
-        let uc = rows.iter().filter(|(_, _, _, u, _)| *u).count();
-        let oc = rows.iter().filter(|(_, _, _, _, o)| *o).count();
+        let count = |s: SaturationStop| rows.iter().filter(|(_, _, u, _, _)| *u == s).count();
+        let mut ended_apps: Vec<f64> = rows.iter().map(|(_, _, _, _, a)| *a as f64).collect();
+        ended_apps.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "  {scope:<10} n={n:<4} unguided quiesced early: {uc}/{n} ({:.1}%)  \
-             oracle quiesced early: {oc}/{n} ({:.1}%)",
-            uc as f64 / n as f64 * 100.0,
-            oc as f64 / n as f64 * 100.0,
+            "  {scope:<10} n={n:<4} quiesced={} class_cap={} grid_exhausted={} sweep_ceiling={}  \
+             ended-at-apps median={:.0} p90={:.0}",
+            count(SaturationStop::Quiesced),
+            count(SaturationStop::ClassCap),
+            count(SaturationStop::ApplicationBudget),
+            count(SaturationStop::IterationCeiling),
+            ended_apps[ended_apps.len() / 2],
+            ended_apps[(ended_apps.len() * 9) / 10],
         );
     }
 
     // ------------------------------------------------------------------
-    // Diagnostic: better forms beyond nominal budget (unguided curve).
+    // Diagnostic: did the recalibrated grid see curve shape at all?
+    // (The 2026-08-30 fraction grid saw exactly one distinct cost per
+    // expression, everywhere — the null result this recalibration fixes.)
     // ------------------------------------------------------------------
-    println!(
-        "\n=== diagnostic: better forms beyond nominal budget (unguided, frac 1.0 -> {:.1}) ===",
-        FRACS.last().unwrap()
-    );
+    println!("\n=== diagnostic: unguided curve shape (distinct costs across checkpoints) ===");
     for scope in ["ALL"].iter().chain(tiers.iter()) {
-        let gaps: Vec<f64> = better_form_diag
+        let rows: Vec<_> = shape_diag
             .iter()
-            .filter(|(name, t, _)| {
+            .filter(|(name, t, ..)| {
                 synthetic_names.contains(name.as_str()) && (*scope == "ALL" || t == scope)
             })
-            .map(|(_, _, g)| *g)
             .collect();
-        if gaps.is_empty() {
+        if rows.is_empty() {
             continue;
         }
-        let n = gaps.len();
-        let improved = gaps.iter().filter(|g| **g > 1e-9).count();
-        let mean = gaps.iter().sum::<f64>() / n as f64;
+        let n = rows.len();
+        let with_shape = rows.iter().filter(|(_, _, d, _)| *d > 1).count();
+        let gaps: Vec<f64> = rows.iter().map(|(_, _, _, g)| *g).collect();
         let mut sorted = gaps.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "  {scope:<10} n={n:<4} strictly-better-at-max-budget: {improved}/{n} ({:.1}%)  \
-             mean gap={:.2}%  median gap={:.2}%",
-            improved as f64 / n as f64 * 100.0,
-            mean,
+            "  {scope:<10} n={n:<4} curves-with-shape: {with_shape}/{n} ({:.1}%)  \
+             first-to-final gap: mean={:.2}% median={:.2}%",
+            with_shape as f64 / n as f64 * 100.0,
+            gaps.iter().sum::<f64>() / n as f64,
             sorted[n / 2],
         );
     }
@@ -993,43 +913,50 @@ fn main() {
     // ------------------------------------------------------------------
     // Shaders in-sample.
     // ------------------------------------------------------------------
+    // Compared at the FINAL grid target: every curve has exactly one row per
+    // grid target (clamped rows freeze the end state), so the last target is
+    // the "all the budget this harness ever grants" point — the analogue of
+    // the old fraction grid's 1.0x row.
+    let final_target = *APP_CHECKPOINT_GRID
+        .last()
+        .expect("checkpoint grid is non-empty");
     println!("\n=== shaders in-sample check (named realistic kernels vs synthetic corpus) ===");
     for item in corpus.iter().filter(|c| c.is_named_shader) {
         let tier = tier_name(item.node_count);
-        let synth_regret_at_1: Vec<f64> = all_rows
+        let synth_regret_at_final: Vec<f64> = all_rows
             .iter()
             .filter(|r| {
                 r.tier == tier
                     && r.curve == "unguided"
-                    && (r.frac - 1.0).abs() < 1e-9
+                    && r.app_target == final_target
                     && synthetic_names.contains(r.expr_name.as_str())
             })
             .map(|r| r.regret_pct)
             .collect();
-        let (lo, hi) = if synth_regret_at_1.is_empty() {
+        let (lo, hi) = if synth_regret_at_final.is_empty() {
             (0.0, 0.0)
         } else {
-            let mut s = synth_regret_at_1.clone();
+            let mut s = synth_regret_at_final.clone();
             s.sort_by(|a, b| a.partial_cmp(b).unwrap());
             (s[0], s[s.len() - 1])
         };
         let uc_regret = all_rows
             .iter()
             .find(|r| {
-                r.expr_name == item.name && r.curve == "unguided" && (r.frac - 1.0).abs() < 1e-9
+                r.expr_name == item.name && r.curve == "unguided" && r.app_target == final_target
             })
             .map(|r| r.regret_pct)
             .unwrap_or(f64::NAN);
         let oc_regret = all_rows
             .iter()
             .find(|r| {
-                r.expr_name == item.name && r.curve == "oracle" && (r.frac - 1.0).abs() < 1e-9
+                r.expr_name == item.name && r.curve == "oracle" && r.app_target == final_target
             })
             .map(|r| r.regret_pct)
             .unwrap_or(f64::NAN);
         let in_sample = uc_regret >= lo && uc_regret <= hi;
         println!(
-            "  {:<20} nodes={:<4} tier={:<10} unguided_regret@1.0={:>7.2}%  oracle_regret@1.0={:>7.2}%  \
+            "  {:<20} nodes={:<4} tier={:<10} unguided_regret@end={:>7.2}%  oracle_regret@end={:>7.2}%  \
              synthetic-{tier}-tier range=[{lo:.2}%,{hi:.2}%] in-sample={}",
             item.name, item.node_count, tier, uc_regret, oc_regret, in_sample,
         );

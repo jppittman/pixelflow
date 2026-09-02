@@ -24,6 +24,7 @@
 //! front door — insert an [`pixelflow_ir::arena::ExprArena`] directly, no AST
 //! involved.
 
+pub mod anytime;
 pub mod codegen;
 pub(crate) mod cost;
 pub mod deps;
@@ -36,9 +37,13 @@ mod node;
 pub mod ops;
 pub mod provenance;
 pub mod rewrite;
+pub mod rule_order;
 pub mod saturate;
 
 // Re-export public API
+pub use anytime::{
+    APP_CHECKPOINT_GRID, AnytimeCheckpoint, AnytimeCurve, AnytimeCurveOutput, run_anytime_curve,
+};
 pub use cost::{CostFunction, CostModel};
 pub use deps::{Deps, DepsAnalysis};
 pub use derivative::{ChainRule, derivative_rules};
@@ -47,15 +52,19 @@ pub use extract::{
     compute_ref_counts, extract, extract_dag,
 };
 pub use extraction::{ExtractionPolicy, env_extraction_policy};
-pub use graph::{ApplyResult, EGraph, EGraphBatch, RewriteTarget, SaturationStats};
+pub use graph::{
+    AppBudgetSaturationStats, ApplyResult, EGraph, EGraphBatch, RewriteTarget, SaturationStats,
+    SaturationStop,
+};
 pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
 pub use node::{EClassId, ENode};
 pub use ops::Op;
 pub use provenance::{
     ApplicationId, ApplicationRecord, ENodeId, Origin, Provenance, UnionEvent,
-    derivation_ancestors, format_derivation_trace,
+    derivation_ancestors, derivation_ancestors_tight, format_derivation_trace,
 };
 pub use rewrite::{Rewrite, RewriteAction};
+pub use rule_order::{NUMERIC_FIRST_ORDER, RuleOrder, build_rule_set};
 pub use saturate::{
     SaturationConfig, SaturationResult, achievable_cost_within_budget, config_for_node_count,
     saturate_with_budget, saturate_with_full_budget,

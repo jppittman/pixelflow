@@ -34,6 +34,34 @@
 //! acceptable, documented cost of a conservative label; under-crediting
 //! would silently corrupt the Guide's training signal, which is not
 //! acceptable.
+//!
+//! # Tightened variant
+//!
+//! [`EpisodeLabels::compute_tight`] is the same pipeline built on
+//! [`super::provenance::derivation_ancestors_tight`] instead of
+//! `derivation_ancestors` — a narrower, still-safe over-approximation (see
+//! that function's doc comment for exactly which axes are narrowed). It
+//! exists **alongside** `compute`, not in place of it
+//! (`docs/plans/2026-08-31-guide-design-revision.md` §3, option 3): both can
+//! be run on the same episode so the tightened labels can be compared
+//! directly against the original ones, and `compute`'s existing behavior and
+//! tests are untouched.
+//!
+//! # Strict variant (no over-approximation at all)
+//!
+//! [`EpisodeLabels::compute_strict`] is the third point on the same
+//! over-approximation spectrum (loose `compute` > tight `compute_tight` >
+//! `compute_strict`): an application counts only if its output e-node is
+//! *literally* one of the chosen nodes — no ancestry walk, no
+//! child-class/union-event credit at all. This is `guide_headroom`'s
+//! pre-existing "strict lower bound" measurement
+//! (`docs/results/2026-08-30-guide-headroom.md` §2.1), lifted here so the
+//! label-minting pipeline (`docs/plans/2026-08-31-guide-design-revision.md`
+//! §3 option 3, "strict-label cold start") and `guide_headroom` share one
+//! computation instead of `guide_headroom` re-deriving it against the public
+//! API. Sound-by-construction (never over-credits), but blind to enabling
+//! credit — see the design doc §3 for why that is an accepted, documented
+//! cost of a cold-start label source, not a bug.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,7 +69,7 @@ use super::cost::CostModel;
 use super::extract::{self, ExtractedDAG};
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
-use super::provenance::{ApplicationId, ENodeId};
+use super::provenance::{ApplicationId, ENodeId, Origin};
 use super::rewrite::Rewrite;
 
 /// Binary hindsight label for one recorded rewrite application.
@@ -126,7 +154,46 @@ impl EpisodeLabels {
     pub fn compute(egraph: &EGraph, root: EClassId, choices: &[Option<usize>]) -> Self {
         let chosen_nodes = chosen_tagged_nodes(egraph, root, choices);
         let load_bearing = egraph.derivation_ancestors(&chosen_nodes);
+        Self::from_load_bearing(egraph, load_bearing)
+    }
 
+    /// The tightened counterpart to [`Self::compute`] — identical pipeline,
+    /// built on [`EGraph::derivation_ancestors_tight`] instead of
+    /// [`EGraph::derivation_ancestors`]. See the module doc's "Tightened
+    /// variant" section: this exists alongside `compute` so both can be
+    /// computed on the same episode for direct comparison, and does not
+    /// change what `compute` returns.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`Self::compute`] — a missing/out-of-range `choices`
+    /// entry for a class reachable via the chosen extraction is an extractor
+    /// bug, surfaced loudly rather than papered over.
+    pub fn compute_tight(egraph: &EGraph, root: EClassId, choices: &[Option<usize>]) -> Self {
+        let chosen_nodes = chosen_tagged_nodes(egraph, root, choices);
+        let load_bearing = egraph.derivation_ancestors_tight(&chosen_nodes);
+        Self::from_load_bearing(egraph, load_bearing)
+    }
+
+    /// The strict lower bound — see the module doc's "Strict variant"
+    /// section. No ancestry walk: an application is credited iff its own
+    /// output e-node is one of `chosen_nodes`.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`Self::compute`] — a missing/out-of-range `choices`
+    /// entry for a class reachable via the chosen extraction is an extractor
+    /// bug, surfaced loudly rather than papered over.
+    pub fn compute_strict(egraph: &EGraph, root: EClassId, choices: &[Option<usize>]) -> Self {
+        let chosen_nodes = chosen_tagged_nodes(egraph, root, choices);
+        let load_bearing = strict_load_bearing(egraph, &chosen_nodes);
+        Self::from_load_bearing(egraph, load_bearing)
+    }
+
+    /// Shared tail of `compute`/`compute_tight`: given the already-computed
+    /// load-bearing set (from whichever ancestry walk the caller chose),
+    /// build the flat per-application label map and per-rule aggregates.
+    fn from_load_bearing(egraph: &EGraph, load_bearing: BTreeSet<ApplicationId>) -> Self {
         let mut labels = BTreeMap::new();
         let mut rule_stats: BTreeMap<usize, RuleStats> = BTreeMap::new();
 
@@ -203,6 +270,24 @@ impl EpisodeLabels {
         }
         out
     }
+}
+
+/// The strict bound itself: an application is credited iff its output
+/// e-node is literally one of `chosen_nodes` — the direct creating
+/// application of each node the winning extraction actually selected, and
+/// nothing else. No traversal beyond `chosen_nodes` itself, unlike
+/// `derivation_ancestors`/`derivation_ancestors_tight`.
+fn strict_load_bearing(
+    egraph: &EGraph,
+    chosen_nodes: &[(EClassId, ENodeId)],
+) -> BTreeSet<ApplicationId> {
+    let mut result = BTreeSet::new();
+    for &(_, tag) in chosen_nodes {
+        if let Some(Origin::Rule(app_id)) = egraph.provenance().origin(tag) {
+            result.insert(app_id);
+        }
+    }
+    result
 }
 
 /// Walk the chosen extraction from `root`, following only the chosen node's
@@ -484,6 +569,51 @@ mod tests {
         assert_eq!(stats.wasted(), 0);
     }
 
+    /// (b2) The strict bound agrees with the loose bound on a single-hop
+    /// case (both applications directly produce the chosen node — no
+    /// congruence-closure or child-class over-approximation for either bound
+    /// to diverge on), and is always a subset of the loose bound in general
+    /// (checked here on the same chain episode as (b), where they happen to
+    /// coincide because every credited application's product is itself the
+    /// chosen node).
+    #[test]
+    fn strict_bound_agrees_on_single_hop_and_is_never_a_superset() {
+        let mut eg = egraph_with_commutative();
+
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let sum = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![x, y],
+        });
+        let target = eg
+            .find_rewrite_matches()
+            .into_iter()
+            .find(|t| t.class_id == eg.find(sum))
+            .expect("commutative should match x + y");
+        assert!(eg.apply_single_rule(target.rule_idx, target.class_id, target.node_idx));
+        let app0 = ApplicationId(0);
+
+        let sum_class = eg.find(sum);
+        let commuted_tag = tag_created_by(&eg, sum_class, app0);
+        let commuted_idx = eg
+            .tags(sum_class)
+            .iter()
+            .position(|&t| t == commuted_tag)
+            .unwrap();
+
+        let mut choices: Vec<Option<usize>> = vec![None; eg.num_classes()];
+        choices[eg.find(x).index()] = Some(0);
+        choices[eg.find(y).index()] = Some(0);
+        choices[sum_class.index()] = Some(commuted_idx);
+
+        let loose = EpisodeLabels::compute(&eg, sum_class, &choices);
+        let strict = EpisodeLabels::compute_strict(&eg, sum_class, &choices);
+
+        assert_eq!(strict.load_bearing, BTreeSet::from([app0]));
+        assert!(strict.load_bearing.is_subset(&loose.load_bearing));
+    }
+
     /// (c) Aggregate counts sum correctly on a real saturation episode:
     /// fired == load_bearing + wasted per rule, and the per-rule totals
     /// reconcile against the flat label map / provenance log.
@@ -531,5 +661,59 @@ mod tests {
         // Report renders without panicking and lists every rule that fired.
         let report = result.labels.format_rule_report(&result.egraph);
         assert_eq!(report.lines().count(), 1 + result.labels.rule_stats.len());
+    }
+
+    /// (d) `compute_tight` on a real saturation episode: well-formed (same
+    /// reconciliation properties as `compute`) and its load-bearing set is a
+    /// subset of `compute`'s on the identical episode — the safety property
+    /// `derivation_ancestors_tight`'s doc comment claims, exercised here
+    /// through the full labeler pipeline rather than the raw provenance API.
+    #[test]
+    fn compute_tight_is_well_formed_and_subset_of_loose() {
+        use pixelflow_ir::ExprArena;
+
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let y = arena.push_var(1);
+        let sum = arena.push_binary(pixelflow_ir::OpKind::Add, x, y);
+        let doubled = arena.push_binary(pixelflow_ir::OpKind::Mul, sum, sum);
+        let root = arena.push_binary(pixelflow_ir::OpKind::Sub, doubled, doubled);
+
+        let mut egraph = EGraph::with_rules(crate::egraph::all_rules());
+        let root_class = egraph.add_arena(&arena, root);
+        egraph.saturate();
+
+        let costs = CostModel::latency_prior();
+        let extraction = extract::extract_dag(&egraph, root_class, &costs);
+        let loose = EpisodeLabels::compute(&egraph, extraction.root, &extraction.choices);
+        let tight = EpisodeLabels::compute_tight(&egraph, extraction.root, &extraction.choices);
+
+        // Same reconciliation properties `aggregate_counts_reconcile` checks
+        // for `compute`, now for `compute_tight`.
+        let total_fired: usize = tight.rule_stats.values().map(|s| s.fired).sum();
+        let total_load_bearing: usize = tight.rule_stats.values().map(|s| s.load_bearing).sum();
+        assert_eq!(total_fired, egraph.provenance().application_count());
+        assert_eq!(total_fired, tight.labels.len());
+        assert_eq!(
+            total_load_bearing,
+            tight
+                .labels
+                .values()
+                .filter(|&&l| l == Label::LoadBearing)
+                .count()
+        );
+        for stats in tight.rule_stats.values() {
+            assert_eq!(stats.fired, stats.load_bearing + stats.wasted());
+        }
+
+        // The safety property: tight never credits an application loose
+        // didn't already credit.
+        assert!(
+            tight.load_bearing.is_subset(&loose.load_bearing),
+            "compute_tight's load-bearing set ({} applications) must be a subset of \
+             compute's ({} applications) on the same episode",
+            tight.load_bearing.len(),
+            loose.load_bearing.len()
+        );
     }
 }

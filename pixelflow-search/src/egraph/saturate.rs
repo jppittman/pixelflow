@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use super::graph::EGraph;
+use super::graph::{EGraph, SaturationStop};
 use super::node::EClassId;
 
 /// Result of a budget-limited saturation run.
@@ -48,6 +48,12 @@ pub struct SaturationResult {
 
     /// The rewrite budget that was used.
     pub budget: usize,
+
+    /// Which condition ended the run — read off `EGraph::saturate_with_limits`'s
+    /// own stopping decision, not inferred from the counts above (those can
+    /// tie: a class-cap or timeout break can leave `iterations <
+    /// max_iterations` exactly like a quiesced run).
+    pub stop: SaturationStop,
 }
 
 impl SaturationResult {
@@ -131,6 +137,7 @@ pub fn saturate_with_full_budget(
         classes_after,
         rule_matches,
         budget: max_iterations,
+        stop: stats.stop,
     }
 }
 
@@ -341,6 +348,7 @@ mod tests {
             classes_after: 15,
             rule_matches: HashMap::new(),
             budget: 100,
+            stop: SaturationStop::Quiesced,
         };
 
         assert!((result.growth_ratio() - 1.5).abs() < 0.01);

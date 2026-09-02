@@ -938,3 +938,422 @@ mod expansion_derivative_tests {
         assert!(differentiate_in_optimizer(&a, root).is_none());
     }
 }
+
+/// Production saturation telemetry, stage 2 of 2 (the `Dwrt` macro-time
+/// e-graph; stage 1 is `pixelflow-search/src/runtime.rs`'s
+/// `production_telemetry`, docs/results/2026-09-01-production-saturation-telemetry.md).
+///
+/// [`differentiate_in_optimizer`] (this file, above) is production's *other*
+/// saturation site: it runs at `kernel_value!` macro-expansion time, on
+/// every kernel whose body contains `Dwrt` (`DX`/`DY`), with a budget that is
+/// NOT `config_for_node_count`-tiered — it is the hardcoded "standard
+/// optimizer budget" `eg.saturate()` = 100 iterations / 10,000 classes /
+/// 500 ms (`graph.rs:811-813`), called at `:722` above with the result
+/// discarded exactly like `optimize_runtime_arena_uncached` discards its
+/// `SaturationResult`. core-term's one reachable user of this path is the
+/// glyph winding segment's coverage kernel
+/// (`pixelflow-graphics/src/fonts/ttf_curve_analytical.rs:106-129`, a
+/// `kernel_value!` whose `grad` term differentiates `d` through `DX`/`DY`).
+///
+/// This module drives the *exact* front-end pipeline the `kernel_value!`
+/// proc-macro fn runs (`lib.rs:223-238`: `parser::parse` → `sema::analyze` →
+/// `optimize::optimize` — a FIRST, algebra-only e-graph, AST-level, sized by
+/// `config_for_node_count` on raw AST node count, distinct from the Dwrt
+/// e-graph and measured here too for completeness) on the winding kernel's
+/// literal closure source, reaching the same `AnalyzedKernel` that
+/// `jit_backend::emit_kernel_value` (`:306-339`) would feed to
+/// `ast_to_runtime_arena` (`:468-482`) — then replays
+/// `differentiate_in_optimizer`'s own body verbatim (same param encoding,
+/// same rule set, same extraction) with `saturate_with_limits` standing in
+/// for `saturate()` so `SaturationStats` and provenance survive instead of
+/// being dropped.
+///
+/// There is exactly one kernel to measure here, not a sweep: every glyph
+/// segment shares this one closure body (only the 7 scalar params — the
+/// endpoints and slope — differ per segment, substituted after arena
+/// construction), so the arena `differentiate_in_optimizer` sees is
+/// structurally identical for every call site. `param_indices` are threaded
+/// through as arena `Param` leaves either way (see the encode step below),
+/// so the measured arena does not depend on which segment's numbers would
+/// eventually be substituted.
+///
+/// Nothing here changes production behavior: no signature, no visibility,
+/// no code outside `#[cfg(test)]`.
+#[cfg(test)]
+mod production_telemetry {
+    use super::*;
+    use pixelflow_search::egraph::{CostModel, EGraph, SaturationStats, SaturationStop, extract};
+    use std::time::{Duration, Instant};
+
+    /// Verbatim closure body from
+    /// `pixelflow-graphics/src/fonts/ttf_curve_analytical.rs:106-118` (the
+    /// `kernel_value!` argument, up through the closing `}` of the body —
+    /// the call-site arguments on `:119-127` are runtime values, irrelevant
+    /// to the arena's shape). `crate::parser::parse` expects exactly the
+    /// tokens between the macro's parens, per its own doc example
+    /// (`lib.rs:217`: `kernel_value!(|cx: f32, r: f32| (X - cx) * r)`).
+    const WINDING_KERNEL_SRC: &str = r#"
+        |x0: f32,
+         y0: f32,
+         dx_over_dy: f32,
+         dir: f32,
+         y_min: f32,
+         y_max: f32,
+         min_grad: f32|
+         -> Field {
+            let in_y = (Y >= y_min) & (Y < y_max);
+            let d = X - ((Y - y0) * dx_over_dy + x0);
+            let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+            let coverage = (V(d) / (grad + V(min_grad)) + V(0.5))
+                .max(V(0.0))
+                .min(V(1.0));
+            in_y.select(coverage * V(dir), V(0.0))
+        }
+    "#;
+
+    fn reachable_count(arena: &ExprArena, root: ExprId) -> usize {
+        let len = arena.nodes_raw().len();
+        let mut seen = vec![false; len];
+        let mut stack = vec![root];
+        let mut n = 0usize;
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            n += 1;
+            stack.extend(arena.children(id));
+        }
+        n
+    }
+
+    /// Latency-prior DAG cost (leaves free, each reachable op counted once) —
+    /// NOT `extract`'s own returned cost, which (like `extract_dag`'s
+    /// `total_cost`) folds in a 1,000,000-per-cycle `CYCLE_COST` penalty
+    /// (`extract.rs:958`) that does not describe emitted code. See
+    /// `runtime.rs`'s `arena_cost` for the sibling of this function.
+    fn arena_cost(arena: &ExprArena, root: ExprId, costs: &CostModel) -> usize {
+        use pixelflow_ir::arena::ExprNode;
+        let len = arena.nodes_raw().len();
+        let mut seen = vec![false; len];
+        let mut stack = vec![root];
+        let mut total = 0usize;
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            let kind = match arena.node(id) {
+                ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Buffer(_) => None,
+                ExprNode::Unary(k, _)
+                | ExprNode::Binary(k, _, _)
+                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                other @ (ExprNode::Param(_) | ExprNode::Nary(..)) => {
+                    panic!(
+                        "winding-kernel Dwrt arena contains {other:?}, unexpected pre-extraction"
+                    )
+                }
+            };
+            if let Some(k) = kind {
+                total += costs.cost(k);
+            }
+            stack.extend(arena.children(id));
+        }
+        total
+    }
+
+    struct DwrtRun {
+        stop: SaturationStop,
+        iterations: usize,
+        total_unions: usize,
+        classes_after: usize,
+        applications: usize,
+        journal_unions: usize,
+        elapsed: Duration,
+        cost: usize,
+        dwrt_survived: bool,
+    }
+
+    /// Ops in `arena` that the e-graph cannot represent — the same test
+    /// `differentiate_in_optimizer` runs at `:687-694` before ever building
+    /// an `EGraph`, replicated (not called) so the caller can report *which*
+    /// op blocked it rather than the production function's plain `None`.
+    /// Empty means representable.
+    fn unrepresentable_ops(arena: &ExprArena) -> Vec<OpKind> {
+        use pixelflow_ir::arena::ExprNode;
+        let mut bad: Vec<OpKind> = arena
+            .nodes_raw()
+            .iter()
+            .filter_map(|n| match n {
+                ExprNode::Unary(op, _)
+                | ExprNode::Binary(op, _, _)
+                | ExprNode::Ternary(op, _, _, _) => {
+                    (pixelflow_search::egraph::ops::op_from_kind(*op).is_none()).then_some(*op)
+                }
+                ExprNode::Buffer(_) => Some(OpKind::Buffer), // ir_bridge.rs:690: Buffer => false unconditionally
+                ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Param(_) => None,
+                ExprNode::Nary(op, _, _) => {
+                    (pixelflow_search::egraph::ops::op_from_kind(*op).is_none()).then_some(*op)
+                }
+            })
+            .collect();
+        bad.sort_by_key(|k| format!("{k:?}"));
+        bad.dedup();
+        bad
+    }
+
+    /// [`differentiate_in_optimizer`]'s own body (`:661-732`), replayed with
+    /// budget as parameters and `saturate_with_limits` in place of
+    /// `saturate()` so the discarded `SaturationStats` and the (unconditional,
+    /// per `graph.rs:137,157`) provenance counters survive. Encode/decode and
+    /// rule set are copied verbatim; nothing in the production function is
+    /// called or modified. Returns `Err(blocking ops)` exactly where
+    /// production's `representable` guard (`:687-694`) would return `None`
+    /// WITHOUT ever constructing an `EGraph` — i.e. zero saturation, not a
+    /// truncated one.
+    fn run_dwrt_egraph(
+        arena: &ExprArena,
+        root: ExprId,
+        max_iterations: usize,
+        max_classes: usize,
+        timeout: Duration,
+    ) -> Result<DwrtRun, Vec<OpKind>> {
+        use pixelflow_ir::arena::ExprNode;
+        let bad = unrepresentable_ops(arena);
+        if !bad.is_empty() {
+            return Err(bad);
+        }
+
+        // ir_bridge.rs:697-712 — Param(i) -> Var(16+i) encoding.
+        let encoded_nodes: Vec<ExprNode> = arena
+            .nodes_raw()
+            .iter()
+            .map(|n| match n {
+                ExprNode::Param(i) => {
+                    assert!(
+                        PARAM_VAR_BASE + i < MANIFOLD_SLOT_BASE,
+                        "too many scalar params to encode"
+                    );
+                    ExprNode::Var(PARAM_VAR_BASE + i)
+                }
+                other => other.clone(),
+            })
+            .collect();
+        let encoded = ExprArena::from_raw(encoded_nodes, arena.nary_children_raw().to_vec());
+
+        // ir_bridge.rs:718-722, with saturate_with_limits standing in for saturate().
+        let mut eg = EGraph::with_rules(crate::optimize::standard_rules());
+        let root_class = eg.add_arena(&encoded, root);
+        let started = Instant::now();
+        let stats: SaturationStats = eg.saturate_with_limits(max_iterations, max_classes, timeout);
+        let elapsed = started.elapsed();
+
+        // ir_bridge.rs:724 — extract's own returned cost carries the
+        // cycle-penalty caveat above; recompute from the extracted arena.
+        let costs = CostModel::latency_prior();
+        let (out, out_root, _extract_reported_cost) = extract(&eg, root_class, &costs);
+        let dwrt_survived = contains_dwrt(&out);
+        let cost = if dwrt_survived {
+            // A Dwrt-carrying "extraction" is not code arena_cost can price
+            // (Dwrt has no CostModel entry) — the real fallback (:733)
+            // recompiles the ORIGINAL arena unresolved, at the runtime tier;
+            // report the pre-extraction node count's cost as N/A via 0 and
+            // let `dwrt_survived` carry the signal instead of a fabricated number.
+            0
+        } else {
+            arena_cost(&out, out_root, &costs)
+        };
+
+        Ok(DwrtRun {
+            stop: stats.stop,
+            iterations: stats.iterations,
+            total_unions: stats.total_unions,
+            classes_after: eg.num_classes(),
+            applications: eg.provenance().application_count(),
+            journal_unions: eg.provenance().union_count(),
+            elapsed,
+            cost,
+            dwrt_survived,
+        })
+    }
+
+    /// Drives `parser::parse` -> `sema::analyze` -> `optimize::optimize` ->
+    /// `ast_to_arena`, i.e. everything `jit_backend::emit_kernel_value`
+    /// (`:306-339`) does before calling `ast_to_runtime_arena` — reaching the
+    /// identical pre-Dwrt-resolution arena, without going through
+    /// `ast_to_runtime_arena` itself (which would call the production
+    /// `differentiate_in_optimizer` and discard the stats we need).
+    #[test]
+    #[ignore = "measurement: cargo test -p pixelflow-compiler --release -- --ignored winding_kernel_dwrt_egraph_telemetry --nocapture"]
+    fn winding_kernel_dwrt_egraph_telemetry() {
+        assert!(
+            std::env::var("PIXELFLOW_NNUE_WEIGHTS").is_err(),
+            "PIXELFLOW_NNUE_WEIGHTS is set; optimize::optimize's e-graph #1 would use it — unset it"
+        );
+
+        // lib.rs:224-227
+        let tokens: TokenStream = WINDING_KERNEL_SRC
+            .parse()
+            .expect("lex winding kernel source");
+        let kernel_ast = crate::parser::parse(tokens).expect("parse winding kernel source");
+        // lib.rs:228-231
+        let analyzed = crate::sema::analyze(kernel_ast).expect("sema winding kernel");
+        // lib.rs:236 — e-graph #1 (algebra, AST-level, config_for_node_count-tiered).
+        let algebra_started = Instant::now();
+        let analyzed = crate::optimize::optimize(analyzed);
+        let algebra_elapsed = algebra_started.elapsed();
+
+        // jit_backend.rs:307-325 gates (must all pass, or emit_kernel_value
+        // would never reach ast_to_runtime_arena for this kernel).
+        assert!(
+            analyzed.def.struct_decl.is_none(),
+            "winding kernel must be a named-struct-free fragment"
+        );
+        let param_map = scalar_param_indices(&analyzed);
+        let manifold_map = manifold_param_indices(&analyzed);
+        assert!(
+            manifold_map.is_empty(),
+            "winding kernel takes no manifold params"
+        );
+        assert_eq!(
+            param_map.len(),
+            7,
+            "winding kernel has 7 scalar params (x0,y0,dx_over_dy,dir,y_min,y_max,min_grad)"
+        );
+
+        // ir_bridge.rs:471-472 — the arena differentiate_in_optimizer receives.
+        let mut arena = ExprArena::new();
+        let (root, plan) = ast_to_arena(&analyzed.def.body, &param_map, &manifold_map, &mut arena)
+            .expect("ast_to_arena on winding kernel body");
+        assert!(
+            plan.is_empty(),
+            "winding kernel is non-composing; a non-empty plan would make ast_to_runtime_arena SKIP differentiate_in_optimizer entirely (ir_bridge.rs:477)"
+        );
+        assert!(
+            contains_dwrt(&arena),
+            "winding kernel body must contain Dwrt (DX/DY) after e-graph #1 — nothing to measure otherwise"
+        );
+
+        let node_count = reachable_count(&arena, root);
+        println!(
+            "winding kernel Dwrt arena: {node_count} reachable nodes (post-algebra-e-graph, pre-Dwrt-resolution)"
+        );
+        println!(
+            "algebra e-graph (#1, AST-level) wall-clock: {:.1}ms",
+            algebra_elapsed.as_secs_f64() * 1e3
+        );
+
+        // Production budget (ir_bridge.rs:718-722): NOT config_for_node_count
+        // -tiered, the hardcoded EGraph::saturate() default.
+        const PROD_MAX_ITERS: usize = 100;
+        const PROD_MAX_CLASSES: usize = 10_000;
+        const PROD_TIMEOUT_MS: u64 = 500;
+        let mult: usize = std::env::var("PIXELFLOW_TELEMETRY_REF_MULT")
+            .map(|s| s.parse().expect("REF_MULT must be an integer"))
+            .unwrap_or(4);
+        let ceiling = Duration::from_secs(
+            std::env::var("PIXELFLOW_TELEMETRY_REF_CEILING_S")
+                .map(|s| s.parse().expect("REF_CEILING_S must be an integer"))
+                .unwrap_or(600),
+        );
+
+        // Guard first (matches differentiate_in_optimizer:687-694 exactly):
+        // if the arena is not e-graph-representable, production returns
+        // `None` WITHOUT constructing an `EGraph` at all — zero saturation,
+        // not a truncated one. Check once; all three runs would bail
+        // identically since the guard depends only on the (budget-independent)
+        // arena contents.
+        if let Err(bad_ops) = run_dwrt_egraph(
+            &arena,
+            root,
+            PROD_MAX_ITERS,
+            PROD_MAX_CLASSES,
+            Duration::from_millis(PROD_TIMEOUT_MS),
+        ) {
+            println!(
+                "RESULT: differentiate_in_optimizer bails at the representable guard (ir_bridge.rs:687-694) \
+                 BEFORE constructing an EGraph — blocking op(s): {bad_ops:?}. Zero saturation happens for this \
+                 kernel at macro-expansion time; Dwrt survives to ast_to_runtime_arena's fallback (:733), which \
+                 emits the Dwrt-carrying arena unchanged, and the runtime `lower_dwrt` SYMBOLIC PASS (not an \
+                 e-graph — runtime.rs:120) resolves it before the runtime tier's e-graph saturates the composed \
+                 glyph arena. That runtime e-graph is the SAME one already measured per-glyph in \
+                 pixelflow-search's production_telemetry (stage 1) — this kernel's Dwrt resolution has no \
+                 budget of its own to report."
+            );
+            return;
+        }
+        let prod = run_dwrt_egraph(
+            &arena,
+            root,
+            PROD_MAX_ITERS,
+            PROD_MAX_CLASSES,
+            Duration::from_millis(PROD_TIMEOUT_MS),
+        )
+        .expect("guard already checked representable");
+        let refr = run_dwrt_egraph(
+            &arena,
+            root,
+            PROD_MAX_ITERS * mult,
+            PROD_MAX_CLASSES,
+            ceiling,
+        )
+        .expect("guard already checked representable");
+        assert!(
+            refr.elapsed < ceiling,
+            "reference run hit its {ceiling:?} safety ceiling — raise PIXELFLOW_TELEMETRY_REF_CEILING_S and re-run"
+        );
+        let lifted = run_dwrt_egraph(
+            &arena,
+            root,
+            PROD_MAX_ITERS * mult,
+            PROD_MAX_CLASSES * mult,
+            ceiling,
+        )
+        .expect("guard already checked representable");
+        assert!(
+            lifted.elapsed < ceiling,
+            "cap-lifted run hit its {ceiling:?} safety ceiling — raise PIXELFLOW_TELEMETRY_REF_CEILING_S and re-run"
+        );
+
+        assert!(
+            !prod.dwrt_survived,
+            "production run left Dwrt unresolved (budget miss) — the runtime lower_dwrt fallback would fire for every glyph; this changes the flat-answer conclusion, do not treat as a normal row"
+        );
+        assert!(
+            !refr.dwrt_survived && !lifted.dwrt_survived,
+            "reference/lifted run left Dwrt unresolved despite a larger budget — investigate before trusting cost numbers"
+        );
+
+        // Read off the loop's own decision (`SaturationStats::stop`),
+        // never inferred from the reference runs; those exist only to price
+        // the truncation.
+        let stop = prod.stop;
+        let loss_vs_ref = (prod.cost as f64 - refr.cost as f64) / refr.cost as f64 * 100.0;
+        let loss_vs_lifted = (prod.cost as f64 - lifted.cost as f64) / lifted.cost as f64 * 100.0;
+
+        println!(
+            "prod:   stop={stop:?} iters={}/{PROD_MAX_ITERS} classes={} apps={} unions={} journal_unions={} elapsed_ms={:.1} cost={}",
+            prod.iterations,
+            prod.classes_after,
+            prod.applications,
+            prod.total_unions,
+            prod.journal_unions,
+            prod.elapsed.as_secs_f64() * 1e3,
+            prod.cost
+        );
+        println!(
+            "ref({mult}x iters, same class cap): iters={} classes={} apps={} elapsed_ms={:.1} cost={} loss_vs_ref={loss_vs_ref:.2}%",
+            refr.iterations,
+            refr.classes_after,
+            refr.applications,
+            refr.elapsed.as_secs_f64() * 1e3,
+            refr.cost
+        );
+        println!(
+            "lifted({mult}x iters, {mult}x classes): iters={} classes={} apps={} elapsed_ms={:.1} cost={} loss_vs_lifted={loss_vs_lifted:.2}%",
+            lifted.iterations,
+            lifted.classes_after,
+            lifted.applications,
+            lifted.elapsed.as_secs_f64() * 1e3,
+            lifted.cost
+        );
+    }
+}

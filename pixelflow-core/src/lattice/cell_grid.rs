@@ -1594,4 +1594,153 @@ mod tests {
         // R and B both at bit 0: the OR would blend two channels' bytes.
         let _refused = CellGridPackedProgram::compile(geom, [0.0; 4], [0, 8, 0, 24]);
     }
+
+    /// Production saturation telemetry, stage 1 of 2
+    /// (docs/results/2026-09-01-production-saturation-telemetry.md): write
+    /// the packed cell-grid arena core-term actually compiles, for the
+    /// geometries it actually compiles it at, so the measurer in
+    /// `pixelflow-search/src/runtime.rs` (`production_telemetry`) can replay
+    /// `optimize_runtime_arena`'s calls on it and keep the `SaturationResult`
+    /// production discards. Lives here because `packed_kernel` and
+    /// `GridBuffers::mint` are private, and stays private itself.
+    ///
+    /// Geometry is core-term's, not a fixture's:
+    /// `core-term/src/terminal_app.rs:362-372` builds `CellGridGeometry` from
+    /// the snapshot's cell size (config defaults `cell_width_px: 10`,
+    /// `cell_height_px: 16`, `config.rs`) times the display density, with
+    /// `density: 1.0`, and the atlas extents of
+    /// `GlyphAtlas::new(cell_height, density, ATLAS_CAPACITY = 128)`
+    /// (`terminal_app.rs:204,243`), whose arithmetic (`atlas.rs:90-98`, PAD = 1)
+    /// is restated here and cross-checked against a real `GlyphAtlas` by the
+    /// glyph dumper. Shifts are `PlatformColorCube::PACKED_SHIFTS` on macOS
+    /// (`RgbaColorCube`, `[0, 8, 16, 24]`); `default_bg` is the default
+    /// `ColorScheme.background` (black). Density 1.0 is the startup compile,
+    /// 2.0 the Retina recompile after `WindowCreated`; 120x40 is one resize.
+    #[test]
+    #[ignore = "telemetry dumper: PIXELFLOW_TELEMETRY_DIR=<dir> cargo test -p pixelflow-core --release -- --ignored dump_production_cell_grid_arenas"]
+    fn dump_production_cell_grid_arenas() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("PIXELFLOW_TELEMETRY_DIR").expect("PIXELFLOW_TELEMETRY_DIR must be set"),
+        );
+        std::fs::create_dir_all(&dir).expect("create dump dir");
+        const CELL_W_PT: f32 = 10.0;
+        const CELL_H_PT: f32 = 16.0;
+        const ATLAS_SLOTS_PER_ROW: u32 = 12; // ceil(sqrt(128))
+        const ATLAS_SLOT_ROWS: u32 = 11; // ceil(128 / 12)
+        const ATLAS_PAD: u32 = 1;
+        const DEFAULT_BG_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+        for (label, cols, rows, density) in [
+            ("80x24_d1", 80u32, 24u32, 1.0f32),
+            ("80x24_d2", 80, 24, 2.0),
+            ("120x40_d2", 120, 40, 2.0),
+        ] {
+            let tile_px = (CELL_H_PT * density).round().max(1.0) as u32;
+            let slot_px = tile_px + 2 * ATLAS_PAD;
+            let cell_w = CELL_W_PT * density;
+            let cell_h = CELL_H_PT * density;
+            let geom = CellGridGeometry {
+                cols,
+                rows,
+                cell_w,
+                cell_h,
+                density: 1.0,
+                atlas_width: ATLAS_SLOTS_PER_ROW * slot_px,
+                atlas_height: ATLAS_SLOT_ROWS * slot_px,
+                tile_w: tile_px,
+                tile_h: tile_px,
+                frame_w: (cols as f32 * cell_w).round() as u32,
+                frame_h: (rows as f32 * cell_h).round() as u32,
+            };
+            // Same preconditions `CellGridPackedProgram::compile` enforces.
+            assert_compilable(&geom);
+            let kernel = packed_kernel(&geom, GridBuffers::mint(), DEFAULT_BG_BLACK, RGBA_SHIFTS);
+            let (arena, root) = kernel.parts();
+            let name = alloc::format!("cellgrid:{label}");
+            let path = dir.join(alloc::format!("cellgrid_{label}.arena"));
+            dump_arena(arena, root, &name, &path);
+            std::println!(
+                "{name}: {} reachable nodes -> {}",
+                reachable_nodes(arena, root),
+                path.display()
+            );
+        }
+    }
+
+    /// Text dump of the subgraph reachable from `root`: nodes in ascending
+    /// original id order (children precede parents), ids remapped dense,
+    /// constants as bit patterns, buffer identities as dense ordinals. The
+    /// loader in `pixelflow-search/src/runtime.rs` is the inverse. Duplicated
+    /// verbatim in `pixelflow-graphics/tests/production_glyph_arena_dump.rs`
+    /// rather than shared, because the only crate both dumpers can see is
+    /// `pixelflow-ir`, which must not grow a test-only serializer.
+    fn dump_arena(
+        arena: &ExprArena,
+        root: pixelflow_ir::ExprId,
+        name: &str,
+        path: &std::path::Path,
+    ) {
+        use core::fmt::Write as _;
+        use pixelflow_ir::arena::ExprNode;
+        let len = arena.nodes_raw().len();
+        let mut reachable = vec![false; len];
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut reachable[id.0 as usize], true) {
+                continue;
+            }
+            stack.extend(arena.children(id));
+        }
+        let mut out = std::string::String::new();
+        writeln!(out, "# pixelflow arena dump v1").expect("fmt");
+        writeln!(out, "name {name}").expect("fmt");
+        let mut idents: alloc::vec::Vec<pixelflow_ir::arena::BufferIdentity> =
+            alloc::vec::Vec::new();
+        for decl in arena.buffers() {
+            let ord = match idents.iter().position(|i| *i == decl.id) {
+                Some(p) => p,
+                None => {
+                    idents.push(decl.id);
+                    idents.len() - 1
+                }
+            };
+            writeln!(out, "buf {ord} {} {}", decl.width, decl.height).expect("fmt");
+        }
+        let mut dense: alloc::vec::Vec<u32> = vec![u32::MAX; len];
+        let mut next = 0u32;
+        let d = |dense: &[u32], id: pixelflow_ir::ExprId| -> u32 {
+            let v = dense[id.0 as usize];
+            assert_ne!(v, u32::MAX, "child dumped before parent");
+            v
+        };
+        for idx in 0..len {
+            if !reachable[idx] {
+                continue;
+            }
+            let id = pixelflow_ir::ExprId(idx as u32);
+            match arena.node(id) {
+                ExprNode::Var(i) => writeln!(out, "V {i}"),
+                ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
+                ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
+                ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
+                ExprNode::Binary(k, a, b) => {
+                    writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+                }
+                ExprNode::Ternary(k, a, b, c) => writeln!(
+                    out,
+                    "T {k:?} {} {} {}",
+                    d(&dense, *a),
+                    d(&dense, *b),
+                    d(&dense, *c)
+                ),
+                other @ (ExprNode::Param(_) | ExprNode::Nary(..)) => {
+                    panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
+                }
+            }
+            .expect("fmt");
+            dense[idx] = next;
+            next += 1;
+        }
+        writeln!(out, "root {}", d(&dense, root)).expect("fmt");
+        std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
 }
