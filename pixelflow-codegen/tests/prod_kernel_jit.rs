@@ -53,6 +53,7 @@ fn optimize(arena: &ExprArena, root: ExprId, tag: &str) -> (ExprArena, ExprId) {
     let mut optimizer = Optimizer::production().budget(Budget::Explicit {
         iterations: 40,
         classes: 10_000,
+        allocated_classes: pixelflow_search::egraph::HARD_CLASS_LIMIT,
         applications: None,
     });
     let mut eg = optimizer.egraph();

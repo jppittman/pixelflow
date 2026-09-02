@@ -51,7 +51,7 @@ use pixelflow_ir::{ExprArena, ExprId, LatticeShape};
 
 use super::cost::CostModel;
 use super::extract::{Extraction, IncrementalExtractor, Reranker, choices_to_arena};
-use super::graph::{EGraph, SaturationStop};
+use super::graph::{ClassCeilings, EGraph, SaturationStop};
 use super::node::EClassId;
 use super::provenance::ApplicationRecord;
 use super::rules::{Fingerprint, RuleSet};
@@ -109,8 +109,12 @@ pub enum Budget {
     Explicit {
         /// Rewrite rounds.
         iterations: usize,
-        /// E-class ceiling.
+        /// LIVE e-class budget — canonical, non-empty classes.
         classes: usize,
+        /// ALLOCATED e-class ceiling — the memory guard. Clamped to
+        /// [`HARD_CLASS_LIMIT`](super::graph::HARD_CLASS_LIMIT) by the
+        /// driver.
+        allocated_classes: usize,
         /// Rule applications, if capped.
         applications: Option<u64>,
     },
@@ -121,10 +125,28 @@ pub enum Budget {
 pub struct Limits {
     /// Rewrite rounds.
     pub iterations: usize,
-    /// E-class ceiling.
+    /// LIVE e-class budget: canonical, non-empty classes — the population
+    /// [`EGraph::class_ids`](super::graph::EGraph::class_ids) enumerates and
+    /// the rules can actually match against. This is the search knob.
     pub classes: usize,
+    /// ALLOCATED e-class ceiling: every slot the graph has minted, merged
+    /// away or not. This is the memory guard, and it is a different and
+    /// larger number than `classes` — see
+    /// [`ClassCeiling`](super::graph::ClassCeiling).
+    pub allocated_classes: usize,
     /// Rule applications, if capped.
     pub applications: Option<u64>,
+}
+
+impl Limits {
+    /// The two class ceilings, as the drivers take them.
+    #[must_use]
+    pub fn ceilings(self) -> ClassCeilings {
+        ClassCeilings {
+            live: self.classes,
+            allocated: self.allocated_classes,
+        }
+    }
 }
 
 impl Budget {
@@ -141,20 +163,24 @@ impl Budget {
             Self::Production => Limits {
                 iterations: preset.max_iterations,
                 classes: preset.max_classes,
+                allocated_classes: super::graph::HARD_CLASS_LIMIT,
                 applications: None,
             },
             Self::Applications(n) => Limits {
                 iterations: preset.max_iterations,
                 classes: preset.max_classes,
+                allocated_classes: super::graph::HARD_CLASS_LIMIT,
                 applications: Some(n),
             },
             Self::Explicit {
                 iterations,
                 classes,
+                allocated_classes,
                 applications,
             } => Limits {
                 iterations,
                 classes,
+                allocated_classes,
                 applications,
             },
         }
@@ -173,8 +199,15 @@ pub struct OptimizerStats {
     pub applications: u64,
     /// Class merges saturation performed.
     pub unions: usize,
-    /// E-classes when the run ended.
+    /// ALLOCATED e-class slots when the run ended — the memory number,
+    /// monotone across the run.
     pub classes: usize,
+    /// LIVE e-classes when the run ended — canonical and non-empty, the
+    /// population the class budget counts. Reported beside `classes`
+    /// because the two are different numbers (median 2.6x apart on this
+    /// workspace's kernel corpus) and a reader given only one of them
+    /// cannot tell which question it answers.
+    pub live_classes: usize,
     /// The limits this run was held to.
     pub limits: Limits,
 }
@@ -369,7 +402,7 @@ impl Optimizer {
 
         egraph.set_provenance_recording(self.observer.is_some());
         let saturation =
-            egraph.saturate_budgeted(limits.iterations, limits.classes, limits.applications);
+            egraph.saturate_budgeted(limits.iterations, limits.ceilings(), limits.applications);
 
         if let Some(ceiling) = self.hard_ceiling {
             let elapsed = started.elapsed();
@@ -407,6 +440,7 @@ impl Optimizer {
                 applications: egraph.application_count(),
                 unions: saturation.total_unions,
                 classes: egraph.num_classes(),
+                live_classes: egraph.live_class_count(),
                 limits,
             },
         }

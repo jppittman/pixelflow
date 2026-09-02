@@ -45,7 +45,7 @@
 use std::io::Write as _;
 use std::time::Duration;
 
-use crate::egraph::{CostModel, OptimizerStats, SaturationStop};
+use crate::egraph::{ClassCeiling, CostModel, OptimizerStats, SaturationStop};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
 /// Which tier invoked saturation.
@@ -144,7 +144,10 @@ pub fn record(inv: SaturationInvocation<'_>) {
 fn stop_str(stop: SaturationStop) -> &'static str {
     match stop {
         SaturationStop::Quiesced => "quiesced",
-        SaturationStop::ClassCap => "class_cap",
+        // Two ceilings, two strings: a reader must be able to tell "the
+        // search budget was spent" from "the memory guard fired".
+        SaturationStop::ClassCap(ClassCeiling::Live) => "class_cap_live",
+        SaturationStop::ClassCap(ClassCeiling::Allocated) => "class_cap_allocated",
         SaturationStop::IterationCeiling => "iteration_ceiling",
         SaturationStop::Timeout => "timeout",
         SaturationStop::ApplicationBudget => "application_budget",

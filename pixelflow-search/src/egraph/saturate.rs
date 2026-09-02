@@ -176,7 +176,15 @@ pub struct SaturationConfig {
     pub max_iterations: usize,
     /// Wall-clock budget for the whole run.
     pub hard_timeout: std::time::Duration,
-    /// E-class count budget — caps pathological e-graph blowup.
+    /// LIVE e-class budget — canonical, non-empty classes: the population
+    /// [`EGraph::class_ids`] enumerates, not the allocated slot count.
+    ///
+    /// There is deliberately no allocated-class field beside it: the
+    /// allocated ceiling is the memory guard and every shipping tier holds
+    /// it at [`HARD_CLASS_LIMIT`](super::graph::HARD_CLASS_LIMIT), so it is
+    /// a constant here rather than a knob. A caller that needs to move it
+    /// says so with [`Budget::Explicit`](super::optimizer::Budget::Explicit),
+    /// which names both ceilings.
     pub max_classes: usize,
 }
 

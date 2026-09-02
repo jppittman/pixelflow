@@ -44,12 +44,21 @@ fn egraph_of(arena: &ExprArena, root: ExprId) -> EGraph {
 fn class_cap_reports_class_cap_not_quiesced() {
     let (arena, root) = busy_expression();
     let mut eg = egraph_of(&arena, root);
-    let cap = eg.num_classes() + 2;
+    let cap = eg.live_class_count() + 2;
     let result = saturate_with_full_budget(&mut eg, 100, cap, GENEROUS);
-    assert_eq!(result.stop, SaturationStop::ClassCap, "{result:?}");
     assert!(
-        result.classes_after <= cap,
-        "budget scan must hold the cap: {result:?}"
+        matches!(result.stop, SaturationStop::ClassCap(_)),
+        "{result:?}"
+    );
+    // The budget bounds LIVE classes, not allocated slots. `classes_after`
+    // is `num_classes()` — allocated — and legitimately exceeds the cap:
+    // `union` never frees a merged-away slot, so the two counts diverge
+    // from the first merge onwards. Asserting the allocated count against
+    // the live budget is the confusion this budget exists to end.
+    assert!(
+        eg.live_class_count() <= cap,
+        "budget scan must hold the LIVE cap: {} > {cap} ({result:?})",
+        eg.live_class_count()
     );
 }
 
@@ -79,7 +88,10 @@ fn busy_expression_under_production_cap_is_class_capped() {
     let (arena, root) = busy_expression();
     let mut eg = egraph_of(&arena, root);
     let result = saturate_with_full_budget(&mut eg, 100, 10_000, GENEROUS);
-    assert_eq!(result.stop, SaturationStop::ClassCap, "{result:?}");
+    assert!(
+        matches!(result.stop, SaturationStop::ClassCap(_)),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -115,7 +127,10 @@ fn productive_but_class_capped_final_sweep_is_class_cap() {
         result.total_unions > 0,
         "repro needs a sweep that both truncated and committed unions: {result:?}"
     );
-    assert_eq!(result.stop, SaturationStop::ClassCap, "{result:?}");
+    assert!(
+        matches!(result.stop, SaturationStop::ClassCap(_)),
+        "{result:?}"
+    );
     assert!(!result.saturated, "{result:?}");
 }
 

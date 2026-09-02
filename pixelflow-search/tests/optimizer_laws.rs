@@ -143,11 +143,13 @@ fn every_ordering_policy_extracts_the_same_denotation() {
         Budget::Explicit {
             iterations: 1,
             classes: 5_000,
+            allocated_classes: pixelflow_search::egraph::HARD_CLASS_LIMIT,
             applications: None,
         },
         Budget::Explicit {
             iterations: 12,
             classes: 64,
+            allocated_classes: pixelflow_search::egraph::HARD_CLASS_LIMIT,
             applications: None,
         },
     ];

@@ -96,6 +96,17 @@ pub struct EGraph {
     /// Application ceiling for the current run, or `None`. Set for the
     /// duration of [`EGraph::saturate_budgeted`].
     application_cap: Option<u64>,
+    /// LIVE e-classes: canonical AND non-empty — exactly the population
+    /// [`EGraph::class_ids`] enumerates, maintained in O(1) at the three
+    /// places a class can enter or leave it (`add`, `union`, and
+    /// `rebuild_budgeted`'s drain/refill) instead of rescanned.
+    ///
+    /// It is a *different number* from `classes.len()`: `union` merges
+    /// through the union-find and never removes a slot, so `classes.len()`
+    /// is ALLOCATED classes and only ever grows. The two answer different
+    /// questions — allocated bounds memory, live bounds the search — and
+    /// [`ClassCeilings`] budgets each against its own.
+    live_classes: usize,
 }
 
 impl Default for EGraph {
@@ -123,6 +134,7 @@ impl Clone for EGraph {
             applications: self.applications,
             record_provenance: self.record_provenance,
             application_cap: self.application_cap,
+            live_classes: self.live_classes,
         }
     }
 }
@@ -152,9 +164,11 @@ pub struct ApplyResult {
 pub enum ScanStop {
     /// Every e-class was visited and every match committed.
     Completed,
-    /// The class budget `max_nodes` stopped the scan: the graph (plus the
-    /// nodes the pending actions would create) reached the cap.
-    ClassCap,
+    /// A class ceiling stopped the scan: the graph (plus the classes the
+    /// pending actions would mint) reached one of them. The payload says
+    /// WHICH — the live budget (search quality) or the allocated ceiling
+    /// (memory) — because they are different facts with different fixes.
+    ClassCap(ClassCeiling),
     /// The wall-clock deadline elapsed before the scan finished — either it
     /// cut the walk short, or it passed while a rule's `apply` (or the
     /// commit that follows) was running. Both mean the same thing: this
@@ -178,10 +192,13 @@ pub enum SaturationStop {
     /// A full rule sweep completed with zero unions. Diagnostic, not a
     /// certified fixpoint.
     Quiesced,
-    /// The class budget `max_classes` stopped the run (memory protection) —
-    /// either the count exceeded it outright, or a sweep produced zero
-    /// unions only because every remaining action was discarded for budget.
-    ClassCap,
+    /// A class ceiling stopped the run — either the count exceeded it
+    /// outright, or a sweep produced zero unions only because every
+    /// remaining action was discarded for budget. The payload says WHICH
+    /// ceiling: [`ClassCeiling::Live`] means the search budget was spent on
+    /// classes that are really there; [`ClassCeiling::Allocated`] means the
+    /// memory guard fired.
+    ClassCap(ClassCeiling),
     /// `max_iters` sweeps completed without any other condition firing.
     IterationCeiling,
     /// The wall-clock safety ceiling elapsed. Offline measurement callers
@@ -212,6 +229,70 @@ pub struct SaturationStats {
     /// caller never has to infer "quiesced" from `iterations < max_iters`
     /// (which conflates a timeout or class cap with quiescence).
     pub stop: SaturationStop,
+}
+
+/// Which class population a ceiling counts.
+///
+/// The e-graph holds two populations and they are not the same number.
+/// ALLOCATED classes ([`EGraph::num_classes`]) is every slot [`EGraph::add`]
+/// ever minted; it only grows, because [`EGraph::union`] merges through the
+/// union-find and never removes a slot. LIVE classes
+/// ([`EGraph::live_class_count`], the population [`EGraph::class_ids`]
+/// enumerates) is the canonical, non-empty subset — the graph the rules
+/// actually see. On this workspace's kernel corpus the ratio between them
+/// runs a median 2.6x and a worst case 10x
+/// (`docs/results/2026-09-02-class-cap-ghosts.md`), so a single number
+/// cannot mean both.
+///
+/// They bound different things, which is why both exist rather than one
+/// winning: allocated bounds MEMORY (a merged-away class still owns its
+/// slot), live bounds the SEARCH (a merged-away class offers the rules
+/// nothing). Budgeting the search against allocated is what made a
+/// 5 000-class budget stop at ~1 350 live classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ClassCeiling {
+    /// The search budget: canonical, non-empty classes.
+    Live,
+    /// The memory guard: allocated class slots.
+    Allocated,
+}
+
+/// The two class ceilings a saturation run is held to at once.
+///
+/// Grouped rather than passed as two `usize`s so a call site cannot silently
+/// swap them — the whole defect this type exists to retire was one number
+/// standing in for two populations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassCeilings {
+    /// Live-class budget — how much search this run may buy.
+    pub live: usize,
+    /// Allocated-class ceiling — how much memory the graph may hold.
+    /// Never above [`HARD_CLASS_LIMIT`]; the drivers clamp it.
+    pub allocated: usize,
+}
+
+impl ClassCeilings {
+    /// A live budget under the standing memory guard, which is what every
+    /// production tier wants: [`HARD_CLASS_LIMIT`] allocated slots, `live`
+    /// live classes.
+    #[must_use]
+    pub fn live_budget(live: usize) -> Self {
+        Self {
+            live,
+            allocated: HARD_CLASS_LIMIT,
+        }
+    }
+
+    /// Clamp the allocated ceiling to [`HARD_CLASS_LIMIT`]. Applied by every
+    /// driver, so a caller naming `usize::MAX` gets the guard rather than a
+    /// graph that grows until it runs the machine out of memory.
+    #[must_use]
+    fn clamped(self) -> Self {
+        Self {
+            live: self.live.min(HARD_CLASS_LIMIT),
+            allocated: self.allocated.min(HARD_CLASS_LIMIT),
+        }
+    }
 }
 
 /// The ceiling on every class budget: no saturation driver grows the graph
@@ -263,6 +344,7 @@ impl EGraph {
             applications: 0,
             record_provenance: true,
             application_cap: None,
+            live_classes: 0,
         }
     }
 
@@ -288,6 +370,7 @@ impl EGraph {
             applications: 0,
             record_provenance: true,
             application_cap: None,
+            live_classes: 0,
         }
     }
 
@@ -436,6 +519,10 @@ impl EGraph {
         });
         self.parent.push(id);
         self.memo.insert(node, id);
+        // The fresh class is its own parent and holds exactly one node, so
+        // it is live by construction. One of the three sites that move the
+        // live count; see `EGraph::live_classes`.
+        self.live_classes += 1;
         id
     }
 
@@ -507,6 +594,21 @@ impl EGraph {
             }
         }
         let (parent, child) = if a.0 < b.0 { (a, b) } else { (b, a) };
+        // Live bookkeeping, from the emptiness this merge actually observes
+        // rather than from "canonical implies non-empty" — which is false
+        // exactly where it matters: `rebuild_budgeted` drains a class's
+        // nodes with `mem::take` and only THEN unions it. After the merge
+        // `child` is non-canonical (contributes 0) and `parent` holds both
+        // node vectors (live iff either side was), so the only case that
+        // moves the count is two live classes becoming one.
+        let parent_was_live = !self.classes[parent.index()].nodes.is_empty();
+        let child_was_live = !self.classes[child.index()].nodes.is_empty();
+        if parent_was_live && child_was_live {
+            self.live_classes = self.live_classes.checked_sub(1).expect(
+                "EGraph::union: live class count underflowed — the counter \
+                 disagrees with the graph it counts",
+            );
+        }
         self.parent[child.index()] = parent;
         let child_nodes = std::mem::take(&mut self.classes[child.index()].nodes);
         let child_tags = std::mem::take(&mut self.classes[child.index()].tags);
@@ -585,6 +687,15 @@ impl EGraph {
             processed += 1;
             let id = self.find(id);
             let nodes = std::mem::take(&mut self.classes[id.index()].nodes);
+            // `id` was canonicalized on the line above, so draining it takes
+            // it out of the live set for the duration of this item; the
+            // refill at the bottom puts it back if anything survives.
+            if !nodes.is_empty() {
+                self.live_classes = self.live_classes.checked_sub(1).expect(
+                    "EGraph::rebuild_budgeted: live class count underflowed \
+                     — the counter disagrees with the graph it counts",
+                );
+            }
             // `tags` must stay zipped with `nodes` through this loop: no
             // reordering happens (nodes are only appended to `new_nodes` in
             // the same order they're drained from `nodes`), so zipping by
@@ -642,6 +753,18 @@ impl EGraph {
             // Extend, not assign: a mid-loop union() above may have already
             // pushed nodes/tags onto classes[id.index()] (see comment above).
             // Overwriting here would silently discard them.
+            //
+            // `id` re-enters the live set only if it is still canonical (a
+            // mid-loop union may have made it a child), is empty right now
+            // (a union that kept `id` as parent already counted it), and the
+            // refill is non-empty (every node may have been left with the
+            // class the memo names, on the const-refusal path).
+            if self.find(id) == id
+                && self.classes[id.index()].nodes.is_empty()
+                && !new_nodes.is_empty()
+            {
+                self.live_classes += 1;
+            }
             self.classes[id.index()].nodes.extend(new_nodes);
             self.classes[id.index()].tags.extend(new_tags);
         }
@@ -726,9 +849,46 @@ impl EGraph {
         self.rules.len()
     }
 
-    /// Get the number of e-classes.
+    /// ALLOCATED e-class slots — every class [`Self::add`] ever minted.
+    ///
+    /// Monotonically increasing: [`Self::union`] merges through the
+    /// union-find and never removes a slot, so a merged-away class still
+    /// counts here. This is the memory number. For the number of classes
+    /// the rules can actually see, use [`Self::live_class_count`].
     pub fn num_classes(&self) -> usize {
         self.classes.len()
+    }
+
+    /// LIVE e-classes — canonical AND non-empty, i.e. exactly
+    /// `class_ids().count()`, in O(1).
+    ///
+    /// This is the number a search budget wants: a class that has been
+    /// merged away offers the rules nothing, and counting it against the
+    /// budget spends search on ghosts. Maintained incrementally at the
+    /// three sites that move it (`add`, `union`, `rebuild_budgeted`), never
+    /// rescanned — `class_ids().count()` is O(allocated) and this is
+    /// consulted inside the rule-scan loop.
+    ///
+    /// [`Self::debug_assert_live_count`] is the drift check; it is what the
+    /// tests hold this against.
+    #[must_use]
+    pub fn live_class_count(&self) -> usize {
+        self.live_classes
+    }
+
+    /// Panic (debug builds only) if the incrementally-maintained live count
+    /// has drifted from the O(n) definition it stands in for.
+    ///
+    /// Call it at a *stable* point — never between `rebuild_budgeted`'s
+    /// drain and its refill, where a canonical class is legitimately empty
+    /// and the counter is mid-update. The saturation drivers call it at the
+    /// top of every round; the tests call it after every mutation.
+    pub fn debug_assert_live_count(&self) {
+        debug_assert_eq!(
+            self.live_classes,
+            self.class_ids().count(),
+            "EGraph live class counter drifted from class_ids()"
+        );
     }
 
     /// Iterate over all canonical e-class IDs.
@@ -759,6 +919,16 @@ impl EGraph {
     /// Get the total number of nodes across all e-classes.
     pub fn node_count(&self) -> usize {
         self.classes.iter().map(|c| c.nodes.len()).sum()
+    }
+
+    /// Number of distinct e-nodes hash-consed in the `add()` memo table.
+    ///
+    /// `pub(crate)`, not public: this exists for offline memory measurement
+    /// (docs/results/2026-09-02-class-cap-ghosts.md) — the memo is a
+    /// production-internal dedup structure, not part of the algebra's public
+    /// surface.
+    pub(crate) fn memo_len(&self) -> usize {
+        self.memo.len()
     }
 
     /// Get the OpKind of the canonical representative of an e-class.
@@ -1027,6 +1197,22 @@ impl EGraph {
 
     /// The one rewrite-until-budget-exhausted loop.
     ///
+    /// Which ceiling — if either — `pending` more classes would breach.
+    ///
+    /// `pending` is the scan's own estimate of the classes its queued
+    /// actions will mint, so the check is "would committing this overshoot",
+    /// not "did it already". Live is tested first: it is the budget a caller
+    /// chose, and the allocated ceiling is the memory backstop behind it.
+    fn exceeded_ceiling(&self, ceilings: ClassCeilings, pending: usize) -> Option<ClassCeiling> {
+        if self.live_classes + pending > ceilings.live {
+            return Some(ClassCeiling::Live);
+        }
+        if self.classes.len() + pending > ceilings.allocated {
+            return Some(ClassCeiling::Allocated);
+        }
+        None
+    }
+
     /// Every saturation in the workspace bottoms out here, and nothing else
     /// re-decides when a run stops. Callers reach it through one of two
     /// entry points:
@@ -1063,7 +1249,12 @@ impl EGraph {
         max_classes: usize,
         timeout: std::time::Duration,
     ) -> SaturationStats {
-        self.saturate_bounded(max_iters, max_classes, None, Some(timeout))
+        self.saturate_bounded(
+            max_iters,
+            ClassCeilings::live_budget(max_classes),
+            None,
+            Some(timeout),
+        )
     }
 
     /// Saturate under deterministic limits only — rounds, classes, and
@@ -1083,10 +1274,10 @@ impl EGraph {
     pub fn saturate_budgeted(
         &mut self,
         max_iters: usize,
-        max_classes: usize,
+        ceilings: ClassCeilings,
         max_applications: Option<u64>,
     ) -> SaturationStats {
-        self.saturate_bounded(max_iters, max_classes, max_applications, None)
+        self.saturate_bounded(max_iters, ceilings, max_applications, None)
     }
 
     /// The one rewrite-until-budget-exhausted loop. Every saturation entry
@@ -1095,7 +1286,7 @@ impl EGraph {
     fn saturate_bounded(
         &mut self,
         max_iters: usize,
-        max_classes: usize,
+        ceilings: ClassCeilings,
         max_applications: Option<u64>,
         timeout: Option<std::time::Duration>,
     ) -> SaturationStats {
@@ -1106,7 +1297,7 @@ impl EGraph {
         // the shared loop rather than in `saturate_with_limits`, so
         // `saturate_budgeted` — and therefore every production tier — is
         // held to it too.
-        let max_classes = max_classes.min(HARD_CLASS_LIMIT);
+        let ceilings = ceilings.clamped();
         let start = std::time::Instant::now();
         // `Instant + Duration::MAX` panics, so the deadline is optional
         // rather than "infinitely far away".
@@ -1129,8 +1320,9 @@ impl EGraph {
                     break;
                 }
             }
-            if self.classes.len() > max_classes {
-                stop = SaturationStop::ClassCap;
+            self.debug_assert_live_count();
+            if let Some(ceiling) = self.exceeded_ceiling(ceilings, 0) {
+                stop = SaturationStop::ClassCap(ceiling);
                 break;
             }
             if self
@@ -1154,11 +1346,11 @@ impl EGraph {
                 let mut total = 0;
                 let mut sweep = ScanStop::Completed;
                 for rule_idx in 0..n_rules {
-                    if batch.node_count() > max_classes {
-                        sweep = ScanStop::ClassCap;
+                    if let Some(ceiling) = batch.graph.exceeded_ceiling(ceilings, 0) {
+                        sweep = ScanStop::ClassCap(ceiling);
                         break;
                     }
-                    let result = batch.apply_rule(rule_idx, max_classes, deadline);
+                    let result = batch.apply_rule(rule_idx, ceilings, deadline);
                     total += result.changes;
                     match result.scan {
                         ScanStop::Completed => {}
@@ -1166,7 +1358,7 @@ impl EGraph {
                         // may still fit inside the cap, so the sweep goes on
                         // — but it is no longer a full sweep, and can never
                         // read as quiescence.
-                        ScanStop::ClassCap => sweep = ScanStop::ClassCap,
+                        ScanStop::ClassCap(ceiling) => sweep = ScanStop::ClassCap(ceiling),
                         // The wall-clock ceiling is hard: do not start
                         // another rule's scan on the far side of it.
                         ScanStop::Deadline => {
@@ -1198,8 +1390,8 @@ impl EGraph {
             // loop almost never sees a capped run — the sweep's own report is
             // what makes `ClassCap` observable at all.
             match sweep {
-                ScanStop::ClassCap => {
-                    stop = SaturationStop::ClassCap;
+                ScanStop::ClassCap(ceiling) => {
+                    stop = SaturationStop::ClassCap(ceiling);
                     break;
                 }
                 ScanStop::Deadline => {
@@ -1230,31 +1422,32 @@ impl EGraph {
         }
     }
 
-    /// Apply all rewrite rules once with a node budget.
+    /// Apply all rewrite rules once under both class ceilings.
     ///
-    /// Returns the number of changes made. Stops if the graph exceeds
-    /// `max_nodes` classes.
-    pub fn apply_rules_once(&mut self, max_nodes: usize) -> usize {
-        self.apply_rules_budgeted(max_nodes)
+    /// Returns the number of changes made. Stops if the graph reaches
+    /// either ceiling — see [`ClassCeilings`].
+    pub fn apply_rules_once(&mut self, ceilings: ClassCeilings) -> usize {
+        self.apply_rules_budgeted(ceilings)
     }
 
-    /// Apply a single rule (by index) everywhere it matches, with budget.
+    /// Apply a single rule (by index) everywhere it matches, under both
+    /// class ceilings.
     ///
-    /// Returns changes made and evaluations consumed. Stops scanning
-    /// if the graph exceeds `max_nodes` classes.
-    pub fn apply_rule_at_index(&mut self, rule_idx: usize, max_nodes: usize) -> ApplyResult {
-        self.apply_rule_at_index_budgeted(rule_idx, max_nodes)
+    /// Returns changes made and evaluations consumed. Stops scanning when
+    /// the graph reaches either ceiling.
+    pub fn apply_rule_at_index(&mut self, rule_idx: usize, ceilings: ClassCeilings) -> ApplyResult {
+        self.apply_rule_at_index_budgeted(rule_idx, ceilings)
     }
 
-    /// Apply a single rule with a node budget. Stops scanning when the
-    /// e-graph exceeds `max_nodes` classes, preventing runaway growth
-    /// from a single rule application.
+    /// Apply a single rule under both class ceilings. Stops scanning when
+    /// the e-graph reaches either, preventing runaway growth from a single
+    /// rule application.
     pub fn apply_rule_at_index_budgeted(
         &mut self,
         rule_idx: usize,
-        max_nodes: usize,
+        ceilings: ClassCeilings,
     ) -> ApplyResult {
-        self.apply_rule_at_index_timed(rule_idx, max_nodes, None)
+        self.apply_rule_at_index_timed(rule_idx, ceilings, None)
     }
 
     /// Apply a single rule with node budget AND optional wall-clock deadline.
@@ -1262,13 +1455,13 @@ impl EGraph {
     pub fn apply_rule_at_index_timed(
         &mut self,
         rule_idx: usize,
-        max_nodes: usize,
+        ceilings: ClassCeilings,
         deadline: Option<std::time::Instant>,
     ) -> ApplyResult {
         // See `HARD_CLASS_LIMIT`: the scan below is one of the two places
         // the graph decides to grow, so it is one of the two places the
         // ceiling is applied.
-        let max_nodes = max_nodes.min(HARD_CLASS_LIMIT);
+        let ceilings = ceilings.clamped();
         if rule_idx >= self.rules.len() {
             return ApplyResult {
                 changes: 0,
@@ -1316,9 +1509,11 @@ impl EGraph {
 
         let canonical_ids = self.canonical_class_ids();
         'scan: for canonical in canonical_ids {
-            // Budget check: current graph + pending creates must stay under limit
-            if self.classes.len() + estimated_new_nodes > max_nodes {
-                scan = ScanStop::ClassCap;
+            // Budget check: current graph + pending creates must stay under
+            // both ceilings — the live budget the caller chose, and the
+            // allocated backstop that bounds memory.
+            if let Some(ceiling) = self.exceeded_ceiling(ceilings, estimated_new_nodes) {
+                scan = ScanStop::ClassCap(ceiling);
                 break;
             }
             if expired(deadline) {
@@ -1349,9 +1544,9 @@ impl EGraph {
                     estimated_new_nodes += action_cost;
 
                     // If this action would push us over budget, stop scanning
-                    if self.classes.len() + estimated_new_nodes > max_nodes {
+                    if let Some(ceiling) = self.exceeded_ceiling(ceilings, estimated_new_nodes) {
                         // Don't add this action — discard it and stop
-                        scan = ScanStop::ClassCap;
+                        scan = ScanStop::ClassCap(ceiling);
                         break 'scan;
                     }
 
@@ -2166,9 +2361,9 @@ impl EGraph {
         }
     }
 
-    fn apply_rules_budgeted(&mut self, max_nodes: usize) -> usize {
+    fn apply_rules_budgeted(&mut self, ceilings: ClassCeilings) -> usize {
         // See `HARD_CLASS_LIMIT`.
-        let max_nodes = max_nodes.min(HARD_CLASS_LIMIT);
+        let ceilings = ceilings.clamped();
         // One call = one "apply all rules once" pass, the same granularity
         // saturate_with_limits uses for its step counter.
         self.step += 1;
@@ -2178,7 +2373,7 @@ impl EGraph {
 
         let canonical_ids = self.canonical_class_ids();
         for canonical in canonical_ids {
-            if self.classes.len() > max_nodes {
+            if self.exceeded_ceiling(ceilings, 0).is_some() {
                 break;
             }
             let nodes: Vec<ENode> = self.classes[canonical.index()].nodes.clone();
@@ -2198,7 +2393,7 @@ impl EGraph {
 
         for (rule_idx, class_id, action) in updates {
             unions += self.apply_action_from_rule(rule_idx, class_id, action);
-            if self.classes.len() > max_nodes {
+            if self.exceeded_ceiling(ceilings, 0).is_some() {
                 break;
             }
         }
@@ -3264,12 +3459,12 @@ impl<'a> EGraphBatch<'a> {
     pub fn apply_rule(
         &mut self,
         rule_idx: usize,
-        max_nodes: usize,
+        ceilings: ClassCeilings,
         deadline: Option<std::time::Instant>,
     ) -> ApplyResult {
         let result = self
             .graph
-            .apply_rule_at_index_timed(rule_idx, max_nodes, deadline);
+            .apply_rule_at_index_timed(rule_idx, ceilings, deadline);
         if result.changes > 0 {
             self.any_changes = true;
             // Interleaved partial rebuild: process some worklist items to keep

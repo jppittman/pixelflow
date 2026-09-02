@@ -1195,7 +1195,7 @@ mod congruence_gap_probe {
     /// replays reachable nodes in original id order through the public
     /// `push_*` API, which never hash-conses, so the rebuilt arena has
     /// exactly the dumped node multiset.
-    fn load_arena_dump(path: &Path) -> (String, ExprArena, ExprId) {
+    pub(super) fn load_arena_dump(path: &Path) -> (String, ExprArena, ExprId) {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let mut lines = text.lines();
@@ -1359,7 +1359,7 @@ mod congruence_gap_probe {
     /// harness this probe borrows its corpus from also uses (`arena_cost` in
     /// `docs/results/2026-09-01-rule-order-real-kernels.md`), not
     /// `ExtractedDAG::total_cost`'s cycle-penalty-inflated DP total.
-    fn arena_static_cost(model: &CostModel, arena: &ExprArena, root: ExprId) -> usize {
+    pub(super) fn arena_static_cost(model: &CostModel, arena: &ExprArena, root: ExprId) -> usize {
         let len = arena.nodes_raw().len();
         let mut seen = vec![false; len];
         let mut stack = vec![root];
@@ -1440,7 +1440,7 @@ mod congruence_gap_probe {
 
         let optimized = optimizer.run(&mut egraph, root_class, node_count);
         let max_classes = optimized.stats.limits.classes;
-        let hit_class_cap = optimized.stats.stop == SaturationStop::ClassCap;
+        let hit_class_cap = matches!(optimized.stats.stop, SaturationStop::ClassCap(_));
 
         let live_before = live_class_count(&egraph);
 
@@ -1500,7 +1500,7 @@ mod congruence_gap_probe {
         }
     }
 
-    fn category_of(filename: &str) -> &'static str {
+    pub(super) fn category_of(filename: &str) -> &'static str {
         if filename.starts_with("cellgrid_") {
             "cellgrid"
         } else if filename.starts_with("shader_") {
@@ -1514,7 +1514,7 @@ mod congruence_gap_probe {
         }
     }
 
-    fn median(xs: &mut [f64]) -> f64 {
+    pub(super) fn median(xs: &mut [f64]) -> f64 {
         if xs.is_empty() {
             return f64::NAN;
         }
@@ -1527,7 +1527,7 @@ mod congruence_gap_probe {
         }
     }
 
-    fn percentile(xs: &mut [f64], p: f64) -> f64 {
+    pub(super) fn percentile(xs: &mut [f64], p: f64) -> f64 {
         if xs.is_empty() {
             return f64::NAN;
         }
@@ -2255,6 +2255,10 @@ mod production_telemetry {
             .budget(Budget::Explicit {
                 iterations: max_iterations,
                 classes: max_classes,
+                // The LIVE budget is what this measurement varies; the
+                // allocated ceiling stays production's memory guard so the
+                // rows keep describing production's actual limits (#1114).
+                allocated_classes: crate::egraph::HARD_CLASS_LIMIT,
                 applications: None,
             })
             .hard_ceiling(timeout);
@@ -2443,7 +2447,7 @@ mod production_telemetry {
             let mut fatal = false;
             let clock_did_not_decide = matches!(
                 prod.stop,
-                SaturationStop::Quiesced | SaturationStop::ClassCap
+                SaturationStop::Quiesced | SaturationStop::ClassCap(_)
             );
             if clock_did_not_decide
                 && refr.stop != SaturationStop::Timeout
@@ -2580,7 +2584,11 @@ mod production_telemetry {
                 .iter()
                 .filter(|r| g == "ALL" || &r.group == g)
                 .collect();
-            let count = |s: SaturationStop| sel.iter().filter(|r| r.stop == s).count();
+            // Counts by KIND, not by value: `ClassCap` now names which ceiling
+            // bound (#1114), and these columns are "how many stopped on the class
+            // cap at all", across both.
+            let count =
+                |pred: fn(&SaturationStop) -> bool| sel.iter().filter(|r| pred(&r.stop)).count();
             let lr: Vec<f64> = sel.iter().filter_map(|r| r.loss_vs_ref).collect();
             let ll: Vec<f64> = sel.iter().filter_map(|r| r.loss_vs_lifted).collect();
             let apps: Vec<f64> = sel.iter().map(|r| r.apps as f64).collect();
@@ -2599,15 +2607,15 @@ mod production_telemetry {
             println!(
                 "{g}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}",
                 sel.len(),
-                count(SaturationStop::Quiesced),
-                count(SaturationStop::IterationCeiling),
-                count(SaturationStop::ClassCap),
-                count(SaturationStop::Timeout),
+                count(|s| matches!(s, SaturationStop::Quiesced)),
+                count(|s| matches!(s, SaturationStop::IterationCeiling)),
+                count(|s| matches!(s, SaturationStop::ClassCap(_))),
+                count(|s| matches!(s, SaturationStop::Timeout)),
                 sel.iter()
-                    .filter(|r| r.ref_stop == SaturationStop::ClassCap)
+                    .filter(|r| matches!(r.ref_stop, SaturationStop::ClassCap(_)))
                     .count(),
                 sel.iter()
-                    .filter(|r| r.lifted_stop == SaturationStop::ClassCap)
+                    .filter(|r| matches!(r.lifted_stop, SaturationStop::ClassCap(_)))
                     .count(),
                 lr.len(),
                 q(&lr),
@@ -2661,5 +2669,678 @@ mod production_telemetry {
             fatal.len(),
             fatal.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "runtime/class_cap_live_ab.rs"]
+mod class_cap_live_ab;
+
+#[cfg(test)]
+mod class_cap_ghosts {
+    use super::congruence_gap_probe::{
+        arena_static_cost, category_of, load_arena_dump, median, percentile,
+    };
+    use super::*;
+    use crate::egraph::{Budget, CostModel, Optimizer, SaturationStop, config_for_node_count};
+    use crate::nnue::{BwdGenConfig, BwdGenerator};
+    use std::path::PathBuf;
+
+    /// One run's counters, read at the moment `Optimizer::run` stopped.
+    #[derive(Clone, Debug)]
+    struct CapRow {
+        name: String,
+        category: &'static str,
+        node_count: usize,
+        cap: usize,
+        stop: String,
+        hit_cap: bool,
+        /// `egraph.num_classes()` — allocated, monotonically increasing.
+        allocated: usize,
+        /// `egraph.class_ids().count()` — canonical AND non-empty.
+        live: usize,
+        nodes: usize,
+        memo: usize,
+        /// `allocated / live`, or 1.0 if `live == 0` (never observed; a
+        /// saturated root class always has at least one live node).
+        ratio: f64,
+        extracted_cost: usize,
+    }
+
+    /// Run one kernel through `Optimizer::production()` under `budget`
+    /// (production's own budget for the baseline row, an
+    /// `Budget::Explicit` raised-cap for the recovery row), and read every
+    /// counter this measurement needs off the graph the run left behind.
+    fn run_one(
+        name: &str,
+        category: &'static str,
+        arena: &ExprArena,
+        root: ExprId,
+        budget: Budget,
+    ) -> CapRow {
+        let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
+            .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
+        let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
+        let node_count = reachable_count(&arena, root);
+
+        let mut optimizer = Optimizer::production().budget(budget);
+        let mut egraph = optimizer.egraph();
+        let mut id_memo: HashMap<ExprId, EClassId> = HashMap::new();
+        let root_class = arena_to_egraph(&arena, root, &mut egraph, &mut id_memo)
+            .unwrap_or_else(|| panic!("{name}: arena_to_egraph returned None (unsupported node)"));
+
+        let optimized = optimizer.run(&mut egraph, root_class, node_count);
+        let cap = optimized.stats.limits.classes;
+        let hit_cap = matches!(optimized.stats.stop, SaturationStop::ClassCap(_));
+        let allocated = egraph.num_classes();
+        let live = egraph.class_ids().count();
+        let nodes = egraph.node_count();
+        let memo = egraph.memo_len();
+        let ratio = if live > 0 {
+            allocated as f64 / live as f64
+        } else {
+            1.0
+        };
+
+        let model = CostModel::latency_prior();
+        let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
+        let extracted_cost = arena_static_cost(&model, &extracted, extracted_root);
+
+        CapRow {
+            name: name.to_string(),
+            category,
+            node_count,
+            cap,
+            stop: format!("{:?}", optimized.stats.stop),
+            hit_cap,
+            allocated,
+            live,
+            nodes,
+            memo,
+            ratio,
+            extracted_cost,
+        }
+    }
+
+    /// The recovery row: same kernel, cap raised to
+    /// `5000 * baseline.ratio`, production's iteration count for this
+    /// input size kept fixed (only the class ceiling moves) so the
+    /// comparison isolates the cap's effect.
+    fn raised_cap_row(
+        name: &str,
+        category: &'static str,
+        arena: &ExprArena,
+        root: ExprId,
+        baseline: &CapRow,
+    ) -> CapRow {
+        let preset = config_for_node_count(baseline.node_count);
+        let raised = ((5000.0 * baseline.ratio).round() as usize).max(baseline.cap + 1);
+        run_one(
+            &format!("{name} [raised x{:.2}]", baseline.ratio),
+            category,
+            arena,
+            root,
+            Budget::Explicit {
+                iterations: preset.max_iterations,
+                classes: raised,
+                allocated_classes: crate::egraph::HARD_CLASS_LIMIT,
+                applications: None,
+            },
+        )
+    }
+
+    fn median_usize(xs: &mut [usize]) -> f64 {
+        let mut fs: Vec<f64> = xs.iter().map(|&x| x as f64).collect();
+        median(&mut fs)
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecoveryRow {
+        name: String,
+        category: &'static str,
+        node_count: usize,
+        base_cap: usize,
+        raised_cap: usize,
+        base_ratio: f64,
+        base_allocated: usize,
+        base_live: usize,
+        base_stop: String,
+        base_extracted_cost: usize,
+        raised_stop: String,
+        raised_allocated: usize,
+        raised_live: usize,
+        raised_nodes: usize,
+        raised_memo: usize,
+        raised_extracted_cost: usize,
+        /// `(base_cost - raised_cost) / base_cost` — positive is an
+        /// improvement (cheaper extraction). This is an UPPER BOUND on what
+        /// any of the three candidate fixes can recover: it is what a
+        /// perfectly live-counted (or compacted) 5,000-class budget would
+        /// have bought THIS kernel, holding the cost model and rule set
+        /// fixed.
+        cost_improvement_frac: f64,
+        still_hit_cap: bool,
+    }
+
+    /// THE measurement. Writes
+    /// `docs/results/2026-09-02-class-cap-ghosts.{md,csv,json}`.
+    #[test]
+    #[ignore = "offline measurement: PIXELFLOW_CLASSCAP_ARENA_DIR=<dir of .arena dumps> cargo test -p pixelflow-search --release --lib -- --ignored class_cap_ghost_measurement"]
+    fn class_cap_ghost_measurement() {
+        let dir = PathBuf::from(
+            std::env::var("PIXELFLOW_CLASSCAP_ARENA_DIR")
+                .expect("PIXELFLOW_CLASSCAP_ARENA_DIR must be set"),
+        );
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().map(|e| e == "arena").unwrap_or(false))
+            .collect();
+        paths.sort();
+        assert!(
+            !paths.is_empty(),
+            "no .arena files found in {}",
+            dir.display()
+        );
+        eprintln!(
+            "class-cap ghost probe: {} real-kernel arena dumps",
+            paths.len()
+        );
+
+        // ---- Baseline: production regime on every real kernel ----
+        let mut real_arenas: Vec<(String, &'static str, ExprArena, ExprId)> = Vec::new();
+        let mut rows: Vec<CapRow> = Vec::new();
+        for path in &paths {
+            let (name, arena, root) = load_arena_dump(path);
+            let category = category_of(&path.file_name().unwrap().to_string_lossy());
+            let row = run_one(&name, category, &arena, root, Budget::Production);
+            rows.push(row);
+            real_arenas.push((name, category, arena, root));
+        }
+        let real_kernel_count = rows.len();
+
+        // ---- Size-stratified synthetic sample: 5 depth bands x 40 seeds,
+        // same generator/config the congruence probe and extraction-head
+        // training data use, unoptimized (junkified) form. ----
+        let templates = crate::egraph::collect_rule_templates();
+        let mut synth_arenas: Vec<(String, &'static str, ExprArena, ExprId)> = Vec::new();
+        for &max_depth in &[3usize, 5, 7, 9, 11] {
+            for seed in 0u64..40 {
+                let config = BwdGenConfig {
+                    max_depth,
+                    ..Default::default()
+                };
+                let mut generator = BwdGenerator::new(
+                    seed.wrapping_add(max_depth as u64 * 10_000),
+                    config,
+                    templates.clone(),
+                );
+                let pair = generator.generate_arena();
+                let name = format!("synth_d{max_depth}_s{seed}");
+                let row = run_one(
+                    &name,
+                    "synthetic",
+                    &pair.arena,
+                    pair.unoptimized,
+                    Budget::Production,
+                );
+                rows.push(row);
+                synth_arenas.push((name, "synthetic", pair.arena, pair.unoptimized));
+            }
+        }
+        let synthetic_count = rows.len() - real_kernel_count;
+        eprintln!("class-cap ghost probe: {synthetic_count} synthetic classical expressions");
+
+        let all_arenas: Vec<(String, &'static str, ExprArena, ExprId)> = real_arenas
+            .into_iter()
+            .chain(synth_arenas.into_iter())
+            .collect();
+        assert_eq!(all_arenas.len(), rows.len(), "arena/row count drifted");
+
+        // ---- Ratio distribution over the WHOLE corpus ----
+        let mut all_ratios: Vec<f64> = rows.iter().map(|r| r.ratio).collect();
+        let ratio_median = median(&mut all_ratios.clone());
+        let ratio_q1 = percentile(&mut all_ratios.clone(), 25.0);
+        let ratio_q3 = percentile(&mut all_ratios.clone(), 75.0);
+        let ratio_worst = all_ratios.iter().cloned().fold(0.0f64, f64::max);
+
+        // ---- Cap-hit population ----
+        let cap_hit_idx: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.hit_cap)
+            .map(|(i, _)| i)
+            .collect();
+        let cap_hit_count = cap_hit_idx.len();
+        let ghost_bound_count = cap_hit_idx
+            .iter()
+            .filter(|&&i| rows[i].live < rows[i].cap / 2)
+            .count();
+        let mut cap_hit_ratios: Vec<f64> = cap_hit_idx.iter().map(|&i| rows[i].ratio).collect();
+        let mut cap_hit_slack: Vec<usize> = cap_hit_idx
+            .iter()
+            .map(|&i| rows[i].cap.saturating_sub(rows[i].live))
+            .collect();
+
+        eprintln!(
+            "class-cap ghost probe: {cap_hit_count}/{} kernels hit the class cap; \
+             {ghost_bound_count} of those have live < cap/2",
+            rows.len()
+        );
+
+        // ---- THE decisive number: per-cap-hit-kernel raised-cap rerun ----
+        let mut recovery_rows: Vec<RecoveryRow> = Vec::new();
+        for &i in &cap_hit_idx {
+            let (name, category, arena, root) = &all_arenas[i];
+            let base = &rows[i];
+            let raised = raised_cap_row(name, category, arena, *root, base);
+            let cost_improvement_frac = if base.extracted_cost > 0 {
+                (base.extracted_cost as f64 - raised.extracted_cost as f64)
+                    / base.extracted_cost as f64
+            } else {
+                0.0
+            };
+            recovery_rows.push(RecoveryRow {
+                name: name.clone(),
+                category,
+                node_count: base.node_count,
+                base_cap: base.cap,
+                raised_cap: raised.cap,
+                base_ratio: base.ratio,
+                base_allocated: base.allocated,
+                base_live: base.live,
+                base_stop: base.stop.clone(),
+                base_extracted_cost: base.extracted_cost,
+                raised_stop: raised.stop.clone(),
+                raised_allocated: raised.allocated,
+                raised_live: raised.live,
+                raised_nodes: raised.nodes,
+                raised_memo: raised.memo,
+                raised_extracted_cost: raised.extracted_cost,
+                cost_improvement_frac,
+                still_hit_cap: raised.hit_cap,
+            });
+        }
+
+        let mut improvements: Vec<f64> = recovery_rows
+            .iter()
+            .map(|r| r.cost_improvement_frac)
+            .collect();
+        let improvement_median = median(&mut improvements.clone());
+        let improvement_p90 = percentile(&mut improvements.clone(), 90.0);
+        let improvement_mean = if !improvements.is_empty() {
+            improvements.iter().sum::<f64>() / improvements.len() as f64
+        } else {
+            0.0
+        };
+        let improved_count = recovery_rows
+            .iter()
+            .filter(|r| r.cost_improvement_frac > 1e-9)
+            .count();
+        let still_capped_count = recovery_rows.iter().filter(|r| r.still_hit_cap).count();
+
+        // ---- Memory cost of the raised cap: peak proxy = end-of-run
+        // counters (classes/nodes only grow across a run; `memo.insert`
+        // never removes a key either — see `EGraph::rebuild_budgeted` —
+        // so end-of-run IS peak for all three). ----
+        let base_alloc_at_hit: Vec<usize> =
+            cap_hit_idx.iter().map(|&i| rows[i].allocated).collect();
+        let base_nodes_at_hit: Vec<usize> = cap_hit_idx.iter().map(|&i| rows[i].nodes).collect();
+        let base_memo_at_hit: Vec<usize> = cap_hit_idx.iter().map(|&i| rows[i].memo).collect();
+        let raised_alloc: Vec<usize> = recovery_rows.iter().map(|r| r.raised_allocated).collect();
+        let raised_nodes: Vec<usize> = recovery_rows.iter().map(|r| r.raised_nodes).collect();
+        let raised_memo: Vec<usize> = recovery_rows.iter().map(|r| r.raised_memo).collect();
+
+        let worst_alloc_growth = recovery_rows
+            .iter()
+            .map(|r| r.raised_allocated as f64 / r.base_allocated.max(1) as f64)
+            .fold(1.0f64, f64::max);
+
+        eprintln!("=== headline numbers ===");
+        eprintln!(
+            "allocated/live ratio (whole corpus, n={}): median={:.2}x q1={:.2}x q3={:.2}x worst={:.2}x",
+            rows.len(),
+            ratio_median,
+            ratio_q1,
+            ratio_q3,
+            ratio_worst
+        );
+        eprintln!(
+            "cap-hit kernels: {cap_hit_count}/{} ; ghost-bound (live < cap/2): {ghost_bound_count}/{cap_hit_count}",
+            rows.len()
+        );
+        eprintln!(
+            "cap-hit ratio: median={:.2}x ; median live-slack below cap={:.0} classes",
+            median(&mut cap_hit_ratios),
+            median_usize(&mut cap_hit_slack)
+        );
+        eprintln!(
+            "raised-cap (5000 * ratio) extracted-cost improvement, n={}: median={:.3}% p90={:.3}% mean={:.3}% ({improved_count} kernels improved, {still_capped_count} still hit the raised cap)",
+            recovery_rows.len(),
+            improvement_median * 100.0,
+            improvement_p90 * 100.0,
+            improvement_mean * 100.0
+        );
+        eprintln!(
+            "raised-cap memory (proxy=end-of-run, monotonic across a run): allocated median {:.0}->{:.0}, nodes median {:.0}->{:.0}, memo median {:.0}->{:.0}; worst-case allocated growth {worst_alloc_growth:.2}x",
+            median_usize(&mut base_alloc_at_hit.clone()),
+            median_usize(&mut raised_alloc.clone()),
+            median_usize(&mut base_nodes_at_hit.clone()),
+            median_usize(&mut raised_nodes.clone()),
+            median_usize(&mut base_memo_at_hit.clone()),
+            median_usize(&mut raised_memo.clone()),
+        );
+
+        // ---- Write docs/results/2026-09-02-class-cap-ghosts.{csv,json,md} ----
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("pixelflow-search has a parent directory");
+        let results_dir = repo_root.join("docs/results");
+        std::fs::create_dir_all(&results_dir).expect("create docs/results");
+
+        write_csv(
+            &results_dir.join("2026-09-02-class-cap-ghosts.csv"),
+            &rows,
+            &recovery_rows,
+        );
+        write_json(
+            &results_dir.join("2026-09-02-class-cap-ghosts.json"),
+            &rows,
+            &recovery_rows,
+            real_kernel_count,
+            synthetic_count,
+            (ratio_median, ratio_q1, ratio_q3, ratio_worst),
+            (cap_hit_count, ghost_bound_count),
+            (improvement_median, improvement_p90, improvement_mean),
+            worst_alloc_growth,
+        );
+        write_md(
+            &results_dir.join("2026-09-02-class-cap-ghosts.md"),
+            &rows,
+            &recovery_rows,
+            real_kernel_count,
+            synthetic_count,
+            (ratio_median, ratio_q1, ratio_q3, ratio_worst),
+            (cap_hit_count, ghost_bound_count),
+            (
+                improvement_median,
+                improvement_p90,
+                improvement_mean,
+                improved_count,
+                still_capped_count,
+            ),
+            worst_alloc_growth,
+        );
+
+        assert!(
+            cap_hit_count > 0,
+            "no kernel in the corpus hit the class cap — nothing to recover"
+        );
+    }
+
+    fn write_csv(path: &std::path::Path, rows: &[CapRow], recovery: &[RecoveryRow]) {
+        let mut out = String::new();
+        out.push_str("name,category,node_count,cap,stop,hit_cap,allocated,live,nodes,memo,ratio,extracted_cost\n");
+        for r in rows {
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{:.4},{}\n",
+                r.name,
+                r.category,
+                r.node_count,
+                r.cap,
+                r.stop,
+                r.hit_cap,
+                r.allocated,
+                r.live,
+                r.nodes,
+                r.memo,
+                r.ratio,
+                r.extracted_cost
+            ));
+        }
+        out.push_str("\n# recovery: raised cap = 5000 * base ratio, per cap-hit kernel\n");
+        out.push_str("name,category,node_count,base_cap,raised_cap,base_ratio,base_allocated,base_live,base_stop,base_extracted_cost,raised_stop,raised_allocated,raised_live,raised_nodes,raised_memo,raised_extracted_cost,cost_improvement_frac,still_hit_cap\n");
+        for r in recovery {
+            out.push_str(&format!(
+                "{},{},{},{},{},{:.4},{},{},{},{},{},{},{},{},{},{},{:.4},{}\n",
+                r.name,
+                r.category,
+                r.node_count,
+                r.base_cap,
+                r.raised_cap,
+                r.base_ratio,
+                r.base_allocated,
+                r.base_live,
+                r.base_stop,
+                r.base_extracted_cost,
+                r.raised_stop,
+                r.raised_allocated,
+                r.raised_live,
+                r.raised_nodes,
+                r.raised_memo,
+                r.raised_extracted_cost,
+                r.cost_improvement_frac,
+                r.still_hit_cap
+            ));
+        }
+        std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_json(
+        path: &std::path::Path,
+        rows: &[CapRow],
+        recovery: &[RecoveryRow],
+        real_kernel_count: usize,
+        synthetic_count: usize,
+        ratio_stats: (f64, f64, f64, f64),
+        cap_hit_stats: (usize, usize),
+        improvement_stats: (f64, f64, f64),
+        worst_alloc_growth: f64,
+    ) {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        writeln!(out, "{{").unwrap();
+        writeln!(out, "  \"real_kernel_count\": {real_kernel_count},").unwrap();
+        writeln!(out, "  \"synthetic_count\": {synthetic_count},").unwrap();
+        writeln!(out, "  \"total_count\": {},", rows.len()).unwrap();
+        writeln!(
+            out,
+            "  \"ratio_distribution\": {{ \"median\": {:.4}, \"q1\": {:.4}, \"q3\": {:.4}, \"worst\": {:.4} }},",
+            ratio_stats.0, ratio_stats.1, ratio_stats.2, ratio_stats.3
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "  \"cap_hit_count\": {}, \"ghost_bound_count\": {},",
+            cap_hit_stats.0, cap_hit_stats.1
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "  \"recovery_cost_improvement_frac\": {{ \"median\": {:.4}, \"p90\": {:.4}, \"mean\": {:.4} }},",
+            improvement_stats.0, improvement_stats.1, improvement_stats.2
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "  \"worst_allocated_growth_x\": {worst_alloc_growth:.4},"
+        )
+        .unwrap();
+        writeln!(out, "  \"rows\": [").unwrap();
+        for (i, r) in rows.iter().enumerate() {
+            writeln!(
+                out,
+                "    {{ \"name\": \"{}\", \"category\": \"{}\", \"node_count\": {}, \"cap\": {}, \"stop\": \"{}\", \"hit_cap\": {}, \"allocated\": {}, \"live\": {}, \"nodes\": {}, \"memo\": {}, \"ratio\": {:.4}, \"extracted_cost\": {} }}{}",
+                r.name, r.category, r.node_count, r.cap, r.stop, r.hit_cap,
+                r.allocated, r.live, r.nodes, r.memo, r.ratio, r.extracted_cost,
+                if i + 1 == rows.len() { "" } else { "," }
+            )
+            .unwrap();
+        }
+        writeln!(out, "  ],").unwrap();
+        writeln!(out, "  \"recovery\": [").unwrap();
+        for (i, r) in recovery.iter().enumerate() {
+            writeln!(
+                out,
+                "    {{ \"name\": \"{}\", \"category\": \"{}\", \"node_count\": {}, \"base_cap\": {}, \"raised_cap\": {}, \"base_ratio\": {:.4}, \"base_allocated\": {}, \"base_live\": {}, \"base_stop\": \"{}\", \"base_extracted_cost\": {}, \"raised_stop\": \"{}\", \"raised_allocated\": {}, \"raised_live\": {}, \"raised_nodes\": {}, \"raised_memo\": {}, \"raised_extracted_cost\": {}, \"cost_improvement_frac\": {:.4}, \"still_hit_cap\": {} }}{}",
+                r.name, r.category, r.node_count, r.base_cap, r.raised_cap, r.base_ratio,
+                r.base_allocated, r.base_live, r.base_stop, r.base_extracted_cost,
+                r.raised_stop, r.raised_allocated, r.raised_live, r.raised_nodes, r.raised_memo,
+                r.raised_extracted_cost, r.cost_improvement_frac, r.still_hit_cap,
+                if i + 1 == recovery.len() { "" } else { "," }
+            )
+            .unwrap();
+        }
+        writeln!(out, "  ]").unwrap();
+        writeln!(out, "}}").unwrap();
+        std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_md(
+        path: &std::path::Path,
+        rows: &[CapRow],
+        recovery: &[RecoveryRow],
+        real_kernel_count: usize,
+        synthetic_count: usize,
+        ratio_stats: (f64, f64, f64, f64),
+        cap_hit_stats: (usize, usize),
+        improvement_stats: (f64, f64, f64, usize, usize),
+        worst_alloc_growth: f64,
+    ) {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        writeln!(
+            out,
+            "# Class-cap ghosts: allocated vs live e-classes (2026-09-02)\n"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "`EGraph::union` (graph.rs) merges through the union-find and never removes an \
+             entry from `self.classes`. `num_classes()` returns `self.classes.len()` — \
+             ALLOCATED classes, monotonically increasing. The live graph is `class_ids()` \
+             — canonical AND non-empty. The production budget check \
+             (`self.classes.len() > max_classes`, `saturate_bounded`) counts allocated, \
+             not live.\n"
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "Corpus: {real_kernel_count} real kernels (190 glyph + 13 shader/psychedelic + 3 \
+             cell-grid) + {synthetic_count} size-stratified synthetic expressions (5 depth \
+             bands x 40 seeds) = {} total. Production regime: `Optimizer::production()` \
+             exactly as `pixelflow-search/src/runtime.rs`'s `optimize_runtime_arena_uncached` \
+             calls it. Cost model: `CostModel::latency_prior()`.\n",
+            rows.len()
+        )
+        .unwrap();
+
+        writeln!(out, "## Headline numbers\n").unwrap();
+        writeln!(
+            out,
+            "1. **Allocated/live ratio** (whole corpus, n={}): median **{:.2}x**, q1={:.2}x, \
+             q3={:.2}x, worst={:.2}x.",
+            rows.len(),
+            ratio_stats.0,
+            ratio_stats.1,
+            ratio_stats.2,
+            ratio_stats.3
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "2. **Cap-hit kernels**: {}/{} ({:.1}%). Of those, **{}** ({:.1}%) are \
+             ghost-bound — live < cap/2 at the moment the cap tripped.",
+            cap_hit_stats.0,
+            rows.len(),
+            100.0 * cap_hit_stats.0 as f64 / rows.len().max(1) as f64,
+            cap_hit_stats.1,
+            100.0 * cap_hit_stats.1 as f64 / cap_hit_stats.0.max(1) as f64
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "3. **Upper-bound recovery** — re-running each cap-hit kernel with the cap \
+             raised to `5000 * (allocated/live ratio observed at the original cap-hit)`, \
+             extracted-cost improvement over the {}-class-cap baseline (n={}): median \
+             **{:.3}%**, p90 **{:.3}%**, mean {:.3}%. {}/{} cap-hit kernels improved; {}/{} \
+             still hit the raised cap.",
+            5000,
+            recovery.len(),
+            improvement_stats.0 * 100.0,
+            improvement_stats.1 * 100.0,
+            improvement_stats.2 * 100.0,
+            improvement_stats.3,
+            recovery.len(),
+            improvement_stats.4,
+            recovery.len()
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "4. **Memory cost of the raised cap** (proxy: end-of-run allocated/nodes/memo — \
+             all three are monotonically non-decreasing across a single saturation run: \
+             `add()` only appends to `classes`, `union()` never removes an entry, and \
+             `rebuild_budgeted`'s `memo.insert` never removes a key either — so end-of-run \
+             equals peak for a single run). Worst-case allocated-class growth from raising \
+             the cap: **{:.2}x**.\n",
+            worst_alloc_growth
+        )
+        .unwrap();
+
+        writeln!(out, "## Recommendation\n").unwrap();
+        writeln!(
+            out,
+            "See the accompanying write-up in this file's companion PR description for the \
+             (a) compact / (b) live-counted-budget / (c) neither analysis and the \
+             EClassId/ENodeId holder enumeration for (a). The numbers above are what that \
+             recommendation is built on.\n"
+        )
+        .unwrap();
+
+        writeln!(out, "## Cap-hit kernels: raised-cap recovery (raw)\n").unwrap();
+        writeln!(
+            out,
+            "| kernel | category | nodes | base cap | ratio | raised cap | base cost | raised cost | improvement | still capped |"
+        )
+        .unwrap();
+        writeln!(out, "|---|---|---|---|---|---|---|---|---|---|").unwrap();
+        let mut sorted_recovery = recovery.to_vec();
+        sorted_recovery.sort_by(|a, b| {
+            b.cost_improvement_frac
+                .partial_cmp(&a.cost_improvement_frac)
+                .unwrap()
+        });
+        for r in &sorted_recovery {
+            writeln!(
+                out,
+                "| {} | {} | {} | {} | {:.2}x | {} | {} | {} | {:.2}% | {} |",
+                r.name,
+                r.category,
+                r.node_count,
+                r.base_cap,
+                r.base_ratio,
+                r.raised_cap,
+                r.base_extracted_cost,
+                r.raised_extracted_cost,
+                r.cost_improvement_frac * 100.0,
+                r.still_hit_cap
+            )
+            .unwrap();
+        }
+
+        writeln!(out, "\n## Raw data\n").unwrap();
+        writeln!(
+            out,
+            "See `2026-09-02-class-cap-ghosts.csv` / `.json` for every kernel's row \
+             ({} baseline rows + {} recovery rows).",
+            rows.len(),
+            recovery.len()
+        )
+        .unwrap();
+
+        std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     }
 }
