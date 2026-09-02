@@ -1198,10 +1198,12 @@ impl EGraph {
             // loop almost never sees a capped run — the sweep's own report is
             // what makes `ClassCap` observable at all.
             match sweep {
-                ScanStop::ClassCap => {
-                    stop = SaturationStop::ClassCap;
-                    break;
-                }
+                // Classifying a sweep is not the same as ending the run.
+                // The class budget cut THIS sweep short, but its unions are
+                // committed and the rebuild has run, so the next sweep meets
+                // a different graph and can make progress on different
+                // classes. Record the reason; keep iterating.
+                ScanStop::ClassCap => stop = SaturationStop::ClassCap,
                 ScanStop::Deadline => {
                     stop = SaturationStop::Timeout;
                     break;
@@ -1217,6 +1219,10 @@ impl EGraph {
                         stop = SaturationStop::Quiesced;
                         break;
                     }
+                    // A full, productive sweep: if the round budget is what
+                    // ends the run, that — not a cap some earlier sweep hit
+                    // — is the reason. `stop` always names the LAST sweep.
+                    stop = SaturationStop::IterationCeiling;
                 }
             }
         }
