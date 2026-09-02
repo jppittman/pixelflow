@@ -1052,4 +1052,94 @@ mod tests {
             "X and Add are pixel: {hist:?}"
         );
     }
+
+    // ========================================================================
+    // Latency-prior cold start (#1063): dim 0 must actually carry the signal
+    // ========================================================================
+
+    /// The extraction head's cold start seeded from
+    /// [`OpEmbeddings::new_with_latency_prior`] rather than fully-random
+    /// [`OpEmbeddings::new_random`] — the point being to hand the trainer a
+    /// monotone latency signal in dimension 0 instead of noise. Its binary
+    /// (`bootstrap_extraction_head`) was deleted with the extraction-head
+    /// program in #1093; the property below is still worth pinning, because
+    /// `new_with_latency_prior` remains and any future consumer wants the
+    /// same guarantee.
+    /// This pins that the signal is actually there: a future edit to the
+    /// squash (or a seed that happens to overwrite dim 0 with the "small
+    /// random" loop) would otherwise regress silently, since nothing else
+    /// distinguishes prior-seeded from random init at the type level.
+    #[test]
+    fn latency_prior_init_dim0_correlates_with_log_cycles() {
+        let emb = OpEmbeddings::new_with_latency_prior(42);
+        let cycles_of = latency_prior_cycles();
+
+        let xs: alloc::vec::Vec<f64> = OpKind::all()
+            .map(|op| f64::from(logf(1.0 + cycles_of[op] as f32)))
+            .collect();
+        let ys: alloc::vec::Vec<f64> = OpKind::all().map(|op| f64::from(emb.e[op][0])).collect();
+        assert_eq!(xs.len(), ys.len());
+
+        let n = xs.len() as f64;
+        let mean_x = xs.iter().sum::<f64>() / n;
+        let mean_y = ys.iter().sum::<f64>() / n;
+        let mut cov = 0.0f64;
+        let mut var_x = 0.0f64;
+        let mut var_y = 0.0f64;
+        for (&x, &y) in xs.iter().zip(&ys) {
+            let dx = x - mean_x;
+            let dy = y - mean_y;
+            cov += dx * dy;
+            var_x += dx * dx;
+            var_y += dy * dy;
+        }
+        assert!(
+            var_x > 0.0 && var_y > 0.0,
+            "degenerate input, correlation undefined"
+        );
+        let corr = cov / (var_x.sqrt() * var_y.sqrt());
+
+        assert!(
+            corr > 0.95,
+            "dim0 of a latency-prior-seeded embedding must correlate with \
+             log(1+cycles) across OpKind::all(); got r={corr:.4}"
+        );
+    }
+
+    /// Random init (the OLD cold start, still used elsewhere e.g. saturation
+    /// head / test fixtures) must NOT show this correlation — otherwise the
+    /// test above would be vacuous, passing regardless of which
+    /// initializer actually ran.
+    #[test]
+    fn random_init_dim0_does_not_correlate_with_log_cycles() {
+        let emb = OpEmbeddings::new_random(42);
+        let cycles_of = latency_prior_cycles();
+
+        let xs: alloc::vec::Vec<f64> = OpKind::all()
+            .map(|op| f64::from(logf(1.0 + cycles_of[op] as f32)))
+            .collect();
+        let ys: alloc::vec::Vec<f64> = OpKind::all().map(|op| f64::from(emb.e[op][0])).collect();
+
+        let n = xs.len() as f64;
+        let mean_x = xs.iter().sum::<f64>() / n;
+        let mean_y = ys.iter().sum::<f64>() / n;
+        let mut cov = 0.0f64;
+        let mut var_x = 0.0f64;
+        let mut var_y = 0.0f64;
+        for (&x, &y) in xs.iter().zip(&ys) {
+            let dx = x - mean_x;
+            let dy = y - mean_y;
+            cov += dx * dy;
+            var_x += dx * dx;
+            var_y += dy * dy;
+        }
+        let corr = cov / (var_x.sqrt() * var_y.sqrt());
+
+        assert!(
+            corr.abs() < 0.5,
+            "fully-random init should show no meaningful correlation with \
+             log(1+cycles); got r={corr:.4} — did the RNG seed happen to \
+             collide with a structured pattern, or did new_random change?"
+        );
+    }
 }
