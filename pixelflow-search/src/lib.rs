@@ -5,6 +5,8 @@ extern crate alloc;
 
 #[cfg(test)]
 mod arena_corpus;
+#[cfg(test)]
+mod cost_table_ab;
 pub mod egraph;
 #[cfg(test)]
 mod extraction_gap;
