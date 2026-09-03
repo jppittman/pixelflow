@@ -246,8 +246,25 @@ fn sentinel_drift_exceeded(calibration_ns: f64, measured_ns: f64, max_drift_frac
 
 /// Conservative lower bound on plausible per-eval cost for an expression with
 /// `op_count` compute ops (audit M4).
+///
+/// [`MIN_NS_PER_OP`] prices ops the machine actually *issues*, but `op_count`
+/// counts nodes in the arena the caller hands in — and those two stopped being
+/// the same number when the backend learned to fuse (#1076, MulAdd shapes). A
+/// `Mul` feeding an `Add` is two arena nodes and one `FMLA`, so the source
+/// count is an UPPER bound on issued ops where the floor needs a LOWER one.
+/// Using the upper bound as if it were the lower bound is unsound in the
+/// false-positive direction: it rejects correct measurements of fusable
+/// kernels. `measure_latency_prior`'s 47-node throughput probe is one — it
+/// computes the right answer (checked against `eval_scalar`) and measures
+/// 1.82ns against a 2.35ns floor.
+///
+/// Fusion retires at most one node per surviving node, so half the source
+/// count is the sound lower bound on issued ops. Halving costs the guard
+/// nothing it was built for: an early `ret`, a mis-scaled timebase, or an
+/// unroll miscount lands at or near zero, orders of magnitude below either
+/// floor.
 fn plausibility_floor_ns(op_count: usize) -> f64 {
-    op_count as f64 * MIN_NS_PER_OP
+    op_count.div_ceil(2) as f64 * MIN_NS_PER_OP
 }
 
 /// Panic if a RAW per-eval measurement is below the dependency-chain floor
@@ -1532,8 +1549,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "plausibility failure")]
     fn plausibility_floor_fires_below_floor() {
-        // 10 ops → floor 0.5ns; 0.1ns raw is a harness bug.
+        // 10 source ops → at most 5 issued after fusion → floor 0.25ns;
+        // 0.1ns raw is a harness bug.
         assert_plausible(0.1, 10);
+    }
+
+    #[test]
+    fn plausibility_floor_allows_full_fma_fusion() {
+        // The floor must not reject a kernel whose every Mul fused into the
+        // Add above it: 2N source nodes can issue as N `FMLA`s, so the floor
+        // has to sit at or below N * MIN_NS_PER_OP. Without the halving this
+        // is 2N * MIN_NS_PER_OP and correct measurements panic — the exact
+        // false positive `measure_latency_prior` hit on current main.
+        let source_ops = 48;
+        let fully_fused_ns = (source_ops / 2) as f64 * MIN_NS_PER_OP;
+        assert_plausible(fully_fused_ns, source_ops);
     }
 
     #[test]

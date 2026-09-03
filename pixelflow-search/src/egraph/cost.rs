@@ -72,6 +72,57 @@ use pixelflow_ir::kind::OpMap;
 /// Caveat: measured on one machine (aarch64 NEON). The lowered subgraphs are
 /// the same shape on x86, so the ordering is expected to transfer, but the
 /// exact ratios are host-specific — see `cargo xtask isa-matrix`.
+///
+/// # Re-measurement (2026-09-02, same machine, 7 load-gated runs)
+///
+/// Re-run against current `main` because the code generator was substantially
+/// rewritten after Round 1 (#1071 collapse-JIT unification, #1082 one compile
+/// entry, #1092/#1119 the loop nest, #1075–#1077 memory operands and the ABI).
+/// Extraction is argmin over this table, so stale coefficients would put every
+/// cost number this repo reports in stale units.
+///
+/// **Most of the table survived.** 24 of the 29 measured ops came back within
+/// their own cross-run spread of the Round 1 value, so those numbers describe
+/// the current machine and are left alone. Five moved:
+///
+/// | op | was | now | why |
+/// |---|---|---|---|
+/// | `Sin` | 70 | 95 | Cody-Waite range reduction (#992) |
+/// | `Cos` | 75 | 103 | same reduction |
+/// | `Tan` | 87 | 117 | same reduction |
+/// | `Sqrt` | 15 | 13 | codegen |
+/// | `Select` | 4 | 3 | codegen |
+///
+/// The trig row is not drift, it is a *different function*: #992 landed 62
+/// seconds before Round 1's own measurement commit, so Round 1 almost
+/// certainly priced the pre-fix reduction. The fingerprint says so — the only
+/// ops that moved are the three sharing `expand_sin`'s reduction, while
+/// `Atan`, `Atan2`, `Asin` and `Acos`, which do not use it, came back at
+/// +0.6%, +0.7%, −3.7% and −3.5%. Correct reduction costs ~25 cycles more
+/// than the reduction it replaced, and this table now says so.
+///
+/// The Round 1 consistency identity still holds under the new numbers:
+/// Log2 116.8 + Mul 5.5 + Exp2 66.1 = 188.4 against a directly measured
+/// `Pow` of 189.3.
+///
+/// **What this protocol does NOT measure**, and therefore what no re-run can
+/// refresh: 21 of the 50 entries are unmeasured, including `Gather` and
+/// `RawGather` at 10 apiece. `measure_latency_prior` calls every kernel with
+/// a NULL context pointer and a single-batch tile, and gathers read their
+/// buffer bases out of that context register — so a probe containing one
+/// would segfault. The memory-operand and loop-nest work (#1075, #1092,
+/// #1119) therefore cannot show up in this table's memory entries: those
+/// entries are, and remain, guesses. The comparisons (`Lt`..`Ne`) and the
+/// integer/bit ops are unmeasured for the same protocol reason.
+///
+/// Two further caveats on the instrument, both recorded in
+/// `docs/results/2026-09-02-latency-prior-remeasure.md`: `BenchMode::Latency`
+/// divides by lane count, so its ABSOLUTE ns are 4× optimistic (the example
+/// prints an impossible "13.66GHz" clock estimate off them) — harmless here
+/// only because this table is normalized to `Add = 4` and a uniform scale
+/// cancels; and `Select`'s number rests on the assumption that its compare
+/// overlaps the Mul the protocol subtracts, which is the weakest measurement
+/// in the set.
 #[must_use]
 pub fn latency_prior_cycles() -> OpMap<usize> {
     OpMap::from_fn(|op| match op {
@@ -82,7 +133,7 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Mul => 5,     // measured 5.3
         OpKind::Div => 11,    // measured 11.3 (was 15)
         OpKind::Neg => 3,     // measured 3.1 (was 1)
-        OpKind::Sqrt => 15,   // measured 14.5
+        OpKind::Sqrt => 13,   // remeasured 13.4 (was 15)
         OpKind::Rsqrt => 21,  // measured 21.5 — estimate + NR chain (was 5)
         OpKind::Abs => 3,     // measured 3.1 (was 1)
         OpKind::Min => 3,     // measured 2.7 (was 4)
@@ -92,9 +143,9 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Floor => 4,   // measured ~4
         OpKind::Ceil => 4,    // measured 4.3
         OpKind::Round => 4,   // measured 4.3
-        OpKind::Sin => 70,    // measured 70.6 (was 10)
-        OpKind::Cos => 75,    // measured 74.8 (was 10)
-        OpKind::Tan => 87,    // measured 86.8 (was 10)
+        OpKind::Sin => 95,    // remeasured 95.0 — Cody-Waite reduction (was 70)
+        OpKind::Cos => 103,   // remeasured 103.0 — Cody-Waite reduction (was 75)
+        OpKind::Tan => 117,   // remeasured 116.8 — Cody-Waite reduction (was 87)
         OpKind::Asin => 103,  // measured 102.8 (was 10)
         OpKind::Acos => 103,  // measured 102.9 (was 10)
         OpKind::Atan => 79,   // measured 79.3 (was 10)
@@ -111,7 +162,7 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Ge => 3,
         OpKind::Eq => 3,
         OpKind::Ne => 3,
-        OpKind::Select => 4,
+        OpKind::Select => 3,     // remeasured 3.3 (was 4)
         OpKind::Tuple => 0,      // free (structural)
         OpKind::TruncToInt => 1, // cvttps2dq
         OpKind::IntToFloat => 1, // cvtdq2ps

@@ -64,7 +64,9 @@ use std::time::{Duration, Instant};
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape};
 
 use crate::arena_corpus::{category_of, load_arena_dump, median, percentile};
-use crate::egraph::extract::extract_dag_scoped;
+use crate::egraph::extract::{
+    ExtractedDAG, extract_dag_objectives, extract_dag_scoped, extract_dag_tree_arm,
+};
 use crate::egraph::{
     Budget, CostModel, EClassId, EGraph, ENode, Extraction, Optimizer, SaturationStop,
 };
@@ -1001,6 +1003,28 @@ struct Row {
     reported_matches_returned: bool,
     reported_delta: i64,
     dominated_candidates: usize,
+
+    // --- #1116: the sharing-aware objective, measured against the same
+    //     references as everything above ---
+    /// True DAG cost of the term the sharing-aware DP returns.
+    sharing_dag: u64,
+    /// True TREE cost of that same term — expected to RISE where the
+    /// objective change bites, since tree cost is the thing being abandoned.
+    sharing_tree: u64,
+    /// True DAG cost of what `extract_dag_scoped` now returns: the cheaper of
+    /// the two arms. Never above `greedy_dag`, by construction.
+    chosen_dag: u64,
+    /// Did the sharing arm change the extracted term at all?
+    sharing_changed_term: bool,
+    /// `greedy_dag - chosen_dag`: cost units the objective change recovers.
+    sharing_gain: i64,
+    /// Of the gap `greedy_dag - exact_dag`, the share this closes. NaN when
+    /// the exact optimum is unproved or the gap is zero.
+    gap_closed_frac: f64,
+    /// Median nanoseconds for the pre-#1116 extractor (tree arm alone).
+    tree_arm_ns: f64,
+    /// Median nanoseconds for what `extract_dag_scoped` now does (both arms).
+    scoped_ns: f64,
 }
 
 struct Measured {
@@ -1034,15 +1058,21 @@ fn measure(
     let model = CostModel::latency_prior();
     let inst = Instance::build(&egraph, root_class, &model);
 
-    // (a) the production chooser
-    let dag = extract_dag_scoped(&egraph, root_class, &model, LatticeShape::POINT);
+    // (a) the production chooser, both arms. `tree_arm` is the pre-#1116
+    // extractor verbatim and is what every "greedy_*" column below reports,
+    // so the A/B is against the thing being replaced rather than against a
+    // remembered number; `shared_arm` is the sharing-aware objective (#1116).
+    let (tree_arm, shared_arm): (ExtractedDAG, ExtractedDAG) =
+        extract_dag_objectives(&egraph, root_class, &model, LatticeShape::POINT);
+    let dag = tree_arm;
     let trace = greedy_trace(&egraph, root_class, &model);
     let mirrored = Extraction::from_dp(&egraph, root_class, trace.choices.clone());
     assert_eq!(
         mirrored.choices(),
         dag.choices.as_slice(),
-        "{name}: the instrumented greedy mirror has drifted from extract_dag_scoped — \
-         the measurement would be describing a different algorithm than production runs"
+        "{name}: the instrumented greedy mirror has drifted from the tree arm of \
+         extract_dag_objectives — the measurement would be describing a different \
+         algorithm than the one #1116 replaces"
     );
     let greedy_choices = dag.choices.clone();
     let greedy_dag = inst.dag_cost(&greedy_choices).unwrap_or_else(|| {
@@ -1056,6 +1086,53 @@ fn measure(
         .tree_cost(&greedy_choices)
         .expect("a well-founded choice function has a finite tree cost");
 
+    let sharing_choices = shared_arm.choices.clone();
+    let sharing_dag = inst.dag_cost(&sharing_choices).unwrap_or_else(|| {
+        panic!(
+            "{name}: the sharing-aware DP returned a choice function that is not a term \
+             — either cyclic after `repair_choices_well_founded`, or missing a choice \
+             for a class the root reaches. That is a production bug, not a measurement \
+             outcome"
+        )
+    });
+    let sharing_tree = inst
+        .tree_cost(&sharing_choices)
+        .expect("a well-founded choice function has a finite tree cost");
+    // What production now returns: the cheaper arm by DAG cost, ties to tree.
+    let chosen_dag = greedy_dag.min(sharing_dag);
+
+    // Extraction cost. This is the one wall-clock number in an otherwise
+    // deterministic measurement, so it is taken as a RATIO of two things
+    // timed back to back in the same process on the same saturated graph,
+    // alternating and taking medians — the absolute nanoseconds are the
+    // machine's, the ratio is the change's.
+    const TIMING_REPS: usize = 9;
+    let mut tree_ns: Vec<f64> = Vec::with_capacity(TIMING_REPS);
+    let mut scoped_ns: Vec<f64> = Vec::with_capacity(TIMING_REPS);
+    for _ in 0..TIMING_REPS {
+        let t0 = Instant::now();
+        let a = extract_dag_tree_arm(&egraph, root_class, &model, LatticeShape::POINT);
+        tree_ns.push(t0.elapsed().as_secs_f64() * 1e9);
+        let t1 = Instant::now();
+        let b = extract_dag_scoped(&egraph, root_class, &model, LatticeShape::POINT);
+        scoped_ns.push(t1.elapsed().as_secs_f64() * 1e9);
+        // Keep the optimizer from eliding either call.
+        assert!(
+            a.dag_cost >= b.dag_cost,
+            "{name}: the scoped extractor returned a worse term than its own tree arm"
+        );
+    }
+    let tree_arm_ns = median(&mut tree_ns);
+    let scoped_ns = median(&mut scoped_ns);
+    let production = extract_dag_scoped(&egraph, root_class, &model, LatticeShape::POINT);
+    let production_dag = inst
+        .dag_cost(&production.choices)
+        .expect("extract_dag_scoped returns a well-founded choice function");
+    assert_eq!(
+        production_dag, chosen_dag,
+        "{name}: extract_dag_scoped did not return the cheaper of its two arms"
+    );
+
     // (b) exact minimum tree cost
     let treeopt_choices = tree_optimal_choices(&inst)
         .unwrap_or_else(|| panic!("{name}: no finite-cost term reaches the root"));
@@ -1067,11 +1144,15 @@ fn measure(
         .unwrap_or_else(|| panic!("{name}: tree-optimal choice has no finite tree cost"));
 
     // (c) exact minimum DAG cost, seeded with the better of (a) and (b)
-    let (seed, seed_cost) = if treeopt_dag < greedy_dag {
-        (treeopt_choices.clone(), treeopt_dag)
-    } else {
-        (greedy_choices.clone(), greedy_dag)
-    };
+    let (seed, seed_cost) = [
+        (&treeopt_choices, treeopt_dag),
+        (&greedy_choices, greedy_dag),
+        (&sharing_choices, sharing_dag),
+    ]
+    .into_iter()
+    .min_by_key(|&(_, c)| c)
+    .map(|(choices, c)| (choices.clone(), c))
+    .expect("three seeds");
     let exact = exact_dag_choices(&inst, &seed, seed_cost, max_expansions, time_limit);
 
     let cycle_priced_used_by_exact = trace
@@ -1141,6 +1222,18 @@ fn measure(
         reported_matches_returned: greedy_tree == dag.total_cost as u64,
         reported_delta: dag.total_cost as i64 - greedy_tree as i64,
         dominated_candidates: inst.dominated,
+        sharing_dag,
+        sharing_tree,
+        chosen_dag,
+        sharing_changed_term: sharing_choices != greedy_choices,
+        sharing_gain: greedy_dag as i64 - chosen_dag as i64,
+        tree_arm_ns,
+        scoped_ns,
+        gap_closed_frac: match (solved, greedy_dag as i64 - exact.cost as i64) {
+            (false, _) => f64::NAN,
+            (true, 0) => f64::NAN,
+            (true, gap) => (greedy_dag as i64 - chosen_dag as i64) as f64 / gap as f64,
+        },
     };
     Measured { row }
 }
@@ -1963,6 +2056,654 @@ fn write_report(
     eprintln!(
         "wrote {}",
         out_dir.join("2026-09-02-extraction-gap.md").display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1116: does pricing sharing close the gap the probe above measured?
+// ---------------------------------------------------------------------------
+
+/// THE measurement for #1116: the sharing-aware objective, scored against the
+/// same two exact references — Knuth's exact tree optimum on every kernel, and
+/// the branch-and-bound DAG optimum where it closes.
+///
+/// Writes docs/results/2026-09-02-extraction-objective.{md,csv,json}.
+#[test]
+#[ignore = "offline measurement: PIXELFLOW_EXTRACTION_GAP_ARENA_DIR=<dir of .arena dumps> cargo test -p pixelflow-search --release --lib -- --ignored extraction_objective_measurement"]
+fn extraction_objective_measurement() {
+    let dir = PathBuf::from(
+        std::env::var("PIXELFLOW_EXTRACTION_GAP_ARENA_DIR")
+            .expect("PIXELFLOW_EXTRACTION_GAP_ARENA_DIR must be set"),
+    );
+    let time_limit = Duration::from_secs(env_usize("PIXELFLOW_EXTRACTION_GAP_SECS", 4) as u64);
+    let max_expansions = env_usize("PIXELFLOW_EXTRACTION_GAP_EXPANSIONS", 15_000_000) as u64;
+    let limit_kernels = env_usize("PIXELFLOW_EXTRACTION_GAP_LIMIT", usize::MAX);
+    let skip_synthetic = std::env::var("PIXELFLOW_EXTRACTION_OBJECTIVE_REAL_ONLY").is_ok();
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().map(|e| e == "arena").unwrap_or(false))
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "no .arena files found in {}",
+        dir.display()
+    );
+
+    let mut rows: Vec<Row> = Vec::new();
+
+    // --- 1. Real kernels, production regime -------------------------------
+    for path in paths.iter().take(limit_kernels) {
+        let (name, arena, root) = load_arena_dump(path);
+        let category = category_of(&path.file_name().unwrap().to_string_lossy());
+        let m = measure(
+            &name,
+            category,
+            Budget::Production,
+            "production",
+            &arena,
+            root,
+            time_limit,
+            max_expansions,
+        );
+        eprintln!(
+            "{:<28} tree {:>8} shared {:>8} chosen {:>8} exact {:>8} [{}]",
+            m.row.name,
+            m.row.greedy_dag,
+            m.row.sharing_dag,
+            m.row.chosen_dag,
+            m.row.exact_dag,
+            m.row.exact_status
+        );
+        rows.push(m.row);
+    }
+    let real_count = rows.len();
+
+    // --- 2. The same synthetic ladder, because that is where the exact
+    //        reference actually closes -------------------------------------
+    if !skip_synthetic {
+        use crate::nnue::{BwdGenConfig, BwdGenerator};
+        let templates = crate::egraph::collect_rule_templates();
+        for &max_depth in &[2usize, 3, 4, 5, 6, 7, 9, 11] {
+            for seed in 0u64..12 {
+                let config = BwdGenConfig {
+                    max_depth,
+                    ..Default::default()
+                };
+                let mut generator = BwdGenerator::new(
+                    seed.wrapping_add(max_depth as u64 * 10_000),
+                    config,
+                    templates.clone(),
+                );
+                let pair = generator.generate_arena();
+                let name = format!("synth_d{max_depth}_s{seed}");
+                let m = measure(
+                    &name,
+                    "synthetic",
+                    Budget::Production,
+                    "production",
+                    &pair.arena,
+                    pair.unoptimized,
+                    time_limit,
+                    max_expansions,
+                );
+                rows.push(m.row);
+            }
+        }
+    }
+
+    write_objective_report(&rows, real_count, time_limit, max_expansions);
+}
+
+fn write_objective_report(
+    rows: &[Row],
+    real_count: usize,
+    time_limit: Duration,
+    max_expansions: u64,
+) {
+    // The gate, first and unconditionally: a single real kernel priced worse
+    // than before is a stop, not a line in a table.
+    let regressions: Vec<&Row> = rows
+        .iter()
+        .take(real_count)
+        .filter(|r| r.chosen_dag > r.greedy_dag)
+        .collect();
+    assert!(
+        regressions.is_empty(),
+        "extract_dag_scoped returns the cheaper arm by construction, so a regression is a \
+         broken invariant, not a result: {:?}",
+        regressions.iter().map(|r| &r.name).collect::<Vec<_>>()
+    );
+
+    let real = &rows[..real_count];
+    let solved: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.exact_status == "OPTIMAL")
+        .collect();
+
+    // --- the headline: what fraction of the measured gap is closed --------
+    let gap_rows: Vec<&Row> = solved
+        .iter()
+        .copied()
+        .filter(|r| r.greedy_dag > r.exact_dag)
+        .collect();
+    let gap_total: i64 = gap_rows
+        .iter()
+        .map(|r| r.greedy_dag as i64 - r.exact_dag as i64)
+        .sum();
+    let gap_closed: i64 = gap_rows
+        .iter()
+        .map(|r| r.greedy_dag as i64 - r.chosen_dag as i64)
+        .sum();
+    let pooled_closed = if gap_total > 0 {
+        gap_closed as f64 / gap_total as f64
+    } else {
+        f64::NAN
+    };
+    let now_optimal = solved
+        .iter()
+        .filter(|r| r.chosen_dag == r.exact_dag)
+        .count();
+    let was_optimal = solved
+        .iter()
+        .filter(|r| r.greedy_dag == r.exact_dag)
+        .count();
+
+    // --- the real-kernel table, per category ------------------------------
+    let mut cats: Vec<&'static str> = real.iter().map(|r| r.category).collect();
+    cats.sort_unstable();
+    cats.dedup();
+
+    let cat_stats = |cat: Option<&'static str>| -> (usize, usize, usize, usize, f64, f64, i64) {
+        let sel: Vec<&Row> = real
+            .iter()
+            .filter(|r| cat.is_none_or(|c| r.category == c))
+            .collect();
+        let improved = sel.iter().filter(|r| r.chosen_dag < r.greedy_dag).count();
+        let worse = sel.iter().filter(|r| r.chosen_dag > r.greedy_dag).count();
+        let mut deltas: Vec<f64> = sel
+            .iter()
+            .map(|r| {
+                if r.greedy_dag == 0 {
+                    0.0
+                } else {
+                    (r.chosen_dag as f64 - r.greedy_dag as f64) / r.greedy_dag as f64 * 100.0
+                }
+            })
+            .collect();
+        let best = deltas.iter().copied().fold(f64::INFINITY, f64::min);
+        let med = median(&mut deltas);
+        let units: i64 = sel
+            .iter()
+            .map(|r| r.greedy_dag as i64 - r.chosen_dag as i64)
+            .sum();
+        (
+            sel.len(),
+            improved,
+            sel.len() - improved - worse,
+            worse,
+            med,
+            if best.is_finite() { best } else { 0.0 },
+            units,
+        )
+    };
+
+    let (n_all, imp_all, unch_all, worse_all, med_all, best_all, units_all) = cat_stats(None);
+    let pooled_greedy: i64 = real.iter().map(|r| r.greedy_dag as i64).sum();
+    let pooled_chosen: i64 = real.iter().map(|r| r.chosen_dag as i64).sum();
+    // Signed the same way as every other delta in this report: negative is
+    // cheaper. Mixing the two conventions in one document is how a result
+    // gets read backwards.
+    let pooled_real = if pooled_greedy > 0 {
+        (pooled_chosen - pooled_greedy) as f64 / pooled_greedy as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "\ngap closed on the {} solved kernels with a gap: {:.1}% ({} of {} units)",
+        gap_rows.len(),
+        pooled_closed * 100.0,
+        gap_closed,
+        gap_total
+    );
+    eprintln!(
+        "exactly DAG-optimal on solved kernels: {was_optimal}/{} -> {now_optimal}/{}",
+        solved.len(),
+        solved.len()
+    );
+    eprintln!(
+        "real kernels: {n_all} total, {imp_all} improved, {unch_all} unchanged, {worse_all} worse; \
+         pooled {pooled_real:+.2}%"
+    );
+
+    // Extraction cost, as a per-kernel ratio of medians.
+    let mut ratios: Vec<f64> = real
+        .iter()
+        .filter(|r| r.tree_arm_ns > 0.0)
+        .map(|r| r.scoped_ns / r.tree_arm_ns)
+        .collect();
+    let ratio_med = median(&mut ratios.clone());
+    let ratio_p90 = percentile(&mut ratios, 90.0);
+    let ratio_max = ratios.iter().copied().fold(0.0_f64, f64::max);
+    let tree_total: f64 = real.iter().map(|r| r.tree_arm_ns).sum();
+    let scoped_total: f64 = real.iter().map(|r| r.scoped_ns).sum();
+    let ratio_pooled = if tree_total > 0.0 {
+        scoped_total / tree_total
+    } else {
+        f64::NAN
+    };
+    eprintln!(
+        "extraction time vs the extractor it replaces: median {ratio_med:.2}x, p90 \
+         {ratio_p90:.2}x, max {ratio_max:.2}x, pooled {ratio_pooled:.2}x"
+    );
+
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("docs/results");
+    std::fs::create_dir_all(&out_dir).expect("create docs/results");
+
+    // ---- CSV ----
+    let mut csv = String::new();
+    csv.push_str(
+        "name,category,node_count,classes,reachable_classes,tree_dag,tree_tree,sharing_dag,\
+         sharing_tree,chosen_dag,sharing_changed_term,sharing_gain,dag_delta_pct,treeopt_dag,\
+         exact_status,exact_dag,gap_closed_frac,tree_arm_ns,scoped_ns\n",
+    );
+    for r in rows.iter() {
+        let delta_pct = if r.greedy_dag == 0 {
+            0.0
+        } else {
+            (r.chosen_dag as f64 - r.greedy_dag as f64) / r.greedy_dag as f64 * 100.0
+        };
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{},{},{},{:.6},{:.0},{:.0}\n",
+            r.name,
+            r.category,
+            r.node_count,
+            r.classes,
+            r.reachable_classes,
+            r.greedy_dag,
+            r.greedy_tree,
+            r.sharing_dag,
+            r.sharing_tree,
+            r.chosen_dag,
+            r.sharing_changed_term,
+            r.sharing_gain,
+            delta_pct,
+            r.treeopt_dag,
+            r.exact_status,
+            r.exact_dag,
+            r.gap_closed_frac,
+            r.tree_arm_ns,
+            r.scoped_ns
+        ));
+    }
+    std::fs::write(out_dir.join("2026-09-02-extraction-objective.csv"), csv).expect("write csv");
+
+    // ---- JSON ----
+    let mut json = String::new();
+    json.push_str("{\n  \"summary\": {\n");
+    json.push_str(&format!(
+        "    \"kernels\": {}, \"real\": {}, \"synthetic\": {},\n",
+        rows.len(),
+        real_count,
+        rows.len() - real_count
+    ));
+    json.push_str(&format!(
+        "    \"exact_solved\": {}, \"solved_with_a_gap\": {},\n",
+        solved.len(),
+        gap_rows.len()
+    ));
+    json.push_str(&format!(
+        "    \"gap_units_total\": {gap_total}, \"gap_units_closed\": {gap_closed}, \
+         \"gap_closed_frac\": {pooled_closed:.6},\n"
+    ));
+    json.push_str(&format!(
+        "    \"dag_optimal_before\": {was_optimal}, \"dag_optimal_after\": {now_optimal},\n"
+    ));
+    json.push_str(&format!(
+        "    \"real_improved\": {imp_all}, \"real_unchanged\": {unch_all}, \
+         \"real_worse\": {worse_all},\n"
+    ));
+    json.push_str(&format!(
+        "    \"real_pooled_dag_delta_pct\": {pooled_real:.4}, \
+         \"real_median_dag_delta_pct\": {med_all:.4}, \
+         \"real_best_dag_delta_pct\": {best_all:.4}, \"real_units_saved\": {units_all},\n"
+    ));
+    json.push_str(&format!(
+        "    \"arm_sharing_wins\": {}, \"arm_tie\": {}, \"arm_tree_wins\": {},\n",
+        real.iter().filter(|r| r.sharing_dag < r.greedy_dag).count(),
+        real.iter()
+            .filter(|r| r.sharing_dag == r.greedy_dag)
+            .count(),
+        real.iter().filter(|r| r.sharing_dag > r.greedy_dag).count()
+    ));
+    json.push_str(&format!(
+        "    \"extraction_time_ratio_median\": {ratio_med:.4}, \
+         \"extraction_time_ratio_p90\": {ratio_p90:.4}, \
+         \"extraction_time_ratio_max\": {ratio_max:.4}, \
+         \"extraction_time_ratio_pooled\": {ratio_pooled:.4},\n"
+    ));
+    json.push_str(&format!(
+        "    \"exact_time_limit_s\": {}, \"exact_max_expansions\": {max_expansions}\n  }},\n",
+        time_limit.as_secs()
+    ));
+    json.push_str("  \"by_category\": [\n");
+    let cat_json: Vec<String> = cats
+        .iter()
+        .map(|&c| {
+            let (n, i, u, w, med, best, units) = cat_stats(Some(c));
+            format!(
+                "    {{\"category\":\"{c}\",\"n\":{n},\"improved\":{i},\"unchanged\":{u},\
+                 \"worse\":{w},\"median_pct\":{med:.4},\"best_pct\":{best:.4},\"units\":{units}}}"
+            )
+        })
+        .collect();
+    json.push_str(&cat_json.join(",\n"));
+    json.push_str("\n  ],\n  \"rows\": [\n");
+    let body: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "    {{\"name\":\"{}\",\"category\":\"{}\",\"reachable_classes\":{},\
+                 \"tree_dag\":{},\"sharing_dag\":{},\"chosen_dag\":{},\"tree_tree\":{},\
+                 \"sharing_tree\":{},\"changed\":{},\"exact_status\":\"{}\",\"exact_dag\":{}}}",
+                r.name,
+                r.category,
+                r.reachable_classes,
+                r.greedy_dag,
+                r.sharing_dag,
+                r.chosen_dag,
+                r.greedy_tree,
+                r.sharing_tree,
+                r.sharing_changed_term,
+                r.exact_status,
+                r.exact_dag
+            )
+        })
+        .collect();
+    json.push_str(&body.join(",\n"));
+    json.push_str("\n  ]\n}\n");
+    std::fs::write(out_dir.join("2026-09-02-extraction-objective.json"), json).expect("write json");
+
+    // ---- Markdown ----
+    let mut md = String::new();
+    let _ = writeln!(md, "# Making extraction price sharing (#1116)\n");
+    let _ = writeln!(
+        md,
+        "`extract_dag` summed each child's `best_cost` — a TREE cost — so a subterm used ten \
+         times was charged ten times in the objective and emitted once in the kernel. This is \
+         the measurement of replacing that objective with the DAG cost the kernel actually \
+         pays, scored against the same two exact references #1115 built \
+         (`2026-09-02-extraction-gap.md`): Knuth's exact tree optimum, and the branch-and-bound \
+         DAG optimum where it closes.\n"
+    );
+    let _ = writeln!(
+        md,
+        "Cost table: the latency prior as re-measured on current main (#1134 — Sin 70->95, \
+         Cos 75->103, Tan 87->117, Sqrt 15->13, Select 4->3). Every number below is \
+         deterministic: `CostModel::latency_prior` through `ExtractedDAG::dag_cost`.\n"
+    );
+
+    let _ = writeln!(md, "## Headline\n");
+    let _ = writeln!(
+        md,
+        "- **Gap closed: {:.1}%** of the measured gap — {gap_closed} of {gap_total} pooled cost \
+         units — on the {} kernel(s) where the branch and bound proved an optimum *and* the \
+         old extractor missed it. That population is small by construction: the B&B stops \
+         closing at ~100-200 reachable classes, and greedy was already exactly optimal on \
+         most of what it does close.",
+        pooled_closed * 100.0,
+        gap_rows.len()
+    );
+    let _ = writeln!(
+        md,
+        "- Exactly DAG-optimal on the {} solved kernels: **{was_optimal} -> {now_optimal}**.",
+        solved.len()
+    );
+    let _ = writeln!(
+        md,
+        "- Real kernels ({n_all}): **{imp_all} improved, {unch_all} unchanged, {worse_all} \
+         worse**. Pooled `dag_cost` **{pooled_real:+.2}%**, median {med_all:+.2}%, best \
+         {best_all:+.2}%, {units_all} cost units saved.\n"
+    );
+    let _ = writeln!(
+        md,
+        "**Zero regressions is structural, not lucky.** `extract_dag_scoped` runs both \
+         objectives and returns the cheaper term by true `dag_cost`, ties going to the tree \
+         arm, so the returned cost is a minimum over a set that contains the old answer. The \
+         probe asserts it rather than reporting it.\n"
+    );
+    let _ = writeln!(
+        md,
+        "**The gap denominator is this run's own, not #1115's.** #1115 pooled 195 units over \
+         the 89 kernels its branch and bound closed, under the pre-#1134 cost table. This run \
+         closes {} kernels under the refreshed table and pools {gap_total} units over them. \
+         Where the two numbers agree that is arithmetic coincidence, not the same set \
+         re-measured, and the fraction above is computed entirely within this run.\n",
+        solved.len()
+    );
+
+    if !gap_rows.is_empty() {
+        let _ = writeln!(md, "### The gap kernels, one row each\n");
+        let _ = writeln!(
+            md,
+            "| kernel | reachable classes | old (tree) | new | exact DAG optimum | closed |"
+        );
+        let _ = writeln!(md, "|---|---:|---:|---:|---:|---:|");
+        for r in &gap_rows {
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {} | {:.0}% |",
+                r.name,
+                r.reachable_classes,
+                r.greedy_dag,
+                r.chosen_dag,
+                r.exact_dag,
+                r.gap_closed_frac * 100.0
+            );
+        }
+        let _ = writeln!(md);
+    }
+
+    let _ = writeln!(md, "## Real kernels, by group\n");
+    let _ = writeln!(
+        md,
+        "| group | n | improved | unchanged | worse | median Δ dag_cost | best Δ | units saved |"
+    );
+    let _ = writeln!(md, "|---|---:|---:|---:|---:|---:|---:|---:|");
+    for &c in &cats {
+        let (n, i, u, w, med, best, units) = cat_stats(Some(c));
+        let _ = writeln!(
+            md,
+            "| {c} | {n} | {i} | {u} | {w} | {med:+.2}% | {best:+.2}% | {units} |"
+        );
+    }
+    let _ = writeln!(
+        md,
+        "| **all real** | **{n_all}** | **{imp_all}** | **{unch_all}** | **{worse_all}** | \
+         **{med_all:+.2}%** | **{best_all:+.2}%** | **{units_all}** |\n"
+    );
+
+    let _ = writeln!(md, "## Which arm wins, and how often\n");
+    let arm_shared = real.iter().filter(|r| r.sharing_dag < r.greedy_dag).count();
+    let arm_tie = real
+        .iter()
+        .filter(|r| r.sharing_dag == r.greedy_dag)
+        .count();
+    let arm_tree = real.iter().filter(|r| r.sharing_dag > r.greedy_dag).count();
+    let _ = writeln!(
+        md,
+        "Neither DP is optimal — both choose greedily bottom-up — so the sharing arm is not \
+         uniformly better, and reporting only the min would hide that. Over the {n_all} real \
+         kernels: the sharing arm is strictly cheaper on **{arm_shared}**, ties on \
+         **{arm_tie}**, and is strictly *dearer* on **{arm_tree}**.\n"
+    );
+    let _ = writeln!(
+        md,
+        "The {arm_tree} are the honest cost of a bottom-up chooser: a class that is DAG-cheap \
+         in isolation need not compose into a DAG-cheap parent. Running both arms and taking \
+         the min is what turns that from a regression into a no-op, and is why the second pass \
+         buys robustness as well as cost.\n"
+    );
+
+    let mut losers: Vec<&Row> = real
+        .iter()
+        .filter(|r| r.sharing_dag > r.greedy_dag)
+        .collect();
+    losers.sort_by(|a, b| {
+        let da = (a.sharing_dag as f64 - a.greedy_dag as f64) / a.greedy_dag.max(1) as f64;
+        let db = (b.sharing_dag as f64 - b.greedy_dag as f64) / b.greedy_dag.max(1) as f64;
+        db.partial_cmp(&da).unwrap()
+    });
+    if !losers.is_empty() {
+        let _ = writeln!(
+            md,
+            "The worst of them, so the shape of the failure is on the record rather than \
+             averaged away:\n"
+        );
+        let _ = writeln!(
+            md,
+            "| kernel | group | tree dag | sharing dag | Δ if taken alone |"
+        );
+        let _ = writeln!(md, "|---|---|---:|---:|---:|");
+        for r in losers.iter().take(8) {
+            let d =
+                (r.sharing_dag as f64 - r.greedy_dag as f64) / r.greedy_dag.max(1) as f64 * 100.0;
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {:+.2}% |",
+                r.name, r.category, r.greedy_dag, r.sharing_dag, d
+            );
+        }
+        let _ = writeln!(md);
+    }
+
+    let _ = writeln!(md, "## Where the objective change bites\n");
+    let mut movers: Vec<&Row> = real
+        .iter()
+        .filter(|r| r.chosen_dag < r.greedy_dag)
+        .collect();
+    movers.sort_by(|a, b| {
+        let da = (a.greedy_dag as f64 - a.chosen_dag as f64) / a.greedy_dag.max(1) as f64;
+        let db = (b.greedy_dag as f64 - b.chosen_dag as f64) / b.greedy_dag.max(1) as f64;
+        db.partial_cmp(&da).unwrap()
+    });
+    if movers.is_empty() {
+        let _ = writeln!(
+            md,
+            "No real kernel changed. That is the result, and it is the same shape as #1115's \
+             own negative finding: exact DAG extraction was worth 0.028% pooled beyond the tree \
+             optimum on this corpus.\n"
+        );
+    } else {
+        let _ = writeln!(
+            md,
+            "| kernel | group | reachable classes | tree dag | sharing dag | Δ | tree TREE cost | sharing TREE cost |"
+        );
+        let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|---:|");
+        for r in movers.iter().take(25) {
+            let d =
+                (r.chosen_dag as f64 - r.greedy_dag as f64) / r.greedy_dag.max(1) as f64 * 100.0;
+            let _ = writeln!(
+                md,
+                "| {} | {} | {} | {} | {} | {:+.2}% | {} | {} |",
+                r.name,
+                r.category,
+                r.reachable_classes,
+                r.greedy_dag,
+                r.sharing_dag,
+                d,
+                r.greedy_tree,
+                r.sharing_tree
+            );
+        }
+        let _ = writeln!(md);
+        let _ = writeln!(
+            md,
+            "The two right-hand columns are the point: where the objective change bites, the \
+             TREE cost **rises**. That is not a regression — it is the old objective being \
+             abandoned, visible.\n"
+        );
+    }
+
+    let _ = writeln!(md, "## Cost\n");
+    let changed = rows.iter().filter(|r| r.sharing_changed_term).count();
+    let _ = writeln!(
+        md,
+        "Extraction wall time against the extractor it replaces, over the {n_all} real \
+         kernels: **median {ratio_med:.2}x, p90 {ratio_p90:.2}x, max {ratio_max:.2}x, pooled \
+         {ratio_pooled:.2}x**. Each kernel is the median of {} alternating pairs timed \
+         back to back in one process on one saturated graph, so the absolute nanoseconds \
+         belong to the machine and only the ratio is claimed. Deterministically: two DP \
+         traversals where there was one.\n",
+        9
+    );
+    let _ = writeln!(
+        md,
+        "Two DP passes over the e-graph instead of one, plus one bit per class per class of \
+         scratch for the sharing pass (~385 KB at the median production glyph's 1,755 reachable \
+         classes; ~12.5 MB at the 10,000-class production ceiling, allocated once per extraction \
+         and dropped at the end of it). Extraction runs **once** per compile against thousands \
+         of rule applications in saturation, which is why this is the cheap place to spend.\n"
+    );
+    let _ = writeln!(
+        md,
+        "The sharing arm returned a different term on {changed} of {} kernels; on the rest the \
+         second pass is pure overhead and the tree arm's answer is returned unchanged.\n",
+        rows.len()
+    );
+
+    let _ = writeln!(md, "## The gate\n");
+    let _ = writeln!(
+        md,
+        "The bar this change was held to was: no real kernel regresses in `dag_cost`, and \
+         extraction runs in under 2x. The first is met and is structural. **The second is \
+         not** — {ratio_med:.2}x median. The second DP pass is not free and the compacted \
+         bitset only took it from 2.57x to {ratio_med:.2}x, because the sharing arm also pays \
+         a repair and a costing pass of its own. So this is not self-arming: the trade is \
+         {units_all} cost units and {:.1}% of the closable gap against {ratio_med:.2}x on a \
+         phase that runs once per compile, and that is a judgement call, not a threshold.\n",
+        pooled_closed * 100.0
+    );
+
+    let _ = writeln!(md, "## What this obliges downstream\n");
+    let _ = writeln!(
+        md,
+        "Every Guide label and every registered constant in the Phase-3 program was minted \
+         under tree cost. #1128's bisect already showed the consequence: guides trained on \
+         tree-cost labels steer toward UNSHARED terms (tree/dag sharing ratio 4.25 unguided vs \
+         3.29 guided on `sh`) and lose to unguided on the real metric. With the objective \
+         changed, that chain restarts — re-mint, retrain, re-evaluate — and any registered \
+         constant carried across it is in stale units.\n"
+    );
+
+    let _ = writeln!(md, "## Reproduction\n");
+    let _ = writeln!(md, "```sh");
+    let _ = writeln!(
+        md,
+        "PIXELFLOW_EXTRACTION_GAP_ARENA_DIR=<dir of .arena dumps> \\\n  \
+         PIXELFLOW_EXTRACTION_GAP_SECS={} \\\n  \
+         PIXELFLOW_EXTRACTION_GAP_EXPANSIONS={max_expansions} \\\n  \
+         RUST_MIN_STACK=268435456 \\\n  \
+         cargo test -p pixelflow-search --release --lib -- --ignored \
+         extraction_objective_measurement",
+        time_limit.as_secs()
+    );
+    let _ = writeln!(md, "```\n");
+    let _ = writeln!(
+        md,
+        "`2026-09-02-extraction-objective.csv` / `.json` carry every kernel's row."
+    );
+
+    std::fs::write(out_dir.join("2026-09-02-extraction-objective.md"), md).expect("write md");
+    eprintln!(
+        "wrote {}",
+        out_dir.join("2026-09-02-extraction-objective.md").display()
     );
 }
 

@@ -1,0 +1,39 @@
+# machine-state-before: 21:43  up 52 days, 12:16, 2 users, load averages: 3.89 6.62 8.42
+# date: 2026-09-03T04:43:39Z
+# host: Mac14,6 ncpu=12
+# git: ddb51a91
+# session: call_overhead(throughput)=0.529ns call_overhead(latency)=1.455ns sentinel=2.808ns
+
+op               lat_ns   tbl_cycles   (Add=4 unit)       thr_ns      prior
+Add               0.222         4.00                       0.009          4
+Sub               0.227         4.09                       0.010          4
+Mul               0.305         5.50                       0.012          5
+Div               0.612        11.02                       0.021         11
+Neg               0.146         2.63                       0.005          3
+Abs               0.144         2.60                       0.006          3
+Min               0.154         2.78                       0.014          3
+Max               0.152         2.73                       0.013          3
+MulAdd            0.295         5.31                       0.030          5
+Floor             0.205         3.70                       0.001          4
+Ceil              0.225         4.06                       0.004          4
+Round             0.205         3.70                       0.005          4
+Select            0.171         3.08                       0.067          4
+Sqrt              0.750        13.50                       0.055         15
+Rsqrt             1.129        20.33                       0.049         21
+Recip             0.797        14.35                       0.036         16
+Sin               5.229        94.16                       0.781         70
+Cos               5.716       102.94                       0.908         75
+Tan               6.273       112.96                       1.741         87
+Asin              5.446        98.07                       0.916        103
+Acos              5.595       100.75                       0.915        103
+Atan              4.415        79.50                       0.759         79
+Atan2             4.354        78.40                       0.760         79
+Exp               3.940        70.95                       0.548         75
+Exp2              3.669        66.07                       0.491         69
+Ln                6.788       122.23                       1.345        128
+Log2              6.450       116.14                       1.265        122
+Log10             7.100       127.86                       1.346        134
+Pow              10.390       187.10                       2.523        196
+
+# anchors: Add slope 0.222ns/stage, Mul slope 0.305ns/stage; assuming FADD latency 3cyc => est. clock 13.51GHz
+# machine-state-after: 21:43  up 52 days, 12:16, 2 users, load averages: 3.89 6.62 8.42
