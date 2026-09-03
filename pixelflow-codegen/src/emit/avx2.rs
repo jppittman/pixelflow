@@ -3,11 +3,9 @@
 //! The middle width between the SSE2 leaf encoders (`x86_64.rs`, 128-bit) and
 //! the AVX-512 EVEX encoders (`avx512.rs`, 512-bit). Register numbering is
 //! identical to SSE2 (ymm0-15, no extended file — AVX2 has no REX2/EVEX), so
-//! this backend reuses the register *roles* `X86Backend` established (inputs
-//! 0-3, reload 11-12, select_reload 13) and only the instruction *encoding*
-//! changes. The pool itself differs: see `AVX2_FILE` for why the gather's
-//! half-temporaries cost it ymm8/ymm9, and why ymm10 — SSE2's own fixed
-//! scratch — is allocatable here.
+//! this backend reuses the exact register-role layout `X86Backend` already
+//! established (inputs 0-3, allocatable 4-9, fixed scratch 10, reload 11-12,
+//! builtin scratch 10/13-15): only the instruction *encoding* changes.
 //!
 //! Unlike legacy SSE2, VEX is 3-operand and non-destructive — same property
 //! AVX-512's EVEX has — so there is no two-operand hazard to route around
@@ -792,33 +790,23 @@ pub(crate) mod driver {
     /// The AVX2 register file (ymm, 256-bit).
     ///
     /// Same register roles as SSE2 (ymm0-15 is the same physical file as xmm0-15)
-    /// at twice the width, with a pool of **five**, one fewer than SSE2's six.
+    /// at twice the width, but with a pool of **four**, two fewer than SSE2's six.
     /// AVX2's gather splits into 128-bit halves and so needs two scratch registers
     /// beyond the pair SSE2 uses (ymm13/14) to hold the high-half indices and the
     /// high-half result across the recombine. Those live in ymm8/ymm9, which must
-    /// therefore sit OUTSIDE the allocator's range: with them allocatable the
-    /// allocator could hand `dst` or `idx` an ymm8/9 that the gather then
+    /// therefore sit OUTSIDE the allocator's range: with six allocatable (ymm4-9)
+    /// the allocator could hand `dst` or `idx` an ymm8/9 that the gather then
     /// overwrites mid-sequence, silently returning wrong lanes — reachable
     /// whenever five values stay live across a gather.
     ///
-    /// The cost is more spilling in AVX2 kernels than SSE2 sees, to fix a bug on
-    /// the gather path specifically. Spilling the two half-temporaries to the red
-    /// zone instead would restore those two as well; that is a contained change
-    /// to `super::emit_gather_scalar` and is the better long-term fix.
+    /// The cost is more spilling in AVX2 kernels generally, to fix a bug on the
+    /// gather path specifically. Spilling the two half-temporaries to the red zone
+    /// instead would restore the sixth register; that is a contained change to
+    /// `super::emit_gather_scalar` and is the better long-term fix.
     const AVX2_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
-        // ymm4-7 and ymm10. ymm8/ymm9 carry the gather's high half and
-        // ymm14/ymm15 its low half and the unary temp.
-        //
-        // ymm10 is this backend's share of what step 1's accounting turned up:
-        // it is `x86_64::X86_SCRATCH`, the SSE2 backend's two-operand and
-        // select temp, and AVX2 reaches neither of those. Its select is a VEX
-        // blend with no temp (`avx2::emit_select`), and the one shared helper
-        // it does call, `x86_64::emit_gather_scalar`, never touches it. So on
-        // this backend the register was reserved by inheritance rather than by
-        // use — the case `fixed` exists to make checkable, since every other
-        // ymm here is now named by `inputs`, `scratch`, `reload`,
-        // `select_reload` or `fixed`.
-        scratch: regalloc::RegSet::range(4, 4).union(regalloc::RegSet::of(&[Reg(10)])),
+        // ymm4-7. ymm8/ymm9 carry the gather's high half and ymm14/ymm15 its
+        // low half and the unary temp, so a sixteen-register file leaves four.
+        scratch: regalloc::RegSet::range(4, 4),
         // ymm13: outside the allocatable range and the reload pair; the AVX2
         // select is a VEX blend with no internal temp.
         select_reload: Reg(13),
