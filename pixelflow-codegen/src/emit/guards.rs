@@ -262,3 +262,87 @@ pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
 
     guards
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pixelflow_ir::kind::OpKind;
+
+    fn def(value: u32, op: ScheduledOp) -> Def {
+        Def {
+            value: ValueId(value),
+            op,
+        }
+    }
+
+    /// A `Select` whose true arm alone does work exclusive to it — the false
+    /// arm is just the mask again, so it contributes nothing beyond
+    /// `mask_deps`. Pins the exact range rather than only "a guard formed
+    /// somewhere," which the whole-kernel `assert_guard_forms`-style tests
+    /// in `emit/mod.rs` already cover.
+    #[test]
+    fn range_the_true_arm_when_only_it_is_exclusive() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Unary(OpKind::Neg, ValueId(1))),
+            def(
+                3,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+            ),
+        ];
+
+        let guards = analyze_select_guards(&schedule);
+
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].mask_vid, ValueId(0));
+        assert_eq!(guards[0].true_range, (1, 3));
+        assert_eq!(guards[0].false_range, (3, 3));
+    }
+
+    /// Symmetric to the above: the false arm alone is exclusive.
+    #[test]
+    fn range_the_false_arm_when_only_it_is_exclusive() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Unary(OpKind::Neg, ValueId(1))),
+            def(
+                3,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(0), ValueId(2)),
+            ),
+        ];
+
+        let guards = analyze_select_guards(&schedule);
+
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].true_range, (3, 3));
+        assert_eq!(guards[0].false_range, (1, 3));
+    }
+
+    /// An operand reachable only through a value the schedule never defines
+    /// (a "hole" — legitimate for a schedule spliced from arbitrary
+    /// fragments, per this module's doc comment) must not be mistaken for a
+    /// real schedule position. Regression test for treating the sentinel
+    /// `usize::MAX` (marking "not in this schedule") as a valid index, which
+    /// would corrupt the range or overflow computing its end.
+    #[test]
+    fn ignore_a_false_operand_missing_from_the_schedule() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(3))), // ValueId(3) has no Def
+            def(
+                4,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(0), ValueId(1)),
+            ),
+        ];
+
+        let guards = analyze_select_guards(&schedule);
+
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].select_idx, 2);
+        assert_eq!(guards[0].false_range, (1, 2));
+    }
+}
