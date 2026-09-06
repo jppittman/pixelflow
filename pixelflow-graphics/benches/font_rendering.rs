@@ -4,7 +4,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pixelflow_core::{Lattice, Manifold};
-use pixelflow_graphics::fonts::{text, CachedText, Font, GlyphCache};
+use pixelflow_graphics::fonts::{text, text_union, CachedText, Font, GlyphCache};
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -34,21 +34,42 @@ fn bench_pixelflow_single_char(c: &mut Criterion) {
     group.finish();
 }
 
+/// Long enough that `take(n)` is `n` characters for every length benchmarked.
+/// It used to be the 26-letter alphabet, so `text_sizes/50` rendered 26
+/// characters over a 50-character frame and its curve was not the flattening
+/// it appeared to be.
+const SPECIMEN: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\
+                        0123456789 The quick brown fox jumps over the lazy dog";
+
 fn bench_pixelflow_text_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("pixelflow_text_sizes");
     let font = Font::parse(FONT_DATA).unwrap();
 
     for length in [5, 10, 26, 50] {
-        let text_str: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().take(length).collect();
+        let text_str: String = SPECIMEN.chars().take(length).collect();
+        assert_eq!(
+            text_str.chars().count(),
+            length,
+            "the specimen is shorter than the length this case claims to render"
+        );
+        let lattice = Lattice {
+            extent: [(length as u32) * 15, 24, 1, 1],
+            origin: [0.5, 0.5, 0.0, 0.0],
+        };
 
-        group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
+        // The range encoding: one kernel, every pixel evaluating every glyph.
+        group.bench_with_input(BenchmarkId::new("sum", length), &length, |b, _| {
             let kernel = text(&font, &text_str, 16.0);
-            let lattice = Lattice {
-                extent: [(length as u32) * 15, 24, 1, 1],
-                origin: [0.5, 0.5, 0.0, 0.0],
-            };
-
             b.iter(|| black_box(lattice.bake(black_box(&kernel))));
+        });
+
+        // The domain encoding: one program per cell, each collapsed only over
+        // the columns its glyphs can reach. `compile` is hoisted for the same
+        // reason `cached_HELLO` hoists its own — the measurement is the
+        // collapse, and the sum row leaves its compile to the global cache.
+        group.bench_with_input(BenchmarkId::new("union", length), &length, |b, _| {
+            let program = text_union(&font, lattice, &text_str, 16.0).compile();
+            b.iter(|| black_box(program.collapse()));
         });
     }
 
@@ -146,8 +167,8 @@ fn bench_freetype_text(c: &mut Criterion) {
     let face = library.new_memory_face(FONT_DATA.to_vec(), 0).unwrap();
     face.set_char_size(0, 16 * 64, 96, 96).unwrap();
 
-    for length in [5, 10, 26] {
-        let text_str: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().take(length).collect();
+    for length in [5, 10, 26, 50] {
+        let text_str: String = SPECIMEN.chars().take(length).collect();
 
         group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
             b.iter(|| {

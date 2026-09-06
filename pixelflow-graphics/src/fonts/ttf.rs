@@ -64,6 +64,124 @@ pub(crate) fn affine_kernel(inner: &Kernel, [a, b, c, d, tx, ty]: [f32; 6]) -> K
     )
 }
 
+/// **The box outside which a coverage [`Kernel`] is exactly zero.**
+///
+/// Not a bounding box of the ink: a bound on the *support*, which is what a
+/// domain-side extent needs. A glyph's antialiasing ramp reaches past its
+/// outline, and past it by an amount that depends on the gradient — a shallow
+/// segment's crossing ramp is `‖∇d‖` pixels wide in X, which for a nearly
+/// horizontal edge is tens of pixels. What *is* exact is the unit-square mask
+/// every outline is cut to (`Font::compile`), whose false arm is the literal
+/// constant 0, so this box is that square carried through the same warps as
+/// the kernel it describes.
+///
+/// Coordinates are `[x0, y0, x1, y1]` in whatever frame the kernel is in;
+/// a box with no area is [`Support::EMPTY`] and meets nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Support([f32; 4]);
+
+impl Support {
+    /// No support at all: a glyph with no outline is the constant 0 everywhere.
+    pub const EMPTY: Self = Self([0.0, 0.0, 0.0, 0.0]);
+
+    /// The unit square `[0,1]²` — the mask every outline is cut to before it
+    /// is warped back to font units.
+    pub const UNIT: Self = Self([0.0, 0.0, 1.0, 1.0]);
+
+    /// `[x0, y0, x1, y1]`.
+    #[must_use]
+    pub fn bounds(self) -> [f32; 4] {
+        self.0
+    }
+
+    /// Whether the box encloses no samples.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0[2] <= self.0[0] || self.0[3] <= self.0[1]
+    }
+
+    /// The box carried through the forward affine map
+    /// `x' = a·x + b·y + tx, y' = c·x + d·y + ty` — the same map
+    /// [`affine_kernel`] warps a kernel by, so a support stays a support.
+    #[must_use]
+    pub fn through(self, [a, b, c, d, tx, ty]: [f32; 6]) -> Self {
+        if self.is_empty() {
+            return Self::EMPTY;
+        }
+        let [x0, y0, x1, y1] = self.0;
+        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+        let mut out = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for (x, y) in corners {
+            let (u, v) = (a * x + b * y + tx, c * x + d * y + ty);
+            out[0] = out[0].min(u);
+            out[1] = out[1].min(v);
+            out[2] = out[2].max(u);
+            out[3] = out[3].max(v);
+        }
+        Self(out)
+    }
+
+    /// The smallest box containing both.
+    #[must_use]
+    pub fn join(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        Self([
+            self.0[0].min(other.0[0]),
+            self.0[1].min(other.0[1]),
+            self.0[2].max(other.0[2]),
+            self.0[3].max(other.0[3]),
+        ])
+    }
+
+    /// The box shifted `dx` along X.
+    #[must_use]
+    pub fn shifted_x(self, dx: f32) -> Self {
+        if self.is_empty() {
+            return Self::EMPTY;
+        }
+        Self([self.0[0] + dx, self.0[1], self.0[2] + dx, self.0[3]])
+    }
+
+    /// The columns of a pixel grid this box can reach: every integer `c` with
+    /// a sample center `c + center` inside `[x0, x1]`, as `[first, last]`.
+    /// `None` when the box reaches no sample center.
+    #[must_use]
+    pub fn columns(self, center: f32) -> Option<[i64; 2]> {
+        if self.is_empty() {
+            return None;
+        }
+        // center + c ∈ [x0, x1]  ⇔  c ∈ [x0 - center, x1 - center]
+        let first = (self.0[0] - center).ceil();
+        let last = (self.0[2] - center).floor();
+        if last < first {
+            return None;
+        }
+        Some([first as i64, last as i64])
+    }
+}
+
+/// A glyph as this module composes it: the coverage kernel and the box
+/// outside which that kernel is exactly zero. They travel together because
+/// they are derived together — a support restated separately from the
+/// composition it describes is a future divergence.
+#[derive(Clone)]
+pub struct Glyph {
+    /// The coverage kernel.
+    pub kernel: Kernel,
+    /// Where it can be nonzero.
+    pub support: Support,
+}
+
 /// Winding coverage for a set of segment kernels: `min(|Σ|, 1)` — the
 /// non-zero fill rule over the summed line/quad contributions.
 fn coverage(segments: &[Kernel]) -> Kernel {
@@ -367,13 +485,13 @@ impl<'a> Font<'a> {
     /// from `Dwrt` at bake.
     #[must_use]
     pub fn glyph_kernel(&self, ch: char) -> Option<Kernel> {
-        self.compile(self.cmap.lookup(ch as u32)?)
+        Some(self.compile(self.cmap.lookup(ch as u32)?)?.kernel)
     }
 
     /// [`Font::glyph_kernel`] by pre-looked-up glyph ID.
     #[must_use]
     pub fn glyph_kernel_by_id(&self, id: u16) -> Option<Kernel> {
-        self.compile(id)
+        Some(self.compile(id)?.kernel)
     }
 
     /// The `size`-scaled glyph for `ch` as a coverage [`Kernel`]: the ascent
@@ -388,6 +506,17 @@ impl<'a> Font<'a> {
     /// [`Font::glyph_kernel_scaled`] by pre-looked-up glyph ID.
     #[must_use]
     pub fn glyph_kernel_scaled_by_id(&self, id: u16, size: f32) -> Option<Kernel> {
+        Some(self.glyph_scaled_by_id(id, size)?.kernel)
+    }
+
+    /// The `size`-scaled glyph **and the box outside which its kernel is
+    /// exactly zero**, by pre-looked-up glyph ID.
+    ///
+    /// The pair is what a caller placing the glyph on a domain-side extent
+    /// needs: the range it must give the glyph is the support, and outside it
+    /// the glyph may be dropped without changing a bit.
+    #[must_use]
+    pub fn glyph_scaled_by_id(&self, id: u16, size: f32) -> Option<Glyph> {
         let g = self.compile(id)?;
         // Scale based on total font height (ascent + |descent|) to fit within
         // `size` pixels; Y-flip because screen Y increases downward while font
@@ -396,7 +525,11 @@ impl<'a> Font<'a> {
         let total_height = self.ascent as f32 + self.descent.abs() as f32;
         let scale = size / total_height;
         let ascent_px = self.ascent as f32 * scale;
-        Some(affine_kernel(&g, [scale, 0.0, 0.0, -scale, 0.0, ascent_px]))
+        let to_screen = [scale, 0.0, 0.0, -scale, 0.0, ascent_px];
+        Some(Glyph {
+            kernel: affine_kernel(&g.kernel, to_screen),
+            support: g.support.through(to_screen),
+        })
     }
 
     #[must_use]
@@ -451,16 +584,25 @@ impl<'a> Font<'a> {
         self.kern(left, right) * size / self.units_per_em as f32
     }
 
-    /// Compile a glyph to its coverage [`Kernel`] in font units.
+    /// Compile a glyph to its coverage [`Kernel`] in font units, together
+    /// with the box outside which that kernel is **exactly** zero.
     ///
     /// Simple glyphs: parse segments in normalized [0,1] space, apply the
-    /// winding rule + unit-square bounds, then warp back to font units.
-    /// Compound glyphs: recursively compile children and sum them through
-    /// their affine transforms. Empty glyphs are the constant 0.
-    fn compile(&self, id: u16) -> Option<Kernel> {
+    /// winding rule + unit-square bounds, then warp back to font units. The
+    /// support is that unit square warped the same way — the mask's false arm
+    /// is the constant 0, so outside it the value is not merely small, it is
+    /// the literal zero, and a domain-side extent may drop the glyph there
+    /// without changing a bit. Compound glyphs: recursively compile children
+    /// and sum them through their affine transforms; the support is the union
+    /// of the children's, transformed alike. Empty glyphs are the constant 0
+    /// over the empty support.
+    fn compile(&self, id: u16) -> Option<Glyph> {
         let (a, b) = (self.loca.get(id as usize)?, self.loca.get(id as usize + 1)?);
         if a == b {
-            return Some(kc(0.0));
+            return Some(Glyph {
+                kernel: kc(0.0),
+                support: Support::EMPTY,
+            });
         }
         let mut r = R(self.data, self.glyf + a);
         let n = r.i16()?;
@@ -494,7 +636,10 @@ impl<'a> Font<'a> {
 
             // Compose: winding coverage -> unit-square bounds -> font units.
             let bounded = unit_square_mask().select(&coverage(&segments), &kc(0.0));
-            Some(affine_kernel(&bounded, restore))
+            Some(Glyph {
+                kernel: affine_kernel(&bounded, restore),
+                support: Support::UNIT.through(restore),
+            })
         } else {
             // Compound glyphs: children are already fully composed with their own bounds
             self.compound(&mut r)
@@ -565,8 +710,9 @@ impl<'a> Font<'a> {
         Some(segments)
     }
 
-    fn compound(&self, r: &mut R) -> Option<Kernel> {
+    fn compound(&self, r: &mut R) -> Option<Glyph> {
         let mut kids = vec![];
+        let mut support = Support::EMPTY;
         loop {
             let fl = r.u16()?;
             let id = r.u16()?;
@@ -595,13 +741,17 @@ impl<'a> Font<'a> {
                 m[3] = r.i16()? as f32 / 16384.0;
             }
             if let Some(g) = self.compile(id) {
-                kids.push(affine_kernel(&g, m));
+                kids.push(affine_kernel(&g.kernel, m));
+                support = support.join(g.support.through(m));
             }
             if fl & 0x20 == 0 {
                 break;
             }
         }
-        Some(Kernel::sum(&kids))
+        Some(Glyph {
+            kernel: Kernel::sum(&kids),
+            support,
+        })
     }
 }
 

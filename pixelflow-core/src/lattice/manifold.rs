@@ -363,6 +363,54 @@ impl BoundManifold {
         unsafe { self.collapse(region, out.as_mut_ptr().cast::<f32>(), band) }
     }
 
+    /// Collapse the region into the `width × rows` sub-rectangle of `out`
+    /// whose first sample is `out[0]` and whose rows are `stride` elements
+    /// apart, writing **exactly** `region.width` samples per row and leaving
+    /// every other element of `out` as it was.
+    ///
+    /// [`BoundManifold::collapse_rows`] deliberately lets a row's final
+    /// partial batch overhang into the stride's spare columns, because for a
+    /// frame those columns are padding nobody reads. For a summand of a
+    /// [`Union`](crate::Union) they are the *neighbour's* columns, filled by a
+    /// different program, so an overhang there is not scratch — it is wrong
+    /// samples. When the row has spare columns this stages the band in a plane
+    /// padded to whole batches (one collapse call, as before) and copies each
+    /// row's own samples out; `scratch` is the caller's, so a scene of many
+    /// summands allocates once rather than once per summand.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the region's width is zero, `stride` is less than it, or
+    /// `out` cannot hold the sub-rectangle.
+    pub(crate) fn collapse_subrect(
+        &self,
+        region: PlaneRegion,
+        out: &mut [f32],
+        stride: usize,
+        scratch: &mut Vec<f32>,
+    ) {
+        let (width, rows) = (region.width, region.rows);
+        assert!(width > 0, "collapse_subrect: zero width");
+        assert!(
+            stride >= width,
+            "collapse_subrect: stride {stride} is narrower than the {width} samples a row holds"
+        );
+        if stride == width {
+            // No spare columns to overhang into: the packed path already
+            // stores only what the row owns.
+            self.collapse_rows(region, out, stride);
+            return;
+        }
+        let padded = width.div_ceil(BATCH_LANES) * BATCH_LANES;
+        scratch.clear();
+        scratch.resize(rows * padded, 0.0);
+        self.collapse_rows(region, scratch, padded);
+        for row in 0..rows {
+            out[row * stride..row * stride + width]
+                .copy_from_slice(&scratch[row * padded..row * padded + width]);
+        }
+    }
+
     /// How a band lands in a destination of a given stride, and the guard that
     /// the destination can hold it.
     ///

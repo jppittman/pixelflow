@@ -94,13 +94,13 @@ pub mod ttf;
 pub mod ttf_curve_analytical;
 
 // Re-export font types (user-facing only)
-pub use ttf::Font;
+pub use ttf::{Font, Glyph, Support};
 
 // Re-export loader types
 pub use loader::{DataSource, EmbeddedSource, FontSource, LoadedFont, MmapSource};
 
 // Re-export text
-pub use text::text;
+pub use text::{text, text_cells, text_union, TextCell};
 
 // Re-export cache
 pub use atlas::GlyphAtlas;
