@@ -267,6 +267,11 @@ And the corollary to that: **when a bug ships green, the retrospective is about
 the gate, not the author.** "Should have looked harder" is not a finding.
 "This class of bug is invisible to every job we run" is one, and it has a fix.
 
+A CL that touches only `docs/` and Markdown skips the build-and-test jobs
+(`scripts/ci-change-scope.sh` classifies the diff; the three metadata jobs still
+run). The skip is a job-level `if`, so the required checks report "skipped" and
+merge; a workflow-level `paths-ignore` would leave them pending.
+
 Shift left where it is cheap, and *measure* the cheapness rather than assuming
 it. A check that costs an hour presubmit belongs in postsubmit — but a fast
 fraction of it usually belongs presubmit, and finding that fraction is the

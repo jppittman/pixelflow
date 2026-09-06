@@ -21,6 +21,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A CL that touches only docs/ and Markdown cannot change what any build or
+  # test job would report, so those jobs are skipped for it -- as a job-level
+  # `if`, not a workflow-level `paths-ignore`: a job skipped by `if` reports
+  # "skipped", which satisfies a required status check, while a workflow that
+  # never runs leaves the required checks pending and blocks the merge. The
+  # three metadata jobs below run on every CL regardless; they take seconds.
+  change-scope:
+    name: Change scope
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+    steps:
+      - name: Checkout code and CL history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify the CL by what it touches
+        id: scope
+        env:
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/ci-change-scope.sh "$BASE_COMMIT" "$HEAD_COMMIT"
+
   cl-metadata:
     name: CL metadata
     runs-on: ubuntu-latest
@@ -79,6 +103,8 @@ jobs:
 
   dependency-advisories:
     name: Dependency advisories
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -95,6 +121,8 @@ jobs:
 
   feature-matrix:
     name: Feature matrix
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
@@ -142,6 +170,8 @@ jobs:
 
   fmt:
     name: Rustfmt
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -157,6 +187,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
@@ -195,6 +227,8 @@ jobs:
 
   cross-target-abi:
     name: Cross-target ABI (aarch64)
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
@@ -236,6 +270,8 @@ jobs:
 
   test:
     name: Test on ${{ matrix.os }}
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ${{ matrix.os }}
     # Backstop for non-test hangs (compile / doctests). The precise
     # "no test over 10 minutes" policy is enforced per-test by nextest below.
@@ -302,6 +338,8 @@ jobs:
 
   behavior-contracts:
     name: Behavior contracts
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -411,6 +449,8 @@ jobs:
 
   isa-matrix:
     name: ISA matrix (SSE2/AVX2/AVX-512)
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     # Build+lint every supported ISA level, then RUN the two crates whose
     # output is per-level machine code (`--smoke`). Building the test binaries
@@ -485,6 +525,8 @@ jobs:
     # same policy as the WASM status job: keep the signal, don't gate merges
     # on an unproven check. Flip to blocking once it has a green history.
     name: macOS launch stability (informational, non-blocking)
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     continue-on-error: true
     runs-on: macos-latest
     timeout-minutes: 30
@@ -557,6 +599,8 @@ jobs:
   # proves it -- and so nobody has to rediscover this by hand.
   wasm32-status:
     name: WASM target status (informational, non-blocking)
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 15
@@ -636,6 +680,8 @@ jobs:
   # Making pixelflow-search genuinely no_std is separate, larger work.
   no-std:
     name: pixelflow-ir no_std + pixelflow-search std-feature-off builds
+    needs: change-scope
+    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
