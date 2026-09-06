@@ -15,7 +15,6 @@
 
 use core::fmt::Debug;
 use core::ops::{Add, BitAnd, BitOr, Div, Mul, Neg, Not, Shl, Shr, Sub};
-use pixelflow_ir::passes::{EXP2_CLAMP, EXP2_POLY, LOG2_E_MINUS_1, LOG2_POLY};
 
 /// A backend provides the SIMD implementation for a specific platform.
 pub trait Backend: 'static + Copy + Clone + Send + Sync + Debug {
@@ -139,89 +138,17 @@ pub trait SimdOps:
     /// Splat u32 bit pattern as float (BITCAST).
     fn from_u32_bits(bits: u32) -> Self;
 
-    /// `bits >> 23`: slide the exponent field down to the low bits.
-    ///
-    /// Named for the operation rather than exposed as a general shift because
-    /// there is exactly one shift distance in this trait's transcendentals,
-    /// and baking it in lets every backend emit the immediate-form shift
-    /// (`psrld xmm, 23`) instead of moving a count into a register first —
-    /// which is what a generic count costs, in the inner loop of every
-    /// `log2`.
-    fn shr_exponent(self) -> Self;
+    /// Shift bits right treating as u32.
+    fn shr_u32(self, n: u32) -> Self;
 
     /// Interpret bits as i32, convert to f32.
     fn i32_to_f32(self) -> Self;
 
-    /// Truncate f32 lanes to i32, keeping the result as this type's bits.
-    /// The inverse of [`SimdOps::i32_to_f32`].
-    fn f32_to_i32(self) -> Self;
-
-    /// `bits << 23`: slide a biased exponent up into the exponent field.
-    /// The mirror of [`SimdOps::shr_exponent`], immediate for the same reason.
-    fn shl_exponent(self) -> Self;
-
     /// Base-2 logarithm.
-    ///
-    /// One implementation for every backend, evaluating
-    /// [`LOG2_POLY`](pixelflow_ir::passes::LOG2_POLY) — the same table the IR
-    /// expansion the JIT and the `eval_scalar` oracle lower through uses. It
-    /// was previously overridden per backend with a degree-4 fit whose own doc
-    /// recorded "Max error: ~1e-4", so `log2` (and `ln`, `log10`, `pow` above
-    /// it) computed a different function depending on which tier ran it.
-    #[inline(always)]
-    fn log2(self) -> Self {
-        // e = (bits >> 23) − 127; m = mantissa | 1.0 ∈ [1, 2).
-        let e = self.shr_exponent().i32_to_f32() - Self::splat(127.0);
-        let m = (self & Self::from_u32_bits(0x007F_FFFF)) | Self::from_u32_bits(0x3F80_0000);
-
-        // Range-reduce to √2-centered so t = m − 1 ∈ [−0.293, 0.414].
-        let reduce = m.cmp_ge(Self::splat(core::f32::consts::SQRT_2));
-        let m = Self::simd_select(reduce, m * Self::splat(0.5), m);
-        let e = Self::simd_select(reduce, e + Self::splat(1.0), e);
-        let t = m - Self::splat(1.0);
-
-        let mut p = Self::splat(LOG2_POLY[LOG2_POLY.len() - 1]);
-        for &c in LOG2_POLY.iter().rev().skip(1) {
-            p = p.mul_add(t, Self::splat(c));
-        }
-
-        // y = t³·P(t) − t²/2, so ln(1+t) = t + y.
-        let t2 = t * t;
-        let y = (t2 * t) * p - t2 * Self::splat(0.5);
-
-        // log2(m) = (t + y)·log2(e), with log2(e) split as 1 + LOG2_E_MINUS_1
-        // and the pieces summed smallest-first (Cephes ordering) for precision.
-        let ea = Self::splat(LOG2_E_MINUS_1);
-        y.mul_add(ea, t * ea) + y + t + e
-    }
+    fn log2(self) -> Self;
 
     /// Base-2 exponential.
-    ///
-    /// One implementation for every backend, evaluating
-    /// [`EXP2_POLY`](pixelflow_ir::passes::EXP2_POLY) — see [`SimdOps::log2`]
-    /// for why these are shared rather than restated per backend. The clamp is
-    /// load-bearing and was absent from every previous override: `2^n` is built
-    /// by writing `n` into the exponent field, so an unclamped `n` walks out of
-    /// it and yields a value that is not a power of two.
-    #[inline(always)]
-    fn exp2(self) -> Self {
-        let x = self
-            .simd_max(Self::splat(-EXP2_CLAMP))
-            .simd_min(Self::splat(EXP2_CLAMP));
-        let n = x.simd_floor();
-        let f = x - n;
-
-        let mut p = Self::splat(EXP2_POLY[EXP2_POLY.len() - 1]);
-        for &c in EXP2_POLY.iter().rev().skip(1) {
-            p = p.mul_add(f, Self::splat(c));
-        }
-
-        // 2^n = bitcast((int(n) + 127) << 23). The bias is added in the float
-        // domain, where it is exact for the clamped range, so this needs no
-        // integer-add primitive.
-        let pow2n = (n + Self::splat(127.0)).f32_to_i32().shl_exponent();
-        p * pow2n
-    }
+    fn exp2(self) -> Self;
 
     /// Natural exponential.
     #[inline(always)]

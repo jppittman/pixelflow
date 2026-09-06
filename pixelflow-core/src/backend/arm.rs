@@ -306,11 +306,13 @@ impl SimdOps for F32x4 {
     }
 
     #[inline(always)]
-    fn shr_exponent(self) -> Self {
+    fn shr_u32(self, n: u32) -> Self {
         unsafe {
-            Self(vreinterpretq_f32_u32(vshrq_n_u32::<23>(
-                vreinterpretq_u32_f32(self.0),
-            )))
+            let as_int = vreinterpretq_u32_f32(self.0);
+            // NEON uses negative shift for right shift
+            let shift = vdupq_n_s32(-(n as i32));
+            let shifted = vshlq_u32(as_int, shift);
+            Self(vreinterpretq_f32_u32(shifted))
         }
     }
 
@@ -323,16 +325,81 @@ impl SimdOps for F32x4 {
     }
 
     #[inline(always)]
-    fn f32_to_i32(self) -> Self {
-        unsafe { Self(vreinterpretq_f32_s32(vcvtq_s32_f32(self.0))) }
+    fn log2(self) -> Self {
+        // NEON: Use bit manipulation for exponent/mantissa extraction
+        // Uses range [√2/2, √2] centered at 1 for better polynomial accuracy
+        // log2(x) = exponent + log2(mantissa)
+        unsafe {
+            let x_u32 = vreinterpretq_u32_f32(self.0);
+
+            // Extract exponent: (bits >> 23) - 127
+            let exp_bits = vshrq_n_u32::<23>(x_u32);
+            let bias = vdupq_n_s32(127);
+            let mut n = vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(exp_bits), bias));
+
+            // Extract mantissa in [1, 2): (bits & 0x007FFFFF) | 0x3F800000
+            let mant_mask = vdupq_n_u32(0x007FFFFF);
+            let one_bits = vdupq_n_u32(0x3F800000);
+            let mut f = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(x_u32, mant_mask), one_bits));
+
+            // Adjust to [√2/2, √2] range for better accuracy (centered at 1)
+            // If f >= √2, divide by 2 and increment exponent
+            let sqrt2 = vdupq_n_f32(core::f32::consts::SQRT_2);
+            let mask = vcgeq_f32(f, sqrt2);
+            let adjust = vandq_u32(mask, vreinterpretq_u32_f32(vdupq_n_f32(1.0)));
+            n = vaddq_f32(n, vreinterpretq_f32_u32(adjust));
+            f = vbslq_f32(mask, vmulq_f32(f, vdupq_n_f32(0.5)), f);
+
+            // Polynomial for log2(f) on [√2/2, √2]
+            // Fitted using least squares on Chebyshev nodes
+            // Max error: ~1e-4
+            let c4 = vdupq_n_f32(-0.320_043_5);
+            let c3 = vdupq_n_f32(1.797_496_9);
+            let c2 = vdupq_n_f32(-4.198_805);
+            let c1 = vdupq_n_f32(5.727_023);
+            let c0 = vdupq_n_f32(-3.005_614_8);
+
+            // Horner's method using NEON FMA: vfmaq_f32(c, a, b) = a*b + c
+            let poly = vfmaq_f32(c3, c4, f);
+            let poly = vfmaq_f32(c2, poly, f);
+            let poly = vfmaq_f32(c1, poly, f);
+            let poly = vfmaq_f32(c0, poly, f);
+
+            Self(vaddq_f32(n, poly))
+        }
     }
 
     #[inline(always)]
-    fn shl_exponent(self) -> Self {
+    fn exp2(self) -> Self {
+        // NEON: 2^x = 2^n * 2^f where n = floor(x), f = frac(x) ∈ [0, 1)
+        // Use polynomial approximation for 2^f
         unsafe {
-            Self(vreinterpretq_f32_u32(vshlq_n_u32::<23>(
-                vreinterpretq_u32_f32(self.0),
-            )))
+            // n = floor(x), f = x - n
+            let n = vrndmq_f32(self.0); // floor
+            let f = vsubq_f32(self.0, n);
+
+            // Minimax polynomial for 2^f, f ∈ [0, 1)
+            // Degree 4, max error ~10^-7
+            let c4 = vdupq_n_f32(0.0135557);
+            let c3 = vdupq_n_f32(0.0520323);
+            let c2 = vdupq_n_f32(0.2413793);
+            let c1 = vdupq_n_f32(core::f32::consts::LN_2);
+            let c0 = vdupq_n_f32(1.0);
+
+            // Horner's method
+            let poly = vfmaq_f32(c3, c4, f);
+            let poly = vfmaq_f32(c2, poly, f);
+            let poly = vfmaq_f32(c1, poly, f);
+            let poly = vfmaq_f32(c0, poly, f);
+
+            // Compute 2^n by adding n to exponent bits
+            // 2^n = reinterpret((n + 127) << 23)
+            let bias = vdupq_n_s32(127);
+            let n_i32 = vcvtq_s32_f32(n);
+            let exp_bits = vshlq_n_s32::<23>(vaddq_s32(n_i32, bias));
+            let scale = vreinterpretq_f32_s32(exp_bits);
+
+            Self(vmulq_f32(poly, scale))
         }
     }
 

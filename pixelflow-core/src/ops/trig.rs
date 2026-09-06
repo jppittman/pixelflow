@@ -18,11 +18,8 @@
 //!
 //! # Implementation Note
 //!
-//! The polynomial steps are written as explicit `mul_add`, which is one
-//! `MulAdd` node lowering to the backend's FMA intrinsic. Writing them as
-//! `p * t + c` does NOT fuse — nothing rewrites `Add<Mul<..>, C>` into
-//! `MulAdd`, and Rust does not contract floating point — so that spelling
-//! costs an extra instruction per Horner step on every target that has an FMA.
+//! This module builds AST graphs using operators, enabling automatic FMA fusion
+//! and other optimizations. The graph is evaluated at the return boundary.
 
 use crate::Field;
 use crate::{Manifold, ManifoldExt};
@@ -109,17 +106,10 @@ fn cheby_sin_phase(x: Field, phase: f32) -> Field {
     let t = r * Field::from(PI_INV);
     let t2 = eval(t.clone() * t.clone());
 
-    // Horner from the highest degree down, fused. `mul_add` is one `MulAdd`
-    // node, which `Field::mul_add` lowers to the backend's FMA intrinsic
-    // (`_mm512_fmadd_ps`, `_mm256_fmadd_ps`, `vfmaq_f32`) and to mul+add where
-    // no FMA exists. `p * t2 + c` would NOT fuse: nothing rewrites
-    // `Add<Mul<..>, C>` into `MulAdd`, and Rust does not contract FP, so that
-    // form is two instructions on every target. The `exp2`/`log2` polynomials
-    // in `backend/` already fuse this way; this is the same win, and keeping
-    // them consistent is what makes an op count comparable across ops.
+    // Horner from the highest degree down; AST building enables FMA fusion.
     let mut p = Field::from(SIN_CHEB[SIN_CHEB.len() - 1]);
     for &c in SIN_CHEB.iter().rev().skip(1) {
-        p = eval(p.mul_add(t2, Field::from(c)));
+        p = eval(p * t2 + Field::from(c));
     }
     let s = eval(p * t);
 
@@ -207,7 +197,7 @@ pub(crate) fn cheby_atan2(y: Field, x: Field) -> Field {
         let t2 = eval(t * t);
         let mut p = Field::from(ATAN_MINIMAX[ATAN_MINIMAX.len() - 1]);
         for &c in ATAN_MINIMAX.iter().rev().skip(1) {
-            p = eval(p.mul_add(t2, Field::from(c)));
+            p = eval(p * t2 + Field::from(c));
         }
         eval(p * t)
     };

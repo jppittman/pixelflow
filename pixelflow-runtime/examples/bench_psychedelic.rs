@@ -141,45 +141,6 @@ fn bench_scanline<M: Manifold<Output = Field>>(shader: &M) -> f64 {
     times[samples / 2] as f64 / total_pixels as f64
 }
 
-/// The JIT through its ROW entry point rather than one call per SIMD vector.
-///
-/// `bench_scanline` drives every tier through `Manifold::eval`, which for the
-/// JIT means crossing the `extern "C"` boundary once per [`PARALLELISM`]
-/// pixels — 120 calls per 1920px scanline — while the combinator tiers it is
-/// compared against are inlined Rust with no call at all. That is not a
-/// codegen difference, it is an entry-point difference, and `eval_row` is the
-/// entry point that removes it: the loop lives inside the emitted kernel, so
-/// the boundary is crossed once per row and the spill frame is set up once
-/// instead of 120 times.
-#[inline(never)]
-fn bench_scanline_rows(jit: &pixelflow_core::__macro::codegen::JitManifold) -> f64 {
-    use pixelflow_core::__macro::codegen::Point4;
-
-    let width = 1920usize;
-    let height = 1080usize;
-    let mut row = vec![0.0f32; width];
-
-    for py in (0..height).step_by(108) {
-        jit.eval_row(&mut row, Point4::new(0.0, py as f32, 0.0, 0.0));
-        std::hint::black_box(&row);
-    }
-
-    let scanlines = 10usize;
-    let total_pixels = width * scanlines;
-    let samples = 50;
-    let mut times = vec![0u64; samples];
-    for t in &mut times {
-        let start = nanos_now();
-        for sy in 0..scanlines {
-            jit.eval_row(&mut row, Point4::new(0.0, (sy * 108) as f32, 0.0, 0.0));
-            std::hint::black_box(&row);
-        }
-        *t = nanos_now() - start;
-    }
-    times.sort();
-    times[samples / 2] as f64 / total_pixels as f64
-}
-
 fn main() {
     let raw = PsychRaw {};
     let opt = PsychOpt {};
@@ -220,47 +181,10 @@ fn main() {
     let raw_ns = bench_scanline(&raw);
     let opt_ns = bench_scanline(&opt);
     let jit_ns = bench_scanline(&jit);
-    // A 2x speedup is the shape a bug makes too (a row that is never written
-    // is very fast), so check eval_row computes the same pixels before
-    // believing its timings. `eval_at` is the independent-enough witness
-    // available here: same emitted kernel, but a one-group tile instead of a
-    // 120-group one, so it exercises the loop bounds and the X induction
-    // rather than sharing them.
-    {
-        use pixelflow_core::__macro::codegen::Point4;
-        let width = 1920usize;
-        let mut row = vec![0.0f32; width];
-        let y_probe = 324.0f32;
-        let jitm = jit.__compiled();
-        jitm.eval_row(&mut row, Point4::new(0.0, y_probe, 0.0, 0.0));
-
-        let mut mismatches = 0usize;
-        for (i, &got) in row.iter().enumerate() {
-            let want = jitm.eval_at(Point4::new(i as f32, y_probe, 0.0, 0.0));
-            if got.to_bits() != want.to_bits() {
-                mismatches += 1;
-            }
-        }
-        assert_eq!(
-            mismatches, 0,
-            "eval_row disagrees with eval_at on {mismatches}/{width} pixels — \
-             the row timing below would be measuring the wrong thing"
-        );
-        let lo = row.iter().cloned().fold(f32::INFINITY, f32::min);
-        let hi = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        assert!(
-            hi > lo,
-            "eval_row produced a constant row ({lo}); it is not evaluating per-pixel"
-        );
-        println!("  (eval_row verified: {width} pixels match eval_at, range {lo:.3}..{hi:.3})\n");
-    }
-
-    let jit_row_ns = bench_scanline_rows(jit.__compiled());
 
     println!("  LLVM only (kernel_raw!):  {:.3}ns/pixel", raw_ns);
     println!("  NNUE + LLVM (kernel!):    {:.3}ns/pixel", opt_ns);
     println!("  JIT (kernel_jit!):        {:.3}ns/pixel", jit_ns);
-    println!("  JIT, eval_row:            {:.3}ns/pixel", jit_row_ns);
     println!();
     println!(
         "  NNUE+LLVM vs LLVM: {:.1}%",
@@ -269,9 +193,5 @@ fn main() {
     println!(
         "  JIT vs LLVM:       {:.1}%",
         (jit_ns / raw_ns - 1.0) * 100.0
-    );
-    println!(
-        "  JIT rows vs NNUE:  {:.1}%",
-        (jit_row_ns / opt_ns - 1.0) * 100.0
     );
 }

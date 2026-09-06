@@ -18,7 +18,6 @@ use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId};
 use pixelflow_ir::binding::BindingTable;
 use pixelflow_ir::eval_scalar;
-use pixelflow_ir::{DifferentialCheck, PointVerdict};
 
 const LANES: usize = JIT_VECTOR_BYTES / 4;
 
@@ -92,33 +91,10 @@ fn assert_collapse_matches_interpreter(
         run_collapse(&collapse, &ctx, &mut got, Point4::new(x0, y, z, w));
         for (i, &g) in got.iter().enumerate() {
             let xi = x0 + i as f32;
-            let vars = [xi, y, z, w];
-            let want = eval_scalar(arena, root, &vars, &bindings);
-            if (want.is_nan() && g.is_nan()) || g == want {
-                continue;
-            }
-            // Not bit-identical. That is a miscompile for everything this
-            // suite builds EXCEPT where the op is one CLAUDE.md's "Floating
-            // point at the edges" table already marks target-divergent —
-            // `MulAdd` is one rounding where an FMA instruction exists and two
-            // where it does not, and the transcendental expansions are Horner
-            // chains of exactly that node. The oracle rounds twice, so an
-            // FMA-capable build legitimately lands within an ulp instead of on
-            // top. `DifferentialCheck` composes the per-node bound that says
-            // how far is legal here; a mask root has no such band, so it stays
-            // bit-exact.
+            let want = eval_scalar(arena, root, &[xi, y, z, w], &bindings);
             assert!(
-                !pixelflow_ir::is_mask_valued(arena, root),
-                "{label}: mask-valued root differs — collapse {g:?} != interp {want:?} \
-                 at lane {i} of ({x0}, {y}, {z}, {w}); masks are bit patterns, never near-misses"
-            );
-            let point = DifferentialCheck::new(arena, root).at(&vars, &bindings);
-            assert_eq!(
-                point.verdict(g),
-                PointVerdict::Accept,
-                "{label}: collapse {g} outside interp {want} ± {bound} at lane {i} of \
-                 ({x0}, {y}, {z}, {w})",
-                bound = point.error_bound(),
+                (want.is_nan() && g.is_nan()) || g == want,
+                "{label}: collapse {g} != interp {want} at lane {i} of ({x0}, {y}, {z}, {w})"
             );
         }
     }

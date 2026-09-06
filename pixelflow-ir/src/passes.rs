@@ -1056,8 +1056,8 @@ fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
 /// the float↔int conversions a backend cannot avoid for exp/log.
 fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     // Clamp to a safe exponent range to avoid int overflow / inf.
-    let lo = arena.push_const(-EXP2_CLAMP);
-    let hi = arena.push_const(EXP2_CLAMP);
+    let lo = arena.push_const(-126.0);
+    let hi = arena.push_const(126.0);
     let x = arena.push_binary(OpKind::Max, x, lo);
     let x = arena.push_binary(OpKind::Min, x, hi);
 
@@ -1065,12 +1065,18 @@ fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let xi = arena.push_unary(OpKind::Floor, x);
     let xf = arena.push_binary(OpKind::Sub, x, xi);
 
-    // 2^xf ≈ Horner([`EXP2_POLY`]) at xf, highest degree down.
-    let mut p = arena.push_const(EXP2_POLY[EXP2_POLY.len() - 1]);
-    for &c in EXP2_POLY.iter().rev().skip(1) {
-        let c = arena.push_const(c);
-        p = horner_step(arena, p, xf, c);
-    }
+    // 2^xf ≈ Horner(c5..c0) at xf  (minimax coefficients).
+    let c0 = arena.push_const(1.0);
+    let c1 = arena.push_const(core::f32::consts::LN_2);
+    let c2 = arena.push_const(0.240_226_5);
+    let c3 = arena.push_const(0.055_504_11);
+    let c4 = arena.push_const(0.009_618_129);
+    let c5 = arena.push_const(0.001_333_355_8);
+    let p = horner_step(arena, c5, xf, c4);
+    let p = horner_step(arena, p, xf, c3);
+    let p = horner_step(arena, p, xf, c2);
+    let p = horner_step(arena, p, xf, c1);
+    let p = horner_step(arena, p, xf, c0);
 
     // 2^xi = bitcast((int(xi) + 127) << 23).
     let xi_int = arena.push_unary(OpKind::TruncToInt, xi);
@@ -1127,11 +1133,23 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
 
     // P(t): Cephes lnf/log2f degree-8 minimax numerator for
     // (ln(1+t) − t + t²/2) / t³ on the reduced range.
-    let mut p = arena.push_const(LOG2_POLY[LOG2_POLY.len() - 1]);
-    for &c in LOG2_POLY.iter().rev().skip(1) {
-        let c = arena.push_const(c);
-        p = horner_step(arena, p, t, c);
-    }
+    let c8 = arena.push_const(7.037_683_6e-2);
+    let c7 = arena.push_const(-1.151_461e-1);
+    let c6 = arena.push_const(1.167_699_9e-1);
+    let c5 = arena.push_const(-1.242_014_1e-1);
+    let c4 = arena.push_const(1.424_932_3e-1);
+    let c3 = arena.push_const(-1.666_805_8e-1);
+    let c2 = arena.push_const(2.000_071_5e-1);
+    let c1 = arena.push_const(-2.499_999_4e-1);
+    let c0 = arena.push_const(3.333_333e-1);
+    let p = horner_step(arena, c8, t, c7);
+    let p = horner_step(arena, p, t, c6);
+    let p = horner_step(arena, p, t, c5);
+    let p = horner_step(arena, p, t, c4);
+    let p = horner_step(arena, p, t, c3);
+    let p = horner_step(arena, p, t, c2);
+    let p = horner_step(arena, p, t, c1);
+    let p = horner_step(arena, p, t, c0);
 
     // y = t³·P(t) − t²/2, so ln(1+t) = t + y.
     let t2 = arena.push_binary(OpKind::Mul, t, t);
@@ -1143,7 +1161,7 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     // log2(m) = (t + y)·log2(e), with log2(e) split as 1 + LOG2EA and the
     // pieces summed smallest-first (Cephes ordering) to keep full precision:
     // e + t + y + y·LOG2EA + t·LOG2EA.
-    let log2ea = arena.push_const(LOG2_E_MINUS_1);
+    let log2ea = arena.push_const(0.442_695_04); // log2(e) − 1
     let y_ea = arena.push_binary(OpKind::Mul, y, log2ea);
     let t_ea = arena.push_binary(OpKind::Mul, t, log2ea);
     let z = arena.push_binary(OpKind::Add, y_ea, t_ea);
@@ -1189,52 +1207,6 @@ pub const SIN_CHEB: [f32; 6] = [
     0.080_476_06,
     -0.005_990_654,
 ];
-
-/// `2^f` on `f ∈ [0, 1)`, degree-5 minimax, ascending degree.
-///
-/// THE definition of the exp2 polynomial. `pixelflow-core`'s backends evaluate
-/// this same table so the JIT tier, the `eval_scalar` oracle and the combinator
-/// tier cannot disagree about what `exp2` is — the divergence this replaced had
-/// the backends on a degree-4 fit with different coefficients entirely, which
-/// made `exp`, `ln`, `log10` and `pow` compute measurably different functions
-/// depending on which tier ran them.
-pub const EXP2_POLY: [f32; 6] = [
-    1.0,
-    core::f32::consts::LN_2,
-    0.240_226_5,
-    0.055_504_11,
-    0.009_618_129,
-    0.001_333_355_8,
-];
-
-/// Exponent range `exp2` saturates to, rather than overflowing to `inf`.
-///
-/// `2^n` is built as `bitcast((int(n) + 127) << 23)`, so an unclamped `n` past
-/// this walks out of the exponent field and produces a value that is not a
-/// power of two at all. CLAUDE.md lists the saturation as behavior every target
-/// agrees on; clamping here is what makes that true.
-pub const EXP2_CLAMP: f32 = 126.0;
-
-/// Cephes `log2f` degree-8 minimax for `(ln(1+t) − t + t²/2) / t³` on the
-/// √2-centered reduced range, ascending degree.
-///
-/// THE definition of the log2 polynomial, shared with `pixelflow-core`'s
-/// backends for the reason [`EXP2_POLY`] gives.
-pub const LOG2_POLY: [f32; 9] = [
-    3.333_333e-1,
-    -2.499_999_4e-1,
-    2.000_071_5e-1,
-    -1.666_805_8e-1,
-    1.424_932_3e-1,
-    -1.242_014_1e-1,
-    1.167_699_9e-1,
-    -1.151_461e-1,
-    7.037_683_6e-2,
-];
-
-/// `log2(e) − 1`. Cephes splits `log2(e)` this way and sums the pieces
-/// smallest-first to keep full precision; see [`LOG2_POLY`]'s use.
-pub const LOG2_E_MINUS_1: f32 = 0.442_695_04;
 
 /// `sin(x)` as a primitive subgraph (Chebyshev, matching the runtime path).
 fn expand_sin(arena: &mut ExprArena, x: ExprId) -> ExprId {
@@ -1348,39 +1320,27 @@ fn expand_sin_phase(arena: &mut ExprArena, x: ExprId, phase: f32) -> ExprId {
     arena.push_ternary(OpKind::Select, in_domain, s, nan)
 }
 
-/// `acc·x + add` as one `MulAdd` node.
+/// `acc·x + add` as `Add(Mul(acc, x), add)` — two nodes, not one `MulAdd`.
 ///
-/// Nothing downstream would fuse this for us: [`legalize`] is the last thing to
-/// touch the arena, and the only thing that becomes an FMA instruction is an
-/// `OpKind::MulAdd` node already in it. So a Horner chain emitted as
-/// `Add(Mul(..))` reaches the emitter unfused — 5 mul + 5 add for `sin`, where
-/// 5 `MulAdd`s do — and the e-graph cannot recover it either, since it runs
-/// *before* this lowering and has no multiplies to fuse yet.
+/// Two tempting justifications for it are simply untrue, and worth stating so
+/// they are not assumed: the jet path *does* have a `MulAdd` rule (`diff_node`,
+/// `ExprNode::Ternary`), and nothing re-fuses these afterwards — [`legalize`] is
+/// the last thing to touch the arena, and the only thing that becomes an FMA
+/// instruction is an `OpKind::MulAdd` node already in it. So the Horner chains
+/// here reach the emitter unfused: 5 mul + 5 add for `sin`, where 5 `MulAdd`s
+/// would do.
 ///
-/// Fusing here rather than anywhere later is what keeps the trig identities
-/// intact. Saturating after expansion would fuse these multiplies, but by then
-/// there is no `Sin` node left for `AngleAddition` or `Parity` to match, and
-/// the general rewriter turned loose on an expanded polynomial can reassociate
-/// Horner form — which is chosen for accuracy, not just for op count.
-///
-/// # The cost, taken deliberately
-///
-/// This is the tier divergence the previous form existed to avoid, so it is
-/// stated rather than discovered. Unfused mul+add rounds twice everywhere, so
-/// the `eval_scalar` oracle and every backend agreed bit-for-bit. `MulAdd`
-/// rounds **once** where an FMA instruction exists (x86 with `+fma`, aarch64
-/// `FMLA`) and **twice** where it does not (SSE2 baseline: `mulps` + `addps`)
-/// — CLAUDE.md, "Floating point at the edges". So the SSE2 tier now differs
-/// from the FMA tiers by up to a rounding per Horner step.
-///
-/// That is a *precision* difference, which the codebase's own rule puts on the
-/// table; it is not a range difference, which is not. One rounding is never
-/// less accurate than two, so the FMA tiers move toward the true value, not
-/// away from it, and the polynomial's range guarantees (`|sin| ≤ 1`, the
-/// `TRIG_DOMAIN` NaN edge) are unaffected — they come from the reduction and
-/// the `Select`, neither of which is a Horner step.
+/// The real reason to keep it is parity. Unfused mul+add rounds twice on every
+/// target, so the `eval_scalar` oracle and every backend agree exactly. `MulAdd`
+/// rounds *once* where FMA exists and twice where it does not (CLAUDE.md,
+/// "Floating point at the edges"), which would reintroduce a tier divergence —
+/// small, but this expansion is precisely where a shared-definition disagreement
+/// between oracle and JIT went unnoticed for so long. Fusing is a real ~5-op win
+/// per `sin` available for the taking; it should be taken deliberately, with the
+/// parity tests updated to expect a 1-ulp tier difference, not as a side effect.
 fn horner_step(arena: &mut ExprArena, acc: ExprId, x: ExprId, add: ExprId) -> ExprId {
-    arena.push_ternary(OpKind::MulAdd, acc, x, add)
+    let prod = arena.push_binary(OpKind::Mul, acc, x);
+    arena.push_binary(OpKind::Add, prod, add)
 }
 
 #[cfg(test)]

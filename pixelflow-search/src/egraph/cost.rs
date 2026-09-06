@@ -51,18 +51,7 @@ use pixelflow_ir::kind::OpMap;
 /// `compile` (so transcendentals are timed in their
 /// `expand_transcendentals` lowered form — the form this table is actually
 /// pricing) and timed under `BenchMode::Latency`; the per-stage slope cancels
-/// call overhead exactly.
-///
-/// **The transcendental entries are stale as of the Horner fusion.**
-/// `passes::horner_step` now emits one `MulAdd` where it emitted `Mul` + `Add`,
-/// so every polynomial expansion lost ~5 ops (`sin`: 5 mul + 5 add → 5
-/// `MulAdd`) and each affected entry below now prices a lowering that no longer
-/// exists. Extraction is *unaffected* — the e-graph runs before that lowering
-/// and reads `Sin` as one node with the cost named here, so nothing it chooses
-/// has changed (`optimizer_equivalence` digests identically) — but the numbers
-/// are now upper bounds, which biases extraction mildly *against*
-/// transcendentals. Re-deriving them is a measurement, not a guess: rerun
-/// `pixelflow-pipeline/examples/measure_latency_prior.rs` per its protocol. Units are normalized so `Add = 4` (the table's
+/// call overhead exactly. Units are normalized so `Add = 4` (the table's
 /// historical unit; measured FADD slope 0.87ns/stage ≈ 3 real cycles at
 /// ~3.4GHz). Two independent runs agreed within 3% on every corrected entry.
 /// Protocol: `pixelflow-pipeline/examples/measure_latency_prior.rs`.

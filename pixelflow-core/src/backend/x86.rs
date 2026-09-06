@@ -7,6 +7,27 @@ use core::fmt::{Debug, Formatter};
 use core::ops::*;
 
 // ============================================================================
+// Shared minimax polynomial coefficients (f32 precision)
+// ============================================================================
+
+/// log2(f) on [√2/2, √2], fitted via least-squares on Chebyshev nodes.
+/// Max error: ~1e-4.
+mod log2_poly {
+    pub const C4: f32 = -0.320_043_5;
+    pub const C3: f32 = 1.797_496_9;
+    pub const C2: f32 = -4.198_805;
+    pub const C1: f32 = 5.727_023;
+    pub const C0: f32 = -3.005_614_8;
+}
+
+/// 2^f on [0, 1), degree-4 minimax. Max error: ~1e-7.
+mod exp2_poly {
+    pub const C4: f32 = 0.013_555_7;
+    pub const C3: f32 = 0.052_032_3;
+    pub const C2: f32 = 0.241_379_3;
+}
+
+// ============================================================================
 // SSE2 Backend
 // ============================================================================
 
@@ -279,11 +300,12 @@ impl SimdOps for F32x4 {
     }
 
     #[inline(always)]
-    fn shr_exponent(self) -> Self {
+    fn shr_u32(self, n: u32) -> Self {
         unsafe {
-            Self(_mm_castsi128_ps(_mm_srli_epi32::<23>(_mm_castps_si128(
-                self.0,
-            ))))
+            let as_int = _mm_castps_si128(self.0);
+            let shift = _mm_cvtsi32_si128(n as i32);
+            let shifted = _mm_srl_epi32(as_int, shift);
+            Self(_mm_castsi128_ps(shifted))
         }
     }
 
@@ -294,17 +316,81 @@ impl SimdOps for F32x4 {
             Self(_mm_cvtepi32_ps(as_int))
         }
     }
+
     #[inline(always)]
-    fn f32_to_i32(self) -> Self {
-        unsafe { Self(_mm_castsi128_ps(_mm_cvttps_epi32(self.0))) }
+    fn log2(self) -> Self {
+        // SSE2: Use bit manipulation for exponent/mantissa extraction
+        // Uses range [√2/2, √2] centered at 1 for better polynomial accuracy
+        // log2(x) = exponent + log2(mantissa)
+        unsafe {
+            let x_i32 = _mm_castps_si128(self.0);
+
+            // Extract exponent: ((bits >> 23) & 0xFF) - 127.
+            let exp_shifted = _mm_srli_epi32(x_i32, 23);
+            let exp_masked = _mm_and_si128(exp_shifted, _mm_set1_epi32(0xFF));
+            let exp_unbiased = _mm_sub_epi32(exp_masked, _mm_set1_epi32(127));
+            let mut n = _mm_cvtepi32_ps(exp_unbiased);
+
+            // Extract mantissa in [1, 2)
+            let one_bits = _mm_set1_epi32(0x3F800000_u32 as i32);
+            let mant_mask = _mm_set1_epi32(0x007FFFFF_u32 as i32);
+            let mut f = _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(x_i32, mant_mask), one_bits));
+
+            // Adjust to [√2/2, √2] range for better accuracy (centered at 1)
+            // If f >= √2, divide by 2 and increment exponent
+            let sqrt2 = _mm_set1_ps(core::f32::consts::SQRT_2);
+            let mask = _mm_cmpge_ps(f, sqrt2);
+            let adjust = _mm_and_ps(mask, _mm_set1_ps(1.0));
+            n = _mm_add_ps(n, adjust);
+            f = _mm_or_ps(
+                _mm_and_ps(mask, _mm_mul_ps(f, _mm_set1_ps(0.5))),
+                _mm_andnot_ps(mask, f),
+            );
+
+            let c4 = _mm_set1_ps(log2_poly::C4);
+            let c3 = _mm_set1_ps(log2_poly::C3);
+            let c2 = _mm_set1_ps(log2_poly::C2);
+            let c1 = _mm_set1_ps(log2_poly::C1);
+            let c0 = _mm_set1_ps(log2_poly::C0);
+
+            // Horner's method (no FMA on base SSE2)
+            let mut poly = _mm_add_ps(_mm_mul_ps(c4, f), c3);
+            poly = _mm_add_ps(_mm_mul_ps(poly, f), c2);
+            poly = _mm_add_ps(_mm_mul_ps(poly, f), c1);
+            poly = _mm_add_ps(_mm_mul_ps(poly, f), c0);
+
+            Self(_mm_add_ps(n, poly))
+        }
     }
 
     #[inline(always)]
-    fn shl_exponent(self) -> Self {
+    fn exp2(self) -> Self {
+        // SSE2: 2^x = 2^n * 2^f where n = floor(x), f = frac(x) ∈ [0, 1)
         unsafe {
-            Self(_mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_castps_si128(
-                self.0,
-            ))))
+            // n = floor(x), f = x - n
+            let n = _mm_floor_ps(self.0);
+            let f = _mm_sub_ps(self.0, n);
+
+            let c4 = _mm_set1_ps(exp2_poly::C4);
+            let c3 = _mm_set1_ps(exp2_poly::C3);
+            let c2 = _mm_set1_ps(exp2_poly::C2);
+            let c1 = _mm_set1_ps(core::f32::consts::LN_2);
+            let c0 = _mm_set1_ps(1.0);
+
+            // Horner's method (no FMA on base SSE2)
+            let mut poly = _mm_add_ps(_mm_mul_ps(c4, f), c3);
+            poly = _mm_add_ps(_mm_mul_ps(poly, f), c2);
+            poly = _mm_add_ps(_mm_mul_ps(poly, f), c1);
+            poly = _mm_add_ps(_mm_mul_ps(poly, f), c0);
+
+            // Compute 2^n by adding n to exponent bits
+            // 2^n = reinterpret((n + 127) << 23)
+            let bias = _mm_set1_epi32(127);
+            let n_i32 = _mm_cvtps_epi32(n);
+            let exp_bits = _mm_slli_epi32(_mm_add_epi32(n_i32, bias), 23);
+            let scale = _mm_castsi128_ps(exp_bits);
+
+            Self(_mm_mul_ps(poly, scale))
         }
     }
 
@@ -818,11 +904,12 @@ impl SimdOps for F32x8 {
     }
 
     #[inline(always)]
-    fn shr_exponent(self) -> Self {
+    fn shr_u32(self, n: u32) -> Self {
         unsafe {
-            Self(_mm256_castsi256_ps(_mm256_srli_epi32::<23>(
-                _mm256_castps_si256(self.0),
-            )))
+            let as_int = _mm256_castps_si256(self.0);
+            let shift = _mm_cvtsi32_si128(n as i32);
+            let shifted = _mm256_srl_epi32(as_int, shift);
+            Self(_mm256_castsi256_ps(shifted))
         }
     }
 
@@ -833,17 +920,82 @@ impl SimdOps for F32x8 {
             Self(_mm256_cvtepi32_ps(as_int))
         }
     }
+
     #[inline(always)]
-    fn f32_to_i32(self) -> Self {
-        unsafe { Self(_mm256_castsi256_ps(_mm256_cvttps_epi32(self.0))) }
+    fn log2(self) -> Self {
+        unsafe {
+            let x_i32 = _mm256_castps_si256(self.0);
+
+            // Extract exponent: ((bits >> 23) & 0xFF) - 127.
+            let exp_shifted = _mm256_srli_epi32(x_i32, 23);
+            let exp_masked = _mm256_and_si256(exp_shifted, _mm256_set1_epi32(0xFF));
+            let exp_unbiased = _mm256_sub_epi32(exp_masked, _mm256_set1_epi32(127));
+            let mut n = _mm256_cvtepi32_ps(exp_unbiased);
+
+            // Extract mantissa in [1, 2)
+            let one_bits = _mm256_set1_epi32(0x3F800000_u32 as i32);
+            let mant_mask = _mm256_set1_epi32(0x007FFFFF_u32 as i32);
+            let mut f = _mm256_castsi256_ps(_mm256_or_si256(
+                _mm256_and_si256(x_i32, mant_mask),
+                one_bits,
+            ));
+
+            // Adjust to [√2/2, √2] range for better accuracy (centered at 1)
+            // If f >= √2, divide by 2 and increment exponent
+            let sqrt2 = _mm256_set1_ps(core::f32::consts::SQRT_2);
+            let mask = _mm256_cmp_ps::<_CMP_GE_OQ>(f, sqrt2);
+            let adjust = _mm256_and_ps(mask, _mm256_set1_ps(1.0));
+            n = _mm256_add_ps(n, adjust);
+            f = _mm256_or_ps(
+                _mm256_and_ps(mask, _mm256_mul_ps(f, _mm256_set1_ps(0.5))),
+                _mm256_andnot_ps(mask, f),
+            );
+
+            let c4 = _mm256_set1_ps(log2_poly::C4);
+            let c3 = _mm256_set1_ps(log2_poly::C3);
+            let c2 = _mm256_set1_ps(log2_poly::C2);
+            let c1 = _mm256_set1_ps(log2_poly::C1);
+            let c0 = _mm256_set1_ps(log2_poly::C0);
+
+            // Horner's method with FMA when available
+            {
+                let mut poly = _mm256_fmadd_ps(c4, f, c3);
+                poly = _mm256_fmadd_ps(poly, f, c2);
+                poly = _mm256_fmadd_ps(poly, f, c1);
+                poly = _mm256_fmadd_ps(poly, f, c0);
+                Self(_mm256_add_ps(n, poly))
+            }
+        }
     }
 
     #[inline(always)]
-    fn shl_exponent(self) -> Self {
+    fn exp2(self) -> Self {
         unsafe {
-            Self(_mm256_castsi256_ps(_mm256_slli_epi32::<23>(
-                _mm256_castps_si256(self.0),
-            )))
+            // n = floor(x), f = x - n
+            let n = _mm256_floor_ps(self.0);
+            let f = _mm256_sub_ps(self.0, n);
+
+            let c4 = _mm256_set1_ps(exp2_poly::C4);
+            let c3 = _mm256_set1_ps(exp2_poly::C3);
+            let c2 = _mm256_set1_ps(exp2_poly::C2);
+            let c1 = _mm256_set1_ps(core::f32::consts::LN_2);
+            let c0 = _mm256_set1_ps(1.0);
+
+            // Horner's method
+            {
+                let mut poly = _mm256_fmadd_ps(c4, f, c3);
+                poly = _mm256_fmadd_ps(poly, f, c2);
+                poly = _mm256_fmadd_ps(poly, f, c1);
+                poly = _mm256_fmadd_ps(poly, f, c0);
+
+                // 2^n = (n + 127) << 23
+                let bias = _mm256_set1_epi32(127);
+                let n_i32 = _mm256_cvtps_epi32(n);
+                let exp_bits = _mm256_slli_epi32(_mm256_add_epi32(n_i32, bias), 23);
+                let scale = _mm256_castsi256_ps(exp_bits);
+
+                Self(_mm256_mul_ps(poly, scale))
+            }
         }
     }
 
@@ -1372,11 +1524,12 @@ impl SimdOps for F32x16 {
     }
 
     #[inline(always)]
-    fn shr_exponent(self) -> Self {
+    fn shr_u32(self, n: u32) -> Self {
         unsafe {
-            Self(_mm512_castsi512_ps(_mm512_srli_epi32::<23>(
-                _mm512_castps_si512(self.0),
-            )))
+            let as_int = _mm512_castps_si512(self.0);
+            let shift = _mm_cvtsi32_si128(n as i32);
+            let shifted = _mm512_srl_epi32(as_int, shift);
+            Self(_mm512_castsi512_ps(shifted))
         }
     }
 
@@ -1389,16 +1542,62 @@ impl SimdOps for F32x16 {
     }
 
     #[inline(always)]
-    fn f32_to_i32(self) -> Self {
-        unsafe { Self(_mm512_castsi512_ps(_mm512_cvttps_epi32(self.0))) }
+    fn log2(self) -> Self {
+        unsafe {
+            // Extract mantissa in [1, 2) - no exponent adjustment needed
+            // Interval=0 (_MM_MANT_NORM_1_2), sign=0 (_MM_MANT_SIGN_src)
+            let mut f = _mm512_getmant_ps::<0, 0>(self.0);
+
+            // Extract exponent
+            let mut n = _mm512_getexp_ps(self.0);
+
+            // Adjust to [√2/2, √2] range for better accuracy (centered at 1)
+            // If f >= √2, divide by 2 and increment exponent
+            let sqrt2 = _mm512_set1_ps(core::f32::consts::SQRT_2);
+            let mask = _mm512_cmp_ps_mask::<_CMP_GE_OQ>(f, sqrt2);
+            let adjust = _mm512_mask_blend_ps(mask, _mm512_setzero_ps(), _mm512_set1_ps(1.0));
+            n = _mm512_add_ps(n, adjust);
+            f = _mm512_mask_blend_ps(mask, f, _mm512_mul_ps(f, _mm512_set1_ps(0.5)));
+
+            let c4 = _mm512_set1_ps(log2_poly::C4);
+            let c3 = _mm512_set1_ps(log2_poly::C3);
+            let c2 = _mm512_set1_ps(log2_poly::C2);
+            let c1 = _mm512_set1_ps(log2_poly::C1);
+            let c0 = _mm512_set1_ps(log2_poly::C0);
+
+            // Horner's method with FMA
+            let mut poly = _mm512_fmadd_ps(c4, f, c3);
+            poly = _mm512_fmadd_ps(poly, f, c2);
+            poly = _mm512_fmadd_ps(poly, f, c1);
+            poly = _mm512_fmadd_ps(poly, f, c0);
+
+            Self(_mm512_add_ps(n, poly))
+        }
     }
 
     #[inline(always)]
-    fn shl_exponent(self) -> Self {
+    fn exp2(self) -> Self {
+        // AVX-512: Use scalef for efficient 2^n computation
+        // 2^x = 2^n * 2^f where n = floor(x), f = frac(x) ∈ [0, 1)
         unsafe {
-            Self(_mm512_castsi512_ps(_mm512_slli_epi32::<23>(
-                _mm512_castps_si512(self.0),
-            )))
+            // n = floor(x), f = x - n
+            let n = _mm512_roundscale_ps::<9>(self.0); // 9 = floor mode
+            let f = _mm512_sub_ps(self.0, n);
+
+            let c4 = _mm512_set1_ps(exp2_poly::C4);
+            let c3 = _mm512_set1_ps(exp2_poly::C3);
+            let c2 = _mm512_set1_ps(exp2_poly::C2);
+            let c1 = _mm512_set1_ps(core::f32::consts::LN_2);
+            let c0 = _mm512_set1_ps(1.0);
+
+            // Horner's method with FMA
+            let poly = _mm512_fmadd_ps(c4, f, c3);
+            let poly = _mm512_fmadd_ps(poly, f, c2);
+            let poly = _mm512_fmadd_ps(poly, f, c1);
+            let poly = _mm512_fmadd_ps(poly, f, c0);
+
+            // Use scalef: poly * 2^n
+            Self(_mm512_scalef_ps(poly, n))
         }
     }
 

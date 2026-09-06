@@ -336,11 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn shr_exponent_slides_the_exponent_field_down() {
-        let v = F32x4::from_u32_bits(1 << 25);
-        let got = lanes(v.shr_exponent());
+    fn shr_u32_shifts_the_reinterpreted_bit_pattern_right() {
+        let v = F32x4::from_u32_bits(128);
+        let got = lanes(v.shr_u32(3));
         for x in got {
-            assert_eq!(x.to_bits(), 4, "(1 << 25) >> 23 should be 4");
+            assert_eq!(x.to_bits(), 16, "128 >> 3 should be 16");
         }
     }
 
