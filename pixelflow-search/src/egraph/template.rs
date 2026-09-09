@@ -629,14 +629,13 @@ mod tests {
 
     #[test]
     fn dag_builder_template_rewrite() {
-        use pixelflow_ir::expr::ExprBuilderExt;
-        let mut b = pixelflow_ir::Builder::new();
-        let v0 = b.push_var(0);
-        let v1 = b.push_var(1);
-        let lhs = b.push_binary(OpKind::Sub, v0, v1);
-        let neg_v1 = b.push_unary(OpKind::Neg, v1);
-        let rhs = b.push_binary(OpKind::Add, v0, neg_v1);
-        let rooted = b.finish(&[lhs, rhs]);
+        // `x - y`, `x + (-y)`, built directly via `dag::Builder` rather than
+        // derived from an `ExprArena` — the thing this test exists to
+        // exercise. `Builder`/`Id` are `pub(crate)` to `pixelflow_ir`, so
+        // this crate can no longer build that shape itself; the fixture
+        // lives in `pixelflow_ir::internal_test_support`, the one place
+        // still allowed to.
+        let rooted = pixelflow_ir::internal_test_support::template_rewrite_sub_fixture();
         let rule = TemplateRewrite::new("test_dag_sub", rooted);
         assert_eq!(rule.lhs().child_count(), 2);
         assert_eq!(rule.rhs().child_count(), 2);

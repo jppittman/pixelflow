@@ -18,7 +18,8 @@ use crate::kind::OpKind;
 /// edge indices, or slab offsets. All edge topology is owned by [`Dag<ExprData>`].
 ///
 /// Constants are stored as IEEE 754 32-bit patterns (`u32`) for bit-exact
-/// comparison and to implement [`crate::dag::Key`] for [`Builder`].
+/// comparison and to implement `dag::Key` — bitwise `Eq`/`Ord`/`Hash`,
+/// needed for interning — which an `f32`'s `NaN` would refuse.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum ExprData {
     /// Bound variable: coordinate (0 for X, 1 for Y), reduction binder (4..8),
@@ -77,7 +78,7 @@ impl ExprData {
 }
 
 /// Construction helpers on [`Builder<ExprData>`].
-pub trait ExprBuilderExt {
+pub(crate) trait ExprBuilderExt {
     fn push_var(&mut self, var: u8) -> Id;
     fn push_const(&mut self, val: f32) -> Id;
     fn push_param(&mut self, param: u8) -> Id;
@@ -139,13 +140,13 @@ impl ExprBuilderExt for Builder<ExprData> {
 // ────────────────────────────────────────── Splicing & Transforms ─────────────
 
 /// Copy the reachable subgraph from `root` into `builder`, preserving DAG sharing.
-pub fn copy_subgraph(builder: &mut Builder<ExprData>, root: Node<'_, ExprData>) -> Id {
+pub(crate) fn copy_subgraph(builder: &mut Builder<ExprData>, root: Node<'_, ExprData>) -> Id {
     let mut table = root.dag().side_table(None);
     copy_subgraph_in(builder, root, &mut table)
 }
 
 /// Copy the reachable subgraph using an existing side table for memoization.
-pub fn copy_subgraph_in(
+pub(crate) fn copy_subgraph_in(
     builder: &mut Builder<ExprData>,
     root: Node<'_, ExprData>,
     table: &mut SideTable<Option<Id>>,
@@ -175,7 +176,7 @@ pub fn copy_subgraph_in(
 }
 
 /// Copy subgraph, replacing variables according to `subs`.
-pub fn substitute_vars(
+pub(crate) fn substitute_vars(
     builder: &mut Builder<ExprData>,
     root: Node<'_, ExprData>,
     subs: &[(u8, Id)],
@@ -216,7 +217,17 @@ pub fn substitute_vars(
 }
 
 /// Copy subgraph, replacing macro parameters with values.
-pub fn substitute_params(
+///
+/// Not yet called: `Kernel`'s parameter substitution still goes through the
+/// legacy `ExprArena` path (`pixelflow-compiler/src/emit.rs`); this is the
+/// `Dag`-native replacement staged for that, per
+/// `docs/plans/2026-09-09-exprarena-on-dag.md`'s Stage C. `pub(crate)`
+/// rather than `pub` made the gap visible (a `pub` fn is dead-code-exempt on
+/// the assumption an external crate might call it, which none ever did) —
+/// `#[allow(dead_code)]` because deleting or wiring this in isn't this
+/// change's call to make.
+#[allow(dead_code)]
+pub(crate) fn substitute_params(
     builder: &mut Builder<ExprData>,
     root: Node<'_, ExprData>,
     params: &[Scalar],
@@ -443,7 +454,7 @@ impl Environment {
 
 /// Splicing: copy donor subgraph into `builder`, remapping buffer and uniform
 /// slots into `env` by identity.
-pub fn splice(
+pub(crate) fn splice(
     builder: &mut Builder<ExprData>,
     env: &mut Environment,
     root: Node<'_, ExprData>,

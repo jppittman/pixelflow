@@ -53,15 +53,23 @@ use core::ops::Deref;
 
 /// Build-time handle. Opaque, and never needed by consumers.
 ///
-/// The guarantee is over *construction*, not observation: there is no public
-/// constructor and no public accessor, so the only way to hold one is to have
-/// been given it by `push`/`intern`, and the only thing it can be spent on is
-/// this builder. `Debug` does render the underlying index — the panic in
-/// `Dag::push` needs it to say which child was missing — so it is not a
-/// secret, merely unforgeable. Nothing a caller can learn from printing one
-/// can be turned back into an `Id`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct Id(u32);
+/// The guarantee is over *construction* and *observation* both: there is no
+/// public constructor and no public accessor, so the only way to hold one is
+/// to have been given it by `push`/`intern`, the only thing it can be spent
+/// on is the `Builder` that issued it, and `Debug` does not render the
+/// underlying index — printing an `Id` learns nothing that could be turned
+/// back into one or compared against another builder's.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) struct Id(u32);
+
+impl fmt::Debug for Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // No index: printing an `Id` must not hand back the thing the type
+        // exists to withhold. `Dag::push`'s panic on a foreign/not-yet-built
+        // child names the failure, not the index, for the same reason.
+        f.write_str("Id")
+    }
+}
 
 struct Slot<T> {
     value: T,
@@ -152,7 +160,7 @@ impl<T> Dag<T> {
         let edge_start = self.edges.len() as u32;
         let here = self.nodes.len() as u32;
         for c in children {
-            assert!(c.0 < here, "child {:?} does not exist yet", c);
+            assert!(c.0 < here, "child does not exist yet in this builder");
             self.edges.push(c.0);
         }
         self.nodes.push(Slot {
@@ -371,16 +379,16 @@ impl<'a, T> Iterator for Descendants<'a, T> {
 /// for the always-available `BTreeMap` fallback, `Eq + Hash + Clone` when
 /// `hash-memo` swaps in a `HashMap`.
 #[cfg(not(feature = "hash-memo"))]
-pub trait Key: Ord + Clone {}
+pub(crate) trait Key: Ord + Clone {}
 #[cfg(not(feature = "hash-memo"))]
 impl<T: Ord + Clone> Key for T {}
 
 #[cfg(feature = "hash-memo")]
-pub trait Key: Eq + Hash + Clone {}
+pub(crate) trait Key: Eq + Hash + Clone {}
 #[cfg(feature = "hash-memo")]
 impl<T: Eq + Hash + Clone> Key for T {}
 
-pub struct Builder<T: Key> {
+pub(crate) struct Builder<T: Key> {
     dag: Dag<T>,
     // Keyed on raw indices rather than `Id`, so the memo's `Ord`/`Hash`
     // requirement lands on a `u32` instead of forcing those bounds onto the
@@ -396,7 +404,7 @@ impl<T: Key> Default for Builder<T> {
 
 impl<T: Key> Builder<T> {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Builder {
             dag: Dag::new(),
             memo: Memo::new(),
@@ -404,7 +412,7 @@ impl<T: Key> Builder<T> {
     }
 
     #[must_use]
-    pub fn with_capacity(nodes: usize, edges: usize) -> Self {
+    pub(crate) fn with_capacity(nodes: usize, edges: usize) -> Self {
         Builder {
             dag: Dag {
                 identity: DagIdentity::mint(),
@@ -415,7 +423,7 @@ impl<T: Key> Builder<T> {
         }
     }
 
-    pub fn intern(&mut self, value: T, children: &[Id]) -> Id {
+    pub(crate) fn intern(&mut self, value: T, children: &[Id]) -> Id {
         let key = (value, children.iter().map(|c| c.0).collect::<Vec<_>>());
         if let Some(&ix) = self.memo.get(&key) {
             return Id(ix);
@@ -427,7 +435,7 @@ impl<T: Key> Builder<T> {
 
     /// Uninterned insert, for nodes that must stay distinct despite
     /// comparing equal (fresh temporaries, debug markers).
-    pub fn push_unique(&mut self, value: T, children: &[Id]) -> Id {
+    pub(crate) fn push_unique(&mut self, value: T, children: &[Id]) -> Id {
         self.dag.push(value, children)
     }
 
@@ -435,7 +443,7 @@ impl<T: Key> Builder<T> {
     /// caller's `Id`s die with the builder and consumers start from
     /// `Rooted::entries()` — a handle iterator.
     #[must_use]
-    pub fn finish(self, entries: &[Id]) -> Rooted<T> {
+    pub(crate) fn finish(self, entries: &[Id]) -> Rooted<T> {
         let n = self.dag.nodes.len() as u32;
         let entries = entries
             .iter()
