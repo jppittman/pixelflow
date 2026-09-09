@@ -9,7 +9,7 @@
 //! shared counter. A dedicated binary is its own process — nothing else
 //! here is allocating into the count.
 
-use pixelflow_ir::{Builder, Rooted};
+use pixelflow_ir::internal_test_support::scratch_allocation_fixture as build;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -33,21 +33,12 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum Op {
-    Var(&'static str),
-    Add,
-    Mul,
-}
-
-fn build() -> Rooted<Op> {
-    let mut b = Builder::new();
-    let x = b.intern(Op::Var("x"), &[]);
-    let y = b.intern(Op::Var("y"), &[]);
-    let add = b.intern(Op::Add, &[x, y]);
-    let root = b.intern(Op::Mul, &[add, x]);
-    b.finish(&[root])
-}
+// The fixture itself (`x`, `y`, `add = x + y`, `root = add * x`) lives in
+// `pixelflow_ir::internal_test_support`, imported above as `build`:
+// `dag::Builder`/`dag::Id` are `pub(crate)`, and this integration test is a
+// separate Cargo target that only sees `pub` API, same as any external
+// crate. What this test actually exercises — `Scratch`, `descendants_in`,
+// the allocation count — never touches `Builder` or `Id` either way.
 
 #[test]
 fn repeated_walks_do_not_allocate() {

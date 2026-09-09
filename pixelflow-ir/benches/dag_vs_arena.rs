@@ -22,20 +22,16 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::internal_test_support::{dag_naive_sharing, dag_no_sharing};
 use pixelflow_ir::kind::OpKind;
-use pixelflow_ir::{Builder, Rooted};
 use std::hint::black_box;
 
-// `Ord` too, not just `Hash`: `Builder<T: Key>`'s bound depends on whether
-// `hash-memo` is on (wants `Hash`) or off (the `BTreeMap` fallback wants
-// `Ord`; see dag.rs), and this needs to build either way — matching
-// `dag.rs`'s own `Op` test fixture.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-enum Payload {
-    Var(u8),
-    Const(u32),
-    Op(OpKind),
-}
+// The `dag::Builder`-side fixtures (`dag_no_sharing`/`dag_naive_sharing`)
+// live in `pixelflow_ir::internal_test_support`, not here: `Builder`/`Id`
+// are `pub(crate)`, and this bench is a separate Cargo target that only
+// sees `pub` API, same as any external crate. This file never names either
+// type — it calls two fixture functions and treats their `Rooted<_>`
+// result opaquely, exactly as any real consumer of a `Dag` would.
 
 // ───────────────────────── no_sharing: N independent terms ───────────────
 
@@ -55,28 +51,6 @@ fn arena_no_sharing(n: u32) -> (ExprArena, ExprId) {
         acc = a.push_binary(OpKind::Add, acc, term);
     }
     (a, acc)
-}
-
-fn dag_no_sharing(n: u32, intern: bool) -> Rooted<Payload> {
-    let mut b: Builder<Payload> = Builder::with_capacity(6 * n as usize + 4, 0);
-    let push = |b: &mut Builder<Payload>, v: Payload, kids: &[_]| {
-        if intern {
-            b.intern(v, kids)
-        } else {
-            b.push_unique(v, kids)
-        }
-    };
-    let x = push(&mut b, Payload::Var(0), &[]);
-    let y = push(&mut b, Payload::Var(1), &[]);
-    let mut acc = push(&mut b, Payload::Const(0.0f32.to_bits()), &[]);
-    for i in 0..n {
-        let s = push(&mut b, Payload::Const((i as f32 + 1.0).to_bits()), &[]);
-        let xs = push(&mut b, Payload::Op(OpKind::Mul), &[x, s]);
-        let ys = push(&mut b, Payload::Op(OpKind::Mul), &[y, s]);
-        let term = push(&mut b, Payload::Op(OpKind::Add), &[xs, ys]);
-        acc = push(&mut b, Payload::Op(OpKind::Add), &[acc, term]);
-    }
-    b.finish(&[acc])
 }
 
 fn bench_build_no_sharing(c: &mut Criterion) {
@@ -123,28 +97,6 @@ fn arena_naive_sharing(n: u32) -> (ExprArena, ExprId) {
         acc = a.push_binary(OpKind::Add, acc, d);
     }
     (a, acc)
-}
-
-fn dag_naive_sharing(n: u32, intern: bool) -> Rooted<Payload> {
-    let mut b: Builder<Payload> = Builder::new();
-    let push = |b: &mut Builder<Payload>, v: Payload, kids: &[_]| {
-        if intern {
-            b.intern(v, kids)
-        } else {
-            b.push_unique(v, kids)
-        }
-    };
-    let mut acc = push(&mut b, Payload::Const(0.0f32.to_bits()), &[]);
-    for _ in 0..n {
-        let x = push(&mut b, Payload::Var(0), &[]);
-        let y = push(&mut b, Payload::Var(1), &[]);
-        let c = push(&mut b, Payload::Const(1.5f32.to_bits()), &[]);
-        let xs = push(&mut b, Payload::Op(OpKind::Mul), &[x, c]);
-        let ys = push(&mut b, Payload::Op(OpKind::Mul), &[y, c]);
-        let d = push(&mut b, Payload::Op(OpKind::Add), &[xs, ys]);
-        acc = push(&mut b, Payload::Op(OpKind::Add), &[acc, d]);
-    }
-    b.finish(&[acc])
 }
 
 fn bench_build_naive_sharing(c: &mut Criterion) {

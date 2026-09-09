@@ -48,14 +48,22 @@ pub mod arena;
 ///
 /// A *new* graph should reach for this rather than hand-roll another `Vec`
 /// plus index-newtype.
+///
+/// Only the consumption vocabulary — `Dag`, `Node`, `Rooted`, `Scratch`,
+/// `SideTable` — is public at all. `Id`, `Key`, and `Builder` (which builds
+/// a `Dag`) are `pub(crate)`: invisible outside this crate, not merely
+/// unexported at the root. Memory management is a `Dag`'s own business —
+/// `kernel.rs` and `expr.rs` build DAGs because they *are* this crate's
+/// construction machinery, the same standing `arena.rs`'s own callers have;
+/// nothing further out ever needs to. A caller that only ever reads a `Dag`
+/// someone handed it never notices the difference.
 pub mod dag;
-pub use dag::{Builder, Dag, Key, Node, Rooted, Scratch, SideTable};
+pub use dag::{Dag, Node, Rooted, Scratch, SideTable};
 
 pub mod expr;
 pub use expr::{
-    Environment, ExprBuilderExt, ExprData, compute_dag_depth, copy_subgraph, copy_subgraph_in,
-    depth, from_arena, has_degenerate, has_var, node_count_subtree, retired_axis, splice,
-    substitute_params, substitute_vars, subtree_eq, to_arena,
+    Environment, ExprData, compute_dag_depth, depth, from_arena, has_degenerate, has_var,
+    node_count_subtree, retired_axis, subtree_eq, to_arena,
 };
 
 /// IR-to-IR transforms: each takes an expression graph and returns another.
@@ -96,3 +104,13 @@ pub use kernel::{Bits, Kernel, Monoid, Scalar, Uniform};
 pub use kind::OpKind;
 pub use kind::known_method_names;
 pub use traits::EmitStyle;
+
+/// Fixture builders for this crate's own `benches/`/`tests/` binaries and
+/// one `pixelflow-search` unit test — the only callers still allowed to
+/// know a `Dag` is built at all. `pub` only because Cargo compiles a
+/// `benches/`/`tests/` target as if it were an external crate, so there is
+/// no visibility short of `pub` that reaches it; `#[doc(hidden)]` keeps it
+/// out of rendered docs and out of the API this crate actually advertises.
+/// Not for anything else. See the module doc for why.
+#[doc(hidden)]
+pub mod internal_test_support;
