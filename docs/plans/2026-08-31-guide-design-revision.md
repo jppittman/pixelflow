@@ -25,7 +25,7 @@ semantics), all pinned to a static-latency-prior cost model, no wall-clock timin
 |---|---|---|---|
 | Oracle headroom | If a perfect Guide replayed only load-bearing applications, how much smaller would saturation be? | `pixelflow-pipeline/src/bin/guide_headroom.rs` | `docs/results/2026-08-30-guide-headroom.md` |
 | Saturation delta economics | Does the Stockfish incrementality argument (refuted for extraction candidates) hold for the Guide's actual scoring object — the growing e-graph? | `pixelflow-pipeline/src/bin/guide_scope_saturation_delta.rs` | `docs/results/2026-08-30-guide-scope-saturation-delta.md` |
-| Oracle-filtered anytime budget curves | Does replaying only oracle-approved rules reach forms unguided saturation never finds, at standardized work fractions? | `pixelflow-search/examples/oracle_filtered_budget_curves.rs` | `docs/results/2026-08-30-oracle-filtered-budget-curves.md` |
+| Oracle-filtered anytime budget curves | Does replaying only oracle-approved rules reach forms unguided saturation never finds, at standardized work fractions? | `pixelflow-search/examples/oracle_filtered_budget_curves.rs` (deleted) | `docs/results/2026-08-30-oracle-filtered-budget-curves.md` |
 
 **Audit note on this round's provenance.** All three artifacts existed on disk from an
 interrupted session (three agents that each hit a session limit mid-write) and were audited,

@@ -923,7 +923,7 @@ reconcile them by inspection.
 | Unconditional application counter; `set_provenance_recording` | `egraph/graph.rs` |
 | `ApplicationRecord.{rule, minted, unions}` + `changed()` | `egraph/provenance.rs` |
 | All three production tiers on `Optimizer::run` | `optimize.rs`, `ir_bridge.rs`, `runtime.rs` |
-| L2 / L3a / L4 / determinism / observation tests | `pixelflow-search/tests/optimizer_laws.rs` (new) |
+| L2 / L3a / L4 / determinism / observation tests | `pixelflow-search/tests/optimizer_laws.rs` (deleted) (new) |
 | G5's "62 rules, 62 ids" test | `egraph/rules.rs` |
 | G8 for the runtime cache | `runtime.rs` — `pixelflow-codegen::jit_cache` still unkeyed |
 | Telemetry re-pointed at `OptimizerStats` | `telemetry.rs` — `hard_timeout_us` → `max_applications` |

@@ -672,7 +672,7 @@ split's store may go:
 - A value defined *inside* an arm has no such point. Storing at its definition
   is right only if no *nested* guard sits between there and the eviction;
   ignoring that nesting miscompiles glyph bakes, which
-  `kernel_glyph_golden.rs` catches.
+  `kernel_glyph_golden.rs` (deleted) catches.
 - A `Select`'s own operands cannot be split at all: the guard reads its mask
   under the name the pre-redirect analysis recorded, and the arms are read at
   the `Select`, outside both ranges.
@@ -790,7 +790,7 @@ quickly.
 > ("the crates whose output is per-level machine code") already included
 > it; it was simply missing. It is in the set now (`smoke: codegen+ir+core`,
 > ~20s per level), the fix patches the join before the reconciliation, and
-> `guarded_arm_reconciliation.rs` builds the shape on purpose and fails on
+> `guarded_arm_reconciliation.rs` (deleted) builds the shape on purpose and fails on
 > the parent commit. An allocator-level invariant check cannot see this
 > class: the placement is self-consistent and every operand resolves; only
 > the order of two emissions at one index is wrong, and the guarded path has

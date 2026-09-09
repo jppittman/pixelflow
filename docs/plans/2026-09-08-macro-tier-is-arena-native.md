@@ -103,7 +103,7 @@ third meaning of `Var` along with it, for real this time.
 - **One optimizer, not three.** `optimize.rs`'s AST round trip, `ir_bridge`'s
   `Dwrt` entry point, and `pixelflow-search::runtime`'s pipeline become one
   `Optimize` pipeline, in the `Optimize`/`Then`/`Identity` vocabulary that
-  already exists and that `optimizer_laws.rs` L5 already tests.
+  already exists and that `optimizer_laws.rs` (deleted) L5 already tests.
 - **`kernel_raw!` becomes a value**, not a branch that declines to call a
   function — which is what `Identity`'s doc comment already claims it is for.
 - **Two stage boundaries disappear**, and with them the class of defect that
@@ -253,7 +253,7 @@ decisions used to compound, and the *compounding* is what straddled the edge.
 The test goes back to asserting emptiness, which is the guard it was written to
 be.
 
-`quad_tangency_winding.rs` pinned the grazing residual at 0.745; it now
+`quad_tangency_winding.rs` (deleted) pinned the grazing residual at 0.745; it now
 measures 0.688. Also not a fix — the defect is the same size in the only unit
 that matters (most of a crossing, where zero is correct). This one is worth
 recording for a second reason: the file's doc claimed it was "deliberately free
@@ -304,7 +304,7 @@ runtime tier, one write serves both.
 ### Correction (2026-09-08, later): one of them *was* fixed
 
 The section above says two pinned defects moved and neither was fixed. That
-was right about `kernel_glyph_optimize.rs` and `quad_tangency_winding.rs`,
+was right about `kernel_glyph_optimize.rs` and `quad_tangency_winding.rs` (deleted),
 which compare this code to itself, and wrong as a conclusion — because it was
 drawn before running the one test that compares it to something else.
 
@@ -329,7 +329,7 @@ The scope is worth stating precisely, because "fixed" can mean too much here:
 - **Fixed:** no glyph in the oracle corpus — 9 glyphs × 11 sizes, 7 px to
   48 px — puts ink where FreeType finds none.
 - **Not fixed:** the knife edge. `disc >= 0` is still exact zero at a shared
-  extremum, and `quad_tangency_winding.rs` still measures a grazing residual
+  extremum, and `quad_tangency_winding.rs` (deleted) still measures a grazing residual
   of 0.688 where zero is correct. A future fusion choice could put a glyph
   back on it; the now-zero assertion in `freetype_oracle.rs` is what would
   catch that.

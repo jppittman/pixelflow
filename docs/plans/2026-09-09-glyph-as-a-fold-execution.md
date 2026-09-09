@@ -189,7 +189,7 @@ would remove the third and is S3's measurement to make.
 | `kernel_glyph_optimize.rs::affine_edge_gradients_fold_to_constants` | **breaks by design.** Asserts `opt_dwrt == 0` and `opt_sqrt ≤ 5`, "one sqrt per edge". There is no longer one fragment per edge to count. Needs a new formulation, not a bumped number |
 | `kernel_glyph_optimize.rs::lowered_glyph_ops_are_all_egraph_representable` | at risk on paper; `Gather` resolves in both vocabularies, so expected to pass. If it fails, that is a real finding |
 | `freetype_oracle.rs` | pins **exact** texel counts (`KNOWN_ORPHAN_TEXELS = 0`, `TEXELS_WE_MISS_FAST = 3`). Coverage arithmetic changes shape here, so a shift is possible without a real regression. Any change must be argued against the oracle, never renumbered |
-| `text_union_identity.rs` | thresholds calibrated to today's scheduling noise (`SCHEDULING_NOISE = COVERAGE_STEP/4`). May need recalibration; recalibrating is allowed, loosening past a coverage step is not |
+| `text_union_identity.rs` (deleted) | thresholds calibrated to today's scheduling noise (`SCHEDULING_NOISE = COVERAGE_STEP/4`). May need recalibration; recalibrating is allowed, loosening past a coverage step is not |
 | `loop_blinn.rs`'s own `#[cfg(test)] mod tests` (2) | poke `Piece`/`Pieces` fields directly; rewritten with the representation |
 | `production_glyph_arena_dump.rs` (`#[ignore]`) | panics on `Nary`. `ExpandReduce` runs before this sees anything, but confirm rather than assume |
 | `golden/glyph_atlas_coverage.ppm` | regenerate if it moves; its own doc already anticipates this |
@@ -205,7 +205,7 @@ sole non-test caller in the workspace is one Criterion bench
 That reframes the stage entirely. Deleting `cells` is not a performance
 decision and there is no regression to fear; it costs a **demonstration**.
 `cells` is what makes G1's dependency on L3 concrete — the worked example of
-a domain-side extent — and `text_union_identity.rs` is a real correctness
+a domain-side extent — and `text_union_identity.rs` (deleted) is a real correctness
 suite over it.
 
 So S2 is not "blocked on ask A" as first written. The honest statement: the

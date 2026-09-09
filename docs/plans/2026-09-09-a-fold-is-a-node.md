@@ -161,7 +161,7 @@ why it is not in the tree.
 
 ## 7. Gates
 
-- `pixelflow-search/tests/a_fold_is_a_node.rs` — a fold inserts; hash-conses
+- `pixelflow-search/tests/a_fold_is_a_node.rs` (deleted) — a fold inserts; hash-conses
   on exactly its meaning (algebra, binder, range, body); keeps its binder out
   of the variance it reports; round-trips through extraction; an empty fold is
   its identity.
