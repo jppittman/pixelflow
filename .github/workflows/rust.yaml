@@ -187,6 +187,14 @@ jobs:
 
       - name: Install X11 dependencies
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
@@ -255,6 +263,14 @@ jobs:
 
       - name: Install X11 dependencies
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
@@ -365,6 +381,14 @@ jobs:
       - name: Install X11 dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
@@ -562,6 +586,14 @@ jobs:
 
       - name: Install X11 dependencies
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
