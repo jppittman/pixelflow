@@ -1043,11 +1043,12 @@ fn measure(
     time_limit: Duration,
     max_expansions: u64,
 ) -> Measured {
-    // The same two lowering passes `optimize_runtime_arena_uncached` runs
-    // before the e-graph sees the arena.
-    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
-        .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-    let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
+    // What `optimize_runtime_arena_uncached` hands the e-graph: `ExpandRefs`
+    // and nothing else. Legalization (`LowerDwrt`, `ExpandReduce`) runs
+    // *after* saturation now — it is the fallback for shapes the graph
+    // declined — so lowering here would measure a pipeline that no longer
+    // exists, on an arena an order of magnitude larger than production's.
+    let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
     let node_count = reachable_count(&arena, root);
 
     let mut optimizer = Optimizer::production().budget(budget);

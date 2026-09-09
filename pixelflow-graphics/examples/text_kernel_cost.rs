@@ -7,10 +7,11 @@
 //! The two downstream columns are different questions and the difference
 //! matters, because the runtime pipeline splits between them:
 //!
-//! - `saturation_sees` is reference-linked, derivative-lowered and
-//!   reduce-unrolled — exactly `pixelflow_search::runtime`'s
-//!   `[LowerDwrt, ExpandReduce, Saturate]` at the moment the e-graph is
-//!   handed the arena. It is the lever on optimization cost.
+//! - `saturation_sees` is reference-linked and nothing else — exactly what
+//!   `pixelflow_search::runtime` hands the e-graph, since legalization
+//!   (`LowerDwrt`, `ExpandReduce`) runs *after* saturation as the fallback
+//!   for shapes the rule set declined. It is the lever on optimization cost,
+//!   and holding it down is why the legalizer sits at the end.
 //! - `legalized` is the whole of `legalize` on the *unoptimized* arena, so
 //!   it also expands every `Gather` into address arithmetic. Nothing folds
 //!   that here, whereas in the pipeline saturation runs first and CSEs the
@@ -24,7 +25,7 @@ use std::time::Instant;
 use pixelflow_core::Kernel;
 use pixelflow_graphics::fonts::{text, Font};
 use pixelflow_ir::arena::{ExprArena, ExprId};
-use pixelflow_ir::passes::{expand_reduce_owned, expand_refs_owned, legalize, lower_dwrt_owned};
+use pixelflow_ir::passes::{expand_refs_owned, legalize};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -70,8 +71,6 @@ fn main() {
             .sum::<usize>()
             / PIECE_ROW_COLS;
         let (linked, linked_root) = expand_refs_owned(arena, root);
-        let (differentiated, d_root) = lower_dwrt_owned(&linked, linked_root).expect("lower_dwrt");
-        let (unrolled, u_root) = expand_reduce_owned(&differentiated, d_root);
         let t1 = Instant::now();
         let (legal, legal_root) = legalize(arena, root).expect("legalize");
         let legalize_t = t1.elapsed();
@@ -80,7 +79,7 @@ fn main() {
             construct.as_micros(),
             arena.len(),
             reachable(arena, root),
-            reachable(&unrolled, u_root),
+            reachable(&linked, linked_root),
             reachable(&legal, legal_root),
             legalize_t.as_micros(),
         );

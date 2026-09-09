@@ -160,50 +160,49 @@ fn optimize_runtime_arena_uncached(
     // this arena. It is an identity when nothing composed by reference, which
     // is every kernel production builds today.
     //
-    // `LowerDwrt` next, because differentiation manufactures constants (the
-    // winding kernels' `d = X − f(Y)` gives `DX(d) = 1` and, for a straight
-    // edge, a constant `DY(d)` — making the whole gradient magnitude
-    // `√(DX²+DY²)` a compile-time number) and `ConstantFold` can only cascade
-    // over constants that exist by the time saturation runs.
+    // `Saturate` next, on the arena as *written* — folds still folded,
+    // derivatives still `Dwrt`. Both are things the graph knows: the chain
+    // rule and a fold's decompositions are rule sets (`egraph::derivative`,
+    // `egraph::fold_rules`), so the graph resolves what it judges worth
+    // resolving and keeps the rest folded.
     //
-    // `ExpandReduce` next, in `legalize`'s order, so what saturation sees is
-    // binder-free arithmetic it can CSE and fold across the unrolled terms.
+    // **`LowerDwrt` and `ExpandReduce` come last, and that is the whole
+    // point.** Legalization is the *fallback*: it takes whatever illegal
+    // shape survived saturation — a `Dwrt` the chain rule did not reach, a
+    // `Reduce` the graph declined to peel — and makes it emittable. It owns
+    // nothing the graph does not also know, so running it first only takes
+    // choices away.
     //
-    // **Both are meant to move after saturation**, so that the graph resolves
-    // what it can (the chain rule and a fold's decompositions are both rule
-    // sets — `egraph::derivative`, `egraph::fold_rules`) and the legalizer is
-    // the fallback for what it declined. That reorder is written and
-    // measured, and it is not landed: on a production glyph, saturation
-    // quiesces with the folds still intact, extraction keeps them, and
-    // `ExpandReduce` then unrolls after everything that could have folded
-    // across the terms — **+23% to +42% emitted nodes**, on every glyph
-    // measured. It is not the class budget (8x the cap and 9x the wall clock
-    // recover 1.5%) and not the chain's association (peeling from the back
-    // builds `expand_reduce`'s own left-leaning shape, and changes nothing).
-    // What is missing is why `PeelFold` stops firing at that scale when a
-    // 40-term table-reading fold unrolls fine. See
-    // docs/plans/2026-09-09-a-fold-is-a-node.md §9 and
-    // `pixelflow-graphics/examples/glyph_saturation_cost.rs`, which is the
-    // measurement, and `pixelflow-graphics/tests/glyph_optimization_cost.rs`,
-    // which is the gate that will not let the regression ship green.
+    // Size is not symmetric across that boundary, which is why the order is
+    // not arbitrary. Unrolling a 34-piece fold *before* saturation hands the
+    // e-graph 141,530 nodes for one glyph, and an e-graph is quadratic-ish in
+    // what it is fed: that is where the budget goes. Unrolling it *after*
+    // hands the same expansion to the assembler, which is linear and does not
+    // care — a million-node IR is a routine afternoon for a register
+    // allocator and a catastrophe for saturation. So the emitted node count
+    // rises when the legalizer moves back, and that is the trade being made,
+    // not a regression: the e-graph gets to see the small, high-level program
+    // it can actually reason about.
     //
     // A declining step short-circuits the rest and yields `None` here, which
     // means exactly what it always meant: the caller compiles its own arena
-    // unchanged, unoptimized but correct.
+    // unchanged, unoptimized but correct — and legalizes it itself, since
+    // `Manifold::compile` runs `passes::legalize` regardless of whether this
+    // function returned anything.
     match saturation_switch() {
         SaturationSwitch::On => pipeline![
             ExpandRefs,
+            Saturate::runtime(shape),
             LowerDwrt,
-            ExpandReduce,
-            Saturate::runtime(shape)
+            ExpandReduce
         ]
         .optimize(arena, root)
         .into_changed(),
-        // The `Identity` path: the same legalizing prefix, no saturation.
+        // The `Identity` path: the same legalizing tail, no saturation.
         // What `Lattice::bake` would emit if the e-graph did not exist —
         // the "F" column of docs/plans/2026-09-06-egraph-at-production-scale.md
         // §7, measured by docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
-        SaturationSwitch::Off => pipeline![ExpandRefs, LowerDwrt, ExpandReduce, Identity]
+        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandReduce]
             .optimize(arena, root)
             .into_changed(),
     }
@@ -1250,15 +1249,12 @@ mod congruence_gap_probe {
         arena: &ExprArena,
         root: ExprId,
     ) -> ProductionRun {
-        // Same two lowering passes `optimize_runtime_arena_uncached` runs
-        // before the e-graph ever sees the arena (Dwrt resolved first so
-        // ConstantFold can cascade over the constants it manufactures, then
-        // Reduce unrolled). Real production dumps (the glyph corpus) still
-        // carry raw `Dwrt` markers at this point — `Font::glyph_kernel_scaled`
-        // returns `kernel.parts()` before this step runs.
-        let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
-            .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-        let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
+        // What `optimize_runtime_arena_uncached` hands the e-graph:
+        // `ExpandRefs` and nothing else. `LowerDwrt`/`ExpandReduce` run after
+        // saturation — a `Dwrt` and a `Reduce` are both things the rule set
+        // knows, and legalization is the fallback for what it declined — so
+        // lowering here would measure a pipeline that no longer exists.
+        let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
         let node_count = crate::egraph::reachable_count(&arena, root);
 
         // THE production regime, through the one entry point
