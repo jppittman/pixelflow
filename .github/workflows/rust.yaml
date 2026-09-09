@@ -341,8 +341,17 @@ jobs:
       # script before it type-checks a single line. These are the crates whose
       # output is architecture-specific; runtime and core-term carry no
       # aarch64-only code. Do not "simplify" this to `--workspace`.
+      # `-D warnings`, matching the macOS clippy step, because a warning is
+      # how this class actually presents. Deleting an aarch64-only test can
+      # leave the helper it called dead on aarch64 and live on x86, which is
+      # `dead_code` — a warning, so a bare `check` stays green and the failure
+      # surfaces on the macOS runner instead, where it fails *clippy* and so
+      # skips the whole test step. That happened to `logged_expr_jit_output`,
+      # and the point of this job is that it should not have to.
       - name: Type-check every aarch64 block
         shell: bash
+        env:
+          RUSTFLAGS: -D warnings
         run: |
           cargo check --target aarch64-unknown-linux-gnu --all-targets \
             -p pixelflow-core -p pixelflow-codegen -p pixelflow-ir \

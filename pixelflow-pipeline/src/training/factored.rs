@@ -681,8 +681,6 @@ fn format_const_kc(v: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_arch = "aarch64")]
-    use crate::jit_bench::benchmark_jit_arena;
 
     /// The values the frozen corpus expressions' third and fourth variables
     /// take. Those were the Z and W coordinates; a lattice has two axes now,
@@ -691,24 +689,21 @@ mod tests {
     /// coordinate carried.
     const REWRITE_BUG_ARGS: [f32; 2] = [1.3, -0.2];
 
-    // The scalar reference is the differential-testing oracle: it runs the same
-    // `expand_transcendentals` lowering the JIT runs, so Pow/exp/log evaluate
-    // through their one definition rather than a second host-libm semantics.
     /// Replace the frozen fixtures' `Var(2)`/`Var(3)` with the values they
     /// used to carry as the Z and W coordinates.
     ///
     /// **Every** consumer of a fixture goes through this, which is the whole
-    /// point. The scalar oracle used to substitute here while the JIT
-    /// harness fed the emitter zeros in those lanes, so the two evaluated
-    /// different programs and disagreed by three orders of magnitude — a
-    /// silent numeric divergence, not a failure, and invisible on x86 where
-    /// the JIT half of the comparison is not even compiled. `emit::compile`
-    /// now refuses an arena that names a retired axis, so a fixture that
-    /// skipped this would panic rather than diverge.
+    /// point. A scalar oracle used to substitute here while the JIT harness
+    /// fed the emitter zeros in those lanes, so the two evaluated different
+    /// programs and disagreed by three orders of magnitude — a silent numeric
+    /// divergence, not a failure. `emit::compile` now refuses an arena that
+    /// names a retired axis, so a fixture that skipped this panics rather
+    /// than diverging, which is why that pairing is no longer what defends
+    /// the invariant.
     ///
-    /// Constants, not uniforms: `benchmark_jit_arena` calls the collapse ABI
-    /// with a null context, so a uniform read would fault. A constant needs
-    /// no context and denotes exactly the same number on both sides.
+    /// Constants, not uniforms: the collapse ABI is called with a null
+    /// context in these harnesses, so a uniform read would fault. A constant
+    /// needs no context and denotes exactly the same number either way.
     fn bind_retired_axes(arena: &ExprArena, id: ExprId) -> (ExprArena, ExprId) {
         let mut arena = arena.clone();
         let subs: Vec<(u8, ExprId)> = REWRITE_BUG_ARGS
@@ -721,29 +716,18 @@ mod tests {
             .collect();
         let id = arena.substitute_vars_with(id, &subs);
         // The precondition `emit::compile` will assert, checked here where
-        // *every* caller reaches it on *every* architecture. The scalar/JIT
-        // comparisons below are `cfg(target_arch = "aarch64")`, so on an x86
-        // machine they do not exist and the emitter is never reached with
-        // these arenas at all — this file has learned that from a macOS
-        // runner twice. Asserting the precondition rather than the outcome is
-        // what makes the next miss local.
+        // *every* caller reaches it on *every* architecture. This file used
+        // to reach the emitter only from `cfg(target_arch = "aarch64")`
+        // comparisons, so on an x86 machine these arenas never met it at all
+        // — and it learned that from a macOS runner twice. Asserting the
+        // precondition rather than the outcome is what makes the next miss
+        // local.
         assert_eq!(
             arena.retired_axis(id),
             None,
             "bind_retired_axes left a reachable retired axis"
         );
         (arena, id)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn logged_expr_jit_output(src: &str) -> f32 {
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        // The same substitution the oracle applies. Skipping it here is the
-        // bug this pairing exists to catch.
-        let (arena, root) = bind_retired_axes(&arena, root);
-        benchmark_jit_arena(&arena, root)
-            .unwrap_or_else(|err| panic!("benchmark_jit_arena failed for {src}: {err:?}"))
-            .output[0]
     }
 
     /// `substitute_vars_with` rewrites the reachable graph and leaves what it
