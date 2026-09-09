@@ -4,10 +4,13 @@
 #
 # A CL is "docs only" when every changed path is under docs/ or is a Markdown
 # file anywhere in the tree (README.md, CLAUDE.md, .claude/agents/*.md). Those
-# files are read by no build, no test and no check script that gates a merge;
-# the three metadata jobs (CL metadata, driver-cfg coverage, provenance-journal
-# scope) still run on every CL because they are seconds and two of them read
-# the workflow and Cargo manifests, not the diff.
+# files are read by no build, no test and no check script that gates a merge --
+# except `check-doc-paths.sh`, which reads docs and so is exactly the job a
+# docs-only CL most needs.
+#
+# The six metadata jobs (CL metadata, driver-cfg coverage, bin declarations,
+# platform-cfg encapsulation, provenance-journal scope, doc source paths) still
+# run on every CL because they are seconds each and none of them needs a build.
 #
 # An empty diff, an unreadable range, or any path outside the pattern is NOT
 # docs-only: the conservative answer is to run everything.

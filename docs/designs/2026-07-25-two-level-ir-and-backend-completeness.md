@@ -1,3 +1,11 @@
+> **Paths stale, findings live (annotated 2026-09-09).** The completeness check and
+> the first `Instruction`/`Assembler` split landed as described. The files it cites
+> for the follow-up work have since moved to `pixelflow-codegen`:
+> `pixelflow-ir/src/backend/emit/lowering.rs`, `bench_hoisted_scanline.rs` and
+> `pixelflow-pipeline/src/bin/bench_scanline_jit.rs` were all deleted. Its central
+> finding — that `Kernel::over` has never emitted a loop on any backend because it
+> always unrolls — is still true and is why the language is a DAG with no binder.
+
 # Two-level IR, backend completeness, and where the loop binder belongs
 
 **Date:** 2026-07-25

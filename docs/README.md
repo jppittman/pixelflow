@@ -14,9 +14,16 @@ describes how it should be read today; directory names alone do not establish cu
 - **Fixed bug** — a defect report whose described fault has been corrected.
 
 Classification is separate from design workflow status. **Every future plan and design must
-use exactly one of `Draft`, `Review`, `Approved`, or `Implemented` in its metadata**, as
-specified by [`templates/DESIGN_DOC.md`](templates/DESIGN_DOC.md). Use `Supersedes` or
-`Superseded by` metadata to record lineage rather than creating new status words.
+use exactly one status from the vocabulary in
+[`templates/DESIGN_DOC.md`](templates/DESIGN_DOC.md)** — `Draft`, `Proposed`, `Registered`,
+`Plan of record`, `Landed`, `Closed`, `Superseded` or `Historical` — and must record a
+**`Verified against:` commit sha** if it makes claims about the tree. Use `Supersedes` or
+`Superseded by` metadata to record lineage *in addition to* the status.
+
+That vocabulary was widened on 2026-09-09. It used to be `Draft | Review | Approved |
+Implemented`, which 3 of 59 plans and designs actually used; the rest had invented about
+twenty words of their own, several of which said more than any of the four. The rule now
+matches what the corpus needs rather than asking 56 documents to lie about themselves.
 
 ## Current architecture
 
@@ -127,3 +134,91 @@ specified by [`templates/DESIGN_DOC.md`](templates/DESIGN_DOC.md). Use `Supersed
   — concurrent-test contract fix.
 - [`bugs/2026-07-22-trig-chebyshev-coefficients-wrong.md`](bugs/2026-07-22-trig-chebyshev-coefficients-wrong.md)
   — trigonometric approximation and regression-test fixes.
+
+### The test-quality audit series — read the newest one only
+
+`bugs/` holds 23 documents from one scheduled series running 2026-07-20 → 2026-09-07. They
+are a **chain**: each pass names its predecessor, re-checks that pass's "Recommended next
+steps" against the tree, and carries forward whatever is still open. So the newest document
+carries the live backlog and the older ones are the audit trail — reading all 23 to find out
+what is open is the mistake the chain's shape invites.
+
+Start at [`bugs/2026-09-07-test-quality-audit-followup.md`](bugs/2026-09-07-test-quality-audit-followup.md).
+Two standing cautions the series records about itself: the 2026-08-07 pass found that two
+passes had swept the *same* commit range because each derived its window from what the
+previous document named rather than from `main` (they independently fixed the same
+violation), and the 2026-09-01 pass notes that several findings live in PRs that never
+merged (#1049, #1050, #1054, #1154), so a "closed" item may not be closed on `main`.
+
+## Complete index of plans and designs
+
+The curated sections above are the *start here* view and are deliberately partial. This is
+the full list, so nothing is invisible. Every entry's own header states its status; where a
+document is historical it now says so in a banner on line 1, which
+[`scripts/check-doc-paths.sh`](../scripts/check-doc-paths.sh) treats as load-bearing — a
+plan or design may only name a source file the tree lacks if it is bannered, says the file is
+gone, or is recorded in `scripts/doc-paths-baseline.txt`.
+
+**Current direction — read these first.** `plans/2026-09-06-kernel-with-a-lattice.md`
+(plan of record), `plans/2026-09-06-lattice-is-the-index.md` (landed),
+`plans/2026-09-06-uniform-slot-identity.md` (U0 landed),
+`plans/2026-09-08-one-conditional-three-lowerings.md` (draft, nothing built),
+`plans/2026-09-09-exprarena-on-dag.md` (proposed),
+`plans/2026-09-08-macro-tier-is-arena-native.md`,
+`designs/2026-07-24-totality-and-the-cost-model.md` (axiom layer),
+`plans/2026-07-20-kernel-unification.md` (plan of record).
+
+**Compiler, codegen, optimizer.** `plans/2026-09-02-optimizer-api.md` (the five laws and
+the G1–G8 gap table), `plans/2026-09-01-loop-aware-codegen.md` (stage 0 landed),
+`plans/2026-09-01-register-allocation-escape-hatches.md`,
+`plans/2026-09-01-production-budget-determinism.md` (revised 2026-09-08 for the class cap),
+`plans/2026-09-06-egraph-at-production-scale.md` (measured facts, not a plan),
+`plans/2026-09-08-egraph-cpu-memory-profile.md`, `plans/2026-09-04-ir-as-a-trait.md`,
+`plans/2026-08-02-ir-layering.md`, `plans/2026-08-08-egraph-constant-domain-spike.md`,
+`designs/2026-07-25-two-level-ir-and-backend-completeness.md`,
+`designs/assembler-as-functor.md`, `designs/opkind-numbering-is-private.md`.
+
+**Cost model and the Guide** — read the claims ledger (PR #1207) before citing any number
+from these. `plans/2026-07-07-guided-saturation-redesign.md`,
+`plans/2026-08-31-guide-design-revision.md`, `plans/2026-09-01-schedule-cost-model-denotation.md`,
+`plans/2026-09-01-guide-candidate-context.md`, `plans/2026-09-01-guide-return-to-go.md`,
+`plans/2026-09-02-phase3-forward-port.md`, and the pre-registration series:
+`plans/2026-09-01-phase3-registration.md`,
+`plans/2026-09-01-phase3-round1b-domain-shift-registration.md`,
+`plans/2026-09-01-phase3-round2-rule-scaling.md`, and
+`plans/2026-09-01-phase3-round2-registration.md` →
+`plans/2026-09-01-phase3-round2-registration-v2.md` →
+`plans/2026-09-01-phase3-round2-registration-v3.md` (each supersedes the last, so
+v3 is the one to read), `plans/2026-09-02-bilinear-guide-registration.md`.
+
+**Actors, runtime, platform.** `designs/actor-scheduler-mealy-transducer.md` (design of
+record), `designs/actor-scheduler-backpressure.md`,
+`designs/pixelflow-runtime-engine-mesh-migration.md` (not landed),
+`designs/pty-actor-troupe.md` (implemented), `plans/2026-09-03-wayland-driver.md`, and the
+two preemption alternatives `designs/2026-08-31-preemption-as-transaction-abort.md` /
+`designs/2026-08-31-hardware-sandboxed-kernel-preemption.md` — neither adopted, both gated
+on a step actually being observed to overrun.
+
+**Historical — bannered, kept for rationale.** `designs/LATTICE_EVAL.md`,
+`designs/lattice-scheduling-types.md`, `designs/REDUCTIONS_AND_FOLDS.md`,
+`designs/KERNELS_AND_LATTICES.md`, `designs/BRAINSTORM_VARIANCE_EGRAPH.md`,
+`designs/ML_AUTODIFF_PIPELINE.md`, `designs/ML_AND_LINEAR_ALGEBRA.md`,
+`designs/compiler-architecture-2026.md`, `designs/2026-07-23-jit-orthodoxy-survey.md`,
+`designs/2026-07-23-lower-realize-boundary.md`,
+`designs/actor-scheduler-supervisor-migration.md`,
+`plans/2025-02-21-kernel-jit-feature-parity{,-design}.md`,
+`plans/2026-07-28-jit-performance-parity.md`,
+`plans/2026-08-05-egraph-nnue-research-workflow.md` (closed 2026-09-01),
+`plans/2026-08-17-cost-model-domain.md`, `plans/2026-08-17-egraph-vsa-nnue-research-notes.md`
+(the §5 reading list is the live half), `plans/2026-09-01-dead-code-with-ideas.md`,
+`plans/2026-09-07-demand-is-a-dag-property.md`, `plans/archive/`, `archive/`,
+`superpowers/`.
+
+### A caution about the four oldest designs
+
+`LATTICE_EVAL.md`, `lattice-scheduling-types.md`, `REDUCTIONS_AND_FOLDS.md` and
+`BRAINSTORM_VARIANCE_EGRAPH.md` are April 2026 and state ideas that are still load-bearing
+in APIs that no longer exist — `FrameLattice`/`ScanlineLattice`/`PointLattice`, a
+per-point `Manifold::eval`, variance as a type parameter, an NNUE or ILP choosing the
+schedule. Their banners say which half is which. The thinking is worth reading; none of the
+code is worth copying.

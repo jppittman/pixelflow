@@ -1,0 +1,39 @@
+# Doc-path baseline for scripts/check-doc-paths.sh -- <doc>TAB<path>.
+#
+# Every pair here is a plan or design naming a .rs file the tree does not have,
+# recorded so the check can fail on NEW ones. Two legitimate reasons appear:
+#
+#   - the doc PROPOSES the file (guide-candidate-context designs egraph/cell.rs
+#     and training/rule_conditioned.rs; neither exists and naming them is right);
+#   - the doc is live and correct but cites a path that has since moved, in a
+#     spot where saying so would not improve it (a stage table, a file census).
+#
+# Deleting a line is the intended direction of travel. Adding one needs a reason.
+# Generated 2026-09-09 against main @ 8b6e3ce4.
+
+docs/designs/2026-07-25-two-level-ir-and-backend-completeness.md	bench_hoisted_scanline.rs
+docs/designs/2026-07-25-two-level-ir-and-backend-completeness.md	lowering.rs
+docs/designs/2026-07-25-two-level-ir-and-backend-completeness.md	pixelflow-ir/src/backend/emit/lowering.rs
+docs/designs/2026-07-25-two-level-ir-and-backend-completeness.md	pixelflow-pipeline/src/bin/bench_scanline_jit.rs
+docs/designs/pixelflow-runtime-engine-mesh-migration.md	vsync_actor_tests.rs
+docs/plans/2026-08-08-egraph-constant-domain-spike.md	pixelflow-search/src/egraph/codegen.rs
+docs/plans/2026-09-01-dead-code-with-ideas.md	bootstrap_extraction_head.rs
+docs/plans/2026-09-01-dead-code-with-ideas.md	pixelflow-pipeline/src/bin/bootstrap_extraction_head.rs
+docs/plans/2026-09-01-dead-code-with-ideas.md	pixelflow-pipeline/src/bin/profile_extraction.rs
+docs/plans/2026-09-01-dead-code-with-ideas.md	pixelflow-pipeline/src/training/episodes.rs
+docs/plans/2026-09-01-dead-code-with-ideas.md	unified_backward.rs
+docs/plans/2026-09-01-guide-candidate-context.md	bench_extraction_3way.rs
+docs/plans/2026-09-01-guide-candidate-context.md	extraction.rs
+docs/plans/2026-09-01-guide-candidate-context.md	pixelflow-pipeline/src/bin/bench_extraction_3way.rs
+docs/plans/2026-09-01-guide-candidate-context.md	pixelflow-pipeline/src/bin/gen_rc_corpus.rs
+docs/plans/2026-09-01-guide-candidate-context.md	pixelflow-pipeline/src/bin/guide_coverage.rs
+docs/plans/2026-09-01-guide-candidate-context.md	pixelflow-pipeline/src/training/rule_conditioned.rs
+docs/plans/2026-09-01-guide-candidate-context.md	pixelflow-search/src/egraph/cell.rs
+docs/plans/2026-09-01-guide-candidate-context.md	unified_backward.rs
+docs/plans/2026-09-01-loop-aware-codegen.md	discrete.rs
+docs/plans/2026-09-02-optimizer-api.md	ir_bridge.rs
+docs/plans/2026-09-06-uniform-slot-identity.md	codegen/emitter.rs
+docs/plans/2026-09-06-uniform-slot-identity.md	ir_bridge.rs
+docs/plans/2026-09-06-uniform-slot-identity.md	jit_manifold.rs
+docs/plans/2026-09-06-uniform-slot-identity.md	pixelflow-compiler/src/jit_backend.rs
+docs/plans/2026-09-06-uniform-slot-identity.md	pixelflow-graphics/src/animation.rs

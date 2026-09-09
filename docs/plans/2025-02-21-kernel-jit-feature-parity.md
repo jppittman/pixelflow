@@ -1,3 +1,10 @@
+> **Superseded (2026-07-20) — the implementation plan for a macro that no longer
+> exists.** See the banner on
+> [`2025-02-21-kernel-jit-feature-parity-design.md`](2025-02-21-kernel-jit-feature-parity-design.md).
+> `kernel_jit!`, `JitManifold`, `pixelflow-ir/src/expr.rs` and
+> `pixelflow-compiler/src/ir_bridge.rs` are all deleted; the task list below is
+> finished or moot. Kept for the param-baking rationale.
+
 # kernel_jit! Feature Parity Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.

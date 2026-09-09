@@ -1,3 +1,11 @@
+> **Live plan; three cited paths moved (annotated 2026-09-09).** The uniform leaf
+> landed as U0 (#1183) and this document is still the reference for it. Since it was
+> written, `pixelflow-compiler/src/ir_bridge.rs` was split into `lower.rs` and
+> `emit.rs` (#1206), and `pixelflow-compiler/src/jit_backend.rs`,
+> `codegen/emitter.rs`, `jit_manifold.rs` and `pixelflow-graphics/src/animation.rs`
+> were deleted. The stage table's T2/T5/T8 rows name those paths; the stages
+> themselves are unaffected.
+
 # Uniforms: a scalar parameter that is invariant without being known
 
 ## Metadata

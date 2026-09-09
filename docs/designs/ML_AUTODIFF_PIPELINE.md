@@ -1,3 +1,11 @@
+> **Historical (Apr 2026), directional.** Symbolic differentiation in the e-graph
+> did land — `Dwrt`, the chain rule as rewrite rules, and `lower_dwrt` are all
+> real, and CLAUDE.md records why a `Dwrt` deliberately survives macro expansion.
+> The rest is a sketch that was never built: there is no ML training path through
+> this compiler, and the "Learned Traversal (MCTS / NNUE guided search)" it relies
+> on to survive expression swell was removed in July 2026 (MCTS) and Sep 2026
+> (the extraction head). No `Dual`-number fallback tier exists.
+
 # Denotational Machine Learning & Symbolic Autodiff
 
 ## Vision

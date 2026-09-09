@@ -1,3 +1,15 @@
+> **Historical (Apr 2026) — the idea landed, this spelling did not.** The thesis
+> below is current and load-bearing: a lattice is a demand for evaluation, and
+> `index(collapse(f)) = f` is still the law. **The API is not.** Every concrete type
+> in the "Trait Design" section was deleted in June 2026 — `FrameLattice`,
+> `ScanlineLattice`, `PointLattice`, `IndexLattice1D/2D` collapsed into one
+> `Lattice` struct, and `trait Manifold`'s per-point `eval` was retired with the
+> combinator tier (S4b-2). A `Lattice` today is `{ extent: [u32; AXES] }` and
+> nothing else: the `origin` this document gives it was removed by
+> [`../plans/2026-09-06-lattice-is-the-index.md`](../plans/2026-09-06-lattice-is-the-index.md),
+> which is landed. For the current shape read
+> [`../plans/2026-09-06-kernel-with-a-lattice.md`](../plans/2026-09-06-kernel-with-a-lattice.md).
+
 # Lattice as Representable Functor: Unified Scheduling
 
 ## The Idea (Apr 3, 2026)

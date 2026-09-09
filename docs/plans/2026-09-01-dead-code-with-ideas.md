@@ -1,3 +1,10 @@
+> **A dated audit, largely executed (annotated 2026-09-09).** Its verdicts were
+> acted on: much of what it marked DELETE is gone, which is why it now names files
+> that are not in the tree (`bench_extraction_3way.rs`, `unified_backward.rs`,
+> `pixelflow-ml/src/nnue.rs`, the `nnue/` cost-model modules). Read it as the record
+> of that decision round and for the six D-questions in §6 — of which D4
+> (`pixelflow-ml`, still a workspace member with zero dependents) is still open.
+
 # Dead code with decent ideas — keep / reuse-for-round-2 / segregate / delete
 
 **Date:** 2026-09-01

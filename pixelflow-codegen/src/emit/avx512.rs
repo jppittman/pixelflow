@@ -21,8 +21,8 @@
 //! red zone the SSE2 path relies on).
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm32, Mem, NoDisp, gpr};
-use super::{EncodedInst, KReg, Reg, assemble, unimplemented_op};
+use super::x86_64::{Disp, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
+use super::{AsmProgram, EncodedInst, KReg, Reg, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -308,22 +308,9 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 /// base pointer, so a slot *is* `rsp + offset`.
 const fn frame_slot(offset: u32) -> Mem<Imm32> {
     Mem {
-        base: gpr::RSP,
+        base: ptr::RSP,
         disp: Imm32(offset as i32),
     }
-}
-
-/// vmovups zmmDST, [addr] — 512-bit load (EVEX.512.0F.W0 10 /r).
-/// `vmovups` has NO mandatory prefix; `F3 0F 10` would be the *scalar* `vmovss`.
-pub fn emit_load<D: Disp>(code: &mut Vec<u8>, dst: Reg, addr: Mem<D>) {
-    assemble(code, [Evex::m0f(0x10).rm(dst.0, addr)]);
-}
-
-/// vmovups [addr], zmmSRC — 512-bit store (EVEX.512.0F.W0 11 /r).
-/// `vmovups` has NO mandatory prefix; `F3 0F 11` would be the *scalar* `vmovss`
-/// (which caused the spill-path SIGSEGV: a scalar store to a garbage SIB base).
-pub fn emit_store<D: Disp>(code: &mut Vec<u8>, addr: Mem<D>, src: Reg) {
-    assemble(code, [Evex::m0f(0x11).rm(src.0, addr)]);
 }
 
 /// Where [`emit_const`] stages an f32 before broadcasting it: four bytes of
@@ -334,7 +321,7 @@ pub fn emit_store<D: Disp>(code: &mut Vec<u8>, addr: Mem<D>, src: Reg) {
 /// the byte by the tuple element size (4 for a `vbroadcastss` scalar source),
 /// so a `disp8` of -4 would address `[rsp-16]`. `disp32` is never scaled.
 const RED_ZONE_CONST: Mem<Imm32> = Mem {
-    base: gpr::RSP,
+    base: ptr::RSP,
     disp: Imm32(-4),
 };
 
@@ -363,17 +350,22 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
 /// scaling never enters into it. See `x86_64::emit_uniform_load` for the
 /// register contract.
 pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
-    emit_load_ptr_from_ctx(code, gpr::RAX.0, gpr::RDI.0, i32::from(load.ctx_slot) * 8);
-    assemble(
-        code,
-        [Evex::m0f38_66(0x18).rm(
+    AsmProgram::from([
+        MovLoadPtr {
+            dst: ptr::RAX,
+            base: ptr::RDI,
+            disp: i32::from(load.ctx_slot) * 8,
+        }
+        .encode(),
+        Evex::m0f38_66(0x18).rm(
             dst.0,
             Mem {
-                base: gpr::RAX,
+                base: ptr::RAX,
                 disp: Imm32(i32::from(load.offset) * 4),
             },
-        )],
-    );
+        ),
+    ])
+    .assemble(code);
 }
 
 // =============================================================================
@@ -619,7 +611,9 @@ pub fn emit_load_ptr_from_ctx(code: &mut Vec<u8>, dst_gpr: u8, ctx_gpr: u8, disp
 /// ([`emit_cvttps2dq`]), and `dst != index` (the instruction forbids the
 /// destination and index vectors aliasing). `base_gpr` must not be rbp/r13
 /// (mod=00 SIB base restriction) — the emitter uses `rax`.
-pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
+/// Pure encoding for `vgatherdps zmmDST{k1}, [baseGPR + zmmINDEX*4]`
+#[must_use]
+pub fn gather(dst: Reg, base_gpr: u8, index: Reg) -> EncodedInst {
     let d = dst.0;
     let idx = index.0;
     let base = base_gpr;
@@ -652,7 +646,11 @@ pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
     inst.push(((d & 7) << 3) | 0b100);
     // SIB: scale=10 (*4), index=idx[2:0], base=base[2:0].
     inst.push((0b10 << 6) | ((idx & 7) << 3) | (base & 7));
-    assemble(code, [inst]);
+    inst
+}
+
+pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
+    AsmProgram::from([gather(dst, base_gpr, index)]).assemble(code);
 }
 
 #[cfg(test)]
@@ -699,6 +697,7 @@ mod tests {
     mod runtime {
         use super::super::*;
         use crate::emit::executable::ExecutableCode;
+        use crate::emit::{Gpr, PtrReg};
         use core::arch::x86_64::*;
 
         // Passing __m512 by value IS the emitted ABI (SysV: zmm0-7), so
@@ -796,18 +795,18 @@ mod tests {
             #[allow(improper_ctypes_definitions)]
             type F = unsafe extern "C" fn(*mut f32);
 
-            let r9 = x86_64::Gpr(9);
+            let r9 = Gpr(9);
             let mut c = Vec::new();
             x86_64::mov(&mut c, r9, x86_64::gpr::RDI);
             let via_r9 = Mem {
-                base: r9,
+                base: PtrReg(9),
                 disp: NoDisp,
             };
-            emit_load(&mut c, X, via_r9);
+            AsmProgram::from([Evex::m0f(0x10).rm(X.0, via_r9)]).assemble(&mut c);
             emit_const(&mut c, Reg(5), 1.0);
             emit_binary(&mut c, OpKind::Add, X, X, Reg(5));
-            emit_store(&mut c, via_r9, X);
-            crate::emit::x86_64::ret(&mut c);
+            AsmProgram::from([Evex::m0f(0x11).rm(X.0, via_r9)]).assemble(&mut c);
+            AsmProgram::from([crate::emit::x86_64::Inst::Ret]).assemble(&mut c);
 
             let mut buf = [0.0f32; 16];
             for (i, v) in buf.iter_mut().enumerate() {
@@ -950,7 +949,7 @@ mod tests {
             type G = unsafe extern "C" fn(*const f32, __m512) -> __m512;
 
             let mut c = Vec::new();
-            x86_64::mov(&mut c, x86_64::Gpr(9), gpr::RDI);
+            x86_64::mov(&mut c, Gpr(9), x86_64::gpr::RDI);
             emit_cvttps2dq(&mut c, Reg(21), Reg(0)); // zmm21 = (i32) idx_float
             emit_set_gather_mask(&mut c);
             emit_gather(&mut c, Reg(20), 9, Reg(21)); // zmm20{k1} = [r9 + zmm21*4]
@@ -982,12 +981,20 @@ mod tests {
         fn emit_load_after_emit_store_recovers_the_spilled_value() {
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
-            crate::emit::x86_64::emit_sub_rsp(&mut c, 64);
+            AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
+                dst: crate::emit::x86_64::gpr::RSP,
+                imm: crate::emit::x86_64::Imm32(64),
+            }])
+            .assemble(&mut c);
             emit_binary(&mut c, OpKind::Mul, Reg(6), X, Y);
-            emit_store(&mut c, frame_slot(0), Reg(6));
+            AsmProgram::from([Evex::m0f(0x11).rm(6, frame_slot(0))]).assemble(&mut c);
             emit_binary(&mut c, OpKind::Add, Reg(6), X, X); // clobber
-            emit_load(&mut c, X, frame_slot(0));
-            crate::emit::x86_64::emit_add_rsp(&mut c, 64);
+            AsmProgram::from([Evex::m0f(0x10).rm(X.0, frame_slot(0))]).assemble(&mut c);
+            AsmProgram::from([crate::emit::x86_64::Inst::AddImm32 {
+                dst: crate::emit::x86_64::gpr::RSP,
+                imm: crate::emit::x86_64::Imm32(64),
+            }])
+            .assemble(&mut c);
             check(run(&c, xs, ys, zs), |i| xs[i] * ys[i], "spill roundtrip");
         }
     }
@@ -1021,7 +1028,7 @@ mod tests {
 )]
 pub(crate) mod driver {
     use super::super::*;
-    use super::{Mem, NoDisp, frame_slot};
+    use super::{AsmProgram, Evex, Mem, NoDisp, UNUSED_VVVV, frame_slot};
     use crate::emit::x86_64 as x86;
     use crate::emit::x86_64::driver::SSE2_FILE;
     use crate::error::CompileError;
@@ -1067,7 +1074,8 @@ pub(crate) mod driver {
         fn reload(code: &mut Vec<u8>, reload: &Reload) {
             match reload {
                 Reload::FromStack { target, slot } => {
-                    super::emit_load(code, *target, frame_slot(slot.offset()));
+                    AsmProgram::from([Evex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
+                        .assemble(code);
                 }
                 Reload::Const { target, val_bits } => {
                     super::emit_const(code, *target, f32::from_bits(*val_bits));
@@ -1095,8 +1103,10 @@ pub(crate) mod driver {
             for r in &plan.reloads {
                 Self::reload(code, r);
             }
-            if let Some((dst, src)) = plan.setup_mov {
-                super::emit_mov(code, dst, src);
+            if let Some((dst, src)) = plan.setup_mov
+                && dst != src
+            {
+                AsmProgram::from([Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
             }
             match &plan.op {
                 ResolvedOp::Nop => {}
@@ -1125,11 +1135,23 @@ pub(crate) mod driver {
                     let gather_dst = crate::emit::declared_temp(plan.scratch.temp(1));
                     const RAX: u8 = 0;
                     const RDI: u8 = 7;
-                    super::emit_cvttps2dq(code, idx_int, *idx); // float idx -> int32 lanes
-                    super::emit_set_gather_mask(code); // k1 = 0xFFFF (clobbers rax)
-                    super::emit_load_ptr_from_ctx(code, RAX, RDI, (*slot as i32) * 8);
-                    super::emit_gather(code, gather_dst, RAX, idx_int);
-                    super::emit_mov(code, *dst, gather_dst);
+                    AsmProgram::from([
+                        Evex::m0f_f3(0x5B).rrr(idx_int.0, UNUSED_VVVV, idx.0),
+                        EncodedInst::from_slice(&[0xB8, 0xFF, 0xFF, 0x00, 0x00]),
+                        EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]),
+                        x86::MovLoadPtr {
+                            dst: PtrReg(RAX),
+                            base: PtrReg(RDI),
+                            disp: (*slot as i32) * 8,
+                        }
+                        .encode(),
+                        super::gather(gather_dst, RAX, idx_int),
+                    ])
+                    .assemble(code);
+                    if *dst != gather_dst {
+                        AsmProgram::from([Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, gather_dst.0)])
+                            .assemble(code);
+                    }
                 }
                 ResolvedOp::Uniform { dst, load } => {
                     super::emit_uniform_load(code, *dst, *load);
@@ -1163,7 +1185,8 @@ pub(crate) mod driver {
                     super::emit_binary(code, OpKind::Mul, *dst, *a, *b);
                     match c_deferred {
                         Some(DeferredReload::FromStack(slot)) => {
-                            super::emit_load(code, *c, frame_slot(slot.offset()));
+                            AsmProgram::from([Evex::m0f(0x10).rm(c.0, frame_slot(slot.offset()))])
+                                .assemble(code);
                         }
                         Some(DeferredReload::Const(bits)) => {
                             super::emit_const(code, *c, f32::from_bits(*bits));
@@ -1178,14 +1201,19 @@ pub(crate) mod driver {
                     if_false,
                 } => {
                     // setup_mov already placed the vector mask in dst; one vpternlogd.
-                    super::emit_select(code, *dst, *if_true, *if_false);
+                    AsmProgram::from([Evex::m0f3a_66(0x25)
+                        .imm(0xCA)
+                        .rrr(dst.0, if_true.0, if_false.0)])
+                    .assemble(code);
                 }
             }
             Ok(())
         }
 
         fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
-            super::emit_mov(code, dst, src);
+            if dst != src {
+                AsmProgram::from([Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
+            }
         }
 
         fn emit_store(
@@ -1194,7 +1222,7 @@ pub(crate) mod driver {
             src: Reg,
             offset: u32,
         ) -> Result<(), CompileError> {
-            super::emit_store(code, frame_slot(offset), src);
+            AsmProgram::from([Evex::m0f(0x11).rm(src.0, frame_slot(offset))]).assemble(code);
             Ok(())
         }
 
@@ -1212,7 +1240,8 @@ pub(crate) mod driver {
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
-                    super::emit_load(code, target, frame_slot(slot.offset()));
+                    AsmProgram::from([Evex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
+                        .assemble(code);
                     target
                 }
             }
@@ -1256,19 +1285,27 @@ pub(crate) mod driver {
         // slots sit above it.
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            x86::emit_sub_rsp(code, bytes);
+            AsmProgram::from([x86::Inst::SubImm32 {
+                dst: x86::gpr::RSP,
+                imm: x86::Imm32(bytes as i32),
+            }])
+            .assemble(code);
         }
 
         fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            x86::emit_add_rsp(code, bytes);
+            AsmProgram::from([x86::Inst::AddImm32 {
+                dst: x86::gpr::RSP,
+                imm: x86::Imm32(bytes as i32),
+            }])
+            .assemble(code);
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-            super::emit_store(code, frame_slot(offset), src);
+            AsmProgram::from([Evex::m0f(0x11).rm(src.0, frame_slot(offset))]).assemble(code);
         }
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-            super::emit_load(code, dst, frame_slot(offset));
+            AsmProgram::from([Evex::m0f(0x10).rm(dst.0, frame_slot(offset))]).assemble(code);
         }
 
         fn latch_bounds(&mut self, code: &mut Vec<u8>) {
@@ -1288,14 +1325,14 @@ pub(crate) mod driver {
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            super::emit_store(
-                code,
+            AsmProgram::from([Evex::m0f(0x11).rm(
+                src.0,
                 Mem {
                     base: x86::scaffold::OUT_PTR,
                     disp: NoDisp,
                 },
-                src,
-            );
+            )])
+            .assemble(code);
         }
 
         fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
@@ -1308,7 +1345,7 @@ pub(crate) mod driver {
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            x86::ret(code);
+            AsmProgram::from([x86::Inst::Ret]).assemble(code);
         }
     }
 

@@ -1,3 +1,11 @@
+> **Resolved and obsolete (annotated 2026-09-09).** The defect this investigates —
+> kernels with more than three parameters failing on trait-bound errors — was a
+> property of the type-level combinator tier, which no longer exists. `kernel!`
+> lowers to an arena and folds parameters in as constants; the tree today contains
+> working five- and seven-parameter kernels. The root cause identified below is
+> correct history for a compiler that was replaced, not a live constraint. See
+> [`plans/2026-07-20-kernel-unification.md`](plans/2026-07-20-kernel-unification.md).
+
 # Kernel Parameter Limit Investigation
 
 **Date**: 2026-01-19

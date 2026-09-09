@@ -1,3 +1,11 @@
+> **Obsolete — the problem it prototypes against is gone (annotated 2026-09-09).**
+> The nested-`Let` trait-bound explosion was a property of the type-level
+> combinator tier, retired by the JIT-first `Kernel`/`ExprArena` architecture; the
+> `opt-level=1/2` dev-profile workaround it belongs to is likewise gone (see
+> Cargo.toml's own note). `pixelflow-core/src/combinators/context.rs` and
+> `pixelflow-compiler/src/codegen.rs` no longer exist. Kept as the record of a
+> considered alternative, not as work to do.
+
 # Flat Context Tuple Prototype
 
 ## Problem: Nested Let Trait Bound Explosion

@@ -155,6 +155,27 @@ enum Command {
         #[arg(long)]
         app_cap: Option<u64>,
     },
+    /// The extraction self-consistency census: what the winning DP arm
+    /// claimed for the choice map it selected, against what the term that map
+    /// materializes actually costs — same cost model, same shape the
+    /// extraction ran at. Deterministic: no clock, no emitter, no probe.
+    Consistency {
+        /// CSV output (one row per kernel per cap).
+        #[arg(long)]
+        out: PathBuf,
+        /// Class caps to census, one arm each.
+        #[arg(long, num_args = 1..)]
+        class_cap: Vec<usize>,
+        /// Only kernels whose name contains this substring.
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        font: Option<PathBuf>,
+        /// The application budget beside each cap; the plan's 40 per class
+        /// of the cap when omitted.
+        #[arg(long)]
+        app_cap: Option<u64>,
+    },
     /// Aggregate `run --class-cap` rows across caps into the sweep documents.
     CapSweep {
         #[arg(long, num_args = 1..)]
@@ -1510,6 +1531,117 @@ fn run(args: &RunArgs<'_>) {
 }
 
 // ---------------------------------------------------------------------------
+// consistency: the extractor's claim against the price of what it returned
+// ---------------------------------------------------------------------------
+
+const CONSISTENCY_HEADER: &str = "family,kernel,extent,cap,app_cap,input_nodes,inserted_classes,\
+classes_after,live_classes,objective,scale,claimed,tree_cost,dag_cost,signed_error,error_frac,\
+arena_nodes,arena_dag_unweighted,sharing_ratio,\
+optimize_ms\n";
+
+/// One kernel at one cap: saturate, extract, and compare the winning DP arm's
+/// own minimized value against the price of the term it returned.
+///
+/// Nothing here is timed for a claim — `optimize_ms` is context, not a
+/// result. Every other column is a deterministic function of the input, so
+/// two hosts must produce the same file.
+fn consistency(
+    out: &Path,
+    caps: &[usize],
+    filter: Option<&str>,
+    font: Option<&Path>,
+    app_cap: Option<u64>,
+) {
+    assert!(!caps.is_empty(), "--class-cap: at least one arm");
+    let default_font = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../pixelflow-graphics/assets/DejaVuSansMono-Fallback.ttf");
+    let kernels = real_kernels(font.unwrap_or(&default_font), filter);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).expect("create out dir");
+    }
+    let mut sink = std::fs::File::create(out).unwrap_or_else(|e| panic!("create {out:?}: {e}"));
+    write!(sink, "{CONSISTENCY_HEADER}").expect("header");
+
+    for (i, rk) in kernels.iter().enumerate() {
+        let (arena, root) = rk.kernel.parts();
+        let shape = LatticeShape::new(rk.extent);
+        let (la, lr) = legalize(arena, root);
+        let nodes = reachable_count(&la, lr);
+        for &cap in caps {
+            let arm = CapArm {
+                rule: CapRule::Flat(cap),
+                applications: app_cap,
+            };
+            let mut egraph = Optimizer::production().egraph();
+            let root_class = insert(&la, lr, &mut egraph, Vocabulary::Runtime)
+                .unwrap_or_else(|_| panic!("{}: not e-graph representable", rk.name));
+            let inserted = egraph.num_classes();
+            let sizes = InputSizes { nodes, inserted };
+            let (resolved_cap, resolved_apps) = arm.resolve(sizes);
+            let mut optimizer = arm.optimizer(shape, sizes);
+            let t = Instant::now();
+            let optimized = optimizer.run(&mut egraph, root_class, nodes);
+            let optimize_ms = t.elapsed().as_secs_f64() * 1e3;
+
+            let audit = optimized
+                .extraction
+                .audit
+                .expect("production extraction always runs a DP");
+            let actual = audit.scale.of(optimized.cost);
+            let signed = audit.signed_error(optimized.cost);
+            let (a, r) = optimized.to_arena(&egraph, root_class);
+            let row = format!(
+                "{family},{kernel},{w}x{h},{cap},{apps},{nodes},{inserted},{after},{live},\
+{objective},{scale},{claimed},{tree},{dag},{signed},{frac:.6},\
+{arena_nodes},{arena_dag},{ratio:.3},{ms:.1}\n",
+                family = rk.class,
+                kernel = rk.name,
+                w = rk.extent[0],
+                h = rk.extent[1],
+                cap = resolved_cap,
+                apps = resolved_apps,
+                after = optimized.stats.classes,
+                live = optimized
+                    .extraction
+                    .shared_pass
+                    .map_or(0, |p| p.live_classes),
+                objective = optimized.extraction.objective.as_str(),
+                scale = audit.scale.as_str(),
+                claimed = audit.claimed,
+                tree = optimized.cost.tree,
+                dag = optimized.cost.dag,
+                signed = signed,
+                frac = if actual == 0 {
+                    0.0
+                } else {
+                    signed as f64 / actual as f64
+                },
+                arena_nodes = reachable(&a, r).len(),
+                arena_dag = dag_cost(&a, r),
+                ratio = optimized.cost.tree as f64 / optimized.cost.dag.max(1) as f64,
+                ms = optimize_ms,
+            );
+            write!(sink, "{row}").expect("append row");
+            sink.flush().expect("flush");
+            eprintln!(
+                "[{}/{}] {} cap={resolved_cap} live={} obj={} claimed={} dag={} err={signed} \
+({optimize_ms:.0}ms)",
+                i + 1,
+                kernels.len(),
+                rk.name,
+                optimized
+                    .extraction
+                    .shared_pass
+                    .map_or(0, |p| p.live_classes),
+                optimized.extraction.objective.as_str(),
+                audit.claimed,
+                optimized.cost.dag,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // diff
 // ---------------------------------------------------------------------------
 
@@ -2624,6 +2756,19 @@ fn main() {
             skip: &skip,
             font: font.as_deref(),
         }),
+        Command::Consistency {
+            out,
+            class_cap,
+            filter,
+            font,
+            app_cap,
+        } => consistency(
+            &out,
+            &class_cap,
+            filter.as_deref(),
+            font.as_deref(),
+            app_cap,
+        ),
         Command::CapSweep {
             rows,
             out_prefix,

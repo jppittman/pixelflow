@@ -1,3 +1,10 @@
+> **Historical (Apr 2026), exploratory.** A brainstorm, never a plan of record.
+> Variance analysis did land and is live on the arena; the NNUE-scored extraction
+> it assumes was deleted in Sep 2026, and `pixelflow-compiler/src/codegen/leveled.rs`
+> no longer exists. Kept for the reference list and the scope-aware-CSE framing,
+> which survives as "demand is a property of the DAG" in
+> [`../plans/2026-09-08-one-conditional-three-lowerings.md`](../plans/2026-09-08-one-conditional-three-lowerings.md).
+
 # Brainstorm: Variance Analysis via E-Graph Saturation
 
 ## Context

@@ -26,7 +26,7 @@ jobs:
   # `if`, not a workflow-level `paths-ignore`: a job skipped by `if` reports
   # "skipped", which satisfies a required status check, while a workflow that
   # never runs leaves the required checks pending and blocks the merge. The
-  # three metadata jobs below run on every CL regardless; they take seconds.
+  # six metadata jobs below run on every CL regardless; they take seconds.
   change-scope:
     name: Change scope
     runs-on: ubuntu-latest
@@ -112,6 +112,24 @@ jobs:
 
       - name: Check platform cfg only gates a whole file/mod, or a single-line dispatch item in mod.rs
         run: bash scripts/check-cfg-encapsulation.sh
+
+  # A plan or design must not name a source file the tree does not have.
+  # docs/plans/2026-09-06-kernel-with-a-lattice.md §4 asked for this by name:
+  # every stage of that programme deleted files that prose elsewhere still
+  # described, and every stage found them by grepping rather than by a job
+  # failing. Baselined the same way cfg-encapsulation is, and for the same
+  # reason it needs one: a plan may legitimately name a file it proposes to
+  # create, so only NEW pairs fail.
+  # Runs on docs-only CLs too -- it is a docs check, and it needs no toolchain.
+  doc-paths:
+    name: Doc source paths
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check plans and designs cite source paths that exist
+        run: bash scripts/check-doc-paths.sh
 
   # pixelflow-search's `provenance-journal` feature (the rule-provenance
   # journal: origins, application log, union journal, `derivation_ancestors`,

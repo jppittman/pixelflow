@@ -1,3 +1,12 @@
+> **Superseded — every crate and type it names is gone.** The "Triple IR" problem
+> it describes was real and was solved, but not this way. `pixelflow-nnue` no
+> longer exists as a crate; `OpType` is `OpKind`; `ExprTree`, `Expr` (the Arc tree)
+> and `HalfEPFeature` are all deleted; `ExprArena` is the sole IR. The migration
+> checklist below is finished or moot. For the current layering read
+> [`../plans/2026-08-02-ir-layering.md`](../plans/2026-08-02-ir-layering.md) and
+> CLAUDE.md's crate table; for how to add an op, `pixelflow-ir/src/kind.rs`'s
+> `op_table!` and [`opkind-numbering-is-private.md`](opkind-numbering-is-private.md).
+
 # Compiler Architecture 2026: Unifying the IR
 
 ## 1. The Problem

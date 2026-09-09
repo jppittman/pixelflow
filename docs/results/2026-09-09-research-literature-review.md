@@ -1,9 +1,17 @@
 # A literature review of PixelFlow's own record
 
 **Date:** 2026-09-09
-**Verified against:** `main` @ `8b6e3ce4` ("docs: one conditional, three lowerings (#1211)", 2026-09-08),
-plus `origin/claude/claims-ledger` @ #1207 and `origin/claude/benchmark-correction` @ #1215, which are
-unmerged and cited as such throughout.
+**Verified against:** `9b9ac41` ("feat(pixelflow-ir): generic arena-backed `Dag` (#1230)", 2026-09-08),
+plus `origin/claude/claims-ledger` @ #1207 and `origin/claude/benchmark-correction` @ #1215, which were
+unmerged when this was written and are cited as such throughout.
+
+> **Corrected 2026-09-09, and the error is this document's own subject.** The first revision of this
+> line read `main @ 8b6e3ce4`. That was the local `main` ref, which was five commits stale; the tree
+> actually surveyed was `9b9ac41`, which additionally contains #1206, #1224, #1226, #1229 and #1230.
+> Nothing in the survey changes — but a document whose §4 names "no record of *which tree* was
+> verified" as the cheapest unfixed failure mode got its own provenance wrong on the first try, by
+> trusting a ref name instead of resolving it. Naming a commit is not enough; the commit has to be
+> the one you actually read. Recorded rather than quietly amended, per §4.
 **Corpus:** 304 files under `docs/` (179 markdown), 57 GitHub issues (8 open), 11 open pull requests.
 **Status:** Draft. A survey, not a plan. It proposes nothing and retracts nothing; where it disagrees
 with a document it says so and cites the source that settles it.
@@ -44,19 +52,26 @@ checks somebody could write rather than caveats somebody keeps attaching:
 
 - **The `DESIGN_DOC.md` status vocabulary is followed by 3 of 59 plans and designs.** `docs/README.md`
   states: "Every future plan and design must use exactly one of `Draft`, `Review`, `Approved`, or
-  `Implemented` in its metadata." 31 of 59 carry a `**Status:**` line at all; 3 of those use a
+  `Implemented` in its metadata." 31 of 59 carried a `**Status:**` line at all; 3 of those use a
   sanctioned word. The rest have invented ~20 status words in the field — `Plan of record`,
   `REGISTERED`, `Landed`, `Proposed`, `Closed`, `Scoping`, `denotation`, `DESIGN + PRE-REGISTRATION`,
   `Reconnaissance only`, `Ported`, `Superseded`. Several of those are genuinely more informative than
   the sanctioned four, which is the actual finding: **the vocabulary is wrong, not the authors.** A
   pre-registration is not a draft and never becomes "implemented"; a plan of record is not "approved".
   The fix is to widen the vocabulary to what the corpus actually needs and then enforce it, not to
-  rewrite 56 headers into words that fit none of them.
-- **33 of 59 plans and designs are not linked from `docs/README.md`**, including every current-direction
-  document written since 2026-09-06 (`kernel-with-a-lattice`, `lattice-is-the-index`,
+  rewrite 56 headers into words that fit none of them. *(Partly addressed in this change: 52 of 59 now
+  carry a status line or a supersession banner. The template's vocabulary itself is still unfixed.)*
+- **33 of 59 plans and designs were not linked from `docs/README.md`**, including every
+  current-direction document written since 2026-09-06 (`kernel-with-a-lattice`, `lattice-is-the-index`,
   `egraph-at-production-scale`, `one-conditional-three-lowerings`, `exprarena-on-dag`) and the entire
-  Phase 3 registration series. The index describes the tree as it stood roughly a week ago. It is
-  accurate about what it covers, which is the more dangerous kind of stale.
+  Phase 3 registration series. The index described the tree as it stood roughly a week ago. It was
+  accurate about what it covered, which is the more dangerous kind of stale. *(Fixed in this change:
+  the README now carries a complete index and 0 are unlisted.)*
+- **17 plans and designs named source files the tree does not have**, 90 mentions across 48 distinct
+  dead paths — `FrameLattice`-era types, `ir_bridge.rs` (split into `lower.rs` + `emit.rs` by #1206
+  the day before this review), the whole deleted extraction-head module tree. A reader following one
+  lands on nothing. *(Fixed in this change: 19 documents gained supersession banners saying which half
+  of them is still true, and `scripts/check-doc-paths.sh` now fails CI on a new one.)*
 
 ---
 
@@ -627,11 +642,15 @@ Five, ordered by value per hour. None requires a measurement.
 2. **Add a `Verified against:` field to the design-doc template and grep for it.** Failure mode 5 costs
    more than any other unfixed one, it recurred four times in a single sweep, and the check is one
    script in the metadata jobs (which already run in ~6 s with no toolchain — `check-bin-declarations.sh`
-   is the precedent).
-3. **Fix the status vocabulary rather than the 56 documents.** Replace `Draft/Review/Approved/Implemented`
-   in `templates/DESIGN_DOC.md` with the words the corpus actually needs — at minimum
-   `Draft / Proposed / Registered / Plan of record / Landed / Superseded / Closed` — then enforce it in
-   the same metadata job, and refresh `docs/README.md`'s index over the 33 unlisted documents.
+   is the precedent). *(Half done: the field is now required by `templates/DESIGN_DOC.md`, which also
+   says to resolve the sha rather than name a ref — the mistake this document itself made. Nothing
+   enforces it yet; that is the remaining half.)*
+3. ~~**Fix the status vocabulary rather than the 56 documents.**~~ **Done.**
+   `templates/DESIGN_DOC.md` now defines `Draft / Proposed / Registered / Plan of record / Landed /
+   Closed / Superseded / Historical`, and `docs/README.md` states the same list and indexes all 59
+   documents. `Registered` is the one worth naming: a pre-registration commits its constants before the
+   data exists and is never revisable afterwards, which none of the old four words could express. Still
+   unenforced by a job.
 4. **Write #1193.** It is the gate that makes the benchmark correction's §B.5 enforceable and the one
    that would have caught the class-cap warm regression without a human noticing.
 5. **Amend `2026-09-01-schedule-cost-model-denotation.md`.** Its successor program is a reranker over

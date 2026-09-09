@@ -76,9 +76,10 @@ pub use cost::{CostFunction, CostModel};
 pub use deps::{Deps, DepsAnalysis};
 pub use derivative::{ChainRule, derivative_rules};
 pub use extract::{
-    ChoiceCost, ExtractedDAG, Extraction, ExtractionObjective, ExtractionReport,
-    SHARED_DAG_PASS_BYTE_BUDGET, SharedPassStats, build_extracted_dag_from_choices,
-    choices_to_arena, compute_ref_counts, cost_of_choices, extract, extract_dag,
+    ChoiceCost, ClaimAudit, CostScale, ExtractedDAG, Extraction, ExtractionObjective,
+    ExtractionReport, SHARED_DAG_PASS_BYTE_BUDGET, SharedPassStats,
+    build_extracted_dag_from_choices, choices_to_arena, compute_ref_counts, cost_of_choices,
+    extract, extract_dag,
 };
 pub use fold_rules::{EmptyFold, PeelFold, fold_rules};
 pub use graph::{

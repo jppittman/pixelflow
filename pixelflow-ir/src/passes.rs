@@ -1243,11 +1243,11 @@ fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
 /// exponent field directly: `2^xi = bitcast((int(xi) + 127) << 23)`. Built from
 /// the bit-manip primitives (`TruncToInt`/`IntToFloat`/`IAdd`/`Shl`) — these are
 /// the float↔int conversions a backend cannot avoid for exp/log.
-fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
+fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
     // Clamp to a safe exponent range to avoid int overflow / inf.
     let lo = arena.push_const(-EXP2_CLAMP);
     let hi = arena.push_const(EXP2_CLAMP);
-    let x = arena.push_binary(OpKind::Max, x, lo);
+    let x = arena.push_binary(OpKind::Max, arg_x, lo);
     let x = arena.push_binary(OpKind::Min, x, hi);
 
     // xi = floor(x), xf = x - xi
@@ -1270,10 +1270,15 @@ fn expand_exp2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let pow2i = arena.push_binary(OpKind::Shl, biased, shift); // bitcast result
 
     // 2^x = 2^xf · 2^xi
-    arena.push_binary(OpKind::Mul, p, pow2i)
+    let val = arena.push_binary(OpKind::Mul, p, pow2i);
+
+    // Outside domain (NaN input), return NaN. Check original arg_x, not clamped x.
+    let is_not_nan = arena.push_binary(OpKind::Eq, arg_x, arg_x);
+    let nan = arena.push_const(f32::NAN);
+    arena.push_ternary(OpKind::Select, is_not_nan, val, nan)
 }
 
-/// `log2(x)` as a primitive subgraph (x > 0).
+/// `log2(x)` as a primitive subgraph (documented domain x > 0).
 ///
 /// Cephes `log2f` algorithm. `log2(x) = e + log2(m)` where `e` is the unbiased
 /// exponent and `m ∈ [1,2)` is the mantissa. Extract `e` by shifting the
@@ -1338,7 +1343,14 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let z = arena.push_binary(OpKind::Add, y_ea, t_ea);
     let z = arena.push_binary(OpKind::Add, z, y);
     let z = arena.push_binary(OpKind::Add, z, t);
-    arena.push_binary(OpKind::Add, z, e)
+    let val = arena.push_binary(OpKind::Add, z, e);
+
+    // Documented domain: x > 0.0. Outside domain (x <= 0 or x is NaN), return NaN.
+    // Lt(zero, x) is 0 < x (ordered comparison, false for NaN and false for x <= 0).
+    let zero = arena.push_const(0.0);
+    let in_domain = arena.push_binary(OpKind::Lt, zero, x);
+    let nan = arena.push_const(f32::NAN);
+    arena.push_ternary(OpKind::Select, in_domain, val, nan)
 }
 
 /// Largest `|x|` for which `sin`/`cos`/`tan` return a value. Beyond it they

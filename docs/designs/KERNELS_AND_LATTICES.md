@@ -1,3 +1,13 @@
+> **Milestones stale, design current (annotated 2026-09-09).** The design below is
+> the implemented substrate and CLAUDE.md still points here for it. The June 2026
+> milestone list is a point-in-time snapshot and under-reports: `combinators/texture.rs`
+> was deleted (M4's absorption into `DiscreteManifold` happened), and the
+> `Frozen`/`Pinned` binding listed as "not yet built" exists. The `Lattice` struct
+> described in Open Questions has since lost its `origin` — a lattice is an extent,
+> per [`../plans/2026-09-06-lattice-is-the-index.md`](../plans/2026-09-06-lattice-is-the-index.md)
+> (landed). Use [`../plans/2026-09-06-kernel-with-a-lattice.md`](../plans/2026-09-06-kernel-with-a-lattice.md)
+> for consumer-migration status.
+
 # Kernels and Lattices: Bound Memory in the Language
 
 **Status:** IR + lowering + interpreter + AVX-512 JIT + internal-loop collapse

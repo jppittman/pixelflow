@@ -200,13 +200,13 @@ pub fn trace<C: CostFunction>(
     let n = egraph.num_classes();
 
     let mut dp = Dp::new(costs, shape, Insertion, CandidateTable::with_classes(n));
-    let tree_raw = tree_dp_pass(egraph, root, &mut dp);
+    let tree_raw = tree_dp_pass(egraph, root, &mut dp).choices;
     let tree = finish(egraph, root, tree_raw, dp.into_recorder(), costs, shape);
 
     let mut dp = Dp::new(costs, shape, Insertion, CandidateTable::with_classes(n));
     let pass = shared_dag_dp_pass(egraph, root, &mut dp, SHARED_DAG_PASS_BYTE_BUDGET);
     let table = dp.into_recorder();
-    let Some(raw) = pass.choices else {
+    let Some(raw) = pass.outcome.map(|o| o.choices) else {
         let (choices, cost) = (tree.repaired.clone(), tree.cost);
         return StageTrace {
             tree,
@@ -290,13 +290,13 @@ fn run_arms<C: CostFunction, T: TieBreak + Copy>(
     ties: T,
 ) -> (Vec<Option<usize>>, ChoiceCost) {
     let mut dp = Dp::new(costs, shape, ties, ());
-    let mut tree = tree_dp_pass(egraph, root, &mut dp);
+    let mut tree = tree_dp_pass(egraph, root, &mut dp).choices;
     repair_choices_well_founded(egraph, root, &mut tree);
     let tree_cost = cost_of_choices(egraph, root, &tree, costs, shape);
 
     let mut dp = Dp::new(costs, shape, ties, ());
     let pass = shared_dag_dp_pass(egraph, root, &mut dp, SHARED_DAG_PASS_BYTE_BUDGET);
-    let Some(mut shared) = pass.choices else {
+    let Some(mut shared) = pass.outcome.map(|o| o.choices) else {
         return (tree, tree_cost);
     };
     repair_choices_well_founded(egraph, root, &mut shared);

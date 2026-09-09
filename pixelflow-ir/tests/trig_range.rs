@@ -40,12 +40,34 @@ fn asin_at(x: f32) -> f32 {
 fn acos_at(x: f32) -> f32 {
     eval1(|a, v| a.push_unary(OpKind::Acos, v), x)
 }
+fn log2_at(x: f32) -> f32 {
+    eval1(|a, v| a.push_unary(OpKind::Log2, v), x)
+}
+fn ln_at(x: f32) -> f32 {
+    eval1(|a, v| a.push_unary(OpKind::Ln, v), x)
+}
+fn log10_at(x: f32) -> f32 {
+    eval1(|a, v| a.push_unary(OpKind::Log10, v), x)
+}
+fn exp_at(x: f32) -> f32 {
+    eval1(|a, v| a.push_unary(OpKind::Exp, v), x)
+}
+fn exp2_at(x: f32) -> f32 {
+    eval1(|a, v| a.push_unary(OpKind::Exp2, v), x)
+}
 fn atan2_at(y: f32, x: f32) -> f32 {
     let mut a = ExprArena::new();
     let vy = a.push_var(0);
     let vx = a.push_var(1);
     let root = a.push_binary(OpKind::Atan2, vy, vx);
     eval_scalar(&a, root, &[y, x], &BindingTable::empty())
+}
+fn pow_at(a_val: f32, b_val: f32) -> f32 {
+    let mut a = ExprArena::new();
+    let va = a.push_var(0);
+    let vb = a.push_var(1);
+    let root = a.push_binary(OpKind::Pow, va, vb);
+    eval_scalar(&a, root, &[a_val, b_val], &BindingTable::empty())
 }
 
 /// Reproducible LCG — a fixed seed keeps a failure reproducible from the
@@ -418,4 +440,85 @@ fn sin_of_negative_zero_is_positive_zero() {
     // The value at +0.0 is unaffected either way.
     assert_eq!(sin_at(0.0), 0.0);
     assert!(sin_at(0.0).is_sign_positive());
+}
+
+// ===========================================================================
+// Log and Pow family domain contracts.
+// ===========================================================================
+
+/// `log2`, `ln`, `log10` return NaN for x <= 0 and non-finite arguments, and
+/// are accurate for x > 0.
+#[test]
+fn log_family_nan_outside_domain_and_accurate_inside() {
+    let out_of_domain = [0.0, -0.0, -1.0, -100.0, f32::NEG_INFINITY, f32::NAN];
+    for &x in &out_of_domain {
+        let l2 = log2_at(x);
+        let ln = ln_at(x);
+        let l10 = log10_at(x);
+        assert!(l2.is_nan(), "log2({x}) should be NaN, got {l2}");
+        assert!(ln.is_nan(), "ln({x}) should be NaN, got {ln}");
+        assert!(l10.is_nan(), "log10({x}) should be NaN, got {l10}");
+    }
+
+    let in_domain = [0.1f32, 0.5, 1.0, 2.0, 10.0, 1000.0];
+    for &x in &in_domain {
+        let got_log2 = log2_at(x);
+        let want_log2 = (x as f64).log2() as f32;
+        assert!(
+            (got_log2 - want_log2).abs() <= 1e-4,
+            "log2({x}) = {got_log2}, want {want_log2}"
+        );
+
+        let got_ln = ln_at(x);
+        let want_ln = (x as f64).ln() as f32;
+        assert!(
+            (got_ln - want_ln).abs() <= 1e-4,
+            "ln({x}) = {got_ln}, want {want_ln}"
+        );
+
+        let got_log10 = log10_at(x);
+        let want_log10 = (x as f64).log10() as f32;
+        assert!(
+            (got_log10 - want_log10).abs() <= 1e-4,
+            "log10({x}) = {got_log10}, want {want_log10}"
+        );
+    }
+}
+
+/// `pow` returns NaN for non-positive bases (a <= 0) or NaN arguments.
+#[test]
+fn pow_nan_for_nonpositive_base_or_nan() {
+    let bad_bases = [0.0, -0.0, -0.5, -1.0, -100.0, f32::NAN];
+    for &a in &bad_bases {
+        for &b in &[0.5f32, 1.0, 2.0, -1.0, f32::NAN] {
+            let res = pow_at(a, b);
+            assert!(res.is_nan(), "pow({a}, {b}) should be NaN, got {res}");
+        }
+    }
+    // Base positive but exponent NaN
+    assert!(pow_at(2.0, f32::NAN).is_nan());
+
+    // Valid positive base
+    let got = pow_at(2.0, 3.0);
+    assert!((got - 8.0).abs() <= 1e-3, "pow(2.0, 3.0) = {got}, want 8.0");
+    let got_sqrt = pow_at(4.0, 0.5);
+    assert!(
+        (got_sqrt - 2.0).abs() <= 1e-3,
+        "pow(4.0, 0.5) = {got_sqrt}, want 2.0"
+    );
+}
+
+/// `exp` and `exp2` propagate NaN arguments.
+#[test]
+fn exp_family_propagates_nan() {
+    let e_nan = exp_at(f32::NAN);
+    let e2_nan = exp2_at(f32::NAN);
+    assert!(e_nan.is_nan(), "exp(NAN) should be NaN, got {e_nan}");
+    assert!(e2_nan.is_nan(), "exp2(NAN) should be NaN, got {e2_nan}");
+
+    let got_exp = exp_at(0.0);
+    assert!((got_exp - 1.0).abs() <= 1e-4);
+
+    let got_exp2 = exp2_at(3.0);
+    assert!((got_exp2 - 8.0).abs() <= 1e-4);
 }

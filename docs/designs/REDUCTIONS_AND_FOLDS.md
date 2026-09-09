@@ -1,3 +1,13 @@
+> **Historical (Apr 2026) — the denotation is current, the cost model is not.**
+> `Reduce` exists, `expand_reduce` unrolls it, and the variance rule
+> `deps(Reduce) = deps(body) \ {dim}` is the shipped one. Ignore every reference
+> below to the NNUE picking an implementation or an ILP producing training data:
+> that program was deleted in Sep 2026
+> ([`../plans/2026-09-01-schedule-cost-model-denotation.md`](../plans/2026-09-01-schedule-cost-model-denotation.md)).
+> Extraction is priced by `CostModel::latency_prior()`. The axiom this document
+> descends from is
+> [`2026-07-24-totality-and-the-cost-model.md`](2026-07-24-totality-and-the-cost-model.md).
+
 # Reductions, Folds, and Dimension Collapse
 
 ## The Problem (Apr 2, 2026)

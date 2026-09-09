@@ -1,3 +1,12 @@
+> **Historical (Jan 2026) — a ranked wishlist against a compiler that has since
+> been replaced (annotated 2026-09-09).** Several entries have been done by other
+> means and several are moot: optimization now runs on the arena rather than the
+> AST (#1206), the combinator tier whose ergonomics it costs is retired, and
+> `context.rs` is gone. The ranking *method* — improvements to the compiler are
+> multiplicative because every kernel pays them — is still the right frame, and is
+> why the e-graph and codegen work has been prioritised the way it has. Check any
+> individual row against the tree before acting on it.
+
 # Compiler Improvement Opportunities
 
 Analysis of potential improvements to the `kernel!` macro compiler, ranked by bang-for-buck.
