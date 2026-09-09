@@ -12,13 +12,13 @@
 use std::sync::Arc;
 
 use pixelflow_codegen::jit_cache::{compile, entry_count};
-use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{ExprArena, ExprId, UniformDecl, UniformIdentity};
+use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformIdentity};
 use pixelflow_ir::kind::OpKind;
+use pixelflow_ir::{Kernel, LatticeShape};
 
 /// `(x − cx)·r + cy` over three fresh instances, declared in one of two
 /// orders so the link — not the declaration order — is what is shared.
-fn circle(declared_in_order: bool) -> (ExprArena, ExprId) {
+fn circle(declared_in_order: bool) -> Kernel {
     let decl = |default| UniformDecl {
         id: UniformIdentity::mint(),
         default,
@@ -43,20 +43,20 @@ fn circle(declared_in_order: bool) -> (ExprArena, ExprId) {
     let d = a.push_binary(OpKind::Sub, x, ucx);
     let scaled = a.push_binary(OpKind::Mul, d, ur);
     let root = a.push_binary(OpKind::Add, scaled, ucy);
-    (a, root)
+    Kernel::from_parts(a, root)
 }
 
 #[test]
 fn a_thousand_circles_is_one_compile() {
     const SHAPE: LatticeShape = LatticeShape::new([64, 64]);
     let before = entry_count();
-    let (a, root) = circle(true);
-    let first = compile(&a, root, SHAPE).expect("compile").kernel;
+    let k = circle(true);
+    let first = compile(&k, SHAPE).expect("compile").kernel;
     let after_first = entry_count();
     assert_eq!(after_first - before, 1, "the first circle compiles once");
     for i in 1..1000 {
-        let (a, root) = circle(i % 2 == 0);
-        let linked = compile(&a, root, SHAPE).expect("compile");
+        let k = circle(i % 2 == 0);
+        let linked = compile(&k, SHAPE).expect("compile");
         assert!(
             Arc::ptr_eq(&first, &linked.kernel),
             "circle {i} did not share the first one's code"

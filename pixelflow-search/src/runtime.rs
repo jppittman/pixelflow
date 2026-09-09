@@ -233,7 +233,7 @@ fn saturation_switch() -> SaturationSwitch {
 /// `Buffer`/`Nary`, to memoize the bail-out case too, not just the
 /// e-graph-representable ones).
 fn canonical_key(arena: &ExprArena, root: ExprId) -> Vec<u8> {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -312,12 +312,11 @@ fn canonical_key(arena: &ExprArena, root: ExprId) -> Vec<u8> {
                 push_id(&mut key, &dense, b);
                 push_id(&mut key, &dense, c);
             }
-            &ExprNode::Nary(op, start, n) => {
+            &ExprNode::Nary(op, _start, n) => {
                 key.push(7);
                 key.extend_from_slice(&op.marshal().to_bytes());
                 key.extend_from_slice(&n.to_le_bytes());
-                let (s, l) = (start as usize, n as usize);
-                for &child in &arena.nary_children_raw()[s..s + l] {
+                for child in arena.children(id) {
                     push_id(&mut key, &dense, child);
                 }
             }

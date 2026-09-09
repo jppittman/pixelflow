@@ -7,6 +7,7 @@ use super::node::{EClassId, ENode};
 use super::ops::Op;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 
+use pixelflow_ir::Rooted;
 /// A rewrite RHS pattern, shared.
 ///
 /// [`ExprArena`] has no `Debug` impl (it is not a debugging-facing type
@@ -14,12 +15,17 @@ use pixelflow_ir::arena::{ExprArena, ExprId};
 /// assertion failures and test output — so `Instantiate`'s pattern arena is
 /// wrapped rather than forcing a `Debug` impl onto `ExprArena` itself,
 /// which would be a wider API surface change than this justifies.
-#[derive(Clone)]
-pub struct TemplateArena(pub Arc<ExprArena>);
+use pixelflow_ir::expr::ExprData;
 
-impl core::fmt::Debug for TemplateArena {
+/// A rewrite RHS pattern, shared.
+#[derive(Clone)]
+pub struct TemplatePattern(pub Arc<Rooted<ExprData>>);
+
+pub type TemplateArena = TemplatePattern;
+
+impl core::fmt::Debug for TemplatePattern {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "TemplateArena(..)")
+        write!(f, "TemplatePattern(..)")
     }
 }
 
@@ -180,9 +186,9 @@ pub enum RewriteAction {
     /// than by twelve.
     Instantiate {
         /// The RHS pattern.
-        template: TemplateArena,
-        /// Which node of `template` is the pattern's root.
-        root: ExprId,
+        template: TemplatePattern,
+        /// Which entry of `template` is the pattern's root.
+        entry: usize,
         /// `bindings[i]` is the e-class the pattern's `Var(i)` names.
         bindings: alloc::vec::Vec<EClassId>,
     },
