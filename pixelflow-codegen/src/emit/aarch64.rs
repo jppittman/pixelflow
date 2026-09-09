@@ -3,7 +3,7 @@
 //! Each function emits raw machine code bytes for one instruction (or a small fixed sequence).
 //! These are the "atoms" that compound operations are built from.
 
-use super::{AsmInsn, Gpr, Reg, assemble, unimplemented_op};
+use super::{AsmInsn, AsmProgram, Gpr, PtrReg, Reg, assemble, unimplemented_op};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -62,14 +62,14 @@ pub enum Inst {
     Bsl(Reg, Reg, Reg),
 
     // Memory transfers
-    LdrQ(Reg, Mem),
-    StrQ(Reg, Mem),
-    LdrX(Xr, Mem),
-    LdrS(Reg, Mem),
-    LdrW(Xr, MemIndexed),
+    Ldr(Ldr),
+    Str(Str),
 
     // Integer & lane operations
     DupLane0(Reg, Reg),
+    UmovW { dst: Gpr, src: Reg, lane: u8 },
+    InsW { dst: Reg, lane: u8, src: Gpr },
+    MvnW { dst: Gpr, src: Gpr },
     Fcvtzs(Reg, Reg),
     Scvtf(Reg, Reg),
     AddI32(Reg, Reg, Reg),
@@ -88,6 +88,75 @@ pub enum Inst {
 }
 
 impl Inst {
+    #[must_use]
+    #[inline(always)]
+    pub fn ldr(dst: impl Into<LdrReg>, addr: impl Into<Addr>) -> Self {
+        Self::Ldr(Ldr::new(dst, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn ldr_q(dst: Reg, addr: Mem) -> Self {
+        Self::Ldr(Ldr::q(dst, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn ldr_x(dst: PtrReg, addr: Mem) -> Self {
+        Self::Ldr(Ldr::x(dst, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn ldr_s(dst: Reg, addr: Mem) -> Self {
+        Self::Ldr(Ldr::s(dst, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn ldr_w(dst: Gpr, addr: MemIndexed) -> Self {
+        Self::Ldr(Ldr::w(dst, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn str(src: impl Into<StrReg>, addr: Mem) -> Self {
+        Self::Str(Str::new(src, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn str_q(src: Reg, addr: Mem) -> Self {
+        Self::Str(Str::q(src, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn str_x(src: PtrReg, addr: Mem) -> Self {
+        Self::Str(Str::x(src, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn mov(dst: Reg, src: Reg) -> Self {
+        Self::Mov(dst, src)
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn umov_w(dst: Gpr, src: Reg, lane: u8) -> Self {
+        Self::UmovW { dst, src, lane }
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn ins_w(dst: Reg, lane: u8, src: Gpr) -> Self {
+        Self::InsW { dst, lane, src }
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn mvn_w(dst: impl Into<Gpr>, src: impl Into<Gpr>) -> Self {
+        Self::MvnW {
+            dst: dst.into(),
+            src: src.into(),
+        }
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn dup_lane0(dst: Reg, src: Reg) -> Self {
+        Self::DupLane0(dst, src)
+    }
+
     /// Pure encoding of single-word instructions into a 32-bit machine word.
     #[must_use]
     #[inline]
@@ -115,41 +184,13 @@ impl Inst {
             Inst::Fcmge(dst, s1, s2) => Fcmge::new(dst, s1, s2).encode(),
             Inst::Fcmeq(dst, s1, s2) => Fcmeq::new(dst, s1, s2).encode(),
             Inst::Bsl(mask, if_true, if_false) => Bsl::new(mask, if_true, if_false).encode(),
-            Inst::LdrQ(dst, addr) => {
-                assert!(addr.offset.is_multiple_of(Q_BYTES));
-                0x3DC0_0000
-                    | ((addr.offset / Q_BYTES) << 10)
-                    | ((addr.base.0 as u32) << 5)
-                    | (dst.0 as u32)
-            }
-            Inst::StrQ(src, addr) => {
-                assert!(addr.offset.is_multiple_of(Q_BYTES));
-                0x3D80_0000
-                    | ((addr.offset / Q_BYTES) << 10)
-                    | ((addr.base.0 as u32) << 5)
-                    | (src.0 as u32)
-            }
-            Inst::LdrX(dst, addr) => {
-                assert!(addr.offset.is_multiple_of(X_BYTES));
-                0xF940_0000
-                    | ((addr.offset / X_BYTES) << 10)
-                    | ((addr.base.0 as u32) << 5)
-                    | (dst.0 as u32)
-            }
-            Inst::LdrS(dst, addr) => {
-                assert!(addr.offset.is_multiple_of(S_BYTES));
-                0xBD40_0000
-                    | ((addr.offset / S_BYTES) << 10)
-                    | ((addr.base.0 as u32) << 5)
-                    | (dst.0 as u32)
-            }
-            Inst::LdrW(dst, addr) => {
-                0xB860_5800
-                    | ((addr.index.0 as u32) << 16)
-                    | ((addr.base.0 as u32) << 5)
-                    | (dst.0 as u32)
+            Inst::Ldr(_) | Inst::Str(_) => {
+                panic!("Ldr and Str must be emitted via emit_into or AsmProgram")
             }
             Inst::DupLane0(dst, src) => DupLane0::new(dst, src).encode(),
+            Inst::UmovW { dst, src, lane } => UmovW::new(dst, src, lane).encode(),
+            Inst::InsW { dst, lane, src } => InsW::new(dst, lane, src).encode(),
+            Inst::MvnW { dst, src } => table::MvnW::new(dst, src).encode(),
             Inst::Fcvtzs(dst, src) => Fcvtzs::new(dst, src).encode(),
             Inst::Scvtf(dst, src) => Scvtf::new(dst, src).encode(),
             Inst::AddI32(dst, s1, s2) => AddI32::new(dst, s1, s2).encode(),
@@ -165,14 +206,70 @@ impl Inst {
     }
 }
 
+impl From<Ldr> for Inst {
+    #[inline(always)]
+    fn from(l: Ldr) -> Self {
+        Inst::Ldr(l)
+    }
+}
+
+impl From<Str> for Inst {
+    #[inline(always)]
+    fn from(s: Str) -> Self {
+        Inst::Str(s)
+    }
+}
+
+impl From<DupLane0> for Inst {
+    #[inline(always)]
+    fn from(d: DupLane0) -> Self {
+        Inst::DupLane0(d.dst, d.src)
+    }
+}
+
+impl From<UmovW> for Inst {
+    #[inline(always)]
+    fn from(u: UmovW) -> Self {
+        Inst::UmovW {
+            dst: u.dst,
+            src: u.src,
+            lane: u.lane,
+        }
+    }
+}
+
+impl From<InsW> for Inst {
+    #[inline(always)]
+    fn from(i: InsW) -> Self {
+        Inst::InsW {
+            dst: i.dst,
+            lane: i.lane,
+            src: i.src,
+        }
+    }
+}
+
+impl From<table::MvnW> for Inst {
+    #[inline(always)]
+    fn from(m: table::MvnW) -> Self {
+        Inst::MvnW {
+            dst: m.dst,
+            src: m.src,
+        }
+    }
+}
+
 impl crate::emit::AsmInsn for Inst {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         match self {
-            Inst::LdrQ(dst, addr) => emit_ldr_q(code, dst, addr),
-            Inst::StrQ(src, addr) => emit_str_q(code, src, addr),
-            Inst::LdrS(dst, addr) => emit_ldr_s(code, dst, addr),
-            Inst::Mov(dst, src) => emit_mov(code, dst, src),
+            Inst::Ldr(ldr) => ldr.emit_into(code),
+            Inst::Str(str) => str.emit_into(code),
+            Inst::Mov(dst, src) => {
+                if dst != src {
+                    emit32(code, Orr::new(dst, src, src).encode());
+                }
+            }
             _ => emit32(code, self.encode()),
         }
     }
@@ -182,350 +279,35 @@ impl crate::emit::AsmInsn for Inst {
 // Load / Store
 // =============================================================================
 
-/// An address spelled `[base, #offset]` — the scaled-immediate addressing mode.
-///
-/// `offset` is in BYTES. aarch64 encodes it divided by the *access size*, so
-/// that divisor belongs to the instruction ([`emit_ldr_q`] moves 16 bytes,
-/// [`emit_ldr_x`] moves 8) rather than to the address: one `Mem` names a
-/// different immediate field in each, and an offset that is not a multiple of
-/// the access size is not encodable at all.
-///
-/// The base being an [`Xr`] is the point. `sp`, `x17` and `x0` are values here;
-/// they used to be the `_sp`, `_x17` and `_voff` suffixes of three separate
-/// functions that encoded the same instruction.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Mem {
-    /// The register the displacement is measured from.
-    pub base: Xr,
-    /// Displacement in bytes; must be a multiple of the access size.
-    pub offset: u32,
-}
-
-/// An address spelled `[base, w<index>, uxtw #n]` — a 32-bit index register,
-/// zero-extended to 64 bits and scaled by the access size.
-///
-/// A different addressing *mode* from [`Mem`], not a different kind of offset,
-/// so it is a different type. Only the instruction that encodes it accepts one,
-/// which is what spares every other encoder from rejecting at runtime an
-/// address it cannot spell.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MemIndexed {
-    /// The register holding the buffer base.
-    pub base: Xr,
-    /// The element index, read as the 32-bit `w<index>`.
-    pub index: Xr,
-}
-
-/// Bytes moved by a `q` (128-bit vector) access — also the scale of its offset.
-const Q_BYTES: u32 = 16;
-/// Bytes moved by an `x` (64-bit general) access.
-const X_BYTES: u32 = 8;
-/// The largest value a 12-bit scaled immediate holds.
-const MAX_IMM12: u32 = 4095;
-/// The largest 16-byte-aligned displacement `add`'s own 12-bit immediate holds.
-const MAX_ADD_IMM: u32 = 4080;
-
-/// Rewrite `addr` as `[x16]`, computing `base + offset` into IP0 first.
-///
-/// The fallback for a displacement past the 12-bit scaled immediate — a spill
-/// frame deeper than 64 KiB. `add`'s immediate is 12 bits too, so a large
-/// displacement takes several of them.
-fn address_in_ip0(code: &mut Vec<u8>, Mem { base, offset }: Mem) -> Mem {
-    let mut remaining = offset;
-    let first = remaining.min(MAX_ADD_IMM);
-    add(code, xr::X16, base, Imm12(first as u16));
-    remaining -= first;
-    while remaining > 0 {
-        let chunk = remaining.min(MAX_ADD_IMM);
-        add(code, xr::X16, xr::X16, Imm12(chunk as u16));
-        remaining -= chunk;
-    }
-    Mem {
-        base: xr::X16,
-        offset: 0,
-    }
-}
-
-/// The 128-bit vector transfers, which are one encoding —
-/// `opcode | (imm12 << 10) | (Rn << 5) | Rt` — differing only in `opcode`.
-fn ldst_q(code: &mut Vec<u8>, opcode: u32, vec: Reg, addr: Mem) {
-    assert!(
-        addr.offset.is_multiple_of(Q_BYTES),
-        "128-bit access offset {} is not 16-byte aligned",
-        addr.offset
-    );
-    let addr = if addr.offset / Q_BYTES > MAX_IMM12 {
-        address_in_ip0(code, addr)
-    } else {
-        addr
-    };
-    emit32(
-        code,
-        opcode | ((addr.offset / Q_BYTES) << 10) | ((addr.base.0 as u32) << 5) | (vec.0 as u32),
-    );
-}
-
-/// `ldr q<dst>, [addr]` — load a 128-bit vector.
-pub fn emit_ldr_q(code: &mut Vec<u8>, dst: Reg, addr: Mem) {
-    ldst_q(code, 0x3DC0_0000, dst, addr);
-}
-
-/// `str q<src>, [addr]` — store a 128-bit vector.
-pub fn emit_str_q(code: &mut Vec<u8>, src: Reg, addr: Mem) {
-    ldst_q(code, 0x3D80_0000, src, addr);
-}
-
-/// `ldr x<dst>, [addr]` — load a 64-bit pointer into a *general* register,
-/// e.g. a buffer base out of the context array.
-///
-/// A different instruction on a different register file from [`emit_ldr_q`],
-/// and the signature says so: the destination is an [`Xr`], not a [`Reg`], and
-/// the offset scales by 8 rather than 16. No IP0 fallback — every caller
-/// indexes the small context array, so an offset past the immediate is a bug
-/// and not a deep frame.
-pub fn emit_ldr_x(code: &mut Vec<u8>, dst: Xr, addr: Mem) {
-    assert!(
-        addr.offset.is_multiple_of(X_BYTES),
-        "pointer load offset {} not 8-byte aligned",
-        addr.offset
-    );
-    let imm12 = addr.offset / X_BYTES;
-    assert!(
-        imm12 <= MAX_IMM12,
-        "pointer load offset {} exceeds LDR imm12 range",
-        addr.offset
-    );
-    emit32(
-        code,
-        0xF940_0000 | (imm12 << 10) | ((addr.base.0 as u32) << 5) | (dst.0 as u32),
-    );
-}
-
-/// Bytes moved by an `s` (32-bit scalar SIMD&FP) access.
-const S_BYTES: u32 = 4;
-
-/// `ldr s<dst>, [addr]` — load one `f32` into lane 0 of a vector register,
-/// zeroing the other lanes. The offset scales by 4; past the 12-bit
-/// immediate it goes through IP0 like a deep spill slot.
-pub fn emit_ldr_s(code: &mut Vec<u8>, dst: Reg, addr: Mem) {
-    assert!(
-        addr.offset.is_multiple_of(S_BYTES),
-        "32-bit access offset {} is not 4-byte aligned",
-        addr.offset
-    );
-    let addr = if addr.offset / S_BYTES > MAX_IMM12 {
-        address_in_ip0(code, addr)
-    } else {
-        addr
-    };
-    emit32(
-        code,
-        0xBD40_0000
-            | ((addr.offset / S_BYTES) << 10)
-            | ((addr.base.0 as u32) << 5)
-            | (dst.0 as u32),
-    );
-}
-
 /// `dup v<dst>.4s, v<src>.s[0]` — broadcast lane 0 to every lane.
+#[inline]
 pub fn emit_dup_lane0(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    emit32(code, 0x4E04_0400 | ((src.0 as u32) << 5) | (dst.0 as u32));
+    assemble(code, [DupLane0::new(dst, src)]);
 }
 
 /// `dst = splat(block[offset])`: `ldr x9, [x0, #ctx_slot*8]` fetches the
 /// block's base out of the context, `ldr s<dst>, [x9, #offset*4]` the value,
 /// and `dup` spreads it. `x9` is the base scratch the gather already claims.
 pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
-    const BASE_GPR: Xr = Xr(9);
-    emit_ldr_x(
-        code,
-        BASE_GPR,
-        Mem {
-            base: xr::X0,
-            offset: u32::from(load.ctx_slot) * X_BYTES,
-        },
-    );
-    emit_ldr_s(
-        code,
-        dst,
-        Mem {
-            base: BASE_GPR,
-            offset: u32::from(load.offset) * S_BYTES,
-        },
-    );
-    emit_dup_lane0(code, dst, dst);
-}
-
-/// `ldr w<dst>, [base, w<index>, uxtw #2]` — load one 32-bit element at
-/// `base + index * 4` into the 32-bit view of a general register.
-///
-/// Takes a [`MemIndexed`] because that is the mode it encodes; `#2` is the
-/// shift a 4-byte access implies, which is why the scale is not an operand.
-pub fn emit_ldr_w(code: &mut Vec<u8>, dst: Xr, addr: MemIndexed) {
-    emit32(
-        code,
-        0xB860_5800 | ((addr.index.0 as u32) << 16) | ((addr.base.0 as u32) << 5) | (dst.0 as u32),
-    );
-}
-
-// =============================================================================
-// Stack frame
-// =============================================================================
-
-/// SUB SP, SP, #imm - Allocate stack frame.
-///
-/// ARM64 ADD/SUB immediate has a 12-bit field (max 4095). For larger frames,
-/// we emit multiple instructions, each subtracting up to 4080 (largest
-/// 16-byte-aligned value in 12 bits).
-pub fn emit_sub_sp(code: &mut Vec<u8>, size: u32) {
-    let mut remaining = size;
-    while remaining > 0 {
-        let chunk = remaining.min(4080);
-        assert!(chunk <= 4095, "ARM64 immediate overflow in emit_sub_sp");
-        let inst = 0xD10003FF | (chunk << 10);
-        emit32(code, inst);
-        remaining -= chunk;
-    }
-}
-
-/// ADD SP, SP, #imm - Deallocate stack frame.
-///
-/// See `emit_sub_sp` for why we emit multiple instructions.
-pub fn emit_add_sp(code: &mut Vec<u8>, size: u32) {
-    let mut remaining = size;
-    while remaining > 0 {
-        let chunk = remaining.min(4080);
-        assert!(chunk <= 4095, "ARM64 immediate overflow in emit_add_sp");
-        let inst = 0x910003FF | (chunk << 10);
-        emit32(code, inst);
-        remaining -= chunk;
-    }
-}
-
-// =============================================================================
-// Arithmetic - Single Instructions
-// =============================================================================
-
-/// FADD Vd.4S, Vn.4S, Vm.4S
-pub fn emit_fadd(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fadd(dst, src1, src2).emit_into(code);
-}
-
-/// FSUB Vd.4S, Vn.4S, Vm.4S
-pub fn emit_fsub(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fsub(dst, src1, src2).emit_into(code);
-}
-
-/// FMUL Vd.4S, Vn.4S, Vm.4S
-pub fn emit_fmul(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fmul(dst, src1, src2).emit_into(code);
-}
-
-/// FDIV Vd.4S, Vn.4S, Vm.4S
-pub fn emit_fdiv(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fdiv(dst, src1, src2).emit_into(code);
-}
-
-/// FMLA Vd.4S, Vn.4S, Vm.4S (fused multiply-add: Vd += Vn * Vm)
-pub fn emit_fmla(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fmla(dst, src1, src2).emit_into(code);
-}
-
-/// FMIN Vd.4S, Vn.4S, Vm.4S
-pub fn emit_fmin(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fmin(dst, src1, src2).emit_into(code);
-}
-
-/// FMAX Vd.4S, Vn.4S, Vm.4S
-pub fn emit_fmax(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fmax(dst, src1, src2).emit_into(code);
-}
-
-/// FSQRT Vd.4S, Vn.4S
-pub fn emit_fsqrt(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    Inst::Fsqrt(dst, src).emit_into(code);
-}
-
-/// FABS Vd.4S, Vn.4S
-pub fn emit_fabs(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    Inst::Fabs(dst, src).emit_into(code);
-}
-
-/// FNEG Vd.4S, Vn.4S
-pub fn emit_fneg(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    Inst::Fneg(dst, src).emit_into(code);
-}
-
-/// NOT Vd.16B, Vn.16B (bitwise NOT, 2-register miscellaneous)
-pub fn emit_not(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    Inst::Not(dst, src).emit_into(code);
-}
-
-/// FRINTM Vd.4S, Vn.4S (floor)
-pub fn emit_frintm(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    Inst::Frintm(dst, src).emit_into(code);
-}
-
-/// FRINTP Vd.4S, Vn.4S (ceil)
-pub fn emit_frintp(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    Inst::Frintp(dst, src).emit_into(code);
-}
-
-// =============================================================================
-// Approximate operations (estimate + refinement)
-// =============================================================================
-
-/// FRSQRTE + FRSQRTS refinement (~3 instructions for rsqrt)
-pub fn emit_frsqrt(code: &mut Vec<u8>, dst: Reg, src: Reg, scratch: Reg) {
-    assemble(
-        code,
-        [
-            Inst::Frsqrte(dst, src),
-            Inst::Fmul(scratch, dst, dst),
-            Inst::Frsqrts(scratch, src, scratch),
-            Inst::Fmul(dst, dst, scratch),
-        ],
-    );
-}
-
-/// FRECPE + FRECPS refinement (~3 instructions for recip)
-pub fn emit_frecip(code: &mut Vec<u8>, dst: Reg, src: Reg, scratch: Reg) {
-    assemble(
-        code,
-        [
-            Inst::Frecpe(dst, src),
-            Inst::Frecps(scratch, src, dst),
-            Inst::Fmul(dst, dst, scratch),
-        ],
-    );
-}
-
-// =============================================================================
-// Comparisons
-// =============================================================================
-
-/// FCMGT Vd.4S, Vn.4S, Vm.4S (greater than)
-pub fn emit_fcmgt(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fcmgt(dst, src1, src2).emit_into(code);
-}
-
-/// FCMGE Vd.4S, Vn.4S, Vm.4S (greater or equal)
-pub fn emit_fcmge(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fcmge(dst, src1, src2).emit_into(code);
-}
-
-/// FCMEQ Vd.4S, Vn.4S, Vm.4S (equal)
-pub fn emit_fcmeq(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    Inst::Fcmeq(dst, src1, src2).emit_into(code);
-}
-
-// =============================================================================
-// Selection / Blending
-// =============================================================================
-
-/// BSL Vd.16B, Vn.16B, Vm.16B (bitwise select: Vd = (Vd & Vn) | (~Vd & Vm))
-pub fn emit_bsl(code: &mut Vec<u8>, mask: Reg, if_true: Reg, if_false: Reg) {
-    Inst::Bsl(mask, if_true, if_false).emit_into(code);
+    const BASE_GPR: PtrReg = ptr::X9;
+    AsmProgram::from([
+        Inst::ldr_x(
+            BASE_GPR,
+            Mem {
+                base: ptr::X0,
+                offset: u32::from(load.ctx_slot) * X_BYTES,
+            },
+        ),
+        Inst::ldr_s(
+            dst,
+            Mem {
+                base: BASE_GPR,
+                offset: u32::from(load.offset) * S_BYTES,
+            },
+        ),
+        Inst::DupLane0(dst, dst),
+    ])
+    .assemble(code);
 }
 
 // =============================================================================
@@ -710,34 +492,14 @@ pub fn emit_pool_entry(code: &mut Vec<u8>, val_bits: u32) {
 // Bound-Memory Gather (scalar-load lowering — NEON has no native gather)
 // =============================================================================
 
-/// UMOV Wd, Vn.S[lane] — extract a 32-bit vector lane into a GP register.
-pub fn emit_umov_w(code: &mut Vec<u8>, dst: Xr, src: Reg, lane: u8) {
-    debug_assert!(lane < 4);
-    let imm5 = ((lane as u32) << 3) | 0b100; // S-lane element size
-    emit32(
-        code,
-        0x0E003C00 | (imm5 << 16) | ((src.0 as u32) << 5) | (dst.0 as u32),
-    );
-}
-
-/// INS Vd.S[lane], Wn — insert a GP register into a 32-bit vector lane.
-pub fn emit_ins_w(code: &mut Vec<u8>, dst: Reg, lane: u8, src: Xr) {
-    debug_assert!(lane < 4);
-    let imm5 = ((lane as u32) << 3) | 0b100;
-    emit32(
-        code,
-        0x4E001C00 | (imm5 << 16) | ((src.0 as u32) << 5) | (dst.0 as u32),
-    );
-}
-
 /// GP registers used by the scalar-load gather sequence.
 pub struct GatherGprs {
     /// Holds the buffer base pointer (survives the whole sequence).
-    pub base: Xr,
+    pub base: PtrReg,
     /// Scratch: one extracted lane index at a time. Clobbered.
-    pub idx: Xr,
+    pub idx: Gpr,
     /// Scratch: one loaded value at a time. Clobbered.
-    pub val: Xr,
+    pub val: Gpr,
 }
 
 /// dst.4S = base[idx_int.S[lane]] for each lane — the NEON gather: four scalar
@@ -745,18 +507,25 @@ pub struct GatherGprs {
 /// `idx_int` holds int32 lane indices (already converted and in-bounds by the
 /// `expand_gather` lowering). Clobbers `gprs.idx` and `gprs.val`.
 pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, gprs: GatherGprs) {
-    for lane in 0..4 {
-        emit_umov_w(code, gprs.idx, idx_int, lane);
-        emit_ldr_w(
-            code,
-            gprs.val,
-            MemIndexed {
-                base: gprs.base,
-                index: gprs.idx,
-            },
-        );
-        emit_ins_w(code, dst, lane, gprs.val);
-    }
+    let mem = MemIndexed {
+        base: gprs.base,
+        index: gprs.idx,
+    };
+    AsmProgram::from([
+        Inst::umov_w(gprs.idx, idx_int, 0),
+        Inst::ldr_w(gprs.val, mem),
+        Inst::ins_w(dst, 0, gprs.val),
+        Inst::umov_w(gprs.idx, idx_int, 1),
+        Inst::ldr_w(gprs.val, mem),
+        Inst::ins_w(dst, 1, gprs.val),
+        Inst::umov_w(gprs.idx, idx_int, 2),
+        Inst::ldr_w(gprs.val, mem),
+        Inst::ins_w(dst, 2, gprs.val),
+        Inst::umov_w(gprs.idx, idx_int, 3),
+        Inst::ldr_w(gprs.val, mem),
+        Inst::ins_w(dst, 3, gprs.val),
+    ])
+    .assemble(code);
 }
 
 // =============================================================================
@@ -773,7 +542,7 @@ fn emit_ushr(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
     // classifies a count of 0 as agreeing on every target, so the encoder has
     // to honour it.
     if shift == 0 {
-        emit_mov(code, dst, src);
+        AsmProgram::from([Inst::mov(dst, src)]).assemble(code);
         return;
     }
     // `immh` selects the element size: 01xx is .4S, 001x is .8H, 1xxx is .2D.
@@ -803,49 +572,6 @@ fn emit_shl(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
     let immhb = (shift as u32) + 32;
     let inst = 0x4F005400 | (dst.0 as u32) | ((src.0 as u32) << 5) | (immhb << 16);
     emit32(code, inst);
-}
-
-/// ADD Vd.4S, Vn.4S, Vm.4S (integer add)
-fn emit_add_i32(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    emit32(code, AddI32::new(dst, src1, src2).encode());
-}
-
-/// AND Vd.16B, Vn.16B, Vm.16B (bitwise AND)
-fn emit_and(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    emit32(code, And::new(dst, src1, src2).encode());
-}
-
-/// ORR Vd.16B, Vn.16B, Vm.16B (bitwise OR)
-fn emit_orr(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
-    emit32(code, Orr::new(dst, src1, src2).encode());
-}
-
-/// FCVTZS Vd.4S, Vn.4S (float to signed int, round toward zero)
-pub fn emit_fcvtzs(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    emit32(code, Fcvtzs::new(dst, src).encode());
-}
-
-/// SCVTF Vd.4S, Vn.4S (signed int to float)
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-fn emit_scvtf(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    emit32(code, Scvtf::new(dst, src).encode());
-}
-
-/// FRINTA Vd.4S, Vn.4S (round to nearest, ties away from zero)
-fn emit_frinta(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    emit32(code, Frinta::new(dst, src).encode());
-}
-
-/// MOV Vd.16B, Vn.16B (register copy via ORR)
-fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    if dst.0 != src.0 {
-        emit_orr(code, dst, src, src);
-    }
-}
-
-/// round(x) — round to nearest, ties away from zero. ARM64 FRINTA instruction.
-pub fn emit_round_builtin(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    emit_frinta(code, dst, src);
 }
 
 // =============================================================================
@@ -880,18 +606,35 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// estimates use it, to hold the Newton-Raphson correction.
 pub(crate) fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, temp: Option<Reg>) {
     match op {
-        OpKind::Neg => emit_fneg(code, dst, src),
-        OpKind::Abs => emit_fabs(code, dst, src),
-        OpKind::Sqrt => emit_fsqrt(code, dst, src),
-        OpKind::Rsqrt => emit_frsqrt(code, dst, src, super::declared_temp(temp)),
-        OpKind::Recip => emit_frecip(code, dst, src, super::declared_temp(temp)),
-        OpKind::Floor => emit_frintm(code, dst, src),
-        OpKind::Ceil => emit_frintp(code, dst, src),
-        OpKind::Round => emit_round_builtin(code, dst, src),
+        OpKind::Neg => AsmProgram::from([Inst::Fneg(dst, src)]).assemble(code),
+        OpKind::Abs => AsmProgram::from([Inst::Fabs(dst, src)]).assemble(code),
+        OpKind::Sqrt => AsmProgram::from([Inst::Fsqrt(dst, src)]).assemble(code),
+        OpKind::Rsqrt => {
+            let temp = super::declared_temp(temp);
+            AsmProgram::from([
+                Inst::Frsqrte(dst, src),
+                Inst::Fmul(temp, dst, dst),
+                Inst::Frsqrts(temp, src, temp),
+                Inst::Fmul(dst, dst, temp),
+            ])
+            .assemble(code);
+        }
+        OpKind::Recip => {
+            let temp = super::declared_temp(temp);
+            AsmProgram::from([
+                Inst::Frecpe(dst, src),
+                Inst::Frecps(temp, src, dst),
+                Inst::Fmul(dst, dst, temp),
+            ])
+            .assemble(code);
+        }
+        OpKind::Floor => AsmProgram::from([Inst::Frintm(dst, src)]).assemble(code),
+        OpKind::Ceil => AsmProgram::from([Inst::Frintp(dst, src)]).assemble(code),
+        OpKind::Round => AsmProgram::from([Inst::Frinta(dst, src)]).assemble(code),
 
         // Bit-manip primitives (integer-domain conversions).
-        OpKind::TruncToInt => emit_fcvtzs(code, dst, src), // f32 -> i32 (truncate)
-        OpKind::IntToFloat => emit_scvtf(code, dst, src),  // i32 -> f32
+        OpKind::TruncToInt => AsmProgram::from([Inst::Fcvtzs(dst, src)]).assemble(code),
+        OpKind::IntToFloat => AsmProgram::from([Inst::Scvtf(dst, src)]).assemble(code),
 
         // Transcendentals (sin/cos/tan/exp/exp2/ln/log2/log10/atan/asin/acos) are
         // expanded to primitive arithmetic by `lowering` before codegen, so they
@@ -913,120 +656,31 @@ pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount
 /// Emit binary operation
 pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
     match op {
-        OpKind::Add => emit_fadd(code, dst, src1, src2),
-        OpKind::Sub => emit_fsub(code, dst, src1, src2),
-        OpKind::Mul => emit_fmul(code, dst, src1, src2),
-        OpKind::Div => emit_fdiv(code, dst, src1, src2),
-        OpKind::Min => emit_fmin(code, dst, src1, src2),
-        OpKind::Max => emit_fmax(code, dst, src1, src2),
+        OpKind::Add => AsmProgram::from([Inst::Fadd(dst, src1, src2)]).assemble(code),
+        OpKind::Sub => AsmProgram::from([Inst::Fsub(dst, src1, src2)]).assemble(code),
+        OpKind::Mul => AsmProgram::from([Inst::Fmul(dst, src1, src2)]).assemble(code),
+        OpKind::Div => AsmProgram::from([Inst::Fdiv(dst, src1, src2)]).assemble(code),
+        OpKind::Min => AsmProgram::from([Inst::Fmin(dst, src1, src2)]).assemble(code),
+        OpKind::Max => AsmProgram::from([Inst::Fmax(dst, src1, src2)]).assemble(code),
 
         // Comparisons (result is mask in dst)
-        OpKind::Gt => emit_fcmgt(code, dst, src1, src2),
-        OpKind::Ge => emit_fcmge(code, dst, src1, src2),
-        OpKind::Lt => emit_fcmgt(code, dst, src2, src1), // swap args
-        OpKind::Le => emit_fcmge(code, dst, src2, src1),
-        OpKind::Eq => emit_fcmeq(code, dst, src1, src2),
+        OpKind::Gt => AsmProgram::from([Inst::Fcmgt(dst, src1, src2)]).assemble(code),
+        OpKind::Ge => AsmProgram::from([Inst::Fcmge(dst, src1, src2)]).assemble(code),
+        OpKind::Lt => AsmProgram::from([Inst::Fcmgt(dst, src2, src1)]).assemble(code), // swap args
+        OpKind::Le => AsmProgram::from([Inst::Fcmge(dst, src2, src1)]).assemble(code),
+        OpKind::Eq => AsmProgram::from([Inst::Fcmeq(dst, src1, src2)]).assemble(code),
         OpKind::Ne => {
             // Ne = not Eq: FCMEQ then bitwise NOT
-            emit_fcmeq(code, dst, src1, src2);
-            emit_not(code, dst, dst);
+            AsmProgram::from([Inst::Fcmeq(dst, src1, src2), Inst::Not(dst, dst)]).assemble(code);
         }
 
         // Bit-manip primitives (integer-domain).
-        OpKind::IAdd => emit_add_i32(code, dst, src1, src2),
-        OpKind::BitAnd => emit_and(code, dst, src1, src2),
-        OpKind::BitOr => emit_orr(code, dst, src1, src2),
+        OpKind::IAdd => AsmProgram::from([Inst::AddI32(dst, src1, src2)]).assemble(code),
+        OpKind::BitAnd => AsmProgram::from([Inst::And(dst, src1, src2)]).assemble(code),
+        OpKind::BitOr => AsmProgram::from([Inst::Orr(dst, src1, src2)]).assemble(code),
 
         _ => unimplemented_op("aarch64", op),
     }
-}
-
-// =============================================================================
-// Select Short-Circuit Helpers
-// =============================================================================
-
-/// UMINV Sd, Vn.4S — horizontal unsigned minimum across all 4 lanes.
-/// Result is in lane 0 of dst (scalar Sd).
-/// If mask is all-ones (0xFFFFFFFF per lane), result = 0xFFFFFFFF.
-pub fn emit_uminv(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    // UMINV Vd.4S: 0x6EB1A800 | Rd | (Rn << 5)
-    // Encoding: 0 1 1 0 1 1 1 0 1 0 1 1 0 0 0 1  1 0 1 0 1 0 0 0  Rn:5 Rd:5
-    emit32(code, 0x6EB1A800 | (dst.0 as u32) | ((src.0 as u32) << 5));
-}
-
-/// UMAXV Sd, Vn.4S — horizontal unsigned maximum across all 4 lanes.
-/// If mask is all-zeros, result = 0x00000000.
-pub fn emit_umaxv(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    // UMAXV Vd.4S: 0x6E30A800 | Rd | (Rn << 5)
-    emit32(code, 0x6E30A800 | (dst.0 as u32) | ((src.0 as u32) << 5));
-}
-
-/// FMOV Wd, Sn — move lane 0 of SIMD register to GP register W16.
-/// We always use W16 as the GP scratch for Select branching.
-pub fn emit_fmov_to_gp(code: &mut Vec<u8>, src: Reg) {
-    // FMOV W16, Sn: 0x1E260000 | (Rn << 5) | Rd
-    // where Rd=16 (W16), Rn is the SIMD register number
-    emit32(code, 0x1E260000 | ((src.0 as u32) << 5) | 16);
-}
-
-/// CBZ W16, #offset — branch if W16 == 0 (mask all-false).
-/// `offset` is in bytes, must be aligned to 4, range ±1MB.
-/// Returns the index in `code` where the offset is encoded (for patching).
-pub fn emit_cbz_w16(code: &mut Vec<u8>) -> usize {
-    let patch_pos = code.len();
-    // CBZ W16, #0 (placeholder offset)
-    // Encoding: 0 0110100 imm19 Rt
-    // Rt = 16 (W16)
-    emit32(code, 0x34000010); // imm19 = 0, will be patched
-    patch_pos
-}
-
-/// B #offset — unconditional branch (for skipping past else-arm).
-/// Returns the index in `code` where the offset is encoded (for patching).
-pub fn emit_b(code: &mut Vec<u8>) -> usize {
-    let patch_pos = code.len();
-    // B #0 (placeholder)
-    emit32(code, 0x14000000); // imm26 = 0, will be patched
-    patch_pos
-}
-
-/// Patch a CBZ/CBNZ instruction at `patch_pos` to branch to `target_pos`.
-/// Both positions are byte offsets into the code buffer.
-pub fn patch_cbz_cbnz(code: &mut [u8], patch_pos: usize, target_pos: usize) {
-    let offset = (target_pos as i64 - patch_pos as i64) / 4;
-    assert!(
-        (-(1 << 18)..(1 << 18)).contains(&offset),
-        "CBZ/CBNZ branch offset {} out of range (±1MB)",
-        offset
-    );
-    let imm19 = (offset as u32) & 0x7FFFF;
-    let existing = u32::from_le_bytes([
-        code[patch_pos],
-        code[patch_pos + 1],
-        code[patch_pos + 2],
-        code[patch_pos + 3],
-    ]);
-    let patched = (existing & 0xFF00001F) | (imm19 << 5);
-    code[patch_pos..patch_pos + 4].copy_from_slice(&patched.to_le_bytes());
-}
-
-/// Patch an unconditional B instruction at `patch_pos` to branch to `target_pos`.
-pub fn patch_b(code: &mut [u8], patch_pos: usize, target_pos: usize) {
-    let offset = (target_pos as i64 - patch_pos as i64) / 4;
-    assert!(
-        (-(1 << 25)..(1 << 25)).contains(&offset),
-        "B branch offset {} out of range (±128MB)",
-        offset
-    );
-    let imm26 = (offset as u32) & 0x3FFFFFF;
-    let existing = u32::from_le_bytes([
-        code[patch_pos],
-        code[patch_pos + 1],
-        code[patch_pos + 2],
-        code[patch_pos + 3],
-    ]);
-    let patched = (existing & 0xFC000000) | imm26;
-    code[patch_pos..patch_pos + 4].copy_from_slice(&patched.to_le_bytes());
 }
 
 // =============================================================================
@@ -1568,7 +1222,7 @@ mod tests {
     #[test]
     fn disassemble_fadd() {
         let mut code = Vec::new();
-        emit_fadd(&mut code, Reg(0), Reg(1), Reg(2));
+        AsmProgram::from([Inst::Fadd(Reg(0), Reg(1), Reg(2))]).assemble(&mut code);
         let dis = disassemble_code(&code);
         assert!(
             dis.contains("fadd v0.4s, v1.4s, v2.4s"),
@@ -1606,7 +1260,7 @@ mod tests {
     #[test]
     fn disassemble_mov_vec() {
         let mut code = Vec::new();
-        emit_mov(&mut code, Reg(5), Reg(3));
+        AsmProgram::from([Inst::mov(Reg(5), Reg(3))]).assemble(&mut code);
         let dis = disassemble_code(&code);
         assert!(
             dis.contains("mov v5.16b, v3.16b"),
@@ -1617,9 +1271,12 @@ mod tests {
     #[test]
     fn disassemble_sequence() {
         let mut code = Vec::new();
-        emit_fmul(&mut code, Reg(4), Reg(0), Reg(0));
-        emit_fsqrt(&mut code, Reg(4), Reg(4));
-        ret(&mut code);
+        AsmProgram::from([
+            Inst::Fmul(Reg(4), Reg(0), Reg(0)),
+            Inst::Fsqrt(Reg(4), Reg(4)),
+            Inst::Ret,
+        ])
+        .assemble(&mut code);
         let dis = disassemble_code(&code);
         assert!(dis.contains("fmul"), "missing fmul in: {dis}");
         assert!(dis.contains("fsqrt"), "missing fsqrt in: {dis}");
@@ -1640,22 +1297,23 @@ mod tests {
     #[test]
     fn disassemble_ldr_str() {
         let mut code = Vec::new();
-        emit_ldr_q(
-            &mut code,
-            Reg(0),
-            Mem {
-                base: xr::X0,
-                offset: 32,
-            },
-        );
-        emit_str_q(
-            &mut code,
-            Reg(1),
-            Mem {
-                base: xr::X0,
-                offset: 48,
-            },
-        );
+        AsmProgram::from([
+            Inst::ldr_q(
+                Reg(0),
+                Mem {
+                    base: ptr::X0,
+                    offset: 32,
+                },
+            ),
+            Inst::str_q(
+                Reg(1),
+                Mem {
+                    base: ptr::X0,
+                    offset: 48,
+                },
+            ),
+        ])
+        .assemble(&mut code);
         let dis = disassemble_code(&code);
         assert!(dis.contains("ldr"), "missing ldr in: {dis}");
         assert!(dis.contains("str"), "missing str in: {dis}");
@@ -1683,9 +1341,12 @@ mod tests {
     #[test]
     fn disassemble_offsets_are_sequential() {
         let mut code = Vec::new();
-        emit_fadd(&mut code, Reg(0), Reg(1), Reg(2));
-        emit_fsub(&mut code, Reg(0), Reg(1), Reg(2));
-        ret(&mut code);
+        AsmProgram::from([
+            Inst::Fadd(Reg(0), Reg(1), Reg(2)),
+            Inst::Fsub(Reg(0), Reg(1), Reg(2)),
+            Inst::Ret,
+        ])
+        .assemble(&mut code);
         let dis = disassemble_code(&code);
         // Lines should start with offsets 0, 4, 8
         assert!(
@@ -1716,53 +1377,80 @@ mod tests {
         }
 
         // fcvtzs v28.4s, v5.4s
-        assert_eq!(one(|c| emit_fcvtzs(c, Reg(28), Reg(5))), 0x4EA1B8BC);
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::Fcvtzs(Reg(28), Reg(5))]).assemble(c)),
+            0x4EA1B8BC
+        );
         // ldr x9, [x0, #8]
         assert_eq!(
-            one(|c| emit_ldr_x(
-                c,
-                Xr(9),
+            one(|c| AsmProgram::from([Inst::ldr_x(
+                ptr::X9,
                 Mem {
-                    base: xr::X0,
-                    offset: 8
-                }
-            )),
+                    base: ptr::X0,
+                    offset: 8,
+                },
+            )])
+            .assemble(c)),
             0xF9400409
         );
         // ldr x9, [x0]
         assert_eq!(
-            one(|c| emit_ldr_x(
-                c,
-                Xr(9),
+            one(|c| AsmProgram::from([Inst::ldr_x(
+                ptr::X9,
                 Mem {
-                    base: xr::X0,
-                    offset: 0
-                }
-            )),
+                    base: ptr::X0,
+                    offset: 0,
+                },
+            )])
+            .assemble(c)),
             0xF9400009
         );
         // umov w10, v28.s[0..3]
-        assert_eq!(one(|c| emit_umov_w(c, Xr(10), Reg(28), 0)), 0x0E043F8A);
-        assert_eq!(one(|c| emit_umov_w(c, Xr(10), Reg(28), 1)), 0x0E0C3F8A);
-        assert_eq!(one(|c| emit_umov_w(c, Xr(10), Reg(28), 2)), 0x0E143F8A);
-        assert_eq!(one(|c| emit_umov_w(c, Xr(10), Reg(28), 3)), 0x0E1C3F8A);
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::umov_w(Gpr(10), Reg(28), 0)]).assemble(c)),
+            0x0E043F8A
+        );
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::umov_w(Gpr(10), Reg(28), 1)]).assemble(c)),
+            0x0E0C3F8A
+        );
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::umov_w(Gpr(10), Reg(28), 2)]).assemble(c)),
+            0x0E143F8A
+        );
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::umov_w(Gpr(10), Reg(28), 3)]).assemble(c)),
+            0x0E1C3F8A
+        );
         // ldr w11, [x9, w10, uxtw #2]
         assert_eq!(
-            one(|c| emit_ldr_w(
-                c,
-                Xr(11),
+            one(|c| AsmProgram::from([Inst::ldr_w(
+                Gpr(11),
                 MemIndexed {
-                    base: Xr(9),
-                    index: Xr(10)
-                }
-            )),
+                    base: ptr::X9,
+                    index: Gpr(10),
+                },
+            )])
+            .assemble(c)),
             0xB86A592B
         );
         // ins v6.s[0..3], w11
-        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 0, Xr(11))), 0x4E041D66);
-        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 1, Xr(11))), 0x4E0C1D66);
-        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 2, Xr(11))), 0x4E141D66);
-        assert_eq!(one(|c| emit_ins_w(c, Reg(6), 3, Xr(11))), 0x4E1C1D66);
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::ins_w(Reg(6), 0, Gpr(11))]).assemble(c)),
+            0x4E041D66
+        );
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::ins_w(Reg(6), 1, Gpr(11))]).assemble(c)),
+            0x4E0C1D66
+        );
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::ins_w(Reg(6), 2, Gpr(11))]).assemble(c)),
+            0x4E141D66
+        );
+        assert_eq!(
+            one(|c| AsmProgram::from([Inst::ins_w(Reg(6), 3, Gpr(11))]).assemble(c)),
+            0x4E1C1D66
+        );
     }
 
     #[test]
@@ -1773,9 +1461,9 @@ mod tests {
             Reg(6),
             Reg(28),
             GatherGprs {
-                base: Xr(9),
-                idx: Xr(10),
-                val: Xr(11),
+                base: ptr::X9,
+                idx: Gpr(10),
+                val: Gpr(11),
             },
         );
         // 4 lanes x (umov + ldr + ins) = 12 instructions.
@@ -1795,20 +1483,22 @@ mod tests {
         }
         // ldr q0, [x0, #32] / [sp, #32] / [x17, #32] — one encoder, three bases.
         for base in [xr::X0, xr::SP, xr::X17] {
-            let word = one(|c| emit_ldr_q(c, Reg(0), Mem { base, offset: 32 }));
+            let word = one(|c| {
+                AsmProgram::from([Inst::ldr_q(Reg(0), Mem { base, offset: 32 })]).assemble(c)
+            });
             assert_eq!(word & !(0x1F << 5), 0x3DC0_0800, "same instruction");
             assert_eq!((word >> 5) & 0x1F, u32::from(base.0), "Rn is the base");
         }
         // str q1, [sp, #48]
         assert_eq!(
-            one(|c| emit_str_q(
-                c,
+            one(|c| AsmProgram::from([Inst::str_q(
                 Reg(1),
                 Mem {
                     base: xr::SP,
                     offset: 48
                 }
-            )),
+            )])
+            .assemble(c)),
             0x3D80_0FE1
         );
     }
@@ -1819,14 +1509,14 @@ mod tests {
     fn a_deep_frame_addresses_through_ip0() {
         let mut code = Vec::new();
         // 65536 = 16 * 4096, one slot past the largest encodable displacement.
-        emit_ldr_q(
-            &mut code,
+        AsmProgram::from([Inst::ldr_q(
             Reg(3),
             Mem {
                 base: xr::SP,
                 offset: 65536,
             },
-        );
+        )])
+        .assemble(&mut code);
         let words: Vec<u32> = code
             .as_chunks::<4>()
             .0
@@ -1867,7 +1557,9 @@ mod tests {
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) mod driver {
     use super::super::*;
+    use super::ptr;
     use super::xr::*;
+    use super::*;
     use super::{Mem, Xr};
     use crate::error::CompileError;
     use alloc::vec::Vec;
@@ -1933,14 +1625,14 @@ pub(crate) mod driver {
     /// Falls back to `emit_fmov_imm` for zero and FMOV-encodable values.
     fn emit_const_load(code: &mut Vec<u8>, dst: Reg, val_bits: u32, pool: &ConstPool) {
         if let Some(offset) = pool.offset_for(val_bits) {
-            super::emit_ldr_q(
-                code,
+            AsmProgram::from([Inst::ldr_q(
                 dst,
                 Mem {
-                    base: X17,
+                    base: ptr::X17,
                     offset: offset.into(),
                 },
-            );
+            )])
+            .assemble(code);
         } else {
             super::emit_fmov_imm(code, dst, f32::from_bits(val_bits));
         }
@@ -1950,15 +1642,16 @@ pub(crate) mod driver {
     /// naming that here keeps `sp` a fact about the frame instead of a suffix
     /// on the load and store that reach it.
     const fn frame_slot(offset: u32) -> Mem {
-        Mem { base: SP, offset }
+        Mem {
+            base: ptr::SP,
+            offset,
+        }
     }
 
-    /// A pending aarch64 branch: CBZ and B are patched differently.
+    /// A pending aarch64 branch: 19-bit conditional or 26-bit unconditional.
     pub(crate) enum Aarch64Branch {
-        Cbz(usize),
-        B(usize),
-        /// A `b.hs` awaiting its target — the collapse loop's exit test.
-        Hs(super::Cond19),
+        Cond(super::Cond19),
+        Uncond(super::Rel26),
     }
 
     /// aarch64 implementation of the shared driver's leaf operations.
@@ -2114,7 +1807,7 @@ pub(crate) mod driver {
         }
 
         fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
-            super::assemble(code, [super::Inst::Mov(dst, src)]);
+            AsmProgram::from([Inst::mov(dst, src)]).assemble(code);
         }
 
         fn emit_store(
@@ -2123,7 +1816,7 @@ pub(crate) mod driver {
             src: Reg,
             offset: u32,
         ) -> Result<(), CompileError> {
-            super::assemble(code, [super::Inst::StrQ(src, frame_slot(offset))]);
+            AsmProgram::from([Inst::str_q(src, frame_slot(offset))]).assemble(code);
             Ok(())
         }
 
@@ -2141,7 +1834,8 @@ pub(crate) mod driver {
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
-                    super::assemble(code, [super::Inst::LdrQ(target, frame_slot(slot.offset()))]);
+                    AsmProgram::from([Inst::ldr_q(target, frame_slot(slot.offset()))])
+                        .assemble(code);
                     target
                 }
             }
@@ -2157,9 +1851,9 @@ pub(crate) mod driver {
             scratch: Option<Reg>,
         ) -> Aarch64Branch {
             let scratch = guard_scratch(scratch, mask_reg);
-            super::emit_umaxv(code, scratch, mask_reg); // max lane; 0 => all-false
-            super::emit_fmov_to_gp(code, scratch);
-            Aarch64Branch::Cbz(super::emit_cbz_w16(code))
+            AsmProgram::from([Inst::Umaxv(scratch, mask_reg), Inst::FmovToGp(scratch)])
+                .assemble(code);
+            Aarch64Branch::Cond(super::cbz_w16(code))
         }
 
         fn emit_skip_if_all_true(
@@ -2169,22 +1863,23 @@ pub(crate) mod driver {
             scratch: Option<Reg>,
         ) -> Aarch64Branch {
             let scratch = guard_scratch(scratch, mask_reg);
-            super::emit_uminv(code, scratch, mask_reg); // min lane; 0xFFFFFFFF => all-true
-            super::emit_fmov_to_gp(code, scratch);
-            // MVN W16, W16 -> 0 iff all-true, which the cbz below tests.
-            super::mvn_w(code, X16, X16);
-            Aarch64Branch::Cbz(super::emit_cbz_w16(code))
+            AsmProgram::from([
+                Inst::Uminv(scratch, mask_reg),
+                Inst::FmovToGp(scratch),
+                Inst::mvn_w(X16, X16),
+            ])
+            .assemble(code);
+            Aarch64Branch::Cond(super::cbz_w16(code))
         }
 
         fn emit_jump(&mut self, code: &mut Vec<u8>) -> Aarch64Branch {
-            Aarch64Branch::B(super::emit_b(code))
+            Aarch64Branch::Uncond(super::b_placeholder(code))
         }
 
         fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Aarch64Branch, target: usize) {
             match branch {
-                Aarch64Branch::Cbz(p) => super::patch_cbz_cbnz(code, p, target),
-                Aarch64Branch::B(p) => super::patch_b(code, p, target),
-                Aarch64Branch::Hs(c) => c.patch(code, target),
+                Aarch64Branch::Cond(c) => c.patch(code, target),
+                Aarch64Branch::Uncond(b) => b.patch(code, target),
             }
         }
 
@@ -2196,11 +1891,31 @@ pub(crate) mod driver {
         // touches, so `latch_bounds` has nothing to do.
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            super::emit_sub_sp(code, bytes);
+            let mut remaining = bytes;
+            while remaining > 0 {
+                let chunk = remaining.min(table::MAX_ADD_IMM);
+                AsmProgram::from([table::SubI64::new(
+                    ptr::SP,
+                    ptr::SP,
+                    table::Imm12(chunk as u16),
+                )])
+                .assemble(code);
+                remaining -= chunk;
+            }
         }
 
         fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            super::emit_add_sp(code, bytes);
+            let mut remaining = bytes;
+            while remaining > 0 {
+                let chunk = remaining.min(table::MAX_ADD_IMM);
+                AsmProgram::from([table::AddI64::new(
+                    ptr::SP,
+                    ptr::SP,
+                    table::Imm12(chunk as u16),
+                )])
+                .assemble(code);
+                remaining -= chunk;
+            }
         }
 
         /// The prologue's and body's constant loads are X17-relative, so the
@@ -2214,20 +1929,20 @@ pub(crate) mod driver {
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-            super::assemble(code, [super::Inst::StrQ(src, frame_slot(offset))]);
+            AsmProgram::from([Inst::str_q(src, frame_slot(offset))]).assemble(code);
         }
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-            super::assemble(code, [super::Inst::LdrQ(dst, frame_slot(offset))]);
+            AsmProgram::from([Inst::ldr_q(dst, frame_slot(offset))]).assemble(code);
         }
 
         fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            super::movz(code, counter_reg(counter), 0);
+            AsmProgram::from([table::Movz::new(counter_reg(counter), 0)]).assemble(code);
         }
 
         fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter) {
             let r = counter_reg(counter);
-            super::add(code, r, r, super::Imm12(1));
+            AsmProgram::from([table::AddI64::new(r, r, table::Imm12(1))]).assemble(code);
         }
 
         fn branch_if_counter_done(
@@ -2235,39 +1950,45 @@ pub(crate) mod driver {
             code: &mut Vec<u8>,
             counter: Counter,
         ) -> Aarch64Branch {
-            super::cmp(code, counter_reg(counter), bound_reg(counter));
-            Aarch64Branch::Hs(super::b_hs(code))
+            AsmProgram::from([table::CmpI64::new(counter_reg(counter), bound_reg(counter))])
+                .assemble(code);
+            Aarch64Branch::Cond(super::b_hs(code))
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            super::assemble(
-                code,
-                [super::Inst::StrQ(
-                    src,
-                    Mem {
-                        base: X1,
-                        offset: 0,
-                    },
-                )],
-            );
+            AsmProgram::from([Inst::str_q(
+                src,
+                Mem {
+                    base: X1,
+                    offset: 0,
+                },
+            )])
+            .assemble(code);
         }
 
         fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
             match step {
                 OutStep::Batch => {
-                    super::add(code, X1, X1, super::Imm12(self.file.vector_bytes as u16));
+                    AsmProgram::from([table::AddI64::new(
+                        X1,
+                        X1,
+                        table::Imm12(self.file.vector_bytes as u16),
+                    )])
+                    .assemble(code);
                 }
-                OutStep::RowSkip => super::add(code, X1, X1, X4),
+                OutStep::RowSkip => {
+                    AsmProgram::from([table::AddI64::new(X1, X1, X4)]).assemble(code);
+                }
             }
         }
 
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
             super::emit_fmov_imm(code, scratch, scalar);
-            super::emit_fadd(code, dst, dst, scratch);
+            AsmProgram::from([Inst::Fadd(dst, dst, scratch)]).assemble(code);
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            super::assemble(code, [super::Inst::Ret]);
+            AsmProgram::from([Inst::Ret]).assemble(code);
         }
     }
 
@@ -2303,7 +2024,8 @@ pub(crate) mod driver {
         for reload in &plan.reloads {
             match reload {
                 Reload::FromStack { target, slot } => {
-                    assemble(code, [Inst::LdrQ(*target, frame_slot(slot.offset()))]);
+                    AsmProgram::from([Inst::ldr_q(*target, frame_slot(slot.offset()))])
+                        .assemble(code);
                 }
                 Reload::Const { target, val_bits } => {
                     emit_const_load(code, *target, *val_bits, pool);
@@ -2313,7 +2035,7 @@ pub(crate) mod driver {
 
         // 2. Emit setup MOV (for FMLA accumulator or BSL mask)
         if let Some((dst, src)) = plan.setup_mov {
-            assemble(code, [Inst::Mov(dst, src)]);
+            AsmProgram::from([Inst::mov(dst, src)]).assemble(code);
         }
 
         // 3. Emit main op
@@ -2345,30 +2067,90 @@ pub(crate) mod driver {
                 // it; x9-x11 are caller-saved GPR scratch clear of the branch
                 // guard (w16) and the const-pool anchor (x17).
                 let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
-                const BASE_GPR: Xr = Xr(9);
-                const IDX_GPR: Xr = Xr(10);
-                const VAL_GPR: Xr = Xr(11);
+                const BASE_GPR: PtrReg = ptr::X9;
+                const IDX_GPR: Gpr = gpr::X10;
+                const VAL_GPR: Gpr = gpr::X11;
                 /// Bytes per pointer in the context array.
                 const PTR_BYTES: u32 = 8;
-                emit_fcvtzs(code, idx_int, *idx); // float idx -> int32 lanes
-                emit_ldr_x(
-                    code,
-                    BASE_GPR,
-                    Mem {
-                        base: X0,
-                        offset: u32::from(*slot) * PTR_BYTES,
+                AsmProgram::from([
+                    Inst::Fcvtzs(idx_int, *idx),
+                    Inst::ldr_x(
+                        BASE_GPR,
+                        Mem {
+                            base: X0,
+                            offset: u32::from(*slot) * PTR_BYTES,
+                        },
+                    ),
+                    Inst::UmovW {
+                        dst: IDX_GPR,
+                        src: idx_int,
+                        lane: 0,
                     },
-                );
-                emit_gather(
-                    code,
-                    *dst,
-                    idx_int,
-                    super::GatherGprs {
-                        base: BASE_GPR,
-                        idx: IDX_GPR,
-                        val: VAL_GPR,
+                    Inst::ldr_w(
+                        VAL_GPR,
+                        MemIndexed {
+                            base: BASE_GPR,
+                            index: IDX_GPR,
+                        },
+                    ),
+                    Inst::InsW {
+                        dst: *dst,
+                        lane: 0,
+                        src: VAL_GPR,
                     },
-                );
+                    Inst::UmovW {
+                        dst: IDX_GPR,
+                        src: idx_int,
+                        lane: 1,
+                    },
+                    Inst::ldr_w(
+                        VAL_GPR,
+                        MemIndexed {
+                            base: BASE_GPR,
+                            index: IDX_GPR,
+                        },
+                    ),
+                    Inst::InsW {
+                        dst: *dst,
+                        lane: 1,
+                        src: VAL_GPR,
+                    },
+                    Inst::UmovW {
+                        dst: IDX_GPR,
+                        src: idx_int,
+                        lane: 2,
+                    },
+                    Inst::ldr_w(
+                        VAL_GPR,
+                        MemIndexed {
+                            base: BASE_GPR,
+                            index: IDX_GPR,
+                        },
+                    ),
+                    Inst::InsW {
+                        dst: *dst,
+                        lane: 2,
+                        src: VAL_GPR,
+                    },
+                    Inst::UmovW {
+                        dst: IDX_GPR,
+                        src: idx_int,
+                        lane: 3,
+                    },
+                    Inst::ldr_w(
+                        VAL_GPR,
+                        MemIndexed {
+                            base: BASE_GPR,
+                            index: IDX_GPR,
+                        },
+                    ),
+                    Inst::InsW {
+                        dst: *dst,
+                        lane: 3,
+                        src: VAL_GPR,
+                    },
+                ])
+                .assemble(code);
             }
             ResolvedOp::Uniform { dst, load } => {
                 super::emit_uniform_load(code, *dst, *load);
@@ -2386,7 +2168,7 @@ pub(crate) mod driver {
             }
             ResolvedOp::FusedMulAdd { dst, a, b } => {
                 // setup_mov already placed c into dst
-                assemble(code, [Inst::Fmla(*dst, *a, *b)]);
+                AsmProgram::from([Inst::Fmla(*dst, *a, *b)]).assemble(code);
             }
             ResolvedOp::DecomposedMulAdd {
                 dst,
@@ -2396,11 +2178,11 @@ pub(crate) mod driver {
                 c_deferred,
             } => {
                 // FMUL(dst, a, b) — consumes a and b (loaded upfront).
-                assemble(code, [Inst::Fmul(*dst, *a, *b)]);
+                AsmProgram::from([Inst::Fmul(*dst, *a, *b)]).assemble(code);
                 // Reload c after FMUL (c may reuse tmp_op which held b).
                 emit_deferred(code, *c, c_deferred.as_ref(), pool);
                 // FADD(dst, dst, c)
-                assemble(code, [Inst::Fadd(*dst, *dst, *c)]);
+                AsmProgram::from([Inst::Fadd(*dst, *dst, *c)]).assemble(code);
             }
             ResolvedOp::Select {
                 dst,
@@ -2408,7 +2190,7 @@ pub(crate) mod driver {
                 if_false,
             } => {
                 // setup_mov already placed mask into dst
-                assemble(code, [Inst::Bsl(*dst, *if_true, *if_false)]);
+                AsmProgram::from([Inst::Bsl(*dst, *if_true, *if_false)]).assemble(code);
             }
         }
 
@@ -2423,7 +2205,7 @@ pub(crate) mod driver {
     ) {
         match deferred {
             Some(DeferredReload::FromStack(slot)) => {
-                super::assemble(code, [super::Inst::LdrQ(target, frame_slot(slot.offset()))]);
+                AsmProgram::from([Inst::ldr_q(target, frame_slot(slot.offset()))]).assemble(code);
             }
             Some(DeferredReload::Const(val_bits)) => {
                 emit_const_load(code, target, *val_bits, pool);
@@ -2434,7 +2216,8 @@ pub(crate) mod driver {
 }
 
 // =============================================================================
-// General-purpose registers
+// =============================================================================
+// General-purpose and Pointer registers
 // =============================================================================
 
 /// The aarch64 general register file (`x0`–`x30`, plus the zero register).
@@ -2442,11 +2225,6 @@ pub(crate) mod driver {
 /// A distinct type from [`Reg`], which names the *vector* file `v0`–`v31`.
 /// They are different files that share a numbering, so `Xr(1)` is `x1` and
 /// `Reg(1)` is `v1`, and neither can be passed where the other belongs.
-///
-/// A SIMD language barely touches these: loop counters, the output pointer,
-/// the row stride, the scalar half of a gather, and the base of every address
-/// a load or store names. That is the whole list, which is why this stays a
-/// vocabulary rather than an assembler.
 pub type Xr = Gpr;
 
 /// Constructor function for backwards compatibility with `Xr(u8)`.
@@ -2457,15 +2235,30 @@ pub const fn Xr(r: u8) -> Gpr {
     Gpr(r)
 }
 
-/// AAPCS64 registers the emitted kernels use.
-pub mod xr {
+/// Physical pointer registers used by AAPCS64 emitted kernels.
+pub mod ptr {
+    use super::PtrReg;
+
+    /// 1st argument: context pointer — array of bound buffer bases.
+    pub const X0: PtrReg = PtrReg(0);
+    /// 2nd argument: output pointer, advanced per batch and per row.
+    pub const X1: PtrReg = PtrReg(1);
+    /// Scratch base register for gather.
+    pub const X9: PtrReg = PtrReg(9);
+    /// IP0, intra-procedure scratch (displacement fallback).
+    pub const X16: PtrReg = PtrReg(16);
+    /// IP1, intra-procedure scratch (constant-pool anchor).
+    pub const X17: PtrReg = PtrReg(17);
+    /// The stack pointer — spill slots are addressed from it.
+    pub const SP: PtrReg = PtrReg(31);
+}
+
+/// AAPCS64 general-purpose registers (integers, counters, indices, bounds).
+pub mod gpr {
     use super::Gpr;
 
-    /// 1st argument: the context pointer — the array of bound buffer bases a
-    /// gather reads its slot from. Read-only for the whole kernel.
-    pub const X0: Gpr = Gpr(0);
-    /// 2nd argument: the output pointer, advanced per batch and per row.
-    pub const X1: Gpr = Gpr(1);
+    /// The zero register in positions where `xzr` is meant.
+    pub const XZR: Gpr = Gpr(31);
     /// 3rd argument: group count (the inner bound).
     pub const X2: Gpr = Gpr(2);
     /// 4th argument: row count (the outer bound).
@@ -2476,66 +2269,72 @@ pub mod xr {
     pub const X5: Gpr = Gpr(5);
     /// Outer (row) loop counter.
     pub const X6: Gpr = Gpr(6);
-    /// IP0, the intra-procedure scratch. The encoder borrows it to hold an
-    /// address whose displacement is past a load's 12-bit immediate.
-    pub const X16: Gpr = Gpr(16);
-    /// IP1, the intra-procedure scratch holding the constant-pool anchor.
-    pub const X17: Gpr = Gpr(17);
-    /// The zero register in the positions where `xzr` is meant.
-    pub const XZR: Gpr = Gpr(31);
-    /// The stack pointer — spill slots are addressed from it.
-    ///
-    /// Encoded as register 31, the number [`XZR`] also uses. Which of the two
-    /// `31` means is decided by the instruction (load/store and `add` read it
-    /// as `sp`; most data-processing reads it as `xzr`), so the two constants
-    /// exist to say at the call site which one was meant.
-    pub const SP: Gpr = Gpr(31);
+    /// Scratch: gather index.
+    pub const X10: Gpr = Gpr(10);
+    /// Scratch: gather value.
+    pub const X11: Gpr = Gpr(11);
+}
+
+/// AAPCS64 registers the emitted kernels use.
+pub mod xr {
+    pub use super::gpr::*;
+    pub use super::ptr::*;
 }
 
 pub use table::Imm12;
 
 /// `movz dst, #imm16` — also how `mov dst, xzr` is spelled, as `movz dst, #0`.
 #[inline(always)]
-pub fn movz(code: &mut Vec<u8>, dst: Xr, imm: u16) {
+pub fn movz(code: &mut Vec<u8>, dst: impl Into<Gpr>, imm: u16) {
+    let dst = dst.into();
     emit32(code, 0xD280_0000 | ((imm as u32) << 5) | dst.0 as u32);
 }
 
 /// `cmp lhs, rhs` — `subs xzr, lhs, rhs`, setting the flags [`b_hs`] reads.
 #[inline(always)]
-pub fn cmp(code: &mut Vec<u8>, lhs: Xr, rhs: Xr) {
+pub fn cmp(code: &mut Vec<u8>, lhs: impl Into<Gpr>, rhs: impl Into<Gpr>) {
+    let lhs = lhs.into();
+    let rhs = rhs.into();
     emit32(
         code,
         0xEB00_0000 | ((rhs.0 as u32) << 16) | ((lhs.0 as u32) << 5) | 31,
     );
 }
 
-/// What an [`add`] can add: another register, or a 12-bit immediate.
+/// What an [`add`] can add: another register, a pointer register, or a 12-bit immediate.
 ///
 /// As on x86, the operand's *type* selects the encoding, so the mnemonic stays
 /// one name instead of splitting into `add_reg` / `add_imm`.
 pub trait AddOperand {
     /// Emit `add dst, src, self`.
-    fn add_into(self, code: &mut Vec<u8>, dst: Xr, src: Xr);
+    fn add_into(self, code: &mut Vec<u8>, dst: Gpr, src: Gpr);
 }
 
-impl AddOperand for Xr {
+impl AddOperand for Gpr {
     #[inline(always)]
-    fn add_into(self, code: &mut Vec<u8>, dst: Xr, src: Xr) {
+    fn add_into(self, code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
         table::AddI64::new(dst, src, self).emit_into(code);
+    }
+}
+
+impl AddOperand for PtrReg {
+    #[inline(always)]
+    fn add_into(self, code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
+        table::AddI64::new(dst, src, self.as_gpr()).emit_into(code);
     }
 }
 
 impl AddOperand for Imm12 {
     #[inline(always)]
-    fn add_into(self, code: &mut Vec<u8>, dst: Xr, src: Xr) {
+    fn add_into(self, code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
         table::AddI64::new(dst, src, self).emit_into(code);
     }
 }
 
 /// `add dst, src, operand`
 #[inline(always)]
-pub fn add(code: &mut Vec<u8>, dst: Xr, src: Xr, operand: impl AddOperand) {
-    operand.add_into(code, dst, src);
+pub fn add(code: &mut Vec<u8>, dst: impl Into<Gpr>, src: impl Into<Gpr>, operand: impl AddOperand) {
+    operand.add_into(code, dst.into(), src.into());
 }
 
 /// `mvn w<dst>, w<src>` — bitwise NOT of a 32-bit general register.
@@ -2543,7 +2342,9 @@ pub fn add(code: &mut Vec<u8>, dst: Xr, src: Xr, operand: impl AddOperand) {
 /// `ORN Wd, WZR, Wm`; the guard path uses it to turn "all lanes set" into
 /// zero so a following `cbz` tests it.
 #[inline(always)]
-pub fn mvn_w(code: &mut Vec<u8>, dst: Xr, src: Xr) {
+pub fn mvn_w(code: &mut Vec<u8>, dst: impl Into<Gpr>, src: impl Into<Gpr>) {
+    let dst = dst.into();
+    let src = src.into();
     emit32(code, 0x2A20_03E0 | ((src.0 as u32) << 16) | dst.0 as u32);
 }
 
@@ -2562,10 +2363,55 @@ impl Cond19 {
     /// Point the branch at `target`, a byte offset into the same buffer.
     #[inline(always)]
     pub fn patch(self, code: &mut [u8], target: usize) {
-        let imm19 = (((target - self.0) / 4) as u32) & 0x7FFFF;
-        let word = 0x5400_0000 | (imm19 << 5) | 0x2; // cond = HS
-        code[self.0..self.0 + 4].copy_from_slice(&word.to_le_bytes());
+        let offset = ((target as i64 - self.0 as i64) / 4) as i32;
+        assert!(
+            (-(1 << 18)..(1 << 18)).contains(&offset),
+            "19-bit branch offset {offset} out of range (±1MB)"
+        );
+        let imm19 = (offset as u32) & 0x7FFFF;
+        let existing = u32::from_le_bytes([
+            code[self.0],
+            code[self.0 + 1],
+            code[self.0 + 2],
+            code[self.0 + 3],
+        ]);
+        let patched = (existing & 0xFF00_001F) | (imm19 << 5);
+        code[self.0..self.0 + 4].copy_from_slice(&patched.to_le_bytes());
     }
+}
+
+/// An unconditional branch whose 26-bit displacement is not filled in yet.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[must_use = "an unpatched branch falls through to itself"]
+pub struct Rel26(usize);
+
+impl Rel26 {
+    /// Point the branch at `target`, a byte offset into the same buffer.
+    #[inline(always)]
+    pub fn patch(self, code: &mut [u8], target: usize) {
+        let offset = ((target as i64 - self.0 as i64) / 4) as i32;
+        assert!(
+            (-(1 << 25)..(1 << 25)).contains(&offset),
+            "26-bit branch offset {offset} out of range (±128MB)"
+        );
+        let imm26 = (offset as u32) & 0x03FF_FFFF;
+        let existing = u32::from_le_bytes([
+            code[self.0],
+            code[self.0 + 1],
+            code[self.0 + 2],
+            code[self.0 + 3],
+        ]);
+        let patched = (existing & 0xFC00_0000) | imm26;
+        code[self.0..self.0 + 4].copy_from_slice(&patched.to_le_bytes());
+    }
+}
+
+/// `cbz w16, #0` — branch if W16 == 0 (mask all-false), awaiting patch.
+#[inline(always)]
+pub fn cbz_w16(code: &mut Vec<u8>) -> Cond19 {
+    let at = code.len();
+    emit32(code, 0x3400_0010);
+    Cond19(at)
 }
 
 /// `b.hs` — taken when the previous [`cmp`] found `lhs >= rhs` unsigned.
@@ -2574,6 +2420,14 @@ pub fn b_hs(code: &mut Vec<u8>) -> Cond19 {
     let at = code.len();
     emit32(code, 0x5400_0002);
     Cond19(at)
+}
+
+/// `b #0` — unconditional forward branch placeholder awaiting patch.
+#[inline(always)]
+pub fn b_placeholder(code: &mut Vec<u8>) -> Rel26 {
+    let at = code.len();
+    emit32(code, 0x1400_0000);
+    Rel26(at)
 }
 
 /// `b target` — an unconditional branch to an already-known offset.
@@ -2617,14 +2471,14 @@ mod xr_tests {
         assert_eq!(word(|c| add(c, X1, X1, X4)), 0x8B04_0021);
         // STR Qt, [Xn]
         assert_eq!(
-            word(|c| emit_str_q(
-                c,
+            word(|c| AsmProgram::from([Inst::str_q(
                 Reg(0),
                 Mem {
                     base: X1,
-                    offset: 0
-                }
-            )),
+                    offset: 0,
+                },
+            )])
+            .assemble(c)),
             0x3D80_0020
         );
         // RET
@@ -2672,30 +2526,30 @@ mod xr_tests {
     #[test]
     fn the_two_register_files_are_not_interchangeable() {
         assert_eq!(X1.0, Reg(1).0);
-        // `emit_str_q` takes both, in their own positions: the vector operand
+        // `Inst::str_q` takes both, in their own positions: the vector operand
         // lands in Rt and the address's base in Rn, so swapping them cannot
-        // typecheck. `emit_ldr_x` is the mirror — an `Xr` destination, because
+        // typecheck. `Inst::ldr_x` is the mirror — an `Xr` destination, because
         // it is a load on the general file, not the vector one.
         assert_eq!(
-            word(|c| emit_str_q(
-                c,
+            word(|c| AsmProgram::from([Inst::str_q(
                 Reg(3),
                 Mem {
                     base: X1,
-                    offset: 0
-                }
-            )),
+                    offset: 0,
+                },
+            )])
+            .assemble(c)),
             0x3D80_0023
         );
         assert_eq!(
-            word(|c| emit_ldr_x(
-                c,
-                Xr(3),
+            word(|c| AsmProgram::from([Inst::ldr_x(
+                PtrReg(3),
                 Mem {
                     base: X1,
-                    offset: 0
-                }
-            )),
+                    offset: 0,
+                },
+            )])
+            .assemble(c)),
             0xF940_0023
         );
     }

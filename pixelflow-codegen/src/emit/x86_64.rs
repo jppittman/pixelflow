@@ -9,7 +9,10 @@
 //! Transcendental builtins (atan2, atan, asin, acos) use VEX encoding for the
 //! 3-operand form which avoids extra MOV instructions in multi-step sequences.
 
-use super::{Counter, EncodedInst, OutStep, Reg, SourceOperand, assemble, unimplemented_op};
+use super::{
+    AsmInsn, AsmProgram, Counter, EncodedInst, Gpr, OutStep, PtrReg, Reg, SourceOperand, assemble,
+    unimplemented_op,
+};
 use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 
@@ -102,22 +105,21 @@ impl Vex {
     }
 
     /// `op reg, [addr]` — the memory-operand form, for any base and any
-    /// `op reg, [addr]` — the memory-operand form, for any base and any
     /// displacement mode. The prefix is VEX's (L=0); the ModRM/SIB/
     /// displacement tail is the architecture's, so it comes from
     /// [`mem_operand`]. VEX.B extends the *base* here, not an r/m register.
-    fn rm<D: Disp>(self, reg: Reg, addr: Mem<D>) -> EncodedInst {
+    fn rm<D: Disp, P: BaseReg>(self, reg: Reg, addr: Mem<D, P>) -> EncodedInst {
         let mut inst = EncodedInst::new();
-        self.head_into(&mut inst, reg.0, UNUSED_VVVV, addr.base.0);
+        self.head_into(&mut inst, reg.0, UNUSED_VVVV, addr.base.reg_num());
         mem_operand_into(&mut inst, reg.0, addr);
         inst
     }
 
     /// `op reg, vvvv, [addr]` — 3-operand VEX with memory operand.
     #[allow(dead_code)]
-    fn rrm<D: Disp>(self, reg: Reg, vvvv: Reg, addr: Mem<D>) -> EncodedInst {
+    fn rrm<D: Disp, P: BaseReg>(self, reg: Reg, vvvv: Reg, addr: Mem<D, P>) -> EncodedInst {
         let mut inst = EncodedInst::new();
-        self.head_into(&mut inst, reg.0, vvvv.0, addr.base.0);
+        self.head_into(&mut inst, reg.0, vvvv.0, addr.base.reg_num());
         mem_operand_into(&mut inst, reg.0, addr);
         inst
     }
@@ -278,10 +280,10 @@ pub fn emit_movaps(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 
 /// `movups` between `xmm<reg>` and `[addr]`. Load and store are one encoding
 /// a single opcode byte apart, so they share everything below.
-fn movups<D: Disp>(opcode: u8, reg: Reg, addr: Mem<D>) -> EncodedInst {
+fn movups<D: Disp, P: BaseReg>(opcode: u8, reg: Reg, addr: Mem<D, P>) -> EncodedInst {
     let mut inst = EncodedInst::new();
     // REX only when an operand needs extending: R for the xmm, B for the base.
-    let rex = 0x40 | (u8::from(reg.0 >= 8) << 2) | u8::from(addr.base.0 >= 8);
+    let rex = 0x40 | (u8::from(reg.0 >= 8) << 2) | u8::from(addr.base.reg_num() >= 8);
     if rex != 0x40 {
         inst.push(rex);
     }
@@ -292,8 +294,10 @@ fn movups<D: Disp>(opcode: u8, reg: Reg, addr: Mem<D>) -> EncodedInst {
 }
 
 /// `movups xmm<dst>, [addr]` — unaligned 128-bit load.
-pub fn emit_movups_load<D: Disp>(code: &mut Vec<u8>, dst: Reg, addr: Mem<D>) {
-    assemble(code, [movups(0x10, dst, addr)]);
+#[must_use]
+#[inline(always)]
+pub fn movups_load<D: Disp, P: BaseReg>(dst: Reg, addr: Mem<D, P>) -> EncodedInst {
+    movups(0x10, dst, addr)
 }
 
 /// `movups [addr], xmm<src>` — unaligned 128-bit store.
@@ -301,27 +305,10 @@ pub fn emit_movups_load<D: Disp>(code: &mut Vec<u8>, dst: Reg, addr: Mem<D>) {
 /// The address comes first because that is where it sits in the instruction:
 /// the direction is the operand *order*, and `0F 10` versus `0F 11` is the
 /// only thing the two mnemonics do not share.
-pub fn emit_movups_store<D: Disp>(code: &mut Vec<u8>, addr: Mem<D>, src: Reg) {
-    assemble(code, [movups(0x11, src, addr)]);
-}
-
-// =============================================================================
-// Stack frame
-// =============================================================================
-
-/// `sub rsp, imm32` — allocate a spill frame (kernels stay leaf functions;
-/// no base pointer, offsets are rsp-relative).
-///
-/// Spelled through the shared vocabulary: stack adjustment is a general-register
-/// instruction and is identical at every vector width, so it is defined once
-/// here rather than once per width.
-pub fn emit_sub_rsp(code: &mut Vec<u8>, size: u32) {
-    sub(code, gpr::RSP, Imm32(size as i32));
-}
-
-/// `add rsp, imm32` — release the spill frame before `ret`.
-pub fn emit_add_rsp(code: &mut Vec<u8>, size: u32) {
-    add(code, gpr::RSP, Imm32(size as i32));
+#[must_use]
+#[inline(always)]
+pub fn movups_store<D: Disp, P: BaseReg>(src: Reg, addr: Mem<D, P>) -> EncodedInst {
+    movups(0x11, src, addr)
 }
 
 // =============================================================================
@@ -505,17 +492,46 @@ fn emit_vcvtdq2ps(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 // emits (`vroundps`, `vandnps`).
 
 /// `mov dstGPR, [ctxGPR + disp32]` — load a buffer base pointer out of the
-/// context struct. Mirrors the AVX-512 backend's loader.
+/// 64-bit pointer load: `mov dst, [base + disp32]`
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MovLoadPtr {
+    pub dst: PtrReg,
+    pub base: PtrReg,
+    pub disp: i32,
+}
+
+impl MovLoadPtr {
+    #[must_use]
+    #[inline]
+    pub fn encode(self) -> EncodedInst {
+        debug_assert!(self.dst.0 < 8 && self.base.0 < 8, "MovLoadPtr: GPR8 only");
+        let mut inst = EncodedInst::new();
+        inst.push(0x48);
+        inst.push(0x8B);
+        inst.push(0x80 | ((self.dst.0 & 7) << 3) | (self.base.0 & 7));
+        inst.extend(&self.disp.to_le_bytes());
+        inst
+    }
+}
+
+impl AsmInsn for MovLoadPtr {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        self.encode().emit_into(code);
+    }
+}
+
+/// Fetch a pointer out of the caller's context: `mov dst, [ctx + disp32]`.
+/// Used by gather to load a buffer's base, and by `emit_uniform_load` to load
+/// the uniform block's base. Read-only on the context struct. Mirrors the
+/// AVX-512 backend's loader.
 pub fn emit_load_ptr_from_ctx(code: &mut Vec<u8>, dst_gpr: u8, ctx_gpr: u8, disp: i32) {
-    debug_assert!(
-        dst_gpr < 8 && ctx_gpr < 8,
-        "emit_load_ptr_from_ctx: GPR8 only"
-    );
-    // REX.W ; 8B ; mod=10 reg=dst r/m=ctx ; disp32
-    code.push(0x48);
-    code.push(0x8B);
-    code.push(0x80 | ((dst_gpr & 7) << 3) | (ctx_gpr & 7));
-    code.extend_from_slice(&disp.to_le_bytes());
+    MovLoadPtr {
+        dst: PtrReg(dst_gpr),
+        base: PtrReg(ctx_gpr),
+        disp,
+    }
+    .emit_into(code);
 }
 
 /// `vpextrd r32, xmmSRC, lane` — move one 32-bit lane into a GP register.
@@ -576,22 +592,22 @@ const UNIFORM_BYTES: i32 = 4;
 /// (VEX.128.66.0F38.W0 18 /r). `rax` is the scratch the gather already
 /// claims; `rdi` is the context, read-only for the whole kernel.
 pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
-    emit_load_ptr_from_ctx(
-        code,
-        gpr::RAX.0,
-        gpr::RDI.0,
-        i32::from(load.ctx_slot) * PTR_BYTES,
-    );
-    assemble(
-        code,
-        [Vex::m0f38_66(0x18).rm(
+    AsmProgram::from([
+        MovLoadPtr {
+            dst: ptr::RAX,
+            base: ptr::RDI,
+            disp: i32::from(load.ctx_slot) * PTR_BYTES,
+        }
+        .encode(),
+        Vex::m0f38_66(0x18).rm(
             dst,
             Mem {
-                base: gpr::RAX,
+                base: ptr::RAX,
                 disp: Imm32(i32::from(load.offset) * UNIFORM_BYTES),
             },
-        )],
-    );
+        ),
+    ])
+    .assemble(code);
 }
 
 /// `dst = base[idx_lane]` for each lane — the whole gather sequence.
@@ -990,56 +1006,56 @@ mod tests {
     #[test]
     fn emit_movups_store_omits_rex_for_a_no_disp_address_when_both_registers_are_low() {
         let mut code = Vec::new();
-        emit_movups_store(
-            &mut code,
+        AsmProgram::from([movups_store(
+            Reg(3),
             Mem {
                 base: Gpr(3),
                 disp: NoDisp,
             },
-            Reg(3),
-        );
+        )])
+        .assemble(&mut code);
         assert_eq!(code, vec![0x0F, 0x11, ((3 & 7) << 3) | 3]);
     }
 
     #[test]
     fn emit_movups_store_sets_rex_r_for_a_no_disp_address_when_only_the_source_register_is_high() {
         let mut code = Vec::new();
-        emit_movups_store(
-            &mut code,
+        AsmProgram::from([movups_store(
+            Reg(9),
             Mem {
                 base: Gpr(3),
                 disp: NoDisp,
             },
-            Reg(9),
-        );
+        )])
+        .assemble(&mut code);
         assert_eq!(code, vec![0x44, 0x0F, 0x11, ((9 & 7) << 3) | 3]);
     }
 
     #[test]
     fn emit_movups_store_sets_rex_b_for_a_no_disp_address_when_only_the_base_register_is_high() {
         let mut code = Vec::new();
-        emit_movups_store(
-            &mut code,
+        AsmProgram::from([movups_store(
+            Reg(2),
             Mem {
                 base: Gpr(11),
                 disp: NoDisp,
             },
-            Reg(2),
-        );
+        )])
+        .assemble(&mut code);
         assert_eq!(code, vec![0x41, 0x0F, 0x11, ((2 & 7) << 3) | (11 & 7)]);
     }
 
     #[test]
     fn emit_movups_store_sets_both_rex_bits_for_a_no_disp_address_when_both_registers_are_high() {
         let mut code = Vec::new();
-        emit_movups_store(
-            &mut code,
+        AsmProgram::from([movups_store(
+            Reg(11),
             Mem {
                 base: Gpr(14),
                 disp: NoDisp,
             },
-            Reg(11),
-        );
+        )])
+        .assemble(&mut code);
         assert_eq!(code, vec![0x45, 0x0F, 0x11, ((11 & 7) << 3) | (14 & 7)]);
     }
 
@@ -1104,7 +1120,9 @@ mod tests {
 )]
 pub(crate) mod driver {
     use super::super::*;
-    use super::{Imm8, Imm32, Mem, NoDisp, gpr, scaffold};
+    use super::{
+        AsmProgram, Imm8, Imm32, Inst, Mem, NoDisp, gpr, movups_load, movups_store, ptr, scaffold,
+    };
     use crate::error::CompileError;
     use alloc::vec::Vec;
     use pixelflow_ir::kind::OpKind;
@@ -1145,7 +1163,7 @@ pub(crate) mod driver {
     /// frame mode able to address a frame the red zone could not.
     const fn frame_slot(offset: u32) -> Mem<Imm32> {
         Mem {
-            base: gpr::RSP,
+            base: ptr::RSP,
             disp: Imm32(offset as i32),
         }
     }
@@ -1159,7 +1177,7 @@ pub(crate) mod driver {
         let disp = -(offset as i64 + 16);
         if disp < -128 {
             return Err(CompileError::Internal(
-                "x86 spill: red-zone displacement out of range (prologue mode bug)",
+                "red-zone offset exceeded 128 bytes despite frame fitting the zone",
             ));
         }
         Ok(disp as i8)
@@ -1185,15 +1203,15 @@ pub(crate) mod driver {
 
         fn spill_store(&self, code: &mut Vec<u8>, src: Reg, offset: u32) {
             match self.red_zone_slot(offset) {
-                Some(addr) => super::emit_movups_store(code, addr, src),
-                None => super::emit_movups_store(code, frame_slot(offset), src),
+                Some(addr) => AsmProgram::from([movups_store(src, addr)]).assemble(code),
+                None => AsmProgram::from([movups_store(src, frame_slot(offset))]).assemble(code),
             }
         }
 
         fn spill_load(&self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
             match self.red_zone_slot(offset) {
-                Some(addr) => super::emit_movups_load(code, dst, addr),
-                None => super::emit_movups_load(code, dst, frame_slot(offset)),
+                Some(addr) => AsmProgram::from([movups_load(dst, addr)]).assemble(code),
+                None => AsmProgram::from([movups_load(dst, frame_slot(offset))]).assemble(code),
             }
         }
 
@@ -1206,7 +1224,7 @@ pub(crate) mod driver {
             }
             let disp = x86_redzone_disp(offset).expect("red-zone mode implies fitting offsets");
             Some(Mem {
-                base: gpr::RSP,
+                base: ptr::RSP,
                 disp: Imm8(disp),
             })
         }
@@ -1425,21 +1443,29 @@ pub(crate) mod driver {
         }
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            super::emit_sub_rsp(code, bytes);
+            AsmProgram::from([Inst::SubImm32 {
+                dst: gpr::RSP,
+                imm: Imm32(bytes as i32),
+            }])
+            .assemble(code);
         }
 
         fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            super::emit_add_rsp(code, bytes);
+            AsmProgram::from([Inst::AddImm32 {
+                dst: gpr::RSP,
+                imm: Imm32(bytes as i32),
+            }])
+            .assemble(code);
         }
 
         // The scaffold's slots are always at a positive displacement, unlike
         // `emit_store`/`emit_resolve`, which follow the body's frame mode.
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-            super::emit_movups_store(code, frame_slot(offset), src);
+            AsmProgram::from([movups_store(src, frame_slot(offset))]).assemble(code);
         }
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-            super::emit_movups_load(code, dst, frame_slot(offset));
+            AsmProgram::from([movups_load(dst, frame_slot(offset))]).assemble(code);
         }
 
         /// Preserve the row count away from `rcx`, which the body's gather and
@@ -1461,14 +1487,14 @@ pub(crate) mod driver {
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            super::emit_movups_store(
-                code,
+            AsmProgram::from([movups_store(
+                src,
                 Mem {
                     base: scaffold::OUT_PTR,
                     disp: NoDisp,
                 },
-                src,
-            );
+            )])
+            .assemble(code);
         }
 
         fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
@@ -1481,7 +1507,7 @@ pub(crate) mod driver {
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            super::ret(code);
+            AsmProgram::from([Inst::Ret]).assemble(code);
         }
     }
 
@@ -1545,11 +1571,12 @@ pub(crate) mod driver {
 /// general-register ops, and the width only reaches them as the batch stride.
 pub(in crate::emit) mod scaffold {
     use super::gpr::*;
-    use super::{Counter, Gpr, OutStep};
+    use super::ptr;
+    use super::{AsmProgram, Counter, Gpr, Imm8, Inst, OutStep, PtrReg};
     use alloc::vec::Vec;
 
     /// The output pointer the scaffold writes through.
-    pub(in crate::emit) const OUT_PTR: Gpr = RSI;
+    pub(in crate::emit) const OUT_PTR: PtrReg = ptr::RSI;
 
     /// The register each loop counter lives in.
     const fn counter_reg(counter: Counter) -> Gpr {
@@ -1572,32 +1599,47 @@ pub(in crate::emit) mod scaffold {
     /// select guards may clobber.
     #[inline(always)]
     pub(in crate::emit) fn latch_bounds(code: &mut Vec<u8>) {
-        super::mov(code, R10, RCX);
+        AsmProgram::from([Inst::Mov { dst: R10, src: RCX }]).assemble(code);
     }
 
     #[inline(always)]
     pub(in crate::emit) fn counter_clear(code: &mut Vec<u8>, counter: Counter) {
         let r = counter_reg(counter);
-        super::xor(code, r, r);
+        AsmProgram::from([Inst::Xor { dst: r, src: r }]).assemble(code);
     }
 
     #[inline(always)]
     pub(in crate::emit) fn counter_step(code: &mut Vec<u8>, counter: Counter) {
-        super::inc(code, counter_reg(counter));
+        AsmProgram::from([Inst::Inc {
+            dst: counter_reg(counter),
+        }])
+        .assemble(code);
     }
 
     /// The loop's exit test: unsigned `counter >= bound`.
     #[inline(always)]
     pub(in crate::emit) fn branch_if_counter_done(code: &mut Vec<u8>, counter: Counter) -> usize {
-        super::cmp(code, counter_reg(counter), bound_reg(counter));
+        AsmProgram::from([Inst::Cmp {
+            lhs: counter_reg(counter),
+            rhs: bound_reg(counter),
+        }])
+        .assemble(code);
         super::jae(code).field()
     }
 
     #[inline(always)]
     pub(in crate::emit) fn advance_out(code: &mut Vec<u8>, step: OutStep, vector_bytes: u32) {
         match step {
-            OutStep::Batch => super::add(code, RSI, super::Imm8(vector_bytes as i8)),
-            OutStep::RowSkip => super::add(code, RSI, R8),
+            OutStep::Batch => {
+                AsmProgram::from([Inst::AddImm8 {
+                    dst: RSI,
+                    imm: Imm8(vector_bytes as i8),
+                }])
+                .assemble(code);
+            }
+            OutStep::RowSkip => {
+                AsmProgram::from([Inst::Add { dst: RSI, src: R8 }]).assemble(code);
+            }
         }
     }
 }
@@ -1606,19 +1648,18 @@ pub(in crate::emit) mod scaffold {
 // General-purpose registers
 // =============================================================================
 
-/// The x86-64 general register file.
-///
-/// A distinct type from [`Reg`], which names the *vector* file. They are
-/// different register files that happen to be numbered the same way, so
-/// `Gpr(10)` is `r10` and `Reg(10)` is `xmm10`, and nothing can silently pass
-/// one where the other belongs. Before this existed the general file had no
-/// type at all: it appeared as bare `u8` in a few encoder signatures and as
-/// raw opcode bytes everywhere else.
-///
-/// A SIMD language barely touches these — loop counters, pointers, and the
-/// scalar half of a gather — which is why the vocabulary below is nine
-/// instructions rather than an assembler.
-pub use super::Gpr;
+// The x86-64 general register file.
+//
+// A distinct type from [`Reg`], which names the *vector* file. They are
+// different register files that happen to be numbered the same way, so
+// `Gpr(10)` is `r10` and `Reg(10)` is `xmm10`, and nothing can silently pass
+// one where the other belongs. Before this existed the general file had no
+// type at all: it appeared as bare `u8` in a few encoder signatures and as
+// raw opcode bytes everywhere else.
+//
+// A SIMD language barely touches these — loop counters, pointers, and the
+// scalar half of a gather — which is why the vocabulary below is nine
+// instructions rather than an assembler.
 
 /// SysV argument and scratch registers the emitted kernels use.
 pub mod gpr {
@@ -1626,6 +1667,9 @@ pub mod gpr {
 
     /// Scratch / `movmskps` destination.
     pub const RAX: Gpr = Gpr(0);
+    /// Scratch aliases for RAX.
+    pub const AX: Gpr = RAX;
+    pub const RX: Gpr = RAX;
     /// 4th integer argument; the collapse loop's row count on entry.
     pub const RCX: Gpr = Gpr(1);
     /// 3rd integer argument: group count.
@@ -1646,6 +1690,87 @@ pub mod gpr {
     pub const R10: Gpr = Gpr(10);
     /// Outer (row) loop counter.
     pub const R11: Gpr = Gpr(11);
+}
+
+/// SysV argument and scratch pointer registers.
+pub mod ptr {
+    use super::PtrReg;
+
+    /// Scratch / base pointer register (`rax`).
+    pub const RAX: PtrReg = PtrReg(0);
+    /// Output pointer register (`rsi`).
+    pub const RSI: PtrReg = PtrReg(6);
+    /// Context pointer register (`rdi`).
+    pub const RDI: PtrReg = PtrReg(7);
+    /// Stack pointer register (`rsp`).
+    pub const RSP: PtrReg = PtrReg(4);
+}
+
+/// First-class x86-64 instruction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Inst {
+    Mov { dst: Gpr, src: Gpr },
+    Xor { dst: Gpr, src: Gpr },
+    Cmp { lhs: Gpr, rhs: Gpr },
+    Inc { dst: Gpr },
+    Add { dst: Gpr, src: Gpr },
+    AddImm8 { dst: Gpr, imm: Imm8 },
+    AddImm32 { dst: Gpr, imm: Imm32 },
+    SubImm32 { dst: Gpr, imm: Imm32 },
+    Ret,
+    MovLoadPtr(MovLoadPtr),
+    Encoded(EncodedInst),
+}
+
+impl Inst {
+    #[must_use]
+    #[inline(always)]
+    pub const fn mov(dst: Gpr, src: Gpr) -> Self {
+        Self::Mov { dst, src }
+    }
+    #[must_use]
+    #[inline(always)]
+    pub const fn xor(dst: Gpr, src: Gpr) -> Self {
+        Self::Xor { dst, src }
+    }
+    #[must_use]
+    #[inline(always)]
+    pub const fn ret() -> Self {
+        Self::Ret
+    }
+}
+
+impl From<EncodedInst> for Inst {
+    #[inline(always)]
+    fn from(e: EncodedInst) -> Self {
+        Inst::Encoded(e)
+    }
+}
+
+impl From<MovLoadPtr> for Inst {
+    #[inline(always)]
+    fn from(m: MovLoadPtr) -> Self {
+        Inst::MovLoadPtr(m)
+    }
+}
+
+impl AsmInsn for Inst {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        match self {
+            Inst::Mov { dst, src } => mov(code, dst, src),
+            Inst::Xor { dst, src } => xor(code, dst, src),
+            Inst::Cmp { lhs, rhs } => cmp(code, lhs, rhs),
+            Inst::Inc { dst } => inc(code, dst),
+            Inst::Add { dst, src } => add(code, dst, src),
+            Inst::AddImm8 { dst, imm } => add(code, dst, imm),
+            Inst::AddImm32 { dst, imm } => add(code, dst, imm),
+            Inst::SubImm32 { dst, imm } => sub(code, dst, imm),
+            Inst::Ret => ret(code),
+            Inst::MovLoadPtr(m) => m.emit_into(code),
+            Inst::Encoded(e) => e.emit_into(code),
+        }
+    }
 }
 
 /// A sign-extended 8-bit immediate.
@@ -1887,15 +2012,34 @@ impl Disp for Imm32 {
     }
 }
 
+/// A register usable as the base of a memory address ([`Mem`]).
+pub trait BaseReg: Copy {
+    fn reg_num(self) -> u8;
+}
+
+impl BaseReg for Gpr {
+    #[inline(always)]
+    fn reg_num(self) -> u8 {
+        self.0
+    }
+}
+
+impl BaseReg for PtrReg {
+    #[inline(always)]
+    fn reg_num(self) -> u8 {
+        self.0
+    }
+}
+
 /// An address spelled `[base + disp]`.
 ///
-/// The base being a [`Gpr`] is the point: `rsp` is a value here. It used to be
+/// The base being a [`Gpr`] or [`PtrReg`] is the point: `rsp` is a value here. It used to be
 /// the `_rsp` and `_base` suffixes of five separate functions that all encoded
 /// the same `movups`, where nothing could check it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Mem<D> {
+pub struct Mem<D, P = PtrReg> {
     /// The register the displacement is measured from.
-    pub base: Gpr,
+    pub base: P,
     /// The displacement — and, through its type, the mode (see [`Disp`]).
     pub disp: D,
 }
@@ -1912,8 +2056,12 @@ const RM_RIP_AT_MOD0: u8 = 0b101;
 const SIB_BASE_ONLY: u8 = 0x24;
 
 /// Write the ModRM/SIB/disp tail into an `EncodedInst`.
-pub(in crate::emit) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: Mem<D>) {
-    let rm = addr.base.0 & 7;
+pub(in crate::emit) fn mem_operand_into<D: Disp, P: BaseReg>(
+    inst: &mut EncodedInst,
+    reg: u8,
+    addr: Mem<D, P>,
+) {
+    let rm = addr.base.reg_num() & 7;
     debug_assert!(
         D::MOD != NoDisp::MOD || rm != RM_RIP_AT_MOD0,
         "[rbp]/[r13] has no mod=00 form: that encoding is RIP-relative"
@@ -1959,6 +2107,31 @@ mod gpr_tests {
         assert_eq!(asm(|c| add(c, RSI, Imm8(64))), [0x48, 0x83, 0xC6, 0x40]);
         // C3 — RET
         assert_eq!(asm(ret), [0xC3]);
+    }
+
+    #[test]
+    fn asm_program_declarative_array() {
+        let mut buff = Vec::new();
+        AsmProgram::from([Inst::Mov { src: AX, dst: RX }]).assemble(&mut buff);
+        assert_eq!(buff, [0x48, 0x89, 0xC0]);
+
+        let mut seq = Vec::new();
+        AsmProgram::from([
+            Inst::Mov { src: AX, dst: RX },
+            Inst::Xor { dst: R11, src: R11 },
+            Inst::Inc { dst: R9 },
+            Inst::Ret,
+        ])
+        .assemble(&mut seq);
+        assert_eq!(
+            seq,
+            [
+                0x48, 0x89, 0xC0, // mov rax, rax
+                0x4D, 0x31, 0xDB, // xor r11, r11
+                0x49, 0xFF, 0xC1, // inc r9
+                0xC3, // ret
+            ]
+        );
     }
 
     /// REX.R extends the source, REX.B the destination; a register above r7
@@ -2008,14 +2181,14 @@ mod gpr_tests {
     fn the_base_register_is_an_operand() {
         let store = |base| {
             asm(|c| {
-                emit_movups_store(
-                    c,
+                AsmProgram::from([movups_store(
+                    Reg(1),
                     Mem {
                         base,
                         disp: Imm8(8),
                     },
-                    Reg(1),
-                )
+                )])
+                .assemble(c);
             })
         };
         // 0F 11 /r, mod=01: rsp takes a SIB byte, rax and r10 do not.
@@ -2031,24 +2204,24 @@ mod gpr_tests {
     #[test]
     fn the_displacement_type_picks_the_encoding() {
         let d8 = asm(|c| {
-            emit_movups_load(
-                c,
+            AsmProgram::from([movups_load(
                 Reg(0),
                 Mem {
                     base: RSP,
                     disp: Imm8(16),
                 },
-            )
+            )])
+            .assemble(c);
         });
         let d32 = asm(|c| {
-            emit_movups_load(
-                c,
+            AsmProgram::from([movups_load(
                 Reg(0),
                 Mem {
                     base: RSP,
                     disp: Imm32(16),
                 },
-            )
+            )])
+            .assemble(c);
         });
         assert_eq!(d8, [0x0F, 0x10, 0x44, 0x24, 0x10], "mod=01, disp8");
         assert_eq!(
@@ -2058,24 +2231,24 @@ mod gpr_tests {
         );
 
         let bare = asm(|c| {
-            emit_movups_load(
-                c,
+            AsmProgram::from([movups_load(
                 Reg(0),
                 Mem {
                     base: RSI,
                     disp: NoDisp,
                 },
-            )
+            )])
+            .assemble(c);
         });
         let zero = asm(|c| {
-            emit_movups_load(
-                c,
+            AsmProgram::from([movups_load(
                 Reg(0),
                 Mem {
                     base: RSI,
                     disp: Imm8(0),
                 },
-            )
+            )])
+            .assemble(c);
         });
         assert_eq!(bare, [0x0F, 0x10, 0x06], "mod=00 is its own mode");
         assert_eq!(zero, [0x0F, 0x10, 0x46, 0x00], "and a byte longer than it");
@@ -2089,8 +2262,8 @@ mod gpr_tests {
             base: RSP,
             disp: Imm32(64),
         };
-        let mut load = asm(|c| emit_movups_load(c, Reg(9), addr));
-        let store = asm(|c| emit_movups_store(c, addr, Reg(9)));
+        let mut load = asm(|c| AsmProgram::from([movups_load(Reg(9), addr)]).assemble(c));
+        let store = asm(|c| AsmProgram::from([movups_store(Reg(9), addr)]).assemble(c));
         assert_eq!(load[2], 0x10);
         assert_eq!(store[2], 0x11);
         load[2] = 0x11;

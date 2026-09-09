@@ -81,12 +81,69 @@ pub trait AsmInsn: Copy {
     fn emit_into(self, code: &mut Vec<u8>);
 }
 
+/// A declarative sequence of assembly instructions.
+///
+/// Written as an array or collection of instructions, then assembled into machine code:
+/// ```ignore
+/// AsmProgram::from([
+///     Inst::Mov { src: AX, dst: RX },
+/// ]).assemble(&mut buff);
+/// ```
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AsmProgram<S> {
+    insts: S,
+}
+
+impl<S> AsmProgram<S> {
+    /// Create a new assembly program wrapping an instruction sequence.
+    #[inline(always)]
+    pub const fn new(insts: S) -> Self {
+        Self { insts }
+    }
+}
+
+impl<I: AsmInsn, const N: usize> From<[I; N]> for AsmProgram<[I; N]> {
+    #[inline(always)]
+    fn from(insts: [I; N]) -> Self {
+        Self { insts }
+    }
+}
+
+impl<I: AsmInsn> From<alloc::vec::Vec<I>> for AsmProgram<alloc::vec::Vec<I>> {
+    #[inline(always)]
+    fn from(insts: alloc::vec::Vec<I>) -> Self {
+        Self { insts }
+    }
+}
+
+impl<'a, I: AsmInsn> From<&'a [I]> for AsmProgram<&'a [I]> {
+    #[inline(always)]
+    fn from(insts: &'a [I]) -> Self {
+        Self { insts }
+    }
+}
+
+impl<I: AsmInsn, S: IntoIterator<Item = I>> AsmProgram<S> {
+    /// Assemble the program into the machine-code buffer.
+    #[inline]
+    pub fn assemble(self, code: &mut Vec<u8>) {
+        for inst in self.insts {
+            inst.emit_into(code);
+        }
+    }
+}
+
+impl<I: AsmInsn, S: IntoIterator<Item = I> + Copy> AsmInsn for AsmProgram<S> {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        self.assemble(code);
+    }
+}
+
 /// Free-function fold: assemble a declarative sequence directly into `code`.
 #[inline]
 pub fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = I>) {
-    for inst in insts {
-        inst.emit_into(code);
-    }
+    AsmProgram::new(insts).assemble(code);
 }
 
 /// Physical vector register index (v0..v31 on AArch64, xmm/ymm/zmm0..zmm31 on x86).
@@ -99,6 +156,35 @@ pub type VReg = Reg;
 /// Physical 64-bit general-purpose register index (x0..x31 on AArch64, rax..r15 on x86).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Gpr(pub u8);
+
+/// Physical pointer register index holding a memory address (x0..x31/sp on AArch64, rax..r15/rsp on x86).
+///
+/// Distinct from [`Gpr`] (integers, counters, indices) and [`Reg`] (SIMD vectors).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PtrReg(pub u8);
+
+impl PtrReg {
+    /// Conversion to raw register index.
+    #[inline(always)]
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// View as general-purpose register for instructions that manipulate pointers as raw 64-bit values.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_gpr(self) -> Gpr {
+        Gpr(self.0)
+    }
+}
+
+impl From<PtrReg> for Gpr {
+    #[inline(always)]
+    fn from(p: PtrReg) -> Self {
+        p.as_gpr()
+    }
+}
 
 /// Physical mask/predicate register index (k0..k7 on AVX-512).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
