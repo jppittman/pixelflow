@@ -502,22 +502,19 @@ jobs:
               --no-tests fail
           done
 
-      - name: Check JIT/interpreter glyph parity
+      # Was `kernel_glyph_golden`, four JIT-vs-interpreter goldens. That
+      # oracle shared its definitions with the thing it checked, and went with
+      # the interpreter. Its replacement is the one glyph check that never
+      # did: FreeType, a rasterizer with no code in common with ours, now
+      # compared against the JIT's own pixels through `Glyph::bound`.
+      - name: Check glyph coverage against an external rasterizer
         shell: bash
         run: |
           set -euo pipefail
-          tests=(
-            descender_glyph_bake_matches_interpreter
-            double_counter_glyph_bake_matches_interpreter
-            round_glyph_bake_matches_interpreter
-            simple_glyph_bake_matches_interpreter
-          )
-          for test_name in "${tests[@]}"; do
-            cargo nextest run -p pixelflow-graphics \
-              --test kernel_glyph_golden \
-              -E "test(=$test_name)" \
-              --no-tests fail
-          done
+          cargo nextest run -p pixelflow-graphics --features freetype \
+            --test freetype_oracle \
+            -E "test(=our_ink_is_never_more_than_a_texel_from_freetype_s)" \
+            --no-tests fail
 
       - name: Check scene color, reflection, and antialiasing contracts
         shell: bash
