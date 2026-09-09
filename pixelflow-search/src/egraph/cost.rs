@@ -136,7 +136,12 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Buffer => 0,     // leaf, free
         OpKind::Gather => 10,    // memory read
         OpKind::RawGather => 10, // primitive memory read
-        OpKind::Reduce => 0,     // lowered (unrolled) before costing
+        // A fold's cost depends on its range and its monoid, and an `OpKind`
+        // carries neither; `node_op_cost`'s `ENode::Reduce` arm is where it is
+        // priced. Zero here so a caller reaching this table for a fold adds
+        // nothing rather than a wrong number. (It said "lowered (unrolled)
+        // before costing" while `ExpandReduce` ran first. It runs last now.)
+        OpKind::Reduce => 0,
         // A leaf like Buffer: its one broadcast load lands in the per-call
         // prologue, which the per-sample cost model does not see.
         OpKind::Uniform => 0,
@@ -610,18 +615,31 @@ mod cost_model_accessors {
         assert_eq!(model.node_op_cost(&ENode::Buffer(decl)), 0);
     }
 
-    /// `Dwrt` is the unlowered-autodiff marker and must never look cheap to
-    /// extraction, however the op-cost table happens to price it — so
-    /// `node_op_cost` overrides the table for it specifically.
+    /// `Dwrt` is the unlowered-autodiff marker: dear, so extraction takes the
+    /// chain rule wherever saturation produced one, but **finite**, because
+    /// `LowerDwrt` runs after saturation now and extraction has to be able to
+    /// keep one and hand it to the legalizer.
+    ///
+    /// This asserted `usize::MAX / 4` while lowering ran first and a `Dwrt`
+    /// could not reach the e-graph at all. A sentinel is not a large number,
+    /// it is an unrepresentable one: it makes the DP settle on a finite term
+    /// whose recomputed price saturates, and `extract.rs`'s claim/price audit
+    /// fires on the difference.
     #[test]
-    fn node_op_cost_makes_a_dwrt_node_prohibitively_expensive() {
+    fn node_op_cost_prices_a_dwrt_node_dearly_but_finitely() {
         let model = CostModel::latency_prior();
         let op = op_from_kind(OpKind::Dwrt).expect("Dwrt has an Op impl");
         let node = ENode::Op {
             op,
             children: vec![],
         };
-        assert_eq!(model.node_op_cost(&node), usize::MAX / 4);
+        let cost = model.node_op_cost(&node);
+        assert_eq!(cost, model.cost(OpKind::Dwrt), "priced from the table");
+        assert!(cost < usize::MAX / 4, "finite, not a sentinel: {cost}");
+        assert!(
+            cost > model.cost(OpKind::Sqrt),
+            "still dearer than any real op, so the chain rule wins where it exists"
+        );
     }
 
     /// An ordinary op node (not Dwrt, not a leaf) prices straight from the
