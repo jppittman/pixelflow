@@ -697,6 +697,7 @@ mod tests {
     mod runtime {
         use super::super::*;
         use crate::emit::executable::ExecutableCode;
+        use crate::emit::{Gpr, PtrReg};
         use core::arch::x86_64::*;
 
         // Passing __m512 by value IS the emitted ABI (SysV: zmm0-7), so
@@ -794,11 +795,11 @@ mod tests {
             #[allow(improper_ctypes_definitions)]
             type F = unsafe extern "C" fn(*mut f32);
 
-            let r9 = x86_64::Gpr(9);
+            let r9 = Gpr(9);
             let mut c = Vec::new();
             x86_64::mov(&mut c, r9, x86_64::gpr::RDI);
             let via_r9 = Mem {
-                base: r9,
+                base: PtrReg(9),
                 disp: NoDisp,
             };
             AsmProgram::from([Evex::m0f(0x10).rm(X.0, via_r9)]).assemble(&mut c);
@@ -948,7 +949,7 @@ mod tests {
             type G = unsafe extern "C" fn(*const f32, __m512) -> __m512;
 
             let mut c = Vec::new();
-            x86_64::mov(&mut c, x86_64::Gpr(9), gpr::RDI);
+            x86_64::mov(&mut c, Gpr(9), x86_64::gpr::RDI);
             emit_cvttps2dq(&mut c, Reg(21), Reg(0)); // zmm21 = (i32) idx_float
             emit_set_gather_mask(&mut c);
             emit_gather(&mut c, Reg(20), 9, Reg(21)); // zmm20{k1} = [r9 + zmm21*4]
