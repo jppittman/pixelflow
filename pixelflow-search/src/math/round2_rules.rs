@@ -39,7 +39,7 @@
 use alloc::sync::Arc;
 
 use crate::arena_pat;
-use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, TemplateArena, ops};
+use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, TemplatePattern, ops};
 use core::f32::consts::{LN_2, LOG2_E, LOG10_2};
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
@@ -55,13 +55,11 @@ use pixelflow_ir::arena::{ExprArena, ExprId};
 /// Every rule in this module already spells its RHS exactly once, as the
 /// `rhs_template` the cross-form oracle test at the bottom of this file
 /// reads. Re-spelling the same shape a second time as a bespoke
-/// [`RewriteAction`] variant would hand the e-graph a definition no test
-/// checks — and a second spelling of one shape is the drift this codebase's
-/// one-constructor rule exists to prevent. So the action *is* the template:
-/// 33 harness-only rules add one variant to [`RewriteAction`], not twelve.
+/// Instantiate a rule's RHS via its `rhs_template()`.
 ///
-/// `bindings[i]` is the e-class the rule matched for the template's
-/// `Var(i)`, in the same numbering `lhs_template` uses.
+/// Every rule in this module has a fixed-shape RHS, and its `apply` method
+/// produces a `RewriteAction::Instantiate` pointing at that shape rather
+/// than handwriting its own node-building loop.
 ///
 /// # Panics
 ///
@@ -75,9 +73,10 @@ fn instantiate_rhs(rule: &dyn Rewrite, bindings: Vec<EClassId>) -> RewriteAction
             rule.name()
         )
     });
+    let (rooted, _) = pixelflow_ir::expr::from_arena(&arena, root);
     RewriteAction::Instantiate {
-        template: TemplateArena(Arc::new(arena)),
-        root,
+        template: TemplatePattern(Arc::new(rooted)),
+        entry: 0,
         bindings,
     }
 }
@@ -1232,9 +1231,10 @@ impl Rewrite for DivByLiteral {
         // shape, with a representative literal, for the oracle test.
         let mut arena = ExprArena::new();
         let root = arena_pat!(arena, bin OpKind::Mul, (var 0), (cst 1.0 / k));
+        let (rooted, _) = pixelflow_ir::expr::from_arena(&arena, root);
         Some(RewriteAction::Instantiate {
-            template: TemplateArena(Arc::new(arena)),
-            root,
+            template: TemplatePattern(Arc::new(rooted)),
+            entry: 0,
             bindings: vec![children[0]],
         })
     }

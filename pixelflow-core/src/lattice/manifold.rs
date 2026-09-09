@@ -298,8 +298,7 @@ impl Manifold {
             pixelflow_codegen::JIT_VECTOR_BYTES,
             "Manifold::compile: Field width does not match the JIT's emitted width"
         );
-        let (arena, root) = kernel.parts();
-        for decl in arena.buffers() {
+        for decl in kernel.buffers() {
             assert!(
                 buffer_len(decl) <= EXACT_F32_INDEX,
                 "Manifold::compile: buffer of {} elements exceeds the \
@@ -314,12 +313,9 @@ impl Manifold {
         // identity each slot binds, in the order the code was compiled
         // against. That order, not the arena's declaration order, is the
         // one `bind` fills the context in.
-        let linked = pixelflow_codegen::jit_cache::compile(
-            arena,
-            root,
-            pixelflow_ir::LatticeShape::new(extent),
-        )
-        .expect("Manifold: kernel failed to compile");
+        let linked =
+            pixelflow_codegen::jit_cache::compile(kernel, pixelflow_ir::LatticeShape::new(extent))
+                .expect("Manifold: kernel failed to compile");
         assert!(
             linked.buffers.len() <= MAX_BOUND_BUFFERS,
             "Manifold::compile: kernel needs {} buffer slots, over the \

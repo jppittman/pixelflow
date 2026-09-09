@@ -210,6 +210,12 @@ impl<'a, T> Node<'a, T> {
         &self.dag.nodes[self.ix as usize].value
     }
 
+    /// The DAG this node belongs to.
+    #[must_use]
+    pub fn dag(self) -> &'a Dag<T> {
+        self.dag
+    }
+
     fn ix(self) -> u32 {
         self.ix
     }
@@ -255,6 +261,12 @@ impl<'a, T> Node<'a, T> {
             scratch,
         }
     }
+
+    /// The payload stored at this node.
+    #[must_use]
+    pub fn data(&self) -> &T {
+        self
+    }
 }
 
 impl<'a, T> Deref for Node<'a, T> {
@@ -276,6 +288,20 @@ impl<'a, T> Hash for Node<'a, T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.ix.hash(state);
         (self.dag as *const Dag<T>).hash(state);
+    }
+}
+
+impl<'a, T> PartialOrd for Node<'a, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a, T> Ord for Node<'a, T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.dag as *const Dag<T>)
+            .cmp(&(other.dag as *const Dag<T>))
+            .then_with(|| self.ix.cmp(&other.ix))
     }
 }
 
@@ -456,6 +482,15 @@ impl<T> Rooted<T> {
         Node {
             dag: &self.dag,
             ix: self.entries[0],
+        }
+    }
+
+    /// Access the i-th declared entry point.
+    #[must_use]
+    pub fn entry_at(&self, idx: usize) -> Node<'_, T> {
+        Node {
+            dag: &self.dag,
+            ix: self.entries[idx],
         }
     }
 }

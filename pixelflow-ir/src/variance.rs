@@ -365,6 +365,74 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
     result
 }
 
+/// Compute variance for every node in a DAG.
+///
+/// Because `dag.iter()` visits nodes strictly in children-before-parents order,
+/// a single forward pass over `dag.iter()` suffices.
+///
+/// Returns a [`SideTable<Variance>`] indexed directly by [`Node<'_, ExprData>`].
+#[must_use]
+pub fn compute_dag_variance(
+    dag: &crate::dag::Dag<crate::expr::ExprData>,
+) -> crate::dag::SideTable<Variance> {
+    use crate::expr::ExprData;
+    use crate::kind::OpKind;
+
+    let mut table = dag.side_table(Variance::CONST);
+
+    for node in dag.iter() {
+        let v = match *node {
+            ExprData::Var(idx) => {
+                if idx < 8 {
+                    Variance::from_var(idx)
+                } else {
+                    Variance::ALL
+                }
+            }
+            ExprData::Const(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => Variance::CONST,
+            ExprData::Param(_) => Variance::ALL,
+            ExprData::Op(OpKind::Reduce) => {
+                let mut kids = node.children();
+                let _acc = kids.next();
+                let bound_child = kids.next();
+                let _init = kids.next();
+                let body = kids.next();
+
+                let body_v = body.map_or(Variance::ALL, |b| table[b]);
+                let slot = bound_child.and_then(|c| match *c {
+                    ExprData::Const(bits) => {
+                        let val = f32::from_bits(bits);
+                        if val == libm::floorf(val) && (0.0..256.0).contains(&val) {
+                            let s = val as u8;
+                            let binders = crate::arena::REDUCE_BINDER_BASE
+                                ..crate::arena::REDUCE_BINDER_BASE + crate::arena::REDUCE_BINDERS;
+                            if binders.contains(&s) { Some(s) } else { None }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                });
+
+                match slot {
+                    Some(s) => body_v.without(Variance::from_var(s)),
+                    None => Variance::ALL,
+                }
+            }
+            ExprData::Op(_) => {
+                let mut v = Variance::CONST;
+                for child in node.children() {
+                    v = v.union(table[child]);
+                }
+                v
+            }
+        };
+        table[node] = v;
+    }
+
+    table
+}
+
 /// The index slot a `Reduce`'s children bind, read from child 1 (a `Const`
 /// holding the slot number). `None` if the node is not a well-formed binder.
 fn bound_index_slot(
@@ -881,7 +949,7 @@ mod tests {
 
 #[cfg(test)]
 mod lattice_shape_tests {
-    use super::{LatticeShape, Variance};
+    use super::{LatticeShape, Variance, compute_dag_variance};
 
     #[test]
     fn binders_are_the_axes_with_extent_above_one() {
@@ -922,5 +990,23 @@ mod lattice_shape_tests {
         assert_eq!(a.key_bytes()[4..8], 8u32.to_le_bytes());
         assert_ne!(a.key_bytes(), b.key_bytes());
         assert_eq!(a.extent(), [8, 8]);
+    }
+
+    #[test]
+    fn verify_compute_dag_variance() {
+        use crate::dag::Builder;
+        use crate::expr::ExprBuilderExt;
+        use crate::kind::OpKind;
+
+        let mut b = Builder::new();
+        let x = b.push_var(0); // Variance::X
+        let y = b.push_var(1); // Variance::Y
+        let add = b.push_binary(OpKind::Add, x, y); // Variance::COORDS
+        let c = b.push_const(5.0); // Variance::CONST
+        let mul = b.push_binary(OpKind::Mul, add, c); // Variance::COORDS
+        let rooted = b.finish(&[mul]);
+
+        let var_table = compute_dag_variance(&rooted);
+        assert_eq!(var_table[rooted.entry()], Variance::COORDS);
     }
 }

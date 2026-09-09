@@ -89,7 +89,7 @@ pub use provenance::{ApplicationId, ENodeId, Provenance};
 pub use provenance::{
     ApplicationRecord, Origin, UnionEvent, derivation_ancestors, format_derivation_trace,
 };
-pub use rewrite::{Rewrite, RewriteAction, TemplateArena};
+pub use rewrite::{Rewrite, RewriteAction, TemplateArena, TemplatePattern};
 pub use rules::{Fingerprint, RuleId, RuleSet, rule_label};
 pub use saturate::{
     APPLICATIONS_PER_CLASS, CLASSICAL_CLASS_CEILING, CLASSICAL_CLASS_CEILING_CALIBRATED,
