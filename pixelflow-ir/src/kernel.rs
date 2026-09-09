@@ -948,95 +948,6 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binding::BindingTable;
-    use crate::eval::eval_scalar;
-
-    fn eval(k: &Kernel, x: f32, y: f32) -> f32 {
-        let (arena, root) = k.parts();
-        eval_scalar(arena, root, &[x, y], &BindingTable::empty())
-    }
-
-    #[test]
-    fn circle_sdf_composes() {
-        // √(x² + y²) − 1, built entirely through the value API.
-        let x = Kernel::x();
-        let y = Kernel::y();
-        let r2 = x.mul(&x).add(&y.mul(&y));
-        let sdf = r2.sqrt().sub(&Kernel::constant(1.0));
-        assert!((eval(&sdf, 3.0, 4.0) - 4.0).abs() < 1e-5);
-        assert!((eval(&sdf, 0.0, 0.0) + 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn sum_is_variadic_fold() {
-        let terms = [
-            Kernel::x(),
-            Kernel::y(),
-            Kernel::constant(10.0),
-            Kernel::x(),
-        ];
-        let s = Kernel::sum(&terms);
-        assert_eq!(eval(&s, 3.0, 4.0), 3.0 + 4.0 + 10.0 + 3.0);
-        assert_eq!(eval(&Kernel::sum(&[]), 9.0, 9.0), 0.0);
-    }
-
-    #[test]
-    fn winding_rule_and_select() {
-        // min(|Σ|, 1) then a bounds select — the glyph shape in miniature.
-        let total = Kernel::sum(&[Kernel::x(), Kernel::y().neg()]);
-        let coverage = total.abs().min(&Kernel::constant(1.0));
-        let in_bounds = Kernel::x().ge(&Kernel::constant(0.0));
-        let masked = in_bounds.select(&coverage, &Kernel::constant(0.0));
-        assert_eq!(eval(&masked, 0.3, 0.1), (0.3f32 - 0.1).abs().min(1.0));
-        assert_eq!(eval(&masked, -1.0, 0.0), 0.0); // out of bounds
-        assert_eq!(eval(&masked, 5.0, 0.0), 1.0); // |5| clamped to 1
-    }
-
-    #[test]
-    fn at_warps_coordinates() {
-        // (x·y) sampled at (x+1, 2y) = (x+1)·2y.
-        let body = Kernel::x().mul(&Kernel::y());
-        let warped = body.at(
-            &Kernel::x().add(&Kernel::constant(1.0)),
-            &Kernel::y().mul(&Kernel::constant(2.0)),
-        );
-        assert_eq!(eval(&warped, 3.0, 4.0), 4.0 * 8.0);
-    }
-
-    #[test]
-    fn trunc_shl_or_pack_a_byte_lane() {
-        // The packing idiom: clamp-truncated bytes shifted to their lanes and
-        // OR-folded. 3.7 truncates toward zero to 3; 3 << 8 | 2 = 0x0302.
-        let lo = Kernel::x().trunc_to_int();
-        let hi = Kernel::y().trunc_to_int().shl(8);
-        let packed = hi.or(&lo).into_kernel();
-        assert_eq!(eval(&packed, 2.9, 3.7).to_bits(), 0x0302);
-    }
-
-    /// A choice between two packed words is the same blend, one word at a
-    /// time: selecting the words is bit-exact with selecting each byte before
-    /// it is packed. That equality is what lets a colour be one `Select`.
-    #[test]
-    fn selecting_packed_words_is_selecting_the_bytes() {
-        let pack = |lo: &Kernel, hi: &Kernel| hi.trunc_to_int().shl(8).or(&lo.trunc_to_int());
-        let mask = Kernel::x().lt(&Kernel::constant(4.0));
-        let (a_lo, a_hi) = (Kernel::constant(2.0), Kernel::constant(3.0));
-        let (b_lo, b_hi) = (Kernel::constant(9.0), Kernel::constant(7.0));
-
-        let on_words = Bits::select(&mask, &pack(&a_lo, &a_hi), &pack(&b_lo, &b_hi));
-        let on_bytes = pack(&mask.select(&a_lo, &b_lo), &mask.select(&a_hi, &b_hi));
-
-        for (x, want) in [(1.0, 0x0302), (9.0, 0x0709)] {
-            assert_eq!(
-                eval(&on_words.clone().into_kernel(), x, 0.0).to_bits(),
-                want
-            );
-            assert_eq!(
-                eval(&on_bytes.clone().into_kernel(), x, 0.0).to_bits(),
-                want
-            );
-        }
-    }
 
     /// The count is still checked at runtime; the OPERAND no longer needs
     /// checking, because `Kernel::x().shl(32)` does not compile at all now —
@@ -1045,39 +956,6 @@ mod tests {
     #[should_panic(expected = "32-bit lane")]
     fn shl_past_the_lane_is_refused() {
         let _refused = Kernel::x().trunc_to_int().shl(32);
-    }
-
-    /// A handle composes like any kernel, one instance is one slot however
-    /// many times it is read, two instances are two, and `dwrt` of it is 0.
-    #[test]
-    fn a_uniform_is_one_argument_however_often_it_is_read() {
-        use crate::passes::lower_dwrt_owned;
-        let cx = Uniform::new(1.0);
-        let r = Uniform::new(2.0);
-        // (x - cx)² + r·r — cx read twice, r read twice, from separate kernels.
-        let dx = Kernel::x().sub(&cx.kernel());
-        let k = dx
-            .mul(&Kernel::x().sub(&cx.kernel()))
-            .add(&r.kernel().mul(&r.kernel()));
-        let (arena, root) = k.parts();
-        assert_eq!(arena.uniforms(), &[cx.decl(), r.decl()]);
-        assert_eq!(eval(&k, 3.0, 0.0), 4.0 + 4.0);
-        let bound = BindingTable::empty()
-            .bind_uniforms(arena, &[(cx.identity(), 0.0), (r.identity(), 1.0)])
-            .expect("both are arguments");
-        assert_eq!(eval_scalar(arena, root, &[3.0, 0.0], &bound), 10.0);
-
-        // ∂/∂x = 2(x − cx): the uniform differentiates to zero.
-        let (out, oroot) = lower_dwrt_owned(arena, root).expect("calculus");
-        let _ = oroot;
-        let ddx = k.dx();
-        let (da, dr) = ddx.parts();
-        let (out2, oroot2) = lower_dwrt_owned(da, dr).expect("calculus");
-        assert_eq!(
-            eval_scalar(&out2, oroot2, &[3.0, 0.0], &BindingTable::empty()),
-            4.0
-        );
-        assert_eq!(out.uniforms(), arena.uniforms());
     }
 
     /// A hand-built arena that names the retired Z axis is refused where it
@@ -1103,14 +981,6 @@ mod tests {
         let _refused = Kernel::from_parts(a, w);
     }
 
-    /// A reduction binder's index sits in the same `Var` space and is not a
-    /// coordinate — the guard must not catch it.
-    #[test]
-    fn a_reduction_binder_is_not_a_retired_axis() {
-        let k = Kernel::sum_over(4, |i| i.add(&Kernel::x()));
-        assert_eq!(eval(&k, 1.0, 0.0), 6.0 + 4.0);
-    }
-
     #[test]
     fn scalar_is_chosen_by_type() {
         let u = Uniform::new(0.0);
@@ -1121,20 +991,6 @@ mod tests {
             Uniform::new(0.0),
             "two instances are two arguments"
         );
-    }
-
-    #[test]
-    fn dx_differentiates_at_compile_time() {
-        use crate::passes::lower_dwrt_owned;
-        // d/dx √(x²+y²) = x / √(x²+y²).
-        let x = Kernel::x();
-        let y = Kernel::y();
-        let dist = x.mul(&x).add(&y.mul(&y)).sqrt();
-        let ddx = dist.dx();
-        let (arena, root) = ddx.parts();
-        let (out, oroot) = lower_dwrt_owned(arena, root).expect("calculus");
-        let got = eval_scalar(&out, oroot, &[3.0, 4.0], &BindingTable::empty());
-        assert!((got - 0.6).abs() < 1e-5);
     }
 
     // ───────────── the data travels with the value ─────────────

@@ -23,9 +23,7 @@ name = "growth_report"
 required-features = ["saturation-telemetry"]
 
 [dev-dependencies]
-# Rewrite-soundness tests check a rule's two sides numerically against the
-# language's own semantics; `oracle` is what exposes that walker.
-pixelflow-ir = { path = "../pixelflow-ir", features = ["oracle"] }
+pixelflow-ir = { path = "../pixelflow-ir" }
 # Self-dependency so this crate's own `tests/`, `examples/`, and `#[cfg(test)]`
 # code see the provenance journal (origins, application log, union journal,
 # `derivation_ancestors`, the hindsight labeler). Nothing else turns the

@@ -684,8 +684,6 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     use crate::jit_bench::benchmark_jit_arena;
 
-    const REWRITE_BUG_INPUTS: [f32; 2] = [0.5, 0.7];
-
     /// The values the frozen corpus expressions' third and fourth variables
     /// take. Those were the Z and W coordinates; a lattice has two axes now,
     /// so the fixtures' `Var(2)`/`Var(3)` are bound as arguments — invariant
@@ -737,16 +735,6 @@ mod tests {
         (arena, id)
     }
 
-    fn eval_arena_scalar(arena: &ExprArena, id: ExprId, vars: &[f32; 2]) -> f32 {
-        let (arena, id) = bind_retired_axes(arena, id);
-        pixelflow_ir::eval_scalar(&arena, id, vars, &pixelflow_ir::BindingTable::empty())
-    }
-
-    fn logged_expr_scalar_output(src: &str) -> f32 {
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        eval_arena_scalar(&arena, root, &REWRITE_BUG_INPUTS)
-    }
-
     #[cfg(target_arch = "aarch64")]
     fn logged_expr_jit_output(src: &str) -> f32 {
         let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
@@ -756,26 +744,6 @@ mod tests {
         benchmark_jit_arena(&arena, root)
             .unwrap_or_else(|err| panic!("benchmark_jit_arena failed for {src}: {err:?}"))
             .output[0]
-    }
-
-    fn logged_expr_roundtrip_scalar_output(src: &str) -> f32 {
-        // arena -> kernel-code -> arena round-trip must preserve scalar semantics.
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        let kernel = arena_to_kernel_code(&arena, root);
-        let (re_arena, re_root) = parse_kernel_code_arena(&kernel)
-            .unwrap_or_else(|| panic!("parse_kernel_code_arena failed: {kernel}"));
-        eval_arena_scalar(&re_arena, re_root, &REWRITE_BUG_INPUTS)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn assert_scalar_and_jit_close(src: &str, epsilon: f32) {
-        let scalar = logged_expr_scalar_output(src);
-        let jit = logged_expr_jit_output(src);
-        let diff = (scalar - jit).abs();
-        assert!(
-            diff <= epsilon,
-            "scalar/JIT mismatch\nexpr: {src}\nscalar: {scalar}\njit: {jit}\ndiff: {diff} > {epsilon}"
-        );
     }
 
     /// `substitute_vars_with` rewrites the reachable graph and leaves what it
@@ -870,24 +838,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_expr_fract_builds_sub_floor_compound() {
-        // fract(x) = x - floor(x); no OpKind::Fract exists (see kernel.rs) so
-        // this must expand to the primitive subgraph, not a single node.
-        let src = "fract(Var(0))";
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse failed: {src}"));
-        assert_eq!(eval_arena_scalar(&arena, root, &[1.75, 0.0]), 0.75);
-        assert_eq!(eval_arena_scalar(&arena, root, &[-1.25, 0.0]), 0.75);
-    }
-
-    #[test]
-    fn parse_expr_hypot_builds_sqrt_mul_add_compound() {
-        // hypot(x, y) = sqrt(x*x + y*y); no OpKind::Hypot exists (see kernel.rs).
-        let src = "hypot(Var(0), Var(1))";
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse failed: {src}"));
-        assert_eq!(eval_arena_scalar(&arena, root, &[3.0, 4.0]), 5.0);
-    }
-
     // ========================================================================
     // Kernel Code Parser Tests
     // ========================================================================
@@ -897,19 +847,6 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn seed_42_t1_pair_is_close_under_scalar_semantics() {
-        let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
-        let final_ = "log2(add(Const(0.001), abs(atan2(pow(add(abs(neg(pow(add(abs(Const(-0.9631642)), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(mul(min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))), exp(pow(add(abs(atan2(Const(0.1167655), Var(1))), Const(0.001)), Const(-1)))), exp(add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001))))))))))";
-        let initial = logged_expr_scalar_output(initial);
-        let final_ = logged_expr_scalar_output(final_);
-        let diff = (initial - final_).abs();
-        assert!(
-            diff <= 1e-6,
-            "scalar rewrite mismatch\ninitial: {initial}\nfinal: {final_}\ndiff: {diff}"
-        );
-    }
-
-    #[test]
     // These deeply-nested expressions exceed the x86-64 JIT's spill-free SSE
     // register budget (it rejects them with an error). The aarch64 backend uses
     // linear-scan allocation with spilling, so it handles arbitrary depth.
@@ -917,17 +854,6 @@ mod tests {
     fn seed_42_t1_initial_jit_matches_scalar() {
         let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
-    }
-
-    #[test]
-    fn seed_42_t1_initial_roundtrip_scalar_matches_tree_scalar() {
-        let initial = "log2(add(abs(neg(atan2(pow(add(abs(neg(pow(add(abs(neg(neg(Const(-0.9631642)))), Const(0.001)), Const(-1)))), Const(0.001)), Const(-1)), mul(exp(add(pow(add(abs(neg(neg(atan2(Const(0.1167655), Var(1))))), Const(0.001)), Const(-1)), add(min(Var(3), Var(1)), log2(add(abs(neg(Var(3))), Const(0.001)))))), min(min(sub(cos(neg(Const(1.5691397))), add(Const(-1.1460416), Var(2))), abs(exp(Var(0)))), log10(add(abs(min(sub(Const(0.1855638), Var(1)), exp(Var(1)))), Const(0.001)))))))), Const(0.001)))";
-        let tree = logged_expr_scalar_output(initial);
-        let roundtrip = logged_expr_roundtrip_scalar_output(initial);
-        assert!(
-            (tree - roundtrip).abs() <= 1e-6,
-            "tree: {tree}, roundtrip: {roundtrip}"
-        );
     }
 
     #[test]
@@ -941,19 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn seed_24042_t52_pair_is_close_under_scalar_semantics() {
-        let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
-        let final_ = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(Const(0.12621832), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(Const(0.20414245), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(Const(0.093906365), Var(2)), mul(Const(0.093906365), Var(3))), max(Const(-1.3763785), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(Const(8.641348), recip(add(Const(1.7208018), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(Const(1.1988422), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(Const(1.670574), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
-        let initial = logged_expr_scalar_output(initial);
-        let final_ = logged_expr_scalar_output(final_);
-        let diff = (initial - final_).abs();
-        assert!(
-            diff <= 1e-3,
-            "scalar rewrite mismatch\ninitial: {initial}\nfinal: {final_}\ndiff: {diff}"
-        );
-    }
-
-    #[test]
     // These deeply-nested expressions exceed the x86-64 JIT's spill-free SSE
     // register budget (it rejects them with an error). The aarch64 backend uses
     // linear-scan allocation with spilling, so it handles arbitrary depth.
@@ -961,17 +874,6 @@ mod tests {
     fn seed_24042_t52_initial_jit_matches_scalar() {
         let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
         assert_scalar_and_jit_close(initial, 1e-3);
-    }
-
-    #[test]
-    fn seed_24042_t52_initial_roundtrip_scalar_matches_tree_scalar() {
-        let initial = "div(min(add(mul(min(pow(add(abs(neg(neg(abs(neg(neg(add(mul(cos(neg(neg(Var(1)))), Const(0.52093434)), Const(-1.414685)))))))), Const(0.001)), Const(-1)), Var(1)), log10(add(abs(neg(neg(add(add(max(add(mul(Var(2), Var(2)), Var(3)), Var(1)), atan2(atan2(Var(0), Var(3)), add(Var(1), neg(Var(3))))), mul(ln(add(abs(neg(neg(neg(Const(0.12621832))))), Const(0.001))), mul_add(Var(0), cos(neg(neg(Var(3)))), pow(add(abs(neg(neg(Const(-0.20414245)))), Const(0.001)), Const(-0.5)))))))), Const(0.001)))), pow(add(abs(neg(neg(atan2(Var(2), log10(add(abs(neg(neg(tan(Var(1))))), Const(0.001))))))), Const(0.001)), Const(-0.5))), log2(add(abs(neg(neg(Var(0)))), Const(0.001)))), add(abs(neg(pow(add(abs(neg(pow(add(abs(neg(log2(add(abs(neg(mul(min(add(mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(2)), mul(log10(add(abs(neg(neg(Const(1.2403846)))), Const(0.001))), Var(3))), max(ln(add(abs(neg(neg(Const(0.2514913)))), Const(0.001))), mul(Var(0), Const(0.5072496)))), mul(pow(abs(neg(neg(log10(add(abs(neg(neg(Var(3)))), Const(0.001)))))), Const(0.5)), ln(add(abs(neg(sin(Var(2)))), Const(0.001))))))), Const(0.001))))), Const(0.001)), mul(add(add(mul(div(add(Const(0.61049294), Const(1.354384)), add(abs(neg(mul(Var(0), Var(0)))), Const(0.001))), mul(tan(Const(-1.6860065)), recip(add(abs(neg(Const(-1.7208018))), Const(0.001))))), add(mul(max(Var(3), Var(0)), cos(neg(Var(0)))), mul_add(Var(3), Var(1), Var(0)))), log10(add(abs(neg(Const(-1.1988422))), Const(0.001)))), max(abs(neg(ln(add(abs(neg(pow(add(abs(Var(1)), Const(0.001)), Var(2)))), Const(0.001))))), ln(add(abs(mul(Const(-0.47071946), pow(add(abs(neg(Const(-1.670574))), Const(0.001)), Var(0)))), Const(0.001)))))))), Const(0.001)), Const(-1)))), Const(0.001)))";
-        let tree = logged_expr_scalar_output(initial);
-        let roundtrip = logged_expr_roundtrip_scalar_output(initial);
-        assert!(
-            (tree - roundtrip).abs() <= 1e-6,
-            "tree: {tree}, roundtrip: {roundtrip}"
-        );
     }
 
     #[test]

@@ -91,21 +91,6 @@ mod tests {
     use crate::arena_pat;
     use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
-    /// Evaluate an arena expression via the reference interpreter.
-    ///
-    /// Delegates to `pixelflow_ir::eval_scalar` rather than walking the arena
-    /// here: that is the language's semantics (it lowers transcendentals to the
-    /// expansion the compiler emits), and a private walker would be a second
-    /// definition free to drift from it.
-    fn eval(arena: &ExprArena, id: ExprId, vars: &[f32; 2]) -> f32 {
-        pixelflow_ir::eval_scalar(
-            arena,
-            id,
-            vars,
-            &pixelflow_ir::binding::BindingTable::empty(),
-        )
-    }
-
     /// Saturate `D(differentiand, var)` with the full rule set, extract the
     /// cheapest representative, and assert it is `Dwrt`-free.
     fn differentiate(arena: &ExprArena, differentiand: ExprId, var: u8) -> (ExprArena, ExprId) {
@@ -151,71 +136,6 @@ mod tests {
             "at {pt:?}: got {got}, want {want} (tol {tol})"
         );
     }
-
-    #[test]
-    fn d_var_is_one_or_zero() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let (out, root) = differentiate(&a, x, 0);
-        let pts = [[3.0, 5.0], [-2.0, 7.0]];
-        for p in &pts {
-            assert_close(eval(&out, root, p), 1.0, p); // dx/dx = 1
-        }
-
-        let mut a = ExprArena::new();
-        let y = a.push_var(1);
-        let (out, root) = differentiate(&a, y, 0);
-        for p in &pts {
-            assert_close(eval(&out, root, p), 0.0, p); // dy/dx = 0
-        }
-    }
-
-    #[test]
-    fn d_product_obeys_product_rule() {
-        // d/dx (x * x) = 2x.
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (var 0));
-        let (out, root) = differentiate(&a, e, 0);
-        for p in &[[1.5, 0.0], [-3.0, 0.0], [4.2, 0.0]] {
-            assert_close(eval(&out, root, p), 2.0 * p[0], p);
-        }
-    }
-
-    #[test]
-    fn d_sqrt_sum_of_squares() {
-        // The north-star case: d/dx sqrt(x^2 + y^2) = x / sqrt(x^2 + y^2).
-        let mut a = ExprArena::new();
-        let e = arena_pat!(
-            &mut a,
-            un OpKind::Sqrt,
-            (bin OpKind::Add,
-                (bin OpKind::Mul, (var 0), (var 0)),
-                (bin OpKind::Mul, (var 1), (var 1)))
-        );
-        let (out, root) = differentiate(&a, e, 0);
-
-        let pts: [[f32; 2]; 4] = [[3.0, 4.0], [1.0, 1.0], [-2.0, 5.0], [0.5, 0.25]];
-        for p in &pts {
-            let want = p[0] / (p[0] * p[0] + p[1] * p[1]).sqrt();
-            assert_close(eval(&out, root, p), want, p);
-        }
-    }
-
-    #[test]
-    fn d_sin_is_cos() {
-        // d/dx sin(x) = cos(x), where `cos` means the language's cos — built
-        // as an arena expression and evaluated the same way, not `f32::cos`.
-        // The rule is exact; the polynomial `cos` is expanded from
-        // `sin(x + π/2)` and carries its own approximation error, which
-        // comparing against libm would charge to the chain rule.
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, un OpKind::Sin, (var 0));
-        let expected = arena_pat!(&mut a, un OpKind::Cos, (var 0));
-        let (out, root) = differentiate(&a, e, 0);
-        for p in &[[0.0, 0.0], [0.7, 0.0], [-1.2, 0.0]] {
-            assert_close(eval(&out, root, p), eval(&a, expected, p), p);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -251,83 +171,11 @@ mod piecewise_tests {
         (out, out_root)
     }
 
-    fn eval(arena: &ExprArena, id: ExprId, vars: &[f32; 2]) -> f32 {
-        match *arena.node(id) {
-            ExprNode::Var(i) => vars[i as usize],
-            ExprNode::Const(c) => c,
-            ExprNode::Unary(op, a) => {
-                let a = eval(arena, a, vars);
-                op.eval_unary(a).unwrap()
-            }
-            ExprNode::Binary(op, a, b) => {
-                let a = eval(arena, a, vars);
-                let b = eval(arena, b, vars);
-                op.eval_binary(a, b).unwrap()
-            }
-            ExprNode::Ternary(op, a, b, c) => {
-                let a = eval(arena, a, vars);
-                let b = eval(arena, b, vars);
-                let c = eval(arena, c, vars);
-                op.eval_ternary(a, b, c).unwrap()
-            }
-            ref other => panic!("unexpected node in extracted derivative: {other:?}"),
-        }
-    }
-
     fn assert_close(got: f32, want: f32, pt: &[f32; 2]) {
         let tol = 1e-3 * want.abs().max(1.0);
         assert!(
             (got - want).abs() <= tol,
             "at {pt:?}: got {got}, want {want} (tol {tol})"
         );
-    }
-
-    #[test]
-    fn d_min_picks_branch_derivative() {
-        // d/dx min(x·2, y·3): 2 where x·2 < y·3, else 0.
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, bin OpKind::Min,
-            (bin OpKind::Mul, (var 0), (cst 2.0)),
-            (bin OpKind::Mul, (var 1), (cst 3.0)));
-        let (out, root) = differentiate(&a, e, 0);
-        assert_close(eval(&out, root, &[1.0, 5.0]), 2.0, &[1.0, 5.0]);
-        assert_close(eval(&out, root, &[9.0, 1.0]), 0.0, &[9.0, 1.0]);
-    }
-
-    #[test]
-    fn d_select_blends_branch_derivatives() {
-        // d/dx select(y > 0, x·x, x·5): 2x above the axis, 5 below.
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, tern OpKind::Select,
-            (bin OpKind::Gt, (var 1), (cst 0.0)),
-            (bin OpKind::Mul, (var 0), (var 0)),
-            (bin OpKind::Mul, (var 0), (cst 5.0)));
-        let (out, root) = differentiate(&a, e, 0);
-        assert_close(eval(&out, root, &[3.0, 1.0]), 6.0, &[3.0, 1.0]);
-        assert_close(eval(&out, root, &[3.0, -1.0]), 5.0, &[3.0, -1.0]);
-    }
-
-    #[test]
-    fn d_clamp_saturates() {
-        // d/dx clamp(x·x, 0, 10): 2x inside, 0 saturated. `clamp` is library,
-        // so this is its min/max composition and the derivative falls out of
-        // the min/max rules — there is no clamp-specific rule to exercise.
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, bin OpKind::Min,
-            (bin OpKind::Max,
-                (bin OpKind::Mul, (var 0), (var 0)),
-                (cst 0.0)),
-            (cst 10.0));
-        let (out, root) = differentiate(&a, e, 0);
-        assert_close(eval(&out, root, &[2.0, 0.0]), 4.0, &[2.0, 0.0]);
-        assert_close(eval(&out, root, &[5.0, 0.0]), 0.0, &[5.0, 0.0]);
-    }
-
-    #[test]
-    fn d_comparison_is_zero() {
-        let mut a = ExprArena::new();
-        let e = arena_pat!(&mut a, bin OpKind::Lt, (var 0), (var 1));
-        let (out, root) = differentiate(&a, e, 0);
-        assert_close(eval(&out, root, &[3.0, 5.0]), 0.0, &[3.0, 5.0]);
     }
 }

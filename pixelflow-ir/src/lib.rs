@@ -98,18 +98,6 @@ pub use optimize::{Identity, Optimize, Rewritten, Then};
 pub mod binding;
 pub use binding::{BindError, BindingTable};
 
-// The differential-testing oracle, not an execution tier: PixelFlow is
-// JIT-only, so nothing in a shipped build may reach a tree-walking evaluator.
-// Gating it here is what enforces that — `cargo build` cannot name it.
-#[cfg(any(test, feature = "oracle"))]
-pub mod eval;
-#[cfg(any(test, feature = "oracle"))]
-pub use eval::{
-    DifferentialCheck, Evaluator, MaskComparison, MaskVerdict, PointCheck, PointVerdict, Tolerance,
-    compare_mask_root, equivalence_tolerance, eval_scalar, is_mask_valued, is_valid_mask,
-    op_is_divergent_at, trunc_input_is_divergent,
-};
-
 pub mod kernel;
 pub use kernel::{Bits, Kernel, Scalar, Uniform};
 

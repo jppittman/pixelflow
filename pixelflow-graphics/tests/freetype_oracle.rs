@@ -11,12 +11,13 @@
 //! agreed on by our raw arena, our goldens and our corpus, and was found only
 //! by asking a different rasterizer.
 //!
-//! **What it covers, exactly.** It evaluates `eval_scalar` on the *raw
-//! lowered* arena: no optimizer, no JIT. So it is an external bound on the IR
-//! interpreter's reading of the unoptimized arena, and it reaches real pixels
-//! only transitively — `kernel_glyph_optimize` ties the optimized arena to the
-//! raw one, and `kernel_glyph_golden` ties the JIT to the interpreter. A
-//! miscompile that this suite cannot see is one of those two tests' business.
+//! **What it covers, exactly.** It bakes the glyph through `Glyph::bound` —
+//! the shipped path, optimizer and JIT included — and compares the machine
+//! code's own answer against FreeType. So this is an external bound on the
+//! pixels a frame actually draws, with nothing standing in for them. It used
+//! to evaluate the raw arena through `eval_scalar` and reach real pixels only
+//! transitively, through two further same-form checks; the interpreter that
+//! made that indirection necessary is gone.
 //!
 //! **The assertion is topological, not photometric.** FreeType's antialiasing
 //! convention is its own and need not equal ours; comparing coverage values
@@ -55,10 +56,6 @@
 
 use freetype as ft;
 use pixelflow_graphics::fonts::Font;
-use pixelflow_ir::{
-    passes::{expand_refs_owned, lower_dwrt_owned},
-    BindingTable, Evaluator,
-};
 
 /// Device samples per texel edge when rasterizing the reference.
 const SUPERSAMPLE: i64 = 16;
@@ -77,11 +74,10 @@ const REFERENCE_INKED: f32 = 0.25;
 /// at 38-48 px, outside every earlier sweep.
 ///
 /// **It does not all run presubmit**, and the split is a cost measurement,
-/// not a judgement about which cases matter. This suite evaluates the *raw
-/// lowered* arena through `eval_scalar` — no JIT — and CI runs a debug
-/// build, where that is orders of magnitude slower than the compiled
-/// kernel. The full sweep is 99 glyph-size pairs and timed out at nextest's
-/// ten-minute cap. The subset keeps `'8'` at the sizes its defect lived at,
+/// not a judgement about which cases matter. Each glyph-size pair is a
+/// production compile, and CI runs a debug build where saturation dominates.
+/// The full sweep is 99 such pairs and timed out at nextest's ten-minute
+/// cap. The subset keeps `'8'` at the sizes its defect lived at,
 /// a large size where the ramp reaches furthest, and each historically
 /// fragile glyph; the rest runs under `--ignored`, the same shape other
 /// full-corpus suites in this crate use for the same reason:
@@ -139,17 +135,6 @@ fn font_path() -> String {
     )
 }
 
-/// Which arena the check evaluates.
-#[derive(Clone, Copy)]
-enum Arm {
-    /// The raw lowered arena: the IR interpreter's reading of the glyph with
-    /// no optimizer between it and the outlines.
-    Raw,
-    /// The arena production bakes: `optimize_runtime_arena` at the bake's
-    /// lattice. The one that reaches pixels.
-    Optimized,
-}
-
 /// The glyphs and sizes one run covers, and the reverse-direction count
 /// pinned for exactly that set — a subset of the corpus is a different
 /// number, not a smaller one.
@@ -173,37 +158,25 @@ const FULL: Corpus = Corpus {
     texels_we_miss: TEXELS_WE_MISS_FULL,
 };
 
-/// The raw arm. See the module docs for what this bounds.
+/// **One arm, because there is one answer.** This used to run twice — the
+/// raw lowered arena and the optimized one — but both arms were the *IR
+/// interpreter's* reading, and that second evaluator is gone: PixelFlow
+/// renders through the JIT and nothing else, so what a bake compiles is the
+/// only thing there is to compare against an independent rasterizer.
 #[test]
 fn our_ink_is_never_more_than_a_texel_from_freetype_s() {
-    compare_against_freetype(Arm::Raw, &FAST);
+    compare_against_freetype(&FAST);
 }
 
-/// The optimized arm — the arena a bake actually compiles, at the bake's
-/// lattice. `kernel_glyph_optimize` ties the optimized arena to the raw one
-/// texel for texel; this ties it to an independent rasterizer directly, so a
-/// rewrite that moves ink is caught here whether or not the raw arena
-/// happened to agree with it.
-#[test]
-fn our_optimized_ink_is_never_more_than_a_texel_from_freetype_s() {
-    compare_against_freetype(Arm::Optimized, &FAST);
-}
-
-/// The full corpus, both arms. `#[ignore]`d because it interprets the whole
-/// arena per texel — see [`GLYPHS`] for the measurement behind the split.
+/// The full corpus. `#[ignore]`d for cost — see [`GLYPHS`] for the
+/// measurement behind the split.
 #[test]
 #[ignore = "the full corpus: cargo test -p pixelflow-graphics --all-features --test freetype_oracle -- --ignored"]
 fn our_ink_matches_freetype_over_the_full_corpus() {
-    compare_against_freetype(Arm::Raw, &FULL);
+    compare_against_freetype(&FULL);
 }
 
-#[test]
-#[ignore = "the full corpus: cargo test -p pixelflow-graphics --all-features --test freetype_oracle -- --ignored"]
-fn our_optimized_ink_matches_freetype_over_the_full_corpus() {
-    compare_against_freetype(Arm::Optimized, &FULL);
-}
-
-fn compare_against_freetype(arm: Arm, corpus: &Corpus) {
+fn compare_against_freetype(corpus: &Corpus) {
     let Corpus {
         glyphs,
         sizes,
@@ -274,60 +247,24 @@ fn compare_against_freetype(arm: Arm, corpus: &Corpus) {
             };
 
             let ours_glyph = ours.glyph_kernel_scaled(ch, size as f32).expect("glyph");
-            let coverage = ours_glyph.kernel();
-            let (arena, root) = coverage.parts();
-            // Link before anything reads structure: the folds name the
-            // winding by reference, and a name has no derivative and
-            // declares no buffer.
-            let (arena, root) = expand_refs_owned(arena, root);
-            let (lowered, r) = match arm {
-                Arm::Raw => lower_dwrt_owned(&arena, root).expect("lower"),
-                Arm::Optimized => {
-                    let shape = pixelflow_ir::LatticeShape::new([extent as u32, extent as u32]);
-                    let optimized =
-                        pixelflow_search::runtime::optimize_runtime_arena(&arena, root, shape)
-                            .expect("glyph arenas must optimize");
-                    (optimized.0.clone(), optimized.1)
-                }
-            };
-            // The folds read a piece table that travels with the kernel
-            // itself, so the oracle's own binding table must carry it rather
-            // than evaluate empty — neither lowering nor optimization touches
-            // the buffer declarations, so `lowered` declares the same
-            // slot(s), in the same order, `ours_glyph.kernel()` carries data
-            // for.
-            // Bound first: `kernel()` builds a fresh `Kernel`, so the data
-            // it carries cannot outlive a temporary.
+            // The shipped path: `Glyph::bound` compiles through
+            // `optimize_runtime_arena` and binds the piece table the folds
+            // read, so this asks the JIT the same question a frame does.
+            // `eval_at` takes texel centres directly, which is why the
+            // manifold is compiled at a 1x1 extent rather than the glyph's.
             let ours_kernel = ours_glyph.kernel();
-            let ours_data: Vec<&[f32]> = lowered
-                .buffers()
-                .iter()
-                .map(|decl| {
-                    ours_kernel
-                        .buffer_data()
-                        .find(|(id, _)| *id == decl.id)
-                        .map(|(_, d)| d.as_ref())
-                        .expect("glyph kernel carries data for every slot it declares")
-                })
-                .collect();
-            let ours_table = BindingTable::bind(&lowered, &ours_data).expect("bind winding table");
+            let bound = ours_glyph.bound(&ours_kernel, [1, 1]);
 
             // Both grids once per (glyph, size), not per probe. `reference`
-            // is a 16x16 supersample block and `eval_scalar` walks the whole
-            // arena, and each was being called up to ten times per texel by
-            // the neighbourhood tests below — which timed this suite out at
-            // nextest's ten-minute cap on a debug build once the arenas grew.
+            // is a 16x16 supersample block, and each was being called up to
+            // ten times per texel by the neighbourhood tests below — which
+            // timed this suite out at nextest's ten-minute cap once the
+            // arenas grew.
             let reference_grid: Vec<f32> = (0..extent * extent)
                 .map(|n| reference(n % extent, n / extent))
                 .collect();
-            let oracle = Evaluator::new(&lowered, r);
             let ours_grid: Vec<f32> = (0..extent * extent)
-                .map(|n| {
-                    oracle.eval(
-                        &[(n % extent) as f32 + 0.5, (n / extent) as f32 + 0.5],
-                        &ours_table,
-                    )
-                })
+                .map(|n| bound.eval_at((n % extent) as f32 + 0.5, (n / extent) as f32 + 0.5))
                 .collect();
             let reference = |i: i64, j: i64| reference_grid[(j * extent + i) as usize];
             let ours = |i: i64, j: i64| ours_grid[(j * extent + i) as usize];

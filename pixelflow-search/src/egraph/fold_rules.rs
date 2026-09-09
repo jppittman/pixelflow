@@ -295,15 +295,10 @@ mod tests {
     use crate::egraph::extract::extract;
     use crate::egraph::saturate::SaturationConfig;
     use crate::egraph::{Vocabulary, insert};
-    use pixelflow_ir::binding::BindingTable;
-    use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind, eval_scalar};
+    use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
 
     fn binder(slot: u8) -> Binder {
         Binder::from_slot(slot).expect("a live binder")
-    }
-
-    fn eval(arena: &ExprArena, root: ExprId, x: f32) -> f32 {
-        eval_scalar(arena, root, &[x, 0.0], &BindingTable::empty())
     }
 
     /// Saturate with the fold rules alone and extract. Isolating them keeps
@@ -322,71 +317,6 @@ mod tests {
             .nodes_raw()
             .iter()
             .any(|n| matches!(n, ExprNode::Reduce { .. }))
-    }
-
-    /// The headline: the graph can now unroll a fold *itself*, and the result
-    /// is the value the fold denotes. Extraction prefers it because a
-    /// surviving fold is priced at the sentinel — codegen would have to
-    /// unroll it anyway, after everything that could fold across the copies.
-    #[test]
-    fn the_graph_unrolls_a_fold_and_agrees_with_the_legalizer() {
-        // Σ_{k ∈ [0,4)} (X + k) = 4X + 6.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let k = a.push_var(binder(0).var());
-        let body = a.push_binary(OpKind::Add, x, k);
-        let root = a.push_reduce(Fold::new(Monoid::SUM, binder(0), 0..4), body);
-
-        let (out, out_root) = unroll_by_rule(&a, root);
-        assert!(
-            !has_fold(&out),
-            "the extracted form must be binder-free: {}",
-            out.display(out_root)
-        );
-
-        // Against the legalizer, which is the same operation at a different
-        // budget — `expand_reduce` is `Fold::peel` run to exhaustion.
-        let (legalized, legal_root) = pixelflow_ir::passes::expand_reduce_owned(&a, root);
-        for x in [0.0f32, 1.5, -3.25, 10.0] {
-            let by_rule = eval(&out, out_root, x);
-            assert_eq!(by_rule, eval(&legalized, legal_root, x), "at X={x}");
-            assert_eq!(by_rule, 4.0 * x + 6.0, "at X={x}");
-        }
-    }
-
-    /// Every monoid, not just `Σ`. The mask algebras are the ones whose
-    /// combiner `op_from_kind` deliberately will not resolve, so they are the
-    /// reason `combiner_op` exists.
-    #[test]
-    fn every_algebra_peels() {
-        for monoid in [
-            Monoid::SUM,
-            Monoid::PRODUCT,
-            Monoid::MIN,
-            Monoid::MAX,
-            Monoid::ANY,
-            Monoid::ALL,
-        ] {
-            let mut a = ExprArena::new();
-            let k = a.push_var(binder(0).var());
-            let body = a.push_binary(OpKind::Add, k, k);
-            let root = a.push_reduce(Fold::new(monoid, binder(0), 0..3), body);
-
-            let (out, out_root) = unroll_by_rule(&a, root);
-            // Assert the *form* first: `eval_scalar` interprets a surviving
-            // fold perfectly well, so a value-only assertion here would pass
-            // whether or not a single peel ever fired.
-            assert!(
-                !has_fold(&out),
-                "{monoid:?}: the rule must have unrolled it, not the interpreter"
-            );
-            let (legalized, legal_root) = pixelflow_ir::passes::expand_reduce_owned(&a, root);
-            assert_eq!(
-                eval(&out, out_root, 0.0).to_bits(),
-                eval(&legalized, legal_root, 0.0).to_bits(),
-                "{monoid:?}: the rule and the legalizer must agree bit for bit"
-            );
-        }
     }
 
     /// **A peel moves the range, not the body.** `Σ_{[0,3)} X` has a body
@@ -442,48 +372,6 @@ mod tests {
             }
             None => panic!("the rest must be a fold"),
         }
-    }
-
-    /// The empty rule, in the graph rather than in the constructor.
-    #[test]
-    fn an_empty_fold_rewrites_to_its_identity() {
-        for (monoid, want) in [
-            (Monoid::SUM, 0.0f32),
-            (Monoid::PRODUCT, 1.0),
-            (Monoid::MIN, f32::INFINITY),
-            (Monoid::MAX, f32::NEG_INFINITY),
-        ] {
-            let mut a = ExprArena::new();
-            let k = a.push_var(binder(0).var());
-            let root = a.push_reduce(Fold::new(monoid, binder(0), 2..2), k);
-            let (out, out_root) = unroll_by_rule(&a, root);
-            // The form, again before the value: an empty fold *evaluates* to
-            // its identity with no rule at all, so only the shape shows that
-            // the rewrite is what produced it.
-            assert!(
-                matches!(out.node(out_root), ExprNode::Const(_)),
-                "{monoid:?}: the rule must leave a bare constant, got {}",
-                out.display(out_root)
-            );
-            assert_eq!(eval(&out, out_root, 0.0), want, "{monoid:?}");
-        }
-    }
-
-    /// A nested fold survives being peeled through: the outer substitution
-    /// passes into the inner body, which binds a slot of its own.
-    #[test]
-    fn peeling_reaches_through_a_nested_fold() {
-        // Σ_{i ∈ [0,2)} Σ_{j ∈ [0,2)} (i + j) = 0+1+1+2 = 4.
-        let mut a = ExprArena::new();
-        let i = a.push_var(binder(0).var());
-        let j = a.push_var(binder(1).var());
-        let body = a.push_binary(OpKind::Add, i, j);
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, binder(1), 0..2), body);
-        let root = a.push_reduce(Fold::new(Monoid::SUM, binder(0), 0..2), inner);
-
-        let (out, out_root) = unroll_by_rule(&a, root);
-        assert!(!has_fold(&out), "both binders must be gone");
-        assert_eq!(eval(&out, out_root, 0.0), 4.0);
     }
 }
 

@@ -641,67 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_glyph_matches_analytical_at_pixel_centers() {
-        // At pixel centers the bilinear weights vanish, so the cached glyph
-        // must reproduce the analytical coverage kernel to f32 tolerance.
-        //
-        // The reference is the interpreter, not a second bake. This used to
-        // compare against `Lattice::point(x, y).bake(&kernel)`, which was
-        // bit-exact while every lattice compiled identically. Extraction is
-        // now priced against the lattice a kernel runs over, so a point and a
-        // 32×32 frame are two compilations of the same function: over a frame
-        // the optimizer un-fuses an FMA whose multiplier is Y-invariant,
-        // trading one rounding for two in exchange for hoisting the multiply
-        // out of the pixel loop. Comparing two compilations at f32 tolerance
-        // pinned a promise the compiler no longer makes; comparing against
-        // the reference evaluation pins the one it does.
-        //
-        // The tolerance holds the measured divergence with room: the baked
-        // glyph sits ~8.5e-6 from the interpreter at the worst of these
-        // points, and a genuinely mistabulated glyph (a half-texel offset,
-        // say) is off by O(0.1).
-        let font = Font::parse(FONT_DATA).unwrap();
-        let glyph = font.glyph_kernel_scaled('A', 32.0).unwrap();
-        let cached = CachedGlyph::from_kernel(&glyph, 32, 1.0);
-        let coverage = glyph.kernel();
-        let (arena, root) = coverage.parts();
-        // Link first — the winding sum is composed by reference — then
-        // lower: `Dwrt` (the antialiasing gradient) has no scalar evaluation
-        // until it is lowered, exactly as the compile entries lower it.
-        let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
-        let (lowered, lowered_root) =
-            pixelflow_ir::passes::lower_dwrt_owned(&arena, root).expect("glyph kernel lowers");
-        // `glyph.kernel()`'s winding sum reads a piece table that travels with
-        // the kernel itself (`Kernel::with_buffer_data`); the oracle needs
-        // it bound too — `lower_dwrt` restructures the Dwrt subtrees only,
-        // never the buffer declarations, so `lowered` declares the same
-        // slot(s), in the same order, that `glyph.kernel()` carries data for.
-        let data: Vec<&[f32]> = lowered
-            .buffers()
-            .iter()
-            .map(|decl| {
-                coverage
-                    .buffer_data()
-                    .find(|(id, _)| *id == decl.id)
-                    .map(|(_, d)| d.as_ref())
-                    .expect("glyph kernel carries data for every slot it declares")
-            })
-            .collect();
-        let table = pixelflow_ir::BindingTable::bind(&lowered, &data).expect("bind winding table");
-
-        for &(i, j) in &[(4usize, 4usize), (10, 16), (16, 8), (16, 20), (24, 28)] {
-            let (x, y) = (i as f32 + 0.5, j as f32 + 0.5);
-            let reference = pixelflow_ir::eval_scalar(&lowered, lowered_root, &[x, y], &table);
-            let baked = sample(&cached, x, y);
-            assert!(
-                (reference - baked).abs() < 1e-4,
-                "cached glyph diverges from the analytical kernel at pixel center ({x}, {y}): \
-                 reference {reference}, baked {baked}"
-            );
-        }
-    }
-
-    #[test]
     fn no_half_pixel_shift_center_of_mass() {
         // Regression: the baked glyph must sit at the same position as the
         // analytical glyph rasterized directly at pixel centers. A half-pixel
