@@ -305,30 +305,50 @@ impl CostModel {
             | ENode::Buffer(_)
             | ENode::Uniform(_)
             | ENode::Param(_) => 0,
-            // `Dwrt` is the internal autodiff marker. It is rewritten away by
-            // the chain rule; a surviving one is the (not-yet-wired) jet
-            // fallback. Either way extraction must never choose it, so it is
-            // prohibitively expensive regardless of the learned weight table.
-            ENode::Op { op, .. } if op.kind() == OpKind::Dwrt => usize::MAX / 4,
-            ENode::Op { op, .. } => self.cost(op.kind()),
-            // Priced like `Dwrt`, and for the same reason rather than a
-            // similar one: **codegen has no iteration binder**, so a fold
-            // that survives extraction is unrolled into `len()` copies of
-            // its body afterwards, by a legalizer that runs after everything
-            // that could have folded or CSE'd across those copies. Any
-            // decomposition sharing the e-class is therefore the same
-            // machine code plus the optimizations, and extraction should
-            // take it whenever one exists.
+            // `Dwrt` is the internal autodiff marker, and the latency table
+            // already carries a considered number for it (1000 — dear enough
+            // that the extractor takes the chain rule wherever saturation
+            // produced one).
             //
-            // Note what this is *not*: an estimate of `len × cost(body)`.
-            // That number is not expressible here — `node_cost` sees a node,
-            // never its children's costs — and a fold is precisely the case
-            // where a node's cost is not additive in its operands. That is
-            // the non-additive schedule cost the `Reranker` seam exists for
-            // (docs/plans/2026-09-01-schedule-cost-model-denotation.md), and
-            // the sentinel is the honest placeholder until something can
-            // answer it.
-            ENode::Reduce { .. } => usize::MAX / 4,
+            // It used to be overridden to `usize::MAX / 4` here, on the
+            // reasoning that "extraction must never choose it". That was safe
+            // only while `LowerDwrt` ran *before* saturation, so a `Dwrt`
+            // could not reach the e-graph in the first place. It runs last
+            // now (`pixelflow_search::runtime`) — legalization is the
+            // fallback for what the rules declined — so extraction must be
+            // able to *keep* a `Dwrt` the chain rule did not reach, and hand
+            // it to the legalizer. A sentinel makes that unrepresentable:
+            // the DP settles on a finite term while the recomputed price
+            // saturates, and the two come apart in the claim/price audit.
+            //
+            // Expensive, not infinite, is the distinction. The same one the
+            // fold arm below makes, for the same reason.
+            ENode::Op { op, .. } => self.cost(op.kind()),
+            // **A fold's own work is its combiner chain**: `len - 1`
+            // applications of the monoid's operation. The body's `len`
+            // evaluations are not here — a node's cost cannot see its
+            // children's — they are applied where the DP adds the body in,
+            // which is the one place that number exists. See
+            // `extract.rs`'s `fold_body_multiple`.
+            //
+            // This was `usize::MAX / 4`, the prohibitive sentinel `Dwrt`
+            // carries, on the reasoning that a surviving fold is unrolled
+            // afterwards past everything that could fold across the copies,
+            // so any decomposition in the e-class was strictly better. That
+            // held only while the legalizer ran *before* saturation. With it
+            // last (`pixelflow_search::runtime`), an unpriced fold is what
+            // forces the graph to unroll internally to escape the sentinel —
+            // four nodes reaching the 500-class cap through `PeelFold` — and,
+            // because the sentinel saturates, a DP claim that no longer
+            // equals the price of the term it names, which `extract.rs`'s
+            // claim/price audit catches outright.
+            //
+            // An unpriceable monoid keeps the sentinel: extraction must not
+            // choose a fold whose combiner has no operation to emit.
+            ENode::Reduce { fold, .. } => match super::fold_rules::combiner_op(fold.monoid()) {
+                Some(op) => (fold.len() as usize).saturating_sub(1) * self.cost(op.kind()),
+                None => usize::MAX / 4,
+            },
         }
     }
 

@@ -943,11 +943,14 @@ pub fn extract<C: CostFunction>(
                             // own `CYCLE_COST`), so a node with several such
                             // children overflows a plain `usize` sum. A real
                             // `Dwrt`-bearing e-graph reaches that here.
+                            let per_child = fold_body_multiple(node);
                             let children_cost: usize = children
                                 .iter()
                                 .map(|&child| {
                                     let c = egraph.find(child);
-                                    best_cost[c.0 as usize].unwrap_or(CYCLE_COST)
+                                    let sub = best_cost[c.0 as usize].unwrap_or(CYCLE_COST);
+                                    usize::try_from((sub as u64).saturating_mul(per_child))
+                                        .unwrap_or(usize::MAX)
                                 })
                                 .fold(0usize, usize::saturating_add);
                             op_cost.saturating_add(children_cost)
@@ -1871,12 +1874,15 @@ pub fn cost_of_choices<C: CostFunction>(
         // sums reach the ceiling on real inputs.
         let own = usize::try_from((costs.node_cost(node, None) as u64).saturating_mul(weight))
             .unwrap_or(usize::MAX);
+        // A fold evaluates its body once per index — see `fold_body_multiple`.
+        let per_child = fold_body_multiple(node);
         let children_cost = node
             .children_slice()
             .iter()
             .map(|&child| {
                 let c = egraph.find(child).0 as usize;
-                tree[c].expect("post-order visits every child before its parent")
+                let sub = tree[c].expect("post-order visits every child before its parent");
+                usize::try_from((sub as u64).saturating_mul(per_child)).unwrap_or(usize::MAX)
             })
             .fold(0usize, usize::saturating_add);
         tree[idx] = Some(own.saturating_add(children_cost));
@@ -2181,6 +2187,32 @@ pub(crate) const CYCLE_COST: usize = usize::MAX / 4;
 fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize {
     usize::try_from((costs.node_cost(node, None) as u64).saturating_mul(weight))
         .unwrap_or(usize::MAX)
+}
+
+/// **How many times `node`'s children are evaluated per evaluation of `node`.**
+///
+/// One, for everything except a fold: `⊕_{[lo,hi)} f` evaluates `f` once per
+/// index, and **codegen has no iteration binder**, so `ExpandReduce` emits
+/// exactly that many copies of the body. Pricing the body once would tell the
+/// extractor a 34-piece fold costs what one piece costs, which is how an
+/// unpriced fold turns the loop unroller off — it would keep every fold,
+/// unconditionally, because folding would always look free.
+///
+/// This is the multiplier the fold's own [`CostModel::node_op_cost`] arm
+/// deliberately leaves out: a node's cost cannot see its children's, and this
+/// is the one place that number is in hand.
+///
+/// The trip count is *local to the fold node*, which is what makes it exact.
+/// A per-binder-slot table would not work: `PeelFold` rewrites
+/// `⊕_{[lo,hi)} f` to `f(hi-1) ⊕ ⊕_{[lo,hi-1)} f`, keeping the same binder
+/// and the same body e-class, so after saturation one slot carries folds of
+/// many different lengths over one shared body and no single number is right
+/// for it.
+fn fold_body_multiple(node: &ENode) -> u64 {
+    match node {
+        ENode::Reduce { fold, .. } => u64::from(fold.len()),
+        _ => 1,
+    }
 }
 
 /// The two policy knobs the DP passes read, plus the trace they write.
@@ -2589,15 +2621,20 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
             // sit at a prohibitive sentinel (`Dwrt`'s `usize::MAX / 4` from
             // `CostModel::node_op_cost`), so a node with several such
             // children overflows a plain `usize` sum.
-            ENode::Op { .. } | ENode::Reduce { .. } => own.saturating_add(
-                node.children_slice()
-                    .iter()
-                    .map(|&child| {
-                        self.cost[self.egraph.find(child).0 as usize]
-                            .expect("a priced candidate's children are settled")
-                    })
-                    .fold(0usize, usize::saturating_add),
-            ),
+            ENode::Op { .. } | ENode::Reduce { .. } => {
+                let per_child = fold_body_multiple(node);
+                own.saturating_add(
+                    node.children_slice()
+                        .iter()
+                        .map(|&child| {
+                            let sub = self.cost[self.egraph.find(child).0 as usize]
+                                .expect("a priced candidate's children are settled");
+                            usize::try_from((sub as u64).saturating_mul(per_child))
+                                .unwrap_or(usize::MAX)
+                        })
+                        .fold(0usize, usize::saturating_add),
+                )
+            }
         };
         self.dp.rec.candidate(class, idx, cost, own);
         cost
