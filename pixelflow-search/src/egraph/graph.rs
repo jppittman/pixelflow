@@ -1873,15 +1873,14 @@ impl EGraph {
     /// binding.
     fn instantiate_template(
         &mut self,
-        template: &pixelflow_ir::ExprArena,
-        id: pixelflow_ir::ExprId,
+        node: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>,
         bindings: &[EClassId],
     ) -> EClassId {
-        use pixelflow_ir::arena::ExprNode;
+        use pixelflow_ir::expr::ExprData;
 
-        match template.node(id) {
-            ExprNode::Var(mv) => {
-                let mv = *mv as usize;
+        match *node {
+            ExprData::Var(mv) => {
+                let mv = mv as usize;
                 assert!(
                     mv < bindings.len(),
                     "instantiate_template: metavariable {mv} has no binding \
@@ -1891,30 +1890,23 @@ impl EGraph {
                 );
                 bindings[mv]
             }
-            ExprNode::Const(v) => self.add(ENode::constant(*v)),
-            ExprNode::Param(p) => {
+            ExprData::Const(v) => self.add(ENode::constant(f32::from_bits(v))),
+            ExprData::Param(p) => {
                 panic!("instantiate_template: Param({p}) in a rewrite RHS template")
             }
-            ExprNode::Buffer(b) => {
-                panic!(
-                    "instantiate_template: Buffer({}) in a rewrite RHS template",
-                    b.0
-                )
+            ExprData::Buffer(b) => {
+                panic!("instantiate_template: Buffer({b:?}) in a rewrite RHS template")
             }
-            ExprNode::Uniform(u) => {
-                panic!(
-                    "instantiate_template: Uniform({}) in a rewrite RHS template",
-                    u.0
-                )
+            ExprData::Uniform(u) => {
+                panic!("instantiate_template: Uniform({u:?}) in a rewrite RHS template")
             }
-            _ => {
-                let kind = template.kind(id);
+            ExprData::Op(kind) => {
                 let static_op = ops::op_from_kind(kind).unwrap_or_else(|| {
                     panic!("instantiate_template: no static Op for OpKind {kind:?}")
                 });
-                let children: Vec<EClassId> = template
-                    .children(id)
-                    .map(|c| self.instantiate_template(template, c, bindings))
+                let children: Vec<EClassId> = node
+                    .children()
+                    .map(|c| self.instantiate_template(c, bindings))
                     .collect();
                 self.add(ENode::Op {
                     op: static_op,
@@ -1929,10 +1921,11 @@ impl EGraph {
             RewriteAction::Union(target_id) => self.union_counted(class_id, target_id),
             RewriteAction::Instantiate {
                 template,
-                root,
+                entry,
                 bindings,
             } => {
-                let result_id = self.instantiate_template(&template.0, root, &bindings);
+                let node = template.0.entry_at(entry);
+                let result_id = self.instantiate_template(node, &bindings);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Create(new_node) => {

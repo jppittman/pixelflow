@@ -32,7 +32,7 @@ pub mod kind;
 pub mod traits;
 pub mod variance;
 
-pub use variance::{LatticeShape, Variance};
+pub use variance::{LatticeShape, Variance, compute_dag_variance};
 
 pub mod arena;
 
@@ -50,6 +50,13 @@ pub mod arena;
 /// plus index-newtype.
 pub mod dag;
 pub use dag::{Builder, Dag, Key, Node, Rooted, Scratch, SideTable};
+
+pub mod expr;
+pub use expr::{
+    Environment, ExprBuilderExt, ExprData, compute_dag_depth, copy_subgraph, copy_subgraph_in,
+    depth, from_arena, has_degenerate, has_var, node_count_subtree, retired_axis, splice,
+    substitute_params, substitute_vars, subtree_eq, to_arena,
+};
 
 /// IR-to-IR transforms: each takes an expression graph and returns another.
 /// Target-blind by construction — nothing here knows which ISA it is feeding.

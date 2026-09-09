@@ -146,7 +146,8 @@ fn assert_jit_matches_oracle(
         declared,
     } = subject;
     let tol = expression_tolerance(arena, root);
-    let jit = jit_cache::compile(arena, root, pixelflow_ir::LatticeShape::POINT)
+    let k = pixelflow_ir::Kernel::from_parts(arena.clone(), root);
+    let jit = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
         .unwrap_or_else(|e| panic!("{name}: kernel failed to compile on this backend: {e}"))
         .kernel;
     let mut checked = 0usize;
