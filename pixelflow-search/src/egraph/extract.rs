@@ -2741,11 +2741,17 @@ impl ReachSets {
     fn union_below(&mut self, egraph: &EGraph, node: &ENode) -> usize {
         self.epoch += 1;
         self.scratch.clear();
-        let ENode::Op { children, .. } = node else {
-            return 0;
-        };
+        // `children_slice`, not a `let ENode::Op { children, .. } = node else
+        // { return 0 }`. That pattern read as "leaves reach nothing", which is
+        // true, but it also silently swallowed `ENode::Reduce`: a fold's body
+        // never entered the union, so the Dag arm priced a fold as its
+        // combiner chain and nothing else, while `cost_of_choices` — which
+        // walks `children_slice` — charged for the body too. The DP then
+        // settled on a claim below the price of the term it named, and the
+        // claim/price audit fired. `children_slice` is empty for a leaf, so
+        // the early return bought nothing the general path does not give.
         let mut below = 0usize;
-        for &child in children.iter() {
+        for &child in node.children_slice() {
             let ci = self.compact[egraph.find(child).0 as usize] as usize;
             // Taken and put back: the closure below needs `self` mutably
             // while the set is read, and a set is never its own member's.

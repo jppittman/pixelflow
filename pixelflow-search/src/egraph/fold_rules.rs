@@ -429,4 +429,50 @@ mod production_shape_tests {
         );
         assert!(out.len() > 40, "and the unrolled form is 40 terms wide");
     }
+
+    /// **The same fold, priced at a real lattice.**
+    ///
+    /// Every other extraction test in this crate runs at
+    /// [`LatticeShape::POINT`], where `evals` is 1 for every node and a
+    /// node's weighted cost is just its op cost. A frame makes the weights
+    /// differ by orders of magnitude between scopes, and `extract_dag_scoped`
+    /// audits the DP's claim against the recomputed price of the term it
+    /// names — so a weighting the two disagree about is invisible at POINT
+    /// and fires here.
+    ///
+    /// This is the gap that let the glyph-scale claim/price mismatch reach
+    /// CI with the whole crate green: production bakes at a frame, and
+    /// nothing here did.
+    #[test]
+    fn a_table_reading_fold_prices_consistently_at_a_frame() {
+        use crate::egraph::extract::extract_dag_scoped;
+        use pixelflow_ir::LatticeShape;
+
+        let mut a = ExprArena::new();
+        let buf = a.declare_buffer(BufferDecl {
+            id: BufferIdentity::mint(),
+            width: 64,
+            height: 1,
+        });
+        let i = a.push_var(binder(0).var());
+        let zero = a.push_const(0.0);
+        let read = a.push_gather(buf, i, zero);
+        let x = a.push_var(0);
+        let body = a.push_binary(OpKind::Mul, read, x);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, binder(0), 0..40), body);
+
+        let mut eg = EGraph::with_rules(fold_rules());
+        let class = insert(&a, root, &mut eg, Vocabulary::Runtime).expect("a fold inserts");
+        SaturationConfig::compatibility(200).run(&mut eg);
+
+        // The audit inside is the assertion: it is a `debug_assert`, and it
+        // panics when the objective and the price come apart.
+        for shape in [
+            LatticeShape::POINT,
+            LatticeShape::new([16, 16]),
+            LatticeShape::new([256, 256]),
+        ] {
+            let _ = extract_dag_scoped(&eg, class, &CostModel::latency_prior(), shape);
+        }
+    }
 }
