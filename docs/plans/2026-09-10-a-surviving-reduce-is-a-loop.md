@@ -294,6 +294,138 @@ collapse loop, where the next iteration reloads them. A fold runs inside the
 body, where they are live. Its registers have to be reserved by the allocator,
 as a guard's are.
 
+## 4b. Correction to the correction: the nest is a *tree*, and a placement is *per scope*
+
+§4a concludes "the fold's loop must be a region of the same nest as X and Y".
+The diagnosis is right — a fold needs a scope, because reconciliation is per
+scope — but "a region of the same nest" is wrong about what a region *is*.
+
+`ScopedSchedule` is a **chain**, and a region is a **prologue**:
+
+```text
+regions[0]              once per call, parks roots
+  loop y {
+    regions[1]          once per row, parks roots
+      loop x {
+        body            once per sample, produces the result
+      }
+  }
+```
+
+Region *i* encloses region *i+1*; its roots flow **inward**, read by
+everything inside. A fold is the other shape. It sits *inside* the body, and
+its accumulator flows **outward** to the defs after it:
+
+```text
+body_pre                the defs the fold reads
+  loop i { fold_body }  parks the accumulator
+body_post               the defs that read it
+```
+
+There is no position in the chain for `body_post`. Adding a fourth link puts
+the fold's loop *around* the code that consumes it, which is not what a fold
+means. **The nest is a tree**, and the chain is the special case where every
+scope has one child and it is last.
+
+### What actually blocks the tree
+
+Not the emitter — `emit_nest` already counts no levels. It is `Point`:
+
+```rust
+pub struct Point { pub scope: Scope, pub index: usize }   // Ord: lexicographic
+```
+
+Lexicographic `(scope, index)` is execution order only because the chain has
+both properties a tree lacks: scopes are totally ordered by nesting, **and**
+all of an outer scope's code precedes all of an inner scope's. In a tree the
+second is false — `body`'s own defs sit on both sides of the fold's — so
+`Placement`'s "strictly increasing sequence of spans" stops being a sequence
+at all, and `Placement::at` answers with a location the value had already
+left.
+
+### The fix is a subtraction: a placement is per scope
+
+Give up nest-wide placements. A value's life is a life *within one scope*,
+because a scope is a loop body and a loop body is what a scan reasons about.
+What crosses a scope boundary is already carried by something else — `parked`,
+a slot or a carried register — and that mechanism is untouched.
+
+This is the grain of the code rather than something imposed on it. Every
+consumer already reads placements per scope:
+
+- `Allocation::transitions` **filters** spans by `s.from.scope == scope` and
+  throws the rest away.
+- `record` takes one `scope` and stamps every range it writes with it.
+- `parked` already holds the cross-scope answer, and is what an inner scan is
+  given.
+
+So `Point` loses its `scope` field and becomes what its name says — a position
+in a schedule — and `Scope` becomes a key rather than half a coordinate.
+Nothing needs cross-scope ordering afterwards, which is why the tree stops
+being hard.
+
+One consumer changes meaning, and the new meaning is the correct one.
+Head reconciliation asks `placement.at(Point::TAIL) != at_head` — *"did this
+value end the nest somewhere other than where the next iteration expects it"*.
+The honest question is about **this scope's** tail, since this scope's back
+edge is the one being reconciled. For the collapse body the two coincide
+(the body is the innermost scope, so its tail is the nest's), which is why
+today's version is right — by coincidence. For a fold they differ.
+
+### Measured: the head reconciliation has never run
+
+§4a says "codegen already has the answer" and quotes the reconciliation. It
+does have it. **It has also never executed.** A `panic!` in that branch, run
+over `pixelflow-codegen`, `pixelflow-core` and `pixelflow-graphics` — glyph
+bakes and all — comes back green: 20 suites, 0 failures, no hit.
+
+It cannot fire, and the reason is structural rather than accidental. `record`
+skips a parked value, so a root's ranges in the body are *only* the park; the
+park is one span; so `at(TAIL)` and `at_head` are the same span by
+construction. The neighbouring `resident_throughout` check
+(`spans().all(|s| s.from <= inside || s.at == head)`) is dead for the same
+reason — there are no spans after the park to disagree.
+
+Both were written for a shape the chain cannot produce: a value the scopes
+*inside* a park relocate. Nothing relocates one, because a carried root's
+register is removed from the inner pool and a slot-parked root is reloaded per
+use.
+
+This matters twice over:
+
+1. **It corrects the premise.** A fold is not slotting into working
+   machinery; it will be the first thing to run this code, and the first
+   thing to depend on it being right. Unexercised code that has been correct
+   for months is not evidence.
+2. **It says what actually fixes the bracket bug.** The 2/89 glyph value
+   failures came from the body's own scan relocating values across a back
+   edge in the middle of its schedule — where there was no park at all. What
+   fixes that is *giving the fold a park set*, not running the reconciliation.
+   With a park, a fold's live-ins are pinned for the whole of it, exactly as a
+   region's roots are, and the reconciliation stays dead.
+
+So the reconciliation should not be trusted as the answer, and should not be
+deleted as dead either until 2c settles whether a fold's own back edge needs
+it. Whichever way that lands, it needs a test that reaches it — a nest where
+an inner scope genuinely moves a parked value — rather than another few months
+of looking correct.
+
+### Sequencing
+
+`ExpandReduce` still runs, so no `Reduce` reaches codegen and none of this is
+load-bearing until the last step. That buys a gate for each piece:
+
+| | | gate |
+|---|---|---|
+| **2a** | placements become per-scope | byte-identity |
+| **2b** | a scope gains `inner`; `ScopeId` is preorder | byte-identity |
+| **2c** | a surviving `Reduce` is a def plus an inner scope | additive — no kernel has one yet |
+| **2d** | delete `ExpandReduce`; the e-graph decides | behaviour |
+
+Step 3 — deleting the X/Y precoloring — then has nothing left to do to the
+nest: a collapse loop becomes a def with an inner scope, exactly like a fold,
+and `regions` stops being a separate concept from `inner`.
+
 ## 5. What this does not do
 
 - **The trip count stays compile-time.** `Fold` holds `lo: u16, hi: u16`, and

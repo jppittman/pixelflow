@@ -1647,7 +1647,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 continue;
             }
             let placement = allocation.placement(vid);
-            let at_head = allocation.where_at(vid, 0);
+            let at_head = allocation.at_head(vid);
             let head = layout.binding(vid, at_head);
             if let Binding::Loc(Loc::Reg(r)) = head
                 && placement.at(regalloc::Point::TAIL) != at_head
@@ -1827,15 +1827,23 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let r = dst_loc.reg();
             // The slot is written unless nothing inside will ever read it —
             // which is exactly the case where the value holds one register at
-            // every point of every scope within. Read off the placement, not
-            // off a flag beside it.
-            let inside = allocation.inner_head();
-            let head = allocation.placement(*vid).at(inside);
+            // every point of every scope within. Read off the placements, not
+            // off a flag beside them.
+            //
+            // Every scope within, not just the first: a root parked here is
+            // live across all of them, and one of them keeping it somewhere
+            // else is what makes the slot load-bearing. A scope that never
+            // reads it has no opinion.
+            let head = allocation
+                .within()
+                .next()
+                .map_or(regalloc::Where::Spilled, |inner| inner.at_head(*vid));
             let resident_throughout = matches!(head, regalloc::Where::Reg(_))
-                && allocation
-                    .placement(*vid)
-                    .spans()
-                    .all(|s| s.from <= inside || s.at == head);
+                && allocation.within().all(|inner| {
+                    inner
+                        .placement_of(*vid)
+                        .is_none_or(|p| p.locations().all(|at| at == head))
+                });
             if !resident_throughout {
                 backend.emit_store(&mut asm.code, r, offset)?;
             }
@@ -3353,7 +3361,7 @@ mod tests {
             .collect();
         let mut a = regalloc::LinearScan.allocate(schedule, &TEST_FILE);
         for &(v, p) in placements {
-            a.place(ValueId(v), p);
+            a.place(regalloc::Scope::Body, ValueId(v), p);
         }
         a
     }
@@ -4231,7 +4239,7 @@ mod tests {
                 .expect("a guard formed above")
                 .mask_vid;
             assert!(
-                allocation.placement(mask_vid).spills(),
+                allocation.body().placement(mask_vid).spills(),
                 "the mask stayed in a register, so the spilled-mask path this \
                  test exists for is never reached"
             );
@@ -4346,10 +4354,11 @@ mod tests {
         fn a_split_range_inside_a_guarded_arm_is_correct_when_the_arm_is_skipped() {
             let (a, root, split_vid, arm, allocation) = split_across_a_guarded_arm();
             assert!(
-                allocation.placement(split_vid).spills(),
+                allocation.body().placement(split_vid).spills(),
                 "the value under test stayed in a register, so nothing is split"
             );
             let kept = allocation
+                .body()
                 .placement(split_vid)
                 .spans()
                 .any(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0);
@@ -4393,7 +4402,7 @@ mod tests {
         fn a_kept_reload_inside_a_guarded_arm_ends_at_the_arm() {
             let (_, _, split_vid, arm, allocation) = split_across_a_guarded_arm();
             let spans: alloc::vec::Vec<regalloc::Span> =
-                allocation.placement(split_vid).spans().collect();
+                allocation.body().placement(split_vid).spans().collect();
             let kept = spans
                 .iter()
                 .position(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0)
