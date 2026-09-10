@@ -155,7 +155,7 @@ H1 is picked up.
 
 | | what | where |
 |---|---|---|
-| **D1** | **mask ⟹ index range, symbolic tier.** Axis-aligned literals and their conjunctions/disjunctions, read off the DAG. No lowering — derive the range and check it. Gate is *containment* (collapse the mask, assert every nonzero index is inside), plus a usefulness comparison against `grid_range`. Independent of everything else here. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
+| **D1** | ~~mask ⟹ index range, symbolic tier.~~ **Landed.** `pixelflow_ir::mask_support` — axis-aligned literals in either operand order, conjunctions (intersect), disjunctions (hull), everything else the full extent. No lowering; production behaviour unchanged. 13 tests: soundness by containment over the whole extent in `pixelflow-ir/tests/mask_support.rs`, usefulness against the real `Kernel` builder and `grid_range` in `pixelflow-core/tests/mask_support_of_a_built_kernel.rs`. **A bare `Var` is load-bearing**: the cell grid samples pixel *centres*, so its arena holds `Add(Var, 0.5)` and the analysis widens; teaching `axis_of` to see through that `Add` without moving the shift into the literal deletes a row of pixels, and a test pins it. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
 | **D2** | Lowering 1 — emit the split: select over the derived range, root specialized at `m ≡ false` over the complement. | *ibid.* |
 | **D3** | Bind-time tier, and splitting `IndexRange` into a derived region and a requested band. | *ibid.* |
 | **D4** | Interval evaluation, target-aware and rounding outward. Unlocks glyph supports, which the symbolic tier cannot reach (a compound glyph's affine mixes X and Y). | *ibid.* |
