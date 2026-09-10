@@ -180,4 +180,50 @@ mod tests {
         let oversized = vec![0x90u8; 65];
         page.write(&oversized);
     }
+
+    /// `ExecutableCode`'s `Drop` (not this file's `LinuxCodePage::drop` —
+    /// `finish` wraps `self` in `ManuallyDrop` before that impl ever runs) is
+    /// what owns unmapping the flipped page, and nothing in this crate reads
+    /// it back to notice if that stopped happening: a `Drop` reduced to a
+    /// no-op would leak every kernel this process ever compiled, silently.
+    ///
+    /// Ask the kernel for the exact address back with `MAP_FIXED_NOREPLACE`
+    /// rather than scanning `/proc/self/maps`: reading that file is itself an
+    /// allocation, large enough on a real process to plausibly reuse the
+    /// single freed page by coincidence before it's inspected, which is
+    /// exactly the false "still mapped" a scan can't tell apart from a real
+    /// one. `MAP_FIXED_NOREPLACE` asks the kernel to place a mapping at this
+    /// precise address and refuses instead of overlapping if anything is
+    /// already there — the two outcomes `Drop` running or not would produce.
+    #[test]
+    fn dropping_the_executable_code_unmaps_the_page() {
+        // Content is irrelevant: this page is only ever mapped, never executed.
+        let code = [0x90u8];
+        let exec = LinuxCodePage::from_code(&code).expect("map + flip");
+        let addr = exec.as_bytes().as_ptr();
+        let len = <LinuxCodePage as CodePage>::page_size();
+        drop(exec);
+
+        let remap = unsafe {
+            libc::mmap(
+                addr.cast::<libc::c_void>().cast_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(
+            remap,
+            libc::MAP_FAILED,
+            "{addr:p} is still mapped after drop"
+        );
+        assert_eq!(
+            remap.cast::<u8>(),
+            addr.cast_mut(),
+            "kernel placed the remap elsewhere despite MAP_FIXED_NOREPLACE"
+        );
+        unsafe { libc::munmap(remap, len) };
+    }
 }
