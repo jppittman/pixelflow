@@ -2876,6 +2876,86 @@
     {
       "app_cap_max": 200000,
       "app_cap_min": 200000,
+      "applications_max": 200000,
+      "applications_median": 82466.0,
+      "arm": "cap50000-app200000",
+      "class": "glyph16",
+      "class_cap_in_round_1": 0,
+      "class_cap_max": 50000,
+      "class_cap_min": 50000,
+      "classes_at_stop_max": 48083,
+      "classes_at_stop_median": 39811.0,
+      "iterations_max": 31,
+      "iterations_median": 3.0,
+      "live_classes_max": 12932,
+      "n": 95,
+      "objectives": {
+        "shared": 47,
+        "tree_cheaper": 48
+      },
+      "packed_mismatch_same": 0,
+      "peak_alloc_mb_max": 23.078495,
+      "same_form_max_abs": 3.378838300704956e-6,
+      "same_form_nan_mismatch": 0,
+      "shared_pass_bytes_max": 1438896,
+      "stops": {
+        "application_budget": 4,
+        "class_cap": 81,
+        "quiesced": 10
+      },
+      "sum_bytes": 790196,
+      "sum_compiled_nodes": 80889,
+      "sum_dag_cost": 350192,
+      "sum_emit_ms": 1497.8987069999996,
+      "sum_guarded": 38260,
+      "sum_optimize_ms": 1859927.1109149996,
+      "sum_schedule": 22145,
+      "sum_selects": 2847,
+      "sum_spills": 86
+    },
+    {
+      "app_cap_max": 200000,
+      "app_cap_min": 200000,
+      "applications_max": 200000,
+      "applications_median": 82466.0,
+      "arm": "cap50000-app200000",
+      "class": "glyph32",
+      "class_cap_in_round_1": 0,
+      "class_cap_max": 50000,
+      "class_cap_min": 50000,
+      "classes_at_stop_max": 48083,
+      "classes_at_stop_median": 39811.0,
+      "iterations_max": 31,
+      "iterations_median": 3.0,
+      "live_classes_max": 12932,
+      "n": 95,
+      "objectives": {
+        "shared": 47,
+        "tree_cheaper": 48
+      },
+      "packed_mismatch_same": 0,
+      "peak_alloc_mb_max": 23.078495,
+      "same_form_max_abs": 5.125999450683594e-6,
+      "same_form_nan_mismatch": 0,
+      "shared_pass_bytes_max": 1438896,
+      "stops": {
+        "application_budget": 4,
+        "class_cap": 81,
+        "quiesced": 10
+      },
+      "sum_bytes": 790228,
+      "sum_compiled_nodes": 80893,
+      "sum_dag_cost": 350194,
+      "sum_emit_ms": 898.3104140000002,
+      "sum_guarded": 38260,
+      "sum_optimize_ms": 1585144.7092960002,
+      "sum_schedule": 22145,
+      "sum_selects": 2847,
+      "sum_spills": 86
+    },
+    {
+      "app_cap_max": 200000,
+      "app_cap_min": 200000,
       "applications_max": 103075,
       "applications_median": 103075.0,
       "arm": "cap50000-app200000",
@@ -3104,40 +3184,40 @@
       "app_cap_max": 2000000,
       "app_cap_min": 2000000,
       "applications_max": 1449603,
-      "applications_median": 80308.5,
+      "applications_median": 82466.0,
       "arm": "cap50000-app2000000",
       "class": "glyph32",
       "class_cap_in_round_1": 0,
       "class_cap_max": 50000,
       "class_cap_min": 50000,
       "classes_at_stop_max": 48083,
-      "classes_at_stop_median": 38326.5,
+      "classes_at_stop_median": 39811.0,
       "iterations_max": 91,
-      "iterations_median": 6.0,
+      "iterations_median": 3.0,
       "live_classes_max": 12932,
-      "n": 78,
+      "n": 95,
       "objectives": {
-        "shared": 36,
-        "tree_cheaper": 42
+        "shared": 47,
+        "tree_cheaper": 48
       },
       "packed_mismatch_same": 0,
       "peak_alloc_mb_max": 23.078495,
-      "same_form_max_abs": 3.814697265625e-6,
+      "same_form_max_abs": 5.125999450683594e-6,
       "same_form_nan_mismatch": 0,
       "shared_pass_bytes_max": 1438896,
       "stops": {
-        "class_cap": 68,
+        "class_cap": 85,
         "quiesced": 10
       },
-      "sum_bytes": 634596,
-      "sum_compiled_nodes": 64670,
-      "sum_dag_cost": 279919,
-      "sum_emit_ms": 581.9671250000001,
-      "sum_guarded": 31166,
-      "sum_optimize_ms": 1446055.5640810002,
-      "sum_schedule": 17874,
-      "sum_selects": 2290,
-      "sum_spills": 54
+      "sum_bytes": 790228,
+      "sum_compiled_nodes": 80893,
+      "sum_dag_cost": 350194,
+      "sum_emit_ms": 781.7163780000001,
+      "sum_guarded": 38260,
+      "sum_optimize_ms": 1951725.8782470005,
+      "sum_schedule": 22145,
+      "sum_selects": 2847,
+      "sum_spills": 86
     },
     {
       "app_cap_max": 2000000,
@@ -8845,55 +8925,7 @@
     },
     {
       "arm": "cap50000-app200000",
-      "better": 2,
-      "moved": [
-        {
-          "d_bytes": 592,
-          "d_dag_cost": 584,
-          "kernel": "chrome_R"
-        },
-        {
-          "d_bytes": 576,
-          "d_dag_cost": 546,
-          "kernel": "chrome_packed"
-        },
-        {
-          "d_bytes": 304,
-          "d_dag_cost": 187,
-          "kernel": "shader_julia_set"
-        },
-        {
-          "d_bytes": 208,
-          "d_dag_cost": 77,
-          "kernel": "shader_mandelbrot_distance"
-        },
-        {
-          "d_bytes": 144,
-          "d_dag_cost": 100,
-          "kernel": "shader_metaballs"
-        },
-        {
-          "d_bytes": -16,
-          "d_dag_cost": 4,
-          "kernel": "psychedelic_packed"
-        },
-        {
-          "d_bytes": -16,
-          "d_dag_cost": -1,
-          "kernel": "cellgrid_80x24_d2"
-        },
-        {
-          "d_bytes": -32,
-          "d_dag_cost": -18,
-          "kernel": "shader_domain_warp_fbm"
-        }
-      ],
-      "same": 8,
-      "worse": 6
-    },
-    {
-      "arm": "cap50000-app2000000",
-      "better": 100,
+      "better": 110,
       "moved": [
         {
           "d_bytes": 1264,
@@ -8919,6 +8951,11 @@
           "d_bytes": 720,
           "d_dag_cost": 669,
           "kernel": "glyph16_U0072"
+        },
+        {
+          "d_bytes": 720,
+          "d_dag_cost": 669,
+          "kernel": "glyph32_U0072"
         },
         {
           "d_bytes": 704,
@@ -8954,6 +8991,11 @@
           "d_bytes": 592,
           "d_dag_cost": 612,
           "kernel": "glyph16_U0075"
+        },
+        {
+          "d_bytes": 592,
+          "d_dag_cost": 612,
+          "kernel": "glyph32_U0075"
         },
         {
           "d_bytes": 592,
@@ -8997,6 +9039,11 @@
         },
         {
           "d_bytes": 368,
+          "d_dag_cost": 311,
+          "kernel": "glyph32_U0074"
+        },
+        {
+          "d_bytes": 368,
           "d_dag_cost": 306,
           "kernel": "glyph16_U0074"
         },
@@ -9004,6 +9051,11 @@
           "d_bytes": 208,
           "d_dag_cost": 455,
           "kernel": "glyph16_U006E"
+        },
+        {
+          "d_bytes": 208,
+          "d_dag_cost": 455,
+          "kernel": "glyph32_U006E"
         },
         {
           "d_bytes": 304,
@@ -9026,6 +9078,11 @@
           "kernel": "glyph16_U0079"
         },
         {
+          "d_bytes": 240,
+          "d_dag_cost": 120,
+          "kernel": "glyph32_U0079"
+        },
+        {
           "d_bytes": 208,
           "d_dag_cost": 77,
           "kernel": "shader_mandelbrot_distance"
@@ -9034,11 +9091,6 @@
           "d_bytes": 144,
           "d_dag_cost": 100,
           "kernel": "shader_metaballs"
-        },
-        {
-          "d_bytes": 0,
-          "d_dag_cost": 12,
-          "kernel": "shader_smooth_min_scene"
         },
         {
           "d_bytes": -16,
@@ -9171,6 +9223,11 @@
           "kernel": "glyph16_U007A"
         },
         {
+          "d_bytes": -48,
+          "d_dag_cost": -79,
+          "kernel": "glyph32_U007A"
+        },
+        {
           "d_bytes": -16,
           "d_dag_cost": -124,
           "kernel": "glyph16_U0059"
@@ -9256,6 +9313,11 @@
           "kernel": "glyph16_U0076"
         },
         {
+          "d_bytes": -64,
+          "d_dag_cost": -116,
+          "kernel": "glyph32_U0076"
+        },
+        {
           "d_bytes": -112,
           "d_dag_cost": -86,
           "kernel": "glyph16_U0031"
@@ -9281,6 +9343,11 @@
           "kernel": "glyph16_U0078"
         },
         {
+          "d_bytes": 48,
+          "d_dag_cost": -253,
+          "kernel": "glyph32_U0078"
+        },
+        {
           "d_bytes": -176,
           "d_dag_cost": -147,
           "kernel": "glyph16_U0056"
@@ -9294,6 +9361,11 @@
           "d_bytes": -96,
           "d_dag_cost": -232,
           "kernel": "glyph16_U0077"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -232,
+          "kernel": "glyph32_U0077"
         },
         {
           "d_bytes": -96,
@@ -9339,6 +9411,11 @@
           "d_bytes": -1456,
           "d_dag_cost": -811,
           "kernel": "glyph16_U0071"
+        },
+        {
+          "d_bytes": -1456,
+          "d_dag_cost": -811,
+          "kernel": "glyph32_U0071"
         },
         {
           "d_bytes": -1344,
@@ -9516,6 +9593,11 @@
           "kernel": "glyph16_U006F"
         },
         {
+          "d_bytes": -2400,
+          "d_dag_cost": -1164,
+          "kernel": "glyph32_U006F"
+        },
+        {
           "d_bytes": -2144,
           "d_dag_cost": -1432,
           "kernel": "glyph16_U0032"
@@ -9561,9 +9643,19 @@
           "kernel": "glyph16_U0073"
         },
         {
+          "d_bytes": -2416,
+          "d_dag_cost": -1470,
+          "kernel": "glyph32_U0073"
+        },
+        {
           "d_bytes": -2768,
           "d_dag_cost": -1157,
           "kernel": "glyph16_U007D"
+        },
+        {
+          "d_bytes": -2768,
+          "d_dag_cost": -1157,
+          "kernel": "glyph32_U007D"
         },
         {
           "d_bytes": -912,
@@ -9581,14 +9673,29 @@
           "kernel": "glyph16_U0070"
         },
         {
+          "d_bytes": -2480,
+          "d_dag_cost": -1471,
+          "kernel": "glyph32_U0070"
+        },
+        {
           "d_bytes": -2784,
           "d_dag_cost": -1246,
           "kernel": "glyph16_U007B"
         },
         {
+          "d_bytes": -2784,
+          "d_dag_cost": -1246,
+          "kernel": "glyph32_U007B"
+        },
+        {
           "d_bytes": -2480,
           "d_dag_cost": -1622,
           "kernel": "glyph16_U007E"
+        },
+        {
+          "d_bytes": -2480,
+          "d_dag_cost": -1622,
+          "kernel": "glyph32_U007E"
         },
         {
           "d_bytes": -2624,
@@ -9631,8 +9738,831 @@
           "kernel": "glyph32_U0024"
         }
       ],
-      "same": 42,
-      "worse": 47
+      "same": 44,
+      "worse": 52
+    },
+    {
+      "arm": "cap50000-app2000000",
+      "better": 110,
+      "moved": [
+        {
+          "d_bytes": 1264,
+          "d_dag_cost": 704,
+          "kernel": "glyph16_U006A"
+        },
+        {
+          "d_bytes": 1264,
+          "d_dag_cost": 704,
+          "kernel": "glyph32_U006A"
+        },
+        {
+          "d_bytes": 880,
+          "d_dag_cost": 540,
+          "kernel": "glyph16_U0068"
+        },
+        {
+          "d_bytes": 880,
+          "d_dag_cost": 540,
+          "kernel": "glyph32_U0068"
+        },
+        {
+          "d_bytes": 720,
+          "d_dag_cost": 669,
+          "kernel": "glyph16_U0072"
+        },
+        {
+          "d_bytes": 720,
+          "d_dag_cost": 669,
+          "kernel": "glyph32_U0072"
+        },
+        {
+          "d_bytes": 704,
+          "d_dag_cost": 679,
+          "kernel": "glyph16_U0066"
+        },
+        {
+          "d_bytes": 704,
+          "d_dag_cost": 679,
+          "kernel": "glyph32_U0066"
+        },
+        {
+          "d_bytes": 624,
+          "d_dag_cost": 709,
+          "kernel": "glyph16_U0029"
+        },
+        {
+          "d_bytes": 624,
+          "d_dag_cost": 709,
+          "kernel": "glyph32_U0029"
+        },
+        {
+          "d_bytes": 528,
+          "d_dag_cost": 707,
+          "kernel": "glyph16_U0050"
+        },
+        {
+          "d_bytes": 528,
+          "d_dag_cost": 707,
+          "kernel": "glyph32_U0050"
+        },
+        {
+          "d_bytes": 592,
+          "d_dag_cost": 612,
+          "kernel": "glyph16_U0075"
+        },
+        {
+          "d_bytes": 592,
+          "d_dag_cost": 612,
+          "kernel": "glyph32_U0075"
+        },
+        {
+          "d_bytes": 592,
+          "d_dag_cost": 584,
+          "kernel": "chrome_R"
+        },
+        {
+          "d_bytes": 576,
+          "d_dag_cost": 546,
+          "kernel": "chrome_packed"
+        },
+        {
+          "d_bytes": 480,
+          "d_dag_cost": 641,
+          "kernel": "glyph16_U0028"
+        },
+        {
+          "d_bytes": 480,
+          "d_dag_cost": 641,
+          "kernel": "glyph32_U0028"
+        },
+        {
+          "d_bytes": 432,
+          "d_dag_cost": 619,
+          "kernel": "glyph16_U0044"
+        },
+        {
+          "d_bytes": 432,
+          "d_dag_cost": 619,
+          "kernel": "glyph32_U0044"
+        },
+        {
+          "d_bytes": 224,
+          "d_dag_cost": 574,
+          "kernel": "glyph16_U004A"
+        },
+        {
+          "d_bytes": 224,
+          "d_dag_cost": 572,
+          "kernel": "glyph32_U004A"
+        },
+        {
+          "d_bytes": 368,
+          "d_dag_cost": 311,
+          "kernel": "glyph32_U0074"
+        },
+        {
+          "d_bytes": 368,
+          "d_dag_cost": 306,
+          "kernel": "glyph16_U0074"
+        },
+        {
+          "d_bytes": 208,
+          "d_dag_cost": 455,
+          "kernel": "glyph16_U006E"
+        },
+        {
+          "d_bytes": 208,
+          "d_dag_cost": 455,
+          "kernel": "glyph32_U006E"
+        },
+        {
+          "d_bytes": 304,
+          "d_dag_cost": 187,
+          "kernel": "shader_julia_set"
+        },
+        {
+          "d_bytes": 0,
+          "d_dag_cost": 471,
+          "kernel": "glyph16_U006C"
+        },
+        {
+          "d_bytes": 0,
+          "d_dag_cost": 471,
+          "kernel": "glyph32_U006C"
+        },
+        {
+          "d_bytes": 240,
+          "d_dag_cost": 120,
+          "kernel": "glyph16_U0079"
+        },
+        {
+          "d_bytes": 240,
+          "d_dag_cost": 120,
+          "kernel": "glyph32_U0079"
+        },
+        {
+          "d_bytes": 208,
+          "d_dag_cost": 77,
+          "kernel": "shader_mandelbrot_distance"
+        },
+        {
+          "d_bytes": 144,
+          "d_dag_cost": 100,
+          "kernel": "shader_metaballs"
+        },
+        {
+          "d_bytes": 0,
+          "d_dag_cost": 12,
+          "kernel": "shader_smooth_min_scene"
+        },
+        {
+          "d_bytes": -16,
+          "d_dag_cost": 4,
+          "kernel": "psychedelic_packed"
+        },
+        {
+          "d_bytes": 224,
+          "d_dag_cost": -237,
+          "kernel": "glyph16_U002A"
+        },
+        {
+          "d_bytes": 224,
+          "d_dag_cost": -237,
+          "kernel": "glyph32_U002A"
+        },
+        {
+          "d_bytes": -16,
+          "d_dag_cost": -1,
+          "kernel": "cellgrid_80x24_d2"
+        },
+        {
+          "d_bytes": -32,
+          "d_dag_cost": -5,
+          "kernel": "glyph16_U0069"
+        },
+        {
+          "d_bytes": -32,
+          "d_dag_cost": -5,
+          "kernel": "glyph32_U0069"
+        },
+        {
+          "d_bytes": -32,
+          "d_dag_cost": -18,
+          "kernel": "shader_domain_warp_fbm"
+        },
+        {
+          "d_bytes": 48,
+          "d_dag_cost": -109,
+          "kernel": "glyph16_U003E"
+        },
+        {
+          "d_bytes": 48,
+          "d_dag_cost": -109,
+          "kernel": "glyph32_U003E"
+        },
+        {
+          "d_bytes": -32,
+          "d_dag_cost": -38,
+          "kernel": "glyph16_U002C"
+        },
+        {
+          "d_bytes": -32,
+          "d_dag_cost": -38,
+          "kernel": "glyph32_U002C"
+        },
+        {
+          "d_bytes": 32,
+          "d_dag_cost": -109,
+          "kernel": "glyph16_U003C"
+        },
+        {
+          "d_bytes": 32,
+          "d_dag_cost": -109,
+          "kernel": "glyph32_U003C"
+        },
+        {
+          "d_bytes": -48,
+          "d_dag_cost": -38,
+          "kernel": "glyph16_U002F"
+        },
+        {
+          "d_bytes": -48,
+          "d_dag_cost": -38,
+          "kernel": "glyph16_U005C"
+        },
+        {
+          "d_bytes": -48,
+          "d_dag_cost": -38,
+          "kernel": "glyph32_U002F"
+        },
+        {
+          "d_bytes": -48,
+          "d_dag_cost": -38,
+          "kernel": "glyph32_U005C"
+        },
+        {
+          "d_bytes": 144,
+          "d_dag_cost": -237,
+          "kernel": "glyph16_U0023"
+        },
+        {
+          "d_bytes": 144,
+          "d_dag_cost": -237,
+          "kernel": "glyph32_U0023"
+        },
+        {
+          "d_bytes": 48,
+          "d_dag_cost": -157,
+          "kernel": "glyph16_U004B"
+        },
+        {
+          "d_bytes": 48,
+          "d_dag_cost": -157,
+          "kernel": "glyph32_U004B"
+        },
+        {
+          "d_bytes": -64,
+          "d_dag_cost": -48,
+          "kernel": "glyph16_U0060"
+        },
+        {
+          "d_bytes": -64,
+          "d_dag_cost": -48,
+          "kernel": "glyph32_U0060"
+        },
+        {
+          "d_bytes": 32,
+          "d_dag_cost": -157,
+          "kernel": "glyph16_U006B"
+        },
+        {
+          "d_bytes": 32,
+          "d_dag_cost": -157,
+          "kernel": "glyph32_U006B"
+        },
+        {
+          "d_bytes": -48,
+          "d_dag_cost": -79,
+          "kernel": "glyph16_U007A"
+        },
+        {
+          "d_bytes": -48,
+          "d_dag_cost": -79,
+          "kernel": "glyph32_U007A"
+        },
+        {
+          "d_bytes": -16,
+          "d_dag_cost": -124,
+          "kernel": "glyph16_U0059"
+        },
+        {
+          "d_bytes": -16,
+          "d_dag_cost": -124,
+          "kernel": "glyph32_U0059"
+        },
+        {
+          "d_bytes": -64,
+          "d_dag_cost": -82,
+          "kernel": "glyph16_U0034"
+        },
+        {
+          "d_bytes": -64,
+          "d_dag_cost": -82,
+          "kernel": "glyph32_U0034"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -54,
+          "kernel": "glyph16_U004E"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -54,
+          "kernel": "glyph32_U004E"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -58,
+          "kernel": "glyph16_U0037"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -58,
+          "kernel": "glyph32_U0037"
+        },
+        {
+          "d_bytes": 80,
+          "d_dag_cost": -236,
+          "kernel": "glyph16_U0058"
+        },
+        {
+          "d_bytes": 80,
+          "d_dag_cost": -236,
+          "kernel": "glyph32_U0058"
+        },
+        {
+          "d_bytes": -80,
+          "d_dag_cost": -79,
+          "kernel": "glyph16_U003B"
+        },
+        {
+          "d_bytes": -80,
+          "d_dag_cost": -79,
+          "kernel": "glyph32_U003B"
+        },
+        {
+          "d_bytes": -32,
+          "d_dag_cost": -137,
+          "kernel": "glyph16_U004D"
+        },
+        {
+          "d_bytes": -32,
+          "d_dag_cost": -137,
+          "kernel": "glyph32_U004D"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -83,
+          "kernel": "glyph16_U005A"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -83,
+          "kernel": "glyph32_U005A"
+        },
+        {
+          "d_bytes": -64,
+          "d_dag_cost": -116,
+          "kernel": "glyph16_U0076"
+        },
+        {
+          "d_bytes": -64,
+          "d_dag_cost": -116,
+          "kernel": "glyph32_U0076"
+        },
+        {
+          "d_bytes": -112,
+          "d_dag_cost": -86,
+          "kernel": "glyph16_U0031"
+        },
+        {
+          "d_bytes": -112,
+          "d_dag_cost": -86,
+          "kernel": "glyph32_U0031"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -108,
+          "kernel": "glyph16_U005E"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -108,
+          "kernel": "glyph32_U005E"
+        },
+        {
+          "d_bytes": 48,
+          "d_dag_cost": -253,
+          "kernel": "glyph16_U0078"
+        },
+        {
+          "d_bytes": 48,
+          "d_dag_cost": -253,
+          "kernel": "glyph32_U0078"
+        },
+        {
+          "d_bytes": -176,
+          "d_dag_cost": -147,
+          "kernel": "glyph16_U0056"
+        },
+        {
+          "d_bytes": -176,
+          "d_dag_cost": -147,
+          "kernel": "glyph32_U0056"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -232,
+          "kernel": "glyph16_U0077"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -232,
+          "kernel": "glyph32_U0077"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -258,
+          "kernel": "glyph16_U0057"
+        },
+        {
+          "d_bytes": -96,
+          "d_dag_cost": -258,
+          "kernel": "glyph32_U0057"
+        },
+        {
+          "d_bytes": -256,
+          "d_dag_cost": -106,
+          "kernel": "glyph16_U0021"
+        },
+        {
+          "d_bytes": -256,
+          "d_dag_cost": -106,
+          "kernel": "glyph32_U0021"
+        },
+        {
+          "d_bytes": -224,
+          "d_dag_cost": -230,
+          "kernel": "glyph16_U0041"
+        },
+        {
+          "d_bytes": -224,
+          "d_dag_cost": -230,
+          "kernel": "glyph32_U0041"
+        },
+        {
+          "d_bytes": -1072,
+          "d_dag_cost": -790,
+          "kernel": "glyph16_U0039"
+        },
+        {
+          "d_bytes": -1072,
+          "d_dag_cost": -790,
+          "kernel": "glyph32_U0039"
+        },
+        {
+          "d_bytes": -1456,
+          "d_dag_cost": -811,
+          "kernel": "glyph16_U0071"
+        },
+        {
+          "d_bytes": -1456,
+          "d_dag_cost": -811,
+          "kernel": "glyph32_U0071"
+        },
+        {
+          "d_bytes": -1344,
+          "d_dag_cost": -966,
+          "kernel": "glyph16_U0052"
+        },
+        {
+          "d_bytes": -1344,
+          "d_dag_cost": -966,
+          "kernel": "glyph32_U0052"
+        },
+        {
+          "d_bytes": -1520,
+          "d_dag_cost": -888,
+          "kernel": "glyph16_U0062"
+        },
+        {
+          "d_bytes": -1520,
+          "d_dag_cost": -888,
+          "kernel": "glyph32_U0062"
+        },
+        {
+          "d_bytes": 416,
+          "d_dag_cost": -2834,
+          "kernel": "glyph16_U0025"
+        },
+        {
+          "d_bytes": 416,
+          "d_dag_cost": -2834,
+          "kernel": "glyph32_U0025"
+        },
+        {
+          "d_bytes": -1680,
+          "d_dag_cost": -946,
+          "kernel": "glyph16_U0033"
+        },
+        {
+          "d_bytes": -1680,
+          "d_dag_cost": -946,
+          "kernel": "glyph32_U0033"
+        },
+        {
+          "d_bytes": -1712,
+          "d_dag_cost": -975,
+          "kernel": "glyph16_U0051"
+        },
+        {
+          "d_bytes": -1712,
+          "d_dag_cost": -975,
+          "kernel": "glyph32_U0051"
+        },
+        {
+          "d_bytes": -2208,
+          "d_dag_cost": -673,
+          "kernel": "glyph16_U0061"
+        },
+        {
+          "d_bytes": -2208,
+          "d_dag_cost": -673,
+          "kernel": "glyph32_U0061"
+        },
+        {
+          "d_bytes": -1824,
+          "d_dag_cost": -1067,
+          "kernel": "glyph16_U0055"
+        },
+        {
+          "d_bytes": -1824,
+          "d_dag_cost": -1067,
+          "kernel": "glyph32_U0055"
+        },
+        {
+          "d_bytes": -1616,
+          "d_dag_cost": -1343,
+          "kernel": "glyph16_U0042"
+        },
+        {
+          "d_bytes": -1616,
+          "d_dag_cost": -1343,
+          "kernel": "glyph32_U0042"
+        },
+        {
+          "d_bytes": -1888,
+          "d_dag_cost": -1175,
+          "kernel": "glyph16_U004F"
+        },
+        {
+          "d_bytes": -1888,
+          "d_dag_cost": -1175,
+          "kernel": "glyph32_U004F"
+        },
+        {
+          "d_bytes": -1936,
+          "d_dag_cost": -1144,
+          "kernel": "glyph16_U0063"
+        },
+        {
+          "d_bytes": -1936,
+          "d_dag_cost": -1144,
+          "kernel": "glyph32_U0063"
+        },
+        {
+          "d_bytes": -1856,
+          "d_dag_cost": -1290,
+          "kernel": "glyph16_U0035"
+        },
+        {
+          "d_bytes": -1856,
+          "d_dag_cost": -1290,
+          "kernel": "glyph32_U0035"
+        },
+        {
+          "d_bytes": -2240,
+          "d_dag_cost": -919,
+          "kernel": "glyph16_U006D"
+        },
+        {
+          "d_bytes": -2240,
+          "d_dag_cost": -919,
+          "kernel": "glyph32_U006D"
+        },
+        {
+          "d_bytes": -2016,
+          "d_dag_cost": -1173,
+          "kernel": "glyph16_U0043"
+        },
+        {
+          "d_bytes": -2016,
+          "d_dag_cost": -1173,
+          "kernel": "glyph32_U0043"
+        },
+        {
+          "d_bytes": -2064,
+          "d_dag_cost": -1186,
+          "kernel": "glyph16_U0047"
+        },
+        {
+          "d_bytes": -2064,
+          "d_dag_cost": -1186,
+          "kernel": "glyph32_U0047"
+        },
+        {
+          "d_bytes": -736,
+          "d_dag_cost": -2559,
+          "kernel": "glyph16_U0040"
+        },
+        {
+          "d_bytes": -752,
+          "d_dag_cost": -2565,
+          "kernel": "glyph32_U0040"
+        },
+        {
+          "d_bytes": -1952,
+          "d_dag_cost": -1436,
+          "kernel": "glyph16_U0064"
+        },
+        {
+          "d_bytes": -1952,
+          "d_dag_cost": -1436,
+          "kernel": "glyph32_U0064"
+        },
+        {
+          "d_bytes": -1936,
+          "d_dag_cost": -1497,
+          "kernel": "glyph16_U0065"
+        },
+        {
+          "d_bytes": -1936,
+          "d_dag_cost": -1497,
+          "kernel": "glyph32_U0065"
+        },
+        {
+          "d_bytes": -2400,
+          "d_dag_cost": -1164,
+          "kernel": "glyph16_U006F"
+        },
+        {
+          "d_bytes": -2400,
+          "d_dag_cost": -1164,
+          "kernel": "glyph32_U006F"
+        },
+        {
+          "d_bytes": -2144,
+          "d_dag_cost": -1432,
+          "kernel": "glyph16_U0032"
+        },
+        {
+          "d_bytes": -2144,
+          "d_dag_cost": -1432,
+          "kernel": "glyph32_U0032"
+        },
+        {
+          "d_bytes": -2608,
+          "d_dag_cost": -1010,
+          "kernel": "glyph16_U0030"
+        },
+        {
+          "d_bytes": -2608,
+          "d_dag_cost": -1010,
+          "kernel": "glyph32_U0030"
+        },
+        {
+          "d_bytes": -2784,
+          "d_dag_cost": -1041,
+          "kernel": "glyph16_U003F"
+        },
+        {
+          "d_bytes": -2784,
+          "d_dag_cost": -1041,
+          "kernel": "glyph32_U003F"
+        },
+        {
+          "d_bytes": -1312,
+          "d_dag_cost": -2524,
+          "kernel": "glyph16_U0038"
+        },
+        {
+          "d_bytes": -1312,
+          "d_dag_cost": -2524,
+          "kernel": "glyph32_U0038"
+        },
+        {
+          "d_bytes": -2416,
+          "d_dag_cost": -1470,
+          "kernel": "glyph16_U0073"
+        },
+        {
+          "d_bytes": -2416,
+          "d_dag_cost": -1470,
+          "kernel": "glyph32_U0073"
+        },
+        {
+          "d_bytes": -2768,
+          "d_dag_cost": -1157,
+          "kernel": "glyph16_U007D"
+        },
+        {
+          "d_bytes": -2768,
+          "d_dag_cost": -1157,
+          "kernel": "glyph32_U007D"
+        },
+        {
+          "d_bytes": -912,
+          "d_dag_cost": -3014,
+          "kernel": "glyph16_U0026"
+        },
+        {
+          "d_bytes": -912,
+          "d_dag_cost": -3014,
+          "kernel": "glyph32_U0026"
+        },
+        {
+          "d_bytes": -2480,
+          "d_dag_cost": -1471,
+          "kernel": "glyph16_U0070"
+        },
+        {
+          "d_bytes": -2480,
+          "d_dag_cost": -1471,
+          "kernel": "glyph32_U0070"
+        },
+        {
+          "d_bytes": -2784,
+          "d_dag_cost": -1246,
+          "kernel": "glyph16_U007B"
+        },
+        {
+          "d_bytes": -2784,
+          "d_dag_cost": -1246,
+          "kernel": "glyph32_U007B"
+        },
+        {
+          "d_bytes": -2480,
+          "d_dag_cost": -1622,
+          "kernel": "glyph16_U007E"
+        },
+        {
+          "d_bytes": -2480,
+          "d_dag_cost": -1622,
+          "kernel": "glyph32_U007E"
+        },
+        {
+          "d_bytes": -2624,
+          "d_dag_cost": -1502,
+          "kernel": "glyph16_U0036"
+        },
+        {
+          "d_bytes": -2624,
+          "d_dag_cost": -1502,
+          "kernel": "glyph32_U0036"
+        },
+        {
+          "d_bytes": -3088,
+          "d_dag_cost": -1223,
+          "kernel": "glyph16_U0067"
+        },
+        {
+          "d_bytes": -3088,
+          "d_dag_cost": -1223,
+          "kernel": "glyph32_U0067"
+        },
+        {
+          "d_bytes": -2832,
+          "d_dag_cost": -1636,
+          "kernel": "glyph16_U0053"
+        },
+        {
+          "d_bytes": -2832,
+          "d_dag_cost": -1636,
+          "kernel": "glyph32_U0053"
+        },
+        {
+          "d_bytes": -3632,
+          "d_dag_cost": -1546,
+          "kernel": "glyph16_U0024"
+        },
+        {
+          "d_bytes": -3632,
+          "d_dag_cost": -1546,
+          "kernel": "glyph32_U0024"
+        }
+      ],
+      "same": 43,
+      "worse": 53
     },
     {
       "arm": "cap100000-app200000",
@@ -9737,7 +10667,7 @@
     }
   ],
   "notes": [
-    "Arms: flat class caps 5,000 / 10,000 / 20,000 / 50,000 / 100,000 with the application cap at the plan's 40 per class of cap and, separately, held at 200,000; per-inserted-class caps 6 / 7 / 8 / 10 / 12 (`caph<R>-5000-50000`), the shipped rule being `caph8`; and per-node caps 4 / 6 / 8 (`capx<R>-5000-100000`), the arm that showed the node count is the wrong key. Glyph families at 50,000 with the application cap held at 200,000, and at 100,000, are the arms still in flight when this was generated (see the prose)."
+    "Arms: flat class caps 5,000 / 10,000 / 20,000 / 50,000 / 100,000 with the application cap at the plan's 40 per class of cap and, separately, held at 200,000; per-inserted-class caps 6 / 7 / 8 / 10 / 12 (`caph<R>-5000-50000`), the calibrated rule being `caph8` (pinned off in the tree — see the prose); and per-node caps 4 / 6 / 8 (`capx<R>-5000-100000`), the arm that showed the node count is the wrong key. The flat 100,000 arms on the glyph families were still in flight when this was generated (26 of 95 glyph16 rows and 14 of 95 glyph32 rows after 16 minutes; the small straight glyphs take minutes each there) and are left out of the tables."
   ],
   "schema": "class-cap-sweep-v1"
 }
