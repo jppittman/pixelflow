@@ -194,19 +194,6 @@ impl LabelScope {
         self.next += 1;
         Label(id)
     }
-
-    /// How many labels this scope has minted — the size of the table a
-    /// resolution needs.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.next as usize
-    }
-
-    /// Whether nothing has been minted.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.next == 0
-    }
 }
 
 /// Where a branch's displacement sits, and how to write it.
@@ -259,14 +246,116 @@ pub trait AsmBranch: Copy {
     /// that displacement sits and what it is measured from.
     fn place(self, code: &mut Vec<u8>) -> (usize, usize);
 
-    /// Write the displacement for a branch at `fixup` landing on `target`.
+    /// Write the displacement for this branch, laid out at `fixup`, landing on
+    /// `target`.
+    ///
+    /// Takes `self` because the field is the *branch's*, not the ISA's: x86
+    /// spells every displacement `rel32`, but aarch64's `B` carries imm26 and
+    /// its `B.cond` and `CBZ` carry imm19 at a different bit position. Asking
+    /// the fixup to know that would put an encoding detail in the one struct
+    /// this layer keeps ISA-independent, and decoding it back out of the
+    /// placeholder bytes would be recovering at resolution time what the
+    /// branch already knew at layout time.
     ///
     /// # Errors
     ///
     /// When the displacement does not fit the encoding's field — an aarch64
     /// `B` reaches ±128 MiB, a `B.cond` only ±1 MiB — which is a real limit
     /// and not an invariant to assume away.
-    fn resolve(code: &mut [u8], fixup: Fixup, target: usize) -> Result<(), CompileError>;
+    fn resolve(self, code: &mut [u8], fixup: Fixup, target: usize) -> Result<(), CompileError>;
+}
+
+/// What a label means, accumulated while a program is laid out and spent once
+/// it is complete.
+///
+/// Two front ends want this and they are not the same shape. A program that
+/// can be a *value* is a sequence of [`Item`]s and goes through
+/// [`assemble_labeled`]. An emitter that must interleave `&mut self` calls —
+/// [`IsaBackend::emit_collapse_loop`], whose every verb is a method on the
+/// backend — cannot build that sequence, because each verb would have to
+/// capture the same `&mut self`. So it streams: emit some bytes, [`bind`] a
+/// name, [`branch`] to one, emit more.
+///
+/// They are two front ends and not two mechanisms: both record the same table
+/// and both spend it in [`finish`], so a label means the same thing either way.
+///
+/// [`bind`]: Resolver::bind
+/// [`branch`]: Resolver::branch
+/// [`finish`]: Resolver::finish
+pub struct Resolver<B> {
+    /// Where the program starts within the buffer, so a labeled program is
+    /// position-independent — it can be assembled after bytes that are already
+    /// there.
+    base: usize,
+    /// Dense by [`Label`], which is why this is a `Vec` and not a map. It grows
+    /// as names arrive rather than being sized from a scope up front: a
+    /// streaming emitter mints as it walks, and does not know its own label
+    /// count until it is done.
+    bound: Vec<Option<usize>>,
+    pending: Vec<(B, Fixup)>,
+}
+
+impl<B: AsmBranch> Resolver<B> {
+    /// A resolver for a program starting at the current end of `code`.
+    #[must_use]
+    pub fn new(code: &[u8]) -> Self {
+        Self {
+            base: code.len(),
+            bound: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn slot(&mut self, label: Label) -> &mut Option<usize> {
+        let i = label.0 as usize;
+        if self.bound.len() <= i {
+            self.bound.resize(i + 1, None);
+        }
+        &mut self.bound[i]
+    }
+
+    /// Bind `label` to the current end of `code`.
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::DuplicateLabel`] if it is already bound — a name that
+    /// means two positions is not a name.
+    pub fn bind(&mut self, label: Label, code: &[u8]) -> Result<(), CompileError> {
+        let at = code.len();
+        let slot = self.slot(label);
+        if slot.is_some() {
+            return Err(CompileError::DuplicateLabel);
+        }
+        *slot = Some(at);
+        Ok(())
+    }
+
+    /// Lay out a branch to `label`, whether or not it is bound yet.
+    pub fn branch(&mut self, branch: B, label: Label, code: &mut Vec<u8>) {
+        let (at, origin) = branch.place(code);
+        self.pending.push((branch, Fixup { at, origin, label }));
+    }
+
+    /// Write every deferred displacement.
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::UnboundLabel`] if a branch names a label nothing bound,
+    /// or [`CompileError::BranchOutOfRange`] if a displacement does not fit.
+    pub fn finish(self, code: &mut [u8]) -> Result<(), CompileError> {
+        let base = self.base;
+        let code = &mut code[base..];
+        for (branch, fixup) in self.pending {
+            let target = self
+                .bound
+                .get(fixup.label.0 as usize)
+                .copied()
+                .flatten()
+                .ok_or(CompileError::UnboundLabel)?;
+            branch.resolve(code, fixup_rebased(fixup, base), target - base)?;
+        }
+        Ok(())
+    }
 }
 
 /// Assemble a program of [`Item`]s, resolving every label reference.
@@ -278,53 +367,25 @@ pub trait AsmBranch: Copy {
 ///
 /// # Errors
 ///
-/// [`CompileError`] if a referenced label was never bound, or if a
-/// displacement does not fit its encoding.
+/// [`CompileError`] if a referenced label was never bound, if one was bound
+/// twice, or if a displacement does not fit its encoding.
 pub fn assemble_labeled<I, B>(
     code: &mut Vec<u8>,
-    scope: &LabelScope,
     items: impl IntoIterator<Item = Item<I, B>>,
 ) -> Result<(), CompileError>
 where
     I: AsmInsn,
     B: AsmBranch,
 {
-    // Positions are relative to where this program starts, not to the buffer,
-    // so a labeled program can be assembled into a buffer that already has
-    // bytes in it.
-    let base = code.len();
-    let mut bound: Vec<Option<usize>> = alloc::vec![None; scope.len()];
-    let mut fixups: Vec<Fixup> = Vec::new();
-
+    let mut labels = Resolver::new(code);
     for item in items {
         match item {
             Item::Inst(i) => i.emit_into(code),
-            Item::Bind(label) => {
-                let slot = bound
-                    .get_mut(label.0 as usize)
-                    .ok_or(CompileError::UnboundLabel)?;
-                if slot.is_some() {
-                    // A name that means two positions is not a name.
-                    return Err(CompileError::DuplicateLabel);
-                }
-                *slot = Some(code.len());
-            }
-            Item::Branch(branch, label) => {
-                let (at, origin) = branch.place(code);
-                fixups.push(Fixup { at, origin, label });
-            }
+            Item::Bind(label) => labels.bind(label, code)?,
+            Item::Branch(branch, label) => labels.branch(branch, label, code),
         }
     }
-
-    for fixup in fixups {
-        let target = bound
-            .get(fixup.label.0 as usize)
-            .copied()
-            .flatten()
-            .ok_or(CompileError::UnboundLabel)?;
-        B::resolve(&mut code[base..], fixup_rebased(fixup, base), target - base)?;
-    }
-    Ok(())
+    labels.finish(code)
 }
 
 /// A fixup's offsets, measured from the start of the program rather than the
@@ -1038,10 +1099,17 @@ pub struct CompileResult {
 /// aarch64's constant pool). Both backends therefore run the *same* driver: there is one
 /// place that decides when to emit a guard branch, where the root goes, etc.
 ///
-/// `Branch` is an opaque per-backend fixup token (aarch64 distinguishes CBZ from
-/// B; x86 uses a uniform rel32), patched later by `patch_branch`.
+/// `Cond` is how this seam spells control flow: a branch named by the condition
+/// it tests, laid out against a [`Label`] and resolved by a [`Resolver`]. It
+/// replaced an opaque per-backend fixup token that the driver placed with
+/// `emit_jump` and later handed back to `patch_branch` along with an offset it
+/// had tracked itself — which is a label, minus the name.
 trait IsaBackend {
-    type Branch;
+    /// The conditions this ISA can branch on in a labeled program.
+    type Cond: AsmBranch;
+
+    /// An unconditional branch — the back edge of every loop here.
+    const JUMP: Self::Cond;
 
     /// This backend's register file: the whole of what allocation and frame
     /// layout need to know about the target.
@@ -1081,7 +1149,14 @@ trait IsaBackend {
         locs: &[Option<Binding>],
     ) -> Reg;
 
-    /// Branch taken when `mask_reg` is all-false (skip the true arm).
+    /// Reduce `mask_reg` to something testable, and say which condition means
+    /// **no lane selects `arm`** — so the arm can be jumped over.
+    ///
+    /// One verb rather than a `skip_if_all_false`/`skip_if_all_true` pair: the
+    /// two differ only in which uniform mask lets an arm go, which is what
+    /// [`SelectArm`] already names. The reduction and the condition come back
+    /// together for the same reason [`IsaBackend::compare_counter`]'s do —
+    /// flags mean nothing apart from the comparison that set them.
     ///
     /// `scratch` is a vector register the backend may destroy, present exactly
     /// when its [`RegisterFile::guard_temps`](regalloc::RegisterFile::guard_temps)
@@ -1089,24 +1164,13 @@ trait IsaBackend {
     /// writes a scalar into a vector register before it can reach a GP
     /// register — so the x86 tiers, whose guards go through
     /// `movmskps`/`kortest` and the flags, receive `None` and want nothing.
-    fn emit_skip_if_all_false(
+    fn compare_mask(
         &mut self,
         code: &mut Vec<u8>,
         mask_reg: Reg,
         scratch: Option<Reg>,
-    ) -> Self::Branch;
-    /// Branch taken when `mask_reg` is all-true (skip the false arm). See
-    /// [`IsaBackend::emit_skip_if_all_false`] for `scratch`.
-    fn emit_skip_if_all_true(
-        &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-    ) -> Self::Branch;
-    /// Unconditional jump.
-    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch;
-    /// Patch a previously emitted branch to land at `target`.
-    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Self::Branch, target: usize);
+        arm: SelectArm,
+    ) -> Self::Cond;
 
     // -------------------------------------------------------------------------
     // Collapse-loop scaffold
@@ -1156,8 +1220,14 @@ trait IsaBackend {
     fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter);
     /// `counter += 1`.
     fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter);
-    /// Branch taken once `counter` has reached the bound it is compared against.
-    fn branch_if_counter_done(&mut self, code: &mut Vec<u8>, counter: Counter) -> Self::Branch;
+
+    /// Compare `counter` against its bound, and say which condition means it
+    /// has reached it.
+    ///
+    /// The comparison and the condition come back together because they are one
+    /// fact: flags mean nothing apart from the compare that set them, and
+    /// returning the condition makes it unsayable to test the wrong one.
+    fn compare_counter(&mut self, code: &mut Vec<u8>, counter: Counter) -> Self::Cond;
 
     /// Store one batch of results through the output pointer.
     fn store_result(&mut self, code: &mut Vec<u8>, src: Reg);
@@ -1192,7 +1262,19 @@ trait IsaBackend {
     ///
     /// The two LICM tiers in [`CollapseBody`] park their results in vector
     /// slots directly above the coordinate slots reserved here.
-    fn emit_collapse_loop(&mut self, emitted: &CollapseBody<'_>) -> Vec<u8> {
+    ///
+    /// Every position here is a [`Label`] — a name bound when the scaffold
+    /// reaches it. It used to be a `code.len()` the scaffold read off and
+    /// carried by hand to a `patch_branch` twenty lines later, which is the
+    /// same thing minus the name, and which is why `row_end` had to be computed
+    /// at exactly the one point in the sequence where it was correct.
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BranchOutOfRange`] if a body outgrows what its loop's
+    /// branch encoding can span — a real limit of `B.cond`'s ±1 MiB, and
+    /// exactly the shape a fully unrolled fold grows into.
+    fn emit_collapse_loop(&mut self, emitted: &CollapseBody<'_>) -> Result<Vec<u8>, CompileError> {
         let vw = self.register_file().vector_bytes;
         let base = self.body_frame_bytes(emitted.frame_size);
         let total = base + (COORD_SLOTS + emitted.hoist_slots) * vw;
@@ -1203,6 +1285,13 @@ trait IsaBackend {
                 + emitted.batch.len()
                 + SCAFFOLD_HEADROOM,
         );
+
+        let mut scope = LabelScope::new();
+        let row_top = scope.mint();
+        let row_end = scope.mint();
+        let batch_top = scope.mint();
+        let exit = scope.mint();
+        let mut labels: Resolver<Self::Cond> = Resolver::new(&code);
 
         self.frame_alloc(&mut code, total);
         self.scaffold_anchor(&mut code);
@@ -1215,8 +1304,9 @@ trait IsaBackend {
         self.latch_bounds(&mut code);
         self.counter_clear(&mut code, Counter::Row);
 
-        let row_top = code.len();
-        let rows_done = self.branch_if_counter_done(&mut code, Counter::Row);
+        labels.bind(row_top, &code)?;
+        let rows_done = self.compare_counter(&mut code, Counter::Row);
+        labels.branch(rows_done, exit, &mut code);
 
         // Row LICM: X-invariant values, recomputed once per row. Reload the
         // coordinates first — the previous body and Y-step clobbered them.
@@ -1226,8 +1316,9 @@ trait IsaBackend {
         code.extend_from_slice(emitted.row_hoist);
         self.counter_clear(&mut code, Counter::Batch);
 
-        let batch_top = code.len();
-        let batches_done = self.branch_if_counter_done(&mut code, Counter::Batch);
+        labels.bind(batch_top, &code)?;
+        let batches_done = self.compare_counter(&mut code, Counter::Batch);
+        labels.branch(batches_done, row_end, &mut code);
 
         for k in 0..INPUT_COORDS {
             self.slot_load(&mut code, coord_reg(k), slot(k));
@@ -1245,11 +1336,9 @@ trait IsaBackend {
         self.slot_store(&mut code, SCAFFOLD_ACC, slot(SLOT_X));
 
         self.counter_step(&mut code, Counter::Batch);
-        let repeat_batch = self.emit_jump(&mut code);
-        self.patch_branch(&mut code, repeat_batch, batch_top);
+        labels.branch(Self::JUMP, batch_top, &mut code);
 
-        let row_end = code.len();
-        self.patch_branch(&mut code, batches_done, row_end);
+        labels.bind(row_end, &code)?;
 
         // Reset X, advance Y, and skip any scalar tail in the output row.
         self.slot_load(&mut code, SCAFFOLD_ACC, slot(SLOT_ROW_START_X));
@@ -1260,15 +1349,17 @@ trait IsaBackend {
         self.advance_out(&mut code, OutStep::RowSkip);
 
         self.counter_step(&mut code, Counter::Row);
-        let repeat_row = self.emit_jump(&mut code);
-        self.patch_branch(&mut code, repeat_row, row_top);
+        labels.branch(Self::JUMP, row_top, &mut code);
 
-        let end = code.len();
-        self.patch_branch(&mut code, rows_done, end);
+        labels.bind(exit, &code)?;
         self.frame_free(&mut code, total);
         self.emit_ret(&mut code);
+        // Resolve before whatever trails the function: aarch64's constant pool
+        // is appended after the `ret`, and a displacement must not be measured
+        // across bytes that are not instructions.
+        labels.finish(&mut code)?;
         self.scaffold_finish(&mut code);
-        code
+        Ok(code)
     }
 }
 
@@ -1515,7 +1606,12 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         }
     }
 
-    let mut pending_patches: BTreeMap<(usize, SelectArm), B::Branch> = BTreeMap::new();
+    // A guard's skip branch and the point it lands on are separated by an
+    // arbitrary stretch of schedule, so the landing point gets a name and the
+    // branch names it. What is pending is the *binding*, not a fixup.
+    let mut scope = LabelScope::new();
+    let mut labels: Resolver<B::Cond> = Resolver::new(&code);
+    let mut pending_binds: BTreeMap<(usize, SelectArm), Label> = BTreeMap::new();
 
     for (sched_idx, def) in schedule.iter().enumerate() {
         let (vid, sched_op) = (&def.value, &def.op);
@@ -1533,10 +1629,9 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // nothing to reconcile — which is every kernel that reaches this
         // without a split live range.
         for &gi in &branch_ends[sched_idx] {
-            let target = code.len();
             for arm in SelectArm::ALL {
-                if let Some(branch) = pending_patches.remove(&(gi, arm)) {
-                    backend.patch_branch(&mut code, branch, target);
+                if let Some(label) = pending_binds.remove(&(gi, arm)) {
+                    labels.bind(label, &code)?;
                 }
             }
         }
@@ -1576,11 +1671,10 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 Binding::Loc(Loc::Reg(r)) => r,
                 _ => backend.emit_resolve(&mut code, guard.mask_vid, guard_mask(), &locs),
             };
-            let branch = match arm {
-                SelectArm::True => backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp),
-                SelectArm::False => backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp),
-            };
-            pending_patches.insert((guard_idx, arm), branch);
+            let skip = backend.compare_mask(&mut code, mask_reg, guard_temp, arm);
+            let past_arm = scope.mint();
+            labels.branch(skip, past_arm, &mut code);
+            pending_binds.insert((guard_idx, arm), past_arm);
         }
 
         // A hoisted value's placeholder def emits nothing — the prologue
@@ -1611,38 +1705,37 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let true_reg = in_reg(*true_vid);
             let false_reg = in_reg(*false_vid);
 
+            let (only_false, only_true, join) = (scope.mint(), scope.mint(), scope.mint());
+
             // Both guards read `mask_reg`, which is why the reduction
             // scratch is a reservation of its own rather than whichever
             // register the mask was resolved into.
-            let all_false = backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp);
-            let all_true = backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp);
+            let skip_true = backend.compare_mask(&mut code, mask_reg, guard_temp, SelectArm::True);
+            labels.branch(skip_true, only_false, &mut code);
+            let skip_false =
+                backend.compare_mask(&mut code, mask_reg, guard_temp, SelectArm::False);
+            labels.branch(skip_false, only_true, &mut code);
 
             // Mixed lanes: the real select.
             backend.emit_plan(&mut code, &plan)?;
-            let skip_end = backend.emit_jump(&mut code);
+            labels.branch(B::JUMP, join, &mut code);
 
-            // All-false: dst <- false arm.
-            let all_false_target = code.len();
+            labels.bind(only_false, &code)?;
             if let Some(freg) = false_reg {
                 backend.emit_mov(&mut code, dst, freg);
             } else {
                 backend.emit_resolve(&mut code, *false_vid, dst, &locs);
             }
-            let skip_end2 = backend.emit_jump(&mut code);
+            labels.branch(B::JUMP, join, &mut code);
 
-            // All-true: dst <- true arm.
-            let all_true_target = code.len();
+            labels.bind(only_true, &code)?;
             if let Some(treg) = true_reg {
                 backend.emit_mov(&mut code, dst, treg);
             } else {
                 backend.emit_resolve(&mut code, *true_vid, dst, &locs);
             }
 
-            let end_target = code.len();
-            backend.patch_branch(&mut code, all_false, all_false_target);
-            backend.patch_branch(&mut code, all_true, all_true_target);
-            backend.patch_branch(&mut code, skip_end, end_target);
-            backend.patch_branch(&mut code, skip_end2, end_target);
+            labels.bind(join, &code)?;
 
             if let Some(offset) = store_after_def[sched_idx] {
                 backend.emit_store(&mut code, dst, offset)?;
@@ -1691,9 +1784,9 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     }
 
     assert!(
-        pending_patches.is_empty(),
-        "BUG: {} Select short-circuit branches were never patched",
-        pending_patches.len()
+        pending_binds.is_empty(),
+        "BUG: {} Select short-circuit branches name a point the schedule never reached",
+        pending_binds.len()
     );
 
     // The scope's result, in a register for the scaffold to store. Usually the
@@ -1715,6 +1808,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         }
     };
 
+    labels.finish(&mut code)?;
     Ok((code, result_reg, frame_size, real_spill_count))
 }
 
@@ -2647,7 +2741,7 @@ fn compile_via_backend<B: IsaBackend>(
             result: result_reg,
             frame_size,
             hoist_slots: 0,
-        });
+        })?;
         let scaffold = counting.take(code.len() as u32 - body.len() as u32);
         let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
         return Ok(CompileResult {
@@ -2760,7 +2854,7 @@ fn compile_via_backend<B: IsaBackend>(
         result: result_reg,
         frame_size: m,
         hoist_slots: hoisted_values,
-    });
+    })?;
     let emitted = (frame_code.len() + row_code.len() + body.len()) as u32;
     let scaffold = counting.take(code.len() as u32 - emitted);
     // A parked root that holds a register at the head of the scopes inside it
@@ -2936,22 +3030,21 @@ mod tests {
             let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
             neon.frame_ready(frame_size);
 
-            let neon_code = neon.emit_collapse_loop(&wrapped(Reg(16), frame_size, hoist_slots));
+            let scaffold = |code: Result<alloc::vec::Vec<u8>, CompileError>| {
+                code.expect("the scaffold's own branches always reach")
+                    .len()
+            };
+            let neon_code =
+                scaffold(neon.emit_collapse_loop(&wrapped(Reg(16), frame_size, hoist_slots)));
             assert!(
-                neon_code.len().is_multiple_of(4),
-                "aarch64 is fixed-width, got {} bytes",
-                neon_code.len()
+                neon_code.is_multiple_of(4),
+                "aarch64 is fixed-width, got {neon_code} bytes"
             );
             sizes.push([
-                sse2.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                avx2b
-                    .emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                avx512b
-                    .emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                neon_code.len(),
+                scaffold(sse2.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
+                scaffold(avx2b.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
+                scaffold(avx512b.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
+                neon_code,
             ]);
         }
         assert!(sizes[0].iter().all(|&n| n > 0), "every backend emits");

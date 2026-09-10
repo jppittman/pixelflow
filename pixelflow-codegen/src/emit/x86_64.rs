@@ -925,23 +925,6 @@ pub fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
     code.push(0xC0 | (src.0 & 7)); // mod=11, reg=eax(0), rm=src
 }
 
-/// Emit `jcc rel32` with a zero placeholder; returns the offset of the rel32
-/// field (pass to [`patch_rel32`]). `cc` is the 0x8_ condition byte (0x84 = je/jz,
-/// Emit `jmp rel32` with a zero placeholder; returns the rel32 field offset.
-pub fn emit_jmp_rel32(code: &mut Vec<u8>) -> usize {
-    code.push(0xE9);
-    let pos = code.len();
-    code.extend_from_slice(&[0, 0, 0, 0]);
-    pos
-}
-
-/// Patch a rel32 branch displacement (emitted by the `jcc` forms /
-/// [`emit_jmp_rel32`]) so it lands at `target`.
-pub fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
-    let rel = (target as i64) - (pos as i64 + 4);
-    code[pos..pos + 4].copy_from_slice(&(rel as i32).to_le_bytes());
-}
-
 /// TEST eax, eax (sets ZF iff eax == 0).
 pub fn emit_test_eax(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x85, 0xC0]);
@@ -969,7 +952,6 @@ mod label_tests {
 
         assemble_labeled::<super::Inst, Branch>(
             &mut code,
-            &scope,
             [
                 Item::Branch(Branch::Always, end),
                 Item::Inst(super::Inst::ret()),
@@ -995,7 +977,6 @@ mod label_tests {
 
         assemble_labeled::<super::Inst, Branch>(
             &mut code,
-            &scope,
             [
                 Item::Bind(top),
                 Item::Inst(super::Inst::ret()),
@@ -1023,7 +1004,6 @@ mod label_tests {
         for code in [&mut fresh, &mut offset] {
             assemble_labeled::<super::Inst, Branch>(
                 code,
-                &scope,
                 [Item::Branch(Branch::Always, end), Item::Bind(end)],
             )
             .expect("a bound label resolves");
@@ -1038,7 +1018,6 @@ mod label_tests {
         let mut code = Vec::new();
         let got = assemble_labeled::<super::Inst, Branch>(
             &mut code,
-            &scope,
             [Item::Branch(Branch::Always, never)],
         );
         assert_eq!(got, Err(CompileError::UnboundLabel));
@@ -1051,7 +1030,6 @@ mod label_tests {
         let mut code = Vec::new();
         let got = assemble_labeled::<super::Inst, Branch>(
             &mut code,
-            &scope,
             [Item::Bind(twice), Item::Bind(twice)],
         );
         assert_eq!(got, Err(CompileError::DuplicateLabel));
@@ -1338,7 +1316,9 @@ pub(crate) mod driver {
 
     impl IsaBackend for X86Backend {
         /// rel32 field offset of the branch (uniform for jcc/jmp on x86).
-        type Branch = usize;
+        type Cond = super::super::x86_64::Branch;
+
+        const JUMP: Self::Cond = super::super::x86_64::Branch::Always;
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1503,36 +1483,23 @@ pub(crate) mod driver {
 
         /// `_scratch` is unused: this tier's guard reduces the mask with
         /// `movmskps`/`kortest` into the flags, needing no vector register.
-        fn emit_skip_if_all_false(
+        /// `_scratch` is unused: this tier reduces the mask with `movmskps`
+        /// into the flags, needing no vector register.
+        fn compare_mask(
             &mut self,
             code: &mut Vec<u8>,
             mask_reg: Reg,
             _scratch: Option<Reg>,
-        ) -> usize {
+            arm: SelectArm,
+        ) -> super::Branch {
             super::emit_movmskps_eax(code, mask_reg);
-            super::emit_test_eax(code);
-            super::je(code).field() // ZF set when eax == 0 (all lanes false)
-        }
-
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
-        fn emit_skip_if_all_true(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-        ) -> usize {
-            super::emit_movmskps_eax(code, mask_reg);
-            super::emit_cmp_eax_imm8(code, 0x0F);
-            super::je(code).field() // ZF set when eax == 0xF (all lanes true)
-        }
-
-        fn emit_jump(&mut self, code: &mut Vec<u8>) -> usize {
-            super::emit_jmp_rel32(code)
-        }
-
-        fn patch_branch(&mut self, code: &mut Vec<u8>, branch: usize, target: usize) {
-            super::patch_rel32(code, branch, target);
+            match arm {
+                // ZF set when eax == 0: no lane is true, so the true arm is dead.
+                SelectArm::True => super::emit_test_eax(code),
+                // ZF set when eax == 0xF: every lane is true, so the false arm is.
+                SelectArm::False => super::emit_cmp_eax_imm8(code, 0x0F),
+            }
+            super::Branch::IfEqual
         }
 
         // SysV: rdi = ctx (read-only in the body's gathers), rsi = out,
@@ -1588,8 +1555,12 @@ pub(crate) mod driver {
             scaffold::counter_step(code, counter);
         }
 
-        fn branch_if_counter_done(&mut self, code: &mut Vec<u8>, counter: Counter) -> usize {
-            scaffold::branch_if_counter_done(code, counter)
+        fn compare_counter(
+            &mut self,
+            code: &mut Vec<u8>,
+            counter: Counter,
+        ) -> super::super::x86_64::Branch {
+            scaffold::compare_counter(code, counter)
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -1724,13 +1695,18 @@ pub(in crate::emit) mod scaffold {
 
     /// The loop's exit test: unsigned `counter >= bound`.
     #[inline(always)]
-    pub(in crate::emit) fn branch_if_counter_done(code: &mut Vec<u8>, counter: Counter) -> usize {
+    /// `cmp counter, bound`, and the condition that means the loop is done.
+    ///
+    /// Emits no branch: under labels the branch is a separate item, laid out
+    /// against a name rather than against an offset the caller kept.
+    pub(in crate::emit) fn compare_counter(code: &mut Vec<u8>, counter: Counter) -> super::Branch {
         AsmProgram::from([Inst::Cmp {
             lhs: counter_reg(counter),
             rhs: bound_reg(counter),
         }])
         .assemble(code);
-        super::jae(code).field()
+        // The counter runs up to an unsigned bound, so "done" is `>=`.
+        super::Branch::IfAboveOrEqual
     }
 
     #[inline(always)]
@@ -2087,8 +2063,12 @@ impl crate::emit::AsmBranch for Branch {
         (at, at + 4)
     }
 
+    /// Every x86 branch here spells its displacement `rel32`, so the condition
+    /// does not change the field — but that is a fact about x86, not about
+    /// branches, which is why the trait passes `self` anyway.
     #[inline]
     fn resolve(
+        self,
         code: &mut [u8],
         fixup: crate::emit::Fixup,
         target: usize,

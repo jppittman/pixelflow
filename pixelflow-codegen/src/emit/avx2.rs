@@ -993,7 +993,9 @@ pub(crate) mod driver {
     }
 
     impl IsaBackend for Avx2Backend {
-        type Branch = usize;
+        type Cond = x86::Branch;
+
+        const JUMP: Self::Cond = x86::Branch::Always;
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1149,35 +1151,23 @@ pub(crate) mod driver {
         // sign-extending `cmp eax, imm8` X86Backend uses doesn't work here).
         /// `_scratch` is unused: this tier's guard reduces the mask with
         /// `movmskps`/`kortest` into the flags, needing no vector register.
-        fn emit_skip_if_all_false(
+        /// `_scratch` is unused: this tier reduces the mask with `movmskps`
+        /// into the flags, needing no vector register.
+        fn compare_mask(
             &mut self,
             code: &mut Vec<u8>,
             mask_reg: Reg,
             _scratch: Option<Reg>,
-        ) -> usize {
+            arm: SelectArm,
+        ) -> x86::Branch {
             super::emit_movmskps_eax(code, mask_reg);
-            x86_64::emit_test_eax(code);
-            x86_64::je(code).field() // ZF set when eax == 0 (all lanes false)
-        }
-
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
-        fn emit_skip_if_all_true(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-        ) -> usize {
-            super::emit_movmskps_eax(code, mask_reg);
-            super::emit_cmp_al_imm8(code, 0xFF);
-            x86_64::je(code).field() // ZF set when al == 0xFF (all lanes true)
-        }
-
-        fn emit_jump(&mut self, code: &mut Vec<u8>) -> usize {
-            x86_64::emit_jmp_rel32(code)
-        }
-        fn patch_branch(&mut self, code: &mut Vec<u8>, branch: usize, target: usize) {
-            x86_64::patch_rel32(code, branch, target);
+            match arm {
+                // ZF set when eax == 0: no lane is true, so the true arm is dead.
+                SelectArm::True => x86_64::emit_test_eax(code),
+                // ZF set when al == 0xFF: every lane is true, so the false arm is.
+                SelectArm::False => super::emit_cmp_al_imm8(code, 0xFF),
+            }
+            x86::Branch::IfEqual
         }
 
         // Same scaffold register roles as SSE2 — see `x86_64::scaffold` — at
@@ -1221,8 +1211,8 @@ pub(crate) mod driver {
             x86::scaffold::counter_step(code, counter);
         }
 
-        fn branch_if_counter_done(&mut self, code: &mut Vec<u8>, counter: Counter) -> usize {
-            x86::scaffold::branch_if_counter_done(code, counter)
+        fn compare_counter(&mut self, code: &mut Vec<u8>, counter: Counter) -> x86::Branch {
+            x86::scaffold::compare_counter(code, counter)
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {

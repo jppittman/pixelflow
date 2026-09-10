@@ -1648,12 +1648,6 @@ pub(crate) mod driver {
         }
     }
 
-    /// A pending aarch64 branch: 19-bit conditional or 26-bit unconditional.
-    pub(crate) enum Aarch64Branch {
-        Cond(super::Cond19),
-        Uncond(super::Rel26),
-    }
-
     /// aarch64 implementation of the shared driver's leaf operations.
     ///
     /// Mechanically wraps the existing aarch64 encoders + constant pool, so the
@@ -1764,7 +1758,9 @@ pub(crate) mod driver {
     }
 
     impl IsaBackend for Aarch64Backend {
-        type Branch = Aarch64Branch;
+        type Cond = super::Branch;
+
+        const JUMP: Self::Cond = super::Branch::Always;
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1844,43 +1840,32 @@ pub(crate) mod driver {
         /// `scratch` is this instruction's own reservation, live for these two
         /// instructions only — the allocator makes it because this backend's
         /// `guard_temps` asks for one.
-        fn emit_skip_if_all_false(
+        /// Both polarities end in `cbz w16`, so the arm chooses the
+        /// *reduction*: a horizontal max is zero exactly when no lane is set,
+        /// and an inverted horizontal min is zero exactly when every lane is.
+        fn compare_mask(
             &mut self,
             code: &mut Vec<u8>,
             mask_reg: Reg,
             scratch: Option<Reg>,
-        ) -> Aarch64Branch {
+            arm: SelectArm,
+        ) -> super::Branch {
             let scratch = guard_scratch(scratch, mask_reg);
-            AsmProgram::from([Inst::Umaxv(scratch, mask_reg), Inst::FmovToGp(scratch)])
-                .assemble(code);
-            Aarch64Branch::Cond(super::cbz_w16(code))
-        }
-
-        fn emit_skip_if_all_true(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            scratch: Option<Reg>,
-        ) -> Aarch64Branch {
-            let scratch = guard_scratch(scratch, mask_reg);
-            AsmProgram::from([
-                Inst::Uminv(scratch, mask_reg),
-                Inst::FmovToGp(scratch),
-                Inst::mvn_w(X16, X16),
-            ])
-            .assemble(code);
-            Aarch64Branch::Cond(super::cbz_w16(code))
-        }
-
-        fn emit_jump(&mut self, code: &mut Vec<u8>) -> Aarch64Branch {
-            Aarch64Branch::Uncond(super::b_placeholder(code))
-        }
-
-        fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Aarch64Branch, target: usize) {
-            match branch {
-                Aarch64Branch::Cond(c) => c.patch(code, target),
-                Aarch64Branch::Uncond(b) => b.patch(code, target),
+            match arm {
+                SelectArm::True => {
+                    AsmProgram::from([Inst::Umaxv(scratch, mask_reg), Inst::FmovToGp(scratch)])
+                        .assemble(code);
+                }
+                SelectArm::False => {
+                    AsmProgram::from([
+                        Inst::Uminv(scratch, mask_reg),
+                        Inst::FmovToGp(scratch),
+                        Inst::mvn_w(X16, X16),
+                    ])
+                    .assemble(code);
+                }
             }
+            super::Branch::IfW16Zero
         }
 
         // AAPCS64: x0 = ctx (read-only in the body's gathers), x1 = out,
@@ -1945,14 +1930,11 @@ pub(crate) mod driver {
             AsmProgram::from([table::AddI64::new(r, r, table::Imm12(1))]).assemble(code);
         }
 
-        fn branch_if_counter_done(
-            &mut self,
-            code: &mut Vec<u8>,
-            counter: Counter,
-        ) -> Aarch64Branch {
+        fn compare_counter(&mut self, code: &mut Vec<u8>, counter: Counter) -> super::Branch {
             AsmProgram::from([table::CmpI64::new(counter_reg(counter), bound_reg(counter))])
                 .assemble(code);
-            Aarch64Branch::Cond(super::b_hs(code))
+            // The counter runs up to an unsigned bound, so "done" is `>=`.
+            super::Branch::IfAboveOrEqual
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -2354,90 +2336,288 @@ pub fn ret(code: &mut Vec<u8>) {
     emit32(code, 0xD65F_03C0);
 }
 
-/// A conditional branch whose 19-bit displacement is not filled in yet.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[must_use = "an unpatched branch falls through to itself"]
-pub struct Cond19(usize);
-
-impl Cond19 {
-    /// Point the branch at `target`, a byte offset into the same buffer.
-    #[inline(always)]
-    pub fn patch(self, code: &mut [u8], target: usize) {
-        let offset = ((target as i64 - self.0 as i64) / 4) as i32;
-        assert!(
-            (-(1 << 18)..(1 << 18)).contains(&offset),
-            "19-bit branch offset {offset} out of range (±1MB)"
-        );
-        let imm19 = (offset as u32) & 0x7FFFF;
-        let existing = u32::from_le_bytes([
-            code[self.0],
-            code[self.0 + 1],
-            code[self.0 + 2],
-            code[self.0 + 3],
-        ]);
-        let patched = (existing & 0xFF00_001F) | (imm19 << 5);
-        code[self.0..self.0 + 4].copy_from_slice(&patched.to_le_bytes());
-    }
-}
-
-/// An unconditional branch whose 26-bit displacement is not filled in yet.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[must_use = "an unpatched branch falls through to itself"]
-pub struct Rel26(usize);
-
-impl Rel26 {
-    /// Point the branch at `target`, a byte offset into the same buffer.
-    #[inline(always)]
-    pub fn patch(self, code: &mut [u8], target: usize) {
-        let offset = ((target as i64 - self.0 as i64) / 4) as i32;
-        assert!(
-            (-(1 << 25)..(1 << 25)).contains(&offset),
-            "26-bit branch offset {offset} out of range (±128MB)"
-        );
-        let imm26 = (offset as u32) & 0x03FF_FFFF;
-        let existing = u32::from_le_bytes([
-            code[self.0],
-            code[self.0 + 1],
-            code[self.0 + 2],
-            code[self.0 + 3],
-        ]);
-        let patched = (existing & 0xFC00_0000) | imm26;
-        code[self.0..self.0 + 4].copy_from_slice(&patched.to_le_bytes());
-    }
-}
-
-/// `cbz w16, #0` — branch if W16 == 0 (mask all-false), awaiting patch.
+/// The three branch placeholders, each returning where it put its word.
+///
+/// The displacement is left zero: only [`Branch::place`] calls these, and it
+/// hands the position to a [`Resolver`](crate::emit::Resolver) that writes the
+/// displacement once the target is bound. They are `#[must_use]` because a
+/// placeholder whose position is dropped can never be filled in, and a branch
+/// with a zero displacement branches to itself.
+///
+/// `cbz w16, #0` — taken when W16 is zero (see [`Branch::IfW16Zero`]).
 #[inline(always)]
-pub fn cbz_w16(code: &mut Vec<u8>) -> Cond19 {
+#[must_use = "the position is the only way to fill in the displacement"]
+pub fn cbz_w16(code: &mut Vec<u8>) -> usize {
     let at = code.len();
     emit32(code, 0x3400_0010);
-    Cond19(at)
+    at
 }
 
-/// `b.hs` — taken when the previous [`cmp`] found `lhs >= rhs` unsigned.
+/// `b.hs #0` — taken when the previous [`cmp`] found `lhs >= rhs` unsigned.
 #[inline(always)]
-pub fn b_hs(code: &mut Vec<u8>) -> Cond19 {
+#[must_use = "the position is the only way to fill in the displacement"]
+pub fn b_hs(code: &mut Vec<u8>) -> usize {
     let at = code.len();
     emit32(code, 0x5400_0002);
-    Cond19(at)
+    at
 }
 
-/// `b #0` — unconditional forward branch placeholder awaiting patch.
+/// `b #0` — unconditional.
 #[inline(always)]
-pub fn b_placeholder(code: &mut Vec<u8>) -> Rel26 {
+#[must_use = "the position is the only way to fill in the displacement"]
+pub fn b_placeholder(code: &mut Vec<u8>) -> usize {
     let at = code.len();
     emit32(code, 0x1400_0000);
-    Rel26(at)
+    at
 }
 
-/// `b target` — an unconditional branch to an already-known offset.
+// =============================================================================
+// Branches as program items
+// =============================================================================
+
+/// Where a branch keeps its displacement, and how far it reaches.
 ///
-/// Unlike the x86 counterpart this needs no fixup token: every use in the
-/// scaffold jumps *backwards* to a label already emitted.
-#[inline(always)]
-pub fn b(code: &mut Vec<u8>, target: usize) {
-    let rel = ((target as i64 - code.len() as i64) / 4) as i32;
-    emit32(code, 0x1400_0000 | ((rel as u32) & 0x03FF_FFFF));
+/// aarch64 has no single `rel32`: `B` carries a 26-bit word displacement in the
+/// low bits, and `B.cond`/`CBZ` carry a 19-bit one starting at bit 5. Two
+/// fields, two ranges — so which one a branch uses is part of what the branch
+/// *is*, and this type says it once instead of every conditional repeating the
+/// shift and the mask.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct DispField {
+    /// Bit position of the field's low end.
+    shift: u32,
+    /// Field width in bits.
+    bits: u32,
+}
+
+impl DispField {
+    /// `B`'s imm26, at bit 0 — ±128 MiB.
+    const IMM26: Self = Self { shift: 0, bits: 26 };
+    /// `B.cond`'s and `CBZ`'s imm19, at bit 5 — ±1 MiB.
+    const IMM19: Self = Self { shift: 5, bits: 19 };
+
+    /// Overwrite this field of the instruction word at `at`, leaving every
+    /// other bit — opcode, condition, register — exactly as placed.
+    fn write(
+        self,
+        code: &mut [u8],
+        at: usize,
+        words: i64,
+    ) -> Result<(), crate::error::CompileError> {
+        let limit = 1i64 << (self.bits - 1);
+        if !(-limit..limit).contains(&words) {
+            return Err(crate::error::CompileError::BranchOutOfRange);
+        }
+        let mask = ((1u32 << self.bits) - 1) << self.shift;
+        let field = ((words as u32) << self.shift) & mask;
+        let existing = u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+        code[at..at + 4].copy_from_slice(&((existing & !mask) | field).to_le_bytes());
+        Ok(())
+    }
+}
+
+/// A branch to a [`Label`](crate::emit::Label), as a declarative program item.
+///
+/// Named by the condition it tests, not by the mnemonic: a caller says what
+/// must be true for the branch to be taken, and this type owns which
+/// instruction spells that and which field carries the displacement.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Branch {
+    /// `b` — unconditional, ±128 MiB.
+    Always,
+    /// `b.hs` — the previous [`cmp`] found `lhs >= rhs`, unsigned. ±1 MiB.
+    IfAboveOrEqual,
+    /// `cbz w16` — W16 is zero.
+    ///
+    /// W16 rather than a register operand because W16 *is* the branch-test
+    /// scratch in this backend's ABI: the guard path reduces a mask into it
+    /// with `umaxv`/`uminv` + `fmov`, and nothing else may hold a value there.
+    /// A register parameter would suggest a choice the ABI does not offer.
+    IfW16Zero,
+}
+
+impl Branch {
+    /// Which field of the instruction word carries this branch's displacement.
+    const fn field(self) -> DispField {
+        match self {
+            Self::Always => DispField::IMM26,
+            Self::IfAboveOrEqual | Self::IfW16Zero => DispField::IMM19,
+        }
+    }
+}
+
+impl crate::emit::AsmBranch for Branch {
+    #[inline]
+    fn place(self, code: &mut Vec<u8>) -> (usize, usize) {
+        // The position comes from the placeholder that wrote the word, not from
+        // a second reading of `code.len()`. That is also what spends the
+        // `#[must_use]` fixup token honestly: under labels the patching is
+        // `assemble_labeled`'s, so what these constructors still have to offer
+        // is where they put the instruction.
+        let at = match self {
+            Self::Always => b_placeholder(code),
+            Self::IfAboveOrEqual => b_hs(code),
+            Self::IfW16Zero => cbz_w16(code),
+        };
+        // A64 displacements are measured from the branch's own address, and
+        // the whole instruction is the field's home, so both are `at`.
+        (at, at)
+    }
+
+    #[inline]
+    fn resolve(
+        self,
+        code: &mut [u8],
+        fixup: crate::emit::Fixup,
+        target: usize,
+    ) -> Result<(), crate::error::CompileError> {
+        use crate::error::CompileError;
+        let bytes = i64::try_from(target).map_err(|_| CompileError::BranchOutOfRange)?
+            - i64::try_from(fixup.origin).map_err(|_| CompileError::BranchOutOfRange)?;
+        if bytes % 4 != 0 {
+            // Every A64 instruction is four bytes, so an odd displacement means
+            // this crate laid something out unaligned — not a fact about the
+            // branch.
+            return Err(CompileError::Internal(
+                "aarch64 branch displacement is not a whole number of instructions",
+            ));
+        }
+        self.field().write(code, fixup.at, bytes / 4)
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::emit::{AsmBranch as _, Item, LabelScope, assemble_labeled};
+    use crate::error::CompileError;
+
+    /// An `AsmInsn` of one known word, so a test can measure distances in
+    /// instructions without depending on any real encoding.
+    #[derive(Copy, Clone)]
+    struct Nop;
+
+    impl AsmInsn for Nop {
+        fn emit_into(self, code: &mut Vec<u8>) {
+            emit32(code, 0xD503_201F);
+        }
+    }
+
+    fn word_at(code: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+    }
+
+    fn assemble(items: Vec<Item<Nop, Branch>>) -> Vec<u8> {
+        let mut code = Vec::new();
+        assemble_labeled(&mut code, items).expect("labels resolve");
+        code
+    }
+
+    #[test]
+    fn forward_branch_counts_instructions_not_bytes() {
+        let mut scope = LabelScope::new();
+        let end = scope.mint();
+        let code = assemble(alloc::vec![
+            Item::Branch(Branch::Always, end),
+            Item::Inst(Nop),
+            Item::Inst(Nop),
+            Item::Bind(end),
+        ]);
+        // Three instructions ahead of the branch's own address.
+        assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 3);
+    }
+
+    #[test]
+    fn a_back_edge_is_negative() {
+        let mut scope = LabelScope::new();
+        let top = scope.mint();
+        let code = assemble(alloc::vec![
+            Item::Bind(top),
+            Item::Inst(Nop),
+            Item::Inst(Nop),
+            Item::Branch(Branch::Always, top),
+        ]);
+        // The branch sits two instructions past the label, so -2 words, in
+        // imm26's two's complement.
+        assert_eq!(
+            word_at(&code, 8) & 0x03FF_FFFF,
+            (-2i32 as u32) & 0x03FF_FFFF
+        );
+    }
+
+    #[test]
+    fn a_conditional_writes_imm19_and_keeps_its_condition() {
+        let mut scope = LabelScope::new();
+        let exit = scope.mint();
+        let code = assemble(alloc::vec![
+            Item::Branch(Branch::IfAboveOrEqual, exit),
+            Item::Inst(Nop),
+            Item::Bind(exit),
+        ]);
+        let w = word_at(&code, 0);
+        assert_eq!((w >> 5) & 0x7FFFF, 2, "two words ahead");
+        // Opcode and cond field (HS = 0b0010) survive the field write.
+        assert_eq!(w & 0xFF00_001F, 0x5400_0002);
+    }
+
+    #[test]
+    fn cbz_keeps_its_register() {
+        let mut scope = LabelScope::new();
+        let exit = scope.mint();
+        let code = assemble(alloc::vec![
+            Item::Branch(Branch::IfW16Zero, exit),
+            Item::Inst(Nop),
+            Item::Bind(exit),
+        ]);
+        let w = word_at(&code, 0);
+        assert_eq!((w >> 5) & 0x7FFFF, 2);
+        assert_eq!(w & 0xFF00_001F, 0x3400_0010, "still cbz w16");
+    }
+
+    #[test]
+    fn a_labeled_program_is_position_independent() {
+        let mut scope = LabelScope::new();
+        let end = scope.mint();
+        let items = alloc::vec![
+            Item::Branch(Branch::Always, end),
+            Item::Inst(Nop),
+            Item::Bind(end),
+        ];
+        let alone = assemble(items.clone());
+
+        let mut code = alloc::vec![0xAA; 4];
+        assemble_labeled(&mut code, items).expect("labels resolve");
+        assert_eq!(&code[4..], &alone[..]);
+    }
+
+    #[test]
+    fn imm19_refuses_what_it_cannot_reach() {
+        let field = DispField::IMM19;
+        let mut code = alloc::vec![0u8; 4];
+        assert_eq!(field.write(&mut code, 0, (1 << 18) - 1), Ok(()));
+        assert_eq!(
+            field.write(&mut code, 0, 1 << 18),
+            Err(CompileError::BranchOutOfRange)
+        );
+        assert_eq!(
+            Branch::Always.resolve(
+                &mut code,
+                crate::emit::Fixup {
+                    at: 0,
+                    origin: 0,
+                    label: end_label(),
+                },
+                2,
+            ),
+            Err(CompileError::Internal(
+                "aarch64 branch displacement is not a whole number of instructions"
+            ))
+        );
+    }
+
+    fn end_label() -> crate::emit::Label {
+        crate::emit::Label(0)
+    }
 }
 
 #[cfg(test)]
@@ -2495,30 +2675,6 @@ mod xr_tests {
             "immediate form"
         );
         assert_eq!(word(|c| add(c, X1, X1, X4)) >> 24, 0x8B, "register form");
-    }
-
-    /// A conditional branch is emitted as a placeholder and patched to a
-    /// forward target; the displacement counts instructions, not bytes.
-    #[test]
-    fn conditional_branches_patch_forward_in_instructions() {
-        let mut c = Vec::new();
-        let br = b_hs(&mut c);
-        c.resize(24, 0); // three more instructions
-        br.patch(&mut c, 24);
-        let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        assert_eq!((w >> 5) & 0x7FFFF, 6, "24 bytes ahead is 6 instructions");
-        assert_eq!(w & 0xF, 0x2, "cond = HS");
-    }
-
-    /// An unconditional backward branch encodes a negative instruction count.
-    #[test]
-    fn unconditional_branches_go_backwards() {
-        let mut c = vec![0u8; 16];
-        b(&mut c, 0);
-        let w = u32::from_le_bytes([c[16], c[17], c[18], c[19]]);
-        assert_eq!(w >> 26, 0x05, "B opcode");
-        // -4 instructions, in 26-bit two's complement.
-        assert_eq!(w & 0x03FF_FFFF, (-4i32 as u32) & 0x03FF_FFFF);
     }
 
     /// `Xr` and `Reg` name different files; the same index is a different

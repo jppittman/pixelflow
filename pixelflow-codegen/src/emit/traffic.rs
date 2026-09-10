@@ -135,7 +135,9 @@ impl<'a, B: IsaBackend> Counting<'a, B> {
 }
 
 impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
-    type Branch = B::Branch;
+    type Cond = B::Cond;
+
+    const JUMP: Self::Cond = B::JUMP;
 
     fn register_file(&self) -> super::regalloc::RegisterFile {
         self.inner.register_file()
@@ -197,30 +199,14 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.emit_resolve(code, vid, target, locs)
     }
 
-    fn emit_skip_if_all_false(
+    fn compare_mask(
         &mut self,
         code: &mut Vec<u8>,
         mask_reg: Reg,
         scratch: Option<Reg>,
-    ) -> Self::Branch {
-        self.inner.emit_skip_if_all_false(code, mask_reg, scratch)
-    }
-
-    fn emit_skip_if_all_true(
-        &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-    ) -> Self::Branch {
-        self.inner.emit_skip_if_all_true(code, mask_reg, scratch)
-    }
-
-    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch {
-        self.inner.emit_jump(code)
-    }
-
-    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Self::Branch, target: usize) {
-        self.inner.patch_branch(code, branch, target);
+        arm: super::SelectArm,
+    ) -> Self::Cond {
+        self.inner.compare_mask(code, mask_reg, scratch, arm)
     }
 
     fn body_frame_bytes(&self, frame_size: u32) -> u32 {
@@ -267,12 +253,8 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.counter_step(code, counter);
     }
 
-    fn branch_if_counter_done(
-        &mut self,
-        code: &mut Vec<u8>,
-        counter: super::Counter,
-    ) -> Self::Branch {
-        self.inner.branch_if_counter_done(code, counter)
+    fn compare_counter(&mut self, code: &mut Vec<u8>, counter: super::Counter) -> Self::Cond {
+        self.inner.compare_counter(code, counter)
     }
 
     fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {

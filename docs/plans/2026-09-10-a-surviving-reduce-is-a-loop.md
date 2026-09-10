@@ -81,10 +81,42 @@ names, and it is not needed here.
 
 ## 4. Stages
 
+**R0 — a position gets a name.** *Landed.* Codegen had no way to *say* "here",
+so every branch was placed as a fixup token the emitter carried by hand to a
+`patch_branch` call, against an offset it read off `code.len()` at the one
+point in the sequence where that was correct. A loop's back edge is the same
+shape, so building one meant more of that.
+
+A program is a sequence of **items**: an instruction (fixed bytes, position-
+independent — which is why a branch could never be an `AsmInsn`), a **binding**
+of a name to this position (no bytes), or a **reference** to a name (bytes that
+depend on where it lands). `Label`, `LabelScope`, `Item`, `AsmBranch`,
+`Resolver`, `assemble_labeled` in `pixelflow-codegen/src/emit/mod.rs`; per-ISA
+`Branch` enums named by the condition they test, never by an opcode byte.
+
+`AsmBranch::resolve` takes `self` because the field is the *branch's*: x86
+spells every displacement `rel32`, aarch64's `B` carries imm26 and its
+`B.cond`/`CBZ` an imm19 five bits up. Two front ends, one mechanism —
+`assemble_labeled` for a program that can be a value, `Resolver` streaming for
+an emitter whose every verb is a `&mut self` method and so cannot build that
+sequence at all.
+
+Both loops in the emitter moved: the collapse nest and the `Select`
+short-circuit. That deleted `emit_jump`, `patch_branch`, `emit_skip_if_all_false`,
+`emit_skip_if_all_true`, `IsaBackend::Branch`, `Aarch64Branch`, `Cond19`,
+`Rel26`, `emit_jmp_rel32` and `patch_rel32` — the whole fixup-token mechanism,
+five impls of it. The two skip verbs folded into one `compare_mask(.., arm)`,
+because they differed only in which uniform mask lets an arm go, which is what
+`SelectArm` already names. Emitted bytes are unchanged, which is what the
+goldens are for.
+
 **R1 — emit one.** `arena_to_schedule` grows a `Reduce` arm; the backend grows
 a reduce-loop scaffold beside `emit_collapse_loop`; `ExpandReduce` gains a way
-to be told not to unroll. Gate: a hand-built `⊕_{[0,n)}` over a table produces
-the same buffer looped as unrolled, on both ISAs, for `SUM` and `MIN`.
+to be told not to unroll. The back edge is now `labels.branch(B::JUMP, top,
+&mut code)` in the same `Resolver` the guards use, so the loop is composition
+rather than a third copy of the fixup dance. Gate: a hand-built `⊕_{[0,n)}`
+over a table produces the same buffer looped as unrolled, on both ISAs, for
+`SUM` and `MIN`.
 
 **R2 — the cost model prices a loop.** Today `node_op_cost` for a `Reduce` is
 the *unrolled* cost, so extraction has no reason to keep one. A loop costs
