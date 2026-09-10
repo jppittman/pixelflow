@@ -48,6 +48,8 @@ jobs:
   cl-metadata:
     name: CL metadata
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     steps:
       - name: Checkout code and CL history
         uses: actions/checkout@v4
@@ -56,14 +58,21 @@ jobs:
 
       - name: Check CL title and commit subjects
         env:
-          CL_TITLE: ${{ github.event.pull_request.title }}
+          # `github.event.pull_request.title` is a snapshot from whatever
+          # event triggered this run (open/sync/reopen) -- this job's own
+          # trigger list has no `edited`, so a title fixed *after* a push
+          # (edit the PR title, no new commit) leaves this run's copy stale
+          # and a rerun of the job replays the same stale event payload
+          # rather than reading the PR live. `gh pr view` asks the API for
+          # the title as of *now*, so a title-only fix needs only a rerun,
+          # not another commit.
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
           HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
-        run: >-
-          bash scripts/check-cl-metadata.sh
-          "$CL_TITLE"
-          "$BASE_COMMIT"
-          "$HEAD_COMMIT"
+        run: |
+          cl_title=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title -q .title)
+          bash scripts/check-cl-metadata.sh "$cl_title" "$BASE_COMMIT" "$HEAD_COMMIT"
 
   # A build.rs can declare (via rustc-check-cfg) a display-driver cfg that no
   # CI job ever actually builds -- that's exactly how the headless driver
