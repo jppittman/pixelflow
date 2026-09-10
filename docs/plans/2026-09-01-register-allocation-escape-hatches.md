@@ -495,6 +495,60 @@ prerequisite for real k-register predication on AVX-512 — masked ops instead o
 blend sequences — which is where that backend should eventually go, and which
 is impossible while `k1` is a hardcoded transient.
 
+> **Landed 2026-09-10 — class B, as fields rather than a keyed map.**
+> `RegisterFile` gained `gpr_ctx: Option<Gpr>`, `gpr_scratch: GprSet`,
+> `gpr_temps_for: fn(&ScheduledOp) -> u8`, `mask_scratch: MaskSet`,
+> `mask_temps_for: fn(&ScheduledOp) -> u8`, `mask_guard_temps: u8` — the
+> GPR/mask mirrors of `inputs`/`scratch`/`temps_for`/`guard_temps`, not a
+> `RegClass`-keyed structure. `KReg` (`k0..k7`) already existed as a newtype;
+> `GprSet`/`MaskSet` are two more concrete bitsets beside `RegSet`, not `RegSet`
+> made generic over the register newtype: `of`/`contains`/`len` run in `const
+> fn` — every backend's `RegisterFile` is declared as a `const` — and stable
+> Rust cannot dispatch a trait method from a const context, so a
+> register-newtype-generic bitset could not itself be `const`. Three small
+> concrete types beat one generic one blocked by a language wall.
+>
+> `Scratch` gained `gpr_temp(i)`/`mask_temp(i)` accessors and a
+> `mask_guard_temp`, filled by `LinearScan::scan` the same way vector temps
+> are — except there is no liveness, spilling or eviction to perform for
+> either class: nothing outside `Gather`/`Uniform`/a compare/a guard ever asks
+> for a GPR or a mask register, so each instruction simply takes the low
+> members of the class pool it needs, always free. `RegisterFile::checked`
+> extends to prove `gpr_ctx` misses `gpr_scratch`, the same disjointness it
+> already proved for vector `inputs`/`scratch`/`fixed`.
+>
+> Every backend's hand-chosen GPRs/k-register became reservations read
+> through `Scratch` instead of hardcoded constants: `rax`/`rcx` (SSE2, AVX2)
+> and `rax` (AVX-512) for `Gather`'s/`Uniform`'s base-pointer arithmetic;
+> `x9`/`x10`/`x11` (aarch64) for the scalar-load gather's base/index/value;
+> AVX-512's `k1` for both a compare's `vcmpps` destination and a guard's
+> `vptestmd` destination (`emit_compare`/`emit_mask_flags` now take the
+> register as a parameter rather than naming `SCRATCH_K` internally). The
+> context-pointer GPR (`rdi`/`x0`) is declared as `gpr_ctx` — pinned like a
+> vector `Var` input, never itself allocated — purely so `checked` can prove
+> it, the same reason `inputs` is a field rather than a comment.
+>
+> No pool-size or byte-count change: unlike the vector-class steps above,
+> none of these registers were ever competing with a DAG value for a slot in
+> `scratch`, so there was no register to free by moving them into the
+> allocator's vocabulary. The win is the one class B was always about —
+> `RegisterFile::checked` now proves the disjointness a comment used to
+> assert, and a second GPR/mask consumer is a `gpr_temps_for`/`mask_temps_for`
+> answer rather than a fourth hand-picked constant to keep clear of the
+> others by inspection. Verified on all four backends: the full test suite,
+> including AVX-512's own hardware-executed gather/compare tests, on the
+> SSE2 baseline and `+avx2,+fma`/`+avx512f,+avx512dq`, plus a clean
+> `cargo clippy --all-targets -D warnings` on all three x86 tiers and an
+> aarch64 cross-check (`cargo check --tests --target
+> aarch64-unknown-linux-gnu`; no aarch64 hardware or cross-linker available
+> to execute it here).
+>
+> K-register predication itself — masked ops instead of blend sequences,
+> the reason this step was worth doing — is not attempted here: it needs
+> more than one mask register live at once, which is a real allocation
+> problem (liveness, eviction) this change deliberately did not build,
+> having no case yet that needs it.
+
 ### 4. Show the allocator the loop — dissolves class D
 
 Give the allocator the whole emitted function, scaffold included, rather than

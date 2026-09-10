@@ -22,7 +22,7 @@
 //! than a silently dropped term.
 
 use super::regalloc::ValueId;
-use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload};
+use super::{Binding, InstructionPlan, IsaBackend, KReg, Loc, Reg, Reload};
 use crate::error::CompileError;
 
 /// Emitted traffic within one scope of the collapse nest.
@@ -202,8 +202,10 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         code: &mut Vec<u8>,
         mask_reg: Reg,
         scratch: Option<Reg>,
+        mask_scratch: Option<KReg>,
     ) -> Self::Branch {
-        self.inner.emit_skip_if_all_false(code, mask_reg, scratch)
+        self.inner
+            .emit_skip_if_all_false(code, mask_reg, scratch, mask_scratch)
     }
 
     fn emit_skip_if_all_true(
@@ -211,8 +213,10 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         code: &mut Vec<u8>,
         mask_reg: Reg,
         scratch: Option<Reg>,
+        mask_scratch: Option<KReg>,
     ) -> Self::Branch {
-        self.inner.emit_skip_if_all_true(code, mask_reg, scratch)
+        self.inner
+            .emit_skip_if_all_true(code, mask_reg, scratch, mask_scratch)
     }
 
     fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch {
