@@ -496,10 +496,88 @@ again:
 reassociate it. Iteration is introduced *by lowering*. So the carried value is
 a schedule concept, and putting it in the arena was three layers too low.
 
-Which puts the original question back, unanswered but now correctly placed:
-the schedule boundary is where an algebra has to become an instruction, and
-whether that is a legitimate `Monoid → OpKind` query or a leak is a question
-about *that* boundary, not about the arena.
+Which puts the original question back, correctly placed: the boundary where an
+algebra becomes an instruction. The next section settles which boundary that
+is.
+
+### 2a″: a loop body is a named DAG section, and ⊕ stays on the fold (JP, 2026-09-10)
+
+> *"At what phase do functional concepts become imperative loops, and how do we
+> carry the concept of a loop body at different phases? We already have a DAG,
+> so my feeling was that a loop body was a reference to a DAG section and it
+> conveniently overlapped with the linker work."*
+
+A loop body is a subgraph at every phase before the schedule — reachable from
+`Reduce`'s child in the arena, an e-class in the graph, a chosen DAG after
+extraction — and only becomes a code region at the schedule. `Ref(KernelKey)`
+already names a piece of DAG, so the body is carried *by name* rather than
+re-represented per phase. That is the overlap with L1–L3, and it holds.
+
+Three things follow, in the order they were settled.
+
+**Separate compilation is refused, and that is what forbids cycles.** The
+guard is not `Param`'s doc — it is content addressing. A `KernelKey` is a hash
+of content, so a kernel's name depends on its children's names, and closing a
+cycle would require a kernel's own hash to compute its own hash. The graph is
+acyclic the way a git history is: by how things are named, with no occurs
+check anywhere. Late linking is the one door to a cycle (it is how real linkers
+get mutual recursion) and it is also the only feature that would need the
+check. Nothing here wants it: `Manifold::compile(extent)` is the specialization
+point and the JIT cache is shape-keyed, so "a compiled artifact waiting for a
+link" is not a state this architecture has.
+
+So **`Param` keeps its meaning exactly**, and this is not a repeat of what
+`Var` suffered. A `Reduce` binds its body's slots structurally, at
+construction; nothing reaches bake unbound, so *an unbound slot at bake time is
+still a bug* and `Declined::Param` still means a builder was never called. No
+generalization, no new node.
+
+**Peeling is application, not algebra.** Σ and Π peel identically —
+
+```
+Σ_{i<n} f(i) = (Σ_{i<n-1} f(i)) + f(n-1)
+Π_{i<n} f(i) = (Π_{i<n-1} f(i)) · f(n-1)
+```
+
+— because the rule is a property of the fold and the operator is only the glue.
+Written over a body that takes the carried value, `Reduce{n,k} → apply(k,
+Reduce{n-1,k}, n-1)` mentions no `OpKind` at all. Today's `PeelFold` does
+mention one, and *declines the rewrite when the combiner is not nameable as an
+`Op`* (`fold_rules.rs`) — a coupling the application form would delete.
+
+**But the geometric split needs ⊕ first-class, and that is decisive.** Peel
+today is strictly ±1 (`Fold::peel` advances `lo`, `peel_back` retreats `hi`);
+there is no halving rule in the tree, and a halving rule is what would take the
+bite off unrolling — log depth instead of linear, and lane-parallel reduction.
+Splitting comes in two kinds and only one of them is worth having:
+
+| | needs | buys |
+|---|---|---|
+| sequential — thread the accumulator through both halves | nothing; holds for any body | **nothing** — same work, same order, re-bracketed |
+| parallel — two independent partials, then merged | `acc₁ ⊕ acc₂`, i.e. associativity and an identity | log depth, lane-parallel reduction |
+
+A body of shape `k(acc, i)` takes an *index*, not a second accumulator, so it
+cannot supply the merge. **The split that matters is unreachable if ⊕ is buried
+in the body**, which rules out body-as-`k(acc,i)` and keeps the algebra on the
+`Reduce` — roughly the shape that exists now.
+
+**Where that leaves the combine.** It enters the graph at *lowering* — after
+extraction has decided the fold survives — inside `pixelflow-ir`, where `op()`
+is already in scope. The e-graph reasons about the monoidal form and can split
+it; the lowered form has the accumulate as an ordinary node and is free to fuse
+(`acc + a[i]*b[i] → fma(a[i], b[i], acc)`, which a `Monoid`-shaped combine
+structurally cannot reach, since it forces the accumulate to be its own binary
+node); codegen never asks an algebra for an opcode, because the IR spent it
+during lowering. And lowering targets the **schedule**, so the carried value is
+a `ValueId` and no arena node is needed — which is the 2a′ table's answer,
+arrived at from the other end.
+
+**Sequencing consequence.** L4 and L5 stop being follow-ons and become
+prerequisites. Peeling a `Ref`-bodied fold means materializing the body behind
+the ref, which is L4's growth-gated `Ref(k) ⟷ body(k)` exactly — the growth
+gate is what stops a peel from unrolling the whole fold by accident — and
+applying a named body per iteration is L5's ABI. The loop *is* the call,
+applied N times.
 
 ### The shape 2b adds
 
