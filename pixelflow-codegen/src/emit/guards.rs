@@ -582,11 +582,6 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
 /// batches, 3.2x faster with one).
 const MISPREDICT_PENALTY_CYCLES: usize = 16;
 
-/// How many partitions one scope may be given. Each accepted round strictly
-/// increases the entries under a guard, so this only bounds the *compile*
-/// cost of looking for more; it is not a correctness bound.
-const MAX_CLUSTER_ROUNDS: usize = 8;
-
 /// Reorder a scope's schedule so that a select's arm-exclusive entries form
 /// one run — where that, and only that, is what stands between the arm and a
 /// branch.
@@ -603,75 +598,63 @@ const MAX_CLUSTER_ROUNDS: usize = 8;
 /// - Relative order is preserved inside each group, and every group's
 ///   dependencies now precede it.
 ///
-/// Selects are partitioned outermost first (descending schedule position: a
-/// select is scheduled after everything in its arms, so an enclosing select
-/// comes later), and the result is *accepted only if it is better* — strictly
-/// more entries under a guard, and no select losing one it already had. That
-/// is what keeps the pressure honest: shared values moved ahead of both arms
-/// live across the skipped arm, which is a cost worth paying for a branch and
-/// not otherwise.
+/// Outermost first — a select is scheduled after everything in its arms, so an
+/// enclosing select comes later — and each select is partitioned **once**,
+/// unconditionally.
+///
+/// # This used to be a search, and that was the wrong shape
+///
+/// It ran up to eight rounds of hill-climbing: recompute every arm's closure,
+/// try a partition, recompute every closure *again* to score it, keep it only
+/// if strictly more entries ended up under a guard, restart. Measured on a
+/// glyph it was **73% of an entire bake** — 1,540 ms of 2,127 on `8`@32 — and
+/// what it found was a constant 282 bytes of emitted code, the same 282 for
+/// `A`, `O` and `8`. The search scaled; what it found did not. See
+/// `docs/BACKLOG.md`, X1.
+///
+/// The accept/reject test existed to protect register pressure: partitioning
+/// moves shared values ahead of both arms, so they live across the skipped
+/// arm, and that was judged "a cost worth paying for a branch and not
+/// otherwise". That reasoning takes `Select` to be a blend with the branch as
+/// an upsell to be justified. It is not — a uniform mask *takes an arm*, and
+/// the blend is the fallback for a mask that varies by lane (CLAUDE.md,
+/// "Select contains an if"). The branch is not optional, so neither is the
+/// live-range cost of admitting it, and the test has nothing left to decide.
+///
+/// What still decides something is [`MISPREDICT_PENALTY_CYCLES`] — one
+/// comparison per select, not a search: an arm too cheap to pay for its own
+/// branch is never partitioned, because [`SelectArms::refused_for_order`] is
+/// false for it. That bound is measured (a glyph's coverage mask is 3.6x
+/// *slower* guarded), so "always admit the jump" is a statement about what
+/// `Select` means, not a licence to branch on a two-instruction arm.
 pub(crate) fn cluster_select_arms(schedule: Vec<Def>) -> Vec<Def> {
     let mut current = schedule;
-    let mut spans = guarded_spans(&current);
+    // Keyed by the select's *value*: the one identity that survives a
+    // reordering, where a schedule position does not. Each select is
+    // partitioned at most once, so this terminates in at most one pass per
+    // select and there is no round cap to choose.
+    let mut partitioned: alloc::collections::BTreeSet<ValueId> =
+        alloc::collections::BTreeSet::new();
 
-    for _ in 0..MAX_CLUSTER_ROUNDS {
+    loop {
+        // Recomputed each time because `partition_around` returns a new
+        // schedule and `SelectArms` holds indices into the old one. Only the
+        // region it rewrites moves, and relative order is preserved within
+        // each group, so a select already contiguous inside that region stays
+        // contiguous.
         let arms = select_arms(&current);
-        let mut improved = false;
-        for candidate in arms.iter().rev() {
-            if !candidate.refused_for_order() {
-                continue;
-            }
-            let reordered = partition_around(&current, candidate);
-            let reordered_spans = guarded_spans(&reordered);
-            if !is_improvement(&spans, &reordered_spans) {
-                continue;
-            }
-            current = reordered;
-            spans = reordered_spans;
-            improved = true;
+        let Some(candidate) = arms
+            .iter()
+            .rev()
+            .find(|c| c.refused_for_order() && !partitioned.contains(&c.select_vid))
+        else {
             break;
-        }
-        if !improved {
-            break;
-        }
+        };
+        partitioned.insert(candidate.select_vid);
+        current = partition_around(&current, candidate);
     }
 
     current
-}
-
-/// The entries each select has under a guard, keyed by the select's value —
-/// the one identity that survives a reordering, unlike a schedule position.
-fn guarded_spans(schedule: &[Def]) -> alloc::collections::BTreeMap<ValueId, ArmPair<usize>> {
-    select_arms(schedule)
-        .into_iter()
-        .map(|select| {
-            let ranges = select.ranges();
-            (
-                select.select_vid,
-                ArmPair::new(
-                    ranges.true_arm.1 - ranges.true_arm.0,
-                    ranges.false_arm.1 - ranges.false_arm.0,
-                ),
-            )
-        })
-        .collect()
-}
-
-/// Strictly more schedule entries under a guard, with no select losing what it
-/// already had — including the nested ones, whose arms lie inside the arm that
-/// moved.
-fn is_improvement(
-    before: &alloc::collections::BTreeMap<ValueId, ArmPair<usize>>,
-    after: &alloc::collections::BTreeMap<ValueId, ArmPair<usize>>,
-) -> bool {
-    let total = |spans: &alloc::collections::BTreeMap<ValueId, ArmPair<usize>>| -> usize {
-        spans.values().map(|p| p.true_arm + p.false_arm).sum()
-    };
-    total(after) > total(before)
-        && before.iter().all(|(vid, b)| {
-            let a = after.get(vid).copied().unwrap_or_default();
-            a.true_arm >= b.true_arm && a.false_arm >= b.false_arm
-        })
 }
 
 /// The schedule with `select`'s region stable-partitioned into shared, then
