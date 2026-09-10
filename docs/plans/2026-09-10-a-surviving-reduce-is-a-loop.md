@@ -417,14 +417,80 @@ load-bearing until the last step. That buys a gate for each piece:
 
 | | | gate |
 |---|---|---|
-| **2a** | placements become per-scope | byte-identity |
-| **2b** | a scope gains `inner`; `ScopeId` is preorder | byte-identity |
-| **2c** | a surviving `Reduce` is a def plus an inner scope | additive — no kernel has one yet |
-| **2d** | delete `ExpandReduce`; the e-graph decides | behaviour |
+| **2a** | placements become per-scope | byte-identity — **done**, `cb740e4` |
+| **2b** | a surviving `Reduce` is a def plus a scope | additive — no kernel has one yet |
+| **2c** | delete `ExpandReduce`; the e-graph decides | behaviour |
 
-Step 3 — deleting the X/Y precoloring — then has nothing left to do to the
-nest: a collapse loop becomes a def with an inner scope, exactly like a fold,
-and `regions` stops being a separate concept from `inner`.
+2a and 2b were planned as three steps, with a middle one that added the tree
+types and no producer for them. That middle step is folded into 2b: types with
+no caller are the machinery this plan is supposed to be removing, and the
+byte-identity gate cannot see them either way.
+
+### The shape 2b adds
+
+A parent pointer, not recursion. Storage stays flat — one `ScopeCode` per
+scope, which is what the dense placement vectors want — and the tree is the
+`parent` field:
+
+```rust
+pub struct FoldScope {
+    /// The scope whose schedule holds this loop's def.
+    pub parent: Scope,
+    /// Which def — the `Reduce` this is the body of.
+    pub at: usize,
+    pub schedule: Vec<Def>,
+}
+```
+
+with `Scope::Fold(usize)` indexing them. A fold inside a fold is
+`parent: Scope::Fold(j)`; nothing special-cases depth.
+
+`within()` becomes a subtree walk rather than a suffix of the chain, and that
+is the whole of the tree in the allocator.
+
+### A label should be keyed by the node it names (JP, 2026-09-10)
+
+The emitter keeps two maps and only one of them is doing work:
+
+| | | |
+|---|---|---|
+| `Assembly.bound: Map<Label, usize>` | label → position | irreducible; this *is* what an assembler does |
+| `pending_binds: Map<(guard_idx, arm), Label>` | site → label | exists only because `asm.label()` mints an opaque id |
+
+The second is bookkeeping to remember which id was minted for which site, and
+its key is *positional* — `guard_idx` is an index into a scratch
+`Vec<SelectGuard>` — where the DAG node is the actual identity. Make the
+label's identity the site and the map goes, along with its insert, its remove,
+and the `assert!(pending_binds.is_empty())` that checks the bookkeeping was
+kept.
+
+The reason this belongs in *this* plan rather than in a tidy-up: `emit_loop`'s
+head and exit are per-`Reduce`, and **sibling folds sharing a binder index has
+already been a bug here once** (§4a). It was fixed with a search rule — stop
+at the previous `Reduce` over the same binder. A label keyed by the Reduce's
+`ValueId` cannot alias a sibling's at all. A rule in a comment versus a key
+that is unrepresentable when wrong is the trade CLAUDE.md keeps naming, and
+this is a place to take it.
+
+The cost, stated honestly: not every label has a node. The constant-pool
+anchor has none, and the collapse scaffold's loops are not in the schedule
+(until step 3 puts them there). So either `Label` becomes a sum that mentions
+`ValueId` — and the assembler stops being usable for any little program, which
+is what it was built to be — or the label type becomes a parameter,
+`Assembly<L: Ord>`. The latter is a different axis from the `Assembly<Branch>`
+that was rejected: that parameterized the *instruction*, where there is one
+answer; this parameterizes what names a position, which the assembler has no
+opinion about.
+
+### Where step 3 lands
+
+Uniformity, and it is already visible from here. A region *is* the prologue of
+the loop that contains the next scope, and `body` is the innermost loop's
+body — so the chain is the same (loop, its body) pairing the folds use, with
+the loop kept in the scaffold instead of in the schedule. Deleting the X/Y
+precoloring turns those two loops into defs, at which point `regions` and
+`body` stop being separate concepts from `folds`, and `ScopedSchedule` is one
+tree of scopes with one kind of node.
 
 ## 5. What this does not do
 
