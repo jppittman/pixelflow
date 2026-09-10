@@ -545,21 +545,42 @@ Reduce{n-1,k}, n-1)` mentions no `OpKind` at all. Today's `PeelFold` does
 mention one, and *declines the rewrite when the combiner is not nameable as an
 `Op`* (`fold_rules.rs`) — a coupling the application form would delete.
 
-**But the geometric split needs ⊕ first-class, and that is decisive.** Peel
-today is strictly ±1 (`Fold::peel` advances `lo`, `peel_back` retreats `hi`);
-there is no halving rule in the tree, and a halving rule is what would take the
-bite off unrolling — log depth instead of linear, and lane-parallel reduction.
-Splitting comes in two kinds and only one of them is worth having:
+**But unrolling by halving needs ⊕ first-class, and that is decisive.** Peel
+today is strictly ±1 (`Fold::peel` advances `lo`, `peel_back` retreats `hi`,
+and `PeelFold` uses `peel_back`); there is no halving rule in the tree. The one
+that is wanted is **loop unrolling** — halve the trip count, double the body —
+not a partition of the range into two sequential sub-folds. That distinction
+cost a round of this conversation, so it is worth stating: re-bracketing the
+*range* into `foldl k (foldl k seed [lo,mid)) [mid,hi)` really does buy
+nothing, because it is the same work in the same order. Restructuring the
+*body* is the transformation that pays.
 
-| | needs | buys |
-|---|---|---|
-| sequential — thread the accumulator through both halves | nothing; holds for any body | **nothing** — same work, same order, re-bracketed |
-| parallel — two independent partials, then merged | `acc₁ ⊕ acc₂`, i.e. associativity and an identity | log depth, lane-parallel reduction |
+What it pays is not depth — full unroll reaches the same terminal graph, `n`
+copies of the body, either way. It is **rule applications**: peeling to
+exhaustion takes `n` of them, halving takes `log n`. Saturation's budget is
+denominated in exactly that (`SaturationConfig::max_applications`), so a
+34,993-node glyph fold is the difference between exhausting the budget and not.
+It also hands the extractor the ladder it wants — "trip `n/2ᵏ` with a `2ᵏ`-wide
+body" is an unroll factor — rather than peel's asymmetric "a fold plus `k` loose
+terms".
 
-A body of shape `k(acc, i)` takes an *index*, not a second accumulator, so it
-cannot supply the merge. **The split that matters is unreachable if ⊕ is buried
-in the body**, which rules out body-as-`k(acc,i)` and keeps the algebra on the
-`Reduce` — roughly the shape that exists now.
+Two rewrites look alike here and need different algebra. Only the first is
+sound in general:
+
+| | becomes | order | needs |
+|---|---|---|---|
+| **stride-2** | `[lo,hi) step 2s`, body `b ⊕ b[i := i+s]` | `(f₀⊕f₁) ⊕ (f₂⊕f₃) ⊕ …` — original, re-bracketed | associativity |
+| halve-and-offset | `[lo,lo+n/2)`, body `b ⊕ b[i := i+n/2]` | `(f₀⊕f_{n/2}) ⊕ (f₁⊕f_{1+n/2}) ⊕ …` — interleaved | associativity **and commutativity** |
+
+Build stride-2: it preserves evaluation order, so it holds for any monoid
+rather than only the commutative ones. An odd trip count peels once first —
+`peel_back` is already the epilogue, so the two rules compose and no second
+peel is needed.
+
+And doubling the body means *constructing* the combine node, so the rule needs
+the operator nameable as an `Op` — the same requirement `PeelFold` already has
+and already declines on. **That is what keeps ⊕ on the `Reduce`**, and it rules
+out body-as-`k(acc,i)`, under which there is no ⊕ to name.
 
 **Where that leaves the combine.** It enters the graph at *lowering* — after
 extraction has decided the fold survives — inside `pixelflow-ir`, where `op()`
@@ -586,20 +607,56 @@ scope, which is what the dense placement vectors want — and the tree is the
 `parent` field:
 
 ```rust
-pub struct FoldScope {
+struct FoldScope {
     /// The scope whose schedule holds this loop's def.
-    pub parent: Scope,
+    parent: Scope,
     /// Which def — the `Reduce` this is the body of.
-    pub at: usize,
-    pub schedule: Vec<Def>,
+    at: usize,
+    /// Everything else a scope has. A fold scope is a scope, not a bare
+    /// schedule: the carried value lives across its back edge, which is a
+    /// *placement*, and the combine needs scratch like any other instruction.
+    code: ScopeCode,
 }
 ```
 
-with `Scope::Fold(usize)` indexing them. A fold inside a fold is
-`parent: Scope::Fold(j)`; nothing special-cases depth.
+**A `ScopeCode`, not a loose `Vec<Def>`** — an earlier sketch here gave
+`FoldScope` a `schedule` and nothing else, which would leave the one scope
+whose whole reason for existing is a loop-carried value with nowhere to record
+where that value lives. `ScopeCode` already holds the four things a scope has
+(`placements`, `schedule`, `scratch`, `roots`), so a fold scope contains one
+rather than restating a quarter of it.
 
-`within()` becomes a subtree walk rather than a suffix of the chain, and that
-is the whole of the tree in the allocator.
+`Scope::Fold(usize)` indexes them, alongside the existing `Region(i)` and
+`Body`. A fold inside a fold is `parent: Scope::Fold(j)`; nothing
+special-cases depth. `NestAllocation` grows a `folds: Vec<FoldScope>` beside
+its `regions`/`body`, and `code()` gains the one arm that reads it.
+
+The regions stay a chain — they are the collapse nest, and a `Reduce` does not
+reorder them. What becomes a tree is the whole: folds hang off spine nodes, and
+off each other.
+
+**Exactly two functions carry the tree**, both in `emit/regalloc.rs`, and both
+are today's chain assumption written down:
+
+| | today | with folds |
+|---|---|---|
+| `within()` | suffix of the chain, `(i+1..len)` then `Body` | descendants in the tree |
+| `parked_by_an_enclosing_scope()` | prefix of the chain, `regions[..outside]` | walk up `parent` |
+
+The difference is real rather than cosmetic: a fold parented at `Region(0)` is
+inside region 0, and `Region(1)` is *also* inside region 0, but the fold is not
+inside region 1 — they are siblings. "Everything after me in a total order"
+and "my descendants" coincide for a pure chain, which is why 2a's byte-identity
+gate holds and why this step is additive.
+
+Finding a scope's children is a scan of `folds` filtered by `parent`, not a
+maintained `children` list. A nest has a handful of scopes; a second structure
+to keep in sync would be machinery this plan exists to remove.
+
+One thing to keep honest: `Scope` derives `Ord`, and once folds exist that
+ordering is **not** nesting order. The type's doc already says it is a name and
+not a coordinate — that stays true, and the `Ord` is only for deterministic
+keying.
 
 ### A label should be keyed by the node it names (JP, 2026-09-10)
 
