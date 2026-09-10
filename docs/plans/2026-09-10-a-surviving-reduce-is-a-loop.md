@@ -146,6 +146,47 @@ over a table produces the same buffer looped as unrolled, on both ISAs, for
 *What R1 looks like in this tree, read off the code rather than guessed at
 (2026-09-10):*
 
+**The loop-carried accumulator is a phi, and the slot is how you spell one.**
+`LinearScan` is straight-line over a flat schedule and has no phis, which is why
+§3 puts the accumulator in a slot. What §3 did not say is that this needs *no
+new machinery at all*: it is three ordinary schedule defs plus a pin.
+
+```text
+acc_init = Const(identity)                    // before the loop
+  <body defs — the ones that vary with the binder>
+acc_next = Binary(monoid_op, acc_init, body_root)
+```
+
+- `acc_init` and `acc_next` are pinned to the **same slot** (`FrameLayout::pin_slot`).
+  That aliasing *is* the phi: the bottom of the iteration stores, the top reads.
+- `acc_next` reaching its slot is already automatic. `store_after_def[i]` is set
+  for any value that has a slot and whose def-point binding is a register —
+  *"every definition writes a register, so this is the only place a value
+  reaches its slot"* — so the emitter stores it with no new verb.
+- `acc_init` inside the loop, and the binder's `Var(4..8)` def, are read from
+  their slots by the ordinary spill machinery. That is exactly what
+  `HoistCtx::Body` already does for a parked value: *"mapped values are never
+  emitted; their locations are overridden … to the hoist slot, where every
+  consumer reloads through the ordinary spill machinery."*
+
+So the accumulate is an **ordinary `Binary` def**, not a loop verb. No scratch
+register has to be reserved for it, no `combine` verb is added to `IsaBackend`,
+and the allocator learns nothing about folds. That was the part that looked
+expensive and is not.
+
+**The region is a span, and a fold region is shaped like a guard region.**
+`select_guards` is already a side table of regions with
+`branch_starts[sched_idx]`/`branch_ends[sched_idx]`, walked in schedule order
+and bound as the walk passes; `IsaBackend::loop_open`/`loop_close` are the same
+loop as `emit_loop` for a walk that cannot nest closures. The span runs from the
+first def whose `Variance` includes the binder through `acc_next`.
+
+Variance, not reachability, decides it, and it is already computed: nothing
+outside a fold can read its binder, so a body node shared with the outer graph
+is loop-invariant by construction. A loop-invariant node that happens to sit
+*inside* the span is recomputed per iteration — correct, and merely the
+optimization ask B is about, not a wrong split.
+
 - **The fold's region is `partition_by_scope`, with no new pass.** §4 of
   [a-kept-structure-is-control-flow](2026-09-10-a-kept-structure-is-control-flow.md)
   guessed `&[0, 1, 4]`; the binder list is innermost-first (`COLLAPSE_BINDERS
