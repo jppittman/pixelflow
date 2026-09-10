@@ -239,6 +239,61 @@ the prediction is wrong and this document says so.
 extraction arms. Inert before R2 — split and unsplit price identically under
 `latency_prior()` — which is why it is last and not first.
 
+## 4a. Correction, 2026-09-10: a fold has to be a *scope*
+
+§3 says the accumulator in a slot means "no value is live across the back edge,
+and `LinearScan` never has to represent one." **That is true of the accumulator
+and the binder, and false of everything else in the body.**
+
+`LinearScan` is straight-line: it evicts a value and reloads it at a later
+index, on the assumption that each index executes once. A back edge breaks that
+assumption for *any* value the allocator relocated inside the loop — the reload
+was emitted once, at a point the second iteration reaches with the register
+already reused.
+
+Codegen already has the answer, and it is per **scope**, not per value:
+
+> The scope's head, where the previous iteration's tail flows back in. A value
+> live across this scope's back edge may end an iteration somewhere other than
+> where the next one expects to find it; this is what puts it back, once per
+> iteration — the cost the eviction that moved it was charged.
+
+That reconciliation runs at a scope's head, and `allocate_nest` gives one to
+each region of `ScopedSchedule`. A fold emitted *inside* the body scope has a
+back edge that no scope owns, so nothing reconciles it.
+
+**So the fold's loop must be a region of the same nest as X and Y**, not a
+bracket the emitter draws inside the body. Which is exactly the unification JP
+asked for — *"collapse that distinction and parameterize them"* — and it turns
+out not to be an aesthetic preference: it is what makes a fold's register
+allocation correct. X, Y and a binder are three scopes of one nest, differing
+in what steps them and what ends them, and
+[loop-aware-codegen](2026-09-01-loop-aware-codegen.md) said so on 2026-09-02:
+*"They are not a second anything."*
+
+Measured on the way to this: with the fold bracketed inside the body scope,
+`pixelflow-core` is green (62/62, nested folds included) and `pixelflow-graphics`
+fails 2 of 89 — both *value* differences in glyph coverage, not crashes, which
+is the signature of a register relocated across an unreconciled back edge rather
+than of wrong arithmetic.
+
+Two bugs found and fixed on the way, both real and both worth keeping whatever
+shape the loop ends up:
+
+- **Sibling folds may share a binder index.** The language has eight binders and
+  nothing bounds a kernel to eight folds, so a region search that scans the
+  whole prefix for "first def mentioning binder 4" finds the *previous* fold's
+  body. It must stop at the previous `Reduce` over the same binder.
+- **A nest opening at one index must be pushed outermost-first**, since it
+  closes inside-out.
+
+And one that is the same mistake twice: the loop cannot borrow `SCAFFOLD_ACC`
+/`SCAFFOLD_SCRATCH`. Those are `Reg(0)`/`Reg(1)` — **X and Y** — and the
+scaffold may clobber them only because it runs *between* iterations of the
+collapse loop, where the next iteration reloads them. A fold runs inside the
+body, where they are live. Its registers have to be reserved by the allocator,
+as a guard's are.
+
 ## 5. What this does not do
 
 - **The trip count stays compile-time.** `Fold` holds `lo: u16, hi: u16`, and
