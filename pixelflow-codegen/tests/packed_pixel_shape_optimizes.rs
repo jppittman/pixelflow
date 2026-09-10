@@ -8,7 +8,7 @@ use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId};
 
 fn reachable(arena: &ExprArena, root: ExprId) -> usize {
-    let mut seen = vec![false; arena.nodes_raw().len()];
+    let mut seen = vec![false; arena.len()];
     let mut stack = vec![root];
     let mut n = 0;
     while let Some(id) = stack.pop() {

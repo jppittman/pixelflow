@@ -313,10 +313,7 @@ mod tests {
     }
 
     fn has_fold(arena: &ExprArena) -> bool {
-        arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Reduce { .. }))
+        arena.nodes().any(|n| matches!(n, ExprNode::Reduce { .. }))
     }
 
     /// **A peel moves the range, not the body.** `Σ_{[0,3)} X` has a body
@@ -389,10 +386,7 @@ mod production_shape_tests {
     }
 
     fn has_fold(arena: &ExprArena) -> bool {
-        arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Reduce { .. }))
+        arena.nodes().any(|n| matches!(n, ExprNode::Reduce { .. }))
     }
 
     /// A glyph's winding is `Σ_i table[i]`-shaped: the body reads a *bound

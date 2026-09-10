@@ -176,7 +176,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
     use std::fmt::Write as _;
 
     let (arena, root) = (&kernel.arena, kernel.root);
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {

@@ -645,20 +645,17 @@ impl ExprArena {
         self.push_node(ExprNode::Nary(op, start, len))
     }
 
-    // ───────────────────── raw access (serialization) ───────
+    // ───────────────────── node observation ───────
 
-    /// Raw slice of all nodes in the arena.
+    /// Visit node payloads in construction order.
+    ///
+    /// The order is children before parents, but the iterator deliberately
+    /// does not expose the backing allocation or the n-ary child slab. Code
+    /// that needs an expression's edges must use [`Self::children`].
     #[inline]
     #[must_use]
-    pub fn nodes_raw(&self) -> &[ExprNode] {
-        &self.nodes
-    }
-
-    /// Raw slice of the nary-children slab.
-    #[inline]
-    #[must_use]
-    pub fn nary_children_raw(&self) -> &[ExprId] {
-        &self.nary_children
+    pub fn nodes(&self) -> impl ExactSizeIterator<Item = &ExprNode> + DoubleEndedIterator + '_ {
+        self.nodes.iter()
     }
 
     /// Reconstruct an arena from raw parts.
@@ -1910,7 +1907,10 @@ mod composition_tests {
         let c = by_hand.push_const(2.5);
         let hand_root = by_hand.push_binary(OpKind::Mul, x, c);
         let _ = root;
-        assert_eq!(folded.nodes_raw(), by_hand.nodes_raw());
+        assert_eq!(
+            folded.nodes().collect::<Vec<_>>(),
+            by_hand.nodes().collect::<Vec<_>>()
+        );
         assert_eq!(folded_root, hand_root);
         assert!(folded.uniforms().is_empty());
     }

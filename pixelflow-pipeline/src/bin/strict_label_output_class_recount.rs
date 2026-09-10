@@ -231,8 +231,7 @@ fn origin_label(eg: &EGraph, rules: &RuleSet, tag: ENodeId) -> String {
 
 fn seed_has_const_one(arena: &ExprArena) -> bool {
     arena
-        .nodes_raw()
-        .iter()
+        .nodes()
         .any(|n| matches!(n, ExprNode::Const(v) if v.to_bits() == 1.0_f32.to_bits()))
 }
 
@@ -342,7 +341,7 @@ fn tally_expression(
         if rname == "pythagorean" {
             let row = pyth.get_or_insert_with(|| PythagoreanRow {
                 name: name.to_string(),
-                node_count: arena.nodes_raw().len(),
+                node_count: arena.len(),
                 seed_has_const_one: seed_has_const_one(arena),
                 fired: 0,
                 minted: 0,
@@ -448,7 +447,7 @@ fn main() {
     let started = Instant::now();
 
     for (i, (name, arena, root)) in selected.iter().enumerate() {
-        let class_cap = config_for_node_count(arena.nodes_raw().len()).max_classes;
+        let class_cap = config_for_node_count(arena.len()).max_classes;
         let t0 = Instant::now();
         let mut optimizer = Optimizer::production()
             .cost(costs.clone())

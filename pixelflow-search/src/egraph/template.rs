@@ -223,7 +223,7 @@ impl TemplateRewrite {
     /// Construct from legacy arena + expr IDs.
     #[must_use]
     pub fn from_arena(name: impl Into<String>, arena: ExprArena, lhs: ExprId, rhs: ExprId) -> Self {
-        let (rooted, _) = pixelflow_ir::expr::from_arena_roots(&arena, &[lhs, rhs]);
+        let (rooted, _) = Rooted::unmarshal(&arena, &[lhs, rhs]);
         Self::new(name, rooted)
     }
 
@@ -276,15 +276,13 @@ impl Rewrite for TemplateRewrite {
 
     fn lhs_template(&self, out: &mut ExprArena) -> Option<ExprId> {
         let env = pixelflow_ir::expr::Environment::default();
-        let (arena, roots) =
-            pixelflow_ir::expr::to_arena_roots(&self.rooted, &[self.rooted.entry_at(0)], &env);
+        let (arena, roots) = self.rooted.marshal(&[self.rooted.entry_at(0)], &env);
         Some(out.splice(&arena, roots[0]))
     }
 
     fn rhs_template(&self, out: &mut ExprArena) -> Option<ExprId> {
         let env = pixelflow_ir::expr::Environment::default();
-        let (arena, roots) =
-            pixelflow_ir::expr::to_arena_roots(&self.rooted, &[self.rooted.entry_at(1)], &env);
+        let (arena, roots) = self.rooted.marshal(&[self.rooted.entry_at(1)], &env);
         Some(out.splice(&arena, roots[0]))
     }
 }

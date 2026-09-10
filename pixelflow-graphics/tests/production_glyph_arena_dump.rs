@@ -104,7 +104,7 @@ fn dump_production_glyph_arenas() {
 /// which must not grow a test-only serializer.
 fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Path) {
     use std::fmt::Write as _;
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {

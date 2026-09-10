@@ -39,7 +39,7 @@ fn fixture() -> (ExprArena, ExprId) {
 /// the arena is append-only and extraction emits children before parents,
 /// so this is already canonical for a given configuration.
 fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+    format!("{root:?}|{:?}", arena.nodes().collect::<Vec<_>>())
 }
 
 // ---------------------------------------------------------------------------

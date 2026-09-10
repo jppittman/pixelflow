@@ -317,7 +317,7 @@ mod tests {
     }
 
     fn reachable_nodes(arena: &ExprArena, root: ExprId) -> usize {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         let mut count = 0;
         while let Some(id) = stack.pop() {
@@ -1044,7 +1044,7 @@ mod tests {
     ) {
         use core::fmt::Write as _;
         use pixelflow_ir::arena::ExprNode;
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut reachable = vec![false; len];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {

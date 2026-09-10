@@ -152,7 +152,7 @@ impl GuidedEpisode {
             .applications
             .map(|n| egraph.application_count().saturating_add(n));
         // The episode's feature constant: the live analogue of the offline
-        // label-minting replay's `arena.nodes_raw().len()` snapshot, taken
+        // label-minting replay's `arena.len()` snapshot, taken
         // before saturation runs.
         let expr_node_count = *self
             .expr_node_count

@@ -20,10 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity};
 use crate::dag::{Builder, Dag, Node, Rooted};
-use crate::expr::{
-    Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
-    to_arena,
-};
+use crate::expr::{Environment, ExprBuilderExt, ExprData, copy_subgraph, splice, substitute_vars};
 use crate::fold::{Binder, Fold, Monoid};
 use crate::kind::OpKind;
 
@@ -251,7 +248,7 @@ impl Kernel {
         env: Environment,
         buffers: BTreeMap<BufferIdentity, Arc<[f32]>>,
     ) -> Self {
-        let legacy = to_arena(rooted.entry(), &env);
+        let legacy = rooted.entry().marshal(&env);
         Self {
             inner: Arc::new(KernelData {
                 rooted,
@@ -354,7 +351,7 @@ impl Kernel {
     /// thing that becomes machine code.
     #[must_use]
     pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
-        let (rooted, env) = from_arena(&arena, root);
+        let (rooted, env) = Rooted::unmarshal(&arena, &[root]);
         let entry = rooted.entry();
         assert!(
             entry.retired_axis().is_none(),
@@ -936,7 +933,7 @@ impl Kernel {
         }
         let (arena, root) = self.parts();
         let (expanded, expanded_root) = crate::passes::expand_refs_owned(arena, root);
-        let (rooted, env) = from_arena(&expanded, expanded_root);
+        let (rooted, env) = Rooted::unmarshal(&expanded, &[expanded_root]);
         Self::wrap(rooted, env, self.inner.buffers.clone())
     }
 

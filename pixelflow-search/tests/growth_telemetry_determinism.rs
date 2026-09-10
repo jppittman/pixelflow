@@ -28,7 +28,7 @@ use pixelflow_search::egraph::{Budget, EClassId, EGraph, Optimized, Optimizer};
 /// append-only and extraction emits children before parents, so the node
 /// vector plus the root is already canonical for a given configuration.
 fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+    format!("{root:?}|{:?}", arena.nodes().collect::<Vec<_>>())
 }
 
 /// A mid-sized expression with sharing and several rule families in reach —

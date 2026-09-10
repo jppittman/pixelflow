@@ -161,7 +161,7 @@ pub struct Canonical {
 /// one shape share code.
 #[must_use]
 pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -227,13 +227,12 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
                 push_id(&mut key, &dense, *b);
                 push_id(&mut key, &dense, *c);
             }
-            ExprNode::Nary(op, start, n) => {
+            ExprNode::Nary(op, _, n) => {
                 key.push(6);
                 key.extend_from_slice(&op.marshal().to_bytes());
                 key.extend_from_slice(&n.to_le_bytes());
-                let (s, l) = (*start as usize, *n as usize);
-                for child in &arena.nary_children_raw()[s..s + l] {
-                    push_id(&mut key, &dense, *child);
+                for child in arena.children(ExprId(idx as u32)) {
+                    push_id(&mut key, &dense, child);
                 }
             }
             // Slot by first occurrence, extents in the key: the code folds
@@ -327,8 +326,8 @@ mod tests {
         let (clean, rc) = circle(false);
         let (littered, rl) = circle(true);
         assert_ne!(
-            clean.nodes_raw().len(),
-            littered.nodes_raw().len(),
+            clean.len(),
+            littered.len(),
             "the littered arena must actually hold more nodes"
         );
         assert_ne!(rc, rl, "and its root must sit at a different id");

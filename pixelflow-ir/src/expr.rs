@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 
 use crate::arena::{BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
-use crate::dag::{Builder, Dag, Id, Node, SideTable};
+use crate::dag::{Builder, Dag, Id, Node, Rooted, SideTable};
 use crate::fold::Fold;
 use crate::kernel::Scalar;
 use crate::key::KernelKey;
@@ -307,139 +307,147 @@ pub(crate) fn substitute_params(
     table[root].expect("root must have been copied")
 }
 
-// ────────────────────────────────────────── Legacy Arena Bridge ───────────────
+// ─────────────────────────────────────── Arena Marshaling Boundary ────────────
 
-/// Convert an `ExprArena` and root `ExprId` into a `(Rooted<ExprData>, Environment)`.
-#[must_use]
-pub fn from_arena(
-    arena: &crate::arena::ExprArena,
-    root: crate::arena::ExprId,
-) -> (crate::dag::Rooted<ExprData>, Environment) {
-    from_arena_roots(arena, &[root])
-}
+// `ExprArena` is still the legacy wire representation while the rest of the
+// workspace moves to `Dag`.  The conversion belongs to the representation that
+// owns topology, however: callers ask a rooted DAG to unmarshal an old graph or
+// ask a DAG node to marshal itself.  Keeping this here as free functions made
+// the arena look like the primary representation and encouraged callers to
+// traffic raw node ids alongside it.
+impl Rooted<ExprData> {
+    /// Unmarshal one or more legacy arena roots into an owned expression DAG.
+    ///
+    /// The returned environment owns the arena-local buffer and uniform slot
+    /// declarations needed to interpret the expression payload.  The roots are
+    /// kept in their supplied order.
+    #[must_use]
+    pub fn unmarshal(
+        arena: &crate::arena::ExprArena,
+        roots: &[crate::arena::ExprId],
+    ) -> (Self, Environment) {
+        use crate::arena::ExprNode;
+        let mut b = Builder::new();
+        let mut map: Vec<Option<Id>> = alloc::vec![None; arena.len()];
 
-/// Convert an `ExprArena` and slice of root `ExprId`s into a `(Rooted<ExprData>, Environment)`.
-#[must_use]
-pub fn from_arena_roots(
-    arena: &crate::arena::ExprArena,
-    roots: &[crate::arena::ExprId],
-) -> (crate::dag::Rooted<ExprData>, Environment) {
-    use crate::arena::ExprNode;
-    let mut b = Builder::new();
-    let mut map: Vec<Option<Id>> = alloc::vec![None; arena.len()];
+        enum Task {
+            Descend(crate::arena::ExprId),
+            Emit(crate::arena::ExprId),
+        }
+        let mut stack = Vec::new();
+        for &r in roots.iter().rev() {
+            stack.push(Task::Descend(r));
+        }
 
-    enum Task {
-        Descend(crate::arena::ExprId),
-        Emit(crate::arena::ExprId),
-    }
-    let mut stack = Vec::new();
-    for &r in roots.iter().rev() {
-        stack.push(Task::Descend(r));
-    }
-
-    while let Some(task) = stack.pop() {
-        match task {
-            Task::Descend(id) => {
-                if map[id.0 as usize].is_some() {
-                    continue;
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Descend(id) => {
+                    if map[id.0 as usize].is_some() {
+                        continue;
+                    }
+                    stack.push(Task::Emit(id));
+                    let children: Vec<crate::arena::ExprId> = arena.children(id).collect();
+                    for c in children.into_iter().rev() {
+                        stack.push(Task::Descend(c));
+                    }
                 }
-                stack.push(Task::Emit(id));
-                let children: Vec<crate::arena::ExprId> = arena.children(id).collect();
-                for c in children.into_iter().rev() {
-                    stack.push(Task::Descend(c));
+                Task::Emit(id) => {
+                    if map[id.0 as usize].is_some() {
+                        continue;
+                    }
+                    let child_ids: Vec<Id> = arena
+                        .children(id)
+                        .map(|c| map[c.0 as usize].expect("child must be emitted before parent"))
+                        .collect();
+                    let new_id = match *arena.node(id) {
+                        ExprNode::Var(i) => b.push_var(i),
+                        ExprNode::Const(v) => b.push_const(v),
+                        ExprNode::Param(i) => b.push_param(i),
+                        ExprNode::Buffer(buf) => b.push_buffer(buf),
+                        ExprNode::Uniform(uni) => b.push_uniform(uni),
+                        ExprNode::Ref(key) => b.push_ref(key),
+                        ExprNode::Reduce { fold, .. } => b.push_reduce(fold, child_ids[0]),
+                        ExprNode::Unary(op, _)
+                        | ExprNode::Binary(op, _, _)
+                        | ExprNode::Ternary(op, _, _, _)
+                        | ExprNode::Nary(op, _, _) => b.push_nary(op, &child_ids),
+                    };
+                    map[id.0 as usize] = Some(new_id);
                 }
-            }
-            Task::Emit(id) => {
-                if map[id.0 as usize].is_some() {
-                    continue;
-                }
-                let child_ids: Vec<Id> = arena
-                    .children(id)
-                    .map(|c| map[c.0 as usize].expect("child must be emitted before parent"))
-                    .collect();
-                let new_id = match *arena.node(id) {
-                    ExprNode::Var(i) => b.push_var(i),
-                    ExprNode::Const(v) => b.push_const(v),
-                    ExprNode::Param(i) => b.push_param(i),
-                    ExprNode::Buffer(buf) => b.push_buffer(buf),
-                    ExprNode::Uniform(uni) => b.push_uniform(uni),
-                    ExprNode::Ref(key) => b.push_ref(key),
-                    ExprNode::Reduce { fold, .. } => b.push_reduce(fold, child_ids[0]),
-                    ExprNode::Unary(op, _)
-                    | ExprNode::Binary(op, _, _)
-                    | ExprNode::Ternary(op, _, _, _)
-                    | ExprNode::Nary(op, _, _) => b.push_nary(op, &child_ids),
-                };
-                map[id.0 as usize] = Some(new_id);
             }
         }
-    }
 
-    let rooted_ids: Vec<Id> = roots
-        .iter()
-        .map(|&r| map[r.0 as usize].expect("root must be mapped"))
-        .collect();
-    let env = Environment {
-        buffers: arena.buffers().to_vec(),
-        uniforms: arena.uniforms().to_vec(),
-    };
-    (b.finish(&rooted_ids), env)
-}
-
-/// Convert a `Node<'_, ExprData>` and `Environment` into an `(ExprArena, ExprId)`.
-#[must_use]
-pub fn to_arena(
-    root: Node<'_, ExprData>,
-    env: &Environment,
-) -> (crate::arena::ExprArena, crate::arena::ExprId) {
-    let (arena, roots) = to_arena_roots(root.dag(), &[root], env);
-    (arena, roots[0])
-}
-
-/// Convert a `Dag<ExprData>`, root nodes, and `Environment` into an `(ExprArena, Vec<ExprId>)`.
-#[must_use]
-pub fn to_arena_roots(
-    dag: &Dag<ExprData>,
-    roots: &[Node<'_, ExprData>],
-    env: &Environment,
-) -> (crate::arena::ExprArena, Vec<crate::arena::ExprId>) {
-    let mut arena = crate::arena::ExprArena::new();
-    for b in &env.buffers {
-        arena.declare_buffer(*b);
-    }
-    for u in &env.uniforms {
-        arena.declare_uniform(*u);
-    }
-
-    let mut map = dag.side_table(None);
-    for node in dag.iter() {
-        let child_ids: Vec<crate::arena::ExprId> = node
-            .children()
-            .map(|c| map[c].expect("child already in arena"))
+        let rooted_ids: Vec<Id> = roots
+            .iter()
+            .map(|&r| map[r.0 as usize].expect("root must be mapped"))
             .collect();
-        let id = match *node {
-            ExprData::Var(i) => arena.push_var(i),
-            ExprData::Const(b) => arena.push_const(f32::from_bits(b)),
-            ExprData::Param(i) => arena.push_param(i),
-            ExprData::Buffer(b) => arena.push_buffer(b),
-            ExprData::Uniform(u) => arena.push_uniform(u),
-            ExprData::Ref(key) => arena.push_ref(key),
-            ExprData::Reduce(fold) => arena.push_reduce(fold, child_ids[0]),
-            ExprData::Op(op) => match child_ids.len() {
-                1 => arena.push_unary(op, child_ids[0]),
-                2 => arena.push_binary(op, child_ids[0], child_ids[1]),
-                3 => arena.push_ternary(op, child_ids[0], child_ids[1], child_ids[2]),
-                _ => arena.push_nary(op, &child_ids),
-            },
+        let env = Environment {
+            buffers: arena.buffers().to_vec(),
+            uniforms: arena.uniforms().to_vec(),
         };
-        map[node] = Some(id);
+        (b.finish(&rooted_ids), env)
     }
+}
 
-    let root_ids = roots
-        .iter()
-        .map(|r| map[*r].expect("root must be mapped"))
-        .collect();
-    (arena, root_ids)
+impl<'a> Node<'a, ExprData> {
+    /// Marshal this rooted expression into the legacy arena wire form.
+    #[must_use]
+    pub fn marshal(self, env: &Environment) -> (crate::arena::ExprArena, crate::arena::ExprId) {
+        let (arena, roots) = self.dag().marshal(&[self], env);
+        (arena, roots[0])
+    }
+}
+
+impl Dag<ExprData> {
+    /// Marshal expression roots into the legacy arena wire form.
+    ///
+    /// This is deliberately a DAG operation rather than an arena constructor:
+    /// it preserves child-before-parent order and sharing while keeping the
+    /// old storage layout confined to this compatibility boundary.
+    #[must_use]
+    pub fn marshal(
+        &self,
+        roots: &[Node<'_, ExprData>],
+        env: &Environment,
+    ) -> (crate::arena::ExprArena, Vec<crate::arena::ExprId>) {
+        let mut arena = crate::arena::ExprArena::new();
+        for b in &env.buffers {
+            arena.declare_buffer(*b);
+        }
+        for u in &env.uniforms {
+            arena.declare_uniform(*u);
+        }
+
+        let mut map = self.side_table(None);
+        for node in self.iter() {
+            let child_ids: Vec<crate::arena::ExprId> = node
+                .children()
+                .map(|c| map[c].expect("child already in arena"))
+                .collect();
+            let id = match *node {
+                ExprData::Var(i) => arena.push_var(i),
+                ExprData::Const(b) => arena.push_const(f32::from_bits(b)),
+                ExprData::Param(i) => arena.push_param(i),
+                ExprData::Buffer(b) => arena.push_buffer(b),
+                ExprData::Uniform(u) => arena.push_uniform(u),
+                ExprData::Ref(key) => arena.push_ref(key),
+                ExprData::Reduce(fold) => arena.push_reduce(fold, child_ids[0]),
+                ExprData::Op(op) => match child_ids.len() {
+                    1 => arena.push_unary(op, child_ids[0]),
+                    2 => arena.push_binary(op, child_ids[0], child_ids[1]),
+                    3 => arena.push_ternary(op, child_ids[0], child_ids[1], child_ids[2]),
+                    _ => arena.push_nary(op, &child_ids),
+                },
+            };
+            map[node] = Some(id);
+        }
+
+        let root_ids = roots
+            .iter()
+            .map(|r| map[*r].expect("root must be mapped"))
+            .collect();
+        (arena, root_ids)
+    }
 }
 
 // ────────────────────────────────────────── Environment & Splicing ────────────
@@ -745,18 +753,18 @@ mod tests {
     }
 
     #[test]
-    fn from_arena_to_arena_roundtrip() {
+    fn marshal_unmarshal_roundtrip() {
         let mut arena = crate::arena::ExprArena::new();
         let x = arena.push_var(0);
         let c = arena.push_const(7.5);
         let add = arena.push_binary(OpKind::Add, x, c);
 
-        let (rooted, env) = from_arena(&arena, add);
+        let (rooted, env) = Rooted::unmarshal(&arena, &[add]);
         let root = rooted.entry();
         assert_eq!(root.op(), Some(OpKind::Add));
         assert_eq!(root.depth(), 2);
 
-        let (arena2, root2) = to_arena(root, &env);
+        let (arena2, root2) = root.marshal(&env);
         assert_eq!(arena2.depth(root2), 2);
     }
 }

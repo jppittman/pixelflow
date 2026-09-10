@@ -35,7 +35,7 @@ fn fixture() -> (ExprArena, ExprId) {
 }
 
 fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+    format!("{root:?}|{:?}", arena.nodes().collect::<Vec<_>>())
 }
 
 fn optimize(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {

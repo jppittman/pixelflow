@@ -649,7 +649,7 @@ fn evaluate_expression(
         name: name.to_string(),
         family: dev_family(name),
         run_config: None,
-        node_count: input.arena.nodes_raw().len(),
+        node_count: input.arena.len(),
         class_cap: input.class_cap,
         arms,
         at_budget,
@@ -1157,11 +1157,11 @@ fn main() {
             );
         }
         // The registered claim is on the classical band only (node count > 50).
-        entries.retain(|(_, arena, _)| arena.nodes_raw().len() > 50);
+        entries.retain(|(_, arena, _)| arena.len() > 50);
         entries.sort_by(|a, b| {
-            a.1.nodes_raw()
+            a.1.nodes()
                 .len()
-                .cmp(&b.1.nodes_raw().len())
+                .cmp(&b.1.len())
                 .then_with(|| a.0.cmp(&b.0))
         });
         eprintln!(
@@ -1214,12 +1214,12 @@ fn main() {
             eprintln!(
                 "phase3_bilinear_eval: [{}/{total}] {name} ({} nodes)",
                 i + 1,
-                arena.nodes_raw().len()
+                arena.len()
             );
             let input = CurveInput {
                 arena,
                 root: *root,
-                class_cap: config_for_node_count(arena.nodes_raw().len()).max_classes,
+                class_cap: config_for_node_count(arena.len()).max_classes,
                 costs: &costs,
             };
             let mut row = evaluate_expression(&args.set, name, &input, &guides, &rules);

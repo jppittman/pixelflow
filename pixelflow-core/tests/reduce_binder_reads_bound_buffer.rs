@@ -197,9 +197,9 @@ fn legalize_unrolls_the_binder_and_the_gather_together() {
         let (_binding, table) = bind_table();
         let kernel = Kernel::sum_over(extent, |i| table.at(&Kernel::constant(0.0), i));
         let (arena, root) = kernel.parts();
-        let before = arena.nodes_raw().len();
+        let before = arena.len();
         let (legalized, _root) = pixelflow_ir::passes::legalize(arena, root).expect("legalize");
-        let after = legalized.nodes_raw().len();
+        let after = legalized.len();
         (before, after)
     };
 

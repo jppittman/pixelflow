@@ -26,7 +26,7 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 fn digest(arena: &ExprArena, root: ExprId) -> u64 {
-    let rendered = format!("{root:?}|{:?}", arena.nodes_raw());
+    let rendered = format!("{root:?}|{:?}", arena.nodes().collect::<Vec<_>>());
     let mut h = FNV_OFFSET;
     for b in rendered.as_bytes() {
         h ^= u64::from(*b);

@@ -835,7 +835,7 @@ mod tests {
     pub(crate) const CHANNEL_NODES: usize = 157;
 
     fn reachable_nodes(arena: &ExprArena, root: pixelflow_ir::ExprId) -> usize {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         let mut count = 0;
         while let Some(id) = stack.pop() {

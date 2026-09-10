@@ -239,7 +239,7 @@ fn corpus(cli: &Cli) -> Vec<Case> {
 // ---------------------------------------------------------------------------
 
 fn reachable(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
-    let mut seen = vec![false; arena.nodes_raw().len()];
+    let mut seen = vec![false; arena.len()];
     let mut stack = vec![root];
     let mut out = Vec::new();
     while let Some(id) = stack.pop() {

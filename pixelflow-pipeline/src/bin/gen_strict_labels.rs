@@ -387,7 +387,7 @@ fn mint_split(
             );
             break;
         }
-        let expr_node_count = arena.nodes_raw().len();
+        let expr_node_count = arena.len();
         if expr_node_count > max_expr_nodes {
             stats.skipped_oversized += 1;
             continue;
@@ -519,7 +519,7 @@ fn mint_split(
                 tier_name,
                 family.band,
                 family.seed,
-                arena.nodes_raw().len(),
+                arena.len(),
                 rule.get(),
                 rule_name,
                 app_id.as_u64(),

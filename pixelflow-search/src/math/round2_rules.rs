@@ -73,7 +73,7 @@ fn instantiate_rhs(rule: &dyn Rewrite, bindings: Vec<EClassId>) -> RewriteAction
             rule.name()
         )
     });
-    let (rooted, _) = pixelflow_ir::expr::from_arena(&arena, root);
+    let (rooted, _) = pixelflow_ir::Rooted::unmarshal(&arena, &[root]);
     RewriteAction::Instantiate {
         template: TemplatePattern(Arc::new(rooted)),
         entry: 0,
@@ -1231,7 +1231,7 @@ impl Rewrite for DivByLiteral {
         // shape, with a representative literal, for the oracle test.
         let mut arena = ExprArena::new();
         let root = arena_pat!(arena, bin OpKind::Mul, (var 0), (cst 1.0 / k));
-        let (rooted, _) = pixelflow_ir::expr::from_arena(&arena, root);
+        let (rooted, _) = pixelflow_ir::Rooted::unmarshal(&arena, &[root]);
         Some(RewriteAction::Instantiate {
             template: TemplatePattern(Arc::new(rooted)),
             entry: 0,

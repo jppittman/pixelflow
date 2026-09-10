@@ -442,7 +442,7 @@ fn existing_names(path: &Path) -> HashSet<String> {
 /// multiset the e-graph's own interning sees. Buffers and uniforms keep
 /// their declarations (identity-equal slots stay one node).
 fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -562,7 +562,7 @@ fn median_usize(v: &mut [usize]) -> f64 {
 /// Tree count with multiplicity (a spliced subterm counted once per use)
 /// and the latency-prior tree cost, both saturating.
 fn tree_figures(arena: &ExprArena, root: ExprId, costs: &CostModel) -> (u128, u128) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut memo: Vec<Option<(u128, u128)>> = vec![None; len];
     let mut order = Vec::new();
     let mut stack = vec![root];

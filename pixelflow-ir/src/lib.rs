@@ -89,8 +89,8 @@ pub use dag::{Dag, Node, Rooted, Scratch, SideTable};
 
 pub mod expr;
 pub use expr::{
-    Environment, ExprData, compute_dag_depth, depth, from_arena, has_degenerate, has_var,
-    node_count_subtree, retired_axis, subtree_eq, to_arena,
+    Environment, ExprData, compute_dag_depth, depth, has_degenerate, has_var, node_count_subtree,
+    retired_axis, subtree_eq,
 };
 
 /// IR-to-IR transforms: each takes an expression graph and returns another.

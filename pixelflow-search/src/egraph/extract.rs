@@ -4408,7 +4408,7 @@ mod tests {
         costs: &CostModel,
     ) -> usize {
         use pixelflow_ir::arena::ExprNode;
-        let mut seen = alloc::vec![false; arena.nodes_raw().len()];
+        let mut seen = alloc::vec![false; arena.len()];
         let mut stack = alloc::vec![root];
         let mut total = 0usize;
         while let Some(id) = stack.pop() {

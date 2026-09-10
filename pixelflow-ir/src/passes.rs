@@ -127,7 +127,7 @@ fn try_rebuild_arena<E, F>(arena: &mut ExprArena, root: ExprId, mut lower: F) ->
 where
     F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Result<Option<ExprId>, E>,
 {
-    let old_len = arena.nodes_raw().len();
+    let old_len = arena.len();
     let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
 
     enum Task {
@@ -157,7 +157,7 @@ where
                 let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
                 let new_id = match lower(arena, &node, &m)? {
                     Some(new) => new,
-                    None => copy_node(arena, &node, &m),
+                    None => copy_node(arena, id, &node, &m),
                 };
                 id_map[id.0 as usize] = Some(new_id);
             }
@@ -169,7 +169,12 @@ where
 
 /// Structural copy of `node` into `arena` with its children remapped by `m`.
 /// The default action for any node a lowering hook does not replace.
-fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprId) -> ExprId {
+fn copy_node(
+    arena: &mut ExprArena,
+    source: ExprId,
+    node: &ExprNode,
+    m: &dyn Fn(ExprId) -> ExprId,
+) -> ExprId {
     match node {
         ExprNode::Var(i) => arena.push_var(*i),
         ExprNode::Const(v) => arena.push_const(*v),
@@ -181,10 +186,8 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
         ExprNode::Unary(op, a) => arena.push_unary(*op, m(*a)),
         ExprNode::Binary(op, a, b) => arena.push_binary(*op, m(*a), m(*b)),
         ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, m(*a), m(*b), m(*c)),
-        ExprNode::Nary(op, start, len) => {
-            let (s, l) = (*start as usize, *len as usize);
-            let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
-            let mapped: Vec<ExprId> = children.into_iter().map(&m).collect();
+        ExprNode::Nary(op, ..) => {
+            let mapped: Vec<ExprId> = arena.children(source).map(m).collect();
             arena.push_nary(*op, &mapped)
         }
         ExprNode::Reduce { fold, body } => arena.push_reduce(*fold, m(*body)),
@@ -269,11 +272,7 @@ fn splice_referent(_arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId
 /// fast-path when the arena holds no `Ref`, otherwise clone-and-expand.
 #[must_use]
 pub fn expand_refs_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ref(_)))
-    {
+    if !arena.nodes().any(|n| matches!(n, ExprNode::Ref(_))) {
         return (arena.clone(), root);
     }
     let mut owned = arena.clone();
@@ -311,7 +310,7 @@ pub(crate) fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (
     // re-order / re-dedup nodes), which would perturb register allocation for
     // transcendental-free kernels; skipping it keeps lowering a true no-op for
     // them.
-    if !arena.nodes_raw().iter().any(|n| match n {
+    if !arena.nodes().any(|n| match n {
         ExprNode::Unary(op, _) => is_transcendental_unary(*op),
         ExprNode::Binary(op, _, _) => is_transcendental_binary(*op),
         _ => false,
@@ -348,8 +347,7 @@ pub fn expand_gather(arena: &mut ExprArena, root: ExprId) -> ExprId {
 #[must_use]
 pub(crate) fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
     if !arena
-        .nodes_raw()
-        .iter()
+        .nodes()
         .any(|n| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
     {
         return (arena.clone(), root);
@@ -416,11 +414,7 @@ pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
 /// when the arena has no `Reduce`, otherwise clone-and-lower.
 #[must_use]
 pub fn expand_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Reduce { .. }))
-    {
+    if !arena.nodes().any(|n| matches!(n, ExprNode::Reduce { .. })) {
         return (arena.clone(), root);
     }
     let mut owned = arena.clone();
@@ -553,9 +547,8 @@ impl<'a> Substitution<'a> {
                 let c = self.apply(arena, c);
                 arena.push_ternary(op, a, b, c)
             }
-            ExprNode::Nary(op, start, len) => {
-                let (s, l) = (start as usize, len as usize);
-                let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+            ExprNode::Nary(op, ..) => {
+                let children: Vec<ExprId> = arena.children(id).collect();
                 let mapped: Vec<ExprId> = children
                     .into_iter()
                     .map(|ch| self.apply(arena, ch))
@@ -622,7 +615,7 @@ pub fn lower_dwrt_owned(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<(ExprArena, ExprId), &'static str> {
-    if !arena.nodes_raw().iter().any(|n| {
+    if !arena.nodes().any(|n| {
         matches!(
             n,
             ExprNode::Unary(OpKind::Dwrt, _)
@@ -1601,7 +1594,7 @@ mod dwrt_tests {
         let y = a.push_var(1);
         let e = a.push_binary(OpKind::Add, x, y);
         let (out, root) = lower_dwrt_owned(&a, e).expect("lower_dwrt");
-        assert_eq!(out.nodes_raw().len(), a.nodes_raw().len());
+        assert_eq!(out.len(), a.len());
         assert_eq!(root, e);
     }
 
@@ -1623,8 +1616,8 @@ mod dwrt_tests {
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, e, v0);
         let (out, out_root) = lower_dwrt_owned(&a, root).expect("lower_dwrt");
-        assert!(out.nodes_raw().len() > a.nodes_raw().len());
-        assert!((out_root.0 as usize) < out.nodes_raw().len());
+        assert!(out.len() > a.len());
+        assert!((out_root.0 as usize) < out.len());
     }
 
     #[test]
@@ -1853,7 +1846,7 @@ mod dwrt_tests {
 
     #[test]
     fn rebuild_copies_nary_children_slice_correctly() {
-        // `copy_node`'s Nary arm reads `nodes_raw()[start..start+len]` — a
+        // `copy_node`'s Nary arm reads the n-ary child slab range — a
         // second Nary node makes `start` nonzero, which is what distinguishes
         // `start+len` from `start*len` (they coincide when start is 0).
         let mut a = ExprArena::new();
@@ -1945,11 +1938,7 @@ pub struct ExpandRefs;
 
 impl Optimize for ExpandRefs {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Ref(_)))
-        {
+        if !arena.nodes().any(|n| matches!(n, ExprNode::Ref(_))) {
             return Rewritten::Unchanged;
         }
         let mut owned = arena.clone();
@@ -1976,7 +1965,7 @@ pub struct LowerDwrt;
 
 impl Optimize for LowerDwrt {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes_raw().iter().any(|n| {
+        if !arena.nodes().any(|n| {
             matches!(
                 n,
                 ExprNode::Unary(OpKind::Dwrt, _)
@@ -2006,11 +1995,7 @@ pub struct ExpandReduce;
 
 impl Optimize for ExpandReduce {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Reduce { .. }))
-        {
+        if !arena.nodes().any(|n| matches!(n, ExprNode::Reduce { .. })) {
             return Rewritten::Unchanged;
         }
         let mut owned = arena.clone();
@@ -2048,11 +2033,7 @@ mod ref_expansion_tests {
         let (arena, root) = k.parts();
         let (out, out_root) = expand_refs_owned(arena, root);
         assert_eq!(out_root, root, "the root cannot move");
-        assert_eq!(
-            out.nodes_raw().len(),
-            arena.nodes_raw().len(),
-            "no node may be added or dropped"
-        );
+        assert_eq!(out.len(), arena.len(), "no node may be added or dropped");
         assert_eq!(canonical(&out, out_root).key, canonical(arena, root).key);
         assert!(matches!(
             ExpandRefs.optimize(arena, root),

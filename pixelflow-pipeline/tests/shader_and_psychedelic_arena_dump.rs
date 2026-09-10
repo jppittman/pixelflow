@@ -206,7 +206,7 @@ fn psychedelic_kernel() -> (ExprArena, ExprId) {
 /// grow a test-only serializer).
 fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Path) {
     use std::fmt::Write as _;
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -262,7 +262,7 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
 }
 
 fn reachable_count(arena: &ExprArena, root: ExprId) -> usize {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut seen = vec![false; len];
     let mut stack = vec![root];
     let mut n = 0;

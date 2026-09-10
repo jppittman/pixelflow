@@ -694,7 +694,7 @@ mod tests {
         assert_eq!(loaded[0].2.0, root.0);
 
         // Verify node equality
-        for (i, node) in entries[0].1.nodes_raw().iter().enumerate() {
+        for (i, node) in entries[0].1.nodes().enumerate() {
             assert_eq!(
                 node,
                 loaded[0].1.node(ExprId(i as u32)),

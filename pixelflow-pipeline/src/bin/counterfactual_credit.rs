@@ -450,7 +450,7 @@ fn build_expr_context(
     budget: usize,
     proxies: &Proxies,
 ) -> ExprContext {
-    let max_classes = config_for_node_count(arena.nodes_raw().len()).max_classes;
+    let max_classes = config_for_node_count(arena.len()).max_classes;
     let costs = CostModel::latency_prior();
     // The replay reads the journal afterwards, so recording is asked for
     // with an observer (#1118). `hard_ceiling` panics on the ceiling rather
@@ -473,7 +473,7 @@ fn build_expr_context(
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let _ = optimizer.run(&mut egraph, root_class, arena.nodes_raw().len());
+    let _ = optimizer.run(&mut egraph, root_class, arena.len());
 
     let extraction = extract_dag(&egraph, root_class, &costs);
     // DAG cost — what the emitted kernel pays (#1117).
@@ -514,7 +514,7 @@ fn build_expr_context(
     // module doc.
     let mut candidates: Vec<(ApplicationId, RuleId)> = Vec::new();
     let bound = budget.min(egraph.application_count() as usize) as u64;
-    let expr_node_count = arena.nodes_raw().len();
+    let expr_node_count = arena.len();
     let mut step_of: HashMap<ApplicationId, usize> = HashMap::new();
     let mut keys: Vec<(ApplicationId, usize)> = Vec::new();
     let mut summaries: Vec<CandidateSummary> = Vec::new();
@@ -667,7 +667,7 @@ fn masked_replay(
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let _ = optimizer.run(&mut egraph, root_class, ctx.arena.nodes_raw().len());
+    let _ = optimizer.run(&mut egraph, root_class, ctx.arena.len());
     let skips = egraph.last_replay_mask_skips();
     assert!(
         skips >= 1,
@@ -1062,7 +1062,7 @@ fn main() {
     };
 
     let in_band = |a: &ExprArena| {
-        let n = a.nodes_raw().len();
+        let n = a.len();
         (args.min_expr_nodes == 0 || n >= args.min_expr_nodes)
             && (args.max_expr_nodes == 0 || n <= args.max_expr_nodes)
     };
