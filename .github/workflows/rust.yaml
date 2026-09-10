@@ -370,7 +370,6 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     needs: change-scope
-    if: needs.change-scope.outputs.docs_only != 'true'
     runs-on: ${{ matrix.os }}
     # Backstop for non-test hangs (compile / doctests). The precise
     # "no test over 10 minutes" policy is enforced per-test by nextest below.
@@ -388,16 +387,22 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
+      - name: Report success for docs-only change
+        if: needs.change-scope.outputs.docs_only == 'true'
+        run: echo "Skipped tests for docs-only change"
+
       - name: Checkout code
+        if: needs.change-scope.outputs.docs_only != 'true'
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
+        if: needs.change-scope.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - name: Install X11 dependencies (Linux)
-        if: runner.os == 'Linux'
+        if: needs.change-scope.outputs.docs_only != 'true' && runner.os == 'Linux'
         run: |
           # The runner image ships third-party apt sources this project does
           # not use. A stale index on one of them fails `apt-get update` with
@@ -411,14 +416,17 @@ jobs:
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
       - name: Install cargo-nextest
+        if: needs.change-scope.outputs.docs_only != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
       - name: Set up sccache
+        if: needs.change-scope.outputs.docs_only != 'true'
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # ratchet:mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache cargo registry
+        if: needs.change-scope.outputs.docs_only != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -440,23 +448,26 @@ jobs:
       # is the cheap way to close that: no new job, no new runner minutes
       # beyond the lint itself.
       - name: Run Clippy (macOS/aarch64 coverage)
-        if: runner.os == 'macOS'
+        if: needs.change-scope.outputs.docs_only != 'true' && runner.os == 'macOS'
         shell: bash
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       # Compile tests first so the run step below is (mostly) pure execution.
       - name: Build tests
+        if: needs.change-scope.outputs.docs_only != 'true'
         shell: bash
         run: cargo nextest run --workspace --all-features --no-run
 
       # Per-test hard cap: nextest TERMINATES any test exceeding 10 minutes and
       # names it in the log (see .config/nextest.toml), failing the run.
       - name: Run workspace tests
+        if: needs.change-scope.outputs.docs_only != 'true'
         shell: bash
         run: cargo nextest run --workspace --all-features --profile ci
 
       # nextest does not run doctests; run them separately.
       - name: Run doctests
+        if: needs.change-scope.outputs.docs_only != 'true'
         shell: bash
         run: cargo test --workspace --all-features --doc
 
