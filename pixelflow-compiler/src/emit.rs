@@ -16,7 +16,7 @@
 //! [`Kernel`]: pixelflow_core::Kernel
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, Term};
 use pixelflow_ir::optimize::Optimize;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -52,23 +52,25 @@ pub fn emit_kernel(
     optimizer: &mut dyn Optimize,
 ) -> Result<TokenStream, String> {
     let param_map = lower::param_indices(analyzed);
-    let mut arena = ExprArena::new();
-    let root = lower::ast_to_arena(&analyzed.def.body, &param_map, &mut arena)?;
+    let mut builder = ExprBuilder::new();
+    let root = lower::ast_to_arena(&analyzed.def.body, &param_map, &mut builder)?;
+    let (rooted, env) = builder.finish(&[root]);
 
     // Declining is ordinary and needs no arm: the lowered term stands, and a
     // kernel that reaches the runtime tier unoptimized is optimized there.
-    let (arena, root) = optimizer
-        .optimize(&arena, root)
+    let term = Term::new(rooted.entry(), &env);
+    let (rooted, _env) = optimizer
+        .optimize(term)
         .into_changed()
-        .unwrap_or((arena, root));
+        .unwrap_or((rooted, env));
 
-    let arena_code = arena_to_tokens(&arena, root);
+    let arena_code = arena_to_tokens(rooted.entry());
 
     if analyzed.def.params.is_empty() {
         return Ok(quote! {
             {
-                let (__arena, __root) = #arena_code;
-                ::pixelflow_core::Kernel::from_parts(__arena, __root)
+                let (__rooted, __env) = #arena_code;
+                ::pixelflow_core::Kernel::from_rooted(__rooted, __env)
             }
         });
     }
@@ -92,10 +94,16 @@ pub fn emit_kernel(
                 -> impl Fn( #( #generics ),* ) -> ::pixelflow_core::Kernel
             {
                 move | #( #param_names: #generics ),* | {
-                    let (mut __arena, __root) = #arena_code;
+                    let (__rooted, __env) = #arena_code;
+                    let __term = ::pixelflow_core::__macro::ir::expr::Term::new(
+                        __rooted.entry(),
+                        &__env,
+                    );
                     let __params: [#scalar; #arity] = [ #( #param_names.into() ),* ];
-                    let __root = __arena.substitute_params(__root, &__params);
-                    ::pixelflow_core::Kernel::from_parts(__arena, __root)
+                    let mut __builder = ::pixelflow_core::__macro::ir::expr::ExprBuilder::new();
+                    let __root = __builder.substitute_params(__term, &__params);
+                    let (__rooted, __env) = __builder.finish(&[__root]);
+                    ::pixelflow_core::Kernel::from_rooted(__rooted, __env)
                 }
             }
             __builder()
@@ -115,15 +123,34 @@ pub fn emit_kernel(
 /// the warp to reach, and the substitution silently lands inside `f'`.
 ///
 /// See docs/plans/2026-09-08-macro-tier-is-arena-native.md.
-pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
+pub fn arena_to_tokens(root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>) -> TokenStream {
+    use pixelflow_ir::ExprData;
+
+    let dag = root.dag();
+    let mut reachable = dag.side_table(false);
+    for n in root.descendants() {
+        reachable[n] = true;
+    }
+    let mut ordinal = dag.side_table(None::<u32>);
     let mut stmts = Vec::new();
-    let n = arena.len();
-    for idx in 0..n {
-        let id = ExprId(idx as u32);
+    let mut next = 0u32;
+    for node in dag.iter() {
+        if !reachable[node] {
+            continue;
+        }
+        let idx = next;
+        next += 1;
+        ordinal[node] = Some(idx);
         let ident = format_ident!("__e{}", idx);
-        let expr = match arena.node(id) {
-            pixelflow_ir::arena::ExprNode::Var(i) => {
-                quote! { __arena.push_var(#i) }
+        let child_ident = |c: pixelflow_ir::Node<'_, ExprData>| {
+            format_ident!(
+                "__e{}",
+                ordinal[c].expect("child emitted before its parent")
+            )
+        };
+        let expr = match *node {
+            ExprData::Var(i) => {
+                quote! { __builder.push_var(#i) }
             }
             // By bit pattern, not as a decimal literal: `quote`'s `f32`
             // impl goes through `Literal::f32_suffixed`, which asserts
@@ -132,57 +159,55 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
             // `BitAnd`'s monoid identity and therefore `all_over`'s seed, and
             // the folder now produces those. Bits also roundtrip exactly, with
             // no decimal-formatting question to get wrong.
-            pixelflow_ir::arena::ExprNode::Const(v) => {
-                let bits = v.to_bits();
-                quote! { __arena.push_const(f32::from_bits(#bits)) }
+            ExprData::Const(bits) => {
+                quote! { __builder.push_const(f32::from_bits(#bits)) }
             }
-            pixelflow_ir::arena::ExprNode::Param(i) => {
-                quote! { __arena.push_param(#i) }
+            ExprData::Param(i) => {
+                quote! { __builder.push_param(#i) }
             }
             // The `kernel!` macro has no buffer surface yet, so this is
             // unreachable in practice; fail loud rather than emit a node that
-            // references a buffer table `from_raw` does not reconstruct.
-            pixelflow_ir::arena::ExprNode::Buffer(b) => {
+            // references a buffer table the builder does not reconstruct.
+            ExprData::Buffer(b) => {
                 panic!(
-                    "kernel! produced ExprNode::Buffer({}) — lattice parameters are not wired \
+                    "kernel! produced a Buffer({}) leaf — lattice parameters are not wired \
                      into the compiler yet (KERNELS_AND_LATTICES.md M4)",
                     b.0
                 )
             }
             // Likewise unreachable: a uniform enters a kernel at the builder
             // call (`substitute_params`), never from the macro's own arena.
-            pixelflow_ir::arena::ExprNode::Uniform(u) => {
+            ExprData::Uniform(u) => {
                 panic!(
-                    "kernel! produced ExprNode::Uniform({}) — uniforms are chosen at the \
+                    "kernel! produced a Uniform({}) leaf — uniforms are chosen at the \
                      builder call site, not in the macro body",
                     u.0
                 )
             }
-            pixelflow_ir::arena::ExprNode::Unary(op, child) => {
-                let op_code = opkind_to_tokens(*op);
-                let child_ident = format_ident!("__e{}", child.0);
-                quote! { __arena.push_unary(#op_code, #child_ident) }
-            }
-            pixelflow_ir::arena::ExprNode::Binary(op, a, b) => {
-                let op_code = opkind_to_tokens(*op);
-                let a_ident = format_ident!("__e{}", a.0);
-                let b_ident = format_ident!("__e{}", b.0);
-                quote! { __arena.push_binary(#op_code, #a_ident, #b_ident) }
-            }
-            pixelflow_ir::arena::ExprNode::Ternary(op, a, b, c) => {
-                let op_code = opkind_to_tokens(*op);
-                let a_ident = format_ident!("__e{}", a.0);
-                let b_ident = format_ident!("__e{}", b.0);
-                let c_ident = format_ident!("__e{}", c.0);
-                quote! { __arena.push_ternary(#op_code, #a_ident, #b_ident, #c_ident) }
-            }
-            pixelflow_ir::arena::ExprNode::Nary(op, ..) => {
-                let op_code = opkind_to_tokens(*op);
-                let child_idents: Vec<_> = arena
-                    .children(id)
-                    .map(|c| format_ident!("__e{}", c.0))
-                    .collect();
-                quote! { __arena.push_nary(#op_code, &[#(#child_idents),*]) }
+            ExprData::Op(op) => {
+                let op_code = opkind_to_tokens(op);
+                let children: Vec<_> = node.children().collect();
+                match children.as_slice() {
+                    [a] => {
+                        let a_ident = child_ident(*a);
+                        quote! { __builder.push_unary(#op_code, #a_ident) }
+                    }
+                    [a, b] => {
+                        let a_ident = child_ident(*a);
+                        let b_ident = child_ident(*b);
+                        quote! { __builder.push_binary(#op_code, #a_ident, #b_ident) }
+                    }
+                    [a, b, c] => {
+                        let a_ident = child_ident(*a);
+                        let b_ident = child_ident(*b);
+                        let c_ident = child_ident(*c);
+                        quote! { __builder.push_ternary(#op_code, #a_ident, #b_ident, #c_ident) }
+                    }
+                    many => {
+                        let child_idents: Vec<_> = many.iter().map(|c| child_ident(*c)).collect();
+                        quote! { __builder.push_nary(#op_code, &[#(#child_idents),*]) }
+                    }
+                }
             }
         };
         stmts.push(quote! {
@@ -190,11 +215,12 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
         });
     }
 
-    let root_ident = format_ident!("__e{}", root.0);
+    let root_ord = ordinal[root].expect("the root is its own descendant");
+    let root_ident = format_ident!("__e{}", root_ord);
     quote! {{
-        let mut __arena = ::pixelflow_core::__macro::ir::arena::ExprArena::new();
+        let mut __builder = ::pixelflow_core::__macro::ir::expr::ExprBuilder::new();
         #(#stmts)*
-        (__arena, #root_ident)
+        __builder.finish(&[#root_ident])
     }}
 }
 

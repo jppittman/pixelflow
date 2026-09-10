@@ -1,8 +1,8 @@
-//! Macro AST → `ExprArena`.
+//! Macro AST → `ExprBuilder`.
 //!
 //! The front end's one lowering step: the surface syntax a user wrote becomes
 //! the IR everything downstream speaks. `let` bindings resolve to the
-//! [`ExprId`] they name, so the arena is a DAG and a shared subexpression is
+//! [`ExprRef`] they name, so the arena is a DAG and a shared subexpression is
 //! one node; operators and DSL methods resolve through [`OpKind`], so the op
 //! table is not restated here.
 //!
@@ -10,7 +10,7 @@
 
 use crate::ast::{BinaryOp, Expr, UnaryOp};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 use std::collections::HashMap;
 use syn::Lit;
 
@@ -44,15 +44,15 @@ pub fn param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, 
 ///
 /// Mirrors [`ast_to_ir`] exactly but pushes nodes into `arena` instead of
 /// heap-allocating [`Arc`] wrappers. Children are recursed first so that
-/// parent nodes always reference already-interned [`ExprId`]s.
+/// parent nodes always reference already-interned [`ExprRef`]s.
 ///
 /// `param_indices` maps parameter names to their declaration-order index (0-based).
 /// Parameter identifiers are emitted as arena `Param(i)` nodes.
 pub fn ast_to_arena(
     expr: &Expr,
     param_indices: &HashMap<String, u8>,
-    arena: &mut ExprArena,
-) -> Result<ExprId, String> {
+    arena: &mut ExprBuilder,
+) -> Result<ExprRef, String> {
     let mut lowering = Lowering {
         param_indices,
         locals: HashMap::new(),
@@ -66,17 +66,17 @@ pub fn ast_to_arena(
 /// the arena nodes are pushed into.
 struct Lowering<'a> {
     param_indices: &'a HashMap<String, u8>,
-    locals: HashMap<String, ExprId>,
-    arena: &'a mut ExprArena,
+    locals: HashMap<String, ExprRef>,
+    arena: &'a mut ExprBuilder,
 }
 
 impl Lowering<'_> {
     /// Translate an AST node into the arena, resolving `let`-bound locals via
     /// `self.locals`. The optimizer emits `let`-bindings (a [`Expr::Block`]) for
-    /// shared subexpressions; each binding maps to a single [`ExprId`], so the
+    /// shared subexpressions; each binding maps to a single [`ExprRef`], so the
     /// arena faithfully preserves the discovered CSE as a DAG rather than
     /// duplicating subtrees.
-    fn lower(&mut self, expr: &Expr) -> Result<ExprId, String> {
+    fn lower(&mut self, expr: &Expr) -> Result<ExprRef, String> {
         match expr {
             Expr::Ident(ident) => {
                 let name = ident.name.to_string();
@@ -293,7 +293,7 @@ impl Lowering<'_> {
 
 /// Push `Dwrt(expr, var)` — the variable index rides as a `Const` operand,
 /// matching the encoding the e-graph `ChainRule` and `lower_dwrt` read.
-fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
+fn push_dwrt(arena: &mut ExprBuilder, expr: ExprRef, var: u8) -> ExprRef {
     let v = arena.push_const(var as f32);
     arena.push_binary(OpKind::Dwrt, expr, v)
 }

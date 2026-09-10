@@ -56,8 +56,9 @@ mod parser;
 mod sema;
 mod symbol;
 
+use pixelflow_ir::ExprData;
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::expr::Term;
 use pixelflow_ir::optimize::{Identity, Optimize, Rewritten};
 use pixelflow_search::Saturate;
 use proc_macro::TokenStream;
@@ -184,15 +185,20 @@ fn macro_tier() -> impl Optimize {
 struct DwrtFree<P>(P);
 
 impl<P: Optimize> Optimize for DwrtFree<P> {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        let carries_dwrt = arena
-            .nodes_raw()
+    fn optimize(&mut self, term: Term<'_>) -> Rewritten {
+        // Every node in the DAG, not just those reachable from `term`'s
+        // root: a surviving `Dwrt` anywhere is what this optimizer refuses,
+        // matching the arena-era check over the whole node table rather than
+        // the reachable subgraph.
+        let carries_dwrt = term
+            .root()
+            .dag()
             .iter()
-            .any(|n| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)));
+            .any(|n| matches!(*n, ExprData::Op(OpKind::Dwrt)));
         if carries_dwrt {
             return Rewritten::Declined;
         }
-        self.0.optimize(arena, root)
+        self.0.optimize(term)
     }
 }
 

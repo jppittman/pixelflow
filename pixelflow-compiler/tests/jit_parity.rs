@@ -368,20 +368,22 @@ fn jit_font_coverage_matches_truth() {
 /// part 1 above already pins the closed form.
 #[test]
 fn jit_font_coverage_matches_interpreter() {
-    use pixelflow_ir::passes::lower_dwrt_owned;
+    use pixelflow_ir::expr::Term;
+    use pixelflow_ir::passes::lower_dwrt;
     use pixelflow_ir::{BindingTable, eval_scalar};
 
     let (x0, y0, k, dir, mg) = COVERAGE_PARAMS;
     let jit = coverage_body!()(x0, y0, k, dir, mg);
 
-    // The kernel carries its own pre-lowering arena; lower the Dwrt calculus
+    // The kernel carries its own pre-lowering term; lower the Dwrt calculus
     // the same way the compile entries do, then interpret.
-    let (arena, root) = jit.parts();
-    let (lowered, lroot) = lower_dwrt_owned(arena, root).expect("dwrt lowering");
+    let term = jit.term();
+    let lowered = lower_dwrt(term).expect("dwrt lowering");
+    let lowered_term = Term::new(lowered.entry(), term.env());
 
     for &(x, y) in COVERAGE_GRID {
         let got = eval(&jit, (x, y, 0.0, 0.0));
-        let want = eval_scalar(&lowered, lroot, &[x, y], &BindingTable::empty());
+        let want = eval_scalar(lowered_term, &[x, y], &BindingTable::empty());
         check("font_coverage_vs_interpreter", got, want, 1e-4, 1e-4);
     }
 }
