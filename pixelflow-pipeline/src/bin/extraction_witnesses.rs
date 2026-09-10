@@ -440,9 +440,10 @@ fn node_label(egraph: &EGraph, class: EClassId, idx: usize) -> String {
             format!("{}({})", op.name(), cs.join(","))
         }
         ENode::Reduce { fold, body } => format!(
-            "Reduce[{}..{}]({})",
+            "Reduce[{}..{} step {}]({})",
             fold.range().start,
             fold.range().end,
+            fold.stride(),
             egraph.find(*body).index()
         ),
     }

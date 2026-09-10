@@ -118,7 +118,8 @@ pub enum Shape<'a, R> {
     Ref(KernelKey),
     /// An operation over `children`.
     Op(OpKind, Children<'a, R>),
-    /// A bounded fold: `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
+    /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
+    /// `fold`'s own visited indices (see [`Fold`](crate::Fold)'s doc).
     ///
     /// Deliberately *not* a [`Shape::Op`]. A fold's algebra, binder and range
     /// are metadata, not operands: handing them to a walker as children is

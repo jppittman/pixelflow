@@ -2090,6 +2090,14 @@ impl EGraph {
             } => self.predict(|s| {
                 peel_fold_shape(s, head, *head_root, *rest, *body);
             }),
+            RewriteAction::HalveFold {
+                shift,
+                shift_root,
+                halved,
+                body,
+            } => self.predict(|s| {
+                halve_fold_shape(s, shift, *shift_root, *halved, *body);
+            }),
         }
     }
 
@@ -2237,6 +2245,15 @@ impl EGraph {
             } => {
                 let peeled = peel_fold_shape(self, &head, head_root, rest, body);
                 self.union_counted(class_id, peeled)
+            }
+            RewriteAction::HalveFold {
+                shift,
+                shift_root,
+                halved,
+                body,
+            } => {
+                let doubled = halve_fold_shape(self, &shift, shift_root, halved, body);
+                self.union_counted(class_id, doubled)
             }
         }
     }
@@ -2906,6 +2923,55 @@ fn peel_fold_shape<S: NodeSink>(
     sink.make(ENode::Op {
         op,
         children: vec![rest_class, head],
+    })
+}
+
+/// Build `Reduce { fold: halved, body: body ⊕ shift }` — a fold's body
+/// doubled and its trip count halved.
+///
+/// `shift` arrives as a template for the reason `peel_fold_shape`'s `head`
+/// does: computing it needs to *read* the graph, which a [`NodeSink`]
+/// cannot do. `body` names the unshifted half directly — nothing about it
+/// changes, so nothing about it is rebuilt.
+fn halve_fold_shape<S: NodeSink>(
+    sink: &mut S,
+    shift: &[super::fold_rules::HeadNode],
+    shift_root: super::fold_rules::HeadRef,
+    halved: pixelflow_ir::Fold,
+    body: EClassId,
+) -> EClassId {
+    use super::fold_rules::{HeadNode, HeadRef};
+    let mut planned: Vec<EClassId> = Vec::with_capacity(shift.len());
+    let resolve = |r: HeadRef, planned: &[EClassId]| match r {
+        HeadRef::Plan(i) => planned[i as usize],
+        HeadRef::Class(c) => c,
+    };
+    for entry in shift {
+        let id = match entry {
+            HeadNode::Const(bits) => sink.make(ENode::Const(*bits)),
+            HeadNode::Op { op, children } => sink.make(ENode::Op {
+                op: *op,
+                children: children.iter().map(|c| resolve(*c, &planned)).collect(),
+            }),
+            HeadNode::Reduce { fold, body } => sink.make(ENode::Reduce {
+                fold: *fold,
+                body: resolve(*body, &planned),
+            }),
+        };
+        planned.push(id);
+    }
+    let shifted = resolve(shift_root, &planned);
+    let op = super::fold_rules::combiner_op(halved.monoid())
+        .expect("HalveFold checked the combiner before emitting this action");
+    // `body` first: `b ⊕ b[binder := binder+s]`, the unshifted (original
+    // left-to-right order) half on the left.
+    let doubled_body = sink.make(ENode::Op {
+        op,
+        children: vec![body, shifted],
+    });
+    sink.make(ENode::Reduce {
+        fold: halved,
+        body: doubled_body,
     })
 }
 

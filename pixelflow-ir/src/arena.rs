@@ -220,7 +220,9 @@ pub enum ExprNode {
     Ternary(OpKind, ExprId, ExprId, ExprId),
     /// N-ary node. Children live in `ExprArena::nary_children[start..start+len]`.
     Nary(OpKind, u32, u16),
-    /// A bounded fold: `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
+    /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
+    /// `fold`'s own visited indices (see [`Fold`]'s doc — `lo`, `lo+stride`,
+    /// …, [`Fold::len`] of them).
     ///
     /// The only node that *binds* — the binder is not free in the result — and
     /// the only one whose metadata is part of its identity rather than a
@@ -1447,14 +1449,29 @@ impl ExprArena {
                     ExprNode::Reduce { fold, body } => {
                         stack.push(Task::WriteStr(")"));
                         stack.push(Task::Visit(*body));
-                        write!(
-                            f,
-                            "{}_{}over({}..{})(",
-                            OpKind::Reduce.name(),
-                            fold.binder().var(),
-                            fold.range().start,
-                            fold.range().end
-                        )?;
+                        // The step is worth stating once it is not 1 — the
+                        // shape `Fold::halve` leaves behind — since `range()`
+                        // alone would then read as "every index" and isn't.
+                        if fold.stride() == 1 {
+                            write!(
+                                f,
+                                "{}_{}over({}..{})(",
+                                OpKind::Reduce.name(),
+                                fold.binder().var(),
+                                fold.range().start,
+                                fold.range().end
+                            )?;
+                        } else {
+                            write!(
+                                f,
+                                "{}_{}over({}..{} step {})(",
+                                OpKind::Reduce.name(),
+                                fold.binder().var(),
+                                fold.range().start,
+                                fold.range().end,
+                                fold.stride()
+                            )?;
+                        }
                     }
                 },
             }
