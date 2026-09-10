@@ -370,7 +370,7 @@ impl Rooted<ExprData> {
                         ExprNode::Unary(op, _)
                         | ExprNode::Binary(op, _, _)
                         | ExprNode::Ternary(op, _, _, _)
-                        | ExprNode::Nary(op, _, _) => b.push_nary(op, &child_ids),
+                        | ExprNode::Nary(op, _) => b.push_nary(op, &child_ids),
                     };
                     map[id.0 as usize] = Some(new_id);
                 }

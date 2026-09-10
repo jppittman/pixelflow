@@ -257,8 +257,8 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // body]`. The three `Const` children round trip through the `C`
             // arm above like any other constant; this arm only has to spell
             // the child list itself, whatever its length.
-            ExprNode::Nary(k, start, count) => {
-                let children = arena.nary_children_slice(*start, *count);
+            ExprNode::Nary(k, _) => {
+                let children = arena.nary_children(id);
                 let ids: Vec<u32> = children.iter().map(|c| d(&dense, *c)).collect();
                 write!(out, "N {k:?}").expect("fmt");
                 for id in ids {

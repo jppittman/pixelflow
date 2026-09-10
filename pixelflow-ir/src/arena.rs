@@ -183,6 +183,18 @@ impl core::hash::Hash for UniformDecl {
 
 // ───────────────────────────────────────── ExprNode ───────────────────────────
 
+/// The location of an n-ary node's children inside an [`ExprArena`].
+///
+/// Its fields are private because offsets are storage, not expression
+/// semantics. Consumers obtain the children of a node through
+/// [`ExprArena::children`]; only the arena itself translates this range into a
+/// slice.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NaryChildren {
+    start: u32,
+    len: u16,
+}
+
 /// A single expression node stored in the arena.
 ///
 /// Layout is kept tight: the static assertion below guarantees <= 16 bytes.
@@ -218,8 +230,9 @@ pub enum ExprNode {
     Unary(OpKind, ExprId),
     Binary(OpKind, ExprId, ExprId),
     Ternary(OpKind, ExprId, ExprId, ExprId),
-    /// N-ary node. Children live in `ExprArena::nary_children[start..start+len]`.
-    Nary(OpKind, u32, u16),
+    /// N-ary node. Its child location is private implementation detail;
+    /// consume it through [`ExprArena::children`].
+    Nary(OpKind, NaryChildren),
     /// A bounded fold: `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
     ///
     /// The only node that *binds* — the binder is not free in the result — and
@@ -642,7 +655,7 @@ impl ExprArena {
         let start = self.nary_children.len() as u32;
         let len = children.len() as u16;
         self.nary_children.extend_from_slice(children);
-        self.push_node(ExprNode::Nary(op, start, len))
+        self.push_node(ExprNode::Nary(op, NaryChildren { start, len }))
     }
 
     // ───────────────────── node observation ───────
@@ -691,16 +704,19 @@ impl ExprArena {
         &self.nodes[id.0 as usize]
     }
 
-    /// Get the N-ary children slice for a `Nary(_, start, len)` node.
+    /// Borrow the children of an n-ary node.
     ///
     /// # Panics
     ///
-    /// Panics if `start + len` exceeds the internal nary_children buffer.
+    /// Panics when `id` does not name an n-ary node.
     #[inline]
     #[must_use]
-    pub fn nary_children_slice(&self, start: u32, len: u16) -> &[ExprId] {
-        let s = start as usize;
-        let l = len as usize;
+    pub fn nary_children(&self, id: ExprId) -> &[ExprId] {
+        let ExprNode::Nary(_, range) = self.node(id) else {
+            panic!("ExprArena::nary_children: node {id:?} is not n-ary");
+        };
+        let s = range.start as usize;
+        let l = range.len as usize;
         &self.nary_children[s..s + l]
     }
 
@@ -730,7 +746,7 @@ impl ExprArena {
             ExprNode::Unary(op, _) => *op,
             ExprNode::Binary(op, _, _) => *op,
             ExprNode::Ternary(op, _, _, _) => *op,
-            ExprNode::Nary(op, _, _) => *op,
+            ExprNode::Nary(op, _) => *op,
             ExprNode::Reduce { .. } => OpKind::Reduce,
         }
     }
@@ -749,9 +765,9 @@ impl ExprArena {
             ExprNode::Unary(_, a) => ExprChildren::One(*a),
             ExprNode::Binary(_, a, b) => ExprChildren::Two(*a, *b),
             ExprNode::Ternary(_, a, b, c) => ExprChildren::Three(*a, *b, *c),
-            ExprNode::Nary(_, start, len) => {
-                let s = *start as usize;
-                let l = *len as usize;
+            ExprNode::Nary(_, range) => {
+                let s = range.start as usize;
+                let l = range.len as usize;
                 ExprChildren::Nary(&self.nary_children[s..s + l])
             }
             // One child, not four: the combiner, the binder and the extent
@@ -792,9 +808,9 @@ impl ExprArena {
                     stack.push((*b, d + 1));
                     stack.push((*c, d + 1));
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     if l == 0 {
                         max_depth = max_depth.max(d);
                     } else {
@@ -833,9 +849,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -884,9 +900,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -927,9 +943,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -994,9 +1010,9 @@ impl ExprArena {
                             work.push(Task::Descend(*b));
                             work.push(Task::Descend(*a));
                         }
-                        ExprNode::Nary(_, start, len) => {
-                            let s = *start as usize;
-                            let l = *len as usize;
+                        ExprNode::Nary(_, range) => {
+                            let s = range.start as usize;
+                            let l = range.len as usize;
                             for child in self.nary_children[s..s + l].iter().rev() {
                                 work.push(Task::Descend(*child));
                             }
@@ -1056,9 +1072,9 @@ impl ExprArena {
                                 .expect("substitute_params: child c not yet mapped for Ternary");
                             self.push_ternary(op, na, nb, nc)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let s = start as usize;
-                            let l = len as usize;
+                        ExprNode::Nary(op, range) => {
+                            let s = range.start as usize;
+                            let l = range.len as usize;
                             let child_ids: Vec<ExprId> = self.nary_children[s..s + l]
                                 .iter()
                                 .map(|old_child| {
@@ -1181,8 +1197,8 @@ impl ExprArena {
                             let (a, b, c) = (m(a), m(b), m(c));
                             self.push_ternary(op, a, b, c)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let (s, l) = (start as usize, len as usize);
+                        ExprNode::Nary(op, range) => {
+                            let (s, l) = (range.start as usize, range.len as usize);
                             let mapped: Vec<ExprId> = other.nary_children[s..s + l]
                                 .iter()
                                 .map(|c| m(*c))
@@ -1265,8 +1281,8 @@ impl ExprArena {
                             let (a, b, c) = (m(a), m(b), m(c));
                             self.push_ternary(op, a, b, c)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let (s, l) = (start as usize, len as usize);
+                        ExprNode::Nary(op, range) => {
+                            let (s, l) = (range.start as usize, range.len as usize);
                             let child_ids: Vec<ExprId> = self.nary_children[s..s + l].to_vec();
                             let mapped: Vec<ExprId> = child_ids.into_iter().map(m).collect();
                             self.push_nary(op, &mapped)
@@ -1365,8 +1381,8 @@ impl ExprArena {
                 ExprNode::Unary(op, a) => out.push_unary(*op, m(*a)),
                 ExprNode::Binary(op, a, b) => out.push_binary(*op, m(*a), m(*b)),
                 ExprNode::Ternary(op, a, b, c) => out.push_ternary(*op, m(*a), m(*b), m(*c)),
-                ExprNode::Nary(op, start, len) => {
-                    let (s, l) = (*start as usize, *len as usize);
+                ExprNode::Nary(op, range) => {
+                    let (s, l) = (range.start as usize, range.len as usize);
                     let mapped: Vec<ExprId> =
                         self.nary_children[s..s + l].iter().map(|c| m(*c)).collect();
                     out.push_nary(*op, &mapped)
@@ -1428,9 +1444,9 @@ impl ExprArena {
                         f.write_str(op.name())?;
                         f.write_str("(")?;
                     }
-                    ExprNode::Nary(op, start, len) => {
-                        let s = *start as usize;
-                        let l = *len as usize;
+                    ExprNode::Nary(op, range) => {
+                        let s = range.start as usize;
+                        let l = range.len as usize;
                         stack.push(Task::WriteStr(")"));
                         for (i, child) in self.nary_children[s..s + l].iter().enumerate().rev() {
                             stack.push(Task::Visit(*child));
@@ -1559,13 +1575,13 @@ impl ExprArena {
                     }
                     stack.push((*s_body, *o_body));
                 }
-                (ExprNode::Nary(s_op, s_start, s_len), ExprNode::Nary(o_op, o_start, o_len)) => {
-                    if s_op != o_op || s_len != o_len {
+                (ExprNode::Nary(s_op, s_range), ExprNode::Nary(o_op, o_range)) => {
+                    if s_op != o_op || s_range.len != o_range.len {
                         return false;
                     }
-                    let ss = *s_start as usize;
-                    let os = *o_start as usize;
-                    let len = *s_len as usize;
+                    let ss = s_range.start as usize;
+                    let os = o_range.start as usize;
+                    let len = s_range.len as usize;
                     for i in 0..len {
                         stack.push((self.nary_children[ss + i], other.nary_children[os + i]));
                     }

@@ -518,9 +518,9 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
                     Box::new(move |a| a.push_ternary(k, x, y, z)),
                 )
             }
-            ExprNode::Nary(k, start, n) => {
+            ExprNode::Nary(k, _) => {
                 let kids: Vec<ExprId> = arena
-                    .nary_children_slice(start, n)
+                    .nary_children(id)
                     .iter()
                     .map(|&c| ExprId(m(c, &map)))
                     .collect();

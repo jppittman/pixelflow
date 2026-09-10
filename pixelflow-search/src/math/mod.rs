@@ -195,7 +195,7 @@ mod tests {
                     children: vec![ca, cb, cc],
                 })
             }
-            ExprNode::Nary(kind, _, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
+            ExprNode::Nary(kind, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
         }
     }
 

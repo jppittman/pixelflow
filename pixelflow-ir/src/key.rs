@@ -227,11 +227,12 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
                 push_id(&mut key, &dense, *b);
                 push_id(&mut key, &dense, *c);
             }
-            ExprNode::Nary(op, _, n) => {
+            ExprNode::Nary(op, _) => {
                 key.push(6);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                key.extend_from_slice(&n.to_le_bytes());
-                for child in arena.children(ExprId(idx as u32)) {
+                let id = ExprId(idx as u32);
+                key.extend_from_slice(&(arena.children(id).len() as u16).to_le_bytes());
+                for child in arena.children(id) {
                     push_id(&mut key, &dense, child);
                 }
             }

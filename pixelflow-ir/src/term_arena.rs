@@ -28,9 +28,7 @@ impl Ir for ExprArena {
             ExprNode::Unary(op, a) => Shape::Op(op, Children::One(a)),
             ExprNode::Binary(op, a, b) => Shape::Op(op, Children::Two(a, b)),
             ExprNode::Ternary(op, a, b, c) => Shape::Op(op, Children::Three(a, b, c)),
-            ExprNode::Nary(op, start, len) => {
-                Shape::Op(op, Children::Many(self.nary_children_slice(start, len)))
-            }
+            ExprNode::Nary(op, _) => Shape::Op(op, Children::Many(self.nary_children(r))),
             ExprNode::Reduce { fold, body } => Shape::Reduce { fold, body },
         }
     }

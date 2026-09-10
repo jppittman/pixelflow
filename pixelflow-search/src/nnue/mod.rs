@@ -147,8 +147,8 @@ pub fn pattern_match_arena(
                 }
                 _ => return None,
             },
-            ExprNode::Nary(t_op, _, _) => match arena.node(e_id) {
-                ExprNode::Nary(e_op, _, _) if e_op == t_op => {
+            ExprNode::Nary(t_op, _) => match arena.node(e_id) {
+                ExprNode::Nary(e_op, _) if e_op == t_op => {
                     let e_children = arena.children(e_id);
                     let t_children = template.children(t_id);
                     if e_children.len() == t_children.len() {
@@ -255,7 +255,7 @@ pub fn substitute_template_arena(
                 let c = ExprId(remap[t_c.0 as usize]);
                 target_arena.push_ternary(op, a, b, c)
             }
-            ExprNode::Nary(op, _, _) => {
+            ExprNode::Nary(op, _) => {
                 let t_children: Vec<ExprId> = template
                     .children(*id)
                     .map(|tc| ExprId(remap[tc.0 as usize]))

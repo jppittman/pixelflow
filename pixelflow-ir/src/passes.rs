@@ -602,7 +602,7 @@ pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, &'stati
         }
         ExprNode::Unary(OpKind::Dwrt, _)
         | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-        | ExprNode::Nary(OpKind::Dwrt, _, _) => {
+        | ExprNode::Nary(OpKind::Dwrt, _) => {
             Err("lower_dwrt: malformed Dwrt node (must be Binary(expr, var))")
         }
         _ => Ok(None),
@@ -621,7 +621,7 @@ pub fn lower_dwrt_owned(
             ExprNode::Unary(OpKind::Dwrt, _)
                 | ExprNode::Binary(OpKind::Dwrt, _, _)
                 | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                | ExprNode::Nary(OpKind::Dwrt, _, _)
+                | ExprNode::Nary(OpKind::Dwrt, _)
         )
     }) {
         return Ok((arena.clone(), root));
@@ -776,7 +776,7 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
             }
             _ => {}
         },
-        ExprNode::Nary(_, _, _) => {}
+        ExprNode::Nary(_, _) => {}
         // No rule: `diff_node` raises the error for the fold itself.
         ExprNode::Reduce { .. } => {}
     }
@@ -1010,7 +1010,7 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
             _ => Err("lower_dwrt: no derivative rule for this ternary op"),
         },
 
-        ExprNode::Nary(_, _, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
+        ExprNode::Nary(_, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
         // Linearity — `d(⊕_k f) = ⊕_k d(f)` — holds for `Σ` and for nothing
         // else in the monoid set: `Π` needs the product rule, and `min`/`max`
         // are selections, not sums. The rule is not written here because
@@ -1862,10 +1862,10 @@ mod dwrt_tests {
         // its non-matching arms; `expand_transcendentals` is the simplest
         // public one and this arena has nothing for it to actually lower.
         let new_root = expand_transcendentals(&mut a, root);
-        let ExprNode::Nary(OpKind::Tuple, start, len) = a.node(new_root) else {
+        let ExprNode::Nary(OpKind::Tuple, _) = a.node(new_root) else {
             panic!("expected a rebuilt Tuple, got {:?}", a.node(new_root));
         };
-        let children = a.nary_children_slice(*start, *len);
+        let children = a.nary_children(new_root);
         assert_eq!(children.len(), 3, "wrong slice length");
         for (child, expected_var) in children.iter().zip([0u8, 1, 4]) {
             assert!(
@@ -1971,7 +1971,7 @@ impl Optimize for LowerDwrt {
                 ExprNode::Unary(OpKind::Dwrt, _)
                     | ExprNode::Binary(OpKind::Dwrt, _, _)
                     | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                    | ExprNode::Nary(OpKind::Dwrt, _, _)
+                    | ExprNode::Nary(OpKind::Dwrt, _)
             )
         }) {
             return Rewritten::Unchanged;

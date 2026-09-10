@@ -369,8 +369,8 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             ExprNode::Reduce { fold, body } => {
                 result[body.0 as usize].without(Variance::from_var(fold.binder().var()))
             }
-            ExprNode::Nary(_, start, len) => {
-                let children = arena.nary_children_slice(*start, *len);
+            ExprNode::Nary(_, _) => {
+                let children = arena.nary_children(id);
                 let mut v = Variance::CONST;
                 for &child in children {
                     v = v.union(result[child.0 as usize]);

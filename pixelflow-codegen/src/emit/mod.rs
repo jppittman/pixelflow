@@ -1731,7 +1731,7 @@ fn arena_to_schedule(
                  point, so a survivor means this schedule was built without \
                  the lowering pipeline."
             ),
-            ExprNode::Nary(_, _, _) => panic!("Nary not supported in JIT arena compilation"),
+            ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
             // **The emitter has no iteration binder.** A fold reaching here
             // means `passes::expand_reduce` did not run — that pass is what
             // turns a fold into the `len()` copies of its body the machine
