@@ -118,7 +118,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use pixelflow_ir::ExprArena;
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_search::egraph::{EGraph, ENodeId, Origin};
 use pixelflow_search::math::all_rules;
@@ -474,13 +474,12 @@ fn main() {
 
     let corpus_dir = PathBuf::from(&args.corpus_dir);
     let dev_path = corpus_dir.join("corpus_dev.bin");
-    let mut entries: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = read_corpus(&dev_path)
-        .unwrap_or_else(|e| {
-            panic!(
-                "guide_scope_saturation_delta: failed to read {}: {e}",
-                dev_path.display()
-            )
-        });
+    let mut entries: Vec<(String, Rooted<ExprData>)> = read_corpus(&dev_path).unwrap_or_else(|e| {
+        panic!(
+            "guide_scope_saturation_delta: failed to read {}: {e}",
+            dev_path.display()
+        )
+    });
     let total_available = entries.len();
 
     assert!(
@@ -529,11 +528,14 @@ fn main() {
     let mut total_dropped_origins = 0usize;
     let mut total_refused_const_unions = 0usize;
 
-    for (i, (_name, arena, root)) in entries.iter().enumerate() {
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (_name, expr)) in entries.iter().enumerate() {
+        let term = Term::new(expr.entry(), &env);
         let mut egraph = EGraph::with_rules(all_rules());
-        let root_class = pixelflow_search::egraph::insert(
-            arena,
-            *root,
+        let root_class = pixelflow_search::egraph::insert_term(
+            term,
             &mut egraph,
             pixelflow_search::egraph::Vocabulary::Templates,
         )

@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde::Serialize;
 
-use pixelflow_ir::{ExprArena, ExprNode};
+use pixelflow_ir::{Environment, ExprData, Node, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_search::egraph::{
     APP_CHECKPOINT_GRID, AnytimeCurveOutput, ApplicationId, Budget, CostModel, EClassId, EGraph,
@@ -223,11 +223,9 @@ fn origin_label(eg: &EGraph, rules: &RuleSet, tag: ENodeId) -> String {
     }
 }
 
-fn seed_has_const_one(arena: &ExprArena) -> bool {
-    arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Const(v) if v.to_bits() == 1.0_f32.to_bits()))
+fn seed_has_const_one(root: Node<'_, ExprData>) -> bool {
+    root.descendants()
+        .any(|n| matches!(*n, ExprData::Const(bits) if bits == 1.0_f32.to_bits()))
 }
 
 struct Labels {
@@ -264,7 +262,7 @@ fn labels_of(out: &AnytimeCurveOutput) -> Labels {
 
 fn tally_expression(
     name: &str,
-    arena: &ExprArena,
+    seed: Node<'_, ExprData>,
     out: &AnytimeCurveOutput,
     rules: &RuleSet,
     by_rule: &mut BTreeMap<RuleId, RuleTally>,
@@ -336,8 +334,8 @@ fn tally_expression(
         if rname == "pythagorean" {
             let row = pyth.get_or_insert_with(|| PythagoreanRow {
                 name: name.to_string(),
-                node_count: arena.nodes_raw().len(),
-                seed_has_const_one: seed_has_const_one(arena),
+                node_count: seed.node_count(),
+                seed_has_const_one: seed_has_const_one(seed),
                 fired: 0,
                 minted: 0,
                 union_only: 0,
@@ -416,9 +414,9 @@ fn main() {
     let corpus_path = Path::new(&args.corpus);
     let entries = read_corpus(corpus_path)
         .unwrap_or_else(|e| panic!("failed to read corpus {}: {e}", corpus_path.display()));
-    let selected: Vec<&(String, ExprArena, pixelflow_ir::ExprId)> = entries
+    let selected: Vec<&(String, Rooted<ExprData>)> = entries
         .iter()
-        .filter(|(name, _, _)| name.starts_with(&args.name_prefix))
+        .filter(|(name, _)| name.starts_with(&args.name_prefix))
         .take(args.limit.unwrap_or(usize::MAX))
         .collect();
     assert!(
@@ -441,8 +439,12 @@ fn main() {
     let mut total_applications = 0usize;
     let started = Instant::now();
 
-    for (i, (name, arena, root)) in selected.iter().enumerate() {
-        let class_cap = config_for_node_count(arena.nodes_raw().len()).max_classes;
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (name, expr)) in selected.iter().enumerate() {
+        let term = Term::new(expr.entry(), &env);
+        let class_cap = config_for_node_count(expr.len()).max_classes;
         let t0 = Instant::now();
         let mut optimizer = Optimizer::production()
             .cost(costs.clone())
@@ -456,11 +458,11 @@ fn main() {
                 applications: None,
             })
             .hard_ceiling(SAFETY_TIMEOUT);
-        let out = run_anytime_curve(&mut optimizer, arena, *root, APP_CHECKPOINT_GRID);
+        let out = run_anytime_curve(&mut optimizer, term, APP_CHECKPOINT_GRID);
         // The budget denominator, not the journal's own count.
         let apps = out.egraph.application_count() as usize;
         total_applications += apps;
-        let row = tally_expression(name, arena, &out, &rules, &mut by_rule);
+        let row = tally_expression(name, term.root(), &out, &rules, &mut by_rule);
         let pyth_note = row
             .as_ref()
             .map(|r| {

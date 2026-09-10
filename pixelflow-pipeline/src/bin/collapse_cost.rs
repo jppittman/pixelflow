@@ -26,6 +26,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, Kernel, Rooted};
 use pixelflow_pipeline::collapse_bench::{
     self,
     corpus::{self, CollapseKernel},
@@ -133,6 +134,13 @@ fn main() {
     }
 }
 
+/// A kernel's graph, copied into one this corpus entry owns.
+fn own(kernel: &Kernel) -> (Rooted<ExprData>, Environment) {
+    let mut b = ExprBuilder::new();
+    let root = b.splice(kernel.term());
+    b.finish(&[root])
+}
+
 fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
     // core-term itself loads `NotoSansMono-Regular.ttf`; that asset is stored
     // in large-file storage and is a pointer file in checkouts without it, so
@@ -162,12 +170,12 @@ fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
                 missing += 1;
                 continue;
             };
-            let (arena, root) = kernel.parts();
+            let (expr, env) = own(&kernel);
             kernels.push(CollapseKernel {
                 name: format!("glyph{tile}_U{:04X}", ch as u32),
                 family: format!("glyph{tile}"),
-                arena: arena.clone(),
-                root,
+                expr,
+                env,
                 extent: [tile, tile],
             });
         }
@@ -176,12 +184,12 @@ fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
         let kernel = parsed
             .glyph_kernel_scaled(ch, BENCH_PT)
             .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
-        let (arena, root) = kernel.parts();
+        let (expr, env) = own(&kernel);
         kernels.push(CollapseKernel {
             name: format!("bench_{label}"),
             family: "bench".to_string(),
-            arena: arena.clone(),
-            root,
+            expr,
+            env,
             extent: BENCH_EXTENT,
         });
     }

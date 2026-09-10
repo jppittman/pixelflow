@@ -90,7 +90,7 @@ use std::time::Duration;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
+use pixelflow_ir::{Environment, ExprData, Node, OpKind, Rooted, Term as IrTerm};
 use pixelflow_pipeline::journal::append_record;
 use pixelflow_pipeline::schema::fnv1a64_hex;
 use pixelflow_pipeline::training::corpus::read_corpus;
@@ -425,33 +425,27 @@ const POLY_OPS: &[OpKind] = &[
     OpKind::Neg,
 ];
 
-/// The op of a non-leaf `ExprNode`, or `None` for a leaf
-/// (`Var`/`Const`/`Param`/`Buffer` — excluded from the stratification rule).
-fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
-    match node {
-        ExprNode::Var(_)
-        | ExprNode::Const(_)
-        | ExprNode::Param(_)
-        | ExprNode::Buffer(_)
-        | ExprNode::Uniform(_) => None,
-        ExprNode::Unary(op, _)
-        | ExprNode::Binary(op, _, _)
-        | ExprNode::Ternary(op, _, _, _)
-        | ExprNode::Nary(op, _, _) => Some(*op),
+/// The op of a non-leaf node, or `None` for a leaf
+/// (`Var`/`Const`/`Param`/`Buffer`/`Uniform` — excluded from the
+/// stratification rule).
+fn non_leaf_op(node: Node<'_, ExprData>) -> Option<OpKind> {
+    match *node {
+        ExprData::Op(op) => Some(op),
+        _ => None,
     }
 }
 
-/// The registered op-composition stratum of an arena (§2): first matching
-/// row over `polynomial-only` / `trig-heavy` / `transcendental-heavy` /
-/// `sqrt-recip-heavy` / `mixed`. `polynomial-only` is vacuously true for an
-/// arena with no non-leaf nodes at all (a bare `Var`/`Const`), matching the
-/// registered "every op ∈ POLY" wording.
-fn ops_stratum(arena: &ExprArena) -> &'static str {
+/// The registered op-composition stratum of an expression (§2): first
+/// matching row over `polynomial-only` / `trig-heavy` /
+/// `transcendental-heavy` / `sqrt-recip-heavy` / `mixed`. `polynomial-only`
+/// is vacuously true for an expression with no non-leaf nodes at all (a bare
+/// `Var`/`Const`), matching the registered "every op ∈ POLY" wording.
+fn ops_stratum(expr_root: Node<'_, ExprData>) -> &'static str {
     let mut trig = 0usize;
     let mut trans = 0usize;
-    let mut root = 0usize;
+    let mut root_ops = 0usize;
     let mut poly_only = true;
-    for node in arena.nodes_raw() {
+    for node in expr_root.descendants() {
         let Some(op) = non_leaf_op(node) else {
             continue;
         };
@@ -462,7 +456,7 @@ fn ops_stratum(arena: &ExprArena) -> &'static str {
             trans += 1;
         }
         if ROOT_OPS.contains(&op) {
-            root += 1;
+            root_ops += 1;
         }
         if !POLY_OPS.contains(&op) {
             poly_only = false;
@@ -474,7 +468,7 @@ fn ops_stratum(arena: &ExprArena) -> &'static str {
         "trig-heavy"
     } else if trans >= 3 {
         "transcendental-heavy"
-    } else if root >= 3 {
+    } else if root_ops >= 3 {
         "sqrt-recip-heavy"
     } else {
         "mixed"
@@ -507,95 +501,118 @@ mod registered_rule_tests {
 mod ops_stratum_tests {
     use super::*;
 
+    /// A finished graph from a builder closure returning the root — the
+    /// stratum is a property of what the ROOT reaches, so a test that leaves
+    /// a node unreachable is testing something else.
+    fn built(
+        f: impl FnOnce(&mut pixelflow_ir::ExprBuilder) -> pixelflow_ir::ExprRef,
+    ) -> Rooted<ExprData> {
+        let mut b = pixelflow_ir::ExprBuilder::new();
+        let root = f(&mut b);
+        b.finish(&[root]).0
+    }
+
     #[test]
     fn polynomial_only_is_vacuous_on_a_bare_leaf() {
-        let mut a = ExprArena::new();
-        let _x = a.push_var(0);
-        assert_eq!(ops_stratum(&a), "polynomial-only");
+        let a = built(|a| a.push_var(0));
+        assert_eq!(ops_stratum(a.entry()), "polynomial-only");
     }
 
     #[test]
     fn polynomial_only_over_add_sub_mul_muladd_neg() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let c = a.push_const(2.0);
-        let add = a.push_binary(OpKind::Add, x, c);
-        let sub = a.push_binary(OpKind::Sub, add, x);
-        let mul = a.push_binary(OpKind::Mul, sub, c);
-        let neg = a.push_unary(OpKind::Neg, mul);
-        let _ma = a.push_ternary(OpKind::MulAdd, neg, x, c);
-        assert_eq!(ops_stratum(&a), "polynomial-only");
+        let a = built(|a| {
+            let x = a.push_var(0);
+            let c = a.push_const(2.0);
+            let add = a.push_binary(OpKind::Add, x, c);
+            let sub = a.push_binary(OpKind::Sub, add, x);
+            let mul = a.push_binary(OpKind::Mul, sub, c);
+            let neg = a.push_unary(OpKind::Neg, mul);
+            a.push_ternary(OpKind::MulAdd, neg, x, c)
+        });
+        assert_eq!(ops_stratum(a.entry()), "polynomial-only");
     }
 
     #[test]
     fn one_div_breaks_polynomial_only_into_mixed() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let c = a.push_const(2.0);
-        let _ = a.push_binary(OpKind::Div, x, c);
-        assert_eq!(ops_stratum(&a), "mixed");
+        let a = built(|a| {
+            let x = a.push_var(0);
+            let c = a.push_const(2.0);
+            a.push_binary(OpKind::Div, x, c)
+        });
+        assert_eq!(ops_stratum(a.entry()), "mixed");
     }
 
     #[test]
     fn trig_heavy_needs_three_trig_ops() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let s = a.push_unary(OpKind::Sin, x);
-        let c = a.push_unary(OpKind::Cos, x);
-        let two = a.push_binary(OpKind::Mul, s, c);
-        // Only two trig ops so far — should NOT be trig-heavy yet.
-        assert_ne!(ops_stratum(&a), "trig-heavy");
-        let _t = a.push_unary(OpKind::Tan, two);
-        assert_eq!(ops_stratum(&a), "trig-heavy");
+        let two_trig = built(|a| {
+            let x = a.push_var(0);
+            let s = a.push_unary(OpKind::Sin, x);
+            let c = a.push_unary(OpKind::Cos, x);
+            a.push_binary(OpKind::Mul, s, c)
+        });
+        // Only two trig ops — NOT trig-heavy yet.
+        assert_ne!(ops_stratum(two_trig.entry()), "trig-heavy");
+        let three_trig = built(|a| {
+            let x = a.push_var(0);
+            let s = a.push_unary(OpKind::Sin, x);
+            let c = a.push_unary(OpKind::Cos, x);
+            let two = a.push_binary(OpKind::Mul, s, c);
+            a.push_unary(OpKind::Tan, two)
+        });
+        assert_eq!(ops_stratum(three_trig.entry()), "trig-heavy");
     }
 
     #[test]
     fn transcendental_heavy_needs_three_trans_ops() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let e1 = a.push_unary(OpKind::Exp, x);
-        let e2 = a.push_unary(OpKind::Ln, e1);
-        let _e3 = a.push_unary(OpKind::Log2, e2);
-        assert_eq!(ops_stratum(&a), "transcendental-heavy");
+        let a = built(|a| {
+            let x = a.push_var(0);
+            let e1 = a.push_unary(OpKind::Exp, x);
+            let e2 = a.push_unary(OpKind::Ln, e1);
+            a.push_unary(OpKind::Log2, e2)
+        });
+        assert_eq!(ops_stratum(a.entry()), "transcendental-heavy");
     }
 
     #[test]
     fn sqrt_recip_heavy_needs_three_root_ops() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let r1 = a.push_unary(OpKind::Sqrt, x);
-        let r2 = a.push_unary(OpKind::Rsqrt, r1);
-        let _r3 = a.push_unary(OpKind::Recip, r2);
-        assert_eq!(ops_stratum(&a), "sqrt-recip-heavy");
+        let a = built(|a| {
+            let x = a.push_var(0);
+            let r1 = a.push_unary(OpKind::Sqrt, x);
+            let r2 = a.push_unary(OpKind::Rsqrt, r1);
+            a.push_unary(OpKind::Recip, r2)
+        });
+        assert_eq!(ops_stratum(a.entry()), "sqrt-recip-heavy");
     }
 
     #[test]
     fn trig_takes_priority_over_transcendental_and_root() {
         // 3 trig + 3 trans + 3 root ops present: trig-heavy wins (first
         // matching row after polynomial-only).
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let mut n = a.push_unary(OpKind::Sin, x);
-        n = a.push_unary(OpKind::Cos, n);
-        n = a.push_unary(OpKind::Tan, n);
-        n = a.push_unary(OpKind::Exp, n);
-        n = a.push_unary(OpKind::Ln, n);
-        n = a.push_unary(OpKind::Log2, n);
-        n = a.push_unary(OpKind::Sqrt, n);
-        n = a.push_unary(OpKind::Rsqrt, n);
-        let _ = a.push_unary(OpKind::Recip, n);
-        assert_eq!(ops_stratum(&a), "trig-heavy");
+        let a = built(|a| {
+            let x = a.push_var(0);
+            let mut n = a.push_unary(OpKind::Sin, x);
+            n = a.push_unary(OpKind::Cos, n);
+            n = a.push_unary(OpKind::Tan, n);
+            n = a.push_unary(OpKind::Exp, n);
+            n = a.push_unary(OpKind::Ln, n);
+            n = a.push_unary(OpKind::Log2, n);
+            n = a.push_unary(OpKind::Sqrt, n);
+            n = a.push_unary(OpKind::Rsqrt, n);
+            a.push_unary(OpKind::Recip, n)
+        });
+        assert_eq!(ops_stratum(a.entry()), "trig-heavy");
     }
 
     #[test]
     fn mixed_is_the_fallback() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let s = a.push_unary(OpKind::Sin, x);
-        let e = a.push_unary(OpKind::Exp, s);
-        let _ = a.push_unary(OpKind::Sqrt, e);
+        let a = built(|a| {
+            let x = a.push_var(0);
+            let s = a.push_unary(OpKind::Sin, x);
+            let e = a.push_unary(OpKind::Exp, s);
+            a.push_unary(OpKind::Sqrt, e)
+        });
         // One of each group, none reaching 3 — falls through to mixed.
-        assert_eq!(ops_stratum(&a), "mixed");
+        assert_eq!(ops_stratum(a.entry()), "mixed");
     }
 }
 
@@ -1172,8 +1189,7 @@ struct Guides {
 /// One expression's fixed curve environment, shared by every arm.
 #[derive(Clone, Copy)]
 struct CurveInput<'a> {
-    arena: &'a ExprArena,
-    root: ExprId,
+    term: IrTerm<'a>,
     class_cap: usize,
     costs: &'a CostModel,
     guided_grid: &'a [usize],
@@ -1202,7 +1218,7 @@ fn run_guided(
     input: &CurveInput<'_>,
 ) -> (AnytimeCurveOutput, usize) {
     let mut optimizer = arm_optimizer(input, Some(guide));
-    let out = run_anytime_curve(&mut optimizer, input.arena, input.root, input.guided_grid);
+    let out = run_anytime_curve(&mut optimizer, input.term, input.guided_grid);
     let seen = optimizer
         .guided_keys_seen()
         .expect("a guided optimizer carries an episode");
@@ -1215,13 +1231,12 @@ fn run_guided(
 /// `Optimizer::production()` **is** the production configuration — there is
 /// no second copy of it to drift (#1108 removed the one there was), so this
 /// adds only the reporting: production discards its stats, this keeps them.
-fn production_probe(arena: &ExprArena, root: ExprId, costs: &CostModel) -> ProductionRow {
-    let node_count = arena.nodes_raw().len();
+fn production_probe(term: IrTerm<'_>, costs: &CostModel) -> ProductionRow {
+    let node_count = term.root().node_count();
     let mut optimizer = Optimizer::production().cost(costs.clone());
     let mut egraph = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term,
         &mut egraph,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
@@ -1265,16 +1280,15 @@ fn evaluate_expression(
     stratify_by_ops: bool,
 ) -> ExprRow {
     let CurveInput {
-        arena,
-        root,
+        term,
         class_cap,
         costs,
         ..
     } = *input;
-    let node_count = arena.nodes_raw().len();
+    let node_count = term.root().node_count();
 
     let mut unguided_opt = arm_optimizer(input, None);
-    let unguided = run_anytime_curve(&mut unguided_opt, arena, root, APP_CHECKPOINT_GRID);
+    let unguided = run_anytime_curve(&mut unguided_opt, term, APP_CHECKPOINT_GRID);
     let (control, control_seen) = run_guided(Box::new(guides.control.clone()), input);
     let (linear, linear_seen) = run_guided(Box::new(guides.linear.clone()), input);
 
@@ -1313,7 +1327,7 @@ fn evaluate_expression(
         rules,
     );
 
-    let production = Some(production_probe(arena, root, costs));
+    let production = Some(production_probe(term, costs));
 
     ExprRow {
         name: name.to_string(),
@@ -1322,7 +1336,7 @@ fn evaluate_expression(
         tier: tier_name(node_count).to_string(),
         node_count,
         class_cap,
-        stratum: stratify_by_ops.then(|| ops_stratum(arena).to_string()),
+        stratum: stratify_by_ops.then(|| ops_stratum(term.root()).to_string()),
         arms,
         at_budget,
         full_run: Some(full_run),
@@ -2602,10 +2616,12 @@ fn stride_sample<T>(mut items: Vec<T>, n: Option<usize>) -> Vec<T> {
 }
 
 /// Op-composition stratum counts (registration §2) over a set of entries.
-fn strata_counts(entries: &[(String, ExprArena, ExprId)]) -> BTreeMap<String, usize> {
+fn strata_counts(entries: &[(String, Rooted<ExprData>)]) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for (_, arena, _) in entries {
-        *counts.entry(ops_stratum(arena).to_string()).or_default() += 1;
+    for (_, expr) in entries {
+        *counts
+            .entry(ops_stratum(expr.entry()).to_string())
+            .or_default() += 1;
     }
     counts
 }
@@ -2632,7 +2648,7 @@ fn train_fence_keys(corpus_dir: &Path) -> HashSet<FenceKey> {
         read_corpus(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     entries
         .iter()
-        .map(|(_, arena, root)| FenceKey::of(arena, *root))
+        .map(|(_, expr)| FenceKey::of(expr.entry()))
         .collect()
 }
 
@@ -2644,13 +2660,13 @@ fn train_fence_keys(corpus_dir: &Path) -> HashSet<FenceKey> {
 fn enforce_train_fence(
     corpus_path: &Path,
     corpus_dir: &Path,
-    entries: &[(String, ExprArena, ExprId)],
+    entries: &[(String, Rooted<ExprData>)],
 ) {
     let train_keys = train_fence_keys(corpus_dir);
     let collisions: Vec<&str> = entries
         .iter()
-        .filter(|(_, arena, root)| train_keys.contains(&FenceKey::of(arena, *root)))
-        .map(|(name, _, _)| name.as_str())
+        .filter(|(_, expr)| train_keys.contains(&FenceKey::of(expr.entry())))
+        .map(|(name, _)| name.as_str())
         .collect();
     assert!(
         collisions.is_empty(),
@@ -2711,18 +2727,17 @@ fn main() {
         let entries = read_corpus(&dev_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", dev_path.display()));
         enforce_train_fence(&dev_path, &corpus_dir, &entries);
-        let classical: Vec<(String, ExprArena, ExprId)> = entries
+        let classical: Vec<(String, Rooted<ExprData>)> = entries
             .into_iter()
-            .filter(|(name, arena, _)| {
-                name.starts_with(&args.name_prefix)
-                    && tier_name(arena.nodes_raw().len()) == "classical"
+            .filter(|(name, expr)| {
+                name.starts_with(&args.name_prefix) && tier_name(expr.len()) == "classical"
             })
             .collect();
         strata_population_out = Some(strata_counts(&classical));
         stratum_by_name = Some(
             classical
                 .iter()
-                .map(|(name, arena, _)| (name.clone(), ops_stratum(arena).to_string()))
+                .map(|(name, expr)| (name.clone(), ops_stratum(expr.entry()).to_string()))
                 .collect(),
         );
     }
@@ -2753,7 +2768,7 @@ fn main() {
         enforce_train_fence(&dev_path, &corpus_dir, &entries);
         if !args.name_prefix.is_empty() {
             let before = entries.len();
-            entries.retain(|(name, _, _)| name.starts_with(&args.name_prefix));
+            entries.retain(|(name, _)| name.starts_with(&args.name_prefix));
             assert!(
                 !entries.is_empty(),
                 "--name-prefix {:?} matches none of the {before} entries in {}",
@@ -2766,18 +2781,13 @@ fn main() {
                 entries.len()
             );
         }
-        entries.sort_by(|a, b| {
-            a.1.nodes_raw()
-                .len()
-                .cmp(&b.1.nodes_raw().len())
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        let mut by_band: BTreeMap<&str, Vec<(String, ExprArena, ExprId)>> = BTreeMap::new();
-        for (name, arena, root) in entries {
+        entries.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(&b.0)));
+        let mut by_band: BTreeMap<&str, Vec<(String, Rooted<ExprData>)>> = BTreeMap::new();
+        for (name, expr) in entries {
             by_band
-                .entry(tier_name(arena.nodes_raw().len()))
+                .entry(tier_name(expr.len()))
                 .or_default()
-                .push((name, arena, root));
+                .push((name, expr));
         }
         let counts: BTreeMap<&str, usize> = by_band.iter().map(|(k, v)| (*k, v.len())).collect();
         eprintln!("phase3_at_budget_eval: DEV population by band: {counts:?}");
@@ -2794,7 +2804,7 @@ fn main() {
             strata_population_out = Some(classical_strata);
             stratum_by_name = by_band.get("classical").map(|v| {
                 v.iter()
-                    .map(|(name, arena, _)| (name.clone(), ops_stratum(arena).to_string()))
+                    .map(|(name, expr)| (name.clone(), ops_stratum(expr.entry()).to_string()))
                     .collect()
             });
         }
@@ -2803,13 +2813,13 @@ fn main() {
             (args.min_expr_nodes == 0 || n >= args.min_expr_nodes)
                 && (args.max_expr_nodes == 0 || n <= args.max_expr_nodes)
         };
-        let mut selected: Vec<(String, ExprArena, ExprId)> = Vec::new();
+        let mut selected: Vec<(String, Rooted<ExprData>)> = Vec::new();
         selected.extend(stride_sample(
             by_band
                 .remove("classical")
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|(_, a, _)| in_node_band(a.nodes_raw().len()))
+                .filter(|(_, e)| in_node_band(e.len()))
                 .collect(),
             (args.classical_samples > 0).then_some(args.classical_samples),
         ));
@@ -2819,7 +2829,7 @@ fn main() {
                     .remove(band)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|(_, a, _)| in_node_band(a.nodes_raw().len()))
+                    .filter(|(_, e)| in_node_band(e.len()))
                     .collect(),
                 Some(args.other_samples),
             ));
@@ -2939,7 +2949,10 @@ fn main() {
             .unwrap_or_else(|e| panic!("cannot open {}: {e}", jsonl_path.display()));
 
         let total = selected.len();
-        for (i, (name, arena, root)) in selected.iter().enumerate() {
+        // A corpus entry declares no buffers or uniforms — the format refuses
+        // to write one down — so one empty environment serves every term.
+        let env = Environment::new();
+        for (i, (name, expr)) in selected.iter().enumerate() {
             if existing.contains(name) || skipped.contains(name) {
                 continue;
             }
@@ -2948,13 +2961,12 @@ fn main() {
                 i + 1,
                 total,
                 name,
-                arena.nodes_raw().len(),
-                tier_name(arena.nodes_raw().len())
+                expr.len(),
+                tier_name(expr.len())
             );
             let input = CurveInput {
-                arena,
-                root: *root,
-                class_cap: config_for_node_count(arena.nodes_raw().len()).max_classes,
+                term: IrTerm::new(expr.entry(), &env),
+                class_cap: config_for_node_count(expr.len()).max_classes,
                 costs: &costs,
                 guided_grid: &guided_grid,
             };

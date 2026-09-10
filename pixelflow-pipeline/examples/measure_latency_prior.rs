@@ -20,7 +20,7 @@
 //!
 //! Run: `cargo run --release -p pixelflow-pipeline --example measure_latency_prior`
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, ExprRef, OpKind, Rooted, Term};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 
 const K_SHORT: usize = 8;
@@ -180,8 +180,8 @@ fn specs() -> Vec<OpSpec> {
 ///
 /// Prelude `acc0 = abs(x) + 1` keeps the chain seed strictly positive no
 /// matter what the latency-mode feedback loop feeds back in.
-fn chain_arena(spec: &OpSpec, k: usize) -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+fn chain_term(spec: &OpSpec, k: usize) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let ax = arena.push_unary(OpKind::Abs, x);
     let one = arena.push_const(1.0);
@@ -189,10 +189,10 @@ fn chain_arena(spec: &OpSpec, k: usize) -> (ExprArena, ExprId) {
     for i in 0..k {
         acc = push_stage(&mut arena, spec, acc, i);
     }
-    (arena, acc)
+    arena.finish(&[acc])
 }
 
-fn push_stage(arena: &mut ExprArena, spec: &OpSpec, acc: ExprId, i: usize) -> ExprId {
+fn push_stage(arena: &mut ExprBuilder, spec: &OpSpec, acc: ExprRef, i: usize) -> ExprRef {
     match spec.stage {
         Stage::UnaryScaled(c0, c1) => {
             let c = arena.push_const(if i.is_multiple_of(2) { c0 } else { c1 });
@@ -227,10 +227,10 @@ fn push_stage(arena: &mut ExprArena, spec: &OpSpec, acc: ExprId, i: usize) -> Ex
 /// Throughput kernel: sum of K independent op applications (or, for the
 /// baseline, the same kernel with each op application replaced by its
 /// argument). Marginal cost = (op_kernel - baseline) / K.
-fn throughput_arena(spec: &OpSpec, with_op: bool) -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
-    let vars: Vec<ExprId> = (0..4).map(|i| arena.push_var(i)).collect();
-    let mut acc: Option<ExprId> = None;
+fn throughput_term(spec: &OpSpec, with_op: bool) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
+    let vars: Vec<ExprRef> = (0..4).map(|i| arena.push_var(i)).collect();
+    let mut acc: Option<ExprRef> = None;
     for i in 0..K_THROUGHPUT {
         let v = vars[i % 4];
         let c = arena.push_const(0.3 + 0.11 * i as f32);
@@ -269,7 +269,8 @@ fn throughput_arena(spec: &OpSpec, with_op: bool) -> (ExprArena, ExprId) {
             Some(prev) => arena.push_binary(OpKind::Add, prev, term),
         });
     }
-    (arena, acc.expect("K_THROUGHPUT > 0"))
+    let root = acc.expect("K_THROUGHPUT > 0");
+    arena.finish(&[root])
 }
 
 fn median_of(mut v: Vec<f64>) -> f64 {
@@ -277,20 +278,14 @@ fn median_of(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-/// Measure one arena `reps` times, return median ns (raw, not
+/// Measure one term `reps` times, return median ns (raw, not
 /// overhead-adjusted — every consumer here works on differences that cancel
 /// overhead exactly).
-fn measure(
-    session: &mut BenchSession,
-    arena: &ExprArena,
-    root: ExprId,
-    mode: BenchMode,
-    reps: usize,
-) -> f64 {
+fn measure(session: &mut BenchSession, term: Term<'_>, mode: BenchMode, reps: usize) -> f64 {
     let samples: Vec<f64> = (0..reps)
         .map(|_| {
             session
-                .benchmark_arena(arena, root, mode)
+                .benchmark_term(term, mode)
                 .unwrap_or_else(|e| panic!("benchmark failed: {e}"))
                 .ns
         })
@@ -313,10 +308,20 @@ fn main() {
     // Pass 1: latency chain slopes.
     let mut lat_slope = Vec::new();
     for spec in &specs {
-        let (a_short, r_short) = chain_arena(spec, K_SHORT);
-        let (a_long, r_long) = chain_arena(spec, K_LONG);
-        let ns_short = measure(&mut session, &a_short, r_short, BenchMode::Latency, reps);
-        let ns_long = measure(&mut session, &a_long, r_long, BenchMode::Latency, reps);
+        let (short, short_env) = chain_term(spec, K_SHORT);
+        let (long, long_env) = chain_term(spec, K_LONG);
+        let ns_short = measure(
+            &mut session,
+            Term::new(short.entry(), &short_env),
+            BenchMode::Latency,
+            reps,
+        );
+        let ns_long = measure(
+            &mut session,
+            Term::new(long.entry(), &long_env),
+            BenchMode::Latency,
+            reps,
+        );
         let slope = (ns_long - ns_short) / (K_LONG - K_SHORT) as f64;
         lat_slope.push(slope);
     }
@@ -324,10 +329,20 @@ fn main() {
     // Pass 2: throughput marginals.
     let mut thr_marginal = Vec::new();
     for spec in &specs {
-        let (a_op, r_op) = throughput_arena(spec, true);
-        let (a_base, r_base) = throughput_arena(spec, false);
-        let ns_op = measure(&mut session, &a_op, r_op, BenchMode::Throughput, reps);
-        let ns_base = measure(&mut session, &a_base, r_base, BenchMode::Throughput, reps);
+        let (with_op, with_op_env) = throughput_term(spec, true);
+        let (base, base_env) = throughput_term(spec, false);
+        let ns_op = measure(
+            &mut session,
+            Term::new(with_op.entry(), &with_op_env),
+            BenchMode::Throughput,
+            reps,
+        );
+        let ns_base = measure(
+            &mut session,
+            Term::new(base.entry(), &base_env),
+            BenchMode::Throughput,
+            reps,
+        );
         thr_marginal.push((ns_op - ns_base) / K_THROUGHPUT as f64);
     }
 

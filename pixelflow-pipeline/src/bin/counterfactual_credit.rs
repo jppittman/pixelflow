@@ -102,7 +102,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
-use pixelflow_ir::ExprArena;
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_pipeline::training::guide_linear::{
     load_linear_guide, per_rule_rate_guide_from_report,
@@ -366,8 +366,10 @@ fn sweep_scores<G: SaturationGuide>(
 
 struct ExprContext {
     name: String,
-    arena: ExprArena,
-    root: pixelflow_ir::ExprId,
+    /// The expression, owned, plus the tables its leaves index — the pair
+    /// [`ExprContext::term`] hands on.
+    expr: Rooted<ExprData>,
+    env: Environment,
     max_classes: usize,
     egraph: EGraph,
     cost_original: usize,
@@ -440,17 +442,27 @@ fn reachable_canonical_classes(
 ///
 /// # Panics
 ///
+impl ExprContext {
+    /// The expression paired with the tables its leaves index.
+    fn term(&self) -> Term<'_> {
+        Term::new(self.expr.entry(), &self.env)
+    }
+}
+
 /// Panics if the saturation call hits its own wall-clock safety ceiling
 /// (`SATURATE_TIMEOUT`) — a correctness guard, not the outer sampling
 /// ceiling (see module doc).
 fn build_expr_context(
     name: String,
-    arena: ExprArena,
-    root: pixelflow_ir::ExprId,
+    expr: Rooted<ExprData>,
     budget: usize,
     proxies: &Proxies,
 ) -> ExprContext {
-    let max_classes = config_for_node_count(arena.nodes_raw().len()).max_classes;
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so an empty environment is the right one.
+    let env = Environment::new();
+    let term = Term::new(expr.entry(), &env);
+    let max_classes = config_for_node_count(expr.len()).max_classes;
     let costs = CostModel::latency_prior();
     // The replay reads the journal afterwards, so recording is asked for
     // with an observer (#1118). `hard_ceiling` panics on the ceiling rather
@@ -466,14 +478,13 @@ fn build_expr_context(
         })
         .hard_ceiling(SATURATE_TIMEOUT);
     let mut egraph = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        &arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term,
         &mut egraph,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let _ = optimizer.run(&mut egraph, root_class, arena.nodes_raw().len());
+    let _ = optimizer.run(&mut egraph, root_class, expr.len());
 
     let extraction = extract_dag(&egraph, root_class, &costs);
     // DAG cost — what the emitted kernel pays (#1117).
@@ -514,7 +525,7 @@ fn build_expr_context(
     // module doc.
     let mut candidates: Vec<(ApplicationId, RuleId)> = Vec::new();
     let bound = budget.min(egraph.application_count() as usize) as u64;
-    let expr_node_count = arena.nodes_raw().len();
+    let expr_node_count = expr.len();
     let mut step_of: HashMap<ApplicationId, usize> = HashMap::new();
     let mut keys: Vec<(ApplicationId, usize)> = Vec::new();
     let mut summaries: Vec<CandidateSummary> = Vec::new();
@@ -568,8 +579,8 @@ fn build_expr_context(
 
     ExprContext {
         name,
-        arena,
-        root,
+        expr,
+        env,
         max_classes,
         egraph,
         cost_original,
@@ -660,14 +671,13 @@ fn masked_replay(
         })
         .hard_ceiling(SATURATE_TIMEOUT);
     let mut egraph = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        &ctx.arena,
-        ctx.root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        ctx.term(),
         &mut egraph,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let _ = optimizer.run(&mut egraph, root_class, ctx.arena.nodes_raw().len());
+    let _ = optimizer.run(&mut egraph, root_class, ctx.expr.len());
     let skips = egraph.last_replay_mask_skips();
     assert!(
         skips >= 1,
@@ -1040,9 +1050,9 @@ fn main() {
             ood_path.display()
         )
     });
-    let sh_entries: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = ood_entries
+    let sh_entries: Vec<(String, Rooted<ExprData>)> = ood_entries
         .into_iter()
-        .filter(|(name, _, _)| name.starts_with("dev_sh_"))
+        .filter(|(name, _)| name.starts_with("dev_sh_"))
         .collect();
 
     let rules = RuleSet::production();
@@ -1061,19 +1071,16 @@ fn main() {
         }),
     };
 
-    let in_band = |a: &ExprArena| {
-        let n = a.nodes_raw().len();
+    let in_band = |e: &Rooted<ExprData>| {
+        let n = e.len();
         (args.min_expr_nodes == 0 || n >= args.min_expr_nodes)
             && (args.max_expr_nodes == 0 || n <= args.max_expr_nodes)
     };
     let dev_in_band: Vec<_> = dev_entries
         .into_iter()
-        .filter(|(_, a, _)| in_band(a))
+        .filter(|(_, e)| in_band(e))
         .collect();
-    let sh_in_band: Vec<_> = sh_entries
-        .into_iter()
-        .filter(|(_, a, _)| in_band(a))
-        .collect();
+    let sh_in_band: Vec<_> = sh_entries.into_iter().filter(|(_, e)| in_band(e)).collect();
     let dev_available = dev_in_band.len();
     let sh_available = sh_in_band.len();
 
@@ -1124,7 +1131,7 @@ fn main() {
     let mut ceiling_hit = false;
 
     'expressions: for (set, sample) in [("sh", &sh_sample), ("dev", &dev_sample)] {
-        for (name, arena, root) in sample.iter() {
+        for (name, expr) in sample.iter() {
             if start.elapsed() >= ceiling {
                 ceiling_hit = true;
                 eprintln!(
@@ -1137,7 +1144,7 @@ fn main() {
                 break 'expressions;
             }
 
-            let ctx = build_expr_context(name.clone(), arena.clone(), *root, args.budget, &proxies);
+            let ctx = build_expr_context(name.clone(), expr.clone(), args.budget, &proxies);
             expressions_processed += 1;
 
             if ctx.candidates.len() < args.n_apps {

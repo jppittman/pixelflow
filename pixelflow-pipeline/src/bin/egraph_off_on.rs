@@ -52,7 +52,8 @@ use pixelflow_graphics::scene3d::{Hit, Plane, Ray, Rgba, Sphere, checker, sky};
 use pixelflow_ir::optimize::{Optimize, Rewritten};
 use pixelflow_ir::passes::{ExpandReduce, LowerDwrt};
 use pixelflow_ir::{
-    BindingTable, ExprArena, ExprId, ExprNode, LatticeShape, eval_scalar, pipeline,
+    BindingTable, Environment, ExprData, LatticeShape, Node, Rooted, Term, eval_scalar, pipeline,
+    relink,
 };
 use pixelflow_pipeline::alloc_probe::{self, CountingAlloc};
 use pixelflow_pipeline::collapse_bench::corpus::Trips;
@@ -61,7 +62,7 @@ use pixelflow_pipeline::collapse_bench::{self, LANES, features_of};
 use pixelflow_pipeline::shader_bench::{SHADERTOY_KERNEL_NAMES, named_shadertoy_kernel};
 use pixelflow_search::egraph::{
     Budget, CostModel, EpisodeLabels, KeepJournal, Optimizer, Rewrite, RuleSet, SaturationConfig,
-    Vocabulary, all_rules, config_for_node_count, insert, reachable_count,
+    Vocabulary, all_rules, config_for_node_count, insert_term, reachable_count_term,
 };
 use pixelflow_search::math::round2_rules::experimental_rules;
 use pixelflow_search::{Saturate, Tier};
@@ -495,7 +496,7 @@ struct KernelRow {
 struct CellGridCase {
     shape: CellGridShape,
     metrics: CellGridMetrics,
-    cells_id: pixelflow_ir::arena::BufferIdentity,
+    cells_id: pixelflow_ir::BufferIdentity,
     cells: Arc<Vec<f32>>,
     atlas: Arc<Vec<f32>>,
 }
@@ -737,11 +738,11 @@ fn real_kernels(font: &Path, filter: Option<&str>) -> Vec<RealKernel> {
     }
 
     for name in SHADERTOY_KERNEL_NAMES {
-        let (arena, root) = named_shadertoy_kernel(name).expect("registered shader");
+        let (expr, env) = named_shadertoy_kernel(name).expect("registered shader");
         push(
             format!("shader_{name}"),
             "shader",
-            Kernel::from_parts(arena, root),
+            Kernel::from_rooted(expr, env),
             SHADER_EXTENT,
             false,
         );
@@ -763,8 +764,8 @@ fn real_kernels(font: &Path, filter: Option<&str>) -> Vec<RealKernel> {
 
 struct Compiled {
     result: CompileResult,
-    linked: ExprArena,
-    root: ExprId,
+    linked: Rooted<ExprData>,
+    linked_env: Environment,
     optimize_ms: f64,
     emit_ms: f64,
     guard: Option<GuardTelemetry>,
@@ -843,24 +844,29 @@ fn parse_sat_telemetry(log: &str) -> Option<SatTelemetry> {
 /// Link `a`/`r` back onto the input's buffer and uniform tables, emit, and
 /// gather the emitter's and the optimizer's stderr reports into a row.
 fn emit_and_report(
-    input: &ExprArena,
-    (a, r): (ExprArena, ExprId),
+    input: Term<'_>,
+    (optimized, optimized_env): (Rooted<ExprData>, Environment),
     optimize_ms: f64,
     optimize_log: &str,
 ) -> Compiled {
-    let (linked, root) = if input.buffers().is_empty() && input.uniforms().is_empty() {
-        (a, r)
+    let env = input.env();
+    let (linked, linked_env) = if env.buffers.is_empty() && env.uniforms.is_empty() {
+        (optimized, optimized_env)
     } else {
-        a.relink(r, input.buffers(), input.uniforms())
+        relink(
+            Term::new(optimized.entry(), &optimized_env),
+            &env.buffers,
+            &env.uniforms,
+        )
     };
     let t = Instant::now();
-    let (result, log) = capture_stderr(|| emit::compile(&linked, root));
+    let (result, log) = capture_stderr(|| emit::compile(Term::new(linked.entry(), &linked_env)));
     let emit_ms = t.elapsed().as_secs_f64() * 1e3;
     let result = result.expect("real kernel failed to compile");
     Compiled {
         result,
         linked,
-        root,
+        linked_env,
         optimize_ms,
         emit_ms,
         guard: parse_guard_telemetry(&log),
@@ -869,23 +875,31 @@ fn emit_and_report(
     }
 }
 
-fn compile_via_production_path(arena: &ExprArena, root: ExprId, shape: LatticeShape) -> Compiled {
+fn compile_via_production_path(term: Term<'_>, shape: LatticeShape) -> Compiled {
     alloc_probe::reset();
     let t = Instant::now();
     let (optimized, log) =
-        capture_stderr(|| pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape));
+        capture_stderr(|| pixelflow_search::runtime::optimize_runtime_term(term, shape));
     let optimize_ms = t.elapsed().as_secs_f64() * 1e3;
-    let (a, r) = optimized
+    let pair = optimized
         .as_deref()
-        .map(|(a, r)| (a.clone(), *r))
-        .unwrap_or((arena.clone(), root));
-    emit_and_report(arena, (a, r), optimize_ms, &log)
+        .map(|(rooted, env)| (rooted.clone(), env.clone()))
+        .unwrap_or_else(|| own(term));
+    emit_and_report(term, pair, optimize_ms, &log)
+}
+
+/// A term copied into a graph of its own — what "the optimizer declined"
+/// hands the emitter.
+fn own(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    let mut b = pixelflow_ir::ExprBuilder::new();
+    let root = b.splice(term);
+    b.finish(&[root])
 }
 
 /// An in-harness optimizer (a [`Variant`] or a [`CapArm`]): the same
 /// pipeline `optimize_runtime_arena_uncached` runs, with that optimizer in
 /// the saturation slot.
-fn compile_via_optimizer(arena: &ExprArena, root: ExprId, optimizer: Optimizer) -> Compiled {
+fn compile_via_optimizer(term: Term<'_>, optimizer: Optimizer) -> Compiled {
     alloc_probe::reset();
     let t = Instant::now();
     let (rewritten, log) = capture_stderr(|| {
@@ -894,15 +908,15 @@ fn compile_via_optimizer(arena: &ExprArena, root: ExprId, optimizer: Optimizer) 
             ExpandReduce,
             Saturate::with(optimizer, Vocabulary::Runtime, Tier::Runtime)
         ]
-        .optimize(arena, root)
+        .optimize(term)
     });
     let optimize_ms = t.elapsed().as_secs_f64() * 1e3;
-    let (a, r) = match rewritten {
-        Rewritten::Changed(a, r) => (a, r),
-        Rewritten::Unchanged => (arena.clone(), root),
+    let pair = match rewritten {
+        Rewritten::Changed(rooted, env) => (rooted, env),
+        Rewritten::Unchanged => own(term),
         Rewritten::Declined => panic!("in-harness pipeline declined a real kernel"),
     };
-    emit_and_report(arena, (a, r), optimize_ms, &log)
+    emit_and_report(term, pair, optimize_ms, &log)
 }
 
 fn with_select_hoist_rules() -> Vec<Box<dyn Rewrite>> {
@@ -926,29 +940,11 @@ fn with_select_hoist_rules() -> Vec<Box<dyn Rewrite>> {
 // Static columns
 // ---------------------------------------------------------------------------
 
-fn reachable(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
-    let len = arena.nodes_raw().len();
-    let mut seen = vec![false; len];
-    let mut stack = vec![root];
-    let mut out = Vec::new();
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        out.push(id);
-        stack.extend(arena.children(id));
-    }
-    out
-}
-
-fn dag_cost(arena: &ExprArena, root: ExprId) -> usize {
+fn dag_cost(root: Node<'_, ExprData>) -> usize {
     let model = CostModel::latency_prior();
-    reachable(arena, root)
-        .into_iter()
-        .filter_map(|id| match arena.node(id) {
-            ExprNode::Unary(k, _) | ExprNode::Binary(k, _, _) | ExprNode::Ternary(k, _, _, _) => {
-                Some(model.cost(*k))
-            }
+    root.descendants()
+        .filter_map(|n| match *n {
+            ExprData::Op(k) if n.child_count() <= 3 => Some(model.cost(k)),
             _ => None,
         })
         .sum()
@@ -965,9 +961,9 @@ struct Ctx {
     _buffers: Vec<Arc<Vec<f32>>>,
 }
 
-fn context_for(linked: &ExprArena, case: Option<&CellGridCase>) -> Ctx {
+fn context_for(linked: &Environment, case: Option<&CellGridCase>) -> Ctx {
     let mut buffers: Vec<Arc<Vec<f32>>> = Vec::new();
-    for decl in linked.buffers() {
+    for decl in &linked.buffers {
         let case = case.expect("a buffer-bearing kernel without its buffers");
         let data = if decl.id == case.cells_id {
             case.cells.clone()
@@ -983,7 +979,7 @@ fn context_for(linked: &ExprArena, case: Option<&CellGridCase>) -> Ctx {
         );
         buffers.push(data);
     }
-    let uniforms: Vec<f32> = linked.uniforms().iter().map(|u| u.default).collect();
+    let uniforms: Vec<f32> = linked.uniforms.iter().map(|u| u.default).collect();
     let mut slots: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
     slots.push(uniforms.as_ptr());
     Ctx {
@@ -1017,10 +1013,10 @@ fn fnv(out: &[f32]) -> u64 {
 }
 
 struct OracleForms<'a> {
-    /// The arena as constructed, legalized (`legalize`).
-    input: (&'a ExprArena, ExprId),
-    /// The arena that was emitted.
-    linked: (&'a ExprArena, ExprId),
+    /// The graph as constructed, legalized (`legalize`).
+    input: Term<'a>,
+    /// The graph that was emitted.
+    linked: Term<'a>,
     case: Option<&'a CellGridCase>,
     packed: bool,
 }
@@ -1032,11 +1028,11 @@ fn oracle(forms: &OracleForms<'_>, out: &[f32], trips: Trips) -> Oracle {
         case,
         packed,
     } = *forms;
-    let bindings_for = |arena: &ExprArena| -> BindingTable<'_> {
+    let bindings_for = |env: &Environment| -> BindingTable<'_> {
         let table = match case {
             Some(case) => {
-                let slices: Vec<&[f32]> = arena
-                    .buffers()
+                let slices: Vec<&[f32]> = env
+                    .buffers
                     .iter()
                     .map(|d| {
                         if d.id == case.cells_id {
@@ -1046,16 +1042,14 @@ fn oracle(forms: &OracleForms<'_>, out: &[f32], trips: Trips) -> Oracle {
                         }
                     })
                     .collect();
-                BindingTable::bind(arena, &slices).expect("bind oracle buffers")
+                BindingTable::bind(env, &slices).expect("bind oracle buffers")
             }
             None => BindingTable::empty(),
         };
-        table
-            .bind_uniforms(arena, &[])
-            .expect("bind oracle uniforms")
+        table.bind_uniforms(env, &[]).expect("bind oracle uniforms")
     };
-    let b_in = bindings_for(input.0);
-    let b_ln = bindings_for(linked.0);
+    let b_in = bindings_for(input.env());
+    let b_ln = bindings_for(linked.env());
     let width = trips.groups as usize * LANES;
     let pixels = width * trips.rows as usize;
     let stride = (pixels / ORACLE_POINTS).max(1);
@@ -1064,8 +1058,8 @@ fn oracle(forms: &OracleForms<'_>, out: &[f32], trips: Trips) -> Oracle {
     while px < pixels && o.points < ORACLE_POINTS {
         let (x, y) = ((px % width) as f32 + 0.5, (px / width) as f32 + 0.5);
         let jit = out[px];
-        let same = eval_scalar(linked.0, linked.1, &[x, y], &b_ln);
-        let cross = eval_scalar(input.0, input.1, &[x, y], &b_in);
+        let same = eval_scalar(linked, &[x, y], &b_ln);
+        let cross = eval_scalar(input, &[x, y], &b_in);
         if packed {
             let byte_delta = |a: f32, b: f32| -> u32 {
                 a.to_bits()
@@ -1178,26 +1172,22 @@ fn cell_grid_scene_ns_per_px(case: &CellGridCase) -> f64 {
 
 /// The legalizing prefix on its own — what both modes run before the
 /// switch (`LowerDwrt`, `ExpandReduce`); `eval_scalar` needs it too.
-fn legalize(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    match pipeline![LowerDwrt, ExpandReduce].optimize(arena, root) {
-        Rewritten::Changed(a, r) => (a, r),
-        Rewritten::Unchanged => (arena.clone(), root),
+fn legalize(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    match pipeline![LowerDwrt, ExpandReduce].optimize(term) {
+        Rewritten::Changed(rooted, env) => (rooted, env),
+        Rewritten::Unchanged => own(term),
         Rewritten::Declined => panic!("legalizing prefix declined a real kernel"),
     }
 }
 
-fn saturation_probe(
-    arena: &ExprArena,
-    root: ExprId,
-    optimizer: Optimizer,
-    production_bytes: &[u8],
-) -> SatProbe {
-    let (la, lr) = legalize(arena, root);
+fn saturation_probe(term: Term<'_>, optimizer: Optimizer, production_bytes: &[u8]) -> SatProbe {
+    let (legal, legal_env) = legalize(term);
+    let legal_term = Term::new(legal.entry(), &legal_env);
     let mut optimizer = optimizer.observe(Some(Box::new(KeepJournal)));
     let mut egraph = optimizer.egraph();
-    let root_class = insert(&la, lr, &mut egraph, Vocabulary::Runtime)
+    let root_class = insert_term(legal_term, &mut egraph, Vocabulary::Runtime)
         .unwrap_or_else(|_| panic!("probe: real kernel not representable"));
-    let node_count = reachable_count(&la, lr);
+    let node_count = reachable_count_term(legal_term);
     let t = Instant::now();
     let optimized = optimizer.run(&mut egraph, root_class, node_count);
     let wall_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -1235,14 +1225,15 @@ fn saturation_probe(
     });
 
     // The probe's own extraction, compiled: it must be the production kernel.
-    let (pa, pr) = optimized.to_arena(&egraph, root_class);
-    let bytes_identical_to_production = if arena.buffers().is_empty() && arena.uniforms().is_empty()
-    {
-        let compiled = emit::compile(&pa, pr).expect("probe extraction compiles");
-        Some(compiled.code.as_bytes() == production_bytes)
-    } else {
-        None
-    };
+    let (probe, probe_env) = optimized.to_rooted(&egraph, root_class);
+    let bytes_identical_to_production =
+        if term.env().buffers.is_empty() && term.env().uniforms.is_empty() {
+            let compiled = emit::compile(Term::new(probe.entry(), &probe_env))
+                .expect("probe extraction compiles");
+            Some(compiled.code.as_bytes() == production_bytes)
+        } else {
+            None
+        };
 
     SatProbe {
         applications: optimized.stats.applications,
@@ -1348,18 +1339,19 @@ fn run(args: &RunArgs<'_>) {
     let git_sha = head_sha();
 
     for (i, rk) in kernels.iter().enumerate() {
-        let (arena, root) = rk.kernel.parts();
+        let term = rk.kernel.term();
         let shape = LatticeShape::new(rk.extent);
         let trips = Trips::of(rk.extent, LANES as u32);
         let started = Instant::now();
 
+        let (legal, legal_env) = legalize(term);
+        let legal_term = Term::new(legal.entry(), &legal_env);
         let sizes = {
-            let (la, lr) = legalize(arena, root);
             let mut egraph = Optimizer::production().egraph();
-            insert(&la, lr, &mut egraph, Vocabulary::Runtime)
+            insert_term(legal_term, &mut egraph, Vocabulary::Runtime)
                 .unwrap_or_else(|_| panic!("{}: not e-graph representable", rk.name));
             InputSizes {
-                nodes: reachable_count(&la, lr),
+                nodes: reachable_count_term(legal_term),
                 inserted: egraph.num_classes(),
             }
         };
@@ -1370,8 +1362,8 @@ fn run(args: &RunArgs<'_>) {
             (Some(_), Some(_)) => unreachable!("mode_label rejects both arms at once"),
         };
         let compiled = match in_harness_optimizer(shape) {
-            Some(optimizer) => compile_via_optimizer(arena, root, optimizer),
-            None => compile_via_production_path(arena, root, shape),
+            Some(optimizer) => compile_via_optimizer(term, optimizer),
+            None => compile_via_production_path(term, shape),
         };
         if mode != "off" {
             let sat = compiled.sat.as_ref().unwrap_or_else(|| {
@@ -1389,8 +1381,8 @@ fn run(args: &RunArgs<'_>) {
             );
         }
         let bytes_identical_to_manifold_compile = if in_harness_optimizer(shape).is_none()
-            && arena.buffers().is_empty()
-            && arena.uniforms().is_empty()
+            && term.env().buffers.is_empty()
+            && term.env().uniforms.is_empty()
         {
             let m = pixelflow_core::lattice::manifold::Manifold::compile(&rk.kernel, rk.extent);
             Some(m.code_bytes() == compiled.result.code.as_bytes())
@@ -1398,15 +1390,15 @@ fn run(args: &RunArgs<'_>) {
             None
         };
 
-        let ctx = context_for(&compiled.linked, rk.cell_grid.as_ref());
+        let ctx = context_for(&compiled.linked_env, rk.cell_grid.as_ref());
         let mut buffer = vec![0.0f32; (trips.rows * trips.groups) as usize * LANES];
         run_once(&compiled.result.code, &ctx, trips, &mut buffer);
         let picture_hash = fnv(&buffer);
-        let (legal, legal_root) = legalize(arena, root);
+        let compiled_term = Term::new(compiled.linked.entry(), &compiled.linked_env);
         let oracle = Some(oracle(
             &OracleForms {
-                input: (&legal, legal_root),
-                linked: (&compiled.linked, compiled.root),
+                input: legal_term,
+                linked: compiled_term,
                 case: rk.cell_grid.as_ref(),
                 packed: rk.packed,
             },
@@ -1423,7 +1415,7 @@ fn run(args: &RunArgs<'_>) {
         let probe = (!no_probe && mode != "off").then(|| {
             let optimizer = in_harness_optimizer(shape)
                 .unwrap_or_else(|| Optimizer::production().for_lattice(shape));
-            saturation_probe(arena, root, optimizer, compiled.result.code.as_bytes())
+            saturation_probe(term, optimizer, compiled.result.code.as_bytes())
         });
 
         let row = KernelRow {
@@ -1436,10 +1428,10 @@ fn run(args: &RunArgs<'_>) {
             class: rk.class.clone(),
             extent: rk.extent,
             packed: rk.packed,
-            input_nodes: reachable(arena, root).len(),
-            compiled_nodes: reachable(&compiled.linked, compiled.root).len(),
-            dag_cost_input: dag_cost(arena, root),
-            dag_cost: dag_cost(&compiled.linked, compiled.root),
+            input_nodes: term.root().node_count(),
+            compiled_nodes: compiled_term.root().node_count(),
+            dag_cost_input: dag_cost(term.root()),
+            dag_cost: dag_cost(compiled_term.root()),
             bytes: compiled.result.code.len() as u32,
             spill_slots: compiled.result.spill_count,
             hoisted: compiled.result.hoisted_values,
@@ -1509,17 +1501,18 @@ fn consistency(
     write!(sink, "{CONSISTENCY_HEADER}").expect("header");
 
     for (i, rk) in kernels.iter().enumerate() {
-        let (arena, root) = rk.kernel.parts();
+        let term = rk.kernel.term();
         let shape = LatticeShape::new(rk.extent);
-        let (la, lr) = legalize(arena, root);
-        let nodes = reachable_count(&la, lr);
+        let (legal, legal_env) = legalize(term);
+        let legal_term = Term::new(legal.entry(), &legal_env);
+        let nodes = reachable_count_term(legal_term);
         for &cap in caps {
             let arm = CapArm {
                 rule: CapRule::Flat(cap),
                 applications: app_cap,
             };
             let mut egraph = Optimizer::production().egraph();
-            let root_class = insert(&la, lr, &mut egraph, Vocabulary::Runtime)
+            let root_class = insert_term(legal_term, &mut egraph, Vocabulary::Runtime)
                 .unwrap_or_else(|_| panic!("{}: not e-graph representable", rk.name));
             let inserted = egraph.num_classes();
             let sizes = InputSizes { nodes, inserted };
@@ -1535,7 +1528,7 @@ fn consistency(
                 .expect("production extraction always runs a DP");
             let actual = audit.scale.of(optimized.cost);
             let signed = audit.signed_error(optimized.cost);
-            let (a, r) = optimized.to_arena(&egraph, root_class);
+            let (extracted, _extracted_env) = optimized.to_rooted(&egraph, root_class);
             let row = format!(
                 "{family},{kernel},{w}x{h},{cap},{apps},{nodes},{inserted},{after},{live},\
 {objective},{scale},{claimed},{tree},{dag},{signed},{frac:.6},\
@@ -1562,8 +1555,8 @@ fn consistency(
                 } else {
                     signed as f64 / actual as f64
                 },
-                arena_nodes = reachable(&a, r).len(),
-                arena_dag = dag_cost(&a, r),
+                arena_nodes = extracted.entry().node_count(),
+                arena_dag = dag_cost(extracted.entry()),
                 ratio = optimized.cost.tree as f64 / optimized.cost.dag.max(1) as f64,
                 ms = optimize_ms,
             );

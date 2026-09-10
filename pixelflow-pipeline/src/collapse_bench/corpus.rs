@@ -16,8 +16,9 @@
 
 use std::path::Path;
 
-use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::{
+    Environment, ExprBuilder, ExprData, ExprRef, Node, OpKind, Rooted, Term, Uniform,
+};
 
 /// One kernel and the lattice it is baked at.
 pub struct CollapseKernel {
@@ -25,10 +26,23 @@ pub struct CollapseKernel {
     pub name: String,
     /// Which family it came from — the grouping the analysis reports by.
     pub family: String,
-    pub arena: ExprArena,
-    pub root: ExprId,
+    /// The graph, and the declarations its leaves index. Kept as a pair
+    /// because that pair IS what every consumer needs — a `Uniform(0)` leaf
+    /// means nothing without the table it indexes — and [`Self::term`] is how
+    /// it is handed on.
+    pub expr: Rooted<ExprData>,
+    pub env: Environment,
     /// The lattice extent, exactly as `Lattice::bake` would see it.
     pub extent: [u32; 2],
+}
+
+impl CollapseKernel {
+    /// The kernel as the one value the compiler, the optimizer and the
+    /// dumper all take.
+    #[must_use]
+    pub fn term(&self) -> Term<'_> {
+        Term::new(self.expr.entry(), &self.env)
+    }
 }
 
 /// How many times each scope of the collapse nest runs, for one
@@ -117,15 +131,12 @@ pub fn read_dir(dir: &Path) -> Vec<CollapseKernel> {
 pub fn encode(kernel: &CollapseKernel) -> String {
     use std::fmt::Write as _;
 
-    let (arena, root) = (&kernel.arena, kernel.root);
-    let len = arena.nodes_raw().len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
+    let term = kernel.term();
+    let root = term.root();
+    let dag = term.dag();
+    let mut reachable = dag.side_table(false);
+    for n in root.descendants() {
+        reachable[n] = true;
     }
 
     let mut out = String::new();
@@ -135,20 +146,20 @@ pub fn encode(kernel: &CollapseKernel) -> String {
     let [ex, ey] = kernel.extent;
     writeln!(out, "extent {ex} {ey}").expect("fmt");
 
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
+    // Dense ordinals in ascending, topological (children-before-parents)
+    // order over the reachable subgraph. `Node::descendants()` is a
+    // parent-first DFS, so it is not a valid dump order on its own — this is
+    // the same two-pass shape `expr::encode_into` and the `.arena` dumpers
+    // use, for the same reason.
+    let mut dense = dag.side_table(None::<u32>);
     let mut next = 0u32;
-    let d = |dense: &[u32], id: ExprId| -> u32 {
-        let v = dense[id.0 as usize];
-        assert_ne!(v, u32::MAX, "child dumped before parent");
-        v
-    };
-    for idx in 0..len {
-        if !reachable[idx] {
+    for node in dag.iter() {
+        if !reachable[node] {
             continue;
         }
-        let id = ExprId(idx as u32);
-        match arena.node(id) {
-            ExprNode::Var(i) => writeln!(out, "V {i}"),
+        let d = |c: Node<'_, ExprData>| -> u32 { dense[c].expect("child dumped before parent") };
+        match *node {
+            ExprData::Var(i) => writeln!(out, "V {i}"),
             // A kernel argument. The format knows about one because, with
             // two coordinate axes, a `Uniform` is the *only* leaf that is
             // both invariant across the lattice and beyond the constant
@@ -156,31 +167,35 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // family needs to give LICM's frame prologue something to lift.
             // The Z axis used to serve that role; it was the same thing
             // wearing a coordinate's name.
-            ExprNode::Uniform(u) => {
-                writeln!(out, "A {}", arena.uniform_decl(*u).default.to_bits())
+            ExprData::Uniform(u) => {
+                writeln!(out, "A {}", term.env().uniform(u).default.to_bits())
             }
-            ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-            ExprNode::Binary(k, a, b) => {
-                writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+            ExprData::Const(bits) => writeln!(out, "C {bits}"),
+            ExprData::Op(k) => {
+                let children: Vec<Node<'_, ExprData>> = node.children().collect();
+                match children.as_slice() {
+                    [a] => writeln!(out, "U {k:?} {}", d(*a)),
+                    [a, b] => writeln!(out, "Bi {k:?} {} {}", d(*a), d(*b)),
+                    [a, b, c] => writeln!(out, "T {k:?} {} {} {}", d(*a), d(*b), d(*c)),
+                    _ => panic!(
+                        "{}: corpus kernels must be bakeable, but this one holds {k:?} with \
+                         {} children",
+                        kernel.name,
+                        children.len()
+                    ),
+                }
             }
-            ExprNode::Ternary(k, a, b, c) => writeln!(
-                out,
-                "T {k:?} {} {} {}",
-                d(&dense, *a),
-                d(&dense, *b),
-                d(&dense, *c)
-            ),
             other => panic!(
                 "{}: corpus kernels must be bakeable, but this one holds {other:?}",
                 kernel.name
             ),
         }
         .expect("fmt");
-        dense[idx] = next;
+        dense[node] = Some(next);
         next += 1;
     }
-    writeln!(out, "root {}", d(&dense, root)).expect("fmt");
+    let root_ord = dense[root].expect("the root is its own descendant");
+    writeln!(out, "root {root_ord}").expect("fmt");
     out
 }
 
@@ -195,7 +210,7 @@ fn decode(path: &Path) -> CollapseKernel {
         Some(SUPERSEDED_HEADER) => panic!(
             "{}: this is a v1 corpus and the format is now v2 — v2 carries \
              an argument node (`A`), which v1 had no way to spell. Regenerate \
-             the corpus; a v1 fixture cannot be replayed into a v2 arena.",
+             the corpus; a v1 fixture cannot be replayed into a v2 graph.",
             path.display()
         ),
         other => panic!(
@@ -207,20 +222,21 @@ fn decode(path: &Path) -> CollapseKernel {
     let mut name = None;
     let mut family = None;
     let mut extent = None;
-    let mut root = None;
-    let mut arena = ExprArena::new();
-    let mut next_id = 0u32;
+    let mut root_ord = None;
+    let mut b = ExprBuilder::new();
+    // Ordinal to the ref it named, in dump order. The dump's ids are dense
+    // over the nodes it wrote, children before parents, so a child's ordinal
+    // is always already in here when its parent is read.
+    let mut refs: Vec<ExprRef> = Vec::new();
 
     let op = |s: &str| -> OpKind {
         OpKind::all()
             .find(|k| format!("{k:?}") == s)
             .unwrap_or_else(|| panic!("{}: unknown OpKind {s:?}", path.display()))
     };
-    let id = |s: &str| -> ExprId {
-        ExprId(
-            s.parse()
-                .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display())),
-        )
+    let ordinal = |s: &str| -> usize {
+        s.parse()
+            .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display()))
     };
     let dim = |s: &str| -> u32 {
         s.parse()
@@ -229,6 +245,18 @@ fn decode(path: &Path) -> CollapseKernel {
 
     for line in lines {
         let f: Vec<&str> = line.split_whitespace().collect();
+        // A child ordinal must already have been read: the dump is
+        // children-before-parents, so a forward reference is a corrupt file
+        // rather than a graph.
+        let child = |refs: &[ExprRef], s: &str| -> ExprRef {
+            let i = ordinal(s);
+            *refs.get(i).unwrap_or_else(|| {
+                panic!(
+                    "{}: child ordinal {i} is not an already-read node",
+                    path.display()
+                )
+            })
+        };
         let pushed = match f.as_slice() {
             ["name", n] => {
                 name = Some((*n).to_string());
@@ -243,35 +271,44 @@ fn decode(path: &Path) -> CollapseKernel {
                 continue;
             }
             ["root", r] => {
-                root = Some(id(r));
+                root_ord = Some(ordinal(r));
                 continue;
             }
-            ["V", i] => arena.push_var(i.parse().expect("var index")),
+            ["V", i] => b.push_var(i.parse().expect("var index")),
             ["A", bits] => {
                 let default = f32::from_bits(bits.parse().expect("argument default bits"));
-                let slot = arena.declare_uniform(pixelflow_ir::Uniform::new(default).decl());
-                arena.push_uniform(slot)
+                let slot = b.declare_uniform(Uniform::new(default).decl());
+                b.push_uniform(slot)
             }
-            ["C", bits] => arena.push_const(f32::from_bits(bits.parse().expect("const bits"))),
-            ["U", k, a] => arena.push_unary(op(k), id(a)),
-            ["Bi", k, a, b] => arena.push_binary(op(k), id(a), id(b)),
-            ["T", k, a, b, c] => arena.push_ternary(op(k), id(a), id(b), id(c)),
+            ["C", bits] => b.push_const(f32::from_bits(bits.parse().expect("const bits"))),
+            ["U", k, a] => {
+                let a = child(&refs, a);
+                b.push_unary(op(k), a)
+            }
+            ["Bi", k, x, y] => {
+                let (x, y) = (child(&refs, x), child(&refs, y));
+                b.push_binary(op(k), x, y)
+            }
+            ["T", k, x, y, z] => {
+                let (x, y, z) = (child(&refs, x), child(&refs, y), child(&refs, z));
+                b.push_ternary(op(k), x, y, z)
+            }
             other => panic!("{}: unparseable line {other:?}", path.display()),
         };
-        assert_eq!(
-            pushed,
-            ExprId(next_id),
-            "{}: replay drifted from dumped ids",
-            path.display()
-        );
-        next_id += 1;
+        refs.push(pushed);
     }
+
+    let root_ord = root_ord.unwrap_or_else(|| panic!("{}: no root", path.display()));
+    let root = *refs
+        .get(root_ord)
+        .unwrap_or_else(|| panic!("{}: root ordinal {root_ord} names no node", path.display()));
+    let (expr, env) = b.finish(&[root]);
 
     CollapseKernel {
         name: name.unwrap_or_else(|| panic!("{}: no name", path.display())),
         family: family.unwrap_or_else(|| panic!("{}: no family", path.display())),
-        arena,
-        root: root.unwrap_or_else(|| panic!("{}: no root", path.display())),
+        expr,
+        env,
         extent: extent.unwrap_or_else(|| panic!("{}: no extent", path.display())),
     }
 }
@@ -307,24 +344,27 @@ pub const CORPUS_ARG: f32 = 1.0;
 #[must_use]
 pub fn synthetic() -> Vec<CollapseKernel> {
     let mut out = Vec::new();
-    let mut push =
-        |name: String, family: &str, extent: [u32; 2], build: &dyn Fn(&mut ExprArena) -> ExprId| {
-            let mut arena = ExprArena::new();
-            let root = build(&mut arena);
-            out.push(CollapseKernel {
-                name,
-                family: family.to_string(),
-                arena,
-                root,
-                extent,
-            });
-        };
+    let mut push = |name: String,
+                    family: &str,
+                    extent: [u32; 2],
+                    build: &dyn Fn(&mut ExprBuilder) -> ExprRef| {
+        let mut b = ExprBuilder::new();
+        let root = build(&mut b);
+        let (expr, env) = b.finish(&[root]);
+        out.push(CollapseKernel {
+            name,
+            family: family.to_string(),
+            expr,
+            env,
+            extent,
+        });
+    };
     for n in [8usize, 16, 32, 64] {
         push(
             format!("wide{n:03}"),
             "wide",
             PRESSURE_EXTENT,
-            &move |a: &mut ExprArena| wide(a, n),
+            &move |a: &mut ExprBuilder| wide(a, n),
         );
     }
     for (w, d) in [(8usize, 24usize), (12, 40), (16, 64)] {
@@ -332,7 +372,7 @@ pub fn synthetic() -> Vec<CollapseKernel> {
             format!("anchored{w:02}x{d:02}"),
             "anchored",
             PRESSURE_EXTENT,
-            &move |a: &mut ExprArena| anchored(a, w, d),
+            &move |a: &mut ExprBuilder| anchored(a, w, d),
         );
     }
     for n in [4usize, 8, 16, 48] {
@@ -344,7 +384,7 @@ pub fn synthetic() -> Vec<CollapseKernel> {
                 format!("invariant{n:02}_{tag}"),
                 &format!("invariant_{tag}"),
                 extent,
-                &move |a: &mut ExprArena| invariants(a, n),
+                &move |a: &mut ExprBuilder| invariants(a, n),
             );
         }
     }
@@ -353,16 +393,16 @@ pub fn synthetic() -> Vec<CollapseKernel> {
 
 /// A leaf that varies in X, salted so the tree is not one common
 /// subexpression the optimizer folds away.
-fn x_leaf(a: &mut ExprArena, salt: usize) -> ExprId {
+fn x_leaf(a: &mut ExprBuilder, salt: usize) -> ExprRef {
     let x = a.push_var(0);
     let c = a.push_const(0.125 + (salt % 13) as f32 * 0.0625);
     a.push_binary(OpKind::Mul, x, c)
 }
 
 /// A balanced Add/Sub tree over `n` X-varying leaves.
-fn wide(a: &mut ExprArena, n: usize) -> ExprId {
+fn wide(a: &mut ExprBuilder, n: usize) -> ExprRef {
     assert!(n.is_power_of_two(), "wide takes a power of two, got {n}");
-    let mut level: Vec<ExprId> = (0..n).map(|i| x_leaf(a, i)).collect();
+    let mut level: Vec<ExprRef> = (0..n).map(|i| x_leaf(a, i)).collect();
     let mut salt = 0usize;
     while level.len() > 1 {
         level = level
@@ -383,8 +423,8 @@ fn wide(a: &mut ExprArena, n: usize) -> ExprId {
 
 /// `w` anchors computed first, a dependent chain of depth `d`, then the
 /// anchors folded in — so every anchor is live across the whole chain.
-fn anchored(a: &mut ExprArena, w: usize, d: usize) -> ExprId {
-    let anchors: Vec<ExprId> = (0..w)
+fn anchored(a: &mut ExprBuilder, w: usize, d: usize) -> ExprRef {
+    let anchors: Vec<ExprRef> = (0..w)
         .map(|i| {
             let leaf = x_leaf(a, i * 7 + 1);
             a.push_unary(OpKind::Sqrt, leaf)
@@ -402,15 +442,15 @@ fn anchored(a: &mut ExprArena, w: usize, d: usize) -> ExprId {
 
 /// `n` terms invariant in X — half of them invariant in Y as well, so both
 /// prologues get work — each read exactly once by an X-varying body term.
-fn invariants(a: &mut ExprArena, n: usize) -> ExprId {
+fn invariants(a: &mut ExprBuilder, n: usize) -> ExprRef {
     let y = a.push_var(1);
     // Frame scope needs a leaf the folder cannot collapse and the lattice
     // cannot vary. That is a kernel argument; it used to be the Z axis,
     // which was the same thing wearing a coordinate's name. A `Const` would
     // fold and leave LICM nothing to lift.
-    let arg = a.declare_uniform(pixelflow_ir::Uniform::new(CORPUS_ARG).decl());
+    let arg = a.declare_uniform(Uniform::new(CORPUS_ARG).decl());
     let z = a.push_uniform(arg);
-    let terms: Vec<ExprId> = (0..n)
+    let terms: Vec<ExprRef> = (0..n)
         .map(|i| {
             let c = a.push_const(0.5 + i as f32 * 0.125);
             let base = if i.is_multiple_of(2) {

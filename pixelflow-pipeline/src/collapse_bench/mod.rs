@@ -52,7 +52,7 @@ use std::path::Path;
 use pixelflow_codegen::emit::executable::{ExecutableCode, Point4, TileSlice};
 use pixelflow_codegen::emit::{CompileResult, compile};
 use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::{ExprBuilder, Term};
 
 use crate::jit_bench::{LocalNs, SentinelContext};
 use corpus::{CollapseKernel, Trips};
@@ -136,14 +136,16 @@ pub fn tier() -> &'static str {
 /// corpus bug, and continuing past it would silently change which kernels the
 /// two sides of a comparison share.
 #[must_use]
-pub fn compile_as_baked(arena: &ExprArena, root: ExprId, extent: [u32; 2]) -> CompileResult {
+pub fn compile_as_baked(term: Term<'_>, extent: [u32; 2]) -> CompileResult {
     let shape = LatticeShape::new(extent);
-    let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape);
-    let (arena, root) = optimized
+    let optimized = pixelflow_search::runtime::optimize_runtime_term(term, shape);
+    // The optimized graph's leaves index the optimizer's own environment, so
+    // the pair travels together; declining to optimize leaves the input term
+    // exactly as it was.
+    let term = optimized
         .as_deref()
-        .map(|(a, r)| (a, *r))
-        .unwrap_or((arena, root));
-    compile(arena, root).expect("corpus kernel failed to compile")
+        .map_or(term, |(rooted, env)| Term::new(rooted.entry(), env));
+    compile(term).expect("corpus kernel failed to compile")
 }
 
 /// A measurement run: owns the sentinel calibration and the output buffer.
@@ -170,14 +172,15 @@ impl CollapseSession {
     #[must_use]
     pub fn open() -> Self {
         pin_to_a_core();
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let xx = arena.push_binary(pixelflow_ir::OpKind::Mul, x, x);
-        let yy = arena.push_binary(pixelflow_ir::OpKind::Mul, y, y);
-        let sum = arena.push_binary(pixelflow_ir::OpKind::Add, xx, yy);
-        let root = arena.push_unary(pixelflow_ir::OpKind::Sqrt, sum);
-        let result = compile_as_baked(&arena, root, SENTINEL_EXTENT);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let xx = b.push_binary(pixelflow_ir::OpKind::Mul, x, x);
+        let yy = b.push_binary(pixelflow_ir::OpKind::Mul, y, y);
+        let sum = b.push_binary(pixelflow_ir::OpKind::Add, xx, yy);
+        let root = b.push_unary(pixelflow_ir::OpKind::Sqrt, sum);
+        let (expr, env) = b.finish(&[root]);
+        let result = compile_as_baked(Term::new(expr.entry(), &env), SENTINEL_EXTENT);
         let trips = Trips::of(SENTINEL_EXTENT, LANES as u32);
         let mut sentinel = Sentinel {
             bytes: result.code.len() as u32,
@@ -237,7 +240,7 @@ impl CollapseSession {
     pub fn measure(&mut self, kernel: &CollapseKernel, pass: u32) -> Row {
         self.maybe_resample_sentinel();
         let trips = Trips::of(kernel.extent, LANES as u32);
-        let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
+        let result = compile_as_baked(kernel.term(), kernel.extent);
         let mut buffer = output_buffer(trips);
         let timing = time_kernel(&result.code, &mut buffer, trips);
         let drift = self.context().normalization();
@@ -501,7 +504,7 @@ mod tests {
             .iter()
             .find(|k| k.name.starts_with("invariant16_hot"))
             .expect("the corpus holds invariant16_hot");
-        let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
+        let result = compile_as_baked(kernel.term(), kernel.extent);
         let trips = Trips::of(kernel.extent, LANES as u32);
         let statics = features_of(&result, trips);
         assert!(statics.bytes_total > 0);
@@ -522,7 +525,7 @@ mod tests {
             .iter()
             .find(|k| k.name.starts_with("invariant48_hot"))
             .expect("the corpus holds invariant48_hot");
-        let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
+        let result = compile_as_baked(kernel.term(), kernel.extent);
         assert!(
             result.hoisted_values > 0,
             "48 X-invariant terms and nothing hoisted: the corpus is not exercising LICM"

@@ -81,7 +81,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_pipeline::training::guide_linear::{
     load_linear_guide, per_rule_rate_guide_from_report,
@@ -539,8 +539,7 @@ struct RawTrajectory {
 fn run_trajectory(
     policy: &OrderingPolicy,
     cache: &GuideCache,
-    arena: &ExprArena,
-    root: ExprId,
+    term: Term<'_>,
     max_classes: usize,
     costs: &CostModel,
     budgets: &[usize],
@@ -566,14 +565,13 @@ fn run_trajectory(
         .observe(Some(Box::new(KeepJournal)))
         .hard_ceiling(SATURATE_TIMEOUT);
     let mut egraph = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term,
         &mut egraph,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let node_count = arena.nodes_raw().len();
+    let node_count = term.root().node_count();
     let mut checkpoints = Vec::with_capacity(budgets.len());
     let mut last_stop = SaturationStop::ApplicationBudget;
     let mut last_ext = None;
@@ -672,8 +670,7 @@ struct ExprMintOutcome {
 #[allow(clippy::too_many_arguments)]
 fn mint_expression(
     name: &str,
-    arena: &ExprArena,
-    root: ExprId,
+    term: Term<'_>,
     family_band: u32,
     family_seed: u64,
     tier_label: &str,
@@ -685,10 +682,10 @@ fn mint_expression(
     budgets: &[usize],
     out: &mut impl Write,
 ) -> ExprMintOutcome {
-    let expr_node_count = arena.nodes_raw().len();
+    let expr_node_count = term.root().node_count();
     let raw: Vec<RawTrajectory> = policies
         .iter()
-        .map(|p| run_trajectory(p, cache, arena, root, max_classes, costs, budgets))
+        .map(|p| run_trajectory(p, cache, term, max_classes, costs, budgets))
         .collect();
 
     // Empirical best (§1.2's `c*_e`): the minimum extraction cost seen at
@@ -930,11 +927,11 @@ fn stride_sample<T: Clone>(entries: Vec<T>, limit: usize) -> Vec<T> {
 /// not assigned to `expected` by the checked-in split manifest — the same
 /// fence `gen_strict_labels` enforces for TRAIN/DEV.
 fn assert_family_fence(
-    entries: &[(String, ExprArena, ExprId)],
+    entries: &[(String, Rooted<ExprData>)],
     manifest: &SplitManifest,
     expected: Tier,
 ) {
-    for (name, _, _) in entries {
+    for (name, _) in entries {
         let family = parse_family(name);
         let assigned = manifest.tier_of(family);
         assert_eq!(
@@ -960,7 +957,7 @@ fn train_fence_keys(corpus_dir: &Path) -> HashSet<FenceKey> {
     });
     entries
         .iter()
-        .map(|(_, arena, root)| FenceKey::of(arena, *root))
+        .map(|(_, expr)| FenceKey::of(expr.entry()))
         .collect()
 }
 
@@ -968,14 +965,14 @@ fn train_fence_keys(corpus_dir: &Path) -> HashSet<FenceKey> {
 /// TRAIN — the same discipline `phase3_at_budget_eval`'s
 /// `enforce_train_fence` applies (round-1b registration §3).
 fn assert_train_fence(
-    entries: &[(String, ExprArena, ExprId)],
+    entries: &[(String, Rooted<ExprData>)],
     train_keys: &HashSet<FenceKey>,
     source: &str,
 ) {
     let collisions: Vec<&str> = entries
         .iter()
-        .filter(|(_, arena, root)| train_keys.contains(&FenceKey::of(arena, *root)))
-        .map(|(name, _, _)| name.as_str())
+        .filter(|(_, expr)| train_keys.contains(&FenceKey::of(expr.entry())))
+        .map(|(name, _)| name.as_str())
         .collect();
     assert!(
         collisions.is_empty(),
@@ -1017,7 +1014,7 @@ struct SplitOutcome {
 #[allow(clippy::too_many_arguments)]
 fn mint_split(
     tier_label: &str,
-    entries: &[(String, ExprArena, ExprId)],
+    entries: &[(String, Rooted<ExprData>)],
     policies: &[OrderingPolicy],
     cache: &GuideCache,
     max_expr_nodes: usize,
@@ -1056,8 +1053,12 @@ fn mint_split(
     };
 
     let n = entries.len();
-    for (i, (name, arena, root)) in entries.iter().enumerate() {
-        let node_count = arena.nodes_raw().len();
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (name, expr)) in entries.iter().enumerate() {
+        let term = Term::new(expr.entry(), &env);
+        let node_count = expr.len();
         // `max_expr_nodes == 0` LIFTS the filter — see the flag's own doc.
         if max_expr_nodes != 0 && node_count > max_expr_nodes {
             outcome.skipped_oversized += 1;
@@ -1072,8 +1073,7 @@ fn mint_split(
         let mut scratch = Vec::new();
         let result = mint_expression(
             name,
-            arena,
-            *root,
+            term,
             family_band,
             family_seed,
             tier_label,
@@ -1456,7 +1456,7 @@ fn main() {
         if run_all || args.tier == "sh" {
             let entries: Vec<_> = ood_entries
                 .iter()
-                .filter(|(name, _, _)| name.starts_with("dev_sh_"))
+                .filter(|(name, _)| name.starts_with("dev_sh_"))
                 .cloned()
                 .collect();
             assert!(
@@ -1487,7 +1487,7 @@ fn main() {
         if run_all || args.tier == "bezier" {
             let entries: Vec<_> = ood_entries
                 .iter()
-                .filter(|(name, _, _)| name.starts_with("dev_bezier_"))
+                .filter(|(name, _)| name.starts_with("dev_bezier_"))
                 .cloned()
                 .collect();
             assert!(
@@ -1571,10 +1571,10 @@ mod tests {
     use pixelflow_search::egraph::{APP_CHECKPOINT_GRID, run_anytime_curve};
     use pixelflow_search::nnue::factored::EMBED_DIM;
 
-    fn small_expr() -> (ExprArena, ExprId) {
+    fn small_expr() -> (Rooted<ExprData>, Environment) {
         // (x + y) * (x + y) + 2 * (x + y) — the same fixture
         // `egraph::anytime`'s own tests use.
-        let mut a = ExprArena::new();
+        let mut a = pixelflow_ir::ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let s = a.push_binary(pixelflow_ir::OpKind::Add, x, y);
@@ -1582,7 +1582,7 @@ mod tests {
         let two = a.push_const(2.0);
         let ts = a.push_binary(pixelflow_ir::OpKind::Mul, two, s);
         let out = a.push_binary(pixelflow_ir::OpKind::Add, s2, ts);
-        (a, out)
+        a.finish(&[out])
     }
 
     /// The task's required equivalence check: the `Unguided` trajectory's
@@ -1594,15 +1594,15 @@ mod tests {
     /// cannot silently diverge them.
     #[test]
     fn unguided_trajectory_reproduces_run_anytime_curve_cost_at_b() {
-        let (arena, root) = small_expr();
+        let (expr, env) = small_expr();
+        let term = Term::new(expr.entry(), &env);
         let costs = CostModel::latency_prior();
         let cache = GuideCache::empty();
 
         let traj = run_trajectory(
             &OrderingPolicy::Unguided,
             &cache,
-            &arena,
-            root,
+            term,
             2_000,
             &costs,
             &BUDGET_LADDER,
@@ -1626,7 +1626,7 @@ mod tests {
                 applications: None,
             })
             .hard_ceiling(Duration::from_secs(30));
-        let curve_out = run_anytime_curve(&mut curve_opt, &arena, root, &grid);
+        let curve_out = run_anytime_curve(&mut curve_opt, term, &grid);
         let cost_at_b = curve_out
             .curve
             .checkpoints
@@ -1732,7 +1732,8 @@ mod tests {
     fn minted_records_deserialize_as_r2g_record_and_trajectory_row() {
         use pixelflow_pipeline::training::r2g::R2gRecord;
 
-        let (arena, root) = small_expr();
+        let (expr, env) = small_expr();
+        let term = Term::new(expr.entry(), &env);
         let policies = vec![
             OrderingPolicy::Unguided,
             OrderingPolicy::Random(1),
@@ -1745,8 +1746,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let outcome = mint_expression(
             "fixture_00000",
-            &arena,
-            root,
+            term,
             0,
             0,
             "test",

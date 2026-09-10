@@ -39,7 +39,7 @@ use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::{JIT_VECTOR_BYTES, Point4, TileSlice};
 use pixelflow_core::FastMathGuard;
 use pixelflow_ir::passes::{ATAN_MINIMAX, EXP2_POLY, LOG2_POLY, SIN_CHEB};
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, Node, OpKind, Rooted, Term};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::poly::{PolyForm, build, critical_path};
 use pixelflow_search::egraph::CostModel;
@@ -109,8 +109,8 @@ fn sweep_coeffs(n: usize) -> Vec<f32> {
 /// `p(clamp(X, [ARG_LO, ARG_HI]) · scale)`. The clamp and the scaling `Mul` sit
 /// on the dependency path in both arms, so every difference between them
 /// belongs to the polynomial.
-fn timing_kernel(form: PolyForm, coeffs: &[f32], scale: f32) -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+fn timing_kernel(form: PolyForm, coeffs: &[f32], scale: f32) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let lo = arena.push_const(ARG_LO);
     let hi = arena.push_const(ARG_HI);
@@ -119,17 +119,17 @@ fn timing_kernel(form: PolyForm, coeffs: &[f32], scale: f32) -> (ExprArena, Expr
     let s = arena.push_const(scale);
     let arg = arena.push_binary(OpKind::Mul, clamped, s);
     let root = build(&mut arena, form, coeffs, arg);
-    (arena, root)
+    arena.finish(&[root])
 }
 
 /// `p(X · ACCURACY_SCALE)` — the argument generator for the error sweep.
-fn accuracy_kernel(form: PolyForm, coeffs: &[f32]) -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+fn accuracy_kernel(form: PolyForm, coeffs: &[f32]) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let scale = arena.push_const(ACCURACY_SCALE);
     let arg = arena.push_binary(OpKind::Mul, x, scale);
     let root = build(&mut arena, form, coeffs, arg);
-    (arena, root)
+    arena.finish(&[root])
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -144,16 +144,11 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// identity kernel's per-eval cost and leaves the arithmetic. At AVX-512 the
 /// latency-mode overhead is ~1.4ns against a ~2ns kernel, so a raw ratio
 /// understates a 1.6× difference in the polynomial as 1.1×.
-fn measure(
-    session: &mut BenchSession,
-    arena: &ExprArena,
-    root: ExprId,
-    mode: BenchMode,
-) -> (f64, f64) {
+fn measure(session: &mut BenchSession, term: Term<'_>, mode: BenchMode) -> (f64, f64) {
     let results: Vec<(f64, f64)> = (0..REPS)
         .map(|_| {
             let r = session
-                .benchmark_arena(arena, root, mode)
+                .benchmark_term(term, mode)
                 .unwrap_or_else(|e| panic!("benchmark failed: {e}"));
             (r.ns, r.adjusted_ns)
         })
@@ -165,41 +160,21 @@ fn measure(
 }
 
 /// Op nodes reachable from `root` — what the extraction cost model sums over.
-fn nodes(arena: &ExprArena, root: ExprId) -> usize {
-    let mut visited = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut n = 0;
-    while let Some(id) = stack.pop() {
-        if visited[id.0 as usize] {
-            continue;
-        }
-        visited[id.0 as usize] = true;
-        if !matches!(arena.kind(id), OpKind::Var | OpKind::Const | OpKind::Buffer) {
-            n += 1;
-        }
-        stack.extend(arena.children(id));
-    }
-    n
+fn nodes(root: Node<'_, ExprData>) -> usize {
+    root.descendants()
+        .filter(|n| matches!(**n, ExprData::Op(_)))
+        .count()
 }
 
 /// Sum of the latency prior over reachable nodes: what
 /// `CostModel::latency_prior` charges an extraction.
-fn prior_sum(arena: &ExprArena, root: ExprId, model: &CostModel) -> f64 {
-    let mut visited = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut total = 0.0;
-    while let Some(id) = stack.pop() {
-        if visited[id.0 as usize] {
-            continue;
-        }
-        visited[id.0 as usize] = true;
-        let kind = arena.kind(id);
-        if !matches!(kind, OpKind::Var | OpKind::Const | OpKind::Buffer) {
-            total += model.cost(kind) as f64;
-        }
-        stack.extend(arena.children(id));
-    }
-    total
+fn prior_sum(root: Node<'_, ExprData>, model: &CostModel) -> f64 {
+    root.descendants()
+        .filter_map(|n| match *n {
+            ExprData::Op(op) => Some(model.cost(op) as f64),
+            _ => None,
+        })
+        .sum()
 }
 
 /// What the emitter made of a schedule, alongside its outputs. Spills are the
@@ -214,8 +189,8 @@ struct Emitted {
 /// Run a compiled kernel over `n` consecutive integer X values — the JIT's own
 /// arithmetic, FMA rounding included, which no scalar reference reproduces and
 /// which is why the error check runs here rather than through `eval_scalar`.
-fn evaluate(arena: &ExprArena, root: ExprId, n: usize) -> Emitted {
-    let result = compile(arena, root).expect("compile");
+fn evaluate(term: Term<'_>, n: usize) -> Emitted {
+    let result = compile(term).expect("compile");
     let groups = n.div_ceil(LANES);
     let mut out = vec![0.0f32; groups * LANES];
     let mut x0 = [0.0f32; LANES];
@@ -308,24 +283,25 @@ fn bench_one(
         bytes: [0; 2],
     };
     for (f, &form) in FORMS.iter().enumerate() {
-        let (arena, root) = timing_kernel(form, coeffs, scale);
-        row.nodes[f] = nodes(&arena, root);
-        row.sum[f] = prior_sum(&arena, root, model);
-        row.path[f] = critical_path(&arena, root, |k| model.cost(k) as f64);
+        let (expr, env) = timing_kernel(form, coeffs, scale);
+        let term = Term::new(expr.entry(), &env);
+        row.nodes[f] = nodes(term.root());
+        row.sum[f] = prior_sum(term.root(), model);
+        row.path[f] = critical_path(term.root(), |k| model.cost(k) as f64);
         // Spills and code size describe the kernel that was TIMED; the
         // accuracy kernel below is a different (unclamped) argument generator
         // and would report a different frame.
-        let timed = evaluate(&arena, root, LANES);
+        let timed = evaluate(term, LANES);
         row.spills[f] = timed.spills;
         row.bytes[f] = timed.bytes;
         for (m, &mode) in MODES.iter().enumerate() {
-            let (raw, adjusted) = measure(session, &arena, root, mode);
+            let (raw, adjusted) = measure(session, term, mode);
             row.ns[m][f] = raw;
             row.adj[m][f] = adjusted;
         }
 
-        let (acc_arena, acc_root) = accuracy_kernel(form, coeffs);
-        let accurate = evaluate(&acc_arena, acc_root, ACCURACY_POINTS);
+        let (acc, acc_env) = accuracy_kernel(form, coeffs);
+        let accurate = evaluate(Term::new(acc.entry(), &acc_env), ACCURACY_POINTS);
         row.err[f] = max_error(coeffs, &accurate.outputs);
     }
     row
@@ -395,8 +371,8 @@ fn slope_ns_per_degree(
     hi: usize,
 ) -> f64 {
     let mut at = |n: usize| {
-        let (arena, root) = timing_kernel(form, &sweep_coeffs(n), NOMINAL_SCALE);
-        measure(session, &arena, root, mode).0
+        let (expr, env) = timing_kernel(form, &sweep_coeffs(n), NOMINAL_SCALE);
+        measure(session, Term::new(expr.entry(), &env), mode).0
     };
     let (ns_lo, ns_hi) = (at(lo), at(hi));
     (ns_hi - ns_lo) * LANES as f64 / (hi - lo) as f64

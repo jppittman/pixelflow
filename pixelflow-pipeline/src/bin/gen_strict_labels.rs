@@ -73,7 +73,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use pixelflow_ir::ExprArena;
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_pipeline::training::split::{Family, SplitManifest, Tier};
 use pixelflow_search::egraph::{
@@ -358,7 +358,7 @@ impl SplitStats {
 /// aggregates the report needs.
 #[allow(clippy::too_many_arguments)]
 fn mint_split(
-    entries: &[(String, ExprArena, pixelflow_ir::ExprId)],
+    entries: &[(String, Rooted<ExprData>)],
     tier: Tier,
     manifest: &SplitManifest,
     rules: &RuleSet,
@@ -376,7 +376,10 @@ fn mint_split(
     );
 
     let n = entries.len();
-    for (i, (name, arena, root)) in entries.iter().enumerate() {
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (name, expr)) in entries.iter().enumerate() {
         if stats.applications >= max_total_applications {
             stats.hit_total_cap = true;
             eprintln!(
@@ -387,7 +390,7 @@ fn mint_split(
             );
             break;
         }
-        let expr_node_count = arena.nodes_raw().len();
+        let expr_node_count = expr.len();
         if expr_node_count > max_expr_nodes {
             stats.skipped_oversized += 1;
             continue;
@@ -406,9 +409,8 @@ fn mint_split(
         stats.families.insert(family);
 
         let mut egraph = EGraph::with_rules(all_rules());
-        let root_class = pixelflow_search::egraph::insert(
-            arena,
-            *root,
+        let root_class = pixelflow_search::egraph::insert_term(
+            Term::new(expr.entry(), &env),
             &mut egraph,
             pixelflow_search::egraph::Vocabulary::Templates,
         )
@@ -519,7 +521,7 @@ fn mint_split(
                 tier_name,
                 family.band,
                 family.seed,
-                arena.nodes_raw().len(),
+                expr.len(),
                 rule.get(),
                 rule_name,
                 app_id.as_u64(),

@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_search::egraph::{
     APP_CHECKPOINT_GRID, AnytimeCurveOutput, Budget, CostModel, Optimizer, SaturationStop,
@@ -232,7 +232,7 @@ fn main() {
     );
 
     let corpus_dir = PathBuf::from(&args.corpus_dir);
-    let mut entries: Vec<(&'static str, String, ExprArena, ExprId)> = Vec::new();
+    let mut entries: Vec<(&'static str, String, Rooted<ExprData>)> = Vec::new();
     for (origin, file) in [("train", "corpus_train.bin"), ("dev", "corpus_dev.bin")] {
         let path = corpus_dir.join(file);
         let tier_entries = read_corpus(&path).unwrap_or_else(|e| {
@@ -241,8 +241,8 @@ fn main() {
                 path.display()
             )
         });
-        for (name, arena, root) in tier_entries {
-            entries.push((origin, name, arena, root));
+        for (name, expr) in tier_entries {
+            entries.push((origin, name, expr));
         }
     }
     let total_available = entries.len();
@@ -258,12 +258,12 @@ fn main() {
     // every size stratum is represented proportionally. Deterministic:
     // depends only on corpus content.
     entries.sort_by(|a, b| {
-        let na = a.2.nodes_raw().len();
-        let nb = b.2.nodes_raw().len();
+        let na = a.2.len();
+        let nb = b.2.len();
         na.cmp(&nb).then_with(|| a.1.cmp(&b.1))
     });
     let stride = entries.len() as f64 / args.samples as f64;
-    let mut sampled: Vec<&(&'static str, String, ExprArena, ExprId)> =
+    let mut sampled: Vec<&(&'static str, String, Rooted<ExprData>)> =
         Vec::with_capacity(args.samples);
     for i in 0..args.samples {
         let idx = ((i as f64) * stride) as usize;
@@ -280,8 +280,11 @@ fn main() {
     let grid = APP_CHECKPOINT_GRID;
     let mut curves: Vec<ExprCurve> = Vec::with_capacity(sampled.len());
 
-    for (i, (origin, name, arena, root)) in sampled.iter().enumerate() {
-        let node_count = arena.nodes_raw().len();
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (origin, name, expr)) in sampled.iter().enumerate() {
+        let node_count = expr.len();
         let class_cap = config_for_node_count(node_count).max_classes;
         // The curve's environment, named outright: this expression's own
         // production class cap, a generous sweep ceiling, and no application
@@ -298,7 +301,7 @@ fn main() {
             })
             .hard_ceiling(SAFETY_TIMEOUT);
         let AnytimeCurveOutput { curve, .. } =
-            run_anytime_curve(&mut optimizer, arena, *root, grid);
+            run_anytime_curve(&mut optimizer, Term::new(expr.entry(), &env), grid);
         curves.push(ExprCurve {
             name: name.clone(),
             origin,

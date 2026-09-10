@@ -45,11 +45,9 @@ use std::path::Path;
 
 use pixelflow_codegen::emit::compile;
 use pixelflow_ir::binding::BindingTable;
-use pixelflow_ir::{
-    DifferentialCheck, ExprArena, ExprId, ExprNode, MaskVerdict, OpKind, PointVerdict,
-};
+use pixelflow_ir::{DifferentialCheck, ExprData, MaskVerdict, OpKind, PointVerdict, Term};
 
-use crate::training::factored::arena_to_kernel_code;
+use crate::training::factored::term_to_kernel_code;
 
 /// Check-grid size. 64 seeded points spanning signs and magnitudes
 /// (1e-4..1e4, plus pinned specials including signed zero).
@@ -239,12 +237,12 @@ impl Exclusion {
     /// strings so NaN/inf survive the trip, and mask lanes as hex because a
     /// broken mask is a bit pattern, not a number.
     #[must_use]
-    pub fn to_record(&self, name: &str, arena: &ExprArena, root: ExprId) -> serde_json::Value {
+    pub fn to_record(&self, name: &str, term: Term<'_>) -> serde_json::Value {
         match self {
             Exclusion::CompileFailed { detail } => serde_json::json!({
                 "name": name,
                 "reason": self.reason(),
-                "expression": arena_to_kernel_code(arena, root),
+                "expression": term_to_kernel_code(term),
                 "detail": detail,
             }),
             Exclusion::OracleUnsupported { detail } => serde_json::json!({
@@ -255,7 +253,7 @@ impl Exclusion {
             Exclusion::NoCheckablePoints | Exclusion::NoBoundedPoints => serde_json::json!({
                 "name": name,
                 "reason": self.reason(),
-                "expression": arena_to_kernel_code(arena, root),
+                "expression": term_to_kernel_code(term),
             }),
             Exclusion::Mismatch {
                 point,
@@ -266,7 +264,7 @@ impl Exclusion {
             } => serde_json::json!({
                 "name": name,
                 "reason": self.reason(),
-                "expression": arena_to_kernel_code(arena, root),
+                "expression": term_to_kernel_code(term),
                 "point": point,
                 "expected": format!("{expected:?}"),
                 "got": format!("{got:?}"),
@@ -280,7 +278,7 @@ impl Exclusion {
             } => serde_json::json!({
                 "name": name,
                 "reason": self.reason(),
-                "expression": arena_to_kernel_code(arena, root),
+                "expression": term_to_kernel_code(term),
                 "point": point,
                 "expected_bits": format!("{:#010x}", expected.to_bits()),
                 "got_bits": format!("{:#010x}", got.to_bits()),
@@ -294,7 +292,7 @@ impl Exclusion {
             } => serde_json::json!({
                 "name": name,
                 "reason": self.reason(),
-                "expression": arena_to_kernel_code(arena, root),
+                "expression": term_to_kernel_code(term),
                 "point": point,
                 "expected_bits": format!("{:#010x}", expected.to_bits()),
                 "got_bits": format!("{:#010x}", got.to_bits()),
@@ -396,47 +394,47 @@ pub struct Verdict {
 /// refused here anyway: both callers run with an empty [`BindingTable`], so
 /// there is no buffer to read. A `Uniform` is fine — an empty table reads its
 /// declared default.
-pub fn screen_for_oracle(arena: &ExprArena, root: ExprId) -> Result<(), String> {
-    let mut visited = vec![false; arena.len()];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if visited[idx] {
-            continue;
-        }
-        visited[idx] = true;
-        match arena.node(id) {
-            ExprNode::Param(i) => return Err(format!("Param({i}) — substitute params first")),
-            ExprNode::Buffer(b) => return Err(format!("Buffer({}) — no binding table here", b.0)),
-            ExprNode::Nary(op, _, _) => {
-                return Err(format!(
-                    "Nary({op:?}) — a reduction rebinds its body per iteration; expand_reduce first"
-                ));
-            }
+pub fn screen_for_oracle(term: Term<'_>) -> Result<(), String> {
+    for node in term.root().descendants() {
+        match *node {
+            ExprData::Param(i) => return Err(format!("Param({i}) — substitute params first")),
+            ExprData::Buffer(b) => return Err(format!("Buffer({}) — no binding table here", b.0)),
             // A `Uniform` needs no block: unbound, it reads the default its
             // declaration carries, which is exactly the value a caller who
             // never set it would get. A `Buffer` has no such fallback, which
             // is why that one is still refused.
-            ExprNode::Var(i) if *i >= pixelflow_ir::arena::COORD_AXES as u8 => {
+            ExprData::Var(i) if usize::from(i) >= pixelflow_ir::COORD_AXES => {
                 // Past the axes is two different things: the retired Z/W, and
                 // a reduction binder that escaped its `Reduce`. Naming the
                 // wrong one sends the reader to the wrong file.
-                let why = if *i < 4 {
+                let why = if i < 4 {
                     "a retired coordinate axis; a per-call scalar is a Uniform"
                 } else {
                     "a reduction index outside a Reduce"
                 };
                 return Err(format!("Var({i}) — {why}"));
             }
-            _ => {
-                if let op @ (OpKind::Gather | OpKind::RawGather | OpKind::Dwrt | OpKind::Tuple) =
-                    arena.kind(id)
-                {
+            ExprData::Op(op) => {
+                // Arity is the DAG's, so an n-ary node is spotted by its
+                // child count rather than by a variant. `Reduce` is the only
+                // one built with more than three; `Tuple` is refused below
+                // whatever its arity.
+                if node.child_count() > 3 {
+                    return Err(format!(
+                        "{op:?} with {} children — a reduction rebinds its body per \
+                         iteration; expand_reduce first",
+                        node.child_count()
+                    ));
+                }
+                if matches!(
+                    op,
+                    OpKind::Gather | OpKind::RawGather | OpKind::Dwrt | OpKind::Tuple
+                ) {
                     return Err(format!("{op:?} — not quarantinable"));
                 }
             }
+            ExprData::Var(_) | ExprData::Const(_) | ExprData::Uniform(_) => {}
         }
-        stack.extend(arena.children(id));
     }
     Ok(())
 }
@@ -449,17 +447,17 @@ pub fn screen_for_oracle(arena: &ExprArena, root: ExprId) -> Result<(), String> 
 /// the grid — `new` clones and rebuilds the arena, so preparing it per point
 /// would pay that 64 times.
 #[must_use]
-pub fn quarantine_verdict(arena: &ExprArena, root: ExprId, grid: &QuarantineGrid) -> Verdict {
+pub fn quarantine_verdict(term: Term<'_>, grid: &QuarantineGrid) -> Verdict {
     let mut conditioning = Conditioning::default();
 
-    if let Err(detail) = screen_for_oracle(arena, root) {
+    if let Err(detail) = screen_for_oracle(term) {
         return Verdict {
             exclusion: Some(Exclusion::OracleUnsupported { detail }),
             conditioning,
         };
     }
 
-    let compiled = match compile(arena, root) {
+    let compiled = match compile(term) {
         Ok(c) => c,
         Err(e) => {
             return Verdict {
@@ -471,13 +469,13 @@ pub fn quarantine_verdict(arena: &ExprArena, root: ExprId, grid: &QuarantineGrid
         }
     };
 
-    let check = DifferentialCheck::new(arena, root);
+    let check = DifferentialCheck::new(term);
     let mask_root = check.root_is_mask_valued();
     let bindings = BindingTable::empty();
     // The kernel's arguments at their declared defaults — the same values the
     // empty binding table gives the oracle, so both sides read one block.
     // The screen refuses buffers, so the block is the whole context.
-    let block: Vec<f32> = arena.uniforms().iter().map(|d| d.default).collect();
+    let block: Vec<f32> = term.env().uniforms.iter().map(|d| d.default).collect();
     let ctx: [*const f32; 1] = [if block.is_empty() {
         core::ptr::null()
     } else {
@@ -747,8 +745,8 @@ impl Quarantine {
     /// expression must not become a label and a sidecar line was written. A
     /// passing expression with a non-clean conditioning survey gets an
     /// informational `conditioning_metadata` line.
-    pub fn check(&mut self, name: &str, arena: &ExprArena, root: ExprId) -> bool {
-        self.verdict(name, arena, root).0.is_none()
+    pub fn check(&mut self, name: &str, term: Term<'_>) -> bool {
+        self.verdict(name, term).0.is_none()
     }
 
     /// [`check`](Self::check), handing back the verdict itself for callers that
@@ -756,17 +754,12 @@ impl Quarantine {
     /// in the corpus build, phase attribution in the trainer. Counting and
     /// sidecar writing happen here either way, so the two entry points can
     /// never disagree about what was checked.
-    pub fn verdict(
-        &mut self,
-        name: &str,
-        arena: &ExprArena,
-        root: ExprId,
-    ) -> (Option<Exclusion>, Conditioning) {
+    pub fn verdict(&mut self, name: &str, term: Term<'_>) -> (Option<Exclusion>, Conditioning) {
         self.checked += 1;
         let Verdict {
             exclusion,
             conditioning,
-        } = quarantine_verdict(arena, root, &self.grid);
+        } = quarantine_verdict(term, &self.grid);
         self.coverage.record(&conditioning, exclusion.as_ref());
         match &exclusion {
             None => {
@@ -779,7 +772,7 @@ impl Quarantine {
                 if exclusion.is_miscompile() {
                     self.mismatched += 1;
                 }
-                let record = exclusion.to_record(name, arena, root);
+                let record = exclusion.to_record(name, term);
                 self.write(&record);
             }
         }
@@ -896,33 +889,44 @@ impl Quarantine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pixelflow_ir::{Environment, ExprBuilder, ExprData, Rooted};
 
-    fn recip_pow16() -> (ExprArena, ExprId) {
+    /// A finished graph plus the environment its leaves index — what every
+    /// entry point here takes, as one value.
+    fn built(
+        f: impl FnOnce(&mut ExprBuilder) -> pixelflow_ir::ExprRef,
+    ) -> (Rooted<ExprData>, Environment) {
+        let mut b = ExprBuilder::new();
+        let root = f(&mut b);
+        b.finish(&[root])
+    }
+
+    fn recip_pow16() -> (Rooted<ExprData>, Environment) {
         // recip(x)^16 — the Codex R1 shape: the ~12-bit estimate's error is
         // squared four times, so the max-over-ops fold's 5e-4 allowance is
         // exceeded by a perfectly conforming backend.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let r = a.push_unary(OpKind::Recip, x);
-        let r2 = a.push_binary(OpKind::Mul, r, r);
-        let r4 = a.push_binary(OpKind::Mul, r2, r2);
-        let r8 = a.push_binary(OpKind::Mul, r4, r4);
-        let r16 = a.push_binary(OpKind::Mul, r8, r8);
-        (a, r16)
+        built(|a| {
+            let x = a.push_var(0);
+            let r = a.push_unary(OpKind::Recip, x);
+            let r2 = a.push_binary(OpKind::Mul, r, r);
+            let r4 = a.push_binary(OpKind::Mul, r2, r2);
+            let r8 = a.push_binary(OpKind::Mul, r4, r4);
+            a.push_binary(OpKind::Mul, r8, r8)
+        })
     }
 
-    fn amplified_sin() -> (ExprArena, ExprId) {
+    fn amplified_sin() -> (Rooted<ExprData>, Environment) {
         // sin(recip(x) * y * y) — the smoke run's B1 shape: a reciprocal
         // estimate fed into a large trig argument, where the relative error
         // reaches order 1 while every step stays inside contract.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let k = a.push_unary(OpKind::Recip, x);
-        let yy = a.push_binary(OpKind::Mul, y, y);
-        let arg = a.push_binary(OpKind::Mul, k, yy);
-        let root = a.push_unary(OpKind::Sin, arg);
-        (a, root)
+        built(|a| {
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let k = a.push_unary(OpKind::Recip, x);
+            let yy = a.push_binary(OpKind::Mul, y, y);
+            let arg = a.push_binary(OpKind::Mul, k, yy);
+            a.push_unary(OpKind::Sin, arg)
+        })
     }
 
     #[test]
@@ -949,35 +953,47 @@ mod tests {
 
     #[test]
     fn screen_rejects_oracle_unsupported_shapes() {
-        let mut arena = ExprArena::new();
-        let p = arena.push_param(0);
-        let err = screen_for_oracle(&arena, p).expect_err("params are unsupported");
+        let (expr, env) = built(|a| a.push_param(0));
+        let err =
+            screen_for_oracle(Term::new(expr.entry(), &env)).expect_err("params are unsupported");
         assert!(err.contains("Param"), "got: {err}");
 
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let r = arena.push_nary(OpKind::Tuple, &[x]);
-        let err = screen_for_oracle(&arena, r).expect_err("nary is unsupported");
-        assert!(err.contains("Nary"), "got: {err}");
+        let (expr, env) = built(|a| {
+            let x = a.push_var(0);
+            a.push_nary(OpKind::Tuple, &[x])
+        });
+        let err =
+            screen_for_oracle(Term::new(expr.entry(), &env)).expect_err("Tuple is unsupported");
+        assert!(err.contains("Tuple"), "got: {err}");
+
+        // A reduction: n-ary by child count, which is where arity lives now.
+        let (expr, env) = built(|a| {
+            let y = a.push_var(4);
+            a.push_reduce(OpKind::Add, 4, 3, y)
+        });
+        let err = screen_for_oracle(Term::new(expr.entry(), &env))
+            .expect_err("an unexpanded reduction is unsupported");
+        assert!(err.contains("children"), "got: {err}");
     }
 
     #[test]
     fn screen_accepts_plain_arithmetic() {
-        let (arena, root) = recip_pow16();
-        screen_for_oracle(&arena, root).expect("plain arithmetic is quarantinable");
+        let (expr, env) = recip_pow16();
+        screen_for_oracle(Term::new(expr.entry(), &env))
+            .expect("plain arithmetic is quarantinable");
     }
 
-    fn int_reinterpret_of_recip() -> (ExprArena, ExprId) {
+    fn int_reinterpret_of_recip() -> (Rooted<ExprData>, Environment) {
         // `IntToFloat(Recip(x))` reinterprets an ESTIMATE's bit pattern, so the
         // composed radius is unbounded at every point (a bit pattern has no
         // radius) AND the two tiers' estimates differ in the low bits, which
         // the reinterpretation blows up into different numbers. That is the
         // vacuous-pass shape: nothing is ever accepted or rejected.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let r = a.push_unary(OpKind::Recip, x);
-        let root = a.push_unary(OpKind::IntToFloat, r);
-        (a, root)
+        built(|a| {
+            let x = a.push_var(0);
+            let r = a.push_unary(OpKind::Recip, x);
+            a.push_unary(OpKind::IntToFloat, r)
+        })
     }
 
     #[test]
@@ -1100,11 +1116,11 @@ mod tests {
         // error. The max-over-ops fold called them compiler bugs; the
         // compositional bound must admit them.
         let grid = QuarantineGrid::new();
-        for (label, (arena, root)) in [
+        for (label, (expr, env)) in [
             ("recip(x)^16", recip_pow16()),
             ("sin(recip(x)*y*y)", amplified_sin()),
         ] {
-            let v = quarantine_verdict(&arena, root, &grid);
+            let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
             assert!(
                 v.exclusion.is_none(),
                 "{label} must pass the same-form gate; got {:?}",
@@ -1121,17 +1137,17 @@ mod tests {
         // was admitted as a label — while the JIT had been neither accepted nor
         // rejected anywhere on the grid.
         let sweep = QuarantineGrid::new();
-        let (arena, root) = int_reinterpret_of_recip();
+        let (expr, env) = int_reinterpret_of_recip();
         // Find a point this shape cannot bound, then make the whole grid that
         // point: the seeded sweep deliberately mixes bounded and unbounded
         // points, and the case under test is the all-unbounded grid.
-        let probe = quarantine_verdict(&arena, root, &sweep);
+        let probe = quarantine_verdict(Term::new(expr.entry(), &env), &sweep);
         let &idx =
             probe.conditioning.unbounded_points.first().expect(
                 "IntToFloat(Recip(x)) reinterprets an estimate — some point must be unbounded",
             );
         let grid = QuarantineGrid::uniform(sweep.points()[idx]);
-        let v = quarantine_verdict(&arena, root, &grid);
+        let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
         assert_eq!(
             v.conditioning.bounded_points, 0,
             "shape precondition: this grid must bound nothing"
@@ -1152,11 +1168,11 @@ mod tests {
         // expression decided at least one point, and the survey adds up to the
         // grid.
         let grid = QuarantineGrid::new();
-        for (label, (arena, root)) in [
+        for (label, (expr, env)) in [
             ("recip(x)^16", recip_pow16()),
             ("sin(recip(x)*y*y)", amplified_sin()),
         ] {
-            let v = quarantine_verdict(&arena, root, &grid);
+            let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
             assert!(v.exclusion.is_none(), "{label}: {:?}", v.exclusion);
             assert!(
                 v.conditioning.bounded_points > 0,
@@ -1181,8 +1197,8 @@ mod tests {
         // visible: an amplifying expression reports a wide relative bound, and
         // the points where it exceeds the cross-form threshold are listed.
         let grid = QuarantineGrid::new();
-        let (arena, root) = amplified_sin();
-        let v = quarantine_verdict(&arena, root, &grid);
+        let (expr, env) = amplified_sin();
+        let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
         assert!(v.exclusion.is_none());
         assert!(
             !v.conditioning.ill_conditioned_points.is_empty(),
@@ -1203,12 +1219,13 @@ mod tests {
         // largest intermediate. Its propagated bound is tiny, so every point
         // must stay eligible — otherwise a broken extraction hides as
         // "metadata".
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let k = a.push_const(1e-4);
-        let root = a.push_binary(OpKind::Mul, x, k);
+        let (expr, env) = built(|a| {
+            let x = a.push_var(0);
+            let k = a.push_const(1e-4);
+            a.push_binary(OpKind::Mul, x, k)
+        });
         let grid = QuarantineGrid::new();
-        let v = quarantine_verdict(&a, root, &grid);
+        let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
         assert!(v.exclusion.is_none(), "x*1e-4 must pass");
         assert!(
             v.conditioning.ill_conditioned_points.is_empty(),
@@ -1224,14 +1241,15 @@ mod tests {
         // `Lt(x, x)` is false everywhere, so `Round` is never on the path. The
         // old whole-arena divergence walker skipped every grid point and
         // reported NoCheckablePoints.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let cond = a.push_binary(OpKind::Lt, x, x);
-        let quarter = a.push_const(-0.25);
-        let rounded = a.push_unary(OpKind::Round, quarter);
-        let root = a.push_ternary(OpKind::Select, cond, rounded, x);
+        let (expr, env) = built(|a| {
+            let x = a.push_var(0);
+            let cond = a.push_binary(OpKind::Lt, x, x);
+            let quarter = a.push_const(-0.25);
+            let rounded = a.push_unary(OpKind::Round, quarter);
+            a.push_ternary(OpKind::Select, cond, rounded, x)
+        });
         let grid = QuarantineGrid::new();
-        let v = quarantine_verdict(&a, root, &grid);
+        let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
         assert!(
             v.exclusion.is_none(),
             "the unchosen branch's divergence must not exclude the expression; got {:?}",
@@ -1249,12 +1267,13 @@ mod tests {
         // An all-ones TRUE lane READS as NaN, so a numeric conditioning test
         // would flag every true point. The mask path compares bit patterns and
         // records nothing away from ties.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let root = a.push_binary(OpKind::Lt, x, y);
+        let (expr, env) = built(|a| {
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            a.push_binary(OpKind::Lt, x, y)
+        });
         let grid = QuarantineGrid::new();
-        let v = quarantine_verdict(&a, root, &grid);
+        let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
         assert!(v.exclusion.is_none(), "Lt(x, y) must pass");
         assert!(
             v.conditioning.ill_conditioned_points.is_empty(),
@@ -1267,12 +1286,13 @@ mod tests {
     #[test]
     fn divergent_points_are_metadata_never_exclusions() {
         // min(X, Y) hits opposite-signed zeros at grid point 1.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let root = a.push_binary(OpKind::Min, x, y);
+        let (expr, env) = built(|a| {
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            a.push_binary(OpKind::Min, x, y)
+        });
         let grid = QuarantineGrid::new();
-        let v = quarantine_verdict(&a, root, &grid);
+        let v = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
         assert!(
             v.exclusion.is_none(),
             "min(x, y) must pass the same-form gate"
@@ -1293,13 +1313,15 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let mut q = Quarantine::new(&path_str);
 
-        let (arena, root) = amplified_sin();
-        assert!(q.check("amplified", &arena, root), "must pass the gate");
+        let (expr, env) = amplified_sin();
+        assert!(
+            q.check("amplified", Term::new(expr.entry(), &env)),
+            "must pass the gate"
+        );
 
         // An unquarantinable shape is excluded and recorded.
-        let mut a = ExprArena::new();
-        let p = a.push_param(0);
-        assert!(!q.check("param", &a, p));
+        let (expr, env) = built(|a| a.push_param(0));
+        assert!(!q.check("param", Term::new(expr.entry(), &env)));
         assert_eq!(q.excluded(), 1);
         assert_eq!(q.mismatched(), 0, "a screen refusal is not a miscompile");
 

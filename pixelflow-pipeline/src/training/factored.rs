@@ -3,12 +3,13 @@
 //! Provides parsers for two expression syntaxes:
 //! - **S-expression**: `Add(Mul(Var(0), Var(1)), Var(2))` (test-only repro format)
 //! - **Kernel code**: `(X * Y) + Z` (human-readable, round-trips with
-//!   `parse_kernel_code_arena`/`arena_to_kernel_code`)
+//!   `parse_kernel_code`/`term_to_kernel_code`)
 
 use std::collections::HashMap;
 
-use pixelflow_ir::arena::ExprNode;
-use pixelflow_ir::{EmitStyle, ExprArena, ExprId, OpKind};
+use pixelflow_ir::{
+    EmitStyle, Environment, ExprBuilder, ExprData, ExprRef, Node, OpKind, Rooted, Term,
+};
 
 // ============================================================================
 // Expression Parsing (for loading training data)
@@ -19,15 +20,15 @@ use pixelflow_ir::{EmitStyle, ExprArena, ExprId, OpKind};
 /// Test-only helper for older logged repros in `OpName(child1, child2, ...)`
 /// form such as `Add(Mul(Var(0), Var(1)), Var(2))`.
 #[cfg(test)]
-pub fn parse_expr(s: &str) -> Option<(ExprArena, ExprId)> {
-    let mut arena = ExprArena::new();
+pub fn parse_expr(s: &str) -> Option<(Rooted<ExprData>, Environment)> {
+    let mut arena = ExprBuilder::new();
     let root = parse_expr_into(s, &mut arena)?;
-    Some((arena, root))
+    Some(arena.finish(&[root]))
 }
 
-/// Recursive S-expression parser that builds directly into an [`ExprArena`].
+/// Recursive S-expression parser that builds directly into an [`ExprBuilder`].
 #[cfg(test)]
-fn parse_expr_into(s: &str, arena: &mut ExprArena) -> Option<ExprId> {
+fn parse_expr_into(s: &str, arena: &mut ExprBuilder) -> Option<ExprRef> {
     let s = s.trim();
 
     if let Some(inner) = s.strip_prefix("Var(").and_then(|r| r.strip_suffix(')')) {
@@ -168,25 +169,25 @@ fn split_args(s: &str) -> Vec<&str> {
 enum NodeKey {
     Var(u8),
     Const(u32),
-    Unary(OpKind, ExprId),
-    Binary(OpKind, ExprId, ExprId),
-    Ternary(OpKind, ExprId, ExprId, ExprId),
+    Unary(OpKind, ExprRef),
+    Binary(OpKind, ExprRef, ExprRef),
+    Ternary(OpKind, ExprRef, ExprRef, ExprRef),
 }
 
 struct ArenaInterner {
-    arena: ExprArena,
-    nodes: HashMap<NodeKey, ExprId>,
+    arena: ExprBuilder,
+    nodes: HashMap<NodeKey, ExprRef>,
 }
 
 impl ArenaInterner {
     fn new() -> Self {
         Self {
-            arena: ExprArena::new(),
+            arena: ExprBuilder::new(),
             nodes: HashMap::new(),
         }
     }
 
-    fn push_key(&mut self, key: NodeKey) -> ExprId {
+    fn push_key(&mut self, key: NodeKey) -> ExprRef {
         if let Some(&existing) = self.nodes.get(&key) {
             return existing;
         }
@@ -202,28 +203,28 @@ impl ArenaInterner {
         id
     }
 
-    fn push_var(&mut self, index: u8) -> ExprId {
+    fn push_var(&mut self, index: u8) -> ExprRef {
         self.push_key(NodeKey::Var(index))
     }
 
-    fn push_const(&mut self, value: f32) -> ExprId {
+    fn push_const(&mut self, value: f32) -> ExprRef {
         self.push_key(NodeKey::Const(value.to_bits()))
     }
 
-    fn push_unary(&mut self, op: OpKind, a: ExprId) -> ExprId {
+    fn push_unary(&mut self, op: OpKind, a: ExprRef) -> ExprRef {
         self.push_key(NodeKey::Unary(op, a))
     }
 
-    fn push_binary(&mut self, op: OpKind, a: ExprId, b: ExprId) -> ExprId {
+    fn push_binary(&mut self, op: OpKind, a: ExprRef, b: ExprRef) -> ExprRef {
         self.push_key(NodeKey::Binary(op, a, b))
     }
 
-    fn push_ternary(&mut self, op: OpKind, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
+    fn push_ternary(&mut self, op: OpKind, a: ExprRef, b: ExprRef, c: ExprRef) -> ExprRef {
         self.push_key(NodeKey::Ternary(op, a, b, c))
     }
 
-    fn finish(self, root: ExprId) -> (ExprArena, ExprId) {
-        (self.arena, root)
+    fn finish(self, root: ExprRef) -> (Rooted<ExprData>, Environment) {
+        self.arena.finish(&[root])
     }
 }
 
@@ -249,13 +250,13 @@ impl<'a> ArenaKernelParser<'a> {
         }
     }
 
-    fn parse(mut self) -> Option<(ExprArena, ExprId)> {
+    fn parse(mut self) -> Option<(Rooted<ExprData>, Environment)> {
         let root = self.parse_expr()?;
         self.skip_ws();
         (self.pos == self.input.len()).then(|| self.interner.finish(root))
     }
 
-    fn parse_expr(&mut self) -> Option<ExprId> {
+    fn parse_expr(&mut self) -> Option<ExprRef> {
         let mut values = Vec::new();
         let mut ops = Vec::new();
         let mut expecting_operand = true;
@@ -374,7 +375,7 @@ impl<'a> ArenaKernelParser<'a> {
 
     fn reduce_prefix_negs(
         interner: &mut ArenaInterner,
-        values: &mut Vec<ExprId>,
+        values: &mut Vec<ExprRef>,
         ops: &mut Vec<ParseOp>,
     ) -> Option<()> {
         while matches!(ops.last(), Some(ParseOp::PrefixNeg)) {
@@ -387,7 +388,7 @@ impl<'a> ArenaKernelParser<'a> {
 
     fn reduce_binary_ops(
         interner: &mut ArenaInterner,
-        values: &mut Vec<ExprId>,
+        values: &mut Vec<ExprRef>,
         ops: &mut Vec<ParseOp>,
         incoming: OpKind,
     ) -> Option<()> {
@@ -415,7 +416,7 @@ impl<'a> ArenaKernelParser<'a> {
 
     fn reduce_until_group(
         interner: &mut ArenaInterner,
-        values: &mut Vec<ExprId>,
+        values: &mut Vec<ExprRef>,
         ops: &mut Vec<ParseOp>,
     ) -> Option<()> {
         loop {
@@ -531,15 +532,15 @@ impl<'a> ArenaKernelParser<'a> {
 
 /// Parser result: (parsed value, remaining input)
 ///
-/// Parse kernel code directly into an [`ExprArena`] (DAG) with structural sharing.
+/// Parse kernel code directly into a DAG with structural sharing.
 ///
-/// Identical subexpressions map to the same [`ExprId`], so the returned arena is
-/// a true DAG rather than a duplicated tree.  The dedup key is `ExprNode` equality:
-/// two nodes are shared iff they have the same [`OpKind`] and the same child
-/// [`ExprId`]s (or the same leaf value).
+/// Identical subexpressions map to the same node, so the result is a true DAG
+/// rather than a duplicated tree. The dedup key is `(op, child refs)`: two
+/// nodes are shared iff they have the same [`OpKind`] and the same children
+/// (or the same leaf value).
 ///
 /// Returns `None` if the input fails to parse.
-pub fn parse_kernel_code_arena(s: &str) -> Option<(ExprArena, ExprId)> {
+pub fn parse_kernel_code(s: &str) -> Option<(Rooted<ExprData>, Environment)> {
     ArenaKernelParser::new(s.trim()).parse()
 }
 
@@ -565,22 +566,27 @@ fn parse_ident(input: &str) -> Option<(&str, &str)> {
 // Arena → Kernel Code Serialization
 // ============================================================================
 
-/// Convert an [`ExprArena`] subtree into kernel code syntax.
-pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
-    enum Task {
-        Visit(ExprId),
-        Emit { node: ExprId, arity: usize },
+/// Convert a term into kernel code syntax.
+pub fn term_to_kernel_code(term: Term<'_>) -> String {
+    enum Task<'a> {
+        Visit(Node<'a, ExprData>),
+        Emit {
+            node: Node<'a, ExprData>,
+            arity: usize,
+        },
     }
 
-    let mut stack = vec![Task::Visit(root)];
+    let mut stack = vec![Task::Visit(term.root())];
     let mut result_stack: Vec<String> = Vec::new();
 
     while let Some(task) = stack.pop() {
         match task {
-            Task::Visit(id) => {
-                let arity = arena.children(id).len();
-                stack.push(Task::Emit { node: id, arity });
-                let children: Vec<ExprId> = arena.children(id).collect();
+            Task::Visit(node) => {
+                stack.push(Task::Emit {
+                    node,
+                    arity: node.child_count(),
+                });
+                let children: Vec<Node<'_, ExprData>> = node.children().collect();
                 for child in children.into_iter().rev() {
                     stack.push(Task::Visit(child));
                 }
@@ -588,37 +594,42 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
             Task::Emit { node, arity } => {
                 let start = result_stack.len().saturating_sub(arity);
                 let args: Vec<String> = result_stack.drain(start..).collect();
-                let emitted = match arena.node(node) {
-                    ExprNode::Var(0) => "X".into(),
-                    ExprNode::Var(1) => "Y".into(),
-                    ExprNode::Var(2) => "Z".into(),
-                    ExprNode::Var(3) => "W".into(),
-                    ExprNode::Var(i) => panic!(
-                        "arena_to_kernel_code: variable index {} exceeds X/Y/Z/W range",
-                        i
-                    ),
-                    ExprNode::Const(v) => format_const_kc(*v),
-                    ExprNode::Param(i) => panic!(
-                        "ExprNode::Param({}) reached arena_to_kernel_code — substitute params first",
-                        i
-                    ),
-                    ExprNode::Buffer(b) => panic!(
-                        "ExprNode::Buffer({}) reached arena_to_kernel_code — memory ops require \
+                let emitted = match *node {
+                    ExprData::Var(0) => "X".into(),
+                    ExprData::Var(1) => "Y".into(),
+                    // Z and W are retired *axes*, but the frozen corpus
+                    // fixtures this format round-trips still name them, and
+                    // the parser still reads them. Printing them keeps the
+                    // round trip total; binding them to constants before
+                    // evaluation is `bind_retired_axes`'s job, not this one's.
+                    ExprData::Var(2) => "Z".into(),
+                    ExprData::Var(3) => "W".into(),
+                    ExprData::Var(i) => {
+                        panic!("term_to_kernel_code: variable index {i} exceeds the X/Y/Z/W range")
+                    }
+                    ExprData::Const(bits) => format_const_kc(f32::from_bits(bits)),
+                    ExprData::Param(i) => {
+                        panic!("Param({i}) reached term_to_kernel_code — substitute params first")
+                    }
+                    ExprData::Buffer(b) => panic!(
+                        "Buffer({}) reached term_to_kernel_code — memory ops require \
                          a binding table, not yet wired (M2, see KERNELS_AND_LATTICES.md)",
                         b.0
                     ),
-                    ExprNode::Uniform(u) => panic!(
-                        "ExprNode::Uniform({}) reached arena_to_kernel_code — kernel code has \
+                    ExprData::Uniform(u) => panic!(
+                        "Uniform({}) reached term_to_kernel_code — kernel code has \
                          no block to read it from",
                         u.0
                     ),
-                    ExprNode::Unary(op, _)
-                    | ExprNode::Binary(op, _, _)
-                    | ExprNode::Ternary(op, _, _, _) => emit_op_kc(*op, &args),
-                    ExprNode::Nary(op, _, _) => panic!(
-                        "arena_to_kernel_code: Nary({}) not representable in kernel code syntax",
-                        op.name()
-                    ),
+                    ExprData::Op(op) => {
+                        assert!(
+                            arity <= 3,
+                            "term_to_kernel_code: {} with {arity} children is not \
+                             representable in kernel code syntax",
+                            op.name()
+                        );
+                        emit_op_kc(op, &args)
+                    }
                 };
                 result_stack.push(emitted);
             }
@@ -627,7 +638,7 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
 
     result_stack
         .pop()
-        .unwrap_or_else(|| panic!("arena_to_kernel_code: empty result stack"))
+        .unwrap_or_else(|| panic!("term_to_kernel_code: empty result stack"))
 }
 
 /// Emit an operation in kernel code syntax, dispatching through `emit_style()`.
@@ -703,60 +714,92 @@ mod tests {
     /// Constants, not uniforms: `benchmark_jit_arena` calls the collapse ABI
     /// with a null context, so a uniform read would fault. A constant needs
     /// no context and denotes exactly the same number on both sides.
-    fn bind_retired_axes(arena: &ExprArena, id: ExprId) -> (ExprArena, ExprId) {
-        let mut arena = arena.clone();
-        let subs: Vec<(u8, ExprId)> = REWRITE_BUG_ARGS
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| {
-                let axis = pixelflow_ir::arena::COORD_AXES as u8 + i as u8;
-                (axis, arena.push_const(v))
-            })
-            .collect();
-        let id = arena.substitute_vars_with(id, &subs);
+    fn bind_retired_axes(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+        let root = term.root();
+        let mut out = ExprBuilder::new();
+        let mut map = term.dag().side_table(None);
+        let mut work = vec![(root, false)];
+        while let Some((node, expanded)) = work.pop() {
+            if map[node].is_some() {
+                continue;
+            }
+            if !expanded {
+                work.push((node, true));
+                for child in node.children() {
+                    if map[child].is_none() {
+                        work.push((child, false));
+                    }
+                }
+                continue;
+            }
+            let built = match *node {
+                ExprData::Var(i) if pixelflow_ir::RETIRED_COORD_AXES.contains(&i) => {
+                    let slot = usize::from(i) - pixelflow_ir::COORD_AXES;
+                    out.push_const(REWRITE_BUG_ARGS[slot])
+                }
+                ExprData::Var(i) => out.push_var(i),
+                ExprData::Const(bits) => out.push_const(f32::from_bits(bits)),
+                ExprData::Param(i) => out.push_param(i),
+                ExprData::Op(op) => {
+                    let kids: Vec<ExprRef> = node
+                        .children()
+                        .map(|c| map[c].expect("child rebuilt before parent"))
+                        .collect();
+                    out.push_nary(op, &kids)
+                }
+                other => panic!("bind_retired_axes: fixtures never hold {other:?}"),
+            };
+            map[node] = Some(built);
+        }
+        let new_root = map[root].expect("the root is its own descendant");
+        let (rebuilt, env) = out.finish(&[new_root]);
         // The precondition `emit::compile` will assert, checked here where
         // *every* caller reaches it on *every* architecture. The scalar/JIT
         // comparisons below are `cfg(target_arch = "aarch64")`, so on an x86
         // machine they do not exist and the emitter is never reached with
-        // these arenas at all — this file has learned that from a macOS
+        // these graphs at all — this file has learned that from a macOS
         // runner twice. Asserting the precondition rather than the outcome is
         // what makes the next miss local.
         assert_eq!(
-            arena.retired_axis(id),
+            pixelflow_ir::retired_axis(rebuilt.entry()),
             None,
             "bind_retired_axes left a reachable retired axis"
         );
-        (arena, id)
+        (rebuilt, env)
     }
 
-    fn eval_arena_scalar(arena: &ExprArena, id: ExprId, vars: &[f32; 2]) -> f32 {
-        let (arena, id) = bind_retired_axes(arena, id);
-        pixelflow_ir::eval_scalar(&arena, id, vars, &pixelflow_ir::BindingTable::empty())
+    fn eval_scalar_bound(term: Term<'_>, vars: &[f32; 2]) -> f32 {
+        let (bound, env) = bind_retired_axes(term);
+        pixelflow_ir::eval_scalar(
+            Term::new(bound.entry(), &env),
+            vars,
+            &pixelflow_ir::BindingTable::empty(),
+        )
     }
 
     fn logged_expr_scalar_output(src: &str) -> f32 {
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        eval_arena_scalar(&arena, root, &REWRITE_BUG_INPUTS)
+        let (expr, env) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
+        eval_scalar_bound(Term::new(expr.entry(), &env), &REWRITE_BUG_INPUTS)
     }
 
     #[cfg(target_arch = "aarch64")]
     fn logged_expr_jit_output(src: &str) -> f32 {
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
+        let (expr, env) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
         // The same substitution the oracle applies. Skipping it here is the
         // bug this pairing exists to catch.
-        let (arena, root) = bind_retired_axes(&arena, root);
-        benchmark_jit_arena(&arena, root)
-            .unwrap_or_else(|err| panic!("benchmark_jit_arena failed for {src}: {err:?}"))
+        let (bound, benv) = bind_retired_axes(Term::new(expr.entry(), &env));
+        benchmark_jit_term(Term::new(bound.entry(), &benv))
+            .unwrap_or_else(|err| panic!("benchmark_jit_term failed for {src}: {err:?}"))
             .output[0]
     }
 
     fn logged_expr_roundtrip_scalar_output(src: &str) -> f32 {
         // arena -> kernel-code -> arena round-trip must preserve scalar semantics.
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
-        let kernel = arena_to_kernel_code(&arena, root);
-        let (re_arena, re_root) = parse_kernel_code_arena(&kernel)
-            .unwrap_or_else(|| panic!("parse_kernel_code_arena failed: {kernel}"));
-        eval_arena_scalar(&re_arena, re_root, &REWRITE_BUG_INPUTS)
+        let (expr, env) = parse_expr(src).unwrap_or_else(|| panic!("parse_expr failed: {src}"));
+        let kernel = term_to_kernel_code(Term::new(expr.entry(), &env));
+        let (re_expr, re_env) = parse_kernel_code(&kernel)
+            .unwrap_or_else(|| panic!("parse_kernel_code failed: {kernel}"));
+        eval_scalar_bound(Term::new(re_expr.entry(), &re_env), &REWRITE_BUG_INPUTS)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -770,94 +813,93 @@ mod tests {
         );
     }
 
-    /// `substitute_vars_with` rewrites the reachable graph and leaves what it
-    /// replaced behind, so the arena still *holds* `Var(2)` afterwards. What
-    /// matters — and what the emitter asks — is whether one is reachable from
-    /// the root. Scanning every node instead cost this change a CI round trip.
+    /// Substitution rewrites the reachable graph; what matters — and what
+    /// the emitter asks — is whether a retired axis is reachable from the
+    /// root. Scanning every node instead cost this change a CI round trip.
     #[test]
-    fn substitution_clears_the_reachable_retired_axes_not_the_arena() {
-        let mut a = ExprArena::new();
-        let y = a.push_var(1);
-        let z = a.push_var(2);
-        let w = a.push_var(3);
-        let zw = a.push_binary(pixelflow_ir::OpKind::Add, z, w);
-        let root = a.push_binary(pixelflow_ir::OpKind::Mul, y, zw);
+    fn substitution_clears_the_reachable_retired_axes() {
+        let mut b = ExprBuilder::new();
+        let y = b.push_var(1);
+        let z = b.push_var(2);
+        let w = b.push_var(3);
+        let zw = b.push_binary(pixelflow_ir::OpKind::Add, z, w);
+        let root = b.push_binary(pixelflow_ir::OpKind::Mul, y, zw);
+        let (rooted, env) = b.finish(&[root]);
         assert!(
-            a.retired_axis(root).is_some_and(|v| v == 2 || v == 3),
+            pixelflow_ir::retired_axis(rooted.entry()).is_some_and(|v| v == 2 || v == 3),
             "the fixture names a retired axis (which one depends on walk order)"
         );
 
-        let (bound, bound_root) = bind_retired_axes(&a, root);
+        let (bound, _benv) = bind_retired_axes(Term::new(rooted.entry(), &env));
         assert_eq!(
-            bound.retired_axis(bound_root),
+            pixelflow_ir::retired_axis(bound.entry()),
             None,
             "nothing reachable names a retired axis after substitution"
         );
-        assert!(
-            bound.len() > a.len(),
-            "the replaced nodes are still in the arena, merely unreachable"
-        );
     }
 
     #[test]
-    fn parse_kernel_code_arena_basic() {
+    fn parse_kernel_code_basic() {
         // Simple expression: no structural sharing expected.
-        let (arena, root) = parse_kernel_code_arena("(X + Y)").unwrap();
+        let (expr, env) = parse_kernel_code("(X + Y)").unwrap();
         assert!(
-            arena.len() >= 3,
+            expr.len() >= 3,
             "expected at least 3 nodes (X, Y, Add); got {}",
-            arena.len()
+            expr.len()
         );
-        let _ = root; // root is valid
+        let _ = env; // the graph parsed
     }
 
     #[test]
-    fn parse_kernel_code_arena_structural_sharing() {
+    fn parse_kernel_code_structural_sharing() {
         // (X + X): the two X leaves are structurally identical and should share an id.
-        let (arena, _root) = parse_kernel_code_arena("(X + X)").unwrap();
+        let (expr, _env) = parse_kernel_code("(X + X)").unwrap();
         // Without sharing: 3 nodes (X, X, Add). With sharing: 2 nodes (X, Add).
         assert_eq!(
-            arena.len(),
+            expr.len(),
             2,
             "expected 2 unique nodes for (X + X) with sharing, got {}",
-            arena.len()
+            expr.len()
         );
     }
 
     #[test]
-    fn parse_kernel_code_arena_deeply_shared() {
+    fn parse_kernel_code_deeply_shared() {
         // ((X + Y) * (X + Y)): the (X + Y) subtree appears twice — should be shared.
         // Without sharing: 7 nodes. With sharing: 4 nodes (X, Y, Add, Mul).
-        let (arena, _root) = parse_kernel_code_arena("((X + Y) * (X + Y))").unwrap();
+        let (expr, _env) = parse_kernel_code("((X + Y) * (X + Y))").unwrap();
         assert_eq!(
-            arena.len(),
+            expr.len(),
             4,
             "expected 4 unique nodes for ((X+Y)*(X+Y)) with sharing, got {}",
-            arena.len()
+            expr.len()
         );
     }
 
     #[test]
-    fn parse_kernel_code_arena_round_trip() {
+    fn parse_kernel_code_round_trip() {
         // Arena parse + arena_to_kernel_code should re-parse cleanly.
         let src = "((X * Y) + (X * Y))";
-        let (arena, root) = parse_kernel_code_arena(src).unwrap();
-        let code = arena_to_kernel_code(&arena, root);
+        let (expr, env) = parse_kernel_code(src).unwrap();
+        let code = term_to_kernel_code(Term::new(expr.entry(), &env));
         assert!(
-            parse_kernel_code_arena(&code).is_some(),
+            parse_kernel_code(&code).is_some(),
             "arena round-trip produced un-parseable code: {code}"
         );
     }
 
     #[test]
-    fn parse_kernel_code_arena_methods() {
+    fn parse_kernel_code_methods() {
         let src = "(((X).abs()).min(Y)).mul_add(Z, W)";
-        let (arena, root) = parse_kernel_code_arena(src).unwrap();
-        let code = arena_to_kernel_code(&arena, root);
-        let (reparsed, reparsed_root) = parse_kernel_code_arena(&code).unwrap();
-        assert_eq!(code, arena_to_kernel_code(&reparsed, reparsed_root));
+        let (expr, env) = parse_kernel_code(src).unwrap();
+        let code = term_to_kernel_code(Term::new(expr.entry(), &env));
+        let (reparsed, re_env) = parse_kernel_code(&code).unwrap();
+        assert_eq!(
+            code,
+            term_to_kernel_code(Term::new(reparsed.entry(), &re_env))
+        );
         assert!(
-            arena.len() >= 7,
+            expr.len() >= 7,
             "expected method-heavy parse to build a real DAG"
         );
     }
@@ -867,17 +909,26 @@ mod tests {
         // fract(x) = x - floor(x); no OpKind::Fract exists (see kernel.rs) so
         // this must expand to the primitive subgraph, not a single node.
         let src = "fract(Var(0))";
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse failed: {src}"));
-        assert_eq!(eval_arena_scalar(&arena, root, &[1.75, 0.0]), 0.75);
-        assert_eq!(eval_arena_scalar(&arena, root, &[-1.25, 0.0]), 0.75);
+        let (expr, env) = parse_expr(src).unwrap_or_else(|| panic!("parse failed: {src}"));
+        assert_eq!(
+            eval_scalar_bound(Term::new(expr.entry(), &env), &[1.75, 0.0]),
+            0.75
+        );
+        assert_eq!(
+            eval_scalar_bound(Term::new(expr.entry(), &env), &[-1.25, 0.0]),
+            0.75
+        );
     }
 
     #[test]
     fn parse_expr_hypot_builds_sqrt_mul_add_compound() {
         // hypot(x, y) = sqrt(x*x + y*y); no OpKind::Hypot exists (see kernel.rs).
         let src = "hypot(Var(0), Var(1))";
-        let (arena, root) = parse_expr(src).unwrap_or_else(|| panic!("parse failed: {src}"));
-        assert_eq!(eval_arena_scalar(&arena, root, &[3.0, 4.0]), 5.0);
+        let (expr, env) = parse_expr(src).unwrap_or_else(|| panic!("parse failed: {src}"));
+        assert_eq!(
+            eval_scalar_bound(Term::new(expr.entry(), &env), &[3.0, 4.0]),
+            5.0
+        );
     }
 
     // ========================================================================

@@ -71,9 +71,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
+use pixelflow_ir::{ExprData, Node, OpKind, Term};
 use pixelflow_pipeline::training::bezier_family::{FORMS, Lcg};
-use pixelflow_pipeline::training::corpus::{read_corpus, write_corpus};
+use pixelflow_pipeline::training::corpus::{Entry, read_corpus, write_corpus};
 use pixelflow_pipeline::training::quarantine::Quarantine;
 use pixelflow_pipeline::training::split::SplitManifest;
 use pixelflow_pipeline::training::structural::FenceKey;
@@ -145,39 +145,39 @@ impl ExactKey {
     /// payload (`Const` bit pattern, `Var`/`Param` index) instead of
     /// dropping it — two `bezier` draws with different control points are
     /// meant to compare unequal here.
-    fn of(arena: &ExprArena, root: ExprId) -> Self {
-        enum Task {
-            Visit(ExprId),
-            Emit(ExprId),
+    fn of(root: Node<'_, ExprData>) -> Self {
+        enum Task<'a> {
+            Visit(Node<'a, ExprData>),
+            Emit(Node<'a, ExprData>),
         }
         let mut work = vec![Task::Visit(root)];
         let mut visited = HashSet::new();
         let mut nodes = Vec::new();
-        let mut ids = std::collections::HashMap::<ExprId, u32>::new();
+        let mut ids = std::collections::HashMap::<Node<'_, ExprData>, u32>::new();
 
         while let Some(task) = work.pop() {
             match task {
-                Task::Visit(id) => {
-                    if !visited.insert(id) {
+                Task::Visit(node) => {
+                    if !visited.insert(node) {
                         continue;
                     }
-                    work.push(Task::Emit(id));
-                    for child in arena.children(id) {
+                    work.push(Task::Emit(node));
+                    for child in node.children() {
                         work.push(Task::Visit(child));
                     }
                 }
-                Task::Emit(id) => {
-                    let children: Box<[u32]> = arena
-                        .children(id)
+                Task::Emit(node) => {
+                    let children: Box<[u32]> = node
+                        .children()
                         .map(|c| *ids.get(&c).expect("child visited before parent emits"))
                         .collect();
-                    let (tag, payload) = match arena.node(id) {
-                        ExprNode::Var(i) => (0u8, u32::from(*i)),
-                        ExprNode::Const(v) => (1u8, v.to_bits()),
-                        ExprNode::Param(i) => (2u8, u32::from(*i)),
-                        ExprNode::Buffer(b) => (3u8, u32::from(b.0)),
-                        ExprNode::Uniform(u) => (5u8, u32::from(u.0)),
-                        _ => (4u8, arena.kind(id) as u32),
+                    let (tag, payload) = match *node {
+                        ExprData::Var(i) => (0u8, u32::from(i)),
+                        ExprData::Const(bits) => (1u8, bits),
+                        ExprData::Param(i) => (2u8, u32::from(i)),
+                        ExprData::Buffer(b) => (3u8, u32::from(b.0)),
+                        ExprData::Uniform(u) => (5u8, u32::from(u.0)),
+                        ExprData::Op(op) => (4u8, op as u32),
                     };
                     let key_id = nodes.len() as u32;
                     nodes.push(ExactNode {
@@ -185,7 +185,7 @@ impl ExactKey {
                         payload,
                         children,
                     });
-                    ids.insert(id, key_id);
+                    ids.insert(node, key_id);
                 }
             }
         }
@@ -206,21 +206,16 @@ const ALLOWED_NON_LEAF_OPS: [OpKind; 5] = [
     OpKind::Neg,
 ];
 
-fn assert_polynomial_only(name: &str, arena: &ExprArena) {
-    for node in arena.nodes_raw() {
-        let op = match node {
-            ExprNode::Var(_)
-            | ExprNode::Const(_)
-            | ExprNode::Param(_)
-            | ExprNode::Buffer(_)
-            | ExprNode::Uniform(_) => {
-                continue;
-            }
-            ExprNode::Unary(op, _)
-            | ExprNode::Binary(op, _, _)
-            | ExprNode::Ternary(op, _, _, _)
-            | ExprNode::Nary(op, _, _) => *op,
-        };
+/// Every operator reachable from `root`, in DAG order.
+fn ops_of(root: Node<'_, ExprData>) -> impl Iterator<Item = OpKind> + '_ {
+    root.descendants().filter_map(|n| match *n {
+        ExprData::Op(op) => Some(op),
+        _ => None,
+    })
+}
+
+fn assert_polynomial_only(name: &str, root: Node<'_, ExprData>) {
+    for op in ops_of(root) {
         assert!(
             ALLOWED_NON_LEAF_OPS.contains(&op),
             "bezier entry {name} contains {op:?}, which is outside \
@@ -253,7 +248,7 @@ fn train_fence_keys(corpus_dir: &Path) -> HashSet<FenceKey> {
     );
     entries
         .iter()
-        .map(|(_, arena, root)| FenceKey::of(arena, *root))
+        .map(|(_, expr)| FenceKey::of(expr.entry()))
         .collect()
 }
 
@@ -293,7 +288,7 @@ fn main() {
     let mut rng = Lcg::new(args.seed);
 
     let mut seen_within: HashSet<ExactKey> = HashSet::new();
-    let mut admitted: Vec<(String, ExprArena, ExprId)> = Vec::new();
+    let mut admitted: Vec<Entry> = Vec::new();
     let mut form_counts: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     let mut node_counts: Vec<usize> = Vec::new();
@@ -309,17 +304,18 @@ fn main() {
     while admitted.len() < args.target && attempts < max_attempts {
         attempts += 1;
         let form = FORMS[rng.choice(FORMS.len())];
-        let (arena, root) = form.build(&mut rng);
-        // `arena.len()`, not `node_count_subtree(root)`: these arenas are
-        // built fresh per draw with zero dead nodes (nothing pushed is ever
-        // abandoned), so `len()` already equals the post-`reachable_subtree`
-        // compacted node count `write_corpus` stores and the harness reads
-        // back as `node_count` (`phase3_at_budget_eval.rs`:
-        // `arena.nodes_raw().len()`). `node_count_subtree` instead counts
-        // per-*reference* (a shared node — e.g. `t` used by every power —
-        // counted once per parent), which is a different, larger number and
-        // not the one the registered size band is measured against.
-        let n = arena.len();
+        let (expr, env) = form.build(&mut rng);
+        let term = Term::new(expr.entry(), &env);
+        // `len()`, not `node_count_subtree(root)`: these graphs are built
+        // fresh per draw with zero dead nodes (nothing pushed is ever
+        // abandoned), so `len()` already equals the reachable node count
+        // `write_corpus` stores and the harness reads back as `node_count`
+        // (`phase3_at_budget_eval.rs`: `len()`). `node_count_subtree`
+        // instead counts per-*reference* (a shared node — e.g. `t` used by
+        // every power — counted once per parent), which is a different,
+        // larger number and not the one the registered size band is measured
+        // against.
+        let n = expr.len();
         if n < MIN_NODES {
             too_small += 1;
             continue;
@@ -329,13 +325,13 @@ fn main() {
             continue;
         }
 
-        let exact_key = ExactKey::of(&arena, root);
+        let exact_key = ExactKey::of(term.root());
         if !seen_within.insert(exact_key) {
             dup_within += 1;
             continue;
         }
 
-        let train_key = FenceKey::of(&arena, root);
+        let train_key = FenceKey::of(term.root());
         assert!(
             !train_keys.contains(&train_key),
             "TRAIN-fence violation: a bezier draw (form {}, degree {}, attempt {attempts}) \
@@ -346,33 +342,19 @@ fn main() {
             form.degree()
         );
 
-        assert_polynomial_only(&format!("attempt {attempts}"), &arena);
+        assert_polynomial_only(&format!("attempt {attempts}"), term.root());
 
         let name = format!("dev_bezier_{:05}", admitted.len());
-        if !quarantine.check(&name, &arena, root) {
+        if !quarantine.check(&name, term) {
             quarantined += 1;
             continue;
         }
 
-        for node in arena.nodes_raw() {
-            let op = match node {
-                ExprNode::Var(_)
-                | ExprNode::Const(_)
-                | ExprNode::Param(_)
-                | ExprNode::Buffer(_)
-                | ExprNode::Uniform(_) => {
-                    continue;
-                }
-                ExprNode::Unary(op, _)
-                | ExprNode::Binary(op, _, _)
-                | ExprNode::Ternary(op, _, _, _)
-                | ExprNode::Nary(op, _, _) => *op,
-            };
-            op_universe.insert(op);
-        }
+        op_universe.extend(ops_of(term.root()));
         *form_counts.entry(form.label()).or_insert(0) += 1;
         node_counts.push(n);
-        admitted.push((name, arena, root));
+
+        admitted.push((name, expr));
     }
 
     assert!(
@@ -395,13 +377,13 @@ fn main() {
     } else {
         Vec::new()
     };
-    let preserved: Vec<(String, ExprArena, ExprId)> = existing
+    let preserved: Vec<Entry> = existing
         .into_iter()
-        .filter(|(name, _, _)| !name.starts_with("dev_bezier_"))
+        .filter(|(name, _)| !name.starts_with("dev_bezier_"))
         .collect();
     let preserved_count = preserved.len();
     let mut out_entries = preserved;
-    out_entries.extend(admitted.iter().map(|(n, a, r)| (n.clone(), a.clone(), *r)));
+    out_entries.extend(admitted.iter().map(|(n, e)| (n.clone(), e.clone())));
     write_corpus(&ood_path, &out_entries)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", ood_path.display()));
 
@@ -478,8 +460,8 @@ mod tests {
         let mut rng = Lcg::new(42);
         for _ in 0..50 {
             let form = FORMS[rng.choice(FORMS.len())];
-            let (arena, _root) = form.build(&mut rng);
-            assert_polynomial_only(&format!("{:?}", form), &arena);
+            let (expr, _env) = form.build(&mut rng);
+            assert_polynomial_only(&format!("{form:?}"), expr.entry());
         }
     }
 
@@ -521,17 +503,17 @@ mod tests {
     fn exact_key_distinguishes_different_control_points_same_topology() {
         let mut rng_a = Lcg::new(1);
         let mut rng_b = Lcg::new(2);
-        let (arena_a, root_a) = Form::BernsteinCubic.build(&mut rng_a);
-        let (arena_b, root_b) = Form::BernsteinCubic.build(&mut rng_b);
+        let (a, _ea) = Form::BernsteinCubic.build(&mut rng_a);
+        let (b, _eb) = Form::BernsteinCubic.build(&mut rng_b);
         assert_ne!(
-            ExactKey::of(&arena_a, root_a),
-            ExactKey::of(&arena_b, root_b),
+            ExactKey::of(a.entry()),
+            ExactKey::of(b.entry()),
             "two bernstein-cubic draws with different (seeded) control points must be distinct \
              under the literal-including ExactKey, even though they share one FenceKey"
         );
         assert_eq!(
-            FenceKey::of(&arena_a, root_a),
-            FenceKey::of(&arena_b, root_b),
+            FenceKey::of(a.entry()),
+            FenceKey::of(b.entry()),
             "…and DO share one FenceKey — same op tree, same shape, only the constants differ; \
              this is exactly why FenceKey is not used for in-family dedup here"
         );
@@ -541,11 +523,11 @@ mod tests {
     fn exact_key_is_deterministic_and_repeat_draws_collide() {
         let mut rng1 = Lcg::new(99);
         let mut rng2 = Lcg::new(99);
-        let (a1, r1) = Form::Patch.build(&mut rng1);
-        let (a2, r2) = Form::Patch.build(&mut rng2);
+        let (a1, _e1) = Form::Patch.build(&mut rng1);
+        let (a2, _e2) = Form::Patch.build(&mut rng2);
         assert_eq!(
-            ExactKey::of(&a1, r1),
-            ExactKey::of(&a2, r2),
+            ExactKey::of(a1.entry()),
+            ExactKey::of(a2.entry()),
             "same seed must reproduce the identical draw (determinism), and ExactKey must \
              recognize the resulting duplicate"
         );

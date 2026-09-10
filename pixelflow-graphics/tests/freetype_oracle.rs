@@ -55,7 +55,8 @@
 
 use freetype as ft;
 use pixelflow_graphics::fonts::Font;
-use pixelflow_ir::{eval_scalar, passes::lower_dwrt_owned, BindingTable};
+use pixelflow_ir::expr::Term;
+use pixelflow_ir::{eval_scalar, passes::lower_dwrt, BindingTable};
 
 /// Device samples per texel edge when rasterizing the reference.
 const SUPERSAMPLE: i64 = 16;
@@ -212,17 +213,17 @@ fn check(arm: Arm, known_orphans: usize, texels_we_miss: u32) {
             };
 
             let kernel = ours.glyph_kernel_scaled(ch, size as f32).expect("glyph");
-            let (arena, root) = kernel.parts();
-            let (lowered, r) = match arm {
-                Arm::Raw => lower_dwrt_owned(arena, root).expect("lower"),
+            let term = kernel.term();
+            let (lowered, lowered_env) = match arm {
+                Arm::Raw => (lower_dwrt(term).expect("lower"), term.env().clone()),
                 Arm::Optimized => {
                     let shape = pixelflow_ir::LatticeShape::new([extent as u32, extent as u32]);
-                    let optimized =
-                        pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape)
-                            .expect("glyph arenas must optimize");
-                    (optimized.0.clone(), optimized.1)
+                    let optimized = pixelflow_search::runtime::optimize_runtime_term(term, shape)
+                        .expect("glyph arenas must optimize");
+                    (optimized.0.clone(), optimized.1.clone())
                 }
             };
+            let lowered_term = Term::new(lowered.entry(), &lowered_env);
 
             let inked: Vec<bool> = (0..extent * extent)
                 .map(|n| reference(n % extent, n / extent) > REFERENCE_INKED)
@@ -243,8 +244,7 @@ fn check(arm: Arm, known_orphans: usize, texels_we_miss: u32) {
             for j in 0..extent {
                 for i in 0..extent {
                     let cov = eval_scalar(
-                        &lowered,
-                        r,
+                        lowered_term,
                         &[i as f32 + 0.5, j as f32 + 0.5],
                         &BindingTable::empty(),
                     );
@@ -263,8 +263,7 @@ fn check(arm: Arm, known_orphans: usize, texels_we_miss: u32) {
                                     && a < extent
                                     && b < extent
                                     && eval_scalar(
-                                        &lowered,
-                                        r,
+                                        lowered_term,
                                         &[a as f32 + 0.5, b as f32 + 0.5],
                                         &BindingTable::empty(),
                                     ) > OURS_INKED

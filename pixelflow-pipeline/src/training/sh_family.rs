@@ -56,7 +56,7 @@
 //! `pythagorean` bait in the set, since φ appears only inside
 //! `sin²(mφ) + cos²(mφ)` terms once every m is squared and summed.
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, ExprRef, OpKind, Rooted};
 
 /// θ — the polar angle — is the arena's `X` coordinate (`Var(0)`).
 pub const THETA_VAR: u8 = 0;
@@ -125,7 +125,7 @@ impl Rng {
 /// `base` raised to the integer power `n` (n ∈ {2,3,4}) by repeated
 /// multiplication in the arena — no `Pow` op, so no exp/log rule can touch
 /// it, matching the hand-expanded polynomial form real-SH references use.
-fn ipow(arena: &mut ExprArena, base: ExprId, n: u32) -> ExprId {
+fn ipow(arena: &mut ExprBuilder, base: ExprRef, n: u32) -> ExprRef {
     assert!(n >= 1, "ipow: exponent must be >= 1, got {n}");
     let mut acc = base;
     for _ in 1..n {
@@ -136,19 +136,19 @@ fn ipow(arena: &mut ExprArena, base: ExprId, n: u32) -> ExprId {
 
 /// `Sin(θ)`/`Cos(θ)`/`Sin(φ)`/`Cos(φ)`, computed once per draw and threaded
 /// through every basis-function builder as one value (DAG sharing — each
-/// node is reused, never rebuilt) instead of four positional `ExprId`
+/// node is reused, never rebuilt) instead of four positional `ExprRef`
 /// arguments.
 #[derive(Clone, Copy)]
 struct TrigBasis {
-    sin_th: ExprId,
-    cos_th: ExprId,
-    sin_phi: ExprId,
-    cos_phi: ExprId,
+    sin_th: ExprRef,
+    cos_th: ExprRef,
+    sin_phi: ExprRef,
+    cos_phi: ExprRef,
 }
 
 impl TrigBasis {
     /// Push fresh `θ`/`φ` variables and their `Sin`/`Cos` into `arena`.
-    fn build(arena: &mut ExprArena) -> Self {
+    fn build(arena: &mut ExprBuilder) -> Self {
         let x = arena.push_var(THETA_VAR);
         let y = arena.push_var(PHI_VAR);
         Self {
@@ -163,7 +163,13 @@ impl TrigBasis {
 /// `sin(mφ)` for m ∈ {1,2,3,4}, per [`Form`]. `sin_phi`/`cos_phi` are the
 /// caller's cached `Sin(φ)`/`Cos(φ)` nodes, reused (DAG sharing) rather than
 /// rebuilt per call.
-fn sin_mphi(arena: &mut ExprArena, sin_phi: ExprId, cos_phi: ExprId, m: u32, form: Form) -> ExprId {
+fn sin_mphi(
+    arena: &mut ExprBuilder,
+    sin_phi: ExprRef,
+    cos_phi: ExprRef,
+    m: u32,
+    form: Form,
+) -> ExprRef {
     match (m, form) {
         (1, _) => sin_phi,
         (m, Form::Direct) => {
@@ -204,7 +210,13 @@ fn sin_mphi(arena: &mut ExprArena, sin_phi: ExprId, cos_phi: ExprId, m: u32, for
 }
 
 /// `cos(mφ)` for m ∈ {1,2,3,4}, per [`Form`] — mirrors [`sin_mphi`].
-fn cos_mphi(arena: &mut ExprArena, sin_phi: ExprId, cos_phi: ExprId, m: u32, form: Form) -> ExprId {
+fn cos_mphi(
+    arena: &mut ExprBuilder,
+    sin_phi: ExprRef,
+    cos_phi: ExprRef,
+    m: u32,
+    form: Form,
+) -> ExprRef {
     match (m, form) {
         (1, _) => cos_phi,
         (m, Form::Direct) => {
@@ -246,7 +258,7 @@ fn cos_mphi(arena: &mut ExprArena, sin_phi: ExprId, cos_phi: ExprId, m: u32, for
 /// Convenience: push a fresh reference to the φ variable. Cheap — `Var` is a
 /// tiny leaf node, and the arena does not dedup pushes for us — callers that
 /// already hold a cached φ id should use that instead of this.
-fn phi(arena: &mut ExprArena) -> ExprId {
+fn phi(arena: &mut ExprBuilder) -> ExprRef {
     arena.push_var(PHI_VAR)
 }
 
@@ -260,14 +272,14 @@ fn phi(arena: &mut ExprArena) -> ExprId {
 /// Panics for `l` or `m_abs` outside the table — a caller bug, not a data
 /// condition.
 fn theta_factor(
-    arena: &mut ExprArena,
-    sin_th: ExprId,
-    cos_th: ExprId,
+    arena: &mut ExprBuilder,
+    sin_th: ExprRef,
+    cos_th: ExprRef,
     l: u32,
     m_abs: u32,
-) -> ExprId {
+) -> ExprRef {
     use std::f32::consts::PI;
-    let k_const = |arena: &mut ExprArena, k: f32| arena.push_const(k);
+    let k_const = |arena: &mut ExprBuilder, k: f32| arena.push_const(k);
     match (l, m_abs) {
         (0, 0) => {
             let k = 0.5 * (1.0 / PI).sqrt();
@@ -410,7 +422,7 @@ fn theta_factor(
 /// `Y_l^m(θ, φ)`: [`theta_factor`] times the φ factor (`sin(|m|φ)` for
 /// m < 0, `cos(mφ)` for m > 0, nothing for m = 0). `m` is signed
 /// (`-l..=l`).
-fn y_l_m(arena: &mut ExprArena, basis: TrigBasis, l: u32, m: i32, form: Form) -> ExprId {
+fn y_l_m(arena: &mut ExprBuilder, basis: TrigBasis, l: u32, m: i32, form: Form) -> ExprRef {
     let m_abs = m.unsigned_abs();
     let theta = theta_factor(arena, basis.sin_th, basis.cos_th, l, m_abs);
     match m.cmp(&0) {
@@ -446,7 +458,7 @@ fn shuffle<T>(items: &mut [T], rng: &mut Rng) {
 /// fusion or a plain `Mul`+`Add` pair — both mathematically the sum the
 /// docstring states; the choice only varies which op nodes represent it,
 /// which is exactly the axis `FenceKey` is sensitive to.
-fn sh_sum(arena: &mut ExprArena, l_max: u32, form: Form, rng: &mut Rng) -> ExprId {
+fn sh_sum(arena: &mut ExprBuilder, l_max: u32, form: Form, rng: &mut Rng) -> ExprRef {
     let basis = TrigBasis::build(arena);
 
     let mut terms: Vec<(u32, i32)> = Vec::new();
@@ -462,7 +474,7 @@ fn sh_sum(arena: &mut ExprArena, l_max: u32, form: Form, rng: &mut Rng) -> ExprI
     }
     shuffle(&mut terms, rng);
 
-    let mut acc: Option<ExprId> = None;
+    let mut acc: Option<ExprRef> = None;
     for (l, m) in terms {
         let ylm = y_l_m(arena, basis, l, m, form);
         let c = rng.range(-1.0, 1.0);
@@ -484,8 +496,8 @@ fn sh_sum(arena: &mut ExprArena, l_max: u32, form: Form, rng: &mut Rng) -> ExprI
 /// constant independent of θ,φ: exactly the shape where φ appears only
 /// inside `sin²(mφ) + cos²(mφ)` once every `m` is squared and summed, the
 /// purest `pythagorean` bait this family offers.
-fn band_energy(arena: &mut ExprArena, basis: TrigBasis, l: u32, form: Form) -> ExprId {
-    let mut terms: Vec<ExprId> = Vec::new();
+fn band_energy(arena: &mut ExprBuilder, basis: TrigBasis, l: u32, form: Form) -> ExprRef {
+    let mut terms: Vec<ExprRef> = Vec::new();
     for m in -(l as i32)..=(l as i32) {
         let ylm = y_l_m(arena, basis, l, m, form);
         terms.push(arena.push_binary(OpKind::Mul, ylm, ylm));
@@ -503,7 +515,7 @@ fn band_energy(arena: &mut ExprArena, basis: TrigBasis, l: u32, form: Form) -> E
 /// count > 50) — the band-energy terms alone are small. The subset/form/L
 /// draws are this structure's source of `FenceKey` diversity, the same role
 /// [`sh_sum`]'s term-subset draw plays for the direct/expanded structures.
-fn sh_power(arena: &mut ExprArena, rng: &mut Rng) -> ExprId {
+fn sh_power(arena: &mut ExprBuilder, rng: &mut Rng) -> ExprRef {
     let basis = TrigBasis::build(arena);
 
     let mut bands: Vec<u32> = vec![1, 2, 3];
@@ -513,7 +525,7 @@ fn sh_power(arena: &mut ExprArena, rng: &mut Rng) -> ExprId {
     }
     shuffle(&mut bands, rng);
 
-    let mut energies: Option<ExprId> = None;
+    let mut energies: Option<ExprRef> = None;
     for l in bands {
         let e = band_energy(arena, basis, l, rng.form());
         energies = Some(match energies {
@@ -536,15 +548,15 @@ fn sh_power(arena: &mut ExprArena, rng: &mut Rng) -> ExprId {
 /// filtering, structural dedup, and the numeric quarantine — this function
 /// only builds the expression.
 #[must_use]
-pub fn draw(rng: &mut Rng) -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+pub fn draw(rng: &mut Rng) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     // 3-way structure draw: single sum / product of two sums / band energy.
     match rng.below(3) {
         0 => {
             let form = rng.form();
             let l_max = 2 + rng.below(3); // L in {2,3,4}
             let root = sh_sum(&mut arena, l_max, form, rng);
-            (arena, root)
+            arena.finish(&[root])
         }
         1 => {
             // Product of two independent sums, L<=2 each (irradiance x
@@ -556,11 +568,11 @@ pub fn draw(rng: &mut Rng) -> (ExprArena, ExprId) {
             let a = sh_sum(&mut arena, 1 + rng.below(2), form, rng);
             let b = sh_sum(&mut arena, 1 + rng.below(2), form, rng);
             let root = arena.push_binary(OpKind::Mul, a, b);
-            (arena, root)
+            arena.finish(&[root])
         }
         _ => {
             let root = sh_power(&mut arena, rng);
-            (arena, root)
+            arena.finish(&[root])
         }
     }
 }
@@ -568,10 +580,18 @@ pub fn draw(rng: &mut Rng) -> (ExprArena, ExprId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::{BindingTable, eval_scalar};
+    use pixelflow_ir::{BindingTable, Term, eval_scalar};
 
-    fn eval_at(arena: &ExprArena, root: ExprId, vars: &[f32; 2]) -> f32 {
-        eval_scalar(arena, root, vars, &BindingTable::empty())
+    /// Evaluate a root still under construction: `finish` freezes the
+    /// builder, and a test that wants both the graph and one node's value
+    /// needs the frozen graph anyway.
+    fn eval_built(b: ExprBuilder, root: ExprRef, vars: &[f32; 2]) -> f32 {
+        let (expr, env) = b.finish(&[root]);
+        eval_at(&expr, &env, vars)
+    }
+
+    fn eval_at(expr: &Rooted<ExprData>, env: &Environment, vars: &[f32; 2]) -> f32 {
+        eval_scalar(Term::new(expr.entry(), env), vars, &BindingTable::empty())
     }
 
     /// Every basis function must be finite and agree with a direct
@@ -579,12 +599,12 @@ mod tests {
     /// [`theta_factor`] table before it reaches the corpus.
     #[test]
     fn y_1_0_matches_hand_computed_value_at_theta_zero() {
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let basis = TrigBasis::build(&mut arena);
         let root = y_l_m(&mut arena, basis, 1, 0, Form::Direct);
 
         // theta=0 => cos(theta)=1 => Y_1^0 = sqrt(3/4pi).
-        let got = eval_at(&arena, root, &[0.0, 0.3]);
+        let got = eval_built(arena, root, &[0.0, 0.3]);
         let want = (3.0 / (4.0 * std::f32::consts::PI)).sqrt();
         assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
     }
@@ -594,10 +614,10 @@ mod tests {
         let mut rng = Rng::new(0x00C0_FFEE);
         for i in 0..200u64 {
             let mut draw_rng = Rng::new(0x00C0_FFEE ^ i.wrapping_mul(0x9E37_79B9));
-            let (arena, root) = draw(&mut draw_rng);
+            let (expr, env) = draw(&mut draw_rng);
             for theta in [-2.0f32, -0.5, 0.0, 0.5, 2.0] {
                 for phi in [-2.0f32, -0.5, 0.0, 0.5, 2.0] {
-                    let v = eval_at(&arena, root, &[theta, phi]);
+                    let v = eval_at(&expr, &env, &[theta, phi]);
                     assert!(
                         v.is_finite(),
                         "draw {i} produced non-finite {v} at theta={theta}, phi={phi}"
@@ -616,8 +636,8 @@ mod tests {
         let mut rng = Rng::new(1);
         for i in 0..50u64 {
             let mut draw_rng = Rng::new(i.wrapping_mul(0x2545_F491));
-            let (arena, root) = draw(&mut draw_rng);
-            let n = arena.node_count_subtree(root);
+            let (expr, _env) = draw(&mut draw_rng);
+            let n = pixelflow_ir::node_count_subtree(expr.entry());
             assert!(n >= 5, "draw {i}: implausibly small ({n} nodes)");
             assert!(n <= 2000, "draw {i}: implausibly large ({n} nodes)");
             let _ = &mut rng;
@@ -646,10 +666,10 @@ mod tests {
             for l in 0..=4u32 {
                 let want = f64::from(2 * l + 1) / (4.0 * std::f64::consts::PI);
                 for &(theta, phi_val) in &points {
-                    let mut arena = ExprArena::new();
+                    let mut arena = ExprBuilder::new();
                     let basis = TrigBasis::build(&mut arena);
                     let root = band_energy(&mut arena, basis, l, form);
-                    let got = eval_at(&arena, root, &[theta, phi_val]);
+                    let got = eval_built(arena, root, &[theta, phi_val]);
                     assert!(
                         (f64::from(got) - want).abs() < 1e-3,
                         "l={l} form={form:?} theta={theta} phi={phi_val}: got {got}, want {want}"

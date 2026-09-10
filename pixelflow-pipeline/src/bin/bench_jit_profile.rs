@@ -2,16 +2,17 @@
 //! cargo run --release -p pixelflow-pipeline --features "training profiling" --bin bench_jit_profile
 
 use pixelflow_codegen::emit::compile;
-use pixelflow_ir::arena::ExprArena;
 use pixelflow_ir::kind::OpKind;
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, Rooted, Term};
 
 fn main() {
-    let (arena, root) = build_expr(200);
-    eprintln!("Arena: {} nodes", arena.len());
+    let (expr, env) = build_expr(200);
+    let term = Term::new(expr.entry(), &env);
+    eprintln!("Graph: {} nodes", expr.len());
 
     // Warmup
     for _ in 0..100 {
-        compile(&arena, root).unwrap();
+        compile(term).unwrap();
     }
 
     #[cfg(feature = "profiling")]
@@ -35,7 +36,7 @@ fn main() {
     let n = 10_000;
     let start = std::time::Instant::now();
     for _ in 0..n {
-        std::hint::black_box(compile(&arena, root).unwrap());
+        std::hint::black_box(compile(term).unwrap());
     }
     let elapsed = start.elapsed();
     eprintln!(
@@ -55,8 +56,8 @@ fn main() {
     }
 }
 
-fn build_expr(target_nodes: usize) -> (ExprArena, pixelflow_ir::arena::ExprId) {
-    let mut arena = ExprArena::new();
+fn build_expr(target_nodes: usize) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let y = arena.push_var(1);
     let mut acc = arena.push_binary(OpKind::Mul, x, y);
@@ -91,5 +92,5 @@ fn build_expr(target_nodes: usize) -> (ExprArena, pixelflow_ir::arena::ExprId) {
             }
         }
     }
-    (arena, acc)
+    arena.finish(&[acc])
 }

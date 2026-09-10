@@ -38,7 +38,7 @@
 //! ```
 //!
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, OpKind, Rooted, Term};
 use pixelflow_pipeline::jit_bench::{
     COMPILE_MISS_KERNELS, benchmark_compile_cached_miss, benchmark_compile_fresh,
 };
@@ -67,7 +67,7 @@ const EMIT_SERIES_SALT: f32 = 0.5;
 /// `target_nodes` nodes are reachable from the returned root. Ops stay within
 /// the directly-emittable set (no transcendentals, no gather/reduce), so the
 /// lowering passes are identity fast-paths.
-fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
+fn build_kernel_term(target_nodes: usize, salt: f32) -> (Rooted<ExprData>, Environment) {
     // The SDF seed below is 7 nodes; need at least one more op for a root.
     assert!(
         target_nodes >= 8,
@@ -75,7 +75,7 @@ fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
         target_nodes
     );
 
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     // Circle-SDF-style core: (x-salt)^2 + (y-salt)^2 via mul_add. 7 nodes.
     let x = arena.push_var(0);
     let y = arena.push_var(1);
@@ -113,21 +113,24 @@ fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
         arena.len(),
         target_nodes
     );
-    (arena, cur)
+    arena.finish(&[cur])
 }
 
 /// A stream of `COMPILE_MISS_KERNELS` canonically distinct kernels of
 /// `target_nodes` nodes each. `salt_counter` is global across the whole run
 /// so no two kernels anywhere in the process share a salt (and the salt base
 /// avoids `EMIT_SERIES_SALT`), keeping every `compile_cached` call a miss.
-fn distinct_kernel_stream(target_nodes: usize, salt_counter: &mut u32) -> Vec<(ExprArena, ExprId)> {
+fn distinct_kernel_stream(
+    target_nodes: usize,
+    salt_counter: &mut u32,
+) -> Vec<(Rooted<ExprData>, Environment)> {
     (0..COMPILE_MISS_KERNELS)
         .map(|_| {
             *salt_counter += 1;
             // 0.25 + n·2⁻¹⁶: exactly representable f32 steps, distinct for
             // every n this run can reach, never equal to EMIT_SERIES_SALT.
             let salt = 0.25 + (*salt_counter as f32) * (1.0 / 65536.0);
-            build_kernel_arena(target_nodes, salt)
+            build_kernel_term(target_nodes, salt)
         })
         .collect()
 }
@@ -156,8 +159,8 @@ fn main() {
             .unwrap_or_else(|e| panic!("full-miss bench failed at {} nodes: {}", size, e));
         miss_by_size.push(miss_ns);
 
-        let (arena, root) = build_kernel_arena(size, EMIT_SERIES_SALT);
-        let fresh = benchmark_compile_fresh(&arena, root)
+        let (expr, env) = build_kernel_term(size, EMIT_SERIES_SALT);
+        let fresh = benchmark_compile_fresh(Term::new(expr.entry(), &env))
             .unwrap_or_else(|e| panic!("emit-only bench failed at {} nodes: {}", size, e));
 
         println!(

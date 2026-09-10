@@ -69,7 +69,7 @@ use std::time::Duration;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprData, OpKind, Rooted, Term};
 use pixelflow_pipeline::journal::append_record;
 use pixelflow_pipeline::schema::fnv1a64_hex;
 use pixelflow_pipeline::training::corpus::read_corpus;
@@ -545,8 +545,7 @@ fn induced_order(
 }
 
 struct CurveInput<'a> {
-    arena: &'a ExprArena,
-    root: ExprId,
+    term: Term<'a>,
     class_cap: usize,
     costs: &'a CostModel,
 }
@@ -569,7 +568,7 @@ fn run_guided(
     input: &CurveInput<'_>,
 ) -> (AnytimeCurveOutput, usize) {
     let mut optimizer = arm_optimizer(input, Some(guide));
-    let out = run_anytime_curve(&mut optimizer, input.arena, input.root, GUIDED_GRID);
+    let out = run_anytime_curve(&mut optimizer, input.term, GUIDED_GRID);
     let seen = optimizer
         .guided_keys_seen()
         .expect("a guided optimizer carries an episode");
@@ -590,7 +589,7 @@ fn evaluate_expression(
     rules: &RuleSet,
 ) -> ExprRow {
     let mut unguided_opt = arm_optimizer(input, None);
-    let unguided = run_anytime_curve(&mut unguided_opt, input.arena, input.root, GUIDED_GRID);
+    let unguided = run_anytime_curve(&mut unguided_opt, input.term, GUIDED_GRID);
     let (control, control_seen) = run_guided(Box::new(guides.control.clone()), input);
     let (linear, linear_seen) = run_guided(Box::new(guides.linear.clone()), input);
 
@@ -600,7 +599,7 @@ fn evaluate_expression(
     // same curve the bare guide would have produced.
     let (recorder, capture) = RecordingGuide::new(Box::new(guides.bilinear.clone()));
     let mut bilinear_opt = arm_optimizer(input, Some(Box::new(recorder)));
-    let bilinear = run_anytime_curve(&mut bilinear_opt, input.arena, input.root, GUIDED_GRID);
+    let bilinear = run_anytime_curve(&mut bilinear_opt, input.term, GUIDED_GRID);
     let bilinear_seen = bilinear_opt
         .guided_keys_seen()
         .expect("a guided optimizer carries an episode");
@@ -649,7 +648,7 @@ fn evaluate_expression(
         name: name.to_string(),
         family: dev_family(name),
         run_config: None,
-        node_count: input.arena.nodes_raw().len(),
+        node_count: input.term.root().node_count(),
         class_cap: input.class_cap,
         arms,
         at_budget,
@@ -1086,20 +1085,20 @@ fn train_fence_keys(corpus_dir: &Path) -> HashSet<FenceKey> {
         read_corpus(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     entries
         .iter()
-        .map(|(_, arena, root)| FenceKey::of(arena, *root))
+        .map(|(_, expr)| FenceKey::of(expr.entry()))
         .collect()
 }
 
 fn enforce_train_fence(
     corpus_path: &Path,
     corpus_dir: &Path,
-    entries: &[(String, ExprArena, ExprId)],
+    entries: &[(String, Rooted<ExprData>)],
 ) {
     let train_keys = train_fence_keys(corpus_dir);
     let collisions: Vec<&str> = entries
         .iter()
-        .filter(|(_, arena, root)| train_keys.contains(&FenceKey::of(arena, *root)))
-        .map(|(name, _, _)| name.as_str())
+        .filter(|(_, expr)| train_keys.contains(&FenceKey::of(expr.entry())))
+        .map(|(name, _)| name.as_str())
         .collect();
     assert!(
         collisions.is_empty(),
@@ -1148,7 +1147,7 @@ fn main() {
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", corpus_path.display()));
         enforce_train_fence(&corpus_path, &corpus_dir, &entries);
         if !args.name_prefix.is_empty() {
-            entries.retain(|(name, _, _)| name.starts_with(&args.name_prefix));
+            entries.retain(|(name, _)| name.starts_with(&args.name_prefix));
             assert!(
                 !entries.is_empty(),
                 "--name-prefix {:?} matches no entry in {}",
@@ -1157,13 +1156,8 @@ fn main() {
             );
         }
         // The registered claim is on the classical band only (node count > 50).
-        entries.retain(|(_, arena, _)| arena.nodes_raw().len() > 50);
-        entries.sort_by(|a, b| {
-            a.1.nodes_raw()
-                .len()
-                .cmp(&b.1.nodes_raw().len())
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        entries.retain(|(_, expr)| expr.len() > 50);
+        entries.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(&b.0)));
         eprintln!(
             "phase3_bilinear_eval: set {:?} — {} classical expressions",
             args.set,
@@ -1207,19 +1201,21 @@ fn main() {
             .unwrap_or_else(|e| panic!("cannot open {}: {e}", jsonl_path.display()));
 
         let total = entries.len();
-        for (i, (name, arena, root)) in entries.iter().enumerate() {
+        // A corpus entry declares no buffers or uniforms — the format refuses
+        // to write one down — so one empty environment serves every term.
+        let env = Environment::new();
+        for (i, (name, expr)) in entries.iter().enumerate() {
             if existing.contains(name) {
                 continue;
             }
             eprintln!(
                 "phase3_bilinear_eval: [{}/{total}] {name} ({} nodes)",
                 i + 1,
-                arena.nodes_raw().len()
+                expr.len()
             );
             let input = CurveInput {
-                arena,
-                root: *root,
-                class_cap: config_for_node_count(arena.nodes_raw().len()).max_classes,
+                term: Term::new(expr.entry(), &env),
+                class_cap: config_for_node_count(expr.len()).max_classes,
                 costs: &costs,
             };
             let mut row = evaluate_expression(&args.set, name, &input, &guides, &rules);

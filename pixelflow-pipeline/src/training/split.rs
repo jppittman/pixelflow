@@ -21,7 +21,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::{ExprData, Node, node_count_subtree};
 
 use super::structural::FenceKey;
 
@@ -789,9 +789,9 @@ impl<T: HoldoutSide> Fence<T> {
 
         let mut keys = HashSet::with_capacity(entries.len());
         let mut node_counts = Vec::with_capacity(entries.len());
-        for (_name, arena, root) in &entries {
-            keys.insert(FenceKey::of(arena, *root));
-            node_counts.push(arena.node_count_subtree(*root));
+        for (_name, expr) in &entries {
+            keys.insert(FenceKey::of(expr.entry()));
+            node_counts.push(node_count_subtree(expr.entry()));
         }
         Self {
             keys,
@@ -834,17 +834,16 @@ impl<T: HoldoutSide> Fence<T> {
     }
 }
 
-/// Check `(arena, root)` against every held-out side (DEV and FINAL): a
-/// candidate expression whose feature-quotient structure already belongs to
-/// either is holdout, whichever side owns it.
+/// Check `root` against every held-out side (DEV and FINAL): a candidate
+/// expression whose feature-quotient structure already belongs to either is
+/// holdout, whichever side owns it.
 #[must_use]
 pub fn blocked_by_either(
     dev: &Fence<DevSide>,
     final_fence: &Fence<FinalSide>,
-    arena: &ExprArena,
-    root: ExprId,
+    root: Node<'_, ExprData>,
 ) -> bool {
-    let key = FenceKey::of(arena, root);
+    let key = FenceKey::of(root);
     dev.contains(&key) || final_fence.contains(&key)
 }
 
@@ -853,7 +852,7 @@ pub fn blocked_by_either(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::OpKind;
+    use pixelflow_ir::{ExprBuilder, OpKind, Rooted};
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -866,19 +865,19 @@ mod tests {
         dir
     }
 
-    fn scaled_var(k: f32) -> (ExprArena, ExprId) {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let c = arena.push_const(k);
-        let root = arena.push_binary(OpKind::Mul, x, c);
-        (arena, root)
+    fn scaled_var(k: f32) -> Rooted<ExprData> {
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let c = b.push_const(k);
+        let root = b.push_binary(OpKind::Mul, x, c);
+        b.finish(&[root]).0
     }
 
-    fn write_tier(dir: &Path, tier: Tier, exprs: &[(ExprArena, ExprId)]) {
-        let entries: Vec<(String, ExprArena, ExprId)> = exprs
+    fn write_tier(dir: &Path, tier: Tier, exprs: &[Rooted<ExprData>]) {
+        let entries: Vec<super::super::corpus::Entry> = exprs
             .iter()
             .enumerate()
-            .map(|(i, (a, r))| (format!("{}_{i}", tier.name()), a.clone(), *r))
+            .map(|(i, e)| (format!("{}_{i}", tier.name()), e.clone()))
             .collect();
         super::super::corpus::write_corpus(
             &dir.join(format!("corpus_{}.bin", tier.name())),
@@ -899,9 +898,9 @@ mod tests {
         let dev = Fence::<DevSide>::build(&dir);
         let final_fence = Fence::<FinalSide>::build(&dir);
 
-        let (candidate, root) = scaled_var(3.0);
+        let candidate = scaled_var(3.0);
         assert!(
-            blocked_by_either(&dev, &final_fence, &candidate, root),
+            blocked_by_either(&dev, &final_fence, candidate.entry()),
             "X * 3.0 must be fenced out by a DEV entry of X * 2.0 — both are the identical \
              input to the extraction head"
         );
@@ -918,12 +917,13 @@ mod tests {
         let dev = Fence::<DevSide>::build(&dir);
         let final_fence = Fence::<FinalSide>::build(&dir);
 
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let c = arena.push_const(2.0);
-        let add = arena.push_binary(OpKind::Add, x, c);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let c = b.push_const(2.0);
+        let add = b.push_binary(OpKind::Add, x, c);
+        let (rooted, _env) = b.finish(&[add]);
         assert!(
-            !blocked_by_either(&dev, &final_fence, &arena, add),
+            !blocked_by_either(&dev, &final_fence, rooted.entry()),
             "X + 2.0 is a different op from the fenced X * 2.0 and must survive"
         );
 

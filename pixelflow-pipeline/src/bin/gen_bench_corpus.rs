@@ -56,9 +56,9 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::{ExprBuilder, Term};
 use pixelflow_pipeline::shader_bench::named_kernel;
-use pixelflow_pipeline::training::corpus::write_corpus;
+use pixelflow_pipeline::training::corpus::{Entry, write_corpus};
 use pixelflow_pipeline::training::quarantine::Quarantine;
 use pixelflow_pipeline::training::split::{Family, SplitManifest, Tier};
 use pixelflow_pipeline::training::structural::FenceKey;
@@ -586,7 +586,7 @@ fn tier_staging_path(output_dir: &str, tier: Tier) -> PathBuf {
 ///
 /// Panics on any write or rename failure, after cleaning up the staging files
 /// so a later run cannot mistake them for output.
-fn publish_tiers(output_dir: &str, tier_entries: &[Vec<(String, ExprArena, ExprId)>; 3]) {
+fn publish_tiers(output_dir: &str, tier_entries: &[Vec<Entry>; 3]) {
     // Cleanup REPORTS rather than panics: a failure to remove a staging file is
     // secondary to the failure that aborted the publish, and panicking here
     // would replace the primary diagnosis with a housekeeping error. Nothing is
@@ -673,20 +673,19 @@ fn main() {
     let mut quarantine = Quarantine::new(&quarantine_log_path);
 
     let mut ledger: DedupLedger<FenceKey> = DedupLedger::new();
-    let mut tier_entries: [Vec<(String, ExprArena, ExprId)>; 3] =
-        [Vec::new(), Vec::new(), Vec::new()];
+    let mut tier_entries: [Vec<Entry>; 3] = [Vec::new(), Vec::new(), Vec::new()];
 
     // The named production kernels enter FINAL first, so their structures are
     // fenced off before any synthetic generation can collide with them.
     for name in &manifest.final_kernels {
-        let (arena, root) = named_kernel(name).unwrap_or_else(|| {
+        let (expr, env) = named_kernel(name).unwrap_or_else(|| {
             panic!(
                 "split manifest FINAL kernel \"{name}\" is not a known production kernel \
                  (known: swirl, circle_sdf, poly, redundant, normalize, plus the withheld \
                  ShaderToy set — see pixelflow_pipeline::shader_bench::SHADERTOY_KERNEL_NAMES)"
             )
         });
-        let key = FenceKey::of(&arena, root);
+        let key = FenceKey::of(expr.entry());
         assert_eq!(
             ledger.probe(&key, Tier::Final),
             Admission::New,
@@ -696,12 +695,12 @@ fn main() {
         // corpus-hygiene event — it is an emitter or oracle bug invalidating
         // the whole eval tier. Fail immediately.
         assert!(
-            quarantine.check(name, &arena, root),
+            quarantine.check(name, Term::new(expr.entry(), &env)),
             "named FINAL kernel \"{name}\" failed the numeric quarantine — JIT emitter or \
              oracle bug; see {quarantine_log_path}"
         );
         ledger.register(key, Tier::Final);
-        tier_entries[tier_index(Tier::Final)].push((name.clone(), arena, root));
+        tier_entries[tier_index(Tier::Final)].push((name.clone(), expr));
     }
 
     let total_families: usize = Tier::ALL
@@ -741,16 +740,22 @@ fn main() {
 
             while outcome.admitted < per_family && outcome.attempts < max_attempts {
                 outcome.attempts += 1;
-                let pair = rng.generate_arena();
-                let arena = pair.arena;
-                let root = pair.unoptimized;
+                let pair = rng.generate();
+                // The generator hands back one graph holding both forms; this
+                // corpus stores the junkified one, in a graph of its own.
+                let (expr, env) = {
+                    let mut b = ExprBuilder::new();
+                    let r = b.splice(pair.unoptimized());
+                    b.finish(&[r])
+                };
+                let term = Term::new(expr.entry(), &env);
 
-                if arena.node_count_subtree(root) > args.max_nodes {
+                if pixelflow_ir::node_count_subtree(term.root()) > args.max_nodes {
                     outcome.too_large += 1;
                     continue;
                 }
 
-                let key = FenceKey::of(&arena, root);
+                let key = FenceKey::of(term.root());
                 match ledger.probe(&key, tier) {
                     Admission::New => {}
                     Admission::DuplicateWithin => {
@@ -770,14 +775,14 @@ fn main() {
                     family.seed,
                     tier_generated + outcome.admitted
                 );
-                let (exclusion, _conditioning) = quarantine.verdict(&name, &arena, root);
+                let (exclusion, _conditioning) = quarantine.verdict(&name, term);
                 if let Some(exclusion) = exclusion {
                     *outcome.quarantined.entry(exclusion.reason()).or_insert(0) += 1;
                     continue;
                 }
 
                 ledger.register(key, tier);
-                tier_entries[tier_index(tier)].push((name, arena, root));
+                tier_entries[tier_index(tier)].push((name, expr));
                 outcome.admitted += 1;
             }
 
@@ -1049,9 +1054,9 @@ mod tests {
         dir
     }
 
-    fn one_entry(name: &str) -> Vec<(String, ExprArena, ExprId)> {
-        let (arena, root) = named_kernel("poly").expect("poly is a named kernel");
-        vec![(name.to_string(), arena, root)]
+    fn one_entry(name: &str) -> Vec<Entry> {
+        let (expr, _env) = named_kernel("poly").expect("poly is a named kernel");
+        vec![(name.to_string(), expr)]
     }
 
     #[test]
@@ -1116,8 +1121,8 @@ mod tests {
         use pixelflow_pipeline::training::quarantine::{QuarantineGrid, quarantine_verdict};
         let grid = QuarantineGrid::new();
         for name in all_named_kernels() {
-            let (arena, root) = named_kernel(name).expect("known kernel");
-            let verdict = quarantine_verdict(&arena, root, &grid);
+            let (expr, env) = named_kernel(name).expect("known kernel");
+            let verdict = quarantine_verdict(Term::new(expr.entry(), &env), &grid);
             assert!(
                 verdict.exclusion.is_none(),
                 "named kernel {name} must pass its own quarantine; got {:?}",
@@ -1130,8 +1135,8 @@ mod tests {
     fn named_kernels_are_screenable_by_the_oracle() {
         use pixelflow_pipeline::training::quarantine::screen_for_oracle;
         for name in all_named_kernels() {
-            let (arena, root) = named_kernel(name).expect("known kernel");
-            screen_for_oracle(&arena, root)
+            let (expr, env) = named_kernel(name).expect("known kernel");
+            screen_for_oracle(Term::new(expr.entry(), &env))
                 .unwrap_or_else(|e| panic!("named kernel {name} is not quarantinable: {e}"));
         }
     }

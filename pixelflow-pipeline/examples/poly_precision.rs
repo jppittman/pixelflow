@@ -18,7 +18,7 @@
 use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::{JIT_VECTOR_BYTES, Point4, TileSlice};
 use pixelflow_ir::passes::EXP2_POLY;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, OpKind, Rooted, Term};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::poly::{PolyForm, build, chebyshev_fit};
 
@@ -35,21 +35,23 @@ const REPS: usize = 5;
 
 /// `p(X · scale)` — `scale = 1/SAMPLES` sweeps `[0, 1)` for the error pass,
 /// `1.0` for timing.
-fn kernel(form: PolyForm, coeffs: &[f32], scale: f32) -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+fn kernel(form: PolyForm, coeffs: &[f32], scale: f32) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let s = arena.push_const(scale);
     let arg = arena.push_binary(OpKind::Mul, x, s);
     let root = build(&mut arena, form, coeffs, arg);
-    (arena, root)
+    arena.finish(&[root])
 }
 
 /// Max `|JIT(x) − f(x)|` over the sampled range, using the JIT's own
 /// arithmetic — FMA rounding included, which is the whole point: the floor
 /// being looked for IS a rounding floor, so no scalar oracle can stand in.
 fn error(form: PolyForm, coeffs: &[f32], f: impl Fn(f64) -> f64) -> f64 {
-    let (arena, root) = kernel(form, coeffs, 1.0 / SAMPLES as f32);
-    let code = compile(&arena, root).expect("compile").code;
+    let (expr, env) = kernel(form, coeffs, 1.0 / SAMPLES as f32);
+    let code = compile(Term::new(expr.entry(), &env))
+        .expect("compile")
+        .code;
     let groups = SAMPLES / LANES;
     let mut out = vec![0.0f32; groups * LANES];
     let mut x0 = [0.0f32; LANES];
@@ -78,12 +80,13 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn scanline_ns(session: &mut BenchSession, form: PolyForm, coeffs: &[f32]) -> f64 {
-    let (arena, root) = kernel(form, coeffs, 1.0);
+    let (expr, env) = kernel(form, coeffs, 1.0);
+    let term = Term::new(expr.entry(), &env);
     median(
         (0..REPS)
             .map(|_| {
                 session
-                    .benchmark_arena(&arena, root, BenchMode::Scanline)
+                    .benchmark_term(term, BenchMode::Scanline)
                     .expect("benchmark")
                     .ns
             })

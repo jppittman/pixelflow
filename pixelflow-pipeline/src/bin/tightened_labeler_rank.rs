@@ -63,7 +63,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use pixelflow_ir::ExprArena;
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_search::egraph::{
     CostModel, EGraph, EpisodeLabels, RuleId, RuleSet, SaturationStop, extract_dag,
@@ -297,8 +297,8 @@ fn main() {
     let train_path = corpus_dir.join("corpus_train.bin");
     let dev_path = corpus_dir.join("corpus_dev.bin");
 
-    let mut entries: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = read_corpus(&train_path)
-        .unwrap_or_else(|e| {
+    let mut entries: Vec<(String, Rooted<ExprData>)> =
+        read_corpus(&train_path).unwrap_or_else(|e| {
             panic!(
                 "tightened_labeler_rank: failed to read {}: {e}",
                 train_path.display()
@@ -358,11 +358,14 @@ fn main() {
         (0u64, 0u64, 0u64, 0u64);
     let mut non_quiescent = 0usize;
 
-    for (i, (name, arena, root)) in entries.iter().enumerate() {
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (name, expr)) in entries.iter().enumerate() {
+        let term = Term::new(expr.entry(), &env);
         let mut egraph = EGraph::with_rules(all_rules());
-        let root_class = pixelflow_search::egraph::insert(
-            arena,
-            *root,
+        let root_class = pixelflow_search::egraph::insert_term(
+            term,
             &mut egraph,
             pixelflow_search::egraph::Vocabulary::Templates,
         )
@@ -445,7 +448,7 @@ fn main() {
 
         rows.push(ExprRow {
             name: name.clone(),
-            node_count: arena.nodes_raw().len(),
+            node_count: expr.len(),
             total_applications,
             loose_lb: loose.load_bearing.len() as u64,
             tight_lb: tight.load_bearing.len() as u64,

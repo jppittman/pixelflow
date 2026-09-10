@@ -68,40 +68,40 @@
 //! a simplification of it. `domain_warp_fbm` below keeps one warp level and
 //! two fbm octaves instead.
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, ExprRef, OpKind, Rooted};
 use std::f32::consts::TAU;
 
-/// Minimal builder sugar over [`ExprArena`]'s `push_*` calls, so the ports
+/// Minimal builder sugar over [`ExprBuilder`]'s `push_*` calls, so the ports
 /// below read close to the cited GLSL instead of a wall of `push_binary`.
 /// Every method is a direct one-line wrapper — no new semantics.
 trait Build {
-    fn k(&mut self, v: f32) -> ExprId;
-    fn var(&mut self, i: u8) -> ExprId;
-    fn add(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn sub(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn mul(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn div(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn sqrt(&mut self, x: ExprId) -> ExprId;
-    fn abs(&mut self, x: ExprId) -> ExprId;
-    fn floor(&mut self, x: ExprId) -> ExprId;
-    fn minv(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn maxv(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn sin(&mut self, x: ExprId) -> ExprId;
-    fn cos(&mut self, x: ExprId) -> ExprId;
-    fn atan2(&mut self, y: ExprId, x: ExprId) -> ExprId;
-    fn ln(&mut self, x: ExprId) -> ExprId;
-    fn log2(&mut self, x: ExprId) -> ExprId;
-    fn gt(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn ge(&mut self, x: ExprId, y: ExprId) -> ExprId;
-    fn mul_add(&mut self, x: ExprId, y: ExprId, z: ExprId) -> ExprId;
-    fn select(&mut self, cond: ExprId, t: ExprId, f: ExprId) -> ExprId;
+    fn k(&mut self, v: f32) -> ExprRef;
+    fn var(&mut self, i: u8) -> ExprRef;
+    fn add(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn sub(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn mul(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn div(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn sqrt(&mut self, x: ExprRef) -> ExprRef;
+    fn abs(&mut self, x: ExprRef) -> ExprRef;
+    fn floor(&mut self, x: ExprRef) -> ExprRef;
+    fn minv(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn maxv(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn sin(&mut self, x: ExprRef) -> ExprRef;
+    fn cos(&mut self, x: ExprRef) -> ExprRef;
+    fn atan2(&mut self, y: ExprRef, x: ExprRef) -> ExprRef;
+    fn ln(&mut self, x: ExprRef) -> ExprRef;
+    fn log2(&mut self, x: ExprRef) -> ExprRef;
+    fn gt(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn ge(&mut self, x: ExprRef, y: ExprRef) -> ExprRef;
+    fn mul_add(&mut self, x: ExprRef, y: ExprRef, z: ExprRef) -> ExprRef;
+    fn select(&mut self, cond: ExprRef, t: ExprRef, f: ExprRef) -> ExprRef;
 
     /// `x * x`.
-    fn sq(&mut self, x: ExprId) -> ExprId {
+    fn sq(&mut self, x: ExprRef) -> ExprRef {
         self.mul(x, x)
     }
     /// `max(min(v, hi), lo)`.
-    fn clampf(&mut self, v: ExprId, lo: f32, hi: f32) -> ExprId {
+    fn clampf(&mut self, v: ExprRef, lo: f32, hi: f32) -> ExprRef {
         let lo = self.k(lo);
         let hi = self.k(hi);
         let h = self.minv(v, hi);
@@ -113,7 +113,7 @@ trait Build {
     /// (CLAUDE.md "Floating point at the edges": stay inside `TRIG_DOMAIN`
     /// and avoid NaN-producing regions by construction, not by hoping the
     /// input is small).
-    fn viewport(&mut self, i: u8, half: f32) -> ExprId {
+    fn viewport(&mut self, i: u8, half: f32) -> ExprRef {
         let v = self.var(i);
         self.clampf(v, -half, half)
     }
@@ -122,84 +122,84 @@ trait Build {
     /// a lattice became two axes — the ports below always sampled it at one
     /// value per call, which is what a uniform is. Never folded, so the
     /// expression keeps its shape.
-    fn arg(&mut self, default: f32) -> ExprId;
+    fn arg(&mut self, default: f32) -> ExprRef;
     /// `x*x + y*y`.
-    fn length2(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn length2(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         let xx = self.sq(x);
         let yy = self.sq(y);
         self.add(xx, yy)
     }
     /// `sqrt(x*x + y*y)` — always a non-negative radicand (sum of two
     /// squares), so `Sqrt` never sees a negative input here.
-    fn length(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn length(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         let l2 = self.length2(x, y);
         self.sqrt(l2)
     }
 }
 
-impl Build for ExprArena {
-    fn k(&mut self, v: f32) -> ExprId {
+impl Build for ExprBuilder {
+    fn k(&mut self, v: f32) -> ExprRef {
         self.push_const(v)
     }
-    fn var(&mut self, i: u8) -> ExprId {
+    fn var(&mut self, i: u8) -> ExprRef {
         self.push_var(i)
     }
-    fn arg(&mut self, default: f32) -> ExprId {
+    fn arg(&mut self, default: f32) -> ExprRef {
         let slot = self.declare_uniform(pixelflow_ir::Uniform::new(default).decl());
         self.push_uniform(slot)
     }
-    fn add(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn add(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Add, x, y)
     }
-    fn sub(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn sub(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Sub, x, y)
     }
-    fn mul(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn mul(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Mul, x, y)
     }
-    fn div(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn div(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Div, x, y)
     }
-    fn sqrt(&mut self, x: ExprId) -> ExprId {
+    fn sqrt(&mut self, x: ExprRef) -> ExprRef {
         self.push_unary(OpKind::Sqrt, x)
     }
-    fn abs(&mut self, x: ExprId) -> ExprId {
+    fn abs(&mut self, x: ExprRef) -> ExprRef {
         self.push_unary(OpKind::Abs, x)
     }
-    fn floor(&mut self, x: ExprId) -> ExprId {
+    fn floor(&mut self, x: ExprRef) -> ExprRef {
         self.push_unary(OpKind::Floor, x)
     }
-    fn minv(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn minv(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Min, x, y)
     }
-    fn maxv(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn maxv(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Max, x, y)
     }
-    fn sin(&mut self, x: ExprId) -> ExprId {
+    fn sin(&mut self, x: ExprRef) -> ExprRef {
         self.push_unary(OpKind::Sin, x)
     }
-    fn cos(&mut self, x: ExprId) -> ExprId {
+    fn cos(&mut self, x: ExprRef) -> ExprRef {
         self.push_unary(OpKind::Cos, x)
     }
-    fn atan2(&mut self, y: ExprId, x: ExprId) -> ExprId {
+    fn atan2(&mut self, y: ExprRef, x: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Atan2, y, x)
     }
-    fn ln(&mut self, x: ExprId) -> ExprId {
+    fn ln(&mut self, x: ExprRef) -> ExprRef {
         self.push_unary(OpKind::Ln, x)
     }
-    fn log2(&mut self, x: ExprId) -> ExprId {
+    fn log2(&mut self, x: ExprRef) -> ExprRef {
         self.push_unary(OpKind::Log2, x)
     }
-    fn gt(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn gt(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Gt, x, y)
     }
-    fn ge(&mut self, x: ExprId, y: ExprId) -> ExprId {
+    fn ge(&mut self, x: ExprRef, y: ExprRef) -> ExprRef {
         self.push_binary(OpKind::Ge, x, y)
     }
-    fn mul_add(&mut self, x: ExprId, y: ExprId, z: ExprId) -> ExprId {
+    fn mul_add(&mut self, x: ExprRef, y: ExprRef, z: ExprRef) -> ExprRef {
         self.push_ternary(OpKind::MulAdd, x, y, z)
     }
-    fn select(&mut self, cond: ExprId, t: ExprId, f: ExprId) -> ExprId {
+    fn select(&mut self, cond: ExprRef, t: ExprRef, f: ExprRef) -> ExprRef {
         self.push_ternary(OpKind::Select, cond, t, f)
     }
 }
@@ -221,8 +221,8 @@ impl Build for ExprArena {
 ///   clamped) rather than a 1D gradient parameter; the three RGB channels
 ///   are summed into one scalar rather than returned as a vec3 — this
 ///   corpus's kernels are single-channel.
-fn cosine_palette() -> (ExprArena, ExprId) {
-    fn channel(a: &mut ExprArena, t: ExprId, d: f32) -> ExprId {
+fn cosine_palette() -> (Rooted<ExprData>, Environment) {
+    fn channel(a: &mut ExprBuilder, t: ExprRef, d: f32) -> ExprRef {
         let dk = a.k(d);
         let td = a.add(t, dk);
         let two_pi = a.k(TAU);
@@ -232,7 +232,7 @@ fn cosine_palette() -> (ExprArena, ExprId) {
         let hc = a.mul(c, half);
         a.add(hc, half)
     }
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 2.0);
     let y = a.viewport(1, 2.0);
     let t = a.length(x, y);
@@ -241,7 +241,7 @@ fn cosine_palette() -> (ExprArena, ExprId) {
     let b = channel(&mut a, t, 0.67);
     let rg = a.add(r, g);
     let sum = a.add(rg, b);
-    (a, sum)
+    a.finish(&[sum])
 }
 
 /// iq's quadratic polynomial smooth-minimum, unioning two circle SDFs at
@@ -258,10 +258,10 @@ fn cosine_palette() -> (ExprArena, ExprId) {
 /// - Simplified: the two circle SDFs are this corpus's own primitive (same
 ///   form as the existing `circle_sdf` named kernel) rather than iq's own
 ///   demo shapes; only the `smin` formula itself is transcribed verbatim.
-fn smooth_min_scene() -> (ExprArena, ExprId) {
+fn smooth_min_scene() -> (Rooted<ExprData>, Environment) {
     // `circle_at`: (center_x, center_y, radius), grouped into one tuple so
     // the builder stays under clippy's/CLAUDE.md's argument-count limit.
-    fn circle(a: &mut ExprArena, x: ExprId, y: ExprId, circle_at: (f32, f32, f32)) -> ExprId {
+    fn circle(a: &mut ExprBuilder, x: ExprRef, y: ExprRef, circle_at: (f32, f32, f32)) -> ExprRef {
         let (cx, cy, r) = circle_at;
         let cxk = a.k(cx);
         let cyk = a.k(cy);
@@ -272,7 +272,7 @@ fn smooth_min_scene() -> (ExprArena, ExprId) {
         a.sub(d, rk)
     }
     // iq: k *= 4.0; h = max(k-|a-b|,0)/k; return min(a,b) - h*h*k*(1/4).
-    fn smin(a: &mut ExprArena, x: ExprId, y: ExprId, k: f32) -> ExprId {
+    fn smin(a: &mut ExprBuilder, x: ExprRef, y: ExprRef, k: f32) -> ExprRef {
         let kk = a.k(k * 4.0);
         let diff = a.sub(x, y);
         let ad = a.abs(diff);
@@ -287,13 +287,13 @@ fn smooth_min_scene() -> (ExprArena, ExprId) {
         let m = a.minv(x, y);
         a.sub(m, term)
     }
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 2.0);
     let y = a.viewport(1, 2.0);
     let c1 = circle(&mut a, x, y, (-0.35, 0.0, 0.55));
     let c2 = circle(&mut a, x, y, (0.35, 0.05, 0.5));
     let root = smin(&mut a, c1, c2, 0.3);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Distance estimate to the Mandelbrot set via the Hubbard-Douady potential
@@ -316,11 +316,11 @@ fn smooth_min_scene() -> (ExprArena, ExprId) {
 ///   iterate until escape or a few hundred steps); escape is a `Select`
 ///   freeze rather than an early `break`; `c` is the pixel position clamped
 ///   into `[-2,2]^2` rather than driven by a pan/zoom camera transform.
-fn mandelbrot_distance() -> (ExprArena, ExprId) {
+fn mandelbrot_distance() -> (Rooted<ExprData>, Environment) {
     const ITERS: usize = 5;
     const BAILOUT2: f32 = 100.0;
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let cx = a.viewport(0, 2.0);
     let cy = a.viewport(1, 2.0);
 
@@ -374,7 +374,7 @@ fn mandelbrot_distance() -> (ExprArena, ExprId) {
     let half = a.k(0.5);
     let hl = a.mul(lm, half);
     let root = a.mul(sr, hl);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// `sdPentagram` — a five-pointed star SDF, built from two reflections
@@ -392,9 +392,9 @@ fn mandelbrot_distance() -> (ExprArena, ExprId) {
 ///   `Ge`+`Select` producing +-1 — GLSL's `sign(0)==0` becomes `+1` here, a
 ///   difference only on the measure-zero set where the argument is exactly
 ///   zero.
-fn star_sdf() -> (ExprArena, ExprId) {
+fn star_sdf() -> (Rooted<ExprData>, Environment) {
     // p -= 2*max(dot(v,p),0)*v.
-    fn fold(a: &mut ExprArena, px: ExprId, py: ExprId, vx: f32, vy: f32) -> (ExprId, ExprId) {
+    fn fold(a: &mut ExprBuilder, px: ExprRef, py: ExprRef, vx: f32, vy: f32) -> (ExprRef, ExprRef) {
         let vxk = a.k(vx);
         let vyk = a.k(vy);
         let dpx = a.mul(px, vxk);
@@ -416,7 +416,7 @@ fn star_sdf() -> (ExprArena, ExprId) {
     const K1Z: f32 = 0.726_542_53;
     const R: f32 = 0.6;
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x0 = a.viewport(0, 2.0);
     let y0 = a.viewport(1, 2.0);
     let px0 = a.abs(x0);
@@ -448,7 +448,7 @@ fn star_sdf() -> (ExprArena, ExprId) {
     let negone = a.k(-1.0);
     let sgn = a.select(pos, one, negone);
     let root = a.mul(len, sgn);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Gyroid triply-periodic minimal surface, evaluated directly as a
@@ -472,8 +472,8 @@ fn star_sdf() -> (ExprArena, ExprId) {
 ///   gyroid term is layered in as detail (a common technique in gyroid
 ///   infill shaders). The raw implicit value is returned rather than the
 ///   corrected pseudo-distance some implementations multiply in.
-fn gyroid_slice() -> (ExprArena, ExprId) {
-    fn gyroid(a: &mut ExprArena, x: ExprId, y: ExprId, z: ExprId) -> ExprId {
+fn gyroid_slice() -> (Rooted<ExprData>, Environment) {
+    fn gyroid(a: &mut ExprBuilder, x: ExprRef, y: ExprRef, z: ExprRef) -> ExprRef {
         let sx = a.sin(x);
         let cy = a.cos(y);
         let sy = a.sin(y);
@@ -486,7 +486,7 @@ fn gyroid_slice() -> (ExprArena, ExprId) {
         let s = a.add(t1, t2);
         a.add(s, t3)
     }
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 6.0);
     let y = a.viewport(1, 6.0);
     let z = a.arg(0.0);
@@ -502,7 +502,7 @@ fn gyroid_slice() -> (ExprArena, ExprId) {
     let amp = a.k(0.25);
     let g2s = a.mul(g2, amp);
     let root = a.add(g1, g2s);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Classic multi-sine "plasma" effect: axis-aligned, diagonal, and radial
@@ -521,8 +521,8 @@ fn gyroid_slice() -> (ExprArena, ExprId) {
 ///   its specific palette/post-processing. The kernel's clock — a uniform,
 ///   because it is one value for a whole frame — stands in for ShaderToy's
 ///   `iTime`.
-fn plasma() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn plasma() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 6.0);
     let y = a.viewport(1, 6.0);
     let t = a.arg(0.0);
@@ -554,7 +554,7 @@ fn plasma() -> (ExprArena, ExprId) {
     let s1234 = a.add(s123, term4);
     let quarter = a.k(0.25);
     let root = a.mul(s1234, quarter);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Domain-warped fractional-Brownian-motion pattern:
@@ -577,8 +577,8 @@ fn plasma() -> (ExprArena, ExprId) {
 ///   2-component field each time — this port keeps only the first level,
 ///   to stay inside the corpus's ~30-400 node band (see the module doc's
 ///   "what was tried and abandoned").
-fn domain_warp_fbm() -> (ExprArena, ExprId) {
-    fn hash(a: &mut ExprArena, x: ExprId, y: ExprId) -> ExprId {
+fn domain_warp_fbm() -> (Rooted<ExprData>, Environment) {
+    fn hash(a: &mut ExprBuilder, x: ExprRef, y: ExprRef) -> ExprRef {
         let kx = a.k(127.1);
         let ky = a.k(311.7);
         let xkx = a.mul(x, kx);
@@ -590,7 +590,7 @@ fn domain_warp_fbm() -> (ExprArena, ExprId) {
         let f = a.floor(v);
         a.sub(v, f) // fract(v) in [0, 1).
     }
-    fn fbm2(a: &mut ExprArena, x: ExprId, y: ExprId) -> ExprId {
+    fn fbm2(a: &mut ExprBuilder, x: ExprRef, y: ExprRef) -> ExprRef {
         let n0 = hash(a, x, y);
         let two = a.k(2.0);
         let x2 = a.mul(x, two);
@@ -606,7 +606,7 @@ fn domain_warp_fbm() -> (ExprArena, ExprId) {
         let n1q = a.mul(n1, quarter);
         a.add(n0h, n1q)
     }
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 4.0);
     let y = a.viewport(1, 4.0);
 
@@ -624,7 +624,7 @@ fn domain_warp_fbm() -> (ExprArena, ExprId) {
     let wy = a.add(y, qk_oy);
 
     let root = fbm2(&mut a, wx, wy);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// N-fold kaleidoscope: fold the polar angle into a repeating wedge (mirror
@@ -644,10 +644,10 @@ fn domain_warp_fbm() -> (ExprArena, ExprId) {
 ///   mod-folded into a wedge, then mirrored) the cited shader teaches, with
 ///   its own simple striped/thresholded pattern in place of a sampled
 ///   texture.
-fn kaleidoscope_fold() -> (ExprArena, ExprId) {
+fn kaleidoscope_fold() -> (Rooted<ExprData>, Environment) {
     const SEGMENTS: f32 = 6.0;
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 4.0);
     let y = a.viewport(1, 4.0);
 
@@ -691,7 +691,7 @@ fn kaleidoscope_fold() -> (ExprArena, ExprId) {
     let stripe_h = a.mul(stripe, blend);
     let ring_h = a.mul(ring, blend);
     let root = a.add(stripe_h, ring_h);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Three-ball metaball field: sum of inverse-square "energy" contributions,
@@ -710,11 +710,11 @@ fn kaleidoscope_fold() -> (ExprArena, ExprId) {
 ///   technique (which the cited shader is one of many modern examples of)
 ///   rather than transcribing the cited shader's exact GLSL (not
 ///   fetchable).
-fn metaballs() -> (ExprArena, ExprId) {
+fn metaballs() -> (Rooted<ExprData>, Environment) {
     // `ball_at`: (center_x, center_y, radius_squared), grouped into one
     // tuple so the builder stays under clippy's/CLAUDE.md's argument-count
     // limit.
-    fn ball(a: &mut ExprArena, x: ExprId, y: ExprId, ball_at: (f32, f32, f32)) -> ExprId {
+    fn ball(a: &mut ExprBuilder, x: ExprRef, y: ExprRef, ball_at: (f32, f32, f32)) -> ExprRef {
         let (cx, cy, r2) = ball_at;
         let cxk = a.k(cx);
         let cyk = a.k(cy);
@@ -726,7 +726,7 @@ fn metaballs() -> (ExprArena, ExprId) {
         let r2k = a.k(r2);
         a.div(r2k, d2s)
     }
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 3.0);
     let y = a.viewport(1, 3.0);
 
@@ -753,7 +753,7 @@ fn metaballs() -> (ExprArena, ExprId) {
     let hardh = a.mul(hard, halfk);
     let softh = a.mul(soft, halfk);
     let root = a.add(hardh, softh);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Cubic Julia set (`z -> z^3 + c` for FIXED c, `z0` = pixel position), fixed
@@ -773,13 +773,13 @@ fn metaballs() -> (ExprArena, ExprId) {
 ///   kernel has no loop-carried iteration counter to make that exact).
 ///   Exact GLSL was not transcribed (ShaderToy fetch blocked) — this
 ///   reimplements the standard cubic-Julia escape-time algorithm.
-fn julia_set() -> (ExprArena, ExprId) {
+fn julia_set() -> (Rooted<ExprData>, Environment) {
     const ITERS: usize = 5;
     const BAILOUT2: f32 = 100.0;
     const CX: f32 = -0.4;
     const CY: f32 = 0.6;
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let mut zx = a.viewport(0, 1.6);
     let mut zy = a.viewport(1, 1.6);
     let cx = a.k(CX);
@@ -824,7 +824,7 @@ fn julia_set() -> (ExprArena, ExprId) {
     let l2 = a.log2(l1he);
     let itersk = a.k(ITERS as f32);
     let root = a.sub(itersk, l2);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Radial vignette plus a thin highlight ring, both built from the standard
@@ -842,10 +842,10 @@ fn julia_set() -> (ExprArena, ExprId) {
 ///   as a radial falloff and a ring, not transcribed from any single
 ///   specific ShaderToy vignette shader — `smoothstep`-as-vignette is the
 ///   standard, widely-taught technique the glossary entry itself describes.
-fn smoothstep_vignette() -> (ExprArena, ExprId) {
+fn smoothstep_vignette() -> (Rooted<ExprData>, Environment) {
     // smoothstep(e0, e1, x) = let t = clamp((x-e0)/(e1-e0), 0, 1) in
     // t*t*(3-2t), with (3-2t) computed as MulAdd(t, -2, 3).
-    fn smoothstep(a: &mut ExprArena, e0: f32, e1: f32, x: ExprId) -> ExprId {
+    fn smoothstep(a: &mut ExprBuilder, e0: f32, e1: f32, x: ExprRef) -> ExprRef {
         let e0k = a.k(e0);
         let e1k = a.k(e1);
         let num = a.sub(x, e0k);
@@ -859,7 +859,7 @@ fn smoothstep_vignette() -> (ExprArena, ExprId) {
         a.mul(t2, poly)
     }
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 3.0);
     let y = a.viewport(1, 3.0);
     let r = a.length(x, y);
@@ -877,7 +877,7 @@ fn smoothstep_vignette() -> (ExprArena, ExprId) {
     let vigw = a.mul(vig, vig_w);
     let ringw = a.mul(ring, ring_w);
     let root = a.add(vigw, ringw);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Torus SDF (`sdTorus`), evaluated as a genuine 3-input field over (X, Y,
@@ -898,10 +898,10 @@ fn smoothstep_vignette() -> (ExprArena, ExprId) {
 ///   (x, y, z) as a genuine 3-variable field, in place of stepping a ray
 ///   through it; the second torus (union) is this port's own addition for
 ///   scene composition, not part of the cited article.
-fn torus_slice() -> (ExprArena, ExprId) {
+fn torus_slice() -> (Rooted<ExprData>, Environment) {
     // `p`: (x, y, z); `radii`: (major, minor) — grouped into tuples so the
     // builder stays under clippy's/CLAUDE.md's argument-count limit.
-    fn torus(a: &mut ExprArena, p: (ExprId, ExprId, ExprId), radii: (f32, f32)) -> ExprId {
+    fn torus(a: &mut ExprBuilder, p: (ExprRef, ExprRef, ExprRef), radii: (f32, f32)) -> ExprRef {
         let (x, y, z) = p;
         let (major, minor) = radii;
         let qx = a.length(x, z);
@@ -911,7 +911,7 @@ fn torus_slice() -> (ExprArena, ExprId) {
         let minork = a.k(minor);
         a.sub(d, minork)
     }
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.viewport(0, 3.0);
     let y = a.viewport(1, 3.0);
     let z = a.arg(0.0);
@@ -923,7 +923,7 @@ fn torus_slice() -> (ExprArena, ExprId) {
     let t2 = torus(&mut a, (x, y, z2), (0.5, 0.15));
 
     let root = a.minv(t1, t2);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Names this module's kernels are registered under in
@@ -957,8 +957,8 @@ pub const SHADERTOY_KERNEL_NAMES: [&str; 12] = [
 pub const NAMED_KERNEL_NAMES: [&str; 5] = ["swirl", "circle_sdf", "poly", "redundant", "normalize"];
 
 /// sin(sqrt(x*x + y*y) * freq) * amp + bias — the swirl shader core.
-fn swirl() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn swirl() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let xx = a.push_binary(OpKind::Mul, x, x);
@@ -972,12 +972,12 @@ fn swirl() -> (ExprArena, ExprId) {
     let prod = a.push_binary(OpKind::Mul, sn, ka);
     let kb = a.push_const(0.5);
     let out = a.push_binary(OpKind::Add, prod, kb);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// Circle SDF: sqrt((x-cx)^2 + (y-cy)^2) - r.
-fn circle_sdf() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn circle_sdf() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let cx = a.push_const(0.3);
@@ -990,12 +990,12 @@ fn circle_sdf() -> (ExprArena, ExprId) {
     let dist = a.push_unary(OpKind::Sqrt, sum);
     let r = a.push_const(0.5);
     let out = a.push_binary(OpKind::Sub, dist, r);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// FMA-bait polynomial: a*x*x + b*x + c (Horner-able, fusion-able).
-fn poly() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn poly() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let ka = a.push_const(2.0);
     let kb = a.push_const(-3.0);
@@ -1005,12 +1005,12 @@ fn poly() -> (ExprArena, ExprId) {
     let bx = a.push_binary(OpKind::Mul, kb, x);
     let s1 = a.push_binary(OpKind::Add, ax2, bx);
     let out = a.push_binary(OpKind::Add, s1, kc);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// Redundancy bait: (x+y)*(x+y) + 2*(x+y) — CSE + distribution territory.
-fn redundant() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn redundant() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let s = a.push_binary(OpKind::Add, x, y);
@@ -1018,12 +1018,12 @@ fn redundant() -> (ExprArena, ExprId) {
     let two = a.push_const(2.0);
     let ts = a.push_binary(OpKind::Mul, two, s);
     let out = a.push_binary(OpKind::Add, s2, ts);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// Division/sqrt bait: x / sqrt(x*x + y*y) (normalize — rsqrt rewrites).
-fn normalize() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn normalize() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let xx = a.push_binary(OpKind::Mul, x, x);
@@ -1031,13 +1031,13 @@ fn normalize() -> (ExprArena, ExprId) {
     let d = a.push_binary(OpKind::Add, xx, yy);
     let s = a.push_unary(OpKind::Sqrt, d);
     let out = a.push_binary(OpKind::Div, x, s);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// Resolve any manifest kernel name — one of [`NAMED_KERNEL_NAMES`] or of
 /// [`SHADERTOY_KERNEL_NAMES`] — to its arena builder.
 #[must_use]
-pub fn named_kernel(name: &str) -> Option<(ExprArena, ExprId)> {
+pub fn named_kernel(name: &str) -> Option<(Rooted<ExprData>, Environment)> {
     match name {
         "swirl" => Some(swirl()),
         "circle_sdf" => Some(circle_sdf()),
@@ -1052,7 +1052,7 @@ pub fn named_kernel(name: &str) -> Option<(ExprArena, ExprId)> {
 /// [`named_kernel`] falls back to this for any name outside the five
 /// original production kernels.
 #[must_use]
-pub fn named_shadertoy_kernel(name: &str) -> Option<(ExprArena, ExprId)> {
+pub fn named_shadertoy_kernel(name: &str) -> Option<(Rooted<ExprData>, Environment)> {
     match name {
         "cosine_palette" => Some(cosine_palette()),
         "smooth_min_scene" => Some(smooth_min_scene()),
@@ -1115,7 +1115,7 @@ mod tests {
         // synthetic output). The fractal kernels here deliberately reuse
         // per-iteration state across several downstream consumers — real
         // sharing that both the JIT (`compile`) and the scalar
-        // oracle's memoized evaluator (`eval.rs`'s per-`ExprId` memo table)
+        // oracle's memoized evaluator (`eval.rs`'s per-`ExprRef` memo table)
         // compile/evaluate once each, so `arena.len()` is what "expression
         // size" actually means for these — `node_count_subtree` explodes
         // combinatorially (a fully-unrolled-tree count) on exactly this

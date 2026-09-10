@@ -11,7 +11,7 @@ use std::fmt;
 use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::emit::executable::ExecutableCode;
 use pixelflow_codegen::error::CompileError;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, OpKind, Rooted, Term};
 
 /// Number of timed samples per expression. Take the median.
 const TIMED_RUNS: usize = 20;
@@ -317,23 +317,11 @@ fn assert_plausible(raw_ns: f64, op_count: usize) {
 /// folding produced the arena the caller hands us, which is what identifies
 /// legitimately-instant constant-folded expressions for the plausibility
 /// floor (audit M4).
-fn op_count(arena: &ExprArena, root: ExprId) -> usize {
-    let mut visited = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut count = 0usize;
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if visited[idx] {
-            continue;
-        }
-        visited[idx] = true;
-        match arena.kind(id) {
-            OpKind::Var | OpKind::Const | OpKind::Buffer => {}
-            _ => count += 1,
-        }
-        stack.extend(arena.children(id));
-    }
-    count
+fn op_count(term: Term<'_>) -> usize {
+    term.root()
+        .descendants()
+        .filter(|n| matches!(**n, ExprData::Op(_)))
+        .count()
 }
 
 /// Whether any `Var` node is reachable from `root` — i.e. whether the kernel
@@ -352,21 +340,8 @@ fn op_count(arena: &ExprArena, root: ExprId) -> usize {
 /// LOWERED schedule the emitter actually built, not to blanket-exempt a class
 /// of expressions from checking.
 #[cfg(test)]
-fn has_reachable_var(arena: &ExprArena, root: ExprId) -> bool {
-    let mut visited = vec![false; arena.len()];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if visited[idx] {
-            continue;
-        }
-        visited[idx] = true;
-        if arena.kind(id) == OpKind::Var {
-            return true;
-        }
-        stack.extend(arena.children(id));
-    }
-    false
+fn has_reachable_var(term: Term<'_>) -> bool {
+    term.root().has_var()
 }
 
 /// The fixed input-coordinate buffer (audit H3/H1): 64 deterministic tuples
@@ -1052,8 +1027,8 @@ fn finalize(
 /// historical dependency structure), no QoS pinning, no sentinel, and no
 /// overhead subtraction (`adjusted_ns == ns`). Label-minting callers should
 /// migrate to [`BenchSession`].
-pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResult, BenchError> {
-    benchmark_jit_arena_repeated(arena, root, 1)
+pub fn benchmark_jit_term(term: Term<'_>) -> Result<BenchResult, BenchError> {
+    benchmark_jit_term_repeated(term, 1)
 }
 
 /// Sessionless benchmark with an explicit starting `repeat_batches`.
@@ -1061,14 +1036,13 @@ pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResul
 /// `repeat_batches` is now only the autoscale *starting point*: the core loop
 /// raises it until the median timed sample clears the timer-tick floor
 /// (audit H5), so passing 1 is always safe.
-pub fn benchmark_jit_arena_repeated(
-    arena: &ExprArena,
-    root: ExprId,
+pub fn benchmark_jit_term_repeated(
+    term: Term<'_>,
     repeat_batches: usize,
 ) -> Result<BenchResult, BenchError> {
-    let result = compile(arena, root).map_err(BenchError::CompileFailed)?;
+    let result = compile(term).map_err(BenchError::CompileFailed)?;
     let raw = measure_exec_code(&result.code, repeat_batches, BenchMode::Throughput)?;
-    Ok(finalize(raw, op_count(arena, root), 0.0, None))
+    Ok(finalize(raw, op_count(term), 0.0, None))
 }
 
 // =============================================================================
@@ -1090,8 +1064,8 @@ pub struct SentinelSample {
 /// mul/add/sqrt over both coordinates. Big enough that its cost tracks
 /// real kernel throughput, small enough to re-measure cheaply every
 /// [`SENTINEL_INTERVAL`] expressions.
-fn sentinel_arena() -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+fn sentinel_term() -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let y = arena.push_var(1);
     let vars = [x, y];
@@ -1108,7 +1082,7 @@ fn sentinel_arena() -> (ExprArena, ExprId) {
         let rooted = arena.push_unary(OpKind::Sqrt, shifted);
         acc = arena.push_binary(OpKind::Add, scaled, rooted);
     }
-    (arena, acc)
+    arena.finish(&[acc])
 }
 
 /// The identity kernel (`|x, _, _, _| x`): its measured per-eval time is pure
@@ -1116,10 +1090,10 @@ fn sentinel_arena() -> (ExprArena, ExprId) {
 /// [`BenchMode::Latency`] its chained measurement serializes the same
 /// all-lanes-fed call/ret + register-move path every candidate's chained
 /// measurement pays, so the per-mode subtraction stays coherent.
-fn identity_arena() -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+fn identity_term() -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let root = arena.push_var(0);
-    (arena, root)
+    arena.finish(&[root])
 }
 
 /// Owns measurement integrity for a benchmarking run (audit H4/M1/L5):
@@ -1158,8 +1132,8 @@ impl BenchSession {
     pub fn new() -> Self {
         pin_qos();
 
-        let (sentinel_arena, sentinel_root) = sentinel_arena();
-        let sentinel_code = compile(&sentinel_arena, sentinel_root)
+        let (sentinel_expr, sentinel_env) = sentinel_term();
+        let sentinel_code = compile(Term::new(sentinel_expr.entry(), &sentinel_env))
             .unwrap_or_else(|e| panic!("BenchSession: sentinel kernel failed to compile: {e}"))
             .code;
 
@@ -1175,8 +1149,8 @@ impl BenchSession {
         // Identity-kernel call overhead per mode (audit M1). Throughput and
         // latency overheads differ (overlapped vs serialized call/ret), so
         // each mode subtracts its own.
-        let (identity_arena, identity_root) = identity_arena();
-        let identity_code = compile(&identity_arena, identity_root)
+        let (identity_expr, identity_env) = identity_term();
+        let identity_code = compile(Term::new(identity_expr.entry(), &identity_env))
             .unwrap_or_else(|e| panic!("BenchSession: identity kernel failed to compile: {e}"))
             .code;
         let overhead_throughput_ns = measure_exec_code(&identity_code, 1, BenchMode::Throughput)
@@ -1264,10 +1238,9 @@ impl BenchSession {
     /// detector; smaller drift is recorded on the result's
     /// [`SentinelContext`], not fatal) — and on measurements below the
     /// per-expression plausibility floor (audit M4).
-    pub fn benchmark_arena(
+    pub fn benchmark_term(
         &mut self,
-        arena: &ExprArena,
-        root: ExprId,
+        term: Term<'_>,
         mode: BenchMode,
     ) -> Result<BenchResult, BenchError> {
         // Sentinel BEFORE compiling, as this entry point has always done: the
@@ -1276,8 +1249,8 @@ impl BenchSession {
         // immediately ahead of the timed loop. Delegating wholesale to
         // `benchmark_compiled` would silently reorder that.
         self.check_sentinel_if_due();
-        let compiled = compile(arena, root).map_err(BenchError::CompileFailed)?;
-        self.measure_gated(&compiled.code, arena, root, mode)
+        let compiled = compile(term).map_err(BenchError::CompileFailed)?;
+        self.measure_gated(&compiled.code, term, mode)
     }
 
     /// Benchmark a PRE-COMPILED code object under `mode`, with the same
@@ -1302,12 +1275,11 @@ impl BenchSession {
     pub fn benchmark_compiled(
         &mut self,
         code: &ExecutableCode,
-        arena: &ExprArena,
-        root: ExprId,
+        term: Term<'_>,
         mode: BenchMode,
     ) -> Result<BenchResult, BenchError> {
         self.check_sentinel_if_due();
-        self.measure_gated(code, arena, root, mode)
+        self.measure_gated(code, term, mode)
     }
 
     /// Time `code` and finalize the result. The shared tail of
@@ -1319,15 +1291,14 @@ impl BenchSession {
     fn measure_gated(
         &mut self,
         code: &ExecutableCode,
-        arena: &ExprArena,
-        root: ExprId,
+        term: Term<'_>,
         mode: BenchMode,
     ) -> Result<BenchResult, BenchError> {
         let raw = measure_exec_code(code, 1, mode)?;
         self.exprs_benchmarked += 1;
         Ok(finalize(
             raw,
-            op_count(arena, root),
+            op_count(term),
             self.call_overhead_ns(mode),
             Some(self.sentinel_context()),
         ))
@@ -1335,14 +1306,13 @@ impl BenchSession {
 
     /// Convenience: compile once, measure both modes back-to-back. Counts as
     /// one benchmarked expression for sentinel cadence.
-    pub fn benchmark_arena_both(
+    pub fn benchmark_term_both(
         &mut self,
-        arena: &ExprArena,
-        root: ExprId,
+        term: Term<'_>,
     ) -> Result<(BenchResult, BenchResult), BenchError> {
         self.check_sentinel_if_due();
-        let compiled = compile(arena, root).map_err(BenchError::CompileFailed)?;
-        let ops = op_count(arena, root);
+        let compiled = compile(term).map_err(BenchError::CompileFailed)?;
+        let ops = op_count(term);
         let throughput = measure_exec_code(&compiled.code, 1, BenchMode::Throughput)?;
         let latency = measure_exec_code(&compiled.code, 1, BenchMode::Latency)?;
         self.exprs_benchmarked += 1;
@@ -1453,7 +1423,9 @@ pub struct CompileCostResult {
 /// retain every entry compiled here. That is fine for a one-shot bench
 /// process; do not call this in a long-lived process expecting the memory
 /// back.
-pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Result<f64, BenchError> {
+pub fn benchmark_compile_cached_miss(
+    kernels: Vec<(Rooted<ExprData>, Environment)>,
+) -> Result<f64, BenchError> {
     use pixelflow_codegen::jit_cache;
 
     assert_eq!(
@@ -1467,8 +1439,8 @@ pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Resul
     let entries_before = jit_cache::entry_count();
     let mut kernels = kernels.into_iter();
 
-    for (arena, root) in kernels.by_ref().take(COMPILE_WARMUP_ITERS) {
-        let k = pixelflow_ir::Kernel::from_parts(arena, root);
+    for (expr, env) in kernels.by_ref().take(COMPILE_WARMUP_ITERS) {
+        let k = pixelflow_ir::Kernel::from_rooted(expr, env);
         let compiled = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
             .map_err(BenchError::CompileFailed)?
             .kernel;
@@ -1477,9 +1449,9 @@ pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Resul
 
     let mut times = [0u64; COMPILE_TIMED_RUNS];
     for t in &mut times {
-        let (arena, root) = kernels.next().expect("stream length asserted above");
+        let (expr, env) = kernels.next().expect("stream length asserted above");
         let start = nanos_now();
-        let k = pixelflow_ir::Kernel::from_parts(arena, root);
+        let k = pixelflow_ir::Kernel::from_rooted(expr, env);
         let compiled = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
             .map_err(BenchError::CompileFailed)?
             .kernel;
@@ -1510,12 +1482,9 @@ pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Resul
 /// pays all of those on top; measure that with
 /// [`benchmark_compile_cached_miss`]. Keep this series for attributing how
 /// much of the miss cost is codegen proper.
-pub fn benchmark_compile_fresh(
-    arena: &ExprArena,
-    root: ExprId,
-) -> Result<CompileCostResult, BenchError> {
+pub fn benchmark_compile_fresh(term: Term<'_>) -> Result<CompileCostResult, BenchError> {
     for _ in 0..COMPILE_WARMUP_ITERS {
-        let result = compile(arena, root).map_err(BenchError::CompileFailed)?;
+        let result = compile(term).map_err(BenchError::CompileFailed)?;
         std::hint::black_box(result.code.as_bytes().first());
     }
 
@@ -1523,7 +1492,7 @@ pub fn benchmark_compile_fresh(
     let mut code_bytes = 0usize;
     for t in &mut times {
         let start = nanos_now();
-        let result = compile(arena, root).map_err(BenchError::CompileFailed)?;
+        let result = compile(term).map_err(BenchError::CompileFailed)?;
         std::hint::black_box(result.code.as_bytes().first());
         code_bytes = result.code.len();
         drop(result); // munmap inside the timed window
@@ -1562,7 +1531,16 @@ pub fn log_ns(ns: SessionNs) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::ExprArena;
+
+    /// A finished graph and the environment its leaves index, from a builder
+    /// closure returning the root.
+    fn built(
+        f: impl FnOnce(&mut ExprBuilder) -> pixelflow_ir::ExprRef,
+    ) -> (Rooted<ExprData>, Environment) {
+        let mut b = ExprBuilder::new();
+        let root = f(&mut b);
+        b.finish(&[root])
+    }
 
     #[test]
     fn verify_log_ns() {
@@ -1595,9 +1573,8 @@ mod tests {
 
     #[test]
     fn constant_expr_benchmarks_successfully() {
-        let mut arena = ExprArena::new();
-        let root = arena.push_const(core::f32::consts::PI);
-        let result = benchmark_jit_arena(&arena, root)
+        let (expr, env) = built(|a| a.push_const(core::f32::consts::PI));
+        let result = benchmark_jit_term(Term::new(expr.entry(), &env))
             .expect("constant expression must JIT-compile and benchmark");
         assert_eq!(result.outputs.len(), INPUT_TUPLES);
         for lanes in &result.outputs {
@@ -1620,11 +1597,13 @@ mod tests {
     fn autoscale_reaches_tick_floor() {
         // A 1-op kernel at repeat_batches=1 is 64 evals ≈ hundreds of ns —
         // far below the ~4.2µs tick floor — so autoscale must engage.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Add, x, y);
-        let result = benchmark_jit_arena(&arena, root).expect("tiny kernel must benchmark");
+        let (expr, env) = built(|a| {
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            a.push_binary(OpKind::Add, x, y)
+        });
+        let result =
+            benchmark_jit_term(Term::new(expr.entry(), &env)).expect("tiny kernel must benchmark");
         assert!(
             result.repeat_batches > 1,
             "autoscale should have raised repeat_batches above 1 for a 1-op kernel, got {}",
@@ -1680,40 +1659,44 @@ mod tests {
         assert_plausible(0.0, 0);
     }
 
-    /// A var-free arena with `pairs * 2` ops: nothing in it depends on an
+    /// A var-free graph with `pairs * 2` ops: nothing in it depends on an
     /// input, so a constant-folding compiler could emit one `ret`.
-    fn var_free_multi_op_arena(pairs: usize) -> (ExprArena, ExprId) {
-        let mut arena = ExprArena::new();
-        let mut acc = arena.push_const(1.0);
-        for i in 0..pairs {
-            let c = arena.push_const(1.0 + i as f32);
-            acc = arena.push_binary(OpKind::Add, acc, c);
-            let d = arena.push_const(1.0 + i as f32 * 0.5);
-            acc = arena.push_binary(OpKind::Mul, acc, d);
-        }
-        (arena, acc)
+    fn var_free_multi_op_term(pairs: usize) -> (Rooted<ExprData>, Environment) {
+        built(|a| {
+            let mut acc = a.push_const(1.0);
+            for i in 0..pairs {
+                let c = a.push_const(1.0 + i as f32);
+                acc = a.push_binary(OpKind::Add, acc, c);
+                let d = a.push_const(1.0 + i as f32 * 0.5);
+                acc = a.push_binary(OpKind::Mul, acc, d);
+            }
+            acc
+        })
     }
 
     #[test]
-    fn var_free_arenas_keep_their_full_op_count() {
-        // The floor is computed from the arena the caller hands us, var-free
+    fn var_free_terms_keep_their_full_op_count() {
+        // The floor is computed from the term the caller hands us, var-free
         // or not — see `has_reachable_var` for why no exemption exists.
-        let (arena, root) = var_free_multi_op_arena(3);
-        assert_eq!(op_count(&arena, root), 6);
-        assert!(!has_reachable_var(&arena, root));
+        let (expr, env) = var_free_multi_op_term(3);
+        let term = Term::new(expr.entry(), &env);
+        assert_eq!(op_count(term), 6);
+        assert!(!has_reachable_var(term));
 
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let c = arena.push_const(2.0);
-        let root = arena.push_binary(OpKind::Mul, x, c);
-        assert!(has_reachable_var(&arena, root));
-        assert_eq!(op_count(&arena, root), 1);
+        let (expr, env) = built(|a| {
+            let x = a.push_var(0);
+            let c = a.push_const(2.0);
+            a.push_binary(OpKind::Mul, x, c)
+        });
+        let term = Term::new(expr.entry(), &env);
+        assert!(has_reachable_var(term));
+        assert_eq!(op_count(term), 1);
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
-    fn var_free_arenas_still_execute_their_ops() {
-        // The premise behind exempting var-free arenas from the plausibility
+    fn var_free_terms_still_execute_their_ops() {
+        // The premise behind exempting var-free terms from the plausibility
         // floor is that the JIT folds them to a constant `ret`. It does not:
         // `compile` has no constant-propagation pass, so a 300-op var-free
         // kernel really runs 300 ops and sits far above the 15ns floor
@@ -1724,11 +1707,11 @@ mod tests {
         // NOT to exempt var-free expressions, which would switch off the
         // audit-M4 early-`ret` detector for precisely the easiest shape to
         // emit an early `ret` for.
-        let (arena, root) = var_free_multi_op_arena(150);
-        let ops = op_count(&arena, root);
+        let (expr, env) = var_free_multi_op_term(150);
+        let term = Term::new(expr.entry(), &env);
+        let ops = op_count(term);
         assert_eq!(ops, 300);
-        let result =
-            benchmark_jit_arena(&arena, root).expect("var-free multi-op expression must benchmark");
+        let result = benchmark_jit_term(term).expect("var-free multi-op expression must benchmark");
         assert!(
             result.ns >= plausibility_floor_ns(ops),
             "a var-free {ops}-op kernel measured {:.3}ns, below the {:.3}ns floor — the JIT \
@@ -1744,17 +1727,18 @@ mod tests {
         // Fix 3 substrate: a pre-compiled ExecutableCode can be timed
         // directly, with no compile inside the session call, and yields the
         // same outputs as the compile-inside path.
-        let (arena, root) = sentinel_arena();
-        let compiled = compile(&arena, root).expect("sentinel kernel compiles");
+        let (expr, env) = sentinel_term();
+        let term = Term::new(expr.entry(), &env);
+        let compiled = compile(term).expect("sentinel kernel compiles");
         let mut session = BenchSession::new();
         let via_code = session
-            .benchmark_compiled(&compiled.code, &arena, root, BenchMode::Throughput)
+            .benchmark_compiled(&compiled.code, term, BenchMode::Throughput)
             .expect("precompiled object must benchmark");
-        let via_arena = session
-            .benchmark_arena(&arena, root, BenchMode::Throughput)
-            .expect("arena path must benchmark");
+        let via_term = session
+            .benchmark_term(term, BenchMode::Throughput)
+            .expect("term path must benchmark");
         via_code
-            .check_equivalence(&via_arena, 0.0)
+            .check_equivalence(&via_term, 0.0)
             .expect("same expression through both entry points: outputs must match exactly");
         assert_eq!(via_code.outputs.len(), INPUT_TUPLES);
     }
@@ -1953,29 +1937,30 @@ mod tests {
 
     #[test]
     fn op_count_counts_compute_ops_once() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let c = arena.push_const(2.0);
-        let mul = arena.push_binary(OpKind::Mul, x, c);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let c = b.push_const(2.0);
+        let mul = b.push_binary(OpKind::Mul, x, c);
         // DAG sharing: `mul` referenced twice, counted once.
-        let root = arena.push_binary(OpKind::Add, mul, mul);
-        assert_eq!(op_count(&arena, root), 2);
-        assert_eq!(op_count(&arena, x), 0);
-        assert_eq!(op_count(&arena, c), 0);
+        let root = b.push_binary(OpKind::Add, mul, mul);
+        let (rooted, env) = b.finish(&[root, x, c]);
+        assert_eq!(op_count(Term::new(rooted.entry_at(0), &env)), 2);
+        assert_eq!(op_count(Term::new(rooted.entry_at(1), &env)), 0);
+        assert_eq!(op_count(Term::new(rooted.entry_at(2), &env)), 0);
     }
 
     #[test]
-    fn sentinel_arena_is_moderate_size() {
-        let (arena, root) = sentinel_arena();
-        // arena.len() is the unique-node count (the arena holds only the
+    fn sentinel_term_is_moderate_size() {
+        let (expr, env) = sentinel_term();
+        // `len()` is the unique-node count (the graph holds only the
         // sentinel's nodes); node_count_subtree would multiply out the DAG.
-        let nodes = arena.len();
+        let nodes = expr.len();
         assert!(
             (30..=60).contains(&nodes),
             "sentinel kernel should be 30-60 nodes, got {}",
             nodes
         );
-        assert_eq!(op_count(&arena, root), 40);
+        assert_eq!(op_count(Term::new(expr.entry(), &env)), 40);
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -1987,9 +1972,9 @@ mod tests {
         assert!(session.call_overhead_ns(BenchMode::Latency) > 0.0);
         assert_eq!(session.sentinel_samples().len(), 1);
 
-        let (arena, root) = sentinel_arena();
+        let (expr, env) = sentinel_term();
         let (throughput, latency) = session
-            .benchmark_arena_both(&arena, root)
+            .benchmark_term_both(Term::new(expr.entry(), &env))
             .expect("sentinel-shaped kernel must benchmark in both modes");
 
         assert_eq!(throughput.mode, BenchMode::Throughput);
@@ -2041,12 +2026,13 @@ mod tests {
         let mut session = BenchSession::new();
         assert!(session.call_overhead_ns(BenchMode::Scanline) > 0.0);
 
-        let (arena, root) = sentinel_arena();
+        let (expr, env) = sentinel_term();
+        let term = Term::new(expr.entry(), &env);
         let throughput = session
-            .benchmark_arena(&arena, root, BenchMode::Throughput)
+            .benchmark_term(term, BenchMode::Throughput)
             .expect("sentinel-shaped kernel benchmarks in throughput mode");
         let scanline = session
-            .benchmark_arena(&arena, root, BenchMode::Scanline)
+            .benchmark_term(term, BenchMode::Scanline)
             .expect("sentinel-shaped kernel benchmarks in scanline mode");
 
         assert_eq!(scanline.mode, BenchMode::Scanline);
@@ -2110,21 +2096,24 @@ mod tests {
     #[test]
     fn a_large_expression_is_measurable_rather_than_rejected() {
         // ~150 ops in a chain wide enough that no single op dominates.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let mut acc = arena.push_binary(OpKind::Add, x, y);
-        for i in 0..50 {
-            let c = arena.push_const(1.0 + i as f32);
-            let m = arena.push_binary(OpKind::Mul, acc, c);
-            let a = arena.push_binary(OpKind::Add, m, x);
-            acc = arena.push_binary(OpKind::Sub, a, y);
-        }
-        assert!(op_count(&arena, acc) > 100, "test needs a large expression");
+        let (expr, env) = built(|arena| {
+            let x = arena.push_var(0);
+            let y = arena.push_var(1);
+            let mut acc = arena.push_binary(OpKind::Add, x, y);
+            for i in 0..50 {
+                let c = arena.push_const(1.0 + i as f32);
+                let m = arena.push_binary(OpKind::Mul, acc, c);
+                let a = arena.push_binary(OpKind::Add, m, x);
+                acc = arena.push_binary(OpKind::Sub, a, y);
+            }
+            acc
+        });
+        let term = Term::new(expr.entry(), &env);
+        assert!(op_count(term) > 100, "test needs a large expression");
 
         let mut session = BenchSession::new();
         session
-            .benchmark_arena(&arena, acc, BenchMode::Latency)
+            .benchmark_term(term, BenchMode::Latency)
             .expect("a large expression must benchmark, not trip the floor");
     }
 
@@ -2160,10 +2149,11 @@ mod tests {
         // fed. That is not a property the language still has — Z is retired
         // and no arena can name it — so what survives is the property that
         // was load-bearing: a non-X coordinate is chained.)
-        let mut arena = ExprArena::new();
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Add, y, y);
-        let compiled = compile(&arena, root).expect("y+y must JIT-compile");
+        let (expr, env) = built(|a| {
+            let y = a.push_var(1);
+            a.push_binary(OpKind::Add, y, y)
+        });
+        let compiled = compile(Term::new(expr.entry(), &env)).expect("y+y must JIT-compile");
 
         let mut prev = [0.25f32; LANES]; // nonzero seed so doubling is observable.
         for step in 0..8 {

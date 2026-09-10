@@ -79,7 +79,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use pixelflow_ir::ExprArena;
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_search::egraph::{
     CostModel, EGraph, EpisodeLabels, Origin, SaturationConfig, extract_dag,
@@ -268,8 +268,8 @@ fn main() {
     let train_path = corpus_dir.join("corpus_train.bin");
     let dev_path = corpus_dir.join("corpus_dev.bin");
 
-    let mut entries: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = read_corpus(&train_path)
-        .unwrap_or_else(|e| {
+    let mut entries: Vec<(String, Rooted<ExprData>)> =
+        read_corpus(&train_path).unwrap_or_else(|e| {
             panic!(
                 "guide_headroom: failed to read {}: {e}",
                 train_path.display()
@@ -329,11 +329,14 @@ fn main() {
     let mut total_labeler_lb_all: u64 = 0;
     let mut total_strict_lb_all: u64 = 0;
 
-    for (i, (name, arena, root)) in entries.iter().enumerate() {
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (name, expr)) in entries.iter().enumerate() {
+        let term = Term::new(expr.entry(), &env);
         let mut egraph = EGraph::with_rules(all_rules());
-        let root_class = pixelflow_search::egraph::insert(
-            arena,
-            *root,
+        let root_class = pixelflow_search::egraph::insert_term(
+            term,
             &mut egraph,
             pixelflow_search::egraph::Vocabulary::Templates,
         )
@@ -396,7 +399,7 @@ fn main() {
 
         measurements.push(ExprMeasurement {
             name: name.clone(),
-            node_count: arena.nodes_raw().len(),
+            node_count: expr.len(),
             total_applications,
             labeler_load_bearing: labeler_lb,
             strict_load_bearing: strict_lb,

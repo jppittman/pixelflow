@@ -1,4 +1,4 @@
-//! The two schedules for a polynomial, as arena builders.
+//! The two schedules for a polynomial, as expression builders.
 //!
 //! A polynomial is a *value*: `p(x) = Σ aᵢ xⁱ`. Horner and Estrin are two
 //! *schedules* for that value — same coefficients, same function, different
@@ -19,7 +19,7 @@
 //! expansions — so the Horner arm here IS production's shape, not a
 //! restatement of it.
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprBuilder, ExprData, ExprRef, Node, OpKind};
 
 /// Which schedule to emit for the same coefficient list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +42,7 @@ impl PolyForm {
     }
 }
 
-/// Emit `Σ coeffs[i]·xⁱ` into `arena` under `form`, returning its root.
+/// Emit `Σ coeffs[i]·xⁱ` into `b` under `form`, returning its root.
 ///
 /// `coeffs` is **ascending** in degree (`coeffs[0]` is the constant term),
 /// matching `pixelflow_ir::passes::EXP2_POLY` and friends.
@@ -52,20 +52,20 @@ impl PolyForm {
 /// Panics on an empty coefficient list: the degree-0 polynomial is a constant,
 /// which has no schedule to compare and is never what a caller meant.
 #[must_use]
-pub fn build(arena: &mut ExprArena, form: PolyForm, coeffs: &[f32], x: ExprId) -> ExprId {
+pub fn build(b: &mut ExprBuilder, form: PolyForm, coeffs: &[f32], x: ExprRef) -> ExprRef {
     assert!(!coeffs.is_empty(), "poly::build: empty coefficient list");
     match form {
-        PolyForm::Horner => horner(arena, coeffs, x),
-        PolyForm::Estrin => estrin(arena, coeffs, x),
+        PolyForm::Horner => horner(b, coeffs, x),
+        PolyForm::Estrin => estrin(b, coeffs, x),
     }
 }
 
 /// `a₀ + x(a₁ + x(a₂ + …))`, highest degree down — one `MulAdd` per step.
-fn horner(arena: &mut ExprArena, coeffs: &[f32], x: ExprId) -> ExprId {
-    let mut acc = arena.push_const(coeffs[coeffs.len() - 1]);
+fn horner(b: &mut ExprBuilder, coeffs: &[f32], x: ExprRef) -> ExprRef {
+    let mut acc = b.push_const(coeffs[coeffs.len() - 1]);
     for &c in coeffs.iter().rev().skip(1) {
-        let c = arena.push_const(c);
-        acc = arena.push_ternary(OpKind::MulAdd, acc, x, c);
+        let c = b.push_const(c);
+        acc = b.push_ternary(OpKind::MulAdd, acc, x, c);
     }
     acc
 }
@@ -77,28 +77,28 @@ fn horner(arena: &mut ExprArena, coeffs: &[f32], x: ExprId) -> ExprId {
 /// padded with a zero coefficient — a `MulAdd` against a zero addend is still
 /// a real instruction, and the folder cannot remove it (`x·0` is not `0` for
 /// non-finite `x`).
-fn estrin(arena: &mut ExprArena, coeffs: &[f32], x: ExprId) -> ExprId {
+fn estrin(b: &mut ExprBuilder, coeffs: &[f32], x: ExprRef) -> ExprRef {
     // Level 0: the linear pairs. `MulAdd(a, b, c)` is `a·b + c`.
-    let mut level: Vec<ExprId> = coeffs
+    let mut level: Vec<ExprRef> = coeffs
         .chunks(2)
         .map(|pair| match pair {
             [lo, hi] => {
-                let lo = arena.push_const(*lo);
-                let hi = arena.push_const(*hi);
-                arena.push_ternary(OpKind::MulAdd, hi, x, lo)
+                let lo = b.push_const(*lo);
+                let hi = b.push_const(*hi);
+                b.push_ternary(OpKind::MulAdd, hi, x, lo)
             }
-            [lo] => arena.push_const(*lo),
+            [lo] => b.push_const(*lo),
             _ => unreachable!("chunks(2) yields 1 or 2 elements"),
         })
         .collect();
 
     let mut power = x;
     while level.len() > 1 {
-        power = arena.push_binary(OpKind::Mul, power, power);
+        power = b.push_binary(OpKind::Mul, power, power);
         level = level
             .chunks(2)
             .map(|pair| match pair {
-                [lo, hi] => arena.push_ternary(OpKind::MulAdd, *hi, power, *lo),
+                [lo, hi] => b.push_ternary(OpKind::MulAdd, *hi, power, *lo),
                 [lo] => *lo,
                 _ => unreachable!("chunks(2) yields 1 or 2 elements"),
             })
@@ -186,44 +186,29 @@ fn solve(mut a: Vec<Vec<f64>>, mut y: Vec<f64>) -> Vec<f64> {
 /// `CostModel::latency_prior` charges. Printing both is the point: they are
 /// the same table read two ways, and they disagree about Estrin.
 #[must_use]
-pub fn critical_path(arena: &ExprArena, root: ExprId, cost: impl Fn(OpKind) -> f64) -> f64 {
-    let mut memo: Vec<Option<f64>> = vec![None; arena.len()];
-    // Explicit stack: a polynomial DAG is O(degree) deep, and recursion here
-    // would blow the stack for the same reason the degree sweep exists.
-    let mut stack = vec![(root, false)];
-    while let Some((id, expanded)) = stack.pop() {
-        let idx = id.0 as usize;
-        if memo[idx].is_some() {
-            continue;
-        }
-        if !expanded {
-            stack.push((id, true));
-            for child in arena.children(id) {
-                if memo[child.0 as usize].is_none() {
-                    stack.push((child, false));
-                }
-            }
-            continue;
-        }
-        let kind = arena.kind(id);
-        let own = match kind {
-            OpKind::Var | OpKind::Const | OpKind::Buffer => 0.0,
-            k => cost(k),
+pub fn critical_path(root: Node<'_, ExprData>, cost: impl Fn(OpKind) -> f64) -> f64 {
+    // Bottom-up over the whole DAG in index order, which is already
+    // topological (children strictly before parents) — so one pass resolves
+    // every node, with no explicit stack to overflow on the O(degree)-deep
+    // chains a Horner polynomial builds.
+    let dag = root.dag();
+    let mut memo = dag.side_table(0.0f64);
+    for n in dag.iter() {
+        let own = match *n {
+            ExprData::Op(op) => cost(op),
+            _ => 0.0,
         };
-        let deepest_child = arena
-            .children(id)
-            .map(|c| memo[c.0 as usize].expect("children resolved before parent"))
-            .fold(0.0f64, f64::max);
-        memo[idx] = Some(own + deepest_child);
+        let deepest_child = n.children().map(|c| memo[c]).fold(0.0f64, f64::max);
+        memo[n] = own + deepest_child;
     }
-    memo[root.0 as usize].expect("root resolved")
+    memo[root]
 }
 
 #[cfg(all(test, feature = "training"))]
 mod tests {
     use super::*;
     use pixelflow_ir::binding::BindingTable;
-    use pixelflow_ir::eval_scalar;
+    use pixelflow_ir::{Rooted, Term, eval_scalar};
 
     fn coeffs(n: usize) -> Vec<f32> {
         // Alternating, decaying — a well-conditioned polynomial on [0, 1],
@@ -244,16 +229,18 @@ mod tests {
     fn estrin_agrees_with_horner() {
         for n in 1..=33 {
             let cs = coeffs(n);
-            let mut arena = ExprArena::new();
-            let x = arena.push_var(0);
-            let h = build(&mut arena, PolyForm::Horner, &cs, x);
-            let e = build(&mut arena, PolyForm::Estrin, &cs, x);
+            let mut b = ExprBuilder::new();
+            let x = b.push_var(0);
+            let h = build(&mut b, PolyForm::Horner, &cs, x);
+            let e = build(&mut b, PolyForm::Estrin, &cs, x);
+            // Both roots kept in one graph: `finish` takes a slice of entries.
+            let (rooted, env) = b.finish(&[h, e]);
             let bindings = BindingTable::empty();
             for step in 0..=20 {
                 let xv = step as f32 / 20.0;
                 let vars = [xv, 0.0];
-                let hv = eval_scalar(&arena, h, &vars, &bindings);
-                let ev = eval_scalar(&arena, e, &vars, &bindings);
+                let hv = eval_scalar(Term::new(rooted.entry_at(0), &env), &vars, &bindings);
+                let ev = eval_scalar(Term::new(rooted.entry_at(1), &env), &vars, &bindings);
                 let tol = 1e-5 * hv.abs().max(1e-3);
                 assert!(
                     (hv - ev).abs() <= tol,
@@ -272,22 +259,18 @@ mod tests {
         let unit = |_k: OpKind| 1.0;
         for n in 6..=33 {
             let cs = coeffs(n);
-            let mut ha = ExprArena::new();
-            let hx = ha.push_var(0);
-            let h = build(&mut ha, PolyForm::Horner, &cs, hx);
-            let mut ea = ExprArena::new();
-            let ex = ea.push_var(0);
-            let e = build(&mut ea, PolyForm::Estrin, &cs, ex);
+            let horner = single(PolyForm::Horner, &cs);
+            let estrin = single(PolyForm::Estrin, &cs);
 
-            let hd = critical_path(&ha, h, unit);
-            let ed = critical_path(&ea, e, unit);
+            let hd = critical_path(horner.entry(), unit);
+            let ed = critical_path(estrin.entry(), unit);
             assert!(
                 ed < hd,
                 "degree {n}: estrin depth {ed} not below horner {hd}"
             );
 
             assert!(
-                op_nodes(&ea, e) > op_nodes(&ha, h),
+                op_nodes(estrin.entry()) > op_nodes(horner.entry()),
                 "degree {n}: estrin should cost extra multiplies for its powers"
             );
         }
@@ -331,20 +314,17 @@ mod tests {
         );
     }
 
-    fn op_nodes(arena: &ExprArena, root: ExprId) -> usize {
-        let mut visited = vec![false; arena.len()];
-        let mut stack = vec![root];
-        let mut n = 0;
-        while let Some(id) = stack.pop() {
-            if visited[id.0 as usize] {
-                continue;
-            }
-            visited[id.0 as usize] = true;
-            if !matches!(arena.kind(id), OpKind::Var | OpKind::Const | OpKind::Buffer) {
-                n += 1;
-            }
-            stack.extend(arena.children(id));
-        }
-        n
+    /// One schedule, alone in its own graph.
+    fn single(form: PolyForm, coeffs: &[f32]) -> Rooted<ExprData> {
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let root = build(&mut b, form, coeffs, x);
+        b.finish(&[root]).0
+    }
+
+    fn op_nodes(root: Node<'_, ExprData>) -> usize {
+        root.descendants()
+            .filter(|n| matches!(**n, ExprData::Op(_)))
+            .count()
     }
 }

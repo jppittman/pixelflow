@@ -20,7 +20,7 @@
 //! from-scratch scalar-Rust reference for each form, cross-checked against
 //! `eval_scalar` on genuinely independent control points and sample points.
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, ExprRef, OpKind, Rooted};
 
 // ============================================================================
 // RNG — the same PCG-style LCG `pixelflow_search::nnue::BwdGenerator` uses,
@@ -72,7 +72,7 @@ fn binom(n: usize) -> &'static [f32] {
     }
 }
 
-fn fold_add(a: &mut ExprArena, xs: &[ExprId]) -> ExprId {
+fn fold_add(a: &mut ExprBuilder, xs: &[ExprRef]) -> ExprRef {
     assert!(!xs.is_empty(), "fold_add of an empty term list");
     let mut acc = xs[0];
     for &x in &xs[1..] {
@@ -82,7 +82,7 @@ fn fold_add(a: &mut ExprArena, xs: &[ExprId]) -> ExprId {
 }
 
 /// `[base^0 (represented as None, i.e. "no factor"), base^1, .., base^n]`.
-fn powers(a: &mut ExprArena, base: ExprId, n: usize) -> Vec<Option<ExprId>> {
+fn powers(a: &mut ExprBuilder, base: ExprRef, n: usize) -> Vec<Option<ExprRef>> {
     let mut v = vec![None; n + 1];
     if n >= 1 {
         v[1] = Some(base);
@@ -100,14 +100,14 @@ fn powers(a: &mut ExprArena, base: ExprId, n: usize) -> Vec<Option<ExprId>> {
 /// keeps this function simple and because the registration's own node-count
 /// estimates (~60 cubic / ~85 quartic for `bezier-bernstein`) assume the
 /// un-shared construction).
-fn bernstein_1d(a: &mut ExprArena, t: ExprId, n: usize, values: &[f32]) -> ExprId {
+fn bernstein_1d(a: &mut ExprBuilder, t: ExprRef, n: usize, values: &[f32]) -> ExprRef {
     assert_eq!(values.len(), n + 1, "bernstein_1d: need n+1 control values");
     let one = a.push_const(1.0);
     let omt = a.push_binary(OpKind::Sub, one, t);
     let t_pows = powers(a, t, n);
     let omt_pows = powers(a, omt, n);
     let b = binom(n);
-    let terms: Vec<ExprId> = (0..=n)
+    let terms: Vec<ExprRef> = (0..=n)
         .map(|i| {
             let c = a.push_const(b[i]);
             let mut acc = c;
@@ -125,20 +125,20 @@ fn bernstein_1d(a: &mut ExprArena, t: ExprId, n: usize, values: &[f32]) -> ExprI
 }
 
 /// `lerp(a, b, t) = a + (b - a)*t`, one `Sub` + one `MulAdd` (one rounding).
-fn lerp(a: &mut ExprArena, p0: ExprId, p1: ExprId, t: ExprId) -> ExprId {
+fn lerp(a: &mut ExprBuilder, p0: ExprRef, p1: ExprRef, t: ExprRef) -> ExprRef {
     let diff = a.push_binary(OpKind::Sub, p1, p0);
     a.push_ternary(OpKind::MulAdd, diff, t, p0)
 }
 
-/// de Casteljau reduction of `points` (already-pushed leaf `ExprId`s) at `t`:
+/// de Casteljau reduction of `points` (already-pushed leaf `ExprRef`s) at `t`:
 /// repeatedly lerp adjacent pairs until one point remains. `n` points give
 /// `n-1 + n-2 + .. + 1` lerps (6 for 4 points / degree 3, 10 for 5 points /
 /// degree 4 — registration §3b).
-fn de_casteljau(a: &mut ExprArena, points: &[ExprId], t: ExprId) -> ExprId {
+fn de_casteljau(a: &mut ExprBuilder, points: &[ExprRef], t: ExprRef) -> ExprRef {
     assert!(points.len() >= 2, "de Casteljau needs at least 2 points");
     let mut level = points.to_vec();
     while level.len() > 1 {
-        let next: Vec<ExprId> = level.windows(2).map(|w| lerp(a, w[0], w[1], t)).collect();
+        let next: Vec<ExprRef> = level.windows(2).map(|w| lerp(a, w[0], w[1], t)).collect();
         level = next;
     }
     level[0]
@@ -147,7 +147,7 @@ fn de_casteljau(a: &mut ExprArena, points: &[ExprId], t: ExprId) -> ExprId {
 /// The squared-distance tail shared by `bezier-bernstein` and
 /// `bezier-casteljau`: `(Bx(X) - Y)^2 + (By(X) - c0)^2` (registration §3b).
 /// Squared, not `Sqrt`ed, so the family stays `Div`/`Sqrt`-free.
-fn squared_distance(a: &mut ExprArena, bx: ExprId, by: ExprId, y: ExprId, c0: f32) -> ExprId {
+fn squared_distance(a: &mut ExprBuilder, bx: ExprRef, by: ExprRef, y: ExprRef, c0: f32) -> ExprRef {
     let c0_id = a.push_const(c0);
     let dx = a.push_binary(OpKind::Sub, bx, y);
     let dx2 = a.push_binary(OpKind::Mul, dx, dx);
@@ -161,8 +161,8 @@ fn draw_controls(rng: &mut Lcg, n: usize, lo: f32, hi: f32) -> Vec<f32> {
     (0..=n).map(|_| rng.range(lo, hi)).collect()
 }
 
-fn build_bernstein(rng: &mut Lcg, n: usize) -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn build_bernstein(rng: &mut Lcg, n: usize) -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let t = a.push_var(0);
     let y = a.push_var(1);
     let cx = draw_controls(rng, n, -2.0, 2.0);
@@ -171,30 +171,30 @@ fn build_bernstein(rng: &mut Lcg, n: usize) -> (ExprArena, ExprId) {
     let bx = bernstein_1d(&mut a, t, n, &cx);
     let by = bernstein_1d(&mut a, t, n, &cy);
     let root = squared_distance(&mut a, bx, by, y, c0);
-    (a, root)
+    a.finish(&[root])
 }
 
-fn build_casteljau(rng: &mut Lcg, n: usize) -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn build_casteljau(rng: &mut Lcg, n: usize) -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let t = a.push_var(0);
     let y = a.push_var(1);
     let cx = draw_controls(rng, n, -2.0, 2.0);
     let cy = draw_controls(rng, n, -2.0, 2.0);
     let c0 = rng.range(-2.0, 2.0);
-    let px: Vec<ExprId> = cx.iter().map(|&v| a.push_const(v)).collect();
-    let py: Vec<ExprId> = cy.iter().map(|&v| a.push_const(v)).collect();
+    let px: Vec<ExprRef> = cx.iter().map(|&v| a.push_const(v)).collect();
+    let py: Vec<ExprRef> = cy.iter().map(|&v| a.push_const(v)).collect();
     let bx = de_casteljau(&mut a, &px, t);
     let by = de_casteljau(&mut a, &py, t);
     let root = squared_distance(&mut a, bx, by, y, c0);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Fixed bicubic tensor-product patch: z(X,Y) = Σᵢ Σⱼ Pᵢⱼ·Bᵢ(X)·Bⱼ(Y), 16
 /// independent heights ~ U(-2,2) (registration §3b). `Bᵢ`/`Bⱼ` are built
 /// per (i,j) term rather than shared across terms — same "self-contained,
 /// not hand-optimized for sharing" choice as `bernstein_1d`.
-fn build_patch(rng: &mut Lcg) -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn build_patch(rng: &mut Lcg) -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let n = 3usize;
@@ -209,7 +209,7 @@ fn build_patch(rng: &mut Lcg) -> (ExprArena, ExprId) {
     let omy_pows = powers(&mut a, omy, n);
 
     let basis =
-        |a: &mut ExprArena, pows: &[Option<ExprId>], ompows: &[Option<ExprId>], i: usize| {
+        |a: &mut ExprBuilder, pows: &[Option<ExprRef>], ompows: &[Option<ExprRef>], i: usize| {
             let c = a.push_const(b[i]);
             let mut acc = c;
             if let Some(p) = pows[i] {
@@ -233,7 +233,7 @@ fn build_patch(rng: &mut Lcg) -> (ExprArena, ExprId) {
         }
     }
     let root = fold_add(&mut a, &terms);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// The five registered constructions.
@@ -277,7 +277,7 @@ impl Form {
 
     /// Build one instance of this form from `rng`.
     #[must_use]
-    pub fn build(self, rng: &mut Lcg) -> (ExprArena, ExprId) {
+    pub fn build(self, rng: &mut Lcg) -> (Rooted<ExprData>, Environment) {
         match self {
             Form::BernsteinCubic => build_bernstein(rng, 3),
             Form::BernsteinQuartic => build_bernstein(rng, 4),
@@ -290,10 +290,10 @@ impl Form {
 
 /// One draw: a form chosen uniformly, built from `rng`.
 #[must_use]
-pub fn draw(rng: &mut Lcg) -> (Form, ExprArena, ExprId) {
+pub fn draw(rng: &mut Lcg) -> (Form, Rooted<ExprData>, Environment) {
     let form = FORMS[rng.choice(FORMS.len())];
-    let (arena, root) = form.build(rng);
-    (form, arena, root)
+    let (expr, env) = form.build(rng);
+    (form, expr, env)
 }
 
 // ============================================================================
@@ -307,10 +307,14 @@ pub fn draw(rng: &mut Lcg) -> (Form, ExprArena, ExprId) {
 #[cfg(test)]
 mod oracle_tests {
     use super::*;
-    use pixelflow_ir::{BindingTable, eval_scalar};
+    use pixelflow_ir::{BindingTable, Term, eval_scalar};
 
-    fn eval(a: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-        eval_scalar(a, root, &[x, y], &BindingTable::empty())
+    fn eval(expr: &Rooted<ExprData>, env: &Environment, x: f32, y: f32) -> f32 {
+        eval_scalar(
+            Term::new(expr.entry(), env),
+            &[x, y],
+            &BindingTable::empty(),
+        )
     }
 
     fn ref_bernstein_1d(t: f32, b: &[f32], values: &[f32]) -> f32 {
@@ -346,7 +350,7 @@ mod oracle_tests {
     #[test]
     fn bernstein_cubic_matches_the_scalar_reference() {
         let mut rng = Lcg(1);
-        let (a, root) = build_bernstein(&mut rng, 3);
+        let (expr, env) = build_bernstein(&mut rng, 3);
         // Re-derive the same draws to build the reference independently:
         // build_bernstein consumes rng in a fixed, known order (cx, cy, c0).
         let mut rng2 = Lcg(1);
@@ -357,7 +361,7 @@ mod oracle_tests {
             let bx = ref_bernstein_1d(t, &BINOM3, &cx);
             let by = ref_bernstein_1d(t, &BINOM3, &cy);
             let want = (bx - SAMPLE_Y).powi(2) + (by - c0).powi(2);
-            let got = eval(&a, root, t, SAMPLE_Y);
+            let got = eval(&expr, &env, t, SAMPLE_Y);
             assert_close(got, want, &format!("bernstein cubic t={t}"));
         }
     }
@@ -365,7 +369,7 @@ mod oracle_tests {
     #[test]
     fn bernstein_quartic_matches_the_scalar_reference() {
         let mut rng = Lcg(7);
-        let (a, root) = build_bernstein(&mut rng, 4);
+        let (expr, env) = build_bernstein(&mut rng, 4);
         let mut rng2 = Lcg(7);
         let cx = draw_controls(&mut rng2, 4, -2.0, 2.0);
         let cy = draw_controls(&mut rng2, 4, -2.0, 2.0);
@@ -374,7 +378,7 @@ mod oracle_tests {
             let bx = ref_bernstein_1d(t, &BINOM4, &cx);
             let by = ref_bernstein_1d(t, &BINOM4, &cy);
             let want = (bx - SAMPLE_Y).powi(2) + (by - c0).powi(2);
-            let got = eval(&a, root, t, SAMPLE_Y);
+            let got = eval(&expr, &env, t, SAMPLE_Y);
             assert_close(got, want, &format!("bernstein quartic t={t}"));
         }
     }
@@ -382,7 +386,7 @@ mod oracle_tests {
     #[test]
     fn casteljau_cubic_matches_de_casteljau_and_bernstein_agree() {
         let mut rng = Lcg(3);
-        let (a, root) = build_casteljau(&mut rng, 3);
+        let (expr, env) = build_casteljau(&mut rng, 3);
         let mut rng2 = Lcg(3);
         let cx = draw_controls(&mut rng2, 3, -2.0, 2.0);
         let cy = draw_controls(&mut rng2, 3, -2.0, 2.0);
@@ -407,7 +411,7 @@ mod oracle_tests {
                 &format!("de Casteljau/Bernstein identity y t={t}"),
             );
             let want = (bx_dc - SAMPLE_Y).powi(2) + (by_dc - c0).powi(2);
-            let got = eval(&a, root, t, SAMPLE_Y);
+            let got = eval(&expr, &env, t, SAMPLE_Y);
             assert_close(got, want, &format!("casteljau cubic t={t}"));
         }
     }
@@ -415,7 +419,7 @@ mod oracle_tests {
     #[test]
     fn casteljau_quartic_matches_the_scalar_reference() {
         let mut rng = Lcg(9);
-        let (a, root) = build_casteljau(&mut rng, 4);
+        let (expr, env) = build_casteljau(&mut rng, 4);
         let mut rng2 = Lcg(9);
         let cx = draw_controls(&mut rng2, 4, -2.0, 2.0);
         let cy = draw_controls(&mut rng2, 4, -2.0, 2.0);
@@ -424,7 +428,7 @@ mod oracle_tests {
             let bx = ref_de_casteljau(&cx, t);
             let by = ref_de_casteljau(&cy, t);
             let want = (bx - SAMPLE_Y).powi(2) + (by - c0).powi(2);
-            let got = eval(&a, root, t, SAMPLE_Y);
+            let got = eval(&expr, &env, t, SAMPLE_Y);
             assert_close(got, want, &format!("casteljau quartic t={t}"));
         }
     }
@@ -432,7 +436,7 @@ mod oracle_tests {
     #[test]
     fn patch_matches_the_scalar_reference() {
         let mut rng = Lcg(5);
-        let (a, root) = build_patch(&mut rng);
+        let (expr, env) = build_patch(&mut rng);
         let mut rng2 = Lcg(5);
         // build_patch draws heights in (i, j) row-major order, 16 total.
         let mut heights = [[0.0f32; 4]; 4];
@@ -451,7 +455,7 @@ mod oracle_tests {
                         bi * bj * heights[i][j]
                     })
                     .sum();
-                let got = eval(&a, root, tx, ty);
+                let got = eval(&expr, &env, tx, ty);
                 assert_close(got, want, &format!("patch t=({tx},{ty})"));
             }
         }

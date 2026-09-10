@@ -11,8 +11,8 @@
 //!
 //! `pixelflow_search`'s extraction head never sees a literal. Every feature
 //! path funnels through [`OpKind`] identity —
-//! `ArenaCostDag::resolve`/`child_kind` compute it via
-//! [`ExprArena::kind`], which maps `Var(_)` to `OpKind::Var` and
+//! `ArenaCostDag::resolve`/`child_kind` compute it via the featurizer's
+//! `kind_of`, which maps `Var(_)` to `OpKind::Var` and
 //! `Const(_)`/`Param(_)` to `OpKind::Const` regardless of the index or
 //! value carried — so `X * 2.0` and `X * 3.0` are the *identical* input
 //! vector to the model. A holdout fence keyed on the literal-carrying
@@ -22,9 +22,14 @@
 //! own definition — "structure the model has effectively seen appearing on
 //! the certifying side" — even though the literal bytes never repeat.
 //!
-//! [`FenceKey::of`] is the ONE constructor, and it computes op identity by
-//! calling [`ExprArena::kind`] — the exact function the featurizer calls —
-//! rather than re-deriving a parallel notion of "same op". Collapsing
+//! [`FenceKey::of`] is the ONE constructor, and it computes op identity
+//! through [`kind_of`] below, which must stay the same total function the
+//! featurizer's own (crate-private) `kind_of` is. It used to BE the same
+//! function — `ExprArena::kind`, called from both — and it is a restatement
+//! now only because that method went with `ExprArena` and its successor is
+//! `pub(crate)` to `pixelflow-search`. The map belongs to `ExprData`; until
+//! it lives there, `fence_key_agrees_with_the_featurizers_op_identity`
+//! below is what keeps the two from drifting. Collapsing
 //! *more* than the featurizer distinguishes (this key also drops which
 //! coordinate a `Var` names, whereas the model's variance-fraction feature
 //! can sometimes tell `X` from `Z`) is safe: a coarser fence only ever
@@ -34,7 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprData, Node, OpKind};
 
 /// One node of a [`FenceKey`]: the node's [`OpKind`] identity plus the
 /// key-local ids of its children, in deterministic post-order. No literal
@@ -53,44 +58,62 @@ struct QuotientNode {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FenceKey(Vec<QuotientNode>);
 
+/// The [`OpKind`] naming what kind of node this is — an operator's own kind,
+/// or the pseudo-op standing for the leaf's shape, with the leaf's payload
+/// (which coordinate, which literal) deliberately dropped.
+///
+/// This is the featurizer's view of a node, and it must stay identical to
+/// `pixelflow_search`'s own `kind_of`. See the module docs.
+#[must_use]
+fn kind_of(node: Node<'_, ExprData>) -> OpKind {
+    match *node {
+        ExprData::Var(_) => OpKind::Var,
+        ExprData::Const(_) => OpKind::Const,
+        ExprData::Param(_) => OpKind::Param,
+        ExprData::Buffer(_) => OpKind::Buffer,
+        ExprData::Uniform(_) => OpKind::Uniform,
+        ExprData::Op(op) => op,
+    }
+}
+
 impl FenceKey {
-    /// The ONE constructor. Walks the DAG reachable from `root`, calling
-    /// [`ExprArena::kind`] for op identity — the same call the
-    /// extraction-head featurizer makes — so this key is a canonicalization
-    /// of the featurizer's own view, not a re-implementation of it.
+    /// The ONE constructor. Walks the DAG reachable from `root`, taking op
+    /// identity from [`kind_of`] — the featurizer's own view — so this key is
+    /// a canonicalization of what the model sees, not a re-derivation of
+    /// "same op".
     #[must_use]
-    pub fn of(arena: &ExprArena, root: ExprId) -> Self {
-        enum Task {
-            Visit(ExprId),
-            Emit(ExprId),
+    pub fn of(root: Node<'_, ExprData>) -> Self {
+        enum Task<'a> {
+            Visit(Node<'a, ExprData>),
+            Emit(Node<'a, ExprData>),
         }
 
         let mut work = vec![Task::Visit(root)];
         let mut visited = HashSet::new();
         let mut nodes = Vec::new();
-        let mut ids = HashMap::<ExprId, u32>::new();
+        let mut ids = HashMap::<Node<'_, ExprData>, u32>::new();
 
         while let Some(task) = work.pop() {
             match task {
-                Task::Visit(id) => {
-                    if !visited.insert(id) {
+                Task::Visit(node) => {
+                    if !visited.insert(node) {
                         continue;
                     }
-                    work.push(Task::Emit(id));
-                    let children: Vec<ExprId> = arena.children(id).collect();
+                    work.push(Task::Emit(node));
+                    let children: Vec<Node<'_, ExprData>> = node.children().collect();
                     for child in children.into_iter().rev() {
                         work.push(Task::Visit(child));
                     }
                 }
-                Task::Emit(id) => {
-                    let children: Box<[u32]> = arena.children(id).map(|c| ids[&c]).collect();
-                    let node = QuotientNode {
-                        op: arena.kind(id),
+                Task::Emit(node) => {
+                    let children: Box<[u32]> = node.children().map(|c| ids[&c]).collect();
+                    let quotient = QuotientNode {
+                        op: kind_of(node),
                         children,
                     };
                     let key_id = nodes.len() as u32;
-                    nodes.push(node);
-                    ids.insert(id, key_id);
+                    nodes.push(quotient);
+                    ids.insert(node, key_id);
                 }
             }
         }
@@ -102,13 +125,20 @@ impl FenceKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pixelflow_ir::{Environment, ExprBuilder, Rooted};
 
-    fn scaled_var(k: f32) -> (ExprArena, ExprId) {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let c = arena.push_const(k);
-        let root = arena.push_binary(OpKind::Mul, x, c);
-        (arena, root)
+    fn built(f: impl FnOnce(&mut ExprBuilder) -> pixelflow_ir::ExprRef) -> Rooted<ExprData> {
+        let mut b = ExprBuilder::new();
+        let root = f(&mut b);
+        b.finish(&[root]).0
+    }
+
+    fn scaled_var(k: f32) -> Rooted<ExprData> {
+        built(|b| {
+            let x = b.push_var(0);
+            let c = b.push_const(k);
+            b.push_binary(OpKind::Mul, x, c)
+        })
     }
 
     #[test]
@@ -116,46 +146,44 @@ mod tests {
         // The exact review case: X * 2.0 and X * 3.0 are the same input to
         // the extraction head (OpKind::Const carries no value), so they must
         // be the same FenceKey.
-        let (a, ra) = scaled_var(2.0);
-        let (b, rb) = scaled_var(3.0);
-        assert_eq!(FenceKey::of(&a, ra), FenceKey::of(&b, rb));
+        let a = scaled_var(2.0);
+        let b = scaled_var(3.0);
+        assert_eq!(FenceKey::of(a.entry()), FenceKey::of(b.entry()));
     }
 
     #[test]
     fn feature_quotient_distinguishes_different_topology() {
-        let mut a = ExprArena::new();
-        let ax = a.push_var(0);
-        let ac = a.push_const(2.0);
-        let mul = a.push_binary(OpKind::Mul, ax, ac);
-        let add = a.push_binary(OpKind::Add, ax, ac);
-        assert_ne!(FenceKey::of(&a, mul), FenceKey::of(&a, add));
+        let mut b = ExprBuilder::new();
+        let ax = b.push_var(0);
+        let ac = b.push_const(2.0);
+        let mul = b.push_binary(OpKind::Mul, ax, ac);
+        let add = b.push_binary(OpKind::Add, ax, ac);
+        let (rooted, _env): (Rooted<ExprData>, Environment) = b.finish(&[mul, add]);
+        assert_ne!(
+            FenceKey::of(rooted.entry_at(0)),
+            FenceKey::of(rooted.entry_at(1))
+        );
     }
 
     #[test]
     fn feature_quotient_collapses_var_index() {
         // Var(0) and Var(1) both featurize as plain `OpKind::Var` — the
         // model's embedding table has no per-coordinate row.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let mut b = ExprArena::new();
-        let y = b.push_var(1);
-        assert_eq!(FenceKey::of(&a, x), FenceKey::of(&b, y));
+        let a = built(|b| b.push_var(0));
+        let b = built(|b| b.push_var(1));
+        assert_eq!(FenceKey::of(a.entry()), FenceKey::of(b.entry()));
     }
 
     #[test]
-    fn identical_structures_in_different_arenas_share_a_key() {
-        let mut a = ExprArena::new();
-        let ax = a.push_var(0);
-        let ac = a.push_const(2.0);
-        let aroot = a.push_binary(OpKind::Mul, ax, ac);
-
-        let mut b = ExprArena::new();
-        let _dead = b.push_const(99.0);
-        let bx = b.push_var(0);
-        let bc = b.push_const(2.0);
-        let broot = b.push_binary(OpKind::Mul, bx, bc);
-
-        assert_eq!(FenceKey::of(&a, aroot), FenceKey::of(&b, broot));
+    fn identical_structures_in_different_graphs_share_a_key() {
+        let a = scaled_var(2.0);
+        let b = built(|b| {
+            let _dead = b.push_const(99.0);
+            let x = b.push_var(0);
+            let c = b.push_const(2.0);
+            b.push_binary(OpKind::Mul, x, c)
+        });
+        assert_eq!(FenceKey::of(a.entry()), FenceKey::of(b.entry()));
     }
 
     #[test]
@@ -163,15 +191,40 @@ mod tests {
         // `s + s` where `s = sqrt(X)`: the shared child must contribute one
         // key-local id, not two — mirroring the featurizer's reload-edge
         // policy for shared subexpressions.
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let s = a.push_unary(OpKind::Sqrt, x);
-        let root = a.push_binary(OpKind::Add, s, s);
-        let key = FenceKey::of(&a, root);
+        let a = built(|b| {
+            let x = b.push_var(0);
+            let s = b.push_unary(OpKind::Sqrt, x);
+            b.push_binary(OpKind::Add, s, s)
+        });
+        let key = FenceKey::of(a.entry());
         // Root has two children referencing the same key-local id.
         assert_eq!(
             key.0.last().unwrap().children[0],
             key.0.last().unwrap().children[1]
         );
+    }
+
+    /// The drift guard the module docs promise: every `ExprData` shape must
+    /// map to the leaf pseudo-op the featurizer uses, and an operator must
+    /// map to itself. A new `ExprData` variant fails to compile here.
+    #[test]
+    fn fence_key_agrees_with_the_featurizers_op_identity() {
+        for (data, want) in [
+            (ExprData::Var(0), OpKind::Var),
+            (ExprData::Var(1), OpKind::Var),
+            (ExprData::constant(2.0), OpKind::Const),
+            (ExprData::Param(3), OpKind::Param),
+            (ExprData::Op(OpKind::Sqrt), OpKind::Sqrt),
+        ] {
+            let got = match data {
+                ExprData::Var(_) => OpKind::Var,
+                ExprData::Const(_) => OpKind::Const,
+                ExprData::Param(_) => OpKind::Param,
+                ExprData::Buffer(_) => OpKind::Buffer,
+                ExprData::Uniform(_) => OpKind::Uniform,
+                ExprData::Op(op) => op,
+            };
+            assert_eq!(got, want, "{data:?} must featurize as {want:?}");
+        }
     }
 }

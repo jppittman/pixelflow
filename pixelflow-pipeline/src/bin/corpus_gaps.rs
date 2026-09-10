@@ -30,17 +30,17 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
-use pixelflow_ir::arena::{
-    BufferDecl, BufferId, BufferIdentity, ExprNode, UniformDecl, UniformIdentity,
-};
 use pixelflow_ir::variance::LatticeShape;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{
+    BufferDecl, BufferId, BufferIdentity, Environment, ExprBuilder, ExprData, ExprRef, Node,
+    OpKind, Rooted, Term, UniformDecl, UniformId, UniformIdentity,
+};
 use pixelflow_pipeline::collapse_bench::{self, LANES, corpus::Trips};
 use pixelflow_pipeline::shader_bench::{NAMED_KERNEL_NAMES, SHADERTOY_KERNEL_NAMES, named_kernel};
 use pixelflow_pipeline::training::{bezier_family, sh_family};
 use pixelflow_search::egraph::{
     Budget, CostModel, InputSize, KeepJournal, Optimizer, RuleSet, Vocabulary,
-    collect_rule_templates, insert, reachable_count,
+    collect_rule_templates, insert_term, reachable_count_term,
 };
 use pixelflow_search::nnue::{BwdGenConfig, BwdGenerator};
 
@@ -96,9 +96,37 @@ struct Kernel {
     name: String,
     group: String,
     population: &'static str,
-    arena: ExprArena,
-    root: ExprId,
+    expr: Rooted<ExprData>,
+    env: Environment,
     extent: [u32; 2],
+}
+
+impl Kernel {
+    fn term(&self) -> Term<'_> {
+        Term::new(self.expr.entry(), &self.env)
+    }
+}
+
+/// The [`OpKind`] naming what kind of node this is — an operator's own kind,
+/// or the pseudo-op standing for a leaf's shape. `CostModel::cost` is indexed
+/// by it, and a leaf has to answer something.
+fn kind_of(node: Node<'_, ExprData>) -> OpKind {
+    match *node {
+        ExprData::Var(_) => OpKind::Var,
+        ExprData::Const(_) => OpKind::Const,
+        ExprData::Param(_) => OpKind::Param,
+        ExprData::Buffer(_) => OpKind::Buffer,
+        ExprData::Uniform(_) => OpKind::Uniform,
+        ExprData::Op(op) => op,
+    }
+}
+
+/// Copy `term` into a graph of its own, so it can be owned in a [`Kernel`]
+/// after the graph it was borrowed from is gone.
+fn own(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    let mut b = ExprBuilder::new();
+    let root = b.splice(term);
+    b.finish(&[root])
 }
 
 fn main() {
@@ -162,7 +190,7 @@ fn load_dumps(dir: &Path) -> Vec<Kernel> {
     files
         .iter()
         .filter_map(|p| {
-            let (name, arena, root) = load_arena(p);
+            let (name, expr, env) = load_arena(p);
             let group = name.split(':').next().expect("group prefix").to_string();
             // The `shader:*` dumps predate the retirement of the Z/W axes
             // (they name `Var(2)`, which `emit::compile` refuses); the live
@@ -175,8 +203,8 @@ fn load_dumps(dir: &Path) -> Vec<Kernel> {
                 name,
                 group,
                 population: "real",
-                arena,
-                root,
+                expr,
+                env,
                 extent,
             })
         })
@@ -189,13 +217,13 @@ fn shadertoy_kernels() -> Vec<Kernel> {
     SHADERTOY_KERNEL_NAMES
         .iter()
         .map(|name| {
-            let (arena, root) = named_kernel(name).expect("shadertoy kernel");
+            let (expr, env) = named_kernel(name).expect("shadertoy kernel");
             Kernel {
                 name: format!("shader:{name}"),
                 group: "shader".to_string(),
                 population: "real",
-                arena,
-                root,
+                expr,
+                env,
                 extent: SHADER_EXTENT,
             }
         })
@@ -205,7 +233,7 @@ fn shadertoy_kernels() -> Vec<Kernel> {
 /// Inverse of the dumpers' `dump_arena` (the `production_telemetry` loader
 /// in `pixelflow-search/src/runtime.rs`, plus the `uni`/`Un` lines the scene
 /// dumper writes for uniform-bearing kernels).
-fn load_arena(path: &Path) -> (String, ExprArena, ExprId) {
+fn load_arena(path: &Path) -> (String, Rooted<ExprData>, Environment) {
     let text =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut lines = text.lines();
@@ -216,24 +244,34 @@ fn load_arena(path: &Path) -> (String, ExprArena, ExprId) {
         path.display()
     );
     let mut name = None;
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let mut idents: Vec<BufferIdentity> = Vec::new();
-    let mut uniform_ids = Vec::new();
-    let mut root = None;
-    let mut next_id: u32 = 0;
+    let mut uniform_ids: Vec<UniformId> = Vec::new();
+    let mut root_ord = None;
+    // Ordinal in the dump to the node the replay built for it. The dump names
+    // children by their file ordinal, which is not a name the graph publishes,
+    // so the loader keeps its own dense table.
+    let mut refs: Vec<ExprRef> = Vec::new();
     let op = |s: &str| -> OpKind {
         OpKind::all()
             .find(|k| format!("{k:?}") == s)
             .unwrap_or_else(|| panic!("{}: unknown OpKind {s:?}", path.display()))
     };
-    let id = |s: &str| -> ExprId {
-        ExprId(
-            s.parse()
-                .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display())),
-        )
+    let ordinal = |s: &str| -> usize {
+        s.parse()
+            .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display()))
     };
     for line in lines {
         let f: Vec<&str> = line.split_whitespace().collect();
+        let child = |refs: &[ExprRef], s: &str| -> ExprRef {
+            let i = ordinal(s);
+            *refs.get(i).unwrap_or_else(|| {
+                panic!(
+                    "{}: child ordinal {i} is not an already-read node",
+                    path.display()
+                )
+            })
+        };
         let pushed = match f.as_slice() {
             ["name", n] => {
                 name = Some((*n).to_string());
@@ -260,7 +298,7 @@ fn load_arena(path: &Path) -> (String, ExprArena, ExprId) {
                 continue;
             }
             ["root", r] => {
-                root = Some(id(r));
+                root_ord = Some(ordinal(r));
                 continue;
             }
             ["V", i] => arena.push_var(i.parse().expect("var index")),
@@ -273,35 +311,44 @@ fn load_arena(path: &Path) -> (String, ExprArena, ExprId) {
                 });
                 arena.push_uniform(uid)
             }
-            ["U", k, a] => arena.push_unary(op(k), id(a)),
-            ["Bi", k, a, b] => arena.push_binary(op(k), id(a), id(b)),
-            ["T", k, a, b, c] => arena.push_ternary(op(k), id(a), id(b), id(c)),
+            ["U", k, a] => {
+                let a = child(&refs, a);
+                arena.push_unary(op(k), a)
+            }
+            ["Bi", k, a, b] => {
+                let (a, b) = (child(&refs, a), child(&refs, b));
+                arena.push_binary(op(k), a, b)
+            }
+            ["T", k, a, b, c] => {
+                let (a, b, c) = (child(&refs, a), child(&refs, b), child(&refs, c));
+                arena.push_ternary(op(k), a, b, c)
+            }
             other => panic!("{}: unparseable line {other:?}", path.display()),
         };
-        assert_eq!(
-            pushed,
-            ExprId(next_id),
-            "{}: replay drifted from dumped ids",
-            path.display()
-        );
-        next_id += 1;
+        refs.push(pushed);
     }
     let name = name.unwrap_or_else(|| panic!("{}: no name line", path.display()));
-    let root = root.unwrap_or_else(|| panic!("{}: no root line", path.display()));
-    (name, arena, root)
+    let root_ord = root_ord.unwrap_or_else(|| panic!("{}: no root line", path.display()));
+    let root = *refs
+        .get(root_ord)
+        .unwrap_or_else(|| panic!("{}: root ordinal {root_ord} names no node", path.display()));
+    let (expr, env) = arena.finish(&[root]);
+    (name, expr, env)
 }
 
 fn synthetic_kernels(n: usize, seed: u64) -> Vec<Kernel> {
     let mut out = Vec::new();
-    let synth =
-        |name: String, group: &str, arena: ExprArena, root: ExprId, extent: [u32; 2]| Kernel {
-            name,
-            group: group.to_string(),
-            population: "synthetic",
-            arena,
-            root,
-            extent,
-        };
+    let synth = |name: String,
+                 group: &str,
+                 (expr, env): (Rooted<ExprData>, Environment),
+                 extent: [u32; 2]| Kernel {
+        name,
+        group: group.to_string(),
+        population: "synthetic",
+        expr,
+        env,
+        extent,
+    };
 
     // gen_bench_corpus: BwdGenerator over the size bands, fused ops off.
     for (b, &(max_depth, leaf_prob, num_vars)) in BWD_BANDS.iter().enumerate() {
@@ -318,12 +365,11 @@ fn synthetic_kernels(n: usize, seed: u64) -> Vec<Kernel> {
             collect_rule_templates(),
         );
         for i in 0..n {
-            let pair = rng.generate_arena();
+            let pair = rng.generate();
             out.push(synth(
                 format!("bwd_band{b:02}_d{max_depth}:{i}"),
                 "bwd_bands",
-                pair.arena,
-                pair.unoptimized,
+                own(pair.unoptimized()),
                 SYNTHETIC_EXTENT,
             ));
         }
@@ -341,12 +387,11 @@ fn synthetic_kernels(n: usize, seed: u64) -> Vec<Kernel> {
             collect_rule_templates(),
         );
         for i in 0..n {
-            let pair = rng.generate_arena();
+            let pair = rng.generate();
             out.push(synth(
                 format!("bwd_default_d{depth}:{i}"),
                 "bwd_default",
-                pair.arena,
-                pair.unoptimized,
+                own(pair.unoptimized()),
                 SYNTHETIC_EXTENT,
             ));
         }
@@ -354,35 +399,30 @@ fn synthetic_kernels(n: usize, seed: u64) -> Vec<Kernel> {
     // gen_sh_corpus.
     let mut rng = sh_family::Rng::new(seed);
     for i in 0..n * 2 {
-        let (arena, root) = sh_family::draw(&mut rng);
         out.push(synth(
             format!("sh:{i}"),
             "sh",
-            arena,
-            root,
+            sh_family::draw(&mut rng),
             SYNTHETIC_EXTENT,
         ));
     }
     // gen_bezier_corpus.
     let mut rng = bezier_family::Lcg::new(seed);
     for i in 0..n * 2 {
-        let (form, arena, root) = bezier_family::draw(&mut rng);
+        let (form, expr, env) = bezier_family::draw(&mut rng);
         out.push(synth(
             format!("bezier_{}:{i}", form.label()),
             "bezier",
-            arena,
-            root,
+            (expr, env),
             SYNTHETIC_EXTENT,
         ));
     }
     // The five original named production kernels (gen_bench_corpus FINAL tier).
     for name in NAMED_KERNEL_NAMES {
-        let (arena, root) = named_kernel(name).expect("named kernel");
         out.push(synth(
             format!("named:{name}"),
             "named",
-            arena,
-            root,
+            named_kernel(name).expect("named kernel"),
             SHADER_EXTENT,
         ));
     }
@@ -391,12 +431,12 @@ fn synthetic_kernels(n: usize, seed: u64) -> Vec<Kernel> {
         if k.extent[0] < LANES as u32 {
             continue;
         }
+        let extent = k.extent;
         out.push(synth(
             format!("collapse_{}:{}", k.family, k.name),
             "collapse_synth",
-            k.arena,
-            k.root,
-            k.extent,
+            (k.expr, k.env),
+            extent,
         ));
     }
     out
@@ -441,95 +481,53 @@ fn existing_names(path: &Path) -> HashSet<String> {
 /// A structurally hash-consed copy of the reachable subgraph: the node
 /// multiset the e-graph's own interning sees. Buffers and uniforms keep
 /// their declarations (identity-equal slots stay one node).
-fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    let len = arena.nodes_raw().len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
+fn hash_cons(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    let root = term.root();
+    let dag = term.dag();
+    let mut reachable = dag.side_table(false);
+    for n in root.descendants() {
+        reachable[n] = true;
     }
-    let mut out = ExprArena::new();
-    for decl in arena.buffers() {
+
+    let mut out = ExprBuilder::new();
+    for decl in &term.env().buffers {
         let _ = out.declare_buffer(*decl);
     }
-    for decl in arena.uniforms() {
+    for decl in &term.env().uniforms {
         let _ = out.declare_uniform(*decl);
     }
-    #[derive(Hash, PartialEq, Eq)]
-    enum Key {
-        Var(u8),
-        Const(u32),
-        Param(u8),
-        Buffer(u16),
-        Uniform(u16),
-        Op(OpKind, Vec<u32>),
-    }
-    type Build = Box<dyn Fn(&mut ExprArena) -> ExprId>;
-    let mut interned: HashMap<Key, ExprId> = HashMap::new();
-    let mut map: Vec<u32> = vec![u32::MAX; len];
-    for idx in 0..len {
-        if !reachable[idx] {
+
+    // The interning key the e-graph's own hash-consing uses: payload plus
+    // already-interned children.
+    let mut interned: HashMap<(ExprData, Vec<ExprRef>), ExprRef> = HashMap::new();
+    let mut map = dag.side_table(None::<ExprRef>);
+    // Ascending index order is topological, so a child is interned before its
+    // parent asks for it.
+    for node in dag.iter() {
+        if !reachable[node] {
             continue;
         }
-        let id = ExprId(idx as u32);
-        let m = |c: ExprId, map: &[u32]| {
-            let d = map[c.0 as usize];
-            assert_ne!(d, u32::MAX, "hash_cons: child after parent");
-            d
-        };
-        let (key, build): (Key, Build) = match *arena.node(id) {
-            ExprNode::Var(i) => (Key::Var(i), Box::new(move |a| a.push_var(i))),
-            ExprNode::Const(v) => (Key::Const(v.to_bits()), Box::new(move |a| a.push_const(v))),
-            ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
-            ExprNode::Buffer(b) => (Key::Buffer(b.0), Box::new(move |a| a.push_buffer(b))),
-            ExprNode::Uniform(u) => (Key::Uniform(u.0), Box::new(move |a| a.push_uniform(u))),
-            ExprNode::Unary(k, c) => {
-                let c = ExprId(m(c, &map));
-                (Key::Op(k, vec![c.0]), Box::new(move |a| a.push_unary(k, c)))
-            }
-            ExprNode::Binary(k, x, y) => {
-                let (x, y) = (ExprId(m(x, &map)), ExprId(m(y, &map)));
-                (
-                    Key::Op(k, vec![x.0, y.0]),
-                    Box::new(move |a| a.push_binary(k, x, y)),
-                )
-            }
-            ExprNode::Ternary(k, x, y, z) => {
-                let (x, y, z) = (ExprId(m(x, &map)), ExprId(m(y, &map)), ExprId(m(z, &map)));
-                (
-                    Key::Op(k, vec![x.0, y.0, z.0]),
-                    Box::new(move |a| a.push_ternary(k, x, y, z)),
-                )
-            }
-            ExprNode::Nary(k, start, n) => {
-                let kids: Vec<ExprId> = arena
-                    .nary_children_slice(start, n)
-                    .iter()
-                    .map(|&c| ExprId(m(c, &map)))
-                    .collect();
-                let raw: Vec<u32> = kids.iter().map(|c| c.0).collect();
-                (Key::Op(k, raw), Box::new(move |a| a.push_nary(k, &kids)))
-            }
-        };
-        let new_id = *interned.entry(key).or_insert_with(|| build(&mut out));
-        map[idx] = new_id.0;
+        let kids: Vec<ExprRef> = node
+            .children()
+            .map(|c| map[c].expect("hash_cons: child after parent"))
+            .collect();
+        let key = (*node, kids.clone());
+        let interned_ref = *interned.entry(key).or_insert_with(|| match *node {
+            ExprData::Var(i) => out.push_var(i),
+            ExprData::Const(bits) => out.push_const(f32::from_bits(bits)),
+            ExprData::Param(i) => out.push_param(i),
+            ExprData::Buffer(b) => out.push_buffer(b),
+            ExprData::Uniform(u) => out.push_uniform(u),
+            ExprData::Op(op) => out.push_nary(op, &kids),
+        });
+        map[node] = Some(interned_ref);
     }
-    (out, ExprId(map[root.0 as usize]))
+    let new_root = map[root].expect("hash_cons: the root is its own descendant");
+    out.finish(&[new_root])
 }
 
-fn reach_set(arena: &ExprArena, root: ExprId) -> HashSet<u32> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id.0) {
-            continue;
-        }
-        stack.extend(arena.children(id));
-    }
-    seen
+fn reach_set(root: Node<'_, ExprData>) -> HashSet<Node<'_, ExprData>> {
+    root.descendants().collect()
 }
 
 fn median_usize(v: &mut [usize]) -> f64 {
@@ -547,39 +545,27 @@ fn median_usize(v: &mut [usize]) -> f64 {
 
 /// Tree count with multiplicity (a spliced subterm counted once per use)
 /// and the latency-prior tree cost, both saturating.
-fn tree_figures(arena: &ExprArena, root: ExprId, costs: &CostModel) -> (u128, u128) {
-    let len = arena.nodes_raw().len();
-    let mut memo: Vec<Option<(u128, u128)>> = vec![None; len];
-    let mut order = Vec::new();
-    let mut stack = vec![root];
-    let mut seen = vec![false; len];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        order.push(id);
-        stack.extend(arena.children(id));
-    }
-    // Children have smaller ids than parents (push order), so ascending id
-    // is a valid evaluation order.
-    order.sort_unstable();
-    for id in order {
+fn tree_figures(root: Node<'_, ExprData>, costs: &CostModel) -> (u128, u128) {
+    // A DAG's index order is already topological (children strictly before
+    // parents), so one ascending pass resolves every node.
+    let dag = root.dag();
+    let mut memo = dag.side_table((0u128, 0u128));
+    for node in dag.iter() {
         let mut count: u128 = 1;
-        let mut cost: u128 = costs.cost(arena.kind(id)) as u128;
-        for c in arena.children(id) {
-            let (cc, cs) = memo[c.0 as usize].expect("child before parent");
+        let mut cost: u128 = costs.cost(kind_of(node)) as u128;
+        for c in node.children() {
+            let (cc, cs) = memo[c];
             count = count.saturating_add(cc);
             cost = cost.saturating_add(cs);
         }
-        memo[id.0 as usize] = Some((count, cost));
+        memo[node] = (count, cost);
     }
-    memo[root.0 as usize].expect("root")
+    memo[root]
 }
 
-fn dag_cost(arena: &ExprArena, root: ExprId, costs: &CostModel) -> u128 {
-    reach_set(arena, root)
-        .into_iter()
-        .map(|i| costs.cost(arena.kind(ExprId(i))) as u128)
+fn dag_cost(root: Node<'_, ExprData>, costs: &CostModel) -> u128 {
+    root.descendants()
+        .map(|n| costs.cost(kind_of(n)) as u128)
         .sum()
 }
 
@@ -625,16 +611,14 @@ struct Census {
 }
 
 /// The select/compare/op census over the hash-consed graph.
-fn census(arena: &ExprArena, root: ExprId) -> Census {
-    let nodes = reach_set(arena, root);
+fn census(root: Node<'_, ExprData>) -> Census {
     let mut hist: BTreeMap<String, usize> = BTreeMap::new();
-    let mut selects = Vec::new();
+    let mut selects: Vec<[Node<'_, ExprData>; 3]> = Vec::new();
     let mut compares = 0;
     let mut gathers = 0;
     let mut transcendentals = 0;
-    for &i in &nodes {
-        let id = ExprId(i);
-        let k = arena.kind(id);
+    for node in root.descendants() {
+        let k = kind_of(node);
         *hist.entry(format!("{k:?}")).or_default() += 1;
         if is_compare(k) {
             compares += 1;
@@ -645,11 +629,12 @@ fn census(arena: &ExprArena, root: ExprId) -> Census {
         if k == OpKind::Gather || k == OpKind::RawGather {
             gathers += 1;
         }
-        if let &ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
-            selects.push((m, a, b));
+        if k == OpKind::Select && node.child_count() == 3 {
+            let kids: Vec<_> = node.children().collect();
+            selects.push([kids[0], kids[1], kids[2]]);
         }
     }
-    let mut mask_uses: HashMap<u32, usize> = HashMap::new();
+    let mut mask_uses: HashMap<Node<'_, ExprData>, usize> = HashMap::new();
     let mut cfs = 0;
     let mut arm_t = Vec::new();
     let mut arm_f = Vec::new();
@@ -657,13 +642,13 @@ fn census(arena: &ExprArena, root: ExprId) -> Census {
     let mut ex_f = Vec::new();
     let mut ex_total = 0usize;
     let mut arm_total = 0usize;
-    for &(m, a, b) in &selects {
-        *mask_uses.entry(m.0).or_default() += 1;
-        if is_compare(arena.kind(m)) {
+    for &[m, a, b] in &selects {
+        *mask_uses.entry(m).or_default() += 1;
+        if is_compare(kind_of(m)) {
             cfs += 1;
         }
-        let ra = reach_set(arena, a);
-        let rb = reach_set(arena, b);
+        let ra = reach_set(a);
+        let rb = reach_set(b);
         let ea = ra.difference(&rb).count();
         let eb = rb.difference(&ra).count();
         arm_total += ra.len() + rb.len();
@@ -709,10 +694,11 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     .expect("fmt");
 
     // ---- construction ----
-    let nodes_reachable = reachable_count(&k.arena, k.root);
-    let (hc, hc_root) = hash_cons(&k.arena, k.root);
-    let nodes_hashcons = reachable_count(&hc, hc_root);
-    let (tree_nodes, _) = tree_figures(&k.arena, k.root, &costs);
+    let nodes_reachable = reachable_count_term(k.term());
+    let (hc, hc_env) = hash_cons(k.term());
+    let hc_term = Term::new(hc.entry(), &hc_env);
+    let nodes_hashcons = reachable_count_term(hc_term);
+    let (tree_nodes, _) = tree_figures(k.term().root(), &costs);
     write!(
         row,
         ",{nodes_reachable},{nodes_hashcons},{:.3},{tree_nodes}",
@@ -720,7 +706,7 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     )
     .expect("fmt");
 
-    let c = census(&hc, hc_root);
+    let c = census(hc_term.root());
     write!(
         row,
         ",{},{},{},{},{:.1},{:.1},{:.1},{:.1},{:.3},{},{},{},{},{},{}",
@@ -734,31 +720,35 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
         c.arm_excl_false_med,
         c.arm_excl_frac,
         c.gathers,
-        k.arena.buffers().len(),
-        k.arena.uniforms().len(),
+        k.env.buffers.len(),
+        k.env.uniforms.len(),
         c.transcendentals,
-        hc.depth(hc_root),
+        pixelflow_ir::depth(hc_term.root()),
         c.ops
     )
     .expect("fmt");
 
     // ---- production saturation (runtime.rs: LowerDwrt, ExpandReduce, Saturate::runtime) ----
-    let (lowered, lowered_root) = pixelflow_ir::passes::lower_dwrt_owned(&k.arena, k.root)
+    // Neither pass touches declarations, so the lowered graph indexes the
+    // input's environment unchanged.
+    let dwrt_free = pixelflow_ir::passes::lower_dwrt(k.term())
         .unwrap_or_else(|e| panic!("{}: lower_dwrt failed: {e}", k.name));
-    let (lowered, lowered_root) = pixelflow_ir::passes::expand_reduce_owned(&lowered, lowered_root);
-    let node_count = reachable_count(&lowered, lowered_root);
+    let lowered = pixelflow_ir::passes::expand_reduce(Term::new(dwrt_free.entry(), k.term().env()));
+    let lowered_term = Term::new(lowered.entry(), k.term().env());
+    let node_count = reachable_count_term(lowered_term);
     // Costs are priced on the LOWERED term — what the e-graph is handed —
     // so the input and extracted columns share units (`Dwrt` is expanded
     // by lowering; pricing it as one op would make the pair incomparable).
-    let (lhc, lhc_root) = hash_cons(&lowered, lowered_root);
-    let nodes_lowered_hc = reachable_count(&lhc, lhc_root);
-    let (_, input_tree_cost) = tree_figures(&lowered, lowered_root, &costs);
-    let input_dag_cost = dag_cost(&lhc, lhc_root, &costs);
+    let (lhc, lhc_env) = hash_cons(lowered_term);
+    let lhc_term = Term::new(lhc.entry(), &lhc_env);
+    let nodes_lowered_hc = reachable_count_term(lhc_term);
+    let (_, input_tree_cost) = tree_figures(lowered_term.root(), &costs);
+    let input_dag_cost = dag_cost(lhc_term.root(), &costs);
     let mut optimizer = Optimizer::production()
         .for_lattice(LatticeShape::new(k.extent))
         .observe(Some(Box::new(KeepJournal)));
     let mut egraph = optimizer.egraph();
-    let root_class = insert(&lowered, lowered_root, &mut egraph, Vocabulary::Runtime)
+    let root_class = insert_term(lowered_term, &mut egraph, Vocabulary::Runtime)
         .unwrap_or_else(|_| panic!("{}: not e-graph representable", k.name));
     let limits = Budget::Production.limits(InputSize {
         nodes: node_count,
@@ -767,7 +757,8 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     let started = Instant::now();
     let optimized = optimizer.run(&mut egraph, root_class, node_count);
     let opt_ms = started.elapsed().as_secs_f64() * 1e3;
-    let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
+    let (extracted, extracted_env) = optimized.to_rooted(&egraph, root_class);
+    let extracted_term = Term::new(extracted.entry(), &extracted_env);
     let s = &optimized.stats;
     write!(
         row,
@@ -777,8 +768,8 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     )
     .expect("fmt");
 
-    let ext_nodes = reachable_count(&extracted, extracted_root);
-    let ext_census = census(&extracted, extracted_root);
+    let ext_nodes = reachable_count_term(extracted_term);
+    let ext_census = census(extracted_term.root());
     // `ChoiceCost` is the objective the DP minimized — trip-weighted by the
     // lattice shape since `for_lattice` — so its tree/dag pair is reported as
     // is, and the extracted term is ALSO priced with the flat latency prior
@@ -786,8 +777,8 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     // "input dag cost" and "extracted dag cost" are comparable.
     let trip_dag = optimized.cost.dag;
     let trip_tree = optimized.cost.tree;
-    let (_, ext_tree) = tree_figures(&extracted, extracted_root, &costs);
-    let ext_dag = dag_cost(&extracted, extracted_root, &costs);
+    let (_, ext_tree) = tree_figures(extracted_term.root(), &costs);
+    let ext_dag = dag_cost(extracted_term.root(), &costs);
     write!(
         row,
         ",{ext_nodes},{trip_tree},{trip_dag},{:.3},{ext_tree},{ext_dag},{:.3},{},{:.2}",
@@ -831,15 +822,17 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
         .join(";");
 
     // ---- emit (Saturate re-splices buffers onto the input's slot order) ----
-    let (emit_arena, emit_root) = if lowered.buffers().is_empty() {
-        (extracted, extracted_root)
-    } else {
-        let mut ordered = ExprArena::new();
-        for decl in lowered.buffers() {
+    let reordered = (!lowered_term.env().buffers.is_empty()).then(|| {
+        let mut ordered = ExprBuilder::new();
+        for decl in &lowered_term.env().buffers {
             let _slot = ordered.declare_buffer(*decl);
         }
-        let r = ordered.splice(&extracted, extracted_root);
-        (ordered, r)
+        let r = ordered.splice(extracted_term);
+        ordered.finish(&[r])
+    });
+    let emit_term = match &reordered {
+        Some((expr, env)) => Term::new(expr.entry(), env),
+        None => extracted_term,
     };
     eprintln!("corpus-gaps emit={}", k.name);
     // `emit::compile` refuses an arena naming the retired Z/W axes
@@ -847,10 +840,10 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     // and a generator that draws from four "variables" builds kernels the
     // emitter cannot take. Recorded as its own outcome rather than a panic —
     // the fraction of a population that cannot even be emitted is a column.
-    let emit_result = if emit_arena.retired_axis(emit_root).is_some() {
+    let emit_result = if pixelflow_ir::retired_axis(emit_term.root()).is_some() {
         Err(None)
     } else {
-        pixelflow_codegen::emit::compile(&emit_arena, emit_root).map_err(Some)
+        pixelflow_codegen::emit::compile(emit_term).map_err(Some)
     };
     match emit_result {
         Ok(res) => {

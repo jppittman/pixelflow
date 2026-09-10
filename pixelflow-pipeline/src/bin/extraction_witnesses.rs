@@ -28,14 +28,14 @@ use pixelflow_graphics::render::pixel::Pixel;
 use pixelflow_graphics::scene3d::{Hit, Plane, Ray, Rgba, Sphere, checker, sky};
 use pixelflow_ir::optimize::{Optimize, Rewritten};
 use pixelflow_ir::passes::{ExpandReduce, LowerDwrt};
-use pixelflow_ir::{ExprArena, ExprId, ExprNode, LatticeShape};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, ExprRef, LatticeShape, Node, Rooted, Term};
 use pixelflow_pipeline::shader_bench::{SHADERTOY_KERNEL_NAMES, named_shadertoy_kernel};
 use pixelflow_search::egraph::optimizer::KeepJournal;
 use pixelflow_search::egraph::provenance::{ApplicationId, Origin};
 use pixelflow_search::egraph::witness::{self, Stage, Ties};
 use pixelflow_search::egraph::{
     Budget, CostModel, EClassId, EGraph, ENode, Optimized, Optimizer, Vocabulary,
-    config_for_node_count, insert, reachable_count,
+    config_for_node_count, insert_term, reachable_count_term,
 };
 
 const SCREEN: [u32; 2] = [1920, 1080];
@@ -163,11 +163,11 @@ fn psych_channel(y_weight: f32, clock: Uniform) -> Kernel {
 fn corpus(cli: &Cli) -> Vec<Case> {
     let mut out: Vec<Case> = Vec::new();
     for name in SHADERTOY_KERNEL_NAMES {
-        let (arena, root) = named_shadertoy_kernel(name).expect("registered shader");
+        let (expr, env) = named_shadertoy_kernel(name).expect("registered shader");
         out.push(Case {
             name: format!("shader_{name}"),
             family: "shader".into(),
-            kernel: Kernel::from_parts(arena, root),
+            kernel: Kernel::from_rooted(expr, env),
             extent: SHADER_EXTENT,
             ladder: &BIG_LADDER,
         });
@@ -232,42 +232,40 @@ fn corpus(cli: &Cli) -> Vec<Case> {
 // Costs
 // ---------------------------------------------------------------------------
 
-fn reachable(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
-    let mut seen = vec![false; arena.nodes_raw().len()];
-    let mut stack = vec![root];
-    let mut out = Vec::new();
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        out.push(id);
-        stack.extend(arena.children(id));
-    }
-    out
-}
-
-/// The sweep's column: the latency prior over the emitted arena's reachable
-/// op nodes, each once, **unweighted**. A property of a term, so exact and
+/// The sweep's column: the latency prior over the term's reachable op nodes,
+/// each once, **unweighted**. A property of a term, so exact and
 /// reproducible.
-fn dag_cost(arena: &ExprArena, root: ExprId) -> usize {
+fn dag_cost(root: Node<'_, ExprData>) -> usize {
     let model = CostModel::latency_prior();
-    reachable(arena, root)
-        .into_iter()
-        .filter_map(|id| match arena.node(id) {
-            ExprNode::Unary(k, _) | ExprNode::Binary(k, _, _) | ExprNode::Ternary(k, _, _, _) => {
-                Some(model.cost(*k))
-            }
+    root.descendants()
+        .filter_map(|n| match *n {
+            ExprData::Op(k) if n.child_count() <= 3 => Some(model.cost(k)),
             _ => None,
         })
         .sum()
 }
 
-fn legalize(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    match pixelflow_ir::pipeline![LowerDwrt, ExpandReduce].optimize(arena, root) {
-        Rewritten::Changed(a, r) => (a, r),
-        Rewritten::Unchanged => (arena.clone(), root),
+fn legalize(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    match pixelflow_ir::pipeline![LowerDwrt, ExpandReduce].optimize(term) {
+        Rewritten::Changed(rooted, env) => (rooted, env),
+        Rewritten::Unchanged => own(term),
         Rewritten::Declined => panic!("legalizing prefix declined a real kernel"),
     }
+}
+
+/// A term copied into a graph of its own.
+fn own(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    let mut b = ExprBuilder::new();
+    let root = b.splice(term);
+    b.finish(&[root])
+}
+
+/// A term copied into a builder — the form [`witness::induce`] takes, since
+/// `ExprBuilder` is what implements [`pixelflow_ir::Ir`].
+fn as_builder(term: Term<'_>) -> (ExprBuilder, ExprRef) {
+    let mut b = ExprBuilder::new();
+    let root = b.splice(term);
+    (b, root)
 }
 
 // ---------------------------------------------------------------------------
@@ -368,13 +366,8 @@ struct Saturated {
     rule_of: HashMap<ApplicationId, String>,
 }
 
-fn saturate_at(
-    arena: &ExprArena,
-    root: ExprId,
-    shape: LatticeShape,
-    class_cap: usize,
-) -> Saturated {
-    let node_count = reachable_count(arena, root);
+fn saturate_at(term: Term<'_>, shape: LatticeShape, class_cap: usize) -> Saturated {
+    let node_count = reachable_count_term(term);
     let tier = config_for_node_count(node_count);
     let mut optimizer = Optimizer::production()
         .for_lattice(shape)
@@ -389,7 +382,7 @@ fn saturate_at(
         .no_ceiling()
         .observe(Some(Box::new(KeepJournal)));
     let mut egraph = optimizer.egraph();
-    let root_class = insert(arena, root, &mut egraph, Vocabulary::Runtime)
+    let root_class = insert_term(term, &mut egraph, Vocabulary::Runtime)
         .unwrap_or_else(|d| panic!("kernel not representable: {d:?}"));
     let inserted = egraph.num_classes();
     let optimized = optimizer.run(&mut egraph, root_class, node_count);
@@ -470,7 +463,7 @@ struct Pair<'a> {
     lo: &'a BudgetRow,
     hi: &'a BudgetRow,
     sat: &'a Saturated,
-    witness_term: &'a (ExprArena, ExprId),
+    witness_term: &'a (ExprBuilder, ExprRef),
     costs: &'a CostModel,
 }
 
@@ -732,23 +725,24 @@ fn main() {
     for case in &cases {
         let shape = LatticeShape::new(case.extent);
         let held = case.kernel.clone();
-        let (arena, root) = held.parts();
-        let (la, lr) = legalize(arena, root);
+        let (legal, legal_env) = legalize(held.term());
+        let legal_term = Term::new(legal.entry(), &legal_env);
 
         // Ascending: at each budget the smaller budgets' terms are already
         // in hand, so each graph is built once and analysed against every
         // witness before it is dropped.
-        let mut terms: Vec<(usize, (ExprArena, ExprId), BudgetRow)> = Vec::new();
+        let mut terms: Vec<(usize, (ExprBuilder, ExprRef), BudgetRow)> = Vec::new();
         for &cap in case.ladder {
             let t = Instant::now();
-            let sat = saturate_at(&la, lr, shape, cap);
+            let sat = saturate_at(legal_term, shape, cap);
             let secs = t.elapsed().as_secs_f64();
-            let (oa, orr) = sat.optimized.to_arena(&sat.egraph, sat.root);
+            let (opt, opt_env) = sat.optimized.to_rooted(&sat.egraph, sat.root);
             let live =
                 witness::reachable_under(&sat.egraph, sat.root, &sat.optimized.choices).len();
             let (canon_choices, canon) =
                 witness::extract_under(&sat.egraph, sat.root, &costs, shape, Ties::Canonical);
-            let canon_arena = witness::arena_of(&sat.egraph, sat.root, canon_choices);
+            let (canon_rooted, _canon_env) =
+                witness::rooted_of(&sat.egraph, sat.root, canon_choices);
             let trace = witness::trace(&sat.egraph, sat.root, &costs, shape);
             let tied = witness::reachable_under(&sat.egraph, sat.root, &sat.optimized.choices)
                 .iter()
@@ -764,11 +758,11 @@ fn main() {
                 applications: sat.optimized.stats.applications,
                 stop: format!("{:?}", sat.optimized.stats.stop),
                 objective: sat.optimized.cost.dag,
-                dag_cost: dag_cost(&oa, orr),
+                dag_cost: dag_cost(opt.entry()),
                 tree_cost: sat.optimized.cost.tree,
                 extraction_objective: format!("{:?}", sat.optimized.extraction.objective),
                 canonical_objective: canon.dag,
-                canonical_dag_cost: dag_cost(&canon_arena.0, canon_arena.1),
+                canonical_dag_cost: dag_cost(canon_rooted.entry()),
                 tied_classes: tied,
                 seconds: secs,
             };
@@ -813,7 +807,11 @@ fn main() {
                     witness_rows.push(w);
                 }
             }
-            terms.push((cap, (oa, orr), row.clone()));
+            terms.push((
+                cap,
+                as_builder(Term::new(opt.entry(), &opt_env)),
+                row.clone(),
+            ));
             budget_rows.push(row);
         }
     }

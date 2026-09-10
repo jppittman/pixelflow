@@ -31,7 +31,7 @@ use clap::Parser;
 use serde::Serialize;
 use serde_json::Value;
 
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::{Environment, ExprData, Rooted, Term};
 use pixelflow_pipeline::schema::fnv1a64_hex;
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_pipeline::training::guide_linear::{
@@ -169,14 +169,13 @@ fn curve_to_arm(out: &AnytimeCurveOutput, seen_keys: Option<usize>) -> Arm {
 
 fn run_arm(
     guide: Option<Box<dyn SaturationGuide>>,
-    arena: &ExprArena,
-    root: ExprId,
+    term: Term<'_>,
     class_cap: usize,
     costs: &CostModel,
 ) -> Arm {
     let guided = guide.is_some();
     let mut optimizer = arm_optimizer(class_cap, costs, guide);
-    let out = run_anytime_curve(&mut optimizer, arena, root, GRID);
+    let out = run_anytime_curve(&mut optimizer, term, GRID);
     let seen = if guided {
         Some(
             optimizer
@@ -217,7 +216,7 @@ fn control_by_index(path: &Path, rules: &RuleSet) -> PerRuleRateGuide {
     PerRuleRateGuide::from_labels(&labelled)
 }
 
-fn enforce_train_fence(corpus_dir: &Path, entries: &[(String, ExprArena, ExprId)]) {
+fn enforce_train_fence(corpus_dir: &Path, entries: &[(String, Rooted<ExprData>)]) {
     let path = corpus_dir.join("corpus_train.bin");
     assert!(
         path.exists(),
@@ -227,12 +226,12 @@ fn enforce_train_fence(corpus_dir: &Path, entries: &[(String, ExprArena, ExprId)
     let train: HashSet<FenceKey> = read_corpus(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
         .iter()
-        .map(|(_, a, r)| FenceKey::of(a, *r))
+        .map(|(_, e)| FenceKey::of(e.entry()))
         .collect();
     let collisions: Vec<&str> = entries
         .iter()
-        .filter(|(_, a, r)| train.contains(&FenceKey::of(a, *r)))
-        .map(|(n, _, _)| n.as_str())
+        .filter(|(_, e)| train.contains(&FenceKey::of(e.entry())))
+        .map(|(n, _)| n.as_str())
         .collect();
     assert!(
         collisions.is_empty(),
@@ -272,11 +271,9 @@ fn main() {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", corpus_path.display()));
     enforce_train_fence(Path::new(&args.corpus_dir), &entries);
 
-    let selected: Vec<&(String, ExprArena, ExprId)> = entries
+    let selected: Vec<&(String, Rooted<ExprData>)> = entries
         .iter()
-        .filter(|(name, arena, _)| {
-            name.starts_with(&args.name_prefix) && tier_is_classical(arena.nodes_raw().len())
-        })
+        .filter(|(name, expr)| name.starts_with(&args.name_prefix) && tier_is_classical(expr.len()))
         .collect();
     let selected = if args.limit > 0 {
         selected.into_iter().take(args.limit).collect()
@@ -313,25 +310,28 @@ fn main() {
         rules.fingerprint()
     );
     let total = selected.len();
-    for (i, (name, arena, root)) in selected.into_iter().enumerate() {
+    // A corpus entry declares no buffers or uniforms — the format refuses to
+    // write one down — so one empty environment serves every term.
+    let env = Environment::new();
+    for (i, (name, expr)) in selected.into_iter().enumerate() {
         if done.contains(name) {
             continue;
         }
-        let node_count = arena.nodes_raw().len();
+        let term = Term::new(expr.entry(), &env);
+        let node_count = expr.len();
         let class_cap = config_for_node_count(node_count).max_classes;
         let started = Instant::now();
 
         let mut arms = BTreeMap::new();
         arms.insert(
             "unguided".to_string(),
-            run_arm(None, arena, *root, class_cap, &costs),
+            run_arm(None, term, class_cap, &costs),
         );
         arms.insert(
             "control".to_string(),
             run_arm(
                 Some(Box::new(control_index.clone())),
-                arena,
-                *root,
+                term,
                 class_cap,
                 &costs,
             ),
@@ -340,21 +340,14 @@ fn main() {
             "control_label".to_string(),
             run_arm(
                 Some(Box::new(control_label.clone())),
-                arena,
-                *root,
+                term,
                 class_cap,
                 &costs,
             ),
         );
         arms.insert(
             "linear".to_string(),
-            run_arm(
-                Some(Box::new(linear.clone())),
-                arena,
-                *root,
-                class_cap,
-                &costs,
-            ),
+            run_arm(Some(Box::new(linear.clone())), term, class_cap, &costs),
         );
 
         let row = Row {

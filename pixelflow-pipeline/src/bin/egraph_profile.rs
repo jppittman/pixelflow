@@ -14,8 +14,7 @@
 //!     --bin egraph_profile
 //! ```
 
-use pixelflow_ir::arena::{ExprArena, ExprId};
-use pixelflow_ir::{LatticeShape, OpKind};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, LatticeShape, OpKind, Rooted, Term};
 use pixelflow_pipeline::alloc_probe::{self, CountingAlloc};
 
 #[global_allocator]
@@ -24,10 +23,10 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 /// Same shape as `bench_jit_compile_cost::build_kernel_arena`: an SDF-style
 /// core plus a repeating 8-op mix (select, sqrt, mul, add, mul_add, max,
 /// sub, square) until `target_nodes` is reached. `salt` keeps two calls
-/// canonically distinct so `optimize_runtime_arena`'s cache never hits.
-fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
+/// canonically distinct so `optimize_runtime_term`'s cache never hits.
+fn build_kernel_term(target_nodes: usize, salt: f32) -> (Rooted<ExprData>, Environment) {
     assert!(target_nodes >= 8);
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let y = arena.push_var(1);
     let c = arena.push_const(salt);
@@ -54,7 +53,7 @@ fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
         };
         step += 1;
     }
-    (arena, cur)
+    arena.finish(&[cur])
 }
 
 fn main() {
@@ -76,13 +75,12 @@ fn main() {
         for _ in 0..REPS {
             salt_counter += 1;
             let salt = 0.25 + (salt_counter as f32) * (1.0 / 65536.0);
-            let (arena, root) = build_kernel_arena(size, salt);
+            let (expr, env) = build_kernel_term(size, salt);
 
             alloc_probe::reset();
             let start = std::time::Instant::now();
-            let out = pixelflow_search::runtime::optimize_runtime_arena(
-                &arena,
-                root,
+            let out = pixelflow_search::runtime::optimize_runtime_term(
+                Term::new(expr.entry(), &env),
                 LatticeShape::POINT,
             );
             let elapsed = start.elapsed();
@@ -106,7 +104,7 @@ fn main() {
 
     #[cfg(feature = "profiling")]
     {
-        println!("\n=== CPU flamegraph: fixed 4096-node arena, 2000 distinct calls ===");
+        println!("\n=== CPU flamegraph: fixed 4096-node graph, 2000 distinct calls ===");
         let guard = pprof::ProfilerGuardBuilder::default()
             .frequency(997)
             .blocklist(&["libc", "libgcc", "pthread"])
@@ -118,10 +116,9 @@ fn main() {
         for _ in 0..n {
             salt_counter += 1;
             let salt = 0.25 + (salt_counter as f32) * (1.0 / 65536.0);
-            let (arena, root) = build_kernel_arena(4096, salt);
-            let out = pixelflow_search::runtime::optimize_runtime_arena(
-                &arena,
-                root,
+            let (expr, env) = build_kernel_term(4096, salt);
+            let out = pixelflow_search::runtime::optimize_runtime_term(
+                Term::new(expr.entry(), &env),
                 LatticeShape::POINT,
             );
             std::hint::black_box(&out);

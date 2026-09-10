@@ -6,7 +6,7 @@
 //! alongside the cell-grid and glyph dumps and replay the exact production
 //! saturation sequence on them, under every rule-order arm.
 //!
-//! The 12 shaders are already `(ExprArena, ExprId)` pairs
+//! The 12 shaders are already rooted graphs
 //! (`pixelflow_pipeline::shader_bench::named_shadertoy_kernel`) — dumped
 //! verbatim, no lowering needed (they were built by hand for the corpus,
 //! never through the `kernel!` macro's own e-graph).
@@ -14,7 +14,7 @@
 //! The psychedelic kernel (`pixelflow-compiler/src/codegen/mod.rs`'s
 //! `emit_exact_psychedelic_kernel` test / `pixelflow-runtime/examples/
 //! psychedelic_shader.rs`'s `PsychedelicScene`) is hand-transcribed here
-//! into the same `ExprArena` `push_*` calls `shader_bench.rs` uses, because
+//! into the same `ExprBuilder` `push_*` calls `shader_bench.rs` uses, because
 //! `pixelflow-compiler`'s parser/sema modules are private (getting an
 //! unoptimized arena out of the `kernel!` pipeline from outside the crate
 //! would be the public-API change CLAUDE.md forbids). `t`/`width`/`height`
@@ -28,8 +28,9 @@
 //! root — this corpus's kernels are single-channel, exactly as
 //! `shader_bench.rs`'s `cosine_palette` states for the same reason.
 
-use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::{
+    Environment, ExprBuilder, ExprData, ExprRef, Node, OpKind, Rooted, Term, node_count_subtree,
+};
 use pixelflow_pipeline::shader_bench::{SHADERTOY_KERNEL_NAMES, named_shadertoy_kernel};
 
 /// Screen size and time offset the psychedelic kernel is fixed at for this
@@ -39,40 +40,40 @@ const WIDTH: f32 = 800.0;
 const HEIGHT: f32 = 600.0;
 const T: f32 = 1.0;
 
-fn k(a: &mut ExprArena, v: f32) -> ExprId {
+fn k(a: &mut ExprBuilder, v: f32) -> ExprRef {
     a.push_const(v)
 }
-fn var(a: &mut ExprArena, i: u8) -> ExprId {
+fn var(a: &mut ExprBuilder, i: u8) -> ExprRef {
     a.push_var(i)
 }
-fn add(a: &mut ExprArena, x: ExprId, y: ExprId) -> ExprId {
+fn add(a: &mut ExprBuilder, x: ExprRef, y: ExprRef) -> ExprRef {
     a.push_binary(OpKind::Add, x, y)
 }
-fn sub(a: &mut ExprArena, x: ExprId, y: ExprId) -> ExprId {
+fn sub(a: &mut ExprBuilder, x: ExprRef, y: ExprRef) -> ExprRef {
     a.push_binary(OpKind::Sub, x, y)
 }
-fn mul(a: &mut ExprArena, x: ExprId, y: ExprId) -> ExprId {
+fn mul(a: &mut ExprBuilder, x: ExprRef, y: ExprRef) -> ExprRef {
     a.push_binary(OpKind::Mul, x, y)
 }
-fn div(a: &mut ExprArena, x: ExprId, y: ExprId) -> ExprId {
+fn div(a: &mut ExprBuilder, x: ExprRef, y: ExprRef) -> ExprRef {
     a.push_binary(OpKind::Div, x, y)
 }
-fn abs(a: &mut ExprArena, x: ExprId) -> ExprId {
+fn abs(a: &mut ExprBuilder, x: ExprRef) -> ExprRef {
     a.push_unary(OpKind::Abs, x)
 }
-fn sin(a: &mut ExprArena, x: ExprId) -> ExprId {
+fn sin(a: &mut ExprBuilder, x: ExprRef) -> ExprRef {
     a.push_unary(OpKind::Sin, x)
 }
-fn exp(a: &mut ExprArena, x: ExprId) -> ExprId {
+fn exp(a: &mut ExprBuilder, x: ExprRef) -> ExprRef {
     a.push_unary(OpKind::Exp, x)
 }
 
 /// Exact transcription of `emit_exact_psychedelic_kernel`'s expression
 /// (`pixelflow-compiler/src/codegen/mod.rs`), one `let` at a time, into
-/// direct `ExprArena` calls. See the module doc for what's fixed vs.
+/// direct `ExprBuilder` calls. See the module doc for what's fixed vs.
 /// per-pixel.
-fn psychedelic_kernel() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn psychedelic_kernel() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x_coord = var(&mut a, 0); // X
     let y_coord = var(&mut a, 1); // Y
     let w_coord = var(&mut a, 3); // W
@@ -160,12 +161,12 @@ fn psychedelic_kernel() -> (ExprArena, ExprId) {
     /// The `y_factor_{r,g,b}`/`raw_{r,g,b}`/`soft_{r,g,b}` chain shared by
     /// the three channels — only `y_mult` differs between them.
     struct ChannelInputs {
-        y: ExprId,
-        sin_w03: ExprId,
-        radial_factor: ExprId,
-        swirl: ExprId,
+        y: ExprRef,
+        sin_w03: ExprRef,
+        radial_factor: ExprRef,
+        swirl: ExprRef,
     }
-    fn channel(a: &mut ExprArena, inputs: &ChannelInputs, y_mult: f32) -> ExprId {
+    fn channel(a: &mut ExprBuilder, inputs: &ChannelInputs, y_mult: f32) -> ExprRef {
         let ym = k(a, y_mult);
         let yy = mul(a, inputs.y, ym);
         let p2 = k(a, 0.2);
@@ -197,83 +198,69 @@ fn psychedelic_kernel() -> (ExprArena, ExprId) {
 
     let rg = add(&mut a, red, green);
     let root = add(&mut a, rg, blue);
-    (a, root)
+    a.finish(&[root])
 }
 
 /// Duplicated verbatim from `pixelflow-graphics/tests/production_glyph_arena_dump.rs`
 /// / `pixelflow-core/src/lattice/cell_grid.rs` — see either for why (the
 /// only crate all three dumpers can see is `pixelflow-ir`, which must not
 /// grow a test-only serializer).
-fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Path) {
+fn dump_arena(term: Term<'_>, name: &str, path: &std::path::Path) {
     use std::fmt::Write as _;
-    let len = arena.nodes_raw().len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
+
+    let root = term.root();
+    let dag = term.dag();
+    let mut reachable = dag.side_table(false);
+    for n in root.descendants() {
+        reachable[n] = true;
     }
+
     let mut out = String::new();
     writeln!(out, "# pixelflow arena dump v1").expect("fmt");
     writeln!(out, "name {name}").expect("fmt");
     // Every kernel dumped by this file is pure arithmetic — no buffers.
     assert!(
-        arena.buffers().is_empty(),
+        term.env().buffers.is_empty(),
         "{name}: unexpected buffer in a shader/psychedelic kernel"
     );
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
+
+    // Dense ordinals in ascending, topological (children-before-parents)
+    // order over the reachable subgraph. `Node::descendants()` is a
+    // parent-first DFS, so it is not a valid dump order on its own — this is
+    // the same two-pass shape `expr::encode_into` and the other dumpers use.
+    let mut dense = dag.side_table(None::<u32>);
     let mut next = 0u32;
-    let d = |dense: &[u32], id: ExprId| -> u32 {
-        let v = dense[id.0 as usize];
-        assert_ne!(v, u32::MAX, "child dumped before parent");
-        v
-    };
-    for idx in 0..len {
-        if !reachable[idx] {
+    for node in dag.iter() {
+        if !reachable[node] {
             continue;
         }
-        let id = ExprId(idx as u32);
-        match arena.node(id) {
-            ExprNode::Var(i) => writeln!(out, "V {i}"),
-            ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
-            ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
-            ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-            ExprNode::Binary(k, a, b) => {
-                writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+        let d = |c: Node<'_, ExprData>| -> u32 { dense[c].expect("child dumped before parent") };
+        match *node {
+            ExprData::Var(i) => writeln!(out, "V {i}"),
+            ExprData::Const(bits) => writeln!(out, "C {bits}"),
+            ExprData::Buffer(b) => writeln!(out, "B {}", b.0),
+            ExprData::Uniform(u) => writeln!(out, "Un {}", u.0),
+            ExprData::Op(k) => {
+                let children: Vec<Node<'_, ExprData>> = node.children().collect();
+                match children.as_slice() {
+                    [a] => writeln!(out, "U {k:?} {}", d(*a)),
+                    [a, b] => writeln!(out, "Bi {k:?} {} {}", d(*a), d(*b)),
+                    [a, b, c] => writeln!(out, "T {k:?} {} {} {}", d(*a), d(*b), d(*c)),
+                    _ => panic!(
+                        "{name}: unsupported node in dump: {k:?} with {} children",
+                        children.len()
+                    ),
+                }
             }
-            ExprNode::Ternary(k, a, b, c) => writeln!(
-                out,
-                "T {k:?} {} {} {}",
-                d(&dense, *a),
-                d(&dense, *b),
-                d(&dense, *c)
-            ),
             other => panic!("{name}: unsupported node in dump: {other:?}"),
         }
         .expect("fmt");
-        dense[idx] = next;
+        dense[node] = Some(next);
         next += 1;
     }
-    writeln!(out, "root {}", d(&dense, root)).expect("fmt");
+    let root_ord = dense[root].expect("the root is its own descendant");
+    writeln!(out, "root {root_ord}").expect("fmt");
     std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-}
-
-fn reachable_count(arena: &ExprArena, root: ExprId) -> usize {
-    let len = arena.nodes_raw().len();
-    let mut seen = vec![false; len];
-    let mut stack = vec![root];
-    let mut n = 0;
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        n += 1;
-        stack.extend(arena.children(id));
-    }
-    n
 }
 
 #[test]
@@ -286,27 +273,29 @@ fn dump_shader_and_psychedelic_arenas() {
 
     let mut dumped = 0usize;
     for name in SHADERTOY_KERNEL_NAMES {
-        let (arena, root) = named_shadertoy_kernel(name)
+        let (expr, env) = named_shadertoy_kernel(name)
             .unwrap_or_else(|| panic!("{name}: not found in shader_bench"));
+        let term = Term::new(expr.entry(), &env);
         let dump_name = format!("shader:{name}");
         let path = dir.join(format!("shader_{name}.arena"));
         println!(
             "{dump_name}: {} reachable nodes -> {}",
-            reachable_count(&arena, root),
+            node_count_subtree(term.root()),
             path.display()
         );
-        dump_arena(&arena, root, &dump_name, &path);
+        dump_arena(term, &dump_name, &path);
         dumped += 1;
     }
 
-    let (arena, root) = psychedelic_kernel();
+    let (expr, env) = psychedelic_kernel();
+    let term = Term::new(expr.entry(), &env);
     let path = dir.join("psychedelic.arena");
     println!(
         "psychedelic: {} reachable nodes -> {}",
-        reachable_count(&arena, root),
+        node_count_subtree(term.root()),
         path.display()
     );
-    dump_arena(&arena, root, "psychedelic", &path);
+    dump_arena(term, "psychedelic", &path);
     dumped += 1;
 
     assert_eq!(dumped, SHADERTOY_KERNEL_NAMES.len() + 1);

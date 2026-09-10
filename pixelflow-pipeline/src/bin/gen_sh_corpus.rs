@@ -34,8 +34,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
-use pixelflow_pipeline::training::corpus::{reachable_subtree, read_corpus, write_corpus};
+use pixelflow_ir::{ExprData, Node, OpKind, Term};
+use pixelflow_pipeline::training::corpus::{Entry, read_corpus, write_corpus};
 use pixelflow_pipeline::training::quarantine::Quarantine;
 use pixelflow_pipeline::training::sh_family::{self, Rng};
 use pixelflow_pipeline::training::split::SplitManifest;
@@ -110,23 +110,15 @@ struct Args {
 /// walk (visited-set, not `node_count_subtree`'s raw count) so a shared
 /// subexpression is counted once, matching how the corpus's own dedup key
 /// ([`FenceKey`]) sees the expression.
-fn op_counts(arena: &ExprArena, root: ExprId) -> (usize, usize) {
-    let mut stack = vec![root];
-    let mut visited = HashSet::new();
+fn op_counts(root: Node<'_, ExprData>) -> (usize, usize) {
     let mut non_leaf = 0usize;
     let mut trig = 0usize;
-    while let Some(id) = stack.pop() {
-        if !visited.insert(id) {
-            continue;
+    for node in root.descendants() {
+        let ExprData::Op(kind) = *node else { continue };
+        non_leaf += 1;
+        if TRIG_OPS.contains(&kind) {
+            trig += 1;
         }
-        let kind = arena.kind(id);
-        if !matches!(kind, OpKind::Var | OpKind::Const | OpKind::Buffer) {
-            non_leaf += 1;
-            if TRIG_OPS.contains(&kind) {
-                trig += 1;
-            }
-        }
-        stack.extend(arena.children(id));
     }
     (non_leaf, trig)
 }
@@ -184,7 +176,7 @@ fn main() {
     );
     let train_fence: HashSet<FenceKey> = train_entries
         .iter()
-        .map(|(_name, arena, root)| FenceKey::of(arena, *root))
+        .map(|(_name, expr)| FenceKey::of(expr.entry()))
         .collect();
     println!(
         "Train fence: {} entries, {} distinct structural keys",
@@ -200,7 +192,7 @@ fn main() {
 
     let mut rng = Rng::new(args.seed);
     let mut seen_within: HashSet<FenceKey> = HashSet::new();
-    let mut admitted: Vec<(String, ExprArena, ExprId)> = Vec::new();
+    let mut admitted: Vec<Entry> = Vec::new();
     let mut node_counts: Vec<usize> = Vec::new();
     let mut trig_fractions: Vec<f64> = Vec::new();
     let mut trig_heavy_count = 0usize;
@@ -212,24 +204,23 @@ fn main() {
 
     while admitted.len() < args.target && attempts < args.max_attempts {
         attempts += 1;
-        let (arena, root) = sh_family::draw(&mut rng);
-        // The compacted, unique-node count — `write_corpus` stores
-        // `reachable_subtree(arena, root)` and `phase3_at_budget_eval`
-        // classifies the band from `arena.nodes_raw().len()` of what it
-        // reads back. `node_count_subtree` counts per *reference* instead,
-        // so a shared node is counted once per parent; SH expressions
-        // deliberately share their trigonometric basis nodes, which made
-        // that number strictly larger than the one the registered band is
-        // measured against and admitted candidates the evaluator then
+        let (expr, env) = sh_family::draw(&mut rng);
+        let term = Term::new(expr.entry(), &env);
+        // The reachable, unique-node count — what `write_corpus` stores (the
+        // encoder is reachable-only) and what `phase3_at_budget_eval` reads
+        // back as `len()`. `node_count_subtree` counts per *reference*
+        // instead, so a shared node is counted once per parent; SH
+        // expressions deliberately share their trigonometric basis nodes,
+        // which made that number strictly larger than the one the registered
+        // band is measured against and admitted candidates the evaluator then
         // classified below `classical`.
-        let (compact, _) = reachable_subtree(&arena, root);
-        let n = compact.len();
+        let n = term.root().node_count();
         if !(MIN_NODES..=MAX_NODES).contains(&n) {
             out_of_band += 1;
             continue;
         }
 
-        let key = FenceKey::of(&arena, root);
+        let key = FenceKey::of(term.root());
         assert!(
             !train_fence.contains(&key),
             "sh candidate #{attempts} (node_count={n}) structurally duplicates a TRAIN \
@@ -243,12 +234,12 @@ fn main() {
         }
 
         let name = format!("dev_sh_{:05}", admitted.len());
-        if !quarantine.check(&name, &arena, root) {
+        if !quarantine.check(&name, term) {
             quarantined += 1;
             continue;
         }
 
-        let (non_leaf, trig) = op_counts(&arena, root);
+        let (non_leaf, trig) = op_counts(term.root());
         trig_fractions.push(if non_leaf == 0 {
             0.0
         } else {
@@ -258,7 +249,8 @@ fn main() {
             trig_heavy_count += 1;
         }
         node_counts.push(n);
-        admitted.push((name, arena, root));
+
+        admitted.push((name, expr));
     }
 
     let (checked, excluded, mismatched) = quarantine.tallies();
@@ -299,9 +291,9 @@ fn main() {
     } else {
         Vec::new()
     };
-    let preserved: Vec<(String, ExprArena, ExprId)> = existing
+    let preserved: Vec<Entry> = existing
         .into_iter()
-        .filter(|(name, _, _)| !name.starts_with("dev_sh_"))
+        .filter(|(name, _)| !name.starts_with("dev_sh_"))
         .collect();
     println!(
         "Preserved {} non-`dev_sh_*` entries already in {}",
@@ -309,7 +301,7 @@ fn main() {
         out_path.display()
     );
     let mut out_entries = preserved;
-    out_entries.extend(admitted.iter().map(|(n, a, r)| (n.clone(), a.clone(), *r)));
+    out_entries.extend(admitted.iter().map(|(n, e)| (n.clone(), e.clone())));
     write_corpus(&out_path, &out_entries)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", out_path.display()));
 

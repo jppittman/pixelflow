@@ -18,10 +18,9 @@
 //! drift normalization), so the comparison between them is meaningful even
 //! though the absolute numbers are machine-specific.
 
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::optimize::{Identity, Optimize};
 use pixelflow_ir::passes::{ExpandReduce, LowerDwrt};
-use pixelflow_ir::{LatticeShape, pipeline};
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, LatticeShape, Rooted, Term, pipeline};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::shader_bench::{SHADERTOY_KERNEL_NAMES, named_shadertoy_kernel};
 use pixelflow_search::Saturate;
@@ -30,10 +29,12 @@ use pixelflow_search::Saturate;
 ///
 /// `Unchanged`/`Declined` both mean "compile what you already had", which is
 /// exactly the identity arm's whole behavior — the same code path serves both.
-fn arm<O: Optimize>(mut opt: O, arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    opt.optimize(arena, root)
-        .into_changed()
-        .unwrap_or_else(|| (arena.clone(), root))
+fn arm<O: Optimize>(mut opt: O, term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    opt.optimize(term).into_changed().unwrap_or_else(|| {
+        let mut b = ExprBuilder::new();
+        let root = b.splice(term);
+        b.finish(&[root])
+    })
 }
 
 fn main() {
@@ -47,23 +48,24 @@ fn main() {
     let mut total_saturated = 0.0f64;
 
     for name in SHADERTOY_KERNEL_NAMES {
-        let Some((arena, root)) = named_shadertoy_kernel(name) else {
+        let Some((expr, env)) = named_shadertoy_kernel(name) else {
             continue;
         };
+        let term = Term::new(expr.entry(), &env);
 
-        let (raw_arena, raw_root) = arm(Identity, &arena, root);
-        let (opt_arena, opt_root) = arm(
+        let (raw, raw_env) = arm(Identity, term);
+        let (opt, opt_env) = arm(
             pipeline![
                 LowerDwrt,
                 ExpandReduce,
                 Saturate::runtime(LatticeShape::POINT)
             ],
-            &arena,
-            root,
+            term,
         );
 
-        let identity = session.benchmark_arena(&raw_arena, raw_root, BenchMode::Latency);
-        let saturated = session.benchmark_arena(&opt_arena, opt_root, BenchMode::Latency);
+        let identity = session.benchmark_term(Term::new(raw.entry(), &raw_env), BenchMode::Latency);
+        let saturated =
+            session.benchmark_term(Term::new(opt.entry(), &opt_env), BenchMode::Latency);
 
         match (identity, saturated) {
             (Ok(i), Ok(s)) => {
@@ -72,8 +74,8 @@ fn main() {
                 println!(
                     "{:<22} {:>5} {:>5} {:>9.3}ns {:>9.3}ns {:>8.2}x",
                     name,
-                    raw_arena.len(),
-                    opt_arena.len(),
+                    raw.len(),
+                    opt.len(),
                     i.ns,
                     s.ns,
                     i.ns / s.ns
@@ -83,8 +85,8 @@ fn main() {
                 println!(
                     "{:<22} {:>5} {:>5}  identity={:?} saturated={:?}",
                     name,
-                    raw_arena.len(),
-                    opt_arena.len(),
+                    raw.len(),
+                    opt.len(),
                     i.err(),
                     s.err()
                 );
