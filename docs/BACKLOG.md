@@ -27,12 +27,40 @@ density change, so that is ~31 s to launch and ~31 s per resize. **The glyphs
 are correct; the terminal is not usable.** Everything in this section is about
 that number.
 
+**H2 is answered (2026-09-10, release, this host): a glyph bake is 99.7–99.9%
+compile.** Cold vs warm bake, using the fact that `jit_cache` keys compiles by
+(canonical key, shape) so a second bake of the same glyph at the same shape
+pays only collapse:
+
+```
+glyph   px    cold_ms    warm_ms compile_ms compile%
+    A   16      172.5        0.2      172.3   99.9%
+    O   16      561.8        0.8      561.1   99.9%
+    8   16      758.0        0.9      757.1   99.9%
+    m   16      531.8        0.5      531.4   99.9%
+    A   32      163.0        0.4      162.6   99.7%
+    O   32      672.1        1.7      670.4   99.7%
+    8   32     2096.0        4.5     2091.4   99.8%
+    m   32      639.4        1.6      637.8   99.8%
+```
+
+Two consequences, both of which move items in this table:
+
+- **H1 alone is the fix.** 95 compiles → 1 takes ~31 s to ~2 s; the 95
+  collapses that remain total well under a tenth of a second.
+- **Compile is superlinear in piece count and depends on the shape.** `A` (11
+  pieces) and `8` (34) at 32 px are 163 ms and 2,096 ms — 3.1× the pieces for
+  12.9× the time — and `8` costs 758 ms at 16 px against 2,096 ms at 32 px on
+  the same pieces, because saturation and extraction both run per shape. So
+  **E3/E4/E5 are on this critical path**, not side quests: compile *is*
+  saturation plus extraction plus emit.
+
 | | what | where |
 |---|---|---|
-| **H1** | **S3 — one program for the font.** Font-wide extent, table padded with monoid identities, so every glyph compiles to the same program and a glyph becomes a table write. 95 compiles → 1. Nothing else is the right order of magnitude. | [glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S3 |
-| **H2** | **Split the 331 ms** between saturation+extraction and collapse. Unmeasured, and it decides whether H1 alone is the fix or H1 must land with H4. Cheapest item here; do it first. | — |
-| **H3** | **Hash-consing in `ExprArena`.** Prototyped and measured: arena 2,721 → 154 nodes, 2.1–2.2× on the glyph suites, extracted kernel unchanged. In flight (JP). | [exprarena-on-dag](plans/2026-09-09-exprarena-on-dag.md) §5.2 |
-| **H4** | **Ask B — hoist binder-only work out of the pixel loop.** `‖∇scale‖` is invariant in X and Y but emitted per pixel; ~8,700 `rsqrt` per 16×16 tile where 34 would do. **Do not patch `contains_gather`** (N1) and do not write a new hoist (N5) — the rule already exists and wants a fold that survives to codegen. | [a-glyph-is-a-circle](plans/2026-09-09-a-glyph-is-a-circle.md) §B |
+| **H1** | **S3 — one program for the font.** Font-wide extent, table padded with monoid identities, so every glyph compiles to the same program and a glyph becomes a table write. 95 compiles → 1. With H2 measured, this is the whole hump. | [glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S3 |
+| **H2** | ~~Split the 331 ms between compile and collapse.~~ **Done** — see above. | — |
+| **H3** | **Hash-consing in `ExprArena`.** Prototyped and measured: arena 2,721 → 154 nodes, 2.1–2.2× on the glyph suites, extracted kernel unchanged. In flight (JP). Lands on the compile half, so it compounds with H1 rather than competing. | [exprarena-on-dag](plans/2026-09-09-exprarena-on-dag.md) §5.2 |
+| **H4** | **Ask B — hoist binder-only work out of the pixel loop.** ~~On the hump.~~ **Demoted by H2**: it optimizes *collapse*, which is 0.2% of a bake, and a glyph bakes once into the atlas and is a gather forever after. Still real for per-frame kernels that are not atlas-cached; not the terminal's startup problem. **Do not patch `contains_gather`** (N1) and do not write a new hoist (N5). | [a-glyph-is-a-circle](plans/2026-09-09-a-glyph-is-a-circle.md) §B |
 
 S3's own doc calls itself "a trade, not a win — fewer compiles against
 evaluation of rows that contribute nothing." For the **atlas** path that is
