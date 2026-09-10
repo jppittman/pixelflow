@@ -18,9 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{BufferDecl, BufferId, BufferIdentity, ExprArena, ExprId, ExprNode};
+use pixelflow_ir::arena::{BufferDecl, BufferId, BufferIdentity};
 use pixelflow_ir::fold::Fold;
+use pixelflow_ir::{Environment, ExprBuilder, ExprData, ExprGraph, ExprHandle, Node, OpKind};
 
 /// One kernel and the lattice it is baked at.
 pub struct CollapseKernel {
@@ -28,12 +28,11 @@ pub struct CollapseKernel {
     pub name: String,
     /// Which family it came from — the grouping the analysis reports by.
     pub family: String,
-    pub arena: ExprArena,
-    pub root: ExprId,
+    pub graph: ExprGraph,
     /// The lattice extent, exactly as `Lattice::bake` would see it.
     pub extent: [u32; 2],
-    /// Captured contents for each buffer `arena` declares, aligned by
-    /// [`BufferId`]: `arena.buffers()[i]` is slot `i`'s declaration,
+    /// Captured contents for each buffer the graph declares, aligned by
+    /// [`BufferId`]: `graph.environment().buffers[i]` is slot `i`'s declaration,
     /// `buffer_data[i]` is what production actually bound there. `None` at a
     /// slot means capture had nothing real for it.
     ///
@@ -101,7 +100,7 @@ impl Trips {
 //
 // v3 carried a buffer's *shape* only; replay bound every declared buffer to
 // zeros (`dummy_context`) on the premise that "collapse cost depends on the
-// arena's shape, not the buffer's values." That premise was false: a
+// graph's shape, not the buffer's values." That premise was false: a
 // `Select` guard's runtime skip (`emit_skip_if_all_false`/`_all_true` in
 // `pixelflow-codegen/src/emit/mod.rs`) branches on whether any lane's mask
 // is set, which is a fact about the *data*, not the shape. A zero-filled
@@ -131,7 +130,7 @@ const SUPERSEDED_HEADERS: &[(&str, &str)] = &[
 
 /// Write `kernels` into `dir`, one `.collapse` file each.
 ///
-/// The node encoding is the arena dumpers' (`pixelflow-core`'s cell-grid
+/// The node encoding is the graph dumpers' (`pixelflow-core`'s cell-grid
 /// dumper, `pixelflow-graphics`'s glyph dumper): reachable nodes in ascending
 /// id order with ids remapped dense, constants as bit patterns. The additions
 /// are the `family` and `extent` lines — the shape, which is the point — plus
@@ -175,16 +174,9 @@ pub fn read_dir(dir: &Path) -> Vec<CollapseKernel> {
 pub fn encode(kernel: &CollapseKernel) -> String {
     use std::fmt::Write as _;
 
-    let (arena, root) = (&kernel.arena, kernel.root);
-    let len = arena.len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
-    }
+    let root = kernel.graph.root();
+    let reachable: HashSet<Node<'_, ExprData>> = root.descendants().collect();
+    let len = reachable.len();
 
     let mut out = String::new();
     writeln!(out, "{HEADER}").expect("fmt");
@@ -193,25 +185,24 @@ pub fn encode(kernel: &CollapseKernel) -> String {
     let [ex, ey] = kernel.extent;
     writeln!(out, "extent {ex} {ey}").expect("fmt");
 
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
+    let mut dense: HashMap<Node<'_, ExprData>, u32> = HashMap::with_capacity(len);
     let mut next = 0u32;
-    let d = |dense: &[u32], id: ExprId| -> u32 {
-        let v = dense[id.0 as usize];
-        assert_ne!(v, u32::MAX, "child dumped before parent");
-        v
+    let d = |dense: &HashMap<Node<'_, ExprData>, u32>, node: Node<'_, ExprData>| -> u32 {
+        *dense
+            .get(&node)
+            .unwrap_or_else(|| panic!("child dumped before parent: {node:?}"))
     };
     // A buffer with `n` gathers into it dumps `n` `B` lines (one per
     // `Buffer` leaf), all naming the same slot — see the comment on that
     // arm below. Its `D` line is data, not shape, so it must not repeat
     // `n` times too; this tracks which slots already got theirs.
     let mut buffer_data_emitted: HashSet<u16> = HashSet::new();
-    for idx in 0..len {
-        if !reachable[idx] {
+    for node in kernel.graph.root().dag().iter() {
+        if !reachable.contains(&node) {
             continue;
         }
-        let id = ExprId(idx as u32);
-        match arena.node(id) {
-            ExprNode::Var(i) => writeln!(out, "V {i}"),
+        match *node {
+            ExprData::Var(i) => writeln!(out, "V {i}"),
             // A kernel argument. The format knows about one because, with
             // two coordinate axes, a `Uniform` is the *only* leaf that is
             // both invariant across the lattice and beyond the constant
@@ -219,47 +210,67 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // family needs to give LICM's frame prologue something to lift.
             // The Z axis used to serve that role; it was the same thing
             // wearing a coordinate's name.
-            ExprNode::Uniform(u) => {
-                writeln!(out, "A {}", arena.uniform_decl(*u).default.to_bits())
+            ExprData::Uniform(u) => {
+                writeln!(
+                    out,
+                    "A {}",
+                    kernel.graph.environment().uniforms[u.0 as usize]
+                        .default
+                        .to_bits()
+                )
             }
-            ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
-            // A declared buffer slot. `id.0` is the *arena's* slot index, not
+            ExprData::Const(bits) => writeln!(out, "C {bits}"),
+            // A declared buffer slot. `id.0` is the graph environment's slot index, not
             // a [`BufferIdentity`] — identities are minted and mean nothing
             // across a decode, but the slot index is what lets several
             // `Buffer` leaves (one per `Kernel::at` gather into the same
             // table) fold back onto one declared slot instead of each
-            // minting its own on decode, which would change the arena's
-            // shape (`ExprArena::buffers().len()`, and with it every
+            // minting its own on decode, which would change the graph's
+            // shape (and with it every
             // `Uniform`'s context slot).
-            ExprNode::Buffer(id) => {
-                let decl = arena.buffer_decl(*id);
+            ExprData::Buffer(id) => {
+                let decl = kernel.graph.environment().buffers[id.0 as usize];
                 writeln!(out, "B {} {} {}", id.0, decl.width, decl.height).expect("fmt");
                 // Only the first occurrence of this slot writes its data —
                 // see `buffer_data_emitted` above.
                 if buffer_data_emitted.insert(id.0) {
-                    write_buffer_data(&mut out, kernel, *id);
+                    write_buffer_data(&mut out, kernel, id);
                 }
                 Ok(())
             }
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-            ExprNode::Binary(k, a, b) => {
-                writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+            ExprData::Op(k) if node.child_count() == 1 => {
+                writeln!(
+                    out,
+                    "U {k:?} {}",
+                    d(&dense, node.children().next().unwrap())
+                )
             }
-            ExprNode::Ternary(k, a, b, c) => writeln!(
-                out,
-                "T {k:?} {} {} {}",
-                d(&dense, *a),
-                d(&dense, *b),
-                d(&dense, *c)
-            ),
+            ExprData::Op(k) if node.child_count() == 2 => {
+                let mut children = node.children();
+                writeln!(
+                    out,
+                    "Bi {k:?} {} {}",
+                    d(&dense, children.next().unwrap()),
+                    d(&dense, children.next().unwrap())
+                )
+            }
+            ExprData::Op(k) if node.child_count() == 3 => {
+                let mut children = node.children();
+                writeln!(
+                    out,
+                    "T {k:?} {} {} {}",
+                    d(&dense, children.next().unwrap()),
+                    d(&dense, children.next().unwrap()),
+                    d(&dense, children.next().unwrap())
+                )
+            }
             // An n-ary node — in practice `Reduce`, the winding fold's
             // binder: `[Const(combiner), Const(reduce_var), Const(extent),
             // body]`. The three `Const` children round trip through the `C`
             // arm above like any other constant; this arm only has to spell
             // the child list itself, whatever its length.
-            ExprNode::Nary(k, _) => {
-                let children = arena.nary_children(id);
-                let ids: Vec<u32> = children.iter().map(|c| d(&dense, *c)).collect();
+            ExprData::Op(k) => {
+                let ids: Vec<u32> = node.children().map(|c| d(&dense, c)).collect();
                 write!(out, "N {k:?}").expect("fmt");
                 for id in ids {
                     write!(out, " {id}").expect("fmt");
@@ -268,24 +279,29 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             }
             // The fold as opaque bits — it is metadata, not children, so it
             // travels as one field rather than as three serialized nodes.
-            ExprNode::Reduce { fold, body } => {
-                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+            ExprData::Reduce(fold) => {
+                writeln!(
+                    out,
+                    "R {} {}",
+                    fold.to_bits(),
+                    d(&dense, node.children().next().unwrap())
+                )
             }
-            ExprNode::Param(i) => panic!(
+            ExprData::Param(i) => panic!(
                 "{}: corpus kernels must be bakeable, but this one holds Param({i}) — a \
                  macro front-end placeholder, never present in a compiled kernel",
                 kernel.name
             ),
             // A key names an entry in this process's `KernelStore`, which a
             // corpus file outlives; expand references before dumping one.
-            ExprNode::Ref(k) => panic!(
+            ExprData::Ref(k) => panic!(
                 "{}: corpus kernels must be self-contained, but this one holds Ref({k:?}) — \
                  a name for a kernel interned in this process only",
                 kernel.name
             ),
         }
         .expect("fmt");
-        dense[idx] = next;
+        dense.insert(node, next);
         next += 1;
     }
     writeln!(out, "root {}", d(&dense, root)).expect("fmt");
@@ -329,7 +345,7 @@ fn decode(path: &Path) -> CollapseKernel {
         Some(found) => match SUPERSEDED_HEADERS.iter().find(|(h, _)| *h == found) {
             Some((_, why)) => panic!(
                 "{}: this is a {found:?} corpus and the format is now {HEADER:?} — {why}. \
-                 Regenerate the corpus; a stale fixture cannot be replayed into this arena.",
+                 Regenerate the corpus; a stale fixture cannot be replayed into this graph.",
                 path.display()
             ),
             None => panic!(
@@ -344,16 +360,18 @@ fn decode(path: &Path) -> CollapseKernel {
     let mut family = None;
     let mut extent = None;
     let mut root = None;
-    let mut arena = ExprArena::new();
-    let mut next_id = 0u32;
-    // Original arena slot index -> the slot this decode declared for it. A
+    let mut builder = ExprBuilder::new();
+    let mut environment = Environment::new();
+    let mut nodes: Vec<ExprHandle> = Vec::new();
+    // Original buffer slot index -> the slot this decode declared for it. A
     // buffer with `n` gathers into it dumps `n` separate `B` lines (one per
-    // `Buffer` leaf — the arena has no hash-consing), all naming the same
+    // `Buffer` leaf — all naming the same
     // original slot; the first declares it here, the rest must fold onto
-    // that same declaration or the decoded arena would gain buffer slots the
+    // that same declaration or the decoded graph would gain buffer slots the
     // original never had, shifting every `Uniform`'s context slot
-    // (`ExprArena::buffers().len()`).
+    // (the graph environment's buffer table length).
     let mut buffer_slots: HashMap<u16, BufferId> = HashMap::new();
+    let mut buffer_decls: HashMap<BufferId, BufferDecl> = HashMap::new();
     // Decoded slot -> its captured contents, from that slot's `D` line (at
     // most one, written once per slot regardless of how many `B` lines name
     // it — see `write_buffer_data`). Absent for a slot capture had nothing
@@ -366,11 +384,9 @@ fn decode(path: &Path) -> CollapseKernel {
             .find(|k| format!("{k:?}") == s)
             .unwrap_or_else(|| panic!("{}: unknown OpKind {s:?}", path.display()))
     };
-    let id = |s: &str| -> ExprId {
-        ExprId(
-            s.parse()
-                .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display())),
-        )
+    let id = |s: &str| -> usize {
+        s.parse()
+            .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display()))
     };
     let dim = |s: &str| -> u32 {
         s.parse()
@@ -396,33 +412,39 @@ fn decode(path: &Path) -> CollapseKernel {
                 root = Some(id(r));
                 continue;
             }
-            ["V", i] => arena.push_var(i.parse().expect("var index")),
+            ["V", i] => builder.var(i.parse().expect("var index")),
             ["A", bits] => {
                 let default = f32::from_bits(bits.parse().expect("argument default bits"));
-                let slot = arena.declare_uniform(pixelflow_ir::Uniform::new(default).decl());
-                arena.push_uniform(slot)
+                let decl = pixelflow_ir::Uniform::new(default).decl();
+                environment.slot_for_uniform(decl);
+                builder.uniform(decl)
             }
-            ["C", bits] => arena.push_const(f32::from_bits(bits.parse().expect("const bits"))),
+            ["C", bits] => builder.constant(f32::from_bits(bits.parse().expect("const bits"))),
             ["B", orig_slot, w, h] => {
                 let orig_slot: u16 = orig_slot.parse().unwrap_or_else(|e| {
                     panic!("{}: bad buffer slot {orig_slot:?}: {e}", path.display())
                 });
                 let (width, height) = (dim(w), dim(h));
                 let slot = *buffer_slots.entry(orig_slot).or_insert_with(|| {
-                    arena.declare_buffer(BufferDecl {
+                    let decl = BufferDecl {
                         id: BufferIdentity::mint(),
                         width,
                         height,
-                    })
+                    };
+                    let slot = environment.slot_for_buffer(decl);
+                    buffer_decls.insert(slot, decl);
+                    slot
                 });
-                let decl = arena.buffer_decl(slot);
+                let decl = *buffer_decls
+                    .get(&slot)
+                    .expect("buffer declaration recorded");
                 assert_eq!(
                     (decl.width, decl.height),
                     (width, height),
                     "{}: buffer slot {orig_slot} redeclared at a different shape",
                     path.display()
                 );
-                arena.push_buffer(slot)
+                builder.buffer(decl)
             }
             ["D", orig_slot, bits @ ..] => {
                 let orig_slot: u16 = orig_slot.parse().unwrap_or_else(|e| {
@@ -438,7 +460,9 @@ fn decode(path: &Path) -> CollapseKernel {
                         path.display()
                     )
                 });
-                let decl = arena.buffer_decl(slot);
+                let decl = *buffer_decls
+                    .get(&slot)
+                    .expect("buffer declaration recorded");
                 let expected = decl.width as usize * decl.height as usize;
                 assert_eq!(
                     bits.len(),
@@ -461,12 +485,12 @@ fn decode(path: &Path) -> CollapseKernel {
                 buffer_data.insert(slot, Arc::new(data));
                 continue;
             }
-            ["U", k, a] => arena.push_unary(op(k), id(a)),
-            ["Bi", k, a, b] => arena.push_binary(op(k), id(a), id(b)),
-            ["T", k, a, b, c] => arena.push_ternary(op(k), id(a), id(b), id(c)),
+            ["U", k, a] => builder.unary(op(k), nodes[id(a)]),
+            ["Bi", k, a, b] => builder.binary(op(k), nodes[id(a)], nodes[id(b)]),
+            ["T", k, a, b, c] => builder.ternary(op(k), nodes[id(a)], nodes[id(b)], nodes[id(c)]),
             ["N", k, children @ ..] => {
-                let children: Vec<ExprId> = children.iter().map(|c| id(c)).collect();
-                arena.push_nary(op(k), &children)
+                let children: Vec<ExprHandle> = children.iter().map(|c| nodes[id(c)]).collect();
+                builder.nary(op(k), &children)
             }
             ["R", bits, body] => {
                 let bits: u64 = bits
@@ -474,31 +498,35 @@ fn decode(path: &Path) -> CollapseKernel {
                     .unwrap_or_else(|e| panic!("{}: bad fold bits {bits:?}: {e}", path.display()));
                 let fold = Fold::from_bits(bits)
                     .unwrap_or_else(|| panic!("{}: {bits} names no fold", path.display()));
-                arena.push_reduce(fold, id(body))
+                builder.reduce(fold, nodes[id(body)])
             }
             other => panic!("{}: unparseable line {other:?}", path.display()),
         };
-        assert_eq!(
-            pushed,
-            ExprId(next_id),
-            "{}: replay drifted from dumped ids",
-            path.display()
-        );
-        next_id += 1;
+        nodes.push(pushed);
     }
 
-    // Aligned by `BufferId` — `arena.buffers()[i]` is slot `i`'s
+    let root_index = root.unwrap_or_else(|| panic!("{}: no root", path.display()));
+    let rooted = builder
+        .finish_one(*nodes.get(root_index).unwrap_or_else(|| {
+            panic!(
+                "{}: root index {root_index} is out of range",
+                path.display()
+            )
+        }))
+        .into_parts()
+        .0;
+    let graph = ExprGraph::new(rooted, environment);
+    // Aligned by `BufferId` — the graph environment's buffer table is slot `i`'s
     // declaration — so a slot with no `D` line decodes to `None`, exactly
     // the shape `dummy_context` expects for a genuinely uncaptured slot.
-    let buffer_data_by_slot: Vec<Option<Arc<Vec<f32>>>> = (0..arena.buffers().len())
+    let buffer_data_by_slot: Vec<Option<Arc<Vec<f32>>>> = (0..graph.environment().buffers.len())
         .map(|i| buffer_data.get(&BufferId(i as u16)).cloned())
         .collect();
 
     CollapseKernel {
         name: name.unwrap_or_else(|| panic!("{}: no name", path.display())),
         family: family.unwrap_or_else(|| panic!("{}: no family", path.display())),
-        arena,
-        root: root.unwrap_or_else(|| panic!("{}: no root", path.display())),
+        graph,
         extent: extent.unwrap_or_else(|| panic!("{}: no extent", path.display())),
         buffer_data: buffer_data_by_slot,
     }
@@ -535,26 +563,27 @@ pub const CORPUS_ARG: f32 = 1.0;
 #[must_use]
 pub fn synthetic() -> Vec<CollapseKernel> {
     let mut out = Vec::new();
-    let mut push =
-        |name: String, family: &str, extent: [u32; 2], build: &dyn Fn(&mut ExprArena) -> ExprId| {
-            let mut arena = ExprArena::new();
-            let root = build(&mut arena);
-            out.push(CollapseKernel {
-                name,
-                family: family.to_string(),
-                arena,
-                root,
-                extent,
-                // None of the synthetic families declare a buffer.
-                buffer_data: Vec::new(),
-            });
-        };
+    let mut push = |name: String,
+                    family: &str,
+                    extent: [u32; 2],
+                    build: &dyn Fn(&mut ExprBuilder) -> ExprHandle| {
+        let mut builder = ExprBuilder::new();
+        let root = build(&mut builder);
+        out.push(CollapseKernel {
+            name,
+            family: family.to_string(),
+            graph: builder.finish_one(root),
+            extent,
+            // None of the synthetic families declare a buffer.
+            buffer_data: Vec::new(),
+        });
+    };
     for n in [8usize, 16, 32, 64] {
         push(
             format!("wide{n:03}"),
             "wide",
             PRESSURE_EXTENT,
-            &move |a: &mut ExprArena| wide(a, n),
+            &move |a: &mut ExprBuilder| wide(a, n),
         );
     }
     for (w, d) in [(8usize, 24usize), (12, 40), (16, 64)] {
@@ -562,7 +591,7 @@ pub fn synthetic() -> Vec<CollapseKernel> {
             format!("anchored{w:02}x{d:02}"),
             "anchored",
             PRESSURE_EXTENT,
-            &move |a: &mut ExprArena| anchored(a, w, d),
+            &move |a: &mut ExprBuilder| anchored(a, w, d),
         );
     }
     for n in [4usize, 8, 16, 48] {
@@ -574,7 +603,7 @@ pub fn synthetic() -> Vec<CollapseKernel> {
                 format!("invariant{n:02}_{tag}"),
                 &format!("invariant_{tag}"),
                 extent,
-                &move |a: &mut ExprArena| invariants(a, n),
+                &move |a: &mut ExprBuilder| invariants(a, n),
             );
         }
     }
@@ -583,16 +612,16 @@ pub fn synthetic() -> Vec<CollapseKernel> {
 
 /// A leaf that varies in X, salted so the tree is not one common
 /// subexpression the optimizer folds away.
-fn x_leaf(a: &mut ExprArena, salt: usize) -> ExprId {
-    let x = a.push_var(0);
-    let c = a.push_const(0.125 + (salt % 13) as f32 * 0.0625);
-    a.push_binary(OpKind::Mul, x, c)
+fn x_leaf(builder: &mut ExprBuilder, salt: usize) -> ExprHandle {
+    let x = builder.var(0);
+    let c = builder.constant(0.125 + (salt % 13) as f32 * 0.0625);
+    builder.binary(OpKind::Mul, x, c)
 }
 
 /// A balanced Add/Sub tree over `n` X-varying leaves.
-fn wide(a: &mut ExprArena, n: usize) -> ExprId {
+fn wide(builder: &mut ExprBuilder, n: usize) -> ExprHandle {
     assert!(n.is_power_of_two(), "wide takes a power of two, got {n}");
-    let mut level: Vec<ExprId> = (0..n).map(|i| x_leaf(a, i)).collect();
+    let mut level: Vec<ExprHandle> = (0..n).map(|i| x_leaf(builder, i)).collect();
     let mut salt = 0usize;
     while level.len() > 1 {
         level = level
@@ -604,7 +633,7 @@ fn wide(a: &mut ExprArena, n: usize) -> ExprId {
                 } else {
                     OpKind::Add
                 };
-                a.push_binary(op, pair[0], pair[1])
+                builder.binary(op, pair[0], pair[1])
             })
             .collect();
     }
@@ -613,54 +642,53 @@ fn wide(a: &mut ExprArena, n: usize) -> ExprId {
 
 /// `w` anchors computed first, a dependent chain of depth `d`, then the
 /// anchors folded in — so every anchor is live across the whole chain.
-fn anchored(a: &mut ExprArena, w: usize, d: usize) -> ExprId {
-    let anchors: Vec<ExprId> = (0..w)
+fn anchored(builder: &mut ExprBuilder, w: usize, d: usize) -> ExprHandle {
+    let anchors: Vec<ExprHandle> = (0..w)
         .map(|i| {
-            let leaf = x_leaf(a, i * 7 + 1);
-            a.push_unary(OpKind::Sqrt, leaf)
+            let leaf = x_leaf(builder, i * 7 + 1);
+            builder.unary(OpKind::Sqrt, leaf)
         })
         .collect();
-    let mut chain = x_leaf(a, 991);
+    let mut chain = x_leaf(builder, 991);
     for i in 0..d {
-        let c = a.push_const(1.0 + (i % 5) as f32 * 0.25);
-        chain = a.push_ternary(OpKind::MulAdd, chain, c, chain);
+        let c = builder.constant(1.0 + (i % 5) as f32 * 0.25);
+        chain = builder.ternary(OpKind::MulAdd, chain, c, chain);
     }
     anchors.iter().fold(chain, |acc, &anchor| {
-        a.push_binary(OpKind::Add, acc, anchor)
+        builder.binary(OpKind::Add, acc, anchor)
     })
 }
 
 /// `n` terms invariant in X — half of them invariant in Y as well, so both
 /// prologues get work — each read exactly once by an X-varying body term.
-fn invariants(a: &mut ExprArena, n: usize) -> ExprId {
-    let y = a.push_var(1);
+fn invariants(builder: &mut ExprBuilder, n: usize) -> ExprHandle {
+    let y = builder.var(1);
     // Frame scope needs a leaf the folder cannot collapse and the lattice
     // cannot vary. That is a kernel argument; it used to be the Z axis,
     // which was the same thing wearing a coordinate's name. A `Const` would
     // fold and leave LICM nothing to lift.
-    let arg = a.declare_uniform(pixelflow_ir::Uniform::new(CORPUS_ARG).decl());
-    let z = a.push_uniform(arg);
-    let terms: Vec<ExprId> = (0..n)
+    let z = builder.uniform(pixelflow_ir::Uniform::new(CORPUS_ARG).decl());
+    let terms: Vec<ExprHandle> = (0..n)
         .map(|i| {
-            let c = a.push_const(0.5 + i as f32 * 0.125);
+            let c = builder.constant(0.5 + i as f32 * 0.125);
             let base = if i.is_multiple_of(2) {
                 // Frame scope: reads neither X nor Y.
-                a.push_binary(OpKind::Mul, z, c)
+                builder.binary(OpKind::Mul, z, c)
             } else {
                 // Row scope: reads Y.
-                let scaled = a.push_binary(OpKind::Mul, y, c);
-                a.push_binary(OpKind::Add, scaled, z)
+                let scaled = builder.binary(OpKind::Mul, y, c);
+                builder.binary(OpKind::Add, scaled, z)
             };
-            let one = a.push_const(1.0);
-            let positive = a.push_binary(OpKind::Add, base, one);
-            a.push_unary(OpKind::Sqrt, positive)
+            let one = builder.constant(1.0);
+            let positive = builder.binary(OpKind::Add, base, one);
+            builder.unary(OpKind::Sqrt, positive)
         })
         .collect();
-    let x = a.push_var(0);
+    let x = builder.var(0);
     terms.iter().enumerate().fold(x, |acc, (i, &term)| {
-        let leaf = x_leaf(a, i * 3 + 5);
-        let scaled = a.push_binary(OpKind::Mul, leaf, term);
-        a.push_binary(OpKind::Add, acc, scaled)
+        let leaf = x_leaf(builder, i * 3 + 5);
+        let scaled = builder.binary(OpKind::Mul, leaf, term);
+        builder.binary(OpKind::Add, acc, scaled)
     })
 }
 
@@ -749,28 +777,29 @@ mod tests {
     }
 
     /// A kernel that declares a buffer round trips through the fixture text
-    /// exactly, and the decoded arena is bakeable end to end: compile it at
+    /// exactly, and the decoded graph is bakeable end to end: compile it at
     /// its own shape, bind a zero-filled buffer of the declared extent (the
     /// corpus never carries real pixel data — collapse cost is a function of
-    /// the arena's shape, not what a gather reads), and collapse one call.
+    /// the graph's shape, not what a gather reads), and collapse one call.
     #[test]
     fn a_buffer_declaring_kernel_round_trips_and_bakes() {
-        let mut arena = ExprArena::new();
+        let mut builder = ExprBuilder::new();
         let identity = BufferIdentity::mint();
-        let slot = arena.declare_buffer(BufferDecl {
+        let decl = BufferDecl {
             id: identity,
             width: 4,
             height: 3,
-        });
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
+        };
+        let slot = builder.buffer(decl);
+        let x = builder.var(0);
+        let y = builder.var(1);
         // Two gathers into the same declared slot — the shape a glyph's
         // winding sum has, reading its piece table more than once — so the
         // dedup-by-original-slot in `decode` is actually exercised and not
         // vacuously true for a single reference.
-        let a = arena.push_gather(slot, x, y);
-        let b = arena.push_gather(slot, y, x);
-        let root = arena.push_binary(OpKind::Add, a, b);
+        let a = builder.ternary(OpKind::Gather, slot, x, y);
+        let b = builder.ternary(OpKind::Gather, slot, y, x);
+        let root = builder.binary(OpKind::Add, a, b);
 
         // Real, non-uniform, non-zero contents — the point of this test is
         // that these exact values, not just the 4x3 shape, survive the
@@ -781,8 +810,7 @@ mod tests {
         let kernel = CollapseKernel {
             name: "buffer_gather_test".to_string(),
             family: "buffer".to_string(),
-            arena,
-            root,
+            graph: builder.finish_one(root),
             extent: [64, 4],
             buffer_data: vec![Some(Arc::new(data.clone()))],
         };
@@ -818,7 +846,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean up");
 
         assert_eq!(
-            decoded.arena.buffers().len(),
+            decoded.graph.environment().buffers.len(),
             1,
             "two gathers into one declared slot must decode to one buffer, not two"
         );

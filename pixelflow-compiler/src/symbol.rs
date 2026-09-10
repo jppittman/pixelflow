@@ -10,7 +10,7 @@
 //! |------------|---------------------|----------------------|---------|
 //! | Intrinsic  | Collapse time       | `Var(0..4)`          | X, Y    |
 //! | Parameter  | Construction time   | `Param(i)`           | cx, r   |
-//! | Local      | Expression scope    | A shared `ExprId`    | dx, dy  |
+//! | Local      | Expression scope    | A shared DAG handle  | dx, dy  |
 //!
 //! ## Intrinsic Coordinates
 //!

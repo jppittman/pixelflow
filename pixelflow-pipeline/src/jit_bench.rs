@@ -1,6 +1,6 @@
 //! Shared JIT benchmarking infrastructure.
 //!
-//! Shared helpers for timing arena-native JIT kernels, plus [`BenchSession`],
+//! Shared helpers for timing DAG-native JIT kernels, plus [`BenchSession`],
 //! which owns measurement integrity for label-minting runs: QoS pinning,
 //! DVFS burn-in, a drift sentinel, identity-kernel call-overhead subtraction,
 //! and per-expression plausibility floors. Findings referenced as H#/M#/L#
@@ -8,10 +8,10 @@
 
 use std::fmt;
 
-use pixelflow_codegen::emit::compile;
+use pixelflow_codegen::emit::compile_dag;
 use pixelflow_codegen::emit::executable::ExecutableCode;
 use pixelflow_codegen::error::CompileError;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprBuilder, ExprData, ExprGraph, Node, OpKind};
 
 /// Number of timed samples per expression. Take the median.
 const TIMED_RUNS: usize = 20;
@@ -280,8 +280,8 @@ fn sentinel_drift_exceeded(calibration_ns: f64, measured_ns: f64, max_drift_frac
 /// per lane-op, which is above what a 16-wide unit delivers by construction.
 /// Nothing noticed for as long as it did because the assertion only binds
 /// once `op_count * MIN_NS_PER_OP` exceeds the measured per-lane value, and
-/// every arena reaching this harness had been through the e-graph first —
-/// small enough to stay under it. The first unoptimized arenas (`Identity` as
+/// every graph reaching this harness had been through the e-graph first —
+/// small enough to stay under it. The first unoptimized graphs (`Identity` as
 /// an `Optimize` arm) were the first inputs big enough to cross it.
 fn plausibility_floor_ns(op_count: usize) -> f64 {
     op_count as f64 * MIN_NS_PER_OP / LANES as f64
@@ -314,59 +314,44 @@ fn assert_plausible(raw_ns: f64, op_count: usize) {
 
 /// Count compute ops reachable from `root` (unique DAG nodes whose kind is
 /// not a Var/Const/Buffer leaf). This is the op count *after* whatever
-/// folding produced the arena the caller hands us, which is what identifies
+/// folding produced the graph the caller hands us, which is what identifies
 /// legitimately-instant constant-folded expressions for the plausibility
 /// floor (audit M4).
-fn op_count(arena: &ExprArena, root: ExprId) -> usize {
-    let mut visited = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut count = 0usize;
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if visited[idx] {
-            continue;
-        }
-        visited[idx] = true;
-        match arena.kind(id) {
-            OpKind::Var | OpKind::Const | OpKind::Buffer => {}
-            _ => count += 1,
-        }
-        stack.extend(arena.children(id));
-    }
-    count
+fn op_count(root: Node<'_, ExprData>) -> usize {
+    root.descendants()
+        .filter(|node| {
+            !matches!(
+                **node,
+                ExprData::Var(_)
+                    | ExprData::Const(_)
+                    | ExprData::Param(_)
+                    | ExprData::Buffer(_)
+                    | ExprData::Uniform(_)
+                    | ExprData::Ref(_)
+            )
+        })
+        .count()
 }
 
 /// Whether any `Var` node is reachable from `root` — i.e. whether the kernel
 /// has a data path from its inputs at all.
 ///
 /// Not used to weaken the plausibility floor, and deliberately so: a var-free
-/// arena is only *foldable in principle*. Neither emitter folds
+/// graph is only *foldable in principle*. Neither emitter folds
 /// (`compile` lowers Dwrt/Reduce/Gather/transcendentals and
 /// then schedules every remaining node on both aarch64 and x86-64 — there is
 /// no constant-propagation pass), so a var-free expression still executes its
 /// ops and the floor still describes real work. Exempting it would silently
 /// switch off the audit-M4 harness-bug detector for exactly the shapes where
 /// an early `ret` is easiest to emit. See
-/// `var_free_arenas_still_execute_their_ops`, which fails loudly if a folding
+/// `var_free_graphs_still_execute_their_ops`, which fails loudly if a folding
 /// pass ever lands — at which point the fix is to derive the floor from the
 /// LOWERED schedule the emitter actually built, not to blanket-exempt a class
 /// of expressions from checking.
 #[cfg(test)]
-fn has_reachable_var(arena: &ExprArena, root: ExprId) -> bool {
-    let mut visited = vec![false; arena.len()];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if visited[idx] {
-            continue;
-        }
-        visited[idx] = true;
-        if arena.kind(id) == OpKind::Var {
-            return true;
-        }
-        stack.extend(arena.children(id));
-    }
-    false
+fn has_reachable_var(root: Node<'_, ExprData>) -> bool {
+    root.descendants()
+        .any(|node| matches!(*node, ExprData::Var(_)))
 }
 
 /// The fixed input-coordinate buffer (audit H3/H1): 64 deterministic tuples
@@ -484,7 +469,7 @@ pub struct BenchResult {
     /// recent sentinel measurement plus the run's opening calibration, so
     /// drift is observable per label and post-hoc correctable via
     /// [`SentinelContext::normalization`]. `None` only for the sessionless
-    /// wrappers ([`benchmark_jit_arena`]), which run no sentinel at all —
+    /// wrappers ([`benchmark_jit`]), which run no sentinel at all —
     /// label-minting consumers should treat `None` as "unprotected
     /// measurement", not as "no drift".
     pub sentinel: Option<SentinelContext>,
@@ -871,7 +856,7 @@ fn measure_exec_code(
             ys[lane] = t[1];
         }
         // Zero in the two retired lanes, and `emit::compile` refuses an
-        // arena that names them — so this is the whole coordinate input,
+        // graph that names them — so this is the whole coordinate input,
         // not a convention a fixture can quietly disagree with. It did:
         // the frozen corpus fixtures name `Var(2)`/`Var(3)`, and while the
         // scalar oracle substituted real values here the JIT read these
@@ -1046,14 +1031,14 @@ fn finalize(
     }
 }
 
-/// JIT-compile and benchmark an arena expression. No `Expr` conversion.
+/// JIT-compile and benchmark an immutable expression graph.
 ///
 /// Sessionless compatibility wrapper: [`BenchMode::Throughput`] (the
 /// historical dependency structure), no QoS pinning, no sentinel, and no
 /// overhead subtraction (`adjusted_ns == ns`). Label-minting callers should
 /// migrate to [`BenchSession`].
-pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResult, BenchError> {
-    benchmark_jit_arena_repeated(arena, root, 1)
+pub fn benchmark_jit(graph: &ExprGraph) -> Result<BenchResult, BenchError> {
+    benchmark_jit_repeated(graph, 1)
 }
 
 /// Sessionless benchmark with an explicit starting `repeat_batches`.
@@ -1061,14 +1046,14 @@ pub fn benchmark_jit_arena(arena: &ExprArena, root: ExprId) -> Result<BenchResul
 /// `repeat_batches` is now only the autoscale *starting point*: the core loop
 /// raises it until the median timed sample clears the timer-tick floor
 /// (audit H5), so passing 1 is always safe.
-pub fn benchmark_jit_arena_repeated(
-    arena: &ExprArena,
-    root: ExprId,
+pub fn benchmark_jit_repeated(
+    graph: &ExprGraph,
     repeat_batches: usize,
 ) -> Result<BenchResult, BenchError> {
-    let result = compile(arena, root).map_err(BenchError::CompileFailed)?;
+    let result =
+        compile_dag(graph.root(), graph.environment()).map_err(BenchError::CompileFailed)?;
     let raw = measure_exec_code(&result.code, repeat_batches, BenchMode::Throughput)?;
-    Ok(finalize(raw, op_count(arena, root), 0.0, None))
+    Ok(finalize(raw, op_count(graph.root()), 0.0, None))
 }
 
 // =============================================================================
@@ -1090,25 +1075,25 @@ pub struct SentinelSample {
 /// mul/add/sqrt over both coordinates. Big enough that its cost tracks
 /// real kernel throughput, small enough to re-measure cheaply every
 /// [`SENTINEL_INTERVAL`] expressions.
-fn sentinel_arena() -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
-    let x = arena.push_var(0);
-    let y = arena.push_var(1);
+fn sentinel_graph() -> ExprGraph {
+    let mut builder = ExprBuilder::new();
+    let x = builder.var(0);
+    let y = builder.var(1);
     let vars = [x, y];
     let mut acc = x;
     // 8 rounds × 5 ops = 40 ops (+ 8 consts + 2 vars = 50 nodes).
     // sqrt argument is acc² + positive constant, so it never goes negative.
     let round_consts = [1.25f32, 0.75, 2.5, 0.5, 3.0, 1.5, 0.25, 2.0];
     for (i, &c) in round_consts.iter().enumerate() {
-        let k = arena.push_const(c);
+        let k = builder.constant(c);
         let v = vars[i % vars.len()];
-        let scaled = arena.push_binary(OpKind::Mul, acc, v);
-        let squared = arena.push_binary(OpKind::Mul, acc, acc);
-        let shifted = arena.push_binary(OpKind::Add, squared, k);
-        let rooted = arena.push_unary(OpKind::Sqrt, shifted);
-        acc = arena.push_binary(OpKind::Add, scaled, rooted);
+        let scaled = builder.binary(OpKind::Mul, acc, v);
+        let squared = builder.binary(OpKind::Mul, acc, acc);
+        let shifted = builder.binary(OpKind::Add, squared, k);
+        let rooted = builder.unary(OpKind::Sqrt, shifted);
+        acc = builder.binary(OpKind::Add, scaled, rooted);
     }
-    (arena, acc)
+    builder.finish_one(acc)
 }
 
 /// The identity kernel (`|x, _, _, _| x`): its measured per-eval time is pure
@@ -1116,10 +1101,10 @@ fn sentinel_arena() -> (ExprArena, ExprId) {
 /// [`BenchMode::Latency`] its chained measurement serializes the same
 /// all-lanes-fed call/ret + register-move path every candidate's chained
 /// measurement pays, so the per-mode subtraction stays coherent.
-fn identity_arena() -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
-    let root = arena.push_var(0);
-    (arena, root)
+fn identity_graph() -> ExprGraph {
+    let mut builder = ExprBuilder::new();
+    let root = builder.var(0);
+    builder.finish_one(root)
 }
 
 /// Owns measurement integrity for a benchmarking run (audit H4/M1/L5):
@@ -1158,8 +1143,8 @@ impl BenchSession {
     pub fn new() -> Self {
         pin_qos();
 
-        let (sentinel_arena, sentinel_root) = sentinel_arena();
-        let sentinel_code = compile(&sentinel_arena, sentinel_root)
+        let sentinel_graph = sentinel_graph();
+        let sentinel_code = compile_dag(sentinel_graph.root(), sentinel_graph.environment())
             .unwrap_or_else(|e| panic!("BenchSession: sentinel kernel failed to compile: {e}"))
             .code;
 
@@ -1175,8 +1160,8 @@ impl BenchSession {
         // Identity-kernel call overhead per mode (audit M1). Throughput and
         // latency overheads differ (overlapped vs serialized call/ret), so
         // each mode subtracts its own.
-        let (identity_arena, identity_root) = identity_arena();
-        let identity_code = compile(&identity_arena, identity_root)
+        let identity_graph = identity_graph();
+        let identity_code = compile_dag(identity_graph.root(), identity_graph.environment())
             .unwrap_or_else(|e| panic!("BenchSession: identity kernel failed to compile: {e}"))
             .code;
         let overhead_throughput_ns = measure_exec_code(&identity_code, 1, BenchMode::Throughput)
@@ -1253,7 +1238,7 @@ impl BenchSession {
         }
     }
 
-    /// JIT-compile and benchmark an arena expression under `mode`, with
+    /// JIT-compile and benchmark an expression graph under `mode`, with
     /// sentinel drift checking, overhead adjustment, and the plausibility
     /// floor.
     ///
@@ -1264,10 +1249,9 @@ impl BenchSession {
     /// detector; smaller drift is recorded on the result's
     /// [`SentinelContext`], not fatal) — and on measurements below the
     /// per-expression plausibility floor (audit M4).
-    pub fn benchmark_arena(
+    pub fn benchmark_graph(
         &mut self,
-        arena: &ExprArena,
-        root: ExprId,
+        graph: &ExprGraph,
         mode: BenchMode,
     ) -> Result<BenchResult, BenchError> {
         // Sentinel BEFORE compiling, as this entry point has always done: the
@@ -1276,21 +1260,22 @@ impl BenchSession {
         // immediately ahead of the timed loop. Delegating wholesale to
         // `benchmark_compiled` would silently reorder that.
         self.check_sentinel_if_due();
-        let compiled = compile(arena, root).map_err(BenchError::CompileFailed)?;
-        self.measure_gated(&compiled.code, arena, root, mode)
+        let compiled =
+            compile_dag(graph.root(), graph.environment()).map_err(BenchError::CompileFailed)?;
+        self.measure_gated(&compiled.code, graph.root(), mode)
     }
 
     /// Benchmark a PRE-COMPILED code object under `mode`, with the same
     /// sentinel drift checking, overhead adjustment, and plausibility floor
-    /// as [`BenchSession::benchmark_arena`].
+    /// as [`BenchSession::benchmark_graph`].
     ///
     /// This is the "time the exact artifact that passed the check" entry
     /// point: callers that compiled and correctness-gated an
     /// [`ExecutableCode`] in a preparation phase hand that same object here,
     /// so no compilation (with its allocation and icache pollution) happens
     /// inside the timed phase, and the timed code is bit-identical to the
-    /// checked code. `arena`/`root` must be the expression `code` was
-    /// compiled from — they parameterize the plausibility floor only.
+    /// checked code. `graph` must be the expression `code` was compiled from
+    /// — it parameterizes the plausibility floor only.
     ///
     /// # Panics
     ///
@@ -1302,16 +1287,15 @@ impl BenchSession {
     pub fn benchmark_compiled(
         &mut self,
         code: &ExecutableCode,
-        arena: &ExprArena,
-        root: ExprId,
+        graph: &ExprGraph,
         mode: BenchMode,
     ) -> Result<BenchResult, BenchError> {
         self.check_sentinel_if_due();
-        self.measure_gated(code, arena, root, mode)
+        self.measure_gated(code, graph.root(), mode)
     }
 
     /// Time `code` and finalize the result. The shared tail of
-    /// [`BenchSession::benchmark_arena`] and
+    /// [`BenchSession::benchmark_graph`] and
     /// [`BenchSession::benchmark_compiled`], which differ only in whether they
     /// compile first — and therefore in where the sentinel check falls
     /// relative to compilation, which is why this is factored out instead of
@@ -1319,15 +1303,14 @@ impl BenchSession {
     fn measure_gated(
         &mut self,
         code: &ExecutableCode,
-        arena: &ExprArena,
-        root: ExprId,
+        root: Node<'_, ExprData>,
         mode: BenchMode,
     ) -> Result<BenchResult, BenchError> {
         let raw = measure_exec_code(code, 1, mode)?;
         self.exprs_benchmarked += 1;
         Ok(finalize(
             raw,
-            op_count(arena, root),
+            op_count(root),
             self.call_overhead_ns(mode),
             Some(self.sentinel_context()),
         ))
@@ -1335,14 +1318,14 @@ impl BenchSession {
 
     /// Convenience: compile once, measure both modes back-to-back. Counts as
     /// one benchmarked expression for sentinel cadence.
-    pub fn benchmark_arena_both(
+    pub fn benchmark_graph_both(
         &mut self,
-        arena: &ExprArena,
-        root: ExprId,
+        graph: &ExprGraph,
     ) -> Result<(BenchResult, BenchResult), BenchError> {
         self.check_sentinel_if_due();
-        let compiled = compile(arena, root).map_err(BenchError::CompileFailed)?;
-        let ops = op_count(arena, root);
+        let compiled =
+            compile_dag(graph.root(), graph.environment()).map_err(BenchError::CompileFailed)?;
+        let ops = op_count(graph.root());
         let throughput = measure_exec_code(&compiled.code, 1, BenchMode::Throughput)?;
         let latency = measure_exec_code(&compiled.code, 1, BenchMode::Latency)?;
         self.exprs_benchmarked += 1;
@@ -1435,7 +1418,7 @@ pub struct CompileCostResult {
 /// Median wall-clock cost of one *production* cache-miss compile through
 /// [`pixelflow_codegen::jit_cache::compile`]. On a miss that entry
 /// point runs canonical-key construction, the cache lock,
-/// `optimize_runtime_arena` (e-graph saturation + extraction, itself keyed by
+/// runtime optimization (e-graph saturation + extraction, itself keyed by
 /// the same structure and therefore also a miss for a distinct kernel),
 /// `compile`, and cache insertion. This is what one distinct kernel
 /// actually costs at runtime; [`benchmark_compile_fresh`] times only the emit
@@ -1443,7 +1426,7 @@ pub struct CompileCostResult {
 ///
 /// `kernels` must contain exactly [`COMPILE_MISS_KERNELS`] canonically
 /// distinct entries (e.g. each embedding a different const leaf that survives
-/// optimization) — built by the caller beforehand so arena construction stays
+/// optimization) — built by the caller beforehand so graph construction stays
 /// outside the timed window. Distinctness is not trusted: the entry-count
 /// delta of the global cache is asserted afterwards, so a stream that
 /// accidentally repeats a kernel fails loudly instead of silently timing
@@ -1453,7 +1436,7 @@ pub struct CompileCostResult {
 /// retain every entry compiled here. That is fine for a one-shot bench
 /// process; do not call this in a long-lived process expecting the memory
 /// back.
-pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Result<f64, BenchError> {
+pub fn benchmark_compile_cached_miss(kernels: Vec<ExprGraph>) -> Result<f64, BenchError> {
     use pixelflow_codegen::jit_cache;
 
     assert_eq!(
@@ -1467,8 +1450,8 @@ pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Resul
     let entries_before = jit_cache::entry_count();
     let mut kernels = kernels.into_iter();
 
-    for (arena, root) in kernels.by_ref().take(COMPILE_WARMUP_ITERS) {
-        let k = pixelflow_ir::Kernel::from_parts(arena, root);
+    for graph in kernels.by_ref().take(COMPILE_WARMUP_ITERS) {
+        let k = pixelflow_ir::Kernel::from_graph(graph);
         let compiled = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
             .map_err(BenchError::CompileFailed)?
             .kernel;
@@ -1477,16 +1460,16 @@ pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Resul
 
     let mut times = [0u64; COMPILE_TIMED_RUNS];
     for t in &mut times {
-        let (arena, root) = kernels.next().expect("stream length asserted above");
+        let graph = kernels.next().expect("stream length asserted above");
         let start = nanos_now();
-        let k = pixelflow_ir::Kernel::from_parts(arena, root);
+        let k = pixelflow_ir::Kernel::from_graph(graph);
         let compiled = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
             .map_err(BenchError::CompileFailed)?
             .kernel;
         std::hint::black_box(&compiled);
         *t = nanos_now() - start;
         // The cache retains its own Arc, so dropping ours (and the source
-        // arena) here is deallocation bookkeeping outside the timed window.
+        // source graph) here is deallocation bookkeeping outside the timed window.
     }
 
     let interned = jit_cache::entry_count() - entries_before;
@@ -1510,12 +1493,10 @@ pub fn benchmark_compile_cached_miss(kernels: Vec<(ExprArena, ExprId)>) -> Resul
 /// pays all of those on top; measure that with
 /// [`benchmark_compile_cached_miss`]. Keep this series for attributing how
 /// much of the miss cost is codegen proper.
-pub fn benchmark_compile_fresh(
-    arena: &ExprArena,
-    root: ExprId,
-) -> Result<CompileCostResult, BenchError> {
+pub fn benchmark_compile_fresh(graph: &ExprGraph) -> Result<CompileCostResult, BenchError> {
     for _ in 0..COMPILE_WARMUP_ITERS {
-        let result = compile(arena, root).map_err(BenchError::CompileFailed)?;
+        let result =
+            compile_dag(graph.root(), graph.environment()).map_err(BenchError::CompileFailed)?;
         std::hint::black_box(result.code.as_bytes().first());
     }
 
@@ -1523,7 +1504,8 @@ pub fn benchmark_compile_fresh(
     let mut code_bytes = 0usize;
     for t in &mut times {
         let start = nanos_now();
-        let result = compile(arena, root).map_err(BenchError::CompileFailed)?;
+        let result =
+            compile_dag(graph.root(), graph.environment()).map_err(BenchError::CompileFailed)?;
         std::hint::black_box(result.code.as_bytes().first());
         code_bytes = result.code.len();
         drop(result); // munmap inside the timed window
@@ -1562,7 +1544,7 @@ pub fn log_ns(ns: SessionNs) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::ExprArena;
+    use pixelflow_ir::ExprBuilder;
 
     #[test]
     fn verify_log_ns() {
@@ -1595,10 +1577,11 @@ mod tests {
 
     #[test]
     fn constant_expr_benchmarks_successfully() {
-        let mut arena = ExprArena::new();
-        let root = arena.push_const(core::f32::consts::PI);
-        let result = benchmark_jit_arena(&arena, root)
-            .expect("constant expression must JIT-compile and benchmark");
+        let mut builder = ExprBuilder::new();
+        let root = builder.constant(core::f32::consts::PI);
+        let graph = builder.finish_one(root);
+        let result =
+            benchmark_jit(&graph).expect("constant expression must JIT-compile and benchmark");
         assert_eq!(result.outputs.len(), INPUT_TUPLES);
         for lanes in &result.outputs {
             for lane in lanes {
@@ -1620,11 +1603,12 @@ mod tests {
     fn autoscale_reaches_tick_floor() {
         // A 1-op kernel at repeat_batches=1 is 64 evals ≈ hundreds of ns —
         // far below the ~4.2µs tick floor — so autoscale must engage.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Add, x, y);
-        let result = benchmark_jit_arena(&arena, root).expect("tiny kernel must benchmark");
+        let mut builder = ExprBuilder::new();
+        let x = builder.var(0);
+        let y = builder.var(1);
+        let root = builder.binary(OpKind::Add, x, y);
+        let graph = builder.finish_one(root);
+        let result = benchmark_jit(&graph).expect("tiny kernel must benchmark");
         assert!(
             result.repeat_batches > 1,
             "autoscale should have raised repeat_batches above 1 for a 1-op kernel, got {}",
@@ -1680,40 +1664,41 @@ mod tests {
         assert_plausible(0.0, 0);
     }
 
-    /// A var-free arena with `pairs * 2` ops: nothing in it depends on an
+    /// A var-free graph with `pairs * 2` ops: nothing in it depends on an
     /// input, so a constant-folding compiler could emit one `ret`.
-    fn var_free_multi_op_arena(pairs: usize) -> (ExprArena, ExprId) {
-        let mut arena = ExprArena::new();
-        let mut acc = arena.push_const(1.0);
+    fn var_free_multi_op_graph(pairs: usize) -> ExprGraph {
+        let mut builder = ExprBuilder::new();
+        let mut acc = builder.constant(1.0);
         for i in 0..pairs {
-            let c = arena.push_const(1.0 + i as f32);
-            acc = arena.push_binary(OpKind::Add, acc, c);
-            let d = arena.push_const(1.0 + i as f32 * 0.5);
-            acc = arena.push_binary(OpKind::Mul, acc, d);
+            let c = builder.constant(1.0 + i as f32);
+            acc = builder.binary(OpKind::Add, acc, c);
+            let d = builder.constant(1.0 + i as f32 * 0.5);
+            acc = builder.binary(OpKind::Mul, acc, d);
         }
-        (arena, acc)
+        builder.finish_one(acc)
     }
 
     #[test]
-    fn var_free_arenas_keep_their_full_op_count() {
-        // The floor is computed from the arena the caller hands us, var-free
+    fn var_free_graphs_keep_their_full_op_count() {
+        // The floor is computed from the graph the caller hands us, var-free
         // or not — see `has_reachable_var` for why no exemption exists.
-        let (arena, root) = var_free_multi_op_arena(3);
-        assert_eq!(op_count(&arena, root), 6);
-        assert!(!has_reachable_var(&arena, root));
+        let graph = var_free_multi_op_graph(3);
+        assert_eq!(op_count(graph.root()), 6);
+        assert!(!has_reachable_var(graph.root()));
 
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let c = arena.push_const(2.0);
-        let root = arena.push_binary(OpKind::Mul, x, c);
-        assert!(has_reachable_var(&arena, root));
-        assert_eq!(op_count(&arena, root), 1);
+        let mut builder = ExprBuilder::new();
+        let x = builder.var(0);
+        let c = builder.constant(2.0);
+        let root = builder.binary(OpKind::Mul, x, c);
+        let graph = builder.finish_one(root);
+        assert!(has_reachable_var(graph.root()));
+        assert_eq!(op_count(graph.root()), 1);
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
-    fn var_free_arenas_still_execute_their_ops() {
-        // The premise behind exempting var-free arenas from the plausibility
+    fn var_free_graphs_still_execute_their_ops() {
+        // The premise behind exempting var-free graphs from the plausibility
         // floor is that the JIT folds them to a constant `ret`. It does not:
         // `compile` has no constant-propagation pass, so a 300-op var-free
         // kernel really runs 300 ops and sits far above the 15ns floor
@@ -1724,11 +1709,10 @@ mod tests {
         // NOT to exempt var-free expressions, which would switch off the
         // audit-M4 early-`ret` detector for precisely the easiest shape to
         // emit an early `ret` for.
-        let (arena, root) = var_free_multi_op_arena(150);
-        let ops = op_count(&arena, root);
+        let graph = var_free_multi_op_graph(150);
+        let ops = op_count(graph.root());
         assert_eq!(ops, 300);
-        let result =
-            benchmark_jit_arena(&arena, root).expect("var-free multi-op expression must benchmark");
+        let result = benchmark_jit(&graph).expect("var-free multi-op expression must benchmark");
         assert!(
             result.ns >= plausibility_floor_ns(ops),
             "a var-free {ops}-op kernel measured {:.3}ns, below the {:.3}ns floor — the JIT \
@@ -1744,17 +1728,18 @@ mod tests {
         // Fix 3 substrate: a pre-compiled ExecutableCode can be timed
         // directly, with no compile inside the session call, and yields the
         // same outputs as the compile-inside path.
-        let (arena, root) = sentinel_arena();
-        let compiled = compile(&arena, root).expect("sentinel kernel compiles");
+        let graph = sentinel_graph();
+        let compiled =
+            compile_dag(graph.root(), graph.environment()).expect("sentinel kernel compiles");
         let mut session = BenchSession::new();
         let via_code = session
-            .benchmark_compiled(&compiled.code, &arena, root, BenchMode::Throughput)
+            .benchmark_compiled(&compiled.code, &graph, BenchMode::Throughput)
             .expect("precompiled object must benchmark");
-        let via_arena = session
-            .benchmark_arena(&arena, root, BenchMode::Throughput)
-            .expect("arena path must benchmark");
+        let via_graph = session
+            .benchmark_graph(&graph, BenchMode::Throughput)
+            .expect("graph path must benchmark");
         via_code
-            .check_equivalence(&via_arena, 0.0)
+            .check_equivalence(&via_graph, 0.0)
             .expect("same expression through both entry points: outputs must match exactly");
         assert_eq!(via_code.outputs.len(), INPUT_TUPLES);
     }
@@ -1953,29 +1938,54 @@ mod tests {
 
     #[test]
     fn op_count_counts_compute_ops_once() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let c = arena.push_const(2.0);
-        let mul = arena.push_binary(OpKind::Mul, x, c);
+        let mut builder = ExprBuilder::new();
+        let x = builder.var(0);
+        let c = builder.constant(2.0);
+        let mul = builder.binary(OpKind::Mul, x, c);
         // DAG sharing: `mul` referenced twice, counted once.
-        let root = arena.push_binary(OpKind::Add, mul, mul);
-        assert_eq!(op_count(&arena, root), 2);
-        assert_eq!(op_count(&arena, x), 0);
-        assert_eq!(op_count(&arena, c), 0);
+        let root = builder.binary(OpKind::Add, mul, mul);
+        let graph = builder.finish_one(root);
+        assert_eq!(op_count(graph.root()), 2);
+        assert_eq!(
+            op_count(
+                graph
+                    .root()
+                    .children()
+                    .next()
+                    .unwrap()
+                    .children()
+                    .next()
+                    .unwrap()
+            ),
+            0
+        );
+        assert_eq!(
+            op_count(
+                graph
+                    .root()
+                    .children()
+                    .next()
+                    .unwrap()
+                    .children()
+                    .nth(1)
+                    .unwrap()
+            ),
+            0
+        );
     }
 
     #[test]
-    fn sentinel_arena_is_moderate_size() {
-        let (arena, root) = sentinel_arena();
-        // arena.len() is the unique-node count (the arena holds only the
+    fn sentinel_graph_is_moderate_size() {
+        let graph = sentinel_graph();
+        // The DAG node count is the unique-node count (the graph holds only the
         // sentinel's nodes); node_count_subtree would multiply out the DAG.
-        let nodes = arena.len();
+        let nodes = graph.root().dag().len();
         assert!(
             (30..=60).contains(&nodes),
             "sentinel kernel should be 30-60 nodes, got {}",
             nodes
         );
-        assert_eq!(op_count(&arena, root), 40);
+        assert_eq!(op_count(graph.root()), 40);
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -1987,9 +1997,9 @@ mod tests {
         assert!(session.call_overhead_ns(BenchMode::Latency) > 0.0);
         assert_eq!(session.sentinel_samples().len(), 1);
 
-        let (arena, root) = sentinel_arena();
+        let graph = sentinel_graph();
         let (throughput, latency) = session
-            .benchmark_arena_both(&arena, root)
+            .benchmark_graph_both(&graph)
             .expect("sentinel-shaped kernel must benchmark in both modes");
 
         assert_eq!(throughput.mode, BenchMode::Throughput);
@@ -2041,12 +2051,12 @@ mod tests {
         let mut session = BenchSession::new();
         assert!(session.call_overhead_ns(BenchMode::Scanline) > 0.0);
 
-        let (arena, root) = sentinel_arena();
+        let graph = sentinel_graph();
         let throughput = session
-            .benchmark_arena(&arena, root, BenchMode::Throughput)
+            .benchmark_graph(&graph, BenchMode::Throughput)
             .expect("sentinel-shaped kernel benchmarks in throughput mode");
         let scanline = session
-            .benchmark_arena(&arena, root, BenchMode::Scanline)
+            .benchmark_graph(&graph, BenchMode::Scanline)
             .expect("sentinel-shaped kernel benchmarks in scanline mode");
 
         assert_eq!(scanline.mode, BenchMode::Scanline);
@@ -2103,28 +2113,32 @@ mod tests {
     ///
     /// This is the regression the floor's missing `LANES` divisor caused: it
     /// only binds once `op_count * MIN_NS_PER_OP` exceeds the measured
-    /// per-lane value, so it passed on every arena that had been through the
+    /// per-lane value, so it passed on every graph that had been through the
     /// e-graph and panicked on the first unoptimized ones. Deterministic: a
     /// wrong floor rejects this every time, on any machine.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn a_large_expression_is_measurable_rather_than_rejected() {
         // ~150 ops in a chain wide enough that no single op dominates.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let mut acc = arena.push_binary(OpKind::Add, x, y);
+        let mut builder = ExprBuilder::new();
+        let x = builder.var(0);
+        let y = builder.var(1);
+        let mut acc = builder.binary(OpKind::Add, x, y);
         for i in 0..50 {
-            let c = arena.push_const(1.0 + i as f32);
-            let m = arena.push_binary(OpKind::Mul, acc, c);
-            let a = arena.push_binary(OpKind::Add, m, x);
-            acc = arena.push_binary(OpKind::Sub, a, y);
+            let c = builder.constant(1.0 + i as f32);
+            let m = builder.binary(OpKind::Mul, acc, c);
+            let a = builder.binary(OpKind::Add, m, x);
+            acc = builder.binary(OpKind::Sub, a, y);
         }
-        assert!(op_count(&arena, acc) > 100, "test needs a large expression");
+        let graph = builder.finish_one(acc);
+        assert!(
+            op_count(graph.root()) > 100,
+            "test needs a large expression"
+        );
 
         let mut session = BenchSession::new();
         session
-            .benchmark_arena(&arena, acc, BenchMode::Latency)
+            .benchmark_graph(&graph, BenchMode::Latency)
             .expect("a large expression must benchmark, not trip the floor");
     }
 
@@ -2158,12 +2172,14 @@ mod tests {
         //
         // (It used to be `y + z`, which also proved the *fourth* lane was
         // fed. That is not a property the language still has — Z is retired
-        // and no arena can name it — so what survives is the property that
+        // and no graph can name it — so what survives is the property that
         // was load-bearing: a non-X coordinate is chained.)
-        let mut arena = ExprArena::new();
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Add, y, y);
-        let compiled = compile(&arena, root).expect("y+y must JIT-compile");
+        let mut builder = ExprBuilder::new();
+        let y = builder.var(1);
+        let root = builder.binary(OpKind::Add, y, y);
+        let graph = builder.finish_one(root);
+        let compiled =
+            compile_dag(graph.root(), graph.environment()).expect("y+y must JIT-compile");
 
         let mut prev = [0.25f32; LANES]; // nonzero seed so doubling is observable.
         for step in 0..8 {

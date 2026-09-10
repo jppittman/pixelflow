@@ -12,9 +12,9 @@
 use std::sync::Arc;
 
 use pixelflow_codegen::jit_cache::{compile, entry_count};
-use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformIdentity};
+use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
 use pixelflow_ir::kind::OpKind;
-use pixelflow_ir::{Kernel, LatticeShape};
+use pixelflow_ir::{ExprBuilder, Kernel, LatticeShape};
 
 /// `(x − cx)·r + cy` over three fresh instances, declared in one of two
 /// orders so the link — not the declaration order — is what is shared.
@@ -24,26 +24,21 @@ fn circle(declared_in_order: bool) -> Kernel {
         default,
     };
     let (cx, cy, r) = (decl(0.0), decl(0.0), decl(1.0));
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let (scx, scy, sr) = if declared_in_order {
-        (
-            a.declare_uniform(cx),
-            a.declare_uniform(cy),
-            a.declare_uniform(r),
-        )
+        (a.uniform(cx), a.uniform(cy), a.uniform(r))
     } else {
-        let sr = a.declare_uniform(r);
-        let scy = a.declare_uniform(cy);
-        (a.declare_uniform(cx), scy, sr)
+        let sr = a.uniform(r);
+        let scy = a.uniform(cy);
+        (a.uniform(cx), scy, sr)
     };
-    let x = a.push_var(0);
-    let ucx = a.push_uniform(scx);
-    let ur = a.push_uniform(sr);
-    let ucy = a.push_uniform(scy);
-    let d = a.push_binary(OpKind::Sub, x, ucx);
-    let scaled = a.push_binary(OpKind::Mul, d, ur);
-    let root = a.push_binary(OpKind::Add, scaled, ucy);
-    Kernel::from_parts(a, root)
+    let x = a.var(0);
+    let d = a.binary(OpKind::Sub, x, scx);
+    let scaled = a.binary(OpKind::Mul, d, sr);
+    let root = a.binary(OpKind::Add, scaled, scy);
+    let graph = a.finish_one(root);
+    let (rooted, env) = graph.into_parts();
+    Kernel::from_rooted(rooted, env.buffers, env.uniforms)
 }
 
 #[test]

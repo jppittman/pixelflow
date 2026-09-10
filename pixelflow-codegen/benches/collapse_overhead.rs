@@ -11,37 +11,38 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use pixelflow_codegen::JIT_VECTOR_BYTES;
-use pixelflow_codegen::emit::{CompileResult, compile};
+use pixelflow_codegen::emit::{CompileResult, compile_dag};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::{ExprBuilder, ExprGraph};
 
 const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 const GROUPS: usize = 240;
 const ROWS: usize = 64;
 
-fn arena() -> (ExprArena, pixelflow_ir::arena::ExprId) {
-    let mut arena = ExprArena::new();
-    let x = arena.push_var(0);
-    let y = arena.push_var(1);
-    let scale = arena.push_const(0.013);
-    let bias = arena.push_const(1.75);
-    let xs = arena.push_binary(OpKind::Mul, x, scale);
-    let ys = arena.push_binary(OpKind::Mul, y, scale);
-    let xy = arena.push_binary(OpKind::Mul, xs, ys);
+fn graph() -> ExprGraph {
+    let mut builder = ExprBuilder::new();
+    let x = builder.var(0);
+    let y = builder.var(1);
+    let scale = builder.constant(0.013);
+    let bias = builder.constant(1.75);
+    let xs = builder.binary(OpKind::Mul, x, scale);
+    let ys = builder.binary(OpKind::Mul, y, scale);
+    let xy = builder.binary(OpKind::Mul, xs, ys);
     // Was `Z * Z`, on an axis a lattice no longer has — and the ABI passed
     // zero in that lane, so it was a multiply whose result never mattered.
     // Squaring `ys` keeps the node count and the op mix, which is all this
     // expression owes a call-overhead measurement: the two cases run the
     // *same* compiled kernel and differ only in call granularity.
-    let ys2 = arena.push_binary(OpKind::Mul, ys, ys);
-    let sum = arena.push_binary(OpKind::Add, xy, ys2);
-    let root = arena.push_binary(OpKind::Add, sum, bias);
-    (arena, root)
+    let ys2 = builder.binary(OpKind::Mul, ys, ys);
+    let sum = builder.binary(OpKind::Add, xy, ys2);
+    let root = builder.binary(OpKind::Add, sum, bias);
+    builder.finish_one(root)
 }
 
 fn bench_collapse_overhead(c: &mut Criterion) {
-    let (arena, root) = arena();
-    let collapse = compile(&arena, root).expect("collapse compile must succeed");
+    let graph = graph();
+    let collapse =
+        compile_dag(graph.root(), graph.environment()).expect("collapse compile must succeed");
     let mut out = vec![0.0f32; GROUPS * LANES * ROWS];
     let seq: Vec<f32> = (0..LANES).map(|lane| lane as f32 + 0.5).collect();
 

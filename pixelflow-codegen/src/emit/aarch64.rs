@@ -1088,7 +1088,7 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
 // dump_jit_asm — compile expression and return disassembly
 // =============================================================================
 
-/// Compile an expression from an [`ExprArena`] and return its disassembly.
+/// Compile an expression DAG and return its disassembly.
 ///
 /// This is a diagnostic entry point: it compiles the expression through the
 /// normal JIT pipeline, then disassembles the resulting machine code instead
@@ -1100,10 +1100,10 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
 /// [`compile`](super::compile)).
 #[cfg(target_arch = "aarch64")]
 pub fn dump_jit_asm(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
+    root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>,
+    env: &pixelflow_ir::Environment,
 ) -> Result<String, crate::error::CompileError> {
-    let result = super::compile(arena, root)?;
+    let result = super::compile_dag(root, env)?;
     Ok(disassemble_code(result.code.as_bytes()))
 }
 

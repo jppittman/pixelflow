@@ -398,7 +398,7 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
     let cycles = pixelflow_search::egraph::CostModel::latency_prior();
 
     // Build dense lookup: schedule_ops[vid.0] = Some(&ScheduledOp) for O(1) child traversal.
-    // ValueIds are sequential starting from 0 (guaranteed by arena_to_schedule).
+    // ValueIds are sequential starting from 0 (guaranteed by the DAG scheduler).
     let max_vid = schedule.iter().map(|def| def.value.0).max().unwrap_or(0) as usize;
     let mut schedule_ops: alloc::vec::Vec<Option<ScheduledOp>> = alloc::vec![None; max_vid + 1];
     for def in schedule {

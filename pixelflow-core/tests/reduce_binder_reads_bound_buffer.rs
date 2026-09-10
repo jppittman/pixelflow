@@ -196,10 +196,16 @@ fn legalize_unrolls_the_binder_and_the_gather_together() {
     let node_counts = |extent: u32| {
         let (_binding, table) = bind_table();
         let kernel = Kernel::sum_over(extent, |i| table.at(&Kernel::constant(0.0), i));
-        let (arena, root) = kernel.parts();
-        let before = arena.len();
-        let (legalized, _root) = pixelflow_ir::passes::legalize(arena, root).expect("legalize");
-        let after = legalized.len();
+        let before = kernel.root().node_count();
+        let graph = pixelflow_ir::ExprGraph::new(
+            kernel.rooted().clone(),
+            pixelflow_ir::Environment {
+                buffers: kernel.buffers().to_vec(),
+                uniforms: kernel.uniforms().to_vec(),
+            },
+        );
+        let legalized = pixelflow_ir::passes::legalize_graph(&graph).expect("legalize");
+        let after = legalized.root().node_count();
         (before, after)
     };
 

@@ -78,8 +78,8 @@ pub use derivative::{ChainRule, derivative_rules};
 pub use extract::{
     ChoiceCost, ClaimAudit, CostScale, ExtractedDAG, Extraction, ExtractionObjective,
     ExtractionReport, SHARED_DAG_PASS_BYTE_BUDGET, SharedPassStats,
-    build_extracted_dag_from_choices, choices_to_arena, compute_ref_counts, cost_of_choices,
-    extract, extract_dag,
+    build_extracted_dag_from_choices, choices_to_arena, choices_to_graph, compute_ref_counts,
+    cost_of_choices, extract, extract_dag,
 };
 pub use fold_rules::{EmptyFold, PeelFold, fold_rules};
 pub use graph::{
@@ -88,7 +88,7 @@ pub use graph::{
 };
 #[cfg(feature = "saturation-telemetry")]
 pub use growth::{GrowthTelemetry, RuleGrowth};
-pub use insert::{Declined, insert, reachable_count};
+pub use insert::{Declined, insert, insert_graph, reachable_count, reachable_count_graph};
 #[cfg(feature = "provenance-journal")]
 pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
 pub use node::{EClassId, ENode};

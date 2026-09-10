@@ -1,7 +1,7 @@
 //! Validate and deduplicate raw shader expressions into bench_corpus.bin.
 //!
 //! Reads `raw_shadertoy.jsonl` (from the Python scraper), validates each expression
-//! through `parse_kernel_code_arena` + `arena_to_kernel_code` round-trip, filters by node count,
+//! through `parse_kernel_code` + `graph_to_kernel_code` round-trip, filters by node count,
 //! deduplicates on canonical form, and writes to `bench_corpus.bin` (binary corpus format).
 //!
 //! If an existing `bench_corpus.bin` exists, its entries are loaded for dedup and preserved.
@@ -14,9 +14,9 @@ use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::PathBuf;
 
-use pixelflow_ir::ExprArena;
-use pixelflow_pipeline::training::corpus::{read_corpus, write_corpus};
-use pixelflow_pipeline::training::factored::{arena_to_kernel_code, parse_kernel_code_arena};
+use pixelflow_ir::ExprGraph;
+use pixelflow_pipeline::training::corpus::{CorpusEntry, read_corpus, write_corpus};
+use pixelflow_pipeline::training::factored::{graph_to_kernel_code, parse_kernel_code};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -39,13 +39,14 @@ fn main() {
 
     // Load existing binary corpus for dedup
     let mut seen = HashSet::new();
-    let mut existing: Vec<(String, ExprArena, pixelflow_ir::ExprId)> = Vec::new();
+    let mut existing: Vec<CorpusEntry> = Vec::new();
     if output_path.exists() {
         match read_corpus(&output_path) {
             Ok(entries) => {
                 eprintln!("Existing: {} expressions (dedup base)", entries.len());
-                for (_name, arena, root) in &entries {
-                    let canonical = arena_to_kernel_code(arena, *root);
+                for (_name, rooted, environment) in &entries {
+                    let graph = ExprGraph::new(rooted.clone(), environment.clone());
+                    let canonical = graph_to_kernel_code(&graph);
                     seen.insert(canonical);
                 }
                 existing = entries;
@@ -92,8 +93,8 @@ fn main() {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        // Step 1: Parse directly into arena form.
-        let (arena, root) = match parse_kernel_code_arena(expression) {
+        // Step 1: Parse directly into the immutable DAG form.
+        let graph = match parse_kernel_code(expression) {
             Some(parsed) => parsed,
             None => {
                 if total <= 20 || parse_failed.is_multiple_of(100) {
@@ -107,8 +108,8 @@ fn main() {
             }
         };
 
-        // Step 2: Node count via arena (structural sharing gives tighter bound)
-        let nodes = arena.len();
+        // Step 2: Node count via the DAG (structural sharing gives tighter bound)
+        let nodes = graph.root().dag().len();
         if nodes < min_nodes {
             too_small += 1;
             continue;
@@ -118,11 +119,11 @@ fn main() {
             continue;
         }
 
-        // Step 3: Arena round-trip
-        let canonical = arena_to_kernel_code(&arena, root);
-        match parse_kernel_code_arena(&canonical) {
-            Some((reparsed_arena, reparsed_root)) => {
-                let re_emitted = arena_to_kernel_code(&reparsed_arena, reparsed_root);
+        // Step 3: DAG round-trip
+        let canonical = graph_to_kernel_code(&graph);
+        match parse_kernel_code(&canonical) {
+            Some(reparsed_graph) => {
+                let re_emitted = graph_to_kernel_code(&reparsed_graph);
                 if re_emitted != canonical {
                     roundtrip_failed += 1;
                     continue;
@@ -141,7 +142,8 @@ fn main() {
         }
 
         // Step 5: Collect
-        existing.push((name.to_string(), arena, root));
+        let (rooted, environment) = graph.into_parts();
+        existing.push((name.to_string(), rooted, environment));
         validated += 1;
     }
 

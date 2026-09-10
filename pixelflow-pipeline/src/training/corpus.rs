@@ -1,7 +1,8 @@
 //! Binary corpus format for pre-parsed expression storage.
 //!
 //! Replaces JSONL text corpus with a binary format that loads in microseconds
-//! via sequential read (no parsing, no allocation beyond the arena vecs).
+//! via sequential read (the reader uses a private compatibility arena, then
+//! returns the public rooted-DAG representation).
 //!
 //! ## Format (the header's second field is a derived identity, not a
 //! ## hand-bumped version — see "The schema identity is coupled to the
@@ -16,10 +17,8 @@
 //!   name_len: u16 (little-endian)
 //!   name: [u8; name_len]       (UTF-8)
 //!   node_count: u32 (le)
-//!   nary_count: u32 (le)
-//!   root_index: u32 (le)       (ExprId.0)
+//!   root_index: u32 (le)       (dense node ordinal)
 //!   nodes: node_count encoded ExprNodes (variable per-node)
-//!   nary_children: [u32; nary_count] (le) (ExprId.0 values)
 //! ```
 //!
 //! Each ExprNode is encoded as:
@@ -66,15 +65,19 @@ use std::path::Path;
 
 use pixelflow_ir::fold::Fold;
 use pixelflow_ir::kind::OpCode;
-use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
+use pixelflow_ir::{Environment, ExprArena, ExprData, ExprId, ExprNode, Node, OpKind, Rooted};
 
 use crate::schema::{SchemaIdentity, fnv1a64_const, identity_mismatch};
 
 /// Marker type naming the corpus binary format for [`SchemaIdentity`]. The
 /// format has no single Rust value of its own — it serializes a
-/// `Vec<(String, ExprArena, ExprId)>` — so this type exists purely to carry
-/// `SCHEMA` and derive `SCHEMA_IDENTITY` from it.
+/// `Vec<CorpusEntry>` — so this type exists purely to carry `SCHEMA` and
+/// derive `SCHEMA_IDENTITY` from it.
 struct CorpusFormat;
+
+/// One corpus item: a name, an owned rooted expression DAG, and the
+/// declarations that give `Buffer`/`Uniform` leaves their meaning.
+pub type CorpusEntry = (String, Rooted<ExprData>, Environment);
 
 impl SchemaIdentity for CorpusFormat {
     const MAGIC: &'static str = "PXCR";
@@ -92,13 +95,13 @@ impl SchemaIdentity for CorpusFormat {
     const SCHEMA: &'static str = "\
         header: magic[4]=PXCR, schema_identity: u64 le, count: u32 le entries follow; \
         entry: name_len u16 le, name utf8 bytes, node_count u32 le, \
-        root_index u32 le (ExprId.0 into this entry's own node list), \
+        root_index u32 le (dense node ordinal into this entry's own node list), \
         nodes: node_count encoded ExprNodes in child-before-parent order; \
         ExprNode tag byte: 0=Var(index u8), 1=Const(f32 le), 2=Param(index u8), \
-        3=Unary(OpKind::marshal, ExprId le), \
-        4=Binary(OpKind::marshal, ExprId le, ExprId le), \
-        5=Ternary(OpKind::marshal, ExprId le, ExprId le, ExprId le), \
-        6=Nary(OpKind::marshal, len u16 le, [ExprId le; len]), \
+        3=Unary(OpKind::marshal, dense node ordinal le), \
+        4=Binary(OpKind::marshal, dense node ordinal le, dense node ordinal le), \
+        5=Ternary(OpKind::marshal, dense node ordinal le, dense node ordinal le, dense node ordinal le), \
+        6=Nary(OpKind::marshal, len u16 le, [dense node ordinal le; len]), \
         7=Buffer(BufferId u16 le) refused at write time, its declaration is never \
         serialized; \
         op byte encoding: pixelflow_ir::OpKind::marshal, dense 0..COUNT discriminants \
@@ -211,7 +214,7 @@ const TAG_BUFFER: u8 = 7;
 ///
 /// Panics if the reachable subgraph contains a `Buffer` node.
 #[must_use]
-pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+fn reachable_subtree_legacy(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
     enum Task {
         Descend(ExprId),
         Emit(ExprId),
@@ -281,18 +284,37 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
     (out_arena, new_root)
 }
 
+/// Return the reachable expression DAG and its environment.
+///
+/// The public corpus representation is rooted-DAG based; the legacy arena is
+/// used only inside the binary compatibility reader and this helper's compact
+/// implementation.  The conversion is kept here, at the corpus boundary,
+/// rather than exposing arena storage to corpus consumers.
+#[must_use]
+pub fn reachable_subtree(
+    rooted: &Rooted<ExprData>,
+    environment: &Environment,
+) -> (Rooted<ExprData>, Environment) {
+    let (arena, root) = rooted.entry().marshal(environment);
+    let (compact, compact_root) = reachable_subtree_legacy(&arena, root);
+    let (compact_rooted, compact_environment) = Rooted::unmarshal(&compact, &[compact_root]);
+    (compact_rooted, compact_environment)
+}
+
 // ── Write ────────────────────────────────────────────────────────────────────
 
 /// Write a binary corpus to `path`.
 ///
-/// Each entry is compacted with [`reachable_subtree`] before serialization,
-/// so the stored node count is the expression's size, not its arena's.
+/// Each entry is compacted by a reachable DAG traversal before serialization,
+/// so the stored node count is the expression's size, not construction
+/// garbage in the caller's graph.
 ///
 /// # Panics
 ///
 /// Panics if any expression name exceeds `u16::MAX` bytes, or if any
-/// expression references a `Buffer` node (see [`reachable_subtree`]).
-pub fn write_corpus(path: &Path, entries: &[(String, ExprArena, ExprId)]) -> io::Result<()> {
+/// expression carries a `Buffer` or `Uniform` declaration, because those
+/// declarations are intentionally not part of this corpus schema.
+pub fn write_corpus(path: &Path, entries: &[CorpusEntry]) -> io::Result<()> {
     let file = std::fs::File::create(path)?;
     let mut w = io::BufWriter::new(file);
 
@@ -301,15 +323,20 @@ pub fn write_corpus(path: &Path, entries: &[(String, ExprArena, ExprId)]) -> io:
     w.write_all(&corpus_identity().to_le_bytes())?;
     w.write_all(&(entries.len() as u32).to_le_bytes())?;
 
-    for (name, arena, root) in entries {
-        write_entry(&mut w, name, arena, *root)?;
+    for (name, rooted, environment) in entries {
+        write_entry(&mut w, name, rooted, environment)?;
     }
 
     w.flush()?;
     Ok(())
 }
 
-fn write_entry(w: &mut impl Write, name: &str, arena: &ExprArena, root: ExprId) -> io::Result<()> {
+fn write_entry(
+    w: &mut impl Write,
+    name: &str,
+    rooted: &Rooted<ExprData>,
+    environment: &Environment,
+) -> io::Result<()> {
     let name_bytes = name.as_bytes();
     assert!(
         name_bytes.len() <= u16::MAX as usize,
@@ -317,26 +344,123 @@ fn write_entry(w: &mut impl Write, name: &str, arena: &ExprArena, root: ExprId) 
         name
     );
 
-    // Compact first: the caller's arena is generator scratch space and its
-    // dead nodes are not part of this expression (format v3).
-    let (compact, compact_root) = reachable_subtree(arena, root);
-    let count = compact.len();
+    assert!(
+        environment.buffers.is_empty() && environment.uniforms.is_empty(),
+        "write_corpus: corpus format does not serialize buffer/uniform declarations"
+    );
+
+    // Construction garbage is filtered by reachability.  The DAG itself
+    // supplies the canonical child-before-parent order; only dense ordinals
+    // cross the disk boundary.
+    let root = rooted.entry();
+    let reachable: std::collections::BTreeSet<Node<'_, ExprData>> = root.descendants().collect();
+    let mut dense = std::collections::BTreeMap::new();
+    let mut next = 0u32;
+    for node in rooted.iter() {
+        if reachable.contains(&node) {
+            dense.insert(node, next);
+            next = next
+                .checked_add(1)
+                .expect("write_corpus: reachable node count exceeds u32::MAX");
+        }
+    }
+    let count = dense.len();
+    assert!(
+        dense.contains_key(&root),
+        "write_corpus: declared root is missing from reachable node set"
+    );
 
     w.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
     w.write_all(name_bytes)?;
     w.write_all(&(count as u32).to_le_bytes())?;
-    w.write_all(&compact_root.0.to_le_bytes())?;
+    w.write_all(
+        dense
+            .get(&root)
+            .expect("write_corpus: root must have a dense ordinal")
+            .to_le_bytes()
+            .as_slice(),
+    )?;
 
     // Nodes
-    for idx in 0..count {
-        let id = ExprId(idx as u32);
-        write_node(w, &compact, id)?;
+    for node in rooted.iter() {
+        if reachable.contains(&node) {
+            write_node_dag(w, node, &dense)?;
+        }
     }
 
     Ok(())
 }
 
-fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<()> {
+fn write_node_dag(
+    w: &mut impl Write,
+    node: Node<'_, ExprData>,
+    dense: &std::collections::BTreeMap<Node<'_, ExprData>, u32>,
+) -> io::Result<()> {
+    let child = |child: Node<'_, ExprData>| -> u32 {
+        *dense
+            .get(&child)
+            .expect("write_corpus: child missing from reachable DAG")
+    };
+    match *node {
+        ExprData::Var(i) => w.write_all(&[TAG_VAR, i])?,
+        ExprData::Const(bits) => {
+            w.write_all(&[TAG_CONST])?;
+            w.write_all(&bits.to_le_bytes())?;
+        }
+        ExprData::Param(i) => w.write_all(&[TAG_PARAM, i])?,
+        ExprData::Op(op) => match node.child_count() {
+            1 => {
+                w.write_all(&[TAG_UNARY])?;
+                w.write_all(&op.marshal().to_bytes())?;
+                w.write_all(&child(node.children().next().expect("unary child")).to_le_bytes())?;
+            }
+            2 => {
+                w.write_all(&[TAG_BINARY])?;
+                w.write_all(&op.marshal().to_bytes())?;
+                for c in node.children() {
+                    w.write_all(&child(c).to_le_bytes())?;
+                }
+            }
+            3 => {
+                w.write_all(&[TAG_TERNARY])?;
+                w.write_all(&op.marshal().to_bytes())?;
+                for c in node.children() {
+                    w.write_all(&child(c).to_le_bytes())?;
+                }
+            }
+            count => {
+                assert!(
+                    count <= u16::MAX as usize,
+                    "write_corpus: n-ary arity exceeds u16::MAX"
+                );
+                w.write_all(&[TAG_NARY])?;
+                w.write_all(&op.marshal().to_bytes())?;
+                w.write_all(&(count as u16).to_le_bytes())?;
+                for c in node.children() {
+                    w.write_all(&child(c).to_le_bytes())?;
+                }
+            }
+        },
+        ExprData::Reduce(fold) => {
+            w.write_all(&[TAG_REDUCE])?;
+            w.write_all(&fold.to_bits().to_le_bytes())?;
+            w.write_all(&child(node.children().next().expect("reduce body")).to_le_bytes())?;
+        }
+        ExprData::Buffer(id) => {
+            panic!("write_corpus: Buffer({id:?}) has no serialized declaration")
+        }
+        ExprData::Uniform(id) => {
+            panic!("write_corpus: Uniform({id:?}) has no serialized declaration")
+        }
+        ExprData::Ref(key) => panic!(
+            "write_corpus: Ref({key:?}) names a process-local kernel and cannot be serialized"
+        ),
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn write_node_legacy(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<()> {
     match arena.node(id) {
         ExprNode::Var(i) => {
             w.write_all(&[TAG_VAR, *i])?;
@@ -416,13 +540,13 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
 
 /// Read a binary corpus from `path`.
 ///
-/// Returns `(name, arena, root)` triples.
-pub fn read_corpus(path: &Path) -> io::Result<Vec<(String, ExprArena, ExprId)>> {
+/// Returns `(name, rooted_dag, environment)` triples.
+pub fn read_corpus(path: &Path) -> io::Result<Vec<CorpusEntry>> {
     let data = std::fs::read(path)?;
     read_corpus_bytes(&data)
 }
 
-fn read_corpus_bytes(data: &[u8]) -> io::Result<Vec<(String, ExprArena, ExprId)>> {
+fn read_corpus_bytes(data: &[u8]) -> io::Result<Vec<CorpusEntry>> {
     let mut r = Cursor::new(data);
 
     // Header
@@ -473,7 +597,7 @@ fn read_corpus_bytes(data: &[u8]) -> io::Result<Vec<(String, ExprArena, ExprId)>
     Ok(entries)
 }
 
-fn read_entry(r: &mut Cursor<'_>) -> io::Result<(String, ExprArena, ExprId)> {
+fn read_entry(r: &mut Cursor<'_>) -> io::Result<CorpusEntry> {
     let name_len = r.read_u16()? as usize;
     let name = {
         let bytes = r.read_bytes(name_len)?;
@@ -495,7 +619,8 @@ fn read_entry(r: &mut Cursor<'_>) -> io::Result<(String, ExprArena, ExprId)> {
 
     let root = ExprId(root_index);
 
-    Ok((name, arena, root))
+    let (rooted, environment) = Rooted::unmarshal(&arena, &[root]);
+    Ok((name, rooted, environment))
 }
 
 fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprId> {
@@ -659,6 +784,11 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    fn entry(name: &str, arena: ExprArena, root: ExprId) -> CorpusEntry {
+        let (rooted, environment) = Rooted::unmarshal(&arena, &[root]);
+        (name.to_string(), rooted, environment)
+    }
+
     // Per-process path: concurrent `cargo test` runs must not share corpus files,
     // or one process's remove_file races another's write/read.
     fn unique_tmp(name: &str) -> std::path::PathBuf {
@@ -668,7 +798,7 @@ mod tests {
     #[test]
     fn round_trip_empty() {
         let tmp = unique_tmp("empty");
-        let entries: Vec<(String, ExprArena, ExprId)> = Vec::new();
+        let entries: Vec<CorpusEntry> = Vec::new();
         write_corpus(&tmp, &entries).expect("write");
         let loaded = read_corpus(&tmp).expect("read");
         assert!(loaded.is_empty());
@@ -682,7 +812,7 @@ mod tests {
         let y = arena.push_var(1);
         let root = arena.push_binary(OpKind::Add, x, y);
 
-        let entries = vec![("test_add".to_string(), arena, root)];
+        let entries = vec![entry("test_add", arena, root)];
 
         let tmp = unique_tmp("simple");
         write_corpus(&tmp, &entries).expect("write");
@@ -691,15 +821,11 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "test_add");
         assert_eq!(loaded[0].1.len(), 3);
-        assert_eq!(loaded[0].2.0, root.0);
+        assert_eq!(loaded[0].1.entry().child_count(), 2);
 
         // Verify node equality
-        for (i, node) in entries[0].1.nodes().enumerate() {
-            assert_eq!(
-                node,
-                loaded[0].1.node(ExprId(i as u32)),
-                "node {i} mismatch"
-            );
+        for (i, (left, right)) in entries[0].1.iter().zip(loaded[0].1.iter()).enumerate() {
+            assert_eq!(*left, *right, "node {i} mismatch");
         }
 
         let _ = std::fs::remove_file(&tmp);
@@ -711,7 +837,7 @@ mod tests {
         let c = arena.push_const(std::f32::consts::PI);
         let root = arena.push_unary(OpKind::Sqrt, c);
 
-        let entries = vec![("sqrt_pi".to_string(), arena, root)];
+        let entries = vec![entry("sqrt_pi", arena, root)];
 
         let tmp = unique_tmp("unary");
         write_corpus(&tmp, &entries).expect("write");
@@ -720,10 +846,11 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "sqrt_pi");
         // Check the const value round-trips
-        match loaded[0].1.node(ExprId(0)) {
-            ExprNode::Const(v) => assert!(
-                (v - std::f32::consts::PI).abs() < 1e-6,
-                "const mismatch: {v}"
+        match *loaded[0].1.iter().next().expect("const node") {
+            ExprData::Const(bits) => assert!(
+                (f32::from_bits(bits) - std::f32::consts::PI).abs() < 1e-6,
+                "const mismatch: {}",
+                f32::from_bits(bits)
             ),
             other => panic!("expected Const, got {other:?}"),
         }
@@ -739,15 +866,15 @@ mod tests {
         let z = arena.push_var(2);
         let root = arena.push_ternary(OpKind::Select, x, y, z);
 
-        let entries = vec![("select_xyz".to_string(), arena, root)];
+        let entries = vec![entry("select_xyz", arena, root)];
 
         let tmp = unique_tmp("ternary");
         write_corpus(&tmp, &entries).expect("write");
         let loaded = read_corpus(&tmp).expect("read");
 
         assert_eq!(loaded.len(), 1);
-        match loaded[0].1.node(loaded[0].2) {
-            ExprNode::Ternary(OpKind::Select, _, _, _) => {}
+        match *loaded[0].1.entry() {
+            ExprData::Op(OpKind::Select) if loaded[0].1.entry().child_count() == 3 => {}
             other => panic!("expected Ternary(Select,...), got {other:?}"),
         }
 
@@ -762,16 +889,16 @@ mod tests {
         let c = arena.push_var(2);
         let root = arena.push_nary(OpKind::Tuple, &[a, b, c]);
 
-        let entries = vec![("tuple_abc".to_string(), arena, root)];
+        let entries = vec![entry("tuple_abc", arena, root)];
 
         let tmp = unique_tmp("nary");
         write_corpus(&tmp, &entries).expect("write");
         let loaded = read_corpus(&tmp).expect("read");
 
         assert_eq!(loaded.len(), 1);
-        match loaded[0].1.node(loaded[0].2) {
-            ExprNode::Nary(OpKind::Tuple, _) => {
-                let children: Vec<_> = loaded[0].1.children(loaded[0].2).collect();
+        match *loaded[0].1.entry() {
+            ExprData::Op(OpKind::Tuple) if loaded[0].1.entry().child_count() == 3 => {
+                let children: Vec<_> = loaded[0].1.entry().children().collect();
                 assert_eq!(children.len(), 3);
             }
             other => panic!("expected Nary(Tuple,...), got {other:?}"),
@@ -784,10 +911,7 @@ mod tests {
     // `read_corpus_bytes` is private, and pinning it here would test a path no
     // caller can reach. `name` keeps sibling tests off each other's fixture
     // within a process, `unique_tmp` keeps concurrent test processes apart.
-    fn read_corpus_from_bytes(
-        name: &str,
-        data: &[u8],
-    ) -> io::Result<Vec<(String, ExprArena, ExprId)>> {
+    fn read_corpus_from_bytes(name: &str, data: &[u8]) -> io::Result<Vec<CorpusEntry>> {
         let tmp = unique_tmp(name);
         std::fs::write(&tmp, data).expect("write fixture");
         let result = read_corpus(&tmp);
@@ -933,11 +1057,12 @@ mod tests {
         assert_eq!(arena.len(), 5, "fixture should carry 2 dead nodes");
         assert_eq!(arena.node_count_subtree(root), 3);
 
-        let (compact, compact_root) = reachable_subtree(&arena, root);
+        let (source, environment) = Rooted::unmarshal(&arena, &[root]);
+        let (compact, _) = reachable_subtree(&source, &environment);
         assert_eq!(compact.len(), 3, "only the reachable DAG survives");
-        assert_eq!(compact.node_count_subtree(compact_root), 3);
+        assert_eq!(compact.entry().node_count(), 3);
         assert!(
-            compact.subtree_eq(compact_root, &arena, root),
+            compact.entry().subtree_eq(source.entry()),
             "compaction must preserve the expression, not just its size"
         );
     }
@@ -951,11 +1076,16 @@ mod tests {
         let s = arena.push_unary(OpKind::Sqrt, x);
         let root = arena.push_binary(OpKind::Add, s, s);
 
-        let (compact, compact_root) = reachable_subtree(&arena, root);
+        let (source, environment) = Rooted::unmarshal(&arena, &[root]);
+        let (compact, _) = reachable_subtree(&source, &environment);
         assert_eq!(compact.len(), 3, "shared node must be emitted once");
-        match compact.node(compact_root) {
-            ExprNode::Binary(OpKind::Add, a, b) => {
-                assert_eq!(a, b, "both operands must reference the same node");
+        match *compact.entry() {
+            ExprData::Op(OpKind::Add) => {
+                let children: Vec<_> = compact.entry().children().collect();
+                assert_eq!(
+                    children[0], children[1],
+                    "both operands must reference the same node"
+                );
             }
             other => panic!("expected Binary(Add, ..), got {other:?}"),
         }
@@ -967,7 +1097,7 @@ mod tests {
         // round-trip as a small expression. Reading back `arena.len() == 5`
         // is what let a `> N` filter drop 29% of the DEV tier.
         let (arena, root) = arena_with_dead_nodes();
-        let entries = vec![("junky".to_string(), arena.clone(), root)];
+        let entries = vec![entry("junky", arena.clone(), root)];
 
         let tmp = unique_tmp("dead_nodes");
         write_corpus(&tmp, &entries).expect("write");
@@ -975,16 +1105,18 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         assert_eq!(loaded.len(), 1);
-        let (_, loaded_arena, loaded_root) = &loaded[0];
+        let (_, loaded_rooted, _) = &loaded[0];
         assert_eq!(
-            loaded_arena.len(),
+            loaded_rooted.len(),
             3,
-            "stored arena must hold only the reachable subtree, got {} nodes",
-            loaded_arena.len()
+            "stored DAG must hold only the reachable subtree, got {} nodes",
+            loaded_rooted.len()
         );
-        assert_eq!(loaded_arena.node_count_subtree(*loaded_root), 3);
+        assert_eq!(loaded_rooted.entry().node_count(), 3);
         assert!(
-            loaded_arena.subtree_eq(*loaded_root, &arena, root),
+            loaded_rooted
+                .entry()
+                .subtree_eq(Rooted::unmarshal(&arena, &[root]).0.entry()),
             "the round-tripped expression must equal the original"
         );
     }
@@ -1002,7 +1134,8 @@ mod tests {
             height: 8,
         });
         let root = arena.push_buffer(buf);
-        let _ = reachable_subtree(&arena, root);
+        let (rooted, environment) = Rooted::unmarshal(&arena, &[root]);
+        let _ = reachable_subtree(&rooted, &environment);
     }
 
     #[test]
@@ -1014,13 +1147,13 @@ mod tests {
         let x = a1.push_var(0);
         let y = a1.push_var(1);
         let r1 = a1.push_binary(OpKind::Add, x, y);
-        entries.push(("add_xy".to_string(), a1, r1));
+        entries.push(entry("add_xy", a1, r1));
 
         // Entry 2: sqrt(pi)
         let mut a2 = ExprArena::new();
         let c = a2.push_const(std::f32::consts::PI);
         let r2 = a2.push_unary(OpKind::Sqrt, c);
-        entries.push(("sqrt_pi".to_string(), a2, r2));
+        entries.push(entry("sqrt_pi", a2, r2));
 
         let tmp = unique_tmp("multi");
         write_corpus(&tmp, &entries).expect("write");

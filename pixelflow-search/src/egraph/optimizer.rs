@@ -47,12 +47,13 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use pixelflow_ir::ExprGraph;
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape};
 
 use super::cost::CostModel;
 use super::extract::{
     ChoiceCost, Extraction, ExtractionObjective, ExtractionReport, IncrementalExtractor, Reranker,
-    choices_to_arena,
+    choices_to_arena, choices_to_graph,
 };
 use super::graph::{ApplicationMask, EGraph, SaturationStats, SaturationStop};
 use super::guided::GuidedEpisode;
@@ -244,6 +245,12 @@ pub struct Optimized {
 }
 
 impl Optimized {
+    /// Materialise the extracted DAG as an immutable expression graph.
+    #[must_use]
+    pub fn to_graph(&self, egraph: &EGraph, root: EClassId) -> ExprGraph {
+        choices_to_graph(&Extraction::from_dp(egraph, root, self.choices.clone()))
+    }
+
     /// Materialise the extracted DAG as an arena.
     ///
     /// `egraph` and `root` must be the ones [`Optimizer::run`] was given;

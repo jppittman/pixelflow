@@ -1,7 +1,7 @@
 //! `Kernel` — the language's runtime value.
 //!
-//! A `Kernel` is a handle to an expression fragment: an [`ExprArena`] plus its
-//! root. It is the value the front end (the `kernel!` macro) produces and the
+//! A `Kernel` is a handle to an expression fragment: an immutable rooted DAG
+//! plus its declaration environment. It is the value the front end (the `kernel!` macro) produces and the
 //! thing consumers compose — `sum`, `at`, `select`, arithmetic — with the
 //! arena hidden entirely behind the methods. This is the "JIT-first" surface:
 //! programs are built as `Kernel` values (our own AST), type-checked and
@@ -18,9 +18,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity};
 use crate::dag::{Builder, Dag, Node, Rooted};
-use crate::expr::{Environment, ExprBuilderExt, ExprData, copy_subgraph, splice, substitute_vars};
+use crate::declarations::{BufferDecl, BufferIdentity, COORD_AXES, UniformDecl, UniformIdentity};
+use crate::expr::{
+    Environment, ExprBuilderExt, ExprData, ExprGraph, copy_subgraph, splice, substitute_vars,
+};
 use crate::fold::{Binder, Fold, Monoid};
 use crate::kind::OpKind;
 
@@ -206,7 +208,6 @@ pub struct Kernel {
 struct KernelData {
     rooted: Rooted<ExprData>,
     env: Environment,
-    legacy: (ExprArena, ExprId),
     /// Tabulations this kernel carries, by the [`BufferIdentity`] each was
     /// seeded under — the data travelling with the value, so a consumer
     /// never carries a binding beside the kernel that needs it
@@ -248,12 +249,10 @@ impl Kernel {
         env: Environment,
         buffers: BTreeMap<BufferIdentity, Arc<[f32]>>,
     ) -> Self {
-        let legacy = rooted.entry().marshal(&env);
         Self {
             inner: Arc::new(KernelData {
                 rooted,
                 env,
-                legacy,
                 buffers,
             }),
         }
@@ -276,9 +275,28 @@ impl Kernel {
             } else {
                 "W"
             },
-            crate::arena::COORD_AXES,
+            COORD_AXES,
         );
         let env = Environment { buffers, uniforms };
+        Self::wrap(rooted, env, BTreeMap::new())
+    }
+
+    /// Adopt an expression graph built by [`ExprBuilder`](crate::ExprBuilder).
+    #[must_use]
+    pub fn from_graph(graph: ExprGraph) -> Self {
+        let root = graph.root();
+        assert!(
+            root.retired_axis().is_none(),
+            "Kernel::from_graph: the expression names Var({}), which was the {} coordinate; a lattice has {} axes and a per-call scalar is a Uniform",
+            root.retired_axis().unwrap_or_default(),
+            if root.retired_axis() == Some(2) {
+                "Z"
+            } else {
+                "W"
+            },
+            COORD_AXES,
+        );
+        let (rooted, env) = graph.into_parts();
         Self::wrap(rooted, env, BTreeMap::new())
     }
 
@@ -298,6 +316,12 @@ impl Kernel {
     #[must_use]
     pub fn rooted(&self) -> &Rooted<ExprData> {
         &self.inner.rooted
+    }
+
+    /// The declaration environment carried by this kernel.
+    #[must_use]
+    pub fn environment(&self) -> &Environment {
+        &self.inner.env
     }
 
     /// Buffer declarations.
@@ -336,44 +360,6 @@ impl Kernel {
         let mut b = Builder::new();
         let r = b.push_const(v);
         Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
-    }
-
-    /// Adopt an already-built fragment — the `kernel!` macro's entry point.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the arena names a retired coordinate axis (`Var(2)` or
-    /// `Var(3)`, the old Z and W). A lattice has
-    /// [`COORD_AXES`](crate::arena::COORD_AXES) axes; a scalar that is the
-    /// same at every sample is a [`Uniform`], not an axis of extent 1. This
-    /// is where the refusal lives because `Var` is also a reduction binder's
-    /// index and a rewrite rule's metavariable, and a `Kernel` is the one
-    /// thing that becomes machine code.
-    #[must_use]
-    pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
-        let (rooted, env) = Rooted::unmarshal(&arena, &[root]);
-        let entry = rooted.entry();
-        assert!(
-            entry.retired_axis().is_none(),
-            "Kernel::from_parts: the arena names Var({}), which was the {} \
-             coordinate; a lattice has {} axes and a per-call scalar is a \
-             Uniform (docs/plans/2026-09-06-lattice-is-the-index.md)",
-            entry.retired_axis().unwrap_or_default(),
-            if entry.retired_axis() == Some(2) {
-                "Z"
-            } else {
-                "W"
-            },
-            crate::arena::COORD_AXES,
-        );
-        Self {
-            inner: Arc::new(KernelData {
-                rooted,
-                env,
-                legacy: (arena, root),
-                buffers: BTreeMap::new(),
-            }),
-        }
     }
 
     // ───────────────────── the builder seam ───────────────────────
@@ -657,7 +643,7 @@ impl Kernel {
     /// out explicitly to stay O(total nodes).
     ///
     // DEFERRED (shared-store direction): the deeper fix is one hash-consed arena
-    // that all `Kernel`s index by `ExprId`, so composition interns instead of
+    // that all `Kernel`s use rooted DAG handles, so composition interns instead of
     // splicing (copies vanish, structural sharing is automatic). Not taken yet:
     // it changes the `Kernel` representation and wants the same store P7–P9's
     // discrete domains/typed fields will live in — land it there, deliberately,
@@ -827,10 +813,10 @@ impl Kernel {
     #[must_use]
     pub fn dwrt(&self, var: u8) -> Self {
         assert!(
-            (var as usize) < crate::arena::COORD_AXES,
+            (var as usize) < COORD_AXES,
             "Kernel::dwrt: no axis {var}; a lattice has {} \
              (0 = X, 1 = Y)",
-            crate::arena::COORD_AXES
+            COORD_AXES
         );
         let mut b = Builder::new();
         let r = copy_subgraph(&mut b, self.root());
@@ -852,15 +838,6 @@ impl Kernel {
     #[must_use]
     pub fn dy(&self) -> Self {
         self.dwrt(1)
-    }
-
-    // ───────────────────────── back end ───────────────────────────
-
-    /// The underlying fragment — for the lattice bake and inspection. Not part
-    /// of the composition surface; consumers use the methods above.
-    #[must_use]
-    pub fn parts(&self) -> (&ExprArena, ExprId) {
-        (&self.inner.legacy.0, self.inner.legacy.1)
     }
 
     // ────────────────────────── linking ───────────────────────────
@@ -900,8 +877,10 @@ impl Kernel {
     #[cfg(feature = "std")]
     #[must_use]
     pub fn by_ref(&self) -> Self {
-        let (arena, root) = self.parts();
-        let open = arena.free_var_at_or_above(root, PLACEHOLDER_BASE as u8);
+        let open = self.root().descendants().find_map(|node| match *node {
+            ExprData::Var(i) if i >= PLACEHOLDER_BASE as u8 => Some(i),
+            _ => None,
+        });
         assert!(
             open.is_none(),
             "Kernel::by_ref: this kernel holds Var({}), a reduction binder's \
@@ -931,9 +910,7 @@ impl Kernel {
         if !self.dag().iter().any(|n| matches!(*n, ExprData::Ref(_))) {
             return self.clone();
         }
-        let (arena, root) = self.parts();
-        let (expanded, expanded_root) = crate::passes::expand_refs_owned(arena, root);
-        let (rooted, env) = Rooted::unmarshal(&expanded, &[expanded_root]);
+        let (rooted, env) = crate::passes::expand_refs_rooted(&self.inner.rooted, &self.inner.env);
         Self::wrap(rooted, env, self.inner.buffers.clone())
     }
 
@@ -1087,20 +1064,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "which was the Z coordinate")]
     fn an_arena_naming_a_retired_axis_is_not_a_kernel() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let z = a.push_var(2);
-        let root = a.push_binary(OpKind::Add, x, z);
-        let _refused = Kernel::from_parts(a, root);
+        let mut b = crate::ExprBuilder::new();
+        let x = b.var(0);
+        let z = b.var(2);
+        let root = b.binary(OpKind::Add, x, z);
+        let _refused = Kernel::from_graph(b.finish_one(root));
     }
 
     /// And the same for W, so neither index is quietly readmitted.
     #[test]
     #[should_panic(expected = "which was the W coordinate")]
     fn the_fourth_axis_is_refused_too() {
-        let mut a = ExprArena::new();
-        let w = a.push_var(3);
-        let _refused = Kernel::from_parts(a, w);
+        let mut b = crate::ExprBuilder::new();
+        let w = b.var(3);
+        let _refused = Kernel::from_graph(b.finish_one(w));
     }
 
     #[test]

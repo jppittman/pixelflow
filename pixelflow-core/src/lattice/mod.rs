@@ -411,48 +411,48 @@ pub struct BilinearSampler {
 /// `Σ tap(x?, y?) · weight` with `x0 = floor(X)`, `fx = X − x0`, and the
 /// mirrored pair in y. Gather clamps each tap to the buffer edge.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn bilinear_arena(
+fn bilinear_graph(
     id: pixelflow_ir::arena::BufferIdentity,
     width: u32,
     height: u32,
-) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
+) -> pixelflow_ir::ExprGraph {
     use pixelflow_ir::arena::BufferDecl;
-    use pixelflow_ir::{ExprArena, OpKind};
+    use pixelflow_ir::{ExprBuilder, OpKind};
 
-    let mut a = ExprArena::new();
-    let buf = a.declare_buffer(BufferDecl { id, width, height });
-    let x = a.push_var(0);
-    let y = a.push_var(1);
-    let one = a.push_const(1.0);
+    let mut a = ExprBuilder::new();
+    let buf = a.buffer(BufferDecl { id, width, height });
+    let x = a.var(0);
+    let y = a.var(1);
+    let one = a.constant(1.0);
 
-    let x0 = a.push_unary(OpKind::Floor, x);
-    let y0 = a.push_unary(OpKind::Floor, y);
-    let x1 = a.push_binary(OpKind::Add, x0, one);
-    let y1 = a.push_binary(OpKind::Add, y0, one);
-    let fx = a.push_binary(OpKind::Sub, x, x0);
-    let fy = a.push_binary(OpKind::Sub, y, y0);
-    let gx = a.push_binary(OpKind::Sub, one, fx);
-    let gy = a.push_binary(OpKind::Sub, one, fy);
+    let x0 = a.unary(OpKind::Floor, x);
+    let y0 = a.unary(OpKind::Floor, y);
+    let x1 = a.binary(OpKind::Add, x0, one);
+    let y1 = a.binary(OpKind::Add, y0, one);
+    let fx = a.binary(OpKind::Sub, x, x0);
+    let fy = a.binary(OpKind::Sub, y, y0);
+    let gx = a.binary(OpKind::Sub, one, fx);
+    let gy = a.binary(OpKind::Sub, one, fy);
 
-    let c00 = a.push_gather(buf, x0, y0);
-    let c10 = a.push_gather(buf, x1, y0);
-    let c01 = a.push_gather(buf, x0, y1);
-    let c11 = a.push_gather(buf, x1, y1);
+    let c00 = a.ternary(OpKind::Gather, buf, x0, y0);
+    let c10 = a.ternary(OpKind::Gather, buf, x1, y0);
+    let c01 = a.ternary(OpKind::Gather, buf, x0, y1);
+    let c11 = a.ternary(OpKind::Gather, buf, x1, y1);
 
-    let w00 = a.push_binary(OpKind::Mul, gx, gy);
-    let w10 = a.push_binary(OpKind::Mul, fx, gy);
-    let w01 = a.push_binary(OpKind::Mul, gx, fy);
-    let w11 = a.push_binary(OpKind::Mul, fx, fy);
+    let w00 = a.binary(OpKind::Mul, gx, gy);
+    let w10 = a.binary(OpKind::Mul, fx, gy);
+    let w01 = a.binary(OpKind::Mul, gx, fy);
+    let w11 = a.binary(OpKind::Mul, fx, fy);
 
-    let t00 = a.push_binary(OpKind::Mul, c00, w00);
-    let t10 = a.push_binary(OpKind::Mul, c10, w10);
-    let t01 = a.push_binary(OpKind::Mul, c01, w01);
-    let t11 = a.push_binary(OpKind::Mul, c11, w11);
+    let t00 = a.binary(OpKind::Mul, c00, w00);
+    let t10 = a.binary(OpKind::Mul, c10, w10);
+    let t01 = a.binary(OpKind::Mul, c01, w01);
+    let t11 = a.binary(OpKind::Mul, c11, w11);
 
-    let s0 = a.push_binary(OpKind::Add, t00, t10);
-    let s1 = a.push_binary(OpKind::Add, s0, t01);
-    let root = a.push_binary(OpKind::Add, s1, t11);
-    (a, root)
+    let s0 = a.binary(OpKind::Add, t00, t10);
+    let s1 = a.binary(OpKind::Add, s0, t01);
+    let root = a.binary(OpKind::Add, s1, t11);
+    a.finish_one(root)
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -487,8 +487,9 @@ impl BilinearSampler {
             width > 0 && height > 0,
             "BilinearSampler::kernel_for: empty buffer ({width}x{height})"
         );
-        let (arena, root) = bilinear_arena(id, width, height);
-        pixelflow_ir::Kernel::from_parts(arena, root)
+        let graph = bilinear_graph(id, width, height);
+        let (rooted, env) = graph.into_parts();
+        pixelflow_ir::Kernel::from_rooted(rooted, env.buffers, env.uniforms)
     }
 
     /// This sampler's blend as a composable fragment, its own texture
@@ -537,11 +538,13 @@ impl DiscreteManifold {
             width > 0 && height > 0,
             "DiscreteManifold::kernel_for: empty buffer ({width}x{height})"
         );
-        let mut a = pixelflow_ir::ExprArena::new();
-        let buf = a.declare_buffer(pixelflow_ir::arena::BufferDecl { id, width, height });
-        let (x, y) = (a.push_var(0), a.push_var(1));
-        let root = a.push_gather(buf, x, y);
-        pixelflow_ir::Kernel::from_parts(a, root)
+        let mut a = pixelflow_ir::ExprBuilder::new();
+        let buf = a.buffer(pixelflow_ir::arena::BufferDecl { id, width, height });
+        let (x, y) = (a.var(0), a.var(1));
+        let root = a.ternary(pixelflow_ir::OpKind::Gather, buf, x, y);
+        let graph = a.finish_one(root);
+        let (rooted, env) = graph.into_parts();
+        pixelflow_ir::Kernel::from_rooted(rooted, env.buffers, env.uniforms)
     }
 
     /// This buffer paired with the identity [`Self::kernel`] declared, ready

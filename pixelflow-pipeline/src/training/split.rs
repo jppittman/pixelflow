@@ -21,7 +21,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::{ExprData, Rooted};
 
 use super::structural::FenceKey;
 
@@ -789,9 +789,9 @@ impl<T: HoldoutSide> Fence<T> {
 
         let mut keys = HashSet::with_capacity(entries.len());
         let mut node_counts = Vec::with_capacity(entries.len());
-        for (_name, arena, root) in &entries {
-            keys.insert(FenceKey::of(arena, *root));
-            node_counts.push(arena.node_count_subtree(*root));
+        for (_name, rooted, _environment) in &entries {
+            keys.insert(FenceKey::of_dag(rooted.entry()));
+            node_counts.push(rooted.entry().node_count());
         }
         Self {
             keys,
@@ -841,10 +841,9 @@ impl<T: HoldoutSide> Fence<T> {
 pub fn blocked_by_either(
     dev: &Fence<DevSide>,
     final_fence: &Fence<FinalSide>,
-    arena: &ExprArena,
-    root: ExprId,
+    rooted: &Rooted<ExprData>,
 ) -> bool {
-    let key = FenceKey::of(arena, root);
+    let key = FenceKey::of_dag(rooted.entry());
     dev.contains(&key) || final_fence.contains(&key)
 }
 
@@ -853,6 +852,7 @@ pub fn blocked_by_either(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::training::corpus::CorpusEntry;
     use pixelflow_ir::OpKind;
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
@@ -866,19 +866,26 @@ mod tests {
         dir
     }
 
-    fn scaled_var(k: f32) -> (ExprArena, ExprId) {
-        let mut arena = ExprArena::new();
+    fn scaled_var(k: f32) -> CorpusEntry {
+        let mut arena = pixelflow_ir::ExprArena::new();
         let x = arena.push_var(0);
         let c = arena.push_const(k);
         let root = arena.push_binary(OpKind::Mul, x, c);
-        (arena, root)
+        let (rooted, environment) = Rooted::unmarshal(&arena, &[root]);
+        (format!("scaled_{k}"), rooted, environment)
     }
 
-    fn write_tier(dir: &Path, tier: Tier, exprs: &[(ExprArena, ExprId)]) {
-        let entries: Vec<(String, ExprArena, ExprId)> = exprs
+    fn write_tier(dir: &Path, tier: Tier, exprs: &[CorpusEntry]) {
+        let entries: Vec<CorpusEntry> = exprs
             .iter()
             .enumerate()
-            .map(|(i, (a, r))| (format!("{}_{i}", tier.name()), a.clone(), *r))
+            .map(|(i, (_name, rooted, environment))| {
+                (
+                    format!("{}_{i}", tier.name()),
+                    rooted.clone(),
+                    environment.clone(),
+                )
+            })
             .collect();
         super::super::corpus::write_corpus(
             &dir.join(format!("corpus_{}.bin", tier.name())),
@@ -899,9 +906,9 @@ mod tests {
         let dev = Fence::<DevSide>::build(&dir);
         let final_fence = Fence::<FinalSide>::build(&dir);
 
-        let (candidate, root) = scaled_var(3.0);
+        let (_, candidate, _) = scaled_var(3.0);
         assert!(
-            blocked_by_either(&dev, &final_fence, &candidate, root),
+            blocked_by_either(&dev, &final_fence, &candidate),
             "X * 3.0 must be fenced out by a DEV entry of X * 2.0 — both are the identical \
              input to the extraction head"
         );
@@ -918,12 +925,13 @@ mod tests {
         let dev = Fence::<DevSide>::build(&dir);
         let final_fence = Fence::<FinalSide>::build(&dir);
 
-        let mut arena = ExprArena::new();
+        let mut arena = pixelflow_ir::ExprArena::new();
         let x = arena.push_var(0);
         let c = arena.push_const(2.0);
         let add = arena.push_binary(OpKind::Add, x, c);
+        let (rooted, _) = Rooted::unmarshal(&arena, &[add]);
         assert!(
-            !blocked_by_either(&dev, &final_fence, &arena, add),
+            !blocked_by_either(&dev, &final_fence, &rooted),
             "X + 2.0 is a different op from the fenced X * 2.0 and must survive"
         );
 

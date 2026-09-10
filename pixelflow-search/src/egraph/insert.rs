@@ -10,6 +10,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use pixelflow_ir::{Children, Ir, Shape};
+use pixelflow_ir::{ExprData, ExprGraph, Node};
 
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
@@ -181,6 +182,119 @@ pub fn reachable_count<I: Ir>(term: &I, root: I::Ref) -> usize {
             Shape::Reduce { body, .. } => stack.push(body),
             _ => {}
         }
+    }
+    seen.len()
+}
+
+/// Insert an immutable expression graph without exposing its storage layout.
+///
+/// This is the graph-native counterpart to [`insert`].  Handles are borrowed
+/// nodes from the finished DAG, so the e-graph never needs to know how the
+/// expression is stored or how declarations are slotted.
+pub fn insert_graph(
+    graph: &ExprGraph,
+    egraph: &mut EGraph,
+    vocab: Vocabulary,
+) -> Result<EClassId, Declined> {
+    enum Task<'a> {
+        Visit(Node<'a, ExprData>),
+        Complete(Node<'a, ExprData>),
+    }
+
+    let mut memo = BTreeMap::new();
+    let root = graph.root();
+    let mut tasks = vec![Task::Visit(root)];
+    let mut built = Vec::new();
+    let env = graph.environment();
+
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Visit(node) => {
+                if let Some(&class) = memo.get(&node) {
+                    built.push(class);
+                    continue;
+                }
+                let class = match *node {
+                    ExprData::Var(i) => egraph.add(ENode::Var(i)),
+                    ExprData::Const(bits) => egraph.add(ENode::Const(bits)),
+                    ExprData::Param(i) => match vocab {
+                        Vocabulary::Templates => egraph.add(ENode::Param(i)),
+                        Vocabulary::Runtime => return Err(Declined::Param(i)),
+                    },
+                    ExprData::Buffer(id) => {
+                        let decl = *env.buffers.get(id.0 as usize).unwrap_or_else(|| {
+                            panic!("insert_graph: invalid buffer slot {}", id.0)
+                        });
+                        egraph.add(ENode::Buffer(decl))
+                    }
+                    ExprData::Uniform(id) => {
+                        let decl = *env.uniforms.get(id.0 as usize).unwrap_or_else(|| {
+                            panic!("insert_graph: invalid uniform slot {}", id.0)
+                        });
+                        egraph.add(ENode::Uniform(decl))
+                    }
+                    ExprData::Ref(key) => return Err(Declined::Ref(key)),
+                    ExprData::Op(kind) => {
+                        if vocab.resolve(kind).is_none() {
+                            return Err(Declined::Op(kind));
+                        }
+                        tasks.push(Task::Complete(node));
+                        for child in node.children().rev() {
+                            tasks.push(Task::Visit(child));
+                        }
+                        continue;
+                    }
+                    ExprData::Reduce { .. } => {
+                        tasks.push(Task::Complete(node));
+                        let body = node
+                            .children()
+                            .next()
+                            .expect("insert_graph: reduce missing body");
+                        tasks.push(Task::Visit(body));
+                        continue;
+                    }
+                };
+                memo.insert(node, class);
+                built.push(class);
+            }
+            Task::Complete(node) => {
+                let class = match *node {
+                    ExprData::Op(kind) => {
+                        let op = vocab.resolve(kind).expect("op checked during Visit");
+                        let children: Vec<EClassId> = node
+                            .children()
+                            .map(|child| *memo.get(&child).expect("insert_graph child not built"))
+                            .collect();
+                        egraph.add(ENode::Op { op, children })
+                    }
+                    ExprData::Reduce(fold) => {
+                        let body = node
+                            .children()
+                            .next()
+                            .and_then(|child| memo.get(&child).copied())
+                            .expect("insert_graph reduce body not built");
+                        egraph.add(ENode::Reduce { fold, body })
+                    }
+                    _ => unreachable!("insert_graph complete task for leaf"),
+                };
+                memo.insert(node, class);
+                built.push(class);
+            }
+        }
+    }
+    Ok(built.pop().expect("insert_graph: root produced no e-class"))
+}
+
+/// Count nodes reachable from the graph's single root.
+#[must_use]
+pub fn reachable_count_graph(graph: &ExprGraph) -> usize {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![graph.root()];
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        stack.extend(node.children());
     }
     seen.len()
 }

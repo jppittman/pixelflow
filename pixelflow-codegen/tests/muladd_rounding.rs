@@ -22,10 +22,10 @@
 #![cfg(target_arch = "x86_64")]
 
 use pixelflow_codegen::emit::executable::{Point4, TileSlice};
-use pixelflow_codegen::emit::{EmitCtx, compile};
+use pixelflow_codegen::emit::{EmitCtx, compile_dag};
 use pixelflow_codegen::{CompiledKernel, JIT_VECTOR_BYTES};
+use pixelflow_ir::ExprBuilder;
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 
 /// Lanes in one emitted batch.
 const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
@@ -53,9 +53,8 @@ fn eval_point(jit: &CompiledKernel, x: f32, y: f32, block: &[f32]) -> f32 {
 }
 
 /// Declare an argument in `a` and return its leaf.
-fn arg_leaf(a: &mut ExprArena) -> ExprId {
-    let slot = a.declare_uniform(pixelflow_ir::Uniform::new(0.0).decl());
-    a.push_uniform(slot)
+fn arg_leaf(a: &mut ExprBuilder) -> pixelflow_ir::ExprHandle {
+    a.uniform(pixelflow_ir::Uniform::new(0.0).decl())
 }
 
 // ── The two rounding forms, as scalar references ─────────────────────────────
@@ -130,13 +129,14 @@ fn the_reference_forms_disagree_on_these_inputs() {
 /// all SSE2 has.
 #[test]
 fn an_unspilled_muladd_rounds_the_way_this_target_does() {
-    let mut a = ExprArena::new();
-    let x = a.push_var(0);
-    let y = a.push_var(1);
+    let mut a = ExprBuilder::new();
+    let x = a.var(0);
+    let y = a.var(1);
     let z = arg_leaf(&mut a);
-    let root = a.push_ternary(OpKind::MulAdd, x, y, z);
+    let root = a.ternary(OpKind::MulAdd, x, y, z);
+    let graph = a.finish_one(root);
 
-    let result = compile(&a, root).expect("compile MulAdd(X, Y, U)");
+    let result = compile_dag(graph.root(), graph.environment()).expect("compile MulAdd(X, Y, U)");
     assert_eq!(result.spill_count, 0, "this scenario must not spill");
     let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
     let got = eval_point(&jit, A, B, &[C]);
@@ -181,15 +181,15 @@ fn an_unspilled_muladd_rounds_the_way_this_target_does() {
 /// register.
 #[test]
 fn a_spilled_muladd_rounds_twice_on_every_target() {
-    let mut a = ExprArena::new();
-    let x = a.push_var(0);
-    let y = a.push_var(1);
+    let mut a = ExprBuilder::new();
+    let x = a.var(0);
+    let y = a.var(1);
     let z = arg_leaf(&mut a);
     // The multiplicands, defined first and consumed last, so they hold the
     // longest live ranges in the schedule — which is what makes them Belady's
     // first two eviction choices once the wall fills the pool.
-    let ma = a.push_binary(OpKind::Add, x, x);
-    let mb = a.push_binary(OpKind::Add, y, y);
+    let ma = a.binary(OpKind::Add, x, x);
+    let mb = a.binary(OpKind::Add, y, y);
 
     // The wall. One spilled multiplicand is not enough — `resolve_operands`
     // only decomposes when *both* are out of registers — so something has to
@@ -206,11 +206,11 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     // the folder can see. Each term still depends on X, so none is
     // loop-invariant and hoistable out of a collapse body.
     let w = arg_leaf(&mut a);
-    let wall: Vec<ExprId> = (1..=10u32)
+    let wall = (1..=10u32)
         .map(|i| {
-            let c = a.push_const(i as f32);
-            let xi = a.push_binary(OpKind::Add, x, c);
-            a.push_binary(OpKind::Mul, xi, w)
+            let c = a.constant(i as f32);
+            let xi = a.binary(OpKind::Add, x, c);
+            a.binary(OpKind::Mul, xi, w)
         })
         .collect();
 
@@ -220,12 +220,13 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     let wall_sum = wall
         .iter()
         .skip(1)
-        .fold(wall[0], |acc, &w| a.push_binary(OpKind::Add, acc, w));
-    let addend = a.push_binary(OpKind::Add, z, wall_sum);
-    let root = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
+        .fold(wall[0], |acc, &w| a.binary(OpKind::Add, acc, w));
+    let addend = a.binary(OpKind::Add, z, wall_sum);
+    let root = a.ternary(OpKind::MulAdd, ma, mb, addend);
+    let graph = a.finish_one(root);
 
     let result = EmitCtx::with_max_regs(1)
-        .compile(&a, root)
+        .compile_dag(graph.root(), graph.environment())
         .expect("compile spilled MulAdd");
     assert!(
         result.spill_count > 0,

@@ -11,7 +11,8 @@ the compiled kernel (`×255`, clamp, truncate, shift, or, all of it IR). The byt
 from the frame's own pixel format (`Pixel::packed_shifts`), so the format a kernel packs for
 is the format the frame stores, by construction.
 
-Consumers should not manipulate `ExprArena` directly.
+Consumers should use the rooted DAG and `Kernel` APIs; expression storage is
+encapsulated by `pixelflow-ir`.
 
 ## Pipeline
 

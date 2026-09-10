@@ -34,8 +34,7 @@
 //! ratchet, done deliberately.
 
 use pixelflow_graphics::fonts::Font;
-use pixelflow_ir::arena::{ExprArena, ExprId};
-use pixelflow_ir::LatticeShape;
+use pixelflow_ir::{Environment, LatticeShape};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -61,18 +60,8 @@ const SPREAD: [char; 3] = ['A', 'O', '8'];
 /// count. Ten pieces and forty are the same program over a different table.
 const EGRAPH_INPUT_CEILING: usize = 3200;
 
-fn reachable(arena: &ExprArena, root: ExprId) -> usize {
-    let mut seen = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut n = 0;
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        n += 1;
-        stack.extend(arena.children(id));
-    }
-    n
+fn reachable(root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>) -> usize {
+    root.node_count()
 }
 
 #[test]
@@ -86,17 +75,23 @@ fn a_glyph_costs_no_more_than_it_did() {
             .glyph_kernel_scaled(ch, px as f32)
             .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
         let coverage = glyph.kernel();
-        let (arena, root) = coverage.parts();
+        let env = Environment {
+            buffers: coverage.buffers().to_vec(),
+            uniforms: coverage.uniforms().to_vec(),
+        };
         let shape = LatticeShape::new([px as u32, px as u32]);
 
         // The whole tier, as production runs it: link, legalize, saturate.
         // `None` is not a pass — it means the pipeline declined, and the
         // caller would then compile an arena that still holds a fold, which
         // the emitter has no instruction for.
-        let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape)
-            .unwrap_or_else(|| panic!("{ch}@{px}: the runtime pipeline declined"));
-        let (out, out_root) = &*optimized;
-        let nodes = reachable(out, *out_root);
+        let optimized = pixelflow_search::runtime::optimize_runtime_dag(
+            coverage.rooted(),
+            &env,
+            shape,
+        )
+        .unwrap_or_else(|| panic!("{ch}@{px}: the runtime pipeline declined"));
+        let nodes = reachable(optimized.0.entry());
 
         report.push_str(&format!("  {ch}@{px}: {nodes} nodes (ceiling {ceiling})\n"));
         if nodes > ceiling {
@@ -140,12 +135,15 @@ fn the_egraph_is_fed_a_program_it_can_reason_about() {
             .glyph_kernel_scaled(ch, 16.0)
             .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
         let kernel = glyph.kernel();
-        let (arena, root) = kernel.parts();
+        let env = Environment {
+            buffers: kernel.buffers().to_vec(),
+            uniforms: kernel.uniforms().to_vec(),
+        };
         // `ExpandRefs` is the pipeline's one step before `Saturate`: a `Ref`
         // has no structure for the e-graph to read, so it is resolved first.
         // Everything after it is saturation's input.
-        let (linked, lroot) = pixelflow_ir::passes::expand_refs_owned(arena, root);
-        sizes.push((ch, reachable(&linked, lroot)));
+        let (linked, _) = pixelflow_ir::passes::expand_refs_rooted(kernel.rooted(), &env);
+        sizes.push((ch, reachable(linked.entry())));
     }
 
     let report: String = sizes

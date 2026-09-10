@@ -37,13 +37,20 @@ pub mod dyadic;
 pub mod fold;
 pub use fold::{Binder, Fold, Monoid};
 
+#[doc(hidden)]
+pub mod arena;
+#[doc(hidden)]
+pub use arena::{ExprArena, ExprId, ExprNode};
+pub mod declarations;
 pub mod kind;
 pub mod traits;
 pub mod variance;
 
 pub use variance::{LatticeShape, Variance, compute_dag_variance};
 
-pub mod arena;
+pub use declarations::{
+    BufferDecl, BufferId, BufferIdentity, UniformDecl, UniformId, UniformIdentity,
+};
 
 /// What it means for two kernels to be the same kernel: the canonical form of
 /// a reachable subgraph, and the fixed-size [`KernelKey`] that digests it.
@@ -89,19 +96,19 @@ pub use dag::{Dag, Node, Rooted, Scratch, SideTable};
 
 pub mod expr;
 pub use expr::{
-    Environment, ExprData, compute_dag_depth, depth, has_degenerate, has_var, node_count_subtree,
-    retired_axis, subtree_eq,
+    Environment, ExprBuilder, ExprData, ExprGraph, ExprHandle, compute_dag_depth, depth,
+    has_degenerate, has_var, node_count_subtree, retired_axis, subtree_eq,
 };
 
 /// IR-to-IR transforms: each takes an expression graph and returns another.
 /// Target-blind by construction — nothing here knows which ISA it is feeding.
 pub mod passes;
-pub use arena::{ExprArena, ExprId, ExprNode};
 
 /// The term language the e-graph speaks: destructure a node, rebuild a node.
 /// Naming it is what makes an optimizer expressible as an endomorphism on the
 /// IR rather than as a hand-rolled conversion per tier.
 pub mod term;
+#[doc(hidden)]
 mod term_arena;
 pub use term::{Children, Ir, Shape};
 

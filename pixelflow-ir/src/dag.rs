@@ -60,7 +60,10 @@ use core::ops::Deref;
 /// underlying index — printing an `Id` learns nothing that could be turned
 /// back into one or compared against another builder's.
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub(crate) struct Id(u32);
+pub(crate) struct Id {
+    owner: u32,
+    ix: u32,
+}
 
 impl fmt::Debug for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,15 +163,22 @@ impl<T> Dag<T> {
         let edge_start = self.edges.len() as u32;
         let here = self.nodes.len() as u32;
         for c in children {
-            assert!(c.0 < here, "child does not exist yet in this builder");
-            self.edges.push(c.0);
+            assert_eq!(
+                c.owner, self.identity.0,
+                "child belongs to another DAG builder"
+            );
+            assert!(c.ix < here, "child does not exist yet in this builder");
+            self.edges.push(c.ix);
         }
         self.nodes.push(Slot {
             value,
             edge_start,
             edge_len: children.len() as u32,
         });
-        Id(here)
+        Id {
+            owner: self.identity.0,
+            ix: here,
+        }
     }
 
     #[must_use]
@@ -424,12 +434,15 @@ impl<T: Key> Builder<T> {
     }
 
     pub(crate) fn intern(&mut self, value: T, children: &[Id]) -> Id {
-        let key = (value, children.iter().map(|c| c.0).collect::<Vec<_>>());
+        let key = (value, children.iter().map(|c| c.ix).collect::<Vec<_>>());
         if let Some(&ix) = self.memo.get(&key) {
-            return Id(ix);
+            return Id {
+                owner: self.dag.identity.0,
+                ix,
+            };
         }
         let id = self.dag.push(key.0.clone(), children);
-        self.memo.insert(key, id.0);
+        self.memo.insert(key, id.ix);
         id
     }
 
@@ -448,8 +461,12 @@ impl<T: Key> Builder<T> {
         let entries = entries
             .iter()
             .map(|e| {
-                assert!(e.0 < n, "entry point from a foreign builder");
-                e.0
+                assert_eq!(
+                    e.owner, self.dag.identity.0,
+                    "entry point from a foreign builder"
+                );
+                assert!(e.ix < n, "entry point from a builder that is not finished");
+                e.ix
             })
             .collect();
         Rooted {

@@ -32,12 +32,12 @@
 
 use crate::egraph::{EClassId, EGraph, ENode, Optimizer};
 use crate::saturate_pass::Saturate;
-use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode};
 use pixelflow_ir::optimize::{Identity, Optimize};
 use pixelflow_ir::passes::{ExpandReduce, ExpandRefs, LowerDwrt};
 use pixelflow_ir::pipeline;
+use pixelflow_ir::{Environment, ExprData, LatticeShape, Rooted};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -147,11 +147,45 @@ pub fn optimize_runtime_arena(
         .clone()
 }
 
+/// Optimize a runtime-built expression DAG via bounded e-graph saturation.
+///
+/// This is the DAG-facing entry point for the runtime tier.  The e-graph
+/// implementation is still being migrated from the legacy arena term
+/// representation, so the compatibility conversion is deliberately confined
+/// to this function: callers hand us a rooted DAG and its environment, and
+/// receive the same representation back.  No caller needs to know the arena
+/// layout or carry an arena-local root id.
+///
+/// `None` means that the optimizer declined to rewrite the term.  In that
+/// case the caller keeps its original rooted DAG unchanged, exactly as with
+/// [`optimize_runtime_arena`].
+#[must_use]
+pub fn optimize_runtime_dag(
+    rooted: &Rooted<ExprData>,
+    environment: &Environment,
+    shape: LatticeShape,
+) -> Option<Arc<(Rooted<ExprData>, Environment)>> {
+    let (arena, root) = rooted.entry().marshal(environment);
+    optimize_runtime_arena(&arena, root, shape).map(|optimized| {
+        let (optimized_root, optimized_environment) =
+            Rooted::unmarshal(&optimized.0, &[optimized.1]);
+        Arc::new((optimized_root, optimized_environment))
+    })
+}
+
 fn optimize_runtime_arena_uncached(
     arena: &ExprArena,
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<(ExprArena, ExprId)> {
+    let (rooted, environment) = Rooted::unmarshal(arena, &[root]);
+    let graph = pixelflow_ir::ExprGraph::new(rooted, environment);
+    let materialize = |optimized: Option<pixelflow_ir::ExprGraph>| {
+        optimized.map(|graph| {
+            let (rooted, environment) = graph.into_parts();
+            rooted.entry().marshal(&environment)
+        })
+    };
     // The tier's pipeline, as a composition rather than three hand-sequenced
     // calls. The order is load-bearing and is now the expression itself:
     //
@@ -189,23 +223,24 @@ fn optimize_runtime_arena_uncached(
     // unchanged, unoptimized but correct — and legalizes it itself, since
     // `Manifold::compile` runs `passes::legalize` regardless of whether this
     // function returned anything.
-    match saturation_switch() {
+    let optimized = match saturation_switch() {
         SaturationSwitch::On => pipeline![
             ExpandRefs,
             Saturate::runtime(shape),
             LowerDwrt,
             ExpandReduce
         ]
-        .optimize(arena, root)
+        .optimize(&graph)
         .into_changed(),
         // The `Identity` path: the same legalizing tail, no saturation.
         // What `Lattice::bake` would emit if the e-graph did not exist —
         // the "F" column of docs/plans/2026-09-06-egraph-at-production-scale.md
         // §7, measured by docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
         SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandReduce]
-            .optimize(arena, root)
+            .optimize(&graph)
             .into_changed(),
-    }
+    };
+    materialize(optimized)
 }
 
 /// Whether the runtime tier saturates at all.
@@ -402,6 +437,21 @@ mod tests {
     }
 
     #[test]
+    fn dag_entry_point_round_trips_the_optimized_root() {
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let one = arena.push_const(1.0);
+        let root = arena.push_binary(OpKind::Add, x, one);
+        let (rooted, environment) = Rooted::unmarshal(&arena, &[root]);
+
+        let optimized = optimize_runtime_dag(&rooted, &environment, LatticeShape::POINT)
+            .expect("representable DAG must optimize");
+        assert_eq!(optimized.0.entry().get().as_f32(), None);
+        assert_eq!(optimized.0.entry().child_count(), 2);
+        assert_eq!(optimized.1, environment);
+    }
+
+    #[test]
     fn repeated_bake_of_the_same_kernel_hits_the_cache() {
         // The exact regression this cache exists to close: Lattice::bake
         // calls optimize_runtime_arena on EVERY bake of a Kernel, but real
@@ -514,7 +564,11 @@ mod tests {
                     .1
             })
             .collect();
-        BindingTable::bind(arena, &slices).expect("bind_by_identity")
+        let environment = Environment {
+            buffers: arena.buffers().to_vec(),
+            uniforms: arena.uniforms().to_vec(),
+        };
+        BindingTable::bind(&environment, &slices).expect("bind_by_identity")
     }
 
     /// Slot order is the binding ABI: the JIT loads slot i's base pointer

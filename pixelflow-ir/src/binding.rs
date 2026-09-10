@@ -1,6 +1,6 @@
 //! Binding bound-memory buffers to their declared slots for execution.
 //!
-//! An [`ExprArena`] declares buffers by *shape* ([`BufferDecl`]) via a
+//! An expression [`Environment`] declares buffers by *shape* ([`BufferDecl`]) via a
 //! [`BufferId`]. Before a kernel that contains `Gather` nodes can run, each
 //! slot must be bound to actual contents. This module provides the binding
 //! used by the reference interpreter ([`crate::eval`]); the JIT path will
@@ -9,7 +9,8 @@
 //! Bindings here *borrow* their contents: a [`BindingTable`] is valid for the
 //! duration of one evaluation, not the lifetime of a compiled kernel.
 
-use crate::arena::{BufferId, ExprArena, UniformId, UniformIdentity};
+use crate::arena::{BufferId, UniformId, UniformIdentity};
+use crate::expr::Environment;
 use alloc::vec::Vec;
 
 /// Why binding a buffer table failed. Binding fails loud rather than reading
@@ -42,7 +43,7 @@ impl core::fmt::Display for BindError {
         match self {
             BindError::Count { declared, supplied } => write!(
                 f,
-                "binding count mismatch: arena declares {declared} buffer(s), {supplied} supplied"
+                "binding count mismatch: graph declares {declared} buffer(s), {supplied} supplied"
             ),
             BindError::Length {
                 slot,
@@ -57,7 +58,7 @@ impl core::fmt::Display for BindError {
     }
 }
 
-/// Borrowed contents for every buffer an [`ExprArena`] declares, indexed by
+/// Borrowed contents for every buffer an [`Environment`] declares, indexed by
 /// [`BufferId`]. Row-major, `stride == width`, matching `BufferDecl`.
 ///
 /// Also the values of the arena's uniforms — the oracle's block. They are
@@ -86,10 +87,10 @@ impl<'a> BindingTable<'a> {
     /// declare — a composition mistake, and the pixels would be plausible.
     pub fn bind_uniforms(
         mut self,
-        arena: &ExprArena,
+        env: &Environment,
         values: &[(UniformIdentity, f32)],
     ) -> Result<Self, BindError> {
-        let decls = arena.uniforms();
+        let decls = &env.uniforms;
         if self.uniforms.len() != decls.len() {
             self.uniforms = decls.iter().map(|d| d.default).collect();
         }
@@ -110,7 +111,7 @@ impl<'a> BindingTable<'a> {
         self.uniforms.get(id.0 as usize).copied()
     }
 
-    /// Bind `slices` to the arena's buffer slots, in [`BufferId`] order.
+    /// Bind `slices` to the graph's buffer slots, in [`BufferId`] order.
     ///
     /// Validates that the count and every length match the declarations, so a
     /// later `Gather` can index without bounds surprises.
@@ -118,9 +119,9 @@ impl<'a> BindingTable<'a> {
     /// # Errors
     ///
     /// Returns [`BindError`] if the count or any length disagrees with the
-    /// arena's [`BufferDecl`]s.
-    pub fn bind(arena: &ExprArena, slices: &[&'a [f32]]) -> Result<Self, BindError> {
-        let decls = arena.buffers();
+    /// graph's [`BufferDecl`]s.
+    pub fn bind(env: &Environment, slices: &[&'a [f32]]) -> Result<Self, BindError> {
+        let decls = &env.buffers;
         if decls.len() != slices.len() {
             return Err(BindError::Count {
                 declared: decls.len(),

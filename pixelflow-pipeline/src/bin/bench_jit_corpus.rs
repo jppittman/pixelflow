@@ -27,13 +27,14 @@ use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 use clap::Parser;
+use pixelflow_ir::ExprGraph;
 use serde::Serialize;
 
 use pixelflow_pipeline::jit_bench::{
     BenchError, BenchMode, BenchPosition, BenchResult, BenchSession, CostLabel,
 };
 use pixelflow_pipeline::training::corpus;
-use pixelflow_pipeline::training::factored::arena_to_kernel_code;
+use pixelflow_pipeline::training::factored::graph_to_kernel_code;
 
 /// Censoring alarm threshold (audit M2): a run excluding more than this
 /// fraction of its corpus is minting a biased label set and must not be
@@ -184,9 +185,10 @@ fn main() {
     let mut excluded = 0usize;
     let total_start = Instant::now();
 
-    for (position, (name, arena, root)) in entries.iter().enumerate() {
-        let expression = arena_to_kernel_code(arena, *root);
-        match session.benchmark_arena_both(arena, *root) {
+    for (position, (name, rooted, environment)) in entries.iter().enumerate() {
+        let graph = ExprGraph::new(rooted.clone(), environment.clone());
+        let expression = graph_to_kernel_code(&graph);
+        match session.benchmark_graph_both(&graph) {
             Ok((throughput, latency)) => {
                 // Both modes were measured for the same expression at the
                 // same point in the (unshuffled, stored-order) corpus walk,

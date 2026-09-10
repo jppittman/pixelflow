@@ -13,11 +13,11 @@
 //!     ▼ Semantic Analysis (sema.rs)
 //! Analyzed AST + Symbol Table
 //!     │
-//!     ▼ Arena lowering (lower.rs)
-//! ExprArena
+//!     ▼ DAG lowering (lower.rs)
+//! ExprGraph
 //!     │
 //!     ▼ `impl Optimize`  — `kernel!` saturates, `kernel_raw!` is `Identity`
-//! ExprArena
+//! ExprGraph
 //!     │
 //!     ▼ Emission (emit.rs)
 //! Rust TokenStream that rebuilds a `Kernel` at load time
@@ -57,8 +57,8 @@ mod sema;
 mod symbol;
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 use pixelflow_ir::optimize::{Identity, Optimize, Rewritten};
+use pixelflow_ir::{ExprData, ExprGraph};
 use pixelflow_search::Saturate;
 use proc_macro::TokenStream;
 
@@ -118,18 +118,18 @@ use proc_macro::TokenStream;
 ///
 /// 1. **Parser**: closure syntax → AST
 /// 2. **Semantic analysis**: symbol resolution, method validation
-/// 3. **Arena lowering**: the AST becomes an `ExprArena`
+/// 3. **DAG lowering**: the AST becomes an owned `ExprGraph`
 /// 4. **Optimization**: e-graph saturation + latency-prior extraction, on
-///    the arena. A kernel carrying a `Dwrt` declines here and is optimized
+///    the graph. A kernel carrying a `Dwrt` declines here and is optimized
 ///    at bake time instead, so composition still gets the chain rule.
-/// 5. **Emission**: the arena becomes code that rebuilds it at load time
+/// 5. **Emission**: the graph becomes code that rebuilds it at load time
 #[proc_macro]
 pub fn kernel(input: TokenStream) -> TokenStream {
     expand(input, &mut macro_tier())
 }
 
 /// The `kernel_raw!` macro: like [`kernel!`](macro@kernel) but **without**
-/// e-graph optimization, so the emitted arena has the shape that was written.
+/// e-graph optimization, so the emitted graph has the shape that was written.
 ///
 /// # Use Cases
 ///
@@ -184,14 +184,15 @@ fn macro_tier() -> impl Optimize {
 struct DwrtFree<P>(P);
 
 impl<P: Optimize> Optimize for DwrtFree<P> {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        let carries_dwrt = arena
-            .nodes()
-            .any(|n| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)));
+    fn optimize(&mut self, graph: &ExprGraph) -> Rewritten {
+        let carries_dwrt = graph
+            .root()
+            .descendants()
+            .any(|n| matches!(*n, ExprData::Op(OpKind::Dwrt)) && n.child_count() == 2);
         if carries_dwrt {
             return Rewritten::Declined;
         }
-        self.0.optimize(arena, root)
+        self.0.optimize(graph)
     }
 }
 

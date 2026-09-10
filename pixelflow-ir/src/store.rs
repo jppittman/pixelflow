@@ -74,8 +74,11 @@ impl KernelStore {
     /// to the other.
     #[must_use]
     pub fn intern(kernel: &Kernel) -> KernelKey {
-        let (arena, root) = kernel.parts();
-        let form = canonical(arena, root);
+        let env = crate::Environment {
+            buffers: kernel.buffers().to_vec(),
+            uniforms: kernel.uniforms().to_vec(),
+        };
+        let form = canonical(kernel.root(), &env);
         let key = KernelKey::of_canonical(&form);
         intern_with(key, form, kernel)
     }
@@ -150,9 +153,18 @@ mod tests {
         assert_eq!(KernelStore::intern(&twin), first);
 
         let got = KernelStore::resolve(first).expect("interned kernels resolve");
-        let (want_arena, want_root) = k.parts();
-        let (got_arena, got_root) = got.parts();
-        assert!(got_arena.subtree_eq(got_root, want_arena, want_root));
+        let want_env = crate::Environment {
+            buffers: k.buffers().to_vec(),
+            uniforms: k.uniforms().to_vec(),
+        };
+        let got_env = crate::Environment {
+            buffers: got.buffers().to_vec(),
+            uniforms: got.uniforms().to_vec(),
+        };
+        assert_eq!(
+            canonical(got.root(), &got_env),
+            canonical(k.root(), &want_env)
+        );
     }
 
     #[test]
@@ -176,10 +188,16 @@ mod tests {
         const FORCED: KernelKey = KernelKey::from_bits(0x0123_4567_89ab_cdef);
         let first = Kernel::x();
         let second = Kernel::y();
-        let (a_arena, a_root) = first.parts();
-        let (b_arena, b_root) = second.parts();
-        let a_form = canonical(a_arena, a_root);
-        let b_form = canonical(b_arena, b_root);
+        let a_env = crate::Environment {
+            buffers: first.buffers().to_vec(),
+            uniforms: first.uniforms().to_vec(),
+        };
+        let b_env = crate::Environment {
+            buffers: second.buffers().to_vec(),
+            uniforms: second.uniforms().to_vec(),
+        };
+        let a_form = canonical(first.root(), &a_env);
+        let b_form = canonical(second.root(), &b_env);
         assert!(a_form != b_form, "the two kernels must differ");
 
         let _ = intern_with(FORCED, a_form, &first);

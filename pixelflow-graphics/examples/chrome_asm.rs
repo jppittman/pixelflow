@@ -47,18 +47,9 @@ fn chrome() -> Rgba {
 fn main() {
     let color = chrome();
     let nodes: usize = color.fold(
-        &|channels: &[Kernel; 4]| {
-            channels
-                .iter()
-                .map(|c| {
-                    let (arena, root) = c.parts();
-                    arena.node_count_subtree(root)
-                })
-                .sum()
-        },
+        &|channels: &[Kernel; 4]| channels.iter().map(|c| c.root().node_count()).sum(),
         &|mask: &Kernel, if_true: usize, if_false: usize| {
-            let (arena, root) = mask.parts();
-            arena.node_count_subtree(root) + if_true + if_false
+            mask.root().node_count() + if_true + if_false
         },
     );
 
@@ -73,7 +64,7 @@ fn main() {
     );
 
     println!("chrome sphere at {W}x{H}");
-    println!("  {nodes} arena nodes over four channels, before optimization");
+    println!("  {nodes} DAG nodes over four channels, before optimization");
     println!("  compiled in {compile:?}");
     println!("  {} bytes of code for four channels", code.len());
     println!(

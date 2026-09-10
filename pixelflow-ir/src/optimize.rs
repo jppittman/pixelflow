@@ -1,60 +1,22 @@
-//! Optimization as an endomorphism on the IR.
-//!
-//! An optimizer takes a term and returns a term denoting the same function.
-//! That is the whole contract, and stating it as a type is what makes two
-//! things expressible that were not:
-//!
-//! - **Not optimizing is a value.** `kernel_raw!` means "the identity
-//!   optimizer", and until there was a type for optimizers it could only be a
-//!   branch that declined to call a function. [`Identity`] is that value.
-//! - **Pipelines compose.** The runtime tier is `lower Dwrt`, then `unroll
-//!   Reduce`, then `saturate` — three steps written out by hand at one call
-//!   site, in an order a comment explains and nothing enforces. As
-//!   [`Optimize`] values they are [`Then`], and the order is the expression.
-//!
-//! [`Optimize`] and [`Then`] form a monoid: `Then(Identity, p)` and
-//! `Then(p, Identity)` both do what `p` does, and nesting `Then` either way
-//! associates. That is not decoration — it is why an optimizer-shaped hole
-//! can always be filled, including with "do nothing", which is the arm a
-//! measurement needs when asking what optimization is worth.
-//!
-//! Note what is deliberately absent: nothing here mentions e-graphs, cost
-//! models, budgets or rule sets. Those belong to one particular optimizer
-//! (`pixelflow_search`'s), not to the notion.
+//! Optimization as an endomorphism on an owned expression graph.
 
-use crate::arena::{ExprArena, ExprId};
+use crate::expr::ExprGraph;
 
 /// What one [`Optimize`] step did.
-///
-/// Three outcomes rather than `Option`, because "I had nothing to do" and "I
-/// cannot handle this term" differ in exactly one way that matters: whether
-/// *later* steps in a pipeline should still run. Collapsing them silently
-/// changes what a pipeline produces when a middle step bails.
 #[derive(Clone)]
 pub enum Rewritten {
-    /// A new term, denoting what the input denoted.
-    Changed(ExprArena, ExprId),
+    /// A new graph, denoting what the input denoted.
+    Changed(ExprGraph),
     /// Nothing to do here; the input stands and the pipeline continues.
-    ///
-    /// Distinct from returning a clone of the input: an optimizer that has no
-    /// work should not cost an arena copy to say so.
     Unchanged,
-    /// This term is outside what this optimizer models, and no later step
-    /// should run either. The caller keeps its original input.
-    ///
-    /// Always available as an answer, because optimization is never required
-    /// for correctness — a declined term compiles unoptimized.
+    /// This term is outside what this optimizer models; later steps stop.
     Declined,
 }
 
-// `ExprArena` is not `Debug` (it is large, and printing one is never what a
-// caller wants), so report the outcome and the size rather than the term.
 impl core::fmt::Debug for Rewritten {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Changed(arena, root) => {
-                write!(f, "Changed({} nodes, root {:?})", arena.len(), root)
-            }
+            Self::Changed(graph) => write!(f, "Changed({} nodes)", graph.dag().len()),
             Self::Unchanged => f.write_str("Unchanged"),
             Self::Declined => f.write_str("Declined"),
         }
@@ -62,78 +24,51 @@ impl core::fmt::Debug for Rewritten {
 }
 
 impl Rewritten {
-    /// The optimized term, or `None` when the input stands unchanged.
-    ///
-    /// Callers that hold the input already want this: `None` costs them
-    /// nothing, where a `Changed` clone of the input would.
     #[must_use]
-    pub fn into_changed(self) -> Option<(ExprArena, ExprId)> {
+    pub fn into_changed(self) -> Option<ExprGraph> {
         match self {
-            Self::Changed(arena, root) => Some((arena, root)),
+            Self::Changed(graph) => Some(graph),
             Self::Unchanged | Self::Declined => None,
         }
     }
 
-    /// Whether a pipeline should keep going after this outcome.
     #[must_use]
     pub fn continues(&self) -> bool {
         !matches!(self, Self::Declined)
     }
 }
 
-/// A denotation-preserving endomorphism on the IR.
-///
-/// Implementors owe one property, and it is not checkable by this trait:
-/// the returned term must denote the same function as the input. Everything
-/// else — how hard it tries, what it costs, whether it does anything at all —
-/// is the implementor's business.
+/// A denotation-preserving endomorphism on an expression graph.
 pub trait Optimize {
-    /// Rewrite the term reachable from `root`.
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten;
+    fn optimize(&mut self, graph: &ExprGraph) -> Rewritten;
 }
 
-/// The optimizer that does nothing — `kernel_raw!` as a value.
-///
-/// The unit of [`Then`], and the control arm of any measurement asking what
-/// an optimizer is worth: the same backend, the same term, nothing rewritten.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Identity;
 
 impl Optimize for Identity {
-    fn optimize(&mut self, _arena: &ExprArena, _root: ExprId) -> Rewritten {
+    fn optimize(&mut self, _graph: &ExprGraph) -> Rewritten {
         Rewritten::Unchanged
     }
 }
 
 /// Run `A`, then `B` on whatever `A` produced.
-///
-/// `B` sees `A`'s output when `A` changed the term and the original when it
-/// did not; if `A` declines, `B` does not run and the whole composition
-/// declines. That short-circuit is the reason [`Rewritten`] distinguishes
-/// declining from doing nothing: a pipeline whose first step cannot lower a
-/// construct must not hand the un-lowered term to the steps that assume it is
-/// gone.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Then<A, B>(pub A, pub B);
 
 impl<A: Optimize, B: Optimize> Optimize for Then<A, B> {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        match self.0.optimize(arena, root) {
+    fn optimize(&mut self, graph: &ExprGraph) -> Rewritten {
+        match self.0.optimize(graph) {
             Rewritten::Declined => Rewritten::Declined,
-            Rewritten::Unchanged => self.1.optimize(arena, root),
-            Rewritten::Changed(a, r) => match self.1.optimize(&a, r) {
-                // `B` declining does not discard `A`'s work: `A` already
-                // produced a valid term, and the caller's input is not more
-                // correct than it — only less optimized.
-                Rewritten::Declined | Rewritten::Unchanged => Rewritten::Changed(a, r),
+            Rewritten::Unchanged => self.1.optimize(graph),
+            Rewritten::Changed(first) => match self.1.optimize(&first) {
+                Rewritten::Declined | Rewritten::Unchanged => Rewritten::Changed(first),
                 changed => changed,
             },
         }
     }
 }
 
-/// Sequence optimizers left to right: `pipeline![a, b, c]` is
-/// `Then(a, Then(b, c))`.
 #[macro_export]
 macro_rules! pipeline {
     ($single:expr $(,)?) => { $single };
@@ -145,43 +80,49 @@ macro_rules! pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OpKind;
+    use crate::ExprBuilder;
+    use crate::dag::Builder;
+    use crate::expr::{ExprBuilderExt, copy_subgraph};
+    use crate::kind::OpKind;
 
-    /// Counts calls, and optionally rewrites `x` to `x + 1.0`.
     struct Bump {
         calls: usize,
-        outcome: fn(&ExprArena, ExprId) -> Rewritten,
+        outcome: fn(&ExprGraph) -> Rewritten,
     }
 
-    fn bump(arena: &ExprArena, root: ExprId) -> Rewritten {
-        let mut out = arena.clone();
-        let one = out.push_const(1.0);
-        let new_root = out.push_binary(OpKind::Add, root, one);
-        Rewritten::Changed(out, new_root)
+    fn bump(graph: &ExprGraph) -> Rewritten {
+        let mut builder = Builder::new();
+        let root = copy_subgraph(&mut builder, graph.root());
+        let one = builder.push_const(1.0);
+        let root = builder.push_binary(OpKind::Add, root, one);
+        Rewritten::Changed(ExprGraph::new(
+            builder.finish(&[root]),
+            graph.environment().clone(),
+        ))
     }
-    fn nothing(_: &ExprArena, _: ExprId) -> Rewritten {
+    fn nothing(_: &ExprGraph) -> Rewritten {
         Rewritten::Unchanged
     }
-    fn decline(_: &ExprArena, _: ExprId) -> Rewritten {
+    fn decline(_: &ExprGraph) -> Rewritten {
         Rewritten::Declined
     }
 
     impl Optimize for Bump {
-        fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
+        fn optimize(&mut self, graph: &ExprGraph) -> Rewritten {
             self.calls += 1;
-            (self.outcome)(arena, root)
+            (self.outcome)(graph)
         }
     }
 
-    fn seed() -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        (a, x)
+    fn seed() -> ExprGraph {
+        let mut builder = ExprBuilder::new();
+        let x = builder.var(0);
+        builder.finish_one(x)
     }
 
     #[test]
     fn identity_is_the_unit_of_then() {
-        let (arena, root) = seed();
+        let graph = seed();
         let mut left = Then(
             Identity,
             Bump {
@@ -196,31 +137,21 @@ mod tests {
             },
             Identity,
         );
-        let l = left.optimize(&arena, root).into_changed().expect("changed");
-        let r = right
-            .optimize(&arena, root)
-            .into_changed()
-            .expect("changed");
-        assert_eq!(
-            l.0.len(),
-            r.0.len(),
-            "Identity on either side must not change the result"
-        );
-        assert_eq!(l.1, r.1);
+        let l = left.optimize(&graph).into_changed().expect("changed");
+        let r = right.optimize(&graph).into_changed().expect("changed");
+        assert_eq!(l.dag().len(), r.dag().len());
+        assert_eq!(*l.root(), *r.root());
     }
 
     #[test]
     fn identity_alone_leaves_the_term_alone() {
-        let (arena, root) = seed();
-        assert!(Identity.optimize(&arena, root).into_changed().is_none());
+        let graph = seed();
+        assert!(Identity.optimize(&graph).into_changed().is_none());
     }
 
-    /// The short-circuit: a declining step must stop the ones after it, or a
-    /// pipeline hands a term to a step whose precondition the declining step
-    /// was responsible for establishing.
     #[test]
     fn declining_stops_later_steps() {
-        let (arena, root) = seed();
+        let graph = seed();
         let mut pipe = Then(
             Bump {
                 calls: 0,
@@ -231,15 +162,14 @@ mod tests {
                 outcome: bump,
             },
         );
-        assert!(matches!(pipe.optimize(&arena, root), Rewritten::Declined));
+        assert!(matches!(pipe.optimize(&graph), Rewritten::Declined));
         assert_eq!(pipe.0.calls, 1);
-        assert_eq!(pipe.1.calls, 0, "the step after a decline must not run");
+        assert_eq!(pipe.1.calls, 0);
     }
 
-    /// Doing nothing is not declining: later steps still run.
     #[test]
     fn unchanged_does_not_stop_later_steps() {
-        let (arena, root) = seed();
+        let graph = seed();
         let mut pipe = Then(
             Bump {
                 calls: 0,
@@ -250,15 +180,13 @@ mod tests {
                 outcome: bump,
             },
         );
-        assert!(pipe.optimize(&arena, root).into_changed().is_some());
-        assert_eq!(pipe.1.calls, 1, "a no-op step must not stop the pipeline");
+        assert!(pipe.optimize(&graph).into_changed().is_some());
+        assert_eq!(pipe.1.calls, 1);
     }
 
-    /// A later step declining keeps the earlier step's work rather than
-    /// throwing the pipeline back to the caller's input.
     #[test]
     fn a_later_decline_keeps_earlier_work() {
-        let (arena, root) = seed();
+        let graph = seed();
         let mut pipe = Then(
             Bump {
                 calls: 0,
@@ -269,16 +197,13 @@ mod tests {
                 outcome: decline,
             },
         );
-        let (out, _) = pipe.optimize(&arena, root).into_changed().expect("kept");
-        assert!(
-            out.len() > arena.len(),
-            "the first step's rewrite must survive"
-        );
+        let out = pipe.optimize(&graph).into_changed().expect("kept");
+        assert!(out.dag().len() > graph.dag().len());
     }
 
     #[test]
     fn pipeline_macro_associates_left_to_right() {
-        let (arena, root) = seed();
+        let graph = seed();
         let mut pipe = crate::pipeline![
             Bump {
                 calls: 0,
@@ -293,8 +218,7 @@ mod tests {
                 outcome: bump
             },
         ];
-        let (out, _) = pipe.optimize(&arena, root).into_changed().expect("changed");
-        // Each bump adds a Const and an Add to whatever it was handed.
-        assert_eq!(out.len(), arena.len() + 6);
+        let out = pipe.optimize(&graph).into_changed().expect("changed");
+        assert_eq!(out.dag().len(), graph.dag().len() + 6);
     }
 }

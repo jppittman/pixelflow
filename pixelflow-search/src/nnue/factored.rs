@@ -31,6 +31,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use libm::{logf, sqrtf};
 
@@ -40,6 +41,7 @@ use crate::egraph::extract::Extraction;
 pub use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 use pixelflow_ir::kind::OpMap;
+use pixelflow_ir::{ExprData, Node};
 
 // ============================================================================
 // Constants
@@ -595,6 +597,44 @@ pub struct EdgeTrace {
 }
 
 impl EdgeTrace {
+    /// Walk a rooted expression DAG without exposing its storage layout.
+    #[must_use]
+    pub fn from_dag(root: Node<'_, ExprData>) -> Self {
+        let mut edges = Vec::new();
+        let mut expanded = BTreeSet::new();
+        let mut edge_emitted = BTreeSet::new();
+        let mut stack = alloc::vec![(root, 0u32)];
+        let mut node_count = 0;
+        while let Some((node, depth)) = stack.pop() {
+            if !expanded.insert(node) {
+                continue;
+            }
+            let Some(parent) = dag_node_kind(node) else {
+                continue;
+            };
+            node_count += 1;
+            for (child_index, child) in node.children().enumerate() {
+                let Some(child_kind) = dag_node_kind(child) else {
+                    continue;
+                };
+                let effective_depth =
+                    depth * MAX_ARITY as u32 + child_index.min(MAX_ARITY - 1) as u32;
+                let feature = if edge_emitted.insert(child) {
+                    child_kind
+                } else {
+                    OpKind::Var
+                };
+                edges.push(CostEdge {
+                    parent,
+                    child: feature,
+                    pe: PeSlot::from_effective_depth(effective_depth),
+                });
+                stack.push((child, depth + 1));
+            }
+        }
+        Self { edges, node_count }
+    }
+
     /// Walk an arena subtree. Sharing is by `ExprId` — exactly the sharing
     /// the JIT's let-binding emitter sees when this arena is compiled, so the
     /// reload-edge policy describes the emitted object.
@@ -637,6 +677,21 @@ impl EdgeTrace {
         let mut edges = Vec::new();
         let node_count = walk_cost_dag(dag, &mut edges);
         Self { edges, node_count }
+    }
+}
+
+fn dag_node_kind(node: Node<'_, ExprData>) -> Option<OpKind> {
+    match *node {
+        ExprData::Var(_) => Some(OpKind::Var),
+        ExprData::Const(_) => Some(OpKind::Const),
+        ExprData::Param(i) => panic!(
+            "EdgeTrace::from_dag: ExprData::Param({i}) reached the edge walker — substitute params first"
+        ),
+        ExprData::Buffer(_) => Some(OpKind::Buffer),
+        ExprData::Uniform(_) => Some(OpKind::Uniform),
+        ExprData::Ref(_) => None,
+        ExprData::Reduce(_) => Some(OpKind::Reduce),
+        ExprData::Op(op) => Some(op),
     }
 }
 
@@ -933,6 +988,32 @@ pub(crate) fn variance_histogram(arena: &ExprArena) -> [f32; SCALAR_FEATURE_COUN
     ]
 }
 
+/// Classify the reachable nodes of a rooted DAG by variance.
+#[must_use]
+pub(crate) fn variance_histogram_dag(root: Node<'_, ExprData>) -> [f32; SCALAR_FEATURE_COUNT] {
+    let variances = pixelflow_ir::variance::compute_dag_variance(root.dag());
+    let reachable: BTreeSet<_> = root.descendants().collect();
+    let total = reachable.len() as f32;
+    if total == 0.0 {
+        return [0.0; SCALAR_FEATURE_COUNT];
+    }
+    let mut buckets = [0u32; SCALAR_FEATURE_COUNT];
+    for node in reachable {
+        let variance = variances[node];
+        let bucket = if variance.is_const() {
+            0
+        } else if variance.is_x_invariant() && !variance.depends_on_y() {
+            1
+        } else if variance.is_x_invariant() {
+            2
+        } else {
+            3
+        };
+        buckets[bucket] += 1;
+    }
+    buckets.map(|count| count as f32 / total)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -976,6 +1057,23 @@ mod tests {
             .map(|e| e.child)
             .collect();
         assert_eq!(add_children, alloc::vec![OpKind::Sqrt, OpKind::Var]);
+    }
+
+    #[test]
+    fn rooted_dag_trace_matches_shared_subexpression_policy() {
+        let mut builder = pixelflow_ir::ExprBuilder::new();
+        let x = builder.var(0);
+        let square = builder.binary(OpKind::Mul, x, x);
+        let root = builder.binary(OpKind::Add, square, square);
+        let graph = builder.finish_one(root);
+        let trace = EdgeTrace::from_dag(graph.root());
+        assert_eq!(trace.node_count(), 3);
+        assert!(
+            trace
+                .edges()
+                .iter()
+                .any(|edge| edge.parent == OpKind::Add && edge.child == OpKind::Var)
+        );
     }
 
     #[test]

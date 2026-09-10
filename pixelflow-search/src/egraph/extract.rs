@@ -1463,6 +1463,16 @@ pub fn choices_to_arena(
     (arena, root_id)
 }
 
+/// Materialise an extraction as an owned graph with its declaration
+/// environment.  The extraction walk owns all storage details; callers only
+/// receive the immutable graph surface.
+#[must_use]
+pub fn choices_to_graph(extraction: &Extraction<'_>) -> pixelflow_ir::ExprGraph {
+    let (storage, root) = choices_to_arena(extraction);
+    let (rooted, environment) = pixelflow_ir::Rooted::unmarshal(&storage, &[root]);
+    pixelflow_ir::ExprGraph::new(rooted, environment)
+}
+
 // ============================================================================
 // DAG-Aware Extraction
 // ============================================================================

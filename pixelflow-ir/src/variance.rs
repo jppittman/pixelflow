@@ -296,8 +296,8 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 fn referent_variance(key: crate::key::KernelKey) -> Variance {
     crate::store::KernelStore::resolve(key).map_or(Variance::ALL, |referent| {
-        let (ref_arena, ref_root) = referent.parts();
-        compute_arena_variance(ref_arena)[ref_root.0 as usize]
+        let table = compute_dag_variance(referent.dag());
+        table[referent.root()]
     })
 }
 
@@ -309,7 +309,7 @@ fn referent_variance(_key: crate::key::KernelKey) -> Variance {
     Variance::ALL
 }
 
-/// Compute variance for every node in an `ExprArena`.
+/// Compute variance for every node in an expression DAG.
 ///
 /// Returns a `Vec<Variance>` indexed by `ExprId`. Because the arena is
 /// append-only in topological order, a single forward pass suffices —
@@ -607,24 +607,24 @@ pub fn find_hoistable_out_of(
 /// [`varying`](Self::varying) names the binders as a [`Variance`], so
 /// `deps(node) ∩ shape.varying()` is the scope a node's value lives at.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct LatticeShape([u32; crate::arena::COORD_AXES]);
+pub struct LatticeShape([u32; crate::declarations::COORD_AXES]);
 
 impl LatticeShape {
     /// No lattice: one batch of caller-supplied points per call. Nothing is a
     /// binder.
-    pub const POINT: Self = Self([1; crate::arena::COORD_AXES]);
+    pub const POINT: Self = Self([1; crate::declarations::COORD_AXES]);
 
     /// A lattice with these samples per axis.
     #[inline]
     #[must_use]
-    pub const fn new(extent: [u32; crate::arena::COORD_AXES]) -> Self {
+    pub const fn new(extent: [u32; crate::declarations::COORD_AXES]) -> Self {
         Self(extent)
     }
 
     /// Samples per axis, `[x, y]`.
     #[inline]
     #[must_use]
-    pub const fn extent(self) -> [u32; crate::arena::COORD_AXES] {
+    pub const fn extent(self) -> [u32; crate::declarations::COORD_AXES] {
         self.0
     }
 
@@ -636,7 +636,7 @@ impl LatticeShape {
     pub const fn varying(self) -> Variance {
         let mut bits = 0u8;
         let mut axis = 0;
-        while axis < crate::arena::COORD_AXES {
+        while axis < crate::declarations::COORD_AXES {
             if self.0[axis] > 1 {
                 bits |= 1 << axis;
             }
@@ -674,7 +674,7 @@ impl LatticeShape {
         };
         let mut count: u64 = 1;
         let mut axis = innermost;
-        while axis < crate::arena::COORD_AXES {
+        while axis < crate::declarations::COORD_AXES {
             count *= self.0[axis] as u64;
             axis += 1;
         }
@@ -684,10 +684,10 @@ impl LatticeShape {
     /// The extents serialized little-endian, for cache keys.
     #[inline]
     #[must_use]
-    pub const fn key_bytes(self) -> [u8; 4 * crate::arena::COORD_AXES] {
-        let mut out = [0u8; 4 * crate::arena::COORD_AXES];
+    pub const fn key_bytes(self) -> [u8; 4 * crate::declarations::COORD_AXES] {
+        let mut out = [0u8; 4 * crate::declarations::COORD_AXES];
         let mut axis = 0;
-        while axis < crate::arena::COORD_AXES {
+        while axis < crate::declarations::COORD_AXES {
             let b = self.0[axis].to_le_bytes();
             let mut k = 0;
             while k < 4 {
@@ -703,6 +703,15 @@ impl LatticeShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_parts(k: &crate::kernel::Kernel) -> (crate::arena::ExprArena, crate::arena::ExprId) {
+        let env = crate::Environment {
+            buffers: k.buffers().to_vec(),
+            uniforms: k.uniforms().to_vec(),
+        };
+        let (arena, mut roots) = k.rooted().marshal(&[k.root()], &env);
+        (arena, roots.pop().expect("kernel has one root"))
+    }
 
     #[test]
     fn verify_from_var() {
@@ -818,25 +827,28 @@ mod tests {
         ];
         for (referent, expected) in cases {
             let named = referent.by_ref();
-            let (arena, root) = named.parts();
-            let v = super::compute_arena_variance(arena);
+            let (arena, root) = legacy_parts(&named);
+            let v = super::compute_arena_variance(&arena);
             assert_eq!(v[root.0 as usize], expected);
         }
 
         // And it composes: a reference to an X-only kernel plus Y varies in
         // both, exactly as the spliced form would.
         let mixed = Kernel::x().sqrt().by_ref().add(&Kernel::y());
-        let (arena, root) = mixed.parts();
-        let v = super::compute_arena_variance(arena);
+        let (arena, root) = legacy_parts(&mixed);
+        let v = super::compute_arena_variance(&arena);
         assert_eq!(v[root.0 as usize], Variance::X.union(Variance::Y));
 
         // An unresolvable key claims nothing. `KernelKey::of` on a kernel
         // nobody interned is the honest way to get one: no store entry, so
         // no referent to read a variance off.
         let never = Kernel::x().mul(&Kernel::constant(1.0e-27));
-        let (never_arena, never_root) = never.parts();
+        let never_env = crate::Environment {
+            buffers: never.buffers().to_vec(),
+            uniforms: never.uniforms().to_vec(),
+        };
         let mut orphaned = ExprArena::new();
-        let orphan = orphaned.push_ref(crate::key::KernelKey::of(never_arena, never_root));
+        let orphan = orphaned.push_ref(crate::key::KernelKey::of(never.root(), &never_env));
         assert_eq!(
             super::compute_arena_variance(&orphaned)[orphan.0 as usize],
             Variance::ALL
@@ -882,16 +894,16 @@ mod tests {
 
         // Σ_{i<4} (i + X) depends on X, not on the index it binds.
         let k = Kernel::sum_over(4, |i| i.add(&Kernel::x()));
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
+        let (arena, root) = legacy_parts(&k);
+        let v = super::compute_arena_variance(&arena);
         assert_eq!(v[root.0 as usize], Variance::X);
 
         // Σ_{i<4} i depends on nothing at all: the index is bound, and it was
         // the body's only variable. This is the case that used to come back as
         // ALL — the analysis claimed maximal dependency for a closed term.
         let closed = Kernel::sum_over(4, Clone::clone);
-        let (arena, root) = closed.parts();
-        let v = super::compute_arena_variance(arena);
+        let (arena, root) = legacy_parts(&closed);
+        let v = super::compute_arena_variance(&arena);
         assert!(
             v[root.0 as usize].is_const(),
             "Σ_i i has no free variables, got {:?}",
@@ -908,8 +920,8 @@ mod tests {
 
         // Σ_{i<4} (i · Y): the product depends on both the index and Y.
         let k = Kernel::sum_over(4, |i| i.mul(&Kernel::y()));
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
+        let (arena, root) = legacy_parts(&k);
+        let v = super::compute_arena_variance(&arena);
 
         // The body — a fold's one child.
         let ExprNode::Reduce { body, .. } = arena.node(root) else {
@@ -942,8 +954,8 @@ mod tests {
             let i = i.clone();
             Kernel::sum_over(4, move |j| i.add(j).add(&Kernel::x()))
         });
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
+        let (arena, root) = legacy_parts(&k);
+        let v = super::compute_arena_variance(&arena);
         assert_eq!(v[root.0 as usize], Variance::X);
     }
 
@@ -959,15 +971,15 @@ mod tests {
         // Σ_{i<8} (i · sin(Y)) — sin(Y) is invariant in the index, so it can
         // leave the fold; it is NOT invariant in Y.
         let k = Kernel::sum_over(8, |i| i.mul(&Kernel::y().sin()));
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
+        let (arena, root) = legacy_parts(&k);
+        let v = super::compute_arena_variance(&arena);
 
         let ExprNode::Reduce { body, .. } = arena.node(root) else {
             panic!("expected a Reduce at the root");
         };
         let body = *body;
 
-        let out_of_binder = super::find_hoistable_out_of(4, arena, body, &v, 8);
+        let out_of_binder = super::find_hoistable_out_of(4, &arena, body, &v, 8);
         let sin = out_of_binder
             .iter()
             .find(|id| matches!(arena.node(**id), ExprNode::Unary(OpKind::Sin, _)));
@@ -977,7 +989,7 @@ mod tests {
         );
 
         // Asking about Y instead finds nothing: sin(Y) cannot cross that scope.
-        let out_of_y = super::find_hoistable_out_of(1, arena, body, &v, 8);
+        let out_of_y = super::find_hoistable_out_of(1, &arena, body, &v, 8);
         assert!(
             !out_of_y
                 .iter()

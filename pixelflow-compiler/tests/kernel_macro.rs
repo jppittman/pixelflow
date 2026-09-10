@@ -380,7 +380,7 @@ fn macro_acos() {
 #[test]
 fn an_f32_argument_still_folds() {
     let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(1.0, 2.0);
-    assert!(k.parts().0.uniforms().is_empty());
+    assert!(k.uniforms().is_empty());
     assert!((eval1(&k, 5.0) - 8.0).abs() < 1e-5);
 }
 
@@ -392,7 +392,7 @@ fn a_uniform_argument_is_bound_per_call() {
     use pixelflow_core::{Manifold, Uniform};
     let cx = Uniform::new(1.0);
     let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(cx, 2.0);
-    assert_eq!(k.parts().0.uniforms(), &[cx.decl()]);
+    assert_eq!(k.uniforms(), &[cx.decl()]);
     assert!((eval1(&k, 5.0) - 8.0).abs() < 1e-5, "default cx = 1");
 
     let program = Manifold::compile(&k, [1, 1]);
@@ -402,5 +402,5 @@ fn a_uniform_argument_is_bound_per_call() {
     assert!((moved - 4.0).abs() < 1e-5, "(5 − 3)·2");
 
     let twice = kernel!(|a: f32, b: f32| a * b)(cx, cx);
-    assert_eq!(twice.parts().0.uniforms().len(), 1);
+    assert_eq!(twice.uniforms().len(), 1);
 }

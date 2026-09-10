@@ -678,7 +678,7 @@ mod uniforms_link_and_oracle {
         let circle = Kernel::x().sub(&cx.kernel()).abs();
         let moving = circle.at(&Kernel::x(), &phase.kernel());
         assert_eq!(
-            moving.parts().0.uniforms().len(),
+            moving.uniforms().len(),
             2,
             "the table names the phantom — that is the shape being tested"
         );

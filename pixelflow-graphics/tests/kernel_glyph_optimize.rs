@@ -18,9 +18,8 @@
 //! shows up as a hard number, not a benchmark whisper.
 
 use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, Outline, Segment};
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 use pixelflow_ir::passes::{expand_refs_owned, lower_dwrt_owned};
-use pixelflow_ir::{Kernel, OpKind};
+use pixelflow_ir::{Environment, ExprData, ExprGraph, Kernel, OpKind, Rooted};
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -28,49 +27,44 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf")
 /// composed by reference, and a name has no derivative, declares no buffer,
 /// and counts as one node — so every count and every lowering below starts
 /// from the linked arena, as the pipeline's own first step does.
-fn linked(kernel: &Kernel) -> (ExprArena, ExprId) {
-    let (arena, root) = kernel.parts();
-    expand_refs_owned(arena, root)
+fn linked(kernel: &Kernel) -> ExprGraph {
+    let env = Environment {
+        buffers: kernel.buffers().to_vec(),
+        uniforms: kernel.uniforms().to_vec(),
+    };
+    let (legacy, root) = kernel.root().marshal(&env);
+    let (legacy, root) = expand_refs_owned(&legacy, root);
+    let (rooted, env) = Rooted::unmarshal(&legacy, &[root]);
+    ExprGraph::new(rooted, env)
 }
 
 /// Count reachable nodes matching `pred` from `root`.
-fn count_reachable(arena: &ExprArena, root: ExprId, pred: impl Fn(&ExprNode) -> bool) -> usize {
-    let len = arena.len();
-    let mut seen = vec![false; len];
-    let mut stack = vec![root];
-    let mut count = 0;
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        if pred(arena.node(id)) {
-            count += 1;
-        }
-        stack.extend(arena.children(id));
-    }
-    count
+fn count_reachable(
+    root: pixelflow_ir::Node<'_, ExprData>,
+    pred: impl Fn(&ExprData) -> bool,
+) -> usize {
+    root.descendants().filter(|node| pred(node)).count()
 }
 
-fn count_op(arena: &ExprArena, root: ExprId, op: OpKind) -> usize {
-    count_reachable(arena, root, |n| match n {
-        ExprNode::Unary(k, _) => *k == op,
-        ExprNode::Binary(k, _, _) => *k == op,
-        ExprNode::Ternary(k, _, _, _) => *k == op,
+fn count_op(root: pixelflow_ir::Node<'_, ExprData>, op: OpKind) -> usize {
+    count_reachable(root, |n| match n {
+        ExprData::Op(k) => *k == op,
         _ => false,
     })
 }
 
-fn total_reachable(arena: &ExprArena, root: ExprId) -> usize {
-    count_reachable(arena, root, |_| true)
+fn total_reachable(root: pixelflow_ir::Node<'_, ExprData>) -> usize {
+    count_reachable(root, |_| true)
 }
 
 /// Run the same optimization stages `Lattice::bake` runs, then lower any
 /// residual `Dwrt` exactly as the compile entries do, and report the final
 /// (arena, root) the emitter would actually schedule. Prints per-stage
 /// counts so a failure localizes to the stage that dropped the ball.
-fn bake_pipeline(arena: &ExprArena, root: ExprId, shape: [u32; 2]) -> (ExprArena, ExprId) {
+fn bake_pipeline(graph: &ExprGraph, shape: [u32; 2]) -> ExprGraph {
+    let (arena, root) = graph.root().marshal(graph.environment());
     let optimized = pixelflow_search::runtime::optimize_runtime_arena(
-        arena,
+        &arena,
         root,
         pixelflow_ir::LatticeShape::new(shape),
     );
@@ -78,20 +72,27 @@ fn bake_pipeline(arena: &ExprArena, root: ExprId, shape: [u32; 2]) -> (ExprArena
         .as_deref()
         .map(|(a, r)| (a.clone(), *r))
         .unwrap_or_else(|| (arena.clone(), root));
+    let (optimized_rooted, optimized_env) = Rooted::unmarshal(&a, &[r]);
+    let optimized_graph = ExprGraph::new(optimized_rooted, optimized_env);
     eprintln!(
         "  post-egraph: total={} sqrt={} dwrt={}",
-        total_reachable(&a, r),
-        count_op(&a, r, OpKind::Sqrt),
-        count_op(&a, r, OpKind::Dwrt),
+        total_reachable(optimized_graph.root()),
+        count_op(optimized_graph.root(), OpKind::Sqrt),
+        count_op(optimized_graph.root(), OpKind::Dwrt),
     );
     let (dl, dr) =
-        lower_dwrt_owned(arena, root).expect("dwrt lowering must succeed on glyph kernels");
+        lower_dwrt_owned(&arena, root).expect("dwrt lowering must succeed on glyph kernels");
+    let (baseline_rooted, baseline_env) = Rooted::unmarshal(&dl, &[dr]);
+    let baseline = ExprGraph::new(baseline_rooted, baseline_env);
     eprintln!(
         "  lower_dwrt-only baseline: total={} sqrt={}",
-        total_reachable(&dl, dr),
-        count_op(&dl, dr, OpKind::Sqrt),
+        total_reachable(baseline.root()),
+        count_op(baseline.root(), OpKind::Sqrt),
     );
-    lower_dwrt_owned(&a, r).expect("dwrt lowering must succeed on glyph kernels")
+    let (final_arena, final_root) =
+        lower_dwrt_owned(&a, r).expect("dwrt lowering must succeed on glyph kernels");
+    let (final_rooted, final_env) = Rooted::unmarshal(&final_arena, &[final_root]);
+    ExprGraph::new(final_rooted, final_env)
 }
 
 /// A closed polygon of `n` straight edges: no curves, so every piece's
@@ -155,37 +156,37 @@ const SQRT_PER_PIECE: usize = 4;
 fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
     let (small, large) = (5usize, 11usize);
     let build = |n: usize| linked(&loop_blinn::glyph(&regular_polygon(n)).kernel());
-    let (few, few_root) = build(small);
-    let (many, many_root) = build(large);
+    let few = build(small);
+    let many = build(large);
 
     // The body is one. A different piece count changes the fold's extent
     // (a `Const`) and the table's height, never the arena's shape.
     assert_eq!(
         (
-            total_reachable(&few, few_root),
-            count_op(&few, few_root, OpKind::Sqrt),
-            count_op(&few, few_root, OpKind::Dwrt),
+            total_reachable(few.root()),
+            count_op(few.root(), OpKind::Sqrt),
+            count_op(few.root(), OpKind::Dwrt),
         ),
         (
-            total_reachable(&many, many_root),
-            count_op(&many, many_root, OpKind::Sqrt),
-            count_op(&many, many_root, OpKind::Dwrt),
+            total_reachable(many.root()),
+            count_op(many.root(), OpKind::Sqrt),
+            count_op(many.root(), OpKind::Dwrt),
         ),
         "a {small}-gon and a {large}-gon must build the same arena: the piece \
          count is data in a table, not structure in the graph"
     );
 
-    for (n, arena, root) in [(small, &few, few_root), (large, &many, many_root)] {
-        let (opt, opt_root) = bake_pipeline(arena, root, [32, 32]);
-        let opt_sqrt = count_op(&opt, opt_root, OpKind::Sqrt);
-        let opt_dwrt = count_op(&opt, opt_root, OpKind::Dwrt);
+    for (n, graph) in [(small, &few), (large, &many)] {
+        let opt = bake_pipeline(graph, [32, 32]);
+        let opt_sqrt = count_op(opt.root(), OpKind::Sqrt);
+        let opt_dwrt = count_op(opt.root(), OpKind::Dwrt);
         eprintln!(
             "{n}-gon: raw total={} sqrt={} dwrt={} -> optimized total={} sqrt={opt_sqrt} \
              dwrt={opt_dwrt}",
-            total_reachable(arena, root),
-            count_op(arena, root, OpKind::Sqrt),
-            count_op(arena, root, OpKind::Dwrt),
-            total_reachable(&opt, opt_root),
+            total_reachable(graph.root()),
+            count_op(graph.root(), OpKind::Sqrt),
+            count_op(graph.root(), OpKind::Dwrt),
+            total_reachable(opt.root()),
         );
         assert_eq!(opt_dwrt, 0, "Dwrt must be fully resolved by bake time");
         assert!(
@@ -206,21 +207,16 @@ fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
 fn lowered_glyph_ops_are_all_egraph_representable() {
     let font = Font::parse(FONT_DATA).unwrap();
     let glyph = font.glyph_kernel_scaled('g', 16.0).expect("glyph");
-    let (arena, root) = linked(&glyph.kernel());
-    let (lowered, lroot) = lower_dwrt_owned(&arena, root).expect("lower");
+    let graph = linked(&glyph.kernel());
+    let (legacy, root) = graph.root().marshal(graph.environment());
+    let (lowered, lroot) = lower_dwrt_owned(&legacy, root).expect("lower");
+    let (lowered_rooted, lowered_env) = Rooted::unmarshal(&lowered, &[lroot]);
+    let lowered = ExprGraph::new(lowered_rooted, lowered_env);
     let mut missing = std::collections::BTreeSet::new();
-    let len = lowered.len();
-    let mut seen = vec![false; len];
-    let mut stack = vec![lroot];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        let kind = match lowered.node(id) {
-            ExprNode::Unary(k, _) => Some(*k),
-            ExprNode::Binary(k, _, _) => Some(*k),
-            ExprNode::Ternary(k, _, _, _) => Some(*k),
-            ExprNode::Param(i) => {
+    for node in lowered.root().descendants() {
+        let kind = match *node {
+            ExprData::Op(k) => Some(k),
+            ExprData::Param(i) => {
                 missing.insert(format!("Param({i})"));
                 None
             }
@@ -231,7 +227,6 @@ fn lowered_glyph_ops_are_all_egraph_representable() {
                 missing.insert(format!("{k:?}"));
             }
         }
-        stack.extend(lowered.children(id));
     }
     assert!(
         missing.is_empty(),

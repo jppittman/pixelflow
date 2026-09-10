@@ -1,16 +1,16 @@
-//! Macro AST → `ExprArena`.
+//! Macro AST → rooted expression DAG.
 //!
 //! The front end's one lowering step: the surface syntax a user wrote becomes
 //! the IR everything downstream speaks. `let` bindings resolve to the
-//! [`ExprId`] they name, so the arena is a DAG and a shared subexpression is
-//! one node; operators and DSL methods resolve through [`OpKind`], so the op
+//! [`pixelflow_ir::ExprHandle`] they name, so a shared subexpression is one
+//! DAG node; operators and DSL methods resolve through [`OpKind`], so the op
 //! table is not restated here.
 //!
-//! Emission — arena to the `TokenStream` that rebuilds it — is [`crate::emit`].
+//! Emission — rooted graph to the `TokenStream` that rebuilds it — is [`crate::emit`].
 
 use crate::ast::{BinaryOp, Expr, UnaryOp};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::{ExprBuilder, ExprHandle};
 use std::collections::HashMap;
 use syn::Lit;
 
@@ -27,7 +27,7 @@ pub(crate) const LIBRARY_METHODS: &[(&str, usize)] = &[("fract", 0), ("hypot", 1
 
 /// Build a `param_name → index` map over the params of a kernel.
 ///
-/// Indices are dense in declaration order: each becomes a `Param(i)` arena
+/// Indices are dense in declaration order: each becomes a `Param(i)` graph
 /// node, substituted by `substitute_params` with the builder closure's
 /// arguments in the same order.
 pub fn param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, u8> {
@@ -40,54 +40,54 @@ pub fn param_indices(analyzed: &crate::sema::AnalyzedKernel) -> HashMap<String, 
         .collect()
 }
 
-/// Convert macro AST to an arena-allocated IR.
+/// Convert macro AST to an owned expression graph.
 ///
-/// Mirrors [`ast_to_ir`] exactly but pushes nodes into `arena` instead of
-/// heap-allocating [`Arc`] wrappers. Children are recursed first so that
-/// parent nodes always reference already-interned [`ExprId`]s.
+/// Mirrors [`ast_to_ir`] exactly but pushes nodes into the opaque DAG builder
+/// instead of heap-allocating [`Arc`] wrappers. Children are recursed first so
+/// that parent nodes always reference already-built handles.
 ///
 /// `param_indices` maps parameter names to their declaration-order index (0-based).
-/// Parameter identifiers are emitted as arena `Param(i)` nodes.
-pub fn ast_to_arena(
+/// Parameter identifiers are emitted as graph `Param(i)` nodes.
+pub fn ast_to_graph(
     expr: &Expr,
     param_indices: &HashMap<String, u8>,
-    arena: &mut ExprArena,
-) -> Result<ExprId, String> {
+    builder: &mut ExprBuilder,
+) -> Result<ExprHandle, String> {
     let mut lowering = Lowering {
         param_indices,
         locals: HashMap::new(),
-        arena,
+        builder,
     };
     lowering.lower(expr)
 }
 
-/// State threaded through the AST → arena walk: parameter names (fixed for
+/// State threaded through the AST → DAG walk: parameter names (fixed for
 /// the whole kernel), `let`-bound locals (grows as blocks are walked), and
-/// the arena nodes are pushed into.
+/// the builder nodes are pushed into.
 struct Lowering<'a> {
     param_indices: &'a HashMap<String, u8>,
-    locals: HashMap<String, ExprId>,
-    arena: &'a mut ExprArena,
+    locals: HashMap<String, ExprHandle>,
+    builder: &'a mut ExprBuilder,
 }
 
 impl Lowering<'_> {
-    /// Translate an AST node into the arena, resolving `let`-bound locals via
+    /// Translate an AST node into the DAG, resolving `let`-bound locals via
     /// `self.locals`. The optimizer emits `let`-bindings (a [`Expr::Block`]) for
-    /// shared subexpressions; each binding maps to a single [`ExprId`], so the
-    /// arena faithfully preserves the discovered CSE as a DAG rather than
+    /// shared subexpressions; each binding maps to a single opaque handle, so the
+    /// builder faithfully preserves the discovered CSE as a DAG rather than
     /// duplicating subtrees.
-    fn lower(&mut self, expr: &Expr) -> Result<ExprId, String> {
+    fn lower(&mut self, expr: &Expr) -> Result<ExprHandle, String> {
         match expr {
             Expr::Ident(ident) => {
                 let name = ident.name.to_string();
                 match name.as_str() {
-                    "X" => Ok(self.arena.push_var(0)),
-                    "Y" => Ok(self.arena.push_var(1)),
+                    "X" => Ok(self.builder.var(0)),
+                    "Y" => Ok(self.builder.var(1)),
                     _ => {
                         if let Some(&id) = self.locals.get(&name) {
                             Ok(id)
                         } else if let Some(&idx) = self.param_indices.get(&name) {
-                            Ok(self.arena.push_param(idx))
+                            Ok(self.builder.param(idx))
                         } else {
                             Err(format!("Unknown identifier: {}", name))
                         }
@@ -97,7 +97,7 @@ impl Lowering<'_> {
 
             Expr::Literal(lit) => {
                 if let Some(val) = extract_f64_from_lit(&lit.lit) {
-                    Ok(self.arena.push_const(val as f32))
+                    Ok(self.builder.constant(val as f32))
                 } else {
                     Err("Non-numeric literal".to_string())
                 }
@@ -126,7 +126,7 @@ impl Lowering<'_> {
                     _ => return Err(format!("Unsupported binary op: {:?}", binary.op)),
                 };
 
-                Ok(self.arena.push_binary(op, lhs, rhs))
+                Ok(self.builder.binary(op, lhs, rhs))
             }
 
             Expr::Unary(unary) => {
@@ -137,7 +137,7 @@ impl Lowering<'_> {
                     UnaryOp::Not => return Err("Unsupported unary op: Not".to_string()),
                 };
 
-                Ok(self.arena.push_unary(op, operand))
+                Ok(self.builder.unary(op, operand))
             }
 
             Expr::MethodCall(call) => {
@@ -175,9 +175,9 @@ impl Lowering<'_> {
                         args.push(self.lower(arg)?);
                     }
                     return Ok(match *args.as_slice() {
-                        [] => self.arena.push_unary(op, receiver),
-                        [a] => self.arena.push_binary(op, receiver, a),
-                        [a, b] => self.arena.push_ternary(op, receiver, a, b),
+                        [] => self.builder.unary(op, receiver),
+                        [a] => self.builder.binary(op, receiver, a),
+                        [a, b] => self.builder.ternary(op, receiver, a, b),
                         _ => unreachable!(
                             "OpKind::from_method_call only resolves ops of arity 1..=3"
                         ),
@@ -187,24 +187,24 @@ impl Lowering<'_> {
                 match (method.as_str(), arg_count) {
                     // `fract(x) = x - floor(x)`.
                     ("fract", 0) => {
-                        let f = self.arena.push_unary(OpKind::Floor, receiver);
-                        Ok(self.arena.push_binary(OpKind::Sub, receiver, f))
+                        let f = self.builder.unary(OpKind::Floor, receiver);
+                        Ok(self.builder.binary(OpKind::Sub, receiver, f))
                     }
                     // `hypot(x, y) = sqrt(x² + y²)`.
                     ("hypot", 1) => {
                         let arg = self.lower(&call.args[0])?;
-                        let xx = self.arena.push_binary(OpKind::Mul, receiver, receiver);
-                        let yy = self.arena.push_binary(OpKind::Mul, arg, arg);
-                        let sum = self.arena.push_binary(OpKind::Add, xx, yy);
-                        Ok(self.arena.push_unary(OpKind::Sqrt, sum))
+                        let xx = self.builder.binary(OpKind::Mul, receiver, receiver);
+                        let yy = self.builder.binary(OpKind::Mul, arg, arg);
+                        let sum = self.builder.binary(OpKind::Add, xx, yy);
+                        Ok(self.builder.unary(OpKind::Sqrt, sum))
                     }
                     // `clamp` is library, not a primitive: it denotes
                     // `min(max(x, lo), hi)` and is built as that composition.
                     ("clamp", 2) => {
                         let lo = self.lower(&call.args[0])?;
                         let hi = self.lower(&call.args[1])?;
-                        let floored = self.arena.push_binary(OpKind::Max, receiver, lo);
-                        Ok(self.arena.push_binary(OpKind::Min, floored, hi))
+                        let floored = self.builder.binary(OpKind::Max, receiver, lo);
+                        Ok(self.builder.binary(OpKind::Min, floored, hi))
                     }
 
                     _ => Err(format!("Unsupported method: {}", method)),
@@ -215,7 +215,7 @@ impl Lowering<'_> {
             // `Dwrt` nodes: the runtime `lower_dwrt` pass (pixelflow-ir) rewrites
             // them into chain-rule arithmetic before codegen, replacing the
             // combinator backend's Jet2/Jet3 forward-mode evaluation. `V` is the
-            // identity — every arena expression is already value-space.
+            // identity — every graph expression is already value-space.
             Expr::Call(call) => {
                 let func = call.func.to_string();
                 if call.args.len() != 1 {
@@ -228,23 +228,23 @@ impl Lowering<'_> {
                 let inner = self.lower(&call.args[0])?;
                 match func.as_str() {
                     "V" => Ok(inner),
-                    "DX" => Ok(push_dwrt(self.arena, inner, 0)),
-                    "DY" => Ok(push_dwrt(self.arena, inner, 1)),
+                    "DX" => Ok(push_dwrt(self.builder, inner, 0)),
+                    "DY" => Ok(push_dwrt(self.builder, inner, 1)),
                     "DZ" => Err(
                         "`DZ` is no longer a coordinate: a lattice has two axes, X and Y"
                             .to_string(),
                     ),
                     "DXX" => {
-                        let d = push_dwrt(self.arena, inner, 0);
-                        Ok(push_dwrt(self.arena, d, 0))
+                        let d = push_dwrt(self.builder, inner, 0);
+                        Ok(push_dwrt(self.builder, d, 0))
                     }
                     "DXY" => {
-                        let d = push_dwrt(self.arena, inner, 0);
-                        Ok(push_dwrt(self.arena, d, 1))
+                        let d = push_dwrt(self.builder, inner, 0);
+                        Ok(push_dwrt(self.builder, d, 1))
                     }
                     "DYY" => {
-                        let d = push_dwrt(self.arena, inner, 1);
-                        Ok(push_dwrt(self.arena, d, 1))
+                        let d = push_dwrt(self.builder, inner, 1);
+                        Ok(push_dwrt(self.builder, d, 1))
                     }
                     _ => Err(format!("Unsupported call: {}", func)),
                 }
@@ -254,7 +254,7 @@ impl Lowering<'_> {
             Expr::Paren(inner) => self.lower(inner),
 
             // Blocks carry the optimizer's CSE: each `let __n = <expr>;` binds a
-            // shared subexpression to a single arena node, and the final expression
+            // shared subexpression to a single DAG node, and the final expression
             // references those bindings by name.
             Expr::Block(block) => {
                 for stmt in &block.stmts {
@@ -293,9 +293,9 @@ impl Lowering<'_> {
 
 /// Push `Dwrt(expr, var)` — the variable index rides as a `Const` operand,
 /// matching the encoding the e-graph `ChainRule` and `lower_dwrt` read.
-fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
-    let v = arena.push_const(var as f32);
-    arena.push_binary(OpKind::Dwrt, expr, v)
+fn push_dwrt(builder: &mut ExprBuilder, expr: ExprHandle, var: u8) -> ExprHandle {
+    let v = builder.constant(var as f32);
+    builder.binary(OpKind::Dwrt, expr, v)
 }
 
 /// Extract f64 from a syn::Lit.

@@ -1,4 +1,4 @@
-//! `ExprArena` → the `TokenStream` that rebuilds it at load time.
+//! Rooted expression DAG → the `TokenStream` that rebuilds it at load time.
 //!
 //! The back end, and there is one. It produces a [`Kernel`] — an arena
 //! fragment, the language's own value. Nothing is compiled at
@@ -10,21 +10,21 @@
 //!
 //! Two steps, because the interesting thing happens between them: an arena is
 //! lowered from the AST ([`crate::lower`]), *then* optionally rewritten, then
-//! emitted. Emission takes an arena rather than an AST so that the optimizer
-//! has somewhere to stand.
+//! emitted. Emission takes an expression graph rather than an AST so the
+//! optimizer has somewhere to stand.
 //!
 //! [`Kernel`]: pixelflow_core::Kernel
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::optimize::Optimize;
+use pixelflow_ir::{ExprBuilder, ExprData, ExprGraph};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::lower;
 use crate::sema::AnalyzedKernel;
 
-/// Emit arena-backend code for an analyzed kernel.
+/// Emit DAG-backend code for an analyzed kernel.
 ///
 /// On success, returns a token stream evaluating to:
 /// - zero params — a [`Kernel`](pixelflow_core::Kernel) value, built at load
@@ -52,23 +52,22 @@ pub fn emit_kernel(
     optimizer: &mut dyn Optimize,
 ) -> Result<TokenStream, String> {
     let param_map = lower::param_indices(analyzed);
-    let mut arena = ExprArena::new();
-    let root = lower::ast_to_arena(&analyzed.def.body, &param_map, &mut arena)?;
+    let mut builder = ExprBuilder::new();
+    let root = lower::ast_to_graph(&analyzed.def.body, &param_map, &mut builder)?;
+    let graph = builder.finish_one(root);
 
     // Declining is ordinary and needs no arm: the lowered term stands, and a
     // kernel that reaches the runtime tier unoptimized is optimized there.
-    let (arena, root) = optimizer
-        .optimize(&arena, root)
-        .into_changed()
-        .unwrap_or((arena, root));
+    let graph = optimizer.optimize(&graph).into_changed().unwrap_or(graph);
 
-    let arena_code = arena_to_tokens(&arena, root);
+    let graph_code = graph_to_tokens(&graph);
 
     if analyzed.def.params.is_empty() {
         return Ok(quote! {
             {
-                let (__arena, __root) = #arena_code;
-                ::pixelflow_core::Kernel::from_parts(__arena, __root)
+                let __graph = #graph_code;
+                let (__rooted, __env) = __graph.into_parts();
+                ::pixelflow_core::Kernel::from_rooted(__rooted, __env.buffers, __env.uniforms)
             }
         });
     }
@@ -92,10 +91,11 @@ pub fn emit_kernel(
                 -> impl Fn( #( #generics ),* ) -> ::pixelflow_core::Kernel
             {
                 move | #( #param_names: #generics ),* | {
-                    let (mut __arena, __root) = #arena_code;
+                    let __graph = #graph_code;
                     let __params: [#scalar; #arity] = [ #( #param_names.into() ),* ];
-                    let __root = __arena.substitute_params(__root, &__params);
-                    ::pixelflow_core::Kernel::from_parts(__arena, __root)
+                    let __graph = __graph.substitute_params(&__params);
+                    let (__rooted, __env) = __graph.into_parts();
+                    ::pixelflow_core::Kernel::from_rooted(__rooted, __env.buffers, __env.uniforms)
                 }
             }
             __builder()
@@ -103,7 +103,7 @@ pub fn emit_kernel(
     })
 }
 
-/// Emit the arena, node for node, as code that rebuilds it at load time.
+/// Emit the rooted DAG, node for node, as code that rebuilds it at load time.
 ///
 /// `Dwrt` nodes are emitted as they were built and resolved at bake time, by
 /// the one `LowerDwrt` pass in the runtime pipeline. Resolving them at
@@ -115,16 +115,19 @@ pub fn emit_kernel(
 /// the warp to reach, and the substitution silently lands inside `f'`.
 ///
 /// See docs/plans/2026-09-08-macro-tier-is-arena-native.md.
-pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
+pub fn graph_to_tokens(graph: &ExprGraph) -> TokenStream {
     let mut stmts = Vec::new();
-    let n = arena.len();
-    for idx in 0..n {
-        let id = ExprId(idx as u32);
+    let nodes: Vec<_> = graph.dag().iter().collect();
+    let index_of = |needle: pixelflow_ir::Node<'_, ExprData>| {
+        nodes
+            .iter()
+            .position(|node| *node == needle)
+            .expect("graph_to_tokens: child is absent from the graph")
+    };
+    for (idx, node) in nodes.iter().enumerate() {
         let ident = format_ident!("__e{}", idx);
-        let expr = match arena.node(id) {
-            pixelflow_ir::arena::ExprNode::Var(i) => {
-                quote! { __arena.push_var(#i) }
-            }
+        let expr = match **node {
+            ExprData::Var(i) => quote! { __builder.var(#i) },
             // By bit pattern, not as a decimal literal: `quote`'s `f32`
             // impl goes through `Literal::f32_suffixed`, which asserts
             // `is_finite()` — and non-finite constants are ordinary here. A
@@ -132,28 +135,23 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
             // `BitAnd`'s monoid identity and therefore `all_over`'s seed, and
             // the folder now produces those. Bits also roundtrip exactly, with
             // no decimal-formatting question to get wrong.
-            pixelflow_ir::arena::ExprNode::Const(v) => {
-                let bits = v.to_bits();
-                quote! { __arena.push_const(f32::from_bits(#bits)) }
-            }
-            pixelflow_ir::arena::ExprNode::Param(i) => {
-                quote! { __arena.push_param(#i) }
-            }
+            ExprData::Const(bits) => quote! { __builder.constant(f32::from_bits(#bits)) },
+            ExprData::Param(i) => quote! { __builder.param(#i) },
             // The `kernel!` macro has no buffer surface yet, so this is
             // unreachable in practice; fail loud rather than emit a node that
             // references a buffer table `from_raw` does not reconstruct.
-            pixelflow_ir::arena::ExprNode::Buffer(b) => {
+            ExprData::Buffer(b) => {
                 panic!(
-                    "kernel! produced ExprNode::Buffer({}) — lattice parameters are not wired \
+                    "kernel! produced ExprData::Buffer({}) — lattice parameters are not wired \
                      into the compiler yet (KERNELS_AND_LATTICES.md M4)",
                     b.0
                 )
             }
             // Likewise unreachable: a uniform enters a kernel at the builder
             // call (`substitute_params`), never from the macro's own arena.
-            pixelflow_ir::arena::ExprNode::Uniform(u) => {
+            ExprData::Uniform(u) => {
                 panic!(
-                    "kernel! produced ExprNode::Uniform({}) — uniforms are chosen at the \
+                    "kernel! produced ExprData::Uniform({}) — uniforms are chosen at the \
                      builder call site, not in the macro body",
                     u.0
                 )
@@ -162,47 +160,37 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
             // time — a runtime value, and the key it carries names a store
             // in the *build host's* process, which the compiled program is
             // not. Emitting one would name nothing.
-            pixelflow_ir::arena::ExprNode::Ref(k) => {
+            ExprData::Ref(k) => {
                 panic!(
-                    "kernel! produced ExprNode::Ref({k:?}) — a reference names a kernel \
+                    "kernel! produced ExprData::Ref({k:?}) — a reference names a kernel \
                      interned in this process, which the emitted program does not share"
                 )
             }
-            pixelflow_ir::arena::ExprNode::Unary(op, child) => {
-                let op_code = opkind_to_tokens(*op);
-                let child_ident = format_ident!("__e{}", child.0);
-                quote! { __arena.push_unary(#op_code, #child_ident) }
-            }
-            pixelflow_ir::arena::ExprNode::Binary(op, a, b) => {
-                let op_code = opkind_to_tokens(*op);
-                let a_ident = format_ident!("__e{}", a.0);
-                let b_ident = format_ident!("__e{}", b.0);
-                quote! { __arena.push_binary(#op_code, #a_ident, #b_ident) }
-            }
-            pixelflow_ir::arena::ExprNode::Ternary(op, a, b, c) => {
-                let op_code = opkind_to_tokens(*op);
-                let a_ident = format_ident!("__e{}", a.0);
-                let b_ident = format_ident!("__e{}", b.0);
-                let c_ident = format_ident!("__e{}", c.0);
-                quote! { __arena.push_ternary(#op_code, #a_ident, #b_ident, #c_ident) }
-            }
-            pixelflow_ir::arena::ExprNode::Nary(op, ..) => {
-                let op_code = opkind_to_tokens(*op);
-                let child_idents: Vec<_> = arena
-                    .children(id)
-                    .map(|c| format_ident!("__e{}", c.0))
+            ExprData::Op(op) => {
+                let op_code = opkind_to_tokens(op);
+                let child_indices: Vec<_> = node.children().map(index_of).collect();
+                let child_idents: Vec<_> = child_indices
+                    .iter()
+                    .map(|i| format_ident!("__e{}", i))
                     .collect();
-                quote! { __arena.push_nary(#op_code, &[#(#child_idents),*]) }
+                match child_idents.as_slice() {
+                    [] => panic!("kernel! produced an operation with no children"),
+                    [a] => quote! { __builder.unary(#op_code, #a) },
+                    [a, b] => quote! { __builder.binary(#op_code, #a, #b) },
+                    [a, b, c] => quote! { __builder.ternary(#op_code, #a, #b, #c) },
+                    _ => quote! { __builder.nary(#op_code, &[#(#child_idents),*]) },
+                }
             }
             // A fold's metadata is a `Fold`, whose fields are private
             // precisely so no caller can assemble one that means nothing —
             // so it travels the way the two cache keys carry it, as bits
             // with a total inverse on the far side.
-            pixelflow_ir::arena::ExprNode::Reduce { fold, body } => {
+            ExprData::Reduce(fold) => {
                 let bits = fold.to_bits();
-                let body_ident = format_ident!("__e{}", body.0);
+                let body = node.children().next().expect("reduce body");
+                let body_ident = format_ident!("__e{}", index_of(body));
                 quote! {
-                    __arena.push_reduce(
+                    __builder.reduce(
                         ::pixelflow_core::__macro::ir::fold::Fold::from_bits(#bits)
                             .expect("kernel! emitted a well-formed fold"),
                         #body_ident,
@@ -215,11 +203,11 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
         });
     }
 
-    let root_ident = format_ident!("__e{}", root.0);
+    let root_ident = format_ident!("__e{}", index_of(graph.root()));
     quote! {{
-        let mut __arena = ::pixelflow_core::__macro::ir::arena::ExprArena::new();
+        let mut __builder = ::pixelflow_core::__macro::ir::ExprBuilder::new();
         #(#stmts)*
-        (__arena, #root_ident)
+        __builder.finish_one(#root_ident)
     }}
 }
 

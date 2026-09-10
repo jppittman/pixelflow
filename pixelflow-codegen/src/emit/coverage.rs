@@ -14,7 +14,7 @@
 //! - Reaches `IsaBackend::emit_plan` as `ResolvedOp::Unary` — [`REQUIRED_UNARY_OPS`].
 //! - Reaches it as `ResolvedOp::Binary` — [`REQUIRED_BINARY_OPS`].
 //! - Reaches it as `ResolvedOp::ShiftImm` (the RHS `Const` shift amount is
-//!   folded to an immediate by `arena_to_schedule`, so only the op + LHS
+//!   folded to an immediate by the DAG scheduler, so only the op + LHS
 //!   survive to codegen) — [`REQUIRED_SHIFT_OPS`].
 //! - Reaches it as `ResolvedOp::FusedMulAdd`/`DecomposedMulAdd` or
 //!   `ResolvedOp::Select` — [`REQUIRED_TERNARY_OPS`]. Not swept generically

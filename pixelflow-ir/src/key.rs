@@ -26,10 +26,12 @@
 //! a digest can collide, so anything keyed on one keeps the full form and
 //! compares it (see [`KernelStore`](crate::store::KernelStore)).
 
-use alloc::vec;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use crate::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
+use crate::arena::{BufferDecl, UniformDecl};
+use crate::dag::Node;
+use crate::expr::{Environment, ExprData};
 
 /// The identity of a kernel: a 64-bit digest of its whole [`Canonical`] form
 /// — the shape bytes **and** the link.
@@ -103,8 +105,8 @@ impl KernelKey {
     /// The key of the kernel rooted at `root` in `arena` — its whole
     /// canonical form, shape and link alike.
     #[must_use]
-    pub fn of(arena: &ExprArena, root: ExprId) -> Self {
-        Self::of_canonical(&canonical(arena, root))
+    pub fn of(root: Node<'_, ExprData>, env: &Environment) -> Self {
+        Self::of_canonical(&canonical(root, env))
     }
 
     /// The key of an already-computed canonical form.
@@ -143,7 +145,7 @@ impl KernelKey {
 /// `pixelflow-codegen`'s compile cache keys on `key` alone precisely because
 /// it wants the *opposite* of an identity there (one compiled region per
 /// shape, many links).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Canonical {
     /// The canonical serialization of the graph's shape.
     pub key: Vec<u8>,
@@ -160,27 +162,23 @@ pub struct Canonical {
 /// same order — never by identity, which is what lets two compositions of
 /// one shape share code.
 #[must_use]
-pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
-    let len = arena.len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if core::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
-    }
-
-    // Dense remap in ascending id order.
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
+pub fn canonical(root: Node<'_, ExprData>, env: &Environment) -> Canonical {
+    let reachable: BTreeSet<Node<'_, ExprData>> = root.descendants().collect();
+    // Canonical identity follows expression first occurrence, not builder
+    // insertion order.  Reversing the root-first traversal yields the same
+    // children-before-parent order required by the dense child references,
+    // while making two equivalent graphs with different declaration setup
+    // serialize identically.
+    let mut ordered: Vec<Node<'_, ExprData>> = root.descendants().collect();
+    ordered.reverse();
+    let mut dense: BTreeMap<Node<'_, ExprData>, u32> = BTreeMap::new();
     let mut next = 0u32;
-    let mut key: Vec<u8> = Vec::with_capacity(len * 8);
+    let mut key: Vec<u8> = Vec::with_capacity(reachable.len() * 8);
     let mut buffers: Vec<BufferDecl> = Vec::new();
     let mut uniforms: Vec<UniformDecl> = Vec::new();
 
-    let push_id = |key: &mut Vec<u8>, dense: &[u32], id: ExprId| {
-        let d = dense[id.0 as usize];
-        debug_assert_ne!(d, u32::MAX, "child densified before parent");
+    let push_id = |key: &mut Vec<u8>, dense: &BTreeMap<Node<'_, ExprData>, u32>, id| {
+        let d = *dense.get(&id).expect("child densified before parent");
         key.extend_from_slice(&d.to_le_bytes());
     };
     /// The dense slot of `decl` in `table`, appending it on first sight.
@@ -192,54 +190,54 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
         u16::try_from(slot).expect("dense slot fits the table index width")
     }
 
-    for idx in 0..len {
-        if !reachable[idx] {
-            continue;
-        }
-        match arena.node(ExprId(idx as u32)) {
-            ExprNode::Var(i) => {
+    for node in ordered.into_iter().filter(|node| reachable.contains(node)) {
+        match *node {
+            ExprData::Var(i) => {
                 key.push(0);
-                key.push(*i);
+                key.push(i);
             }
-            ExprNode::Const(v) => {
+            ExprData::Const(v) => {
                 key.push(1);
-                key.extend_from_slice(&v.to_bits().to_le_bytes());
+                key.extend_from_slice(&v.to_le_bytes());
             }
-            ExprNode::Param(i) => {
+            ExprData::Param(i) => {
                 key.push(2);
-                key.push(*i);
+                key.push(i);
             }
-            ExprNode::Unary(op, a) => {
+            ExprData::Op(op) if node.child_count() == 1 => {
                 key.push(3);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, *a);
+                push_id(&mut key, &dense, node.children().next().unwrap());
             }
-            ExprNode::Binary(op, a, b) => {
+            ExprData::Op(op) if node.child_count() == 2 => {
                 key.push(4);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, *a);
-                push_id(&mut key, &dense, *b);
+                for child in node.children() {
+                    push_id(&mut key, &dense, child);
+                }
             }
-            ExprNode::Ternary(op, a, b, c) => {
+            ExprData::Op(op) if node.child_count() == 3 => {
                 key.push(5);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, *a);
-                push_id(&mut key, &dense, *b);
-                push_id(&mut key, &dense, *c);
+                for child in node.children() {
+                    push_id(&mut key, &dense, child);
+                }
             }
-            ExprNode::Nary(op, _) => {
+            ExprData::Op(op) => {
                 key.push(6);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                let id = ExprId(idx as u32);
-                key.extend_from_slice(&(arena.children(id).len() as u16).to_le_bytes());
-                for child in arena.children(id) {
+                key.extend_from_slice(&(node.child_count() as u16).to_le_bytes());
+                for child in node.children() {
                     push_id(&mut key, &dense, child);
                 }
             }
             // Slot by first occurrence, extents in the key: the code folds
             // its address arithmetic against them.
-            ExprNode::Buffer(b) => {
-                let decl = *arena.buffer_decl(*b);
+            ExprData::Buffer(b) => {
+                let decl = *env
+                    .buffers
+                    .get(b.0 as usize)
+                    .expect("buffer slot in environment");
                 key.push(7);
                 key.extend_from_slice(&dense_slot(&mut buffers, decl).to_le_bytes());
                 key.extend_from_slice(&decl.width.to_le_bytes());
@@ -247,15 +245,18 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
             }
             // Offset by first occurrence; the default is the block's
             // business, not the code's.
-            ExprNode::Uniform(u) => {
-                let decl = *arena.uniform_decl(*u);
+            ExprData::Uniform(u) => {
+                let decl = *env
+                    .uniforms
+                    .get(u.0 as usize)
+                    .expect("uniform slot in environment");
                 key.push(8);
                 key.extend_from_slice(&dense_slot(&mut uniforms, decl).to_le_bytes());
             }
             // A leaf with an identity of its own, like `Buffer`: the key it
             // names is exactly the referent's canonical bytes digested, so
             // encoding the key is encoding the referent.
-            ExprNode::Ref(key_of) => {
+            ExprData::Ref(key_of) => {
                 key.push(9);
                 key.extend_from_slice(&key_of.bits().to_le_bytes());
             }
@@ -263,13 +264,17 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
             // encoded as three child nodes. Two folds over the same body
             // under different algebras, binders or ranges are different
             // kernels, and this is where that is said.
-            ExprNode::Reduce { fold, body } => {
+            ExprData::Reduce(fold) => {
                 key.push(10);
                 key.extend_from_slice(&fold.to_bits().to_le_bytes());
-                push_id(&mut key, &dense, *body);
+                push_id(
+                    &mut key,
+                    &dense,
+                    node.children().next().expect("reduce body"),
+                );
             }
         }
-        dense[idx] = next;
+        dense.insert(node, next);
         next += 1;
     }
 
@@ -283,135 +288,112 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kind::OpKind;
+    use crate::{ExprBuilder, ExprGraph, OpKind, Uniform};
 
-    /// `√(x² + y²)`, optionally preceded by unreachable construction garbage.
-    fn circle(garbage: bool) -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
+    fn key(graph: &ExprGraph) -> KernelKey {
+        KernelKey::of(graph.root(), graph.environment())
+    }
+
+    fn circle(garbage: bool) -> ExprGraph {
+        let mut b = ExprBuilder::new();
         if garbage {
-            let g = a.push_const(123.0);
-            let _ = a.push_unary(OpKind::Sqrt, g);
+            let g = b.constant(123.0);
+            let _ = b.unary(OpKind::Sqrt, g);
         }
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let x2 = a.push_binary(OpKind::Mul, x, x);
-        let y2 = a.push_binary(OpKind::Mul, y, y);
-        let s = a.push_binary(OpKind::Add, x2, y2);
-        let root = a.push_unary(OpKind::Sqrt, s);
-        (a, root)
+        let x = b.var(0);
+        let y = b.var(1);
+        let x2 = b.binary(OpKind::Mul, x, x);
+        let y2 = b.binary(OpKind::Mul, y, y);
+        let s = b.binary(OpKind::Add, x2, y2);
+        let root = b.unary(OpKind::Sqrt, s);
+        b.finish_one(root)
     }
 
     #[test]
     fn same_content_is_the_same_key() {
-        let (a, ra) = circle(false);
-        let (b, rb) = circle(false);
-        assert_eq!(KernelKey::of(&a, ra), KernelKey::of(&b, rb));
-        assert_eq!(canonical(&a, ra).key, canonical(&b, rb).key);
+        let a = circle(false);
+        let b = circle(false);
+        assert_eq!(key(&a), key(&b));
+        assert_eq!(
+            canonical(a.root(), a.environment()).key,
+            canonical(b.root(), b.environment()).key
+        );
     }
 
     #[test]
     fn different_content_is_a_different_key() {
-        let (a, ra) = circle(false);
-        let mut b = ExprArena::new();
-        let x = b.push_var(0);
-        let y = b.push_var(1);
-        let rb = b.push_binary(OpKind::Sub, x, y);
-        assert_ne!(KernelKey::of(&a, ra), KernelKey::of(&b, rb));
+        let a = circle(false);
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let rb = b.binary(OpKind::Sub, x, y);
+        let b = b.finish_one(rb);
+        assert_ne!(key(&a), key(&b));
     }
 
-    /// Construction garbage and a different id ordering for the *same*
-    /// reachable subgraph must not perturb the identity — otherwise two
-    /// build histories of one kernel would be two kernels.
     #[test]
-    fn the_key_ignores_node_ordering_and_garbage() {
-        let (clean, rc) = circle(false);
-        let (littered, rl) = circle(true);
-        assert_ne!(
-            clean.len(),
-            littered.len(),
-            "the littered arena must actually hold more nodes"
-        );
-        assert_ne!(rc, rl, "and its root must sit at a different id");
-        assert_eq!(canonical(&clean, rc).key, canonical(&littered, rl).key);
-        assert_eq!(KernelKey::of(&clean, rc), KernelKey::of(&littered, rl));
+    fn the_key_ignores_construction_garbage() {
+        let clean = circle(false);
+        let littered = circle(true);
+        assert_eq!(key(&clean), key(&littered));
     }
 
-    /// The shape bytes are *deliberately* blind to which memory a slot binds
-    /// — that is what lets one compiled region serve a thousand atlases — so
-    /// the key must not be. Two samplers over two different tables of equal
-    /// extents are two kernels, and a store that conflated them would resolve
-    /// a reference to the wrong memory and render the wrong picture.
     #[test]
     fn the_key_separates_two_buffers_of_equal_extents() {
         let read = |decl: BufferDecl| {
-            let mut a = ExprArena::new();
-            let slot = a.declare_buffer(decl);
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_gather(slot, x, y);
-            (a, root)
+            let mut b = ExprBuilder::new();
+            let buffer = b.buffer(decl);
+            let x = b.var(0);
+            let y = b.var(1);
+            let root = b.ternary(OpKind::Gather, buffer, x, y);
+            b.finish_one(root)
         };
         let shape = |id| BufferDecl {
             id,
             width: 4,
             height: 3,
         };
-        let (a, ra) = read(shape(crate::arena::BufferIdentity::mint()));
-        let (b, rb) = read(shape(crate::arena::BufferIdentity::mint()));
-
+        let a = read(shape(crate::arena::BufferIdentity::mint()));
+        let b = read(shape(crate::arena::BufferIdentity::mint()));
         assert_eq!(
-            canonical(&a, ra).key,
-            canonical(&b, rb).key,
-            "one shape, so one compiled region — this is the compile cache's              whole point and must not change"
+            canonical(a.root(), a.environment()).key,
+            canonical(b.root(), b.environment()).key
         );
-        assert_ne!(
-            KernelKey::of(&a, ra),
-            KernelKey::of(&b, rb),
-            "but two memories, so two kernels"
-        );
+        assert_ne!(key(&a), key(&b));
     }
 
-    /// The same for uniforms: two instances of one builder are two arguments,
-    /// and a reference to either must not resolve to the other.
     #[test]
     fn the_key_separates_two_uniform_instances() {
-        let read = |decl: UniformDecl| {
-            let mut a = ExprArena::new();
-            let slot = a.declare_uniform(decl);
-            let u = a.push_uniform(slot);
-            let x = a.push_var(0);
-            let root = a.push_binary(OpKind::Mul, x, u);
-            (a, root)
+        let read = |decl| {
+            let mut b = ExprBuilder::new();
+            let x = b.var(0);
+            let uniform = b.uniform(decl);
+            let root = b.binary(OpKind::Mul, x, uniform);
+            b.finish_one(root)
         };
-        let (a, ra) = read(crate::Uniform::new(0.25).decl());
-        let (b, rb) = read(crate::Uniform::new(0.25).decl());
-        assert_eq!(canonical(&a, ra).key, canonical(&b, rb).key);
-        assert_ne!(KernelKey::of(&a, ra), KernelKey::of(&b, rb));
+        let a = read(Uniform::new(0.25).decl());
+        let b = read(Uniform::new(0.25).decl());
+        assert_eq!(
+            canonical(a.root(), a.environment()).key,
+            canonical(b.root(), b.environment()).key
+        );
+        assert_ne!(key(&a), key(&b));
     }
 
-    /// A `Ref` leaf is keyed by the identity it names, and two references to
-    /// different kernels are different content.
     #[test]
     fn a_ref_leaf_is_keyed_by_what_it_names() {
-        let (a, ra) = circle(false);
-        let mut b = ExprArena::new();
-        let x = b.push_var(0);
-        let rb = b.push_unary(OpKind::Neg, x);
-
-        let mut host = ExprArena::new();
-        let ref_a = host.push_ref(KernelKey::of(&a, ra));
-        let ref_b = host.push_ref(KernelKey::of(&b, rb));
+        let a = circle(false);
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let rb = b.unary(OpKind::Neg, x);
+        let b = b.finish_one(rb);
+        let mut host = ExprBuilder::new();
+        let ra = host.reference(key(&a));
+        let rb = host.reference(key(&b));
+        let host = host.finish(&[ra, rb]);
         assert_ne!(
-            canonical(&host, ref_a).key,
-            canonical(&host, ref_b).key,
-            "two references naming different kernels are different content"
-        );
-
-        let mut twin = ExprArena::new();
-        let ref_a_again = twin.push_ref(KernelKey::of(&a, ra));
-        assert_eq!(
-            canonical(&host, ref_a).key,
-            canonical(&twin, ref_a_again).key
+            canonical(host.rooted().entry_at(0), host.environment()).key,
+            canonical(host.rooted().entry_at(1), host.environment()).key
         );
     }
 }

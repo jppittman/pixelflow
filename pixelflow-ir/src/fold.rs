@@ -24,7 +24,7 @@
 
 use core::ops::Range;
 
-use crate::arena::{REDUCE_BINDER_BASE, REDUCE_BINDERS};
+use crate::declarations::{REDUCE_BINDER_BASE, REDUCE_BINDERS};
 use crate::kind::OpKind;
 
 /// The algebra a reduction folds under: an associative combining operation

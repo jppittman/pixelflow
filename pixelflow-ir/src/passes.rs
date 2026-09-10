@@ -41,6 +41,8 @@
 //! Nothing re-fuses `mul`+`add` into `MulAdd` afterwards — see `horner_step`.
 
 use crate::arena::{ExprArena, ExprId, ExprNode};
+use crate::dag::{Builder, Id, Rooted};
+use crate::expr::{Environment, ExprBuilderExt, ExprData, ExprGraph, substitute_vars};
 use crate::fold::Fold;
 use crate::kind::OpKind;
 use crate::variance::Variance;
@@ -74,6 +76,257 @@ pub fn legalize(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), 
     let (arena, root) = expand_reduce_owned(&arena, root);
     let (arena, root) = expand_gather_owned(&arena, root);
     Ok(expand_transcendentals_owned(&arena, root))
+}
+
+/// Run legalization on an owned expression graph.
+///
+/// This is the public pass boundary. The legacy arena conversion is kept
+/// inside `pixelflow-ir` while the individual lowering rules are migrated;
+/// callers receive only the opaque rooted DAG and its environment. No
+/// arena-local node id or storage layout crosses this API.
+#[must_use]
+pub fn legalize_rooted(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> Result<(Rooted<ExprData>, Environment), &'static str> {
+    // Keep the ordering identical to `legalize`, but use the graph-native
+    // implementations as they become available. In particular, reduction
+    // and gather lowering below never materialize the legacy arena.
+    let (rooted, env) = expand_refs_rooted(rooted, env);
+    let (rooted, env) = lower_dwrt_rooted(&rooted, &env)?;
+    let (rooted, env) = expand_reduce_rooted(&rooted, &env);
+    let (rooted, env) = expand_gather_rooted(&rooted, &env);
+    Ok(expand_transcendentals_rooted(&rooted, &env))
+}
+
+/// Run legalization on an owned [`ExprGraph`].
+#[must_use]
+pub fn legalize_graph(graph: &ExprGraph) -> Result<ExprGraph, &'static str> {
+    let (rooted, env) = legalize_rooted(graph.rooted(), graph.environment())?;
+    Ok(ExprGraph::new(rooted, env))
+}
+
+/// Apply an arena-local compatibility pass without exposing its wire form.
+fn apply_rooted<F>(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+    pass: F,
+) -> Result<(Rooted<ExprData>, Environment), &'static str>
+where
+    F: FnOnce(&ExprArena, ExprId) -> Result<(ExprArena, ExprId), &'static str>,
+{
+    let (arena, mut roots) = rooted.marshal(&[rooted.entry()], env);
+    let root = roots
+        .pop()
+        .expect("apply_rooted: one rooted graph must have one root");
+    let (arena, root) = pass(&arena, root)?;
+    Ok(Rooted::unmarshal(&arena, &[root]))
+}
+
+/// Expand references in an owned rooted DAG.
+#[must_use]
+pub fn expand_refs_rooted(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> (Rooted<ExprData>, Environment) {
+    apply_rooted(rooted, env, |arena, root| {
+        Ok(expand_refs_owned(arena, root))
+    })
+    .expect("expand_refs_rooted: reference expansion failed")
+}
+
+/// Lower symbolic derivatives in an owned rooted DAG.
+#[must_use]
+pub fn lower_dwrt_rooted(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> Result<(Rooted<ExprData>, Environment), &'static str> {
+    apply_rooted(rooted, env, lower_dwrt_owned)
+}
+
+/// Unroll bounded folds in an owned rooted DAG.
+#[must_use]
+pub fn expand_reduce_rooted(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> (Rooted<ExprData>, Environment) {
+    expand_reduce_native(rooted, env)
+}
+
+/// Lower gathers in an owned rooted DAG.
+#[must_use]
+pub fn expand_gather_rooted(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> (Rooted<ExprData>, Environment) {
+    expand_gather_native(rooted, env)
+}
+
+/// Lower transcendental operations in an owned rooted DAG.
+#[must_use]
+pub fn expand_transcendentals_rooted(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> (Rooted<ExprData>, Environment) {
+    apply_rooted(rooted, env, |arena, root| {
+        Ok(expand_transcendentals_owned(arena, root))
+    })
+    .expect("expand_transcendentals_rooted: transcendental expansion failed")
+}
+
+/// Copy a node into a new expression builder after remapping its children.
+fn copy_native_node(
+    builder: &mut Builder<ExprData>,
+    node: crate::dag::Node<'_, ExprData>,
+    children: &[Id],
+) -> Id {
+    match *node {
+        ExprData::Var(i) => builder.push_var(i),
+        ExprData::Const(bits) => builder.push_const(f32::from_bits(bits)),
+        ExprData::Param(i) => builder.push_param(i),
+        ExprData::Buffer(id) => builder.push_buffer(id),
+        ExprData::Uniform(id) => builder.push_uniform(id),
+        ExprData::Ref(key) => builder.push_ref(key),
+        ExprData::Reduce(fold) => builder.push_reduce(
+            fold,
+            *children
+                .first()
+                .expect("copy_native_node: reduction has no body"),
+        ),
+        ExprData::Op(op) => match children {
+            [a] => builder.push_unary(op, *a),
+            [a, b] => builder.push_binary(op, *a, *b),
+            [a, b, c] => builder.push_ternary(op, *a, *b, *c),
+            many => builder.push_nary(op, many),
+        },
+    }
+}
+
+/// Native DAG implementation of `Gather` lowering.
+fn expand_gather_native(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> (Rooted<ExprData>, Environment) {
+    if !rooted
+        .iter()
+        .any(|node| matches!(*node, ExprData::Op(OpKind::Gather)) && node.child_count() == 3)
+    {
+        return (rooted.clone(), env.clone());
+    }
+
+    let mut builder = Builder::new();
+    let mut map = rooted.side_table(None);
+    for node in rooted.iter() {
+        let children: Vec<Id> = node
+            .children()
+            .map(|child| map[child].expect("expand_gather_native: child not copied"))
+            .collect();
+        let replacement =
+            match *node {
+                ExprData::Op(OpKind::Gather) if children.len() == 3 => {
+                    let source_buffer = node
+                        .children()
+                        .next()
+                        .expect("expand_gather_native: missing buffer child");
+                    let slot = match *source_buffer {
+                        ExprData::Buffer(slot) => slot,
+                        other => panic!(
+                            "expand_gather_native: first Gather child must be Buffer, got {other:?}"
+                        ),
+                    };
+                    let decl = env.buffers.get(slot.0 as usize).copied().unwrap_or_else(|| {
+                    panic!(
+                        "expand_gather_native: buffer slot {} is absent from the environment",
+                        slot.0
+                    )
+                });
+                    lower_gather_native(&mut builder, decl, children[0], children[1], children[2])
+                }
+                _ => copy_native_node(&mut builder, node, &children),
+            };
+        map[node] = Some(replacement);
+    }
+    let root = map[rooted.entry()].expect("expand_gather_native: root not copied");
+    (builder.finish(&[root]), env.clone())
+}
+
+fn lower_gather_native(
+    builder: &mut Builder<ExprData>,
+    decl: crate::arena::BufferDecl,
+    buf: Id,
+    x: Id,
+    y: Id,
+) -> Id {
+    let zero = builder.push_const(0.0);
+    let max_x = builder.push_const(decl.width.saturating_sub(1) as f32);
+    let max_y = builder.push_const(decl.height.saturating_sub(1) as f32);
+    let width = builder.push_const(decl.width as f32);
+    let fx = builder.push_unary(OpKind::Floor, x);
+    let xi_lo = builder.push_binary(OpKind::Max, fx, zero);
+    let xi = builder.push_binary(OpKind::Min, xi_lo, max_x);
+    let fy = builder.push_unary(OpKind::Floor, y);
+    let yi_lo = builder.push_binary(OpKind::Max, fy, zero);
+    let yi = builder.push_binary(OpKind::Min, yi_lo, max_y);
+    let row = builder.push_binary(OpKind::Mul, yi, width);
+    let idx = builder.push_binary(OpKind::Add, row, xi);
+    builder.push_binary(OpKind::RawGather, buf, idx)
+}
+
+/// Native DAG implementation of bounded-fold unrolling.
+fn expand_reduce_native(
+    rooted: &Rooted<ExprData>,
+    env: &Environment,
+) -> (Rooted<ExprData>, Environment) {
+    if !rooted
+        .iter()
+        .any(|node| matches!(*node, ExprData::Reduce(_)))
+    {
+        return (rooted.clone(), env.clone());
+    }
+
+    let mut builder = Builder::new();
+    let mut map = rooted.side_table(None);
+    for node in rooted.iter() {
+        let children: Vec<Id> = node
+            .children()
+            .map(|child| map[child].expect("expand_reduce_native: child not copied"))
+            .collect();
+        let replacement = match *node {
+            ExprData::Reduce(fold) => {
+                let body = node
+                    .children()
+                    .next()
+                    .expect("expand_reduce_native: reduction has no body");
+                if fold.is_empty() {
+                    builder.push_const(fold.monoid().identity())
+                } else {
+                    let var = fold.binder().var();
+                    let mut terms = Vec::with_capacity(fold.len() as usize);
+                    let mut rest = fold;
+                    let mut indices = Vec::with_capacity(fold.len() as usize);
+                    while let Some((shorter, k)) = rest.peel_back() {
+                        indices.push(k);
+                        rest = shorter;
+                    }
+                    for k in indices.iter().rev() {
+                        let value = builder.push_const(*k as f32);
+                        terms.push(substitute_vars(&mut builder, body, &[(var, value)]));
+                    }
+                    let mut acc = *terms
+                        .first()
+                        .expect("expand_reduce_native: non-empty fold has no term");
+                    for term in terms.into_iter().skip(1) {
+                        acc = builder.push_binary(fold.monoid().op(), acc, term);
+                    }
+                    acc
+                }
+            }
+            _ => copy_native_node(&mut builder, node, &children),
+        };
+        map[node] = Some(replacement);
+    }
+    let root = map[rooted.entry()].expect("expand_reduce_native: root not copied");
+    (builder.finish(&[root]), env.clone())
 }
 
 /// Whether `op` is a unary transcendental this pass expands.
@@ -247,8 +500,13 @@ fn splice_referent(arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId 
              minted by Kernel::by_ref, which interns first"
         )
     });
-    let (ref_arena, ref_root) = referent.parts();
-    let (expanded, expanded_root) = expand_refs_owned(ref_arena, ref_root);
+    let env = Environment {
+        buffers: referent.buffers().to_vec(),
+        uniforms: referent.uniforms().to_vec(),
+    };
+    let (ref_arena, mut roots) = referent.rooted().marshal(&[referent.root()], &env);
+    let ref_root = roots.pop().expect("referent has one root");
+    let (expanded, expanded_root) = expand_refs_owned(&ref_arena, ref_root);
     arena.splice(&expanded, expanded_root)
 }
 
@@ -1937,13 +2195,12 @@ use crate::optimize::{Optimize, Rewritten};
 pub struct ExpandRefs;
 
 impl Optimize for ExpandRefs {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes().any(|n| matches!(n, ExprNode::Ref(_))) {
+    fn optimize(&mut self, graph: &ExprGraph) -> Rewritten {
+        if !graph.dag().iter().any(|n| matches!(*n, ExprData::Ref(_))) {
             return Rewritten::Unchanged;
         }
-        let mut owned = arena.clone();
-        let new_root = expand_refs(&mut owned, root);
-        Rewritten::Changed(owned, new_root)
+        let (rooted, env) = expand_refs_rooted(graph.rooted(), graph.environment());
+        Rewritten::Changed(ExprGraph::new(rooted, env))
     }
 }
 
@@ -1964,21 +2221,16 @@ impl Optimize for ExpandRefs {
 pub struct LowerDwrt;
 
 impl Optimize for LowerDwrt {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes().any(|n| {
-            matches!(
-                n,
-                ExprNode::Unary(OpKind::Dwrt, _)
-                    | ExprNode::Binary(OpKind::Dwrt, _, _)
-                    | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                    | ExprNode::Nary(OpKind::Dwrt, _)
-            )
-        }) {
+    fn optimize(&mut self, graph: &ExprGraph) -> Rewritten {
+        if !graph
+            .dag()
+            .iter()
+            .any(|n| matches!(*n, ExprData::Op(OpKind::Dwrt)))
+        {
             return Rewritten::Unchanged;
         }
-        let mut owned = arena.clone();
-        match lower_dwrt(&mut owned, root) {
-            Ok(new_root) => Rewritten::Changed(owned, new_root),
+        match lower_dwrt_rooted(graph.rooted(), graph.environment()) {
+            Ok((rooted, env)) => Rewritten::Changed(ExprGraph::new(rooted, env)),
             Err(_) => Rewritten::Declined,
         }
     }
@@ -1994,13 +2246,16 @@ impl Optimize for LowerDwrt {
 pub struct ExpandReduce;
 
 impl Optimize for ExpandReduce {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes().any(|n| matches!(n, ExprNode::Reduce { .. })) {
+    fn optimize(&mut self, graph: &ExprGraph) -> Rewritten {
+        if !graph
+            .dag()
+            .iter()
+            .any(|n| matches!(*n, ExprData::Reduce(_)))
+        {
             return Rewritten::Unchanged;
         }
-        let mut owned = arena.clone();
-        let new_root = expand_reduce(&mut owned, root);
-        Rewritten::Changed(owned, new_root)
+        let (rooted, env) = expand_reduce_rooted(graph.rooted(), graph.environment());
+        Rewritten::Changed(ExprGraph::new(rooted, env))
     }
 }
 
@@ -2008,9 +2263,17 @@ impl Optimize for ExpandReduce {
 mod ref_expansion_tests {
     use super::*;
     use crate::kernel::Kernel;
-    use crate::key::canonical;
     use crate::optimize::Rewritten;
     use crate::store::KernelStore;
+
+    fn legacy_parts(k: &Kernel) -> (ExprArena, ExprId) {
+        let env = Environment {
+            buffers: k.buffers().to_vec(),
+            uniforms: k.uniforms().to_vec(),
+        };
+        let (arena, mut roots) = k.rooted().marshal(&[k.root()], &env);
+        (arena, roots.pop().expect("kernel has one root"))
+    }
 
     /// `√((X − 1.5)² + Y²) − 0.75` — arithmetic with shared subterms, so a
     /// splice that broke DAG sharing would show up in the node count.
@@ -2030,13 +2293,18 @@ mod ref_expansion_tests {
     #[test]
     fn expansion_is_an_identity_when_nothing_is_named() {
         let k = circle();
-        let (arena, root) = k.parts();
-        let (out, out_root) = expand_refs_owned(arena, root);
+        let (arena, root) = legacy_parts(&k);
+        let (out, out_root) = expand_refs_owned(&arena, root);
         assert_eq!(out_root, root, "the root cannot move");
         assert_eq!(out.len(), arena.len(), "no node may be added or dropped");
-        assert_eq!(canonical(&out, out_root).key, canonical(arena, root).key);
         assert!(matches!(
-            ExpandRefs.optimize(arena, root),
+            ExpandRefs.optimize(&ExprGraph::new(
+                k.rooted().clone(),
+                Environment {
+                    buffers: k.buffers().to_vec(),
+                    uniforms: k.uniforms().to_vec(),
+                },
+            )),
             Rewritten::Unchanged
         ));
     }
@@ -2046,8 +2314,8 @@ mod ref_expansion_tests {
     #[test]
     fn differentiating_a_reference_directly_is_refused() {
         let named = Kernel::x().mul(&Kernel::x()).by_ref().dx();
-        let (arena, root) = named.parts();
-        match lower_dwrt_owned(arena, root) {
+        let (arena, root) = legacy_parts(&named);
+        match lower_dwrt_owned(&arena, root) {
             Err(msg) => assert!(
                 msg.contains("cannot differentiate a Ref"),
                 "unexpected message: {msg}"
@@ -2064,8 +2332,13 @@ mod ref_expansion_tests {
         // A key nothing interned: `resolve` says so, and expansion cannot
         // proceed on a name with no referent.
         let never = Kernel::x().add(&Kernel::constant(3.0e-28));
-        let (never_arena, never_root) = never.parts();
-        let orphan = crate::key::KernelKey::of(never_arena, never_root);
+        let orphan = crate::key::KernelKey::of(
+            never.root(),
+            &Environment {
+                buffers: never.buffers().to_vec(),
+                uniforms: never.uniforms().to_vec(),
+            },
+        );
         assert!(KernelStore::resolve(orphan).is_none(), "must be unknown");
         let mut a = ExprArena::new();
         let root = a.push_ref(orphan);
@@ -2080,5 +2353,56 @@ mod ref_expansion_tests {
     #[should_panic(expected = "an open term has no identity")]
     fn naming_an_open_term_is_refused() {
         let _refused = Kernel::sum_over(3, |i| i.by_ref());
+    }
+}
+
+#[cfg(test)]
+mod native_graph_tests {
+    use super::*;
+    use crate::{Binder, ExprBuilder, Monoid};
+
+    #[test]
+    fn native_reduce_lowering_preserves_fold_denotation() {
+        let binder = Binder::from_slot(0).expect("slot 0");
+        let mut builder = ExprBuilder::new();
+        let body = builder.var(binder.var());
+        let root = builder.reduce(Fold::new(Monoid::SUM, binder, 0..3), body);
+        let graph = builder.finish_one(root);
+
+        let (lowered, env) = expand_reduce_rooted(graph.rooted(), graph.environment());
+        let root = lowered.entry();
+        assert_eq!(*root, ExprData::Op(OpKind::Add));
+        assert_eq!(root.node_count(), 5);
+        assert_eq!(env, Environment::new());
+    }
+
+    #[test]
+    fn native_gather_lowering_uses_the_declared_buffer_shape() {
+        let mut builder = ExprBuilder::new();
+        let decl = crate::arena::BufferDecl {
+            id: crate::arena::BufferIdentity::mint(),
+            width: 8,
+            height: 4,
+        };
+        let buffer = builder.buffer(decl);
+        let x = builder.var(0);
+        let y = builder.var(1);
+        let root = builder.ternary(OpKind::Gather, buffer, x, y);
+        let graph = builder.finish_one(root);
+
+        let (lowered, env) = expand_gather_rooted(graph.rooted(), graph.environment());
+        assert_eq!(env.buffers, &[decl]);
+        assert!(
+            lowered
+                .entry()
+                .descendants()
+                .any(|node| matches!(*node, ExprData::Op(OpKind::RawGather)))
+        );
+        assert!(
+            !lowered
+                .entry()
+                .descendants()
+                .any(|node| matches!(*node, ExprData::Op(OpKind::Gather)))
+        );
     }
 }

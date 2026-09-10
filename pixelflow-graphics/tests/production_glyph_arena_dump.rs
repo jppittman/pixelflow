@@ -14,7 +14,7 @@
 //! - `atlas.warm(&font, ' '..='~')` (`:205,244`), which bakes
 //!   `font.glyph_kernel_scaled(ch, tile_px)` through `Lattice::bake`
 //!   (`pixelflow-graphics/src/fonts/atlas.rs:168-184`), and `Lattice::bake`
-//!   hands `kernel.parts()` to `jit_cache::compile` unchanged
+//!   hands the rooted kernel graph to `jit_cache::compile` unchanged
 //!   (`pixelflow-core/src/lattice/mod.rs:402`).
 //!
 //! Also cross-checks the atlas arithmetic the cell-grid dumper in
@@ -22,7 +22,7 @@
 //! cannot drift apart silently.
 
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::{Environment, ExprData, Rooted};
 
 const FONT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -70,18 +70,23 @@ fn dump_production_glyph_arenas() {
                 continue;
             };
             let coverage = glyph.kernel();
-            let (arena, root) = coverage.parts();
+            let env = Environment {
+                buffers: coverage.buffers().to_vec(),
+                uniforms: coverage.uniforms().to_vec(),
+            };
+            let (legacy, legacy_root) = coverage.root().marshal(&env);
             // `glyph.kernel()`'s winding sum is a `Kernel::sum_over` (S1a): the
             // raw arena still carries the `Nary(Reduce, ..)` node this
             // dumper panics on below, same as the JIT would see it before
             // `Manifold::compile`'s own `legalize` unrolls it. Legalize here
             // too, so this telemetry dump matches what production actually
             // compiles rather than an arena shape that never reaches the JIT.
-            let (arena, root) =
-                pixelflow_ir::passes::legalize(arena, root).expect("legalize glyph arena");
+            let (legacy, legacy_root) =
+                pixelflow_ir::passes::legalize(&legacy, legacy_root).expect("legalize glyph graph");
+            let (rooted, env) = Rooted::unmarshal(&legacy, &[legacy_root]);
             let name = format!("glyph{tile_px}:U+{:04X}", ch as u32);
-            let path = dir.join(format!("glyph{tile_px}_U{:04X}.arena", ch as u32));
-            dump_arena(&arena, root, &name, &path);
+            let path = dir.join(format!("glyph{tile_px}_U{:04X}.dag", ch as u32));
+            dump_graph(rooted.entry(), &env, &name, &path);
             dumped += 1;
         }
     }
@@ -90,7 +95,10 @@ fn dump_production_glyph_arenas() {
         // Production skips these too (atlas.rs:180-183: slot None, blank tile),
         // so they are not kernels — but say so out loud rather than dropping
         // them from the count silently.
-        println!("font has no glyph for {} (density, char) pairs; production bakes nothing for them: {missing:?}", missing.len());
+        println!(
+            "font has no glyph for {} (density, char) pairs; production bakes nothing for them: {missing:?}",
+            missing.len()
+        );
     }
     assert!(dumped > 0, "dumped nothing");
 }
@@ -102,64 +110,57 @@ fn dump_production_glyph_arenas() {
 /// from `pixelflow-core/src/lattice/cell_grid.rs`'s test module rather than
 /// shared, because the only crate both dumpers can see is `pixelflow-ir`,
 /// which must not grow a test-only serializer.
-fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Path) {
+fn dump_graph(
+    root: pixelflow_ir::Node<'_, ExprData>,
+    env: &Environment,
+    name: &str,
+    path: &std::path::Path,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write as _;
-    let len = arena.len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
-    }
+    let reachable: BTreeSet<_> = root.descendants().collect();
+    let nodes: Vec<_> = root
+        .dag()
+        .iter()
+        .filter(|n| reachable.contains(n))
+        .collect();
+    let dense: BTreeMap<_, u32> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (*n, i as u32))
+        .collect();
     let mut out = String::new();
-    writeln!(out, "# pixelflow arena dump v1").expect("fmt");
+    writeln!(out, "# pixelflow dag dump v1").expect("fmt");
     writeln!(out, "name {name}").expect("fmt");
-    let mut idents: Vec<pixelflow_ir::arena::BufferIdentity> = Vec::new();
-    for decl in arena.buffers() {
-        let ord = match idents.iter().position(|i| *i == decl.id) {
-            Some(p) => p,
-            None => {
-                idents.push(decl.id);
-                idents.len() - 1
-            }
-        };
+    for (ord, decl) in env.buffers.iter().enumerate() {
         writeln!(out, "buf {ord} {} {}", decl.width, decl.height).expect("fmt");
     }
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
-    let mut next = 0u32;
-    let d = |dense: &[u32], id: ExprId| -> u32 {
-        let v = dense[id.0 as usize];
-        assert_ne!(v, u32::MAX, "child dumped before parent");
-        v
-    };
-    for idx in 0..len {
-        if !reachable[idx] {
-            continue;
-        }
-        let id = ExprId(idx as u32);
-        match arena.node(id) {
-            ExprNode::Var(i) => writeln!(out, "V {i}"),
-            ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
-            ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
-            ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-            ExprNode::Binary(k, a, b) => writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b)),
-            ExprNode::Ternary(k, a, b, c) => {
-                writeln!(out, "T {k:?} {} {} {}", d(&dense, *a), d(&dense, *b), d(&dense, *c))
+    let d = |node| *dense.get(&node).expect("child dumped before parent");
+    for node in nodes {
+        match *node {
+            ExprData::Var(i) => writeln!(out, "V {i}"),
+            ExprData::Const(bits) => writeln!(out, "C {bits}"),
+            ExprData::Buffer(b) => writeln!(out, "B {}", b.0),
+            ExprData::Uniform(u) => writeln!(out, "Un {}", u.0),
+            ExprData::Op(k) => {
+                let children: Vec<_> = node.children().collect();
+                match children.as_slice() {
+                    [a] => writeln!(out, "U {k:?} {}", d(*a)),
+                    [a, b] => writeln!(out, "Bi {k:?} {} {}", d(*a), d(*b)),
+                    [a, b, c] => writeln!(out, "T {k:?} {} {} {}", d(*a), d(*b), d(*c)),
+                    _ => panic!("{name}: production graph contains unsupported operation arity"),
+                }
             }
-            ExprNode::Reduce { fold, body } => {
-                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+            ExprData::Reduce(fold) => {
+                let body = node.children().next().expect("reduce body");
+                writeln!(out, "R {} {}", fold.to_bits(), d(body))
             }
-            other @ (ExprNode::Param(_) | ExprNode::Nary(..) | ExprNode::Ref(_)) => {
-                panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
+            other @ (ExprData::Param(_) | ExprData::Ref(_)) => {
+                panic!("{name}: production graph contains {other:?}, which the runtime optimizer bails on")
             }
         }
         .expect("fmt");
-        dense[idx] = next;
-        next += 1;
     }
-    writeln!(out, "root {}", d(&dense, root)).expect("fmt");
+    writeln!(out, "root {}", d(root)).expect("fmt");
     std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }

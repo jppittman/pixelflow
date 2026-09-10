@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprArena, ExprData, ExprId, Node, OpKind};
 
 /// One node of a [`FenceKey`]: the node's [`OpKind`] identity plus the
 /// key-local ids of its children, in deterministic post-order. No literal
@@ -95,6 +95,52 @@ impl FenceKey {
             }
         }
 
+        FenceKey(nodes)
+    }
+
+    /// Build the same feature-quotient key from a rooted DAG node.
+    ///
+    /// The traversal follows the DAG's child-before-parent iteration order;
+    /// no storage index or arena layout is observed.  This is the preferred
+    /// entry point for corpus and holdout consumers.  `Ref` remains a hard
+    /// error for the same reason as [`Self::of`]: references have no local
+    /// operation identity and must be expanded before structural analysis.
+    #[must_use]
+    pub fn of_dag(root: Node<'_, ExprData>) -> Self {
+        let reachable: HashSet<Node<'_, ExprData>> = root.descendants().collect();
+        let mut ids = HashMap::<Node<'_, ExprData>, u32>::new();
+        let mut nodes = Vec::new();
+        for node in root.dag().iter() {
+            if !reachable.contains(&node) {
+                continue;
+            }
+            let op = match *node {
+                ExprData::Var(_) => OpKind::Var,
+                ExprData::Const(_) | ExprData::Param(_) => OpKind::Const,
+                ExprData::Buffer(_) => OpKind::Buffer,
+                ExprData::Uniform(_) => OpKind::Uniform,
+                ExprData::Ref(key) => panic!(
+                    "FenceKey::of_dag: {key:?} is a reference to a kernel, not an operation; \
+                     run passes::expand_refs before asking for a structural key"
+                ),
+                ExprData::Op(op) => op,
+                ExprData::Reduce(_) => OpKind::Reduce,
+            };
+            let children: Box<[u32]> = node
+                .children()
+                .map(|child| {
+                    *ids.get(&child)
+                        .expect("FenceKey::of_dag: child must precede parent")
+                })
+                .collect();
+            let key_id = nodes.len() as u32;
+            nodes.push(QuotientNode { op, children });
+            ids.insert(node, key_id);
+        }
+        assert!(
+            ids.contains_key(&root),
+            "FenceKey::of_dag: root missing from reachable DAG"
+        );
         FenceKey(nodes)
     }
 }

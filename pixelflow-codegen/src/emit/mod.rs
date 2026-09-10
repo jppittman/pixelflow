@@ -779,25 +779,23 @@ impl EmitCtx {
         }
     }
 
-    /// Compile an [`ExprArena`] DAG under this configuration.
+    /// Compile an expression through the DAG-facing API.
     ///
-    /// The configured spelling of [`compile`]. It is a method rather than a
-    /// `compile_with_ctx` free function because the suffix was only ever
-    /// standing in for a receiver: the config is the thing that varies, so the
-    /// config is what should be on the left.
-    ///
-    /// # Errors
-    ///
-    /// If the arena contains a construct no pass can lower, or the emitter
-    /// cannot allocate a frame for it.
-    pub fn compile(
+    /// The legacy arena is used only as the private compatibility boundary
+    /// required by the current legalization passes.  Once legalization has
+    /// finished, scheduling and emission consume `Node` handles exclusively;
+    /// callers never need to carry an arena and an index together.
+    pub fn compile_dag(
         self,
-        arena: &pixelflow_ir::arena::ExprArena,
-        root: pixelflow_ir::arena::ExprId,
+        root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>,
+        env: &pixelflow_ir::Environment,
     ) -> Result<CompileResult, CompileError> {
-        let (arena, root) =
-            pixelflow_ir::passes::legalize(arena, root).map_err(CompileError::Legalize)?;
-        let schedule = arena_to_schedule(&arena, root);
+        let (legacy, legacy_root) = root.marshal(env);
+        let (legalized, legalized_root) =
+            pixelflow_ir::passes::legalize(&legacy, legacy_root).map_err(CompileError::Legalize)?;
+        let (rooted, legalized_env) =
+            pixelflow_ir::Rooted::unmarshal(&legalized, &[legalized_root]);
+        let schedule = dag_to_schedule(rooted.entry(), &legalized_env);
         compile_via_backend(schedule, &mut Native::new(self))
     }
 }
@@ -1547,7 +1545,7 @@ pub enum ScheduledOp {
     ),
     /// Bit-shift by a compile-time immediate: `op` is `Shl` or `Shr`, the value
     /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
-    /// `arena_to_schedule` (so it never becomes a scheduled value / register).
+    /// The DAG scheduler (so it never becomes a scheduled value / register).
     ShiftImm(OpKind, regalloc::ValueId, u8),
     /// Bound-memory gather: read buffer `slot` at the lane index computed by the
     /// value operand. Lowered from `RawGather(Buffer(slot), index)`; the buffer
@@ -1562,32 +1560,8 @@ pub enum ScheduledOp {
 }
 
 // =============================================================================
-// Arena to Schedule (zero-cost linearization)
+// DAG to Schedule (zero-cost linearization)
 // =============================================================================
-
-/// Mark nodes reachable from `root` via DFS.
-///
-/// The arena may contain garbage nodes from junkify passes; only nodes
-/// transitively referenced by `root` should appear in the schedule.
-fn mark_reachable(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
-    reachable: &mut [bool],
-) {
-    let mut stack = alloc::vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if reachable[idx] {
-            continue;
-        }
-        reachable[idx] = true;
-        for child in arena.children(id) {
-            if !reachable[child.0 as usize] {
-                stack.push(child);
-            }
-        }
-    }
-}
 
 /// Narrow a `Const` shift count to the `u8` immediate the hardware encoders
 /// take, refusing anything a 32-bit lane cannot be shifted by.
@@ -1607,142 +1581,97 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
     count as u8
 }
 
-/// Build a schedule directly from an [`ExprArena`].
+/// Build a schedule from a rooted expression DAG.
 ///
-/// The arena stores nodes in topological order (children before parents by
-/// construction). We filter to reachable nodes, remap `ExprId` to `ValueId`,
-/// and translate `ExprNode` to `ScheduledOp`.
-///
-/// # Panics
-///
-/// Panics if a `Param` or `Nary` node is encountered (these are not expected
-/// in JIT compilation).
-fn arena_to_schedule(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
+/// `Dag` iteration is already children-before-parents, so the scheduler only
+/// needs a side table to retain the dense `ValueId` mapping.  This keeps the
+/// representation boundary one-way: expression storage remains owned by the
+/// IR DAG and the emitter sees borrowed node handles, never raw offsets.
+fn dag_to_schedule(
+    root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>,
+    env: &pixelflow_ir::Environment,
 ) -> Vec<regalloc::Def> {
-    use pixelflow_ir::arena::{ExprId, ExprNode};
+    use pixelflow_ir::ExprData;
     use regalloc::ValueId;
 
-    let len = arena.len();
-    let mut reachable = alloc::vec![false; len];
-    mark_reachable(arena, root, &mut reachable);
+    let dag = root.dag();
+    let mut reachable = dag.side_table(false);
+    for node in root.descendants() {
+        reachable[node] = true;
+    }
 
-    // ExprId to ValueId mapping. u32::MAX = unmapped (unreachable).
-    let mut id_map = alloc::vec![ValueId(u32::MAX); len];
+    let mut ids = dag.side_table(None::<ValueId>);
     let mut schedule = Vec::new();
-    let mut next_id = 0u32;
-
-    for idx in 0..len {
-        if !reachable[idx] {
+    for node in dag.iter() {
+        if !reachable[node] {
             continue;
         }
-        let expr_id = ExprId(idx as u32);
-        let node = arena.node(expr_id);
-        let vid = ValueId(next_id);
-        next_id += 1;
-        id_map[idx] = vid;
-
-        let map_child = |child: &ExprId| -> ValueId {
-            let mapped = id_map[child.0 as usize];
-            assert!(
-                mapped.0 != u32::MAX,
-                "arena_to_schedule: child ExprId({}) not yet mapped -- \
-                 arena is not in topological order or child is unreachable",
-                child.0
-            );
-            mapped
+        let value = ValueId(schedule.len() as u32);
+        ids[node] = Some(value);
+        let mut children = node.children();
+        let child = |node: pixelflow_ir::Node<'_, ExprData>,
+                     ids: &pixelflow_ir::SideTable<Option<ValueId>>| {
+            ids[node].expect("dag_to_schedule: child must precede parent")
         };
-
-        let sched_op = match node {
-            ExprNode::Var(i) => ScheduledOp::Var(*i),
-            ExprNode::Const(v) => ScheduledOp::Const(*v),
-            ExprNode::Param(i) => panic!(
-                "ExprNode::Param({}) reached the JIT emitter -- \
-                 call substitute_params before compile()",
-                i
+        let sched_op = match *node {
+            ExprData::Var(i) => ScheduledOp::Var(i),
+            ExprData::Const(bits) => ScheduledOp::Const(f32::from_bits(bits)),
+            ExprData::Param(i) => panic!(
+                "ExprData::Param({i}) reached the JIT emitter -- call substitute_params before compile_dag()"
             ),
-            // A Buffer leaf is always folded into a `Gather`'s `slot` immediate
-            // (below), so any Buffer that survives as its own reachable node is a
-            // dead operand — never consumed as a value. Emit a harmless dead
-            // placeholder occupying its ValueId slot, exactly as ShiftImm leaves
-            // its folded shift-count Const as a dead schedule entry.
-            ExprNode::Buffer(_) => ScheduledOp::Const(0.0),
-            // The block pointer sits in the context entry after the buffer
-            // slots; the value's offset is its slot index — the link step
-            // (`jit_cache`) renumbers the table into dense first-occurrence
-            // order before anything reaches here, and a caller compiling an
-            // arena directly gets the table order it declared.
-            ExprNode::Uniform(u) => ScheduledOp::Uniform(UniformLoad {
-                ctx_slot: u16::try_from(arena.buffers().len())
+            ExprData::Buffer(_) => ScheduledOp::Const(0.0),
+            ExprData::Uniform(u) => ScheduledOp::Uniform(UniformLoad {
+                ctx_slot: u16::try_from(env.buffers.len())
                     .expect("buffer table index fits the context slot immediate"),
                 offset: u.0,
             }),
-            ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
-            // Shl/Shr fold their Const shift-count operand into an immediate, so
-            // the count never becomes a scheduled value (matching the imm-only
-            // hardware shift encoders). The count const may still appear as its
-            // own schedule entry (harmless/unused) if shared.
-            ExprNode::Binary(op @ (OpKind::Shl | OpKind::Shr), a, b) => {
-                let amount = match arena.node(*b) {
-                    ExprNode::Const(v) => shift_immediate(*op, *v),
-                    _ => panic!(
-                        "{:?} shift count must be a Const (lowering guarantees this)",
-                        op
-                    ),
-                };
-                ScheduledOp::ShiftImm(*op, map_child(a), amount)
-            }
-            // RawGather folds its Buffer leaf into the `slot` immediate (like a
-            // shift count); only the index operand becomes a scheduled value.
-            ExprNode::Binary(OpKind::RawGather, buf, idx) => {
-                let slot = match arena.node(*buf) {
-                    ExprNode::Buffer(id) => id.0,
-                    other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
-                };
-                ScheduledOp::Gather(map_child(idx), slot)
-            }
-            // Unreachable precondition: every compile entry point runs
-            // `passes::lower_dwrt` before scheduling, which either rewrites
-            // all `Dwrt` (autodiff) nodes into chain-rule arithmetic or errors
-            // loudly on an op it cannot differentiate. A `Dwrt` here means a
-            // caller bypassed that pipeline. Fail loudly rather than as a
-            // cryptic instruction-emit panic.
-            ExprNode::Binary(OpKind::Dwrt, _, _) => panic!(
-                "arena_to_schedule: a Dwrt (autodiff) node reached the JIT \
-                 emitter. lower_dwrt runs in every compile entry point and \
-                 either eliminates Dwrt or refuses to compile, so a survivor \
-                 means this schedule was built without the lowering pipeline."
-            ),
-            ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
-            ExprNode::Ternary(op, a, b, c) => {
-                ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
-            }
-            // Same unreachable precondition as `Dwrt` above: `passes::legalize`
-            // runs `expand_refs` first in every compile entry point, so a
-            // reference here means this schedule was built without the
-            // lowering pipeline. Refusing is not a limitation to lift — a
-            // surviving reference is a *call*, and codegen emits one flat
-            // function per kernel with no ABI for one
-            // (docs/plans/2026-09-09-composition-is-linking.md §5.2).
-            ExprNode::Ref(key) => panic!(
-                "arena_to_schedule: {key:?} names a kernel whose body is not in \
-                 this arena. expand_refs runs first in every compile entry \
-                 point, so a survivor means this schedule was built without \
-                 the lowering pipeline."
-            ),
-            ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
-            // **The emitter has no iteration binder.** A fold reaching here
-            // means `passes::expand_reduce` did not run — that pass is what
-            // turns a fold into the `len()` copies of its body the machine
-            // actually executes, and it is the reason a surviving `Reduce`
-            // is priced out of extraction rather than emitted.
-            ExprNode::Reduce { .. } => {
+            ExprData::Reduce(_) => {
                 panic!("a bounded fold reached the JIT emitter -- run passes::expand_reduce first")
             }
+            ExprData::Ref(key) => panic!(
+                "dag_to_schedule: {key:?} names a kernel whose body is not in this DAG; expand_refs runs first"
+            ),
+            ExprData::Op(op) => match node.child_count() {
+                1 => ScheduledOp::Unary(op, child(children.next().expect("unary child"), &ids)),
+                2 if matches!(op, OpKind::Shl | OpKind::Shr) => {
+                    let a = children.next().expect("shift value");
+                    let b = children.next().expect("shift count");
+                    let amount = match *b {
+                        ExprData::Const(bits) => shift_immediate(op, f32::from_bits(bits)),
+                        other => panic!("{op:?} shift count must be a Const, got {other:?}"),
+                    };
+                    ScheduledOp::ShiftImm(op, child(a, &ids), amount)
+                }
+                2 if op == OpKind::RawGather => {
+                    let buf = children.next().expect("gather buffer");
+                    let idx = children.next().expect("gather index");
+                    let slot = match *buf {
+                        ExprData::Buffer(id) => id.0,
+                        other => {
+                            panic!("RawGather's first child must be a Buffer leaf, got {other:?}")
+                        }
+                    };
+                    ScheduledOp::Gather(child(idx, &ids), slot)
+                }
+                2 if op == OpKind::Dwrt => panic!(
+                    "dag_to_schedule: a Dwrt node reached the JIT emitter; lower_dwrt must eliminate it"
+                ),
+                2 => {
+                    let a = children.next().expect("binary left child");
+                    let b = children.next().expect("binary right child");
+                    ScheduledOp::Binary(op, child(a, &ids), child(b, &ids))
+                }
+                3 => {
+                    let a = children.next().expect("ternary first child");
+                    let b = children.next().expect("ternary second child");
+                    let c = children.next().expect("ternary third child");
+                    ScheduledOp::Ternary(op, child(a, &ids), child(b, &ids), child(c, &ids))
+                }
+                arity => panic!("Nary expression with arity {arity} reached the JIT emitter"),
+            },
         };
         schedule.push(regalloc::Def {
-            value: vid,
+            value,
             op: sched_op,
         });
     }
@@ -1755,7 +1684,7 @@ fn arena_to_schedule(
 
 /// Compute [`Variance`](pixelflow_ir::variance::Variance) for every schedule entry.
 ///
-/// The schedule mirrors the arena's topological order, so one forward pass
+/// The schedule mirrors the DAG's topological order, so one forward pass
 /// suffices — the dense result is indexed by `ValueId.0`.
 fn schedule_variance(schedule: &[regalloc::Def]) -> Vec<pixelflow_ir::variance::Variance> {
     use pixelflow_ir::variance::Variance;
@@ -2350,7 +2279,7 @@ type Native = avx2::driver::Avx2Backend;
 ))]
 type Native = x86_64::driver::X86Backend;
 
-/// Compile an [`ExprArena`] DAG into a **collapse** kernel: the X/Y loop nest is
+/// Compile a rooted expression DAG into a **collapse** kernel: the X/Y loop nest is
 /// emitted *inside* the code, so one call fills `rows * groups` output batches
 /// with no per-row or per-batch Rust↔JIT boundary. This is the internal-loop
 /// realization of a lattice collapse.
@@ -2366,14 +2295,14 @@ type Native = x86_64::driver::X86Backend;
 /// [`KernelFn`](executable::KernelFn) ABI
 /// `(ctx, out, groups, rows, row_skip_bytes, x0, y0, z, w)`.
 ///
-/// The context is one base pointer per declared buffer, in the arena's slot
-/// order, followed — only when the arena declares a uniform — by the uniform
-/// block's base pointer: `f32` values in the arena's uniform-slot order, read
+/// The context is one base pointer per declared buffer, in the environment's slot
+/// order, followed — only when the environment declares a uniform — by the uniform
+/// block's base pointer: `f32` values in the DAG environment's uniform-slot order, read
 /// once per call in the frame prologue.
 ///
 /// # Panics
 ///
-/// Panics if the arena names a retired coordinate axis (`Var(2)`/`Var(3)`,
+/// Panics if the DAG names a retired coordinate axis (`Var(2)`/`Var(3)`,
 /// the old Z and W). This is the boundary the check belongs on, because it
 /// is the *only* one every route to machine code passes through — the
 /// shape-keyed cache is one caller, and the benchmark harnesses, the corpus
@@ -2388,17 +2317,22 @@ type Native = x86_64::driver::X86Backend;
 /// `COORDS` and `BINDERS` — so the node reads as frame-uniform and LICM
 /// lifts it into the per-call prologue. Plausible pixels, computed once,
 /// from a lane that means nothing.
+/// Compile a rooted expression through the DAG-facing codegen boundary.
+#[must_use = "code generation errors must be handled"]
 pub fn compile(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
+    root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>,
+    env: &pixelflow_ir::Environment,
 ) -> Result<CompileResult, CompileError> {
-    assert!(
-        arena.retired_axis(root).is_none(),
-        "emit::compile: the arena names Var({:?}), a coordinate axis a \
-         lattice no longer has; a per-call scalar is a Uniform",
-        arena.retired_axis(root)
-    );
-    EmitCtx::default().compile(arena, root)
+    EmitCtx::default().compile_dag(root, env)
+}
+
+/// Explicit spelling for callers that want to make the DAG boundary visible.
+#[must_use = "code generation errors must be handled"]
+pub fn compile_dag(
+    root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>,
+    env: &pixelflow_ir::Environment,
+) -> Result<CompileResult, CompileError> {
+    compile(root, env)
 }
 
 /// Drive a schedule to a complete collapse kernel via an
@@ -2609,2805 +2543,161 @@ fn compile_via_backend<B: IsaBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::arena::ExprArena;
-    // Only the 128-bit x86 helpers (`run1`, `run_xy`, `run2`) take an `ExprId`
-    // at this level; the wider-ISA submodules import their own.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    use pixelflow_ir::arena::ExprId;
+    use pixelflow_ir::{ExprBuilder, ExprData, ExprGraph, OpKind};
 
-    // The three helpers below are shared by ISA-gated tests; which subset is
-    // live depends on the build's target features, so none is unconditionally
-    // used.
-
-    /// Lanes in one SIMD batch for this build.
-    #[allow(dead_code)]
-    const LANES: usize = crate::JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
-
-    /// Evaluate one batch at arbitrary per-lane coordinates.
-    ///
-    /// `V` is `[f32; LANES]`, which is the emitted vector type *by size*, so
-    /// this needs neither intrinsics nor a hand-written `extern "C"` signature
-    /// — the two things every caller in this file used to spell for itself,
-    /// once per ISA. `ctx` may be empty: a kernel that declares no buffer never
-    /// reads the pointer.
-    #[allow(dead_code)]
-    fn eval_batch(
-        code: &executable::ExecutableCode,
-        ctx: &[*const f32],
-        origin: executable::Point4<[f32; LANES]>,
-    ) -> [f32; LANES] {
-        let mut out = [0.0f32; LANES];
-        // SAFETY: `out` holds exactly one batch; size_of::<[f32; LANES]>() is
-        // JIT_VECTOR_BYTES by construction; `ctx` binds every declared buffer.
-        unsafe {
-            code.call_collapse(
-                ctx.as_ptr(),
-                executable::TileSlice::single(out.as_mut_ptr()),
-                origin,
-            );
-        }
-        out
+    fn schedule(graph: ExprGraph) -> Vec<regalloc::Def> {
+        dag_to_schedule(graph.root(), graph.environment())
     }
 
-    /// Evaluate at a single point (all lanes the same X).
-    #[allow(dead_code)]
-    fn eval_point(code: &executable::ExecutableCode, x: f32, y: f32, z: f32, w: f32) -> f32 {
-        let o = executable::Point4::new([x; LANES], [y; LANES], [z; LANES], [w; LANES]);
-        eval_batch(code, &[], o)[0]
-    }
-
-    /// A `Dwrt` that reaches the scheduler (a caller bypassed the lowering
-    /// pipeline) must fail loudly at the schedule boundary, not as a cryptic
-    /// emit panic. The compile entry points run `lower_dwrt` first, so this
-    /// exercises calling `arena_to_schedule` directly.
     #[test]
-    #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
+    #[should_panic(expected = "Dwrt node reached")]
     fn surviving_dwrt_fails_loudly() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let v = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, x, v);
-        let _ = arena_to_schedule(&a, root);
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let zero = b.constant(0.0);
+        let root = b.binary(OpKind::Dwrt, x, zero);
+        let graph = b.finish_one(root);
+        let _ = schedule(graph);
     }
 
-    /// And the same for a `Ref`: its body is not in this arena at all, so a
-    /// survivor is a schedule built without `expand_refs`. `compile` runs
-    /// `legalize` first, so this too has to call the scheduler directly.
     #[test]
-    #[should_panic(expected = "names a kernel whose body is not in")]
-    fn a_surviving_reference_fails_loudly() {
-        let named = pixelflow_ir::Kernel::x()
-            .mul(&pixelflow_ir::Kernel::constant(3.0))
-            .by_ref();
-        let (arena, root) = named.parts();
-        let _ = arena_to_schedule(arena, root);
+    #[should_panic(expected = "names a kernel whose body is not in this DAG")]
+    fn surviving_reference_fails_loudly() {
+        let body = pixelflow_ir::Kernel::x();
+        let key = pixelflow_ir::KernelKey::of(body.root(), &body.environment());
+        let mut b = ExprBuilder::new();
+        let root = b.reference(key);
+        let graph = b.finish_one(root);
+        let _ = schedule(graph);
     }
 
-    /// The route that *does* work: the compile entry expands the reference
-    /// before it schedules, so a kernel composed by reference emits exactly
-    /// what the spliced composition emits.
     #[test]
-    fn a_reference_compiles_through_the_entry_point() {
-        let body = pixelflow_ir::Kernel::x().mul(&pixelflow_ir::Kernel::constant(3.0));
-        let named = body.by_ref().add(&pixelflow_ir::Kernel::y());
-        let direct = body.add(&pixelflow_ir::Kernel::y());
-        let (n_arena, n_root) = named.parts();
-        let (d_arena, d_root) = direct.parts();
-        let named_code = compile(n_arena, n_root).expect("a named kernel compiles");
-        let direct_code = compile(d_arena, d_root).expect("and so does the spliced one");
-        for (x, y) in [(0.0f32, 0.0f32), (1.5, -2.0), (-3.25, 7.5)] {
-            let want = eval_point(&direct_code.code, x, y, 0.0, 0.0);
-            let got = eval_point(&named_code.code, x, y, 0.0, 0.0);
-            assert_eq!(got, want, "at ({x}, {y})");
-        }
+    fn scheduler_maps_dag_nodes_in_topological_order() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let c = b.constant(2.0);
+        let product = b.binary(OpKind::Mul, x, c);
+        let root = b.binary(OpKind::Add, product, y);
+        let schedule = schedule(b.finish_one(root));
+        assert_eq!(schedule.len(), 5);
+        assert!(matches!(
+            schedule.last().map(|d| &d.op),
+            Some(ScheduledOp::Binary(OpKind::Add, _, _))
+        ));
     }
 
-    /// The scaffold's size does not depend on the frame it wraps.
-    ///
-    /// Every backend now shares one `emit_collapse_loop`, so the loop nest's
-    /// branch displacements are computed in exactly one place — and they are
-    /// only correct if the instructions between two labels keep their widths
-    /// as the frame grows. A slot displacement that silently widened from an
-    /// 8-bit to a 32-bit form would move every label after it.
-    ///
-    /// Checking it needs no host CPU: emission is a pure function into
-    /// `Vec<u8>`, so all four backends are measured from whichever host runs
-    /// the tests.
     #[test]
-    fn scaffold_size_is_independent_of_the_frame() {
-        let ctx = EmitCtx::default();
-        let batch: Vec<u8> = alloc::vec![0x90; 8];
-        let fh: Vec<u8> = alloc::vec![0x90; 4];
-        let rh: Vec<u8> = alloc::vec![0x90; 12];
-        let wrapped = |result, frame_size, hoist_slots| CollapseBody {
-            frame_hoist: &fh,
-            row_hoist: &rh,
-            batch: &batch,
-            result,
-            frame_size,
-            hoist_slots,
-        };
-        // Red-zone and allocated frames, with and without hoisted values.
-        const SHAPES: [(u32, u32); 3] = [(0, 0), (64, 2), (160, 3)];
-
-        let mut sizes = alloc::vec::Vec::new();
-        for (frame_size, hoist_slots) in SHAPES {
-            let mut sse2 = x86_64::driver::X86Backend::new(ctx.clone());
-            sse2.frame_ready(frame_size);
-            let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
-            avx2b.frame_ready(frame_size);
-            let mut avx512b = avx512::driver::Avx512Backend::new(ctx.clone());
-            avx512b.frame_ready(frame_size);
-            let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
-            neon.frame_ready(frame_size);
-
-            let neon_code = neon.emit_collapse_loop(&wrapped(Reg(16), frame_size, hoist_slots));
-            assert!(
-                neon_code.len().is_multiple_of(4),
-                "aarch64 is fixed-width, got {} bytes",
-                neon_code.len()
-            );
-            sizes.push([
-                sse2.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                avx2b
-                    .emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                avx512b
-                    .emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                neon_code.len(),
-            ]);
-        }
-        assert!(sizes[0].iter().all(|&n| n > 0), "every backend emits");
-        assert_eq!(
-            sizes[0], sizes[1],
-            "frame mode must not resize the scaffold"
-        );
-        assert_eq!(
-            sizes[1], sizes[2],
-            "hoist slots must not resize the scaffold"
+    fn scheduler_folds_shift_immediate() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let amount = b.constant(3.0);
+        let root = b.binary(OpKind::Shl, x, amount);
+        let schedule = schedule(b.finish_one(root));
+        assert!(
+            schedule
+                .iter()
+                .any(|d| matches!(d.op, ScheduledOp::ShiftImm(OpKind::Shl, _, 3)))
         );
     }
 
-    // =========================================================================
-    // Cross-host emission: every backend, from whatever host runs the tests
-    // =========================================================================
-
-    /// Every backend emits from every host.
-    ///
-    /// This is the property the ISA files buy. Emission is a pure function of
-    /// `(schedule, RegisterFile)` into a `Vec<u8>`, so an x86 box computes NEON
-    /// instruction words and an arm box computes AVX-512 ones. Only running
-    /// them needs the matching CPU.
-    ///
-    /// Before the backends stopped being `#[cfg]`-gated into existence, three
-    /// of these four could not even be *named* here.
-    ///
-    /// The arena reads a uniform, so each backend's `ResolvedOp::Uniform`
-    /// dispatch arm — not only the encoder behind it — is what emits here.
     #[test]
-    fn every_backend_emits_from_this_host() {
-        use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformIdentity};
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let u = a.declare_uniform(UniformDecl {
-            id: UniformIdentity::mint(),
+    fn scheduler_preserves_uniform_environment() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let uniform = b.uniform(pixelflow_ir::arena::UniformDecl {
+            id: pixelflow_ir::arena::UniformIdentity::mint(),
             default: 1.0,
         });
-        let u = a.push_uniform(u);
-        let scaled = a.push_binary(OpKind::Mul, y, u);
-        let root = a.push_binary(OpKind::Add, a.clone().push_var(0).max(x).min(x), scaled);
-        let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
+        let root = b.binary(OpKind::Mul, x, uniform);
+        let graph = b.finish_one(root);
+        let schedule = schedule(graph);
         assert!(
-            arena_to_schedule(&a, root)
+            schedule
                 .iter()
-                .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
-            "the schedule must carry the uniform load for the backends to dispatch on"
+                .any(|d| matches!(d.op, ScheduledOp::Uniform(_)))
         );
+    }
 
-        let ctx = EmitCtx::default();
-        let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
-        let mut sse2 = x86_64::driver::X86Backend::new(ctx.clone());
-        let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
-        let mut avx512b = avx512::driver::Avx512Backend::new(ctx);
-
-        let neon_len = emit_dag_body(arena_to_schedule(&a, root), &mut neon)
-            .expect("NEON emit")
-            .0
-            .len();
-        assert!(
-            neon_len > 0 && neon_len.is_multiple_of(4),
-            "aarch64 is fixed-width"
-        );
-        for (name, len) in [
+    #[test]
+    fn every_backend_emits_a_simple_dag() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let root = b.binary(OpKind::Add, x, y);
+        let graph = b.finish_one(root);
+        let schedule = schedule(graph);
+        for (name, result) in [
             (
-                "SSE2",
-                emit_dag_body(arena_to_schedule(&a, root), &mut sse2)
-                    .expect("SSE2")
-                    .0
-                    .len(),
-            ),
-            (
-                "AVX2",
-                emit_dag_body(arena_to_schedule(&a, root), &mut avx2b)
-                    .expect("AVX2")
-                    .0
-                    .len(),
-            ),
-            (
-                "AVX-512",
-                emit_dag_body(arena_to_schedule(&a, root), &mut avx512b)
-                    .expect("AVX-512")
-                    .0
-                    .len(),
-            ),
-        ] {
-            assert!(len > 0, "{name} emitted nothing");
-        }
-    }
-
-    /// The aarch64 constant pool must APPEND across the two bodies a collapse
-    /// compile pushes through one backend, never reset.
-    ///
-    /// The prologue's bytes already have the first pool's X17-relative offsets
-    /// baked in, so a reset leaves them pointing at different constants — the
-    /// "macOS glyph-ink regression", which painted glyphs with the wrong ink
-    /// and was only ever observable by running the app on a Mac.
-    ///
-    /// It is an aarch64 bug, not a macOS one, and now it is a sub-millisecond
-    /// unit test on every host.
-    #[test]
-    fn aarch64_const_pool_appends_across_bodies() {
-        use pixelflow_ir::arena::ExprArena;
-
-        fn schedule_for(k: f32) -> Vec<regalloc::Def> {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let c = a.push_const(k);
-            let root = a.push_binary(OpKind::Mul, x, c);
-            let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-            arena_to_schedule(&a, root)
-        }
-
-        // Two constants that genuinely need the pool (not FMOV-immediate).
-        let (first, second) = (0.123_456_79_f32, 987.654_3_f32);
-        assert!(aarch64::needs_const_pool(first));
-        assert!(aarch64::needs_const_pool(second));
-
-        let mut backend = aarch64::driver::Aarch64Backend::new(EmitCtx::default());
-        emit_dag_body(schedule_for(first), &mut backend).expect("first body");
-        let after_first = backend.pool_entries().to_vec();
-        emit_dag_body(schedule_for(second), &mut backend).expect("second body");
-
-        assert!(
-            backend.pool_entries().starts_with(&after_first),
-            "the second body RESET the constant pool: the first body's baked-in \
-             X17-relative offsets now name different constants — the glyph-ink \
-             regression. Pool was {after_first:?}, became {:?}",
-            backend.pool_entries()
-        );
-    }
-
-    // =========================================================================
-    // What the nest does and does not partition
-    // =========================================================================
-
-    /// A leaf shared between an invariant expression and a varying one lands
-    /// in **both** scopes' schedules, with a location chosen independently in
-    /// each.
-    ///
-    /// It is tempting to assume `partition_by_scope` partitions `ValueId`s —
-    /// `arena_to_schedule` numbers them sequentially, and every non-leaf is
-    /// either lifted or left behind. Leaves are the exception: `plan_collapse_hoist`
-    /// refuses to make one a hoist root (there is nothing to save by parking a
-    /// value one instruction rebuilds), so a `Const` feeding both sides is
-    /// simply computed twice. A nest-wide placement map that assumed one
-    /// answer per value would have to pick one of the two, and the emitter
-    /// would then read a register the other scope never wrote.
-    #[test]
-    fn a_leaf_feeding_both_scopes_is_scheduled_in_both() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        // One constant, read by an X-invariant term and an X-varying one.
-        let k = a.push_const(3.5);
-        let invariant = a.push_binary(OpKind::Mul, y, k);
-        let varying = a.push_binary(OpKind::Mul, x, k);
-        let root = a.push_binary(OpKind::Add, invariant, varying);
-
-        let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-        let schedule = arena_to_schedule(&arena, root);
-        let variance = schedule_variance(&schedule);
-        let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
-
-        let in_body: alloc::vec::Vec<regalloc::ValueId> =
-            scoped.body.iter().map(|d| d.value).collect();
-        let shared: alloc::vec::Vec<regalloc::ValueId> = scoped
-            .regions
-            .iter()
-            .flat_map(|r| r.schedule.iter().map(|d| d.value))
-            .filter(|v| in_body.contains(v) && !scoped.regions.iter().any(|r| r.roots.contains(v)))
-            .collect();
-
-        assert!(
-            !shared.is_empty(),
-            "no value is scheduled in two scopes, so nothing here is testing \
-             what a nest-wide placement map has to survive"
-        );
-    }
-
-    /// The consequence for the allocator: a value in two scopes gets a range
-    /// per scope, and each range is that scope's own answer.
-    #[test]
-    fn a_shared_leaf_is_placed_once_per_scope() {
-        use regalloc::{RegisterAllocator, Scope};
-
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let k = a.push_const(3.5);
-        let invariant = a.push_binary(OpKind::Mul, y, k);
-        let varying = a.push_binary(OpKind::Mul, x, k);
-        let root = a.push_binary(OpKind::Add, invariant, varying);
-
-        let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-        let schedule = arena_to_schedule(&arena, root);
-        let variance = schedule_variance(&schedule);
-        let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
-
-        let file = Native::new(EmitCtx::default()).register_file();
-        let nest = regalloc::LinearScan.allocate_nest(scoped, &file);
-
-        // Every value the body schedules has an answer at a body point, and
-        // every value a region schedules has one at a point in that region —
-        // which is exactly what a single answer per value could not give.
-        let mut answered = 0;
-        let mut scheduled = 0;
-        for scope in [Scope::Region(0), Scope::Region(1), Scope::Body] {
-            let view = nest.scope(scope);
-            for (i, def) in view.schedule().iter().enumerate() {
-                scheduled += 1;
-                if matches!(
-                    view.where_at(def.value, i),
-                    regalloc::Where::Reg(_) | regalloc::Where::Spilled | regalloc::Where::Remat(_)
-                ) {
-                    answered += 1;
-                }
-            }
-        }
-        assert!(scheduled > 0);
-        assert_eq!(
-            answered, scheduled,
-            "the nest-wide map is total over every scope's schedule"
-        );
-    }
-
-    // =========================================================================
-    // FrameLayout unit tests — the Placement -> address arrow
-    // =========================================================================
-
-    /// Build an allocation with the given placements, in schedule order.
-    fn allocation_of(placements: &[(u32, regalloc::Where)]) -> regalloc::NestAllocation {
-        use regalloc::{Def, RegisterAllocator, ValueId};
-        // Allocate a trivial all-Var schedule to get a well-formed Allocation,
-        // then pin each value where the test wants it.
-        let schedule: alloc::vec::Vec<Def> = placements
-            .iter()
-            .map(|&(v, _)| Def {
-                value: ValueId(v),
-                op: ScheduledOp::Var(0),
-            })
-            .collect();
-        let mut a = regalloc::LinearScan.allocate(schedule, &TEST_FILE);
-        for &(v, p) in placements {
-            a.place(ValueId(v), p);
-        }
-        a
-    }
-
-    #[test]
-    fn an_allocation_with_no_spills_needs_no_frame() {
-        let a = allocation_of(&[(0, regalloc::Where::Reg(Reg(4)))]);
-        let layout = FrameLayout::resolve(a.body(), 16).unwrap();
-        assert_eq!(layout.frame_size, 0);
-        assert_eq!(layout.of(regalloc::ValueId(0)), Loc::Reg(Reg(4)).into());
-    }
-
-    #[test]
-    fn one_spill_takes_one_slot() {
-        let a = allocation_of(&[(5, regalloc::Where::Spilled)]);
-        let layout = FrameLayout::resolve(a.body(), 16).unwrap();
-        assert_eq!(layout.frame_size, 16);
-        assert_eq!(
-            layout.of(regalloc::ValueId(5)),
-            Loc::Slot(Slot::new(0, 16)).into()
-        );
-    }
-
-    /// Slots are laid out at the backend's own stride, so the offsets a wide
-    /// backend encodes are real displacements rather than 16-byte units it has
-    /// to scale back up.
-    #[test]
-    fn slots_are_laid_out_at_the_backends_vector_stride() {
-        let spilled = [
-            (1, regalloc::Where::Spilled),
-            (2, regalloc::Where::Spilled),
-            (3, regalloc::Where::Spilled),
-        ];
-        for (vector_bytes, expected) in
-            [(16u32, [0, 16, 32]), (32, [0, 32, 64]), (64, [0, 64, 128])]
-        {
-            let a = allocation_of(&spilled);
-            let layout = FrameLayout::resolve(a.body(), vector_bytes).unwrap();
-            assert_eq!(layout.frame_size, 3 * vector_bytes);
-            for (i, off) in expected.iter().enumerate() {
-                assert_eq!(
-                    layout.of(regalloc::ValueId(i as u32 + 1)),
-                    Loc::Slot(Slot::new(*off, vector_bytes)).into(),
-                    "vector_bytes={vector_bytes}"
-                );
-            }
-        }
-    }
-
-    /// A rematerialized constant occupies no slot at all.
-    #[test]
-    fn rematerialized_values_take_no_frame_space() {
-        let a = allocation_of(&[
-            (0, regalloc::Where::Remat(1.0f32.to_bits())),
-            (1, regalloc::Where::Spilled),
-        ]);
-        let layout = FrameLayout::resolve(a.body(), 16).unwrap();
-        assert_eq!(layout.frame_size, 16, "only the spill takes a slot");
-        assert_eq!(
-            layout.of(regalloc::ValueId(0)),
-            Binding::Remat(1.0f32.to_bits())
-        );
-        assert_eq!(
-            layout.of(regalloc::ValueId(1)),
-            Loc::Slot(Slot::new(0, 16)).into()
-        );
-    }
-
-    /// The collapse LICM pins a hoisted value to the slot its prologue wrote,
-    /// which is not one this frame laid out.
-    #[test]
-    fn a_slot_can_be_pinned_over_the_frames_own_layout() {
-        let a = allocation_of(&[(0, regalloc::Where::Reg(Reg(4)))]);
-        let mut layout = FrameLayout::resolve(a.body(), 16).unwrap();
-        let v = regalloc::ValueId(0);
-        assert_eq!(layout.slot_of(v), None, "a resident value needs no slot");
-        let pin = Slot::new(256, 16);
-        layout.pin_slot(v, pin);
-        assert_eq!(layout.slot_of(v), Some(pin));
-        assert_eq!(
-            layout.binding(v, regalloc::Where::Spilled),
-            Loc::Slot(pin).into()
-        );
-        assert_eq!(
-            layout.binding(v, regalloc::Where::Reg(Reg(7))),
-            Loc::Reg(Reg(7)).into(),
-            "pinning an address says nothing about where the value is"
-        );
-    }
-
-    // =========================================================================
-    // resolve_operands unit tests — the spill logic that was buggy
-    // =========================================================================
-
-    /// Helper: build minimal assignment + spill maps for resolve_operands
-    /// tests. Every register an instruction may use is handed to it in
-    /// `TEST_SCRATCH`, exactly as the allocator hands one its reservations.
-    const TEST_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
-        fixed: &[],
-        inputs: INPUT_REGS,
-        scratch: regalloc::RegSet::range(4, regalloc::RegisterFile::MIN_SCRATCH),
-        temps_for: regalloc::no_temps,
-        guard_temps: 0,
-        vector_bytes: 16,
-    }
-    .checked();
-
-    /// The two reload registers these `resolve_operands` tests hand the
-    /// instruction, standing in for the allocator's per-instruction
-    /// reservations.
-    const RELOAD: [Reg; 2] = [Reg(11), Reg(12)];
-
-    /// The scratch these `resolve_operands` tests are written against.
-    const TEST_SCRATCH: regalloc::Scratch =
-        regalloc::Scratch::for_test(None, [Some(RELOAD[0]), Some(RELOAD[1])]);
-
-    /// Dense `ValueId -> Binding`, as the emit loop builds it.
-    fn make_locs(
-        assigned: &[(u32, u8)],
-        spilled: &[(u32, u32)],
-    ) -> alloc::vec::Vec<Option<Binding>> {
-        let len = assigned
-            .iter()
-            .map(|&(v, _)| v)
-            .chain(spilled.iter().map(|&(v, _)| v))
-            .max()
-            .map_or(0, |m| m as usize + 1);
-        let mut locs = alloc::vec![None; len];
-        for &(v, r) in assigned {
-            locs[v as usize] = Some(Binding::Loc(Loc::Reg(Reg(r))));
-        }
-        for &(v, off) in spilled {
-            locs[v as usize] = Some(Binding::Loc(Loc::Slot(Slot::new(off, 16))));
-        }
-        locs
-    }
-
-    #[test]
-    fn resolve_binary_no_spills() {
-        // left=v4, right=v5, dst=v6 — all in registers
-        let locs = make_locs(&[(0, 4), (1, 5), (2, 6)], &[]);
-        let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-
-        assert!(plan.reloads.is_empty());
-        assert_eq!(
-            plan.op,
-            ResolvedOp::Binary {
-                op: OpKind::Add,
-                dst: Reg(6),
-                left: Reg(4),
-                right: Reg(5)
-            }
-        );
-    }
-
-    /// A spilled left operand goes straight to the destination.
-    ///
-    /// `dst op= right` consumes the left operand from `dst` anyway, so this
-    /// costs no reservation at all — which is why a binary never needs two,
-    /// however many of its operands are in memory.
-    #[test]
-    fn resolve_binary_left_spilled() {
-        // left spilled at offset 0, right in v5
-        let locs = make_locs(&[(1, 5), (2, 6)], &[(0, 0)]);
-        let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-
-        assert_eq!(plan.reloads.len(), 1);
-        assert_eq!(
-            plan.reloads[0],
-            Reload::FromStack {
-                target: Reg(6),
-                slot: Slot::new(0, 16),
-            }
-        );
-        assert_eq!(
-            plan.op,
-            ResolvedOp::Binary {
-                op: OpKind::Add,
-                dst: Reg(6),
-                left: Reg(6),
-                right: Reg(5)
-            }
-        );
-    }
-
-    #[test]
-    fn resolve_binary_both_spilled() {
-        // Both spilled: left → dst (temp trick), right → tmp_op
-        let locs = make_locs(&[(2, 6)], &[(0, 0), (1, 16)]);
-        let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-
-        assert_eq!(plan.reloads.len(), 2);
-        // left → dst (v6), right → tmp_op (v27)
-        assert_eq!(
-            plan.reloads[0],
-            Reload::FromStack {
-                target: Reg(6),
-                slot: Slot::new(0, 16),
-            }
-        );
-        assert_eq!(
-            plan.reloads[1],
-            Reload::FromStack {
-                target: RELOAD[0],
-                slot: Slot::new(16, 16),
-            }
-        );
-        assert_eq!(
-            plan.op,
-            ResolvedOp::Binary {
-                op: OpKind::Mul,
-                dst: Reg(6),
-                left: Reg(6),
-                right: RELOAD[0]
-            }
-        );
-    }
-
-    /// A definition writes a register or nothing at all.
-    ///
-    /// The spilled destination was the whole job of `reload[0]`: a value that
-    /// lost its register at its own definition was computed into a register
-    /// outside the pool and stored from there. Every definition holds a pool
-    /// register now, so a `Loc::Spill` destination is not a case to handle but
-    /// an allocator that broke its contract — and this is where that shows up
-    /// as a panic rather than as a register two values share.
-    #[test]
-    #[should_panic(expected = "a definition landed in stack slot")]
-    fn a_spilled_destination_is_not_a_thing_the_allocator_can_produce() {
-        let locs = make_locs(&[(0, 4), (1, 5)], &[(2, 32)]);
-        let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        drop(resolve_operands(
-            &op,
-            Loc::Slot(Slot::new(32, 16)).into(),
-            locs.as_slice(),
-            TEST_SCRATCH,
-        ));
-    }
-
-    /// A rematerialized constant's definition emits nothing.
-    ///
-    /// It lives nowhere and is rebuilt at each use, so computing it once into
-    /// a register nobody reads is pure waste — which is what a fixed
-    /// destination register made invisible.
-    #[test]
-    fn a_rematerialized_definition_emits_nothing() {
-        let locs = make_locs(&[], &[]);
-        let op = ScheduledOp::Const(1.5);
-        let plan = resolve_operands(
-            &op,
-            Binding::Remat(1.5f32.to_bits()),
-            locs.as_slice(),
-            TEST_SCRATCH,
-        )
-        .unwrap();
-        assert_eq!(plan.op, ResolvedOp::Nop);
-        assert!(plan.reloads.is_empty());
-    }
-
-    #[test]
-    fn resolve_muladd_fmla_path() {
-        // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
-        let locs = make_locs(&[(0, 4), (1, 5), (2, 7), (3, 8)], &[]);
-        let op = ScheduledOp::Ternary(
-            OpKind::MulAdd,
-            regalloc::ValueId(0),
-            regalloc::ValueId(1),
-            regalloc::ValueId(2),
-        );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-
-        assert!(plan.reloads.is_empty());
-        // c=v7 ≠ dst=v8, so setup_mov should copy c → dst
-        assert_eq!(plan.setup_mov, Some((Reg(8), Reg(7))));
-        assert_eq!(
-            plan.op,
-            ResolvedOp::FusedMulAdd {
-                dst: Reg(8),
-                a: Reg(4),
-                b: Reg(5)
-            }
-        );
-    }
-
-    #[test]
-    fn resolve_muladd_decomposed_both_ab_spilled() {
-        // a and b both spilled → decomposed FMUL+FADD path
-        // c in register
-        let locs = make_locs(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
-        let op = ScheduledOp::Ternary(
-            OpKind::MulAdd,
-            regalloc::ValueId(0),
-            regalloc::ValueId(1),
-            regalloc::ValueId(2),
-        );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-
-        // a → dst, b → tmp_op loaded upfront
-        assert_eq!(plan.reloads.len(), 2);
-        assert_eq!(
-            plan.reloads[0],
-            Reload::FromStack {
-                target: Reg(8),
-                slot: Slot::new(0, 16),
-            }
-        );
-        assert_eq!(
-            plan.reloads[1],
-            Reload::FromStack {
-                target: RELOAD[0],
-                slot: Slot::new(16, 16),
-            }
-        );
-        // c is in a register, no deferred reload needed
-        match &plan.op {
-            ResolvedOp::DecomposedMulAdd {
-                dst,
-                a,
-                b,
-                c,
-                c_deferred,
-            } => {
-                assert_eq!(*dst, Reg(8));
-                assert_eq!(*a, Reg(8));
-                assert_eq!(*b, RELOAD[0]);
-                assert_eq!(*c, Reg(7));
-                assert_eq!(*c_deferred, None);
-            }
-            other => panic!("expected DecomposedMulAdd, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn resolve_muladd_decomposed_all_three_spilled() {
-        // a, b, c all spilled → decomposed with deferred c reload
-        let locs = make_locs(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
-        let op = ScheduledOp::Ternary(
-            OpKind::MulAdd,
-            regalloc::ValueId(0),
-            regalloc::ValueId(1),
-            regalloc::ValueId(2),
-        );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-
-        // Only a and b reloads upfront — c is deferred
-        assert_eq!(plan.reloads.len(), 2);
-        match &plan.op {
-            ResolvedOp::DecomposedMulAdd { c, c_deferred, .. } => {
-                assert_eq!(*c, RELOAD[1]); // its own reservation, deferred past the FMUL
-                assert_eq!(
-                    *c_deferred,
-                    Some(DeferredReload::FromStack(Slot::new(32, 16)))
-                );
-            }
-            other => panic!("expected DecomposedMulAdd, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn resolve_var_is_nop() {
-        let locs = make_locs(&[(0, 0)], &[]);
-        let op = ScheduledOp::Var(0);
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(0)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-        assert_eq!(plan.op, ResolvedOp::Nop);
-        assert!(plan.reloads.is_empty());
-    }
-
-    #[test]
-    fn resolve_const() {
-        let locs = make_locs(&[(0, 6)], &[]);
-        let op = ScheduledOp::Const(core::f32::consts::PI);
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
-        assert_eq!(
-            plan.op,
-            ResolvedOp::LoadConst {
-                dst: Reg(6),
-                val_bits: core::f32::consts::PI.to_bits()
-            }
-        );
-    }
-
-    // =========================================================================
-    // DAG integration tests — expressions that previously crashed (SIGSEGV)
-    // =========================================================================
-
-    /// Test that Select short-circuits: when mask is all-true, the false arm
-    /// (which contains a division by zero) must NOT produce NaN in the output.
-    /// Test Select with all-false mask: should return false arm.
-    /// Test Select with mixed mask: BSL path, both arms evaluated.
-    // =========================================================================
-    // Arena compilation tests
-    // =========================================================================
-
-    // These three tests call the private `arena_to_schedule`/`arena_to_uses`
-    // directly rather than through `compile`: value numbering and
-    // dead-node filtering are schedule-shape invariants with no output-value
-    // signature (a regression here wastes registers/instructions, it doesn't
-    // change what a compiled kernel computes), so there is no public
-    // black-box assertion that would catch a break here.
-    #[test]
-    fn arena_to_schedule_simple() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let sum = arena.push_binary(OpKind::Add, x, y);
-
-        let schedule = arena_to_schedule(&arena, sum);
-
-        // Should have 3 values: X, Y, X+Y
-        assert_eq!(
-            schedule.len(),
-            3,
-            "expected 3 schedule entries, got {}",
-            schedule.len()
-        );
-
-        // Verify the operations
-        assert!(matches!(schedule[0].op, ScheduledOp::Var(0)));
-        assert!(matches!(schedule[1].op, ScheduledOp::Var(1)));
-        assert!(matches!(
-            schedule[2].op,
-            ScheduledOp::Binary(OpKind::Add, _, _)
-        ));
-    }
-
-    #[test]
-    fn arena_to_schedule_filters_unreachable() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let _garbage = arena.push_const(999.0); // unreachable
-        let y = arena.push_var(1);
-        let sum = arena.push_binary(OpKind::Add, x, y);
-
-        let schedule = arena_to_schedule(&arena, sum);
-
-        // Should have 3 values (garbage node filtered out)
-        assert_eq!(
-            schedule.len(),
-            3,
-            "unreachable garbage node should be filtered"
-        );
-    }
-
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn arena_compile_simple() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let sum = arena.push_binary(OpKind::Add, x, y);
-
-        let result = compile(&arena, sum).expect("arena DAG compile failed");
-        assert_eq!(result.spill_count, 0);
-
-        assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 7.0);
-    }
-
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn arena_compile_with_constant() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let two = arena.push_const(2.0);
-        let y = arena.push_var(1);
-        let prod = arena.push_binary(OpKind::Mul, x, two);
-        let sum = arena.push_binary(OpKind::Add, prod, y);
-
-        let result = compile(&arena, sum).expect("arena DAG compile failed");
-
-        // 3*2 + 4 = 10
-        assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 10.0);
-    }
-
-    /// `Σᵢ (X+i)·(Y+i)` for i in 1..=10, summed as a balanced tree: ten
-    /// products are live at once, so any pool must spill. Every leaf depends on
-    /// X or Y — a uniform-only subtree would be loop-invariant, hoisted out
-    /// of the collapse body, and leave nothing to spill.
-    ///
-    /// The pressure comes from the live ranges rather than from the budget.
-    /// This used to be `(X+Y)·(X−Y) + (X·Y)·(X+1)` under `max_regs(2)`, which
-    /// keeps at most three values live: it spilled only because two registers
-    /// is fewer than three, and a two-register pool is no longer a budget a
-    /// caller can ask for (`RegisterFile::MIN_SCRATCH` — an instruction temp
-    /// cannot spill). Ten live values outrun every backend's floor, so the
-    /// subject here — what spilling *does* — no longer depends on how small
-    /// the pool can be made.
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn arena_compile_with_spills() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let mut terms: alloc::vec::Vec<_> = (1..=10u32)
-            .map(|i| {
-                let c = arena.push_const(i as f32);
-                let ax = arena.push_binary(OpKind::Add, x, c);
-                let by = arena.push_binary(OpKind::Add, y, c);
-                arena.push_binary(OpKind::Mul, ax, by)
-            })
-            .collect();
-        while terms.len() > 1 {
-            terms = terms
-                .chunks(2)
-                .map(|pair| match pair {
-                    [l, r] => arena.push_binary(OpKind::Add, *l, *r),
-                    _ => pair[0],
-                })
-                .collect();
-        }
-        let root = terms[0];
-
-        let result = EmitCtx::with_max_regs(4)
-            .compile(&arena, root)
-            .expect("arena DAG compile with spills failed");
-
-        assert!(
-            result.spill_count > 0,
-            "expected spills under ten live terms"
-        );
-
-        // Σᵢ (3+i)·(4+i) = 20+30+42+56+72+90+110+132+156+182 = 890, every
-        // term and partial sum exact in f32.
-        assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 890.0);
-    }
-
-    // =========================================================================
-    // The shared driver's Select short-circuit guard, on every backend that
-    // has a JIT.
-    //
-    // `sched_select_guards` below covers this path, but only on SSE2 — its
-    // module is gated `not(avx2), not(avx512f)` — and `avx512_select_guards`
-    // covers AVX-512. aarch64 had no guard test at all, which mattered because
-    // that is the one backend whose guard needs a scratch register: reducing a
-    // mask with `UMAXV`/`UMINV` writes a scalar into a vector register, where
-    // the x86 tiers use `movmskps`/`kortest` and the flags. So the register
-    // that reduction destroys was, on aarch64 alone, an untested choice.
-    //
-    // These run wherever a backend exists, against the same expected values,
-    // so no backend's guard can drift from another's.
-    // =========================================================================
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    mod select_guard_driver {
-        use super::*;
-        use pixelflow_ir::arena::{ExprArena, ExprId};
-
-        /// Padding that makes an arm worth a branch, and what it adds.
-        ///
-        /// A guard is refused for an arm whose work costs less than the
-        /// mispredict penalty it risks, which is right and which means a
-        /// fixture's arms have to be arms worth guarding — a two-op arm is
-        /// not one. Three adds of distinct constants are 12 latency-prior
-        /// cycles, and every point below stays exact in `f32`.
-        const PADDING: f32 = 6.0;
-
-        fn worth_a_branch(a: &mut ExprArena, arm: ExprId) -> ExprId {
-            (1..=3u32).fold(arm, |acc, i| {
-                let c = a.push_const(i as f32);
-                a.push_binary(OpKind::Add, acc, c)
-            })
-        }
-
-        /// `(X > 0) ? B³ : 3B` (plus [`PADDING`] on each arm) over a shared
-        /// `B = X·Y` — arms that are exclusive *and* contiguous in the
-        /// schedule.
-        ///
-        /// Both properties are needed and the second is easy to lose: a guard
-        /// skips a whole index range, so every index in it must belong to that
-        /// arm. Giving each arm its own `Var` looks exclusive but is not
-        /// contiguous — the `Var` is scheduled with the other leaves, far
-        /// below the arm's body, and the range from there to the arm swallows
-        /// the mask. Deriving both arms from one shared value keeps every leaf
-        /// out of both arms, which is what leaves the arms' own nodes adjacent.
-        fn guarded_select(a: &mut ExprArena) -> ExprId {
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let zero = a.push_const(0.0);
-            let base = a.push_binary(OpKind::Mul, x, y);
-            let cond = a.push_binary(OpKind::Gt, x, zero);
-            let bb = a.push_binary(OpKind::Mul, base, base);
-            let bbb = a.push_binary(OpKind::Mul, bb, base);
-            let bbb = worth_a_branch(a, bbb);
-            let b2 = a.push_binary(OpKind::Add, base, base);
-            let b3 = a.push_binary(OpKind::Add, b2, base);
-            let b3 = worth_a_branch(a, b3);
-            let sel = a.push_ternary(OpKind::Select, cond, bbb, b3);
-            // Live ACROSS the select and read after it. Without something in
-            // this role the select is the root, nothing downstream reads a
-            // register, and a guard that clobbered a live one would still
-            // produce the right answer — the test would be blind to exactly
-            // the mistake it exists to catch.
-            let carried = a.push_binary(OpKind::Sub, x, y);
-            a.push_binary(OpKind::Add, sel, carried)
-        }
-
-        /// Assert a guard region actually formed for `root`.
-        ///
-        /// Without this the tests below still pass when the guard stops
-        /// forming — they would just be testing an ordinary `Select`, which is
-        /// the silent-decay shape this file has been bitten by before.
-        fn assert_guard_forms(a: &ExprArena, root: ExprId) {
-            let schedule = arena_to_schedule(a, root);
-            let guards = analyze_select_guards(&schedule);
-            let guarded = guards.iter().any(|g| g.has_guarded_arm());
-            assert!(
-                guarded,
-                "no Select in this schedule has an arm-exclusive range, so the \
-                 short-circuit guard this test exists for is never emitted"
-            );
-        }
-
-        /// A select whose true arm contains a select, with entries belonging
-        /// to the root sitting inside both arms — so NEITHER level is
-        /// guardable as scheduled, and both become guardable once
-        /// [`guards::cluster_select_arms`] gathers each arm into one run.
-        ///
-        /// Nesting is the case that can go wrong quietly: an inner select's
-        /// arms lie inside an outer arm, so partitioning the outside moves the
-        /// inside with it. If that broke an inner guard the kernel would still
-        /// be correct and merely slower, which no value test would catch —
-        /// hence the assertion on the analysis as well as on the arithmetic.
-        ///
-        /// The two "intruders" are read by the root, so they are shared with
-        /// the world outside the arms and can never be skipped; they are what
-        /// makes the arms non-contiguous to begin with.
-        fn nested_guarded_selects(a: &mut ExprArena) -> (ExprId, ExprId, ExprId) {
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let zero = a.push_const(0.0);
-            let base = a.push_binary(OpKind::Mul, x, y);
-            let outer_cond = a.push_binary(OpKind::Gt, x, zero);
-            let inner_cond = a.push_binary(OpKind::Gt, y, zero);
-
-            // Inner true arm, split around an entry the root reads.
-            let t1 = a.push_binary(OpKind::Mul, base, base);
-            let across_inner = a.push_binary(OpKind::Add, x, y);
-            let t2 = a.push_binary(OpKind::Mul, t1, base);
-            let one = a.push_const(1.0);
-            let t3 = a.push_binary(OpKind::Add, t2, one);
-
-            // Inner false arm.
-            let f1 = a.push_binary(OpKind::Add, base, base);
-            let two = a.push_const(2.0);
-            let f2 = a.push_binary(OpKind::Add, f1, two);
-
-            let (t3, f2) = (worth_a_branch(a, t3), worth_a_branch(a, f2));
-            let inner = a.push_ternary(OpKind::Select, inner_cond, t3, f2);
-
-            // The rest of the outer true arm, split around a second one.
-            let three = a.push_const(3.0);
-            let o1 = a.push_binary(OpKind::Add, inner, three);
-            let four = a.push_const(4.0);
-            let across_outer = a.push_binary(OpKind::Mul, x, four);
-            let five = a.push_const(5.0);
-            let o2 = a.push_binary(OpKind::Mul, o1, five);
-
-            // Outer false arm.
-            let six = a.push_const(6.0);
-            let p1 = a.push_binary(OpKind::Add, base, six);
-            let seven = a.push_const(7.0);
-            let p2 = a.push_binary(OpKind::Mul, p1, seven);
-
-            let (o2, p2) = (worth_a_branch(a, o2), worth_a_branch(a, p2));
-            let outer = a.push_ternary(OpKind::Select, outer_cond, o2, p2);
-            let carried = a.push_binary(OpKind::Add, across_inner, across_outer);
-            let root = a.push_binary(OpKind::Add, outer, carried);
-            (root, outer, inner)
-        }
-
-        /// What `nested_guarded_selects` computes, in scalar `f32` and with no
-        /// guard anywhere — every operation exact at the points below.
-        fn nested_expected(x: f32, y: f32) -> f32 {
-            let base = x * y;
-            let inner = PADDING
-                + if y > 0.0 {
-                    base * base * base + 1.0
-                } else {
-                    base + base + 2.0
-                };
-            let outer = PADDING
-                + if x > 0.0 {
-                    (inner + 3.0) * 5.0
-                } else {
-                    (base + 6.0) * 7.0
-                };
-            outer + (x + y) + x * 4.0
-        }
-
-        /// How many entries each select has under a guard, by schedule
-        /// position, for a schedule built the way `compile` builds it.
-        fn guarded_entries(a: &ExprArena, root: ExprId, cluster: bool) -> alloc::vec::Vec<usize> {
-            let schedule = arena_to_schedule(a, root);
-            let schedule = if cluster {
-                guards::cluster_select_arms(schedule)
-            } else {
-                schedule
-            };
-            analyze_select_guards(&schedule)
-                .iter()
-                .map(|g| g.total_guarded_entries())
-                .collect()
-        }
-
-        /// Both levels of a nested select are guarded once the schedule is
-        /// clustered, and neither was before — the reordering is the whole
-        /// difference.
-        #[test]
-        fn clustering_guards_both_levels_of_a_nested_select() {
-            let mut a = ExprArena::new();
-            let (root, _outer, _inner) = nested_guarded_selects(&mut a);
-
-            let before = guarded_entries(&a, root, false);
-            let after = guarded_entries(&a, root, true);
-            assert!(
-                before.iter().sum::<usize>() < after.iter().sum::<usize>(),
-                "clustering bought nothing: {before:?} -> {after:?}"
-            );
-            assert_eq!(
-                after.len(),
-                2,
-                "both the outer and the inner select must earn a guard, got {after:?}"
-            );
-            assert!(
-                after.iter().all(|&entries| entries > 0),
-                "a guard with an empty range is not a guard: {after:?}"
-            );
-        }
-
-        /// The clustered kernel's answer, against the same expression
-        /// evaluated in scalar `f32` with no guards: uniform masks (which take
-        /// the branches) and mixed lanes (which fall through to the blend),
-        /// exactly equal — every operation here is exact at these points, so
-        /// there is no tolerance to hide a wrong branch in.
-        #[test]
-        fn a_nested_guarded_select_agrees_lane_for_lane() {
-            let mut a = ExprArena::new();
-            let (root, _outer, _inner) = nested_guarded_selects(&mut a);
-            let result = compile(&a, root).expect("nested guarded select compile");
-
-            // One point at a time: all four combinations of the two masks,
-            // each of which takes a pair of branches.
-            for &(x, y) in &[(3.0f32, 4.0f32), (3.0, -4.0), (-3.0, 4.0), (-3.0, -4.0)] {
-                let got = eval_point(&result.code, x, y, 0.0, 0.0);
-                assert_eq!(
-                    got,
-                    nested_expected(x, y),
-                    "nested guarded select at ({x}, {y})"
-                );
-            }
-
-            // Mixed lanes: both masks vary within the batch, so neither guard
-            // fires and the blend has to produce every lane.
-            let xs: [f32; LANES] = core::array::from_fn(|i| if i % 2 == 0 { 3.0 } else { -3.0 });
-            let ys: [f32; LANES] = core::array::from_fn(|i| if i % 3 == 0 { 4.0 } else { -4.0 });
-            let got = eval_batch(
-                &result.code,
-                &[],
-                executable::Point4::new(xs, ys, [0.0; LANES], [0.0; LANES]),
-            );
-            for lane in 0..LANES {
-                assert_eq!(
-                    got[lane],
-                    nested_expected(xs[lane], ys[lane]),
-                    "lane {lane} of a mixed-mask batch"
-                );
-            }
-        }
-
-        /// Uniform masks take the all-true and all-false branches; a mixed
-        /// mask falls through to the blend. All three must agree with the
-        /// arithmetic.
-        #[test]
-        fn a_guarded_select_takes_every_branch() {
-            let mut a = ExprArena::new();
-            let root = guarded_select(&mut a);
-            assert_guard_forms(&a, root);
-
-            let result = compile(&a, root).expect("guarded select compile");
-            for &(x, y) in &[
-                (3.0f32, 4.0f32), // all-true  -> B³
-                (-2.0, 0.5),      // all-false -> 3B
-                (0.5, -1.0),
-                (-0.25, 2.0),
-            ] {
-                let b = x * y;
-                let want = if x > 0.0 { b * b * b } else { 3.0 * b } + PADDING + (x - y);
-                let got = eval_point(&result.code, x, y, 0.0, 0.0);
-                assert!(
-                    (got - want).abs() <= 1e-3,
-                    "guarded select at ({x}, {y}): got {got}, want {want}"
-                );
-            }
-        }
-
-        /// The same, with the mask itself spilled.
-        ///
-        /// This is the case the guard's two reservations exist for: a spilled
-        /// mask is resolved into `Scratch::guard_mask`, *both* guards then read
-        /// it, and the reduction has to land somewhere else
-        /// (`Scratch::guard_temp`). On aarch64 both used to be registers held
-        /// out of every kernel's pool.
-        ///
-        /// Getting the mask to be the value that spills takes care, and the
-        /// test asserts it rather than assuming: eviction is Belady, so the
-        /// victim is whatever is used farthest out. The mask is computed first
-        /// and read last, and everything between it and the `Select` is
-        /// consumed before the `Select` — so the mask is the farthest-out live
-        /// value when the filler fills the pool, and it is the one to go. A
-        /// plain `spill_count > 0` would pass with the mask still resident and
-        /// this path never taken.
-        #[test]
-        fn a_guarded_select_survives_a_spilled_mask() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let zero = a.push_const(0.0);
-
-            // Read only at the very end: the farthest-out live value.
-            let cond = a.push_binary(OpKind::Gt, x, zero);
-
-            // Filler that is all live at once and all consumed *before* the
-            // select, so the mask outlives every one of them.
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
-                .map(|i| {
-                    let c = a.push_const(i as f32);
-                    a.push_binary(OpKind::Add, x, c)
-                })
-                .collect();
-            let mid = terms[1..]
-                .iter()
-                .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
-
-            // Shared-base arms, as in `guarded_select`.
-            let base = a.push_binary(OpKind::Mul, mid, y);
-            let bb = a.push_binary(OpKind::Mul, base, base);
-            let bbb = a.push_binary(OpKind::Mul, bb, base);
-            let bbb = worth_a_branch(&mut a, bbb);
-            let b2 = a.push_binary(OpKind::Add, base, base);
-            let b3 = a.push_binary(OpKind::Add, b2, base);
-            let b3 = worth_a_branch(&mut a, b3);
-            let sel = a.push_ternary(OpKind::Select, cond, bbb, b3);
-            let carried = a.push_binary(OpKind::Sub, x, y);
-            let root = a.push_binary(OpKind::Add, sel, carried);
-            assert_guard_forms(&a, root);
-
-            // The mask must actually be the value that spills.
-            let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
-                .register_file();
-            let allocation = {
-                use regalloc::RegisterAllocator;
-                regalloc::LinearScan.allocate(arena_to_schedule(&a, root), &file)
-            };
-            let mask_vid = analyze_select_guards(allocation.body().schedule())
-                .first()
-                .expect("a guard formed above")
-                .mask_vid;
-            assert!(
-                allocation.placement(mask_vid).spills(),
-                "the mask stayed in a register, so the spilled-mask path this \
-                 test exists for is never reached"
-            );
-
-            let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
-                .compile(&a, root)
-                .expect("spilled guarded select compile");
-
-            for &(px, py) in &[(3.0f32, 2.0f32), (-2.0, 0.5), (0.5, -1.0)] {
-                let m: f32 = (1..=8).map(|i| px + i as f32).sum();
-                let b = m * py;
-                let want = if px > 0.0 { b * b * b } else { 3.0 * b } + PADDING + (px - py);
-                let got = eval_point(&result.code, px, py, 0.0, 0.0);
-                assert!(
-                    (got - want).abs() <= 1e-2 * want.abs().max(1.0),
-                    "spilled guarded select at ({px}, {py}): got {got}, want {want}"
-                );
-            }
-        }
-
-        /// A value spilled before a guarded arm, brought back into a register
-        /// *inside* it, and read again after it.
-        ///
-        /// This is the shape live-range splitting has to get right and the
-        /// previous attempt did not: the arm is code a uniform mask skips, so
-        /// a register range that begins at a read inside it names a register
-        /// the skipped path never loaded. The rule is that such a range ends
-        /// where the arm does — and the value's slot is valid throughout,
-        /// because a value in memory anywhere is stored right after its
-        /// definition, which is outside the arm.
-        ///
-        /// Returns the arena, the root, the value that gets split, and the
-        /// select's true-arm range, so the two tests below can assert on the
-        /// same shape rather than each rebuilding it.
-        fn split_across_a_guarded_arm() -> (
-            ExprArena,
-            ExprId,
-            regalloc::ValueId,
-            (usize, usize),
-            regalloc::NestAllocation,
-        ) {
-            use regalloc::RegisterAllocator;
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let zero = a.push_const(0.0);
-
-            // Computed first, read last: the farthest-out live values, so
-            // these are what eviction takes when the filler fills the pool.
-            let cond = a.push_binary(OpKind::Gt, x, zero);
-            let split = a.push_binary(OpKind::Mul, x, y);
-
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
-                .map(|i| {
-                    let c = a.push_const(i as f32);
-                    a.push_binary(OpKind::Add, x, c)
-                })
-                .collect();
-            let mid = terms[1..]
-                .iter()
-                .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
-
-            // Shared-base arms, so neither arm's leaves land outside it and
-            // the arms' own nodes stay adjacent (see `guarded_select`).
-            let base = a.push_binary(OpKind::Mul, mid, y);
-            // The true arm reads `split` twice: one read would be reloaded
-            // into a scratch and kept nowhere, which is not the case under
-            // test.
-            let t1 = a.push_binary(OpKind::Mul, base, split);
-            let t2 = a.push_binary(OpKind::Add, t1, split);
-            let t3 = a.push_binary(OpKind::Mul, t2, base);
-            let t3 = worth_a_branch(&mut a, t3);
-            let f1 = a.push_binary(OpKind::Add, base, base);
-            let f2 = a.push_binary(OpKind::Add, f1, base);
-            let f2 = worth_a_branch(&mut a, f2);
-            let sel = a.push_ternary(OpKind::Select, cond, t3, f2);
-            // Read after the arm, which is what makes the confinement rule
-            // load-bearing: on the skipped path this must not name the
-            // register the arm would have loaded.
-            let after = a.push_binary(OpKind::Add, sel, split);
-            let carried = a.push_binary(OpKind::Sub, x, y);
-            let root = a.push_binary(OpKind::Add, after, carried);
-
-            let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
-                .register_file();
-            let schedule = arena_to_schedule(&a, root);
-            let allocation = regalloc::LinearScan.allocate(schedule, &file);
-            let guard = analyze_select_guards(allocation.body().schedule())
-                .into_iter()
-                .find(|g| g.is_guarded(SelectArm::True))
-                .expect("the true arm is exclusive and contiguous, so it is guarded");
-
-            // Which `ValueId` the arena's `split` became. `X·Y` is the only
-            // product of two `Var`s in this kernel.
-            let body = allocation.body().schedule();
-            let is_var = |v: regalloc::ValueId| {
-                body.iter()
-                    .any(|d| d.value == v && matches!(d.op, ScheduledOp::Var(_)))
-            };
-            let split_vid = body
-                .iter()
-                .find(|d| {
-                    matches!(d.op, ScheduledOp::Binary(OpKind::Mul, l, r) if is_var(l) && is_var(r))
-                })
-                .map(|d| d.value)
-                .expect("X·Y is in the schedule");
-            (a, root, split_vid, guard.true_range(), allocation)
-        }
-
-        /// The value is right after the arm, on the path that skips it.
-        #[test]
-        fn a_split_range_inside_a_guarded_arm_is_correct_when_the_arm_is_skipped() {
-            let (a, root, split_vid, arm, allocation) = split_across_a_guarded_arm();
-            assert!(
-                allocation.placement(split_vid).spills(),
-                "the value under test stayed in a register, so nothing is split"
-            );
-            let kept = allocation
-                .placement(split_vid)
-                .spans()
-                .any(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0);
-            assert!(
-                kept,
-                "the value was never brought back into a register inside the \
-                 arm, so the confinement rule this test exists for is not exercised"
-            );
-
-            let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
-                .compile(&a, root)
-                .expect("split-across-a-guard compile");
-            // x < 0 is the all-false mask: the true arm — and the reload
-            // inside it — never runs, and the read after it must still be the
-            // value.
-            for &(px, py) in &[(-2.0f32, 3.0f32), (-0.5, -4.0), (3.0, 2.0), (0.25, 1.5)] {
-                let m: f32 = (1..=8).map(|i| px + i as f32).sum();
-                let b = m * py;
-                let v = px * py;
-                let arm_value = if px > 0.0 {
-                    (b * v + v) * b
-                } else {
-                    (b + b) + b
-                };
-                let want = arm_value + PADDING + v + (px - py);
-                let got = eval_point(&result.code, px, py, 0.0, 0.0);
-                assert!(
-                    (got - want).abs() <= 1e-2 * want.abs().max(1.0),
-                    "split across a guarded arm at ({px}, {py}): got {got}, want {want}"
-                );
-            }
-        }
-
-        /// And the range ends exactly where the arm does.
-        ///
-        /// One index later would be a register the skipped path never wrote;
-        /// earlier is merely wasteful. The allocator gets the arm ranges from
-        /// the same `analyze_select_guards` the emitter branches on, which is
-        /// what makes "exactly" a statement about one answer rather than two.
-        #[test]
-        fn a_kept_reload_inside_a_guarded_arm_ends_at_the_arm() {
-            let (_, _, split_vid, arm, allocation) = split_across_a_guarded_arm();
-            let spans: alloc::vec::Vec<regalloc::Span> =
-                allocation.placement(split_vid).spans().collect();
-            let kept = spans
-                .iter()
-                .position(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0)
-                .expect("a register range begins inside the arm");
-            assert!(
-                spans[kept].from.index < arm.1,
-                "the range begins outside the arm it was confined to"
-            );
-            let ends_at = spans
-                .get(kept + 1)
-                .map(|s| s.from.index)
-                .expect("a confined range is followed by the range it reverts to");
-            assert_eq!(
-                ends_at, arm.1,
-                "a register range that begins inside a guarded arm must end \
-                 where the arm does: a read after it would name a register the \
-                 skipped path never loaded"
-            );
-        }
-    }
-
-    /// Run an arena kernel at `x` (Y = 0) and return lane 0. The
-    /// builtin-parity tests below use it. Gated off `+avx512f` (those builtins
-    /// aren't in the AVX-512 op set yet anyway).
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    fn run1(arena: &ExprArena, root: ExprId, x: f32) -> f32 {
-        let r = compile(arena, root).expect("compile failed");
-        eval_point(&r.code, x, 0.0, 0.0, 0.0)
-    }
-
-    /// Eval at (X=x, Y=y, Z=W=0), lane 0. Gated off `+avx512f` like `run1`.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    fn run_xy(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-        let r = compile(arena, root).expect("compile failed");
-        eval_point(&r.code, x, y, 0.0, 0.0)
-    }
-
-    /// A `Dwrt`-carrying arena must JIT-compile end-to-end: the compile entry
-    /// runs `lower_dwrt`, so `D(√(x²+y²), x)` compiles to `x / √(x²+y²)`
-    /// without the caller ever seeing the derivative machinery.
-    #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    fn dwrt_compiles_to_analytic_derivative() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let x2 = a.push_binary(OpKind::Mul, x, x);
-        let y2 = a.push_binary(OpKind::Mul, y, y);
-        let sum = a.push_binary(OpKind::Add, x2, y2);
-        let dist = a.push_unary(OpKind::Sqrt, sum);
-        let v0 = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, dist, v0);
-
-        for (px, py) in [(3.0f32, 4.0f32), (1.0, 1.0), (-2.0, 5.0)] {
-            let got = run_xy(&a, root, px, py);
-            let want = px / (px * px + py * py).sqrt();
-            assert!(
-                (got - want).abs() <= 1e-3 * want.abs().max(1.0),
-                "d/dx dist at ({px},{py}): got {got}, want {want}"
-            );
-        }
-    }
-
-    /// A `Dwrt` over an op with no derivative rule must surface as a compile
-    /// error (loud refusal), not a miscompile or a scheduler panic.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn dwrt_of_gather_refuses_to_compile() {
-        use pixelflow_ir::arena::BufferDecl;
-        let mut a = ExprArena::new();
-        let buf = a.declare_buffer(BufferDecl {
-            id: pixelflow_ir::arena::BufferIdentity::mint(),
-            width: 2,
-            height: 1,
-        });
-        let bufleaf = a.push_buffer(buf);
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let g = a.push_ternary(OpKind::Gather, bufleaf, x, y);
-        let v0 = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, g, v0);
-        assert!(compile(&a, root).is_err());
-    }
-
-    /// A spill frame past the 128-byte red zone must allocate a real frame
-    /// (`sub rsp`) and produce correct results — the glyph-scale-kernel case
-    /// that used to refuse with "exceeds 128-byte red zone". 40 products are
-    /// all pushed before any is consumed, so dozens are simultaneously live
-    /// against 6 allocatable registers.
-    #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    fn spill_frame_beyond_red_zone_compiles_correctly() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let mut products = alloc::vec::Vec::new();
-        for i in 0..40u32 {
-            let c = a.push_const(i as f32 + 1.0);
-            let xa = a.push_binary(OpKind::Add, x, c);
-            let yb = a.push_binary(OpKind::Add, y, c);
-            products.push(a.push_binary(OpKind::Mul, xa, yb));
-        }
-        let mut root = products[0];
-        for p in &products[1..] {
-            root = a.push_binary(OpKind::Add, root, *p);
-        }
-
-        let result = compile(&a, root).expect("large spill frame must compile");
-        assert!(
-            result.spill_bytes > 128,
-            "test did not force a frame beyond the red zone (spill_bytes = {})",
-            result.spill_bytes
-        );
-
-        for (px, py) in [(1.5f32, -2.0f32), (0.0, 0.0), (3.0, 4.0)] {
-            let got = run_xy(&a, root, px, py);
-            let want: f32 = (0..40)
-                .map(|i| (px + i as f32 + 1.0) * (py + i as f32 + 1.0))
-                .sum();
-            let tol = 1e-3 * want.abs().max(1.0);
-            assert!(
-                (got - want).abs() <= tol,
-                "at ({px},{py}): jit {got}, scalar {want}"
-            );
-        }
-    }
-
-    /// Every x86-64 unary transcendental/round op must match its scalar
-    /// reference across a range of inputs — these exercise `emit_arena` →
-    /// `emit_unary` directly (not the compiler's lowering).
-    #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    fn x86_unary_builtins_match_scalar() {
-        // Tolerances reflect the shared (with aarch64) minimax-polynomial
-        // accuracy over a sensible input range; exact ops use tight bounds.
-        // `rel_err = |jit - scalar| / (1 + |scalar|)`.
-        type UnaryCase<'a> = (OpKind, fn(f32) -> f32, &'a [f32], f32);
-        let unary: &[UnaryCase] = &[
-            (
-                OpKind::Sqrt,
-                |x| x.sqrt(),
-                &[0.25, 1.0, 2.0, 9.0, 100.0],
-                1e-5,
-            ),
-            (OpKind::Abs, |x| x.abs(), &[-3.0, -0.5, 0.0, 2.5], 1e-6),
-            (OpKind::Neg, |x| -x, &[-3.0, 0.5, 2.5], 1e-6),
-            (
-                OpKind::Floor,
-                |x| x.floor(),
-                &[-2.3, -0.1, 0.9, 1.5, 3.99],
-                1e-6,
-            ),
-            (
-                OpKind::Ceil,
-                |x| x.ceil(),
-                &[-2.3, -0.1, 0.9, 1.5, 3.01],
-                1e-6,
-            ),
-            (
-                OpKind::Round,
-                |x| x.round_ties_even(),
-                &[-2.4, -0.4, 0.4, 1.5, 2.6],
-                1e-6,
-            ),
-            // sin/cos: 4-term Chebyshev — accurate well inside [-π, π].
-            (
-                OpKind::Sin,
-                |x| x.sin(),
-                &[-2.0, -1.0, -0.3, 0.0, 0.5, 1.5, 2.0],
-                6e-3,
-            ),
-            (
-                OpKind::Cos,
-                |x| x.cos(),
-                &[-1.0, -0.3, 0.0, 0.5, 1.0],
-                1.5e-2,
-            ),
-            (
-                OpKind::Tan,
-                |x| x.tan(),
-                &[-1.0, -0.3, 0.0, 0.3, 1.0],
-                2.5e-2,
-            ),
-            (
-                OpKind::Exp,
-                |x| x.exp(),
-                &[-2.0, -0.5, 0.0, 1.0, 2.0, 3.0],
-                5e-3,
-            ),
-            (
-                OpKind::Exp2,
-                |x| x.exp2(),
-                &[-3.0, -0.5, 0.0, 1.0, 4.0],
-                5e-3,
-            ),
-            (OpKind::Ln, |x| x.ln(), &[0.25, 0.5, 1.0, 2.0, 10.0], 5e-3),
-            (
-                OpKind::Log2,
-                |x| x.log2(),
-                &[0.25, 0.5, 1.0, 2.0, 8.0],
-                5e-3,
-            ),
-            (
-                OpKind::Log10,
-                |x| x.log10(),
-                &[0.1, 0.5, 1.0, 10.0, 100.0],
-                5e-3,
-            ),
-            (
-                OpKind::Atan,
-                |x| x.atan(),
-                &[-5.0, -0.5, -0.2, 0.0, 0.2, 0.5, 5.0],
-                8e-3,
-            ),
-            (
-                OpKind::Asin,
-                |x| x.asin(),
-                &[-0.8, -0.5, 0.0, 0.5, 0.8],
-                1e-2,
-            ),
-            (
-                OpKind::Acos,
-                |x| x.acos(),
-                &[-0.8, -0.5, 0.0, 0.5, 0.8],
-                1e-2,
-            ),
-        ];
-        for &(op, scalar, inputs, tol) in unary {
-            let mut arena = ExprArena::new();
-            let x = arena.push_var(0);
-            let root = arena.push_unary(op, x);
-            for &xv in inputs {
-                let got = run1(&arena, root, xv);
-                let want = scalar(xv);
-                let err = (got - want).abs() / (1.0 + want.abs());
-                assert!(
-                    err <= tol,
-                    "{op:?}({xv}): jit={got} scalar={want} rel_err={err} > {tol}"
-                );
-            }
-        }
-    }
-
-    /// Binary transcendentals + comparisons + ternaries, JIT vs scalar.
-    #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    fn x86_binary_ternary_builtins_match_scalar() {
-        // Helper: compile f(X, Y) and eval at (x, y).
-        fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-            let r = compile(arena, root).expect("compile failed");
-            eval_point(&r.code, x, y, 0.0, 0.0)
-        }
-
-        // atan2(y, x): arena Binary(Atan2, Y, X)  (op order: src1=y, src2=x)
-        let pts = [
-            (0.5, 2.0),
-            (2.0, 0.5),
-            (-0.5, 2.0),
-            (0.5, -2.0),
-            (-2.0, -0.5),
-            (3.0, -0.5),
-        ];
-        {
-            let mut a = ExprArena::new();
-            let y = a.push_var(1);
-            let x = a.push_var(0);
-            let root = a.push_binary(OpKind::Atan2, y, x);
-            for &(yv, xv) in &pts {
-                let got = run2(&a, root, xv, yv);
-                let want = yv.atan2(xv);
-                assert!(
-                    (got - want).abs() <= 1.5e-2,
-                    "atan2({yv},{xv}): {got} vs {want}"
-                );
-            }
-        }
-        // pow(X, Y)
-        {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_binary(OpKind::Pow, x, y);
-            for &(xv, yv) in &[(2.0f32, 3.0f32), (9.0, 0.5), (4.0, -1.0), (1.5, 2.0)] {
-                let got = run2(&a, root, xv, yv);
-                let want = xv.powf(yv);
-                let err = (got - want).abs() / (1.0 + want.abs());
-                assert!(err <= 5e-3, "pow({xv},{yv}): {got} vs {want} err={err}");
-            }
-        }
-        // hypot(X, Y) — the sqrt(x² + y²) composition it denotes.
-        {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let xx = a.push_binary(OpKind::Mul, x, x);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let sum = a.push_binary(OpKind::Add, xx, yy);
-            let root = a.push_unary(OpKind::Sqrt, sum);
-            for &(xv, yv) in &[(3.0f32, 4.0f32), (1.0, 1.0), (0.0, 2.0)] {
-                let got = run2(&a, root, xv, yv);
-                let want = xv.hypot(yv);
-                assert!(
-                    (got - want).abs() <= 1e-4,
-                    "hypot({xv},{yv}): {got} vs {want}"
-                );
-            }
-        }
-        // Min / Max
-        for (op, f) in [
-            (OpKind::Min, f32::min as fn(f32, f32) -> f32),
-            (OpKind::Max, f32::max as fn(f32, f32) -> f32),
-        ] {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_binary(op, x, y);
-            for &(xv, yv) in &[(1.0f32, 2.0f32), (3.0, -1.0), (-2.0, -5.0)] {
-                let got = run2(&a, root, xv, yv);
-                assert!((got - f(xv, yv)).abs() <= 1e-6, "{op:?}({xv},{yv})");
-            }
-        }
-        // clamp(X, 0.0, 1.0) — the min/max composition it denotes.
-        {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let lo = a.push_const(0.0);
-            let hi = a.push_const(1.0);
-            let floored = a.push_binary(OpKind::Max, x, lo);
-            let root = a.push_binary(OpKind::Min, floored, hi);
-            for &xv in &[-0.5f32, 0.25, 0.9, 1.7] {
-                let got = run1(&a, root, xv);
-                assert!(
-                    (got - xv.clamp(0.0, 1.0)).abs() <= 1e-6,
-                    "clamp({xv})={got}"
-                );
-            }
-        }
-        // Select(X >= 0, 1.0, -1.0) == signum-ish
-        {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let cond = a.push_binary(OpKind::Ge, x, zero);
-            let pos = a.push_const(1.0);
-            let neg = a.push_const(-1.0);
-            let root = a.push_ternary(OpKind::Select, cond, pos, neg);
-            for &xv in &[-2.0f32, -0.1, 0.1, 3.0] {
-                let got = run1(&a, root, xv);
-                let want = if xv >= 0.0 { 1.0 } else { -1.0 };
-                assert!((got - want).abs() <= 1e-6, "select({xv})={got} want={want}");
-            }
-        }
-    }
-
-    // =========================================================================
-    // Forward-mode dual (jet) lowering — validated against analytic derivatives.
-    // Uses hardware sqrtps/divps (no polynomial approximations), so tolerances
-    // are tight.
-    /// Transcendental lowering: sin/cos/tan JIT through the shared driver with
-    /// no backend ever emitting a transcendental (they expand to arithmetic in
-    /// `lowering`). Validated against `f32` on the default (128-bit) build.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    mod lowering_tests {
-        use super::*;
-        use pixelflow_ir::arena::ExprArena;
-
-        // The degree-11 Chebyshev in `passes` measures 6e-7 across the whole
-        // reduced interval, so this bound sits an order of magnitude above the
-        // measured worst case: tight enough to test the polynomial, loose
-        // enough not to test the last bit of the build's rounding. A bound in
-        // the 1e-2 range would only be able to catch gross logic errors.
-        const TRIG_TOL: f32 = 1e-5;
-
-        #[test]
-        fn sin_cos_tan_match_scalar() {
-            // Range beyond [-π,π] to exercise the floor-based range reduction.
-            let pts = [0.0f32, 0.3, 1.0, 2.0, 3.5, -1.7, 6.0, -4.2];
-            for &xv in &pts {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let s = a.push_unary(OpKind::Sin, x);
-                assert!((run1(&a, s, xv) - xv.sin()).abs() <= TRIG_TOL, "sin({xv})");
-
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let c = a.push_unary(OpKind::Cos, x);
-                assert!((run1(&a, c, xv) - xv.cos()).abs() <= TRIG_TOL, "cos({xv})");
-            }
-            // tan away from its poles (ratio of two ~3e-3 approximations).
-            for &xv in &[0.0f32, 0.3, 0.7, -0.5, 1.0] {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let t = a.push_unary(OpKind::Tan, x);
-                // tan = sin/cos amplifies both errors by 1/cos²(x); from
-                // 6e-7 apiece that is ~3e-6 at x=1.
-                assert!((run1(&a, t, xv) - xv.tan()).abs() <= 1e-4, "tan({xv})");
-            }
-        }
-
-        /// exp/exp2/ln/log2/log10 lower to arithmetic via the bit-manip
-        /// primitives (TruncToInt/IntToFloat/IAdd/Shl/Shr/BitAnd/BitOr) — the
-        /// float↔int twiddling no backend can avoid. Validated vs `f32`.
-        #[test]
-        fn exp_log_match_scalar() {
-            // exp / exp2 over a moderate range.
-            for &xv in &[-2.0f32, -0.5, 0.0, 0.7, 1.5, 3.0] {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let e = a.push_unary(OpKind::Exp, x);
-                let rel = (run1(&a, e, xv) - xv.exp()).abs() / xv.exp().max(1.0);
-                assert!(rel <= 1e-2, "exp({xv})");
-
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let e2 = a.push_unary(OpKind::Exp2, x);
-                let rel = (run1(&a, e2, xv) - xv.exp2()).abs() / xv.exp2().max(1.0);
-                assert!(rel <= 1e-2, "exp2({xv})");
-            }
-            // ln / log2 / log10 over positive inputs.
-            for &xv in &[0.25f32, 0.5, 1.0, 2.0, 5.0, 100.0] {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let l = a.push_unary(OpKind::Ln, x);
-                assert!((run1(&a, l, xv) - xv.ln()).abs() <= 3e-2, "ln({xv})");
-
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let l2 = a.push_unary(OpKind::Log2, x);
-                assert!((run1(&a, l2, xv) - xv.log2()).abs() <= 3e-2, "log2({xv})");
-            }
-        }
-
-        /// atan/atan2/asin/acos lower to arithmetic + Select (atan2 is the core;
-        /// the others derive from it). Value path only — atan2 uses Select, which
-        /// the jet path can't differentiate. Validated vs `f32`.
-        #[test]
-        fn inverse_trig_match_scalar() {
-            // The atan polynomial is minimax: 8.7e-5 across the interval.
-            // What sets this bound is therefore not the polynomial but
-            // `Recip`, which is a hardware
-            // *estimate* — ~12 bits from `rcpps`, ~14 from `vrcp14ps` — so it
-            // injects ~1.2e-4 into the ratio and differs by ISA level. That is
-            // also why this is looser than the same check in
-            // `pixelflow-ir/tests/trig_range.rs`: the scalar oracle's `Recip`
-            // is an exact `1.0/x`, so that test bounds the polynomial and this
-            // one bounds the polynomial plus the estimate.
-            const ATAN_TOL: f32 = 1e-3;
-
-            // atan over a wide range (exercises the |ratio|>1 swap branch).
-            for &xv in &[0.0f32, 0.3, 1.0, 2.5, -0.7, -4.0] {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let at = a.push_unary(OpKind::Atan, x);
-                assert!(
-                    (run1(&a, at, xv) - xv.atan()).abs() <= ATAN_TOL,
-                    "atan({xv})"
-                );
-            }
-            // asin/acos on [-1, 1].
-            for &xv in &[-0.9f32, -0.4, 0.0, 0.4, 0.9] {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let s = a.push_unary(OpKind::Asin, x);
-                assert!(
-                    (run1(&a, s, xv) - xv.asin()).abs() <= ATAN_TOL,
-                    "asin({xv})"
-                );
-
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let c = a.push_unary(OpKind::Acos, x);
-                assert!(
-                    (run1(&a, c, xv) - xv.acos()).abs() <= ATAN_TOL,
-                    "acos({xv})"
-                );
-            }
-            // atan2 across quadrants (y in var0, x in var1). The (1,1)/(-1,-1)…
-            // cases sit at |ratio|=1, the polynomial's worst point.
-            let pts = [
-                (1.0f32, 1.0f32),
-                (1.0, -1.0),
-                (-1.0, -1.0),
-                (-1.0, 1.0),
-                (0.5, -2.0),
-            ];
-            for &(yv, xv) in &pts {
-                let mut a = ExprArena::new();
-                let y = a.push_var(0);
-                let x = a.push_var(1);
-                let r = a.push_binary(OpKind::Atan2, y, x);
-                let got = run_xy(&a, r, yv, xv);
-                assert!(
-                    (got - yv.atan2(xv)).abs() <= ATAN_TOL,
-                    "atan2({yv},{xv}) = {got}"
-                );
-            }
-        }
-
-        /// A transcendental composed inside arithmetic still works: sin(x)·x + 1.
-        #[test]
-        fn transcendental_in_expression() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let s = a.push_unary(OpKind::Sin, x);
-            let sx = a.push_binary(OpKind::Mul, s, x);
-            let one = a.push_const(1.0);
-            let root = a.push_binary(OpKind::Add, sx, one);
-            for &xv in &[0.2f32, 0.9, 2.1, -1.3] {
-                let want = xv.sin() * xv + 1.0;
-                // sin's ~3e-3 error is scaled by |x|, so allow for that.
-                let tol = 3e-3 * (1.0 + xv.abs());
-                assert!(
-                    (run1(&a, root, xv) - want).abs() <= tol,
-                    "sin(x)·x+1 @ {xv}"
-                );
-            }
-        }
-    }
-
-    // =========================================================================
-    // x86 shared-pipeline path (schedule → regalloc → spill).
-    // =========================================================================
-    // 128-bit build only; gated off `+avx512f` (covered by `avx512_driver`).
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    mod sched {
-        use super::*;
-
-        /// One batch of a kernel whose single argument is bound to `u` — the
-        /// lattice-invariant third input a test used to spell `Var(2)`.
-        fn eval_point_with_arg(code: &executable::ExecutableCode, x: f32, y: f32, u: f32) -> f32 {
-            let block = [u];
-            let ctx: [*const f32; 1] = [block.as_ptr()];
-            let o = executable::Point4::new([x; LANES], [y; LANES], [0.0; LANES], [0.0; LANES]);
-            eval_batch(code, &ctx, o)[0]
-        }
-
-        /// Declare one argument in `a` and return its leaf.
-        fn arg_leaf(a: &mut ExprArena, default: f32) -> pixelflow_ir::ExprId {
-            let slot = a.declare_uniform(pixelflow_ir::Uniform::new(default).decl());
-            a.push_uniform(slot)
-        }
-
-        use pixelflow_ir::arena::ExprArena;
-
-        fn run(res: &CompileResult, x: f32, y: f32, z: f32, w: f32) -> f32 {
-            eval_point(&res.code, x, y, z, w)
-        }
-
-        const PTS: &[(f32, f32, f32, f32)] = &[
-            (3.0, 4.0, 0.0, 1.0),
-            (1.0, 2.0, 3.0, 4.0),
-            (-2.0, 0.5, 1.5, -1.0),
-            (0.7, -1.3, 2.1, 0.2),
-        ];
-
-        /// An expression that fits in registers compiles without spilling and
-        /// computes the right answer.
-        ///
-        /// This used to compare a "Sethi-Ullman path" against a "scheduled
-        /// path". Both arms had long since become the same `compile` call,
-        /// so it compiled one function twice and asserted it equalled
-        /// itself; only the ground-truth comparison was load-bearing.
-        #[test]
-        fn sched_no_spill_is_correct() {
-            // f = sqrt(X*X + Y*Y) - Y*U, a non-commutative shape whose third
-            // input is the kernel's argument rather than a third coordinate.
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let z = arg_leaf(&mut a, 0.0);
-            let xx = a.push_binary(OpKind::Mul, x, x);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let sum = a.push_binary(OpKind::Add, xx, yy);
-            let dist = a.push_unary(OpKind::Sqrt, sum);
-            let yz = a.push_binary(OpKind::Mul, y, z);
-            let sub = a.push_binary(OpKind::Sub, dist, yz); // dist - Y*Z
-            let root = sub;
-
-            let sched = compile(&a, root).expect("compile");
-            assert_eq!(sched.spill_count, 0, "should fit without spilling");
-
-            for &(px, py, pz, _pw) in PTS {
-                let want = (px * px + py * py).sqrt() - py * pz;
-                let got = eval_point_with_arg(&sched.code, px, py, pz);
-                assert!((got - want).abs() <= 1e-4, "got {got} want {want}");
-            }
-        }
-
-        /// A wide expression that exceeds the 7 allocatable registers must spill
-        /// (to the red zone) and still compute the right answer.
-        #[test]
-        fn sched_spills_and_is_correct() {
-            // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree so the 10
-            // products are live together — forcing spills with only 7 regs.
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let mut terms = alloc::vec::Vec::new();
-            for i in 1..=10u32 {
-                let c = a.push_const(i as f32);
-                let ax = a.push_binary(OpKind::Add, x, c);
-                let by = a.push_binary(OpKind::Add, y, c);
-                terms.push(a.push_binary(OpKind::Mul, ax, by));
-            }
-            while terms.len() > 1 {
-                let mut next = alloc::vec::Vec::new();
-                let it = terms.chunks(2);
-                for pair in it {
-                    if pair.len() == 2 {
-                        next.push(a.push_binary(OpKind::Add, pair[0], pair[1]));
-                    } else {
-                        next.push(pair[0]);
-                    }
-                }
-                terms = next;
-            }
-            let root = terms[0];
-
-            let sched = compile(&a, root).expect("scheduled compile");
-            assert!(
-                sched.spill_count > 0,
-                "expected spilling; widen the expression if this regresses"
-            );
-
-            for &(px, py, _pz, _pw) in PTS {
-                let mut want = 0.0f32;
-                for i in 1..=10u32 {
-                    want += (px + i as f32) * (py + i as f32);
-                }
-                let got = run(&sched, px, py, 0.0, 0.0);
-                let tol = 1e-3 * want.abs().max(1.0);
-                assert!((got - want).abs() <= tol, "spill: got {got} want {want}");
-            }
-        }
-
-        /// Exercises the shared driver's Select short-circuit guard path on x86
-        /// (MOVMSKPS all-true/all-false branches): `(X > 0) ? Y*Y*Y : X+X+X`,
-        /// with arm-exclusive subexpressions so a guard region forms. Uniform
-        /// inputs take the all-true / all-false branches.
-        ///
-        /// Both arms are per-*lane*, which is what makes them arms: an arm of
-        /// the kernel's arguments alone would be lattice-invariant and hoist
-        /// out of the body entirely, leaving nothing for a guard to skip.
-        #[test]
-        fn sched_select_guards() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let zero = a.push_const(0.0);
-            let cond = a.push_binary(OpKind::Gt, x, zero); // X > 0 -> mask
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let yyy = a.push_binary(OpKind::Mul, yy, y); // true arm: Y^3
-            let zz = a.push_binary(OpKind::Add, x, x);
-            let zzz = a.push_binary(OpKind::Add, zz, x); // false arm: 3X
-            let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
-
-            let sched = compile(&a, root).expect("scheduled compile");
-
-            // x>0 -> all-true -> Y^3 ; x<=0 -> all-false -> 3X.
-            for &(px, py, _pz, _pw) in PTS {
-                let want = if px > 0.0 { py * py * py } else { 3.0 * px };
-                let got = run(&sched, px, py, 0.0, 0.0);
-                assert!(
-                    (got - want).abs() <= 1e-3,
-                    "select: ({px},{py}) got {got} want {want}"
-                );
-            }
-        }
-    }
-
-    // =========================================================================
-    // Backend op-coverage completeness (docs/designs/2026-07-25-two-level-ir-
-    // and-backend-completeness.md)
-    // =========================================================================
-    //
-    // Turns "backend X silently doesn't support op Y" into a named, itemized
-    // test failure instead of a gap nobody notices until something happens to
-    // exercise it (this is exactly how AVX-512's binary-op dispatch sat at
-    // 6-of-15 required ops — nothing enumerated "the ops every backend must
-    // support" anywhere, so the hole was invisible until 36 tests failed by
-    // accident the first time someone compiled with `-C target-feature=
-    // +avx512f`).
-    //
-    // Each test below is scoped to a backend this build ACTUALLY compiles —
-    // `x86_backend_covers_required_ops` always runs on x86-64,
-    // `aarch64_backend_covers_required_ops` always runs on aarch64, and
-    // `avx512_backend_covers_required_ops` only compiles (and only needs to
-    // pass) when built with `avx512f` — the same feature gate
-    // `compile` uses to select `Avx512Backend` in production. On a default `cargo test --workspace` (no RUSTFLAGS) on
-    // this x86-64 host, that means: the SSE2 test runs and must be green
-    // (it is: X86Backend already covers every required op), and the AVX-512
-    // test does not even compile — it isn't lying about passing, it simply
-    // isn't part of this build. The moment someone builds with
-    // `+avx512f` (exactly the multi-ISA completion work tracked separately),
-    // this same test starts running and will fail loudly, by name, for every
-    // op `avx512::emit_unary`/`emit_binary`/`emit_plan` doesn't yet cover —
-    // rather than waiting for an unrelated test to trip over the gap.
-    mod uniforms {
-        use super::*;
-        use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
-
-        fn decl(default: f32) -> UniformDecl {
-            UniformDecl {
-                id: UniformIdentity::mint(),
-                default,
-            }
-        }
-
-        /// `x + u·u`: the uniform's load and the product that depends on it
-        /// alone are per-call work. Asserted on the partition — which region
-        /// holds them — not on timing.
-        #[test]
-        fn a_uniform_and_what_depends_on_it_alone_land_in_the_frame_prologue() {
-            let mut a = ExprArena::new();
-            let u = a.declare_uniform(decl(3.0));
-            let x = a.push_var(0);
-            let uu = a.push_uniform(u);
-            let sq = a.push_binary(OpKind::Mul, uu, uu);
-            let root = a.push_binary(OpKind::Add, x, sq);
-
-            let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-            let schedule = arena_to_schedule(&arena, root);
-            let variance = schedule_variance(&schedule);
-            let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
-
-            let frame = &scoped.regions[0];
-            assert!(
-                frame
-                    .schedule
-                    .iter()
-                    .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
-                "the broadcast load is once per call"
-            );
-            assert!(
-                frame
-                    .schedule
-                    .iter()
-                    .any(|d| matches!(d.op, ScheduledOp::Binary(OpKind::Mul, ..))),
-                "and so is u·u"
-            );
-            assert_eq!(frame.roots.len(), 1, "the product is the one parked value");
-            assert!(
-                !scoped
-                    .body
-                    .iter()
-                    .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
-                "the body reads the parked product, never the block"
-            );
-            assert!(
-                scoped.regions[1].schedule.is_empty(),
-                "nothing about a uniform is per row"
-            );
-        }
-
-        /// `x + u₀ + 2·u₁`, compiled once and run under two blocks: the
-        /// values come from the block at the call, and the uniform-only
-        /// product was hoisted.
-        #[test]
-        fn a_block_is_read_at_the_call_not_at_compile() {
-            let mut a = ExprArena::new();
-            let u0 = a.declare_uniform(decl(0.0));
-            let u1 = a.declare_uniform(decl(0.0));
-            let x = a.push_var(0);
-            let r0 = a.push_uniform(u0);
-            let r1 = a.push_uniform(u1);
-            let two = a.push_const(2.0);
-            let scaled = a.push_binary(OpKind::Mul, r1, two);
-            let sum = a.push_binary(OpKind::Add, x, r0);
-            let root = a.push_binary(OpKind::Add, sum, scaled);
-            let res = compile(&a, root).expect("compile");
-            assert!(res.hoisted_values >= 1, "2·u₁ is per call");
-
-            let xs: [f32; LANES] = core::array::from_fn(|i| i as f32);
-            for block in [[1.0f32, 10.0], [-2.5, 0.25]] {
-                let ctx = [block.as_ptr()];
-                let out = eval_batch(
-                    &res.code,
-                    &ctx,
-                    executable::Point4::new(xs, [0.0; LANES], [0.0; LANES], [0.0; LANES]),
-                );
-                for (i, got) in out.iter().enumerate() {
-                    assert_eq!(
-                        *got,
-                        i as f32 + block[0] + 2.0 * block[1],
-                        "lane {i} under {block:?}"
-                    );
-                }
-            }
-        }
-
-        /// The block's pointer is the context entry after the buffer slots:
-        /// a kernel over one buffer reads its block from `ctx[1]`.
-        #[test]
-        fn the_block_pointer_follows_the_buffer_slots() {
-            use pixelflow_ir::arena::{BufferDecl, BufferIdentity};
-            let data = [10.0f32, 20.0, 30.0, 40.0];
-            let mut a = ExprArena::new();
-            let buf = a.declare_buffer(BufferDecl {
-                id: BufferIdentity::mint(),
-                width: 4,
-                height: 1,
-            });
-            let u = a.declare_uniform(decl(0.0));
-            let x = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let g = a.push_gather(buf, x, zero);
-            let r = a.push_uniform(u);
-            let root = a.push_binary(OpKind::Add, g, r);
-            let res = compile(&a, root).expect("compile");
-
-            let block = [0.5f32];
-            let ctx = [data.as_ptr(), block.as_ptr()];
-            let xs: [f32; LANES] = core::array::from_fn(|i| i as f32);
-            let out = eval_batch(
-                &res.code,
-                &ctx,
-                executable::Point4::new(xs, [0.0; LANES], [0.0; LANES], [0.0; LANES]),
-            );
-            for (i, got) in out.iter().enumerate() {
-                assert_eq!(*got, data[i.min(3)] + 0.5, "lane {i}");
-            }
-        }
-
-        /// The bytes, per backend, for `ctx_slot = 2, offset = 3, dst = 5`.
-        /// Checked against `llvm-mc --disassemble` (LLVM 18):
-        /// `movq 16(%rdi), %rax` then `vbroadcastss 12(%rax), %xmm5` /
-        /// `%ymm5` / `%zmm5`; `ldr x9, [x0, #16]`, `ldr s5, [x9, #12]`,
-        /// `dup v5.4s, v5.s[0]`.
-        #[test]
-        fn every_backend_encodes_the_broadcast_load() {
-            let load = UniformLoad {
-                ctx_slot: 2,
-                offset: 3,
-            };
-            const MOV_RAX_CTX2: [u8; 7] = [0x48, 0x8B, 0x87, 0x10, 0, 0, 0];
-
-            let mut sse = Vec::new();
-            x86_64::emit_uniform_load(&mut sse, Reg(5), load);
-            assert_eq!(&sse[..7], &MOV_RAX_CTX2);
-            assert_eq!(&sse[7..], &[0xC4, 0xE2, 0x79, 0x18, 0xA8, 0x0C, 0, 0, 0]);
-
-            let mut avx2 = Vec::new();
-            avx2::emit_uniform_load(&mut avx2, Reg(5), load);
-            assert_eq!(&avx2[..7], &MOV_RAX_CTX2);
-            assert_eq!(&avx2[7..], &[0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0, 0, 0]);
-
-            let mut avx512 = Vec::new();
-            avx512::emit_uniform_load(&mut avx512, Reg(5), load);
-            assert_eq!(&avx512[..7], &MOV_RAX_CTX2);
-            assert_eq!(
-                &avx512[7..],
-                &[0x62, 0xF2, 0x7D, 0x48, 0x18, 0xA8, 0x0C, 0, 0, 0]
-            );
-
-            let mut neon = Vec::new();
-            aarch64::emit_uniform_load(&mut neon, Reg(5), load);
-            let words: Vec<u32> = neon
-                .chunks(4)
-                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-                .collect();
-            assert_eq!(words, [0xF940_0809, 0xBD40_0D25, 0x4E04_04A5]);
-        }
-    }
-
-    mod backend_op_coverage {
-        use super::super::coverage::*;
-        use super::*;
-
-        /// Run one `ResolvedOp` through a backend and report whether it
-        /// emitted.
-        ///
-        /// Every backend signals an op it cannot encode the same way now — by
-        /// panicking through [`unimplemented_op`], because after `legalize`
-        /// that is a missing implementation rather than a property of the
-        /// kernel. `catch_unwind` is what lets this test report *which* ops a
-        /// backend owes, by name and all of them, instead of dying on the
-        /// first one.
-        fn try_emit<B: IsaBackend>(backend: &mut B, op: ResolvedOp) -> bool {
-            let plan = InstructionPlan {
-                reloads: alloc::vec::Vec::new(),
-                op,
-                setup_mov: None,
-                // Every shape below uses registers 4-7, so these stand in for
-                // whatever scratch the allocator would hand an encoding that
-                // asks for some. A backend that wants scratch and finds none
-                // panics, which `try_emit` would report as a missing op.
-                scratch: regalloc::Scratch::for_test(
-                    Some([Reg(15), Reg(14), Reg(13), Reg(12)]),
-                    [Some(Reg(11)), Some(Reg(10))],
-                ),
-            };
-            let mut code = alloc::vec::Vec::new();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                backend.emit_plan(&mut code, &plan)
-            }))
-            .map(|r| r.is_ok())
-            .unwrap_or(false)
-        }
-
-        /// Sweep the required unary/binary/shift op lists plus the two
-        /// bespoke ternary shapes (`MulAdd`, `Select`) against `backend`,
-        /// collecting every failure instead of stopping at the first one —
-        /// a completeness gap is much cheaper to fix as an itemized list
-        /// than rediscovered one `cargo test` run per missing op.
-        fn assert_covers_required_ops<B: IsaBackend>(backend_name: &str, backend: &mut B) {
-            // The explicit `try_emit` calls below for MulAdd/Select are this
-            // constant, unrolled by hand (each needs its own `ResolvedOp`
-            // shape, so they aren't worth a generic loop) — kept in sync
-            // deliberately rather than by a shared loop. `MulAdd` unrolls to
-            // four: one fused plus one per `DecomposedMulAdd` spelling.
-            debug_assert_eq!(REQUIRED_TERNARY_OPS, &[OpKind::MulAdd, OpKind::Select]);
-            let mut missing = alloc::vec::Vec::new();
-
-            for &op in REQUIRED_UNARY_OPS {
-                if !try_emit(
-                    backend,
-                    ResolvedOp::Unary {
-                        op,
-                        dst: Reg(4),
-                        src: Reg(5),
-                    },
-                ) {
-                    missing.push(alloc::format!("unary {:?}", op));
-                }
-            }
-            for &op in REQUIRED_BINARY_OPS {
-                if !try_emit(
-                    backend,
-                    ResolvedOp::Binary {
-                        op,
-                        dst: Reg(4),
-                        left: Reg(4),
-                        right: Reg(5),
-                    },
-                ) {
-                    missing.push(alloc::format!("binary {:?}", op));
-                }
-            }
-            for &op in REQUIRED_SHIFT_OPS {
-                if !try_emit(
-                    backend,
-                    ResolvedOp::ShiftImm {
-                        op,
-                        dst: Reg(4),
-                        src: Reg(4),
-                        amount: 1,
-                    },
-                ) {
-                    missing.push(alloc::format!("shift {:?}", op));
-                }
-            }
-            if !try_emit(
-                backend,
-                ResolvedOp::FusedMulAdd {
-                    dst: Reg(4),
-                    a: Reg(5),
-                    b: Reg(6),
-                },
-            ) {
-                missing.push(alloc::string::String::from("ternary MulAdd (fused)"));
-            }
-            // `MulAdd` reaches a backend as EITHER shape depending only on how
-            // the allocator placed `a` and `b` (see `resolve_operands`), so a
-            // backend owes both. Each `c_deferred` spelling is its own arm.
-            for (tag, c_deferred) in [
-                ("c in a register", None),
-                (
-                    "c reloaded from the stack",
-                    Some(DeferredReload::FromStack(Slot::new(32, 16))),
-                ),
-                (
-                    "c rematerialized",
-                    Some(DeferredReload::Const(1.0f32.to_bits())),
-                ),
-            ] {
-                if !try_emit(
-                    backend,
-                    ResolvedOp::DecomposedMulAdd {
-                        dst: Reg(4),
-                        a: Reg(5),
-                        b: Reg(6),
-                        c: Reg(7),
-                        c_deferred,
-                    },
-                ) {
-                    missing.push(alloc::format!("ternary MulAdd (decomposed, {tag})"));
-                }
-            }
-            if !try_emit(
-                backend,
-                ResolvedOp::Select {
-                    dst: Reg(4),
-                    if_true: Reg(5),
-                    if_false: Reg(6),
-                },
-            ) {
-                missing.push(alloc::string::String::from("ternary Select"));
-            }
-
-            assert!(
-                missing.is_empty(),
-                "{backend_name} is missing required ops: {missing:?} (see \
-                 pixelflow-ir/src/backend/emit/coverage.rs for the full \
-                 completeness contract)"
-            );
-        }
-
-        // Ungated, like every sweep below it: these only *encode* — bytes
-        // into a Vec, never executed — and every backend now compiles on
-        // every host, so a coverage gap in any of the four fails every CI
-        // job rather than only the one leg that happens to select it.
-        // AVX-512's binary dispatch once shipped 6 of 15 required ops and
-        // nothing noticed until someone first built `+avx512f`; that is the
-        // hole this closes for all four at once.
-        #[test]
-        fn x86_backend_covers_required_ops() {
-            assert_covers_required_ops(
-                "X86Backend (SSE2)",
-                &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-            );
-        }
-
-        #[test]
-        fn avx2_backend_covers_required_ops() {
-            assert_covers_required_ops(
-                "Avx2Backend",
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            );
-        }
-
-        #[test]
-        fn avx512_backend_covers_required_ops() {
-            assert_covers_required_ops(
-                "Avx512Backend",
-                &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-            );
-        }
-
-        #[test]
-        fn aarch64_backend_covers_required_ops() {
-            let mut backend = aarch64::driver::Aarch64Backend::new(EmitCtx::default());
-            assert_covers_required_ops("Aarch64Backend", &mut backend);
-        }
-    }
-
-    // =========================================================================
-    // MulAdd: the encodings behind the two `ResolvedOp` shapes.
-    //
-    // `MulAdd` is the one row of CLAUDE.md's platform-divergence table whose
-    // two answers live inside a single build: `FusedMulAdd` rounds once where
-    // the hardware has an FMA, `DecomposedMulAdd` is architecturally a
-    // multiply then an add and rounds twice, and which one a node gets is
-    // decided by register pressure alone (`resolve_operands`). So the shapes
-    // are pinned as *bytes*, not just as "it emitted something": a backend
-    // that quietly encoded one where the driver asked for the other would
-    // still satisfy `backend_op_coverage`, still pass every ULP-tolerant
-    // equivalence test, and change the last bit of the answer.
-    //
-    // Ungated, like `backend_op_coverage`: encoding is a pure function into a
-    // `Vec<u8>`, so all four backends are checked from whichever host runs the
-    // tests — including the two (aarch64, AVX-512 decomposed) that no
-    // execution test on any single host reaches.
-    // =========================================================================
-    mod muladd_encoding {
-        use super::*;
-
-        const DST: Reg = Reg(4);
-        const SRC_A: Reg = Reg(5);
-        const SRC_B: Reg = Reg(6);
-        const ADDEND: Reg = Reg(7);
-
-        /// The temp the SSE2 fused stand-in multiplies into. Any pool
-        /// register disjoint from the operands would do — the allocator picks
-        /// it per instruction — so this names one to pin the bytes.
-        const TEMP: Reg = Reg(10);
-
-        /// A bare plan: no reloads, no setup mov, no store — just the op, so
-        /// the bytes below are the op's encoding and nothing else.
-        ///
-        /// `temps` is empty for every spelling but SSE2's `FusedMulAdd`, which
-        /// has no FMA to fuse into and needs somewhere to put the product; the
-        /// empty set elsewhere is the assertion that no other backend starts
-        /// asking for scratch unnoticed.
-        fn plan(
-            op: ResolvedOp,
-            temps: Option<[Reg; regalloc::Scratch::MAX_TEMPS]>,
-        ) -> InstructionPlan {
-            InstructionPlan {
-                reloads: alloc::vec::Vec::new(),
-                op,
-                setup_mov: None,
-                scratch: regalloc::Scratch::for_test(temps, [None, None]),
-            }
-        }
-
-        fn encode<B: IsaBackend>(backend: &mut B, op: ResolvedOp) -> Vec<u8> {
-            let mut code = Vec::new();
-            backend
-                .emit_plan(&mut code, &plan(op, None))
-                .expect("emit_plan");
-            code
-        }
-
-        /// `encode` for the one spelling that asks the allocator for a temp.
-        fn encode_with_temp<B: IsaBackend>(backend: &mut B, op: ResolvedOp) -> Vec<u8> {
-            let mut code = Vec::new();
-            backend
-                .emit_plan(
-                    &mut code,
-                    &plan(op, Some([TEMP; regalloc::Scratch::MAX_TEMPS])),
-                )
-                .expect("emit_plan");
-            code
-        }
-
-        fn fused() -> ResolvedOp {
-            ResolvedOp::FusedMulAdd {
-                dst: DST,
-                a: SRC_A,
-                b: SRC_B,
-            }
-        }
-
-        fn decomposed(c_deferred: Option<DeferredReload>) -> ResolvedOp {
-            ResolvedOp::DecomposedMulAdd {
-                dst: DST,
-                a: SRC_A,
-                b: SRC_B,
-                c: ADDEND,
-                c_deferred,
-            }
-        }
-
-        /// `dst += a * b` in one instruction, one rounding, on the three
-        /// targets that have an FMA — and the SSE2 baseline's honest
-        /// three-instruction stand-in, which rounds twice because that is all
-        /// the hardware offers.
-        #[test]
-        fn fused_encodes_to_the_targets_fma() {
-            // VEX.256.66.0F38.W0 B8 /r — vfmadd231ps ymm4, ymm5, ymm6.
-            assert_eq!(
-                encode(
-                    &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-                    fused()
-                ),
-                alloc::vec![0xc4, 0xe2, 0x55, 0xb8, 0xe6],
-                "AVX2 fused MulAdd"
-            );
-            // EVEX.512.66.0F38.W0 B8 /r — vfmadd231ps zmm4, zmm5, zmm6.
-            assert_eq!(
-                encode(
-                    &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-                    fused()
-                ),
-                alloc::vec![0x62, 0xf2, 0x55, 0x48, 0xb8, 0xe6],
-                "AVX-512 fused MulAdd"
-            );
-            // FMLA V4.4S, V5.4S, V6.4S.
-            let neon = encode(
-                &mut aarch64::driver::Aarch64Backend::new(EmitCtx::default()),
-                fused(),
-            );
-            assert_eq!(
-                aarch64::disassemble_code(&neon).trim_end(),
-                "   0: 4e26cca4  fmla v4.4s, v5.4s, v6.4s",
-                "aarch64 fused MulAdd"
-            );
-            // No FMA at the SSE2 baseline: movaps/mulps into this
-            // instruction's temp, then addps into dst. Two roundings, and the
-            // only reason CLAUDE.md's `MulAdd` row still has a second column.
-            assert_eq!(
-                encode_with_temp(
-                    &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-                    fused()
-                ),
-                alloc::vec![
-                    0x44, 0x0f, 0x28, 0xd5, // movaps xmm10, xmm5
-                    0x44, 0x0f, 0x59, 0xd6, // mulps  xmm10, xmm6
-                    0x41, 0x0f, 0x58, 0xe2, // addps  xmm4,  xmm10
-                ],
-                "SSE2 fused MulAdd"
-            );
-        }
-
-        /// The decomposed shape is a multiply and an add — never an FMA, on
-        /// any target. A backend that "optimized" it back into one instruction
-        /// would change the result's last bit while every tolerant test kept
-        /// passing.
-        #[test]
-        fn decomposed_encodes_to_a_multiply_and_an_add() {
-            assert_eq!(
-                encode(
-                    &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-                    decomposed(None)
-                ),
-                alloc::vec![
-                    0xc4, 0xe1, 0x54, 0x59, 0xe6, // vmulps ymm4, ymm5, ymm6
-                    0xc4, 0xe1, 0x5c, 0x58, 0xe7, // vaddps ymm4, ymm4, ymm7
-                ],
-                "AVX2 decomposed MulAdd"
-            );
-            assert_eq!(
-                encode(
-                    &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-                    decomposed(None)
-                ),
-                alloc::vec![
-                    0x62, 0xf1, 0x54, 0x48, 0x59, 0xe6, // vmulps zmm4, zmm5, zmm6
-                    0x62, 0xf1, 0x5c, 0x48, 0x58, 0xe7, // vaddps zmm4, zmm4, zmm7
-                ],
-                "AVX-512 decomposed MulAdd"
-            );
-            let neon = encode(
-                &mut aarch64::driver::Aarch64Backend::new(EmitCtx::default()),
-                decomposed(None),
-            );
-            assert_eq!(
-                aarch64::disassemble_code(&neon).trim_end(),
-                "   0: 6e26dca4  fmul v4.4s, v5.4s, v6.4s\n   4: 4e27d484  fadd v4.4s, v4.4s, v7.4s",
-                "aarch64 decomposed MulAdd"
-            );
-            assert_eq!(
-                encode(
-                    &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-                    decomposed(None)
-                ),
-                alloc::vec![
-                    0x0f, 0x28, 0xe5, // movaps xmm4, xmm5
-                    0x0f, 0x59, 0xe6, // mulps  xmm4, xmm6
-                    0x0f, 0x58, 0xe7, // addps  xmm4, xmm7
-                ],
-                "SSE2 decomposed MulAdd"
-            );
-        }
-
-        /// A deferred `c` must be reloaded *between* the multiply and the add.
-        ///
-        /// That ordering is the whole reason `DeferredReload` exists: `c`'s
-        /// reload target is the same scratch register `b` was loaded into, so
-        /// hoisting it up with the other reloads would destroy `b` before the
-        /// multiply reads it. The invariant is checked structurally rather
-        /// than as another byte literal — the multiply and the add are already
-        /// pinned above, so what is left to prove is that the reload landed
-        /// strictly between them, on every backend.
-        #[test]
-        fn a_deferred_c_is_reloaded_between_the_multiply_and_the_add() {
-            fn check<B: IsaBackend>(name: &str, backend: &mut B) {
-                let undeferred = encode(backend, decomposed(None));
-                // `dst = a*b` is everything before the final add; on SSE2 the
-                // add is 3 bytes, on VEX 5, on EVEX 6, on NEON 4 — so split by
-                // the tail rather than by a per-backend length.
-                let (mul, add) = undeferred.split_at(undeferred.len() - tail_len(name));
-                for deferred in [
-                    DeferredReload::FromStack(Slot::new(32, 16)),
-                    DeferredReload::Const(1.0f32.to_bits()),
-                ] {
-                    let got = encode(backend, decomposed(Some(deferred.clone())));
-                    assert!(
-                        got.starts_with(mul),
-                        "{name}/{deferred:?}: the multiply is no longer first"
-                    );
-                    assert!(
-                        got.ends_with(add),
-                        "{name}/{deferred:?}: the add is no longer last"
-                    );
-                    assert!(
-                        got.len() > undeferred.len(),
-                        "{name}/{deferred:?}: nothing was emitted for the reload"
-                    );
-                }
-            }
-
-            /// Byte length of the trailing add in `decomposed(None)`.
-            fn tail_len(name: &str) -> usize {
-                match name {
-                    "SSE2" => 3,
-                    "AVX2" => 5,
-                    "AVX-512" => 6,
-                    "aarch64" => 4,
-                    other => panic!("unknown backend {other}"),
-                }
-            }
-
-            check(
-                "SSE2",
-                &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-            );
-            check(
-                "AVX2",
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            );
-            check(
-                "AVX-512",
-                &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-            );
-            check(
                 "aarch64",
-                &mut aarch64::driver::Aarch64Backend::new(EmitCtx::default()),
-            );
+                emit_dag_body(
+                    schedule.clone(),
+                    &mut aarch64::driver::Aarch64Backend::new(EmitCtx::default()),
+                ),
+            ),
+            (
+                "x86_64",
+                emit_dag_body(
+                    schedule.clone(),
+                    &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
+                ),
+            ),
+            (
+                "avx2",
+                emit_dag_body(
+                    schedule.clone(),
+                    &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
+                ),
+            ),
+            (
+                "avx512",
+                emit_dag_body(
+                    schedule.clone(),
+                    &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
+                ),
+            ),
+        ] {
+            let (bytes, _, _, _) =
+                result.unwrap_or_else(|e| panic!("{name} emission failed: {e:?}"));
+            assert!(!bytes.is_empty(), "{name} emitted no instructions");
         }
+    }
 
-        /// A `MulAdd` node really does reach a backend as `FusedMulAdd` when
-        /// nothing spills — the property the byte tests above assume, and the
-        /// one an upstream change (a legalization pass that decomposed it, an
-        /// arena builder that never emitted it) would silently take away.
-        #[test]
-        fn a_muladd_dag_emits_the_fused_encoding() {
-            use pixelflow_ir::arena::ExprArena;
+    #[test]
+    fn muladd_reaches_the_backend() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let z = b.constant(2.0);
+        let root = b.ternary(OpKind::MulAdd, x, y, z);
+        let graph = b.finish_one(root);
+        let schedule = schedule(graph);
+        let (bytes, _, _, _) = emit_dag_body(
+            schedule,
+            &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
+        )
+        .expect("AVX2 emit");
+        assert!(!bytes.is_empty());
+    }
 
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let z = a.push_binary(OpKind::Add, y, x);
-            let root = a.push_ternary(OpKind::MulAdd, x, y, z);
-            let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
+    #[test]
+    fn compile_entry_accepts_a_rooted_graph() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let y = b.var(1);
+        let root = b.binary(OpKind::Add, x, y);
+        let graph = b.finish_one(root);
+        let result = compile(graph.root(), graph.environment());
+        assert!(result.is_ok(), "DAG compile failed");
+    }
 
-            let (code, _, _, _) = emit_dag_body(
-                arena_to_schedule(&a, root),
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            )
-            .expect("AVX2 emit");
-            // vfmadd231ps: VEX.256.66.0F38 B8 — the opcode byte after the
-            // 3-byte prefix. Nothing else this body emits uses it.
-            assert!(
-                code.windows(4)
-                    .any(|w| w[0] == 0xc4 && w[1] == 0xe2 && w[3] == 0xb8),
-                "a MulAdd DAG did not reach the AVX2 backend as FusedMulAdd \
-                 (no VEX.0F38 B8 in {code:02x?})"
-            );
-        }
+    #[test]
+    fn expr_data_is_pure_payload() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let root = b.unary(OpKind::Neg, x);
+        let graph = b.finish_one(root);
+        assert!(matches!(*graph.root(), ExprData::Op(OpKind::Neg)));
+        assert_eq!(graph.root().child_count(), 1);
     }
 }

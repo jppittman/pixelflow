@@ -10,7 +10,7 @@
 //!
 //! # Parameterisation (fixed by the registration)
 //!
-//! θ = [`THETA_VAR`] (`Var(0)`, the arena's `X`), φ = [`PHI_VAR`] (`Var(1)`,
+//! θ = [`THETA_VAR`] (`Var(0)`, the graph's `X`), φ = [`PHI_VAR`] (`Var(1)`,
 //! `Y`) — the coordinate variables ARE the angles. Not the Cartesian route
 //! (normalise a direction, then polynomials in nx, ny, nz — contains no trig
 //! at all) and not `atan2`/`acos` of a direction (inverse-trig ops no rule
@@ -56,11 +56,11 @@
 //! `pythagorean` bait in the set, since φ appears only inside
 //! `sin²(mφ) + cos²(mφ)` terms once every m is squared and summed.
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprBuilder, ExprGraph, ExprHandle, OpKind};
 
-/// θ — the polar angle — is the arena's `X` coordinate (`Var(0)`).
+/// θ — the polar angle — is the graph's `X` coordinate (`Var(0)`).
 pub const THETA_VAR: u8 = 0;
-/// φ — the azimuthal angle — is the arena's `Y` coordinate (`Var(1)`).
+/// φ — the azimuthal angle — is the graph's `Y` coordinate (`Var(1)`).
 pub const PHI_VAR: u8 = 1;
 
 /// How `sin(mφ)`/`cos(mφ)` for m ∈ {2,3,4} are spelled. m = 1 is identical
@@ -123,39 +123,39 @@ impl Rng {
 }
 
 /// `base` raised to the integer power `n` (n ∈ {2,3,4}) by repeated
-/// multiplication in the arena — no `Pow` op, so no exp/log rule can touch
+/// multiplication in the builder — no `Pow` op, so no exp/log rule can touch
 /// it, matching the hand-expanded polynomial form real-SH references use.
-fn ipow(arena: &mut ExprArena, base: ExprId, n: u32) -> ExprId {
+fn ipow(builder: &mut ExprBuilder, base: ExprHandle, n: u32) -> ExprHandle {
     assert!(n >= 1, "ipow: exponent must be >= 1, got {n}");
     let mut acc = base;
     for _ in 1..n {
-        acc = arena.push_binary(OpKind::Mul, acc, base);
+        acc = builder.binary(OpKind::Mul, acc, base);
     }
     acc
 }
 
 /// `Sin(θ)`/`Cos(θ)`/`Sin(φ)`/`Cos(φ)`, computed once per draw and threaded
 /// through every basis-function builder as one value (DAG sharing — each
-/// node is reused, never rebuilt) instead of four positional `ExprId`
+/// node is reused, never rebuilt) instead of four positional handles
 /// arguments.
 #[derive(Clone, Copy)]
 struct TrigBasis {
-    sin_th: ExprId,
-    cos_th: ExprId,
-    sin_phi: ExprId,
-    cos_phi: ExprId,
+    sin_th: ExprHandle,
+    cos_th: ExprHandle,
+    sin_phi: ExprHandle,
+    cos_phi: ExprHandle,
 }
 
 impl TrigBasis {
-    /// Push fresh `θ`/`φ` variables and their `Sin`/`Cos` into `arena`.
-    fn build(arena: &mut ExprArena) -> Self {
-        let x = arena.push_var(THETA_VAR);
-        let y = arena.push_var(PHI_VAR);
+    /// Push fresh `θ`/`φ` variables and their `Sin`/`Cos` into the builder.
+    fn build(builder: &mut ExprBuilder) -> Self {
+        let x = builder.var(THETA_VAR);
+        let y = builder.var(PHI_VAR);
         Self {
-            sin_th: arena.push_unary(OpKind::Sin, x),
-            cos_th: arena.push_unary(OpKind::Cos, x),
-            sin_phi: arena.push_unary(OpKind::Sin, y),
-            cos_phi: arena.push_unary(OpKind::Cos, y),
+            sin_th: builder.unary(OpKind::Sin, x),
+            cos_th: builder.unary(OpKind::Cos, x),
+            sin_phi: builder.unary(OpKind::Sin, y),
+            cos_phi: builder.unary(OpKind::Cos, y),
         }
     }
 }
@@ -163,91 +163,103 @@ impl TrigBasis {
 /// `sin(mφ)` for m ∈ {1,2,3,4}, per [`Form`]. `sin_phi`/`cos_phi` are the
 /// caller's cached `Sin(φ)`/`Cos(φ)` nodes, reused (DAG sharing) rather than
 /// rebuilt per call.
-fn sin_mphi(arena: &mut ExprArena, sin_phi: ExprId, cos_phi: ExprId, m: u32, form: Form) -> ExprId {
+fn sin_mphi(
+    builder: &mut ExprBuilder,
+    sin_phi: ExprHandle,
+    cos_phi: ExprHandle,
+    m: u32,
+    form: Form,
+) -> ExprHandle {
     match (m, form) {
         (1, _) => sin_phi,
         (m, Form::Direct) => {
-            let k = arena.push_const(m as f32);
-            let y = phi(arena);
-            let angle = arena.push_binary(OpKind::Mul, k, y);
-            arena.push_unary(OpKind::Sin, angle)
+            let k = builder.constant(m as f32);
+            let y = phi(builder);
+            let angle = builder.binary(OpKind::Mul, k, y);
+            builder.unary(OpKind::Sin, angle)
         }
         (2, Form::Expanded) => {
             // sin2φ = 2 sinφ cosφ
-            let two = arena.push_const(2.0);
-            let sc = arena.push_binary(OpKind::Mul, sin_phi, cos_phi);
-            arena.push_binary(OpKind::Mul, two, sc)
+            let two = builder.constant(2.0);
+            let sc = builder.binary(OpKind::Mul, sin_phi, cos_phi);
+            builder.binary(OpKind::Mul, two, sc)
         }
         (3, Form::Expanded) => {
             // sin3φ = 3 sinφ - 4 sin³φ
-            let three = arena.push_const(3.0);
-            let four = arena.push_const(4.0);
-            let a = arena.push_binary(OpKind::Mul, three, sin_phi);
-            let sin3 = ipow(arena, sin_phi, 3);
-            let b = arena.push_binary(OpKind::Mul, four, sin3);
-            arena.push_binary(OpKind::Sub, a, b)
+            let three = builder.constant(3.0);
+            let four = builder.constant(4.0);
+            let a = builder.binary(OpKind::Mul, three, sin_phi);
+            let sin3 = ipow(builder, sin_phi, 3);
+            let b = builder.binary(OpKind::Mul, four, sin3);
+            builder.binary(OpKind::Sub, a, b)
         }
         (4, Form::Expanded) => {
             // sin4φ = 4 sinφ cosφ (2cos²φ - 1)
-            let four = arena.push_const(4.0);
-            let two = arena.push_const(2.0);
-            let one = arena.push_const(1.0);
-            let sc = arena.push_binary(OpKind::Mul, sin_phi, cos_phi);
-            let four_sc = arena.push_binary(OpKind::Mul, four, sc);
-            let cos2 = ipow(arena, cos_phi, 2);
-            let two_cos2 = arena.push_binary(OpKind::Mul, two, cos2);
-            let paren = arena.push_binary(OpKind::Sub, two_cos2, one);
-            arena.push_binary(OpKind::Mul, four_sc, paren)
+            let four = builder.constant(4.0);
+            let two = builder.constant(2.0);
+            let one = builder.constant(1.0);
+            let sc = builder.binary(OpKind::Mul, sin_phi, cos_phi);
+            let four_sc = builder.binary(OpKind::Mul, four, sc);
+            let cos2 = ipow(builder, cos_phi, 2);
+            let two_cos2 = builder.binary(OpKind::Mul, two, cos2);
+            let paren = builder.binary(OpKind::Sub, two_cos2, one);
+            builder.binary(OpKind::Mul, four_sc, paren)
         }
         (m, _) => unreachable!("sin_mphi: m = {m} outside 1..=4"),
     }
 }
 
 /// `cos(mφ)` for m ∈ {1,2,3,4}, per [`Form`] — mirrors [`sin_mphi`].
-fn cos_mphi(arena: &mut ExprArena, sin_phi: ExprId, cos_phi: ExprId, m: u32, form: Form) -> ExprId {
+fn cos_mphi(
+    builder: &mut ExprBuilder,
+    sin_phi: ExprHandle,
+    cos_phi: ExprHandle,
+    m: u32,
+    form: Form,
+) -> ExprHandle {
     match (m, form) {
         (1, _) => cos_phi,
         (m, Form::Direct) => {
-            let k = arena.push_const(m as f32);
-            let y = phi(arena);
-            let angle = arena.push_binary(OpKind::Mul, k, y);
-            arena.push_unary(OpKind::Cos, angle)
+            let k = builder.constant(m as f32);
+            let y = phi(builder);
+            let angle = builder.binary(OpKind::Mul, k, y);
+            builder.unary(OpKind::Cos, angle)
         }
         (2, Form::Expanded) => {
             // cos2φ = cos²φ - sin²φ
-            let c2 = ipow(arena, cos_phi, 2);
-            let s2 = ipow(arena, sin_phi, 2);
-            arena.push_binary(OpKind::Sub, c2, s2)
+            let c2 = ipow(builder, cos_phi, 2);
+            let s2 = ipow(builder, sin_phi, 2);
+            builder.binary(OpKind::Sub, c2, s2)
         }
         (3, Form::Expanded) => {
             // cos3φ = 4cos³φ - 3cosφ
-            let four = arena.push_const(4.0);
-            let three = arena.push_const(3.0);
-            let cos3 = ipow(arena, cos_phi, 3);
-            let a = arena.push_binary(OpKind::Mul, four, cos3);
-            let b = arena.push_binary(OpKind::Mul, three, cos_phi);
-            arena.push_binary(OpKind::Sub, a, b)
+            let four = builder.constant(4.0);
+            let three = builder.constant(3.0);
+            let cos3 = ipow(builder, cos_phi, 3);
+            let a = builder.binary(OpKind::Mul, four, cos3);
+            let b = builder.binary(OpKind::Mul, three, cos_phi);
+            builder.binary(OpKind::Sub, a, b)
         }
         (4, Form::Expanded) => {
             // cos4φ = 8cos⁴φ - 8cos²φ + 1
-            let eight = arena.push_const(8.0);
-            let one = arena.push_const(1.0);
-            let cos4 = ipow(arena, cos_phi, 4);
-            let cos2 = ipow(arena, cos_phi, 2);
-            let a = arena.push_binary(OpKind::Mul, eight, cos4);
-            let b = arena.push_binary(OpKind::Mul, eight, cos2);
-            let ab = arena.push_binary(OpKind::Sub, a, b);
-            arena.push_binary(OpKind::Add, ab, one)
+            let eight = builder.constant(8.0);
+            let one = builder.constant(1.0);
+            let cos4 = ipow(builder, cos_phi, 4);
+            let cos2 = ipow(builder, cos_phi, 2);
+            let a = builder.binary(OpKind::Mul, eight, cos4);
+            let b = builder.binary(OpKind::Mul, eight, cos2);
+            let ab = builder.binary(OpKind::Sub, a, b);
+            builder.binary(OpKind::Add, ab, one)
         }
         (m, _) => unreachable!("cos_mphi: m = {m} outside 1..=4"),
     }
 }
 
 /// Convenience: push a fresh reference to the φ variable. Cheap — `Var` is a
-/// tiny leaf node, and the arena does not dedup pushes for us — callers that
+/// tiny leaf node, and the builder interns equivalent nodes — callers that
 /// already hold a cached φ id should use that instead of this.
-fn phi(arena: &mut ExprArena) -> ExprId {
-    arena.push_var(PHI_VAR)
+fn phi(builder: &mut ExprBuilder) -> ExprHandle {
+    builder.var(PHI_VAR)
 }
 
 /// `K_l^{|m|} · P_l^{|m|}(cosθ)` — the θ-only factor shared by `+m` and `-m`,
@@ -260,148 +272,148 @@ fn phi(arena: &mut ExprArena) -> ExprId {
 /// Panics for `l` or `m_abs` outside the table — a caller bug, not a data
 /// condition.
 fn theta_factor(
-    arena: &mut ExprArena,
-    sin_th: ExprId,
-    cos_th: ExprId,
+    builder: &mut ExprBuilder,
+    sin_th: ExprHandle,
+    cos_th: ExprHandle,
     l: u32,
     m_abs: u32,
-) -> ExprId {
+) -> ExprHandle {
     use std::f32::consts::PI;
-    let k_const = |arena: &mut ExprArena, k: f32| arena.push_const(k);
+    let k_const = |builder: &mut ExprBuilder, k: f32| builder.constant(k);
     match (l, m_abs) {
         (0, 0) => {
             let k = 0.5 * (1.0 / PI).sqrt();
-            k_const(arena, k)
+            k_const(builder, k)
         }
         (1, 0) => {
             let k = (3.0 / (4.0 * PI)).sqrt();
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, cos_th)
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, cos_th)
         }
         (1, 1) => {
             let k = (3.0 / (4.0 * PI)).sqrt();
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, sin_th)
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, sin_th)
         }
         (2, 0) => {
             // K * (3cos²θ - 1)
             let k = 0.25 * (5.0 / PI).sqrt();
-            let three = arena.push_const(3.0);
-            let one = arena.push_const(1.0);
-            let cos2 = ipow(arena, cos_th, 2);
-            let a = arena.push_binary(OpKind::Mul, three, cos2);
-            let paren = arena.push_binary(OpKind::Sub, a, one);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, paren)
+            let three = builder.constant(3.0);
+            let one = builder.constant(1.0);
+            let cos2 = ipow(builder, cos_th, 2);
+            let a = builder.binary(OpKind::Mul, three, cos2);
+            let paren = builder.binary(OpKind::Sub, a, one);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, paren)
         }
         (2, 1) => {
             // K * sinθ cosθ
             let k = 0.5 * (15.0 / PI).sqrt();
-            let sc = arena.push_binary(OpKind::Mul, sin_th, cos_th);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, sc)
+            let sc = builder.binary(OpKind::Mul, sin_th, cos_th);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, sc)
         }
         (2, 2) => {
             // K * sin²θ
             let k = 0.25 * (15.0 / PI).sqrt();
-            let s2 = ipow(arena, sin_th, 2);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s2)
+            let s2 = ipow(builder, sin_th, 2);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s2)
         }
         (3, 0) => {
             // K * (5cos³θ - 3cosθ)
             let k = 0.25 * (7.0 / PI).sqrt();
-            let five = arena.push_const(5.0);
-            let three = arena.push_const(3.0);
-            let cos3 = ipow(arena, cos_th, 3);
-            let a = arena.push_binary(OpKind::Mul, five, cos3);
-            let b = arena.push_binary(OpKind::Mul, three, cos_th);
-            let paren = arena.push_binary(OpKind::Sub, a, b);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, paren)
+            let five = builder.constant(5.0);
+            let three = builder.constant(3.0);
+            let cos3 = ipow(builder, cos_th, 3);
+            let a = builder.binary(OpKind::Mul, five, cos3);
+            let b = builder.binary(OpKind::Mul, three, cos_th);
+            let paren = builder.binary(OpKind::Sub, a, b);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, paren)
         }
         (3, 1) => {
             // K * sinθ (5cos²θ - 1)
             let k = 0.25 * (21.0 / (2.0 * PI)).sqrt();
-            let five = arena.push_const(5.0);
-            let one = arena.push_const(1.0);
-            let cos2 = ipow(arena, cos_th, 2);
-            let a = arena.push_binary(OpKind::Mul, five, cos2);
-            let paren = arena.push_binary(OpKind::Sub, a, one);
-            let s_paren = arena.push_binary(OpKind::Mul, sin_th, paren);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s_paren)
+            let five = builder.constant(5.0);
+            let one = builder.constant(1.0);
+            let cos2 = ipow(builder, cos_th, 2);
+            let a = builder.binary(OpKind::Mul, five, cos2);
+            let paren = builder.binary(OpKind::Sub, a, one);
+            let s_paren = builder.binary(OpKind::Mul, sin_th, paren);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s_paren)
         }
         (3, 2) => {
             // K * sin²θ cosθ
             let k = 0.25 * (105.0 / PI).sqrt();
-            let s2 = ipow(arena, sin_th, 2);
-            let s2c = arena.push_binary(OpKind::Mul, s2, cos_th);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s2c)
+            let s2 = ipow(builder, sin_th, 2);
+            let s2c = builder.binary(OpKind::Mul, s2, cos_th);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s2c)
         }
         (3, 3) => {
             // K * sin³θ
             let k = 0.25 * (35.0 / (2.0 * PI)).sqrt();
-            let s3 = ipow(arena, sin_th, 3);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s3)
+            let s3 = ipow(builder, sin_th, 3);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s3)
         }
         (4, 0) => {
             // K * (35cos⁴θ - 30cos²θ + 3)
             let k = (3.0 / 16.0) * (1.0 / PI).sqrt();
-            let c35 = arena.push_const(35.0);
-            let c30 = arena.push_const(30.0);
-            let c3 = arena.push_const(3.0);
-            let cos4 = ipow(arena, cos_th, 4);
-            let cos2 = ipow(arena, cos_th, 2);
-            let a = arena.push_binary(OpKind::Mul, c35, cos4);
-            let b = arena.push_binary(OpKind::Mul, c30, cos2);
-            let ab = arena.push_binary(OpKind::Sub, a, b);
-            let paren = arena.push_binary(OpKind::Add, ab, c3);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, paren)
+            let c35 = builder.constant(35.0);
+            let c30 = builder.constant(30.0);
+            let c3 = builder.constant(3.0);
+            let cos4 = ipow(builder, cos_th, 4);
+            let cos2 = ipow(builder, cos_th, 2);
+            let a = builder.binary(OpKind::Mul, c35, cos4);
+            let b = builder.binary(OpKind::Mul, c30, cos2);
+            let ab = builder.binary(OpKind::Sub, a, b);
+            let paren = builder.binary(OpKind::Add, ab, c3);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, paren)
         }
         (4, 1) => {
             // K * sinθ (7cos³θ - 3cosθ)
             let k = 0.75 * (5.0 / (2.0 * PI)).sqrt();
-            let seven = arena.push_const(7.0);
-            let three = arena.push_const(3.0);
-            let cos3 = ipow(arena, cos_th, 3);
-            let a = arena.push_binary(OpKind::Mul, seven, cos3);
-            let b = arena.push_binary(OpKind::Mul, three, cos_th);
-            let paren = arena.push_binary(OpKind::Sub, a, b);
-            let s_paren = arena.push_binary(OpKind::Mul, sin_th, paren);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s_paren)
+            let seven = builder.constant(7.0);
+            let three = builder.constant(3.0);
+            let cos3 = ipow(builder, cos_th, 3);
+            let a = builder.binary(OpKind::Mul, seven, cos3);
+            let b = builder.binary(OpKind::Mul, three, cos_th);
+            let paren = builder.binary(OpKind::Sub, a, b);
+            let s_paren = builder.binary(OpKind::Mul, sin_th, paren);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s_paren)
         }
         (4, 2) => {
             // K * sin²θ (7cos²θ - 1)
             let k = 0.375 * (5.0 / PI).sqrt();
-            let seven = arena.push_const(7.0);
-            let one = arena.push_const(1.0);
-            let cos2 = ipow(arena, cos_th, 2);
-            let a = arena.push_binary(OpKind::Mul, seven, cos2);
-            let paren = arena.push_binary(OpKind::Sub, a, one);
-            let s2 = ipow(arena, sin_th, 2);
-            let s2_paren = arena.push_binary(OpKind::Mul, s2, paren);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s2_paren)
+            let seven = builder.constant(7.0);
+            let one = builder.constant(1.0);
+            let cos2 = ipow(builder, cos_th, 2);
+            let a = builder.binary(OpKind::Mul, seven, cos2);
+            let paren = builder.binary(OpKind::Sub, a, one);
+            let s2 = ipow(builder, sin_th, 2);
+            let s2_paren = builder.binary(OpKind::Mul, s2, paren);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s2_paren)
         }
         (4, 3) => {
             // K * sin³θ cosθ
             let k = 0.75 * (35.0 / (2.0 * PI)).sqrt();
-            let s3 = ipow(arena, sin_th, 3);
-            let s3c = arena.push_binary(OpKind::Mul, s3, cos_th);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s3c)
+            let s3 = ipow(builder, sin_th, 3);
+            let s3c = builder.binary(OpKind::Mul, s3, cos_th);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s3c)
         }
         (4, 4) => {
             // K * sin⁴θ
             let k = (3.0 / 16.0) * (35.0 / PI).sqrt();
-            let s4 = ipow(arena, sin_th, 4);
-            let kc = k_const(arena, k);
-            arena.push_binary(OpKind::Mul, kc, s4)
+            let s4 = ipow(builder, sin_th, 4);
+            let kc = k_const(builder, k);
+            builder.binary(OpKind::Mul, kc, s4)
         }
         (l, m) => unreachable!("theta_factor: (l={l}, m={m}) outside the l<=4 table"),
     }
@@ -410,18 +422,18 @@ fn theta_factor(
 /// `Y_l^m(θ, φ)`: [`theta_factor`] times the φ factor (`sin(|m|φ)` for
 /// m < 0, `cos(mφ)` for m > 0, nothing for m = 0). `m` is signed
 /// (`-l..=l`).
-fn y_l_m(arena: &mut ExprArena, basis: TrigBasis, l: u32, m: i32, form: Form) -> ExprId {
+fn y_l_m(builder: &mut ExprBuilder, basis: TrigBasis, l: u32, m: i32, form: Form) -> ExprHandle {
     let m_abs = m.unsigned_abs();
-    let theta = theta_factor(arena, basis.sin_th, basis.cos_th, l, m_abs);
+    let theta = theta_factor(builder, basis.sin_th, basis.cos_th, l, m_abs);
     match m.cmp(&0) {
         std::cmp::Ordering::Equal => theta,
         std::cmp::Ordering::Less => {
-            let s = sin_mphi(arena, basis.sin_phi, basis.cos_phi, m_abs, form);
-            arena.push_binary(OpKind::Mul, theta, s)
+            let s = sin_mphi(builder, basis.sin_phi, basis.cos_phi, m_abs, form);
+            builder.binary(OpKind::Mul, theta, s)
         }
         std::cmp::Ordering::Greater => {
-            let c = cos_mphi(arena, basis.sin_phi, basis.cos_phi, m_abs, form);
-            arena.push_binary(OpKind::Mul, theta, c)
+            let c = cos_mphi(builder, basis.sin_phi, basis.cos_phi, m_abs, form);
+            builder.binary(OpKind::Mul, theta, c)
         }
     }
 }
@@ -446,8 +458,8 @@ fn shuffle<T>(items: &mut [T], rng: &mut Rng) {
 /// fusion or a plain `Mul`+`Add` pair — both mathematically the sum the
 /// docstring states; the choice only varies which op nodes represent it,
 /// which is exactly the axis `FenceKey` is sensitive to.
-fn sh_sum(arena: &mut ExprArena, l_max: u32, form: Form, rng: &mut Rng) -> ExprId {
-    let basis = TrigBasis::build(arena);
+fn sh_sum(builder: &mut ExprBuilder, l_max: u32, form: Form, rng: &mut Rng) -> ExprHandle {
+    let basis = TrigBasis::build(builder);
 
     let mut terms: Vec<(u32, i32)> = Vec::new();
     for l in 0..=l_max {
@@ -462,17 +474,17 @@ fn sh_sum(arena: &mut ExprArena, l_max: u32, form: Form, rng: &mut Rng) -> ExprI
     }
     shuffle(&mut terms, rng);
 
-    let mut acc: Option<ExprId> = None;
+    let mut acc: Option<ExprHandle> = None;
     for (l, m) in terms {
-        let ylm = y_l_m(arena, basis, l, m, form);
+        let ylm = y_l_m(builder, basis, l, m, form);
         let c = rng.range(-1.0, 1.0);
-        let cc = arena.push_const(c);
+        let cc = builder.constant(c);
         acc = Some(match acc {
-            None => arena.push_binary(OpKind::Mul, cc, ylm),
-            Some(prev) if rng.below(2) == 0 => arena.push_ternary(OpKind::MulAdd, cc, ylm, prev),
+            None => builder.binary(OpKind::Mul, cc, ylm),
+            Some(prev) if rng.below(2) == 0 => builder.ternary(OpKind::MulAdd, cc, ylm, prev),
             Some(prev) => {
-                let term = arena.push_binary(OpKind::Mul, cc, ylm);
-                arena.push_binary(OpKind::Add, prev, term)
+                let term = builder.binary(OpKind::Mul, cc, ylm);
+                builder.binary(OpKind::Add, prev, term)
             }
         });
     }
@@ -484,15 +496,15 @@ fn sh_sum(arena: &mut ExprArena, l_max: u32, form: Form, rng: &mut Rng) -> ExprI
 /// constant independent of θ,φ: exactly the shape where φ appears only
 /// inside `sin²(mφ) + cos²(mφ)` once every `m` is squared and summed, the
 /// purest `pythagorean` bait this family offers.
-fn band_energy(arena: &mut ExprArena, basis: TrigBasis, l: u32, form: Form) -> ExprId {
-    let mut terms: Vec<ExprId> = Vec::new();
+fn band_energy(builder: &mut ExprBuilder, basis: TrigBasis, l: u32, form: Form) -> ExprHandle {
+    let mut terms: Vec<ExprHandle> = Vec::new();
     for m in -(l as i32)..=(l as i32) {
-        let ylm = y_l_m(arena, basis, l, m, form);
-        terms.push(arena.push_binary(OpKind::Mul, ylm, ylm));
+        let ylm = y_l_m(builder, basis, l, m, form);
+        terms.push(builder.binary(OpKind::Mul, ylm, ylm));
     }
     let mut acc = terms[0];
     for &t in &terms[1..] {
-        acc = arena.push_binary(OpKind::Add, acc, t);
+        acc = builder.binary(OpKind::Add, acc, t);
     }
     acc
 }
@@ -503,8 +515,8 @@ fn band_energy(arena: &mut ExprArena, basis: TrigBasis, l: u32, form: Form) -> E
 /// count > 50) — the band-energy terms alone are small. The subset/form/L
 /// draws are this structure's source of `FenceKey` diversity, the same role
 /// [`sh_sum`]'s term-subset draw plays for the direct/expanded structures.
-fn sh_power(arena: &mut ExprArena, rng: &mut Rng) -> ExprId {
-    let basis = TrigBasis::build(arena);
+fn sh_power(builder: &mut ExprBuilder, rng: &mut Rng) -> ExprHandle {
+    let basis = TrigBasis::build(builder);
 
     let mut bands: Vec<u32> = vec![1, 2, 3];
     bands.retain(|_| rng.unit() < 0.85);
@@ -513,54 +525,54 @@ fn sh_power(arena: &mut ExprArena, rng: &mut Rng) -> ExprId {
     }
     shuffle(&mut bands, rng);
 
-    let mut energies: Option<ExprId> = None;
+    let mut energies: Option<ExprHandle> = None;
     for l in bands {
-        let e = band_energy(arena, basis, l, rng.form());
+        let e = band_energy(builder, basis, l, rng.form());
         energies = Some(match energies {
             None => e,
-            Some(prev) => arena.push_binary(OpKind::Add, prev, e),
+            Some(prev) => builder.binary(OpKind::Add, prev, e),
         });
     }
     let energies = energies.expect("bands is non-empty (guarded above)");
 
     let l_max = 1 + rng.below(2);
     let form = rng.form();
-    let dot = sh_sum(arena, l_max, form, rng);
-    arena.push_binary(OpKind::Add, energies, dot)
+    let dot = sh_sum(builder, l_max, form, rng);
+    builder.binary(OpKind::Add, energies, dot)
 }
 
 /// Draw one `sh` corpus candidate from `rng`: picks a form and a structure
 /// (single dot product / product of two / band energy) per
 /// docs/plans/2026-09-01-phase3-round1b-domain-shift-registration.md §3a,
-/// and returns the arena and its root. Callers are responsible for node-count
+/// and returns the immutable graph. Callers are responsible for node-count
 /// filtering, structural dedup, and the numeric quarantine — this function
 /// only builds the expression.
 #[must_use]
-pub fn draw(rng: &mut Rng) -> (ExprArena, ExprId) {
-    let mut arena = ExprArena::new();
+pub fn draw(rng: &mut Rng) -> ExprGraph {
+    let mut builder = ExprBuilder::new();
     // 3-way structure draw: single sum / product of two sums / band energy.
     match rng.below(3) {
         0 => {
             let form = rng.form();
             let l_max = 2 + rng.below(3); // L in {2,3,4}
-            let root = sh_sum(&mut arena, l_max, form, rng);
-            (arena, root)
+            let root = sh_sum(&mut builder, l_max, form, rng);
+            builder.finish_one(root)
         }
         1 => {
             // Product of two independent sums, L<=2 each (irradiance x
             // transfer). "Independent" means independently drawn
             // coefficients over the SAME (θ,φ) — both factors are still
-            // functions of the one arena's X/Y, matching an actual
+            // functions of the one graph's X/Y, matching an actual
             // lighting x transfer product evaluated at one direction.
             let form = rng.form();
-            let a = sh_sum(&mut arena, 1 + rng.below(2), form, rng);
-            let b = sh_sum(&mut arena, 1 + rng.below(2), form, rng);
-            let root = arena.push_binary(OpKind::Mul, a, b);
-            (arena, root)
+            let a = sh_sum(&mut builder, 1 + rng.below(2), form, rng);
+            let b = sh_sum(&mut builder, 1 + rng.below(2), form, rng);
+            let root = builder.binary(OpKind::Mul, a, b);
+            builder.finish_one(root)
         }
         _ => {
-            let root = sh_power(&mut arena, rng);
-            (arena, root)
+            let root = sh_power(&mut builder, rng);
+            builder.finish_one(root)
         }
     }
 }
@@ -577,8 +589,8 @@ mod tests {
         let mut rng = Rng::new(1);
         for i in 0..50u64 {
             let mut draw_rng = Rng::new(i.wrapping_mul(0x2545_F491));
-            let (arena, root) = draw(&mut draw_rng);
-            let n = arena.node_count_subtree(root);
+            let graph = draw(&mut draw_rng);
+            let n = graph.root().node_count();
             assert!(n >= 5, "draw {i}: implausibly small ({n} nodes)");
             assert!(n <= 2000, "draw {i}: implausibly large ({n} nodes)");
             let _ = &mut rng;

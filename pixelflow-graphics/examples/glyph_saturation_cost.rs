@@ -12,8 +12,7 @@
 use std::time::Instant;
 
 use pixelflow_graphics::fonts::Font;
-use pixelflow_ir::arena::{ExprArena, ExprId};
-use pixelflow_ir::{ExprNode, LatticeShape};
+use pixelflow_ir::{Environment, ExprData, LatticeShape};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -23,35 +22,15 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf"
 const CHARS: [char; 5] = ['A', 'O', 'S', '8', 'g'];
 const SIZES: [usize; 2] = [16, 32];
 
-fn reachable(arena: &ExprArena, root: ExprId) -> usize {
-    let mut seen = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut n = 0;
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        n += 1;
-        stack.extend(arena.children(id));
-    }
-    n
+fn reachable(root: pixelflow_ir::Node<'_, ExprData>) -> usize {
+    root.node_count()
 }
 
 /// Whether a binder survived to the emitter's input. It must not: codegen has
 /// no iteration binder, so a fold here is a legalizer that did not run.
-fn has_fold(arena: &ExprArena, root: ExprId) -> bool {
-    let mut seen = vec![false; arena.len()];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        if matches!(arena.node(id), ExprNode::Reduce { .. }) {
-            return true;
-        }
-        stack.extend(arena.children(id));
-    }
-    false
+fn has_fold(root: pixelflow_ir::Node<'_, ExprData>) -> bool {
+    root.descendants()
+        .any(|node| matches!(*node, ExprData::Reduce(_)))
 }
 
 fn main() {
@@ -63,16 +42,20 @@ fn main() {
                 continue;
             };
             let coverage = glyph.kernel();
-            let (arena, root) = coverage.parts();
-            let built = reachable(arena, root);
+            let env = Environment {
+                buffers: coverage.buffers().to_vec(),
+                uniforms: coverage.uniforms().to_vec(),
+            };
+            let built = reachable(coverage.root());
             let shape = LatticeShape::new([size as u32, size as u32]);
 
             let t0 = Instant::now();
-            let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape);
+            let optimized =
+                pixelflow_search::runtime::optimize_runtime_dag(coverage.rooted(), &env, shape);
             let ms = t0.elapsed().as_secs_f64() * 1e3;
 
-            let (out, out_root) = match optimized.as_deref() {
-                Some((a, r)) => (a.clone(), *r),
+            let out_root = match optimized.as_deref() {
+                Some((rooted, _)) => rooted.entry(),
                 // The pipeline declined outright — which after the reorder
                 // would mean the emitter gets an un-legalized arena, so it is
                 // worth seeing rather than averaging away.
@@ -83,8 +66,8 @@ fn main() {
             };
             println!(
                 "{ch}\t{size}\t{built}\t{}\t{ms:.1}\t{}",
-                reachable(&out, out_root),
-                has_fold(&out, out_root)
+                reachable(out_root),
+                has_fold(out_root)
             );
         }
     }

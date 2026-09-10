@@ -6,6 +6,7 @@
 //! nodes?" were properties of whichever helper a call site happened to call.
 //! Naming the boundary is what makes them assertable.
 
+use pixelflow_ir::ExprBuilder;
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprNode, UniformDecl, UniformIdentity};
 use pixelflow_ir::{Children, ExprArena, Ir, Kernel, KernelStore, OpKind, Shape};
 use pixelflow_search::egraph::{Declined, EGraph, Vocabulary, insert, reachable_count};
@@ -45,6 +46,28 @@ fn uniform_inserts_and_hash_conses_by_identity() {
     // The macro tier holds it too: a uniform is not a runtime-only op.
     let mut eg = EGraph::new();
     assert!(insert(&arena, root, &mut eg, Vocabulary::Templates).is_ok());
+}
+
+#[test]
+fn graph_insert_uses_the_opaque_dag_surface() {
+    let mut builder = ExprBuilder::new();
+    let x = builder.var(0);
+    let one = builder.constant(1.0);
+    let root = builder.binary(OpKind::Add, x, one);
+    let graph = builder.finish_one(root);
+
+    let mut egraph = EGraph::new();
+    let root_class =
+        pixelflow_search::egraph::insert_graph(&graph, &mut egraph, Vocabulary::Runtime)
+            .expect("graph with supported nodes must insert");
+    assert_eq!(egraph.num_classes(), 3);
+    assert_eq!(pixelflow_search::egraph::reachable_count_graph(&graph), 3);
+    assert!(
+        egraph
+            .nodes(root_class)
+            .iter()
+            .any(|node| node.op().is_some())
+    );
 }
 
 /// The macro tier must not hold mask or integer-domain ops.
@@ -176,13 +199,13 @@ fn a_param_is_held_by_the_macro_vocabulary_and_declined_by_the_runtime_one() {
 #[test]
 fn a_reference_is_declined_by_every_vocabulary() {
     let named = Kernel::x().mul(&Kernel::constant(3.0)).by_ref();
-    let (arena, root) = named.parts();
+    let (arena, root) = named.rooted().entry().marshal(named.environment());
     let key = KernelStore::intern(&Kernel::x().mul(&Kernel::constant(3.0)));
 
     for vocab in [Vocabulary::Runtime, Vocabulary::Templates] {
         let mut eg = EGraph::new();
         assert_eq!(
-            insert(arena, root, &mut eg, vocab),
+            insert(&arena, root, &mut eg, vocab),
             Err(Declined::Ref(key)),
             "{vocab:?} must decline a reference"
         );
@@ -196,8 +219,8 @@ fn a_reference_is_declined_by_every_vocabulary() {
 fn the_runtime_pipeline_expands_before_it_saturates() {
     let body = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
     let named = body.by_ref();
-    let (arena, root) = named.parts();
-    let optimized = optimize_runtime_arena(arena, root, pixelflow_ir::LatticeShape::POINT)
+    let (arena, root) = named.rooted().entry().marshal(named.environment());
+    let optimized = optimize_runtime_arena(&arena, root, pixelflow_ir::LatticeShape::POINT)
         .expect("a named kernel must optimize, not bail");
     let (opt, opt_root) = &*optimized;
     // X·0 + Y folds to Y, which it could not do without seeing the body.

@@ -7,8 +7,8 @@
 
 use alloc::vec::Vec;
 
-use crate::arena::{BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
 use crate::dag::{Builder, Dag, Id, Node, Rooted, SideTable};
+use crate::declarations::{BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
 use crate::fold::Fold;
 use crate::kernel::Scalar;
 use crate::key::KernelKey;
@@ -170,6 +170,212 @@ impl ExprBuilderExt for Builder<ExprData> {
     #[inline]
     fn push_ref(&mut self, key: KernelKey) -> Id {
         self.push_unique(ExprData::Ref(key), &[])
+    }
+}
+
+/// An opaque handle to a node under construction.
+///
+/// Handles cannot be inspected, forged, or mixed between builders. They are
+/// consumed by [`ExprBuilder::finish`], where they become borrowed
+/// [`Node`]s in the resulting rooted DAG.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ExprHandle(Id);
+
+impl core::fmt::Debug for ExprHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ExprHandle")
+    }
+}
+
+/// The owned expression graph produced by [`ExprBuilder`].
+///
+/// The graph and its declaration environment travel together so a caller
+/// never has to carry arena-local buffer or uniform slots beside expression
+/// storage. Both are immutable after construction.
+#[derive(Clone)]
+pub struct ExprGraph {
+    rooted: Rooted<ExprData>,
+    env: Environment,
+}
+
+impl ExprGraph {
+    /// Construct a graph from its owned representation pieces.
+    #[must_use]
+    pub fn new(rooted: Rooted<ExprData>, env: Environment) -> Self {
+        Self { rooted, env }
+    }
+
+    /// The rooted expression DAG.
+    #[must_use]
+    pub fn rooted(&self) -> &Rooted<ExprData> {
+        &self.rooted
+    }
+
+    /// The declaration environment for this graph.
+    #[must_use]
+    pub fn environment(&self) -> &Environment {
+        &self.env
+    }
+
+    /// The graph's single expression root.
+    #[must_use]
+    pub fn root(&self) -> Node<'_, ExprData> {
+        self.rooted.entry()
+    }
+
+    /// The graph's DAG structure.
+    #[must_use]
+    pub fn dag(&self) -> &Dag<ExprData> {
+        &self.rooted
+    }
+
+    /// Split the graph into its immutable rooted DAG and environment.
+    #[must_use]
+    pub fn into_parts(self) -> (Rooted<ExprData>, Environment) {
+        (self.rooted, self.env)
+    }
+
+    /// Replace every parameter leaf with a scalar argument.
+    ///
+    /// Constants become `Const` nodes; uniform arguments are declared in the
+    /// returned environment and become `Uniform` leaves.  The source graph is
+    /// unchanged, so one macro-produced template can safely build many
+    /// kernels with different arguments.
+    #[must_use]
+    pub fn substitute_params(&self, params: &[Scalar]) -> Self {
+        let mut builder = ExprBuilder {
+            builder: Builder::new(),
+            env: self.env.clone(),
+        };
+        let uniform_slots = params
+            .iter()
+            .map(|param| match param {
+                Scalar::Const(_) => UniformId(0),
+                Scalar::Uniform(uniform) => builder.env.slot_for_uniform(uniform.decl()),
+            })
+            .collect::<Vec<_>>();
+        let root = substitute_params(&mut builder.builder, self.root(), params, &uniform_slots);
+        ExprGraph::new(builder.builder.finish(&[root]), builder.env)
+    }
+}
+
+/// Build-once expression construction API.
+///
+/// This is the only public construction surface for a new expression graph.
+/// It keeps node handles opaque and records declarations by identity, leaving
+/// the DAG's storage layout entirely private to `pixelflow-ir`.
+pub struct ExprBuilder {
+    builder: Builder<ExprData>,
+    env: Environment,
+}
+
+impl Default for ExprBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExprBuilder {
+    /// Start an empty expression graph.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            builder: Builder::new(),
+            env: Environment::new(),
+        }
+    }
+
+    /// Start an expression graph with capacity for nodes and edges.
+    #[must_use]
+    pub fn with_capacity(nodes: usize, edges: usize) -> Self {
+        Self {
+            builder: Builder::with_capacity(nodes, edges),
+            env: Environment::new(),
+        }
+    }
+
+    #[inline]
+    pub fn var(&mut self, var: u8) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::Var(var), &[]))
+    }
+
+    #[inline]
+    pub fn constant(&mut self, value: f32) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::constant(value), &[]))
+    }
+
+    #[inline]
+    pub fn param(&mut self, param: u8) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::Param(param), &[]))
+    }
+
+    /// Add a buffer declaration and return the corresponding leaf.
+    #[inline]
+    pub fn buffer(&mut self, decl: BufferDecl) -> ExprHandle {
+        let slot = self.env.slot_for_buffer(decl);
+        ExprHandle(self.builder.intern(ExprData::Buffer(slot), &[]))
+    }
+
+    /// Add a uniform declaration and return the corresponding leaf.
+    #[inline]
+    pub fn uniform(&mut self, decl: UniformDecl) -> ExprHandle {
+        let slot = self.env.slot_for_uniform(decl);
+        ExprHandle(self.builder.intern(ExprData::Uniform(slot), &[]))
+    }
+
+    #[inline]
+    pub fn reference(&mut self, key: KernelKey) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::Ref(key), &[]))
+    }
+
+    #[inline]
+    pub fn unary(&mut self, op: OpKind, child: ExprHandle) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::Op(op), &[child.0]))
+    }
+
+    #[inline]
+    pub fn binary(&mut self, op: OpKind, a: ExprHandle, b: ExprHandle) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::Op(op), &[a.0, b.0]))
+    }
+
+    #[inline]
+    pub fn ternary(
+        &mut self,
+        op: OpKind,
+        a: ExprHandle,
+        b: ExprHandle,
+        c: ExprHandle,
+    ) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::Op(op), &[a.0, b.0, c.0]))
+    }
+
+    #[inline]
+    pub fn nary(&mut self, op: OpKind, children: &[ExprHandle]) -> ExprHandle {
+        let ids: Vec<Id> = children.iter().map(|h| h.0).collect();
+        ExprHandle(self.builder.intern(ExprData::Op(op), &ids))
+    }
+
+    #[inline]
+    pub fn reduce(&mut self, fold: Fold, body: ExprHandle) -> ExprHandle {
+        ExprHandle(self.builder.intern(ExprData::Reduce(fold), &[body.0]))
+    }
+
+    /// Freeze this builder into a graph with one expression root.
+    #[must_use]
+    pub fn finish_one(self, root: ExprHandle) -> ExprGraph {
+        let ExprBuilder { builder, env } = self;
+        ExprGraph::new(builder.finish(&[root.0]), env)
+    }
+
+    /// Freeze this builder into an immutable graph with the supplied roots.
+    ///
+    /// A builder may produce multiple roots; [`ExprGraph::root`] is available
+    /// when exactly one root is supplied.
+    #[must_use]
+    pub fn finish(self, roots: &[ExprHandle]) -> ExprGraph {
+        let ExprBuilder { builder, env } = self;
+        let ids: Vec<Id> = roots.iter().map(|h| h.0).collect();
+        ExprGraph::new(builder.finish(&ids), env)
     }
 }
 
@@ -766,5 +972,28 @@ mod tests {
 
         let (arena2, root2) = root.marshal(&env);
         assert_eq!(arena2.depth(root2), 2);
+    }
+
+    #[test]
+    fn public_builder_keeps_environment_with_graph() {
+        let mut b = ExprBuilder::new();
+        let x = b.var(0);
+        let c = b.constant(2.0);
+        let root = b.binary(OpKind::Mul, x, c);
+        let graph = b.finish(&[root]);
+
+        assert_eq!(graph.environment(), &Environment::new());
+        assert_eq!(graph.root().op(), Some(OpKind::Mul));
+        assert_eq!(graph.root().node_count(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "another DAG builder")]
+    fn public_builder_rejects_handles_from_another_builder() {
+        let mut first = ExprBuilder::new();
+        let x = first.var(0);
+        let mut second = ExprBuilder::new();
+        let y = second.var(1);
+        let _ = second.binary(OpKind::Add, x, y);
     }
 }

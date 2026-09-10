@@ -51,9 +51,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use pixelflow_codegen::emit::executable::{ExecutableCode, Point4, TileSlice};
-use pixelflow_codegen::emit::{CompileResult, compile};
-use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_codegen::emit::{CompileResult, compile_dag};
+use pixelflow_ir::{ExprGraph, LatticeShape};
 
 use crate::jit_bench::{LocalNs, SentinelContext};
 use corpus::{CollapseKernel, Trips};
@@ -137,14 +136,16 @@ pub fn tier() -> &'static str {
 /// corpus bug, and continuing past it would silently change which kernels the
 /// two sides of a comparison share.
 #[must_use]
-pub fn compile_as_baked(arena: &ExprArena, root: ExprId, extent: [u32; 2]) -> CompileResult {
+pub fn compile_as_baked(graph: &ExprGraph, extent: [u32; 2]) -> CompileResult {
     let shape = LatticeShape::new(extent);
-    let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape);
-    let (arena, root) = optimized
+    let optimized =
+        pixelflow_search::runtime::optimize_runtime_dag(graph.rooted(), graph.environment(), shape);
+    let optimized_graph = optimized
         .as_deref()
-        .map(|(a, r)| (a, *r))
-        .unwrap_or((arena, root));
-    compile(arena, root).expect("corpus kernel failed to compile")
+        .map(|(rooted, environment)| ExprGraph::new(rooted.clone(), environment.clone()))
+        .unwrap_or_else(|| graph.clone());
+    compile_dag(optimized_graph.root(), optimized_graph.environment())
+        .expect("corpus kernel failed to compile")
 }
 
 /// A measurement run: owns the sentinel calibration and the output buffer.
@@ -162,9 +163,9 @@ struct Sentinel {
     bytes: u32,
     /// Kept so [`Sentinel::measure`] can bind its context the same way
     /// [`CollapseSession::measure`] binds any other kernel's — empty for
-    /// this arena today, but a special-cased hardcoded slot count would be
+    /// this graph today, but a special-cased hardcoded slot count would be
     /// a second definition of the layout `compile_as_baked` already emits.
-    arena: ExprArena,
+    graph: ExprGraph,
 }
 
 impl CollapseSession {
@@ -176,21 +177,22 @@ impl CollapseSession {
     #[must_use]
     pub fn open() -> Self {
         pin_to_a_core();
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let xx = arena.push_binary(pixelflow_ir::OpKind::Mul, x, x);
-        let yy = arena.push_binary(pixelflow_ir::OpKind::Mul, y, y);
-        let sum = arena.push_binary(pixelflow_ir::OpKind::Add, xx, yy);
-        let root = arena.push_unary(pixelflow_ir::OpKind::Sqrt, sum);
-        let result = compile_as_baked(&arena, root, SENTINEL_EXTENT);
+        let mut builder = pixelflow_ir::ExprBuilder::new();
+        let x = builder.var(0);
+        let y = builder.var(1);
+        let xx = builder.binary(pixelflow_ir::OpKind::Mul, x, x);
+        let yy = builder.binary(pixelflow_ir::OpKind::Mul, y, y);
+        let sum = builder.binary(pixelflow_ir::OpKind::Add, xx, yy);
+        let root = builder.unary(pixelflow_ir::OpKind::Sqrt, sum);
+        let graph = builder.finish_one(root);
+        let result = compile_as_baked(&graph, SENTINEL_EXTENT);
         let trips = Trips::of(SENTINEL_EXTENT, LANES as u32);
         let mut sentinel = Sentinel {
             bytes: result.code.len() as u32,
             code: result.code,
             buffer: output_buffer(trips),
             trips,
-            arena,
+            graph,
         };
         // Burn in before calibrating: the first milliseconds of a process run
         // at whatever clock the machine happened to be at.
@@ -244,9 +246,9 @@ impl CollapseSession {
     pub fn measure(&mut self, kernel: &CollapseKernel, pass: u32) -> Row {
         self.maybe_resample_sentinel();
         let trips = Trips::of(kernel.extent, LANES as u32);
-        let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
+        let result = compile_as_baked(&kernel.graph, kernel.extent);
         let mut buffer = output_buffer(trips);
-        let (buffers, uniforms) = dummy_context(&kernel.name, &kernel.arena, &kernel.buffer_data);
+        let (buffers, uniforms) = dummy_context(&kernel.name, &kernel.graph, &kernel.buffer_data);
         let slots = context_slots(&buffers, &uniforms);
         let timing = time_kernel(&result.code, &mut buffer, trips, slots.as_ptr());
         let drift = self.context().normalization();
@@ -319,10 +321,10 @@ fn output_buffer(trips: Trips) -> Vec<f32> {
     vec![0.0f32; (trips.rows * trips.groups) as usize * LANES]
 }
 
-/// Memory for every buffer slot `arena` declares, sized to the slot's own
+/// Memory for every buffer slot the graph declares, sized to the slot's own
 /// extent and bound to `buffer_data`'s captured contents, plus the uniform
 /// block (one `f32` per declared argument, at its default; a single
-/// `CORPUS_ARG` slot when the arena declares none, so a kernel with no
+/// `CORPUS_ARG` slot when the graph declares none, so a kernel with no
 /// argument still reads a real block rather than one omitted array entry
 /// away from a null deref).
 ///
@@ -337,11 +339,12 @@ fn output_buffer(trips: Trips) -> Vec<f32> {
 /// slot — rather than silently reintroducing the artifact this replaced.
 fn dummy_context(
     kernel_name: &str,
-    arena: &ExprArena,
+    graph: &ExprGraph,
     buffer_data: &[Option<Arc<Vec<f32>>>],
 ) -> (Vec<Vec<f32>>, Vec<f32>) {
-    let buffers: Vec<Vec<f32>> = arena
-        .buffers()
+    let buffers: Vec<Vec<f32>> = graph
+        .environment()
+        .buffers
         .iter()
         .enumerate()
         .map(|(slot, decl)| {
@@ -371,18 +374,23 @@ fn dummy_context(
             }
         })
         .collect();
-    let uniforms: Vec<f32> = if arena.uniforms().is_empty() {
+    let uniforms: Vec<f32> = if graph.environment().uniforms.is_empty() {
         vec![corpus::CORPUS_ARG]
     } else {
-        arena.uniforms().iter().map(|u| u.default).collect()
+        graph
+            .environment()
+            .uniforms
+            .iter()
+            .map(|u| u.default)
+            .collect()
     };
     (buffers, uniforms)
 }
 
 /// The context pointer table `dummy_context`'s memory is bound through: one
 /// base pointer per buffer slot, then the uniform block's — exactly the
-/// layout `compile_as_baked`'s emitted code reads (an `ExprNode::Uniform`'s
-/// context slot is `arena.buffers().len()`, the entry right after the last
+/// layout `compile_as_baked`'s emitted code reads (a uniform's context slot is
+/// the graph environment's buffer count, the entry right after the last
 /// buffer). Borrows `buffers`/`uniforms`, so the returned pointers are valid
 /// exactly as long as they are.
 fn context_slots(buffers: &[Vec<f32>], uniforms: &[f32]) -> Vec<*const f32> {
@@ -463,9 +471,9 @@ fn run_calls(
 
 impl Sentinel {
     fn measure(&mut self) -> f64 {
-        // The sentinel arena declares no buffers, so there is nothing for
+        // The sentinel graph declares no buffers, so there is nothing for
         // `buffer_data` to carry.
-        let (buffers, uniforms) = dummy_context("sentinel", &self.arena, &[]);
+        let (buffers, uniforms) = dummy_context("sentinel", &self.graph, &[]);
         let slots = context_slots(&buffers, &uniforms);
         time_kernel(&self.code, &mut self.buffer, self.trips, slots.as_ptr()).median
     }
@@ -591,7 +599,7 @@ mod tests {
             .iter()
             .find(|k| k.name.starts_with("invariant16_hot"))
             .expect("the corpus holds invariant16_hot");
-        let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
+        let result = compile_as_baked(&kernel.graph, kernel.extent);
         let trips = Trips::of(kernel.extent, LANES as u32);
         let statics = features_of(&result, trips);
         assert!(statics.bytes_total > 0);
@@ -612,7 +620,7 @@ mod tests {
             .iter()
             .find(|k| k.name.starts_with("invariant48_hot"))
             .expect("the corpus holds invariant48_hot");
-        let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
+        let result = compile_as_baked(&kernel.graph, kernel.extent);
         assert!(
             result.hoisted_values > 0,
             "48 X-invariant terms and nothing hoisted: the corpus is not exercising LICM"

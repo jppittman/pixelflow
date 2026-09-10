@@ -24,8 +24,8 @@ use std::time::Instant;
 
 use pixelflow_core::Kernel;
 use pixelflow_graphics::fonts::{text, Font};
-use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::passes::{expand_refs_owned, legalize};
+use pixelflow_ir::{Environment, Rooted};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -33,18 +33,8 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf"
 /// (`loop_blinn::PIECE_ROW_COLS`, private to that module).
 const PIECE_ROW_COLS: usize = 22;
 
-fn reachable(arena: &ExprArena, root: ExprId) -> usize {
-    let mut seen = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut n = 0;
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        n += 1;
-        stack.extend(arena.children(id));
-    }
-    n
+fn reachable(root: pixelflow_ir::Node<'_, pixelflow_ir::ExprData>) -> usize {
+    root.node_count()
 }
 
 fn main() {
@@ -64,23 +54,33 @@ fn main() {
             &Kernel::y().add(&Kernel::constant(0.5)),
         );
         let construct = t0.elapsed();
-        let (arena, root) = kernel.parts();
+        let env = Environment {
+            buffers: kernel.buffers().to_vec(),
+            uniforms: kernel.uniforms().to_vec(),
+        };
+        let (legacy, legacy_root) = kernel.root().marshal(&env);
         let pieces: usize = kernel
             .buffer_data()
             .map(|(_, data)| data.len())
             .sum::<usize>()
             / PIECE_ROW_COLS;
-        let (linked, linked_root) = expand_refs_owned(arena, root);
+        let (linked, linked_root) = expand_refs_owned(&legacy, legacy_root);
         let t1 = Instant::now();
-        let (legal, legal_root) = legalize(arena, root).expect("legalize");
+        let (legal, legal_root) = legalize(&legacy, legacy_root).expect("legalize");
         let legalize_t = t1.elapsed();
         println!(
             "{n:>5}  {:>12}  {:>9}  {:>9}  {pieces:>6}  {:>15}  {:>19}  {:>11}",
             construct.as_micros(),
-            arena.len(),
-            reachable(arena, root),
-            reachable(&linked, linked_root),
-            reachable(&legal, legal_root),
+            kernel.root().dag().len(),
+            kernel.root().node_count(),
+            Rooted::unmarshal(&linked, &[linked_root])
+                .0
+                .entry()
+                .node_count(),
+            Rooted::unmarshal(&legal, &[legal_root])
+                .0
+                .entry()
+                .node_count(),
             legalize_t.as_micros(),
         );
     }
