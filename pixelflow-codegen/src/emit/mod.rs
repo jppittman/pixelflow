@@ -147,6 +147,197 @@ pub fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = 
     AsmProgram::new(insts).assemble(code);
 }
 
+// =============================================================================
+// Labels: a name for a position, bound at assembly time
+// =============================================================================
+
+/// A name for a position in the emitted program.
+///
+/// [`AsmInsn`] is deliberately position-*independent* — an instruction writes
+/// its own bytes and knows nothing about where it sits — which is why a branch
+/// could not be one, and why control flow was until now an imperative
+/// `emit_jump` returning a fixup token the caller had to `patch_branch` itself,
+/// against offsets it tracked by hand with `code.len()`.
+///
+/// A label is the missing name. A program is not a sequence of *instructions*;
+/// it is a sequence of [`Item`]s, and an item is an instruction (fixed bytes),
+/// a **binding** of a name to this position (no bytes), or a **reference** to a
+/// name (bytes that depend on where that name lands). Assembling is laying the
+/// items out and then resolving the names — the same "bound later" the rest of
+/// this language is made of, at assembly time instead of bind or collapse time.
+///
+/// Labels are per-[`LabelScope`] and dense from zero, so the resolution table
+/// is a `Vec` rather than a map.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Label(pub u32);
+
+/// Mints labels for one assembly, so two independent programs cannot collide.
+#[derive(Debug, Default)]
+pub struct LabelScope {
+    next: u32,
+}
+
+impl LabelScope {
+    /// A fresh scope with no labels minted.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    /// A name nothing has bound yet.
+    ///
+    /// Minting is separate from binding precisely so a branch may name a
+    /// position that does not exist yet — which is every forward branch, and
+    /// the loop-exit branch of every loop.
+    pub fn mint(&mut self) -> Label {
+        let id = self.next;
+        self.next += 1;
+        Label(id)
+    }
+
+    /// How many labels this scope has minted — the size of the table a
+    /// resolution needs.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.next as usize
+    }
+
+    /// Whether nothing has been minted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.next == 0
+    }
+}
+
+/// Where a branch's displacement sits, and how to write it.
+///
+/// Recorded when the branch is laid out, spent when its target is bound. The
+/// backend owns the *encoding* — an x86 `rel32` and an aarch64 `B` imm26 are
+/// not the same field — so this carries only what is ISA-independent: which
+/// bytes to overwrite, and what the displacement is measured from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Fixup {
+    /// Byte offset of the displacement field within the program.
+    pub at: usize,
+    /// Offset the displacement is relative to — the end of the branch
+    /// instruction on x86, the branch's own address on aarch64.
+    pub origin: usize,
+    /// Which name this site is waiting on.
+    pub label: Label,
+}
+
+/// One item of a declarative program.
+///
+/// `I` is the backend's position-independent instruction type; `B` is its
+/// branch type. Keeping them apart is what lets all 23 existing [`AsmInsn`]
+/// impls stay exactly as they are: an instruction still never learns where it
+/// is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Item<I, B> {
+    /// Fixed bytes, wherever they land.
+    Inst(I),
+    /// Bind `label` to this position. Emits nothing.
+    Bind(Label),
+    /// A branch to `label`, laid out now and resolved once it is bound.
+    Branch(B, Label),
+}
+
+impl<I, B> From<I> for Item<I, B> {
+    #[inline]
+    fn from(i: I) -> Self {
+        Item::Inst(i)
+    }
+}
+
+/// A branch whose displacement is filled in once its target is bound.
+///
+/// The two halves are separate because they happen at different times, and
+/// conflating them is what the old `emit_jump`/`patch_branch` pair did: lay the
+/// instruction out with a placeholder now, write the displacement later.
+pub trait AsmBranch: Copy {
+    /// Lay this branch out with a placeholder displacement, returning where
+    /// that displacement sits and what it is measured from.
+    fn place(self, code: &mut Vec<u8>) -> (usize, usize);
+
+    /// Write the displacement for a branch at `fixup` landing on `target`.
+    ///
+    /// # Errors
+    ///
+    /// When the displacement does not fit the encoding's field — an aarch64
+    /// `B` reaches ±128 MiB, a `B.cond` only ±1 MiB — which is a real limit
+    /// and not an invariant to assume away.
+    fn resolve(code: &mut [u8], fixup: Fixup, target: usize) -> Result<(), CompileError>;
+}
+
+/// Assemble a program of [`Item`]s, resolving every label reference.
+///
+/// One layout pass, then one resolution pass. A branch to a label bound
+/// *later* is why there are two: the displacement is not knowable when the
+/// branch is laid out, which is the entire reason labels exist rather than
+/// callers computing offsets.
+///
+/// # Errors
+///
+/// [`CompileError`] if a referenced label was never bound, or if a
+/// displacement does not fit its encoding.
+pub fn assemble_labeled<I, B>(
+    code: &mut Vec<u8>,
+    scope: &LabelScope,
+    items: impl IntoIterator<Item = Item<I, B>>,
+) -> Result<(), CompileError>
+where
+    I: AsmInsn,
+    B: AsmBranch,
+{
+    // Positions are relative to where this program starts, not to the buffer,
+    // so a labeled program can be assembled into a buffer that already has
+    // bytes in it.
+    let base = code.len();
+    let mut bound: Vec<Option<usize>> = alloc::vec![None; scope.len()];
+    let mut fixups: Vec<Fixup> = Vec::new();
+
+    for item in items {
+        match item {
+            Item::Inst(i) => i.emit_into(code),
+            Item::Bind(label) => {
+                let slot = bound
+                    .get_mut(label.0 as usize)
+                    .ok_or(CompileError::UnboundLabel)?;
+                if slot.is_some() {
+                    // A name that means two positions is not a name.
+                    return Err(CompileError::DuplicateLabel);
+                }
+                *slot = Some(code.len());
+            }
+            Item::Branch(branch, label) => {
+                let (at, origin) = branch.place(code);
+                fixups.push(Fixup { at, origin, label });
+            }
+        }
+    }
+
+    for fixup in fixups {
+        let target = bound
+            .get(fixup.label.0 as usize)
+            .copied()
+            .flatten()
+            .ok_or(CompileError::UnboundLabel)?;
+        B::resolve(&mut code[base..], fixup_rebased(fixup, base), target - base)?;
+    }
+    Ok(())
+}
+
+/// A fixup's offsets, measured from the start of the program rather than the
+/// start of the buffer.
+#[inline]
+const fn fixup_rebased(fixup: Fixup, base: usize) -> Fixup {
+    Fixup {
+        at: fixup.at - base,
+        origin: fixup.origin - base,
+        label: fixup.label,
+    }
+}
+
 /// Physical vector register index (v0..v31 on AArch64, xmm/ymm/zmm0..zmm31 on x86).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Reg(pub u8);

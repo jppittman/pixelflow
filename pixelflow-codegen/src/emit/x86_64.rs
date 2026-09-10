@@ -953,6 +953,112 @@ pub fn emit_cmp_eax_imm8(code: &mut Vec<u8>, imm: u8) {
 }
 
 #[cfg(test)]
+mod label_tests {
+    use super::Branch;
+    use crate::emit::{Item, Label, LabelScope, assemble_labeled};
+    use crate::error::CompileError;
+    use alloc::vec::Vec;
+
+    /// The one thing a label has to do that a fixup token could not: name a
+    /// position that does not exist yet.
+    #[test]
+    fn a_forward_branch_names_a_position_bound_later() {
+        let mut scope = LabelScope::new();
+        let end: Label = scope.mint();
+        let mut code = Vec::new();
+
+        assemble_labeled::<super::Inst, Branch>(
+            &mut code,
+            &scope,
+            [
+                Item::Branch(Branch::Always, end),
+                Item::Inst(super::Inst::ret()),
+                Item::Bind(end),
+            ],
+        )
+        .expect("a bound label resolves");
+
+        // `jmp rel32` is five bytes; `ret` is one; the label lands at 6. The
+        // displacement is measured from the end of the branch, so it is 1.
+        assert_eq!(code.len(), 6);
+        assert_eq!(code[0], 0xE9);
+        assert_eq!(i32::from_le_bytes([code[1], code[2], code[3], code[4]]), 1);
+    }
+
+    /// A back edge — the shape a loop is made of, and the reason the resolution
+    /// pass is separate from the layout pass rather than folded into it.
+    #[test]
+    fn a_back_edge_resolves_to_a_negative_displacement() {
+        let mut scope = LabelScope::new();
+        let top: Label = scope.mint();
+        let mut code = Vec::new();
+
+        assemble_labeled::<super::Inst, Branch>(
+            &mut code,
+            &scope,
+            [
+                Item::Bind(top),
+                Item::Inst(super::Inst::ret()),
+                Item::Branch(Branch::Always, top),
+            ],
+        )
+        .expect("a bound label resolves");
+
+        // `ret` at 0, `jmp` at 1..6. Target 0, origin 6, so the displacement
+        // is -6 — and getting this sign backwards is the classic way a loop
+        // becomes an infinite one.
+        assert_eq!(code.len(), 6);
+        assert_eq!(i32::from_le_bytes([code[2], code[3], code[4], code[5]]), -6);
+    }
+
+    /// Offsets are relative to the program, not the buffer, so a labeled
+    /// program can be assembled after bytes that are already there.
+    #[test]
+    fn a_program_assembled_into_a_nonempty_buffer_is_position_independent() {
+        let mut scope = LabelScope::new();
+        let end: Label = scope.mint();
+
+        let mut fresh = Vec::new();
+        let mut offset = alloc::vec![0x90u8; 7];
+        for code in [&mut fresh, &mut offset] {
+            assemble_labeled::<super::Inst, Branch>(
+                code,
+                &scope,
+                [Item::Branch(Branch::Always, end), Item::Bind(end)],
+            )
+            .expect("a bound label resolves");
+        }
+        assert_eq!(&fresh[..], &offset[7..]);
+    }
+
+    #[test]
+    fn an_unbound_label_is_an_error_and_not_a_jump_to_itself() {
+        let mut scope = LabelScope::new();
+        let never = scope.mint();
+        let mut code = Vec::new();
+        let got = assemble_labeled::<super::Inst, Branch>(
+            &mut code,
+            &scope,
+            [Item::Branch(Branch::Always, never)],
+        );
+        assert_eq!(got, Err(CompileError::UnboundLabel));
+    }
+
+    #[test]
+    fn a_label_bound_twice_is_an_error() {
+        let mut scope = LabelScope::new();
+        let twice = scope.mint();
+        let mut code = Vec::new();
+        let got = assemble_labeled::<super::Inst, Branch>(
+            &mut code,
+            &scope,
+            [Item::Bind(twice), Item::Bind(twice)],
+        );
+        assert_eq!(got, Err(CompileError::DuplicateLabel));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1947,6 +2053,53 @@ pub fn jmp(code: &mut Vec<u8>) -> Rel32 {
     let at = code.len();
     code.extend_from_slice(&[0, 0, 0, 0]);
     Rel32(at)
+}
+
+/// A branch to a [`Label`](crate::emit::Label), as a declarative program item.
+///
+/// Named by condition rather than by opcode byte, for the reason [`jcc`] is
+/// private: a condition is chosen by naming it, never by handing a byte to a
+/// generic emitter.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Branch {
+    /// `jmp` — unconditional.
+    Always,
+    /// `je` — the previous compare or test set ZF.
+    IfEqual,
+    /// `jae` — the previous [`cmp`] found `lhs >= rhs`, unsigned.
+    IfAboveOrEqual,
+    /// `jc` — the previous operation set CF.
+    IfCarry,
+}
+
+impl crate::emit::AsmBranch for Branch {
+    #[inline]
+    fn place(self, code: &mut Vec<u8>) -> (usize, usize) {
+        let rel = match self {
+            Self::Always => jmp(code),
+            Self::IfEqual => je(code),
+            Self::IfAboveOrEqual => jae(code),
+            Self::IfCarry => jc(code),
+        };
+        // `rel32` is measured from the *end* of the instruction, which is the
+        // end of the displacement field itself.
+        let at = rel.field();
+        (at, at + 4)
+    }
+
+    #[inline]
+    fn resolve(
+        code: &mut [u8],
+        fixup: crate::emit::Fixup,
+        target: usize,
+    ) -> Result<(), crate::error::CompileError> {
+        use crate::error::CompileError;
+        let rel = i64::try_from(target).map_err(|_| CompileError::BranchOutOfRange)?
+            - i64::try_from(fixup.origin).map_err(|_| CompileError::BranchOutOfRange)?;
+        let rel = i32::try_from(rel).map_err(|_| CompileError::BranchOutOfRange)?;
+        code[fixup.at..fixup.at + 4].copy_from_slice(&rel.to_le_bytes());
+        Ok(())
+    }
 }
 
 // =============================================================================
