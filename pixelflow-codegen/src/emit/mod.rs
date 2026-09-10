@@ -1279,42 +1279,29 @@ trait IsaBackend {
         asm.code.extend_from_slice(emitted.frame_hoist);
         self.latch_bounds(&mut asm.code);
 
-        self.emit_loop(&mut asm, Counter::Row, |b, asm| {
-            // Row LICM: X-invariant values, recomputed once per row. Reload the
-            // coordinates first — the previous body and Y-step clobbered them.
-            for k in 0..INPUT_COORDS {
-                b.slot_load(&mut asm.code, coord_reg(k), slot(k));
-            }
-            asm.code.extend_from_slice(emitted.row_hoist);
-
-            b.emit_loop(asm, Counter::Batch, |b, asm| {
-                for k in 0..INPUT_COORDS {
-                    b.slot_load(&mut asm.code, coord_reg(k), slot(k));
-                }
-                asm.code.extend_from_slice(emitted.batch);
-
-                b.store_result(&mut asm.code, emitted.result);
-                b.advance_out(&mut asm.code, OutStep::Batch);
-
-                // X += one batch of lanes. The coordinate registers are
-                // reloaded at the top of the next iteration, so they are free
-                // scratch here.
-                let lanes = (vw / BYTES_PER_LANE) as f32;
-                b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(SLOT_X));
-                b.add_scalar(&mut asm.code, SCAFFOLD_ACC, SCAFFOLD_SCRATCH, lanes);
-                b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(SLOT_X));
-                Ok(())
-            })?;
-
-            // Reset X, advance Y, and skip any scalar tail in the output row.
-            b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(SLOT_ROW_START_X));
-            b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(SLOT_X));
-            b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(SLOT_Y));
-            b.add_scalar(&mut asm.code, SCAFFOLD_ACC, SCAFFOLD_SCRATCH, 1.0);
-            b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(SLOT_Y));
-            b.advance_out(&mut asm.code, OutStep::RowSkip);
-            Ok(())
-        })?;
+        // The nest, outermost first. Two levels today because a lattice has two
+        // axes; nothing here counts them, which is what a surviving `Reduce`
+        // needs — a fold is another level, not another mechanism.
+        let levels = [
+            Level {
+                counter: Counter::Row,
+                // X-invariant values, recomputed once per row.
+                hoist: emitted.row_hoist,
+                // Each row starts where the last one did, whatever the batches
+                // inside it did to X.
+                restore: Some((SLOT_X, SLOT_ROW_START_X)),
+                advance: (SLOT_Y, 1.0),
+                out: OutStep::RowSkip,
+            },
+            Level {
+                counter: Counter::Batch,
+                hoist: emitted.batch,
+                restore: None,
+                advance: (SLOT_X, (vw / BYTES_PER_LANE) as f32),
+                out: OutStep::Batch,
+            },
+        ];
+        self.emit_nest(&mut asm, &levels, emitted, &slot)?;
 
         self.frame_free(&mut asm.code, total);
         self.emit_ret(&mut asm.code);
@@ -1325,6 +1312,80 @@ trait IsaBackend {
         self.scaffold_finish(&mut code);
         Ok(code)
     }
+
+    /// Emit `levels` as a loop nest, outermost first.
+    ///
+    /// One iteration of a level is the same four things at every depth: reload
+    /// the coordinates the level below clobbered, run this level's
+    /// loop-invariant code, run everything inside it, then advance. The
+    /// innermost level's "loop-invariant code" is the body itself, and its
+    /// advance is the one that stores a result — which is not a special case so
+    /// much as the observation that a collapse's loop-carried value is its
+    /// output pointer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend's own emission returns.
+    fn emit_nest(
+        &mut self,
+        asm: &mut Assembly,
+        levels: &[Level<'_>],
+        emitted: &CollapseBody<'_>,
+        slot: &impl Fn(u32) -> u32,
+    ) -> Result<(), CompileError>
+    where
+        Self: Sized,
+    {
+        let Some((level, inner)) = levels.split_first() else {
+            return Ok(());
+        };
+        self.emit_loop(asm, level.counter, |b, asm| {
+            // Reload first: the level below, and this level's own advance, left
+            // the coordinate registers holding something else.
+            for k in 0..INPUT_COORDS {
+                b.slot_load(&mut asm.code, coord_reg(k), slot(k));
+            }
+            asm.code.extend_from_slice(level.hoist);
+            b.emit_nest(asm, inner, emitted, slot)?;
+
+            if inner.is_empty() {
+                b.store_result(&mut asm.code, emitted.result);
+            }
+            if let Some((coord, from)) = level.restore {
+                b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(from));
+                b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(coord));
+            }
+            // The coordinate registers are reloaded at the top of the next
+            // iteration, so they are free scratch here.
+            let (coord, by) = level.advance;
+            b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(coord));
+            b.add_scalar(&mut asm.code, SCAFFOLD_ACC, SCAFFOLD_SCRATCH, by);
+            b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(coord));
+            b.advance_out(&mut asm.code, level.out);
+            Ok(())
+        })
+    }
+}
+
+/// One level of the collapse nest.
+///
+/// The two levels a lattice has differ only in these values, which is the whole
+/// content of "a loop is a loop": what bounds it, what runs at the top of an
+/// iteration, which coordinate it advances and by how much, and how far the
+/// output moves when the iteration ends.
+struct Level<'a> {
+    /// What ends this level.
+    counter: Counter,
+    /// Code at the top of each iteration: this level's LICM tier, or — at the
+    /// innermost — the body.
+    hoist: &'a [u8],
+    /// A coordinate to put back before advancing, and where its start was
+    /// saved. The level inside this one moved it.
+    restore: Option<(u32, u32)>,
+    /// The coordinate this level advances, and by how much per iteration.
+    advance: (u32, f32),
+    /// How far the output pointer moves per iteration.
+    out: OutStep,
 }
 
 /// The emitted code a collapse loop wraps: the per-batch body, plus the two
