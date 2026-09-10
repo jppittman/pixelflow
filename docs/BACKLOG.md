@@ -69,13 +69,70 @@ entirely downstream of it.
 
 So the earlier reading here — "E3/E4/E5 are on the critical path, compile *is*
 saturation plus extraction plus emit" — was **wrong about which term
-dominates**, and is corrected above. See **X1**.
+dominates**, and is corrected above.
+
+**X1 is answered, and the hump is one function.** Splitting the compile:
+
+```
+glyph  optimize_ms  emit_ms  post_opt_nodes     (optimize = saturate+extract+legalize)
+A@32          34.4    130.8           1,870
+O@32          33.0    655.3           4,516
+8@32          33.1  2,082.0           8,548
+```
+
+Optimization is flat ~33 ms — so **extraction is inside the constant too**,
+which clears E3. Splitting the emitter, by schedule length `n`:
+
+```
+glyph       n  variance_ms  partition_ms  cluster_ms  regalloc_ms  emit_ms
+A@32    6,055          0.0           0.4        96.1         19.8    133.0
+O@32   17,521          0.1           1.8       493.8         93.0    672.8
+8@32   34,993          0.1           1.9     1,539.7        285.1  2,088.4
+```
+
+**`guards::cluster_select_arms` is 73% of an entire glyph bake.** And what it
+buys is constant — the same 282 bytes of extra code for every glyph, against
+a search that grows superlinearly:
+
+```
+glyph   with cluster   without   code with   code without      Δ
+A@32         131.8 ms   38.4 ms    126,745       126,463   282 B (0.22%)
+O@32         658.8 ms  182.8 ms    367,846       367,564   282 B (0.08%)
+8@32       2,101.6 ms  549.0 ms    735,238       734,956   282 B (0.04%)
+```
+
+With clustering bypassed the whole `pixelflow-graphics` suite is **171/171
+green in 25.9 s**, `glyph_atlas_golden` included — so it is a pure
+optimization, not load-bearing, and `glyph_atlas_coverage_is_unchanged`
+alone goes **31.5 s → 9.8 s (3.2×)**.
+
+**The missing bound is on the search, not on the guard.**
+`MISPREDICT_PENALTY_CYCLES` bounds whether a guard *pays at runtime*, and
+`guards.rs` argues carefully for it ("bounding the downside by the upside is
+enough to keep the analysis honest without a tuned number anywhere"). Nothing
+bounds the *search that looks for guards*. Its cost is compile-time and
+superlinear in schedule length; its benefit is runtime and proportional to
+trips × cycles saved. For a glyph baked once into an atlas at 32×32, a guard
+can save at most microseconds — against 1.5 s of searching for it.
+
+Both terms are already computable at the call site: schedule length is `n`,
+and trips come from the `LatticeShape` the kernel is compiled for. So this is
+a bound to *derive*, not a threshold to tune — which matters, because this
+area has already produced three constants whose stated derivations did not
+survive measurement (`EXTENT_SLOP`, `CLUSTER_ROUNDS_PER_SELECT`,
+`DISC_BAND_ULPS`). **Do not fix this with a size cutoff.**
+
+See **H5**, and note that **D5 deletes the question**: with a demand
+predicate, values of equal demand are contiguous *by construction*, so there
+is nothing to cluster and no round count to choose. That plan is no longer
+only an elegance argument — it is the largest measured item in the tree.
 
 | | what | where |
 |---|---|---|
 | **H1** | **S3 — one program for the font.** Font-wide extent, table padded with monoid identities, so every glyph compiles to the same program and a glyph becomes a table write. 95 compiles → 1. With H2 measured, this is the whole hump. | [glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S3 |
 | **H2** | ~~Split the 331 ms between compile and collapse.~~ **Done** — see above. | — |
 | **H3** | **Hash-consing in `ExprArena`.** Prototyped and measured: arena 2,721 → 154 nodes, 2.1–2.2× on the glyph suites, extracted kernel unchanged. In flight (JP). Lands on the compile half, so it compounds with H1 rather than competing. | [exprarena-on-dag](plans/2026-09-09-exprarena-on-dag.md) §5.2 |
+| **H5** | **Bound the guard search by what a guard can pay.** `cluster_select_arms` is 73% of a glyph bake and finds a constant 282 bytes (X1 above). Derive the bound from `n` and the `LatticeShape`'s trip count, both of which the call site already has — **not** a schedule-size cutoff. Needs a decision on who owns the trade: a bake collapses once, a frame kernel collapses forever, and the compiler currently cannot tell them apart. Superseded outright by D5 if that lands first. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
 | **H4** | **Ask B — hoist binder-only work out of the pixel loop.** ~~On the hump.~~ **Demoted by H2**: it optimizes *collapse*, which is 0.2% of a bake, and a glyph bakes once into the atlas and is a gather forever after. Still real for per-frame kernels that are not atlas-cached; not the terminal's startup problem. **Do not patch `contains_gather`** (N1) and do not write a new hoist (N5). | [a-glyph-is-a-circle](plans/2026-09-09-a-glyph-is-a-circle.md) §B |
 
 S3's own doc calls itself "a trade, not a win — fewer compiles against
@@ -102,7 +159,7 @@ H1 is picked up.
 | **D2** | Lowering 1 — emit the split: select over the derived range, root specialized at `m ≡ false` over the complement. | *ibid.* |
 | **D3** | Bind-time tier, and splitting `IndexRange` into a derived region and a requested band. | *ibid.* |
 | **D4** | Interval evaluation, target-aware and rounding outward. Unlocks glyph supports, which the symbolic tier cannot reach (a compound glyph's affine mixes X and Y). | *ibid.* |
-| **D5** | Lowering 2 on the general predicate — the superseded demand plan's §1–§2, as the third case rather than the whole subject. | *ibid.* |
+| **D5** | Lowering 2 on the general predicate — the superseded demand plan's §1–§2, as the third case rather than the whole subject. **Promoted by X1**: it deletes `cluster_select_arms` rather than speeding it up ("values with equal demand are contiguous by construction; there is nothing to cluster and no round count to choose"), and that function is 73% of a glyph bake. The demand plan's own §"Why now" argued this on shape; it now has the number. | *ibid.* |
 
 D1 → D2 unblocks **S2**: deleting `cells`, `contour_bounds`, the `Union`
 plumbing, `TEXT_CELL`, `min_of`, `may_be_interior` and `chord_winding` —
@@ -112,7 +169,7 @@ roughly 800 lines to 150 — and makes H1's padding free.
 
 | | what | where |
 |---|---|---|
-| **X1** | **Split the ~1,990 ms that is not saturation** — extraction vs legalize vs emit vs register allocation — on `8`@32. This is now the top measurement, the way H2 was. Suspicion, not a finding: emitted nodes go 1,457 (`A`@16) → 8,241 (`8`@32), 5.7×, against 16× the time, so something downstream of extraction is superlinear in emitted nodes, and linear-scan regalloc over live ranges is the obvious candidate. **Do not act on that guess without the split.** | — |
+| **X1** | ~~Split the ~1,990 ms that is not saturation.~~ **Done** — see below. The suspicion recorded here (linear-scan regalloc) was wrong; it is `guards::cluster_select_arms`. | — |
 | **E1** | **Geometric `SplitFold`.** `⊕_{[lo,hi)} = ⊕_{[lo,mid)} ⊕ ⊕_{[mid,hi)}`. Needs no substitution (both halves share the body e-class) and is *exactly* cost-preserving in both extraction arms, so it cannot desync the claim/price audit. Bisect at the midpoint to bound growth at 2n−1. `EmptyFold` already exists as its base case. | — |
 | **E2** | **A critical-path term in the cost model.** Without it E1 buys reachability and no speed: `CostModel::latency_prior()` sets `depth_threshold: 1024, depth_penalty: 0` ("effectively disabled"), so a 34-deep serial chain and a 6-deep balanced tree price identically. A *global* depth hinge is the wrong shape — what is wanted is the reduction's critical path. | [schedule-cost-model-denotation](plans/2026-09-01-schedule-cost-model-denotation.md) |
 | **E3** | Extraction: `shared_dag_dp_pass` is O(L²) — make reach tracking sparse. | — |
