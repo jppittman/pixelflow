@@ -587,22 +587,29 @@ const PTR_BYTES: i32 = 8;
 const UNIFORM_BYTES: i32 = 4;
 
 /// `dst = splat(block[offset])` — one uniform, broadcast to every lane:
-/// `mov rax, [rdi + ctx_slot*8]` to fetch the block's base out of the
-/// context, then `vbroadcastss xmm<dst>, [rax + 4*offset]`
-/// (VEX.128.66.0F38.W0 18 /r). `rax` is the scratch the gather already
-/// claims; `rdi` is the context, read-only for the whole kernel.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
+/// `mov base, [ctx + ctx_slot*8]` to fetch the block's base out of the
+/// context, then `vbroadcastss xmm<dst>, [base + 4*offset]`
+/// (VEX.128.66.0F38.W0 18 /r). `base` is this instruction's
+/// `RegisterFile::gpr_scratch` reservation; `ctx` is `RegisterFile::gpr_ctx`,
+/// read-only for the whole kernel.
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    load: super::UniformLoad,
+    base: PtrReg,
+    ctx: PtrReg,
+) {
     AsmProgram::from([
         MovLoadPtr {
-            dst: ptr::RAX,
-            base: ptr::RDI,
+            dst: base,
+            base: ctx,
             disp: i32::from(load.ctx_slot) * PTR_BYTES,
         }
         .encode(),
         Vex::m0f38_66(0x18).rm(
             dst,
             Mem {
-                base: ptr::RAX,
+                base,
                 disp: Imm32(i32::from(load.offset) * UNIFORM_BYTES),
             },
         ),
@@ -725,6 +732,23 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // The gather truncates the float indices into one vector register and
         // loads each element through another.
         ScheduledOp::Gather(..) => 2,
+        _ => 0,
+    }
+}
+
+/// How many GPRs this backend's encoding of `op` needs beyond
+/// [`regalloc::RegisterFile::gpr_ctx`].
+///
+/// `Gather`'s scalar-load sequence needs a base-pointer GPR (loaded from the
+/// context) and a per-lane index GPR; `Uniform` needs only the base pointer.
+/// Both used to be `rax`/`rcx` chosen by hand — invisible to the allocator,
+/// and correct only because nothing else in the schedule ever asks for a
+/// GPR — and are `RegisterFile::gpr_scratch` reservations now.
+pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+    use super::ScheduledOp;
+    match op {
+        ScheduledOp::Gather(..) => 2,
+        ScheduledOp::Uniform(..) => 1,
         _ => 0,
     }
 }
@@ -1155,6 +1179,21 @@ pub(crate) mod driver {
         // no vector register at all.
         guard_temps: 0,
         vector_bytes: 16,
+        // The context pointer (array of buffer base pointers) arrives in
+        // rdi; `Gather`/`Uniform` never touch it through the allocator, but
+        // declaring it here is what lets `checked` prove `gpr_scratch` misses
+        // it, rather than a comment asserting the two constants never
+        // collide.
+        gpr_ctx: Some(gpr::RDI),
+        // rax/rcx: the gather's base pointer and per-lane index, chosen by
+        // hand before this work and now `Scratch` reservations like every
+        // vector temp.
+        gpr_scratch: regalloc::GprSet::of(&[gpr::RAX, gpr::RCX]),
+        gpr_temps_for: super::gpr_temps_for,
+        // No mask-register file on this tier: masks are ordinary vectors.
+        mask_scratch: regalloc::MaskSet::EMPTY,
+        mask_temps_for: regalloc::no_temps,
+        mask_guard_temps: 0,
     }
     .checked();
 
@@ -1286,27 +1325,40 @@ pub(crate) mod driver {
                     emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
                 ResolvedOp::Gather { dst, idx, slot } => {
-                    // No AVX2 here, so no 128-bit vgatherdps: assemble the lanes
-                    // from four scalar loads. The context pointer (array of buffer
-                    // base pointers) is caller-provided in rdi and never touched by
-                    // arithmetic/const emission, so it survives to here; rax/rcx
-                    // are caller-saved and unused by the rest of the body.
+                    // No AVX2 here, so no 128-bit vgatherdps: assemble the
+                    // lanes from four scalar loads. The context pointer
+                    // (array of buffer base pointers) is caller-provided in
+                    // `SSE2_FILE.gpr_ctx` and never touched by
+                    // arithmetic/const emission, so it survives to here;
+                    // `base_gpr`/`index_gpr` are `SSE2_FILE.gpr_scratch`'s
+                    // allocated reservations for this instruction.
+                    let ctx_gpr = self
+                        .file
+                        .gpr_ctx
+                        .expect("SSE2's gather needs a GPR context input");
                     super::emit_gather_scalar(
                         code,
                         *dst,
                         *idx,
                         *slot,
                         super::GatherScratch {
-                            base_gpr: 0,  // rax
-                            index_gpr: 1, // rcx
-                            ctx_gpr: 7,   // rdi
+                            base_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0,
+                            index_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)).0,
+                            ctx_gpr: ctx_gpr.0,
                             idx_lanes: crate::emit::declared_temp(plan.scratch.temp(0)),
                             value: crate::emit::declared_temp(plan.scratch.temp(1)),
                         },
                     );
                 }
                 ResolvedOp::Uniform { dst, load } => {
-                    super::emit_uniform_load(code, *dst, *load);
+                    let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
+                    let ctx = PtrReg(
+                        self.file
+                            .gpr_ctx
+                            .expect("SSE2's uniform load needs a GPR context input")
+                            .0,
+                    );
+                    super::emit_uniform_load(code, *dst, *load, base, ctx);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -1395,26 +1447,30 @@ pub(crate) mod driver {
             }
         }
 
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
+        /// `_scratch`/`_mask_scratch` are unused: this tier's guard reduces
+        /// the mask with `movmskps`/`kortest` into the flags, needing no
+        /// vector or mask register.
         fn emit_skip_if_all_false(
             &mut self,
             code: &mut Vec<u8>,
             mask_reg: Reg,
             _scratch: Option<Reg>,
+            _mask_scratch: Option<KReg>,
         ) -> usize {
             super::emit_movmskps_eax(code, mask_reg);
             super::emit_test_eax(code);
             super::je(code).field() // ZF set when eax == 0 (all lanes false)
         }
 
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
+        /// `_scratch`/`_mask_scratch` are unused: this tier's guard reduces
+        /// the mask with `movmskps`/`kortest` into the flags, needing no
+        /// vector or mask register.
         fn emit_skip_if_all_true(
             &mut self,
             code: &mut Vec<u8>,
             mask_reg: Reg,
             _scratch: Option<Reg>,
+            _mask_scratch: Option<KReg>,
         ) -> usize {
             super::emit_movmskps_eax(code, mask_reg);
             super::emit_cmp_eax_imm8(code, 0x0F);

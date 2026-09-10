@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::guards::{SelectGuard, analyze_select_guards};
-use super::{Reg, ScheduledOp, operand_sources, reloads_wanted};
+use super::{Gpr, KReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -151,6 +151,106 @@ impl RegSet {
     }
 }
 
+/// A set of general-purpose registers, as a bitmask over register numbers.
+///
+/// The GPR file and the vector file ([`RegSet`]) are different physical
+/// register files — `rax` is not `xmm0` — so a GPR pool needs its own type,
+/// not a second meaning for `RegSet`. It is not [`RegSet`] made generic over
+/// [`Gpr`]: `of`/`contains`/`len` run in `const fn` (a backend's
+/// `RegisterFile` is declared as a `const`), and stable Rust cannot dispatch
+/// a trait method from a const context — so a register-newtype-generic
+/// bitset cannot itself be `const`. Small and duplicated beats generic and
+/// non-const.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GprSet(u32);
+
+impl GprSet {
+    /// The empty set.
+    pub const EMPTY: Self = Self(0);
+
+    /// The set containing exactly `regs`.
+    #[must_use]
+    pub const fn of(regs: &[Gpr]) -> Self {
+        let mut bits = 0u32;
+        let mut i = 0;
+        while i < regs.len() {
+            let r = regs[i].0;
+            assert!(r < 32, "GPR number out of range for a 32-register file");
+            bits |= 1 << r;
+            i += 1;
+        }
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn contains(self, r: Gpr) -> bool {
+        r.0 < 32 && self.0 & (1 << r.0) != 0
+    }
+
+    /// How many registers the set holds.
+    #[must_use]
+    pub const fn len(self) -> u8 {
+        self.0.count_ones() as u8
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Members low to high.
+    pub fn iter(self) -> impl Iterator<Item = Gpr> + use<> {
+        (0u8..32).filter(move |r| self.0 & (1 << r) != 0).map(Gpr)
+    }
+}
+
+/// A set of AVX-512 mask registers (`k0..k7`), as a bitmask.
+///
+/// See [`GprSet`] for why this is a third concrete bitset rather than a
+/// generic one: the same const-fn constraint applies.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MaskSet(u8);
+
+impl MaskSet {
+    /// The empty set.
+    pub const EMPTY: Self = Self(0);
+
+    /// The set containing exactly `regs`.
+    #[must_use]
+    pub const fn of(regs: &[KReg]) -> Self {
+        let mut bits = 0u8;
+        let mut i = 0;
+        while i < regs.len() {
+            let r = regs[i].0;
+            assert!(r < 8, "AVX-512 has only k0..k7");
+            bits |= 1 << r;
+            i += 1;
+        }
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn contains(self, r: KReg) -> bool {
+        r.0 < 8 && self.0 & (1 << r.0) != 0
+    }
+
+    /// How many registers the set holds.
+    #[must_use]
+    pub const fn len(self) -> u8 {
+        self.0.count_ones() as u8
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Members low to high.
+    pub fn iter(self) -> impl Iterator<Item = KReg> + use<> {
+        (0u8..8).filter(move |r| self.0 & (1 << r) != 0).map(KReg)
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct RegisterFile {
     /// Registers holding the coordinate inputs, in order: X, Y, Z, W.
@@ -215,6 +315,49 @@ pub struct RegisterFile {
     /// every use site; a slot offset that failed to be a multiple of 16 would
     /// then have truncated two live values onto the same stack slot.
     pub vector_bytes: u32,
+
+    /// The GPR holding the JIT ABI's context-pointer argument (the array of
+    /// buffer base pointers a `Gather`/`Uniform` load indexes into), if this
+    /// target's encodings read one. `None` on a backend with neither op.
+    ///
+    /// Pinned like a vector `Var` input — fixed by the calling convention,
+    /// never itself allocated — and declared here for the same reason
+    /// [`RegisterFile::inputs`] is: so [`RegisterFile::checked`] can prove it
+    /// misses [`RegisterFile::gpr_scratch`], rather than a comment asserting
+    /// the two constants never collide.
+    pub gpr_ctx: Option<Gpr>,
+
+    /// GPRs the allocator may hand out as instruction-scoped scratch.
+    ///
+    /// Unlike [`RegisterFile::scratch`], nothing here ever carries a value
+    /// across instructions — a `Gather`/`Uniform`'s address arithmetic is the
+    /// only demand this register file was ever chosen by hand to serve, and
+    /// it is one instruction's worth of scratch every time. So there is no
+    /// GPR-class liveness, no spilling and no eviction: each instruction
+    /// simply takes the low members of this set it needs, in order, which
+    /// always succeeds because nothing else is ever concurrently live in it.
+    pub gpr_scratch: GprSet,
+
+    /// How many GPRs this backend's encoding of `op` needs beyond
+    /// [`RegisterFile::gpr_ctx`] — the GPR-class
+    /// [`RegisterFile::temps_for`].
+    pub gpr_temps_for: fn(&ScheduledOp) -> u8,
+
+    /// AVX-512 mask registers (`k0..k7`) the allocator may hand out as
+    /// instruction-scoped scratch: a compare's `vcmpps` destination before it
+    /// is widened to a vector mask. Empty on every other backend, which has
+    /// no mask-register file at all — masks there are ordinary vectors.
+    pub mask_scratch: MaskSet,
+
+    /// The mask-class [`RegisterFile::temps_for`].
+    pub mask_temps_for: fn(&ScheduledOp) -> u8,
+
+    /// How many mask registers a `Select` short-circuit guard destroys
+    /// reducing its mask to a branch condition — the mask-class
+    /// [`RegisterFile::guard_temps`]. AVX-512's guard needs one (`vptestmd`'s
+    /// `k`-register destination before `kortestw` reads it into the flags);
+    /// every other backend's guard needs none.
+    pub mask_guard_temps: u8,
 }
 
 impl RegisterFile {
@@ -272,6 +415,22 @@ impl RegisterFile {
             }
             i += 1;
         }
+
+        // The GPR-class mirror of the vector checks above: the context
+        // pointer is pinned like an `inputs` register, so it must miss the
+        // pool the allocator hands out from.
+        if let Some(ctx) = self.gpr_ctx {
+            assert!(
+                !self.gpr_scratch.contains(ctx),
+                "the GPR context-pointer input is inside the allocatable GPR pool"
+            );
+        }
+
+        assert!(
+            self.mask_guard_temps as usize <= 1,
+            "a backend's Select guard asked for more mask scratch than \
+             `Scratch` reserves for one"
+        );
 
         self
     }
@@ -609,6 +768,23 @@ pub struct Scratch {
     /// entirely reads that root from its park, and the scaffold needs it in a
     /// register to store.
     pub result: Option<Reg>,
+
+    /// GPR-class temps this instruction reserved — see
+    /// [`RegisterFile::gpr_temps_for`]. Read through [`Scratch::gpr_temp`],
+    /// for the same reason [`Scratch::temp`] is private: the order is a
+    /// contract between one backend's `gpr_temps_for` and that backend's own
+    /// encoder, not a codebase-wide convention.
+    gpr_temps: [Option<Gpr>; Scratch::MAX_GPR_TEMPS],
+
+    /// Mask-class temps this instruction reserved — see
+    /// [`RegisterFile::mask_temps_for`]. Read through [`Scratch::mask_temp`].
+    mask_temps: [Option<KReg>; Scratch::MAX_MASK_TEMPS],
+
+    /// A mask register the guard's mask reduction destroys — the mask-class
+    /// [`Scratch::guard_temp`]. `None` on every backend but AVX-512, whose
+    /// guard reduces the mask into a `k`-register (`vptestmd`) before
+    /// `kortestw` reads it into the flags.
+    pub mask_guard_temp: Option<KReg>,
 }
 
 impl Scratch {
@@ -627,6 +803,20 @@ impl Scratch {
     /// reservation.
     pub const MAX_RELOADS: usize = 2;
 
+    /// The most GPR-class temps any one encoding asks for.
+    ///
+    /// Three: aarch64's scalar-load gather needs a base pointer, a per-lane
+    /// index and a loaded value, each a GPR.
+    pub const MAX_GPR_TEMPS: usize = 3;
+
+    /// The most mask-class temps any one encoding asks for.
+    ///
+    /// One: AVX-512 is the only backend with a mask-register file at all, and
+    /// every one of its uses — a compare's `vcmpps` destination, a guard's
+    /// `vptestmd` destination — needs exactly one `k`-register, transiently,
+    /// never two at once.
+    pub const MAX_MASK_TEMPS: usize = 1;
+
     /// A `Scratch` with the registers a test wants to hand an encoder.
     ///
     /// The allocator is what fills these in production; a test that exercises
@@ -638,9 +828,27 @@ impl Scratch {
         temps: Option<[Reg; Self::MAX_TEMPS]>,
         reloads: [Option<Reg>; Self::MAX_RELOADS],
     ) -> Self {
+        Self::for_test_with_classes(temps, reloads, None, None)
+    }
+
+    /// [`Scratch::for_test`], additionally handing an encoder the GPR- and
+    /// mask-class scratch it asks for — the class-B tests (a backend's
+    /// `Gather`/`Uniform`/compare coverage) need these too.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn for_test_with_classes(
+        temps: Option<[Reg; Self::MAX_TEMPS]>,
+        reloads: [Option<Reg>; Self::MAX_RELOADS],
+        gpr_temps: Option<[Gpr; Self::MAX_GPR_TEMPS]>,
+        mask_temp: Option<KReg>,
+    ) -> Self {
         let temps = match temps {
             Some([a, b, c, d]) => [Some(a), Some(b), Some(c), Some(d)],
             None => [None; Self::MAX_TEMPS],
+        };
+        let gpr_temps = match gpr_temps {
+            Some([a, b, c]) => [Some(a), Some(b), Some(c)],
+            None => [None; Self::MAX_GPR_TEMPS],
         };
         Self {
             temps,
@@ -648,6 +856,9 @@ impl Scratch {
             guard_mask: None,
             guard_temp: None,
             result: None,
+            gpr_temps,
+            mask_temps: [mask_temp],
+            mask_guard_temp: mask_temp,
         }
     }
 
@@ -667,6 +878,24 @@ impl Scratch {
     #[must_use]
     pub fn reload(&self, i: usize) -> Option<Reg> {
         self.reloads.get(i).copied().flatten()
+    }
+
+    /// The `i`'th GPR this instruction's encoding asked for.
+    ///
+    /// `i` is the backend's own numbering, matching the count its
+    /// [`RegisterFile::gpr_temps_for`] returned.
+    #[must_use]
+    pub fn gpr_temp(&self, i: usize) -> Option<Gpr> {
+        self.gpr_temps.get(i).copied().flatten()
+    }
+
+    /// The `i`'th mask register this instruction's encoding asked for.
+    ///
+    /// `i` is the backend's own numbering, matching the count its
+    /// [`RegisterFile::mask_temps_for`] returned.
+    #[must_use]
+    pub fn mask_temp(&self, i: usize) -> Option<KReg> {
+        self.mask_temps.get(i).copied().flatten()
     }
 }
 
@@ -1664,6 +1893,47 @@ impl LinearScan {
                 scratch_for[i].temps[role] = Some(pass.reserve(i, &mut taken, &live_here));
             }
 
+            // GPR- and mask-class scratch, reserved the same way but against
+            // their own pools: nothing else in the schedule ever asks for a
+            // GPR or a mask register, so there is no interference to track and
+            // no eviction to perform — each instruction simply takes the low
+            // members of the class pool it needs.
+            let gpr_wanted = (file.gpr_temps_for)(&def.op) as usize;
+            assert!(
+                gpr_wanted <= Scratch::MAX_GPR_TEMPS,
+                "a backend asked for {gpr_wanted} GPR scratch registers for \
+                 one instruction; `Scratch::MAX_GPR_TEMPS` is {}",
+                Scratch::MAX_GPR_TEMPS
+            );
+            assert!(
+                file.gpr_scratch.len() as usize >= gpr_wanted,
+                "{:?} needs {gpr_wanted} GPRs but `RegisterFile::gpr_scratch` \
+                 holds only {}",
+                def.op,
+                file.gpr_scratch.len()
+            );
+            for (role, reg) in file.gpr_scratch.iter().take(gpr_wanted).enumerate() {
+                scratch_for[i].gpr_temps[role] = Some(reg);
+            }
+
+            let mask_wanted = (file.mask_temps_for)(&def.op) as usize;
+            assert!(
+                mask_wanted <= Scratch::MAX_MASK_TEMPS,
+                "a backend asked for {mask_wanted} mask scratch registers for \
+                 one instruction; `Scratch::MAX_MASK_TEMPS` is {}",
+                Scratch::MAX_MASK_TEMPS
+            );
+            assert!(
+                file.mask_scratch.len() as usize >= mask_wanted,
+                "{:?} needs {mask_wanted} mask registers but \
+                 `RegisterFile::mask_scratch` holds only {}",
+                def.op,
+                file.mask_scratch.len()
+            );
+            for (role, reg) in file.mask_scratch.iter().take(mask_wanted).enumerate() {
+                scratch_for[i].mask_temps[role] = Some(reg);
+            }
+
             // A read of a value that is not in a register: bring it back into
             // one and *keep* it there, when it is read again before the keeping
             // has to stop. That is what splitting buys — a value spends the
@@ -1719,6 +1989,16 @@ impl LinearScan {
                 }
                 for _ in 0..file.guard_temps {
                     scratch_for[i].guard_temp = Some(pass.reserve(i, &mut taken, &live_here));
+                }
+                // The mask-class mirror: AVX-512's guard reduces the mask
+                // with `vptestmd` into a `k`-register the vector pool cannot
+                // see, so this comes from `mask_scratch` rather than `pass`.
+                for reg in file
+                    .mask_scratch
+                    .iter()
+                    .take(file.mask_guard_temps as usize)
+                {
+                    scratch_for[i].mask_guard_temp = Some(reg);
                 }
             }
 
@@ -1889,6 +2169,12 @@ mod tests {
         temps_for: no_temps,
         guard_temps: 0,
         vector_bytes: 16,
+        gpr_ctx: None,
+        gpr_scratch: GprSet::EMPTY,
+        gpr_temps_for: no_temps,
+        mask_scratch: MaskSet::EMPTY,
+        mask_temps_for: no_temps,
+        mask_guard_temps: 0,
     }
     .checked();
 
