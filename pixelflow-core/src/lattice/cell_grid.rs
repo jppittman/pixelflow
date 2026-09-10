@@ -81,7 +81,7 @@ use alloc::vec::Vec;
 use super::manifold::{BoundManifold, Manifold, PlaneRegion, UniformBlock, UnknownUniform};
 use super::union::IndexRange;
 use super::{BilinearSampler, DiscreteManifold};
-use pixelflow_ir::arena::BufferIdentity;
+use pixelflow_ir::decl::BufferIdentity;
 use pixelflow_ir::{Kernel, Uniform};
 
 /// `f32`s per cell in the cell-data buffer.
@@ -734,7 +734,6 @@ impl CellGridFrame {
 mod tests {
     use super::*;
     use alloc::vec;
-    use pixelflow_ir::ExprArena;
 
     /// The 2x1 grid's shape: a 2-tile atlas of 4x4-content tiles with
     /// 1-texel aprons, laid out side by side (12x6 texels), over a 12x6
@@ -809,9 +808,9 @@ mod tests {
         let CellGridKernels {
             channels, buffers, ..
         } = shape.channel_kernels();
-        let (arena, root) = channels[0].parts();
+        let term = channels[0].term();
 
-        let slots = arena.buffers();
+        let slots = &term.env().buffers;
         assert_eq!(
             slots.iter().filter(|d| d.id == buffers.cells).count(),
             1,
@@ -824,7 +823,7 @@ mod tests {
         );
         assert_eq!(slots.len(), 2, "exactly {{Cells, Atlas}}, nothing else");
         assert_eq!(
-            reachable_nodes(arena, root),
+            term.root().descendants().count(),
             CHANNEL_NODES,
             "composed node count"
         );
@@ -833,20 +832,6 @@ mod tests {
     /// Reachable nodes in one channel kernel. Pinned rather than derived:
     /// see `reads_of_one_buffer_share_a_slot_but_not_nodes`.
     pub(crate) const CHANNEL_NODES: usize = 157;
-
-    fn reachable_nodes(arena: &ExprArena, root: pixelflow_ir::ExprId) -> usize {
-        let mut seen = vec![false; arena.nodes_raw().len()];
-        let mut stack = vec![root];
-        let mut count = 0;
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            count += 1;
-            stack.extend(arena.children(id));
-        }
-        count
-    }
 
     /// Row-major index into an 8-wide plane.
     fn px(row: usize, col: usize) -> usize {

@@ -480,7 +480,7 @@ mod uniforms {
     use alloc::sync::Arc;
     use alloc::vec;
     use pixelflow_ir::Uniform;
-    use pixelflow_ir::arena::BufferIdentity;
+    use pixelflow_ir::decl::BufferIdentity;
 
     /// `√((x − cx)² + (y − cy)²) − r` over three handles.
     fn circle() -> (Kernel, [Uniform; 3]) {
@@ -660,7 +660,7 @@ mod uniforms_link_and_oracle {
         let circle = Kernel::x().sub(&cx.kernel()).abs();
         let moving = circle.at(&Kernel::x(), &phase.kernel());
         assert_eq!(
-            moving.parts().0.uniforms().len(),
+            moving.environment().uniforms.len(),
             2,
             "the table names the phantom — that is the shape being tested"
         );
@@ -698,12 +698,13 @@ mod uniforms_link_and_oracle {
             .add(&dy.mul(&dy))
             .sqrt()
             .at(&r.kernel(), &Kernel::y());
-        let (arena, root) = k.parts();
+        let term = k.term();
+        let env = term.env();
         let lattice = Lattice::frame(8, 3);
         let program = Manifold::compile(&k, lattice.extent);
         assert_ne!(
             program.uniforms().iter().map(|d| d.id).collect::<Vec<_>>(),
-            arena.uniforms().iter().map(|d| d.id).collect::<Vec<_>>(),
+            env.uniforms.iter().map(|d| d.id).collect::<Vec<_>>(),
             "the link's order and the arena's differ here, which is the point"
         );
         let code = program.code_bytes().as_ptr();
@@ -713,14 +714,14 @@ mod uniforms_link_and_oracle {
             block.set(cy, values[1]).expect("cy");
             block.set(r, values[2]).expect("r");
             let entries: Vec<_> = block.entries().collect();
-            let bindings = BindingTable::bind(arena, &[])
+            let bindings = BindingTable::bind(env, &[])
                 .expect("no buffers")
-                .bind_uniforms(arena, &entries)
+                .bind_uniforms(env, &entries)
                 .expect("every entry is declared");
             let plane = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
             for (i, got) in plane.buffer().iter().enumerate() {
                 let (x, y) = ((i % 8) as f32, (i / 8) as f32);
-                let want = eval_scalar(arena, root, &[x, y], &bindings);
+                let want = eval_scalar(term, &[x, y], &bindings);
                 assert!(
                     (got - want).abs() <= 1e-5 * want.abs().max(1.0),
                     "at ({x},{y}) under {values:?}: jit {got} vs oracle {want}"

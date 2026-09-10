@@ -66,7 +66,7 @@ pub struct DiscreteManifold {
     /// Which memory this is, for merging composed arenas. Clones share it,
     /// which is sound because the buffer is write-once — there is no mutable
     /// accessor, so a clone can never diverge from its original.
-    pub(crate) id: pixelflow_ir::arena::BufferIdentity,
+    pub(crate) id: pixelflow_ir::decl::BufferIdentity,
 }
 
 impl DiscreteManifold {
@@ -90,7 +90,7 @@ impl DiscreteManifold {
             buffer,
             width,
             height,
-            id: pixelflow_ir::arena::BufferIdentity::mint(),
+            id: pixelflow_ir::decl::BufferIdentity::mint(),
         }
     }
 
@@ -153,7 +153,7 @@ pub struct Lattice {
 }
 
 /// Coordinate axes a lattice has.
-pub const AXES: usize = pixelflow_ir::arena::COORD_AXES;
+pub const AXES: usize = pixelflow_ir::decl::COORD_AXES;
 
 impl Lattice {
     /// A 2D pixel frame: X varies per pixel, Y per scanline.
@@ -393,14 +393,18 @@ pub struct BilinearSampler {
 /// mirrored pair in y. Gather clamps each tap to the buffer edge.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn bilinear_arena(
-    id: pixelflow_ir::arena::BufferIdentity,
+    id: pixelflow_ir::decl::BufferIdentity,
     width: u32,
     height: u32,
-) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
-    use pixelflow_ir::arena::BufferDecl;
-    use pixelflow_ir::{ExprArena, OpKind};
+) -> (
+    pixelflow_ir::Rooted<pixelflow_ir::ExprData>,
+    pixelflow_ir::Environment,
+) {
+    use pixelflow_ir::OpKind;
+    use pixelflow_ir::decl::BufferDecl;
+    use pixelflow_ir::expr::ExprBuilder;
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let buf = a.declare_buffer(BufferDecl { id, width, height });
     let x = a.push_var(0);
     let y = a.push_var(1);
@@ -433,7 +437,7 @@ fn bilinear_arena(
     let s0 = a.push_binary(OpKind::Add, t00, t10);
     let s1 = a.push_binary(OpKind::Add, s0, t01);
     let root = a.push_binary(OpKind::Add, s1, t11);
-    (a, root)
+    a.finish(&[root])
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -455,7 +459,7 @@ impl BilinearSampler {
     /// so the composed and called forms cannot drift apart.
     #[must_use]
     pub fn kernel_for(
-        id: pixelflow_ir::arena::BufferIdentity,
+        id: pixelflow_ir::decl::BufferIdentity,
         width: u32,
         height: u32,
     ) -> pixelflow_ir::Kernel {
@@ -468,8 +472,8 @@ impl BilinearSampler {
             width > 0 && height > 0,
             "BilinearSampler::kernel_for: empty buffer ({width}x{height})"
         );
-        let (arena, root) = bilinear_arena(id, width, height);
-        pixelflow_ir::Kernel::from_parts(arena, root)
+        let (rooted, env) = bilinear_arena(id, width, height);
+        pixelflow_ir::Kernel::from_rooted(rooted, env)
     }
 
     /// This sampler's blend as a composable fragment. See [`Self::kernel_for`].
@@ -503,7 +507,7 @@ impl DiscreteManifold {
     /// empty buffer.
     #[must_use]
     pub fn kernel_for(
-        id: pixelflow_ir::arena::BufferIdentity,
+        id: pixelflow_ir::decl::BufferIdentity,
         width: u32,
         height: u32,
     ) -> pixelflow_ir::Kernel {
@@ -511,11 +515,12 @@ impl DiscreteManifold {
             width > 0 && height > 0,
             "DiscreteManifold::kernel_for: empty buffer ({width}x{height})"
         );
-        let mut a = pixelflow_ir::ExprArena::new();
-        let buf = a.declare_buffer(pixelflow_ir::arena::BufferDecl { id, width, height });
+        let mut a = pixelflow_ir::expr::ExprBuilder::new();
+        let buf = a.declare_buffer(pixelflow_ir::decl::BufferDecl { id, width, height });
         let (x, y) = (a.push_var(0), a.push_var(1));
         let root = a.push_gather(buf, x, y);
-        pixelflow_ir::Kernel::from_parts(a, root)
+        let (rooted, env) = a.finish(&[root]);
+        pixelflow_ir::Kernel::from_rooted(rooted, env)
     }
 
     /// This buffer paired with the identity [`Self::kernel`] declared, ready
@@ -530,7 +535,7 @@ impl DiscreteManifold {
     pub fn binding(
         &self,
     ) -> (
-        pixelflow_ir::arena::BufferIdentity,
+        pixelflow_ir::decl::BufferIdentity,
         alloc::sync::Arc<Vec<f32>>,
     ) {
         (self.id, alloc::sync::Arc::new(self.buffer.clone()))

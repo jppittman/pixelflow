@@ -48,7 +48,7 @@ use alloc::vec::Vec;
 
 use crate::Field;
 use pixelflow_codegen::CompiledKernel;
-use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformDecl, UniformIdentity};
+use pixelflow_ir::decl::{BufferDecl, BufferIdentity, UniformDecl, UniformIdentity};
 use pixelflow_ir::{Kernel, Uniform};
 
 /// Buffer slots a [`BoundManifold`] can bind without allocating: binding builds

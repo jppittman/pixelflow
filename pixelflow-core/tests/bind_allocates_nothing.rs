@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pixelflow_core::{DiscreteManifold, Kernel, Manifold, PlaneRegion, Uniform};
-use pixelflow_ir::arena::BufferIdentity;
+use pixelflow_ir::decl::BufferIdentity;
 
 struct Counting;
 
