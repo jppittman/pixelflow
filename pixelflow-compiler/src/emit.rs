@@ -116,14 +116,14 @@ pub fn emit_kernel(
 ///
 /// See docs/plans/2026-09-08-macro-tier-is-arena-native.md.
 pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
-    let nodes = arena.nodes_raw();
-    let nary_children = arena.nary_children_raw();
-
-    let node_tokens: Vec<TokenStream> = nodes
-        .iter()
-        .map(|node| match node {
+    let mut stmts = Vec::new();
+    let n = arena.len();
+    for idx in 0..n {
+        let id = ExprId(idx as u32);
+        let ident = format_ident!("__e{}", idx);
+        let expr = match arena.node(id) {
             pixelflow_ir::arena::ExprNode::Var(i) => {
-                quote! { ::pixelflow_core::__macro::ir::arena::ExprNode::Var(#i) }
+                quote! { __arena.push_var(#i) }
             }
             // By bit pattern, not as a decimal literal: `quote`'s `f32`
             // impl goes through `Literal::f32_suffixed`, which asserts
@@ -134,10 +134,10 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
             // no decimal-formatting question to get wrong.
             pixelflow_ir::arena::ExprNode::Const(v) => {
                 let bits = v.to_bits();
-                quote! { ::pixelflow_core::__macro::ir::arena::ExprNode::Const(f32::from_bits(#bits)) }
+                quote! { __arena.push_const(f32::from_bits(#bits)) }
             }
             pixelflow_ir::arena::ExprNode::Param(i) => {
-                quote! { ::pixelflow_core::__macro::ir::arena::ExprNode::Param(#i) }
+                quote! { __arena.push_param(#i) }
             }
             // The `kernel!` macro has no buffer surface yet, so this is
             // unreachable in practice; fail loud rather than emit a node that
@@ -170,25 +170,29 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
             }
             pixelflow_ir::arena::ExprNode::Unary(op, child) => {
                 let op_code = opkind_to_tokens(*op);
-                let child = child.0;
-                quote! { ::pixelflow_core::__macro::ir::arena::ExprNode::Unary(#op_code, ::pixelflow_core::__macro::ir::arena::ExprId(#child)) }
+                let child_ident = format_ident!("__e{}", child.0);
+                quote! { __arena.push_unary(#op_code, #child_ident) }
             }
             pixelflow_ir::arena::ExprNode::Binary(op, a, b) => {
                 let op_code = opkind_to_tokens(*op);
-                let a = a.0;
-                let b = b.0;
-                quote! { ::pixelflow_core::__macro::ir::arena::ExprNode::Binary(#op_code, ::pixelflow_core::__macro::ir::arena::ExprId(#a), ::pixelflow_core::__macro::ir::arena::ExprId(#b)) }
+                let a_ident = format_ident!("__e{}", a.0);
+                let b_ident = format_ident!("__e{}", b.0);
+                quote! { __arena.push_binary(#op_code, #a_ident, #b_ident) }
             }
             pixelflow_ir::arena::ExprNode::Ternary(op, a, b, c) => {
                 let op_code = opkind_to_tokens(*op);
-                let a = a.0;
-                let b = b.0;
-                let c = c.0;
-                quote! { ::pixelflow_core::__macro::ir::arena::ExprNode::Ternary(#op_code, ::pixelflow_core::__macro::ir::arena::ExprId(#a), ::pixelflow_core::__macro::ir::arena::ExprId(#b), ::pixelflow_core::__macro::ir::arena::ExprId(#c)) }
+                let a_ident = format_ident!("__e{}", a.0);
+                let b_ident = format_ident!("__e{}", b.0);
+                let c_ident = format_ident!("__e{}", c.0);
+                quote! { __arena.push_ternary(#op_code, #a_ident, #b_ident, #c_ident) }
             }
-            pixelflow_ir::arena::ExprNode::Nary(op, start, len) => {
+            pixelflow_ir::arena::ExprNode::Nary(op, ..) => {
                 let op_code = opkind_to_tokens(*op);
-                quote! { ::pixelflow_core::__macro::ir::arena::ExprNode::Nary(#op_code, #start, #len) }
+                let child_idents: Vec<_> = arena
+                    .children(id)
+                    .map(|c| format_ident!("__e{}", c.0))
+                    .collect();
+                quote! { __arena.push_nary(#op_code, &[#(#child_idents),*]) }
             }
             // A fold's metadata is a `Fold`, whose fields are private
             // precisely so no caller can assemble one that means nothing —
@@ -196,34 +200,27 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
             // with a total inverse on the far side.
             pixelflow_ir::arena::ExprNode::Reduce { fold, body } => {
                 let bits = fold.to_bits();
-                let body = body.0;
+                let body_ident = format_ident!("__e{}", body.0);
                 quote! {
-                    ::pixelflow_core::__macro::ir::arena::ExprNode::Reduce {
-                        fold: ::pixelflow_core::__macro::ir::fold::Fold::from_bits(#bits)
+                    __arena.push_reduce(
+                        ::pixelflow_core::__macro::ir::fold::Fold::from_bits(#bits)
                             .expect("kernel! emitted a well-formed fold"),
-                        body: ::pixelflow_core::__macro::ir::arena::ExprId(#body),
-                    }
+                        #body_ident,
+                    )
                 }
             }
-        })
-        .collect();
+        };
+        stmts.push(quote! {
+            let #ident = #expr;
+        });
+    }
 
-    let child_tokens: Vec<TokenStream> = nary_children
-        .iter()
-        .map(|id| {
-            let id = id.0;
-            quote! { ::pixelflow_core::__macro::ir::arena::ExprId(#id) }
-        })
-        .collect();
-
-    let root = root.0;
-    let tokens = quote! {{
-        let __nodes = vec![#(#node_tokens),*];
-        let __nary_children = vec![#(#child_tokens),*];
-        let __arena = ::pixelflow_core::__macro::ir::arena::ExprArena::from_raw(__nodes, __nary_children);
-        (__arena, ::pixelflow_core::__macro::ir::arena::ExprId(#root))
-    }};
-    tokens
+    let root_ident = format_ident!("__e{}", root.0);
+    quote! {{
+        let mut __arena = ::pixelflow_core::__macro::ir::arena::ExprArena::new();
+        #(#stmts)*
+        (__arena, #root_ident)
+    }}
 }
 
 /// The path naming `kind` in generated code.

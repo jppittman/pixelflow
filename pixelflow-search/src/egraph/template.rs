@@ -36,6 +36,9 @@ use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use super::rewrite::{Rewrite, RewriteAction, TemplateArena};
 
+use pixelflow_ir::expr::ExprData;
+use pixelflow_ir::{Node, Rooted};
+
 /// Metavariable → canonical e-class bindings accumulated while matching one
 /// pattern.
 type Bindings = BTreeMap<u8, EClassId>;
@@ -55,39 +58,45 @@ fn bind_var(mv: u8, class: EClassId, egraph: &EGraph, bindings: &mut Bindings) -
 /// the sweep already handed us the specific node to try).
 fn match_root(
     egraph: &EGraph,
-    arena: &ExprArena,
-    pat: ExprId,
+    pat: Node<'_, ExprData>,
     node: &ENode,
     bindings: &mut Bindings,
 ) -> bool {
-    match arena.node(pat) {
+    match *pat {
         // A Var-rooted LHS pattern is degenerate (it would match every node
         // in the graph) and no rule this harness generates ever produces
         // one — `compose_rules` always composes at an Op position. Refuse
         // rather than guess a binding with no class to bind it to.
-        ExprNode::Var(_) => false,
-        ExprNode::Const(v) => node.is_const(*v),
-        ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) => false,
-        _ => match_op(egraph, arena, pat, node, bindings),
+        ExprData::Var(_) => false,
+        ExprData::Const(v) => node.is_const(f32::from_bits(v)),
+        ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_)
+        | ExprData::Ref(_)
+        | ExprData::Reduce(_) => false,
+        ExprData::Op(_) => match_op(egraph, pat, node, bindings),
     }
 }
 
 /// Match `pat` against every representative of `class`, first-match-wins.
 fn match_class(
     egraph: &EGraph,
-    arena: &ExprArena,
-    pat: ExprId,
+    pat: Node<'_, ExprData>,
     class: EClassId,
     bindings: &mut Bindings,
 ) -> bool {
-    match arena.node(pat) {
-        ExprNode::Var(mv) => bind_var(*mv, class, egraph, bindings),
-        ExprNode::Const(v) => egraph.contains_const(class, *v),
-        ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) => false,
-        _ => {
+    match *pat {
+        ExprData::Var(mv) => bind_var(mv, class, egraph, bindings),
+        ExprData::Const(v) => egraph.contains_const(class, f32::from_bits(v)),
+        ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_)
+        | ExprData::Ref(_)
+        | ExprData::Reduce(_) => false,
+        ExprData::Op(_) => {
             for node in egraph.nodes(class) {
                 let mut trial = bindings.clone();
-                if match_op(egraph, arena, pat, node, &mut trial) {
+                if match_op(egraph, pat, node, &mut trial) {
                     *bindings = trial;
                     return true;
                 }
@@ -101,40 +110,63 @@ fn match_class(
 /// same `OpKind`, same arity, every child matched at its class position.
 fn match_op(
     egraph: &EGraph,
-    arena: &ExprArena,
-    pat: ExprId,
+    pat: Node<'_, ExprData>,
     node: &ENode,
     bindings: &mut Bindings,
 ) -> bool {
     let Some(node_op) = node.op() else {
         return false;
     };
-    if node_op.kind() != arena.kind(pat) {
+    let ExprData::Op(kind) = *pat else {
+        return false;
+    };
+    if node_op.kind() != kind {
         return false;
     }
-    let pat_children: Vec<ExprId> = arena.children(pat).collect();
+    let pat_children: Vec<Node<'_, ExprData>> = pat.children().collect();
     let node_children = node.children_slice();
     if pat_children.len() != node_children.len() {
         return false;
     }
     for (pc, nc) in pat_children.iter().zip(node_children.iter()) {
-        if !match_class(egraph, arena, *pc, *nc, bindings) {
+        if !match_class(egraph, *pc, *nc, bindings) {
             return false;
         }
     }
     true
 }
 
-/// Distinct metavariable indices used anywhere in the subtree at `id`.
-fn collect_metavars(arena: &ExprArena, id: ExprId, out: &mut std::collections::BTreeSet<u8>) {
+/// Distinct metavariable indices used anywhere in the subtree at `node`.
+fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeSet<u8>) {
+    match *node {
+        ExprData::Var(mv) => {
+            out.insert(mv);
+        }
+        ExprData::Const(_)
+        | ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_)
+        | ExprData::Ref(_) => {}
+        ExprData::Reduce(_) | ExprData::Op(_) => {
+            for c in node.children() {
+                collect_metavars(c, out);
+            }
+        }
+    }
+}
+
+fn collect_metavars_arena(arena: &ExprArena, id: ExprId, out: &mut std::collections::BTreeSet<u8>) {
     match arena.node(id) {
-        ExprNode::Var(mv) => {
+        pixelflow_ir::arena::ExprNode::Var(mv) => {
             out.insert(*mv);
         }
-        ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) => {}
+        pixelflow_ir::arena::ExprNode::Const(_)
+        | pixelflow_ir::arena::ExprNode::Param(_)
+        | pixelflow_ir::arena::ExprNode::Buffer(_)
+        | pixelflow_ir::arena::ExprNode::Uniform(_) => {}
         _ => {
             for c in arena.children(id) {
-                collect_metavars(arena, c, out);
+                collect_metavars_arena(arena, c, out);
             }
         }
     }
@@ -144,32 +176,32 @@ fn collect_metavars(arena: &ExprArena, id: ExprId, out: &mut std::collections::B
 /// combinator. See the module docs for the matching contract.
 pub struct TemplateRewrite {
     name: String,
-    arena: Arc<ExprArena>,
-    lhs: ExprId,
-    rhs: ExprId,
+    rooted: Arc<Rooted<ExprData>>,
     /// One past the highest metavariable index used in `lhs`/`rhs` — the
     /// fixed length every produced `bindings` vector has.
     metavar_count: u8,
 }
 
 impl TemplateRewrite {
-    /// Build a template rule directly from an LHS/RHS pair already living in
-    /// `arena`. `arena` is wrapped in an `Arc` because every application that
-    /// fires this rule clones it into a `RewriteAction::Instantiate` — the
-    /// pattern is shared read-only data, not a per-application allocation.
+    /// Build a template rule directly from an LHS/RHS pair in `rooted`.
+    /// `rooted` must have exactly 2 entries: `[lhs, rhs]`.
     ///
     /// # Panics
     ///
-    /// Panics if `rhs` uses a metavariable that never appears in `lhs` (the
-    /// rule could never bind it — a construction bug in whatever built the
-    /// pattern, since a sound rewrite's RHS is a function of its LHS's
-    /// bindings only).
+    /// Panics if `rhs` uses a metavariable that never appears in `lhs`.
     #[must_use]
-    pub fn new(name: impl Into<String>, arena: ExprArena, lhs: ExprId, rhs: ExprId) -> Self {
+    pub fn new(name: impl Into<String>, rooted: Rooted<ExprData>) -> Self {
+        assert_eq!(
+            rooted.entries().len(),
+            2,
+            "TemplateRewrite requires 2 entries: [lhs, rhs]"
+        );
+        let lhs = rooted.entry_at(0);
+        let rhs = rooted.entry_at(1);
         let mut lhs_vars = std::collections::BTreeSet::new();
-        collect_metavars(&arena, lhs, &mut lhs_vars);
+        collect_metavars(lhs, &mut lhs_vars);
         let mut rhs_vars = std::collections::BTreeSet::new();
-        collect_metavars(&arena, rhs, &mut rhs_vars);
+        collect_metavars(rhs, &mut rhs_vars);
         assert!(
             rhs_vars.is_subset(&lhs_vars),
             "TemplateRewrite::new: rhs uses metavariable(s) {:?} not bound by lhs {:?}",
@@ -183,11 +215,31 @@ impl TemplateRewrite {
             .map_or(0, |m| m + 1);
         Self {
             name: name.into(),
-            arena: Arc::new(arena),
-            lhs,
-            rhs,
+            rooted: Arc::new(rooted),
             metavar_count,
         }
+    }
+
+    /// Construct from legacy arena + expr IDs.
+    #[must_use]
+    pub fn from_arena(name: impl Into<String>, arena: ExprArena, lhs: ExprId, rhs: ExprId) -> Self {
+        let (rooted, _) = pixelflow_ir::expr::from_arena_roots(&arena, &[lhs, rhs]);
+        Self::new(name, rooted)
+    }
+
+    #[must_use]
+    pub fn rooted(&self) -> &Rooted<ExprData> {
+        &self.rooted
+    }
+
+    #[must_use]
+    pub fn lhs<'a>(&'a self) -> Node<'a, ExprData> {
+        self.rooted.entry_at(0)
+    }
+
+    #[must_use]
+    pub fn rhs<'a>(&'a self) -> Node<'a, ExprData> {
+        self.rooted.entry_at(1)
     }
 }
 
@@ -198,7 +250,8 @@ impl Rewrite for TemplateRewrite {
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
         let mut bindings = Bindings::new();
-        if !match_root(egraph, &self.arena, self.lhs, node, &mut bindings) {
+        let lhs = self.rooted.entry_at(0);
+        if !match_root(egraph, lhs, node, &mut bindings) {
             return None;
         }
         let mut binding_vec = Vec::with_capacity(self.metavar_count as usize);
@@ -215,18 +268,24 @@ impl Rewrite for TemplateRewrite {
             }));
         }
         Some(RewriteAction::Instantiate {
-            template: TemplateArena(Arc::clone(&self.arena)),
-            root: self.rhs,
+            template: super::rewrite::TemplatePattern(Arc::clone(&self.rooted)),
+            entry: 1,
             bindings: binding_vec,
         })
     }
 
     fn lhs_template(&self, out: &mut ExprArena) -> Option<ExprId> {
-        Some(out.splice(&self.arena, self.lhs))
+        let env = pixelflow_ir::expr::Environment::default();
+        let (arena, roots) =
+            pixelflow_ir::expr::to_arena_roots(&self.rooted, &[self.rooted.entry_at(0)], &env);
+        Some(out.splice(&arena, roots[0]))
     }
 
     fn rhs_template(&self, out: &mut ExprArena) -> Option<ExprId> {
-        Some(out.splice(&self.arena, self.rhs))
+        let env = pixelflow_ir::expr::Environment::default();
+        let (arena, roots) =
+            pixelflow_ir::expr::to_arena_roots(&self.rooted, &[self.rooted.entry_at(1)], &env);
+        Some(out.splice(&arena, roots[0]))
     }
 }
 
@@ -300,7 +359,7 @@ fn replace_at(arena: &mut ExprArena, root: ExprId, position: &[u8], replacement:
 /// pattern a namespace disjoint from A's before unification.
 fn shift_vars(arena: &mut ExprArena, root: ExprId, offset: u8) -> ExprId {
     let mut used = std::collections::BTreeSet::new();
-    collect_metavars(arena, root, &mut used);
+    collect_metavars_arena(arena, root, &mut used);
     let subs: Vec<(u8, ExprId)> = used
         .into_iter()
         .map(|v| (v, arena.push_var(offset + v)))
@@ -428,9 +487,9 @@ fn canonicalize_vars(
     rhs: ExprId,
 ) -> Option<(ExprId, ExprId, u8)> {
     let mut lhs_vars = std::collections::BTreeSet::new();
-    collect_metavars(arena, lhs, &mut lhs_vars);
+    collect_metavars_arena(arena, lhs, &mut lhs_vars);
     let mut rhs_vars = std::collections::BTreeSet::new();
-    collect_metavars(arena, rhs, &mut rhs_vars);
+    collect_metavars_arena(arena, rhs, &mut rhs_vars);
     if !rhs_vars.is_subset(&lhs_vars) {
         return None;
     }
@@ -501,7 +560,9 @@ impl TemplateRewrite {
         }
 
         let name = format!("{}\u{2218}{}@{position:?}", a.name(), b.name());
-        Some(TemplateRewrite::new(name, arena, final_lhs, final_rhs))
+        Some(TemplateRewrite::from_arena(
+            name, arena, final_lhs, final_rhs,
+        ))
     }
 }
 
@@ -522,7 +583,7 @@ mod tests {
         let v1b = a.push_var(1);
         let neg = a.push_unary(OpKind::Neg, v1b);
         let rhs = a.push_binary(OpKind::Add, v0b, neg);
-        TemplateRewrite::new("test_sub_to_add_neg", a, lhs, rhs)
+        TemplateRewrite::from_arena("test_sub_to_add_neg", a, lhs, rhs)
     }
 
     #[test]
@@ -552,7 +613,7 @@ mod tests {
         let v0b = a.push_var(0);
         let lhs = a.push_binary(OpKind::Sub, v0, v0b);
         let zero = a.push_const(0.0);
-        let rule = TemplateRewrite::new("test_self_sub", a, lhs, zero);
+        let rule = TemplateRewrite::from_arena("test_self_sub", a, lhs, zero);
 
         let mut eg = EGraph::new();
         let x = eg.add(ENode::Var(0));
@@ -576,5 +637,32 @@ mod tests {
             rule.apply(&eg, other_root, &other_node).is_none(),
             "repeated metavariable must refuse two different classes"
         );
+    }
+
+    #[test]
+    fn dag_builder_template_rewrite() {
+        use pixelflow_ir::expr::ExprBuilderExt;
+        let mut b = pixelflow_ir::Builder::new();
+        let v0 = b.push_var(0);
+        let v1 = b.push_var(1);
+        let lhs = b.push_binary(OpKind::Sub, v0, v1);
+        let neg_v1 = b.push_unary(OpKind::Neg, v1);
+        let rhs = b.push_binary(OpKind::Add, v0, neg_v1);
+        let rooted = b.finish(&[lhs, rhs]);
+        let rule = TemplateRewrite::new("test_dag_sub", rooted);
+        assert_eq!(rule.lhs().child_count(), 2);
+        assert_eq!(rule.rhs().child_count(), 2);
+
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let sub = eg.add(ENode::Op {
+            op: &crate::egraph::ops::Sub,
+            children: vec![x, y],
+        });
+        let sub_root = eg.find(sub);
+        let sub_node = eg.nodes(sub_root)[0].clone();
+        let action = rule.apply(&eg, sub_root, &sub_node).expect("must match");
+        matches!(action, RewriteAction::Instantiate { .. });
     }
 }

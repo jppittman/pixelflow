@@ -39,7 +39,7 @@ use crate::kind::OpKind;
 /// Only associative operations with an identity qualify: associativity is what
 /// lets the backend reassociate and vectorize the fold, and the identity is
 /// what an empty domain denotes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Monoid(OpKind);
 
 impl Monoid {
@@ -145,7 +145,7 @@ impl Binder {
 /// `⟦Reduce { fold, body }⟧ = ⊕_{k ∈ fold.range()} ⟦body⟧[fold.binder() := k]`
 ///
 /// [`Reduce`]: crate::arena::ExprNode::Reduce
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Fold {
     monoid: Monoid,
     binder: Binder,

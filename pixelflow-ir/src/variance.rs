@@ -384,6 +384,65 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
     result
 }
 
+/// Compute variance for every node in a DAG.
+///
+/// Because `dag.iter()` visits nodes strictly in children-before-parents order,
+/// a single forward pass over `dag.iter()` suffices.
+///
+/// Returns a [`SideTable<Variance>`] indexed directly by [`Node<'_, ExprData>`].
+#[must_use]
+pub fn compute_dag_variance(
+    dag: &crate::dag::Dag<crate::expr::ExprData>,
+) -> crate::dag::SideTable<Variance> {
+    use crate::expr::ExprData;
+
+    let mut table = dag.side_table(Variance::CONST);
+
+    for node in dag.iter() {
+        let v = match *node {
+            ExprData::Var(idx) => {
+                if idx < 8 {
+                    Variance::from_var(idx)
+                } else {
+                    Variance::ALL
+                }
+            }
+            ExprData::Const(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => Variance::CONST,
+            ExprData::Param(_) => Variance::ALL,
+            // The only node that *removes* a dependency: its binder is
+            // bound here, so the body's variance on that one slot does not
+            // escape.
+            //
+            // The binder comes off `Fold`, not out of a `Const` child. That
+            // is the whole of the difference: this arm used to read a float,
+            // ask `floorf` whether it was really an integer, check the
+            // integer against a magic range to see whether it was really a
+            // binder slot, and fall back to `Variance::ALL` when any of that
+            // failed — a widening that was silent and unfalsifiable.
+            ExprData::Reduce(fold) => {
+                let body = node.children().next();
+                let body_v = body.map_or(Variance::ALL, |b| table[b]);
+                body_v.without(Variance::from_var(fold.binder().var()))
+            }
+            // A name has no variance of its own to compute. `Ref` is a leaf
+            // whose referent lives in another graph, so nothing here can see
+            // what it depends on; `ALL` is the sound answer, and the linker
+            // (`passes::expand_refs`) is what turns it into a real one.
+            ExprData::Ref(_) => Variance::ALL,
+            ExprData::Op(_) => {
+                let mut v = Variance::CONST;
+                for child in node.children() {
+                    v = v.union(table[child]);
+                }
+                v
+            }
+        };
+        table[node] = v;
+    }
+
+    table
+}
+
 /// Find arena nodes that should be hoisted out of the X-loop.
 ///
 /// [`find_hoistable_out_of`] with `0` — the pixel loop's question.
@@ -930,7 +989,7 @@ mod tests {
 
 #[cfg(test)]
 mod lattice_shape_tests {
-    use super::{LatticeShape, Variance};
+    use super::{LatticeShape, Variance, compute_dag_variance};
 
     #[test]
     fn binders_are_the_axes_with_extent_above_one() {
@@ -971,5 +1030,23 @@ mod lattice_shape_tests {
         assert_eq!(a.key_bytes()[4..8], 8u32.to_le_bytes());
         assert_ne!(a.key_bytes(), b.key_bytes());
         assert_eq!(a.extent(), [8, 8]);
+    }
+
+    #[test]
+    fn verify_compute_dag_variance() {
+        use crate::dag::Builder;
+        use crate::expr::ExprBuilderExt;
+        use crate::kind::OpKind;
+
+        let mut b = Builder::new();
+        let x = b.push_var(0); // Variance::X
+        let y = b.push_var(1); // Variance::Y
+        let add = b.push_binary(OpKind::Add, x, y); // Variance::COORDS
+        let c = b.push_const(5.0); // Variance::CONST
+        let mul = b.push_binary(OpKind::Mul, add, c); // Variance::COORDS
+        let rooted = b.finish(&[mul]);
+
+        let var_table = compute_dag_variance(&rooted);
+        assert_eq!(var_table[rooted.entry()], Variance::COORDS);
     }
 }

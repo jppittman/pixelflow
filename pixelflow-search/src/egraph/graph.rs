@@ -1980,10 +1980,10 @@ impl EGraph {
             }),
             RewriteAction::Instantiate {
                 template,
-                root,
+                entry,
                 bindings,
             } => self.predict(|s| {
-                instantiate_template(s, &template.0, *root, bindings);
+                instantiate_template(s, template.0.entry_at(*entry), bindings);
             }),
             RewriteAction::Distribute {
                 outer,
@@ -2110,10 +2110,11 @@ impl EGraph {
             RewriteAction::Union(target_id) => self.union_counted(class_id, target_id),
             RewriteAction::Instantiate {
                 template,
-                root,
+                entry,
                 bindings,
             } => {
-                let result_id = instantiate_template(self, &template.0, root, &bindings);
+                let node = template.0.entry_at(entry);
+                let result_id = instantiate_template(self, node, &bindings);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Create(new_node) => {
@@ -2801,15 +2802,14 @@ fn diff_of_squares_shape<S: NodeSink>(sink: &mut S, a: EClassId, b: EClassId) ->
 /// not a runtime condition), or on a metavariable with no binding.
 fn instantiate_template<S: NodeSink>(
     sink: &mut S,
-    template: &pixelflow_ir::ExprArena,
-    id: pixelflow_ir::ExprId,
+    node: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>,
     bindings: &[EClassId],
 ) -> EClassId {
-    use pixelflow_ir::arena::ExprNode;
+    use pixelflow_ir::expr::ExprData;
 
-    match template.node(id) {
-        ExprNode::Var(mv) => {
-            let mv = *mv as usize;
+    match *node {
+        ExprData::Var(mv) => {
+            let mv = mv as usize;
             assert!(
                 mv < bindings.len(),
                 "instantiate_template: metavariable {mv} has no binding \
@@ -2819,30 +2819,40 @@ fn instantiate_template<S: NodeSink>(
             );
             bindings[mv]
         }
-        ExprNode::Const(v) => sink.make(ENode::constant(*v)),
-        ExprNode::Param(p) => {
+        ExprData::Const(bits) => sink.make(ENode::constant(f32::from_bits(bits))),
+        ExprData::Param(p) => {
             panic!("instantiate_template: Param({p}) in a rewrite RHS template")
         }
-        ExprNode::Buffer(b) => {
+        ExprData::Buffer(b) => {
             panic!(
                 "instantiate_template: Buffer({}) in a rewrite RHS template",
                 b.0
             )
         }
-        ExprNode::Uniform(u) => {
+        ExprData::Uniform(u) => {
             panic!(
                 "instantiate_template: Uniform({}) in a rewrite RHS template",
                 u.0
             )
         }
-        _ => {
-            let kind = template.kind(id);
+        ExprData::Ref(k) => {
+            panic!("instantiate_template: Ref({k:?}) in a rewrite RHS template")
+        }
+        ExprData::Reduce(fold) => {
+            let body = node
+                .children()
+                .next()
+                .expect("a Reduce template has its body as its one child");
+            let body = instantiate_template(sink, body, bindings);
+            sink.make(ENode::Reduce { fold, body })
+        }
+        ExprData::Op(kind) => {
             let static_op = ops::op_from_kind(kind).unwrap_or_else(|| {
                 panic!("instantiate_template: no static Op for OpKind {kind:?}")
             });
-            let children: Vec<EClassId> = template
-                .children(id)
-                .map(|c| instantiate_template(sink, template, c, bindings))
+            let children: Vec<EClassId> = node
+                .children()
+                .map(|c| instantiate_template(sink, c, bindings))
                 .collect();
             sink.make(ENode::Op {
                 op: static_op,

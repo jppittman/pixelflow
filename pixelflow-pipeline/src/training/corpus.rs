@@ -91,15 +91,14 @@ impl SchemaIdentity for CorpusFormat {
     // could seat a DEV/FINAL-equivalent expression in TRAIN (P1(d)).
     const SCHEMA: &'static str = "\
         header: magic[4]=PXCR, schema_identity: u64 le, count: u32 le entries follow; \
-        entry: name_len u16 le, name utf8 bytes, node_count u32 le, nary_count u32 le, \
+        entry: name_len u16 le, name utf8 bytes, node_count u32 le, \
         root_index u32 le (ExprId.0 into this entry's own node list), \
-        nodes: node_count encoded ExprNodes in child-before-parent order, \
-        nary_children: [u32 le; nary_count] (ExprId.0 values); \
+        nodes: node_count encoded ExprNodes in child-before-parent order; \
         ExprNode tag byte: 0=Var(index u8), 1=Const(f32 le), 2=Param(index u8), \
         3=Unary(OpKind::marshal, ExprId le), \
         4=Binary(OpKind::marshal, ExprId le, ExprId le), \
         5=Ternary(OpKind::marshal, ExprId le, ExprId le, ExprId le), \
-        6=Nary(OpKind::marshal, nary_children start u32 le, len u16 le), \
+        6=Nary(OpKind::marshal, len u16 le, [ExprId le; len]), \
         7=Buffer(BufferId u16 le) refused at write time, its declaration is never \
         serialized; \
         op byte encoding: pixelflow_ir::OpKind::marshal, dense 0..COUNT discriminants \
@@ -219,8 +218,7 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
     }
 
     let mut id_map: Vec<Option<ExprId>> = vec![None; arena.len()];
-    let mut nodes: Vec<ExprNode> = Vec::new();
-    let mut nary_children: Vec<ExprId> = Vec::new();
+    let mut out_arena = ExprArena::new();
     let mut work: Vec<Task> = vec![Task::Descend(root)];
 
     while let Some(task) = work.pop() {
@@ -243,10 +241,10 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                     id_map[old.0 as usize]
                         .expect("reachable_subtree: child must be emitted before its parent")
                 };
-                let compacted = match arena.node(id) {
-                    ExprNode::Var(i) => ExprNode::Var(*i),
-                    ExprNode::Const(v) => ExprNode::Const(*v),
-                    ExprNode::Param(i) => ExprNode::Param(*i),
+                let new_id = match arena.node(id) {
+                    ExprNode::Var(i) => out_arena.push_var(*i),
+                    ExprNode::Const(v) => out_arena.push_const(*v),
+                    ExprNode::Param(i) => out_arena.push_param(*i),
                     ExprNode::Buffer(b) => panic!(
                         "reachable_subtree: expression references Buffer({}), whose declaration \
                          the corpus format does not serialize — writing it would store a node \
@@ -263,32 +261,24 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                          kernel interned in this process — a corpus outlives the process, so \
                          the key would read back naming nothing"
                     ),
-                    ExprNode::Unary(op, a) => ExprNode::Unary(*op, map(*a)),
-                    ExprNode::Binary(op, a, b) => ExprNode::Binary(*op, map(*a), map(*b)),
+                    ExprNode::Unary(op, a) => out_arena.push_unary(*op, map(*a)),
+                    ExprNode::Binary(op, a, b) => out_arena.push_binary(*op, map(*a), map(*b)),
                     ExprNode::Ternary(op, a, b, c) => {
-                        ExprNode::Ternary(*op, map(*a), map(*b), map(*c))
+                        out_arena.push_ternary(*op, map(*a), map(*b), map(*c))
                     }
-                    ExprNode::Reduce { fold, body } => ExprNode::Reduce {
-                        fold: *fold,
-                        body: map(*body),
-                    },
-                    ExprNode::Nary(op, start, len) => {
-                        let start_new = nary_children.len() as u32;
-                        for child in arena.nary_children_slice(*start, *len) {
-                            nary_children.push(map(*child));
-                        }
-                        ExprNode::Nary(*op, start_new, *len)
+                    ExprNode::Reduce { fold, body } => out_arena.push_reduce(*fold, map(*body)),
+                    ExprNode::Nary(op, _, _) => {
+                        let mapped_children: Vec<ExprId> = arena.children(id).map(map).collect();
+                        out_arena.push_nary(*op, &mapped_children)
                     }
                 };
-                let new_id = ExprId(nodes.len() as u32);
-                nodes.push(compacted);
                 id_map[id.0 as usize] = Some(new_id);
             }
         }
     }
 
     let new_root = id_map[root.0 as usize].expect("reachable_subtree: root was never emitted");
-    (ExprArena::from_raw(nodes, nary_children), new_root)
+    (out_arena, new_root)
 }
 
 // ── Write ────────────────────────────────────────────────────────────────────
@@ -330,30 +320,24 @@ fn write_entry(w: &mut impl Write, name: &str, arena: &ExprArena, root: ExprId) 
     // Compact first: the caller's arena is generator scratch space and its
     // dead nodes are not part of this expression (format v3).
     let (compact, compact_root) = reachable_subtree(arena, root);
-    let nodes = compact.nodes_raw();
-    let nary = compact.nary_children_raw();
+    let count = compact.len();
 
     w.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
     w.write_all(name_bytes)?;
-    w.write_all(&(nodes.len() as u32).to_le_bytes())?;
-    w.write_all(&(nary.len() as u32).to_le_bytes())?;
+    w.write_all(&(count as u32).to_le_bytes())?;
     w.write_all(&compact_root.0.to_le_bytes())?;
 
     // Nodes
-    for node in nodes {
-        write_node(w, node)?;
-    }
-
-    // Nary children
-    for child in nary {
-        w.write_all(&child.0.to_le_bytes())?;
+    for idx in 0..count {
+        let id = ExprId(idx as u32);
+        write_node(w, &compact, id)?;
     }
 
     Ok(())
 }
 
-fn write_node(w: &mut impl Write, node: &ExprNode) -> io::Result<()> {
-    match node {
+fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<()> {
+    match arena.node(id) {
         ExprNode::Var(i) => {
             w.write_all(&[TAG_VAR, *i])?;
         }
@@ -382,11 +366,19 @@ fn write_node(w: &mut impl Write, node: &ExprNode) -> io::Result<()> {
             w.write_all(&b.0.to_le_bytes())?;
             w.write_all(&c.0.to_le_bytes())?;
         }
-        ExprNode::Nary(op, start, len) => {
+        ExprNode::Nary(op, _, _) => {
             w.write_all(&[TAG_NARY])?;
             w.write_all(&op.marshal().to_bytes())?;
-            w.write_all(&start.to_le_bytes())?;
-            w.write_all(&len.to_le_bytes())?;
+            let children = arena.children(id);
+            let len = children.len();
+            assert!(
+                len <= u16::MAX as usize,
+                "write_node: Nary children count exceeds u16::MAX"
+            );
+            w.write_all(&(len as u16).to_le_bytes())?;
+            for child in children {
+                w.write_all(&child.0.to_le_bytes())?;
+            }
         }
         ExprNode::Buffer(b) => {
             w.write_all(&[TAG_BUFFER])?;
@@ -494,67 +486,63 @@ fn read_entry(r: &mut Cursor<'_>) -> io::Result<(String, ExprArena, ExprId)> {
     };
 
     let node_count = r.read_u32()? as usize;
-    let nary_count = r.read_u32()? as usize;
     let root_index = r.read_u32()?;
 
-    let mut nodes = Vec::with_capacity(node_count);
+    let mut arena = ExprArena::new();
     for _ in 0..node_count {
-        nodes.push(read_node(r)?);
+        read_node_into(r, &mut arena)?;
     }
 
-    let mut nary_children = Vec::with_capacity(nary_count);
-    for _ in 0..nary_count {
-        nary_children.push(ExprId(r.read_u32()?));
-    }
-
-    let arena = ExprArena::from_raw(nodes, nary_children);
     let root = ExprId(root_index);
 
     Ok((name, arena, root))
 }
 
-fn read_node(r: &mut Cursor<'_>) -> io::Result<ExprNode> {
+fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprId> {
     let tag = r.read_u8()?;
     match tag {
         TAG_VAR => {
             let i = r.read_u8()?;
-            Ok(ExprNode::Var(i))
+            Ok(arena.push_var(i))
         }
         TAG_CONST => {
             let bits = r.read_u32()?;
-            Ok(ExprNode::Const(f32::from_le_bytes(bits.to_le_bytes())))
+            Ok(arena.push_const(f32::from_le_bytes(bits.to_le_bytes())))
         }
         TAG_PARAM => {
             let i = r.read_u8()?;
-            Ok(ExprNode::Param(i))
+            Ok(arena.push_param(i))
         }
         TAG_UNARY => {
             let op = read_opkind(r)?;
             let a = ExprId(r.read_u32()?);
-            Ok(ExprNode::Unary(op, a))
+            Ok(arena.push_unary(op, a))
         }
         TAG_BINARY => {
             let op = read_opkind(r)?;
             let a = ExprId(r.read_u32()?);
             let b = ExprId(r.read_u32()?);
-            Ok(ExprNode::Binary(op, a, b))
+            Ok(arena.push_binary(op, a, b))
         }
         TAG_TERNARY => {
             let op = read_opkind(r)?;
             let a = ExprId(r.read_u32()?);
             let b = ExprId(r.read_u32()?);
             let c = ExprId(r.read_u32()?);
-            Ok(ExprNode::Ternary(op, a, b, c))
+            Ok(arena.push_ternary(op, a, b, c))
         }
         TAG_NARY => {
             let op = read_opkind(r)?;
-            let start = r.read_u32()?;
-            let len = r.read_u16()?;
-            Ok(ExprNode::Nary(op, start, len))
+            let len = r.read_u16()? as usize;
+            let mut children = Vec::with_capacity(len);
+            for _ in 0..len {
+                children.push(ExprId(r.read_u32()?));
+            }
+            Ok(arena.push_nary(op, &children))
         }
         TAG_BUFFER => {
             let b = pixelflow_ir::arena::BufferId(r.read_u16()?);
-            Ok(ExprNode::Buffer(b))
+            Ok(arena.push_buffer(b))
         }
         TAG_REDUCE => {
             let bits = r.read_u64()?;
@@ -564,10 +552,8 @@ fn read_node(r: &mut Cursor<'_>) -> io::Result<ExprNode> {
                     format!("corpus fold bits {bits} name no fold"),
                 )
             })?;
-            Ok(ExprNode::Reduce {
-                fold,
-                body: ExprId(r.read_u32()?),
-            })
+            let body = ExprId(r.read_u32()?);
+            Ok(arena.push_reduce(fold, body))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -784,9 +770,8 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         match loaded[0].1.node(loaded[0].2) {
-            ExprNode::Nary(OpKind::Tuple, start, len) => {
-                assert_eq!(*len, 3);
-                let children = loaded[0].1.nary_children_slice(*start, *len);
+            ExprNode::Nary(OpKind::Tuple, _, _) => {
+                let children: Vec<_> = loaded[0].1.children(loaded[0].2).collect();
                 assert_eq!(children.len(), 3);
             }
             other => panic!("expected Nary(Tuple,...), got {other:?}"),
@@ -1010,9 +995,14 @@ mod tests {
         // A Buffer leaf's declaration is not part of the corpus format, so a
         // corpus entry holding one is unreadable-by-construction. Refuse at
         // write time rather than storing a node that decodes to nothing.
-        let nodes = vec![ExprNode::Buffer(pixelflow_ir::arena::BufferId(0))];
-        let arena = ExprArena::from_raw(nodes, Vec::new());
-        let _ = reachable_subtree(&arena, ExprId(0));
+        let mut arena = ExprArena::new();
+        let buf = arena.declare_buffer(pixelflow_ir::arena::BufferDecl {
+            id: pixelflow_ir::arena::BufferIdentity::mint(),
+            width: 8,
+            height: 8,
+        });
+        let root = arena.push_buffer(buf);
+        let _ = reachable_subtree(&arena, root);
     }
 
     #[test]

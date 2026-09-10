@@ -15,9 +15,15 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{BufferIdentity, ExprArena, ExprId, ExprNode, UniformDecl, UniformIdentity};
+use crate::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity};
+use crate::dag::{Builder, Dag, Node, Rooted};
+use crate::expr::{
+    Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
+    to_arena,
+};
 use crate::fold::{Binder, Fold, Monoid};
 use crate::kind::OpKind;
 
@@ -90,10 +96,13 @@ impl Drop for BinderScope {
 /// # Panics
 ///
 /// Panics when every slot is live, i.e. one fold deeper than the index space.
-fn lowest_free_binder(arena: &ExprArena) -> Binder {
+fn lowest_free_binder(dag: &Dag<ExprData>) -> Binder {
     let mut used = [false; Binder::COUNT];
-    for node in arena.nodes_raw() {
-        if let ExprNode::Reduce { fold, .. } = node {
+    for node in dag.iter() {
+        // `ExprData::Reduce(Fold)` is why this is two lines. Read off a
+        // `Const` child it was a float, tested against `floorf` and a magic
+        // range, and asked again by every pass that wanted a binder.
+        if let ExprData::Reduce(fold) = *node {
             used[fold.binder().slot() as usize] = true;
         }
     }
@@ -158,10 +167,11 @@ impl Uniform {
     /// The leaf, as a fragment: composes like any [`Kernel`].
     #[must_use]
     pub fn kernel(self) -> Kernel {
-        let mut a = ExprArena::new();
-        let slot = a.declare_uniform(self.decl);
-        let r = a.push_uniform(slot);
-        Kernel::wrap(a, r, BTreeMap::new())
+        let mut b = Builder::new();
+        let mut env = Environment::new();
+        let slot = env.slot_for_uniform(self.decl);
+        let r = b.push_uniform(slot);
+        Kernel::wrap(b.finish(&[r]), env, BTreeMap::new())
     }
 }
 
@@ -197,8 +207,9 @@ pub struct Kernel {
 }
 
 struct KernelData {
-    arena: ExprArena,
-    root: ExprId,
+    rooted: Rooted<ExprData>,
+    env: Environment,
+    legacy: (ExprArena, ExprId),
     /// Tabulations this kernel carries, by the [`BufferIdentity`] each was
     /// seeded under — the data travelling with the value, so a consumer
     /// never carries a binding beside the kernel that needs it
@@ -235,14 +246,73 @@ fn merge_buffer_data(
 }
 
 impl Kernel {
-    fn wrap(arena: ExprArena, root: ExprId, buffers: BTreeMap<BufferIdentity, Arc<[f32]>>) -> Self {
+    fn wrap(
+        rooted: Rooted<ExprData>,
+        env: Environment,
+        buffers: BTreeMap<BufferIdentity, Arc<[f32]>>,
+    ) -> Self {
+        let legacy = to_arena(rooted.entry(), &env);
         Self {
             inner: Arc::new(KernelData {
-                arena,
-                root,
+                rooted,
+                env,
+                legacy,
                 buffers,
             }),
         }
+    }
+
+    /// Adopt an already-built fragment.
+    #[must_use]
+    pub fn from_rooted(
+        rooted: Rooted<ExprData>,
+        buffers: Vec<BufferDecl>,
+        uniforms: Vec<UniformDecl>,
+    ) -> Self {
+        let root = rooted.entry();
+        assert!(
+            root.retired_axis().is_none(),
+            "Kernel::from_rooted: the expression names Var({}), which was the {} coordinate; a lattice has {} axes and a per-call scalar is a Uniform",
+            root.retired_axis().unwrap_or_default(),
+            if root.retired_axis() == Some(2) {
+                "Z"
+            } else {
+                "W"
+            },
+            crate::arena::COORD_AXES,
+        );
+        let env = Environment { buffers, uniforms };
+        Self::wrap(rooted, env, BTreeMap::new())
+    }
+
+    /// The root expression node handle.
+    #[must_use]
+    pub fn root(&self) -> Node<'_, ExprData> {
+        self.inner.rooted.entry()
+    }
+
+    /// The DAG structure.
+    #[must_use]
+    pub fn dag(&self) -> &Dag<ExprData> {
+        &self.inner.rooted
+    }
+
+    /// The rooted DAG.
+    #[must_use]
+    pub fn rooted(&self) -> &Rooted<ExprData> {
+        &self.inner.rooted
+    }
+
+    /// Buffer declarations.
+    #[must_use]
+    pub fn buffers(&self) -> &[BufferDecl] {
+        &self.inner.env.buffers
+    }
+
+    /// Uniform declarations.
+    #[must_use]
+    pub fn uniforms(&self) -> &[UniformDecl] {
+        &self.inner.env.uniforms
     }
 
     // ─────────────────────────── leaves ───────────────────────────
@@ -258,17 +328,17 @@ impl Kernel {
         Self::coord(1)
     }
     fn coord(i: u8) -> Self {
-        let mut a = ExprArena::new();
-        let r = a.push_var(i);
-        Self::wrap(a, r, BTreeMap::new())
+        let mut b = Builder::new();
+        let r = b.push_var(i);
+        Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
     }
 
     /// A constant.
     #[must_use]
     pub fn constant(v: f32) -> Self {
-        let mut a = ExprArena::new();
-        let r = a.push_const(v);
-        Self::wrap(a, r, BTreeMap::new())
+        let mut b = Builder::new();
+        let r = b.push_const(v);
+        Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
     }
 
     /// Adopt an already-built fragment — the `kernel!` macro's entry point.
@@ -284,20 +354,29 @@ impl Kernel {
     /// thing that becomes machine code.
     #[must_use]
     pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
+        let (rooted, env) = from_arena(&arena, root);
+        let entry = rooted.entry();
         assert!(
-            arena.retired_axis(root).is_none(),
+            entry.retired_axis().is_none(),
             "Kernel::from_parts: the arena names Var({}), which was the {} \
              coordinate; a lattice has {} axes and a per-call scalar is a \
              Uniform (docs/plans/2026-09-06-lattice-is-the-index.md)",
-            arena.retired_axis(root).unwrap_or_default(),
-            if arena.retired_axis(root) == Some(2) {
+            entry.retired_axis().unwrap_or_default(),
+            if entry.retired_axis() == Some(2) {
                 "Z"
             } else {
                 "W"
             },
             crate::arena::COORD_AXES,
         );
-        Self::wrap(arena, root, BTreeMap::new())
+        Self {
+            inner: Arc::new(KernelData {
+                rooted,
+                env,
+                legacy: (arena, root),
+                buffers: BTreeMap::new(),
+            }),
+        }
     }
 
     // ───────────────────── the builder seam ───────────────────────
@@ -311,31 +390,40 @@ impl Kernel {
 
     /// Apply a unary node.
     fn map(&self, op: OpKind) -> Self {
-        let mut arena = self.inner.arena.clone();
-        let root = arena.push_unary(op, self.inner.root);
-        Self::wrap(arena, root, self.inner.buffers.clone())
+        let mut b = Builder::new();
+        let r = copy_subgraph(&mut b, self.root());
+        let root = b.push_unary(op, r);
+        Self::wrap(
+            b.finish(&[root]),
+            self.inner.env.clone(),
+            self.inner.buffers.clone(),
+        )
     }
 
     /// Apply a binary node with `self` on the left and `rhs` spliced in.
     fn combine(&self, rhs: &Kernel, op: OpKind) -> Self {
-        let mut arena = self.inner.arena.clone();
-        let rhs_root = arena.splice(&rhs.inner.arena, rhs.inner.root);
-        let root = arena.push_binary(op, self.inner.root, rhs_root);
+        let mut b = Builder::new();
+        let mut env = self.inner.env.clone();
+        let lhs_root = copy_subgraph(&mut b, self.root());
+        let rhs_root = splice(&mut b, &mut env, rhs.root(), &rhs.inner.env);
+        let root = b.push_binary(op, lhs_root, rhs_root);
         let mut buffers = self.inner.buffers.clone();
         merge_buffer_data(&mut buffers, &rhs.inner.buffers);
-        Self::wrap(arena, root, buffers)
+        Self::wrap(b.finish(&[root]), env, buffers)
     }
 
     /// Apply a ternary node with `self` first and `b`, `c` spliced in.
     fn combine3(&self, b: &Kernel, c: &Kernel, op: OpKind) -> Self {
-        let mut arena = self.inner.arena.clone();
-        let b_root = arena.splice(&b.inner.arena, b.inner.root);
-        let c_root = arena.splice(&c.inner.arena, c.inner.root);
-        let root = arena.push_ternary(op, self.inner.root, b_root, c_root);
+        let mut builder = Builder::new();
+        let mut env = self.inner.env.clone();
+        let a_root = copy_subgraph(&mut builder, self.root());
+        let b_root = splice(&mut builder, &mut env, b.root(), &b.inner.env);
+        let c_root = splice(&mut builder, &mut env, c.root(), &c.inner.env);
+        let root = builder.push_ternary(op, a_root, b_root, c_root);
         let mut buffers = self.inner.buffers.clone();
         merge_buffer_data(&mut buffers, &b.inner.buffers);
         merge_buffer_data(&mut buffers, &c.inner.buffers);
-        Self::wrap(arena, root, buffers)
+        Self::wrap(builder.finish(&[root]), env, buffers)
     }
 
     // ───────────────────────── arithmetic ─────────────────────────
@@ -600,15 +688,16 @@ impl Kernel {
         let Some((head, tail)) = kernels.split_first() else {
             return Self::constant(monoid.identity());
         };
-        let mut arena = head.inner.arena.clone();
-        let mut root = head.inner.root;
+        let mut b = Builder::new();
+        let mut env = head.inner.env.clone();
+        let mut root = copy_subgraph(&mut b, head.root());
         let mut buffers = head.inner.buffers.clone();
         for k in tail {
-            let rhs = arena.splice(&k.inner.arena, k.inner.root);
-            root = arena.push_binary(op, root, rhs);
+            let rhs = splice(&mut b, &mut env, k.root(), &k.inner.env);
+            root = b.push_binary(op, root, rhs);
             merge_buffer_data(&mut buffers, &k.inner.buffers);
         }
-        Self::wrap(arena, root, buffers)
+        Self::wrap(b.finish(&[root]), env, buffers)
     }
 
     /// `⊕_{i ∈ 0..extent} body(i)` — **the** reduction binder: fold `body` over
@@ -641,20 +730,25 @@ impl Kernel {
         // (and therefore its inner binders) does not exist yet.
         let scope = BinderScope::enter();
         let index = {
-            let mut a = ExprArena::new();
-            let r = a.push_var(scope.placeholder());
-            Self::wrap(a, r, BTreeMap::new())
+            let mut b = Builder::new();
+            let r = b.push_var(scope.placeholder());
+            Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
         };
         let body = body(&index);
 
-        let mut arena = body.inner.arena.clone();
-        let binder = lowest_free_binder(&arena);
-        let renamed = arena.push_var(binder.var());
-        let root = arena.substitute_vars_with(body.inner.root, &[(scope.placeholder(), renamed)]);
-        let root = arena.push_reduce(Fold::new(monoid, binder, 0..extent), root);
-        // Only `body`'s own arena is used above — no other kernel is
-        // spliced in — so its buffer table carries forward unchanged.
-        Self::wrap(arena, root, body.inner.buffers.clone())
+        let mut b = Builder::new();
+        let env = body.inner.env.clone();
+        let binder = lowest_free_binder(body.dag());
+        let renamed = b.push_var(binder.var());
+        let body_root = substitute_vars(&mut b, body.root(), &[(scope.placeholder(), renamed)]);
+        // One typed node. The encoding this replaced pushed three `Const`
+        // children — combiner index, binder slot, extent — and left every
+        // reader to recover them by position and by asking a float whether
+        // it was really a small integer.
+        let root = b.push_reduce(Fold::new(monoid, binder, 0..extent), body_root);
+        // Only `body`'s own graph is used above — no other kernel is spliced
+        // in — so its buffer table carries forward unchanged.
+        Self::wrap(b.finish(&[root]), env, body.inner.buffers.clone())
     }
 
     /// `Σ_{i ∈ 0..extent} body(i)` — contraction, projection, and every other
@@ -711,18 +805,19 @@ impl Kernel {
         // `Ref` is opaque to substitution — it has no `Var` to rewrite here,
         // only a name — so leaving one in place would sample the referent at
         // the outer coordinates and produce plausible, wrong pixels. Expand
-        // first. Identity (a clone, which this already did) when there is no
-        // reference to expand; when there is, this is the static-linking
-        // direction taken, which is the only direction that exists yet.
-        let (mut arena, self_root) =
-            crate::passes::expand_refs_owned(&self.inner.arena, self.inner.root);
-        let x = arena.splice(&cx.inner.arena, cx.inner.root);
-        let y = arena.splice(&cy.inner.arena, cy.inner.root);
-        let root = arena.substitute_vars_with(self_root, &[(0, x), (1, y)]);
-        let mut buffers = self.inner.buffers.clone();
+        // first. Identity (a clone) when there is no reference to expand;
+        // when there is, this is the static-linking direction taken, which
+        // is the only direction that exists yet.
+        let linked = self.linked();
+        let mut b = Builder::new();
+        let mut env = linked.inner.env.clone();
+        let x = splice(&mut b, &mut env, cx.root(), &cx.inner.env);
+        let y = splice(&mut b, &mut env, cy.root(), &cy.inner.env);
+        let root = substitute_vars(&mut b, linked.root(), &[(0, x), (1, y)]);
+        let mut buffers = linked.inner.buffers.clone();
         merge_buffer_data(&mut buffers, &cx.inner.buffers);
         merge_buffer_data(&mut buffers, &cy.inner.buffers);
-        Self::wrap(arena, root, buffers)
+        Self::wrap(b.finish(&[root]), env, buffers)
     }
 
     /// The derivative `∂self/∂var` (0=X, 1=Y), resolved symbolically at
@@ -740,10 +835,15 @@ impl Kernel {
              (0 = X, 1 = Y)",
             crate::arena::COORD_AXES
         );
-        let mut arena = self.inner.arena.clone();
-        let v = arena.push_const(f32::from(var));
-        let root = arena.push_binary(OpKind::Dwrt, self.inner.root, v);
-        Self::wrap(arena, root, self.inner.buffers.clone())
+        let mut b = Builder::new();
+        let r = copy_subgraph(&mut b, self.root());
+        let v = b.push_const(f32::from(var));
+        let root = b.push_binary(OpKind::Dwrt, r, v);
+        Self::wrap(
+            b.finish(&[root]),
+            self.inner.env.clone(),
+            self.inner.buffers.clone(),
+        )
     }
 
     /// `∂self/∂X`.
@@ -763,7 +863,7 @@ impl Kernel {
     /// of the composition surface; consumers use the methods above.
     #[must_use]
     pub fn parts(&self) -> (&ExprArena, ExprId) {
-        (&self.inner.arena, self.inner.root)
+        (&self.inner.legacy.0, self.inner.legacy.1)
     }
 
     // ────────────────────────── linking ───────────────────────────
@@ -803,10 +903,8 @@ impl Kernel {
     #[cfg(feature = "std")]
     #[must_use]
     pub fn by_ref(&self) -> Self {
-        let open = self
-            .inner
-            .arena
-            .free_var_at_or_above(self.inner.root, PLACEHOLDER_BASE as u8);
+        let (arena, root) = self.parts();
+        let open = arena.free_var_at_or_above(root, PLACEHOLDER_BASE as u8);
         assert!(
             open.is_none(),
             "Kernel::by_ref: this kernel holds Var({}), a reduction binder's \
@@ -815,9 +913,31 @@ impl Kernel {
             open.unwrap_or_default(),
         );
         let key = crate::store::KernelStore::intern(self);
-        let mut a = ExprArena::new();
-        let r = a.push_ref(key);
-        Self::wrap(a, r, self.inner.buffers.clone())
+        let mut b = Builder::new();
+        let r = b.push_ref(key);
+        Self::wrap(
+            b.finish(&[r]),
+            self.inner.env.clone(),
+            self.inner.buffers.clone(),
+        )
+    }
+
+    /// This kernel with every [`Ref`](ExprData::Ref) resolved to its
+    /// referent — the static-linking direction of `Ref(k) ⟷ body(k)`, and
+    /// the only direction that exists yet.
+    ///
+    /// A cheap clone when there is no reference to expand, which is the
+    /// common case; the scan is over this kernel's own nodes, not its
+    /// referents'.
+    #[must_use]
+    fn linked(&self) -> Self {
+        if !self.dag().iter().any(|n| matches!(*n, ExprData::Ref(_))) {
+            return self.clone();
+        }
+        let (arena, root) = self.parts();
+        let (expanded, expanded_root) = crate::passes::expand_refs_owned(arena, root);
+        let (rooted, env) = from_arena(&expanded, expanded_root);
+        Self::wrap(rooted, env, self.inner.buffers.clone())
     }
 
     // ────────────────────── bound-memory link ──────────────────────
@@ -846,7 +966,7 @@ impl Kernel {
     pub fn with_buffer_data(&self, id: BufferIdentity, data: Arc<[f32]>) -> Self {
         let mut buffers = self.inner.buffers.clone();
         merge_buffer_data(&mut buffers, &BTreeMap::from([(id, data)]));
-        Self::wrap(self.inner.arena.clone(), self.inner.root, buffers)
+        Self::wrap(self.inner.rooted.clone(), self.inner.env.clone(), buffers)
     }
 
     /// The tabulations this kernel carries, by the [`BufferIdentity`] each
@@ -889,11 +1009,16 @@ impl Bits {
     #[must_use]
     pub fn shl(&self, bits: u32) -> Self {
         assert!(bits < 32, "Bits::shl: shift of {bits} on a 32-bit lane");
-        let mut arena = self.inner.inner.arena.clone();
-        let count = arena.push_const(bits as f32);
-        let root = arena.push_binary(OpKind::Shl, self.inner.inner.root, count);
+        let mut b = Builder::new();
+        let r = copy_subgraph(&mut b, self.inner.root());
+        let count = b.push_const(bits as f32);
+        let root = b.push_binary(OpKind::Shl, r, count);
         Self {
-            inner: Kernel::wrap(arena, root, self.inner.inner.buffers.clone()),
+            inner: Kernel::wrap(
+                b.finish(&[root]),
+                self.inner.inner.env.clone(),
+                self.inner.inner.buffers.clone(),
+            ),
         }
     }
 
