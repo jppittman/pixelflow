@@ -205,6 +205,7 @@ roughly 800 lines to 150 — and makes H1's padding free.
 | **C3** | `CachedText::kernel` sums glyph coverages, so overlapping glyphs can exceed 1. Not on any production path — `core-term` renders through `GlyphAtlas`, and `CachedText` has no non-test caller. | — |
 | **C4** | A corpus needs a new acceptance criterion before `gen_bench_corpus` can come back; its quarantine gate compared against the interpreter. | CLAUDE.md, "Cost Model and the Guide" |
 | **C5** | A local CI runner, so a full presubmit does not cost a push. | — |
+| **C6** | **A transient cache-service error fails a whole job before it compiles anything.** Every job sets `RUSTC_WRAPPER: sccache` with the GitHub Actions cache backend, so sccache is a hard dependency of `rustc` rather than an accelerator: on 2026-09-10 a DNS failure reaching `productionresultssa*.blob.core.windows.net` killed `ISA matrix` at `rustc -vV` with `compile_requests: 0`, on a docs-only commit whose parent had passed the same job. sccache offers `SCCACHE_IGNORE_SERVER_IO_ERROR=1` for exactly this — degrade to no cache instead of failing. A spurious red costs a cycle and, worse, teaches everyone to re-run reds without reading them. | — |
 
 ## Housekeeping
 

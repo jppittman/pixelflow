@@ -51,8 +51,10 @@ Behavior every target agrees on, pinned by
 | `exp`, `exp2` | saturate past ±126 exponents rather than overflowing to `inf` |
 
 A mask is a bit pattern, not a number, and that is a load-bearing distinction:
-`Select` is a bitwise blend on every backend (`andps`/`andnps`/`orps`,
-`vpternlogd 0xCA`, `BSL`) and `BitAnd`/`BitOr` are literal bitwise ops. Spell a
+`Select`'s **mixed-lane path** is a bitwise blend on every backend
+(`andps`/`andnps`/`orps`, `vpternlogd 0xCA`, `BSL`) and `BitAnd`/`BitOr` are
+literal bitwise ops. (The blend is the path a *lane-varying* mask takes, not
+what `Select` is — see "Select contains an if" below.) Spell a
 true mask `1.0` and `mask & 1.0` is `0x3f800000`, which blends `7.0` against
 `9.0` into `4.5` — a value neither branch held. `OpKind::mask(bool)` is the only
 constructor, `OpKind::is_bitwise_domain()` marks the ops whose results are
@@ -387,30 +389,37 @@ Priority: AVX-512 > SSE2 (x86-64), NEON (aarch64) — no scalar fallback for oth
 
   **Branchless is the limit**: no case survives to runtime at all, because one
   expression is correct for every input. It is what this codebase is made of —
-  `Select` is a bitwise blend on every backend, a comparison yields a mask
-  rather than a `bool`, and the language is a DAG with no binder — so take it
-  wherever the hardware offers it. What it does not license is hand-rolling a
+  a comparison yields a mask rather than a `bool`, and the language is a DAG
+  with no binder — so take it wherever the hardware offers it. `Select` is
+  **not** an example of it, however much it looks like one; see "Select
+  contains an if" below. What it does not license is hand-rolling a
   *worse* branchless form than the instruction already there: the retired
   `Round` expansion (`(x + 0.5).floor()`, two instructions where `roundps` is
   one, and not any IEEE rounding mode) is the worked counter-example, and
   "Floating point at the edges" above is the long version.
 
-  Note *what* is branchless, because `Select` is not the example it looks like.
-  The **instruction stream** is branchless: a bitwise blend, every lane, always.
-  The **denotation is a conditional** — `Select(m, a, b)` *means* `if m then a
-  else b`, and that is two cases, not one. Both arms stay live and everything
+  **Select contains an if.** `Select(m, a, b)` *means* `if m then a else b`,
+  and that is two cases, not one. Both arms stay live and everything
   downstream carries both. By this section's own taxonomy `Select` is
-  **dispatch**, not a fold. It is the cheapest dispatch the hardware sells and
-  worth reaching for on those grounds, but it collapses no case and must not be
-  read as if it did.
+  **dispatch**, not a fold — it collapses no case and must not be read as if
+  it did.
 
-  Codegen may then put a real branch back: a short-circuit skipping an arm no
-  lane selected (`emit/guards.rs`, bought only where the arm outcosts
-  `MISPREDICT_PENALTY_CYCLES`, since mask coherence is a property of the data
-  that no static analysis can know). That branch changes the work done, never
-  the value — sound precisely *because* the meaning already carried the case.
-  It is not smuggling a condition in; it is spending one the language always
-  had.
+  So the jump is not an optimization codegen may buy; **the jump is what
+  `Select` is.** A batch whose mask is uniform takes an arm — that is the
+  conditional, executed. A batch whose mask varies *by lane* is the case a
+  jump cannot serve, because different lanes want different arms, and the
+  bitwise blend is the fallback for exactly that case. Blend is the
+  lane-varying path, not the definition.
+
+  Getting that default backwards is what produced `emit/guards.rs`: with
+  blend as the definition, a branch has to be *bought* per select
+  (`MISPREDICT_PENALTY_CYCLES`) and, worse, an arm is only eligible when the
+  values it owns happen to be one contiguous run of a flat schedule — so
+  `cluster_select_arms` permutes the schedule looking for that, in rounds,
+  and it measured **73% of a glyph bake** while finding a constant 282 bytes
+  (docs/BACKLOG.md, X1). Emit the arms as blocks and there is nothing to
+  search for: contiguity is a consequence of building the structure rather
+  than a property to be recovered after destroying it.
 
   The distinction is load-bearing, and getting it backwards has already cost.
   If a select's meaning carries one case, then "which values does this arm
