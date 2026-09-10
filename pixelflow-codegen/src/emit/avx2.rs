@@ -993,9 +993,9 @@ pub(crate) mod driver {
     }
 
     impl IsaBackend for Avx2Backend {
-        type Cond = x86::Branch;
-
-        const JUMP: Self::Cond = x86::Branch::Always;
+        fn jump(&mut self, asm: &mut Assembly, label: Label) {
+            asm.push(x86::Jmp { target: label });
+        }
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1150,24 +1150,17 @@ pub(crate) mod driver {
         // all-true, not 0x0F — see `super::emit_cmp_al_imm8`'s doc for why the
         // sign-extending `cmp eax, imm8` X86Backend uses doesn't work here).
         /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
         /// `_scratch` is unused: this tier reduces the mask with `movmskps`
         /// into the flags, needing no vector register.
-        fn compare_mask(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-            arm: SelectArm,
-        ) -> x86::Branch {
-            super::emit_movmskps_eax(code, mask_reg);
-            match arm {
+        fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+            super::emit_movmskps_eax(&mut asm.code, test.reg);
+            match test.arm {
                 // ZF set when eax == 0: no lane is true, so the true arm is dead.
-                SelectArm::True => x86_64::emit_test_eax(code),
+                SelectArm::True => x86_64::emit_test_eax(&mut asm.code),
                 // ZF set when al == 0xFF: every lane is true, so the false arm is.
-                SelectArm::False => super::emit_cmp_al_imm8(code, 0xFF),
+                SelectArm::False => super::emit_cmp_al_imm8(&mut asm.code, 0xFF),
             }
-            x86::Branch::IfEqual
+            asm.push(x86::Jcc::je(label));
         }
 
         // Same scaffold register roles as SSE2 — see `x86_64::scaffold` — at
@@ -1211,8 +1204,8 @@ pub(crate) mod driver {
             x86::scaffold::counter_step(code, counter);
         }
 
-        fn compare_counter(&mut self, code: &mut Vec<u8>, counter: Counter) -> x86::Branch {
-            x86::scaffold::compare_counter(code, counter)
+        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
+            x86::scaffold::branch_if_counter_done(asm, counter, label);
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -1235,6 +1228,7 @@ pub(crate) mod driver {
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
         }
 
+        /// `ucomiss` is scalar, so this tier's wider broadcast makes no
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
             AsmProgram::from([x86::Inst::Ret]).assemble(code);
         }

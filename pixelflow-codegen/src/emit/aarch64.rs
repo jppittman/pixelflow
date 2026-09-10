@@ -3,7 +3,7 @@
 //! Each function emits raw machine code bytes for one instruction (or a small fixed sequence).
 //! These are the "atoms" that compound operations are built from.
 
-use super::{AsmInsn, AsmProgram, Gpr, PtrReg, Reg, assemble, unimplemented_op};
+use super::{AsmInsn, AsmProgram, Gpr, Label, LabelRef, PtrReg, Reg, assemble, unimplemented_op};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -85,6 +85,10 @@ pub enum Inst {
     // Control & GPR
     Ret,
     Raw(u32),
+
+    B(B),
+    BCond(BCond),
+    CbzW16(CbzW16),
 }
 
 impl Inst {
@@ -202,6 +206,12 @@ impl Inst {
             Inst::FmovToGp(src) => FmovToGp::new(src).encode(),
             Inst::Ret => Ret.encode(),
             Inst::Raw(w) => w,
+            // A branch's word is not a pure function of the instruction: its
+            // displacement is not known until the label lands, so it is
+            // written by the assembler and there is nothing to encode here.
+            Inst::B(_) => 0x1400_0000,
+            Inst::BCond(b) => 0x5400_0000 | b.condition as u32,
+            Inst::CbzW16(_) => 0x3400_0010,
         }
     }
 }
@@ -259,10 +269,47 @@ impl From<table::MvnW> for Inst {
     }
 }
 
+impl From<B> for Inst {
+    #[inline(always)]
+    fn from(b: B) -> Self {
+        Inst::B(b)
+    }
+}
+
+impl From<BCond> for Inst {
+    #[inline(always)]
+    fn from(b: BCond) -> Self {
+        Inst::BCond(b)
+    }
+}
+
+impl From<CbzW16> for Inst {
+    #[inline(always)]
+    fn from(b: CbzW16) -> Self {
+        Inst::CbzW16(b)
+    }
+}
+
 impl crate::emit::AsmInsn for Inst {
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        // A branch is an ordinary instruction whose operand happens to be a
+        // name: `emit_into` writes its word with a zero displacement, and this
+        // says which label the assembler should measure it against.
+        match self {
+            Inst::B(b) => b.label_ref(),
+            Inst::BCond(b) => b.label_ref(),
+            Inst::CbzW16(b) => b.label_ref(),
+            _ => None,
+        }
+    }
+
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         match self {
+            Inst::B(b) => b.emit_into(code),
+            Inst::BCond(b) => b.emit_into(code),
+            Inst::CbzW16(b) => b.emit_into(code),
             Inst::Ldr(ldr) => ldr.emit_into(code),
             Inst::Str(str) => str.emit_into(code),
             Inst::Mov(dst, src) => {
@@ -1758,9 +1805,9 @@ pub(crate) mod driver {
     }
 
     impl IsaBackend for Aarch64Backend {
-        type Cond = super::Branch;
-
-        const JUMP: Self::Cond = super::Branch::Always;
+        fn jump(&mut self, asm: &mut Assembly, label: Label) {
+            asm.push(B { target: label });
+        }
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1843,29 +1890,23 @@ pub(crate) mod driver {
         /// Both polarities end in `cbz w16`, so the arm chooses the
         /// *reduction*: a horizontal max is zero exactly when no lane is set,
         /// and an inverted horizontal min is zero exactly when every lane is.
-        fn compare_mask(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            scratch: Option<Reg>,
-            arm: SelectArm,
-        ) -> super::Branch {
-            let scratch = guard_scratch(scratch, mask_reg);
-            match arm {
+        fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+            let scratch = guard_scratch(test.scratch, test.reg);
+            match test.arm {
                 SelectArm::True => {
-                    AsmProgram::from([Inst::Umaxv(scratch, mask_reg), Inst::FmovToGp(scratch)])
-                        .assemble(code);
+                    AsmProgram::from([Inst::Umaxv(scratch, test.reg), Inst::FmovToGp(scratch)])
+                        .assemble(&mut asm.code);
                 }
                 SelectArm::False => {
                     AsmProgram::from([
-                        Inst::Uminv(scratch, mask_reg),
+                        Inst::Uminv(scratch, test.reg),
                         Inst::FmovToGp(scratch),
                         Inst::mvn_w(X16, X16),
                     ])
-                    .assemble(code);
+                    .assemble(&mut asm.code);
                 }
             }
-            super::Branch::IfW16Zero
+            asm.push(CbzW16 { target: label });
         }
 
         // AAPCS64: x0 = ctx (read-only in the body's gathers), x1 = out,
@@ -1930,11 +1971,11 @@ pub(crate) mod driver {
             AsmProgram::from([table::AddI64::new(r, r, table::Imm12(1))]).assemble(code);
         }
 
-        fn compare_counter(&mut self, code: &mut Vec<u8>, counter: Counter) -> super::Branch {
+        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
             AsmProgram::from([table::CmpI64::new(counter_reg(counter), bound_reg(counter))])
-                .assemble(code);
+                .assemble(&mut asm.code);
             // The counter runs up to an unsigned bound, so "done" is `>=`.
-            super::Branch::IfAboveOrEqual
+            asm.push(BCond::hs(label));
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -2336,52 +2377,15 @@ pub fn ret(code: &mut Vec<u8>) {
     emit32(code, 0xD65F_03C0);
 }
 
-/// The three branch placeholders, each returning where it put its word.
-///
-/// The displacement is left zero: only [`Branch::place`] calls these, and it
-/// hands the position to a [`Resolver`](crate::emit::Resolver) that writes the
-/// displacement once the target is bound. They are `#[must_use]` because a
-/// placeholder whose position is dropped can never be filled in, and a branch
-/// with a zero displacement branches to itself.
-///
-/// `cbz w16, #0` — taken when W16 is zero (see [`Branch::IfW16Zero`]).
-#[inline(always)]
-#[must_use = "the position is the only way to fill in the displacement"]
-pub fn cbz_w16(code: &mut Vec<u8>) -> usize {
-    let at = code.len();
-    emit32(code, 0x3400_0010);
-    at
-}
-
-/// `b.hs #0` — taken when the previous [`cmp`] found `lhs >= rhs` unsigned.
-#[inline(always)]
-#[must_use = "the position is the only way to fill in the displacement"]
-pub fn b_hs(code: &mut Vec<u8>) -> usize {
-    let at = code.len();
-    emit32(code, 0x5400_0002);
-    at
-}
-
-/// `b #0` — unconditional.
-#[inline(always)]
-#[must_use = "the position is the only way to fill in the displacement"]
-pub fn b_placeholder(code: &mut Vec<u8>) -> usize {
-    let at = code.len();
-    emit32(code, 0x1400_0000);
-    at
-}
-
 // =============================================================================
 // Branches as program items
 // =============================================================================
 
 /// Where a branch keeps its displacement, and how far it reaches.
 ///
-/// aarch64 has no single `rel32`: `B` carries a 26-bit word displacement in the
-/// low bits, and `B.cond`/`CBZ` carry a 19-bit one starting at bit 5. Two
-/// fields, two ranges — so which one a branch uses is part of what the branch
-/// *is*, and this type says it once instead of every conditional repeating the
-/// shift and the mask.
+/// A64 has no single `rel32`: `B` carries a 26-bit word displacement in the low
+/// bits, and `B.cond`/`CBZ` carry a 19-bit one starting at bit 5. Two fields,
+/// two ranges — so which one a branch uses is part of what the branch *is*.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct DispField {
     /// Bit position of the field's low end.
@@ -2396,132 +2400,283 @@ impl DispField {
     /// `B.cond`'s and `CBZ`'s imm19, at bit 5 — ±1 MiB.
     const IMM19: Self = Self { shift: 5, bits: 19 };
 
-    /// Overwrite this field of the instruction word at `at`, leaving every
-    /// other bit — opcode, condition, register — exactly as placed.
-    fn write(
-        self,
-        code: &mut [u8],
-        at: usize,
-        words: i64,
-    ) -> Result<(), crate::error::CompileError> {
+    /// Overwrite this field of the instruction word at `at` so the branch
+    /// reaches `target`, leaving every other bit — opcode, condition, register
+    /// — exactly as placed.
+    ///
+    /// # Panics
+    ///
+    /// If the displacement is not a whole number of instructions, or does not
+    /// fit. The first is a bug in this crate; the second is a real limit of the
+    /// encoding, though unreachable for anything that compiles — the widest
+    /// body this emitter has produced is 34,993 instructions against `B.cond`'s
+    /// 262,144-word reach.
+    fn write(self, code: &mut [u8], at: usize, target: usize) {
+        let bytes = target as i64 - at as i64;
+        assert!(
+            bytes % 4 == 0,
+            "aarch64 branch displacement is not a whole number of instructions"
+        );
+        let words = bytes / 4;
         let limit = 1i64 << (self.bits - 1);
-        if !(-limit..limit).contains(&words) {
-            return Err(crate::error::CompileError::BranchOutOfRange);
-        }
+        assert!(
+            (-limit..limit).contains(&words),
+            "branch displacement {words} does not fit {} bits",
+            self.bits
+        );
         let mask = ((1u32 << self.bits) - 1) << self.shift;
         let field = ((words as u32) << self.shift) & mask;
         let existing = u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
         code[at..at + 4].copy_from_slice(&((existing & !mask) | field).to_le_bytes());
-        Ok(())
     }
 }
 
-/// A branch to a [`Label`](crate::emit::Label), as a declarative program item.
+/// The 4-bit condition an A64 `B.cond` tests — the whole field, not a
+/// selection.
 ///
-/// Named by the condition it tests, not by the mnemonic: a caller says what
-/// must be true for the branch to be taken, and this type owns which
-/// instruction spells that and which field carries the displacement.
+/// `B.cond` is one instruction whose low nibble *is* this value, so the
+/// assembler encodes it by casting. Named by the ARM ARM's mnemonics.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Branch {
-    /// `b` — unconditional, ±128 MiB.
-    Always,
-    /// `b.hs` — the previous [`cmp`] found `lhs >= rhs`, unsigned. ±1 MiB.
-    IfAboveOrEqual,
-    /// `cbz w16` — W16 is zero.
+#[repr(u8)]
+pub enum Cond {
+    /// Equal — Z set.
+    Eq = 0x0,
+    /// Not equal — Z clear.
+    Ne = 0x1,
+    /// `HS` / `CS` — C set; unsigned `>=`, and after `FCMP` also "or
+    /// unordered".
+    Hs = 0x2,
+    /// `LO` / `CC` — C clear; unsigned `<`.
+    Lo = 0x3,
+    /// Minus — N set.
+    Mi = 0x4,
+    /// Plus — N clear.
+    Pl = 0x5,
+    /// Overflow set.
+    Vs = 0x6,
+    /// Overflow clear.
+    Vc = 0x7,
+    /// Unsigned `>`.
+    Hi = 0x8,
+    /// Unsigned `<=`.
+    Ls = 0x9,
+    /// Signed `>=`.
+    Ge = 0xA,
+    /// Signed `<`.
+    Lt = 0xB,
+    /// Signed `>`.
+    Gt = 0xC,
+    /// Signed `<=`.
+    Le = 0xD,
+    /// Always.
+    Al = 0xE,
+    /// Never — the encoding exists; the branch is not taken.
+    Nv = 0xF,
+}
+
+/// `b target` — an unconditional branch to a [`Label`], ±128 MiB.
+///
+/// A struct, like every other instruction here, and its label is an operand
+/// like any other. It emits a zero displacement; the assembler writes the real
+/// one once the label lands, which is what [`AsmInsn::label_ref`] tells it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct B {
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl AsmInsn for B {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        emit32(code, 0x1400_0000);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| DispField::IMM26.write(code, at, target),
+        })
+    }
+}
+
+/// `b.cond target` — a conditional branch to a [`Label`], ±1 MiB.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BCond {
+    /// What must hold for the branch to be taken.
+    pub condition: Cond,
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl BCond {
+    /// One constructor per mnemonic, so a call site reads like the assembly it
+    /// is: `BCond::hs(exit)` for `b.hs exit`.
     ///
-    /// W16 rather than a register operand because W16 *is* the branch-test
-    /// scratch in this backend's ABI: the guard path reduces a mask into it
-    /// with `umaxv`/`uminv` + `fmov`, and nothing else may hold a value there.
-    /// A register parameter would suggest a choice the ABI does not offer.
-    IfW16Zero,
-}
+    /// Sugar over the one encoder, not sixteen types: `B.cond` is a single
+    /// instruction whose low nibble is [`Cond`].
+    #[must_use]
+    #[inline(always)]
+    pub const fn eq(target: Label) -> Self {
+        Self::on(Cond::Eq, target)
+    }
+    /// `b.ne`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn ne(target: Label) -> Self {
+        Self::on(Cond::Ne, target)
+    }
+    /// `b.hs` / `b.cs` — unsigned `>=`, and after `FCMP` also "or unordered".
+    #[must_use]
+    #[inline(always)]
+    pub const fn hs(target: Label) -> Self {
+        Self::on(Cond::Hs, target)
+    }
+    /// `b.lo` / `b.cc` — unsigned `<`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn lo(target: Label) -> Self {
+        Self::on(Cond::Lo, target)
+    }
+    /// `b.hi` — unsigned `>`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn hi(target: Label) -> Self {
+        Self::on(Cond::Hi, target)
+    }
+    /// `b.ls` — unsigned `<=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn ls(target: Label) -> Self {
+        Self::on(Cond::Ls, target)
+    }
+    /// `b.ge` — signed `>=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn ge(target: Label) -> Self {
+        Self::on(Cond::Ge, target)
+    }
+    /// `b.lt` — signed `<`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn lt(target: Label) -> Self {
+        Self::on(Cond::Lt, target)
+    }
+    /// `b.gt` — signed `>`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn gt(target: Label) -> Self {
+        Self::on(Cond::Gt, target)
+    }
+    /// `b.le` — signed `<=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn le(target: Label) -> Self {
+        Self::on(Cond::Le, target)
+    }
+    /// `b.mi` — negative.
+    #[must_use]
+    #[inline(always)]
+    pub const fn mi(target: Label) -> Self {
+        Self::on(Cond::Mi, target)
+    }
+    /// `b.pl` — non-negative.
+    #[must_use]
+    #[inline(always)]
+    pub const fn pl(target: Label) -> Self {
+        Self::on(Cond::Pl, target)
+    }
+    /// `b.vs` — overflow set.
+    #[must_use]
+    #[inline(always)]
+    pub const fn vs(target: Label) -> Self {
+        Self::on(Cond::Vs, target)
+    }
+    /// `b.vc` — overflow clear.
+    #[must_use]
+    #[inline(always)]
+    pub const fn vc(target: Label) -> Self {
+        Self::on(Cond::Vc, target)
+    }
 
-impl Branch {
-    /// Which field of the instruction word carries this branch's displacement.
-    const fn field(self) -> DispField {
-        match self {
-            Self::Always => DispField::IMM26,
-            Self::IfAboveOrEqual | Self::IfW16Zero => DispField::IMM19,
-        }
+    /// The branch on a condition chosen at run time, where no single mnemonic
+    /// names it.
+    #[must_use]
+    #[inline(always)]
+    pub const fn on(condition: Cond, target: Label) -> Self {
+        Self { condition, target }
     }
 }
 
-impl crate::emit::AsmBranch for Branch {
+impl AsmInsn for BCond {
     #[inline]
-    fn place(self, code: &mut Vec<u8>) -> (usize, usize) {
-        // The position comes from the placeholder that wrote the word, not from
-        // a second reading of `code.len()`. That is also what spends the
-        // `#[must_use]` fixup token honestly: under labels the patching is
-        // `assemble_labeled`'s, so what these constructors still have to offer
-        // is where they put the instruction.
-        let at = match self {
-            Self::Always => b_placeholder(code),
-            Self::IfAboveOrEqual => b_hs(code),
-            Self::IfW16Zero => cbz_w16(code),
-        };
-        // A64 displacements are measured from the branch's own address, and
-        // the whole instruction is the field's home, so both are `at`.
-        (at, at)
+    fn emit_into(self, code: &mut Vec<u8>) {
+        emit32(code, 0x5400_0000 | self.condition as u32);
     }
 
     #[inline]
-    fn resolve(
-        self,
-        code: &mut [u8],
-        fixup: crate::emit::Fixup,
-        target: usize,
-    ) -> Result<(), crate::error::CompileError> {
-        use crate::error::CompileError;
-        let bytes = i64::try_from(target).map_err(|_| CompileError::BranchOutOfRange)?
-            - i64::try_from(fixup.origin).map_err(|_| CompileError::BranchOutOfRange)?;
-        if bytes % 4 != 0 {
-            // Every A64 instruction is four bytes, so an odd displacement means
-            // this crate laid something out unaligned — not a fact about the
-            // branch.
-            return Err(CompileError::Internal(
-                "aarch64 branch displacement is not a whole number of instructions",
-            ));
-        }
-        self.field().write(code, fixup.at, bytes / 4)
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| DispField::IMM19.write(code, at, target),
+        })
+    }
+}
+
+/// `cbz w16, target` — taken when W16 is zero. ±1 MiB.
+///
+/// W16 rather than a register operand because W16 *is* the branch-test scratch
+/// in this backend's ABI: the guard path reduces a mask into it with
+/// `umaxv`/`uminv` + `fmov`, and nothing else may hold a value there. A
+/// register parameter would suggest a choice the ABI does not offer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CbzW16 {
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl AsmInsn for CbzW16 {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        emit32(code, 0x3400_0010);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| DispField::IMM19.write(code, at, target),
+        })
     }
 }
 
 #[cfg(test)]
 mod label_tests {
     use super::*;
-    use crate::emit::{AsmBranch as _, Item, LabelScope, assemble_labeled};
-    use crate::error::CompileError;
+    use crate::emit::{AsmProgram, Item, Label};
 
-    /// An `AsmInsn` of one known word, so a test can measure distances in
-    /// instructions without depending on any real encoding.
-    #[derive(Copy, Clone)]
-    struct Nop;
+    /// One known word, so a test can measure distances in instructions without
+    /// depending on any real encoding.
+    const NOP: Inst = Inst::Raw(0xD503_201F);
 
-    impl AsmInsn for Nop {
-        fn emit_into(self, code: &mut Vec<u8>) {
-            emit32(code, 0xD503_201F);
-        }
+    fn assemble(items: impl IntoIterator<Item = Item<Inst>>) -> Vec<u8> {
+        let mut code = Vec::new();
+        AsmProgram::new(items).assemble(&mut code);
+        code
     }
 
     fn word_at(code: &[u8], at: usize) -> u32 {
         u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
     }
 
-    fn assemble(items: Vec<Item<Nop, Branch>>) -> Vec<u8> {
-        let mut code = Vec::new();
-        assemble_labeled(&mut code, items).expect("labels resolve");
-        code
-    }
-
     #[test]
     fn forward_branch_counts_instructions_not_bytes() {
-        let mut scope = LabelScope::new();
-        let end = scope.mint();
-        let code = assemble(alloc::vec![
-            Item::Branch(Branch::Always, end),
-            Item::Inst(Nop),
-            Item::Inst(Nop),
-            Item::Bind(end),
+        let end = Label(0);
+        let code = assemble([
+            Item::Inst(B { target: end }.into()),
+            Item::Inst(NOP),
+            Item::Inst(NOP),
+            Item::Label(end),
         ]);
         // Three instructions ahead of the branch's own address.
         assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 3);
@@ -2529,13 +2684,12 @@ mod label_tests {
 
     #[test]
     fn a_back_edge_is_negative() {
-        let mut scope = LabelScope::new();
-        let top = scope.mint();
-        let code = assemble(alloc::vec![
-            Item::Bind(top),
-            Item::Inst(Nop),
-            Item::Inst(Nop),
-            Item::Branch(Branch::Always, top),
+        let top = Label(0);
+        let code = assemble([
+            Item::Label(top),
+            Item::Inst(NOP),
+            Item::Inst(NOP),
+            Item::Inst(B { target: top }.into()),
         ]);
         // The branch sits two instructions past the label, so -2 words, in
         // imm26's two's complement.
@@ -2547,12 +2701,11 @@ mod label_tests {
 
     #[test]
     fn a_conditional_writes_imm19_and_keeps_its_condition() {
-        let mut scope = LabelScope::new();
-        let exit = scope.mint();
-        let code = assemble(alloc::vec![
-            Item::Branch(Branch::IfAboveOrEqual, exit),
-            Item::Inst(Nop),
-            Item::Bind(exit),
+        let exit = Label(0);
+        let code = assemble([
+            Item::Inst(BCond::hs(exit).into()),
+            Item::Inst(NOP),
+            Item::Label(exit),
         ]);
         let w = word_at(&code, 0);
         assert_eq!((w >> 5) & 0x7FFFF, 2, "two words ahead");
@@ -2562,61 +2715,55 @@ mod label_tests {
 
     #[test]
     fn cbz_keeps_its_register() {
-        let mut scope = LabelScope::new();
-        let exit = scope.mint();
-        let code = assemble(alloc::vec![
-            Item::Branch(Branch::IfW16Zero, exit),
-            Item::Inst(Nop),
-            Item::Bind(exit),
+        let exit = Label(0);
+        let code = assemble([
+            Item::Inst(CbzW16 { target: exit }.into()),
+            Item::Inst(NOP),
+            Item::Label(exit),
         ]);
         let w = word_at(&code, 0);
         assert_eq!((w >> 5) & 0x7FFFF, 2);
         assert_eq!(w & 0xFF00_001F, 0x3400_0010, "still cbz w16");
     }
 
+    /// A label may name a position no instruction occupies — the end of the
+    /// program. That is why a label is an item of its own rather than a field
+    /// on an instruction: there is nothing here to hang it on.
     #[test]
-    fn a_labeled_program_is_position_independent() {
-        let mut scope = LabelScope::new();
-        let end = scope.mint();
-        let items = alloc::vec![
-            Item::Branch(Branch::Always, end),
-            Item::Inst(Nop),
-            Item::Bind(end),
+    fn a_label_can_end_the_program() {
+        let end = Label(0);
+        let code = assemble([Item::Inst(B { target: end }.into()), Item::Label(end)]);
+        assert_eq!(code.len(), 4);
+        assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 1);
+    }
+
+    #[test]
+    fn a_program_is_position_independent() {
+        let end = Label(0);
+        let items = [
+            Item::Inst(B { target: end }.into()),
+            Item::Inst(NOP),
+            Item::Label(end),
         ];
-        let alone = assemble(items.clone());
-
-        let mut code = alloc::vec![0xAA; 4];
-        assemble_labeled(&mut code, items).expect("labels resolve");
-        assert_eq!(&code[4..], &alone[..]);
+        let mut offset = alloc::vec![0xAAu8; 4];
+        AsmProgram::new(items).assemble(&mut offset);
+        assert_eq!(&assemble(items)[..], &offset[4..]);
     }
 
     #[test]
-    fn imm19_refuses_what_it_cannot_reach() {
-        let field = DispField::IMM19;
+    #[should_panic(expected = "does not fit 19 bits")]
+    fn a_conditional_refuses_what_it_cannot_reach() {
         let mut code = alloc::vec![0u8; 4];
-        assert_eq!(field.write(&mut code, 0, (1 << 18) - 1), Ok(()));
-        assert_eq!(
-            field.write(&mut code, 0, 1 << 18),
-            Err(CompileError::BranchOutOfRange)
-        );
-        assert_eq!(
-            Branch::Always.resolve(
-                &mut code,
-                crate::emit::Fixup {
-                    at: 0,
-                    origin: 0,
-                    label: end_label(),
-                },
-                2,
-            ),
-            Err(CompileError::Internal(
-                "aarch64 branch displacement is not a whole number of instructions"
-            ))
-        );
+        DispField::IMM19.write(&mut code, 0, 1 << 20);
     }
 
-    fn end_label() -> crate::emit::Label {
-        crate::emit::Label(0)
+    /// A64 is fixed-width, so a displacement that is not a whole number of
+    /// instructions means this crate laid something out unaligned.
+    #[test]
+    #[should_panic(expected = "not a whole number of instructions")]
+    fn an_unaligned_displacement_is_a_bug() {
+        let mut code = alloc::vec![0u8; 4];
+        DispField::IMM26.write(&mut code, 0, 2);
     }
 }
 

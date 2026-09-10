@@ -10,8 +10,8 @@
 //! 3-operand form which avoids extra MOV instructions in multi-step sequences.
 
 use super::{
-    AsmInsn, AsmProgram, Counter, EncodedInst, Gpr, OutStep, PtrReg, Reg, SourceOperand, assemble,
-    unimplemented_op,
+    AsmInsn, AsmProgram, Counter, EncodedInst, Gpr, Label, LabelRef, OutStep, PtrReg, Reg,
+    SourceOperand, assemble, unimplemented_op,
 };
 use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
@@ -937,28 +937,26 @@ pub fn emit_cmp_eax_imm8(code: &mut Vec<u8>, imm: u8) {
 
 #[cfg(test)]
 mod label_tests {
-    use super::Branch;
-    use crate::emit::{Item, Label, LabelScope, assemble_labeled};
-    use crate::error::CompileError;
+    use super::{Cond, Inst, Jcc, Jmp};
+    use crate::emit::{AsmProgram, Item, Label};
     use alloc::vec::Vec;
 
-    /// The one thing a label has to do that a fixup token could not: name a
+    fn assemble(items: impl IntoIterator<Item = Item<Inst>>) -> Vec<u8> {
+        let mut code = Vec::new();
+        AsmProgram::new(items).assemble(&mut code);
+        code
+    }
+
+    /// The one thing a label does that a fixup token could not: name a
     /// position that does not exist yet.
     #[test]
     fn a_forward_branch_names_a_position_bound_later() {
-        let mut scope = LabelScope::new();
-        let end: Label = scope.mint();
-        let mut code = Vec::new();
-
-        assemble_labeled::<super::Inst, Branch>(
-            &mut code,
-            [
-                Item::Branch(Branch::Always, end),
-                Item::Inst(super::Inst::ret()),
-                Item::Bind(end),
-            ],
-        )
-        .expect("a bound label resolves");
+        let end = Label(0);
+        let code = assemble([
+            Item::Inst(Inst::from(Jmp { target: end })),
+            Item::Inst(Inst::ret()),
+            Item::Label(end),
+        ]);
 
         // `jmp rel32` is five bytes; `ret` is one; the label lands at 6. The
         // displacement is measured from the end of the branch, so it is 1.
@@ -967,23 +965,16 @@ mod label_tests {
         assert_eq!(i32::from_le_bytes([code[1], code[2], code[3], code[4]]), 1);
     }
 
-    /// A back edge — the shape a loop is made of, and the reason the resolution
-    /// pass is separate from the layout pass rather than folded into it.
+    /// A back edge — the shape a loop is made of, and the reason the
+    /// resolution pass is separate from the layout pass.
     #[test]
     fn a_back_edge_resolves_to_a_negative_displacement() {
-        let mut scope = LabelScope::new();
-        let top: Label = scope.mint();
-        let mut code = Vec::new();
-
-        assemble_labeled::<super::Inst, Branch>(
-            &mut code,
-            [
-                Item::Bind(top),
-                Item::Inst(super::Inst::ret()),
-                Item::Branch(Branch::Always, top),
-            ],
-        )
-        .expect("a bound label resolves");
+        let top = Label(0);
+        let code = assemble([
+            Item::Label(top),
+            Item::Inst(Inst::ret()),
+            Item::Inst(Inst::from(Jmp { target: top })),
+        ]);
 
         // `ret` at 0, `jmp` at 1..6. Target 0, origin 6, so the displacement
         // is -6 — and getting this sign backwards is the classic way a loop
@@ -992,47 +983,65 @@ mod label_tests {
         assert_eq!(i32::from_le_bytes([code[2], code[3], code[4], code[5]]), -6);
     }
 
-    /// Offsets are relative to the program, not the buffer, so a labeled
-    /// program can be assembled after bytes that are already there.
+    /// A label may name a position no instruction occupies — the end of the
+    /// program. That is why a label is an item of its own rather than a field
+    /// on an instruction: there is nothing here to hang it on.
     #[test]
-    fn a_program_assembled_into_a_nonempty_buffer_is_position_independent() {
-        let mut scope = LabelScope::new();
-        let end: Label = scope.mint();
+    fn a_label_can_end_the_program() {
+        let end = Label(0);
+        let code = assemble([
+            Item::Inst(Inst::from(Jmp { target: end })),
+            Item::Label(end),
+        ]);
+        assert_eq!(code.len(), 5);
+        assert_eq!(i32::from_le_bytes([code[1], code[2], code[3], code[4]]), 0);
+    }
 
-        let mut fresh = Vec::new();
+    /// And two labels may name the same position, for the same reason.
+    #[test]
+    fn two_labels_can_share_a_position() {
+        let (a, b) = (Label(0), Label(1));
+        let code = assemble([
+            Item::Inst(Inst::from(Jcc {
+                condition: Cond::E,
+                target: a,
+            })),
+            Item::Inst(Inst::from(Jmp { target: b })),
+            Item::Label(a),
+            Item::Label(b),
+        ]);
+        // `je` is 6 bytes, `jmp` 5, both landing at 11.
+        assert_eq!(code.len(), 11);
+        assert_eq!(i32::from_le_bytes([code[2], code[3], code[4], code[5]]), 5);
+        assert_eq!(i32::from_le_bytes([code[7], code[8], code[9], code[10]]), 0);
+    }
+
+    /// Offsets are relative to the program, not the buffer, so a program can
+    /// be assembled after bytes that are already there.
+    #[test]
+    fn a_program_is_position_independent() {
+        let end = Label(0);
+        let items = [
+            Item::Inst(Inst::from(Jmp { target: end })),
+            Item::Label(end),
+        ];
+
         let mut offset = alloc::vec![0x90u8; 7];
-        for code in [&mut fresh, &mut offset] {
-            assemble_labeled::<super::Inst, Branch>(
-                code,
-                [Item::Branch(Branch::Always, end), Item::Bind(end)],
-            )
-            .expect("a bound label resolves");
-        }
-        assert_eq!(&fresh[..], &offset[7..]);
+        AsmProgram::new(items).assemble(&mut offset);
+        assert_eq!(&assemble(items)[..], &offset[7..]);
     }
 
     #[test]
-    fn an_unbound_label_is_an_error_and_not_a_jump_to_itself() {
-        let mut scope = LabelScope::new();
-        let never = scope.mint();
-        let mut code = Vec::new();
-        let got = assemble_labeled::<super::Inst, Branch>(
-            &mut code,
-            [Item::Branch(Branch::Always, never)],
-        );
-        assert_eq!(got, Err(CompileError::UnboundLabel));
+    #[should_panic(expected = "never bound")]
+    fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
+        let _ = assemble([Item::Inst(Jmp { target: Label(0) }.into())]);
     }
 
     #[test]
-    fn a_label_bound_twice_is_an_error() {
-        let mut scope = LabelScope::new();
-        let twice = scope.mint();
-        let mut code = Vec::new();
-        let got = assemble_labeled::<super::Inst, Branch>(
-            &mut code,
-            [Item::Bind(twice), Item::Bind(twice)],
-        );
-        assert_eq!(got, Err(CompileError::DuplicateLabel));
+    #[should_panic(expected = "bound twice")]
+    fn a_label_bound_twice_is_a_bug() {
+        let twice = Label(0);
+        let _ = assemble([Item::Label(twice), Item::Label(twice)]);
     }
 }
 
@@ -1316,9 +1325,9 @@ pub(crate) mod driver {
 
     impl IsaBackend for X86Backend {
         /// rel32 field offset of the branch (uniform for jcc/jmp on x86).
-        type Cond = super::super::x86_64::Branch;
-
-        const JUMP: Self::Cond = super::super::x86_64::Branch::Always;
+        fn jump(&mut self, asm: &mut Assembly, label: Label) {
+            asm.push(super::Jmp { target: label });
+        }
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1485,21 +1494,15 @@ pub(crate) mod driver {
         /// `movmskps`/`kortest` into the flags, needing no vector register.
         /// `_scratch` is unused: this tier reduces the mask with `movmskps`
         /// into the flags, needing no vector register.
-        fn compare_mask(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-            arm: SelectArm,
-        ) -> super::Branch {
-            super::emit_movmskps_eax(code, mask_reg);
-            match arm {
+        fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+            super::emit_movmskps_eax(&mut asm.code, test.reg);
+            match test.arm {
                 // ZF set when eax == 0: no lane is true, so the true arm is dead.
-                SelectArm::True => super::emit_test_eax(code),
+                SelectArm::True => super::emit_test_eax(&mut asm.code),
                 // ZF set when eax == 0xF: every lane is true, so the false arm is.
-                SelectArm::False => super::emit_cmp_eax_imm8(code, 0x0F),
+                SelectArm::False => super::emit_cmp_eax_imm8(&mut asm.code, 0x0F),
             }
-            super::Branch::IfEqual
+            asm.push(super::Jcc::je(label));
         }
 
         // SysV: rdi = ctx (read-only in the body's gathers), rsi = out,
@@ -1555,12 +1558,8 @@ pub(crate) mod driver {
             scaffold::counter_step(code, counter);
         }
 
-        fn compare_counter(
-            &mut self,
-            code: &mut Vec<u8>,
-            counter: Counter,
-        ) -> super::super::x86_64::Branch {
-            scaffold::compare_counter(code, counter)
+        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
+            scaffold::branch_if_counter_done(asm, counter, label);
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -1693,20 +1692,23 @@ pub(in crate::emit) mod scaffold {
         .assemble(code);
     }
 
-    /// The loop's exit test: unsigned `counter >= bound`.
-    #[inline(always)]
-    /// `cmp counter, bound`, and the condition that means the loop is done.
+    /// The loop's exit test: jump to `label` on unsigned `counter >= bound`.
     ///
-    /// Emits no branch: under labels the branch is a separate item, laid out
-    /// against a name rather than against an offset the caller kept.
-    pub(in crate::emit) fn compare_counter(code: &mut Vec<u8>, counter: Counter) -> super::Branch {
+    /// Shared by all three x86 tiers — the counters are GPRs, so the vector
+    /// width does not reach this.
+    #[inline(always)]
+    pub(in crate::emit) fn branch_if_counter_done(
+        asm: &mut crate::emit::Assembly,
+        counter: Counter,
+        label: crate::emit::Label,
+    ) {
         AsmProgram::from([Inst::Cmp {
             lhs: counter_reg(counter),
             rhs: bound_reg(counter),
         }])
-        .assemble(code);
+        .assemble(&mut asm.code);
         // The counter runs up to an unsigned bound, so "done" is `>=`.
-        super::Branch::IfAboveOrEqual
+        asm.push(super::Jcc::jae(label));
     }
 
     #[inline(always)]
@@ -1802,6 +1804,8 @@ pub enum Inst {
     Ret,
     MovLoadPtr(MovLoadPtr),
     Encoded(EncodedInst),
+    Jmp(Jmp),
+    Jcc(Jcc),
 }
 
 impl Inst {
@@ -1829,6 +1833,20 @@ impl From<EncodedInst> for Inst {
     }
 }
 
+impl From<Jmp> for Inst {
+    #[inline(always)]
+    fn from(j: Jmp) -> Self {
+        Inst::Jmp(j)
+    }
+}
+
+impl From<Jcc> for Inst {
+    #[inline(always)]
+    fn from(j: Jcc) -> Self {
+        Inst::Jcc(j)
+    }
+}
+
 impl From<MovLoadPtr> for Inst {
     #[inline(always)]
     fn from(m: MovLoadPtr) -> Self {
@@ -1837,6 +1855,18 @@ impl From<MovLoadPtr> for Inst {
 }
 
 impl AsmInsn for Inst {
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        // A branch is an ordinary instruction whose operand happens to be a
+        // name: it emits a placeholder displacement above, and this says which
+        // label the assembler should measure it against.
+        match self {
+            Inst::Jmp(j) => j.label_ref(),
+            Inst::Jcc(j) => j.label_ref(),
+            _ => None,
+        }
+    }
+
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         match self {
@@ -1849,6 +1879,8 @@ impl AsmInsn for Inst {
             Inst::AddImm32 { dst, imm } => add(code, dst, imm),
             Inst::SubImm32 { dst, imm } => sub(code, dst, imm),
             Inst::Ret => ret(code),
+            Inst::Jmp(j) => j.emit_into(code),
+            Inst::Jcc(j) => j.emit_into(code),
             Inst::MovLoadPtr(m) => m.emit_into(code),
             Inst::Encoded(e) => e.emit_into(code),
         }
@@ -1969,117 +2001,226 @@ pub fn ret(code: &mut Vec<u8>) {
     code.push(0xC3);
 }
 
-/// A branch whose 32-bit displacement is not known yet.
+/// The 4-bit condition an x86 `jcc` tests — the whole field, not a selection.
 ///
-/// Holds the offset of the displacement field, so the target can be filled in
-/// once its address is known. Returned by [`jae`] and [`jmp`] so a caller
-/// cannot emit a branch and forget it needs patching.
+/// `0F 8x rel32` is one instruction whose low opcode nibble *is* this value, so
+/// the assembler encodes it by casting rather than by dispatching to one
+/// hand-written mnemonic per condition. Named by the ISA's own mnemonics, with
+/// their aliases, because that is what a reader checks against the manual.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[must_use = "an unpatched branch jumps to itself"]
-pub struct Rel32(usize);
+#[repr(u8)]
+pub enum Cond {
+    /// `jo` — overflow.
+    O = 0x0,
+    /// `jno` — no overflow.
+    No = 0x1,
+    /// `jb` / `jc` / `jnae` — CF set; unsigned `<`.
+    B = 0x2,
+    /// `jae` / `jnb` / `jnc` — CF clear; unsigned `>=`.
+    Ae = 0x3,
+    /// `je` / `jz` — ZF set.
+    E = 0x4,
+    /// `jne` / `jnz` — ZF clear.
+    Ne = 0x5,
+    /// `jbe` / `jna` — unsigned `<=`.
+    Be = 0x6,
+    /// `ja` / `jnbe` — unsigned `>`.
+    A = 0x7,
+    /// `js` — sign set.
+    S = 0x8,
+    /// `jns` — sign clear.
+    Ns = 0x9,
+    /// `jp` / `jpe` — parity even; set by an unordered float compare.
+    P = 0xA,
+    /// `jnp` / `jpo` — parity odd.
+    Np = 0xB,
+    /// `jl` / `jnge` — signed `<`.
+    L = 0xC,
+    /// `jge` / `jnl` — signed `>=`.
+    Ge = 0xD,
+    /// `jle` / `jng` — signed `<=`.
+    Le = 0xE,
+    /// `jg` / `jnle` — signed `>`.
+    G = 0xF,
+}
 
-impl Rel32 {
-    /// Point the branch at `target`, a byte offset into the same buffer.
-    #[inline(always)]
-    pub fn patch(self, code: &mut [u8], target: usize) {
-        let rel = (target as i32) - (self.0 as i32 + 4);
-        code[self.0..self.0 + 4].copy_from_slice(&rel.to_le_bytes());
+/// `jmp rel32 target` — an unconditional branch to a [`Label`].
+///
+/// A struct, like every other instruction here, and its label is an operand
+/// like any other. It emits a zero displacement; the assembler writes the real
+/// one once the label lands, which is what [`AsmInsn::label_ref`] tells it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Jmp {
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl AsmInsn for Jmp {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        code.extend_from_slice(&[0xE9, 0, 0, 0, 0]);
     }
 
-    /// The offset of the displacement field.
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| patch_rel32(code, at + JMP_DISP, target),
+        })
+    }
+}
+
+/// `jcc rel32 target` — a conditional branch to a [`Label`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Jcc {
+    /// What must hold for the branch to be taken.
+    pub condition: Cond,
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl Jcc {
+    /// One constructor per mnemonic, so a call site reads like the assembly it
+    /// is: `Jcc::je(exit)` for `je exit`.
+    ///
+    /// Sugar over the one encoder, not sixteen types: `0F 8x rel32` is a
+    /// single instruction whose low opcode nibble is [`Cond`], and sixteen
+    /// structs would be sixteen copies of one `emit_into` differing by a
+    /// constant. The mnemonics are the assembler's names for the field.
     #[must_use]
     #[inline(always)]
-    pub const fn field(self) -> usize {
-        self.0
+    pub const fn je(target: Label) -> Self {
+        Self::on(Cond::E, target)
+    }
+    /// `jne` / `jnz`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jne(target: Label) -> Self {
+        Self::on(Cond::Ne, target)
+    }
+    /// `jb` / `jc` / `jnae` — unsigned `<`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jb(target: Label) -> Self {
+        Self::on(Cond::B, target)
+    }
+    /// `jae` / `jnb` / `jnc` — unsigned `>=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jae(target: Label) -> Self {
+        Self::on(Cond::Ae, target)
+    }
+    /// `jbe` / `jna` — unsigned `<=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jbe(target: Label) -> Self {
+        Self::on(Cond::Be, target)
+    }
+    /// `ja` / `jnbe` — unsigned `>`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn ja(target: Label) -> Self {
+        Self::on(Cond::A, target)
+    }
+    /// `jl` / `jnge` — signed `<`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jl(target: Label) -> Self {
+        Self::on(Cond::L, target)
+    }
+    /// `jge` / `jnl` — signed `>=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jge(target: Label) -> Self {
+        Self::on(Cond::Ge, target)
+    }
+    /// `jle` / `jng` — signed `<=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jle(target: Label) -> Self {
+        Self::on(Cond::Le, target)
+    }
+    /// `jg` / `jnle` — signed `>`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jg(target: Label) -> Self {
+        Self::on(Cond::G, target)
+    }
+    /// `js` — sign set.
+    #[must_use]
+    #[inline(always)]
+    pub const fn js(target: Label) -> Self {
+        Self::on(Cond::S, target)
+    }
+    /// `jns` — sign clear.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jns(target: Label) -> Self {
+        Self::on(Cond::Ns, target)
+    }
+    /// `jo` — overflow.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jo(target: Label) -> Self {
+        Self::on(Cond::O, target)
+    }
+    /// `jno` — no overflow.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jno(target: Label) -> Self {
+        Self::on(Cond::No, target)
+    }
+    /// `jp` / `jpe` — parity even; set by an unordered float compare.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jp(target: Label) -> Self {
+        Self::on(Cond::P, target)
+    }
+    /// `jnp` / `jpo` — parity odd.
+    #[must_use]
+    #[inline(always)]
+    pub const fn jnp(target: Label) -> Self {
+        Self::on(Cond::Np, target)
+    }
+
+    /// The branch on a condition chosen at run time, where no single mnemonic
+    /// names it.
+    #[must_use]
+    #[inline(always)]
+    pub const fn on(condition: Cond, target: Label) -> Self {
+        Self { condition, target }
     }
 }
 
-/// `jae rel32` — taken when the previous [`cmp`] found `lhs >= rhs` unsigned.
-#[inline(always)]
-pub fn jae(code: &mut Vec<u8>) -> Rel32 {
-    jcc(code, 0x83)
+impl AsmInsn for Jcc {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        code.extend_from_slice(&[0x0F, 0x80 | self.condition as u8, 0, 0, 0, 0]);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| patch_rel32(code, at + JCC_DISP, target),
+        })
+    }
 }
 
-/// `je rel32` — taken when the previous compare or test set ZF.
-#[inline(always)]
-pub fn je(code: &mut Vec<u8>) -> Rel32 {
-    jcc(code, 0x84)
-}
+/// Bytes from a `jmp`'s start to its displacement field: one opcode byte.
+const JMP_DISP: usize = 1;
+/// Bytes from a `jcc`'s start to its displacement field: `0F` plus the
+/// condition byte.
+const JCC_DISP: usize = 2;
 
-/// `jc rel32` — taken when the previous operation set CF.
-#[inline(always)]
-pub fn jc(code: &mut Vec<u8>) -> Rel32 {
-    jcc(code, 0x82)
-}
-
-/// The shared body of the `jcc rel32` forms. Private: a condition is chosen by
-/// calling the mnemonic, never by handing a byte to a generic emitter.
-#[inline(always)]
-fn jcc(code: &mut Vec<u8>, cc: u8) -> Rel32 {
-    code.extend_from_slice(&[0x0F, cc]);
-    let at = code.len();
-    code.extend_from_slice(&[0, 0, 0, 0]);
-    Rel32(at)
-}
-
-/// `jmp rel32`
-#[inline(always)]
-pub fn jmp(code: &mut Vec<u8>) -> Rel32 {
-    code.push(0xE9);
-    let at = code.len();
-    code.extend_from_slice(&[0, 0, 0, 0]);
-    Rel32(at)
-}
-
-/// A branch to a [`Label`](crate::emit::Label), as a declarative program item.
+/// Write a `rel32` at `pos` so the instruction it belongs to reaches `target`.
 ///
-/// Named by condition rather than by opcode byte, for the reason [`jcc`] is
-/// private: a condition is chosen by naming it, never by handing a byte to a
-/// generic emitter.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Branch {
-    /// `jmp` — unconditional.
-    Always,
-    /// `je` — the previous compare or test set ZF.
-    IfEqual,
-    /// `jae` — the previous [`cmp`] found `lhs >= rhs`, unsigned.
-    IfAboveOrEqual,
-    /// `jc` — the previous operation set CF.
-    IfCarry,
-}
-
-impl crate::emit::AsmBranch for Branch {
-    #[inline]
-    fn place(self, code: &mut Vec<u8>) -> (usize, usize) {
-        let rel = match self {
-            Self::Always => jmp(code),
-            Self::IfEqual => je(code),
-            Self::IfAboveOrEqual => jae(code),
-            Self::IfCarry => jc(code),
-        };
-        // `rel32` is measured from the *end* of the instruction, which is the
-        // end of the displacement field itself.
-        let at = rel.field();
-        (at, at + 4)
-    }
-
-    /// Every x86 branch here spells its displacement `rel32`, so the condition
-    /// does not change the field — but that is a fact about x86, not about
-    /// branches, which is why the trait passes `self` anyway.
-    #[inline]
-    fn resolve(
-        self,
-        code: &mut [u8],
-        fixup: crate::emit::Fixup,
-        target: usize,
-    ) -> Result<(), crate::error::CompileError> {
-        use crate::error::CompileError;
-        let rel = i64::try_from(target).map_err(|_| CompileError::BranchOutOfRange)?
-            - i64::try_from(fixup.origin).map_err(|_| CompileError::BranchOutOfRange)?;
-        let rel = i32::try_from(rel).map_err(|_| CompileError::BranchOutOfRange)?;
-        code[fixup.at..fixup.at + 4].copy_from_slice(&rel.to_le_bytes());
-        Ok(())
-    }
+/// `rel32` is measured from the *end* of the instruction, which is the end of
+/// the displacement field itself.
+fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
+    let rel = (target as i64) - (pos as i64 + 4);
+    let rel = i32::try_from(rel).expect("an x86 rel32 spans \u{00b1}2 GiB");
+    code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
 }
 
 // =============================================================================
@@ -2281,30 +2422,36 @@ mod gpr_tests {
         assert_eq!(asm(|c| mov(c, R9, R10))[0], 0x4D, "both extended");
     }
 
-    /// A branch reports where its displacement lives, and patching aims it at
-    /// a byte offset in the same buffer.
+    /// A branch's displacement is measured from the *next* instruction, and a
+    /// backward one is negative. Asserted through the assembler, because that
+    /// is who writes it: the mnemonics emit a zero placeholder and report
+    /// nothing.
     #[test]
     fn branches_patch_relative_to_the_next_instruction() {
+        use crate::emit::{AsmProgram, Item, Label};
+
+        let end = Label(0);
         let mut c = Vec::new();
-        let br = jmp(&mut c);
-        assert_eq!(c.len(), 5, "E9 + rel32");
-        assert_eq!(br.field(), 1);
-        // Jump forward to the end of a 16-byte buffer.
-        c.resize(16, 0x90);
-        br.patch(&mut c, 16);
+        AsmProgram::new([
+            Item::Inst(Inst::from(Jmp { target: end })),
+            // Eleven bytes of padding, so the label lands at 16.
+            Item::Inst(Inst::Encoded(EncodedInst::from_slice(&[0x90; 11]))),
+            Item::Label(end),
+        ])
+        .assemble(&mut c);
+        assert_eq!(c.len(), 16);
+        assert_eq!(c[0], 0xE9, "E9 + rel32");
         assert_eq!(
             &c[1..5],
             &(16i32 - 5).to_le_bytes(),
             "rel is from the next insn"
         );
 
+        let top = Label(0);
         let mut c = Vec::new();
-        let br = jae(&mut c);
+        AsmProgram::new([Item::Label(top), Item::Inst(Inst::from(Jcc::jae(top)))]).assemble(&mut c);
         assert_eq!(c[..2], [0x0F, 0x83]);
-        // A backward jump is negative.
-        c.resize(10, 0x90);
-        br.patch(&mut c, 0);
-        assert_eq!(&c[2..6], &(-6i32).to_le_bytes());
+        assert_eq!(&c[2..6], &(-6i32).to_le_bytes(), "a back edge is negative");
     }
 
     /// One instruction, three bases: `movups [rsp+8]`, `[rax+8]` and `[r10+8]`

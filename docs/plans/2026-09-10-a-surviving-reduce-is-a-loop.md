@@ -83,38 +83,63 @@ names, and it is not needed here.
 
 **R0 — a position gets a name.** *Landed.* Codegen had no way to *say* "here",
 so every branch was placed as a fixup token the emitter carried by hand to a
-`patch_branch` call, against an offset it read off `code.len()` at the one
-point in the sequence where that was correct. A loop's back edge is the same
-shape, so building one meant more of that.
+`patch_branch` call, against an offset it read off `code.len()` at the one point
+in the sequence where that was correct. A loop's back edge is the same shape, so
+building one meant more of that.
 
-A program is a sequence of **items**: an instruction (fixed bytes, position-
-independent — which is why a branch could never be an `AsmInsn`), a **binding**
-of a name to this position (no bytes), or a **reference** to a name (bytes that
-depend on where it lands). `Label`, `LabelScope`, `Item`, `AsmBranch`,
-`Resolver`, `assemble_labeled` in `pixelflow-codegen/src/emit/mod.rs`; per-ISA
-`Branch` enums named by the condition they test, never by an opcode byte.
+**The assembler is an assembler.** A program is a flat sequence of `Item`s:
+either an instruction, or a **label** bound to this position. Not an AST —
+assembly is not context-sensitive and there is nothing to nest.
 
-`AsmBranch::resolve` takes `self` because the field is the *branch's*: x86
-spells every displacement `rel32`, aarch64's `B` carries imm26 and its
-`B.cond`/`CBZ` an imm19 five bits up. Two front ends, one mechanism —
-`assemble_labeled` for a program that can be a value, `Resolver` streaming for
-an emitter whose every verb is a `&mut self` method and so cannot build that
-sequence at all.
+- **A label is an item, not a field on an instruction.** A label names a
+  *position*, and positions are not owned by instructions: a loop's exit label
+  sits past the last body instruction, where there is nothing to hang it on, and
+  two labels may name the same position. Both are free when the label is its own
+  item; both need a dummy `nop` or a `Vec<Label>` per instruction otherwise.
+- **A label *reference* is an operand.** `Jcc::je(exit)` is `je exit` — the label
+  is that instruction's argument, like a register or an immediate. So positions
+  are items and references are fields; two relationships, two spellings.
+- **A branch is an ordinary instruction.** `struct Jmp { target }`,
+  `struct Jcc { condition, target }` on x86; `B`, `BCond`, `CbzW16` on aarch64 —
+  each an `AsmInsn` like any other, wrapped by the backend's `Inst` enum exactly
+  as `MovLoadPtr` already was. `AsmInsn::label_ref` is the one method that was
+  added: it says which label the instruction is waiting on and how to fill in
+  the displacement. That is the whole of what a branch adds.
+- **The condition is the opcode's own field, and all sixteen exist.** x86 `jcc`
+  is `0F 8x rel32` and A64 `B.cond` is `0101 0100 imm19 0 cond`; in both the
+  condition *is* a nibble of the encoding, so `Cond` is a 16-variant
+  `#[repr(u8)]` enum whose discriminants are the manual's values, and encoding
+  is `0x80 | condition as u8`. It replaced a private `jcc(code, cc: u8)` with
+  three hand-picked mnemonics and a doc comment defending the magic byte.
+  `Jcc::je` / `BCond::hs` and friends are `const fn` sugar over the one encoder,
+  so a call site still reads like assembly without sixteen types that differ by
+  a constant.
+- **Where an instruction landed is the assembler's bookkeeping.** The branch
+  emitters used to return a position; they return nothing now, because the
+  assembler wrote down `code.len()` before calling `emit_into`.
 
-Both loops in the emitter moved: the collapse nest and the `Select`
-short-circuit. That deleted `emit_jump`, `patch_branch`, `emit_skip_if_all_false`,
-`emit_skip_if_all_true`, `IsaBackend::Branch`, `Aarch64Branch`, `Cond19`,
-`Rel26`, `emit_jmp_rel32` and `patch_rel32` — the whole fixup-token mechanism,
-five impls of it. The two skip verbs folded into one `compare_mask(.., arm)`,
-because they differed only in which uniform mask lets an arm go, which is what
-`SelectArm` already names. Emitted bytes are unchanged, which is what the
-goldens are for.
+Two front ends, one mechanism: `AsmProgram::from([...]).assemble(code)` for a
+program that is a value, and `Assembly` — push, bind, finish — for the emitter,
+which discovers its instructions while walking a schedule and so cannot hand
+over a finished list. Both keep one label map and both resolve the same way.
+
+Both loops in the emitter moved onto it: the collapse nest and the `Select`
+short-circuit. That deleted `emit_jump`, `patch_branch`,
+`emit_skip_if_all_false`, `emit_skip_if_all_true`, `IsaBackend::Branch`,
+`Aarch64Branch`, `Cond19`, `Rel26`, `Rel32`, `emit_jmp_rel32` and `patch_rel32`
+— the whole fixup-token mechanism, five impls of it. The two skip verbs folded
+into one `branch_if_arm_is_dead(.., MaskTest, Label)`, because they differed
+only in which uniform mask lets an arm go, which is what `SelectArm` already
+names. Emitted bytes are unchanged, which is what the goldens are for.
 
 **R1 — emit one.** `arena_to_schedule` grows a `Reduce` arm; the backend grows
 a reduce-loop scaffold beside `emit_collapse_loop`; `ExpandReduce` gains a way
-to be told not to unroll. The back edge is now `labels.branch(B::JUMP, top,
-&mut code)` in the same `Resolver` the guards use, so the loop is composition
-rather than a third copy of the fixup dance. Gate: a hand-built `⊕_{[0,n)}`
+to be told not to unroll. The back edge is `asm.push(Jmp { target: top })` in
+the same `Assembly` the guards use, so the loop is composition rather than a
+third copy of the fixup dance. `IsaBackend::loop_open`/`loop_close` already
+exist for it: `emit_loop` takes a closure, which a nest wants, and the
+open/close pair is the same loop for a *linear walk*, which is what a schedule
+walk is. Gate: a hand-built `⊕_{[0,n)}`
 over a table produces the same buffer looped as unrolled, on both ISAs, for
 `SUM` and `MIN`.
 

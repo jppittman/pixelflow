@@ -135,9 +135,9 @@ impl<'a, B: IsaBackend> Counting<'a, B> {
 }
 
 impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
-    type Cond = B::Cond;
-
-    const JUMP: Self::Cond = B::JUMP;
+    fn jump(&mut self, asm: &mut super::Assembly, label: super::Label) {
+        self.inner.jump(asm, label);
+    }
 
     fn register_file(&self) -> super::regalloc::RegisterFile {
         self.inner.register_file()
@@ -199,14 +199,13 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.emit_resolve(code, vid, target, locs)
     }
 
-    fn compare_mask(
+    fn branch_if_arm_is_dead(
         &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-        arm: super::SelectArm,
-    ) -> Self::Cond {
-        self.inner.compare_mask(code, mask_reg, scratch, arm)
+        asm: &mut super::Assembly,
+        test: super::MaskTest,
+        label: super::Label,
+    ) {
+        self.inner.branch_if_arm_is_dead(asm, test, label);
     }
 
     fn body_frame_bytes(&self, frame_size: u32) -> u32 {
@@ -253,8 +252,13 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.counter_step(code, counter);
     }
 
-    fn compare_counter(&mut self, code: &mut Vec<u8>, counter: super::Counter) -> Self::Cond {
-        self.inner.compare_counter(code, counter)
+    fn branch_if_counter_done(
+        &mut self,
+        asm: &mut super::Assembly,
+        counter: super::Counter,
+        label: super::Label,
+    ) {
+        self.inner.branch_if_counter_done(asm, counter, label);
     }
 
     fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
