@@ -220,12 +220,12 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.frame_free(code, bytes);
     }
 
-    fn scaffold_anchor(&mut self, code: &mut Vec<u8>) {
-        self.inner.scaffold_anchor(code);
+    fn scaffold_anchor(&mut self, asm: &mut super::Assembly) {
+        self.inner.scaffold_anchor(asm);
     }
 
-    fn scaffold_finish(&mut self, code: &mut Vec<u8>) {
-        self.inner.scaffold_finish(code);
+    fn scaffold_finish(&mut self, asm: &mut super::Assembly) {
+        self.inner.scaffold_finish(asm);
     }
 
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {

@@ -254,9 +254,6 @@ pub struct Assembly {
     /// The bytes so far. Public because emitting into it is what a backend verb
     /// does.
     pub code: Vec<u8>,
-    /// Where the program starts in `code`, so it can be assembled after bytes
-    /// that are already there.
-    base: usize,
     next_label: u32,
     bound: alloc::collections::BTreeMap<Label, usize>,
     pending: Vec<(usize, LabelRef)>,
@@ -274,12 +271,14 @@ impl Assembly {
 
     /// Continue a program whose first bytes are already emitted.
     ///
-    /// Positions are measured from here, so what follows is still position-
-    /// independent.
+    /// Positions are offsets into the whole buffer, not into the part this
+    /// program contributed. A displacement cannot tell the difference — it is
+    /// `target - at` either way — but a *page* can, and `AdrpAdd` asks for
+    /// one, so there is exactly one answer to what a position means here and
+    /// this is it.
     #[must_use]
     pub fn from_code(code: Vec<u8>) -> Self {
         Self {
-            base: code.len(),
             code,
             ..Self::default()
         }
@@ -329,11 +328,7 @@ impl Assembly {
             let target = *self.bound.get(&reference.label).unwrap_or_else(|| {
                 panic!("{:?} is named by a branch but never bound", reference.label)
             });
-            (reference.patch)(
-                &mut self.code[self.base..],
-                at - self.base,
-                target - self.base,
-            );
+            (reference.patch)(&mut self.code, at, target);
         }
         self.code
     }
@@ -1126,11 +1121,15 @@ trait IsaBackend {
     /// Anchor whatever the body's constant loads are relative to, once the
     /// frame exists. Default: nothing to anchor (x86 const loads are
     /// self-contained).
-    fn scaffold_anchor(&mut self, _code: &mut Vec<u8>) {}
+    ///
+    /// Takes the whole [`Assembly`], not just its `code`, because aarch64's
+    /// anchor names a [`Label`] — the constant pool's not-yet-known position —
+    /// rather than a `code.len()` read off and carried by hand.
+    fn scaffold_anchor(&mut self, _asm: &mut Assembly) {}
 
     /// Append whatever must trail the emitted function — a constant pool and
-    /// the fixup that points at it. Default: nothing trails.
-    fn scaffold_finish(&mut self, _code: &mut Vec<u8>) {}
+    /// the label that names it. Default: nothing trails.
+    fn scaffold_finish(&mut self, _asm: &mut Assembly) {}
 
     /// Save / restore one of the scaffold's coordinate slots.
     ///
@@ -1270,7 +1269,7 @@ trait IsaBackend {
         );
 
         self.frame_alloc(&mut asm.code, total);
-        self.scaffold_anchor(&mut asm.code);
+        self.scaffold_anchor(&mut asm);
         for k in 0..INPUT_COORDS {
             self.slot_store(&mut asm.code, coord_reg(k), slot(k));
         }
@@ -1305,12 +1304,16 @@ trait IsaBackend {
 
         self.frame_free(&mut asm.code, total);
         self.emit_ret(&mut asm.code);
-        // Resolve before whatever trails the function: aarch64's constant pool
-        // is appended after the `ret`, and a displacement must not be measured
-        // across bytes that are not instructions.
-        let mut code = asm.finish();
-        self.scaffold_finish(&mut code);
-        Ok(code)
+        // Everything the function needs — the loop nest's branches and
+        // whatever trails the `ret`, aarch64's constant pool included — is one
+        // `Assembly` now, so one `finish` resolves every name in it. It used
+        // to be two: the loop nest's labels were resolved here and the
+        // constant pool's fixup was a separate hand-tracked offset patched
+        // afterward, which is what made the offset's *estimate* — and the
+        // byte-splice when the estimate was wrong — necessary in the first
+        // place. A label the pool binds is just one more name in this pass.
+        self.scaffold_finish(&mut asm);
+        Ok(asm.finish())
     }
 
     /// Emit `levels` as a loop nest, outermost first.

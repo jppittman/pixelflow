@@ -89,6 +89,7 @@ pub enum Inst {
     B(B),
     BCond(BCond),
     CbzW16(CbzW16),
+    AdrpAdd(AdrpAdd),
 }
 
 impl Inst {
@@ -212,6 +213,11 @@ impl Inst {
             Inst::B(_) => 0x1400_0000,
             Inst::BCond(b) => 0x5400_0000 | b.condition as u32,
             Inst::CbzW16(_) => 0x3400_0010,
+            // Two words, not one — `encode` is for single-word instructions
+            // only, same exclusion as `Ldr`/`Str` above.
+            Inst::AdrpAdd(_) => {
+                panic!("AdrpAdd must be emitted via emit_into or AsmProgram")
+            }
         }
     }
 }
@@ -290,6 +296,13 @@ impl From<CbzW16> for Inst {
     }
 }
 
+impl From<AdrpAdd> for Inst {
+    #[inline(always)]
+    fn from(a: AdrpAdd) -> Self {
+        Inst::AdrpAdd(a)
+    }
+}
+
 impl crate::emit::AsmInsn for Inst {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
@@ -300,6 +313,7 @@ impl crate::emit::AsmInsn for Inst {
             Inst::B(b) => b.label_ref(),
             Inst::BCond(b) => b.label_ref(),
             Inst::CbzW16(b) => b.label_ref(),
+            Inst::AdrpAdd(a) => a.label_ref(),
             _ => None,
         }
     }
@@ -310,6 +324,7 @@ impl crate::emit::AsmInsn for Inst {
             Inst::B(b) => b.emit_into(code),
             Inst::BCond(b) => b.emit_into(code),
             Inst::CbzW16(b) => b.emit_into(code),
+            Inst::AdrpAdd(a) => a.emit_into(code),
             Inst::Ldr(ldr) => ldr.emit_into(code),
             Inst::Str(str) => str.emit_into(code),
             Inst::Mov(dst, src) => {
@@ -462,68 +477,96 @@ pub fn needs_const_pool(val: f32) -> bool {
     val.to_bits() != 0 && try_encode_fmov_imm8(val).is_none()
 }
 
-/// Emit `ADR X17, #0` as a placeholder. Returns the code offset for later patching.
+/// `adrp xd, #0` + `add xd, xd, #0`, sharing one [`Label`]: materialize the
+/// constant pool's address in `dst`.
 ///
-/// ADR encodes a PC-relative offset into X17 (IP1, platform scratch register).
-/// The offset is patched after the constant pool position is known.
-pub fn emit_adr_x17_placeholder(code: &mut Vec<u8>) -> usize {
-    let pos = code.len();
-    // ADR X17, #0 — will be patched. Encoding: 0x10000011 (Rd=X17=17, imm=0)
-    emit32(code, 0x10000011);
-    pos
+/// **Two instructions, because A64 is fixed 32-bit** — no single instruction
+/// holds a 64-bit address. `ADR` reaches ±1 MiB by spending a 21-bit *byte*
+/// displacement; `ADRP` spends the same 21 bits on 4 KiB *pages* instead —
+/// `(PC & !0xFFF) + (imm21 << 12)`, ±4 GiB — and hands back the base of the
+/// target's page, not the target itself. The `ADD`'s 12-bit immediate is
+/// exactly one page wide, so it recovers the low bits `ADRP` had to discard.
+///
+/// **Always both, never the one-instruction `ADR`.** Which one is reachable
+/// depends on the distance to the pool; the pool's position depends on where
+/// every instruction ahead of it landed; and this instruction's own size is
+/// one of those — so choosing the short form is branch relaxation, and
+/// resolving it needs layout iterated to a fixed point to save four bytes
+/// once per compiled function. The alternative this replaced tried to dodge
+/// that fixed point instead of running it: emit `ADR` optimistically,
+/// *estimate* the distance to the not-yet-emitted pool with a magic margin,
+/// and — when the estimate crossed it — splice four bytes into the middle of
+/// already-emitted code to widen it to `ADRP`+`ADD` after the fact. That
+/// splice was sound only because the anchor sits above the whole loop nest,
+/// so every branch in the body had both endpoints on the same side of it; a
+/// branch spanning it would have broken silently. `AdrpAdd` has no estimate
+/// and nothing to splice — its size is fixed before a single byte is laid
+/// out, like every other instruction here.
+///
+/// # Alignment invariant
+///
+/// [`AsmInsn::label_ref`]'s patch below computes pages by masking *buffer
+/// offsets* — positions within the `Vec<u8>` this crate is building, not
+/// runtime addresses. That is correct only because the executable mapping
+/// this buffer is copied into starts on a 4 KiB boundary: `(map + pos) &
+/// !0xFFF == map + (pos & !0xFFF)` for every `pos` exactly when `map` is a
+/// multiple of 4 KiB, which is what lets a page found by masking an offset
+/// stand in for the page a masked address would find. Copy these bytes to an
+/// address that is not 4 KiB-aligned and every `ADRP` here is off by a page.
+///
+/// Two things hold it up, and both are checked rather than assumed:
+/// [`CodePage::from_code`](crate::emit::executable::CodePage::from_code)
+/// writes the buffer at offset 0 of a mapping whose size — and therefore
+/// whose base — is a whole number of pages, pinned by
+/// `page_size_is_a_sane_power_of_two`; and an [`Assembly`] position is an
+/// offset into the *whole* buffer rather than into the part one program
+/// contributed, which is why [`Assembly::from_code`] keeps no base to
+/// subtract. A displacement cannot tell those two apart. A page can.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AdrpAdd {
+    /// Where the address is materialized.
+    pub dst: Gpr,
+    /// The constant pool's position.
+    pub target: Label,
 }
 
-/// Patch a previously emitted `ADR X17` placeholder at `adr_pos` to point to `target_pos`.
-/// If `is_adrp` is true, assumes 8 bytes are reserved and patches `ADRP X17` + `ADD X17`.
-pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_adrp: bool) {
-    if is_adrp {
-        assert!(
-            adr_pos + 8 <= code.len(),
-            "patch_adr_or_adrp: adr_pos {} + 8 exceeds code length {}",
-            adr_pos,
-            code.len()
-        );
+impl AsmInsn for AdrpAdd {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        let rd = u32::from(self.dst.0);
+        // ADRP Xd, #0 — page immediate patched by `label_ref` below.
+        emit32(code, 0x9000_0000 | rd);
+        // ADD Xd, Xd, #0 (64-bit immediate form) — within-page offset
+        // patched by `label_ref` below.
+        emit32(code, 0x9100_0000 | (rd << 5) | rd);
+    }
 
-        let pc_page = (adr_pos as i64) & !0xFFF;
-        let target_page = (target_pos as i64) & !0xFFF;
-        let page_offset = (target_page - pc_page) >> 12;
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            // `at` is the ADRP word `emit_into` placed; the ADD it placed
+            // right after sits at `at + 4`. Both words already carry their
+            // opcode and register fields, so this only ORs the immediate in.
+            patch: |code, at, target| {
+                let page = |pos: usize| (pos as i64) & !0xFFF;
+                let pages = (page(target) - page(at)) >> 12;
+                assert!(
+                    (-(1i64 << 20)..(1i64 << 20)).contains(&pages),
+                    "ADRP page offset {pages} out of range (±4GiB)"
+                );
+                let imm = (pages as u32) & 0x1F_FFFF;
+                let immlo = imm & 0x3;
+                let immhi = (imm >> 2) & 0x7_FFFF;
+                let adrp = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                code[at..at + 4]
+                    .copy_from_slice(&(adrp | (immlo << 29) | (immhi << 5)).to_le_bytes());
 
-        assert!(
-            (-(1 << 20)..(1 << 20)).contains(&page_offset),
-            "ADRP page offset {} out of range (±4GB)",
-            page_offset
-        );
-
-        // 1. Patch ADRP
-        let imm_bits = (page_offset as u32) & 0x1F_FFFF;
-        let immlo = imm_bits & 0x3;
-        let immhi = (imm_bits >> 2) & 0x7FFFF;
-        let adrp_inst = 0x90000011 | (immlo << 29) | (immhi << 5);
-        code[adr_pos..adr_pos + 4].copy_from_slice(&adrp_inst.to_le_bytes());
-
-        // 2. Patch ADD (immediate)
-        // ADD X17, X17, #target_pos_within_page
-        let page_inner_offset = (target_pos as u32) & 0xFFF;
-        let add_inst = 0x91000231 | (page_inner_offset << 10);
-        code[adr_pos + 4..adr_pos + 8].copy_from_slice(&add_inst.to_le_bytes());
-    } else {
-        assert!(
-            adr_pos + 4 <= code.len(),
-            "patch_adr_or_adrp: adr_pos {} + 4 exceeds code length {}",
-            adr_pos,
-            code.len()
-        );
-        let offset = (target_pos as i64) - (adr_pos as i64);
-        assert!(
-            (-(1 << 20)..(1 << 20)).contains(&offset),
-            "ADR offset {} out of range (±1MB)",
-            offset
-        );
-        let offset_bits = (offset as u32) & 0x1F_FFFF;
-        let immlo = offset_bits & 0x3;
-        let immhi = (offset_bits >> 2) & 0x7FFFF;
-        let inst = 0x10000011 | (immlo << 29) | (immhi << 5);
-        code[adr_pos..adr_pos + 4].copy_from_slice(&inst.to_le_bytes());
+                let within_page = (target as u32) & 0xFFF;
+                let add = u32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap());
+                code[at + 4..at + 8].copy_from_slice(&(add | (within_page << 10)).to_le_bytes());
+            },
+        })
     }
 }
 
@@ -1157,6 +1200,7 @@ pub fn dump_jit_asm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::Assembly;
 
     #[test]
     fn fmov_imm8_common_values() {
@@ -1184,6 +1228,98 @@ mod tests {
         assert_eq!(try_encode_fmov_imm8(f32::NAN), None);
         assert_eq!(try_encode_fmov_imm8(f32::INFINITY), None);
         assert_eq!(try_encode_fmov_imm8(100.0), None);
+    }
+
+    /// Read an `ADRP`+`ADD` pair back to the buffer offset it materializes.
+    ///
+    /// Written from the ARM ARM's field layout rather than from `AdrpAdd`'s
+    /// patch, so agreeing with it is evidence rather than a tautology.
+    /// `ADRP` is `1 immlo 10000 immhi Rd` with the 21-bit immediate split
+    /// across bits 30:29 and 23:5, counting *pages* from the one holding the
+    /// instruction; `ADD (immediate)` is `1 0 0 100010 sh imm12 Rn Rd`.
+    fn decode_adrp_add(code: &[u8], at: usize) -> (Gpr, i64) {
+        let word = |i: usize| u32::from_le_bytes(code[i..i + 4].try_into().unwrap());
+
+        let adrp = word(at);
+        assert_eq!(adrp & 0x9F00_0000, 0x9000_0000, "not an ADRP: {adrp:#010x}");
+        let imm21 = i64::from(((adrp >> 5) & 0x7_FFFF) << 2 | (adrp >> 29) & 0x3);
+        // Sign-extend from bit 20 — the reach is ±4 GiB, not +8 GiB.
+        let pages = (imm21 << 43) >> 43;
+        let page_base = ((at as i64) & !0xFFF) + (pages << 12);
+
+        let add = word(at + 4);
+        assert_eq!(add & 0xFFC0_0000, 0x9100_0000, "not an ADD: {add:#010x}");
+        let dst = Gpr((add & 0x1F) as u8);
+        assert_eq!(
+            Gpr(((add >> 5) & 0x1F) as u8),
+            dst,
+            "the ADD must accumulate into the register ADRP wrote"
+        );
+
+        (dst, page_base + i64::from((add >> 10) & 0xFFF))
+    }
+
+    /// The pair reaches its label whichever side of a page boundary the label
+    /// falls on — which is the whole reason it is a pair, and which the
+    /// `ADR`-with-a-margin scheme it replaced only ever exercised for pools
+    /// past 1 MiB, i.e. never.
+    #[test]
+    fn adrp_add_reaches_across_pages() {
+        // Distances chosen around 0x1000 so the page delta is 0, then 1, then
+        // more; the last is far enough that no `ADR` would have reached it
+        // under the old scheme's margin either.
+        for gap in [0, 4, 0xFFC, 0x1000, 0x1004, 0x2000, 3 << 20] {
+            let mut asm = Assembly::default();
+            let pool = asm.label();
+            asm.push(AdrpAdd {
+                dst: Gpr(17),
+                target: pool,
+            });
+            asm.code.resize(8 + gap, 0);
+            asm.bind(pool);
+
+            let code = asm.finish();
+            assert_eq!(
+                decode_adrp_add(&code, 0),
+                (Gpr(17), (8 + gap) as i64),
+                "gap {gap:#x}"
+            );
+        }
+    }
+
+    /// A label bound *before* the pair still resolves: the page delta is
+    /// negative, and its 21 bits are two's complement rather than a magnitude.
+    /// Nothing emits this today — the pool always trails the anchor — but the
+    /// sign is the easy half of the encoding to get wrong, and it costs one
+    /// test to find out here instead of the first time a label moves.
+    #[test]
+    fn adrp_add_reaches_backwards() {
+        for gap in [0usize, 4, 0x1000, 0x2004] {
+            let mut asm = Assembly::default();
+            let pool = asm.label();
+            asm.bind(pool);
+            asm.code.resize(gap, 0);
+            asm.push(AdrpAdd {
+                dst: Gpr(17),
+                target: pool,
+            });
+
+            let code = asm.finish();
+            assert_eq!(decode_adrp_add(&code, gap), (Gpr(17), 0), "gap {gap:#x}");
+        }
+    }
+
+    /// `Inst::encode` is for single-word instructions; `AdrpAdd` is two, like
+    /// `Ldr` and `Str`, and says so rather than handing back half of itself.
+    #[test]
+    #[should_panic(expected = "AdrpAdd")]
+    fn adrp_add_has_no_single_word_encoding() {
+        let word = Inst::from(AdrpAdd {
+            dst: Gpr(17),
+            target: Label(0),
+        })
+        .encode();
+        unreachable!("encode handed back {word:#010x} for a two-word instruction");
     }
 
     #[test]
@@ -1755,8 +1891,12 @@ pub(crate) mod driver {
     }
 
     pub(crate) struct Aarch64Backend {
-        pool: ConstPool,
-        adr_patch_pos: usize,
+        consts: ConstPool,
+        /// The constant pool's position, once `scaffold_anchor` has minted
+        /// it — a name rather than the offset `adr_patch_pos` used to be,
+        /// since there is no longer an estimate for that offset to disagree
+        /// with.
+        pool: Option<Label>,
         file: regalloc::RegisterFile,
     }
 
@@ -1769,38 +1909,15 @@ pub(crate) mod driver {
         /// regression.
         #[cfg(test)]
         pub(crate) fn pool_entries(&self) -> &[u32] {
-            &self.pool.entries
+            &self.consts.entries
         }
 
         pub(crate) fn new(ctx: EmitCtx) -> Self {
             Self {
-                pool: ConstPool::new(),
-                adr_patch_pos: 0,
+                consts: ConstPool::new(),
+                pool: None,
                 file: AARCH64_FILE.capped(ctx.max_regs),
             }
-        }
-
-        /// Append the constant pool after the final RET and patch the ADR anchor
-        /// (upgrading to ADRP+ADD when the pool is out of ADR range). Shared by
-        /// the per-batch epilogue and the collapse-loop scaffold.
-        fn finish_pool(&mut self, code: &mut Vec<u8>) {
-            if self.pool.is_empty() {
-                return;
-            }
-            let adr_pos = self.adr_patch_pos;
-            let estimated_offset = (code.len() as i64) - (adr_pos as i64);
-            let needs_adrp = estimated_offset >= (1 << 20) - 32;
-            if needs_adrp {
-                code.splice(adr_pos + 4..adr_pos + 4, [0, 0, 0, 0]);
-            }
-            while !code.len().is_multiple_of(16) {
-                code.push(0);
-            }
-            let pool_start = code.len();
-            for &bits in &self.pool.entries {
-                super::emit_pool_entry(code, bits);
-            }
-            super::patch_adr_or_adrp(code, adr_pos, pool_start, needs_adrp);
         }
     }
 
@@ -1826,14 +1943,14 @@ pub(crate) mod driver {
                 if let ScheduledOp::Const(val) = def.op
                     && super::needs_const_pool(val)
                 {
-                    self.pool.push_f32(val)?;
+                    self.consts.push_f32(val)?;
                 }
             }
             // Builtins add up to ~60 polynomial coefficients during emission; bail
             // if the expression constants + headroom would exceed the 12-bit LDR
             // offset limit.
             const BUILTIN_HEADROOM: usize = 128;
-            if self.pool.entries.len() + BUILTIN_HEADROOM > 4095 {
+            if self.consts.entries.len() + BUILTIN_HEADROOM > 4095 {
                 return Err(CompileError::BudgetExceeded(
                     "expression too large: constant pool would exceed 12-bit LDR offset limit",
                 ));
@@ -1846,7 +1963,7 @@ pub(crate) mod driver {
             code: &mut Vec<u8>,
             plan: &InstructionPlan,
         ) -> Result<(), CompileError> {
-            emit_instruction_plan(code, plan, &mut self.pool)
+            emit_instruction_plan(code, plan, &mut self.consts)
         }
 
         fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
@@ -1873,7 +1990,7 @@ pub(crate) mod driver {
             match location_of(locs, vid) {
                 Binding::Loc(Loc::Reg(reg)) => reg,
                 Binding::Remat(bits) => {
-                    emit_const_load(code, target, bits, &self.pool);
+                    emit_const_load(code, target, bits, &self.consts);
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
@@ -1946,12 +2063,38 @@ pub(crate) mod driver {
 
         /// The prologue's and body's constant loads are X17-relative, so the
         /// anchor has to be inside the emitted function, after the frame.
-        fn scaffold_anchor(&mut self, code: &mut Vec<u8>) {
-            self.adr_patch_pos = super::emit_adr_x17_placeholder(code);
+        fn scaffold_anchor(&mut self, asm: &mut Assembly) {
+            let pool = asm.label();
+            self.pool = Some(pool);
+            asm.push(AdrpAdd {
+                dst: X17.into(),
+                target: pool,
+            });
         }
 
-        fn scaffold_finish(&mut self, code: &mut Vec<u8>) {
-            self.finish_pool(code);
+        /// Append the constant pool after the final `RET`.
+        ///
+        /// `scaffold_anchor` names `self.pool` in an `AdrpAdd` unconditionally
+        /// — whether or not this compile needed the pool is not known until
+        /// every constant has been emitted — so the label must be bound here
+        /// even when there is nothing to append: `Assembly::finish` panics on
+        /// a reference nothing bound, and an unpatched `AdrpAdd` would leave
+        /// X17 pointing at itself, same as the unpatched `ADR` this replaced.
+        fn scaffold_finish(&mut self, asm: &mut Assembly) {
+            let pool = self
+                .pool
+                .expect("scaffold_anchor always mints one before this runs");
+            if self.consts.is_empty() {
+                asm.bind(pool);
+                return;
+            }
+            while !asm.code.len().is_multiple_of(16) {
+                asm.code.push(0);
+            }
+            asm.bind(pool);
+            for &bits in &self.consts.entries {
+                super::emit_pool_entry(&mut asm.code, bits);
+            }
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
