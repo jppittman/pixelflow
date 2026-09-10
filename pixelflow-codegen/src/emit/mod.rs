@@ -54,6 +54,7 @@ pub mod avx2;
 pub mod avx512;
 #[cfg(test)]
 pub(crate) mod coverage;
+pub(crate) mod demand;
 pub mod encoded;
 pub mod executable;
 mod guards;
@@ -1717,7 +1718,28 @@ fn arena_to_schedule(
             ExprNode::Ternary(op, a, b, c) => {
                 ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
             }
+            // Same unreachable precondition as `Dwrt` above: `passes::legalize`
+            // runs `expand_refs` first in every compile entry point, so a
+            // reference here means this schedule was built without the
+            // lowering pipeline. Refusing is not a limitation to lift — a
+            // surviving reference is a *call*, and codegen emits one flat
+            // function per kernel with no ABI for one
+            // (docs/plans/2026-09-09-composition-is-linking.md §5.2).
+            ExprNode::Ref(key) => panic!(
+                "arena_to_schedule: {key:?} names a kernel whose body is not in \
+                 this arena. expand_refs runs first in every compile entry \
+                 point, so a survivor means this schedule was built without \
+                 the lowering pipeline."
+            ),
             ExprNode::Nary(_, _, _) => panic!("Nary not supported in JIT arena compilation"),
+            // **The emitter has no iteration binder.** A fold reaching here
+            // means `passes::expand_reduce` did not run — that pass is what
+            // turns a fold into the `len()` copies of its body the machine
+            // actually executes, and it is the reason a surviving `Reduce`
+            // is priced out of extraction rather than emitted.
+            ExprNode::Reduce { .. } => {
+                panic!("a bounded fold reached the JIT emitter -- run passes::expand_reduce first")
+            }
         };
         schedule.push(regalloc::Def {
             value: vid,
@@ -2650,6 +2672,38 @@ mod tests {
         let v = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, x, v);
         let _ = arena_to_schedule(&a, root);
+    }
+
+    /// And the same for a `Ref`: its body is not in this arena at all, so a
+    /// survivor is a schedule built without `expand_refs`. `compile` runs
+    /// `legalize` first, so this too has to call the scheduler directly.
+    #[test]
+    #[should_panic(expected = "names a kernel whose body is not in")]
+    fn a_surviving_reference_fails_loudly() {
+        let named = pixelflow_ir::Kernel::x()
+            .mul(&pixelflow_ir::Kernel::constant(3.0))
+            .by_ref();
+        let (arena, root) = named.parts();
+        let _ = arena_to_schedule(arena, root);
+    }
+
+    /// The route that *does* work: the compile entry expands the reference
+    /// before it schedules, so a kernel composed by reference emits exactly
+    /// what the spliced composition emits.
+    #[test]
+    fn a_reference_compiles_through_the_entry_point() {
+        let body = pixelflow_ir::Kernel::x().mul(&pixelflow_ir::Kernel::constant(3.0));
+        let named = body.by_ref().add(&pixelflow_ir::Kernel::y());
+        let direct = body.add(&pixelflow_ir::Kernel::y());
+        let (n_arena, n_root) = named.parts();
+        let (d_arena, d_root) = direct.parts();
+        let named_code = compile(n_arena, n_root).expect("a named kernel compiles");
+        let direct_code = compile(d_arena, d_root).expect("and so does the spliced one");
+        for (x, y) in [(0.0f32, 0.0f32), (1.5, -2.0), (-3.25, 7.5)] {
+            let want = eval_point(&direct_code.code, x, y, 0.0, 0.0);
+            let got = eval_point(&named_code.code, x, y, 0.0, 0.0);
+            assert_eq!(got, want, "at ({x}, {y})");
+        }
     }
 
     /// The scaffold's size does not depend on the frame it wraps.
@@ -4691,570 +4745,6 @@ mod tests {
                     (got - want).abs() <= 1e-3,
                     "select: ({px},{py}) got {got} want {want}"
                 );
-            }
-        }
-    }
-
-    // =========================================================================
-    // 128-bit end-to-end: bound-memory gather through the shared driver, run on
-    // the host across 4 lanes. Covers BOTH 128-bit backends — NEON's native
-    // `ld1` lanes and x86's scalar-load assembly (no AVX2 `vgatherdps` at 128
-    // bits) — against the same interpreter oracle, so the two cannot drift.
-    // Mirrors the avx512_driver gather tests at 128-bit width.
-    // =========================================================================
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(
-            target_arch = "x86_64",
-            not(target_feature = "avx512f"),
-            not(target_feature = "avx2")
-        )
-    ))]
-    mod gather_driver_128 {
-        use super::*;
-        use pixelflow_ir::arena::ExprId;
-
-        /// Run a compiled gather kernel over one batch: `ctx` is the array of
-        /// buffer base pointers. Arch-independent now that the coordinates are
-        /// plain arrays rather than intrinsics.
-        fn run4_ctx(
-            res: &CompileResult,
-            ctx: &[*const f32],
-            xs: [f32; LANES],
-            ys: [f32; LANES],
-        ) -> [f32; LANES] {
-            eval_batch(
-                &res.code,
-                ctx,
-                executable::Point4::new(xs, ys, [0.0; LANES], [0.0; LANES]),
-            )
-        }
-
-        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
-        /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
-        /// the reference interpreter, over the same coords and binding. The 16
-        /// coordinate pairs run as four 4-lane batches.
-        fn check_against_interp(
-            arena: &ExprArena,
-            root: ExprId,
-            buffers: &[&[f32]],
-            xs: [f32; 16],
-            ys: [f32; 16],
-            tag: &str,
-        ) {
-            let res = compile(arena, root).expect("compile gather kernel");
-            let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
-            let bindings = pixelflow_ir::binding::BindingTable::bind(arena, buffers).unwrap();
-
-            for batch in 0..4 {
-                let mut cx = [0.0f32; 4];
-                let mut cy = [0.0f32; 4];
-                cx.copy_from_slice(&xs[batch * 4..batch * 4 + 4]);
-                cy.copy_from_slice(&ys[batch * 4..batch * 4 + 4]);
-                let got = run4_ctx(&res, &ctx, cx, cy);
-                for i in 0..4 {
-                    let want =
-                        pixelflow_ir::eval::eval_scalar(arena, root, &[cx[i], cy[i]], &bindings);
-                    assert_eq!(
-                        got[i], want,
-                        "{tag} batch {batch} lane {i} (x={}, y={})",
-                        cx[i], cy[i]
-                    );
-                }
-            }
-        }
-
-        fn idx_lanes() -> ([f32; 16], [f32; 16]) {
-            // A spread of in-range, fractional, and out-of-range coordinates so
-            // the clamp and floor paths are all exercised.
-            let xs = [
-                0.0, 1.0, 2.9, 7.0, -3.0, 100.0, 4.0, 5.5, 6.0, 0.1, 3.0, 2.0, 1.9, 7.9, -0.5, 4.4,
-            ];
-            let ys = [
-                0.0, 0.0, 1.0, 1.9, 2.0, 2.0, -1.0, 3.0, 0.5, 2.9, 1.0, 3.9, 0.0, 2.0, 5.0, 1.0,
-            ];
-            (xs, ys)
-        }
-
-        #[test]
-        fn gather_jit_matches_interpreter() {
-            // 8x4 buffer, gather at (X, Y).
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_gather(b, x, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
-        }
-
-        #[test]
-        fn gather_composed_with_arithmetic() {
-            // out = gather(buf, X, Y) * 2 + Y — proves gather is a schedulable
-            // mid-expression node, not just a whole-kernel root.
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let g = a.push_gather(b, x, y);
-            let two = a.push_const(2.0);
-            let scaled = a.push_binary(OpKind::Mul, g, two);
-            let root = a.push_binary(OpKind::Add, scaled, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
-        }
-
-        #[test]
-        fn gather_two_buffers() {
-            // gA(X,Y) + gB(Y,X) with two distinct bound buffers, exercising
-            // slot 0 and slot 1 of the context.
-            let (w, h) = (6usize, 6usize);
-            let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
-            let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
-            let mut a = ExprArena::new();
-            let ba = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let bb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let ga = a.push_gather(ba, x, y);
-            let gb = a.push_gather(bb, y, x);
-            let root = a.push_binary(OpKind::Add, ga, gb);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(
-                &a,
-                root,
-                &[buf_a.as_slice(), buf_b.as_slice()],
-                xs,
-                ys,
-                "2-buf",
-            );
-        }
-
-        #[test]
-        fn matmul_reduce_jit_matches_interpreter() {
-            // out(j) = Σ_i W(i,j) * input(i), evaluated per output lane j = X.
-            // The reduction over i unrolls to a flat gather/FMA chain (bound
-            // extent), and the whole thing runs as one bound-memory kernel.
-            //   W is IN×OUT row-major (width=IN, height=OUT); input is length IN.
-            let (in_dim, out_dim) = (4usize, 6usize);
-            let w: Vec<f32> = (0..(in_dim * out_dim))
-                .map(|k| (k as f32) * 0.5 - 2.0)
-                .collect();
-            let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
-
-            let mut a = ExprArena::new();
-            let wb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: out_dim as u32,
-            });
-            let ib = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: 1,
-            });
-            // body(i, j=X) = W(i, X) * input(i, 0)
-            let i = a.push_var(4);
-            let j = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let wg = a.push_gather(wb, i, j);
-            let ig = a.push_gather(ib, i, zero);
-            let prod = a.push_binary(OpKind::Mul, wg, ig);
-            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
-
-            let buffers: &[&[f32]] = &[w.as_slice(), input.as_slice()];
-            // Output lanes j = 0..6 (rest clamp to the last row, harmless here).
-            let xs = [
-                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
-            ];
-            let ys = [0.0f32; 16];
-            check_against_interp(&a, root, buffers, xs, ys, "matmul");
-        }
-    }
-
-    // =========================================================================
-    // AVX-512 end-to-end: arena -> shared driver -> EVEX zmm kernel, run on the
-    // host across all 16 lanes. Built only with +avx512f.
-    // =========================================================================
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    mod avx512_driver {
-        use super::*;
-        use pixelflow_ir::arena::{ExprArena, ExprId};
-
-        /// Run a compiled zmm kernel over 16 distinct lanes per coordinate.
-        fn run16(res: &CompileResult, xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
-            let o = executable::Point4::new(xs, ys, zs, [0.0; 16]);
-            eval_batch(&res.code, &[], o)
-        }
-
-        fn lanes() -> ([f32; 16], [f32; 16], [f32; 16]) {
-            let mut xs = [0.0; 16];
-            let mut ys = [0.0; 16];
-            let mut zs = [0.0; 16];
-            for i in 0..16 {
-                xs[i] = i as f32 - 7.0;
-                ys[i] = (i as f32) * 0.5 + 1.0;
-                zs[i] = 3.0 - (i as f32) * 0.25;
-            }
-            (xs, ys, zs)
-        }
-
-        fn check(got: [f32; 16], want: impl Fn(usize) -> f32, tag: &str) {
-            for (i, &g) in got.iter().enumerate() {
-                let w = want(i);
-                assert!(
-                    (g - w).abs() <= 1e-3,
-                    "{tag} lane {i}: got {} want {}",
-                    g,
-                    w
-                );
-            }
-        }
-
-        // ---- Bound-memory gather: JIT vs reference interpreter ----
-
-        /// Run a compiled gather kernel with `ctx` bound as its buffer bases.
-        fn run16_ctx(
-            res: &CompileResult,
-            ctx: &[*const f32],
-            xs: [f32; 16],
-            ys: [f32; 16],
-        ) -> [f32; 16] {
-            let o = executable::Point4::new(xs, ys, [0.0; 16], [0.0; 16]);
-            eval_batch(&res.code, ctx, o)
-        }
-
-        /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
-        /// the reference interpreter, over the same coords and binding.
-        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
-        fn check_against_interp(
-            arena: &ExprArena,
-            root: ExprId,
-            buffers: &[&[f32]],
-            xs: [f32; 16],
-            ys: [f32; 16],
-            tag: &str,
-        ) {
-            let res = compile(arena, root).expect("compile gather kernel");
-            let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
-            let got = run16_ctx(&res, &ctx, xs, ys);
-
-            let bindings = pixelflow_ir::binding::BindingTable::bind(arena, buffers).unwrap();
-            for (i, &g) in got.iter().enumerate() {
-                let want = pixelflow_ir::eval::eval_scalar(arena, root, &[xs[i], ys[i]], &bindings);
-                assert_eq!(g, want, "{tag} lane {i} (x={}, y={})", xs[i], ys[i]);
-            }
-        }
-
-        fn idx_lanes() -> ([f32; 16], [f32; 16]) {
-            // A spread of in-range, fractional, and out-of-range coordinates so
-            // the clamp and floor paths are all exercised.
-            let xs = [
-                0.0, 1.0, 2.9, 7.0, -3.0, 100.0, 4.0, 5.5, 6.0, 0.1, 3.0, 2.0, 1.9, 7.9, -0.5, 4.4,
-            ];
-            let ys = [
-                0.0, 0.0, 1.0, 1.9, 2.0, 2.0, -1.0, 3.0, 0.5, 2.9, 1.0, 3.9, 0.0, 2.0, 5.0, 1.0,
-            ];
-            (xs, ys)
-        }
-
-        #[test]
-        fn gather_jit_matches_interpreter() {
-            // 8x4 buffer, gather at (X, Y).
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_gather(b, x, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
-        }
-
-        #[test]
-        fn gather_composed_with_arithmetic() {
-            // out = gather(buf, X, Y) * 2 + Y — proves gather is a schedulable
-            // mid-expression node, not just a whole-kernel root.
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let g = a.push_gather(b, x, y);
-            let two = a.push_const(2.0);
-            let scaled = a.push_binary(OpKind::Mul, g, two);
-            let root = a.push_binary(OpKind::Add, scaled, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
-        }
-
-        #[test]
-        fn gather_two_buffers() {
-            // coverage.select via arithmetic: gA(X,Y) + gB(Y,X) with two distinct
-            // bound buffers, exercising slot 0 and slot 1 of the context.
-            let (w, h) = (6usize, 6usize);
-            let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
-            let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
-            let mut a = ExprArena::new();
-            let ba = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let bb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let ga = a.push_gather(ba, x, y);
-            let gb = a.push_gather(bb, y, x);
-            let root = a.push_binary(OpKind::Add, ga, gb);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(
-                &a,
-                root,
-                &[buf_a.as_slice(), buf_b.as_slice()],
-                xs,
-                ys,
-                "2-buf",
-            );
-        }
-
-        #[test]
-        fn matmul_reduce_jit_matches_interpreter() {
-            // out(j) = Σ_i W(i,j) * input(i), evaluated per output lane j = X.
-            // The reduction over i unrolls to a flat gather/FMA chain (bound
-            // extent), and the whole thing runs as one bound-memory kernel.
-            //   W is IN×OUT row-major (width=IN, height=OUT); input is length IN.
-            let (in_dim, out_dim) = (4usize, 6usize);
-            let w: Vec<f32> = (0..(in_dim * out_dim))
-                .map(|k| (k as f32) * 0.5 - 2.0)
-                .collect();
-            let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
-
-            let mut a = ExprArena::new();
-            let wb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: out_dim as u32,
-            });
-            let ib = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: 1,
-            });
-            // body(i, j=X) = W(i, X) * input(i, 0)
-            let i = a.push_var(4);
-            let j = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let wg = a.push_gather(wb, i, j);
-            let ig = a.push_gather(ib, i, zero);
-            let prod = a.push_binary(OpKind::Mul, wg, ig);
-            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
-
-            let buffers: &[&[f32]] = &[w.as_slice(), input.as_slice()];
-            // Output lanes j = 0..6 (rest clamp to the last row, harmless here).
-            let xs = [
-                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
-            ];
-            let ys = [0.0f32; 16];
-            check_against_interp(&a, root, buffers, xs, ys, "matmul");
-        }
-
-        /// sqrt(X*X + Y*Y) - Z, with a non-commutative shape and FMA-able terms,
-        /// fitting in registers (no spill).
-        #[test]
-        fn avx512_arith_no_spill() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let z = a.push_binary(OpKind::Mul, y, x);
-            let xx = a.push_binary(OpKind::Mul, x, x);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let sum = a.push_binary(OpKind::Add, xx, yy);
-            let dist = a.push_unary(OpKind::Sqrt, sum);
-            let root = a.push_binary(OpKind::Sub, dist, z);
-
-            let res = compile(&a, root).expect("avx512 compile");
-            assert_eq!(res.spill_count, 0, "should fit without spilling");
-
-            let (xs, ys, zs) = lanes();
-            check(
-                run16(&res, xs, ys, zs),
-                |i| (xs[i] * xs[i] + ys[i] * ys[i]).sqrt() - ys[i] * xs[i],
-                "norm-z",
-            );
-        }
-
-        /// Spilling on AVX-512 must use a real stack frame: a zmm is 64 bytes
-        /// and the SSE2 red zone cannot hold one.
-        ///
-        /// The pool is capped rather than out-sized by the expression. This
-        /// test used to lean on a wide DAG "exceeding the 6 allocatable zmm
-        /// regs" and stopped spilling the moment the pool grew to 22 — the
-        /// subject here is what spilling *does*, not when it happens, so say
-        /// so with `with_max_regs` instead of racing the allocator.
-        #[test]
-        fn avx512_spills_to_real_frame() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let mut terms = alloc::vec::Vec::new();
-            for i in 1..=10u32 {
-                let c = a.push_const(i as f32);
-                let ax = a.push_binary(OpKind::Add, x, c);
-                let by = a.push_binary(OpKind::Add, y, c);
-                terms.push(a.push_binary(OpKind::Mul, ax, by));
-            }
-            while terms.len() > 1 {
-                let mut next = alloc::vec::Vec::new();
-                for pair in terms.chunks(2) {
-                    if pair.len() == 2 {
-                        next.push(a.push_binary(OpKind::Add, pair[0], pair[1]));
-                    } else {
-                        next.push(pair[0]);
-                    }
-                }
-                terms = next;
-            }
-            let root = terms[0];
-
-            let res = EmitCtx::with_max_regs(4)
-                .compile(&a, root)
-                .expect("avx512 compile");
-            assert!(res.spill_count > 0, "expected spilling");
-
-            let (xs, ys, zs) = lanes();
-            check(
-                run16(&res, xs, ys, zs),
-                |i| {
-                    let mut acc = 0.0f32;
-                    for k in 1..=10u32 {
-                        acc += (xs[i] + k as f32) * (ys[i] + k as f32);
-                    }
-                    acc
-                },
-                "spill",
-            );
-        }
-
-        /// Compare + select with non-exclusive arms: `(X < Y) ? X : Y` (== min).
-        /// No guard region forms, so this is the plain vcmpps->vpmovm2d mask +
-        /// vpternlogd blend path.
-        #[test]
-        fn avx512_compare_select_blend() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let cond = a.push_binary(OpKind::Lt, x, y);
-            let root = a.push_ternary(OpKind::Select, cond, x, y);
-
-            let res = compile(&a, root).expect("avx512 compile");
-            let (xs, ys, zs) = lanes();
-            check(run16(&res, xs, ys, zs), |i| xs[i].min(ys[i]), "lt-select");
-        }
-
-        /// Select with arm-exclusive subexpressions: `(X > 0) ? Y*Y*Y : Z+Z+Z`.
-        /// Forms guard regions, exercising the vptestmd+kortestw short-circuit
-        /// branches (all-false skips Y^3, all-true skips 3Z) plus the per-lane
-        /// blend on mixed input.
-        #[test]
-        fn avx512_select_guards() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let zero = a.push_const(0.0);
-            let cond = a.push_binary(OpKind::Gt, x, zero);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let yyy = a.push_binary(OpKind::Mul, yy, y);
-            let zz = a.push_binary(OpKind::Add, x, x);
-            let zzz = a.push_binary(OpKind::Add, zz, x);
-            let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
-
-            let res = compile(&a, root).expect("avx512 compile");
-
-            let allpos = [2.0f32; 16];
-            let allneg = [-2.0f32; 16];
-            let ys = core::array::from_fn::<f32, 16, _>(|i| i as f32 * 0.5 + 1.0);
-            let zs = core::array::from_fn::<f32, 16, _>(|i| 3.0 - i as f32 * 0.25);
-            check(
-                run16(&res, allpos, ys, zs),
-                |i| ys[i] * ys[i] * ys[i],
-                "guard-true",
-            );
-            let _unused_third_input = zs;
-            check(
-                run16(&res, allneg, ys, zs),
-                |_| 3.0 * allneg[0],
-                "guard-false",
-            );
-
-            let mixed = core::array::from_fn::<f32, 16, _>(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
-            check(
-                run16(&res, mixed, ys, zs),
-                |i| {
-                    if mixed[i] > 0.0 {
-                        ys[i] * ys[i] * ys[i]
-                    } else {
-                        3.0 * mixed[i]
-                    }
-                },
-                "guard-mixed",
-            );
-        }
-
-        /// Rounding via vrndscaleps (floor/ceil/round), each a single EVEX op.
-        #[test]
-        fn avx512_rounding() {
-            // Mixed fractional/sign inputs so each rounding mode is distinct.
-            let xs = core::array::from_fn::<f32, 16, _>(|i| (i as f32 - 8.0) * 0.7);
-            let ones = [1.0f32; 16];
-            for (op, f, tag) in [
-                (OpKind::Floor, f32::floor as fn(f32) -> f32, "floor"),
-                (OpKind::Ceil, f32::ceil as fn(f32) -> f32, "ceil"),
-                (
-                    OpKind::Round,
-                    f32::round_ties_even as fn(f32) -> f32,
-                    "round",
-                ),
-            ] {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let root = a.push_unary(op, x);
-                let res = compile(&a, root).expect("avx512 compile");
-                check(run16(&res, xs, ones, ones), |i| f(xs[i]), tag);
             }
         }
     }

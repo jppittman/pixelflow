@@ -23,10 +23,9 @@
 //! contramaps on the kernel (`Kernel::at`), composed before the lattice ever
 //! sees a coordinate.
 //!
-//! A sub-lattice is an index range, and a **[`union::Union`]** is a sum of
-//! them: disjoint ranges, each with the kernel sampled on it, collapsing into
-//! one buffer. That is the domain-side encoding of an extent, the counterpart
-//! to a `select` mask on the range side.
+//! A sub-lattice is an [`IndexRange`](crate::IndexRange): a rectangular
+//! restriction of the index, never a coordinate — the domain-side encoding of
+//! an extent, the counterpart to a `select` mask on the range side.
 //!
 //! A kernel with a lattice is the evaluation API:
 //!
@@ -43,6 +42,7 @@
 //! [`Kernel`]: pixelflow_ir::Kernel
 //! [`Manifold`]: crate::Manifold
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -57,8 +57,17 @@ use alloc::vec::Vec;
 /// `index(collapse(f)) = f` (up to discretization).
 #[derive(Clone, Debug)]
 pub struct DiscreteManifold {
-    /// Raw value buffer, row-major (y * width + x).
-    pub(crate) buffer: Vec<f32>,
+    /// Raw value buffer, row-major (y * width + x). `Arc<[f32]>`, not
+    /// `Vec<f32>`: the buffer is write-once (no mutable accessor exists), so
+    /// every clone of a `DiscreteManifold` — and every [`Self::kernel`] built
+    /// from it — shares this one allocation. That is load-bearing for
+    /// `Kernel::with_buffer_data`'s merge, not only an optimization: two
+    /// kernels that read this manifold twice (a repeated glyph in a run, a
+    /// texture sampled from two places) must carry the *same* `Arc` pointer
+    /// under their shared `BufferIdentity`, or the merge's `Arc::ptr_eq`
+    /// check — the one it can afford, at every composition — reads two
+    /// honest tabulations as if they had drifted apart.
+    pub(crate) buffer: Arc<[f32]>,
     /// Width of the grid (X dimension).
     pub(crate) width: usize,
     /// Height of the grid (Y dimension).
@@ -87,7 +96,7 @@ impl DiscreteManifold {
             width * height,
         );
         Self {
-            buffer,
+            buffer: Arc::from(buffer),
             width,
             height,
             id: pixelflow_ir::arena::BufferIdentity::mint(),
@@ -112,10 +121,13 @@ impl DiscreteManifold {
         &self.buffer
     }
 
-    /// Consume the DiscreteManifold and return the buffer.
+    /// Consume the DiscreteManifold and return the buffer, copied out of the
+    /// shared `Arc` — [`Self::kernel`] may hold other references to it, and
+    /// an unsized `Arc<[f32]>` has no in-place way to reclaim its allocation
+    /// even when this is the last one.
     #[must_use]
     pub fn into_buffer(self) -> Vec<f32> {
-        self.buffer
+        self.buffer.to_vec()
     }
 }
 
@@ -216,7 +228,8 @@ impl Lattice {
     ///
     /// # Panics
     ///
-    /// Panics if `kernel` **declares a buffer** — compile and bind it
+    /// Panics if `kernel` **declares a buffer it carries no data for** (see
+    /// [`Lattice::bake`]'s panics for the distinction) — compile and bind it
     /// yourself, then call
     /// [`BoundManifold::eval_at`](crate::BoundManifold::eval_at). Also
     /// panics if this build's `Field` width is not the JIT's, or if
@@ -320,10 +333,16 @@ impl Lattice {
     ///
     /// # Panics
     ///
-    /// Panics if the kernel **declares a buffer**: binding nothing leaves that
-    /// slot empty, and [`Manifold::bind`](crate::Manifold::bind) refuses it by
+    /// Panics if the kernel **declares a buffer it carries no data for**:
+    /// binding nothing (beyond what the kernel itself carried into
+    /// [`Manifold::compile`](crate::Manifold::compile)) leaves that slot
+    /// empty, and [`Manifold::bind`](crate::Manifold::bind) refuses it by
     /// name rather than letting the gathers load a base pointer out of an
-    /// unbound context. Compile such a kernel yourself and bind its memory.
+    /// unbound context. A kernel built over bound memory
+    /// (`DiscreteManifold::kernel`, `BilinearSampler::kernel`) carries its
+    /// own data and bakes here just fine; one built from
+    /// `DiscreteManifold::kernel_for` alone (a shape with no data seeded
+    /// yet) does not — compile such a kernel yourself and bind its memory.
     /// Also panics if this build's `Field` width is not the JIT's, or if
     /// compilation fails.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -472,7 +491,13 @@ impl BilinearSampler {
         pixelflow_ir::Kernel::from_parts(arena, root)
     }
 
-    /// This sampler's blend as a composable fragment. See [`Self::kernel_for`].
+    /// This sampler's blend as a composable fragment, its own texture
+    /// seeded into the result ([`Kernel::with_buffer_data`]) — the data
+    /// travels with the value from here, so a caller composing this into a
+    /// larger kernel never gathers a binding for it separately. A refcount
+    /// clone of [`DiscreteManifold`]'s own `Arc`, not a copy, and the same
+    /// pointer every call — which is what lets two reads of one texture
+    /// merge by `Arc::ptr_eq` instead of by comparing contents.
     ///
     /// # Panics
     ///
@@ -484,6 +509,7 @@ impl BilinearSampler {
             u32::try_from(self.tex.width).expect("buffer width exceeds u32"),
             u32::try_from(self.tex.height).expect("buffer height exceeds u32"),
         )
+        .with_buffer_data(self.tex.id, Arc::clone(&self.tex.buffer))
     }
 }
 
@@ -533,11 +559,18 @@ impl DiscreteManifold {
         pixelflow_ir::arena::BufferIdentity,
         alloc::sync::Arc<Vec<f32>>,
     ) {
-        (self.id, alloc::sync::Arc::new(self.buffer.clone()))
+        (self.id, alloc::sync::Arc::new(self.buffer.to_vec()))
     }
 
-    /// This buffer's nearest-neighbour read as a composable fragment. See
-    /// [`Self::kernel_for`].
+    /// This buffer's nearest-neighbour read as a composable fragment, this
+    /// buffer's own contents seeded into the result
+    /// ([`Kernel::with_buffer_data`]) — the data travels with the value
+    /// from here, so a caller composing this into a larger kernel never
+    /// gathers a binding for it separately (see [`Self::kernel_for`] for
+    /// the shape-only fragment this builds on). A refcount clone of this
+    /// manifold's own `Arc`, not a copy, and the same pointer every call —
+    /// which is what lets two reads of one buffer (a repeated glyph in a
+    /// run) merge by `Arc::ptr_eq` instead of by comparing contents.
     ///
     /// # Panics
     ///
@@ -549,6 +582,7 @@ impl DiscreteManifold {
             u32::try_from(self.width).expect("buffer width exceeds u32"),
             u32::try_from(self.height).expect("buffer height exceeds u32"),
         )
+        .with_buffer_data(self.id, Arc::clone(&self.buffer))
     }
 
     /// Wrap this buffer in a [`BilinearSampler`].

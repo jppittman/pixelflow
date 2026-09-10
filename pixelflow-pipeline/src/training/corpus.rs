@@ -64,6 +64,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use pixelflow_ir::fold::Fold;
 use pixelflow_ir::kind::OpCode;
 use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
 
@@ -180,6 +181,7 @@ const TAG_UNARY: u8 = 3;
 const TAG_BINARY: u8 = 4;
 const TAG_TERNARY: u8 = 5;
 const TAG_NARY: u8 = 6;
+const TAG_REDUCE: u8 = 9;
 const TAG_BUFFER: u8 = 7;
 
 // ── Reachable-subtree compaction ─────────────────────────────────────────────
@@ -254,11 +256,17 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                          the corpus format does not serialize",
                         u.0
                     ),
+                    ExprNode::Ref(k) => panic!(
+                        "reachable_subtree: expression references Ref({k:?}), which names a \
+                         kernel interned in this process — a corpus outlives the process, so \
+                         the key would read back naming nothing"
+                    ),
                     ExprNode::Unary(op, a) => out_arena.push_unary(*op, map(*a)),
                     ExprNode::Binary(op, a, b) => out_arena.push_binary(*op, map(*a), map(*b)),
                     ExprNode::Ternary(op, a, b, c) => {
                         out_arena.push_ternary(*op, map(*a), map(*b), map(*c))
                     }
+                    ExprNode::Reduce { fold, body } => out_arena.push_reduce(*fold, map(*body)),
                     ExprNode::Nary(op, _, _) => {
                         let mapped_children: Vec<ExprId> = arena.children(id).map(map).collect();
                         out_arena.push_nary(*op, &mapped_children)
@@ -376,6 +384,12 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
             w.write_all(&[TAG_BUFFER])?;
             w.write_all(&b.0.to_le_bytes())?;
         }
+        // The fold as opaque bits: metadata, not children.
+        ExprNode::Reduce { fold, body } => {
+            w.write_all(&[TAG_REDUCE])?;
+            w.write_all(&fold.to_bits().to_le_bytes())?;
+            w.write_all(&body.0.to_le_bytes())?;
+        }
         ExprNode::Uniform(u) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -383,6 +397,15 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
                     "Uniform({}) has no corpus encoding: its declaration is not serialized",
                     u.0
                 ),
+            ));
+        }
+        // A key names an entry in *this* process's `KernelStore`, and a
+        // corpus outlives the process — encoding one would store a name
+        // nothing can resolve on the way back in. Expand refs before writing.
+        ExprNode::Ref(k) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Ref({k:?}) has no corpus encoding: it names a process-local kernel"),
             ));
         }
     }
@@ -520,6 +543,17 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
         TAG_BUFFER => {
             let b = pixelflow_ir::arena::BufferId(r.read_u16()?);
             Ok(arena.push_buffer(b))
+        }
+        TAG_REDUCE => {
+            let bits = r.read_u64()?;
+            let fold = Fold::from_bits(bits).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corpus fold bits {bits} name no fold"),
+                )
+            })?;
+            let body = ExprId(r.read_u32()?);
+            Ok(arena.push_reduce(fold, body))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -29,7 +29,7 @@ libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 criterion = "0.5"
-pixelflow-ir = { path = "../pixelflow-ir", features = ["oracle"] }
+pixelflow-ir = { path = "../pixelflow-ir" }
 
 [[bench]]
 name = "collapse_overhead"

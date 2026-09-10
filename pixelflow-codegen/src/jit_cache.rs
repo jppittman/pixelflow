@@ -6,6 +6,12 @@
 //! every structurally identical glyph kernel in a bake sweep, produces a
 //! byte-identical schedule.
 //!
+//! The key is [`pixelflow_ir::key::canonical`]'s — a kernel's identity is not
+//! codegen's private business, so it lives at the bottom of the dependency
+//! graph where a `Ref` can name into it too
+//! (docs/plans/2026-09-09-composition-is-linking.md §2). This cache is one
+//! consumer of it.
+//!
 //! Keys are the [`LatticeShape`] the kernel is compiled for — its extents,
 //! so a lattice of a different size is a different kernel and a window
 //! resize recompiles, by decision — plus the **canonical form of the
@@ -47,8 +53,8 @@ use crate::CompiledKernel;
 use crate::emit;
 use crate::error::CompileError;
 use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, UniformDecl};
-use pixelflow_ir::{ExprData, Node, SideTable};
+use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
+use pixelflow_ir::key::{Canonical, canonical};
 
 static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Arc<CompiledKernel>>>> = OnceLock::new();
 
@@ -91,11 +97,32 @@ pub struct Linked {
 /// Compile a [`Kernel`](pixelflow_ir::Kernel) for a lattice of the given `shape`.
 pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Linked, CompileError> {
     let (arena, root) = kernel.parts();
+    // References first, before the key or the link is read off anything. A
+    // `Ref` is a leaf whose body — and whose buffer and uniform declarations
+    // — are not in this arena, so a key taken here would name a kernel other
+    // than the one that gets emitted, and the link handed back would be
+    // missing every slot the referent reads. Expanding *is* the linker
+    // (docs/plans/2026-09-09-composition-is-linking.md §3), and it makes
+    // "a reference is a kernel" true at this boundary rather than only in the
+    // algebra: `Manifold::compile` needs to know nothing about it.
+    //
+    // Guarded rather than called unconditionally: the pass's own identity
+    // path still clones the arena, and this runs on every compile including
+    // the cache hits.
+    let expanded = arena
+        .nodes_raw()
+        .iter()
+        .any(|n| matches!(n, ExprNode::Ref(_)))
+        .then(|| pixelflow_ir::passes::expand_refs_owned(arena, root));
+    let (arena, root) = match &expanded {
+        Some((linked, linked_root)) => (linked, *linked_root),
+        None => (arena, root),
+    };
     let Canonical {
         mut key,
         buffers,
         uniforms,
-    } = canonical(kernel);
+    } = canonical(arena, root);
 
     // Optimize, link, then emit. This is not a step callers get to sequence:
     // an arena reaching a backend unoptimized is never what anyone wanted,
@@ -161,126 +188,12 @@ pub fn entry_count() -> usize {
         .unwrap_or(0)
 }
 
-/// The canonical form of a reachable subgraph: its key, and the buffer and
-/// uniform declarations in the dense order the key numbers them by.
-struct Canonical {
-    key: Vec<u8>,
-    buffers: Vec<BufferDecl>,
-    uniforms: Vec<UniformDecl>,
-}
-
-/// Canonical serialization of the subgraph reachable from `kernel.root()`: nodes in
-/// ascending topological order (in Dag, children always strictly precede parents),
-/// child references remapped to dense indices, and buffer
-/// and uniform leaves remapped to dense slots by first occurrence in that
-/// same order — never by identity, which is what lets two compositions of
-/// one shape share code.
-fn canonical(kernel: &pixelflow_ir::Kernel) -> Canonical {
-    let root = kernel.root();
-    let dag = root.dag();
-    let mut reachable = dag.side_table(false);
-    for n in root.descendants() {
-        reachable[n] = true;
-    }
-
-    // Dense remap in ascending id order (dag.iter() yields children strictly before parents).
-    let mut dense = dag.side_table(u32::MAX);
-    let mut next = 0u32;
-    let mut key: Vec<u8> = Vec::with_capacity(dag.len() * 8);
-    let mut buffers: Vec<BufferDecl> = Vec::new();
-    let mut uniforms: Vec<UniformDecl> = Vec::new();
-
-    let push_node = |key: &mut Vec<u8>, dense: &SideTable<u32>, n: Node<'_, ExprData>| {
-        let d = dense[n];
-        debug_assert_ne!(d, u32::MAX, "child densified before parent");
-        key.extend_from_slice(&d.to_le_bytes());
-    };
-
-    /// The dense slot of `decl` in `table`, appending it on first sight.
-    fn dense_slot<T: PartialEq + Copy>(table: &mut Vec<T>, decl: T) -> u16 {
-        let slot = table.iter().position(|d| *d == decl).unwrap_or_else(|| {
-            table.push(decl);
-            table.len() - 1
-        });
-        u16::try_from(slot).expect("dense slot fits the table index width")
-    }
-
-    let kernel_buffers = kernel.buffers();
-    let kernel_uniforms = kernel.uniforms();
-
-    for n in dag.iter() {
-        if !reachable[n] {
-            continue;
-        }
-        match *n.get() {
-            ExprData::Var(i) => {
-                key.push(0);
-                key.push(i);
-            }
-            ExprData::Const(bits) => {
-                key.push(1);
-                key.extend_from_slice(&bits.to_le_bytes());
-            }
-            ExprData::Param(i) => {
-                key.push(2);
-                key.push(i);
-            }
-            ExprData::Op(op) => {
-                let count = n.child_count();
-                match count {
-                    1 => key.push(3),
-                    2 => key.push(4),
-                    3 => key.push(5),
-                    _ => {
-                        key.push(6);
-                        key.extend_from_slice(&op.marshal().to_bytes());
-                        key.extend_from_slice(&(count as u32).to_le_bytes());
-                        for child in n.children() {
-                            push_node(&mut key, &dense, child);
-                        }
-                        dense[n] = next;
-                        next += 1;
-                        continue;
-                    }
-                }
-                key.extend_from_slice(&op.marshal().to_bytes());
-                for child in n.children() {
-                    push_node(&mut key, &dense, child);
-                }
-            }
-            // Slot by first occurrence, extents in the key: the code folds
-            // its address arithmetic against them.
-            ExprData::Buffer(b) => {
-                let decl = kernel_buffers[b.0 as usize];
-                key.push(7);
-                key.extend_from_slice(&dense_slot(&mut buffers, decl).to_le_bytes());
-                key.extend_from_slice(&decl.width.to_le_bytes());
-                key.extend_from_slice(&decl.height.to_le_bytes());
-            }
-            // Offset by first occurrence; the default is the block's
-            // business, not the code's.
-            ExprData::Uniform(u) => {
-                let decl = kernel_uniforms[u.0 as usize];
-                key.push(8);
-                key.extend_from_slice(&dense_slot(&mut uniforms, decl).to_le_bytes());
-            }
-        }
-        dense[n] = next;
-        next += 1;
-    }
-
-    Canonical {
-        key,
-        buffers,
-        uniforms,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pixelflow_ir::Kernel;
     use pixelflow_ir::arena::{BufferIdentity, UniformIdentity};
+    use pixelflow_ir::fold::{Binder, Fold, Monoid};
     use pixelflow_ir::kind::OpKind;
 
     const TEST_SHAPE: LatticeShape = LatticeShape::new([64, 64]);
@@ -377,26 +290,30 @@ mod tests {
     }
 
     #[test]
-    fn nary_reduce_children_affect_kernel_identity() {
-        // Two back-to-back `Reduce` nodes in the same arena: the second one's
-        // children start at a nonzero offset into the flat nary-children slab,
-        // so an off-by-slicing bug in the second node's child range either
-        // indexes out of bounds or silently drops its children from the key,
-        // making two kernels that differ only in the second reduce collide.
+    fn a_folds_range_is_part_of_its_kernel_identity() {
+        // Two kernels alike but for one fold's extent must not share a cache
+        // entry. The hazard this began as — a `Reduce`'s children living at
+        // an offset into the flat nary slab, where an off-by-slicing bug
+        // dropped them from the key — is gone with the encoding: a fold's
+        // range is a field of the node now. What it *tested* is still the
+        // property that matters, and it is about `Fold::to_bits` being in
+        // the key rather than about slicing.
+        let slot = |s: u8| Binder::from_slot(s).expect("a live binder");
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let body1 = a.push_binary(OpKind::Add, x, x);
-        let r1 = a.push_reduce(OpKind::Add, 4, 3, body1);
+        let r1 = a.push_reduce(Fold::new(Monoid::SUM, slot(0), 0..3), body1);
         let body2 = a.push_binary(OpKind::Mul, x, x);
-        let r2 = a.push_reduce(OpKind::Mul, 5, 6, body2);
+        let r2 = a.push_reduce(Fold::new(Monoid::PRODUCT, slot(1), 0..6), body2);
         let root = a.push_binary(OpKind::Add, r1, r2);
 
         let mut a2 = ExprArena::new();
         let x2 = a2.push_var(0);
         let body1b = a2.push_binary(OpKind::Add, x2, x2);
-        let r1b = a2.push_reduce(OpKind::Add, 4, 3, body1b);
+        let r1b = a2.push_reduce(Fold::new(Monoid::SUM, slot(0), 0..3), body1b);
         let body2b = a2.push_binary(OpKind::Mul, x2, x2);
-        let r2b = a2.push_reduce(OpKind::Mul, 5, 9, body2b); // extent differs only here
+        // The extent differs only here.
+        let r2b = a2.push_reduce(Fold::new(Monoid::PRODUCT, slot(1), 0..9), body2b);
         let root2 = a2.push_binary(OpKind::Add, r1b, r2b);
 
         let m1 = kernel_of(&Kernel::from_parts(a, root));
@@ -452,6 +369,13 @@ mod tests {
     /// `(x − cx)·r + cy` over fresh uniform instances: one shape, many
     /// factors. `declared_first` flips the table order so the link, not the
     /// declaration order, is what the code is compiled against.
+    /// `canonical` over a whole kernel — its fragment is already linked in
+    /// these tests, so the arena and root are just its parts.
+    fn canon(k: &Kernel) -> Canonical {
+        let (arena, root) = k.parts();
+        canonical(arena, root)
+    }
+
     fn circle_of(declared_first: bool) -> (Kernel, [UniformDecl; 3]) {
         let decl = |default| UniformDecl {
             id: UniformIdentity::mint(),
@@ -554,7 +478,7 @@ mod tests {
     fn slots_follow_first_occurrence_not_declaration_order() {
         let (k, [cx, r, cy]) = circle_of(false);
         assert_eq!(k.uniforms(), &[r, cy, cx], "declared in the other order");
-        let Canonical { uniforms, .. } = canonical(&k);
+        let Canonical { uniforms, .. } = canon(&k);
         assert_eq!(uniforms, [cx, r, cy]);
         let (a, root) = k.parts();
         let (linked, lroot) = a.relink(root, &[], &uniforms);
@@ -566,14 +490,86 @@ mod tests {
         );
         let k_linked = Kernel::from_parts(linked, lroot);
         assert_eq!(
-            canonical(&k_linked).key,
-            canonical(&k).key,
+            canon(&k_linked).key,
+            canon(&k).key,
             "relinking changes no structure"
         );
         // Both declaration orders canonicalize to one key — the shape, not
         // the table, is what the code is a function of.
         let (kb, _) = circle_of(true);
-        assert_eq!(canonical(&k).key, canonical(&kb).key);
+        assert_eq!(canon(&k).key, canon(&kb).key);
+    }
+
+    /// The compile key, spelled out.
+    ///
+    /// `canonical` moved to `pixelflow-ir` so a `Ref` could name into the same
+    /// identity this cache keys on
+    /// (docs/plans/2026-09-09-composition-is-linking.md §2). The move must not
+    /// have changed a byte: a different encoding is not a *wrong* key — every
+    /// lookup in one process still agrees with every insert — which is exactly
+    /// why nothing else would notice, so the layout is pinned here.
+    ///
+    /// Written out from the documented encoding (tag, then fields, children as
+    /// dense little-endian indices) rather than as an opaque byte literal,
+    /// because `OpCode`'s numbering is explicitly not stable across releases
+    /// and pinning *that* would be a gate on the wrong thing.
+    #[test]
+    fn the_compile_key_is_the_canonical_bytes_plus_the_shape() {
+        let buffer = BufferDecl {
+            id: BufferIdentity::mint(),
+            width: 4,
+            height: 2,
+        };
+        let uniform = UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 0.5,
+        };
+        let mut a = ExprArena::new();
+        let buf_slot = a.declare_buffer(buffer);
+        let uni_slot = a.declare_uniform(uniform);
+        let x = a.push_var(0); // dense 0
+        let c = a.push_const(2.5); // dense 1
+        let scaled = a.push_binary(OpKind::Mul, x, c); // dense 2
+        let u = a.push_uniform(uni_slot); // dense 3
+        let y = a.push_var(1); // dense 4
+        // Pushes the `Buffer` leaf (dense 5) then the `Gather` (dense 6).
+        let g = a.push_gather(buf_slot, scaled, y);
+        let root = a.push_binary(OpKind::Add, g, u); // dense 7
+
+        let mut want: Vec<u8> = Vec::new();
+        want.extend_from_slice(&[0, 0]); // Var(0)
+        want.push(1); // Const
+        want.extend_from_slice(&2.5f32.to_bits().to_le_bytes());
+        want.push(4); // Binary
+        want.extend_from_slice(&OpKind::Mul.marshal().to_bytes());
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.push(8); // Uniform, by dense offset
+        want.extend_from_slice(&0u16.to_le_bytes());
+        want.extend_from_slice(&[0, 1]); // Var(1)
+        want.push(7); // Buffer, by dense slot, then extents
+        want.extend_from_slice(&0u16.to_le_bytes());
+        want.extend_from_slice(&4u32.to_le_bytes());
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.push(5); // Ternary
+        want.extend_from_slice(&OpKind::Gather.marshal().to_bytes());
+        want.extend_from_slice(&5u32.to_le_bytes());
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(&4u32.to_le_bytes());
+        want.push(4); // Binary
+        want.extend_from_slice(&OpKind::Add.marshal().to_bytes());
+        want.extend_from_slice(&6u32.to_le_bytes());
+        want.extend_from_slice(&3u32.to_le_bytes());
+
+        let got = canonical(&a, root);
+        assert_eq!(got.key, want, "the canonical encoding moved");
+        assert_eq!(got.buffers, [buffer], "and its link table with it");
+        assert_eq!(got.uniforms, [uniform]);
+
+        // What `compile` keys the cache on: those bytes, then the shape's.
+        let mut with_shape = want.clone();
+        with_shape.extend_from_slice(&TEST_SHAPE.key_bytes());
+        assert_ne!(with_shape, want, "the shape must be part of the key");
     }
 
     /// A table naming an instance the graph never reads — what `Kernel::at`

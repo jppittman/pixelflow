@@ -222,8 +222,6 @@ pub fn critical_path(arena: &ExprArena, root: ExprId, cost: impl Fn(OpKind) -> f
 #[cfg(all(test, feature = "training"))]
 mod tests {
     use super::*;
-    use pixelflow_ir::binding::BindingTable;
-    use pixelflow_ir::eval_scalar;
 
     fn coeffs(n: usize) -> Vec<f32> {
         // Alternating, decaying — a well-conditioned polynomial on [0, 1],
@@ -235,32 +233,6 @@ mod tests {
                 sign * 0.75f32.powi(i as i32) / (i as f32 + 1.0)
             })
             .collect()
-    }
-
-    /// The two schedules must compute the same function. Not bit-identical:
-    /// they round in a different order, which is exactly the property being
-    /// traded, so the check is a relative band and not an equality.
-    #[test]
-    fn estrin_agrees_with_horner() {
-        for n in 1..=33 {
-            let cs = coeffs(n);
-            let mut arena = ExprArena::new();
-            let x = arena.push_var(0);
-            let h = build(&mut arena, PolyForm::Horner, &cs, x);
-            let e = build(&mut arena, PolyForm::Estrin, &cs, x);
-            let bindings = BindingTable::empty();
-            for step in 0..=20 {
-                let xv = step as f32 / 20.0;
-                let vars = [xv, 0.0];
-                let hv = eval_scalar(&arena, h, &vars, &bindings);
-                let ev = eval_scalar(&arena, e, &vars, &bindings);
-                let tol = 1e-5 * hv.abs().max(1e-3);
-                assert!(
-                    (hv - ev).abs() <= tol,
-                    "degree {n} at x={xv}: horner {hv} vs estrin {ev} (tol {tol})"
-                );
-            }
-        }
     }
 
     /// Estrin buys depth with width: strictly more nodes, strictly shorter

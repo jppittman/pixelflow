@@ -58,6 +58,7 @@
 
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
+use pixelflow_ir::fold::Fold;
 
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
@@ -100,6 +101,9 @@ enum NodeShape {
     Uniform(UniformDecl),
     Param(u8),
     Op(OpKind, Vec<u32>),
+    /// A fold's shape is its metadata plus its body's class — the metadata
+    /// is part of the node's identity, so it is part of its shape.
+    Reduce(Fold, u32),
 }
 
 impl NodeShape {
@@ -117,6 +121,9 @@ impl NodeShape {
                     .map(|&c| egraph.find(c).index() as u32)
                     .collect(),
             ),
+            ENode::Reduce { fold, body } => {
+                NodeShape::Reduce(*fold, egraph.find(*body).index() as u32)
+            }
         }
     }
 

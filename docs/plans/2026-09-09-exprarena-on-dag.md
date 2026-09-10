@@ -233,6 +233,67 @@ baselines, and on `Kernel::sum`'s thousands-of-leaves fold the copying one is
 the expensive side. Whether consing wins there is unmeasured — and measuring
 it wants real glyph kernels, not the synthetic shapes that bench uses.
 
+### 5.2 Measured, 2026-09-09: on real glyphs, against `splice`
+
+The reading §5.1 asks for. Throwaway prototype: a memo in
+`ExprArena::push_node`, keyed on the derived `Debug` string with a
+`BTreeMap` — a deliberately *bad* key (a `String` formatted per node), so
+every number below is a lower bound on what a real `Eq + Hash` cons would
+give. Subject: `Font::glyph_kernel_scaled(ch, 16.0).kernel()`, DejaVu Sans
+Mono.
+
+| | splice | consed | ratio |
+|---|---|---|---|
+| built arena (`A`, `O`, `8` — all equal) | 2,721 | **154** | 17.7× |
+| `Min` fold body (one piece's distance) | 1,476 | **129** | 11.4× |
+| `Add` fold body (one piece's crossing) | 164 | **55** | 3.0× |
+| legalized `A` (11 pieces) | 46,494 | **1,546** | 30× |
+| legalized `O` (28 pieces) | 116,738 | **3,761** | 31× |
+| legalized `8` (34 pieces) | 141,530 | **4,547** | 31× |
+
+Consed, `A` *legalizes* to 1,546 nodes against 46,494 before — the same order
+as the 1,047 the optimizer then extracts from it, where before there were
+45,000 nodes between the two. Most of what saturation spends its budget on is
+rebuilding the DAG the builder took apart.
+
+**The extracted kernel does not change.** `O@16` 2,938 and `8@32` 6,747 are
+identical to the ceilings pinned in
+`pixelflow-graphics/tests/glyph_optimization_cost.rs`; `A@16` moves 1,041 →
+1,047. So this is not a different compilation, it is the same one with the
+copying removed.
+
+Wall clock, `pixelflow-graphics` glyph suites, debug, nextest:
+
+| | banded | consed |
+|---|---|---|
+| `punctuation_and_digits_are_zero_outside_their_support` | 153.5 s | 70.8 s |
+| `a_glyph_is_exactly_zero_outside_its_support` | 131.0 s | 61.2 s |
+| `uppercase_is_zero_outside_its_support` | 116.1 s | 54.0 s |
+| `punctuation_and_digits_wind_like_the_oracle` | 99.7 s | 47.3 s |
+| `glyphs_wind_like_the_oracle_at_24px` | 83.9 s | 39.2 s |
+| `synthetic_outlines_wind_like_the_oracle` | 37.6 s | 17.2 s |
+
+A flat 2.1–2.2×, and `loop_blinn_winding` + `glyph_optimization_cost` +
+`kernel_glyph_golden` all pass under the prototype — including the JIT-vs-
+interpreter golden, which is the per-texel check that the compiled output is
+still right.
+
+**Two consings, and only one of them is what `kernel.rs:581-587` defers.**
+The note's proposal is a *shared* store — one arena every `Kernel` indexes,
+so composition interns instead of splicing — and its stated reason for
+waiting is that it "changes the `Kernel` representation". The prototype above
+is the *other* one: a memo private to a single `ExprArena`, no API change, no
+`Kernel` representation change, `splice` still copying between arenas and the
+memo collapsing the copies on arrival. The deferral's reason does not reach
+it, and the table says that is where the win already is.
+
+Still unverified, and the gate before this could land: consing makes
+`push_node` return an id that is *not* fresh, so any caller assuming one
+push means one new node breaks. Eighteen graphics tests are a signal, not a
+gate — this wants the full workspace suite, `xtask isa-matrix`, and a
+`push_unique` escape hatch for whatever genuinely needs distinct nodes
+(`Builder` already ships one, for exactly this reason).
+
 ---
 
 ## 6. Stages

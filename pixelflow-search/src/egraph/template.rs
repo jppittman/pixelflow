@@ -69,7 +69,11 @@ fn match_root(
         // rather than guess a binding with no class to bind it to.
         ExprData::Var(_) => false,
         ExprData::Const(v) => node.is_const(f32::from_bits(v)),
-        ExprData::Param(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => false,
+        ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_)
+        | ExprData::Ref(_)
+        | ExprData::Reduce(_) => false,
         ExprData::Op(_) => match_op(egraph, pat, node, bindings),
     }
 }
@@ -84,7 +88,11 @@ fn match_class(
     match *pat {
         ExprData::Var(mv) => bind_var(mv, class, egraph, bindings),
         ExprData::Const(v) => egraph.contains_const(class, f32::from_bits(v)),
-        ExprData::Param(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => false,
+        ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_)
+        | ExprData::Ref(_)
+        | ExprData::Reduce(_) => false,
         ExprData::Op(_) => {
             for node in egraph.nodes(class) {
                 let mut trial = bindings.clone();
@@ -134,8 +142,12 @@ fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeS
         ExprData::Var(mv) => {
             out.insert(mv);
         }
-        ExprData::Const(_) | ExprData::Param(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => {}
-        ExprData::Op(_) => {
+        ExprData::Const(_)
+        | ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_)
+        | ExprData::Ref(_) => {}
+        ExprData::Reduce(_) | ExprData::Op(_) => {
             for c in node.children() {
                 collect_metavars(c, out);
             }

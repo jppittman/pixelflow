@@ -24,14 +24,18 @@ fn main() {
 
     // `text` is convention-agnostic (raw glyph space); land on the
     // rasterizer's pixel centers as a contramap, same as a raw glyph kernel.
-    let kernel = text(&font, message, size).at(
+    let glyph = text(&font, message, size);
+    let kernel = glyph.kernel().at(
         &Kernel::x().add(&Kernel::constant(0.5)),
         &Kernel::y().add(&Kernel::constant(0.5)),
     );
 
     let width = 620u32;
     let height = (size * 1.4) as u32;
-    let baked = Lattice::frame(width as usize, height as usize).bake(&kernel);
+    // The winding sum reads a bound piece table (S1a), so bind it rather
+    // than a bare `Lattice::bake`.
+    let lattice = Lattice::frame(width as usize, height as usize);
+    let baked = glyph.bake(&kernel, lattice);
 
     let coverage = baked.buffer();
     println!(

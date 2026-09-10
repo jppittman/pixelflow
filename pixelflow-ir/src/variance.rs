@@ -286,6 +286,29 @@ impl core::fmt::Display for Variance {
 
 use alloc::vec::Vec;
 
+/// A reference denotes what its referent denotes, sampled at the same
+/// coordinates, so it varies exactly as the referent does. Resolving is the
+/// only way to know that — a key carries a kernel's identity, not its
+/// structure — and where it cannot be resolved the answer is the conservative
+/// one: refuse to claim an invariance that cannot be proved. An unresolvable
+/// key is a corrupt graph, which `passes::expand_refs` reports at the layer
+/// that can name it.
+#[cfg(feature = "std")]
+fn referent_variance(key: crate::key::KernelKey) -> Variance {
+    crate::store::KernelStore::resolve(key).map_or(Variance::ALL, |referent| {
+        let (ref_arena, ref_root) = referent.parts();
+        compute_arena_variance(ref_arena)[ref_root.0 as usize]
+    })
+}
+
+/// The same, with no store to resolve against — always the conservative
+/// answer, and never actually asked: `Kernel::by_ref` is the `std` feature
+/// too, so a `no_std` build cannot hold the key this would look up.
+#[cfg(not(feature = "std"))]
+fn referent_variance(_key: crate::key::KernelKey) -> Variance {
+    Variance::ALL
+}
+
 /// Compute variance for every node in an `ExprArena`.
 ///
 /// Returns a `Vec<Variance>` indexed by `ExprId`. Because the arena is
@@ -301,7 +324,6 @@ use alloc::vec::Vec;
 #[must_use]
 pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> {
     use crate::arena::{ExprId, ExprNode};
-    use crate::kind::OpKind;
 
     let n = arena.len();
     let mut result = Vec::with_capacity(n);
@@ -327,6 +349,7 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             // prologue — and unknown on the parameter space, which is why it
             // is not a `Const`.
             ExprNode::Uniform(_) => Variance::CONST,
+            ExprNode::Ref(key) => referent_variance(*key),
             ExprNode::Param(_) => {
                 // Parameters are substituted before JIT compilation.
                 // If we see one here, treat conservatively as all-varying.
@@ -337,18 +360,14 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             ExprNode::Ternary(_, a, b, c) => result[a.0 as usize]
                 .union(result[b.0 as usize])
                 .union(result[c.0 as usize]),
-            // A binder is the only node that shrinks the set: it binds its index,
-            // so the index is not free in the result.
-            ExprNode::Nary(OpKind::Reduce, start, len) => {
-                let children = arena.nary_children_slice(*start, *len);
-                let body = children
-                    .get(3)
-                    .map_or(Variance::ALL, |c| result[c.0 as usize]);
-                match bound_index_slot(arena, children) {
-                    Some(slot) => body.without(Variance::from_var(slot)),
-                    // Malformed binder — refuse to claim invariance we cannot prove.
-                    None => Variance::ALL,
-                }
+            // A binder is the only node that shrinks the set: it binds its
+            // index, so the index is not free in the result. There is no
+            // "malformed binder" case to be conservative about any more —
+            // `Fold` cannot hold an index that is not a binder, so this arm
+            // no longer has to decline an analysis it used to be unable to
+            // trust.
+            ExprNode::Reduce { fold, body } => {
+                result[body.0 as usize].without(Variance::from_var(fold.binder().var()))
             }
             ExprNode::Nary(_, start, len) => {
                 let children = arena.nary_children_slice(*start, *len);
@@ -376,7 +395,6 @@ pub fn compute_dag_variance(
     dag: &crate::dag::Dag<crate::expr::ExprData>,
 ) -> crate::dag::SideTable<Variance> {
     use crate::expr::ExprData;
-    use crate::kind::OpKind;
 
     let mut table = dag.side_table(Variance::CONST);
 
@@ -391,34 +409,26 @@ pub fn compute_dag_variance(
             }
             ExprData::Const(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => Variance::CONST,
             ExprData::Param(_) => Variance::ALL,
-            ExprData::Op(OpKind::Reduce) => {
-                let mut kids = node.children();
-                let _acc = kids.next();
-                let bound_child = kids.next();
-                let _init = kids.next();
-                let body = kids.next();
-
+            // The only node that *removes* a dependency: its binder is
+            // bound here, so the body's variance on that one slot does not
+            // escape.
+            //
+            // The binder comes off `Fold`, not out of a `Const` child. That
+            // is the whole of the difference: this arm used to read a float,
+            // ask `floorf` whether it was really an integer, check the
+            // integer against a magic range to see whether it was really a
+            // binder slot, and fall back to `Variance::ALL` when any of that
+            // failed — a widening that was silent and unfalsifiable.
+            ExprData::Reduce(fold) => {
+                let body = node.children().next();
                 let body_v = body.map_or(Variance::ALL, |b| table[b]);
-                let slot = bound_child.and_then(|c| match *c {
-                    ExprData::Const(bits) => {
-                        let val = f32::from_bits(bits);
-                        if val == libm::floorf(val) && (0.0..256.0).contains(&val) {
-                            let s = val as u8;
-                            let binders = crate::arena::REDUCE_BINDER_BASE
-                                ..crate::arena::REDUCE_BINDER_BASE + crate::arena::REDUCE_BINDERS;
-                            if binders.contains(&s) { Some(s) } else { None }
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                });
-
-                match slot {
-                    Some(s) => body_v.without(Variance::from_var(s)),
-                    None => Variance::ALL,
-                }
+                body_v.without(Variance::from_var(fold.binder().var()))
             }
+            // A name has no variance of its own to compute. `Ref` is a leaf
+            // whose referent lives in another graph, so nothing here can see
+            // what it depends on; `ALL` is the sound answer, and the linker
+            // (`passes::expand_refs`) is what turns it into a real one.
+            ExprData::Ref(_) => Variance::ALL,
             ExprData::Op(_) => {
                 let mut v = Variance::CONST;
                 for child in node.children() {
@@ -431,21 +441,6 @@ pub fn compute_dag_variance(
     }
 
     table
-}
-
-/// The index slot a `Reduce`'s children bind, read from child 1 (a `Const`
-/// holding the slot number). `None` if the node is not a well-formed binder.
-fn bound_index_slot(
-    arena: &crate::arena::ExprArena,
-    children: &[crate::arena::ExprId],
-) -> Option<u8> {
-    let Some(crate::arena::ExprNode::Const(v)) = children.get(1).map(|id| arena.node(*id)) else {
-        return None;
-    };
-    let slot = *v as u8;
-    let binders = crate::arena::REDUCE_BINDER_BASE
-        ..crate::arena::REDUCE_BINDER_BASE + crate::arena::REDUCE_BINDERS;
-    binders.contains(&slot).then_some(slot)
 }
 
 /// Find arena nodes that should be hoisted out of the X-loop.
@@ -801,6 +796,53 @@ mod tests {
         assert_eq!(Variance::ALL.popcount(), 8);
     }
 
+    /// A reference's variance is its referent's — resolved, not guessed. A
+    /// blanket `ALL` would be safe but would stop LICM hoisting anything a
+    /// named kernel feeds; a blanket `CONST` would hoist a Y-varying value
+    /// out of the row loop and render the wrong picture.
+    #[test]
+    fn a_reference_varies_as_its_referent_does() {
+        use crate::arena::ExprArena;
+        use crate::kernel::Kernel;
+
+        // X-only, Y-only, and constant referents: each must come back with
+        // exactly the referent's own free coordinates.
+        let cases = [
+            (Kernel::x().sqrt(), Variance::X),
+            (Kernel::y().neg(), Variance::Y),
+            (Kernel::constant(4.0), Variance::CONST),
+            (
+                Kernel::x().add(&Kernel::y()),
+                Variance::X.union(Variance::Y),
+            ),
+        ];
+        for (referent, expected) in cases {
+            let named = referent.by_ref();
+            let (arena, root) = named.parts();
+            let v = super::compute_arena_variance(arena);
+            assert_eq!(v[root.0 as usize], expected);
+        }
+
+        // And it composes: a reference to an X-only kernel plus Y varies in
+        // both, exactly as the spliced form would.
+        let mixed = Kernel::x().sqrt().by_ref().add(&Kernel::y());
+        let (arena, root) = mixed.parts();
+        let v = super::compute_arena_variance(arena);
+        assert_eq!(v[root.0 as usize], Variance::X.union(Variance::Y));
+
+        // An unresolvable key claims nothing. `KernelKey::of` on a kernel
+        // nobody interned is the honest way to get one: no store entry, so
+        // no referent to read a variance off.
+        let never = Kernel::x().mul(&Kernel::constant(1.0e-27));
+        let (never_arena, never_root) = never.parts();
+        let mut orphaned = ExprArena::new();
+        let orphan = orphaned.push_ref(crate::key::KernelKey::of(never_arena, never_root));
+        assert_eq!(
+            super::compute_arena_variance(&orphaned)[orphan.0 as usize],
+            Variance::ALL
+        );
+    }
+
     #[test]
     fn verify_compute_arena_variance() {
         use crate::arena::ExprArena;
@@ -863,18 +905,16 @@ mod tests {
     fn binder_index_is_a_variable_like_any_other() {
         use crate::Kernel;
         use crate::arena::ExprNode;
-        use crate::kind::OpKind;
 
         // Σ_{i<4} (i · Y): the product depends on both the index and Y.
         let k = Kernel::sum_over(4, |i| i.mul(&Kernel::y()));
         let (arena, root) = k.parts();
         let v = super::compute_arena_variance(arena);
 
-        // Find the body's multiply — the node just under the Reduce.
-        let ExprNode::Nary(OpKind::Reduce, start, len) = arena.node(root) else {
+        // The body — a fold's one child.
+        let ExprNode::Reduce { body, .. } = arena.node(root) else {
             panic!("expected a Reduce at the root");
         };
-        let body = arena.nary_children_slice(*start, *len)[3];
         let body_v = v[body.0 as usize];
 
         assert!(
@@ -922,10 +962,10 @@ mod tests {
         let (arena, root) = k.parts();
         let v = super::compute_arena_variance(arena);
 
-        let ExprNode::Nary(OpKind::Reduce, start, len) = arena.node(root) else {
+        let ExprNode::Reduce { body, .. } = arena.node(root) else {
             panic!("expected a Reduce at the root");
         };
-        let body = arena.nary_children_slice(*start, *len)[3];
+        let body = *body;
 
         let out_of_binder = super::find_hoistable_out_of(4, arena, body, &v, 8);
         let sin = out_of_binder

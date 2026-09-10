@@ -415,6 +415,19 @@ pub fn induce<I: Ir>(
                     children: operands,
                 }
             }
+            Shape::Reduce { fold, body } => {
+                let class = *memo.get(&body).expect("post-order maps children first");
+                ENode::Reduce { fold, body: class }
+            }
+            // Not a term the graph ever held: `passes::expand_refs` runs
+            // before any insertion, so a witness term carrying a reference
+            // came from somewhere that skipped the pipeline.
+            Shape::Ref(key) => {
+                return Err(TermMiss {
+                    node: format!("{key:?} (a reference; expand_refs first)"),
+                    mapped: memo.len(),
+                });
+            }
         };
         let Some(&(class, idx)) = table.get(&node) else {
             return Err(TermMiss {
@@ -467,10 +480,16 @@ fn post_order_term<I: Ir>(term: &I, root: I::Ref) -> Vec<I::Ref> {
                     continue;
                 }
                 stack.push(Task::Emit(r));
-                if let Shape::Op(_, children) = term.project(r) {
-                    for i in (0..children.len()).rev() {
-                        stack.push(Task::Visit(children.get(i).expect("index < len")));
+                match term.project(r) {
+                    Shape::Op(_, children) => {
+                        for i in (0..children.len()).rev() {
+                            stack.push(Task::Visit(children.get(i).expect("index < len")));
+                        }
                     }
+                    // A fold's one child is its body. Missing it would leave
+                    // the body unmapped and the fold unmatchable.
+                    Shape::Reduce { body, .. } => stack.push(Task::Visit(body)),
+                    _ => {}
                 }
             }
             Task::Emit(r) => {

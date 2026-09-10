@@ -85,10 +85,11 @@ fn kernels(font: &Font) {
         for ch in WARM_RANGE {
             // Production bakes nothing for these either (the atlas leaves the
             // slot blank), so they are not kernels.
-            let Some(kernel) = font.glyph_kernel_scaled(ch, tile as f32) else {
+            let Some(glyph) = font.glyph_kernel_scaled(ch, tile as f32) else {
                 continue;
             };
-            let (arena, root) = kernel.parts();
+            let coverage = glyph.kernel();
+            let (arena, root) = coverage.parts();
             let started = Instant::now();
             let result = compile_as_baked(arena, root, [tile, tile]);
             let ms = started.elapsed().as_secs_f64() * 1e3;

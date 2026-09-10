@@ -107,7 +107,7 @@ pixelflow-core/src/lib.rs	#[cfg(all(target_arch = "x86_64", target_feature = "av
 pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::BilinearSampler;
 pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::cell_grid::{
 pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::manifold::{
-pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::union::{CompiledUnion, IndexRange, Union};
+pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::union::IndexRange;
 pixelflow-core/src/lib.rs	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]	compile_error!(
 pixelflow-core/src/lib.rs	#[cfg(target_arch = "aarch64")]	type NativeSimd = backend::arm::F32x4;
 pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	fn get_jit_mul_kernel() -> usize {

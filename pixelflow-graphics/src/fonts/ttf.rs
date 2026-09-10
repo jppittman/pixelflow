@@ -1,209 +1,18 @@
 //! pixelflow-graphics/src/fonts/ttf.rs
 //!
-//! TTF parser producing glyph coverage [`Kernel`]s.
+//! TTF parser producing glyph [`Outline`]s, and the [`Font`] that turns them
+//! into coverage `Kernel`s.
 //!
-//! A glyph is ONE fused coverage kernel: outline segments become leaf kernels
-//! ([`AnalyticalLine::kernel`] / [`AnalyticalQuad::kernel`]), the winding rule
-//! is `sum(...).abs().min(1)`, bounds are a unit-square mask `select`, and
-//! every transform (glyph restore, compound children, scaling) is a coordinate
-//! warp via [`Kernel::at`]. Nothing here is a scene graph of Rust types — the
-//! arena is the program, composed at parse time and compiled once at bake.
-//!
-//! Antialiasing comes from the leaf kernels' symbolic `Dwrt` ramps: the
-//! derivatives chain through every `at` warp, so the crossing ramp is ~1
-//! *screen* pixel wide at any glyph scale. No jet domain.
+//! Parsing is geometry only: a glyph's contours come out as line and
+//! quadratic segments in font units, with compound glyphs flattened through
+//! their component transforms. Every scale — the em square, the screen flip,
+//! a component placement — is applied to control points here, on the host,
+//! so that the kernel [`loop_blinn`] builds is in
+//! the frame it will be evaluated in. Nothing here is a scene graph of Rust
+//! types and nothing here warps a finished kernel.
 
-use pixelflow_core::Kernel;
-
-// Import analytical curve leaf kernels
-use super::ttf_curve_analytical::{AnalyticalLine, AnalyticalQuad, DEGENERATE_EPSILON};
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Kernel composition helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// `Kernel::constant` shorthand for this module's builders.
-fn kc(v: f32) -> Kernel {
-    Kernel::constant(v)
-}
-
-/// The unit-square bounds mask `X≥0 & X≤1 & Y≥0 & Y≤1` — the glyph's
-/// short-circuit bounds check as a Kernel mask.
-fn unit_square_mask() -> Kernel {
-    Kernel::x()
-        .ge(&kc(0.0))
-        .and(&Kernel::x().le(&kc(1.0)))
-        .and(&Kernel::y().ge(&kc(0.0)))
-        .and(&Kernel::y().le(&kc(1.0)))
-}
-
-/// Sample `inner` through the affine transform `[a, b, c, d, tx, ty]` — the
-/// forward map `x' = a·x + b·y + tx, y' = c·x + d·y + ty` — by warping
-/// coordinates with the INVERSE matrix:
-/// `u = (X - tx)·inv_a + (Y - ty)·inv_b`, `v = (X - tx)·inv_c + (Y - ty)·inv_d`.
-pub(crate) fn affine_kernel(inner: &Kernel, [a, b, c, d, tx, ty]: [f32; 6]) -> Kernel {
-    let det = a * d - b * c;
-    let inv_det = if det.abs() < DEGENERATE_EPSILON {
-        0.0
-    } else {
-        1.0 / det
-    };
-
-    let inv_a = d * inv_det;
-    let inv_b = -b * inv_det;
-    let inv_c = -c * inv_det;
-    let inv_d = a * inv_det;
-
-    let coord = |ca: f32, cb: f32| {
-        Kernel::x()
-            .sub(&kc(tx))
-            .mul(&kc(ca))
-            .add(&Kernel::y().sub(&kc(ty)).mul(&kc(cb)))
-    };
-    inner.at(&coord(inv_a, inv_b), &coord(inv_c, inv_d))
-}
-
-/// **The box outside which a coverage [`Kernel`] is exactly zero.**
-///
-/// Not a bounding box of the ink: a bound on the *support*, which is what a
-/// domain-side extent needs. A glyph's antialiasing ramp reaches past its
-/// outline, and past it by an amount that depends on the gradient — a shallow
-/// segment's crossing ramp is `‖∇d‖` pixels wide in X, which for a nearly
-/// horizontal edge is tens of pixels. What *is* exact is the unit-square mask
-/// every outline is cut to (`Font::compile`), whose false arm is the literal
-/// constant 0, so this box is that square carried through the same warps as
-/// the kernel it describes.
-///
-/// Coordinates are `[x0, y0, x1, y1]` in whatever frame the kernel is in;
-/// a box with no area is [`Support::EMPTY`] and meets nothing.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Support([f32; 4]);
-
-impl Support {
-    /// No support at all: a glyph with no outline is the constant 0 everywhere.
-    pub const EMPTY: Self = Self([0.0, 0.0, 0.0, 0.0]);
-
-    /// The unit square `[0,1]²` — the mask every outline is cut to before it
-    /// is warped back to font units. Internal: it is where a support comes
-    /// from, not something a consumer of one constructs.
-    pub(crate) const UNIT: Self = Self([0.0, 0.0, 1.0, 1.0]);
-
-    /// `[x0, y0, x1, y1]`.
-    #[must_use]
-    pub fn bounds(self) -> [f32; 4] {
-        self.0
-    }
-
-    /// Whether the box encloses no samples.
-    #[must_use]
-    pub fn is_empty(self) -> bool {
-        self.0[2] <= self.0[0] || self.0[3] <= self.0[1]
-    }
-
-    /// The box carried through the forward affine map
-    /// `x' = a·x + b·y + tx, y' = c·x + d·y + ty` — the same map
-    /// `affine_kernel` warps a kernel by, so a support stays a support.
-    /// Internal, for the same reason as [`Support::UNIT`]: it is half of how
-    /// `Font::compile` derives a support, not an operation on a finished one.
-    pub(crate) fn through(self, [a, b, c, d, tx, ty]: [f32; 6]) -> Self {
-        if self.is_empty() {
-            return Self::EMPTY;
-        }
-        let [x0, y0, x1, y1] = self.0;
-        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
-        let mut out = [
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        ];
-        for (x, y) in corners {
-            let (u, v) = (a * x + b * y + tx, c * x + d * y + ty);
-            out[0] = out[0].min(u);
-            out[1] = out[1].min(v);
-            out[2] = out[2].max(u);
-            out[3] = out[3].max(v);
-        }
-        Self(out)
-    }
-
-    /// The smallest box containing both — how a compound glyph's support is
-    /// assembled from its children's. Internal, as above.
-    pub(crate) fn join(self, other: Self) -> Self {
-        if self.is_empty() {
-            return other;
-        }
-        if other.is_empty() {
-            return self;
-        }
-        Self([
-            self.0[0].min(other.0[0]),
-            self.0[1].min(other.0[1]),
-            self.0[2].max(other.0[2]),
-            self.0[3].max(other.0[3]),
-        ])
-    }
-
-    /// The box shifted `dx` along X.
-    #[must_use]
-    pub fn shifted_x(self, dx: f32) -> Self {
-        if self.is_empty() {
-            return Self::EMPTY;
-        }
-        Self([self.0[0] + dx, self.0[1], self.0[2] + dx, self.0[3]])
-    }
-
-    /// The columns of a pixel grid this box can reach: every integer `c` with
-    /// a sample center `c + center` inside `[x0, x1]`, widened by one column
-    /// on each side, as `[first, last]`. `None` when the box reaches no sample
-    /// center at all.
-    ///
-    /// The margin is not slack, it is the boundary itself. This box is built
-    /// by pushing corners through the **forward** affine maps; the mask the
-    /// kernel evaluates is the same maps **inverted**, through a reciprocal
-    /// determinant. The two agree to within an ulp, and a sample center inside
-    /// that sliver would be dropped by a box that stopped exactly at `x1` —
-    /// silently, as a single wrong edge pixel. One column costs a glyph in the
-    /// occasional cell and makes the question moot.
-    #[must_use]
-    pub fn columns(self, center: f32) -> Option<[i64; 2]> {
-        if self.is_empty() {
-            return None;
-        }
-        // center + c ∈ [x0, x1]  ⇔  c ∈ [x0 - center, x1 - center]
-        let first = (self.0[0] - center).ceil();
-        let last = (self.0[2] - center).floor();
-        if last < first {
-            return None;
-        }
-        Some([
-            first as i64 - BOUNDARY_MARGIN,
-            last as i64 + BOUNDARY_MARGIN,
-        ])
-    }
-}
-
-/// Columns of margin [`Support::columns`] adds on each side, for the ulp the
-/// forward map and the kernel's inverted one can differ by at the boundary.
-const BOUNDARY_MARGIN: i64 = 1;
-
-/// A glyph as this module composes it: the coverage kernel and the box
-/// outside which that kernel is exactly zero. They travel together because
-/// they are derived together — a support restated separately from the
-/// composition it describes is a future divergence.
-#[derive(Clone)]
-pub struct Glyph {
-    /// The coverage kernel.
-    pub kernel: Kernel,
-    /// Where it can be nonzero.
-    pub support: Support,
-}
-
-/// Winding coverage for a set of segment kernels: `min(|Σ|, 1)` — the
-/// non-zero fill rule over the summed line/quad contributions.
-fn coverage(segments: &[Kernel]) -> Kernel {
-    Kernel::sum(segments).abs().min(&kc(1.0))
-}
+use super::loop_blinn::{self, Glyph};
+use super::outline::{Affine, Contour, Outline};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Reader
@@ -391,12 +200,25 @@ const ENCODING_UNICODE_2_0_FULL: u16 = 4;
 const FORMAT_SEGMENT_MAPPING: u16 = 4;
 const FORMAT_SEGMENTED_COVERAGE: u16 = 12;
 
-/// Normalization parameters for simple glyphs.
-struct Normalization {
-    scale: f32,
-    tx: f32,
-    ty: f32,
-}
+/// Component transform scale factors are 2.14 fixed point.
+const F2DOT14: f32 = 16384.0;
+
+/// Glyph flags (simple glyphs): bit 0 on-curve, bit 3 repeat, bits 1/4 and
+/// 2/5 the X and Y delta encodings.
+const FLAG_ON_CURVE: u8 = 1;
+const FLAG_REPEAT: u8 = 8;
+const FLAG_X_SHORT: u8 = 2;
+const FLAG_X_SAME_OR_POSITIVE: u8 = 16;
+const FLAG_Y_SHORT: u8 = 4;
+const FLAG_Y_SAME_OR_POSITIVE: u8 = 32;
+
+/// Component flags (compound glyphs).
+const COMPONENT_ARGS_ARE_WORDS: u16 = 0x0001;
+const COMPONENT_ARGS_ARE_XY_VALUES: u16 = 0x0002;
+const COMPONENT_HAVE_A_SCALE: u16 = 0x0008;
+const COMPONENT_MORE_COMPONENTS: u16 = 0x0020;
+const COMPONENT_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+const COMPONENT_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
 
 pub struct Font<'a> {
     data: &'a [u8],
@@ -497,33 +319,42 @@ impl<'a> Font<'a> {
         self.cmap.lookup(ch as u32)
     }
 
-    /// The glyph for `ch` as a coverage [`Kernel`] in font units. Bake it once
-    /// (`Lattice::bake`) or compose it into a scene; antialiasing resolves
-    /// from `Dwrt` at bake.
+    /// The glyph for `ch` in font units, as a [`Glyph`]: a coverage
+    /// `Kernel` whose winding sum reads a piece table at a
+    /// `Kernel::sum_over` binder — the table travels with the kernel itself
+    /// (`Kernel::with_buffer_data`), so baking or collapsing it needs no
+    /// separate bind; antialiasing resolves from `Dwrt` at bake.
     #[must_use]
-    pub fn glyph_kernel(&self, ch: char) -> Option<Kernel> {
-        Some(self.compile(self.cmap.lookup(ch as u32)?)?.kernel)
+    pub fn glyph_kernel(&self, ch: char) -> Option<Glyph> {
+        self.glyph_kernel_by_id(self.cmap.lookup(ch as u32)?)
     }
 
     /// [`Font::glyph_kernel`] by pre-looked-up glyph ID.
+    ///
+    /// Built in font units, so its antialiasing ramp is one *font unit* wide
+    /// and its support is bounded at one font unit past the outline. For a
+    /// ramp that is one screen pixel wide, scale the outline before the
+    /// kernel exists — [`Font::glyph_scaled_by_id`] — rather than the kernel
+    /// after.
     #[must_use]
-    pub fn glyph_kernel_by_id(&self, id: u16) -> Option<Kernel> {
-        Some(self.compile(id)?.kernel)
+    pub fn glyph_kernel_by_id(&self, id: u16) -> Option<Glyph> {
+        Some(loop_blinn::glyph(&self.outline_by_id(id)?))
     }
 
-    /// The `size`-scaled glyph for `ch` as a coverage [`Kernel`]: the ascent
-    /// line sits at screen y=0 (top) and the descent at y=`size`, with
-    /// screen Y increasing downward.
+    /// The `size`-scaled glyph for `ch` as a [`Glyph`]: the ascent line sits
+    /// at screen y=0 (top) and the descent at y=`size`, with screen Y
+    /// increasing downward. See [`Font::glyph_kernel`] for the binding this
+    /// carries alongside the kernel.
     #[must_use]
-    pub fn glyph_kernel_scaled(&self, ch: char, size: f32) -> Option<Kernel> {
+    pub fn glyph_kernel_scaled(&self, ch: char, size: f32) -> Option<Glyph> {
         let id = self.cmap.lookup(ch as u32)?;
         self.glyph_kernel_scaled_by_id(id, size)
     }
 
     /// [`Font::glyph_kernel_scaled`] by pre-looked-up glyph ID.
     #[must_use]
-    pub fn glyph_kernel_scaled_by_id(&self, id: u16, size: f32) -> Option<Kernel> {
-        Some(self.glyph_scaled_by_id(id, size)?.kernel)
+    pub fn glyph_kernel_scaled_by_id(&self, id: u16, size: f32) -> Option<Glyph> {
+        self.glyph_scaled_by_id(id, size)
     }
 
     /// The `size`-scaled glyph **and the box outside which its kernel is
@@ -534,19 +365,34 @@ impl<'a> Font<'a> {
     /// the glyph may be dropped without changing a bit.
     #[must_use]
     pub fn glyph_scaled_by_id(&self, id: u16, size: f32) -> Option<Glyph> {
-        let g = self.compile(id)?;
-        // Scale based on total font height (ascent + |descent|) to fit within
-        // `size` pixels; Y-flip because screen Y increases downward while font
-        // Y increases upward. Forward: screen = [scale, 0, 0, -scale] · font
-        // + (0, ascent_px).
+        Some(loop_blinn::glyph(&self.outline_scaled_by_id(id, size)?))
+    }
+
+    /// The glyph's outline in font units (Y up, as the font stores it).
+    ///
+    /// `None` when the font has no such glyph; an outline with no contours
+    /// for a glyph that draws nothing (a space).
+    #[must_use]
+    pub fn outline_by_id(&self, id: u16) -> Option<Outline> {
+        self.outline(id)
+    }
+
+    /// The glyph's outline in the screen frame at `size` pixels: the ascent
+    /// line at y=0, the descent line at y=`size`, Y increasing downward.
+    #[must_use]
+    pub fn outline_scaled_by_id(&self, id: u16, size: f32) -> Option<Outline> {
+        Some(self.outline(id)?.transformed(self.to_screen(size)))
+    }
+
+    /// The map from font units to the `size`-pixel screen frame: scale by
+    /// the total height (ascent + |descent|) so the em fits `size` pixels,
+    /// flip Y because screen Y increases downward while font Y increases
+    /// upward, and drop the ascent line onto y=0.
+    fn to_screen(&self, size: f32) -> Affine {
         let total_height = self.ascent as f32 + self.descent.abs() as f32;
         let scale = size / total_height;
         let ascent_px = self.ascent as f32 * scale;
-        let to_screen = [scale, 0.0, 0.0, -scale, 0.0, ascent_px];
-        Some(Glyph {
-            kernel: affine_kernel(&g.kernel, to_screen),
-            support: g.support.through(to_screen),
-        })
+        Affine([scale, 0.0, 0.0, -scale, 0.0, ascent_px])
     }
 
     #[must_use]
@@ -601,73 +447,31 @@ impl<'a> Font<'a> {
         self.kern(left, right) * size / self.units_per_em as f32
     }
 
-    /// Compile a glyph to its coverage [`Kernel`] in font units, together
-    /// with the box outside which that kernel is **exactly** zero.
-    ///
-    /// Simple glyphs: parse segments in normalized [0,1] space, apply the
-    /// winding rule + unit-square bounds, then warp back to font units. The
-    /// support is that unit square warped the same way — the mask's false arm
-    /// is the constant 0, so outside it the value is not merely small, it is
-    /// the literal zero, and a domain-side extent may drop the glyph there
-    /// without changing a bit. Compound glyphs: recursively compile children
-    /// and sum them through their affine transforms; the support is the union
-    /// of the children's, transformed alike. Empty glyphs are the constant 0
-    /// over the empty support.
-    fn compile(&self, id: u16) -> Option<Glyph> {
+    /// Parse a glyph's outline in font units. Simple glyphs decode to
+    /// contours directly; compound glyphs are the outlines of their
+    /// components, each pushed through its component transform. Empty
+    /// glyphs are the empty outline.
+    fn outline(&self, id: u16) -> Option<Outline> {
         let (a, b) = (self.loca.get(id as usize)?, self.loca.get(id as usize + 1)?);
         if a == b {
-            return Some(Glyph {
-                kernel: kc(0.0),
-                support: Support::EMPTY,
-            });
+            return Some(Outline::default());
         }
         let mut r = R(self.data, self.glyf + a);
         let n = r.i16()?;
-        let x_min = r.i16()?;
-        let y_min = r.i16()?;
-        let x_max = r.i16()?;
-        let y_max = r.i16()?;
-
-        let width = (x_max - x_min) as f32;
-        let height = (y_max - y_min) as f32;
-        let max_dim = width.max(height).max(1.0); // Avoid div by 0
-
-        // Normalize transform: map [x_min, x_min+max_dim] -> [0, 1]
-        let norm_scale = 1.0 / max_dim;
-        let norm_tx = -(x_min as f32) * norm_scale;
-        let norm_ty = -(y_min as f32) * norm_scale;
-
-        // The restore transform maps [0, 1] back to font units
-        // x_world = x_local * max_dim + x_min
-        // y_world = y_local * max_dim + y_min (no flip - keep Y-down from TrueType)
-        let restore = [max_dim, 0.0, 0.0, max_dim, x_min as f32, y_min as f32];
-
+        // The header's bounding box is not needed: the outline's own control
+        // points bound it, and bound the curves too.
+        r.skip(8)?;
         if n >= 0 {
-            // Parse segments in normalized [0,1] space
-            let normalization = Normalization {
-                scale: norm_scale,
-                tx: norm_tx,
-                ty: norm_ty,
-            };
-            let segments = self.simple(&mut r, n as usize, normalization)?;
-
-            // Compose: winding coverage -> unit-square bounds -> font units.
-            let bounded = unit_square_mask().select(&coverage(&segments), &kc(0.0));
-            Some(Glyph {
-                kernel: affine_kernel(&bounded, restore),
-                support: Support::UNIT.through(restore),
-            })
+            self.simple(&mut r, n as usize)
         } else {
-            // Compound glyphs: children are already fully composed with their own bounds
             self.compound(&mut r)
         }
     }
 
-    /// Parse a simple glyph's outline into per-segment winding kernels in
-    /// normalized [0,1] space.
-    fn simple(&self, r: &mut R, n: usize, norm: Normalization) -> Option<Vec<Kernel>> {
+    /// Decode a simple glyph's point list into contours.
+    fn simple(&self, r: &mut R, n: usize) -> Option<Outline> {
         if n == 0 {
-            return Some(Vec::new());
+            return Some(Outline::default());
         }
         let ends: Vec<_> = (0..n)
             .map(|_| r.u16().map(|v| v as usize))
@@ -680,17 +484,17 @@ impl<'a> Font<'a> {
         while fl.len() < np {
             let f = r.u8()?;
             fl.push(f);
-            if f & 8 != 0 {
+            if f & FLAG_REPEAT != 0 {
                 for _ in 0..r.u8()?.min((np - fl.len()) as u8) {
                     fl.push(f);
                 }
             }
         }
 
-        let dec = |r: &mut R, s: u8, m: u8| {
+        let dec = |r: &mut R, short: u8, same: u8| {
             fl.iter()
                 .try_fold((0i16, vec![]), |(mut v, mut out), &f| {
-                    v += match (f & s != 0, f & m != 0) {
+                    v += match (f & short != 0, f & same != 0) {
                         (true, true) => r.u8()? as i16,
                         (true, false) => -(r.u8()? as i16),
                         (false, true) => 0,
@@ -702,113 +506,62 @@ impl<'a> Font<'a> {
                 .map(|(_, v)| v)
         };
 
-        let (xs, ys) = (dec(r, 2, 16)?, dec(r, 4, 32)?);
-
-        // Normalize points immediately
-        let pts: Vec<_> = (0..np)
-            .map(|i| {
-                (
-                    (xs[i] as f32) * norm.scale + norm.tx,
-                    (ys[i] as f32) * norm.scale + norm.ty,
-                    fl[i] & 1 != 0,
-                )
-            })
+        let xs = dec(r, FLAG_X_SHORT, FLAG_X_SAME_OR_POSITIVE)?;
+        let ys = dec(r, FLAG_Y_SHORT, FLAG_Y_SAME_OR_POSITIVE)?;
+        let pts: Vec<(f32, f32, bool)> = (0..np)
+            .map(|i| (xs[i] as f32, ys[i] as f32, fl[i] & FLAG_ON_CURVE != 0))
             .collect();
 
-        // Each contour contributes line/quad segment kernels.
-        let mut segments = Vec::new();
+        let mut contours = Vec::with_capacity(n);
         let mut start = 0;
-        for &e in ends.iter() {
-            let c = &pts[start..=e];
+        for &e in &ends {
+            contours.push(Contour::from_truetype_points(&pts[start..=e])?);
             start = e + 1;
-            push_segs(c, &mut segments);
         }
-
-        Some(segments)
+        Some(Outline { contours })
     }
 
-    fn compound(&self, r: &mut R) -> Option<Glyph> {
-        let mut kids = vec![];
-        let mut support = Support::EMPTY;
+    /// Decode a compound glyph: every component's outline, transformed.
+    fn compound(&self, r: &mut R) -> Option<Outline> {
+        let mut outline = Outline::default();
         loop {
             let fl = r.u16()?;
             let id = r.u16()?;
-            let (dx, dy) = if fl & 2 != 0 {
-                if fl & 1 != 0 {
+            let (dx, dy) = if fl & COMPONENT_ARGS_ARE_XY_VALUES != 0 {
+                if fl & COMPONENT_ARGS_ARE_WORDS != 0 {
                     (r.i16()?, r.i16()?)
                 } else {
                     (r.i8()? as i16, r.i8()? as i16)
                 }
             } else {
-                r.skip(if fl & 1 != 0 { 4 } else { 2 })?;
+                r.skip(if fl & COMPONENT_ARGS_ARE_WORDS != 0 {
+                    4
+                } else {
+                    2
+                })?;
                 (0, 0)
             };
             let mut m = [1.0, 0.0, 0.0, 1.0, dx as f32, dy as f32];
-            if fl & 0x08 != 0 {
-                let s = r.i16()? as f32 / 16384.0;
+            if fl & COMPONENT_HAVE_A_SCALE != 0 {
+                let s = r.i16()? as f32 / F2DOT14;
                 m[0] = s;
                 m[3] = s;
-            } else if fl & 0x40 != 0 {
-                m[0] = r.i16()? as f32 / 16384.0;
-                m[3] = r.i16()? as f32 / 16384.0;
-            } else if fl & 0x80 != 0 {
-                m[0] = r.i16()? as f32 / 16384.0;
-                m[1] = r.i16()? as f32 / 16384.0;
-                m[2] = r.i16()? as f32 / 16384.0;
-                m[3] = r.i16()? as f32 / 16384.0;
+            } else if fl & COMPONENT_HAVE_AN_X_AND_Y_SCALE != 0 {
+                m[0] = r.i16()? as f32 / F2DOT14;
+                m[3] = r.i16()? as f32 / F2DOT14;
+            } else if fl & COMPONENT_HAVE_A_TWO_BY_TWO != 0 {
+                m[0] = r.i16()? as f32 / F2DOT14;
+                m[1] = r.i16()? as f32 / F2DOT14;
+                m[2] = r.i16()? as f32 / F2DOT14;
+                m[3] = r.i16()? as f32 / F2DOT14;
             }
-            if let Some(g) = self.compile(id) {
-                kids.push(affine_kernel(&g.kernel, m));
-                support = support.join(g.support.through(m));
+            if let Some(component) = self.outline(id) {
+                outline.append(component.transformed(Affine(m)));
             }
-            if fl & 0x20 == 0 {
+            if fl & COMPONENT_MORE_COMPONENTS == 0 {
                 break;
             }
         }
-        Some(Glyph {
-            kernel: Kernel::sum(&kids),
-            support,
-        })
-    }
-}
-
-/// Convert one contour's point list into line/quad winding kernels.
-fn push_segs(pts: &[(f32, f32, bool)], segments: &mut Vec<Kernel>) {
-    if pts.is_empty() {
-        return;
-    }
-    let exp: Vec<_> = pts
-        .iter()
-        .enumerate()
-        .flat_map(|(i, &(x, y, on))| {
-            let (nx, ny, non) = pts[(i + 1) % pts.len()];
-            if !on && !non {
-                vec![(x, y, on), ((x + nx) / 2.0, (y + ny) / 2.0, true)]
-            } else {
-                vec![(x, y, on)]
-            }
-        })
-        .collect();
-
-    if exp.is_empty() {
-        return;
-    }
-
-    let start = exp.iter().position(|p| p.2).unwrap_or(0);
-    let mut i = 0;
-    while i < exp.len() {
-        let p = |j: usize| {
-            let (x, y, _) = exp[(start + j) % exp.len()];
-            [x, y]
-        };
-        if exp[(start + i + 1) % exp.len()].2 {
-            if let Some(line) = AnalyticalLine::from_points(p(i), p(i + 1)) {
-                segments.push(line.kernel());
-            }
-            i += 1;
-        } else {
-            segments.push(AnalyticalQuad::new(p(i), p(i + 1), p(i + 2)).kernel());
-            i += 2;
-        }
+        Some(outline)
     }
 }

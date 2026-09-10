@@ -208,7 +208,13 @@ fn corpus(cli: &Cli) -> Vec<Case> {
             if n >= cli.max_glyphs {
                 break;
             }
-            let Some(kernel) = parsed.glyph_kernel_scaled(ch, tile as f32) else {
+            // `glyph_kernel_scaled` yields a `Glyph` — its two folds and its
+            // support — and `kernel()` is the single exit that applies the
+            // coverage ramp once. See fonts/loop_blinn.rs.
+            let Some(kernel) = parsed
+                .glyph_kernel_scaled(ch, tile as f32)
+                .map(|g| g.kernel())
+            else {
                 continue;
             };
             n += 1;
@@ -433,6 +439,12 @@ fn node_label(egraph: &EGraph, class: EClassId, idx: usize) -> String {
                 .collect();
             format!("{}({})", op.name(), cs.join(","))
         }
+        ENode::Reduce { fold, body } => format!(
+            "Reduce[{}..{}]({})",
+            fold.range().start,
+            fold.range().end,
+            egraph.find(*body).index()
+        ),
     }
 }
 

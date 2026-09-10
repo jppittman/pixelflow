@@ -136,7 +136,12 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Buffer => 0,     // leaf, free
         OpKind::Gather => 10,    // memory read
         OpKind::RawGather => 10, // primitive memory read
-        OpKind::Reduce => 0,     // lowered (unrolled) before costing
+        // A fold's cost depends on its range and its monoid, and an `OpKind`
+        // carries neither; `node_op_cost`'s `ENode::Reduce` arm is where it is
+        // priced. Zero here so a caller reaching this table for a fold adds
+        // nothing rather than a wrong number. (It said "lowered (unrolled)
+        // before costing" while `ExpandReduce` ran first. It runs last now.)
+        OpKind::Reduce => 0,
         // A leaf like Buffer: its one broadcast load lands in the per-call
         // prologue, which the per-sample cost model does not see.
         OpKind::Uniform => 0,
@@ -305,12 +310,50 @@ impl CostModel {
             | ENode::Buffer(_)
             | ENode::Uniform(_)
             | ENode::Param(_) => 0,
-            // `Dwrt` is the internal autodiff marker. It is rewritten away by
-            // the chain rule; a surviving one is the (not-yet-wired) jet
-            // fallback. Either way extraction must never choose it, so it is
-            // prohibitively expensive regardless of the learned weight table.
-            ENode::Op { op, .. } if op.kind() == OpKind::Dwrt => usize::MAX / 4,
+            // `Dwrt` is the internal autodiff marker, and the latency table
+            // already carries a considered number for it (1000 — dear enough
+            // that the extractor takes the chain rule wherever saturation
+            // produced one).
+            //
+            // It used to be overridden to `usize::MAX / 4` here, on the
+            // reasoning that "extraction must never choose it". That was safe
+            // only while `LowerDwrt` ran *before* saturation, so a `Dwrt`
+            // could not reach the e-graph in the first place. It runs last
+            // now (`pixelflow_search::runtime`) — legalization is the
+            // fallback for what the rules declined — so extraction must be
+            // able to *keep* a `Dwrt` the chain rule did not reach, and hand
+            // it to the legalizer. A sentinel makes that unrepresentable:
+            // the DP settles on a finite term while the recomputed price
+            // saturates, and the two come apart in the claim/price audit.
+            //
+            // Expensive, not infinite, is the distinction. The same one the
+            // fold arm below makes, for the same reason.
             ENode::Op { op, .. } => self.cost(op.kind()),
+            // **A fold's own work is its combiner chain**: `len - 1`
+            // applications of the monoid's operation. The body's `len`
+            // evaluations are not here — a node's cost cannot see its
+            // children's — they are applied where the DP adds the body in,
+            // which is the one place that number exists. See
+            // `extract.rs`'s `fold_body_multiple`.
+            //
+            // This was `usize::MAX / 4`, the prohibitive sentinel `Dwrt`
+            // carries, on the reasoning that a surviving fold is unrolled
+            // afterwards past everything that could fold across the copies,
+            // so any decomposition in the e-class was strictly better. That
+            // held only while the legalizer ran *before* saturation. With it
+            // last (`pixelflow_search::runtime`), an unpriced fold is what
+            // forces the graph to unroll internally to escape the sentinel —
+            // four nodes reaching the 500-class cap through `PeelFold` — and,
+            // because the sentinel saturates, a DP claim that no longer
+            // equals the price of the term it names, which `extract.rs`'s
+            // claim/price audit catches outright.
+            //
+            // An unpriceable monoid keeps the sentinel: extraction must not
+            // choose a fold whose combiner has no operation to emit.
+            ENode::Reduce { fold, .. } => match super::fold_rules::combiner_op(fold.monoid()) {
+                Some(op) => (fold.len() as usize).saturating_sub(1) * self.cost(op.kind()),
+                None => usize::MAX / 4,
+            },
         }
     }
 
@@ -572,18 +615,31 @@ mod cost_model_accessors {
         assert_eq!(model.node_op_cost(&ENode::Buffer(decl)), 0);
     }
 
-    /// `Dwrt` is the unlowered-autodiff marker and must never look cheap to
-    /// extraction, however the op-cost table happens to price it — so
-    /// `node_op_cost` overrides the table for it specifically.
+    /// `Dwrt` is the unlowered-autodiff marker: dear, so extraction takes the
+    /// chain rule wherever saturation produced one, but **finite**, because
+    /// `LowerDwrt` runs after saturation now and extraction has to be able to
+    /// keep one and hand it to the legalizer.
+    ///
+    /// This asserted `usize::MAX / 4` while lowering ran first and a `Dwrt`
+    /// could not reach the e-graph at all. A sentinel is not a large number,
+    /// it is an unrepresentable one: it makes the DP settle on a finite term
+    /// whose recomputed price saturates, and `extract.rs`'s claim/price audit
+    /// fires on the difference.
     #[test]
-    fn node_op_cost_makes_a_dwrt_node_prohibitively_expensive() {
+    fn node_op_cost_prices_a_dwrt_node_dearly_but_finitely() {
         let model = CostModel::latency_prior();
         let op = op_from_kind(OpKind::Dwrt).expect("Dwrt has an Op impl");
         let node = ENode::Op {
             op,
             children: vec![],
         };
-        assert_eq!(model.node_op_cost(&node), usize::MAX / 4);
+        let cost = model.node_op_cost(&node);
+        assert_eq!(cost, model.cost(OpKind::Dwrt), "priced from the table");
+        assert!(cost < usize::MAX / 4, "finite, not a sentinel: {cost}");
+        assert!(
+            cost > model.cost(OpKind::Sqrt),
+            "still dearer than any real op, so the chain rule wins where it exists"
+        );
     }
 
     /// An ordinary op node (not Dwrt, not a leaf) prices straight from the

@@ -118,6 +118,13 @@ pub fn pattern_match_arena(
                 ExprNode::Uniform(w) if u == w => {}
                 _ => return None,
             },
+            // A reference matches the reference to the same kernel: a key IS
+            // the content, so equal keys are equal terms without resolving
+            // either.
+            ExprNode::Ref(k) => match arena.node(e_id) {
+                ExprNode::Ref(e_k) if k == e_k => {}
+                _ => return None,
+            },
             // Structural match: op must match, push children onto the stack.
             ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
                 ExprNode::Unary(e_op, e_a) if e_op == t_op => {
@@ -154,6 +161,11 @@ pub fn pattern_match_arena(
                 }
                 _ => return None,
             },
+            // No template contains a fold: templates are arithmetic, and the
+            // decompositions of a fold are rules with their own constructors
+            // rather than a pattern to match. A fold in the *target* still
+            // matches nothing, which is what this arm says.
+            ExprNode::Reduce { .. } => return None,
         }
     }
 
@@ -220,6 +232,13 @@ pub fn substitute_template_arena(
             ExprNode::Uniform(u) => panic!(
                 "ExprNode::Uniform({}) in a rewrite template — uniforms are not rewritable",
                 u.0
+            ),
+            ExprNode::Ref(k) => panic!(
+                "ExprNode::Ref({k:?}) in a rewrite template — a reference names a                  kernel this rewrite cannot see; expand_refs first"
+            ),
+            ExprNode::Reduce { .. } => panic!(
+                "a fold in a rewrite template — templates are arithmetic, and a \
+                 fold binds; its decompositions are rules of their own"
             ),
             ExprNode::Unary(op, t_a) => {
                 let a = ExprId(remap[t_a.0 as usize]);
@@ -858,6 +877,14 @@ impl BwdGenerator {
                 Shape::Param(p) => self.arena.push_param(p),
                 Shape::Buffer(decl) => self.arena.embed(Shape::Buffer(decl)),
                 Shape::Uniform(decl) => self.arena.embed(Shape::Uniform(decl)),
+                // A key names a kernel interned in *this* process, and a
+                // corpus outlives the process — same refusal `corpus.rs`
+                // makes when it serializes one.
+                Shape::Ref(k) => panic!("junkify: Ref({k:?}) in a corpus expression"),
+                Shape::Reduce { fold, body } => self.arena.embed(Shape::Reduce {
+                    fold,
+                    body: remap[body.0 as usize],
+                }),
                 Shape::Op(op, children) => match children {
                     Children::Zero => panic!("junkify: op with 0 children"),
                     Children::One(a) => self.arena.push_unary(op, remap[a.0 as usize]),

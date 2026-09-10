@@ -206,6 +206,16 @@ impl DepsAnalysis {
                 }
                 v
             }
+            // The binder is bound, so it is not free in the fold's result —
+            // the only node in the graph that *removes* a dependency.
+            ENode::Reduce { fold, body } => {
+                let child = egraph.find(*body);
+                if child == self_id {
+                    return Variance::ALL;
+                }
+                let child_v = resolved.get(&child).copied().unwrap_or(Variance::ALL);
+                child_v.without(Variance::from_var(fold.binder().var()))
+            }
         }
     }
 
@@ -218,6 +228,7 @@ impl DepsAnalysis {
             }
             ENode::Var(v) => (Some(var_variance(*v)), vec![]),
             ENode::Op { children, .. } => (None, children.clone()),
+            ENode::Reduce { body, .. } => (None, vec![*body]),
         }
     }
 

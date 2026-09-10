@@ -16,10 +16,6 @@ libm = "0.2.15"
 hashbrown = { version = "0.16", optional = true, default-features = false, features = ["default-hasher"] }
 
 [dev-dependencies]
-# Self-dependency so this crate's own `tests/` see the oracle. Nothing else
-# turns the feature on, which is what keeps a tree-walking evaluator out of
-# every shipped build.
-pixelflow-ir = { path = ".", features = ["oracle"] }
 criterion = "0.5"
 
 [[bench]]
@@ -29,9 +25,6 @@ harness = false
 [features]
 default = ["std", "hash-memo"]
 std = []
-# The scalar differential-testing oracle (`eval`). Test-only: PixelFlow renders
-# exclusively through the JIT, so no shipped build may reach an interpreter.
-oracle = []
 # `dag::Builder`'s consing memo. Default on: swaps the always-available
 # `BTreeMap` fallback (needs only `Ord`, no optional dep — what
 # `--no-default-features` gets, since the crate is `no_std`-aspirational

@@ -25,4 +25,4 @@ pixelflow-codegen = { path = "../pixelflow-codegen" }
 
 [dev-dependencies]
 pixelflow-core = { path = "../pixelflow-core" }
-pixelflow-ir = { path = "../pixelflow-ir", features = ["oracle"] }
+pixelflow-ir = { path = "../pixelflow-ir" }

@@ -691,7 +691,7 @@ only bytes that move are addressing-mode encodings for what are still,
 by policy, all-memory hoisted values (i.e., the emitted machine code should
 be provably equivalent, differing at most in slot numbering), backed by
 differential execution across all four backends on the existing
-`collapse_loop.rs`/`spill_pressure.rs` test suites. This stage is real
+`collapse_loop.rs` (deleted)/`spill_pressure.rs` (deleted) test suites. This stage is real
 plumbing work with no user-visible win — it exists so stage 2 is "change one
 policy" rather than "rewrite the allocator and change the policy at once."
 
@@ -701,7 +701,7 @@ value, not forced to memory. This is where `hoist_slots` stops being
 unconditional and coordinates can go resident. *Invariant:* this stage is
 expected to change emitted code and improve it — so the checkable claim is
 not byte-identity but (a) every existing correctness test still passes
-(`collapse_loop.rs`, `spill_pressure.rs`, `muladd_rounding.rs`,
+(`collapse_loop.rs` (deleted), `spill_pressure.rs` (deleted), `muladd_rounding.rs`,
 `transcendental_jit.rs`, the JIT/interpreter differential oracle), and (b) a
 new benchmark on `pixelflow-codegen`'s JIT bench harness
 (`jit_bench.rs`) shows a measured cycle reduction on a kernel with at least

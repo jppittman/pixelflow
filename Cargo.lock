@@ -903,7 +903,6 @@ dependencies = [
  "criterion",
  "hashbrown",
  "libm",
- "pixelflow-ir",
 ]
 
 [[package]]

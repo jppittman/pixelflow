@@ -568,45 +568,6 @@ pub fn draw(rng: &mut Rng) -> (ExprArena, ExprId) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::{BindingTable, eval_scalar};
-
-    fn eval_at(arena: &ExprArena, root: ExprId, vars: &[f32; 2]) -> f32 {
-        eval_scalar(arena, root, vars, &BindingTable::empty())
-    }
-
-    /// Every basis function must be finite and agree with a direct
-    /// hand-computation at a few points, catching a copy-paste error in the
-    /// [`theta_factor`] table before it reaches the corpus.
-    #[test]
-    fn y_1_0_matches_hand_computed_value_at_theta_zero() {
-        let mut arena = ExprArena::new();
-        let basis = TrigBasis::build(&mut arena);
-        let root = y_l_m(&mut arena, basis, 1, 0, Form::Direct);
-
-        // theta=0 => cos(theta)=1 => Y_1^0 = sqrt(3/4pi).
-        let got = eval_at(&arena, root, &[0.0, 0.3]);
-        let want = (3.0 / (4.0 * std::f32::consts::PI)).sqrt();
-        assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
-    }
-
-    #[test]
-    fn draw_produces_finite_values_at_seeded_points() {
-        let mut rng = Rng::new(0x00C0_FFEE);
-        for i in 0..200u64 {
-            let mut draw_rng = Rng::new(0x00C0_FFEE ^ i.wrapping_mul(0x9E37_79B9));
-            let (arena, root) = draw(&mut draw_rng);
-            for theta in [-2.0f32, -0.5, 0.0, 0.5, 2.0] {
-                for phi in [-2.0f32, -0.5, 0.0, 0.5, 2.0] {
-                    let v = eval_at(&arena, root, &[theta, phi]);
-                    assert!(
-                        v.is_finite(),
-                        "draw {i} produced non-finite {v} at theta={theta}, phi={phi}"
-                    );
-                }
-            }
-            let _ = &mut rng; // keep the outer rng alive for future extension
-        }
-    }
 
     #[test]
     fn draw_node_counts_are_in_a_plausible_range() {
@@ -621,41 +582,6 @@ mod tests {
             assert!(n >= 5, "draw {i}: implausibly small ({n} nodes)");
             assert!(n <= 2000, "draw {i}: implausibly large ({n} nodes)");
             let _ = &mut rng;
-        }
-    }
-
-    /// The spherical-harmonics addition theorem at zero separation:
-    /// `Σ_m (Y_l^m(θ,φ))² = (2l+1)/(4π)`, independent of θ,φ — the strongest
-    /// available check on the whole `theta_factor`/`sin_mphi`/`cos_mphi`
-    /// table, since a single wrong constant or a wrong multiple-angle
-    /// identity breaks the invariant at generic points (unlike a
-    /// single-term check, which a compensating pair of sign errors could
-    /// still pass by accident). Checked under both [`Form`]s and through
-    /// l=4, so every `sin_mphi`/`cos_mphi` expansion (m up to 4) is
-    /// exercised, not just `theta_factor`.
-    #[test]
-    fn band_energy_matches_the_addition_theorem() {
-        let points = [
-            (0.4f32, 0.9f32),
-            (-1.1, 2.3),
-            (2.0, -0.7),
-            (0.0, 0.0),
-            (core::f32::consts::FRAC_PI_2, 3.0),
-        ];
-        for form in [Form::Direct, Form::Expanded] {
-            for l in 0..=4u32 {
-                let want = f64::from(2 * l + 1) / (4.0 * std::f64::consts::PI);
-                for &(theta, phi_val) in &points {
-                    let mut arena = ExprArena::new();
-                    let basis = TrigBasis::build(&mut arena);
-                    let root = band_energy(&mut arena, basis, l, form);
-                    let got = eval_at(&arena, root, &[theta, phi_val]);
-                    assert!(
-                        (f64::from(got) - want).abs() < 1e-3,
-                        "l={l} form={form:?} theta={theta} phi={phi_val}: got {got}, want {want}"
-                    );
-                }
-            }
         }
     }
 

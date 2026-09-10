@@ -22,12 +22,15 @@ fn parse_font_and_get_glyph() {
         .expect("Advance for 'A' not found");
     assert!(advance > 0.0, "Glyph should have positive advance");
 
-    // Bake the glyph and confirm it renders real ink in range.
-    let centered = glyph_a.at(
+    // Bake the glyph and confirm it renders real ink in range. The winding
+    // sum reads a bound piece table (S1a), so bind it rather than a bare
+    // `Lattice::bake`.
+    let centered = glyph_a.kernel().at(
         &Kernel::x().add(&Kernel::constant(0.5)),
         &Kernel::y().add(&Kernel::constant(0.5)),
     );
-    let baked = Lattice::frame(64, 64).bake(&centered);
+    let lattice = Lattice::frame(64, 64);
+    let baked = glyph_a.bake(&centered, lattice);
     let buf = baked.buffer();
     assert_eq!(buf.len(), 64 * 64);
     let ink: f32 = buf.iter().sum();

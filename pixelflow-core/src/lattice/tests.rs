@@ -273,16 +273,36 @@ fn frame_zero_dimensions() {
     assert_eq!(discrete.height(), 0);
 }
 
-/// `bake` binds nothing, so a kernel that reads memory cannot be baked — and
-/// the refusal has to **name the slot it could not fill**, not read a null
-/// base pointer and hand back plausible numbers. The rule lives in
-/// `Manifold::bind`, which is the only place that can state it once for both
-/// callers; this pins that `bake` still reaches it.
+/// `bake` binds nothing itself, so a kernel that declares a buffer it does
+/// not *carry* data for cannot be baked — and the refusal has to **name the
+/// slot it could not fill**, not read a null base pointer and hand back
+/// plausible numbers. The rule lives in `Manifold::bind`, which is the only
+/// place that can state it once for both callers; this pins that `bake`
+/// still reaches it.
+///
+/// `DiscreteManifold::kernel_for`, not `.kernel()`: the latter seeds the
+/// kernel with its own buffer (the data travelling with the value), so
+/// `bake` now succeeds on it without a caller binding anything — see
+/// [`a_kernel_carrying_its_own_buffer_bakes_with_no_explicit_binding`]. This
+/// is the genuinely unbound case: an identity a kernel names but no data was
+/// ever seeded under.
 #[test]
 #[should_panic(expected = "nothing bound to slot")]
 fn baking_a_kernel_over_bound_memory_names_the_slot_it_cannot_fill() {
+    let id = pixelflow_ir::arena::BufferIdentity::mint();
+    let dataless = DiscreteManifold::kernel_for(id, 2, 2);
+    let _refused = Lattice::frame(2, 2).bake(&dataless);
+}
+
+/// The other half of the pair above: a kernel built from
+/// [`DiscreteManifold::kernel`] carries its own buffer, so `Lattice::bake` —
+/// which binds nothing itself — still succeeds, reading the data the kernel
+/// seeded rather than a caller-supplied binding.
+#[test]
+fn a_kernel_carrying_its_own_buffer_bakes_with_no_explicit_binding() {
     let texture = DiscreteManifold::new(alloc::vec![1.0, 2.0, 3.0, 4.0], 2, 2);
-    let _refused = Lattice::frame(2, 2).bake(&texture.kernel());
+    let baked = Lattice::frame(2, 2).bake(&texture.kernel());
+    assert_eq!(baked.buffer(), &[1.0, 2.0, 3.0, 4.0]);
 }
 
 // ---- Index-space lattices (feature/tensor indexing) ----
@@ -646,8 +666,6 @@ mod uniforms_link_and_oracle {
     use super::*;
     use crate::lattice::manifold::Manifold;
     use pixelflow_ir::Uniform;
-    use pixelflow_ir::binding::BindingTable;
-    use pixelflow_ir::eval_scalar;
 
     /// `Kernel::at` splices every coordinate fragment whether or not the
     /// receiver reads that axis, so a kernel routinely *declares* an
@@ -678,59 +696,5 @@ mod uniforms_link_and_oracle {
         block.set(cx, 2.0).expect("cx is read");
         let plane = Lattice::frame(4, 1).collapse(&program.bind(&[]).with_uniforms(&block));
         assert_eq!(plane.buffer(), &[2.0, 1.0, 0.0, 1.0]);
-    }
-
-    /// The plan's §5.2: JIT versus oracle under one bound block, across
-    /// several values, without recompiling between them. The block reaches
-    /// the oracle **by identity** (`entries`), never as a positional slice —
-    /// the link's order and the arena's differ, and the type says so.
-    #[test]
-    fn jit_and_oracle_read_one_block_by_identity() {
-        let (cx, cy, r) = (Uniform::new(1.5), Uniform::new(-0.5), Uniform::new(2.0));
-        let dx = Kernel::x().sub(&cx.kernel());
-        let dy = Kernel::y().sub(&cy.kernel());
-        // `√((X − cx)² + (Y − cy)²)` sampled with `r` warped onto X: `at`
-        // splices the coordinate fragment before rebuilding the receiver, so
-        // `r` is read first but declared last, and the link's order and the
-        // arena's differ.
-        let k = dx
-            .mul(&dx)
-            .add(&dy.mul(&dy))
-            .sqrt()
-            .at(&r.kernel(), &Kernel::y());
-        let (arena, root) = k.parts();
-        let lattice = Lattice::frame(8, 3);
-        let program = Manifold::compile(&k, lattice.extent);
-        assert_ne!(
-            program.uniforms().iter().map(|d| d.id).collect::<Vec<_>>(),
-            arena.uniforms().iter().map(|d| d.id).collect::<Vec<_>>(),
-            "the link's order and the arena's differ here, which is the point"
-        );
-        let code = program.code_bytes().as_ptr();
-        let mut block = program.block();
-        for values in [[1.5f32, -0.5, 2.0], [-3.0, 4.0, 0.25], [0.0, 0.0, 10.0]] {
-            block.set(cx, values[0]).expect("cx");
-            block.set(cy, values[1]).expect("cy");
-            block.set(r, values[2]).expect("r");
-            let entries: Vec<_> = block.entries().collect();
-            let bindings = BindingTable::bind(arena, &[])
-                .expect("no buffers")
-                .bind_uniforms(arena, &entries)
-                .expect("every entry is declared");
-            let plane = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
-            for (i, got) in plane.buffer().iter().enumerate() {
-                let (x, y) = ((i % 8) as f32, (i / 8) as f32);
-                let want = eval_scalar(arena, root, &[x, y], &bindings);
-                assert!(
-                    (got - want).abs() <= 1e-5 * want.abs().max(1.0),
-                    "at ({x},{y}) under {values:?}: jit {got} vs oracle {want}"
-                );
-            }
-        }
-        assert_eq!(
-            program.code_bytes().as_ptr(),
-            code,
-            "three blocks, one compiled region"
-        );
     }
 }

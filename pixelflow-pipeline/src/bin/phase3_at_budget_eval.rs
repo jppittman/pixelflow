@@ -426,18 +426,21 @@ const POLY_OPS: &[OpKind] = &[
 ];
 
 /// The op of a non-leaf `ExprNode`, or `None` for a leaf
-/// (`Var`/`Const`/`Param`/`Buffer` — excluded from the stratification rule).
+/// (`Var`/`Const`/`Param`/`Buffer`/`Uniform`/`Ref` — excluded from the
+/// stratification rule).
 fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
     match node {
         ExprNode::Var(_)
         | ExprNode::Const(_)
         | ExprNode::Param(_)
         | ExprNode::Buffer(_)
-        | ExprNode::Uniform(_) => None,
+        | ExprNode::Uniform(_)
+        | ExprNode::Ref(_) => None,
         ExprNode::Unary(op, _)
         | ExprNode::Binary(op, _, _)
         | ExprNode::Ternary(op, _, _, _)
         | ExprNode::Nary(op, _, _) => Some(*op),
+        ExprNode::Reduce { .. } => Some(OpKind::Reduce),
     }
 }
 

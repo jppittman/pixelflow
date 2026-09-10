@@ -146,6 +146,14 @@ pub struct EGraph {
     /// once" from "the mask matched eleven times", and must never have to
     /// infer that a mask fired at all.
     replay_mask_skips: usize,
+    /// Per-application growth telemetry (`docs/plans/2026-08-31-guide-design-revision.md`
+    /// §4.1): `None` until [`EGraph::enable_growth_telemetry`] turns it on.
+    /// Compiled in only under `saturation-telemetry`, and checked with a bare
+    /// `is_some()` on every committed application even then — see
+    /// [`super::growth`]'s module doc for the "costs nothing when off"
+    /// contract this field exists to keep.
+    #[cfg(feature = "saturation-telemetry")]
+    growth: Option<super::growth::GrowthTelemetry>,
     /// Global monotonic counter, bumped once per class-content mutation
     /// (`add`'s memo miss, `union`'s merge) — never reset, never bumped by
     /// anything that only re-canonicalizes existing content (`nodes()`
@@ -324,6 +332,8 @@ impl Clone for EGraph {
             application_cap: self.application_cap,
             replay_mask: self.replay_mask.clone(),
             replay_mask_skips: self.replay_mask_skips,
+            #[cfg(feature = "saturation-telemetry")]
+            growth: self.growth.clone(),
             mutation_counter: self.mutation_counter,
             last_changed: self.last_changed.clone(),
             rule_last_swept: self.rule_last_swept.clone(),
@@ -473,6 +483,8 @@ impl EGraph {
             application_cap: None,
             replay_mask: None,
             replay_mask_skips: 0,
+            #[cfg(feature = "saturation-telemetry")]
+            growth: None,
             mutation_counter: 0,
             last_changed: Vec::new(),
             rule_last_swept: Vec::new(),
@@ -508,6 +520,8 @@ impl EGraph {
             application_cap: None,
             replay_mask: None,
             replay_mask_skips: 0,
+            #[cfg(feature = "saturation-telemetry")]
+            growth: None,
             mutation_counter: 0,
             last_changed: Vec::new(),
             rule_last_swept,
@@ -594,6 +608,23 @@ impl EGraph {
         self.record_provenance
     }
 
+    /// Turn on per-application growth telemetry: how many e-nodes/e-classes
+    /// each committed rewrite application actually adds, per rule (see
+    /// [`super::growth`]). Off by default and free to leave off — this is
+    /// the one call that starts paying for it.
+    #[cfg(feature = "saturation-telemetry")]
+    pub fn enable_growth_telemetry(&mut self) {
+        self.growth = Some(super::growth::GrowthTelemetry::default());
+    }
+
+    /// The growth telemetry collected so far, if
+    /// [`Self::enable_growth_telemetry`] was called on this graph.
+    #[cfg(feature = "saturation-telemetry")]
+    #[must_use]
+    pub fn growth_telemetry(&self) -> Option<&super::growth::GrowthTelemetry> {
+        self.growth.as_ref()
+    }
+
     pub fn find(&self, id: EClassId) -> EClassId {
         let mut current = id;
         while self.parent[current.index()] != current {
@@ -616,17 +647,8 @@ impl EGraph {
     }
 
     fn canonicalize_node(&self, node: &mut ENode) {
-        match node {
-            ENode::Var(_)
-            | ENode::Const(_)
-            | ENode::Buffer(_)
-            | ENode::Uniform(_)
-            | ENode::Param(_) => {}
-            ENode::Op { children, .. } => {
-                for child in children {
-                    *child = self.find(*child);
-                }
-            }
+        for child in node.children_slice_mut() {
+            *child = self.find(*child);
         }
     }
 
@@ -1094,6 +1116,7 @@ impl EGraph {
             ENode::Uniform(_) => pixelflow_ir::OpKind::Uniform,
             ENode::Param(_) => pixelflow_ir::OpKind::Param,
             ENode::Op { op, .. } => op.kind(),
+            ENode::Reduce { .. } => pixelflow_ir::OpKind::Reduce,
         }
     }
 
@@ -1456,10 +1479,7 @@ impl EGraph {
             return true;
         }
         for node in &self.classes[canonical.index()].nodes {
-            let ENode::Op { children, .. } = node else {
-                continue;
-            };
-            for &child in children {
+            for &child in node.children_slice() {
                 let child = self.find(child);
                 if self.last_changed[child.index()] > swept {
                     return true;
@@ -1468,14 +1488,7 @@ impl EGraph {
                     continue;
                 }
                 for gnode in &self.classes[child.index()].nodes {
-                    let ENode::Op {
-                        children: gchildren,
-                        ..
-                    } = gnode
-                    else {
-                        continue;
-                    };
-                    for &gchild in gchildren {
+                    for &gchild in gnode.children_slice() {
                         if self.last_changed[self.find(gchild).index()] > swept {
                             return true;
                         }
@@ -1587,13 +1600,31 @@ impl EGraph {
                     break 'scan;
                 }
                 if let Some(action) = self.rules[rule_idx].apply(self, canonical, node) {
-                    // Track how many nodes this action would create
-                    let action_cost = match &action {
-                        RewriteAction::Union(_) => 0,
-                        RewriteAction::Create(_) => 1,
-                        // Multi-node actions: conservative upper bound
-                        _ => 3,
-                    };
+                    // Exactly how many e-classes this action would add,
+                    // against the graph as it stands right now — see
+                    // `predicted_growth`, whose exactness is asserted on
+                    // every application under growth telemetry. This
+                    // replaced a flat 0/1/3 guess that was so conservative
+                    // saturation stopped ~40% short of its own class budget
+                    // (circle_sdf 1218 of 2000, redundant 428 of 500).
+                    //
+                    // Spending the whole budget moved extraction *both* ways
+                    // on the shipped corpus: four kernels better, four worse
+                    // (mandelbrot_distance +7.3%, smooth_min_scene +6.0%).
+                    // That is not a reason to saturate less. A richer
+                    // equivalence class cannot make the true optimum worse;
+                    // only an extractor that is not monotone in what it is
+                    // given can be led to a worse answer by more choices.
+                    // So the estimator tells the truth and the extractor
+                    // owns the regression — decision JP, 2026-09-09; see
+                    // docs/plans/2026-08-31-guide-design-revision.md §4.2.
+                    //
+                    // Sound as an upper bound on the whole scan's real
+                    // growth even though sibling actions found later in this
+                    // same scan (still uncommitted, so invisible to this
+                    // call) may end up sharing some of the same nodes: real
+                    // growth can only come in lower.
+                    let action_cost = self.predicted_growth(&action);
                     estimated_new_nodes += action_cost;
 
                     // If this action would push us over budget, stop scanning
@@ -1797,7 +1828,7 @@ impl EGraph {
         #[cfg(feature = "provenance-journal")]
         {
             if !self.record_provenance {
-                return self.apply_action(class_id, action);
+                return self.apply_action_measured(rule_idx, class_id, action);
             }
 
             let minted_from = self.next_enode_id;
@@ -1813,7 +1844,7 @@ impl EGraph {
                 rule_idx,
                 application_id,
             });
-            let result = self.apply_action(class_id, action);
+            let result = self.apply_action_measured(rule_idx, class_id, action);
             self.active_application = previous;
             // The record is opened before the action runs (so `add`/`union`
             // can attribute to it) and closed after, which is the only order
@@ -1828,11 +1859,68 @@ impl EGraph {
 
         #[cfg(not(feature = "provenance-journal"))]
         {
-            // `rule_idx` is only needed to attribute a journal record —
-            // with the journal compiled out there is nothing to attribute.
-            let _ = rule_idx;
-            self.apply_action(class_id, action)
+            self.apply_action_measured(rule_idx, class_id, action)
         }
+    }
+
+    /// Apply a rewrite action on behalf of `rule_idx`, threading through
+    /// per-application growth telemetry when it is compiled in and switched
+    /// on ([`Self::enable_growth_telemetry`]). Behaviorally identical to a
+    /// bare `self.apply_action(class_id, action)` call in every other case —
+    /// with `saturation-telemetry` off this compiles to exactly that call,
+    /// and with it on but unused the only added cost is one
+    /// `Option::is_some()` check. See [`super::growth`]'s module doc.
+    ///
+    /// `rule_idx` is unused when `saturation-telemetry` is off (the journal
+    /// path already keeps its own use of it under `provenance-journal`, a
+    /// separate feature).
+    #[cfg_attr(not(feature = "saturation-telemetry"), allow(unused_variables))]
+    fn apply_action_measured(
+        &mut self,
+        rule_idx: usize,
+        class_id: EClassId,
+        action: RewriteAction,
+    ) -> usize {
+        #[cfg(feature = "saturation-telemetry")]
+        if self.growth.is_some() {
+            // The exactness oracle for `predicted_growth`: computed against
+            // the graph exactly as it stands right now, immediately before
+            // the same action executes for real, so there is no window in
+            // which some other commit could move the memo out from under
+            // the comparison. An always-on `assert_eq!`, not `debug_assert!`
+            // — this is a measurement path (telemetry is opt-in), not a hot
+            // one, and a divergence here is exactly the "most important
+            // finding" a mispredicted budget estimator could produce.
+            let predicted = self.predicted_growth(&action);
+            let nodes_before = self.next_enode_id;
+            let unions = self.apply_action(class_id, action);
+            let nodes_added = (self.next_enode_id - nodes_before) as usize;
+            // See `super::growth`'s module doc: `add()` mints exactly one
+            // new class per new node, always, so this equality is an
+            // invariant of the representation, not an assumption of the
+            // measurement — pinned here rather than merely relied upon.
+            debug_assert_eq!(
+                self.classes.len() as u64,
+                self.next_enode_id,
+                "EGraph::add's one-class-per-node invariant broke; growth's \
+                 nodes_added/classes_added equivalence depends on it"
+            );
+            let rule = self.rule_ids.get(rule_idx).copied();
+            assert_eq!(
+                predicted, nodes_added,
+                "predicted_growth mismatch on rule {rule_idx} ({rule:?}): \
+                 predicted {predicted} new e-classes, the commit actually \
+                 added {nodes_added} — predicted_growth must walk exactly \
+                 the same shape apply_action does"
+            );
+            self.growth.as_mut().expect("checked Some above").record(
+                rule,
+                nodes_added,
+                unions > 0 || nodes_added > 0,
+            );
+            return unions;
+        }
+        self.apply_action(class_id, action)
     }
 
     /// Apply a rewrite action and return 1 if a union was made, 0 otherwise.
@@ -1856,64 +1944,165 @@ impl EGraph {
         usize::from(self.find(a) == self.find(b))
     }
 
-    /// Materialize `template`'s subtree at `id` into this e-graph, bottom-up,
-    /// reading each metavariable leaf from `bindings` rather than creating a
-    /// node for it — the same convention every hand-written multi-node
-    /// [`RewriteAction`] uses (`Distribute`, `Canonicalize`, …), just driven
-    /// by a runtime pattern instead of a fixed shape. `self.add` is what
-    /// attributes every node created here to the active application's
-    /// provenance, so this must only ever be called from inside
-    /// `apply_action` (i.e. under `apply_action_from_rule`).
+    /// Predict exactly how many new e-classes committing `action` would add
+    /// to the graph **as it stands right now** — without mutating anything.
     ///
-    /// # Panics
+    /// Every [`RewriteAction`] arm builds a node shape of known structure
+    /// (`Distribute`'s two products and a sum, `Instantiate`'s template,
+    /// `Differentiate`'s one chain-rule step, …), and the e-graph is
+    /// hash-consed, so the e-classes an application would add are exactly
+    /// the shape's nodes that are not already in the memo. This walks that
+    /// same shape — literally the same code [`EGraph::apply_action`] runs,
+    /// via [`NodeSink`] — against a [`GrowthPredictor`] that probes the memo
+    /// exactly as [`EGraph::add`] does on a hit, instead of inserting into
+    /// it.
     ///
-    /// On a `Param`/`Buffer` node (a rewrite RHS template must never contain
-    /// either), on an `OpKind` with no static [`Op`] (an arena/op-table
-    /// drift, not a runtime condition), or on a metavariable with no
-    /// binding.
-    fn instantiate_template(
-        &mut self,
-        node: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>,
-        bindings: &[EClassId],
-    ) -> EClassId {
-        use pixelflow_ir::expr::ExprData;
-
-        match *node {
-            ExprData::Var(mv) => {
-                let mv = mv as usize;
-                assert!(
-                    mv < bindings.len(),
-                    "instantiate_template: metavariable {mv} has no binding \
-                     ({} supplied) — a TemplateRewrite construction bug, since \
-                     apply() refuses to instantiate a binding it cannot fill",
-                    bindings.len()
+    /// Because the e-graph's raw class-slot count and its raw e-node count
+    /// grow in lockstep (see the [`growth`](super::growth) module doc),
+    /// "e-classes added" and "e-nodes added" are the same number here, which
+    /// is why this returns one `usize` rather than a pair.
+    ///
+    /// **Only exact against the graph this is called on.** If several
+    /// actions found in the same scan (before any of them commit) would
+    /// build overlapping nodes, each one's prediction is exact in isolation
+    /// but their sum over-counts the batch's real total — safely: the sum is
+    /// still an upper bound on real growth, never an under-count, so a
+    /// caller budgeting against it (`apply_rule_at_index_timed`) never
+    /// overshoots. Pinned exact per single application — the sense that
+    /// matters for a budget decided one application at a time — by the
+    /// `assert_eq!` in [`EGraph::apply_action_measured`], which calls this
+    /// immediately before executing the same action for real.
+    pub(crate) fn predicted_growth(&self, action: &RewriteAction) -> usize {
+        match action {
+            RewriteAction::Union(_) => 0,
+            RewriteAction::Create(node) => self.predict(|s| {
+                s.make(node.clone());
+            }),
+            RewriteAction::Instantiate {
+                template,
+                entry,
+                bindings,
+            } => self.predict(|s| {
+                instantiate_template(s, template.0.entry_at(*entry), bindings);
+            }),
+            RewriteAction::Distribute {
+                outer,
+                inner,
+                a,
+                b,
+                c,
+            } => self.predict(|s| {
+                distribute_shape(s, *outer, *inner, *a, *b, *c);
+            }),
+            RewriteAction::Factor {
+                outer,
+                inner,
+                common,
+                unique_l,
+                unique_r,
+            } => self.predict(|s| {
+                factor_shape(s, *outer, *inner, *common, *unique_l, *unique_r);
+            }),
+            RewriteAction::Canonicalize {
+                target,
+                inverse,
+                a,
+                b,
+            } => self.predict(|s| {
+                canonicalize_shape(s, *target, *inverse, *a, *b);
+            }),
+            RewriteAction::Associate { op, a, b, c } => self.predict(|s| {
+                associate_shape(s, *op, *a, *b, *c);
+            }),
+            RewriteAction::ReverseAssociate { op, a, b, c } => self.predict(|s| {
+                reverse_associate_shape(s, *op, *a, *b, *c);
+            }),
+            RewriteAction::OddParity { func, inner } => self.predict(|s| {
+                odd_parity_shape(s, *func, *inner);
+            }),
+            RewriteAction::AngleAddition {
+                term1_op1,
+                term1_op2,
+                term2_op1,
+                term2_op2,
+                term2_sign,
+                a,
+                b,
+            } => self.predict(|s| {
+                angle_addition_shape(
+                    s,
+                    *term1_op1,
+                    *term1_op2,
+                    *term2_op1,
+                    *term2_op2,
+                    *term2_sign,
+                    *a,
+                    *b,
                 );
-                bindings[mv]
-            }
-            ExprData::Const(v) => self.add(ENode::constant(f32::from_bits(v))),
-            ExprData::Param(p) => {
-                panic!("instantiate_template: Param({p}) in a rewrite RHS template")
-            }
-            ExprData::Buffer(b) => {
-                panic!("instantiate_template: Buffer({b:?}) in a rewrite RHS template")
-            }
-            ExprData::Uniform(u) => {
-                panic!("instantiate_template: Uniform({u:?}) in a rewrite RHS template")
-            }
-            ExprData::Op(kind) => {
-                let static_op = ops::op_from_kind(kind).unwrap_or_else(|| {
-                    panic!("instantiate_template: no static Op for OpKind {kind:?}")
-                });
-                let children: Vec<EClassId> = node
-                    .children()
-                    .map(|c| self.instantiate_template(c, bindings))
-                    .collect();
-                self.add(ENode::Op {
-                    op: static_op,
-                    children,
-                })
-            }
+            }),
+            RewriteAction::Homomorphism {
+                func,
+                target_op,
+                a,
+                b,
+            } => self.predict(|s| {
+                homomorphism_shape(s, *func, *target_op, *a, *b);
+            }),
+            RewriteAction::PowerCombine { base, exp_a, exp_b } => self.predict(|s| {
+                power_combine_shape(s, *base, *exp_a, *exp_b);
+            }),
+            RewriteAction::ReverseAngleAddition { trig_op, a, b } => self.predict(|s| {
+                reverse_angle_addition_shape(s, *trig_op, *a, *b);
+            }),
+            RewriteAction::HalfAngleProduct { x } => self.predict(|s| {
+                half_angle_product_shape(s, *x);
+            }),
+            RewriteAction::Doubling { a } => self.predict(|s| {
+                doubling_shape(s, *a);
+            }),
+            RewriteAction::Halving { a } => self.predict(|s| {
+                halving_shape(s, *a);
+            }),
+            RewriteAction::PowerRecurrence { base, exponent } => self.predict(|s| {
+                power_recurrence_shape(s, *base, *exponent);
+            }),
+            RewriteAction::LogPower {
+                log_op,
+                base,
+                exponent,
+            } => self.predict(|s| {
+                log_power_shape(s, *log_op, *base, *exponent);
+            }),
+            RewriteAction::ExpandSquare { a, b } => self.predict(|s| {
+                expand_square_shape(s, *a, *b);
+            }),
+            RewriteAction::DiffOfSquares { a, b } => self.predict(|s| {
+                diff_of_squares_shape(s, *a, *b);
+            }),
+            RewriteAction::Differentiate { inner, var } => self.predict(|s| {
+                derivative_shape(s, inner, *var);
+            }),
+            RewriteAction::PeelFold {
+                head,
+                head_root,
+                rest,
+                body,
+            } => self.predict(|s| {
+                peel_fold_shape(s, head, *head_root, *rest, *body);
+            }),
         }
+    }
+
+    /// Run `build` against a fresh [`GrowthPredictor`] over this graph and
+    /// report how many e-classes it would have minted. See
+    /// [`EGraph::predicted_growth`].
+    fn predict(&self, build: impl FnOnce(&mut GrowthPredictor<'_>)) -> usize {
+        let mut sink = GrowthPredictor {
+            egraph: self,
+            pending: HashMap::default(),
+        };
+        build(&mut sink);
+        sink.pending.len()
     }
 
     fn apply_action(&mut self, class_id: EClassId, action: RewriteAction) -> usize {
@@ -1925,7 +2114,7 @@ impl EGraph {
                 bindings,
             } => {
                 let node = template.0.entry_at(entry);
-                let result_id = self.instantiate_template(node, &bindings);
+                let result_id = instantiate_template(self, node, &bindings);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Create(new_node) => {
@@ -1939,21 +2128,7 @@ impl EGraph {
                 b,
                 c,
             } => {
-                let ab_node = ENode::Op {
-                    op: outer,
-                    children: vec![a, b],
-                };
-                let ab_id = self.add(ab_node);
-                let ac_node = ENode::Op {
-                    op: outer,
-                    children: vec![a, c],
-                };
-                let ac_id = self.add(ac_node);
-                let result_node = ENode::Op {
-                    op: inner,
-                    children: vec![ab_id, ac_id],
-                };
-                let result_id = self.add(result_node);
+                let result_id = distribute_shape(self, outer, inner, a, b, c);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Factor {
@@ -1963,16 +2138,7 @@ impl EGraph {
                 unique_l,
                 unique_r,
             } => {
-                let sum_node = ENode::Op {
-                    op: outer,
-                    children: vec![unique_l, unique_r],
-                };
-                let sum_id = self.add(sum_node);
-                let result_node = ENode::Op {
-                    op: inner,
-                    children: vec![common, sum_id],
-                };
-                let result_id = self.add(result_node);
+                let result_id = factor_shape(self, outer, inner, common, unique_l, unique_r);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Canonicalize {
@@ -1981,59 +2147,20 @@ impl EGraph {
                 a,
                 b,
             } => {
-                let inv_node = ENode::Op {
-                    op: inverse,
-                    children: vec![b],
-                };
-                let inv_id = self.add(inv_node);
-                let target_node = ENode::Op {
-                    op: target,
-                    children: vec![a, inv_id],
-                };
-                let target_id = self.add(target_node);
-                self.union_counted(class_id, target_id)
+                let result_id = canonicalize_shape(self, target, inverse, a, b);
+                self.union_counted(class_id, result_id)
             }
             RewriteAction::Associate { op, a, b, c } => {
-                let bc_node = ENode::Op {
-                    op,
-                    children: vec![b, c],
-                };
-                let bc_id = self.add(bc_node);
-                let result_node = ENode::Op {
-                    op,
-                    children: vec![a, bc_id],
-                };
-                let result_id = self.add(result_node);
+                let result_id = associate_shape(self, op, a, b, c);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::ReverseAssociate { op, a, b, c } => {
-                // a op (b op c) → (a op b) op c
-                let ab_node = ENode::Op {
-                    op,
-                    children: vec![a, b],
-                };
-                let ab_id = self.add(ab_node);
-                let result_node = ENode::Op {
-                    op,
-                    children: vec![ab_id, c],
-                };
-                let result_id = self.add(result_node);
+                let result_id = reverse_associate_shape(self, op, a, b, c);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::OddParity { func, inner } => {
-                // For odd functions: Op(neg(x)) → neg(Op(x))
-                // Create func(inner), then wrap in neg
-                let func_node = ENode::Op {
-                    op: func,
-                    children: vec![inner],
-                };
-                let func_id = self.add(func_node);
-                let neg_node = ENode::Op {
-                    op: &ops::Neg,
-                    children: vec![func_id],
-                };
-                let neg_id = self.add(neg_node);
-                self.union_counted(class_id, neg_id)
+                let result_id = odd_parity_shape(self, func, inner);
+                self.union_counted(class_id, result_id)
             }
             RewriteAction::AngleAddition {
                 term1_op1,
@@ -2044,72 +2171,9 @@ impl EGraph {
                 a,
                 b,
             } => {
-                // sin(a+b) → sin(a)cos(b) + cos(a)sin(b)
-                // cos(a+b) → cos(a)cos(b) - sin(a)sin(b)
-                //
-                // Create: term1_op1(a)*term1_op2(b) +/- term2_op1(a)*term2_op2(b)
-
-                // term1_op1(a)
-                let t1_left = ENode::Op {
-                    op: term1_op1,
-                    children: vec![a],
-                };
-                let t1_left_id = self.add(t1_left);
-
-                // term1_op2(b)
-                let t1_right = ENode::Op {
-                    op: term1_op2,
-                    children: vec![b],
-                };
-                let t1_right_id = self.add(t1_right);
-
-                // term1_op1(a) * term1_op2(b)
-                let term1 = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![t1_left_id, t1_right_id],
-                };
-                let term1_id = self.add(term1);
-
-                // term2_op1(a)
-                let t2_left = ENode::Op {
-                    op: term2_op1,
-                    children: vec![a],
-                };
-                let t2_left_id = self.add(t2_left);
-
-                // term2_op2(b)
-                let t2_right = ENode::Op {
-                    op: term2_op2,
-                    children: vec![b],
-                };
-                let t2_right_id = self.add(t2_right);
-
-                // term2_op1(a) * term2_op2(b)
-                let term2 = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![t2_left_id, t2_right_id],
-                };
-                let term2_id = self.add(term2);
-
-                // Combine based on sign
-                use crate::math::trig::Sign;
-                let result_id = match term2_sign {
-                    Sign::Plus => {
-                        let result = ENode::Op {
-                            op: &ops::Add,
-                            children: vec![term1_id, term2_id],
-                        };
-                        self.add(result)
-                    }
-                    Sign::Minus => {
-                        let result = ENode::Op {
-                            op: &ops::Sub,
-                            children: vec![term1_id, term2_id],
-                        };
-                        self.add(result)
-                    }
-                };
-
+                let result_id = angle_addition_shape(
+                    self, term1_op1, term1_op2, term2_op1, term2_op2, term2_sign, a, b,
+                );
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Homomorphism {
@@ -2118,137 +2182,31 @@ impl EGraph {
                 a,
                 b,
             } => {
-                // f(a ⊕ b) → f(a) ⊗ f(b)
-                // e.g., exp(a + b) → exp(a) * exp(b)
-
-                // func(a)
-                let func_a = ENode::Op {
-                    op: func,
-                    children: vec![a],
-                };
-                let func_a_id = self.add(func_a);
-
-                // func(b)
-                let func_b = ENode::Op {
-                    op: func,
-                    children: vec![b],
-                };
-                let func_b_id = self.add(func_b);
-
-                // target_op(func(a), func(b))
-                let result = ENode::Op {
-                    op: target_op,
-                    children: vec![func_a_id, func_b_id],
-                };
-                let result_id = self.add(result);
-
+                let result_id = homomorphism_shape(self, func, target_op, a, b);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::PowerCombine { base, exp_a, exp_b } => {
-                // x^a * x^b → x^(a+b)
-
-                // a + b
-                let sum = ENode::Op {
-                    op: &ops::Add,
-                    children: vec![exp_a, exp_b],
-                };
-                let sum_id = self.add(sum);
-
-                // x^(a+b)
-                let result = ENode::Op {
-                    op: &ops::Pow,
-                    children: vec![base, sum_id],
-                };
-                let result_id = self.add(result);
-
+                let result_id = power_combine_shape(self, base, exp_a, exp_b);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::ReverseAngleAddition { trig_op, a, b } => {
-                // sin(a)cos(b) + cos(a)sin(b) → sin(a + b)
-                // (or cos case)
-
-                // a + b
-                let sum = ENode::Op {
-                    op: &ops::Add,
-                    children: vec![a, b],
-                };
-                let sum_id = self.add(sum);
-
-                // trig(a + b)
-                let result = ENode::Op {
-                    op: trig_op,
-                    children: vec![sum_id],
-                };
-                let result_id = self.add(result);
-
+                let result_id = reverse_angle_addition_shape(self, trig_op, a, b);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::HalfAngleProduct { x } => {
-                // sin(x) * cos(x) → sin(x + x) / 2
-                // Derived from: sin(2x) = 2*sin(x)*cos(x)
-
-                // x + x
-                let two_x = ENode::Op {
-                    op: &ops::Add,
-                    children: vec![x, x],
-                };
-                let two_x_id = self.add(two_x);
-
-                // sin(x + x)
-                let sin_2x = ENode::Op {
-                    op: &ops::Sin,
-                    children: vec![two_x_id],
-                };
-                let sin_2x_id = self.add(sin_2x);
-
-                // constant 2
-                let two = ENode::Const(2.0_f32.to_bits());
-                let two_id = self.add(two);
-
-                // sin(x + x) / 2
-                let result = ENode::Op {
-                    op: &ops::Div,
-                    children: vec![sin_2x_id, two_id],
-                };
-                let result_id = self.add(result);
-
+                let result_id = half_angle_product_shape(self, x);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Doubling { a } => {
-                // a + a → 2 * a
-                let two = ENode::Const(2.0_f32.to_bits());
-                let two_id = self.add(two);
-                let result = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![two_id, a],
-                };
-                let result_id = self.add(result);
-
+                let result_id = doubling_shape(self, a);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Halving { a } => {
-                // 2 * a → a + a
-                let result = ENode::Op {
-                    op: &ops::Add,
-                    children: vec![a, a],
-                };
-                let result_id = self.add(result);
-
+                let result_id = halving_shape(self, a);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::PowerRecurrence { base, exponent } => {
-                let n_minus_1 = ENode::constant((exponent - 1) as f32);
-                let n_minus_1_id = self.add(n_minus_1);
-                let pow_reduced = ENode::Op {
-                    op: &ops::Pow,
-                    children: vec![base, n_minus_1_id],
-                };
-                let pow_id = self.add(pow_reduced);
-                let result = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![base, pow_id],
-                };
-                let result_id = self.add(result);
+                let result_id = power_recurrence_shape(self, base, exponent);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::LogPower {
@@ -2256,371 +2214,29 @@ impl EGraph {
                 base,
                 exponent,
             } => {
-                let log_x = ENode::Op {
-                    op: log_op,
-                    children: vec![base],
-                };
-                let log_x_id = self.add(log_x);
-                let result = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![exponent, log_x_id],
-                };
-                let result_id = self.add(result);
+                let result_id = log_power_shape(self, log_op, base, exponent);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::ExpandSquare { a, b } => {
-                let a2 = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![a, a],
-                };
-                let a2_id = self.add(a2);
-                let b2 = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![b, b],
-                };
-                let b2_id = self.add(b2);
-                let ab = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![a, b],
-                };
-                let ab_id = self.add(ab);
-                let two = ENode::constant(2.0);
-                let two_id = self.add(two);
-                let two_ab = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![two_id, ab_id],
-                };
-                let two_ab_id = self.add(two_ab);
-                let sum1 = ENode::Op {
-                    op: &ops::Add,
-                    children: vec![a2_id, two_ab_id],
-                };
-                let sum1_id = self.add(sum1);
-                let result = ENode::Op {
-                    op: &ops::Add,
-                    children: vec![sum1_id, b2_id],
-                };
-                let result_id = self.add(result);
+                let result_id = expand_square_shape(self, a, b);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::DiffOfSquares { a, b } => {
-                let sum = ENode::Op {
-                    op: &ops::Add,
-                    children: vec![a, b],
-                };
-                let sum_id = self.add(sum);
-                let diff = ENode::Op {
-                    op: &ops::Sub,
-                    children: vec![a, b],
-                };
-                let diff_id = self.add(diff);
-                let result = ENode::Op {
-                    op: &ops::Mul,
-                    children: vec![sum_id, diff_id],
-                };
-                let result_id = self.add(result);
+                let result_id = diff_of_squares_shape(self, a, b);
                 self.union_counted(class_id, result_id)
             }
             RewriteAction::Differentiate { inner, var } => {
-                let deriv_id = self.build_derivative(&inner, var);
+                let deriv_id = derivative_shape(self, &inner, var);
                 self.union_counted(class_id, deriv_id)
             }
-        }
-    }
-
-    /// Build the e-class of the derivative of `inner` with respect to variable
-    /// `var`, one chain-rule step deep. Sub-expressions are wrapped in fresh
-    /// `Dwrt` nodes so equality saturation continues the expansion; the leaf
-    /// cases (`Var`, `Const`) terminate it. Operators whose derivative is not
-    /// (yet) known reconstruct the original `Dwrt`, leaving it to survive
-    /// saturation as the jet fallback.
-    fn build_derivative(&mut self, inner: &ENode, var: u8) -> EClassId {
-        let (op, children) = match inner {
-            ENode::Const(_) => return self.add(ENode::constant(0.0)),
-            ENode::Var(i) => {
-                return self.add(ENode::constant(if *i == var { 1.0 } else { 0.0 }));
-            }
-            // A Buffer leaf is not a value — it only ever appears as Gather's
-            // first child, and no rewrite builds `Dwrt(buffer)`. Reaching one
-            // here means the graph is malformed; fail loudly. (`Dwrt(gather)`
-            // is the Op arm below: Gather has no derivative table entry, so it
-            // reconstructs the Dwrt as the jet fallback.)
-            ENode::Buffer(decl) => {
-                panic!("build_derivative: Dwrt applied to a Buffer leaf ({decl:?})")
-            }
-            // Invariant across the lattice: ∂u/∂x = 0, as for a constant.
-            ENode::Uniform(_) => return self.add(ENode::constant(0.0)),
-            // Likewise ∂p/∂x = 0: a builder's scalar is one number for the
-            // whole lattice, whichever number it turns out to be.
-            ENode::Param(_) => return self.add(ENode::constant(0.0)),
-            ENode::Op { op, children } => (*op, children.clone()),
-        };
-
-        let var_const = self.add(ENode::constant(var as f32));
-        // d(child)/dvar as a fresh Dwrt node (saturation expands it later).
-        let dwrt = |s: &mut Self, c: EClassId| {
-            s.add(ENode::Op {
-                op: &ops::Dwrt,
-                children: vec![c, var_const],
-            })
-        };
-        let op2 = |s: &mut Self, o: &'static dyn Op, a: EClassId, b: EClassId| {
-            s.add(ENode::Op {
-                op: o,
-                children: vec![a, b],
-            })
-        };
-        let un = |s: &mut Self, o: &'static dyn Op, a: EClassId| {
-            s.add(ENode::Op {
-                op: o,
-                children: vec![a],
-            })
-        };
-        let cst = |s: &mut Self, v: f32| s.add(ENode::constant(v));
-
-        match op.kind() {
-            // Linearity: D(a + b) = D(a) + D(b); D(a - b) = D(a) - D(b).
-            OpKind::Add | OpKind::Sub => {
-                let da = dwrt(self, children[0]);
-                let db = dwrt(self, children[1]);
-                let same = ops::op_from_kind(op.kind()).expect("add/sub op");
-                op2(self, same, da, db)
-            }
-            OpKind::Neg => {
-                let da = dwrt(self, children[0]);
-                un(self, &ops::Neg, da)
-            }
-            // Product rule: D(a*b) = D(a)*b + a*D(b).
-            OpKind::Mul => {
-                let (a, b) = (children[0], children[1]);
-                let da = dwrt(self, a);
-                let db = dwrt(self, b);
-                let t1 = op2(self, &ops::Mul, da, b);
-                let t2 = op2(self, &ops::Mul, a, db);
-                op2(self, &ops::Add, t1, t2)
-            }
-            // Fused multiply-add a*b + c: D = D(a)*b + a*D(b) + D(c).
-            OpKind::MulAdd => {
-                let (a, b, c) = (children[0], children[1], children[2]);
-                let da = dwrt(self, a);
-                let db = dwrt(self, b);
-                let dc = dwrt(self, c);
-                let t1 = op2(self, &ops::Mul, da, b);
-                let t2 = op2(self, &ops::Mul, a, db);
-                let prod = op2(self, &ops::Add, t1, t2);
-                op2(self, &ops::Add, prod, dc)
-            }
-            // Quotient rule: D(a/b) = (D(a)*b - a*D(b)) / (b*b).
-            OpKind::Div => {
-                let (a, b) = (children[0], children[1]);
-                let da = dwrt(self, a);
-                let db = dwrt(self, b);
-                let t1 = op2(self, &ops::Mul, da, b);
-                let t2 = op2(self, &ops::Mul, a, db);
-                let num = op2(self, &ops::Sub, t1, t2);
-                let den = op2(self, &ops::Mul, b, b);
-                op2(self, &ops::Div, num, den)
-            }
-            // d(sqrt u) = 0.5 * rsqrt(u) * u'.
-            OpKind::Sqrt => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let half = cst(self, 0.5);
-                let rs = un(self, &ops::Rsqrt, u);
-                let factor = op2(self, &ops::Mul, half, rs);
-                op2(self, &ops::Mul, factor, du)
-            }
-            // d(recip u) = -u' / (u*u).
-            OpKind::Recip => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let ndu = un(self, &ops::Neg, du);
-                let u2 = op2(self, &ops::Mul, u, u);
-                op2(self, &ops::Div, ndu, u2)
-            }
-            // d(|u|) = (u / |u|) * u'.
-            OpKind::Abs => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let au = un(self, &ops::Abs, u);
-                let sign = op2(self, &ops::Div, u, au);
-                op2(self, &ops::Mul, sign, du)
-            }
-            // d(rsqrt u) = -0.5 * rsqrt(u) * recip(u) * u'.
-            OpKind::Rsqrt => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let neg_half = cst(self, -0.5);
-                let rs = un(self, &ops::Rsqrt, u);
-                let rc = un(self, &ops::Recip, u);
-                let t = op2(self, &ops::Mul, rs, rc);
-                let factor = op2(self, &ops::Mul, neg_half, t);
-                op2(self, &ops::Mul, factor, du)
-            }
-            // Piecewise: derivative of the branch the primal takes. Masks and
-            // tie behavior mirror Jet2 (and the runtime `lower_dwrt` pass).
-            OpKind::Min => {
-                let (a, b) = (children[0], children[1]);
-                let da = dwrt(self, a);
-                let db = dwrt(self, b);
-                let mask = op2(self, &ops::Lt, a, b);
-                self.add(ENode::Op {
-                    op: &ops::Select,
-                    children: vec![mask, da, db],
-                })
-            }
-            OpKind::Max => {
-                let (a, b) = (children[0], children[1]);
-                let da = dwrt(self, a);
-                let db = dwrt(self, b);
-                let mask = op2(self, &ops::Gt, a, b);
-                self.add(ENode::Op {
-                    op: &ops::Select,
-                    children: vec![mask, da, db],
-                })
-            }
-            // Blend the branch derivatives on the primal mask; the mask itself
-            // is not differentiated.
-            OpKind::Select => {
-                let (m, t, f) = (children[0], children[1], children[2]);
-                let dt = dwrt(self, t);
-                let df = dwrt(self, f);
-                self.add(ENode::Op {
-                    op: &ops::Select,
-                    children: vec![m, dt, df],
-                })
-            }
-            // Masks and rounding are step functions: zero almost everywhere.
-            OpKind::Lt
-            | OpKind::Le
-            | OpKind::Gt
-            | OpKind::Ge
-            | OpKind::Eq
-            | OpKind::Ne
-            | OpKind::Floor
-            | OpKind::Ceil
-            | OpKind::Round => self.add(ENode::constant(0.0)),
-            // d(sin u) = cos(u) * u'.
-            OpKind::Sin => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let c = un(self, &ops::Cos, u);
-                op2(self, &ops::Mul, c, du)
-            }
-            // d(cos u) = -sin(u) * u'.
-            OpKind::Cos => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let s = un(self, &ops::Sin, u);
-                let ns = un(self, &ops::Neg, s);
-                op2(self, &ops::Mul, ns, du)
-            }
-            // d(tan u) = u' / cos(u)^2.
-            OpKind::Tan => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let c = un(self, &ops::Cos, u);
-                let c2 = op2(self, &ops::Mul, c, c);
-                op2(self, &ops::Div, du, c2)
-            }
-            // d(atan u) = u' / (1 + u*u).
-            OpKind::Atan => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let one = cst(self, 1.0);
-                let u2 = op2(self, &ops::Mul, u, u);
-                let den = op2(self, &ops::Add, one, u2);
-                op2(self, &ops::Div, du, den)
-            }
-            // d(asin u) = u' / sqrt(1 - u*u).
-            OpKind::Asin => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let one = cst(self, 1.0);
-                let u2 = op2(self, &ops::Mul, u, u);
-                let diff = op2(self, &ops::Sub, one, u2);
-                let s = un(self, &ops::Sqrt, diff);
-                op2(self, &ops::Div, du, s)
-            }
-            // d(acos u) = -u' / sqrt(1 - u*u).
-            OpKind::Acos => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let one = cst(self, 1.0);
-                let u2 = op2(self, &ops::Mul, u, u);
-                let diff = op2(self, &ops::Sub, one, u2);
-                let s = un(self, &ops::Sqrt, diff);
-                let q = op2(self, &ops::Div, du, s);
-                un(self, &ops::Neg, q)
-            }
-            // d(exp u) = exp(u) * u'.
-            OpKind::Exp => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let e = un(self, &ops::Exp, u);
-                op2(self, &ops::Mul, e, du)
-            }
-            // d(2^u) = 2^u * ln2 * u'.
-            OpKind::Exp2 => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let e = un(self, &ops::Exp2, u);
-                let ln2 = cst(self, core::f32::consts::LN_2);
-                let factor = op2(self, &ops::Mul, e, ln2);
-                op2(self, &ops::Mul, factor, du)
-            }
-            // d(ln u) = u' / u.
-            OpKind::Ln => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                op2(self, &ops::Div, du, u)
-            }
-            // d(log2 u) = u' / (u * ln2).
-            OpKind::Log2 => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let ln2 = cst(self, core::f32::consts::LN_2);
-                let den = op2(self, &ops::Mul, u, ln2);
-                op2(self, &ops::Div, du, den)
-            }
-            // d(log10 u) = u' / (u * ln10).
-            OpKind::Log10 => {
-                let u = children[0];
-                let du = dwrt(self, u);
-                let ln10 = cst(self, core::f32::consts::LN_10);
-                let den = op2(self, &ops::Mul, u, ln10);
-                op2(self, &ops::Div, du, den)
-            }
-            // d(atan2(y, x)) = (x*y' - y*x') / (x² + y²).
-            OpKind::Atan2 => {
-                let (y, x) = (children[0], children[1]);
-                let dy = dwrt(self, y);
-                let dx = dwrt(self, x);
-                let t1 = op2(self, &ops::Mul, x, dy);
-                let t2 = op2(self, &ops::Mul, y, dx);
-                let num = op2(self, &ops::Sub, t1, t2);
-                let x2 = op2(self, &ops::Mul, x, x);
-                let y2 = op2(self, &ops::Mul, y, y);
-                let den = op2(self, &ops::Add, x2, y2);
-                op2(self, &ops::Div, num, den)
-            }
-            // d(f^g) = f^g * (g'*ln f + g*f'/f)  (Jet2's rule).
-            OpKind::Pow => {
-                let (f, g) = (children[0], children[1]);
-                let df = dwrt(self, f);
-                let dg = dwrt(self, g);
-                let lnf = un(self, &ops::Ln, f);
-                let t1 = op2(self, &ops::Mul, dg, lnf);
-                let g_over_f = op2(self, &ops::Div, g, f);
-                let t2 = op2(self, &ops::Mul, g_over_f, df);
-                let inner = op2(self, &ops::Add, t1, t2);
-                let p = op2(self, &ops::Pow, f, g);
-                op2(self, &ops::Mul, p, inner)
-            }
-            // Unknown derivative: reconstruct the Dwrt and let it survive.
-            _ => {
-                let reconstructed = self.add(inner.clone());
-                dwrt(self, reconstructed)
+            RewriteAction::PeelFold {
+                head,
+                head_root,
+                rest,
+                body,
+            } => {
+                let peeled = peel_fold_shape(self, &head, head_root, rest, body);
+                self.union_counted(class_id, peeled)
             }
         }
     }
@@ -2763,6 +2379,843 @@ impl EGraph {
         costs: &CostModel,
     ) -> super::extract::ExtractedDAG {
         super::extract::extract_dag(self, root, costs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RewriteAction shapes: one definition per action, run twice
+// ---------------------------------------------------------------------------
+//
+// Every `RewriteAction` (besides `Union`, which builds nothing) constructs a
+// node shape of fixed structure and then unions the result with the matched
+// class. `apply_action` needs to build that shape for real; `predicted_growth`
+// needs to know how many of its nodes are new, without building anything.
+// Rather than a second, hand-copied spelling of each shape for the predictor
+// (exactly the drift `RewriteAction::Instantiate`'s own doc warns about —
+// "two spellings of one shape"), every shape below is written once, generic
+// over where its nodes land: a [`NodeSink`].
+
+/// Materializes one [`ENode`], returning the e-class that holds it.
+///
+/// [`EGraph`] is a sink that actually inserts (`add`); [`GrowthPredictor`] is
+/// a sink that only probes the memo. Every `RewriteAction`'s node-building
+/// shape (below) is written once against this trait, so committing an
+/// action for real and predicting how many e-classes it would add
+/// ([`EGraph::predicted_growth`]) run the exact same code.
+trait NodeSink {
+    fn make(&mut self, node: ENode) -> EClassId;
+}
+
+impl NodeSink for EGraph {
+    fn make(&mut self, node: ENode) -> EClassId {
+        self.add(node)
+    }
+}
+
+/// A [`NodeSink`] that predicts what [`EGraph::add`] would do without
+/// mutating the graph: canonicalize, then check the graph's real memo first
+/// and a local `pending` table second — the nodes this same prediction has
+/// already "created" earlier in the same shape walk, keyed and deduplicated
+/// the identical way the real memo would (e.g. `ExpandSquare`'s `a²` and
+/// `b²` degenerate to one shared node when `a == b`, and this catches that
+/// exactly as a real `add` would).
+///
+/// `pending`'s virtual ids are minted the same way [`EGraph::add`] mints
+/// real ones — sequentially from `egraph.classes.len()` — so a shape that
+/// references its own earlier output builds the identical composite node a
+/// real run would look up.
+struct GrowthPredictor<'a> {
+    egraph: &'a EGraph,
+    pending: HashMap<ENode, EClassId>,
+}
+
+impl GrowthPredictor<'_> {
+    /// [`EGraph::canonicalize_node`], except a child may be a `pending` id
+    /// — an id this same prediction minted for a node earlier in the same
+    /// shape walk, one that does not exist in the real graph
+    /// (`id.index() >= egraph.classes.len()`) and so is not in `egraph.parent`
+    /// at all. `EGraph::find` indexes `parent` directly, so calling it on
+    /// such an id is out of bounds rather than merely wrong. A pending id
+    /// needs no lookup regardless: nothing has unioned a class that does
+    /// not yet exist in the real graph, so it is already its own canonical
+    /// form. Only a real child is resolved through the real union-find.
+    fn canonicalize(&self, node: &mut ENode) {
+        for child in node.children_slice_mut() {
+            if child.index() < self.egraph.classes.len() {
+                *child = self.egraph.find(*child);
+            }
+        }
+    }
+}
+
+impl NodeSink for GrowthPredictor<'_> {
+    fn make(&mut self, mut node: ENode) -> EClassId {
+        self.canonicalize(&mut node);
+        if let Some(&id) = self.egraph.memo.get(&node) {
+            return self.egraph.find(id);
+        }
+        if let Some(&id) = self.pending.get(&node) {
+            return id;
+        }
+        let id = EClassId((self.egraph.classes.len() + self.pending.len()) as u32);
+        self.pending.insert(node, id);
+        id
+    }
+}
+
+/// `Distribute`: `A * (B + C) -> A*B + A*C`.
+fn distribute_shape<S: NodeSink>(
+    sink: &mut S,
+    outer: &'static dyn Op,
+    inner: &'static dyn Op,
+    a: EClassId,
+    b: EClassId,
+    c: EClassId,
+) -> EClassId {
+    let ab_id = sink.make(ENode::Op {
+        op: outer,
+        children: vec![a, b],
+    });
+    let ac_id = sink.make(ENode::Op {
+        op: outer,
+        children: vec![a, c],
+    });
+    sink.make(ENode::Op {
+        op: inner,
+        children: vec![ab_id, ac_id],
+    })
+}
+
+/// `Factor`: `A*B + A*C -> A * (B + C)`.
+fn factor_shape<S: NodeSink>(
+    sink: &mut S,
+    outer: &'static dyn Op,
+    inner: &'static dyn Op,
+    common: EClassId,
+    unique_l: EClassId,
+    unique_r: EClassId,
+) -> EClassId {
+    let sum_id = sink.make(ENode::Op {
+        op: outer,
+        children: vec![unique_l, unique_r],
+    });
+    sink.make(ENode::Op {
+        op: inner,
+        children: vec![common, sum_id],
+    })
+}
+
+/// `Canonicalize`: `Sub(a,b) -> Add(a, Neg(b))`.
+fn canonicalize_shape<S: NodeSink>(
+    sink: &mut S,
+    target: &'static dyn Op,
+    inverse: &'static dyn Op,
+    a: EClassId,
+    b: EClassId,
+) -> EClassId {
+    let inv_id = sink.make(ENode::Op {
+        op: inverse,
+        children: vec![b],
+    });
+    sink.make(ENode::Op {
+        op: target,
+        children: vec![a, inv_id],
+    })
+}
+
+/// `Associate`: `(a op b) op c -> a op (b op c)`.
+fn associate_shape<S: NodeSink>(
+    sink: &mut S,
+    op: &'static dyn Op,
+    a: EClassId,
+    b: EClassId,
+    c: EClassId,
+) -> EClassId {
+    let bc_id = sink.make(ENode::Op {
+        op,
+        children: vec![b, c],
+    });
+    sink.make(ENode::Op {
+        op,
+        children: vec![a, bc_id],
+    })
+}
+
+/// `ReverseAssociate`: `a op (b op c) -> (a op b) op c`.
+fn reverse_associate_shape<S: NodeSink>(
+    sink: &mut S,
+    op: &'static dyn Op,
+    a: EClassId,
+    b: EClassId,
+    c: EClassId,
+) -> EClassId {
+    let ab_id = sink.make(ENode::Op {
+        op,
+        children: vec![a, b],
+    });
+    sink.make(ENode::Op {
+        op,
+        children: vec![ab_id, c],
+    })
+}
+
+/// `OddParity`: `Op(neg(x)) -> neg(Op(x))`.
+fn odd_parity_shape<S: NodeSink>(sink: &mut S, func: &'static dyn Op, inner: EClassId) -> EClassId {
+    let func_id = sink.make(ENode::Op {
+        op: func,
+        children: vec![inner],
+    });
+    sink.make(ENode::Op {
+        op: &ops::Neg,
+        children: vec![func_id],
+    })
+}
+
+/// `AngleAddition`: `sin(a+b) -> sin(a)cos(b) + cos(a)sin(b)` (or the `cos`
+/// case, sign-selected).
+#[allow(clippy::too_many_arguments)]
+fn angle_addition_shape<S: NodeSink>(
+    sink: &mut S,
+    term1_op1: &'static dyn Op,
+    term1_op2: &'static dyn Op,
+    term2_op1: &'static dyn Op,
+    term2_op2: &'static dyn Op,
+    term2_sign: crate::math::trig::Sign,
+    a: EClassId,
+    b: EClassId,
+) -> EClassId {
+    use crate::math::trig::Sign;
+
+    let t1_left_id = sink.make(ENode::Op {
+        op: term1_op1,
+        children: vec![a],
+    });
+    let t1_right_id = sink.make(ENode::Op {
+        op: term1_op2,
+        children: vec![b],
+    });
+    let term1_id = sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![t1_left_id, t1_right_id],
+    });
+
+    let t2_left_id = sink.make(ENode::Op {
+        op: term2_op1,
+        children: vec![a],
+    });
+    let t2_right_id = sink.make(ENode::Op {
+        op: term2_op2,
+        children: vec![b],
+    });
+    let term2_id = sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![t2_left_id, t2_right_id],
+    });
+
+    match term2_sign {
+        Sign::Plus => sink.make(ENode::Op {
+            op: &ops::Add,
+            children: vec![term1_id, term2_id],
+        }),
+        Sign::Minus => sink.make(ENode::Op {
+            op: &ops::Sub,
+            children: vec![term1_id, term2_id],
+        }),
+    }
+}
+
+/// `Homomorphism`: `f(a ⊕ b) -> f(a) ⊗ f(b)`.
+fn homomorphism_shape<S: NodeSink>(
+    sink: &mut S,
+    func: &'static dyn Op,
+    target_op: &'static dyn Op,
+    a: EClassId,
+    b: EClassId,
+) -> EClassId {
+    let func_a_id = sink.make(ENode::Op {
+        op: func,
+        children: vec![a],
+    });
+    let func_b_id = sink.make(ENode::Op {
+        op: func,
+        children: vec![b],
+    });
+    sink.make(ENode::Op {
+        op: target_op,
+        children: vec![func_a_id, func_b_id],
+    })
+}
+
+/// `PowerCombine`: `x^a * x^b -> x^(a+b)`.
+fn power_combine_shape<S: NodeSink>(
+    sink: &mut S,
+    base: EClassId,
+    exp_a: EClassId,
+    exp_b: EClassId,
+) -> EClassId {
+    let sum_id = sink.make(ENode::Op {
+        op: &ops::Add,
+        children: vec![exp_a, exp_b],
+    });
+    sink.make(ENode::Op {
+        op: &ops::Pow,
+        children: vec![base, sum_id],
+    })
+}
+
+/// `ReverseAngleAddition`: `sin(a)cos(b) + cos(a)sin(b) -> sin(a + b)` (or
+/// the `cos` case).
+fn reverse_angle_addition_shape<S: NodeSink>(
+    sink: &mut S,
+    trig_op: &'static dyn Op,
+    a: EClassId,
+    b: EClassId,
+) -> EClassId {
+    let sum_id = sink.make(ENode::Op {
+        op: &ops::Add,
+        children: vec![a, b],
+    });
+    sink.make(ENode::Op {
+        op: trig_op,
+        children: vec![sum_id],
+    })
+}
+
+/// `HalfAngleProduct`: `sin(x) * cos(x) -> sin(x + x) / 2`.
+fn half_angle_product_shape<S: NodeSink>(sink: &mut S, x: EClassId) -> EClassId {
+    let two_x_id = sink.make(ENode::Op {
+        op: &ops::Add,
+        children: vec![x, x],
+    });
+    let sin_2x_id = sink.make(ENode::Op {
+        op: &ops::Sin,
+        children: vec![two_x_id],
+    });
+    let two_id = sink.make(ENode::Const(2.0_f32.to_bits()));
+    sink.make(ENode::Op {
+        op: &ops::Div,
+        children: vec![sin_2x_id, two_id],
+    })
+}
+
+/// `Doubling`: `a + a -> 2 * a`.
+fn doubling_shape<S: NodeSink>(sink: &mut S, a: EClassId) -> EClassId {
+    let two_id = sink.make(ENode::Const(2.0_f32.to_bits()));
+    sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![two_id, a],
+    })
+}
+
+/// `Halving`: `2 * a -> a + a`.
+fn halving_shape<S: NodeSink>(sink: &mut S, a: EClassId) -> EClassId {
+    sink.make(ENode::Op {
+        op: &ops::Add,
+        children: vec![a, a],
+    })
+}
+
+/// `PowerRecurrence`: `pow(x, n) -> x * pow(x, n-1)` for integer `n >= 3`.
+fn power_recurrence_shape<S: NodeSink>(sink: &mut S, base: EClassId, exponent: i32) -> EClassId {
+    let n_minus_1_id = sink.make(ENode::constant((exponent - 1) as f32));
+    let pow_id = sink.make(ENode::Op {
+        op: &ops::Pow,
+        children: vec![base, n_minus_1_id],
+    });
+    sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![base, pow_id],
+    })
+}
+
+/// `LogPower`: `log(pow(x, n)) -> n * log(x)`.
+fn log_power_shape<S: NodeSink>(
+    sink: &mut S,
+    log_op: &'static dyn Op,
+    base: EClassId,
+    exponent: EClassId,
+) -> EClassId {
+    let log_x_id = sink.make(ENode::Op {
+        op: log_op,
+        children: vec![base],
+    });
+    sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![exponent, log_x_id],
+    })
+}
+
+/// `ExpandSquare`: `(a+b)² -> a² + 2ab + b²`.
+fn expand_square_shape<S: NodeSink>(sink: &mut S, a: EClassId, b: EClassId) -> EClassId {
+    let a2_id = sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![a, a],
+    });
+    let b2_id = sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![b, b],
+    });
+    let ab_id = sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![a, b],
+    });
+    let two_id = sink.make(ENode::constant(2.0));
+    let two_ab_id = sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![two_id, ab_id],
+    });
+    let sum1_id = sink.make(ENode::Op {
+        op: &ops::Add,
+        children: vec![a2_id, two_ab_id],
+    });
+    sink.make(ENode::Op {
+        op: &ops::Add,
+        children: vec![sum1_id, b2_id],
+    })
+}
+
+/// `DiffOfSquares`: `a² - b² -> (a+b)(a-b)`.
+fn diff_of_squares_shape<S: NodeSink>(sink: &mut S, a: EClassId, b: EClassId) -> EClassId {
+    let sum_id = sink.make(ENode::Op {
+        op: &ops::Add,
+        children: vec![a, b],
+    });
+    let diff_id = sink.make(ENode::Op {
+        op: &ops::Sub,
+        children: vec![a, b],
+    });
+    sink.make(ENode::Op {
+        op: &ops::Mul,
+        children: vec![sum_id, diff_id],
+    })
+}
+
+/// Materialize `template`'s subtree at `id`, bottom-up, reading each
+/// metavariable leaf from `bindings` rather than creating a node for it —
+/// the same convention every hand-written multi-node shape above uses, just
+/// driven by a runtime pattern instead of a fixed shape.
+///
+/// # Panics
+///
+/// On a `Param`/`Buffer` node (a rewrite RHS template must never contain
+/// either), on an `OpKind` with no static [`Op`] (an arena/op-table drift,
+/// not a runtime condition), or on a metavariable with no binding.
+fn instantiate_template<S: NodeSink>(
+    sink: &mut S,
+    node: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>,
+    bindings: &[EClassId],
+) -> EClassId {
+    use pixelflow_ir::expr::ExprData;
+
+    match *node {
+        ExprData::Var(mv) => {
+            let mv = mv as usize;
+            assert!(
+                mv < bindings.len(),
+                "instantiate_template: metavariable {mv} has no binding \
+                 ({} supplied) — a TemplateRewrite construction bug, since \
+                 apply() refuses to instantiate a binding it cannot fill",
+                bindings.len()
+            );
+            bindings[mv]
+        }
+        ExprData::Const(bits) => sink.make(ENode::constant(f32::from_bits(bits))),
+        ExprData::Param(p) => {
+            panic!("instantiate_template: Param({p}) in a rewrite RHS template")
+        }
+        ExprData::Buffer(b) => {
+            panic!(
+                "instantiate_template: Buffer({}) in a rewrite RHS template",
+                b.0
+            )
+        }
+        ExprData::Uniform(u) => {
+            panic!(
+                "instantiate_template: Uniform({}) in a rewrite RHS template",
+                u.0
+            )
+        }
+        ExprData::Ref(k) => {
+            panic!("instantiate_template: Ref({k:?}) in a rewrite RHS template")
+        }
+        ExprData::Reduce(fold) => {
+            let body = node
+                .children()
+                .next()
+                .expect("a Reduce template has its body as its one child");
+            let body = instantiate_template(sink, body, bindings);
+            sink.make(ENode::Reduce { fold, body })
+        }
+        ExprData::Op(kind) => {
+            let static_op = ops::op_from_kind(kind).unwrap_or_else(|| {
+                panic!("instantiate_template: no static Op for OpKind {kind:?}")
+            });
+            let children: Vec<EClassId> = node
+                .children()
+                .map(|c| instantiate_template(sink, c, bindings))
+                .collect();
+            sink.make(ENode::Op {
+                op: static_op,
+                children,
+            })
+        }
+    }
+}
+
+/// Build `head ⊕ ⊕_{rest} body` — one peeled term combined with the fold over
+/// what is left.
+///
+/// The head arrives as a template because computing it needs to *read* the
+/// graph (walking the body's classes to substitute the binder), which a
+/// [`NodeSink`] cannot do; the rule does that half and this replays it. The
+/// tail names `body` directly: peeling moves the range, never the body, which
+/// is what makes the rule affordable at all.
+fn peel_fold_shape<S: NodeSink>(
+    sink: &mut S,
+    head: &[super::fold_rules::HeadNode],
+    head_root: super::fold_rules::HeadRef,
+    rest: pixelflow_ir::Fold,
+    body: EClassId,
+) -> EClassId {
+    use super::fold_rules::{HeadNode, HeadRef};
+    let mut planned: Vec<EClassId> = Vec::with_capacity(head.len());
+    let resolve = |r: HeadRef, planned: &[EClassId]| match r {
+        HeadRef::Plan(i) => planned[i as usize],
+        HeadRef::Class(c) => c,
+    };
+    for entry in head {
+        let id = match entry {
+            HeadNode::Const(bits) => sink.make(ENode::Const(*bits)),
+            HeadNode::Op { op, children } => sink.make(ENode::Op {
+                op: *op,
+                children: children.iter().map(|c| resolve(*c, &planned)).collect(),
+            }),
+            HeadNode::Reduce { fold, body } => sink.make(ENode::Reduce {
+                fold: *fold,
+                body: resolve(*body, &planned),
+            }),
+        };
+        planned.push(id);
+    }
+    let head = resolve(head_root, &planned);
+    let rest_class = sink.make(ENode::Reduce { fold: rest, body });
+    let op = super::fold_rules::combiner_op(rest.monoid())
+        .expect("PeelFold checked the combiner before emitting this action");
+    // `rest` first: the peel takes the *last* index, so the accumulator is on
+    // the left and the chain leans the way `expand_reduce` builds it.
+    sink.make(ENode::Op {
+        op,
+        children: vec![rest_class, head],
+    })
+}
+
+/// Build the e-class of the derivative of `inner` with respect to variable
+/// `var`, one chain-rule step deep. Sub-expressions are wrapped in fresh
+/// `Dwrt` nodes so equality saturation continues the expansion; the leaf
+/// cases (`Var`, `Const`) terminate it. Operators whose derivative is not
+/// (yet) known reconstruct the original `Dwrt`, leaving it to survive
+/// saturation as the jet fallback.
+fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClassId {
+    let (op, children) = match inner {
+        ENode::Const(_) => return sink.make(ENode::constant(0.0)),
+        ENode::Var(i) => {
+            return sink.make(ENode::constant(if *i == var { 1.0 } else { 0.0 }));
+        }
+        // A Buffer leaf is not a value — it only ever appears as Gather's
+        // first child, and no rewrite builds `Dwrt(buffer)`. Reaching one
+        // here means the graph is malformed; fail loudly. (`Dwrt(gather)`
+        // is the Op arm below: Gather has no derivative table entry, so it
+        // reconstructs the Dwrt as the jet fallback.)
+        ENode::Buffer(decl) => {
+            panic!("derivative_shape: Dwrt applied to a Buffer leaf ({decl:?})")
+        }
+        // Invariant across the lattice: ∂u/∂x = 0, as for a constant.
+        ENode::Uniform(_) => return sink.make(ENode::constant(0.0)),
+        // Likewise ∂p/∂x = 0: a builder's scalar is one number for the
+        // whole lattice, whichever number it turns out to be.
+        ENode::Param(_) => return sink.make(ENode::constant(0.0)),
+        ENode::Op { op, children } => (*op, children.clone()),
+        // `d(⊕_k f) = ⊕_k d(f)` is linearity, which holds for `Σ` and for
+        // nothing else in the monoid set — `Π` wants the product rule, and
+        // `min`/`max` are selections. It is a rule this table does not have,
+        // so the `Dwrt` is reconstructed below and survives as the fallback,
+        // exactly as `Gather` does.
+        ENode::Reduce { .. } => {
+            let var_const = sink.make(ENode::constant(var as f32));
+            let inner = sink.make(inner.clone());
+            return sink.make(ENode::Op {
+                op: &ops::Dwrt,
+                children: vec![inner, var_const],
+            });
+        }
+    };
+
+    let var_const = sink.make(ENode::constant(var as f32));
+    // d(child)/dvar as a fresh Dwrt node (saturation expands it later).
+    let dwrt = |s: &mut S, c: EClassId| {
+        s.make(ENode::Op {
+            op: &ops::Dwrt,
+            children: vec![c, var_const],
+        })
+    };
+    let op2 = |s: &mut S, o: &'static dyn Op, a: EClassId, b: EClassId| {
+        s.make(ENode::Op {
+            op: o,
+            children: vec![a, b],
+        })
+    };
+    let un = |s: &mut S, o: &'static dyn Op, a: EClassId| {
+        s.make(ENode::Op {
+            op: o,
+            children: vec![a],
+        })
+    };
+    let cst = |s: &mut S, v: f32| s.make(ENode::constant(v));
+
+    match op.kind() {
+        // Linearity: D(a + b) = D(a) + D(b); D(a - b) = D(a) - D(b).
+        OpKind::Add | OpKind::Sub => {
+            let da = dwrt(sink, children[0]);
+            let db = dwrt(sink, children[1]);
+            let same = ops::op_from_kind(op.kind()).expect("add/sub op");
+            op2(sink, same, da, db)
+        }
+        OpKind::Neg => {
+            let da = dwrt(sink, children[0]);
+            un(sink, &ops::Neg, da)
+        }
+        // Product rule: D(a*b) = D(a)*b + a*D(b).
+        OpKind::Mul => {
+            let (a, b) = (children[0], children[1]);
+            let da = dwrt(sink, a);
+            let db = dwrt(sink, b);
+            let t1 = op2(sink, &ops::Mul, da, b);
+            let t2 = op2(sink, &ops::Mul, a, db);
+            op2(sink, &ops::Add, t1, t2)
+        }
+        // Fused multiply-add a*b + c: D = D(a)*b + a*D(b) + D(c).
+        OpKind::MulAdd => {
+            let (a, b, c) = (children[0], children[1], children[2]);
+            let da = dwrt(sink, a);
+            let db = dwrt(sink, b);
+            let dc = dwrt(sink, c);
+            let t1 = op2(sink, &ops::Mul, da, b);
+            let t2 = op2(sink, &ops::Mul, a, db);
+            let prod = op2(sink, &ops::Add, t1, t2);
+            op2(sink, &ops::Add, prod, dc)
+        }
+        // Quotient rule: D(a/b) = (D(a)*b - a*D(b)) / (b*b).
+        OpKind::Div => {
+            let (a, b) = (children[0], children[1]);
+            let da = dwrt(sink, a);
+            let db = dwrt(sink, b);
+            let t1 = op2(sink, &ops::Mul, da, b);
+            let t2 = op2(sink, &ops::Mul, a, db);
+            let num = op2(sink, &ops::Sub, t1, t2);
+            let den = op2(sink, &ops::Mul, b, b);
+            op2(sink, &ops::Div, num, den)
+        }
+        // d(sqrt u) = 0.5 * rsqrt(u) * u'.
+        OpKind::Sqrt => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let half = cst(sink, 0.5);
+            let rs = un(sink, &ops::Rsqrt, u);
+            let factor = op2(sink, &ops::Mul, half, rs);
+            op2(sink, &ops::Mul, factor, du)
+        }
+        // d(recip u) = -u' / (u*u).
+        OpKind::Recip => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let ndu = un(sink, &ops::Neg, du);
+            let u2 = op2(sink, &ops::Mul, u, u);
+            op2(sink, &ops::Div, ndu, u2)
+        }
+        // d(|u|) = (u / |u|) * u'.
+        OpKind::Abs => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let au = un(sink, &ops::Abs, u);
+            let sign = op2(sink, &ops::Div, u, au);
+            op2(sink, &ops::Mul, sign, du)
+        }
+        // d(rsqrt u) = -0.5 * rsqrt(u) * recip(u) * u'.
+        OpKind::Rsqrt => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let neg_half = cst(sink, -0.5);
+            let rs = un(sink, &ops::Rsqrt, u);
+            let rc = un(sink, &ops::Recip, u);
+            let t = op2(sink, &ops::Mul, rs, rc);
+            let factor = op2(sink, &ops::Mul, neg_half, t);
+            op2(sink, &ops::Mul, factor, du)
+        }
+        // Piecewise: derivative of the branch the primal takes. Masks and
+        // tie behavior mirror Jet2 (and the runtime `lower_dwrt` pass).
+        OpKind::Min => {
+            let (a, b) = (children[0], children[1]);
+            let da = dwrt(sink, a);
+            let db = dwrt(sink, b);
+            let mask = op2(sink, &ops::Lt, a, b);
+            sink.make(ENode::Op {
+                op: &ops::Select,
+                children: vec![mask, da, db],
+            })
+        }
+        OpKind::Max => {
+            let (a, b) = (children[0], children[1]);
+            let da = dwrt(sink, a);
+            let db = dwrt(sink, b);
+            let mask = op2(sink, &ops::Gt, a, b);
+            sink.make(ENode::Op {
+                op: &ops::Select,
+                children: vec![mask, da, db],
+            })
+        }
+        // Blend the branch derivatives on the primal mask; the mask itself
+        // is not differentiated.
+        OpKind::Select => {
+            let (m, t, f) = (children[0], children[1], children[2]);
+            let dt = dwrt(sink, t);
+            let df = dwrt(sink, f);
+            sink.make(ENode::Op {
+                op: &ops::Select,
+                children: vec![m, dt, df],
+            })
+        }
+        // Masks and rounding are step functions: zero almost everywhere.
+        OpKind::Lt
+        | OpKind::Le
+        | OpKind::Gt
+        | OpKind::Ge
+        | OpKind::Eq
+        | OpKind::Ne
+        | OpKind::Floor
+        | OpKind::Ceil
+        | OpKind::Round => sink.make(ENode::constant(0.0)),
+        // d(sin u) = cos(u) * u'.
+        OpKind::Sin => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let c = un(sink, &ops::Cos, u);
+            op2(sink, &ops::Mul, c, du)
+        }
+        // d(cos u) = -sin(u) * u'.
+        OpKind::Cos => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let s = un(sink, &ops::Sin, u);
+            let ns = un(sink, &ops::Neg, s);
+            op2(sink, &ops::Mul, ns, du)
+        }
+        // d(tan u) = u' / cos(u)^2.
+        OpKind::Tan => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let c = un(sink, &ops::Cos, u);
+            let c2 = op2(sink, &ops::Mul, c, c);
+            op2(sink, &ops::Div, du, c2)
+        }
+        // d(atan u) = u' / (1 + u*u).
+        OpKind::Atan => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let one = cst(sink, 1.0);
+            let u2 = op2(sink, &ops::Mul, u, u);
+            let den = op2(sink, &ops::Add, one, u2);
+            op2(sink, &ops::Div, du, den)
+        }
+        // d(asin u) = u' / sqrt(1 - u*u).
+        OpKind::Asin => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let one = cst(sink, 1.0);
+            let u2 = op2(sink, &ops::Mul, u, u);
+            let diff = op2(sink, &ops::Sub, one, u2);
+            let s = un(sink, &ops::Sqrt, diff);
+            op2(sink, &ops::Div, du, s)
+        }
+        // d(acos u) = -u' / sqrt(1 - u*u).
+        OpKind::Acos => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let one = cst(sink, 1.0);
+            let u2 = op2(sink, &ops::Mul, u, u);
+            let diff = op2(sink, &ops::Sub, one, u2);
+            let s = un(sink, &ops::Sqrt, diff);
+            let q = op2(sink, &ops::Div, du, s);
+            un(sink, &ops::Neg, q)
+        }
+        // d(exp u) = exp(u) * u'.
+        OpKind::Exp => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let e = un(sink, &ops::Exp, u);
+            op2(sink, &ops::Mul, e, du)
+        }
+        // d(2^u) = 2^u * ln2 * u'.
+        OpKind::Exp2 => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let e = un(sink, &ops::Exp2, u);
+            let ln2 = cst(sink, core::f32::consts::LN_2);
+            let factor = op2(sink, &ops::Mul, e, ln2);
+            op2(sink, &ops::Mul, factor, du)
+        }
+        // d(ln u) = u' / u.
+        OpKind::Ln => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            op2(sink, &ops::Div, du, u)
+        }
+        // d(log2 u) = u' / (u * ln2).
+        OpKind::Log2 => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let ln2 = cst(sink, core::f32::consts::LN_2);
+            let den = op2(sink, &ops::Mul, u, ln2);
+            op2(sink, &ops::Div, du, den)
+        }
+        // d(log10 u) = u' / (u * ln10).
+        OpKind::Log10 => {
+            let u = children[0];
+            let du = dwrt(sink, u);
+            let ln10 = cst(sink, core::f32::consts::LN_10);
+            let den = op2(sink, &ops::Mul, u, ln10);
+            op2(sink, &ops::Div, du, den)
+        }
+        // d(atan2(y, x)) = (x*y' - y*x') / (x² + y²).
+        OpKind::Atan2 => {
+            let (y, x) = (children[0], children[1]);
+            let dy = dwrt(sink, y);
+            let dx = dwrt(sink, x);
+            let t1 = op2(sink, &ops::Mul, x, dy);
+            let t2 = op2(sink, &ops::Mul, y, dx);
+            let num = op2(sink, &ops::Sub, t1, t2);
+            let x2 = op2(sink, &ops::Mul, x, x);
+            let y2 = op2(sink, &ops::Mul, y, y);
+            let den = op2(sink, &ops::Add, x2, y2);
+            op2(sink, &ops::Div, num, den)
+        }
+        // d(f^g) = f^g * (g'*ln f + g*f'/f)  (Jet2's rule).
+        OpKind::Pow => {
+            let (f, g) = (children[0], children[1]);
+            let df = dwrt(sink, f);
+            let dg = dwrt(sink, g);
+            let lnf = un(sink, &ops::Ln, f);
+            let t1 = op2(sink, &ops::Mul, dg, lnf);
+            let g_over_f = op2(sink, &ops::Div, g, f);
+            let t2 = op2(sink, &ops::Mul, g_over_f, df);
+            let inner = op2(sink, &ops::Add, t1, t2);
+            let p = op2(sink, &ops::Pow, f, g);
+            op2(sink, &ops::Mul, p, inner)
+        }
+        // Unknown derivative: reconstruct the Dwrt and let it survive.
+        _ => {
+            let reconstructed = sink.make(inner.clone());
+            dwrt(sink, reconstructed)
+        }
     }
 }
 

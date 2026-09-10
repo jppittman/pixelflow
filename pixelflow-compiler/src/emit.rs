@@ -158,6 +158,16 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
                     u.0
                 )
             }
+            // And a reference is minted by `Kernel::by_ref` at composition
+            // time — a runtime value, and the key it carries names a store
+            // in the *build host's* process, which the compiled program is
+            // not. Emitting one would name nothing.
+            pixelflow_ir::arena::ExprNode::Ref(k) => {
+                panic!(
+                    "kernel! produced ExprNode::Ref({k:?}) — a reference names a kernel \
+                     interned in this process, which the emitted program does not share"
+                )
+            }
             pixelflow_ir::arena::ExprNode::Unary(op, child) => {
                 let op_code = opkind_to_tokens(*op);
                 let child_ident = format_ident!("__e{}", child.0);
@@ -183,6 +193,21 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
                     .map(|c| format_ident!("__e{}", c.0))
                     .collect();
                 quote! { __arena.push_nary(#op_code, &[#(#child_idents),*]) }
+            }
+            // A fold's metadata is a `Fold`, whose fields are private
+            // precisely so no caller can assemble one that means nothing —
+            // so it travels the way the two cache keys carry it, as bits
+            // with a total inverse on the far side.
+            pixelflow_ir::arena::ExprNode::Reduce { fold, body } => {
+                let bits = fold.to_bits();
+                let body_ident = format_ident!("__e{}", body.0);
+                quote! {
+                    __arena.push_reduce(
+                        ::pixelflow_core::__macro::ir::fold::Fold::from_bits(#bits)
+                            .expect("kernel! emitted a well-formed fold"),
+                        #body_ident,
+                    )
+                }
             }
         };
         stmts.push(quote! {

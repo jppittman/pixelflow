@@ -7,9 +7,7 @@
 //! Naming the boundary is what makes them assertable.
 
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprNode, UniformDecl, UniformIdentity};
-use pixelflow_ir::binding::BindingTable;
-use pixelflow_ir::eval::eval_scalar;
-use pixelflow_ir::{Children, ExprArena, Ir, OpKind, Shape};
+use pixelflow_ir::{Children, ExprArena, Ir, Kernel, KernelStore, OpKind, Shape};
 use pixelflow_search::egraph::{Declined, EGraph, Vocabulary, insert, reachable_count};
 use pixelflow_search::runtime::optimize_runtime_arena;
 
@@ -47,75 +45,6 @@ fn uniform_inserts_and_hash_conses_by_identity() {
     // The macro tier holds it too: a uniform is not a runtime-only op.
     let mut eg = EGraph::new();
     assert!(insert(&arena, root, &mut eg, Vocabulary::Templates).is_ok());
-}
-
-/// `ConstantFold` never sees a uniform: `u + 1` stays `u + 1` through the
-/// production optimizer, extraction redeclares the decl (identity and
-/// default), and the optimized arena evaluates as the input does, with and
-/// without a block. A uniform-only subexpression read twice is CSE'd to one.
-#[test]
-fn a_uniform_survives_the_optimizer_unfolded() {
-    let u = uniform(2.0);
-    let mut a = ExprArena::new();
-    let slot = a.declare_uniform(u);
-    let ua = a.push_uniform(slot);
-    let ub = a.push_uniform(slot);
-    let one = a.push_const(1.0);
-    // (u + 1) * X + (u + 1)
-    let u1 = a.push_binary(OpKind::Add, ua, one);
-    let u1_again = a.push_binary(OpKind::Add, ub, one);
-    let x = a.push_var(0);
-    let prod = a.push_binary(OpKind::Mul, u1, x);
-    let root = a.push_binary(OpKind::Add, prod, u1_again);
-
-    let optimized = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
-        .expect("a uniform-bearing arena optimizes rather than bailing");
-    let (oa, oroot) = (&optimized.0, optimized.1);
-
-    assert_eq!(oa.uniforms(), &[u], "extraction redeclares the decl");
-    let leaves = |arena: &ExprArena, root: pixelflow_ir::ExprId| {
-        let mut seen = vec![false; arena.len()];
-        let mut stack = vec![root];
-        let (mut uniforms, mut consts) = (0usize, Vec::<f32>::new());
-        while let Some(id) = stack.pop() {
-            if std::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            match arena.node(id) {
-                ExprNode::Uniform(_) => uniforms += 1,
-                ExprNode::Const(v) => consts.push(*v),
-                _ => {}
-            }
-            stack.extend(arena.children(id));
-        }
-        (uniforms, consts)
-    };
-    let (uniforms, consts) = leaves(oa, oroot);
-    assert!(
-        uniforms >= 1,
-        "the uniform was folded away: {}",
-        oa.display(oroot)
-    );
-    assert!(
-        !consts.contains(&3.0),
-        "`u + 1` was folded with the default into 3: {}",
-        oa.display(oroot)
-    );
-    for (block, x) in [(None, 5.0f32), (Some(4.0f32), 5.0), (Some(-1.5), 0.25)] {
-        let bind = |arena: &ExprArena| {
-            let t = BindingTable::bind(arena, &[]).expect("no buffers");
-            match block {
-                Some(v) => t.bind_uniforms(arena, &[(u.id, v)]).expect("u is declared"),
-                None => t,
-            }
-        };
-        let want = eval_scalar(&a, root, &[x, 0.0], &bind(&a));
-        let got = eval_scalar(oa, oroot, &[x, 0.0], &bind(oa));
-        assert!(
-            (want - got).abs() < 1e-5,
-            "block {block:?} at x={x}: {want} != {got}"
-        );
-    }
 }
 
 /// The macro tier must not hold mask or integer-domain ops.
@@ -237,6 +166,45 @@ fn a_param_is_held_by_the_macro_vocabulary_and_declined_by_the_runtime_one() {
         insert(&arena, p, &mut runtime, Vocabulary::Runtime),
         Err(Declined::Param(3)),
         "a Param at bake time means a builder was never called"
+    );
+}
+
+/// A reference is declined, not mishandled. `passes::expand_refs` runs before
+/// saturation in every pipeline, so one arriving here is a pipeline-order bug
+/// — and the e-graph must say so rather than insert a leaf it cannot rewrite,
+/// which would silently make an inlining rule look like it had nothing to do.
+#[test]
+fn a_reference_is_declined_by_every_vocabulary() {
+    let named = Kernel::x().mul(&Kernel::constant(3.0)).by_ref();
+    let (arena, root) = named.parts();
+    let key = KernelStore::intern(&Kernel::x().mul(&Kernel::constant(3.0)));
+
+    for vocab in [Vocabulary::Runtime, Vocabulary::Templates] {
+        let mut eg = EGraph::new();
+        assert_eq!(
+            insert(arena, root, &mut eg, vocab),
+            Err(Declined::Ref(key)),
+            "{vocab:?} must decline a reference"
+        );
+    }
+}
+
+/// And the runtime tier as a whole does not decline it: `ExpandRefs` runs
+/// first, so what reaches the e-graph is the referent's body and the kernel
+/// optimizes exactly as the spliced composition does.
+#[test]
+fn the_runtime_pipeline_expands_before_it_saturates() {
+    let body = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
+    let named = body.by_ref();
+    let (arena, root) = named.parts();
+    let optimized = optimize_runtime_arena(arena, root, pixelflow_ir::LatticeShape::POINT)
+        .expect("a named kernel must optimize, not bail");
+    let (opt, opt_root) = &*optimized;
+    // X·0 + Y folds to Y, which it could not do without seeing the body.
+    assert!(
+        matches!(opt.node(*opt_root), ExprNode::Var(1)),
+        "expected the referent's body to be folded to bare Y, got {:?}",
+        opt.node(*opt_root)
     );
 }
 

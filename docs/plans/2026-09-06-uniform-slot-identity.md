@@ -94,7 +94,7 @@ call". That distinction, and not the folding itself, is the missing type.
 
 | Behavior | Where |
 |---|---|
-| Panics: "substitute params first" | `pixelflow-codegen/src/emit/mod.rs` (emitter), `pixelflow-ir/src/eval.rs` (oracle, PointCheck), `pixelflow-search/src/nnue/factored.rs` (edge walker) |
+| Panics: "substitute params first" | `pixelflow-codegen/src/emit/mod.rs` (emitter), `pixelflow-ir/src/eval.rs` (deleted) (oracle, PointCheck), `pixelflow-search/src/nnue/factored.rs` (edge walker) |
 | Declines | `pixelflow-search/src/egraph/insert.rs` returns `Declined::Param` |
 | Passes through as an opaque leaf | `arena.rs` (splice, canonical key), `passes.rs` (copy; derivative is `0`), `term_arena.rs`, `jit_cache.rs` (key is the *index*, not a value) |
 
@@ -397,8 +397,8 @@ same collapse call as today with one more pointer.
 |---|---|---|---|
 | T1: `UniformIdentity`, `UniformDecl`, `UniformId`, `ExprNode::Uniform`, table, `declare`/`push`, splice merge by identity, canonical form | `pixelflow-ir/src/arena.rs`, `term.rs`, `term_arena.rs` | None | M |
 | T2: `Scalar`, `Uniform` handle, `substitute_params(&[Scalar])`; `kernel_value!` builders take `impl Into<Scalar>` | `pixelflow-ir/src/kernel.rs`, `pixelflow-compiler/src/jit_backend.rs`, `codegen/emitter.rs` | T1 | S |
-| T3: variance `CONST`; derivative `0`; oracle takes a block | `pixelflow-ir/src/variance.rs`, `passes.rs`, `eval.rs` | T1 | S |
-| T4: `ENode::Uniform`, insert instead of decline, extraction redeclares; template/oracle match arms | `pixelflow-search/src/egraph/{node,insert,template,graph}.rs`, `math/oracle.rs`, `runtime.rs` | T1 | M |
+| T3: variance `CONST`; derivative `0`; oracle takes a block | `pixelflow-ir/src/variance.rs`, `passes.rs`, `eval.rs` (deleted) | T1 | S |
+| T4: `ENode::Uniform`, insert instead of decline, extraction redeclares; template/oracle match arms | `pixelflow-search/src/egraph/{node,insert,template,graph}.rs`, `math/oracle.rs` (deleted), `runtime.rs` | T1 | M |
 | T5: link step, emitter `ScheduledOp::Uniform` → broadcast load per backend, `ctx[0]` ABI, cache key by dense offset (buffers too) | `pixelflow-codegen/src/emit/{mod,x86_64,avx2,avx512,aarch64}.rs`, `jit_cache.rs`, `jit_manifold.rs` | T1, T3 | L |
 | T6: test pinning that `expand_reduce` refuses a `Uniform` in the extent slot | `pixelflow-ir/src/passes.rs` | T1 | S |
 | T7: `Lattice::compile`, `Compiled`, `UniformBlock`; `CellGridProgram::frame` takes a block; `MAX_SLOTS + 1` | `pixelflow-core/src/lattice/{mod,cell_grid}.rs` | T5 | M |

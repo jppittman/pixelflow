@@ -354,7 +354,8 @@ impl<'a, R: Reranker + ?Sized> IncrementalExtractor<'a, R> {
                     }
 
                     // Skip self-referential candidates (would create cycles).
-                    if let ENode::Op { children, .. } = &nodes[node_idx] {
+                    {
+                        let children = (&nodes[node_idx]).children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
                             continue;
                         }
@@ -425,7 +426,8 @@ impl<'a, R: Reranker + ?Sized> IncrementalExtractor<'a, R> {
             });
             let nodes = egraph.nodes(canonical);
             if node_idx < nodes.len() {
-                if let ENode::Op { children, .. } = &nodes[node_idx] {
+                {
+                    let children = (&nodes[node_idx]).children_slice();
                     for &child in children {
                         stack.push(child);
                     }
@@ -489,7 +491,8 @@ fn backfill_well_founded(egraph: &EGraph, start: EClassId, choices: &mut [Option
         scope_pos[idx] = Some(scope.len());
         scope.push(canonical.0);
         for node in egraph.nodes(canonical) {
-            if let ENode::Op { children, .. } = node {
+            {
+                let children = (node).children_slice();
                 for &child in children {
                     stack.push(egraph.find(child));
                 }
@@ -513,7 +516,8 @@ fn backfill_well_founded(egraph: &EGraph, start: EClassId, choices: &mut [Option
         let mut any_ready = false;
         for (node_idx, node) in nodes.iter().enumerate() {
             let mut count = 0usize;
-            if let ENode::Op { children, .. } = node {
+            {
+                let children = (node).children_slice();
                 for &child in children {
                     let child_idx = egraph.find(child).0 as usize;
                     if let Some(child_pos) = scope_pos[child_idx] {
@@ -709,7 +713,8 @@ pub(crate) fn repair_choices_well_founded(
         scope_pos[idx] = Some(scope.len());
         scope.push(canonical.0);
         for node in egraph.nodes(canonical) {
-            if let ENode::Op { children, .. } = node {
+            {
+                let children = (node).children_slice();
                 for &child in children {
                     stack.push(egraph.find(child));
                 }
@@ -730,7 +735,8 @@ pub(crate) fn repair_choices_well_founded(
         let mut per_node = Vec::with_capacity(nodes.len());
         for (node_idx, node) in nodes.iter().enumerate() {
             let mut count = 0usize;
-            if let ENode::Op { children, .. } = node {
+            {
+                let children = (node).children_slice();
                 for &child in children {
                     let child_pos = scope_pos[egraph.find(child).0 as usize]
                         .expect("child of a scope class is in scope");
@@ -895,7 +901,8 @@ pub fn extract<C: CostFunction>(
 
             // Push all children that need processing
             for node in egraph.nodes(canonical) {
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &child in children {
                         let child_canonical = egraph.find(child);
                         if best_cost[child_canonical.0 as usize].is_none() {
@@ -919,7 +926,11 @@ pub fn extract<C: CostFunction>(
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
                     | ENode::Param(_) => costs.node_cost(node, None),
-                    ENode::Op { children, .. } => {
+                    // A fold is, for costing, a node with one child: its
+                    // metadata is not an operand, so `children_slice` is the
+                    // whole of what this arm needs to know about either.
+                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                        let children = node.children_slice();
                         // Check for self-referential children
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
                             CYCLE_COST
@@ -932,11 +943,14 @@ pub fn extract<C: CostFunction>(
                             // own `CYCLE_COST`), so a node with several such
                             // children overflows a plain `usize` sum. A real
                             // `Dwrt`-bearing e-graph reaches that here.
+                            let per_child = fold_body_multiple(node);
                             let children_cost: usize = children
                                 .iter()
                                 .map(|&child| {
                                     let c = egraph.find(child);
-                                    best_cost[c.0 as usize].unwrap_or(CYCLE_COST)
+                                    let sub = best_cost[c.0 as usize].unwrap_or(CYCLE_COST);
+                                    usize::try_from((sub as u64).saturating_mul(per_child))
+                                        .unwrap_or(usize::MAX)
                                 })
                                 .fold(0usize, usize::saturating_add);
                             op_cost.saturating_add(children_cost)
@@ -1008,7 +1022,8 @@ pub fn compute_ref_counts(egraph: &EGraph, root: EClassId, choices: &[Option<usi
             if let Some(node_idx) = choices[idx] {
                 let nodes = egraph.nodes(canonical);
                 if node_idx < nodes.len() {
-                    if let ENode::Op { children, .. } = &nodes[node_idx] {
+                    {
+                        let children = (&nodes[node_idx]).children_slice();
                         for &child in children {
                             stack.push(child);
                         }
@@ -1070,7 +1085,8 @@ pub fn build_extracted_dag_from_choices(
 
         if let Some(node_idx) = choices.get(idx).copied().flatten() {
             if let Some(node) = egraph.nodes(canonical).get(node_idx) {
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &child in children {
                         topo_walk(egraph, child, choices, ref_counts, visited, schedule);
                     }
@@ -1353,7 +1369,8 @@ pub fn choices_to_arena(
                         }
                         result_stack.push(expr_id);
                     }
-                    ENode::Op { children, .. } => {
+                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                        let children = node.children_slice();
                         assert!(
                             color[idx] != 1,
                             "choices_to_arena: extraction choices are CYCLIC — e-class {} is \
@@ -1395,6 +1412,17 @@ pub fn choices_to_arena(
                 let nodes = egraph.nodes(canonical);
                 let node = &nodes[node_idx];
 
+                if let ENode::Reduce { fold, .. } = node {
+                    let body = result_stack
+                        .pop()
+                        .expect("choices_to_arena: a fold's body is built before it");
+                    let expr_id = arena.embed(Shape::Reduce { fold: *fold, body });
+                    if idx < id_map.len() {
+                        id_map[idx] = Some(expr_id);
+                    }
+                    result_stack.push(expr_id);
+                    continue;
+                }
                 let ENode::Op { op, children } = node else {
                     // Leaves are handled in Visit; reaching here would be a bug.
                     panic!(
@@ -1716,6 +1744,17 @@ fn node_variance(
             }
             acc.union(best_var[c.0 as usize])
         }),
+        // The one node that *shrinks* the set. Its index is bound, so it is
+        // not free in the result — which is what makes `Σ_i f(i)` frame-
+        // uniform when `f` reads nothing but the index, and therefore
+        // hoistable out of the pixel loop.
+        ENode::Reduce { fold, body } => {
+            let c = egraph.find(*body);
+            if c == canonical {
+                return Variance::ALL;
+            }
+            best_var[c.0 as usize].without(Variance::from_var(fold.binder().var()))
+        }
     }
 }
 
@@ -1817,7 +1856,8 @@ pub fn cost_of_choices<C: CostFunction>(
             );
             color[idx] = 1;
             stack.push((canonical, true));
-            if let ENode::Op { children, .. } = chosen(canonical) {
+            {
+                let children = (chosen(canonical)).children_slice();
                 for &child in children {
                     stack.push((child, false));
                 }
@@ -1834,20 +1874,17 @@ pub fn cost_of_choices<C: CostFunction>(
         // sums reach the ceiling on real inputs.
         let own = usize::try_from((costs.node_cost(node, None) as u64).saturating_mul(weight))
             .unwrap_or(usize::MAX);
-        let children_cost = match node {
-            ENode::Op { children, .. } => children
-                .iter()
-                .map(|&child| {
-                    let c = egraph.find(child).0 as usize;
-                    tree[c].expect("post-order visits every child before its parent")
-                })
-                .fold(0usize, usize::saturating_add),
-            ENode::Var(_)
-            | ENode::Const(_)
-            | ENode::Buffer(_)
-            | ENode::Uniform(_)
-            | ENode::Param(_) => 0,
-        };
+        // A fold evaluates its body once per index — see `fold_body_multiple`.
+        let per_child = fold_body_multiple(node);
+        let children_cost = node
+            .children_slice()
+            .iter()
+            .map(|&child| {
+                let c = egraph.find(child).0 as usize;
+                let sub = tree[c].expect("post-order visits every child before its parent");
+                usize::try_from((sub as u64).saturating_mul(per_child)).unwrap_or(usize::MAX)
+            })
+            .fold(0usize, usize::saturating_add);
         tree[idx] = Some(own.saturating_add(children_cost));
         var[idx] = node_var;
         dag = dag.saturating_add(own);
@@ -2152,6 +2189,32 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
         .unwrap_or(usize::MAX)
 }
 
+/// **How many times `node`'s children are evaluated per evaluation of `node`.**
+///
+/// One, for everything except a fold: `⊕_{[lo,hi)} f` evaluates `f` once per
+/// index, and **codegen has no iteration binder**, so `ExpandReduce` emits
+/// exactly that many copies of the body. Pricing the body once would tell the
+/// extractor a 34-piece fold costs what one piece costs, which is how an
+/// unpriced fold turns the loop unroller off — it would keep every fold,
+/// unconditionally, because folding would always look free.
+///
+/// This is the multiplier the fold's own [`CostModel::node_op_cost`] arm
+/// deliberately leaves out: a node's cost cannot see its children's, and this
+/// is the one place that number is in hand.
+///
+/// The trip count is *local to the fold node*, which is what makes it exact.
+/// A per-binder-slot table would not work: `PeelFold` rewrites
+/// `⊕_{[lo,hi)} f` to `f(hi-1) ⊕ ⊕_{[lo,hi-1)} f`, keeping the same binder
+/// and the same body e-class, so after saturation one slot carries folds of
+/// many different lengths over one shared body and no single number is right
+/// for it.
+fn fold_body_multiple(node: &ENode) -> u64 {
+    match node {
+        ENode::Reduce { fold, .. } => u64::from(fold.len()),
+        _ => 1,
+    }
+}
+
 /// The two policy knobs the DP passes read, plus the trace they write.
 ///
 /// Grouped rather than passed as four more arguments, and monomorphized
@@ -2246,6 +2309,9 @@ fn canonical_key(egraph: &EGraph, node: &ENode) -> (u8, u64, usize, Vec<u32>) {
         ENode::Uniform(_) => (3, 0, 0, children),
         ENode::Param(i) => (4, u64::from(*i), 0, children),
         ENode::Op { op, .. } => (5, op.kind() as u64, children.len(), children),
+        // The fold *is* the discriminating part: two folds over one body
+        // differ only in their metadata, so that is what orders them.
+        ENode::Reduce { fold, .. } => (6, fold.to_bits(), children.len(), children),
     }
 }
 
@@ -2394,7 +2460,8 @@ fn settle_in_cost_order<S: Settling>(
         for (idx, node) in nodes.iter().enumerate() {
             distinct.clear();
             let mut self_referential = false;
-            if let ENode::Op { children, .. } = node {
+            {
+                let children = (node).children_slice();
                 for &child in children.iter() {
                     let c = egraph.find(child);
                     if c == class {
@@ -2554,15 +2621,20 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
             // sit at a prohibitive sentinel (`Dwrt`'s `usize::MAX / 4` from
             // `CostModel::node_op_cost`), so a node with several such
             // children overflows a plain `usize` sum.
-            ENode::Op { children, .. } => own.saturating_add(
-                children
-                    .iter()
-                    .map(|&child| {
-                        self.cost[self.egraph.find(child).0 as usize]
-                            .expect("a priced candidate's children are settled")
-                    })
-                    .fold(0usize, usize::saturating_add),
-            ),
+            ENode::Op { .. } | ENode::Reduce { .. } => {
+                let per_child = fold_body_multiple(node);
+                own.saturating_add(
+                    node.children_slice()
+                        .iter()
+                        .map(|&child| {
+                            let sub = self.cost[self.egraph.find(child).0 as usize]
+                                .expect("a priced candidate's children are settled");
+                            usize::try_from((sub as u64).saturating_mul(per_child))
+                                .unwrap_or(usize::MAX)
+                        })
+                        .fold(0usize, usize::saturating_add),
+                )
+            }
         };
         self.dp.rec.candidate(class, idx, cost, own);
         cost
@@ -2669,11 +2741,17 @@ impl ReachSets {
     fn union_below(&mut self, egraph: &EGraph, node: &ENode) -> usize {
         self.epoch += 1;
         self.scratch.clear();
-        let ENode::Op { children, .. } = node else {
-            return 0;
-        };
+        // `children_slice`, not a `let ENode::Op { children, .. } = node else
+        // { return 0 }`. That pattern read as "leaves reach nothing", which is
+        // true, but it also silently swallowed `ENode::Reduce`: a fold's body
+        // never entered the union, so the Dag arm priced a fold as its
+        // combiner chain and nothing else, while `cost_of_choices` — which
+        // walks `children_slice` — charged for the body too. The DP then
+        // settled on a claim below the price of the term it named, and the
+        // claim/price audit fired. `children_slice` is empty for a leaf, so
+        // the early return bought nothing the general path does not give.
         let mut below = 0usize;
-        for &child in children.iter() {
+        for &child in node.children_slice() {
             let ci = self.compact[egraph.find(child).0 as usize] as usize;
             // Taken and put back: the closure below needs `self` mutably
             // while the set is read, and a set is never its own member's.
@@ -2845,7 +2923,8 @@ fn post_order(egraph: &EGraph, root: EClassId) -> Vec<EClassId> {
             stack.push((canonical, true));
 
             for node in egraph.nodes(canonical) {
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &child in children {
                         let child_canonical = egraph.find(child);
                         if !settled[child_canonical.0 as usize] {
@@ -2883,7 +2962,8 @@ fn count_refs_recursive(
         if ref_counts[canonical.0 as usize] == 1 {
             if let Some(node_idx) = best_node[canonical.0 as usize] {
                 let node = &egraph.nodes(canonical)[node_idx];
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &child in children {
                         stack.push(child);
                     }
@@ -2932,7 +3012,8 @@ fn toposort_dag(
 
             if let Some(node_idx) = best_node.get(idx).and_then(|o| *o) {
                 let node = &egraph.nodes(canonical)[node_idx];
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &child in children {
                         let child_can = egraph.find(child);
                         if !visited[child_can.0 as usize] {
@@ -3189,7 +3270,8 @@ mod tests {
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
                     | ENode::Param(_) => own,
-                    ENode::Op { children, .. } => {
+                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                        let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
                             CYCLE_COST
                         } else {
@@ -3234,7 +3316,8 @@ mod tests {
             }
             let base = me * words;
             reach[base..base + words].fill(0);
-            if let ENode::Op { children, .. } = &nodes[min_idx] {
+            {
+                let children = (&nodes[min_idx]).children_slice();
                 if min_cost != CYCLE_COST {
                     for &child in children.iter() {
                         let cbase = compact[egraph.find(child).0 as usize] as usize * words;
@@ -4536,7 +4619,7 @@ mod tests {
         fn node_cost(&self, node: &ENode, _parent: Option<pixelflow_ir::OpKind>) -> usize {
             match node {
                 ENode::Op { op, .. } if op.kind() == pixelflow_ir::OpKind::Sin => usize::MAX / 2,
-                ENode::Op { .. } => 1,
+                ENode::Op { .. } | ENode::Reduce { .. } => 1,
                 ENode::Var(_)
                 | ENode::Const(_)
                 | ENode::Buffer(_)

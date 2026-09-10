@@ -175,6 +175,23 @@ impl RuleSet {
         Self::new(super::all_rules())
     }
 
+    /// [`RuleSet::production`] plus the bounded-fold decompositions.
+    ///
+    /// The runtime tier's set, and only its: `kernel!` has no syntax that
+    /// builds a fold, so at the macro tier these two rules can never fire.
+    /// Adding them to [`super::all_rules`] instead would leave them inert
+    /// there while perturbing the pinned rule-set grids that
+    /// `crate::math::inflate`'s inflation study measures against — a changed
+    /// baseline for no measurement's sake. Which rules a tier holds is
+    /// already a place the tiers differ (so is the vocabulary, and so is
+    /// whether extraction is priced against a lattice).
+    #[must_use]
+    pub fn runtime() -> Self {
+        let mut rules = super::all_rules();
+        rules.extend(super::fold_rules::fold_rules());
+        Self::new(rules)
+    }
+
     /// A rule set over an explicit vector — the research harnesses that
     /// compare orderings, and the tests.
     #[must_use]

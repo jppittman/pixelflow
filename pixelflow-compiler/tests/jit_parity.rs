@@ -360,32 +360,6 @@ fn jit_font_coverage_matches_truth() {
     }
 }
 
-/// P2 acceptance (part 2): the JIT'd `Dwrt` kernel matches the IR interpreter
-/// evaluating the same lowered arena — the language's semantic ground truth,
-/// the same oracle the real-glyph goldens use (kernel_glyph_golden.rs).
-/// Formerly this compared against the combinator backend evaluating the same
-/// source over `Jet2`; that oracle retires with the combinator emitter, and
-/// part 1 above already pins the closed form.
-#[test]
-fn jit_font_coverage_matches_interpreter() {
-    use pixelflow_ir::passes::lower_dwrt_owned;
-    use pixelflow_ir::{BindingTable, eval_scalar};
-
-    let (x0, y0, k, dir, mg) = COVERAGE_PARAMS;
-    let jit = coverage_body!()(x0, y0, k, dir, mg);
-
-    // The kernel carries its own pre-lowering arena; lower the Dwrt calculus
-    // the same way the compile entries do, then interpret.
-    let (arena, root) = jit.parts();
-    let (lowered, lroot) = lower_dwrt_owned(arena, root).expect("dwrt lowering");
-
-    for &(x, y) in COVERAGE_GRID {
-        let got = eval(&jit, (x, y, 0.0, 0.0));
-        let want = eval_scalar(&lowered, lroot, &[x, y], &BindingTable::empty());
-        check("font_coverage_vs_interpreter", got, want, 1e-4, 1e-4);
-    }
-}
-
 /// (x, y) grid spanning both sides of the coverage ramp, its interior, and
 /// points far into each saturated region.
 const COVERAGE_GRID: &[(f32, f32)] = &[

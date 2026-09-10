@@ -3,6 +3,7 @@
 use super::ops::Op;
 use alloc::vec::Vec;
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
+use pixelflow_ir::fold::Fold;
 
 /// Identifier for an equivalence class in the e-graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -60,6 +61,19 @@ pub enum ENode {
         op: &'static dyn Op,
         children: Vec<EClassId>,
     },
+    /// A bounded fold: `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
+    ///
+    /// The one node in the graph that *binds*, and the reason it can be in
+    /// the graph at all: its algebra, binder and range live in the node's
+    /// identity rather than in three `Const` children. As children they were
+    /// e-classes like any other — the `Const(4.0)` naming the `Add` combiner
+    /// was the same class as any literal `4.0` in the kernel, and every
+    /// arithmetic rule in the set could reach a trip count — so `Reduce` was
+    /// simply lowered before insertion and the e-graph never saw a fold.
+    ///
+    /// Hash-consing therefore does what it should: two folds are one node iff
+    /// they fold the same body, under the same algebra, over the same range.
+    Reduce { fold: Fold, body: EClassId },
 }
 
 impl ENode {
@@ -89,6 +103,14 @@ impl ENode {
         }
     }
 
+    /// The fold this node performs, if it is one.
+    pub fn fold(&self) -> Option<Fold> {
+        match self {
+            ENode::Reduce { fold, .. } => Some(*fold),
+            _ => None,
+        }
+    }
+
     /// Get children of this node.
     ///
     /// Allocates and clones — see [`Self::children_slice`] for the
@@ -109,6 +131,21 @@ impl ENode {
             | ENode::Uniform(_)
             | ENode::Param(_) => &[],
             ENode::Op { children, .. } => children,
+            ENode::Reduce { body, .. } => core::slice::from_ref(body),
+        }
+    }
+
+    /// Borrow this node's children mutably — what canonicalization needs, and
+    /// the only reason a caller should want it.
+    pub fn children_slice_mut(&mut self) -> &mut [EClassId] {
+        match self {
+            ENode::Var(_)
+            | ENode::Const(_)
+            | ENode::Buffer(_)
+            | ENode::Uniform(_)
+            | ENode::Param(_) => &mut [],
+            ENode::Op { children, .. } => children,
+            ENode::Reduce { body, .. } => core::slice::from_mut(body),
         }
     }
 
@@ -150,6 +187,9 @@ impl PartialEq for ENode {
                 // Compare by OpKind - ZST pointer addresses are unreliable
                 op1.kind() == op2.kind() && c1 == c2
             }
+            (ENode::Reduce { fold: f1, body: b1 }, ENode::Reduce { fold: f2, body: b2 }) => {
+                f1 == f2 && b1 == b2
+            }
             _ => false,
         }
     }
@@ -186,6 +226,11 @@ impl core::hash::Hash for ENode {
                 // Hash by OpKind - ZST pointer addresses are unreliable
                 op.kind().hash(state);
                 children.hash(state);
+            }
+            ENode::Reduce { fold, body } => {
+                6u8.hash(state);
+                fold.hash(state);
+                body.hash(state);
             }
         }
     }

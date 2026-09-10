@@ -466,6 +466,9 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
         Buffer(u16),
         Uniform(u16),
         Op(OpKind, Vec<u32>),
+        /// A fold's identity is its metadata plus its body — the bits are
+        /// the metadata, and two folds sharing them fold the same way.
+        Reduce(u64, u32),
     }
     type Build = Box<dyn Fn(&mut ExprArena) -> ExprId>;
     let mut interned: HashMap<Key, ExprId> = HashMap::new();
@@ -486,6 +489,17 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
             ExprNode::Buffer(b) => (Key::Buffer(b.0), Box::new(move |a| a.push_buffer(b))),
             ExprNode::Uniform(u) => (Key::Uniform(u.0), Box::new(move |a| a.push_uniform(u))),
+            ExprNode::Ref(k) => panic!(
+                "hash_cons: Ref({k:?}) names a kernel interned in this process; \
+                 corpus arenas are self-contained, so expand_refs first"
+            ),
+            ExprNode::Reduce { fold, body } => {
+                let body = ExprId(m(body, &map));
+                (
+                    Key::Reduce(fold.to_bits(), body.0),
+                    Box::new(move |a: &mut ExprArena| a.push_reduce(fold, body)),
+                )
+            }
             ExprNode::Unary(k, c) => {
                 let c = ExprId(m(c, &map));
                 (Key::Op(k, vec![c.0]), Box::new(move |a| a.push_unary(k, c)))

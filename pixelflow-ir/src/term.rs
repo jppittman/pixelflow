@@ -27,6 +27,8 @@
 //! written down.
 
 use crate::arena::{BufferDecl, UniformDecl};
+use crate::fold::Fold;
+use crate::key::KernelKey;
 use crate::kind::OpKind;
 
 /// The children of one node, borrowed where they are contiguous.
@@ -106,8 +108,25 @@ pub enum Shape<'a, R> {
     /// Per-call scalar leaf, carrying its identity and default for the same
     /// reason a buffer carries its declaration.
     Uniform(UniformDecl),
+    /// A kernel named by content — a leaf here, because its body is in the
+    /// [`KernelStore`](crate::store::KernelStore) and not in this term. An
+    /// e-graph insert declines one, for the reason it declines a `Param`:
+    /// there is no value to reason about until something resolves it.
+    ///
+    /// (The `Ref` in [`Ir::Ref`] is unrelated — that is how a representation
+    /// *names* one of its own nodes; this is a name for a whole kernel.)
+    Ref(KernelKey),
     /// An operation over `children`.
     Op(OpKind, Children<'a, R>),
+    /// A bounded fold: `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
+    ///
+    /// Deliberately *not* a [`Shape::Op`]. A fold's algebra, binder and range
+    /// are metadata, not operands: handing them to a walker as children is
+    /// what let the combiner's `Const` share an e-class with any literal of
+    /// the same value, and put a trip count within reach of every arithmetic
+    /// rule in the set. The one child is the body, and the binder is bound in
+    /// it — this is the only shape in the language that binds anything.
+    Reduce { fold: Fold, body: R },
 }
 
 /// A term language the e-graph can destructure and rebuild.

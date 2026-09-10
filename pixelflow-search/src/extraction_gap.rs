@@ -131,7 +131,8 @@ impl Instance {
         while let Some(c) = stack.pop() {
             reachable.push(c);
             for node in egraph.nodes(EClassId(c)) {
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &ch in children {
                         let ch = egraph.find(ch).0;
                         if !seen[ch as usize] {
@@ -885,7 +886,8 @@ fn greedy_trace(egraph: &EGraph, root: EClassId, costs: &CostModel) -> GreedyTra
             }
             stack.push((canonical, true));
             for node in egraph.nodes(canonical) {
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &child in children {
                         let child_canonical = egraph.find(child);
                         if best_cost[child_canonical.0 as usize].is_none() {
@@ -908,7 +910,8 @@ fn greedy_trace(egraph: &EGraph, root: EClassId, costs: &CostModel) -> GreedyTra
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
                     | ENode::Param(_) => costs.node_op_cost(node),
-                    ENode::Op { children, .. } => {
+                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                        let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
                             saw_cycle = true;
                             CYCLE_COST
@@ -1040,11 +1043,12 @@ fn measure(
     time_limit: Duration,
     max_expansions: u64,
 ) -> Measured {
-    // The same two lowering passes `optimize_runtime_arena_uncached` runs
-    // before the e-graph sees the arena.
-    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
-        .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-    let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
+    // What `optimize_runtime_arena_uncached` hands the e-graph: `ExpandRefs`
+    // and nothing else. Legalization (`LowerDwrt`, `ExpandReduce`) runs
+    // *after* saturation now — it is the fallback for shapes the graph
+    // declined — so lowering here would measure a pipeline that no longer
+    // exists, on an arena an order of magnitude larger than production's.
+    let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
     let node_count = reachable_count(&arena, root);
 
     let mut optimizer = Optimizer::production().budget(budget);

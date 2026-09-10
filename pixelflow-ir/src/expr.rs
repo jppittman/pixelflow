@@ -9,7 +9,9 @@ use alloc::vec::Vec;
 
 use crate::arena::{BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
 use crate::dag::{Builder, Dag, Id, Node, SideTable};
+use crate::fold::Fold;
 use crate::kernel::Scalar;
+use crate::key::KernelKey;
 use crate::kind::OpKind;
 
 /// Pure expression node payload.
@@ -36,6 +38,28 @@ pub enum ExprData {
     /// Operator node. Arity (unary, binary, ternary, nary) is a property of the
     /// DAG edge count (`node.child_count()`).
     Op(OpKind),
+    /// A bounded fold. Its one child is the body; everything else about it —
+    /// monoid, binder, range — is [`Fold`], and lives here rather than in
+    /// `Const` children.
+    ///
+    /// The alternative encoding is `Op(OpKind::Reduce)` over
+    /// `[Const(combiner), Const(binder), Const(count), body]`, which is what
+    /// this replaced. It costs a reader the question "is this float really a
+    /// small integer, and is that integer really a binder slot?" — a question
+    /// with no type-level answer, asked with `floorf` and a magic range, and
+    /// re-asked by every pass. `Fold` answers it once, by construction, and
+    /// `Fold::to_bits` gives the total order the cache keys need.
+    ///
+    /// One child, so "arity is a property of the edge count" still holds.
+    Reduce(Fold),
+    /// A kernel named rather than spliced — the content-addressed key a
+    /// [`KernelStore`](crate::store) resolves.
+    ///
+    /// A leaf, like [`Buffer`](Self::Buffer) and [`Uniform`](Self::Uniform),
+    /// and for the same reason: it names something this graph does not
+    /// contain. What it names is a *kernel*, which is what makes it the one
+    /// of the three that can be resolved back into graph.
+    Ref(KernelKey),
 }
 
 impl ExprData {
@@ -88,6 +112,8 @@ pub(crate) trait ExprBuilderExt {
     fn push_binary(&mut self, op: OpKind, a: Id, b: Id) -> Id;
     fn push_ternary(&mut self, op: OpKind, a: Id, b: Id, c: Id) -> Id;
     fn push_nary(&mut self, op: OpKind, children: &[Id]) -> Id;
+    fn push_reduce(&mut self, fold: Fold, body: Id) -> Id;
+    fn push_ref(&mut self, key: KernelKey) -> Id;
 }
 
 impl ExprBuilderExt for Builder<ExprData> {
@@ -134,6 +160,16 @@ impl ExprBuilderExt for Builder<ExprData> {
     #[inline]
     fn push_nary(&mut self, op: OpKind, children: &[Id]) -> Id {
         self.push_unique(ExprData::Op(op), children)
+    }
+
+    #[inline]
+    fn push_reduce(&mut self, fold: Fold, body: Id) -> Id {
+        self.push_unique(ExprData::Reduce(fold), &[body])
+    }
+
+    #[inline]
+    fn push_ref(&mut self, key: KernelKey) -> Id {
+        self.push_unique(ExprData::Ref(key), &[])
     }
 }
 
@@ -327,6 +363,8 @@ pub fn from_arena_roots(
                     ExprNode::Param(i) => b.push_param(i),
                     ExprNode::Buffer(buf) => b.push_buffer(buf),
                     ExprNode::Uniform(uni) => b.push_uniform(uni),
+                    ExprNode::Ref(key) => b.push_ref(key),
+                    ExprNode::Reduce { fold, .. } => b.push_reduce(fold, child_ids[0]),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _)
@@ -385,6 +423,8 @@ pub fn to_arena_roots(
             ExprData::Param(i) => arena.push_param(i),
             ExprData::Buffer(b) => arena.push_buffer(b),
             ExprData::Uniform(u) => arena.push_uniform(u),
+            ExprData::Ref(key) => arena.push_ref(key),
+            ExprData::Reduce(fold) => arena.push_reduce(fold, child_ids[0]),
             ExprData::Op(op) => match child_ids.len() {
                 1 => arena.push_unary(op, child_ids[0]),
                 2 => arena.push_binary(op, child_ids[0], child_ids[1]),

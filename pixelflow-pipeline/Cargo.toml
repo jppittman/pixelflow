@@ -10,13 +10,7 @@ bench = false
 
 [features]
 default = ["training"]
-# `pixelflow-ir/oracle` gives the label-minting harness its independent
-# scalar correctness reference (audit H1/H2) — training tooling only, so the
-# shipped crates still cannot name a tree-walking evaluator. It has to be a
-# real (non-dev) dependency feature: `gen_bench_corpus` is a `[[bin]]`
-# target that calls `eval_scalar`, and a `[dev-dependencies]` feature does
-# not reach it.
-training = ["pixelflow-ir/oracle"]
+training = []
 profiling = ["pprof"]
 
 [dependencies]
@@ -44,7 +38,7 @@ pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
-pixelflow-ir = { path = "../pixelflow-ir", features = ["oracle"] }
+pixelflow-ir = { path = "../pixelflow-ir" }
 
 [[bin]]
 name = "collapse_cost"
@@ -55,13 +49,6 @@ bench = false
 [[bin]]
 name = "bench_jit_corpus"
 path = "src/bin/bench_jit_corpus.rs"
-required-features = ["training"]
-# libtest harness rejects Criterion's bencher flags under `cargo bench --benches`.
-bench = false
-
-[[bin]]
-name = "gen_bench_corpus"
-path = "src/bin/gen_bench_corpus.rs"
 required-features = ["training"]
 # libtest harness rejects Criterion's bencher flags under `cargo bench --benches`.
 bench = false
@@ -151,20 +138,6 @@ required-features = ["training"]
 bench = false
 
 [[bin]]
-name = "gen_sh_corpus"
-path = "src/bin/gen_sh_corpus.rs"
-required-features = ["training"]
-# libtest harness rejects Criterion's bencher flags under `cargo bench --benches`.
-bench = false
-
-[[bin]]
-name = "gen_bezier_corpus"
-path = "src/bin/gen_bezier_corpus.rs"
-required-features = ["training"]
-# libtest harness rejects Criterion's bencher flags under `cargo bench --benches`.
-bench = false
-
-[[bin]]
 name = "strict_label_output_class_recount"
 path = "src/bin/strict_label_output_class_recount.rs"
 required-features = ["training"]
@@ -245,15 +218,6 @@ bench = false
 name = "phase3_bisect_eval"
 path = "src/bin/phase3_bisect_eval.rs"
 required-features = ["training"]
-bench = false
-
-[[bin]]
-name = "egraph_off_on"
-path = "src/bin/egraph_off_on.rs"
-# Needs `pixelflow-ir/oracle` (`eval_scalar`) and, at run time, the
-# `pixelflow-search/saturation-switch` measurement feature for the `off` mode.
-required-features = ["training"]
-# libtest harness rejects Criterion's bencher flags under `cargo bench --benches`.
 bench = false
 
 [[bin]]

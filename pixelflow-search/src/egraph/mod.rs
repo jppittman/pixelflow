@@ -16,6 +16,8 @@
 //! - [`saturate`]: Budget-limited saturation, plus the size-based
 //!   [`saturate::SaturationConfig`] presets both tiers drive it with
 //! - [`graph`]: The EGraph itself
+//! - `growth` (feature `saturation-telemetry`): per-application growth
+//!   telemetry — how many e-nodes/e-classes a rewrite actually added
 //! - [`deps`]: Dependency analysis for uniform hoisting
 //!
 //! Mathematical rewrite rules are now in the [`crate::math`] module.
@@ -31,7 +33,14 @@ pub(crate) mod cost;
 pub mod deps;
 pub mod derivative;
 pub(crate) mod extract;
+pub mod fold_rules;
 mod graph;
+// Per-application growth telemetry (docs/plans/2026-08-31-guide-design-revision.md
+// §4.1) has no production consumer yet, exactly like `crate::telemetry` —
+// gated behind the same `saturation-telemetry` feature so a build that
+// doesn't ask for it doesn't carry the module at all.
+#[cfg(feature = "saturation-telemetry")]
+mod growth;
 mod guided;
 pub mod insert;
 // The hindsight labeler reads the provenance journal directly
@@ -72,10 +81,13 @@ pub use extract::{
     build_extracted_dag_from_choices, choices_to_arena, compute_ref_counts, cost_of_choices,
     extract, extract_dag,
 };
+pub use fold_rules::{EmptyFold, PeelFold, fold_rules};
 pub use graph::{
     ApplicationMask, ApplyResult, EGraph, EGraphBatch, HARD_CLASS_LIMIT, MaskScope, RewriteTarget,
     SaturationStats, SaturationStop, ScanStop,
 };
+#[cfg(feature = "saturation-telemetry")]
+pub use growth::{GrowthTelemetry, RuleGrowth};
 pub use insert::{Declined, insert, reachable_count};
 #[cfg(feature = "provenance-journal")]
 pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};

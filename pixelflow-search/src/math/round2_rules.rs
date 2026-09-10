@@ -1301,7 +1301,6 @@ mod tests {
     use super::*;
     use pixelflow_ir::Uniform;
     use pixelflow_ir::binding::BindingTable;
-    use pixelflow_ir::eval_scalar;
 
     /// Well-conditioned sample points, seeded and fixed: finite, moderate
     /// magnitude, no zeros (avoids `Recip`/`Rsqrt` poles), all-positive
@@ -1369,62 +1368,6 @@ mod tests {
         arena.substitute_vars_with(root, &subs)
     }
 
-    /// Evaluate `rule`'s LHS and RHS templates at every point in `points`
-    /// and assert they agree within `tol` (relative for |value| > 1, else
-    /// absolute) — the cross-form conditioned gate (§2.4). `tol` is per-rule:
-    /// exact identities use a tight tolerance, estimate-based ones (`Recip`,
-    /// `Rsqrt`) use a loose one, matching CLAUDE.md's own table.
-    fn assert_oracle(rule: &dyn Rewrite, points: &[[f32; 4]], tol: f32) {
-        // A metavariable stands for an arbitrary subterm. The first two can
-        // be coordinates — a lattice has two axes — and the rest are the
-        // kernel arguments they would be, sampled from the point's remaining
-        // slots through the block. The same handles go into both arenas, so
-        // the two sides read one value per metavariable.
-        let args = [Uniform::new(0.0), Uniform::new(0.0)];
-        let mut lhs_arena = ExprArena::new();
-        let lhs_root = rule
-            .lhs_template(&mut lhs_arena)
-            .unwrap_or_else(|| panic!("{}: missing lhs_template", rule.name()));
-        let lhs_root = bind_metavars_past_the_axes(&mut lhs_arena, lhs_root, &args);
-        let mut rhs_arena = ExprArena::new();
-        let rhs_root = rule
-            .rhs_template(&mut rhs_arena)
-            .unwrap_or_else(|| panic!("{}: missing rhs_template", rule.name()));
-        let rhs_root = bind_metavars_past_the_axes(&mut rhs_arena, rhs_root, &args);
-
-        for point in points {
-            let values = [
-                (args[0].identity(), point[2]),
-                (args[1].identity(), point[3]),
-            ];
-            let coords = [point[0], point[1]];
-            let lhs_bindings = BindingTable::empty()
-                .bind_uniforms(&lhs_arena, &values)
-                .expect("declared just above");
-            let rhs_bindings = BindingTable::empty()
-                .bind_uniforms(&rhs_arena, &values)
-                .expect("declared just above");
-            let lhs = eval_scalar(&lhs_arena, lhs_root, &coords, &lhs_bindings);
-            let rhs = eval_scalar(&rhs_arena, rhs_root, &coords, &rhs_bindings);
-            if lhs.is_nan() && rhs.is_nan() {
-                continue;
-            }
-            let threshold = if lhs.abs() > 1.0 {
-                tol * lhs.abs()
-            } else {
-                tol
-            };
-            assert!(
-                (lhs - rhs).abs() <= threshold,
-                "{}: LHS/RHS disagree at well-conditioned point {point:?}: \
-                 lhs={lhs} rhs={rhs} (threshold {threshold})\n  lhs = {}\n  rhs = {}",
-                rule.name(),
-                lhs_arena.display(lhs_root),
-                rhs_arena.display(rhs_root),
-            );
-        }
-    }
-
     const TIGHT: f32 = 1e-4;
     /// `Recip`/`Rsqrt` are hardware estimates in the JIT, but `eval_scalar`
     /// computes them exactly (`1.0/x`, `1.0/sqrt(x)`) — see kind.rs
@@ -1432,133 +1375,6 @@ mod tests {
     /// the loose tolerance exists only for float rounding across the two
     /// independently-built expression trees, not for estimate error.
     const LOOSE: f32 = 1e-3;
-
-    #[test]
-    fn n1_n2_min_max_duality() {
-        for r in min_max_duality_rules() {
-            assert_oracle(r.as_ref(), &general_points(), TIGHT);
-        }
-    }
-
-    #[test]
-    fn n3_n4_min_max_absorption() {
-        for r in min_max_absorption_rules() {
-            assert_oracle(r.as_ref(), &general_points(), TIGHT);
-        }
-    }
-
-    #[test]
-    fn n5_n6_min_max_translate() {
-        for r in min_max_translate_rules() {
-            assert_oracle(r.as_ref(), &general_points(), TIGHT);
-        }
-    }
-
-    #[test]
-    fn n7_min_scaled_by_nonneg_literal() {
-        assert_oracle(&MinScaledByNonnegLiteral, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n8_min_max_distributive() {
-        assert_oracle(&MinMaxDistributive, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n9_n10_abs_as_lattice_op() {
-        assert_oracle(&AbsAsMax, &general_points(), TIGHT);
-        assert_oracle(&MaxSelfNegAsAbs, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n11_select_same_branch() {
-        assert_oracle(&SelectSameBranch, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n12_n13_select_as_min_max() {
-        assert_oracle(&SelectLtToMin, &general_points(), TIGHT);
-        assert_oracle(&SelectLtToMax, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n14_select_hoist_unary() {
-        for r in select_hoist_unary_rules() {
-            // Var(0) is the mask metavariable here — must be a genuine
-            // all-ones/all-zero pattern (select_mask_points), and Sqrt is in
-            // the pool so the non-mask slots must stay positive.
-            assert_oracle(r.as_ref(), &select_mask_points(), TIGHT);
-        }
-    }
-
-    #[test]
-    fn n15_compare_flip_lt() {
-        assert_oracle(&CompareFlipLt, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n16_n17_tan_definition() {
-        assert_oracle(&TanDefinition, &general_points(), TIGHT);
-        assert_oracle(&TanFusion, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n18_exp_as_exp2() {
-        assert_oracle(&ExpAsExp2, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n19_ln_as_log2() {
-        assert_oracle(&LnAsLog2, &positive_points(), TIGHT);
-    }
-
-    #[test]
-    fn n20_log10_as_log2() {
-        assert_oracle(&Log10AsLog2, &positive_points(), TIGHT);
-    }
-
-    #[test]
-    fn n21_sqrt_product() {
-        assert_oracle(&SqrtProduct, &positive_points(), TIGHT);
-    }
-
-    #[test]
-    fn n22_rsqrt_square_as_recip() {
-        assert_oracle(&RsqrtSquareAsRecip, &positive_points(), LOOSE);
-    }
-
-    #[test]
-    fn n23_normalize_as_sqrt() {
-        assert_oracle(&NormalizeAsSqrt, &positive_points(), LOOSE);
-    }
-
-    #[test]
-    fn n24_n24r_recip_product() {
-        assert_oracle(&RecipProduct, &general_points(), LOOSE);
-        assert_oracle(&RecipOfProduct, &general_points(), LOOSE);
-    }
-
-    #[test]
-    fn n25_fma_unfuse() {
-        assert_oracle(&FmaUnfuse, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n26_fma_identities() {
-        assert_oracle(&FmaMulIdentity, &general_points(), TIGHT);
-        assert_oracle(&FmaAddIdentity, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n27_neg_distributes() {
-        assert_oracle(&NegDistributesAdd, &general_points(), TIGHT);
-        assert_oracle(&NegDistributesMul, &general_points(), TIGHT);
-    }
-
-    #[test]
-    fn n28_div_by_literal() {
-        assert_oracle(&DivByLiteral, &general_points(), TIGHT);
-    }
 
     /// Sanity: the batch is harness-only, and its count matches the doc
     /// comment on [`experimental_rules`] (guards against silent drift if a

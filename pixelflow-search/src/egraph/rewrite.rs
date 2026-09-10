@@ -156,6 +156,34 @@ pub enum RewriteAction {
     ExpandSquare { a: EClassId, b: EClassId },
     /// DiffOfSquares: a² - b² -> (a+b)(a-b)
     DiffOfSquares { a: EClassId, b: EClassId },
+    /// Peel one term off a bounded fold:
+    /// `⊕_{[lo,hi)} f  ->  f(lo) ⊕ ⊕_{[lo+1,hi)} f`.
+    ///
+    /// `head` is `f(lo)` — the body with the binder substituted, already
+    /// computed by the rule, which is the half that needs to *read* the
+    /// graph. It travels as a plan of nodes carrying their own resolved
+    /// `Op`s rather than as an arena template, because a peeled body is a
+    /// copy of a term the graph already holds and may contain any op the
+    /// graph holds — while the arena-template path resolves through
+    /// `op_from_kind`, which deliberately admits only what a *rewrite rule*
+    /// may name and so refuses a `Gather` or a mask.
+    ///
+    /// `rest` and `body` are the tail, which shares the original body's
+    /// e-class unchanged — the whole reason a fold carries a *range* rather
+    /// than an extent.
+    PeelFold {
+        /// `f(lo)`, in build order.
+        head: alloc::vec::Vec<super::fold_rules::HeadNode>,
+        /// Which entry of `head` — or which existing class — is the peeled
+        /// term. A body that never mentions the binder plans nothing at all
+        /// and its head *is* the body's class.
+        head_root: super::fold_rules::HeadRef,
+        /// The fold over everything after the peeled index.
+        rest: pixelflow_ir::Fold,
+        /// The body both folds share.
+        body: EClassId,
+    },
+
     /// Differentiate: expand `Dwrt(inner, var)` one chain-rule step.
     ///
     /// `inner` is a representative node of the expression being differentiated;
