@@ -302,6 +302,309 @@ mod tests {
     use pixelflow_ir::OpKind;
     use pixelflow_ir::arena::{ExprArena, ExprId};
 
+    use super::super::regalloc;
+    use super::super::storage::Slot;
+    use super::super::{
+        Binding, Counter, InstructionPlan, IsaBackend, KReg, Loc, OutStep, Reg, Reload, ResolvedOp,
+    };
+    use super::{Counting, EmitTraffic, ScopeTraffic};
+    use crate::error::CompileError;
+
+    /// An [`IsaBackend`] that does nothing but hand back what a test told it
+    /// to, so [`Counting`]'s own counting and forwarding can be pinned
+    /// without a real encoder or a compiled kernel.
+    struct RecordingBackend {
+        begin_result: Result<(), CompileError>,
+        scaffold_anchor_calls: u32,
+        scaffold_finish_calls: u32,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Self {
+            Self {
+                begin_result: Ok(()),
+                scaffold_anchor_calls: 0,
+                scaffold_finish_calls: 0,
+            }
+        }
+    }
+
+    impl IsaBackend for RecordingBackend {
+        type Branch = ();
+
+        fn register_file(&self) -> regalloc::RegisterFile {
+            unimplemented!("not exercised by the traffic-counting tests")
+        }
+
+        fn begin(&mut self, _schedule: &[regalloc::Def]) -> Result<(), CompileError> {
+            self.begin_result
+        }
+
+        fn emit_plan(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _plan: &InstructionPlan,
+        ) -> Result<(), CompileError> {
+            Ok(())
+        }
+
+        fn emit_mov(&mut self, _code: &mut Vec<u8>, _dst: Reg, _src: Reg) {}
+
+        fn emit_store(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _src: Reg,
+            _offset: u32,
+        ) -> Result<(), CompileError> {
+            Ok(())
+        }
+
+        fn emit_resolve(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _vid: regalloc::ValueId,
+            target: Reg,
+            _locs: &[Option<Binding>],
+        ) -> Reg {
+            target
+        }
+
+        fn emit_skip_if_all_false(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _mask_reg: Reg,
+            _scratch: Option<Reg>,
+            _mask_scratch: Option<KReg>,
+        ) -> Self::Branch {
+        }
+
+        fn emit_skip_if_all_true(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _mask_reg: Reg,
+            _scratch: Option<Reg>,
+            _mask_scratch: Option<KReg>,
+        ) -> Self::Branch {
+        }
+
+        fn emit_jump(&mut self, _code: &mut Vec<u8>) -> Self::Branch {}
+
+        fn patch_branch(&mut self, _code: &mut Vec<u8>, _branch: Self::Branch, _target: usize) {}
+
+        fn frame_alloc(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
+
+        fn frame_free(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
+
+        fn scaffold_anchor(&mut self, _code: &mut Vec<u8>) {
+            self.scaffold_anchor_calls += 1;
+        }
+
+        fn scaffold_finish(&mut self, _code: &mut Vec<u8>) {
+            self.scaffold_finish_calls += 1;
+        }
+
+        fn slot_store(&mut self, _code: &mut Vec<u8>, _src: Reg, _offset: u32) {}
+
+        fn slot_load(&mut self, _code: &mut Vec<u8>, _dst: Reg, _offset: u32) {}
+
+        fn counter_clear(&mut self, _code: &mut Vec<u8>, _counter: Counter) {}
+
+        fn counter_step(&mut self, _code: &mut Vec<u8>, _counter: Counter) {}
+
+        fn branch_if_counter_done(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _counter: Counter,
+        ) -> Self::Branch {
+        }
+
+        fn store_result(&mut self, _code: &mut Vec<u8>, _src: Reg) {}
+
+        fn advance_out(&mut self, _code: &mut Vec<u8>, _step: OutStep) {}
+
+        fn add_scalar(&mut self, _code: &mut Vec<u8>, _dst: Reg, _scratch: Reg, _scalar: f32) {}
+
+        fn emit_ret(&mut self, _code: &mut Vec<u8>) {}
+    }
+
+    /// `memory_ops` is read by a measurement harness, not by anything this
+    /// crate itself branches on, so a wrong formula would ship silently
+    /// unless a test pins the exact arithmetic against values that cannot
+    /// agree by coincidence.
+    #[test]
+    fn memory_ops_sums_transient_loads_kept_loads_and_stores() {
+        let traffic = ScopeTraffic {
+            loads_transient: 3,
+            loads_kept: 5,
+            stores: 7,
+            ..ScopeTraffic::default()
+        };
+        assert_eq!(traffic.memory_ops(), 15);
+    }
+
+    /// Same reasoning as `memory_ops` above, one level up: the three scopes'
+    /// weights (1, `rows`, `rows * groups`) are exactly what makes this
+    /// number differ from a plain sum, so the test's inputs are chosen so
+    /// every wrong weighting or wrong operator lands on a different total.
+    #[test]
+    fn dynamic_memory_ops_weights_row_and_body_scopes_by_their_trip_counts() {
+        let mut traffic = EmitTraffic::default();
+        traffic.frame.loads_transient = 1;
+        traffic.row.loads_transient = 2;
+        traffic.row.stores = 1;
+        traffic.body.loads_transient = 4;
+        traffic.body.stores = 1;
+
+        assert_eq!(traffic.dynamic_memory_ops(6, 7), 229);
+    }
+
+    /// `begin` is the one place a backend can refuse to compile at all
+    /// (aarch64's constant pool overflowing its 12-bit `LDR` offset); the
+    /// decorator must hand that error back rather than swallowing it.
+    #[test]
+    fn begin_propagates_the_inner_backends_error_instead_of_swallowing_it() {
+        let mut backend = RecordingBackend::new();
+        backend.begin_result = Err(CompileError::BudgetExceeded("stub"));
+        let mut counting = Counting::new(&mut backend);
+
+        assert_eq!(
+            counting.begin(&[]),
+            Err(CompileError::BudgetExceeded("stub"))
+        );
+    }
+
+    /// A schedule can carry both kinds of reload in one instruction; each
+    /// must land in its own counter rather than either being folded into, or
+    /// masking, the other.
+    #[test]
+    fn emit_plan_counts_a_stack_reload_and_a_const_reload_separately() {
+        let mut backend = RecordingBackend::new();
+        let mut counting = Counting::new(&mut backend);
+        let mut code = Vec::new();
+        let plan = InstructionPlan {
+            reloads: vec![
+                Reload::FromStack {
+                    target: Reg(0),
+                    slot: Slot::new(0, 16),
+                },
+                Reload::Const {
+                    target: Reg(1),
+                    val_bits: 0x3f80_0000,
+                },
+            ],
+            op: ResolvedOp::Nop,
+            setup_mov: None,
+            scratch: regalloc::Scratch::for_test(None, [None, None]),
+        };
+
+        counting.emit_plan(&mut code, &plan).expect("emit_plan");
+        let traffic = counting.take(0);
+
+        assert_eq!(traffic.instructions, 1);
+        assert_eq!(
+            traffic.loads_transient, 1,
+            "a stack reload was not counted: {traffic:?}"
+        );
+        assert_eq!(
+            traffic.remats, 1,
+            "a constant reload was not counted: {traffic:?}"
+        );
+    }
+
+    /// A value resolved from its spilled slot is a kept load, not a remat —
+    /// the two counters back different rows of the cost model and must not
+    /// bleed into each other.
+    #[test]
+    fn emit_resolve_counts_a_spilled_value_as_a_kept_load() {
+        let mut backend = RecordingBackend::new();
+        let mut counting = Counting::new(&mut backend);
+        let mut code = Vec::new();
+        let locs = [Some(Binding::Loc(Loc::Slot(Slot::new(0, 16))))];
+
+        counting.emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs);
+        let traffic = counting.take(0);
+
+        assert_eq!(
+            traffic.loads_kept, 1,
+            "a value resolved from a stack slot was not counted as a kept load: {traffic:?}"
+        );
+        assert_eq!(traffic.remats, 0);
+    }
+
+    /// The `Remat` mirror of the case above: re-emitting a constant is not a
+    /// memory operation and must not be counted as one.
+    #[test]
+    fn emit_resolve_counts_a_rematerialized_constant_as_a_remat_not_a_load() {
+        let mut backend = RecordingBackend::new();
+        let mut counting = Counting::new(&mut backend);
+        let mut code = Vec::new();
+        let locs = [Some(Binding::Remat(0x3f80_0000))];
+
+        counting.emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs);
+        let traffic = counting.take(0);
+
+        assert_eq!(
+            traffic.remats, 1,
+            "a rematerialized constant was not counted: {traffic:?}"
+        );
+        assert_eq!(traffic.loads_kept, 0);
+    }
+
+    /// A value already resident in a register costs nothing to resolve, so
+    /// resolving it must not move any counter.
+    #[test]
+    fn emit_resolve_counts_nothing_for_a_value_already_in_a_register() {
+        let mut backend = RecordingBackend::new();
+        let mut counting = Counting::new(&mut backend);
+        let mut code = Vec::new();
+        let locs = [Some(Binding::Loc(Loc::Reg(Reg(3))))];
+
+        counting.emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs);
+
+        assert_eq!(counting.take(0), ScopeTraffic::default());
+    }
+
+    /// The scaffold hooks carry no counter of their own, but aarch64's
+    /// backend overrides both to seed and flush its literal pool — if the
+    /// decorator ever stopped forwarding them, that pool would silently go
+    /// missing on that target.
+    #[test]
+    fn scaffold_anchor_and_finish_forward_to_the_inner_backend() {
+        let mut backend = RecordingBackend::new();
+        let mut code = Vec::new();
+        {
+            let mut counting = Counting::new(&mut backend);
+            counting.scaffold_anchor(&mut code);
+            counting.scaffold_finish(&mut code);
+        }
+
+        assert_eq!(backend.scaffold_anchor_calls, 1);
+        assert_eq!(backend.scaffold_finish_calls, 1);
+    }
+
+    /// The scaffold's own store/reload path (`slot_store`/`slot_load`) is
+    /// separate from an instruction's operand resolution and must count
+    /// independently of it.
+    #[test]
+    fn slot_store_and_slot_load_each_count_once_per_call() {
+        let mut backend = RecordingBackend::new();
+        let mut counting = Counting::new(&mut backend);
+        let mut code = Vec::new();
+
+        counting.slot_store(&mut code, Reg(0), 0);
+        counting.slot_load(&mut code, Reg(0), 0);
+        let traffic = counting.take(0);
+
+        assert_eq!(
+            traffic.stores, 1,
+            "slot_store did not count as a store: {traffic:?}"
+        );
+        assert_eq!(
+            traffic.loads_kept, 1,
+            "slot_load did not count as a kept load: {traffic:?}"
+        );
+    }
+
     /// Registers to allocate in the pressure test: small enough that a
     /// deliberately wide expression cannot fit, on every tier.
     const TIGHT_POOL: u8 = 4;
