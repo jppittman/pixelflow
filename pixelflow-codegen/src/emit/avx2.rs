@@ -30,7 +30,7 @@
 
 use super::x86_64;
 use super::x86_64::{Disp, Imm8, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
-use super::{AsmProgram, EncodedInst, Reg, SourceOperand, assemble, unimplemented_op};
+use super::{AsmProgram, EncodedInst, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -358,21 +358,27 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
     assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, RED_ZONE_CONST)]);
 }
 
-/// `dst = splat(block[offset])` at 256 bits: `mov rax, [rdi + ctx_slot*8]`
-/// then `vbroadcastss ymm<dst>, [rax + 4*offset]` (VEX.256.66.0F38.W0 18 /r).
-/// See `x86_64::emit_uniform_load` for the register contract.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
+/// `dst = splat(block[offset])` at 256 bits: `mov base, [ctx + ctx_slot*8]`
+/// then `vbroadcastss ymm<dst>, [base + 4*offset]` (VEX.256.66.0F38.W0 18
+/// /r). See `x86_64::emit_uniform_load` for the register contract.
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    load: super::UniformLoad,
+    base: PtrReg,
+    ctx: PtrReg,
+) {
     AsmProgram::from([
         MovLoadPtr {
-            dst: ptr::RAX,
-            base: ptr::RDI,
+            dst: base,
+            base: ctx,
             disp: i32::from(load.ctx_slot) * 8,
         }
         .encode(),
         Vex::m0f38_66(0x18).rm(
             dst.0,
             Mem {
-                base: ptr::RAX,
+                base,
                 disp: Imm32(i32::from(load.offset) * 4),
             },
         ),
@@ -1035,14 +1041,21 @@ pub(crate) mod driver {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
                 ResolvedOp::Gather { dst, idx, slot } => {
-                    // Context pointer (array of buffer base pointers) arrives in
-                    // rdi; arithmetic/const emit never touches rdi, so it
-                    // survives to here. ymm13/14 mirror X86Backend's gather
-                    // scratch; ymm8/9 are the AVX2-only high-half scratch this
-                    // two-half gather needs (see `super::emit_gather_scalar`).
-                    // ymm8/9 are non-allocatable by construction — see
-                    // `AVX2_SCHED_NUM_REGS`, which caps the pool at ymm4-7 so the
-                    // allocator can never place `dst`/`idx` where this clobbers.
+                    // Context pointer (array of buffer base pointers) arrives
+                    // in `AVX2_FILE.gpr_ctx` (rdi); arithmetic/const emit
+                    // never touches it, so it survives to here. The base
+                    // pointer and index GPRs are `AVX2_FILE.gpr_scratch`'s
+                    // allocated reservations. ymm13/14 mirror X86Backend's
+                    // gather scratch; ymm8/9 are the AVX2-only high-half
+                    // scratch this two-half gather needs (see
+                    // `super::emit_gather_scalar`). ymm8/9 are non-allocatable
+                    // by construction — see `AVX2_SCHED_NUM_REGS`, which caps
+                    // the pool at ymm4-7 so the allocator can never place
+                    // `dst`/`idx` where this clobbers.
+                    let ctx_gpr = self
+                        .file
+                        .gpr_ctx
+                        .expect("AVX2's gather needs a GPR context input");
                     super::emit_gather_scalar(
                         code,
                         *dst,
@@ -1050,9 +1063,11 @@ pub(crate) mod driver {
                         *slot,
                         super::GatherScratch {
                             half: x86_64::GatherScratch {
-                                base_gpr: 0,  // rax
-                                index_gpr: 1, // rcx
-                                ctx_gpr: 7,   // rdi
+                                base_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0))
+                                    .0,
+                                index_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1))
+                                    .0,
+                                ctx_gpr: ctx_gpr.0,
                                 idx_lanes: crate::emit::declared_temp(plan.scratch.temp(0)),
                                 value: crate::emit::declared_temp(plan.scratch.temp(1)),
                             },
@@ -1062,7 +1077,14 @@ pub(crate) mod driver {
                     );
                 }
                 ResolvedOp::Uniform { dst, load } => {
-                    super::emit_uniform_load(code, *dst, *load);
+                    let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
+                    let ctx = PtrReg(
+                        self.file
+                            .gpr_ctx
+                            .expect("AVX2's uniform load needs a GPR context input")
+                            .0,
+                    );
+                    super::emit_uniform_load(code, *dst, *load, base, ctx);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -1149,9 +1171,9 @@ pub(crate) mod driver {
         // X86Backend's MOVMSKPS guards but 8 lanes wide (al == 0xFF for
         // all-true, not 0x0F — see `super::emit_cmp_al_imm8`'s doc for why the
         // sign-extending `cmp eax, imm8` X86Backend uses doesn't work here).
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `_scratch` is unused: this tier reduces the mask with `movmskps`
-        /// into the flags, needing no vector register.
+        /// [`MaskTest::scratch`] and [`MaskTest::mask_scratch`] are both
+        /// unused: this tier reduces the mask with `movmskps` into the
+        /// flags, needing neither a vector nor a mask register.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
             super::emit_movmskps_eax(&mut asm.code, test.reg);
             match test.arm {

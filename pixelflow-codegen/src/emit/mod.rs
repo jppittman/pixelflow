@@ -1008,6 +1008,22 @@ pub(crate) fn declared_temp(temp: Option<Reg>) -> Reg {
     temp.expect("this encoding needs a temp that `RegisterFile::temps_for` did not ask for")
 }
 
+/// The GPR-class mirror of [`declared_temp`], for
+/// [`regalloc::RegisterFile::gpr_temps_for`].
+#[track_caller]
+pub(crate) fn declared_gpr_temp(temp: Option<Gpr>) -> Gpr {
+    temp.expect("this encoding needs a GPR that `RegisterFile::gpr_temps_for` did not ask for")
+}
+
+/// The mask-class mirror of [`declared_temp`], for
+/// [`regalloc::RegisterFile::mask_temps_for`].
+#[track_caller]
+pub(crate) fn declared_mask_temp(temp: Option<KReg>) -> KReg {
+    temp.expect(
+        "this encoding needs a mask register that `RegisterFile::mask_temps_for` did not ask for",
+    )
+}
+
 /// Emission context with register budget for ML training.
 #[derive(Clone, Debug, Default)]
 pub struct EmitCtx {
@@ -1509,6 +1525,12 @@ struct MaskTest {
     /// — so the x86 tiers, whose guards go through `movmskps`/`kortest` and the
     /// flags, receive `None` and want nothing.
     scratch: Option<Reg>,
+    /// The mask-class mirror of `scratch`, present exactly when this backend's
+    /// [`RegisterFile::mask_guard_temps`](regalloc::RegisterFile::mask_guard_temps)
+    /// asked for one. Only AVX-512 does — `vptestmd` writes its result into a
+    /// `k`-register before `kortestw` can read it into the flags — so every
+    /// other tier receives `None` and wants nothing.
+    mask_scratch: Option<KReg>,
     /// Which arm is being skipped.
     arm: SelectArm,
 }
@@ -1805,6 +1827,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             )
         };
         let guard_temp = scratch.guard_temp;
+        let mask_guard_temp = scratch.mask_guard_temp;
 
         // Guard branches that begin before this instruction.
         for pb in &branch_starts[sched_idx] {
@@ -1818,6 +1841,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let test = MaskTest {
                 reg: mask_reg,
                 scratch: guard_temp,
+                mask_scratch: mask_guard_temp,
                 arm,
             };
             backend.branch_if_arm_is_dead(&mut asm, test, past_arm);
@@ -1863,6 +1887,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let test = |arm| MaskTest {
                 reg: mask_reg,
                 scratch: guard_temp,
+                mask_scratch: mask_guard_temp,
                 arm,
             };
             backend.branch_if_arm_is_dead(&mut asm, test(SelectArm::True), only_false);
@@ -3552,6 +3577,12 @@ mod tests {
         temps_for: regalloc::no_temps,
         guard_temps: 0,
         vector_bytes: 16,
+        gpr_ctx: None,
+        gpr_scratch: regalloc::GprSet::EMPTY,
+        gpr_temps_for: regalloc::no_temps,
+        mask_scratch: regalloc::MaskSet::EMPTY,
+        mask_temps_for: regalloc::no_temps,
+        mask_guard_temps: 0,
     }
     .checked();
 
@@ -5358,17 +5389,23 @@ mod tests {
             const MOV_RAX_CTX2: [u8; 7] = [0x48, 0x8B, 0x87, 0x10, 0, 0, 0];
 
             let mut sse = Vec::new();
-            x86_64::emit_uniform_load(&mut sse, Reg(5), load);
+            x86_64::emit_uniform_load(&mut sse, Reg(5), load, x86_64::ptr::RAX, x86_64::ptr::RDI);
             assert_eq!(&sse[..7], &MOV_RAX_CTX2);
             assert_eq!(&sse[7..], &[0xC4, 0xE2, 0x79, 0x18, 0xA8, 0x0C, 0, 0, 0]);
 
             let mut avx2 = Vec::new();
-            avx2::emit_uniform_load(&mut avx2, Reg(5), load);
+            avx2::emit_uniform_load(&mut avx2, Reg(5), load, x86_64::ptr::RAX, x86_64::ptr::RDI);
             assert_eq!(&avx2[..7], &MOV_RAX_CTX2);
             assert_eq!(&avx2[7..], &[0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0, 0, 0]);
 
             let mut avx512 = Vec::new();
-            avx512::emit_uniform_load(&mut avx512, Reg(5), load);
+            avx512::emit_uniform_load(
+                &mut avx512,
+                Reg(5),
+                load,
+                x86_64::ptr::RAX,
+                x86_64::ptr::RDI,
+            );
             assert_eq!(&avx512[..7], &MOV_RAX_CTX2);
             assert_eq!(
                 &avx512[7..],
@@ -5376,7 +5413,7 @@ mod tests {
             );
 
             let mut neon = Vec::new();
-            aarch64::emit_uniform_load(&mut neon, Reg(5), load);
+            aarch64::emit_uniform_load(&mut neon, Reg(5), load, aarch64::ptr::X9, aarch64::ptr::X0);
             let words: Vec<u32> = neon
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
@@ -5407,9 +5444,14 @@ mod tests {
                 // whatever scratch the allocator would hand an encoding that
                 // asks for some. A backend that wants scratch and finds none
                 // panics, which `try_emit` would report as a missing op.
-                scratch: regalloc::Scratch::for_test(
+                // `Gpr(9..=11)`/`KReg(1)` stand in the same way for the
+                // GPR/mask-class reservations `Gather`/`Uniform`/compare ask
+                // for.
+                scratch: regalloc::Scratch::for_test_with_classes(
                     Some([Reg(15), Reg(14), Reg(13), Reg(12)]),
                     [Some(Reg(11)), Some(Reg(10))],
+                    Some([Gpr(9), Gpr(10), Gpr(11)]),
+                    Some(KReg(1)),
                 ),
             };
             let mut code = alloc::vec::Vec::new();

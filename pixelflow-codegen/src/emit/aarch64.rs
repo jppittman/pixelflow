@@ -347,23 +347,29 @@ pub fn emit_dup_lane0(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     assemble(code, [DupLane0::new(dst, src)]);
 }
 
-/// `dst = splat(block[offset])`: `ldr x9, [x0, #ctx_slot*8]` fetches the
-/// block's base out of the context, `ldr s<dst>, [x9, #offset*4]` the value,
-/// and `dup` spreads it. `x9` is the base scratch the gather already claims.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
-    const BASE_GPR: PtrReg = ptr::X9;
+/// `dst = splat(block[offset])`: `ldr base, [ctx, #ctx_slot*8]` fetches the
+/// block's base out of the context, `ldr s<dst>, [base, #offset*4]` the
+/// value, and `dup` spreads it. `base` is this instruction's
+/// `RegisterFile::gpr_scratch` reservation; `ctx` is `RegisterFile::gpr_ctx`.
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    load: super::UniformLoad,
+    base: PtrReg,
+    ctx: PtrReg,
+) {
     AsmProgram::from([
         Inst::ldr_x(
-            BASE_GPR,
+            base,
             Mem {
-                base: ptr::X0,
+                base: ctx,
                 offset: u32::from(load.ctx_slot) * X_BYTES,
             },
         ),
         Inst::ldr_s(
             dst,
             Mem {
-                base: BASE_GPR,
+                base,
                 offset: u32::from(load.offset) * S_BYTES,
             },
         ),
@@ -693,6 +699,22 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         ScheduledOp::Unary(OpKind::Rsqrt | OpKind::Recip, _) => 1,
         // The gather's truncated-index lanes.
         ScheduledOp::Gather(..) => 1,
+        _ => 0,
+    }
+}
+
+/// How many GPRs this backend's encoding of `op` needs beyond
+/// [`regalloc::RegisterFile::gpr_ctx`].
+///
+/// `Gather`'s scalar-load sequence needs a base pointer, a per-lane index and
+/// a loaded value, each a GPR; `Uniform` needs only the base pointer. All
+/// were `x9`/`x10`/`x11` chosen by hand before this work and are
+/// `RegisterFile::gpr_scratch` reservations now.
+pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+    use super::ScheduledOp;
+    match op {
+        ScheduledOp::Gather(..) => 3,
+        ScheduledOp::Uniform(..) => 1,
         _ => 0,
     }
 }
@@ -1881,6 +1903,21 @@ pub(crate) mod driver {
         // guard is emitted before.
         guard_temps: 1,
         vector_bytes: 16,
+        // The context pointer (array of buffer base pointers) arrives in x0
+        // per AAPCS64, disjoint from the coordinate vectors in v0-v3.
+        // Declaring it here is what lets `checked` prove `gpr_scratch` misses
+        // it, rather than a comment asserting the two constants never
+        // collide.
+        gpr_ctx: Some(ptr::X0.as_gpr()),
+        // x9-x11: the gather's base pointer and per-lane index/value GPRs,
+        // chosen by hand before this work and now `Scratch` reservations —
+        // clear of the branch guard (w16) and the const-pool anchor (x17).
+        gpr_scratch: regalloc::GprSet::of(&[ptr::X9.as_gpr(), gpr::X10, gpr::X11]),
+        gpr_temps_for: super::gpr_temps_for,
+        // No mask-register file on this tier: masks are ordinary vectors.
+        mask_scratch: regalloc::MaskSet::EMPTY,
+        mask_temps_for: regalloc::no_temps,
+        mask_guard_temps: 0,
     }
     .checked();
 
@@ -2221,102 +2258,105 @@ pub(crate) mod driver {
             ResolvedOp::Gather { dst, idx, slot } => {
                 // dst = buffer[slot][idx], via four scalar loads (NEON has no
                 // native gather). The context pointer (array of buffer base
-                // pointers) is caller-provided in x0 per AAPCS64 — disjoint from
-                // the coordinate vectors in v0..3 and never touched by the
-                // arithmetic/const emit, so it survives to here.
+                // pointers) is caller-provided in x0 per AAPCS64
+                // (`AARCH64_FILE.gpr_ctx`) — disjoint from the coordinate
+                // vectors in v0..3 and never touched by the arithmetic/const
+                // emit, so it survives to here.
                 // v30 is declared in `AARCH64_FILE.fixed`, so
                 // `RegisterFile::checked` proves it misses the pool, the reload
                 // pair and the guard scratch (v28) rather than a comment claiming
-                // it; x9-x11 are caller-saved GPR scratch clear of the branch
-                // guard (w16) and the const-pool anchor (x17).
+                // it; x9-x11 are `AARCH64_FILE.gpr_scratch`'s allocated
+                // reservations for this instruction, clear of the branch guard
+                // (w16) and the const-pool anchor (x17).
                 let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
-                const BASE_GPR: PtrReg = ptr::X9;
-                const IDX_GPR: Gpr = gpr::X10;
-                const VAL_GPR: Gpr = gpr::X11;
+                let base_gpr = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
+                let idx_gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1));
+                let val_gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(2));
                 /// Bytes per pointer in the context array.
                 const PTR_BYTES: u32 = 8;
                 AsmProgram::from([
                     Inst::Fcvtzs(idx_int, *idx),
                     Inst::ldr_x(
-                        BASE_GPR,
+                        base_gpr,
                         Mem {
                             base: X0,
                             offset: u32::from(*slot) * PTR_BYTES,
                         },
                     ),
                     Inst::UmovW {
-                        dst: IDX_GPR,
+                        dst: idx_gpr,
                         src: idx_int,
                         lane: 0,
                     },
                     Inst::ldr_w(
-                        VAL_GPR,
+                        val_gpr,
                         MemIndexed {
-                            base: BASE_GPR,
-                            index: IDX_GPR,
+                            base: base_gpr,
+                            index: idx_gpr,
                         },
                     ),
                     Inst::InsW {
                         dst: *dst,
                         lane: 0,
-                        src: VAL_GPR,
+                        src: val_gpr,
                     },
                     Inst::UmovW {
-                        dst: IDX_GPR,
+                        dst: idx_gpr,
                         src: idx_int,
                         lane: 1,
                     },
                     Inst::ldr_w(
-                        VAL_GPR,
+                        val_gpr,
                         MemIndexed {
-                            base: BASE_GPR,
-                            index: IDX_GPR,
+                            base: base_gpr,
+                            index: idx_gpr,
                         },
                     ),
                     Inst::InsW {
                         dst: *dst,
                         lane: 1,
-                        src: VAL_GPR,
+                        src: val_gpr,
                     },
                     Inst::UmovW {
-                        dst: IDX_GPR,
+                        dst: idx_gpr,
                         src: idx_int,
                         lane: 2,
                     },
                     Inst::ldr_w(
-                        VAL_GPR,
+                        val_gpr,
                         MemIndexed {
-                            base: BASE_GPR,
-                            index: IDX_GPR,
+                            base: base_gpr,
+                            index: idx_gpr,
                         },
                     ),
                     Inst::InsW {
                         dst: *dst,
                         lane: 2,
-                        src: VAL_GPR,
+                        src: val_gpr,
                     },
                     Inst::UmovW {
-                        dst: IDX_GPR,
+                        dst: idx_gpr,
                         src: idx_int,
                         lane: 3,
                     },
                     Inst::ldr_w(
-                        VAL_GPR,
+                        val_gpr,
                         MemIndexed {
-                            base: BASE_GPR,
-                            index: IDX_GPR,
+                            base: base_gpr,
+                            index: idx_gpr,
                         },
                     ),
                     Inst::InsW {
                         dst: *dst,
                         lane: 3,
-                        src: VAL_GPR,
+                        src: val_gpr,
                     },
                 ])
                 .assemble(code);
             }
             ResolvedOp::Uniform { dst, load } => {
-                super::emit_uniform_load(code, *dst, *load);
+                let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
+                super::emit_uniform_load(code, *dst, *load, base, ptr::X0);
             }
             ResolvedOp::Binary {
                 op,

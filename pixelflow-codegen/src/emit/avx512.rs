@@ -10,9 +10,11 @@
 //! `emit_shift_imm`) — so the exp/log lowering reaches this backend intact.
 //! Comparisons go through the k-register class (`vcmpps` -> `vpmovm2d`, see
 //! `emit_compare` below) so every downstream consumer still sees an ordinary
-//! all-ones/all-zeros vector, exactly like every other backend — the allocator
-//! never learns k-registers exist. Note `vpmovm2d` is AVX-512**DQ**, not F: an
-//! F-only part would fault on any kernel containing a comparison.
+//! all-ones/all-zeros vector, exactly like every other backend — the DAG's
+//! values are still all vectors, even though the k-register itself is now an
+//! allocated `RegisterFile::mask_scratch` reservation rather than a hardcoded
+//! transient. Note `vpmovm2d` is AVX-512**DQ**, not F: an F-only part would
+//! fault on any kernel containing a comparison.
 //!
 //! Transcendentals themselves are still a separate lowering stage; ops with no
 //! rule here are refused up front rather than mis-emitted.
@@ -22,7 +24,7 @@
 
 use super::x86_64;
 use super::x86_64::{Disp, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
-use super::{AsmProgram, EncodedInst, KReg, Reg, assemble, unimplemented_op};
+use super::{AsmProgram, EncodedInst, KReg, PtrReg, Reg, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -238,6 +240,33 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
     }
 }
 
+/// How many GPRs this backend's encoding of `op` needs beyond
+/// [`regalloc::RegisterFile::gpr_ctx`].
+///
+/// `Gather`/`Uniform` each need one GPR to hold the buffer/block base pointer
+/// loaded from the context — `rax`, chosen by hand before this work and now a
+/// `RegisterFile::gpr_scratch` reservation.
+pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+    use super::ScheduledOp;
+    match op {
+        ScheduledOp::Gather(..) | ScheduledOp::Uniform(..) => 1,
+        _ => 0,
+    }
+}
+
+/// How many mask registers this backend's encoding of `op` needs.
+///
+/// A comparison's `vcmpps` destination — `k1`, chosen by hand before this
+/// work and now a `RegisterFile::mask_scratch` reservation. Every other op
+/// either has no mask (arithmetic) or reads the mask as an ordinary vector
+/// (`Select`).
+pub(crate) fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
+    match op {
+        super::ScheduledOp::Binary(op_kind, ..) if is_compare(*op_kind) => 1,
+        _ => 0,
+    }
+}
+
 // --- unary (one source; no second source -> UNUSED_VVVV) ---
 /// vsqrtps zmmD, zmmS — EVEX.512.0F.W0 51 /r ; vvvv unused.
 fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) {
@@ -344,23 +373,29 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
     );
 }
 
-/// `dst = splat(block[offset])` at 512 bits: `mov rax, [rdi + ctx_slot*8]`
-/// then `vbroadcastss zmm<dst>, [rax + 4*offset]` (EVEX.512.66.0F38.W0 18
+/// `dst = splat(block[offset])` at 512 bits: `mov base, [ctx + ctx_slot*8]`
+/// then `vbroadcastss zmm<dst>, [base + 4*offset]` (EVEX.512.66.0F38.W0 18
 /// /r). A full `disp32`, as [`emit_const`]'s is, so EVEX's compressed-`disp8`
 /// scaling never enters into it. See `x86_64::emit_uniform_load` for the
 /// register contract.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    load: super::UniformLoad,
+    base: PtrReg,
+    ctx: PtrReg,
+) {
     AsmProgram::from([
         MovLoadPtr {
-            dst: ptr::RAX,
-            base: ptr::RDI,
+            dst: base,
+            base: ctx,
             disp: i32::from(load.ctx_slot) * 8,
         }
         .encode(),
         Evex::m0f38_66(0x18).rm(
             dst.0,
             Mem {
-                base: ptr::RAX,
+                base,
                 disp: Imm32(i32::from(load.offset) * 4),
             },
         ),
@@ -401,9 +436,11 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
 // =============================================================================
 // Masks & select — a mask is an ordinary vector (all-ones / all-zeros lanes) in
 // the regular zmm register file, exactly like NEON. It flows through the shared
-// allocator as a normal value; the k-register (k1) is only transient scratch
-// inside these encoders, never an allocatable class. This is the trait's job
-// (IsaBackend::emit_plan), not the allocator's.
+// allocator as a normal value; the k-register these encoders use transiently
+// (a `vcmpps`/`vptestmd` destination, immediately widened or read into the
+// flags) is `RegisterFile::mask_scratch`'s allocated reservation for the one
+// instruction that needs it, named through `Scratch::mask_temp`/
+// `mask_guard_temp` rather than a hardcoded constant.
 // =============================================================================
 
 /// `vcmpps`/`vpternlog` predicate (imm8). Same ordering as the SSE2 path.
@@ -413,10 +450,6 @@ const CMP_LE: u8 = 2;
 const CMP_NEQ: u8 = 4;
 const CMP_GE: u8 = 5;
 const CMP_GT: u8 = 6;
-
-/// Transient k-register used to receive a `vcmpps` result before it is widened
-/// to a vector mask. Never allocated — scratch internal to compare emission.
-const SCRATCH_K: KReg = KReg(1);
 
 /// Map a comparison `OpKind` to its `vcmpps` predicate imm8.
 fn cmp_pred(op: OpKind) -> Option<u8> {
@@ -437,22 +470,28 @@ pub fn is_compare(op: OpKind) -> bool {
     cmp_pred(op).is_some()
 }
 
-/// Emit `dst = (src1 <op> src2) ? all-ones : all-zeros` as a vector mask.
+/// Emit `dst = (srcs[0] <op> srcs[1]) ? all-ones : all-zeros` as a vector
+/// mask.
 ///
-/// `vcmpps k1, src1, src2, pred` (EVEX.512.0F.W0 C2 /r ib) writes a k-register;
-/// `vpmovm2d dst, k1` (EVEX.512.F3.0F38.W0 38 /r) widens it to a per-lane
+/// `vcmpps k, src1, src2, pred` (EVEX.512.0F.W0 C2 /r ib) writes a k-register —
+/// this instruction's `RegisterFile::mask_scratch` reservation, `k` — and
+/// `vpmovm2d dst, k` (EVEX.512.F3.0F38.W0 38 /r) widens it to a per-lane
 /// all-ones/all-zeros vector occupying the allocator-assigned `dst` zmm.
-pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
+///
+/// `srcs` is a pair rather than two more positional args to stay inside this
+/// crate's 5-argument ceiling.
+pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k: KReg) {
     let Some(pred) = cmp_pred(op) else {
         unimplemented_op("avx-512", op)
     };
-    // vcmpps k1, src1, src2, pred  (k-dest in ModRM.reg)
-    // vpmovm2d dst, k1  (widen mask -> vector)
+    let [src1, src2] = srcs;
+    // vcmpps k, src1, src2, pred  (k-dest in ModRM.reg)
+    // vpmovm2d dst, k  (widen mask -> vector)
     assemble(
         code,
         [
-            Evex::m0f(0xC2).imm(pred).rrr(SCRATCH_K.0, src1.0, src2.0),
-            Evex::m0f38_f3(0x38).rrr(dst.0, UNUSED_VVVV, SCRATCH_K.0),
+            Evex::m0f(0xC2).imm(pred).rrr(k.0, src1.0, src2.0),
+            Evex::m0f38_f3(0x38).rrr(dst.0, UNUSED_VVVV, k.0),
         ],
     );
 }
@@ -474,15 +513,23 @@ pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
 
 /// Set flags from a vector mask for the Select short-circuit guards.
 ///
-/// `vptestmd k1, mask, mask` sets `k1[i]` for each nonzero lane; `kortestw k1,k1`
-/// then sets ZF iff `k1 == 0` (all lanes false) and CF iff `k1 == 0xFFFF` (all
-/// 16 lanes true). The caller follows with `jz` (all-false) or `jc` (all-true).
-pub fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg) {
+/// `vptestmd k, mask, mask` sets `k[i]` for each nonzero lane — `k` is this
+/// guard's `RegisterFile::mask_guard_temps` reservation; `kortestw k,k` then
+/// sets ZF iff `k == 0` (all lanes false) and CF iff `k == 0xFFFF` (all 16
+/// lanes true). The caller follows with `jz` (all-false) or `jc` (all-true).
+///
+/// `kortestw`'s encoding is `VEX.L0.0F.W0 98 /r` with both operands `k1` —
+/// only `k1` is ever reserved for a guard (`MAX_MASK_TEMPS` is 1), so the
+/// fixed `0xC9` ModRM byte (`11 001 001`, encoding k1,k1) is correct as long
+/// as `k` is `k1`; `debug_assert` states that rather than silently emitting
+/// the wrong register the moment a second mask register is ever wanted here.
+pub fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg, k: KReg) {
+    debug_assert_eq!(k, KReg(1), "kortestw's ModRM below hardcodes k1,k1");
     assemble(
         code,
         [
-            // vptestmd k1, mask, mask  (EVEX.512.66.0F38.W0 27 /r)
-            Evex::m0f38_66(0x27).rrr(SCRATCH_K.0, mask.0, mask.0),
+            // vptestmd k, mask, mask  (EVEX.512.66.0F38.W0 27 /r)
+            Evex::m0f38_66(0x27).rrr(k.0, mask.0, mask.0),
             // kortestw k1, k1  (VEX.L0.0F.W0 98 /r) -> C5 F8 98 C9
             EncodedInst::from_slice(&[0xC5, 0xF8, 0x98, 0xC9]),
         ],
@@ -1055,6 +1102,21 @@ pub(crate) mod driver {
         fixed: &[],
         temps_for: super::temps_for,
         vector_bytes: 64,
+        // The gather/uniform base pointer is one GPR (`vgatherdps`'s native
+        // addressing needs no per-lane index GPR, unlike the scalar-load
+        // tiers), not SSE2's two.
+        gpr_scratch: regalloc::GprSet::of(&[x86::gpr::RAX]),
+        gpr_temps_for: super::gpr_temps_for,
+        // AVX-512's mask-register file: k1, transient scratch for a
+        // compare's `vcmpps` destination and a guard's `vptestmd`
+        // destination, never the same instruction's use of both at once.
+        mask_scratch: regalloc::MaskSet::of(&[KReg(1)]),
+        mask_temps_for: super::mask_temps_for,
+        // `vptestmd`'s k-register destination, reduced to flags by
+        // `kortestw` — the mask-class mirror of a vector `guard_temps`,
+        // needed because this tier's guard (unlike SSE2/AVX2's
+        // `movmskps`/flags) goes through the mask-register file.
+        mask_guard_temps: 1,
         ..SSE2_FILE
     }
     .checked();
@@ -1127,27 +1189,30 @@ pub(crate) mod driver {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
                 ResolvedOp::Gather { dst, idx, slot } => {
-                    // dst = buffer[slot][idx]. The context pointer (array of buffer
-                    // base pointers) is caller-provided in rdi; arithmetic/const emit
-                    // never touches rdi, so it survives to here. Both are
-                    // declared in AVX512_FILE.fixed, so `RegisterFile::checked`
-                    // proves they miss the pool, the reload pair and
-                    // the allocator's `arm_reload`.
+                    // dst = buffer[slot][idx]. The context pointer (array of
+                    // buffer base pointers) is caller-provided in
+                    // `AVX512_FILE.gpr_ctx` (rdi); arithmetic/const emit
+                    // never touches it, so it survives to here. The buffer
+                    // base pointer is `AVX512_FILE.gpr_scratch`'s allocated
+                    // reservation for this instruction.
                     let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
                     let gather_dst = crate::emit::declared_temp(plan.scratch.temp(1));
-                    const RAX: u8 = 0;
-                    const RDI: u8 = 7;
+                    let base_ptr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0));
+                    let ctx_ptr = self
+                        .file
+                        .gpr_ctx
+                        .expect("AVX-512's gather needs a GPR context input");
                     AsmProgram::from([
                         Evex::m0f_f3(0x5B).rrr(idx_int.0, UNUSED_VVVV, idx.0),
                         EncodedInst::from_slice(&[0xB8, 0xFF, 0xFF, 0x00, 0x00]),
                         EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]),
                         x86::MovLoadPtr {
-                            dst: PtrReg(RAX),
-                            base: PtrReg(RDI),
+                            dst: PtrReg(base_ptr.0),
+                            base: PtrReg(ctx_ptr.0),
                             disp: (*slot as i32) * 8,
                         }
                         .encode(),
-                        super::gather(gather_dst, RAX, idx_int),
+                        super::gather(gather_dst, base_ptr.0, idx_int),
                     ])
                     .assemble(code);
                     if *dst != gather_dst {
@@ -1156,7 +1221,14 @@ pub(crate) mod driver {
                     }
                 }
                 ResolvedOp::Uniform { dst, load } => {
-                    super::emit_uniform_load(code, *dst, *load);
+                    let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
+                    let ctx = PtrReg(
+                        self.file
+                            .gpr_ctx
+                            .expect("AVX-512's uniform load needs a GPR context input")
+                            .0,
+                    );
+                    super::emit_uniform_load(code, *dst, *load, base, ctx);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -1165,9 +1237,11 @@ pub(crate) mod driver {
                     right,
                 } => {
                     // EVEX 3-operand: no two-operand hazard, emit directly.
-                    // Comparisons produce a vector mask (vcmpps -> vpmovm2d).
+                    // Comparisons produce a vector mask (vcmpps -> vpmovm2d),
+                    // through the mask-register temp `mask_temps_for` reserved.
                     if super::is_compare(*op) {
-                        super::emit_compare(code, *op, *dst, *left, *right);
+                        let k = crate::emit::declared_mask_temp(plan.scratch.mask_temp(0));
+                        super::emit_compare(code, *op, *dst, [*left, *right], k);
                     } else {
                         super::emit_binary(code, *op, *dst, *left, *right);
                     }
@@ -1252,14 +1326,13 @@ pub(crate) mod driver {
         // Select short-circuit guards: reduce the vector mask to flags (vptestmd +
         // kortestw) and branch. jz = all-false (skip true arm); jc = all-true (skip
         // false arm). Mirrors the SSE2 MOVMSKPS guards, k-register-based.
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
-        /// `_scratch` is unused: this tier reduces the mask with `kortest`
-        /// into the flags, needing no vector register. One `kortest` sets both
-        /// answers at once, which is why the arm picks a condition rather than
-        /// a different reduction.
+        /// [`MaskTest::scratch`] is unused: this tier reduces the mask with
+        /// `kortest` into the flags, needing no *vector* register. It is the
+        /// one tier that wants [`MaskTest::mask_scratch`], because `vptestmd`
+        /// lands in a `k`-register before `kortestw` can read it.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
-            super::emit_mask_flags(&mut asm.code, test.reg);
+            let k = crate::emit::declared_mask_temp(test.mask_scratch);
+            super::emit_mask_flags(&mut asm.code, test.reg, k);
             // One `kortest` sets both answers at once, so the arm picks the
             // condition rather than a different reduction.
             asm.push(match test.arm {
