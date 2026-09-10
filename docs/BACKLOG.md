@@ -259,3 +259,11 @@ roughly 800 lines to 150 — and makes H1's padding free.
   ever gone through them. Delete with S2, not before — they are the worked
   example of a domain-side extent.
   ([glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S2)
+- **aarch64's constant pool is 4× its own data.** `emit_pool_entry` splats each
+  `f32` to 16 bytes so `LDR Q` can read it as a vector, so a 60-coefficient
+  transcendental kernel spends 960 bytes — 15 cache lines — on 240 bytes of
+  constants. `LD1R {Vt.4S}, [Xn]` loads-and-replicates in one instruction at
+  the same cost, but takes no immediate offset, so every load would pay an
+  `ADD` to form its address. Not worth it while the pool fits in L1d, which it
+  does for every kernel measured. It stops fitting near the cap — 4095 entries
+  is ~65 KB — and that is the case to check before dismissing this again.

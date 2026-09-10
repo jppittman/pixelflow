@@ -471,6 +471,14 @@ pub fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 // Constant Pool Support
 // =============================================================================
 
+/// What the constant pool is called.
+///
+/// One name per emitted function, because there is one pool per emitted
+/// function: the anchor branches to it before a single constant is known, and
+/// the pool is written where it lands. Nothing is carried between the two —
+/// they agree because they spell the same thing.
+pub const CONST_POOL: &str = "const_pool";
+
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
 pub fn needs_const_pool(val: f32) -> bool {
@@ -1270,7 +1278,7 @@ mod tests {
         // under the old scheme's margin either.
         for gap in [0, 4, 0xFFC, 0x1000, 0x1004, 0x2000, 3 << 20] {
             let mut asm = Assembly::default();
-            let pool = asm.label();
+            let pool = Label::new(CONST_POOL);
             asm.push(AdrpAdd {
                 dst: Gpr(17),
                 target: pool,
@@ -1296,7 +1304,7 @@ mod tests {
     fn adrp_add_reaches_backwards() {
         for gap in [0usize, 4, 0x1000, 0x2004] {
             let mut asm = Assembly::default();
-            let pool = asm.label();
+            let pool = Label::new(CONST_POOL);
             asm.bind(pool);
             asm.code.resize(gap, 0);
             asm.push(AdrpAdd {
@@ -1316,7 +1324,7 @@ mod tests {
     fn adrp_add_has_no_single_word_encoding() {
         let word = Inst::from(AdrpAdd {
             dst: Gpr(17),
-            target: Label(0),
+            target: Label::new("end"),
         })
         .encode();
         unreachable!("encode handed back {word:#010x} for a two-word instruction");
@@ -1892,11 +1900,6 @@ pub(crate) mod driver {
 
     pub(crate) struct Aarch64Backend {
         consts: ConstPool,
-        /// The constant pool's position, once `scaffold_anchor` has minted
-        /// it — a name rather than the offset `adr_patch_pos` used to be,
-        /// since there is no longer an estimate for that offset to disagree
-        /// with.
-        pool: Option<Label>,
         file: regalloc::RegisterFile,
     }
 
@@ -1915,7 +1918,6 @@ pub(crate) mod driver {
         pub(crate) fn new(ctx: EmitCtx) -> Self {
             Self {
                 consts: ConstPool::new(),
-                pool: None,
                 file: AARCH64_FILE.capped(ctx.max_regs),
             }
         }
@@ -2064,34 +2066,29 @@ pub(crate) mod driver {
         /// The prologue's and body's constant loads are X17-relative, so the
         /// anchor has to be inside the emitted function, after the frame.
         fn scaffold_anchor(&mut self, asm: &mut Assembly) {
-            let pool = asm.label();
-            self.pool = Some(pool);
             asm.push(AdrpAdd {
                 dst: X17.into(),
-                target: pool,
+                target: Label::new(CONST_POOL),
             });
         }
 
         /// Append the constant pool after the final `RET`.
         ///
-        /// `scaffold_anchor` names `self.pool` in an `AdrpAdd` unconditionally
-        /// — whether or not this compile needed the pool is not known until
-        /// every constant has been emitted — so the label must be bound here
-        /// even when there is nothing to append: `Assembly::finish` panics on
-        /// a reference nothing bound, and an unpatched `AdrpAdd` would leave
-        /// X17 pointing at itself, same as the unpatched `ADR` this replaced.
+        /// `scaffold_anchor` branches to [`CONST_POOL`] unconditionally —
+        /// whether this compile needed the pool is not known until every
+        /// constant has been emitted — so the name must be written here even
+        /// when there is nothing to append: `Assembly::finish` panics on a
+        /// name nobody wrote, and an unpatched `AdrpAdd` would leave X17
+        /// pointing at itself, same as the unpatched `ADR` this replaced.
         fn scaffold_finish(&mut self, asm: &mut Assembly) {
-            let pool = self
-                .pool
-                .expect("scaffold_anchor always mints one before this runs");
             if self.consts.is_empty() {
-                asm.bind(pool);
+                asm.bind(CONST_POOL);
                 return;
             }
             while !asm.code.len().is_multiple_of(16) {
                 asm.code.push(0);
             }
-            asm.bind(pool);
+            asm.bind(CONST_POOL);
             for &bits in &self.consts.entries {
                 super::emit_pool_entry(&mut asm.code, bits);
             }
@@ -2814,7 +2811,7 @@ mod label_tests {
 
     #[test]
     fn forward_branch_counts_instructions_not_bytes() {
-        let end = Label(0);
+        let end = Label::new("end");
         let code = assemble([
             Item::Inst(B { target: end }.into()),
             Item::Inst(NOP),
@@ -2827,7 +2824,7 @@ mod label_tests {
 
     #[test]
     fn a_back_edge_is_negative() {
-        let top = Label(0);
+        let top = Label::new("end");
         let code = assemble([
             Item::Label(top),
             Item::Inst(NOP),
@@ -2844,7 +2841,7 @@ mod label_tests {
 
     #[test]
     fn a_conditional_writes_imm19_and_keeps_its_condition() {
-        let exit = Label(0);
+        let exit = Label::new("end");
         let code = assemble([
             Item::Inst(BCond::hs(exit).into()),
             Item::Inst(NOP),
@@ -2858,7 +2855,7 @@ mod label_tests {
 
     #[test]
     fn cbz_keeps_its_register() {
-        let exit = Label(0);
+        let exit = Label::new("end");
         let code = assemble([
             Item::Inst(CbzW16 { target: exit }.into()),
             Item::Inst(NOP),
@@ -2874,7 +2871,7 @@ mod label_tests {
     /// on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
-        let end = Label(0);
+        let end = Label::new("end");
         let code = assemble([Item::Inst(B { target: end }.into()), Item::Label(end)]);
         assert_eq!(code.len(), 4);
         assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 1);
@@ -2882,7 +2879,7 @@ mod label_tests {
 
     #[test]
     fn a_program_is_position_independent() {
-        let end = Label(0);
+        let end = Label::new("end");
         let items = [
             Item::Inst(B { target: end }.into()),
             Item::Inst(NOP),

@@ -951,7 +951,7 @@ mod label_tests {
     /// position that does not exist yet.
     #[test]
     fn a_forward_branch_names_a_position_bound_later() {
-        let end = Label(0);
+        let end = Label::new("end");
         let code = assemble([
             Item::Inst(Inst::from(Jmp { target: end })),
             Item::Inst(Inst::ret()),
@@ -969,7 +969,7 @@ mod label_tests {
     /// resolution pass is separate from the layout pass.
     #[test]
     fn a_back_edge_resolves_to_a_negative_displacement() {
-        let top = Label(0);
+        let top = Label::new("end");
         let code = assemble([
             Item::Label(top),
             Item::Inst(Inst::ret()),
@@ -988,7 +988,7 @@ mod label_tests {
     /// on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
-        let end = Label(0);
+        let end = Label::new("end");
         let code = assemble([
             Item::Inst(Inst::from(Jmp { target: end })),
             Item::Label(end),
@@ -1000,7 +1000,7 @@ mod label_tests {
     /// And two labels may name the same position, for the same reason.
     #[test]
     fn two_labels_can_share_a_position() {
-        let (a, b) = (Label(0), Label(1));
+        let (a, b) = (Label::new("end"), Label::new("other"));
         let code = assemble([
             Item::Inst(Inst::from(Jcc {
                 condition: Cond::E,
@@ -1020,7 +1020,7 @@ mod label_tests {
     /// be assembled after bytes that are already there.
     #[test]
     fn a_program_is_position_independent() {
-        let end = Label(0);
+        let end = Label::new("end");
         let items = [
             Item::Inst(Inst::from(Jmp { target: end })),
             Item::Label(end),
@@ -1032,15 +1032,20 @@ mod label_tests {
     }
 
     #[test]
-    #[should_panic(expected = "never bound")]
+    #[should_panic(expected = "never written")]
     fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
-        let _ = assemble([Item::Inst(Jmp { target: Label(0) }.into())]);
+        let _ = assemble([Item::Inst(
+            Jmp {
+                target: Label::new("end"),
+            }
+            .into(),
+        )]);
     }
 
     #[test]
-    #[should_panic(expected = "bound twice")]
+    #[should_panic(expected = "written twice")]
     fn a_label_bound_twice_is_a_bug() {
-        let twice = Label(0);
+        let twice = Label::new("end");
         let _ = assemble([Item::Label(twice), Item::Label(twice)]);
     }
 }
@@ -2430,7 +2435,7 @@ mod gpr_tests {
     fn branches_patch_relative_to_the_next_instruction() {
         use crate::emit::{AsmProgram, Item, Label};
 
-        let end = Label(0);
+        let end = Label::new("end");
         let mut c = Vec::new();
         AsmProgram::new([
             Item::Inst(Inst::from(Jmp { target: end })),
@@ -2447,7 +2452,7 @@ mod gpr_tests {
             "rel is from the next insn"
         );
 
-        let top = Label(0);
+        let top = Label::new("end");
         let mut c = Vec::new();
         AsmProgram::new([Item::Label(top), Item::Inst(Inst::from(Jcc::jae(top)))]).assemble(&mut c);
         assert_eq!(c[..2], [0x0F, 0x83]);

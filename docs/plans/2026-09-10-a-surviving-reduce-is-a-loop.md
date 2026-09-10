@@ -59,25 +59,40 @@ the count to stop being part of the key.
 
 ## 3. The design decision that makes this tractable
 
-**The accumulator lives in a slot, not a register.**
+~~**The accumulator lives in a slot, not a register.**~~ **Superseded
+2026-09-10 — see §3a.** The original claim was that the accumulator should be
+pinned to a frame slot, loaded at the top of each iteration and stored at the
+bottom, so that no value is live across the back edge and `LinearScan` never
+has to represent one. It costs one load and one store per iteration, which
+against a ~1,000-instruction body is nothing, and the same trick was to supply
+the binder.
 
-`emit_collapse_loop` keeps its loop-carried value — the coordinate — in a
-frame slot: `slot_load` at the top of each iteration, `slot_store` at the
-bottom. So **no value is live across the back edge**, and `LinearScan`, which
-is straight-line over a flat schedule and has no CFG, never has to represent
-one.
+## 3a. Correction: placement is the allocator's job (JP, 2026-09-10)
 
-That is the whole reason this does not need the allocator work L5 names for a
-call. It costs one load and one store per iteration — against a body of ~1,000
-instructions, nothing.
+> *"Register allocation is the job of the register allocator. I want to
+> eliminate fixed, single case oob, bespoke allocations."*
 
-The same trick supplies the binder: the body reads `Var(4..8)` as an `f32`
-index, and the loop broadcasts its counter into that register at the top of
-each iteration, exactly as the collapse nest reloads `coord_reg(k)`.
+§3 is a **bespoke allocation** wearing a performance argument. It decides,
+outside the allocator and for one value, that the accumulator is in memory —
+which is precisely the class of thing step 3 exists to delete, alongside the
+X/Y precoloring, `SCAFFOLD_ACC`, and the `Counter` registers.
 
-**Do not "improve" this to keep the accumulator in a register** without first
-giving the allocator live ranges with holes. That is the same boundary L5
-names, and it is not needed here.
+The accumulator is a **value**. It has a live range that spans the loop, and
+the question "register or slot" is the allocator's, asked and answered the
+same way for every other value that crosses a scope boundary: `allocate_nest`
+already ranks a scope's roots by use count against the pool budget and parks
+each one in a carried register or a slot accordingly. A fold's accumulator
+goes through that path or the path is wrong for everything else too.
+
+Which is the argument *for* §4b's shape rather than a complication of it. A
+fold bracketed inside the body scope has no park mechanism available and needs
+a bespoke answer; a fold that is a scope of the nest has the general one
+already. The pinned slot was never a design decision — it was the workaround
+the wrong shape forced, and it disappears with the shape.
+
+What §3 got right and keeps: **nothing here needs live ranges with holes.**
+That was the stated reason for pinning, and it survives without the pinning,
+because a park is a whole-scope answer rather than a hole in one.
 
 ## 4. Stages
 
@@ -146,10 +161,13 @@ over a table produces the same buffer looped as unrolled, on both ISAs, for
 *What R1 looks like in this tree, read off the code rather than guessed at
 (2026-09-10):*
 
-**The loop-carried accumulator is a phi, and the slot is how you spell one.**
-`LinearScan` is straight-line over a flat schedule and has no phis, which is why
-§3 puts the accumulator in a slot. What §3 did not say is that this needs *no
-new machinery at all*: it is three ordinary schedule defs plus a pin.
+**The loop-carried accumulator is a phi, and the park is how you spell one.**
+`LinearScan` is straight-line over a flat schedule and has no phis. This was
+written as "which is why §3 puts the accumulator in a slot"; §3a retracts the
+pinning — a park is the general spelling, and the allocator chooses between a
+carried register and a slot the way it already does for every root. What
+stands is that this needs *no new machinery at all*: it is three ordinary
+schedule defs.
 
 ```text
 acc_init = Const(identity)                    // before the loop
@@ -157,17 +175,23 @@ acc_init = Const(identity)                    // before the loop
 acc_next = Binary(monoid_op, acc_init, body_root)
 ```
 
-- `acc_init` and `acc_next` are pinned to the **same slot** (`FrameLayout::pin_slot`).
-  That aliasing *is* the phi: the bottom of the iteration stores, the top reads.
-- `acc_next` reaching its slot is already automatic. `store_after_def[i]` is set
-  for any value that has a slot and whose def-point binding is a register —
-  *"every definition writes a register, so this is the only place a value
-  reaches its slot"* — so the emitter stores it with no new verb.
+- `acc_init` and `acc_next` are the **same park**: the fold scope's live-in and
+  its live-out are one place, and that aliasing *is* the phi — the bottom of
+  the iteration writes where the top reads. Which place is the allocator's
+  call, not this plan's (§3a): a carried register when the budget affords one,
+  a slot when it does not, ranked by use count like every other root.
+- If the park is a slot, `acc_next` reaching it is already automatic.
+  `store_after_def[i]` is set for any value that has a slot and whose def-point
+  binding is a register — *"every definition writes a register, so this is the
+  only place a value reaches its slot"* — so the emitter stores it with no new
+  verb. If the park is a register, there is nothing to store.
 - `acc_init` inside the loop, and the binder's `Var(4..8)` def, are read from
-  their slots by the ordinary spill machinery. That is exactly what
-  `HoistCtx::Body` already does for a parked value: *"mapped values are never
-  emitted; their locations are overridden … to the hoist slot, where every
-  consumer reloads through the ordinary spill machinery."*
+  the park by the ordinary machinery. That is exactly what `HoistCtx::Body`
+  already does for a parked value: *"mapped values are never emitted; their
+  locations are overridden — to a carried register where the allocator found
+  one, and otherwise to the hoist slot, where every consumer reloads through
+  the ordinary spill machinery."* Both halves of that sentence apply here; the
+  retracted §3 only ever used the second.
 
 So the accumulate is an **ordinary `Binary` def**, not a loop verb. No scratch
 register has to be reserved for it, no `combine` verb is added to `IsaBackend`,

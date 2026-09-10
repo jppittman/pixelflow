@@ -202,8 +202,81 @@ pub fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = 
 /// passes instead of one — lay the items out, then fill in the displacements
 /// that could not be known until the layout was — which is the only thing that
 /// changed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Label(pub u32);
+/// A label is a **name**.
+///
+/// That is the whole of it. You write instructions and labels, you assemble,
+/// you get a binary; addresses never come back out, and the caller is not a
+/// participant in working them out. Mapping names to hex is the assembler's
+/// job, which is the only reason to have one.
+///
+/// So this is not a handle. There is nothing to mint, nothing to keep, and no
+/// table to look a name up in — a branch to `"row_top"` and the `"row_top"`
+/// written later in the stream are the same label because they are the same
+/// name. Whatever the emitter uses to *build* a name — a schedule index, a
+/// `ValueId`, a guard arm — is its own business and stops here.
+///
+/// The name is inline rather than a `String` so that a label is `Copy`: a
+/// branch instruction holds one, and [`AsmInsn`] is `Copy`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Label {
+    name: [u8; Self::CAPACITY],
+    len: u8,
+}
+
+impl Label {
+    /// The longest a name may be. Generous for the names this emitter writes
+    /// (`"batch_exit"`, `"v1234_past_true"`) and small enough that carrying
+    /// one inside an instruction is free.
+    pub const CAPACITY: usize = 31;
+
+    /// The label called `name`.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is longer than [`Label::CAPACITY`]. Only this crate writes
+    /// these programs, and a truncated name is one that silently aliases
+    /// another — so it refuses rather than trims.
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        let bytes = name.as_bytes();
+        assert!(
+            bytes.len() <= Self::CAPACITY,
+            "label {name:?} is longer than {} bytes",
+            Self::CAPACITY
+        );
+        let mut buffer = [0u8; Self::CAPACITY];
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            name: buffer,
+            len: bytes.len() as u8,
+        }
+    }
+
+    /// The name, as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.len as usize])
+            .unwrap_or_else(|_| unreachable!("built from a &str"))
+    }
+}
+
+impl From<&str> for Label {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl core::fmt::Display for Label {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::fmt::Debug for Label {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
 
 /// How an instruction whose bytes depend on a position gets those bytes.
 ///
@@ -254,7 +327,6 @@ pub struct Assembly {
     /// The bytes so far. Public because emitting into it is what a backend verb
     /// does.
     pub code: Vec<u8>,
-    next_label: u32,
     bound: alloc::collections::BTreeMap<Label, usize>,
     pending: Vec<(usize, LabelRef)>,
 }
@@ -284,28 +356,23 @@ impl Assembly {
         }
     }
 
-    /// A name for a position nothing has bound yet.
+    /// Write a label here — the name of this position.
     ///
-    /// Minting is separate from binding precisely so a branch may name a
-    /// position that does not exist yet — which is every forward branch, and
-    /// the exit of every loop.
-    pub fn label(&mut self) -> Label {
-        let id = self.next_label;
-        self.next_label += 1;
-        Label(id)
-    }
-
-    /// Bind `label` here.
+    /// A branch may name a position before it exists, which is every forward
+    /// branch and the exit of every loop, so nothing here checks that anything
+    /// refers to it. [`Assembly::finish`] is where a name nobody wrote is
+    /// reported.
     ///
     /// # Panics
     ///
-    /// If it is already bound. A name that means two positions is not a name,
-    /// and only this crate mints them, so that is a bug here rather than
-    /// anything about the kernel being compiled.
-    pub fn bind(&mut self, label: Label) {
-        let at = self.code.len();
+    /// If this name is already written elsewhere in the program. A name that
+    /// means two positions is not a name, and only this crate writes these
+    /// programs, so that is a bug here rather than anything about the kernel
+    /// being compiled.
+    pub fn bind(&mut self, label: impl Into<Label>) {
+        let (label, at) = (label.into(), self.code.len());
         let previously = self.bound.insert(label, at);
-        assert!(previously.is_none(), "{label:?} was bound twice");
+        assert!(previously.is_none(), "{label} was written twice");
     }
 
     /// Emit one instruction, recording the name it waits on if it has one.
@@ -324,10 +391,10 @@ impl Assembly {
     /// If a branch names a label nothing bound.
     #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
-        for (at, reference) in self.pending {
-            let target = *self.bound.get(&reference.label).unwrap_or_else(|| {
-                panic!("{:?} is named by a branch but never bound", reference.label)
-            });
+        for (at, reference) in core::mem::take(&mut self.pending) {
+            let Some(&target) = self.bound.get(&reference.label) else {
+                panic!("{} is branched to but never written", reference.label)
+            };
             (reference.patch)(&mut self.code, at, target);
         }
         self.code
@@ -1207,7 +1274,9 @@ trait IsaBackend {
     /// the region ends — which is exactly how the `Select` guards' branch spans
     /// are already handled a few hundred lines below.
     fn loop_open(&mut self, asm: &mut Assembly, counter: Counter) -> LoopFrame {
-        let (top, exit) = (asm.label(), asm.label());
+        // Named after what drives the loop, because that is what tells one
+        // from the loop it nests inside.
+        let (top, exit) = (counter.label("top"), counter.label("exit"));
         self.counter_clear(&mut asm.code, counter);
         asm.bind(top);
         self.branch_if_counter_done(asm, counter, exit);
@@ -1456,6 +1525,17 @@ enum Counter {
     Row,
 }
 
+impl Counter {
+    /// This loop's `part`, as a label: `batch_top`, `row_exit`.
+    fn label(self, part: &str) -> Label {
+        let name = match self {
+            Self::Batch => "batch",
+            Self::Row => "row",
+        };
+        Label::new(&alloc::format!("{name}_{part}"))
+    }
+}
+
 /// How far the output pointer moves.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum OutStep {
@@ -1526,8 +1606,6 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     hoist: HoistCtx<'_>,
     frame_override: Option<u32>,
 ) -> Result<(Vec<u8>, Reg, u32, u32), CompileError> {
-    use alloc::collections::BTreeMap;
-
     let file = backend.register_file();
     // Allocation happened before this call — once per region, over the whole
     // nest. The allocator chooses the evaluation order, so everything here —
@@ -1569,7 +1647,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     }
     let mut branch_starts: alloc::vec::Vec<alloc::vec::Vec<PendingBranch>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
-    let mut branch_ends: alloc::vec::Vec<alloc::vec::Vec<usize>> =
+    let mut branch_ends: alloc::vec::Vec<alloc::vec::Vec<PendingBranch>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     for (gi, guard) in select_guards.iter().enumerate() {
         for arm in SelectArm::ALL {
@@ -1577,11 +1655,27 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             if range.0 != range.1 {
                 branch_starts[range.0].push(PendingBranch { guard_idx: gi, arm });
                 if range.1 < sched_len {
-                    branch_ends[range.1].push(gi);
+                    // The arm too, not just the guard: an end used to name the
+                    // guard alone and recover the arm by trying both, which
+                    // meant a guard whose arms end together was visited twice.
+                    branch_ends[range.1].push(PendingBranch { guard_idx: gi, arm });
                 }
             }
         }
     }
+
+    // What to call the point past one arm of one guard. The `Select`'s own
+    // `ValueId` rather than its index in `select_guards`, because the node is
+    // the identity and the index is a position in a scratch vector — and
+    // because two guards can share a mask, so the mask would alias.
+    let arm_join = |guard: &guards::SelectGuard, arm: SelectArm| {
+        let select = schedule[guard.select_idx].value;
+        let side = match arm {
+            SelectArm::True => "true",
+            SelectArm::False => "false",
+        };
+        Label::new(&alloc::format!("v{}_past_{side}", select.0))
+    };
 
     // One dense ValueId -> Binding lookup for the hot loop, carried *forward*: a
     // placement is a schedule, so the answer changes at program points, and
@@ -1666,11 +1760,6 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         }
     }
 
-    // A guard's skip branch and the point it lands on are separated by an
-    // arbitrary stretch of schedule, so the landing point gets a name and the
-    // branch names it. What is pending is the *binding*, not a fixup.
-    let mut pending_binds: BTreeMap<(usize, SelectArm), Label> = BTreeMap::new();
-
     for (sched_idx, def) in schedule.iter().enumerate() {
         let (vid, sched_op) = (&def.value, &def.op);
 
@@ -1686,12 +1775,8 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // claiming otherwise. Ordering it first costs nothing when there is
         // nothing to reconcile — which is every kernel that reaches this
         // without a split live range.
-        for &gi in &branch_ends[sched_idx] {
-            for arm in SelectArm::ALL {
-                if let Some(label) = pending_binds.remove(&(gi, arm)) {
-                    asm.bind(label);
-                }
-            }
+        for pb in &branch_ends[sched_idx] {
+            asm.bind(arm_join(&select_guards[pb.guard_idx], pb.arm));
         }
 
         // Ranges that begin here. A register range starting away from the
@@ -1729,14 +1814,13 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 Binding::Loc(Loc::Reg(r)) => r,
                 _ => backend.emit_resolve(&mut asm.code, guard.mask_vid, guard_mask(), &locs),
             };
-            let past_arm = asm.label();
+            let past_arm = arm_join(guard, arm);
             let test = MaskTest {
                 reg: mask_reg,
                 scratch: guard_temp,
                 arm,
             };
             backend.branch_if_arm_is_dead(&mut asm, test, past_arm);
-            pending_binds.insert((guard_idx, arm), past_arm);
         }
 
         // A hoisted value's placeholder def emits nothing — the prologue
@@ -1767,7 +1851,11 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let true_reg = in_reg(*true_vid);
             let false_reg = in_reg(*false_vid);
 
-            let (only_false, only_true, join) = (asm.label(), asm.label(), asm.label());
+            // Named after the `Select` they belong to, so two of these in one
+            // schedule cannot collide however they interleave.
+            let part = |part: &str| Label::new(&alloc::format!("v{}_{part}", vid.0));
+            let (only_false, only_true, join) =
+                (part("only_false"), part("only_true"), part("join"));
 
             // Both guards read `mask_reg`, which is why the reduction
             // scratch is a reservation of its own rather than whichever
@@ -1855,11 +1943,9 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         }
     }
 
-    assert!(
-        pending_binds.is_empty(),
-        "BUG: {} Select short-circuit branches name a point the schedule never reached",
-        pending_binds.len()
-    );
+    // No "did every branch get its landing point" assertion here any more:
+    // `Assembly::finish` panics on a name nobody wrote, which is the same
+    // check, stated once, for every branch rather than only these.
 
     // The scope's result, in a register for the scaffold to store. Usually the
     // last instruction's own destination; not when the body's root was hoisted
