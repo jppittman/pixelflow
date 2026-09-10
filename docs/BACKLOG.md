@@ -2,7 +2,7 @@
 
 ## Metadata
 - **Status**: `Plan of record`
-- **Verified against**: `6f3eb619e314304149db65d71bafbe7c096cfd15`
+- **Verified against**: `3a4c4e3247c90bc1dd980e268f2edec505dd6fd1`
 
 The running list of open work. One line per item, pointing at the document
 that owns the detail — this file is an **index and a status**, never the
@@ -17,6 +17,40 @@ reads as current.
 Ordering inside a section is rough priority, not a commitment.
 
 ---
+
+## The shape
+
+**Almost everything below is one pattern.** A structure the language has is
+destroyed early by an unconditional pass, and a later stage spends real work
+partially reconstructing it:
+
+| the structure | destroyed by | reconstructed by |
+|---|---|---|
+| a fold — a **loop** | `ExpandReduce`, unconditionally, every time | nothing; the loop is simply gone, so `partition_by_scope` is handed `[0,1]` and can never hoist out of a fold (**N5**, H4) |
+| a reference — a **call** or a block | `ExpandRefs`, unconditionally, *before* saturation | nothing; extraction never sees a boundary to keep (**N2**, N3) |
+| a tabulation — a **name for memory** | `push_gather` in `DiscreteManifold::kernel_for` | a `Gather` case in every pass — `contains_gather`, `lower_dwrt`'s table rule, `MAX_BOUND_BUFFERS` (**N1**, N4) |
+| a select's arms — **blocks** | flattening the DAG to a linear schedule | `cluster_select_arms`, which was a permutation *search* and 73% of a glyph bake (**H5**, now one pass) |
+| a mask's region — a **domain split** | never derived at all | nothing, until `mask_support` (**D1**, landed) |
+
+The fix is the same shape every time, and it is not "optimize the
+reconstruction": **stop destroying it, and let the cost model choose.** That is
+what [a-kept-structure-is-control-flow](plans/2026-09-10-a-kept-structure-is-control-flow.md)
+says for control flow and [one-name-bound-later](plans/2026-09-10-one-name-bound-later.md)
+says for names — the same claim about the two halves of a function, its
+parameters and its control flow. **D7** is that claim about the conditional.
+
+**Two threads, and they are not the same work.**
+
+- **The terminal is unusable**, and the fix is **H1 (S3)** alone: 95 compiles →
+  1, ~31 s → ~2 s. This is *not* an instance of the pattern above. It is
+  "don't pay a cost 95 times," it is orthogonal to everything architectural,
+  and it is **untouched**.
+- **The compiler reconstructs what it destroyed.** Everything in Names, Demand
+  and the e-graph. This is where the measurement led and where the effort has
+  gone; it makes the compiler right rather than merely fast.
+
+Keep them apart when prioritising. H5 cut a bake 36%, which is a real win and
+also a constant factor on a cost H1 would make **95× smaller**.
 
 ## The hump
 
@@ -152,7 +186,7 @@ dissolve it. What is unbounded is the **search**, not the need.
 | **H1** | **S3 — one program for the font.** Font-wide extent, table padded with monoid identities, so every glyph compiles to the same program and a glyph becomes a table write. 95 compiles → 1. With H2 measured, this is the whole hump. | [glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S3 |
 | **H2** | ~~Split the 331 ms between compile and collapse.~~ **Done** — see above. | — |
 | **H3** | **Hash-consing in `ExprArena`.** Prototyped and measured: arena 2,721 → 154 nodes, 2.1–2.2× on the glyph suites, extracted kernel unchanged. In flight (JP). Lands on the compile half, so it compounds with H1 rather than competing. | [exprarena-on-dag](plans/2026-09-09-exprarena-on-dag.md) §5.2 |
-| **H5** | **Bound the guard search by what a guard can pay.** A `Select` is a blend — both arms run every batch — and a *guard* is a real branch skipping an arm when no lane in the batch wants it (worth ~2× per row on `O`@32, per the demand plan's C1 numbers). A branch skips a contiguous range, so an arm is only guardable when the values it owns form one unbroken run; `cluster_select_arms` permutes the schedule to make that so, in up to `MAX_CLUSTER_ROUNDS = 8` rounds, each recomputing every arm's transitive closure. That search is 73% of a glyph bake and finds a constant 282 bytes (X1 above). **Contiguity is real work** — demand does not give it for free, see the correction above — so the target is the search's cost, not its existence. Two leads, in order: (a) `demand.rs` names one, *"a partition that ordered within its groups"*, which would replace repeated trial with one pass; (b) failing that, bound when to search at all, derived from `n` and the `LatticeShape`'s trip count, both already at the call site — **not** a schedule-size cutoff. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
+| **H5** | ~~Bound the guard search by what a guard can pay.~~ **Search killed** (`3a4c4e3`): `cluster_select_arms` is one unconditional pass — partition every select worth guarding and not already contiguous, outermost first, each once. `MAX_CLUSTER_ROUNDS`, `is_improvement` and `guarded_spans` went with the hill-climbing. **31.5 s → 20.0 s** on the 95-glyph atlas *with guards kept* (the 9.8 s figure above is what the optimization is worth, not a target — it comes from discarding them). `MISPREDICT_PENALTY_CYCLES` stays: one comparison, and measured, not tuned — a glyph's coverage mask is 3.6× *slower* guarded. **What remains:** `select_arms` is recomputed once per partitioned select, O(selects²·n). A single stable sort keyed by arm ownership would be one pass. But see **D6/D7** — the decision belongs in the e-graph, and optimizing this further is polishing a reconstruction. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
 | **H4** | **Ask B — hoist binder-only work out of the pixel loop.** ~~On the hump.~~ **Demoted by H2**: it optimizes *collapse*, which is 0.2% of a bake, and a glyph bakes once into the atlas and is a gather forever after. Still real for per-frame kernels that are not atlas-cached; not the terminal's startup problem. **Do not patch `contains_gather`** (N1) and do not write a new hoist (N5). | [a-glyph-is-a-circle](plans/2026-09-09-a-glyph-is-a-circle.md) §B |
 
 S3's own doc calls itself "a trade, not a win — fewer compiles against
@@ -180,6 +214,9 @@ H1 is picked up.
 | **D3** | Bind-time tier, and splitting `IndexRange` into a derived region and a requested band. | *ibid.* |
 | **D4** | Interval evaluation, target-aware and rounding outward. Unlocks glyph supports, which the symbolic tier cannot reach (a compound glyph's affine mixes X and Y). | *ibid.* |
 | **D5** | Lowering 2 on the general predicate — the superseded demand plan's §1–§2, as the third case rather than the whole subject. **Does not delete `cluster_select_arms`**: `emit/demand.rs` already computes the predicate and disproved that plan's scheduling claim (see the correction above). What it buys is *more* exclusivity than `guards` finds — the per-select `demand_exclusive` vs `exclusive` gap under `PIXELFLOW_GUARD_TELEMETRY` — and `demand.rs` says outright that this gap, not the scheduling claim, is what C1b should be justified by. Read that measurement before starting. | *ibid.* |
+
+| **D6** | **A static demand fraction in the extraction cost** (the demand plan's C2a). Extraction is additive per node; the demand-aware cost is `cost(node) · P(demanded)`, with `P = 1` where a node is unguardable. Where the demand is a row-uniform mask with a known extent, `P` is **static and already in the program** — a segment gated on `y_lo ≤ Y < y_hi` over a 45-row glyph is demanded on `(y_hi − y_lo)/45` of rows. This is what D7 needs and what nothing today supplies. | [demand-is-a-dag-property](plans/2026-09-07-demand-is-a-dag-property.md) §4 |
+| **D7** | **`Guard` in the graph, and the sink rule** (C2b) — *guarding becomes the e-graph's decision instead of codegen's.* Today it is neither: `analyze_select_guards` runs on the linearized schedule, after extraction, and the emitter places branches from it. Worse, the graph pulls the other way — `SelectHoistUnary` rewrites `Select(m, f(a), f(b)) → f(Select(m, a, b))`, hoisting shared work *out* of arms, which is right for op count and exactly wrong for guarding when `f` is expensive and `m` is coherent, and **no term in the extraction cost opposes it**. Denote `Select(m, a, b)` as `Guard(m, a) ⊕ Guard(¬m, b)`, add the inverse sink rule, and let the cost decide. Needs D6 for the term. Composes with N1: `Guard(m, Ref(a))` carries its arm as a unit, which is what makes H5's partition *unsayable* rather than merely cheap. | [demand-is-a-dag-property](plans/2026-09-07-demand-is-a-dag-property.md) §4 |
 
 D1 → D2 unblocks **S2**: deleting `cells`, `contour_bounds`, the `Union`
 plumbing, `TEXT_CELL`, `min_of`, `may_be_interior` and `chord_winding` —
@@ -212,6 +249,10 @@ roughly 800 lines to 150 — and makes H1's padding free.
 - `Kernel::parts()` hands out the **unlinked** fragment, and five measurement
   consumers each learned to link first. Right division, five copies of one
   line. ([composition-is-linking](plans/2026-09-09-composition-is-linking.md) §7)
+- **This file is drifting from its own rule.** "The hump" is now several
+  screens of narrative where the preamble says index-and-status. The
+  measurements belong in `docs/results/`; the section should be four rows and
+  a pointer.
 - `cells` / `text_union` reach only one Criterion bench; nothing on screen has
   ever gone through them. Delete with S2, not before — they are the worked
   example of a domain-side extent.
