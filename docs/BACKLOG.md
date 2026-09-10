@@ -51,9 +51,25 @@ Two consequences, both of which move items in this table:
 - **Compile is superlinear in piece count and depends on the shape.** `A` (11
   pieces) and `8` (34) at 32 px are 163 ms and 2,096 ms — 3.1× the pieces for
   12.9× the time — and `8` costs 758 ms at 16 px against 2,096 ms at 32 px on
-  the same pieces, because saturation and extraction both run per shape. So
-  **E3/E4/E5 are on this critical path**, not side quests: compile *is*
-  saturation plus extraction plus emit.
+  the same pieces.
+
+**And compile is not saturation.** Measured the same day from the telemetry
+feature's own `wall_clock_us`:
+
+```
+A@32: cold 164.4 ms   runtime saturation 32.2 ms   (~20%)
+8@32: cold 2154.0 ms  runtime saturation 31.5 ms   (~1.5%)
+```
+
+Both saturations are *identical* — `nodes=2881, classes=5000, apps≈7054,
+extracted cost 6573` — which is legalize-last working as designed: the fold
+stays folded, so the e-graph sees the same program for an 11-piece glyph and
+a 34-piece one. Saturation is a **constant ~32 ms**. `8`'s extra ~1,990 ms is
+entirely downstream of it.
+
+So the earlier reading here — "E3/E4/E5 are on the critical path, compile *is*
+saturation plus extraction plus emit" — was **wrong about which term
+dominates**, and is corrected above. See **X1**.
 
 | | what | where |
 |---|---|---|
@@ -96,10 +112,11 @@ roughly 800 lines to 150 — and makes H1's padding free.
 
 | | what | where |
 |---|---|---|
+| **X1** | **Split the ~1,990 ms that is not saturation** — extraction vs legalize vs emit vs register allocation — on `8`@32. This is now the top measurement, the way H2 was. Suspicion, not a finding: emitted nodes go 1,457 (`A`@16) → 8,241 (`8`@32), 5.7×, against 16× the time, so something downstream of extraction is superlinear in emitted nodes, and linear-scan regalloc over live ranges is the obvious candidate. **Do not act on that guess without the split.** | — |
 | **E1** | **Geometric `SplitFold`.** `⊕_{[lo,hi)} = ⊕_{[lo,mid)} ⊕ ⊕_{[mid,hi)}`. Needs no substitution (both halves share the body e-class) and is *exactly* cost-preserving in both extraction arms, so it cannot desync the claim/price audit. Bisect at the midpoint to bound growth at 2n−1. `EmptyFold` already exists as its base case. | — |
 | **E2** | **A critical-path term in the cost model.** Without it E1 buys reachability and no speed: `CostModel::latency_prior()` sets `depth_threshold: 1024, depth_penalty: 0` ("effectively disabled"), so a 34-deep serial chain and a 6-deep balanced tree price identically. A *global* depth hinge is the wrong shape — what is wanted is the reduction's critical path. | [schedule-cost-model-denotation](plans/2026-09-01-schedule-cost-model-denotation.md) |
 | **E3** | Extraction: `shared_dag_dp_pass` is O(L²) — make reach tracking sparse. | — |
-| **E4** | Saturation rescans every class with every rule every iteration — dirty tracking. | — |
+| **E4** | ~~Saturation rescans every class with every rule every iteration — dirty tracking.~~ **Already built**, and this entry was stale the day it was written: `EGraph::class_is_dirty` with per-rule `rule_last_swept` baselines and a 2-hop forward-neighbourhood check (`DIRTY_TRACKING_MAX_DEPTH`), wired into the scan so a clean class skips the clone and every `apply`. What remains is narrower and, per X1, **not hump work**: the scan still visits every class for every rule and filters, and `class_is_dirty` is itself a neighbourhood walk rather than O(1), so the cheap path is O(classes × rules) per iteration. A dirty *worklist* would make it O(dirty). Saturation is a constant ~32 ms of a 2,154 ms compile, so this needs a reason other than the hump. | — |
 | **E5** | Extraction is not monotone in graph richness: the same kernel in a superset graph can extract a worse DAG. | — |
 
 ## Correctness and CI
