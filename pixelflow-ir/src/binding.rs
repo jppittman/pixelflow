@@ -1,6 +1,6 @@
 //! Binding bound-memory buffers to their declared slots for execution.
 //!
-//! An [`ExprArena`] declares buffers by *shape* ([`BufferDecl`]) via a
+//! An [`Environment`] declares buffers by *shape* ([`BufferDecl`]) via a
 //! [`BufferId`]. Before a kernel that contains `Gather` nodes can run, each
 //! slot must be bound to actual contents. This module provides the binding
 //! used by the reference interpreter ([`crate::eval`]); the JIT path will
@@ -9,16 +9,18 @@
 //! Bindings here *borrow* their contents: a [`BindingTable`] is valid for the
 //! duration of one evaluation, not the lifetime of a compiled kernel.
 
-use crate::arena::{BufferId, ExprArena, UniformId, UniformIdentity};
+use crate::decl::{BufferDecl, BufferId, UniformId, UniformIdentity};
+use crate::expr::Environment;
 use alloc::vec::Vec;
 
 /// Why binding a buffer table failed. Binding fails loud rather than reading
 /// out of bounds — consistent with the workspace's no-silent-failure rule.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BindError {
-    /// The number of supplied slices does not match the arena's buffer count.
+    /// The number of supplied slices does not match the environment's buffer
+    /// count.
     Count {
-        /// Buffers the arena declares.
+        /// Buffers the environment declares.
         declared: usize,
         /// Slices supplied.
         supplied: usize,
@@ -32,7 +34,7 @@ pub enum BindError {
         /// Length supplied.
         actual: usize,
     },
-    /// A uniform value was supplied for an identity the arena does not
+    /// A uniform value was supplied for an identity the environment does not
     /// declare.
     Uniform(UniformIdentity),
 }
@@ -42,7 +44,7 @@ impl core::fmt::Display for BindError {
         match self {
             BindError::Count { declared, supplied } => write!(
                 f,
-                "binding count mismatch: arena declares {declared} buffer(s), {supplied} supplied"
+                "binding count mismatch: {declared} buffer(s) declared, {supplied} supplied"
             ),
             BindError::Length {
                 slot,
@@ -52,26 +54,30 @@ impl core::fmt::Display for BindError {
                 f,
                 "buffer slot {slot}: declared length {expected}, bound slice has {actual}"
             ),
-            BindError::Uniform(id) => write!(f, "{id:?} is not a uniform this arena declares"),
+            BindError::Uniform(id) => {
+                write!(f, "{id:?} is not a uniform this environment declares")
+            }
         }
     }
 }
 
-/// Borrowed contents for every buffer an [`ExprArena`] declares, indexed by
+/// Borrowed contents for every buffer an [`Environment`] declares, indexed by
 /// [`BufferId`]. Row-major, `stride == width`, matching `BufferDecl`.
 ///
-/// Also the values of the arena's uniforms — the oracle's block. They are
-/// supplied **by identity** ([`BindingTable::bind_uniforms`]), never as a
+/// Also the values of the environment's uniforms — the oracle's block. They
+/// are supplied **by identity** ([`BindingTable::bind_uniforms`]), never as a
 /// positional slice: a compiled kernel's block is laid out in the link's
-/// order and an arena's table in its own, and the two disagree in general,
+/// order and an environment's table in its own, and the two disagree in
+/// general,
 /// so a `&[f32]` that means one of them cannot be the type that means the
 /// other. A table bound without uniforms evaluates every one at its declared
 /// default, which is what a bake without a block does.
 #[derive(Clone, Debug)]
 pub struct BindingTable<'a> {
     slots: Vec<&'a [f32]>,
-    /// One value per uniform slot, in [`UniformId`] order — the arena's
-    /// order, resolved from identities here — or empty for "every default".
+    /// One value per uniform slot, in [`UniformId`] order — the
+    /// environment's order, resolved from identities here — or empty for
+    /// "every default".
     uniforms: Vec<f32>,
 }
 
@@ -82,14 +88,14 @@ impl<'a> BindingTable<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`BindError::Uniform`] for an identity the arena does not
-    /// declare — a composition mistake, and the pixels would be plausible.
+    /// Returns [`BindError::Uniform`] for an identity the environment does
+    /// not declare — a composition mistake, and the pixels would be plausible.
     pub fn bind_uniforms(
         mut self,
-        arena: &ExprArena,
+        env: &Environment,
         values: &[(UniformIdentity, f32)],
     ) -> Result<Self, BindError> {
-        let decls = arena.uniforms();
+        let decls: &[crate::decl::UniformDecl] = &env.uniforms;
         if self.uniforms.len() != decls.len() {
             self.uniforms = decls.iter().map(|d| d.default).collect();
         }
@@ -110,7 +116,7 @@ impl<'a> BindingTable<'a> {
         self.uniforms.get(id.0 as usize).copied()
     }
 
-    /// Bind `slices` to the arena's buffer slots, in [`BufferId`] order.
+    /// Bind `slices` to the environment's buffer slots, in [`BufferId`] order.
     ///
     /// Validates that the count and every length match the declarations, so a
     /// later `Gather` can index without bounds surprises.
@@ -118,9 +124,9 @@ impl<'a> BindingTable<'a> {
     /// # Errors
     ///
     /// Returns [`BindError`] if the count or any length disagrees with the
-    /// arena's [`BufferDecl`]s.
-    pub fn bind(arena: &ExprArena, slices: &[&'a [f32]]) -> Result<Self, BindError> {
-        let decls = arena.buffers();
+    /// environment's [`BufferDecl`]s.
+    pub fn bind(env: &Environment, slices: &[&'a [f32]]) -> Result<Self, BindError> {
+        let decls: &[BufferDecl] = &env.buffers;
         if decls.len() != slices.len() {
             return Err(BindError::Count {
                 declared: decls.len(),
@@ -143,7 +149,7 @@ impl<'a> BindingTable<'a> {
         })
     }
 
-    /// An empty binding table, for arenas that declare no buffers.
+    /// An empty binding table, for environments that declare no buffers.
     #[must_use]
     pub fn empty() -> Self {
         Self {

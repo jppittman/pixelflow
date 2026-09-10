@@ -9,7 +9,7 @@
 //! - Bit 0 (X): pixel column — varies per pixel
 //! - Bit 1 (Y): pixel row — varies per scanline
 //! - Bits 2..4: retired. They were the Z and W axes; a lattice has
-//!   [`COORD_AXES`](crate::arena::COORD_AXES) axes and a per-call scalar is a
+//!   [`COORD_AXES`](crate::decl::COORD_AXES) axes and a per-call scalar is a
 //!   uniform, whose variance is `CONST`.
 //! - Bits 4..8: the four reduction index slots — vary per step of the binder
 //!   that binds them
@@ -70,9 +70,9 @@ impl Variance {
     /// the reduction index slots.
     ///
     /// Indices 2 and 3 were the Z and W axes.
-    /// [`ExprArena::push_var`](crate::arena::ExprArena::push_var) still
+    /// [`ExprBuilder::push_var`](crate::expr::ExprBuilder::push_var) still
     /// builds them — `Var` is also a rewrite metavariable — and it is
-    /// [`emit::compile`] that refuses one, so the bits stay constructible
+    /// `emit::compile` that refuses one, so the bits stay constructible
     /// and belong to no scope.
     ///
     /// **Note what that costs, because it is a trap.** Bits 2 and 3 are
@@ -264,8 +264,8 @@ impl core::fmt::Debug for Variance {
             match bit {
                 0 => write!(f, "X")?,
                 1 => write!(f, "Y")?,
-                // A retired axis: no arena can name one, but the macro
-                // tier's e-graph indexes its names in the same space.
+                // A retired axis: no compiled kernel can name one, but the
+                // macro tier's e-graph indexes its names in the same space.
                 2 | 3 => write!(f, "?{bit}")?,
                 // Reduction index slots print as the slot they bind, so a
                 // variance set reads back as the binders that enclose the node.
@@ -282,95 +282,23 @@ impl core::fmt::Display for Variance {
     }
 }
 
-// ───────────────────── Arena-level variance analysis ─────────────────────
-
-use alloc::vec::Vec;
-
-/// Compute variance for every node in an `ExprArena`.
-///
-/// Returns a `Vec<Variance>` indexed by `ExprId`. Because the arena is
-/// append-only in topological order, a single forward pass suffices —
-/// when we visit node `i`, all its children `j < i` are already computed.
-///
-/// Cost: O(n) where n = `arena.len()`. No allocations beyond the result vec.
-///
-/// Public because it is the input the public `find_hoistable_*` functions
-/// require, and because `pixelflow-search`'s NNUE featurizer uses it to
-/// populate the variance histogram on arena-built accumulators (the same
-/// classification `egraph::deps::DepsAnalysis` provides on e-graphs).
-#[must_use]
-pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> {
-    use crate::arena::{ExprId, ExprNode};
-    use crate::kind::OpKind;
-
-    let n = arena.len();
-    let mut result = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let id = ExprId(i as u32);
-        let v = match arena.node(id) {
-            // Coordinates (0..4) and reduction index slots (4..8) each get their
-            // own bit. Anything above that is not a variable this analysis knows.
-            ExprNode::Var(idx) => {
-                if *idx < 8 {
-                    Variance::from_var(*idx)
-                } else {
-                    Variance::ALL
-                }
-            }
-            ExprNode::Const(_) => Variance::CONST,
-            // A buffer leaf is constant; a Gather's variance is the union of
-            // its index expressions (handled by the Ternary arm below).
-            ExprNode::Buffer(_) => Variance::CONST,
-            // A uniform is invariant on the lattice — that one line is what
-            // moves everything computed from it alone into the per-call
-            // prologue — and unknown on the parameter space, which is why it
-            // is not a `Const`.
-            ExprNode::Uniform(_) => Variance::CONST,
-            ExprNode::Param(_) => {
-                // Parameters are substituted before JIT compilation.
-                // If we see one here, treat conservatively as all-varying.
-                Variance::ALL
-            }
-            ExprNode::Unary(_, child) => result[child.0 as usize],
-            ExprNode::Binary(_, a, b) => result[a.0 as usize].union(result[b.0 as usize]),
-            ExprNode::Ternary(_, a, b, c) => result[a.0 as usize]
-                .union(result[b.0 as usize])
-                .union(result[c.0 as usize]),
-            // A binder is the only node that shrinks the set: it binds its index,
-            // so the index is not free in the result.
-            ExprNode::Nary(OpKind::Reduce, start, len) => {
-                let children = arena.nary_children_slice(*start, *len);
-                let body = children
-                    .get(3)
-                    .map_or(Variance::ALL, |c| result[c.0 as usize]);
-                match bound_index_slot(arena, children) {
-                    Some(slot) => body.without(Variance::from_var(slot)),
-                    // Malformed binder — refuse to claim invariance we cannot prove.
-                    None => Variance::ALL,
-                }
-            }
-            ExprNode::Nary(_, start, len) => {
-                let children = arena.nary_children_slice(*start, *len);
-                let mut v = Variance::CONST;
-                for &child in children {
-                    v = v.union(result[child.0 as usize]);
-                }
-                v
-            }
-        };
-        result.push(v);
-    }
-
-    result
-}
+// ───────────────────── DAG-level variance analysis ─────────────────────
 
 /// Compute variance for every node in a DAG.
 ///
 /// Because `dag.iter()` visits nodes strictly in children-before-parents order,
-/// a single forward pass over `dag.iter()` suffices.
+/// a single forward pass suffices — when a node is visited, every child's
+/// answer is already in the table. O(V + E), one allocation.
 ///
-/// Returns a [`SideTable<Variance>`] indexed directly by [`Node<'_, ExprData>`].
+/// Returns a [`SideTable<Variance>`](crate::dag::SideTable) indexed directly by
+/// [`Node<'_, ExprData>`](crate::dag::Node).
+///
+/// There used to be a second copy of this over `ExprArena`, plus a
+/// `find_hoistable_out_of` built on it that nothing called — the live
+/// loop-invariant code motion runs over the *schedule* instead
+/// (`schedule_variance`/`plan_collapse_hoist` in pixelflow-codegen's
+/// `emit/mod.rs`). The arena copy went with the arena; the hoisting question
+/// stays where it is answered.
 #[must_use]
 pub fn compute_dag_variance(
     dag: &crate::dag::Dag<crate::expr::ExprData>,
@@ -382,6 +310,9 @@ pub fn compute_dag_variance(
 
     for node in dag.iter() {
         let v = match *node {
+            // Coordinates (0..2) and reduction index slots (4..8) each get
+            // their own bit. Anything above that is not a variable this
+            // analysis knows, so it claims nothing.
             ExprData::Var(idx) => {
                 if idx < 8 {
                     Variance::from_var(idx)
@@ -389,43 +320,34 @@ pub fn compute_dag_variance(
                     Variance::ALL
                 }
             }
+            // A buffer leaf is constant; a Gather's variance is the union of
+            // its index expressions, which the `Op` arm below computes.
+            //
+            // A uniform is invariant on the lattice — that one line is what
+            // moves everything computed from it alone into the per-call
+            // prologue — and unknown on the parameter space, which is why it
+            // is not folded like a `Const`.
             ExprData::Const(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => Variance::CONST,
+            // Parameters are substituted before compilation. Seeing one here
+            // is conservatively all-varying.
             ExprData::Param(_) => Variance::ALL,
+            // A binder is the only node that shrinks the set: it binds its
+            // index, so the index is not free in the result.
             ExprData::Op(OpKind::Reduce) => {
                 let mut kids = node.children();
-                let _acc = kids.next();
-                let bound_child = kids.next();
-                let _init = kids.next();
-                let body = kids.next();
-
+                let (_combiner, bound, _extent, body) =
+                    (kids.next(), kids.next(), kids.next(), kids.next());
                 let body_v = body.map_or(Variance::ALL, |b| table[b]);
-                let slot = bound_child.and_then(|c| match *c {
-                    ExprData::Const(bits) => {
-                        let val = f32::from_bits(bits);
-                        if val == libm::floorf(val) && (0.0..256.0).contains(&val) {
-                            let s = val as u8;
-                            let binders = crate::arena::REDUCE_BINDER_BASE
-                                ..crate::arena::REDUCE_BINDER_BASE + crate::arena::REDUCE_BINDERS;
-                            if binders.contains(&s) { Some(s) } else { None }
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                });
-
-                match slot {
+                match bound.and_then(bound_index_slot) {
                     Some(s) => body_v.without(Variance::from_var(s)),
+                    // Malformed binder — refuse to claim invariance we cannot
+                    // prove.
                     None => Variance::ALL,
                 }
             }
-            ExprData::Op(_) => {
-                let mut v = Variance::CONST;
-                for child in node.children() {
-                    v = v.union(table[child]);
-                }
-                v
-            }
+            ExprData::Op(_) => node
+                .children()
+                .fold(Variance::CONST, |v, child| v.union(table[child])),
         };
         table[node] = v;
     }
@@ -433,168 +355,19 @@ pub fn compute_dag_variance(
     table
 }
 
-/// The index slot a `Reduce`'s children bind, read from child 1 (a `Const`
-/// holding the slot number). `None` if the node is not a well-formed binder.
-fn bound_index_slot(
-    arena: &crate::arena::ExprArena,
-    children: &[crate::arena::ExprId],
-) -> Option<u8> {
-    let Some(crate::arena::ExprNode::Const(v)) = children.get(1).map(|id| arena.node(*id)) else {
+/// The index slot a `Reduce` binds, read from its second child (a `Const`
+/// holding the slot number). `None` if that is not a well-formed binder index.
+fn bound_index_slot(child: crate::dag::Node<'_, crate::expr::ExprData>) -> Option<u8> {
+    let val = child.as_f32()?;
+    if val != libm::floorf(val) || !(0.0..256.0).contains(&val) {
         return None;
-    };
-    let slot = *v as u8;
-    let binders = crate::arena::REDUCE_BINDER_BASE
-        ..crate::arena::REDUCE_BINDER_BASE + crate::arena::REDUCE_BINDERS;
-    binders.contains(&slot).then_some(slot)
+    }
+    let slot = val as u8;
+    crate::decl::reduce_binders()
+        .contains(&slot)
+        .then_some(slot)
 }
 
-/// Find arena nodes that should be hoisted out of the X-loop.
-///
-/// [`find_hoistable_out_of`] with `0` — the pixel loop's question.
-#[must_use]
-/// NOTE (2026-08-03): this is the ARENA-side hoisting analysis, and it has no
-/// callers. The live loop-invariant-code-motion in the collapse compile path
-/// does the same job over the *schedule* instead — see `schedule_variance` and
-/// `plan_collapse_hoist` in pixelflow-codegen's `emit/mod.rs`, which
-/// `compile_via_backend` runs at two scopes (whole-nest, then
-/// per-row). So this is one analysis implemented twice at two tiers, the same
-/// shape as the chain rule was. Which copy survives is an open question, not a
-/// dormant feature.
-pub fn find_hoistable_arena_nodes(
-    arena: &crate::arena::ExprArena,
-    root: crate::arena::ExprId,
-    variance: &[Variance],
-    max: usize,
-) -> Vec<crate::arena::ExprId> {
-    find_hoistable_out_of(0, arena, root, variance, max)
-}
-
-/// Find arena nodes that should be hoisted out of the scope binding `var`.
-///
-/// Returns up to `max` `ExprId`s that are:
-/// 1. invariant in `var` (so hoisting is legal)
-/// 2. non-trivial (not Var or Const — actual computation worth hoisting)
-/// 3. used by at least one `var`-dependent node (so hoisting pays)
-///
-/// Results are sorted by estimated cost (transcendentals first).
-///
-/// One function serves every level of the nest, because "can this leave the
-/// loop" is one question asked of different variables: `0` for the pixel loop,
-/// `1` for a scanline, a reduction's own slot for hoisting out of the fold —
-/// which is the rewrite `⊕_i (f(i) · c) = c · ⊕_i f(i)` stated as an analysis.
-///
-/// # Panics
-///
-/// Panics if `var >= 8`.
-#[must_use]
-pub fn find_hoistable_out_of(
-    var: u8,
-    arena: &crate::arena::ExprArena,
-    root: crate::arena::ExprId,
-    variance: &[Variance],
-    max: usize,
-) -> Vec<crate::arena::ExprId> {
-    use crate::arena::{ExprId, ExprNode};
-    use crate::kind::OpKind;
-
-    assert!(var < 8, "variable index must be 0..8");
-    let n = arena.len();
-
-    // Mark which nodes are reachable from root
-    let mut reachable = alloc::vec![false; n];
-    let mut stack = alloc::vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if idx >= n || reachable[idx] {
-            continue;
-        }
-        reachable[idx] = true;
-        for child in arena.children(id) {
-            stack.push(child);
-        }
-    }
-
-    // Mark which reachable nodes are consumed by a `var`-dependent node: those
-    // are the ones whose value has to cross the loop boundary to be useful.
-    let mut feeds_dependent = alloc::vec![false; n];
-    for i in 0..n {
-        if !reachable[i] {
-            continue;
-        }
-        let id = ExprId(i as u32);
-        if variance[i].depends_on(var) {
-            for child in arena.children(id) {
-                feeds_dependent[child.0 as usize] = true;
-            }
-        }
-    }
-
-    // Collect hoistable candidates
-    let mut candidates: Vec<(ExprId, u8)> = Vec::new(); // (id, priority)
-    for i in 0..n {
-        if !reachable[i] || !feeds_dependent[i] {
-            continue;
-        }
-        let v = variance[i];
-        if !v.is_invariant_in(var) || v.is_const() {
-            continue; // Must be invariant in `var` and non-const
-        }
-        let id = ExprId(i as u32);
-        let node = arena.node(id);
-
-        // Skip trivial nodes (Var, Const, Param, Buffer, Uniform) — not worth a register
-        let priority = match node {
-            ExprNode::Var(_)
-            | ExprNode::Const(_)
-            | ExprNode::Param(_)
-            | ExprNode::Buffer(_)
-            | ExprNode::Uniform(_) => {
-                continue;
-            }
-            // A loop-invariant memory read is well worth a register.
-            ExprNode::Ternary(OpKind::Gather, _, _, _) => 2,
-            ExprNode::Unary(
-                OpKind::Sin
-                | OpKind::Cos
-                | OpKind::Exp
-                | OpKind::Exp2
-                | OpKind::Ln
-                | OpKind::Log2
-                | OpKind::Log10
-                | OpKind::Sqrt
-                | OpKind::Asin
-                | OpKind::Acos
-                | OpKind::Atan
-                | OpKind::Atan2
-                | OpKind::Pow
-                | OpKind::Tan,
-                _,
-            ) => 3, // Transcendentals: highest priority
-            ExprNode::Unary(_, _) => 1,
-            ExprNode::Binary(op, _, _) => match *op {
-                OpKind::Div => 2, // Division is expensive
-                OpKind::Pow | OpKind::Atan2 => 3,
-                _ => 1, // Add, Sub, Mul are cheap
-            },
-            _ => 1,
-        };
-
-        candidates.push((id, priority));
-    }
-
-    // Sort by priority (highest first), then by ExprId (topological order)
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
-    candidates.into_iter().take(max).map(|(id, _)| id).collect()
-}
-
-// Several tests below call `compute_arena_variance` directly. That is testing
-// the public API, not an exception to it: the function is `pub`, and
-// `pixelflow-search`'s `nnue::factored` calls it from outside this crate. Its
-// in-crate callers are `passes::unroll_reduce` and `eval::eval_scalar`, both of
-// which consume the whole per-node table; `find_hoistable_out_of` and
-// `find_hoistable_arena_nodes` are not callers at all — they take an
-// already-computed variance slice from theirs.
 /// The extents of the lattice a kernel is compiled for: samples per axis,
 /// `[x, y]`.
 ///
@@ -612,24 +385,24 @@ pub fn find_hoistable_out_of(
 /// [`varying`](Self::varying) names the binders as a [`Variance`], so
 /// `deps(node) ∩ shape.varying()` is the scope a node's value lives at.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct LatticeShape([u32; crate::arena::COORD_AXES]);
+pub struct LatticeShape([u32; crate::decl::COORD_AXES]);
 
 impl LatticeShape {
     /// No lattice: one batch of caller-supplied points per call. Nothing is a
     /// binder.
-    pub const POINT: Self = Self([1; crate::arena::COORD_AXES]);
+    pub const POINT: Self = Self([1; crate::decl::COORD_AXES]);
 
     /// A lattice with these samples per axis.
     #[inline]
     #[must_use]
-    pub const fn new(extent: [u32; crate::arena::COORD_AXES]) -> Self {
+    pub const fn new(extent: [u32; crate::decl::COORD_AXES]) -> Self {
         Self(extent)
     }
 
     /// Samples per axis, `[x, y]`.
     #[inline]
     #[must_use]
-    pub const fn extent(self) -> [u32; crate::arena::COORD_AXES] {
+    pub const fn extent(self) -> [u32; crate::decl::COORD_AXES] {
         self.0
     }
 
@@ -641,7 +414,7 @@ impl LatticeShape {
     pub const fn varying(self) -> Variance {
         let mut bits = 0u8;
         let mut axis = 0;
-        while axis < crate::arena::COORD_AXES {
+        while axis < crate::decl::COORD_AXES {
             if self.0[axis] > 1 {
                 bits |= 1 << axis;
             }
@@ -679,7 +452,7 @@ impl LatticeShape {
         };
         let mut count: u64 = 1;
         let mut axis = innermost;
-        while axis < crate::arena::COORD_AXES {
+        while axis < crate::decl::COORD_AXES {
             count *= self.0[axis] as u64;
             axis += 1;
         }
@@ -689,10 +462,10 @@ impl LatticeShape {
     /// The extents serialized little-endian, for cache keys.
     #[inline]
     #[must_use]
-    pub const fn key_bytes(self) -> [u8; 4 * crate::arena::COORD_AXES] {
-        let mut out = [0u8; 4 * crate::arena::COORD_AXES];
+    pub const fn key_bytes(self) -> [u8; 4 * crate::decl::COORD_AXES] {
+        let mut out = [0u8; 4 * crate::decl::COORD_AXES];
         let mut axis = 0;
-        while axis < crate::arena::COORD_AXES {
+        while axis < crate::decl::COORD_AXES {
             let b = self.0[axis].to_le_bytes();
             let mut k = 0;
             while k < 4 {
@@ -802,34 +575,34 @@ mod tests {
     }
 
     #[test]
-    fn verify_compute_arena_variance() {
-        use crate::arena::ExprArena;
+    fn variance_of_a_uniform_expression_is_const() {
+        use crate::expr::ExprBuilder;
         use crate::kind::OpKind;
 
-        let mut arena = ExprArena::new();
-        // Build: sin(u * 0.3) * (X + Y), where `u` is a uniform — the shape
-        // the old `sin(Z * 0.3)` becomes, and CONST rather than a coordinate.
-        let u = arena.declare_uniform(crate::Uniform::new(0.0).decl());
-        let z = arena.push_uniform(u); // u → {}
-        let c03 = arena.push_const(0.3); // 0.3 → {}
-        let z_mul = arena.push_binary(OpKind::Mul, z, c03); // u*0.3 → {}
-        let sin_z = arena.push_unary(OpKind::Sin, z_mul); // sin(u*0.3) → {}
-        let x = arena.push_var(0); // X → {X}
-        let y = arena.push_var(1); // Y → {Y}
-        let x_add_y = arena.push_binary(OpKind::Add, x, y); // X+Y → {X,Y}
-        let result = arena.push_binary(OpKind::Mul, sin_z, x_add_y); // → {X,Y}
+        // sin(u * 0.3) * (X + Y), where `u` is a uniform — the shape the old
+        // `sin(Z * 0.3)` becomes, and CONST rather than a coordinate.
+        let mut b = ExprBuilder::new();
+        let u = b.declare_uniform(crate::Uniform::new(0.0).decl());
+        let z = b.push_uniform(u); // u → {}
+        let c03 = b.push_const(0.3); // 0.3 → {}
+        let z_mul = b.push_binary(OpKind::Mul, z, c03); // u*0.3 → {}
+        let sin_z = b.push_unary(OpKind::Sin, z_mul); // sin(u*0.3) → {}
+        let x = b.push_var(0); // X → {X}
+        let y = b.push_var(1); // Y → {Y}
+        let x_add_y = b.push_binary(OpKind::Add, x, y); // X+Y → {X,Y}
+        let result = b.push_binary(OpKind::Mul, sin_z, x_add_y); // → {X,Y}
+        let (rooted, _) = b.finish(&[z, c03, z_mul, sin_z, x, y, x_add_y, result]);
 
-        let v = super::compute_arena_variance(&arena);
-
-        assert_eq!(v[z.0 as usize], Variance::CONST);
-        assert_eq!(v[c03.0 as usize], Variance::CONST);
-        assert_eq!(v[z_mul.0 as usize], Variance::CONST);
-        assert_eq!(v[sin_z.0 as usize], Variance::CONST);
-        assert!(v[sin_z.0 as usize].is_x_invariant());
-        assert_eq!(v[x.0 as usize], Variance::X);
-        assert_eq!(v[y.0 as usize], Variance::Y);
-        assert_eq!(v[x_add_y.0 as usize], Variance::X.union(Variance::Y));
-        assert_eq!(v[result.0 as usize], Variance::X.union(Variance::Y));
+        let v = compute_dag_variance(&rooted);
+        let at = |i: usize| v[rooted.entry_at(i)];
+        for slot in 0..4 {
+            assert_eq!(at(slot), Variance::CONST, "entry {slot}");
+        }
+        assert!(at(3).is_x_invariant(), "sin(u*0.3) leaves the pixel loop");
+        assert_eq!(at(4), Variance::X);
+        assert_eq!(at(5), Variance::Y);
+        assert_eq!(at(6), Variance::COORDS);
+        assert_eq!(at(7), Variance::COORDS);
     }
 
     /// `deps(⊕_{i∈D} body) = deps(body) \ {i}` — REDUCTIONS_AND_FOLDS.md:32.
@@ -840,20 +613,18 @@ mod tests {
 
         // Σ_{i<4} (i + X) depends on X, not on the index it binds.
         let k = Kernel::sum_over(4, |i| i.add(&Kernel::x()));
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
-        assert_eq!(v[root.0 as usize], Variance::X);
+        let v = compute_dag_variance(k.dag());
+        assert_eq!(v[k.root()], Variance::X);
 
         // Σ_{i<4} i depends on nothing at all: the index is bound, and it was
         // the body's only variable. This is the case that used to come back as
         // ALL — the analysis claimed maximal dependency for a closed term.
         let closed = Kernel::sum_over(4, Clone::clone);
-        let (arena, root) = closed.parts();
-        let v = super::compute_arena_variance(arena);
+        let v = compute_dag_variance(closed.dag());
         assert!(
-            v[root.0 as usize].is_const(),
+            v[closed.root()].is_const(),
             "Σ_i i has no free variables, got {:?}",
-            v[root.0 as usize]
+            v[closed.root()]
         );
     }
 
@@ -862,20 +633,14 @@ mod tests {
     #[test]
     fn binder_index_is_a_variable_like_any_other() {
         use crate::Kernel;
-        use crate::arena::ExprNode;
-        use crate::kind::OpKind;
 
         // Σ_{i<4} (i · Y): the product depends on both the index and Y.
         let k = Kernel::sum_over(4, |i| i.mul(&Kernel::y()));
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
+        let v = compute_dag_variance(k.dag());
 
-        // Find the body's multiply — the node just under the Reduce.
-        let ExprNode::Nary(OpKind::Reduce, start, len) = arena.node(root) else {
-            panic!("expected a Reduce at the root");
-        };
-        let body = arena.nary_children_slice(*start, *len)[3];
-        let body_v = v[body.0 as usize];
+        // The body is the Reduce's fourth child.
+        let body = k.root().children().nth(3).expect("Reduce has a body");
+        let body_v = v[body];
 
         assert!(
             body_v.depends_on_binder(),
@@ -889,7 +654,7 @@ mod tests {
             "a value that changes per fold step cannot lift to frame scope"
         );
         // The result, by contrast, has lost the index.
-        assert_eq!(v[root.0 as usize], Variance::Y);
+        assert_eq!(v[k.root()], Variance::Y);
     }
 
     /// Nested binders occupy distinct slots, and each consumes exactly its own.
@@ -902,48 +667,26 @@ mod tests {
             let i = i.clone();
             Kernel::sum_over(4, move |j| i.add(j).add(&Kernel::x()))
         });
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
-        assert_eq!(v[root.0 as usize], Variance::X);
+        let v = compute_dag_variance(k.dag());
+        assert_eq!(v[k.root()], Variance::X);
     }
 
-    /// The LICM rule and the reduction-hoisting rule are one query at different
-    /// variables: `⊕_i (f(i) · c) = c · ⊕_i f(i)` when `deps(c) ∩ {i} = {}`
-    /// (REDUCTIONS_AND_FOLDS.md:109) is `find_hoistable_out_of(i, …)`.
+    /// A malformed binder claims nothing: an index slot that is not a `Const`
+    /// naming one leaves the analysis unable to prove the index is bound, and
+    /// "unable to prove" is ALL rather than a guess.
     #[test]
-    fn hoisting_out_of_a_binder_is_the_same_query_as_licm() {
-        use crate::Kernel;
-        use crate::arena::ExprNode;
+    fn a_malformed_binder_is_all_varying() {
+        use crate::expr::ExprBuilder;
         use crate::kind::OpKind;
 
-        // Σ_{i<8} (i · sin(Y)) — sin(Y) is invariant in the index, so it can
-        // leave the fold; it is NOT invariant in Y.
-        let k = Kernel::sum_over(8, |i| i.mul(&Kernel::y().sin()));
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
-
-        let ExprNode::Nary(OpKind::Reduce, start, len) = arena.node(root) else {
-            panic!("expected a Reduce at the root");
-        };
-        let body = arena.nary_children_slice(*start, *len)[3];
-
-        let out_of_binder = super::find_hoistable_out_of(4, arena, body, &v, 8);
-        let sin = out_of_binder
-            .iter()
-            .find(|id| matches!(arena.node(**id), ExprNode::Unary(OpKind::Sin, _)));
-        assert!(
-            sin.is_some(),
-            "sin(Y) must be hoistable out of the fold, got {out_of_binder:?}"
-        );
-
-        // Asking about Y instead finds nothing: sin(Y) cannot cross that scope.
-        let out_of_y = super::find_hoistable_out_of(1, arena, body, &v, 8);
-        assert!(
-            !out_of_y
-                .iter()
-                .any(|id| matches!(arena.node(*id), ExprNode::Unary(OpKind::Sin, _))),
-            "sin(Y) must not be hoistable out of Y, got {out_of_y:?}"
-        );
+        let mut b = ExprBuilder::new();
+        let combiner = b.push_const(0.0);
+        let not_a_slot = b.push_var(1); // where a Const(4..8) belongs
+        let extent = b.push_const(3.0);
+        let body = b.push_var(4);
+        let root = b.push_nary(OpKind::Reduce, &[combiner, not_a_slot, extent, body]);
+        let (rooted, _) = b.finish(&[root]);
+        assert_eq!(compute_dag_variance(&rooted)[rooted.entry()], Variance::ALL);
     }
 }
 

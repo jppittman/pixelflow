@@ -170,7 +170,7 @@ op_table! {
     Dwrt = 45,
 
     // --- Bound memory (lattices) ---
-    /// Buffer leaf: a slot referencing a `BufferDecl` in the arena's buffer
+    /// Buffer leaf: a slot referencing a `BufferDecl` in the environment's buffer
     /// table. The declared extents are static IR; the contents are bound at
     /// JIT-compile time. See `docs/designs/KERNELS_AND_LATTICES.md`.
     Buffer = 46,
@@ -197,7 +197,7 @@ op_table! {
     Reduce = 49,
 
     // --- Uniforms (per-call scalars) ---
-    /// Uniform leaf: a slot referencing a `UniformDecl` in the arena's
+    /// Uniform leaf: a slot referencing a `UniformDecl` in the environment's
     /// uniform table. A scalar invariant across the lattice, supplied per
     /// call from a block; never folded, loaded once per call.
     Uniform = 50,

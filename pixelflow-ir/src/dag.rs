@@ -17,18 +17,11 @@
 //!   - a node's edges are contiguous, so children iterate as a slice.
 //!
 //! The lifecycle is build-once: `Builder` accumulates, `finish()` freezes
-//! it into a `Rooted`, and reading happens after. That is narrower than
-//! `ExprArena`'s `&mut self` methods *look*, but not narrower than what
-//! they actually do — every one of them is already pure at its call site,
-//! and `Kernel` clones its arena before composing, so composition is
-//! already "fresh graph, splice, done". An earlier draft of these docs
-//! claimed the interleaving ruled `ExprArena` out; it does not.
-//!
-//! `ExprArena` nonetheless still keeps its own index-based storage, for
-//! reasons of representation rather than lifecycle: `ExprNode::Nary`
-//! publishes raw slab offsets, and several call sites store an `ExprId`
-//! beside the arena it indexes. `docs/plans/2026-09-09-exprarena-on-dag.md`
-//! has the full list and the staging around it.
+//! it into a `Rooted`, and reading happens after. Composition is therefore
+//! always "fresh graph, splice, done" — which is what every transform in
+//! `passes.rs` was already doing to the append-only `ExprArena` this
+//! replaced, one `&mut self` method at a time
+//! (`docs/plans/2026-09-09-exprarena-on-dag.md`).
 
 extern crate alloc;
 #[cfg(test)]
@@ -87,7 +80,7 @@ struct Slot<T> {
 /// pointer comparison and impossible under a minted one.
 ///
 /// Same discipline, for the same reason, as `BufferIdentity` and
-/// `UniformIdentity` in `arena.rs`: identity is provenance.
+/// `UniformIdentity` in `decl.rs`: identity is provenance.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct DagIdentity(u32);
 
@@ -103,7 +96,7 @@ impl DagIdentity {
         // `fetch_update`, not `fetch_add` + assert: the add would wrap
         // *before* the assert fires, so a caught panic would leave the
         // counter back on a live identity. Declining to store leaves it
-        // permanently exhausted instead. (`arena.rs`'s `mint_identity` has
+        // permanently exhausted instead. (`decl.rs`'s `mint_identity` has
         // the long version of this note.)
         Self(
             NEXT.fetch_update(
@@ -437,6 +430,25 @@ impl<T: Key> Builder<T> {
     /// comparing equal (fresh temporaries, debug markers).
     pub(crate) fn push_unique(&mut self, value: T, children: &[Id]) -> Id {
         self.dag.push(value, children)
+    }
+
+    /// Read back a node this builder has already created.
+    ///
+    /// Building is not always write-only: an [`Ir`](crate::term::Ir)
+    /// implementation has to `project` what it just embedded, and a transform
+    /// that rewrites a term it is midway through rebuilding has to look at it.
+    /// The handle is the ordinary consumption handle, borrowed from the
+    /// partial DAG — nothing here can observe an index or mutate a node.
+    pub(crate) fn get(&self, id: Id) -> Node<'_, T> {
+        Node {
+            dag: &self.dag,
+            ix: id.0,
+        }
+    }
+
+    /// How many nodes exist so far.
+    pub(crate) fn len(&self) -> usize {
+        self.dag.len()
     }
 
     /// Spends the ids. Entry points are recorded as indices, so the

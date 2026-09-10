@@ -13,14 +13,6 @@
 //! reaches its two remaining constructors as inherent methods on
 //! `pixelflow-core`'s own `pub(crate)` lane types, with no trait at all.
 
-// NOTE: `no_std` support (disabling the `std` feature) is currently
-// incomplete: `cargo check -p pixelflow-ir --no-default-features` fails with
-// over 200 errors (missing f32 methods, `ExprId` deref mismatches in
-// `arena.rs`). No CI job builds this crate with `std` off -- the default
-// feature set and `--all-features` both enable it -- so this has never been
-// exercised. Tracked as a known, non-blocking gap by the
-// `pixelflow-ir-nostd-status` job in `.github/workflows/rust.yaml`; treat
-// `no_std` as aspirational until that job is green.
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -34,19 +26,21 @@ pub mod variance;
 
 pub use variance::{LatticeShape, Variance, compute_dag_variance};
 
-pub mod arena;
+/// The declarations an expression's leaves index, and the index spaces `Var`
+/// is drawn from. Domain types, not storage.
+pub mod decl;
+pub use decl::{
+    BufferDecl, BufferId, BufferIdentity, COORD_AXES, REDUCE_BINDER_BASE, REDUCE_BINDERS,
+    RETIRED_COORD_AXES, UniformDecl, UniformId, UniformIdentity,
+};
 
 /// A generic arena-backed DAG whose consumers never see the arena: nodes
 /// are named by a borrowed [`dag::Node`] handle, never a raw index.
 ///
-/// `ExprArena` predates this and still keeps its own index-based storage.
-/// What holds it back is representation coupling, not lifecycle — its
-/// mutating methods take `&mut self` but are already pure at every call
-/// site, so `Builder` would serve them. See
-/// `docs/plans/2026-09-09-exprarena-on-dag.md` for the actual blockers and
-/// the staging around them.
-///
-/// A *new* graph should reach for this rather than hand-roll another `Vec`
+/// This is the *only* expression storage. `ExprArena` — a parallel `Vec` of
+/// nodes addressed by a public `ExprId`, with a raw slab of n-ary children —
+/// was deleted in favour of it (`docs/plans/2026-09-09-exprarena-on-dag.md`);
+/// a *new* graph should reach for this rather than hand-roll another `Vec`
 /// plus index-newtype.
 ///
 /// Only the consumption vocabulary — `Dag`, `Node`, `Rooted`, `Scratch`,
@@ -54,29 +48,30 @@ pub mod arena;
 /// a `Dag`) are `pub(crate)`: invisible outside this crate, not merely
 /// unexported at the root. Memory management is a `Dag`'s own business —
 /// `kernel.rs` and `expr.rs` build DAGs because they *are* this crate's
-/// construction machinery, the same standing `arena.rs`'s own callers have;
-/// nothing further out ever needs to. A caller that only ever reads a `Dag`
-/// someone handed it never notices the difference.
+/// construction machinery; nothing further out ever needs to. What outside
+/// callers build with is [`expr::ExprBuilder`], whose vocabulary is
+/// expressions rather than nodes and edges.
 pub mod dag;
 pub use dag::{Dag, Node, Rooted, Scratch, SideTable};
 
 pub mod expr;
 pub use expr::{
-    Environment, ExprData, compute_dag_depth, depth, from_arena, has_degenerate, has_var,
-    node_count_subtree, retired_axis, subtree_eq, to_arena,
+    DecodeError, Environment, ExprBuilder, ExprData, ExprRef, Term, compute_dag_depth, decode,
+    depth, display, encode, encode_into, has_degenerate, has_var, node_count_subtree, relink,
+    retired_axis, subtree_eq,
 };
 
 /// IR-to-IR transforms: each takes an expression graph and returns another.
 /// Target-blind by construction — nothing here knows which ISA it is feeding.
 pub mod passes;
-pub use arena::{ExprArena, ExprId, ExprNode};
 
 /// The term language the e-graph speaks: destructure a node, rebuild a node.
 /// Naming it is what makes an optimizer expressible as an endomorphism on the
 /// IR rather than as a hand-rolled conversion per tier.
 pub mod term;
-mod term_arena;
+mod term_dag;
 pub use term::{Children, Ir, Shape};
+pub use term_dag::rebuild_into;
 
 /// Optimization as an endomorphism on the IR — including the identity, which
 /// is what `kernel_raw!` means and what a measurement's control arm needs.

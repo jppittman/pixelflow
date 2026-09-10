@@ -1,27 +1,28 @@
 //! `Kernel` — the language's runtime value.
 //!
-//! A `Kernel` is a handle to an expression fragment: an [`ExprArena`] plus its
-//! root. It is the value the front end (the `kernel!` macro) produces and the
-//! thing consumers compose — `sum`, `at`, `select`, arithmetic — with the
-//! arena hidden entirely behind the methods. This is the "JIT-first" surface:
-//! programs are built as `Kernel` values (our own AST), type-checked and
-//! monomorphized by our codegen at `compile` time, never encoded in Rust's
-//! type system.
+//! A `Kernel` is a handle to an expression fragment: a rooted expression DAG
+//! plus the [`Environment`] its leaves index. It is the value the front end
+//! (the `kernel!` macro) produces and the thing consumers compose — `sum`,
+//! `at`, `select`, arithmetic — with the graph hidden entirely behind the
+//! methods. This is the "JIT-first" surface: programs are built as `Kernel`
+//! values (our own AST), type-checked and monomorphized by our codegen at
+//! `compile` time, never encoded in Rust's type system.
 //!
-//! Composition is arena splicing: every method clones the receiver's arena,
-//! splices the operands in (DAG-preserving), and appends the new node. Values
-//! are immutable and cheaply cloned (`Arc`); the deep copy happens only when a
-//! new node is built, which is construction/bake time, not per pixel.
+//! Composition is splicing: every method copies the receiver's graph into a
+//! fresh builder, splices the operands in (DAG- and identity-preserving), and
+//! appends the new node. Values are immutable and cheaply cloned (`Arc`); the
+//! deep copy happens only when a new node is built, which is
+//! construction/bake time, not per pixel.
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{BufferDecl, ExprArena, ExprId, UniformDecl, UniformIdentity};
 use crate::dag::{Builder, Dag, Node, Rooted};
+use crate::decl::{
+    BufferDecl, COORD_AXES, REDUCE_BINDER_BASE, REDUCE_BINDERS, UniformDecl, UniformIdentity,
+};
 use crate::expr::{
-    Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
-    to_arena,
+    Environment, ExprBuilderExt, ExprData, Term, copy_subgraph, splice, substitute_vars,
 };
 use crate::kind::OpKind;
 
@@ -86,7 +87,7 @@ impl Drop for BinderScope {
     }
 }
 
-/// The lowest reduction-index slot not already bound by a `Reduce` in `arena`.
+/// The lowest reduction-index slot not already bound by a `Reduce` in `dag`.
 ///
 /// Binders are built inside-out, so a fold sees every inner fold's slot and
 /// takes the next free one — distinct live binders never share an index.
@@ -95,8 +96,8 @@ impl Drop for BinderScope {
 ///
 /// Panics when all four slots are live, i.e. a fifth nested reduction.
 fn lowest_free_index_slot(dag: &Dag<ExprData>) -> u8 {
-    const BINDER_BASE: usize = crate::arena::REDUCE_BINDER_BASE as usize;
-    let mut used = [false; 4];
+    const BINDER_BASE: usize = REDUCE_BINDER_BASE as usize;
+    let mut used = [false; REDUCE_BINDERS as usize];
     for node in dag.iter() {
         if *node != ExprData::Op(OpKind::Reduce) {
             continue;
@@ -115,7 +116,7 @@ fn lowest_free_index_slot(dag: &Dag<ExprData>) -> u8 {
     }
     used.iter()
         .position(|u| !u)
-        .map(|i| i as u8 + crate::arena::REDUCE_BINDER_BASE)
+        .map(|i| i as u8 + REDUCE_BINDER_BASE)
         .unwrap_or_else(|| {
             panic!(
                 "more than {} live nested reductions: the index space is {}..{}",
@@ -197,7 +198,7 @@ impl Uniform {
         }
     }
 
-    /// The declaration this handle carries into every arena that reads it.
+    /// The declaration this handle carries into every graph that reads it.
     #[must_use]
     pub fn decl(self) -> UniformDecl {
         self.decl
@@ -260,41 +261,44 @@ pub struct Kernel {
 struct KernelData {
     rooted: Rooted<ExprData>,
     env: Environment,
-    legacy: (ExprArena, ExprId),
 }
 
 impl Kernel {
     fn wrap(rooted: Rooted<ExprData>, env: Environment) -> Self {
-        let legacy = to_arena(rooted.entry(), &env);
         Self {
-            inner: Arc::new(KernelData {
-                rooted,
-                env,
-                legacy,
-            }),
+            inner: Arc::new(KernelData { rooted, env }),
         }
     }
 
-    /// Adopt an already-built fragment.
+    /// Adopt an already-built fragment — the `kernel!` macro's entry point,
+    /// and the one way a graph built anywhere else becomes a kernel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the expression names a retired coordinate axis (`Var(2)` or
+    /// `Var(3)`, the old Z and W). A lattice has
+    /// [`COORD_AXES`] axes; a scalar that is the same
+    /// at every sample is a [`Uniform`], not an axis of extent 1. This is
+    /// where the refusal lives because `Var` is also a reduction binder's
+    /// index and a rewrite rule's metavariable, and a `Kernel` is the one
+    /// thing that becomes machine code
+    /// (docs/plans/2026-09-06-lattice-is-the-index.md).
     #[must_use]
-    pub fn from_rooted(
-        rooted: Rooted<ExprData>,
-        buffers: Vec<BufferDecl>,
-        uniforms: Vec<UniformDecl>,
-    ) -> Self {
+    pub fn from_rooted(rooted: Rooted<ExprData>, env: Environment) -> Self {
         let root = rooted.entry();
         assert!(
             root.retired_axis().is_none(),
-            "Kernel::from_rooted: the expression names Var({}), which was the {} coordinate; a lattice has {} axes and a per-call scalar is a Uniform",
+            "Kernel::from_rooted: the expression names Var({}), which was the \
+             {} coordinate; a lattice has {} axes and a per-call scalar is a \
+             Uniform",
             root.retired_axis().unwrap_or_default(),
             if root.retired_axis() == Some(2) {
                 "Z"
             } else {
                 "W"
             },
-            crate::arena::COORD_AXES,
+            COORD_AXES,
         );
-        let env = Environment { buffers, uniforms };
         Self::wrap(rooted, env)
     }
 
@@ -328,6 +332,19 @@ impl Kernel {
         &self.inner.env.uniforms
     }
 
+    /// The declaration tables this kernel's leaves index.
+    #[must_use]
+    pub fn environment(&self) -> &Environment {
+        &self.inner.env
+    }
+
+    /// The fragment and its environment as one value — what every consumer
+    /// that reads leaves (the lattice bake, the oracle, the passes) needs.
+    #[must_use]
+    pub fn term(&self) -> Term<'_> {
+        Term::new(self.inner.rooted.entry(), &self.inner.env)
+    }
+
     // ─────────────────────────── leaves ───────────────────────────
 
     /// The X coordinate.
@@ -352,43 +369,6 @@ impl Kernel {
         let mut b = Builder::new();
         let r = b.push_const(v);
         Self::wrap(b.finish(&[r]), Environment::new())
-    }
-
-    /// Adopt an already-built fragment — the `kernel!` macro's entry point.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the arena names a retired coordinate axis (`Var(2)` or
-    /// `Var(3)`, the old Z and W). A lattice has
-    /// [`COORD_AXES`](crate::arena::COORD_AXES) axes; a scalar that is the
-    /// same at every sample is a [`Uniform`], not an axis of extent 1. This
-    /// is where the refusal lives because `Var` is also a reduction binder's
-    /// index and a rewrite rule's metavariable, and a `Kernel` is the one
-    /// thing that becomes machine code.
-    #[must_use]
-    pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
-        let (rooted, env) = from_arena(&arena, root);
-        let entry = rooted.entry();
-        assert!(
-            entry.retired_axis().is_none(),
-            "Kernel::from_parts: the arena names Var({}), which was the {} \
-             coordinate; a lattice has {} axes and a per-call scalar is a \
-             Uniform (docs/plans/2026-09-06-lattice-is-the-index.md)",
-            entry.retired_axis().unwrap_or_default(),
-            if entry.retired_axis() == Some(2) {
-                "Z"
-            } else {
-                "W"
-            },
-            crate::arena::COORD_AXES,
-        );
-        Self {
-            inner: Arc::new(KernelData {
-                rooted,
-                env,
-                legacy: (arena, root),
-            }),
-        }
     }
 
     // ───────────────────── the builder seam ───────────────────────
@@ -649,19 +629,20 @@ impl Kernel {
     /// `Σ kernels`, empty summing to `0` — the variadic monoid fold the
     /// fixed-arity operators cannot express (glyph outlines, text runs).
     ///
-    /// Builds into ONE arena in a single pass: clone the first term's arena
-    /// once, then splice each remaining term once and chain an `Add`. A naive
-    /// `fold(acc.add(k))` would re-clone the *growing* accumulator arena every
-    /// step — O(n²) for a glyph's thousands of leaves — so the fold is written
-    /// out explicitly to stay O(total nodes).
+    /// Builds into ONE graph in a single pass: copy the first term once, then
+    /// splice each remaining term once and chain an `Add`. A naive
+    /// `fold(acc.add(k))` would re-copy the *growing* accumulator every step —
+    /// O(n²) for a glyph's thousands of leaves — so the fold is written out
+    /// explicitly to stay O(total nodes).
     ///
-    // DEFERRED (shared-store direction): the deeper fix is one hash-consed arena
-    // that all `Kernel`s index by `ExprId`, so composition interns instead of
-    // splicing (copies vanish, structural sharing is automatic). Not taken yet:
-    // it changes the `Kernel` representation and wants the same store P7–P9's
-    // discrete domains/typed fields will live in — land it there, deliberately,
-    // rather than as a silent representation swap. The compile cache already
-    // dedups at the compile boundary, so only construction-time copies remain.
+    // DEFERRED (shared-store direction): the deeper fix is one hash-consed
+    // store all `Kernel`s share, so composition interns instead of splicing
+    // (copies vanish, structural sharing is automatic). `dag::Builder::intern`
+    // is the half of that which exists. Not taken yet: it changes the `Kernel`
+    // representation and wants the same store P7–P9's discrete domains/typed
+    // fields will live in — land it there, deliberately, rather than as a
+    // silent representation swap. The compile cache already dedups at the
+    // compile boundary, so only construction-time copies remain.
     #[must_use]
     pub fn sum(kernels: &[Kernel]) -> Self {
         let Some((head, tail)) = kernels.split_first() else {
@@ -798,10 +779,9 @@ impl Kernel {
     #[must_use]
     pub fn dwrt(&self, var: u8) -> Self {
         assert!(
-            (var as usize) < crate::arena::COORD_AXES,
-            "Kernel::dwrt: no axis {var}; a lattice has {} \
+            (var as usize) < COORD_AXES,
+            "Kernel::dwrt: no axis {var}; a lattice has {COORD_AXES} \
              (0 = X, 1 = Y)",
-            crate::arena::COORD_AXES
         );
         let mut b = Builder::new();
         let r = copy_subgraph(&mut b, self.root());
@@ -819,15 +799,6 @@ impl Kernel {
     #[must_use]
     pub fn dy(&self) -> Self {
         self.dwrt(1)
-    }
-
-    // ───────────────────────── back end ───────────────────────────
-
-    /// The underlying fragment — for the lattice bake and inspection. Not part
-    /// of the composition surface; consumers use the methods above.
-    #[must_use]
-    pub fn parts(&self) -> (&ExprArena, ExprId) {
-        (&self.inner.legacy.0, self.inner.legacy.1)
     }
 }
 
@@ -924,10 +895,10 @@ mod tests {
     use super::*;
     use crate::binding::BindingTable;
     use crate::eval::eval_scalar;
+    use crate::expr::ExprBuilder;
 
     fn eval(k: &Kernel, x: f32, y: f32) -> f32 {
-        let (arena, root) = k.parts();
-        eval_scalar(arena, root, &[x, y], &BindingTable::empty())
+        eval_scalar(k.term(), &[x, y], &BindingTable::empty())
     }
 
     #[test]
@@ -1025,7 +996,7 @@ mod tests {
     /// many times it is read, two instances are two, and `dwrt` of it is 0.
     #[test]
     fn a_uniform_is_one_argument_however_often_it_is_read() {
-        use crate::passes::lower_dwrt_owned;
+        use crate::passes::lower_dwrt;
         let cx = Uniform::new(1.0);
         let r = Uniform::new(2.0);
         // (x - cx)² + r·r — cx read twice, r read twice, from separate kernels.
@@ -1033,48 +1004,54 @@ mod tests {
         let k = dx
             .mul(&Kernel::x().sub(&cx.kernel()))
             .add(&r.kernel().mul(&r.kernel()));
-        let (arena, root) = k.parts();
-        assert_eq!(arena.uniforms(), &[cx.decl(), r.decl()]);
+        assert_eq!(k.uniforms(), &[cx.decl(), r.decl()]);
         assert_eq!(eval(&k, 3.0, 0.0), 4.0 + 4.0);
         let bound = BindingTable::empty()
-            .bind_uniforms(arena, &[(cx.identity(), 0.0), (r.identity(), 1.0)])
+            .bind_uniforms(
+                k.environment(),
+                &[(cx.identity(), 0.0), (r.identity(), 1.0)],
+            )
             .expect("both are arguments");
-        assert_eq!(eval_scalar(arena, root, &[3.0, 0.0], &bound), 10.0);
+        assert_eq!(eval_scalar(k.term(), &[3.0, 0.0], &bound), 10.0);
 
         // ∂/∂x = 2(x − cx): the uniform differentiates to zero.
-        let (out, oroot) = lower_dwrt_owned(arena, root).expect("calculus");
-        let _ = oroot;
         let ddx = k.dx();
-        let (da, dr) = ddx.parts();
-        let (out2, oroot2) = lower_dwrt_owned(da, dr).expect("calculus");
+        let lowered = lower_dwrt(ddx.term()).expect("calculus");
+        let env = ddx.environment();
         assert_eq!(
-            eval_scalar(&out2, oroot2, &[3.0, 0.0], &BindingTable::empty()),
+            eval_scalar(
+                Term::new(lowered.entry(), env),
+                &[3.0, 0.0],
+                &BindingTable::empty()
+            ),
             4.0
         );
-        assert_eq!(out.uniforms(), arena.uniforms());
+        assert_eq!(env.uniforms, k.uniforms());
     }
 
-    /// A hand-built arena that names the retired Z axis is refused where it
+    /// A hand-built graph that names the retired Z axis is refused where it
     /// would become a kernel. `Var` still carries reduction indices and the
-    /// rewrite tier's pattern metavariables, so the arena cannot refuse the
+    /// rewrite tier's pattern metavariables, so the builder cannot refuse the
     /// node itself; this is the boundary where it means a coordinate.
     #[test]
     #[should_panic(expected = "which was the Z coordinate")]
-    fn an_arena_naming_a_retired_axis_is_not_a_kernel() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let z = a.push_var(2);
-        let root = a.push_binary(OpKind::Add, x, z);
-        let _refused = Kernel::from_parts(a, root);
+    fn a_graph_naming_a_retired_axis_is_not_a_kernel() {
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let z = b.push_var(2);
+        let root = b.push_binary(OpKind::Add, x, z);
+        let (rooted, env) = b.finish(&[root]);
+        let _refused = Kernel::from_rooted(rooted, env);
     }
 
     /// And the same for W, so neither index is quietly readmitted.
     #[test]
     #[should_panic(expected = "which was the W coordinate")]
     fn the_fourth_axis_is_refused_too() {
-        let mut a = ExprArena::new();
-        let w = a.push_var(3);
-        let _refused = Kernel::from_parts(a, w);
+        let mut b = ExprBuilder::new();
+        let w = b.push_var(3);
+        let (rooted, env) = b.finish(&[w]);
+        let _refused = Kernel::from_rooted(rooted, env);
     }
 
     /// A reduction binder's index sits in the same `Var` space and is not a
@@ -1099,15 +1076,18 @@ mod tests {
 
     #[test]
     fn dx_differentiates_at_compile_time() {
-        use crate::passes::lower_dwrt_owned;
+        use crate::passes::lower_dwrt;
         // d/dx √(x²+y²) = x / √(x²+y²).
         let x = Kernel::x();
         let y = Kernel::y();
         let dist = x.mul(&x).add(&y.mul(&y)).sqrt();
         let ddx = dist.dx();
-        let (arena, root) = ddx.parts();
-        let (out, oroot) = lower_dwrt_owned(arena, root).expect("calculus");
-        let got = eval_scalar(&out, oroot, &[3.0, 4.0], &BindingTable::empty());
+        let out = lower_dwrt(ddx.term()).expect("calculus");
+        let got = eval_scalar(
+            Term::new(out.entry(), ddx.environment()),
+            &[3.0, 4.0],
+            &BindingTable::empty(),
+        );
         assert!((got - 0.6).abs() < 1e-5);
     }
 }

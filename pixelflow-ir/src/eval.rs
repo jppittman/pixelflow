@@ -1,4 +1,5 @@
-//! Differential-testing oracle: a scalar, memoized walk over an [`ExprArena`].
+//! Differential-testing oracle: a scalar, memoized walk over an expression
+//! graph.
 //!
 //! **This is not an execution tier.** PixelFlow is JIT-only: every rendered
 //! pixel comes from emitted machine code. This module exists so tests can ask
@@ -18,8 +19,10 @@
 //! `pixelflow-core`: floor each index, clamp to `[0, extent - 1]`, read
 //! row-major. The round-trip test asserts that equivalence.
 
-use crate::arena::{ExprArena, ExprId, ExprNode, UniformId};
 use crate::binding::BindingTable;
+use crate::dag::{Node, Rooted, SideTable};
+use crate::decl::{COORD_AXES, REDUCE_BINDER_BASE, RETIRED_COORD_AXES, UniformId};
+use crate::expr::{Environment, ExprData, Term};
 use crate::kind::OpKind;
 // `alloc`, not `std`: the oracle must stay buildable with the `std` feature
 // off (the crate is the bootloader target's floor), and a memoized DAG walk
@@ -36,12 +39,7 @@ use alloc::vec::Vec;
 /// (substitute first), a bare `Buffer` outside a `Gather`, an `Nary`, or an
 /// op with no scalar evaluation. These are programming errors, not inputs.
 #[must_use]
-pub fn eval_scalar(
-    arena: &ExprArena,
-    root: ExprId,
-    vars: &[f32; crate::arena::COORD_AXES],
-    bindings: &BindingTable<'_>,
-) -> f32 {
+pub fn eval_scalar(term: Term<'_>, vars: &[f32; COORD_AXES], bindings: &BindingTable<'_>) -> f32 {
     // A transcendental in this language IS the expansion the compiler emits, so
     // the reference interpreter evaluates that expansion rather than the host's
     // `f32::sin`. Three reasons, one answer:
@@ -53,36 +51,34 @@ pub fn eval_scalar(
     //   * no_std — `f32::sin` does not exist in `core`, and this crate has to
     //     run without an operating system.
     //
-    // `expand_transcendentals_owned` is the identity (a bare clone) when the
-    // arena holds none, so ordinary kernels pay nothing.
-    // The arena is a DAG and the expansions share subexpressions heavily, so
+    // The graph is a DAG and the expansions share subexpressions heavily, so
     // the walk memoizes per node — a naive tree walk re-evaluates every shared
     // node once per reference, which is exponential in nesting depth for
     // transcendental-heavy expressions. Nodes under a reduction binder are
     // excluded: their value changes with the binding, so caching them across
     // iterations would return a stale term.
-    let (expanded, root) = crate::passes::expand_transcendentals_owned(arena, root);
-    let variance = crate::variance::compute_arena_variance(&expanded);
-    let n = expanded.len();
-    let memo = core::cell::RefCell::new(alloc::vec![None; n]);
+    let expanded = crate::passes::expand_transcendentals(term);
+    let term = Term::new(expanded.entry(), term.env());
+    let variance = crate::variance::compute_dag_variance(term.dag());
+    let memo = core::cell::RefCell::new(term.dag().side_table(None));
     Env {
-        arena: &expanded,
+        term,
         vars,
         bindings,
         reduce_vars: [0.0; 4],
         variance: &variance,
         memo: &memo,
     }
-    .eval(root)
+    .eval(term.root())
 }
 
 /// How closely a JIT-computed lane must match [`eval_scalar`]'s answer for the
-/// same `(arena, root, coordinates)` before the divergence is a bug.
+/// same `(term, coordinates)` before the divergence is a bug.
 ///
 /// The oracle and the JIT share one semantics (the same lowering), so most ops
 /// agree bit-for-bit — but a handful of instructions are *estimates* or
 /// target-rounded, and an optimized/extracted form may associate float
-/// arithmetic differently than the reference arena. A single global tolerance
+/// arithmetic differently than the reference graph. A single global tolerance
 /// either masks real miscompiles (0.2 absolute hides a dropped Newton step —
 /// audit H1) or rejects correct hardware (a 12-bit `rcpps` can never match an
 /// exact `1.0 / x`). [`equivalence_tolerance`] gives the per-op allowance.
@@ -129,7 +125,7 @@ impl Tolerance {
     /// The looser of two tolerances.
     ///
     /// **This is not a whole-expression acceptance rule, and must not be used
-    /// as one.** Folding the per-op table over an arena asserts that a
+    /// as one.** Folding the per-op table over a whole graph asserts that a
     /// composition drifts no more than its worst single op, which is false as
     /// soon as an inexact value is reused: `recip(x)^16` multiplies the
     /// estimate's relative width by 16, and `sin(K·Y²)` multiplies it by the
@@ -187,78 +183,78 @@ pub fn is_valid_mask(bits: u32) -> bool {
 /// mask-valued root ⇒ [`compare_mask_root`]; otherwise fold
 /// [`equivalence_tolerance`] with [`Tolerance::loosest`].
 ///
-/// Memoized per node, for the same reason [`eval_scalar`]'s walk is: the arena
+/// Memoized per node, for the same reason [`eval_scalar`]'s walk is: the graph
 /// is a **DAG**, and mask-valuedness composes over shared children, so a naive
 /// recursion re-derives every shared node once per reference — exponential in
 /// nesting depth, not linear in node count. `BitAnd(n, n)` chains are the
 /// realistic shape (e-graph extraction shares aggressively), and unmemoized
-/// they cost `2^depth`: a **29-node** arena measured ~1.2s, a 40-deep one is
+/// they cost `2^depth`: a **29-node** graph measured ~1.2s, a 40-deep one is
 /// weeks. That is an unbounded hang inside a correctness gate, which is worse
 /// than any wrong answer it could have given.
 #[must_use]
-pub fn is_mask_valued(arena: &ExprArena, root: ExprId) -> bool {
-    enum Task {
-        Visit(ExprId),
-        Emit(ExprId),
-    }
-
+pub fn is_mask_valued(root: Node<'_, ExprData>) -> bool {
     /// Mask-valuedness of a node whose children are already resolved, or
     /// `None` for the composing shapes that need their children first.
-    fn leaf_verdict(node: &ExprNode) -> Option<bool> {
-        match node {
-            ExprNode::Binary(OpKind::BitAnd | OpKind::BitOr, _, _)
-            | ExprNode::Ternary(OpKind::Select, _, _, _) => None,
-            ExprNode::Binary(op, _, _) => Some(matches!(
+    fn leaf_verdict(node: Node<'_, ExprData>) -> Option<bool> {
+        match (*node, node.child_count()) {
+            (ExprData::Op(OpKind::BitAnd | OpKind::BitOr), 2)
+            | (ExprData::Op(OpKind::Select), 3) => None,
+            (ExprData::Op(op), 2) => Some(matches!(
                 op,
                 OpKind::Lt | OpKind::Le | OpKind::Gt | OpKind::Ge | OpKind::Eq | OpKind::Ne
             )),
             // A literal all-zeros / all-ones lane IS a mask; anything else is a
             // number. See the doc comment for why this is the safe direction.
-            ExprNode::Const(v) => Some(is_valid_mask(v.to_bits())),
+            (ExprData::Const(bits), _) => Some(is_valid_mask(bits)),
             _ => Some(false),
         }
     }
 
-    let mut memo: Vec<Option<bool>> = vec![None; arena.len()];
+    /// The two operands that decide a composing node's verdict. `Select`'s
+    /// condition is a stencil, not part of the output domain, so it is
+    /// deliberately not among them.
+    fn deciders<'a>(node: Node<'a, ExprData>) -> (Node<'a, ExprData>, Node<'a, ExprData>) {
+        let mut kids = node.children();
+        if node.child_count() == 3 {
+            let _cond = kids.next();
+        }
+        let a = kids.next().expect("a composing node has two deciders");
+        let b = kids.next().expect("a composing node has two deciders");
+        (a, b)
+    }
+
+    enum Task<'a> {
+        Visit(Node<'a, ExprData>),
+        Emit(Node<'a, ExprData>),
+    }
+
+    let mut memo = root.dag().side_table(None);
     let mut stack = vec![Task::Visit(root)];
     while let Some(task) = stack.pop() {
         match task {
-            Task::Visit(id) => {
-                if memo[id.0 as usize].is_some() {
+            Task::Visit(node) => {
+                if memo[node].is_some() {
                     continue;
                 }
-                let node = arena.node(id);
                 if let Some(verdict) = leaf_verdict(node) {
-                    memo[id.0 as usize] = Some(verdict);
+                    memo[node] = Some(verdict);
                     continue;
                 }
-                // Composing shape: resolve the two operands that decide it.
-                // `Select`'s condition is a stencil, not part of the output
-                // domain, so it is deliberately not visited.
-                let (a, b) = match node {
-                    ExprNode::Binary(_, a, b) => (*a, *b),
-                    ExprNode::Ternary(_, _, t, f) => (*t, *f),
-                    _ => unreachable!("leaf_verdict returned None for a non-composing node"),
-                };
-                stack.push(Task::Emit(id));
+                let (a, b) = deciders(node);
+                stack.push(Task::Emit(node));
                 stack.push(Task::Visit(a));
                 stack.push(Task::Visit(b));
             }
-            Task::Emit(id) => {
-                let (a, b) = match arena.node(id) {
-                    ExprNode::Binary(_, a, b) => (*a, *b),
-                    ExprNode::Ternary(_, _, t, f) => (*t, *f),
-                    _ => unreachable!("Emit queued for a non-composing node"),
+            Task::Emit(node) => {
+                let (a, b) = deciders(node);
+                let resolved = |child: Node<'_, ExprData>| {
+                    memo[child].expect("post-order walk resolves children before their parent")
                 };
-                let resolved = |child: ExprId| {
-                    memo[child.0 as usize]
-                        .expect("post-order walk resolves children before their parent")
-                };
-                memo[id.0 as usize] = Some(resolved(a) && resolved(b));
+                memo[node] = Some(resolved(a) && resolved(b));
             }
         }
     }
-    memo[root.0 as usize].expect("the root is always resolved by the walk")
+    memo[root].expect("the root is always resolved by the walk")
 }
 
 /// Outcome of checking a mask-valued root lane (JIT `got` vs oracle `want`).
@@ -352,7 +348,7 @@ pub fn trunc_input_is_divergent(v: f32) -> bool {
 /// backend may drift from the oracle on **one instruction**.
 ///
 /// **This table is not an expression-level gate.** Composition amplifies, and
-/// by an input-dependent factor, so a differential check over a whole arena
+/// by an input-dependent factor, so a differential check over a whole graph
 /// belongs to [`DifferentialCheck`] — which seeds from the same estimate widths
 /// documented below and propagates them along the evaluation path. What the
 /// table is still good for is what it says: the per-op conformance rows, and
@@ -465,7 +461,7 @@ pub fn equivalence_tolerance(op: OpKind) -> Tolerance {
         | OpKind::Pow => TRANSCENDENTAL,
         OpKind::Dwrt => panic!(
             "equivalence_tolerance: dwrt must be rewritten away before any backend — \
-             an arena reaching a correctness check with one is a compile bug"
+             a graph reaching a correctness check with one is a compile bug"
         ),
         OpKind::Tuple => panic!(
             "equivalence_tolerance: tuple is structural, not a lane value — \
@@ -839,69 +835,89 @@ fn radius_of(lo: f32, hi: f32, value: f32) -> f32 {
 /// What a uniform evaluates to: the block's value for its slot, or the
 /// declared default when the table binds none — the same rule a bake without
 /// a block follows, so the oracle and the JIT agree on it by construction.
-fn uniform_value(arena: &ExprArena, bindings: &BindingTable<'_>, u: UniformId) -> f32 {
-    bindings.uniform(u).unwrap_or(arena.uniform_decl(u).default)
+fn uniform_value(env: &Environment, bindings: &BindingTable<'_>, u: UniformId) -> f32 {
+    bindings.uniform(u).unwrap_or(env.uniform(u).default)
 }
 
-/// The children whose *values* feed a node. Identical to `ExprArena::children`
+/// The children whose *values* feed a node. Identical to `Node::children`
 /// except that a `Buffer` leaf — which is a name, not a value — is dropped from
 /// `Gather`/`RawGather`, exactly as [`eval_scalar`] handles them.
 ///
 /// # Panics
 ///
 /// Panics on the node shapes the bound walk does not model: `Param` (substitute
-/// first), a bare `Buffer`, and `Nary`/`Reduce` (a fold rebinds its body per
+/// first), a bare `Buffer`, and `Reduce` (a fold rebinds its body per
 /// iteration, so a flat per-node memo cannot represent it — expand the reduce
 /// first).
-fn value_children(node: &ExprNode) -> ([ExprId; 3], usize) {
-    const NONE: ExprId = ExprId(0);
-    match node {
-        ExprNode::Var(_) | ExprNode::Const(_) | ExprNode::Uniform(_) => ([NONE; 3], 0),
-        ExprNode::Unary(_, a) => ([*a, NONE, NONE], 1),
-        ExprNode::Binary(OpKind::RawGather, _, idx) => ([*idx, NONE, NONE], 1),
-        ExprNode::Binary(_, a, b) => ([*a, *b, NONE], 2),
-        ExprNode::Ternary(OpKind::Gather, _, x, y) => ([*x, *y, NONE], 2),
-        ExprNode::Ternary(_, a, b, c) => ([*a, *b, *c], 3),
-        ExprNode::Param(p) => panic!("PointCheck: Param({p}) — substitute params first"),
-        ExprNode::Buffer(b) => panic!(
+fn value_children<'a>(node: Node<'a, ExprData>) -> ([Option<Node<'a, ExprData>>; 3], usize) {
+    fn take<'a>(
+        kids: &mut impl Iterator<Item = Node<'a, ExprData>>,
+        n: usize,
+    ) -> ([Option<Node<'a, ExprData>>; 3], usize) {
+        let mut out = [None; 3];
+        for slot in out.iter_mut().take(n) {
+            *slot = kids.next();
+        }
+        (out, n)
+    }
+
+    let mut kids = node.children();
+    match (*node, node.child_count()) {
+        (ExprData::Var(_) | ExprData::Const(_) | ExprData::Uniform(_), _) => ([None; 3], 0),
+        (ExprData::Param(p), _) => panic!("PointCheck: Param({p}) — substitute params first"),
+        (ExprData::Buffer(b), _) => panic!(
             "PointCheck: bare Buffer({}) is not a value; read it through Gather",
             b.0
         ),
-        ExprNode::Nary(op, _, _) => panic!(
-            "PointCheck: Nary({op:?}) — a reduction rebinds its body per iteration, \
-             which a per-node bound cannot represent; expand_reduce first"
+        // The buffer leaf is the first child of either gather form; skip it.
+        (ExprData::Op(OpKind::RawGather), 2) => {
+            let _buf = kids.next();
+            take(&mut kids, 1)
+        }
+        (ExprData::Op(OpKind::Gather), 3) => {
+            let _buf = kids.next();
+            take(&mut kids, 2)
+        }
+        (ExprData::Op(_), n @ 1..=3) => take(&mut kids, n),
+        (ExprData::Op(op), n) => panic!(
+            "PointCheck: {op:?} with {n} children — a reduction rebinds its body per \
+             iteration, which a per-node bound cannot represent; expand_reduce first"
         ),
     }
 }
 
-/// A prepared differential check for one `(arena, root)`: the transcendental
-/// expansion and the root's mask-valuedness are computed once, then
-/// [`DifferentialCheck::at`] is called per grid point.
+/// A prepared differential check for one term: the transcendental expansion and
+/// the root's mask-valuedness are computed once, then [`DifferentialCheck::at`]
+/// is called per grid point.
 ///
-/// Splitting it this way is not a micro-optimization — the expansion clones and
-/// rebuilds the arena, and a gate that runs it per point would pay that on
-/// every one of its check points.
+/// Splitting it this way is not a micro-optimization — the expansion rebuilds
+/// the whole graph, and a gate that ran it per point would pay that on every
+/// one of its check points.
 pub struct DifferentialCheck {
-    expanded: ExprArena,
-    root: ExprId,
+    expanded: Rooted<ExprData>,
+    env: Environment,
     mask_root: bool,
 }
 
 impl DifferentialCheck {
-    /// Prepare a check. `root` is the arena root the JIT compiles; the
-    /// expansion performed here is the same one the emitter performs, so the
-    /// walk and the machine code are interpreting one semantics.
+    /// Prepare a check. `term` is what the JIT compiles; the expansion
+    /// performed here is the same one the emitter performs, so the walk and the
+    /// machine code are interpreting one semantics.
     #[must_use]
-    pub fn new(arena: &ExprArena, root: ExprId) -> Self {
-        // Mask-valuedness is structural and read off the UNEXPANDED arena:
-        // that is the arena whose root defines the output's domain.
-        let mask_root = is_mask_valued(arena, root);
-        let (expanded, root) = crate::passes::expand_transcendentals_owned(arena, root);
+    pub fn new(term: Term<'_>) -> Self {
+        // Mask-valuedness is structural and read off the UNEXPANDED graph:
+        // that is the graph whose root defines the output's domain.
+        let mask_root = is_mask_valued(term.root());
         Self {
-            expanded,
-            root,
+            expanded: crate::passes::expand_transcendentals(term),
+            env: term.env().clone(),
             mask_root,
         }
+    }
+
+    /// The expanded term this check evaluates.
+    fn term(&self) -> Term<'_> {
+        Term::new(self.expanded.entry(), &self.env)
     }
 
     /// Whether the root produces a mask lane. Decides which acceptance method
@@ -915,50 +931,46 @@ impl DifferentialCheck {
     /// Evaluate at one point, carrying the composed error bound.
     ///
     /// The walk is iterative and memoized per node for the reason every walk in
-    /// this module is: the arena is a **DAG** with heavy sharing, and a
+    /// this module is: the graph is a **DAG** with heavy sharing, and a
     /// recursive re-derivation costs `2^depth`.
     ///
     /// # Panics
     ///
     /// Panics on the shapes [`value_children`] refuses (`Param`, bare `Buffer`,
-    /// `Nary`), and on an op with no scalar evaluation (lower it first).
+    /// a reduction), and on an op with no scalar evaluation (lower it first).
     #[must_use]
-    pub fn at(
-        &self,
-        vars: &[f32; crate::arena::COORD_AXES],
-        bindings: &BindingTable<'_>,
-    ) -> PointCheck {
-        enum Task {
-            Visit(ExprId),
-            Emit(ExprId),
+    pub fn at(&self, vars: &[f32; COORD_AXES], bindings: &BindingTable<'_>) -> PointCheck {
+        enum Task<'a> {
+            Visit(Node<'a, ExprData>),
+            Emit(Node<'a, ExprData>),
         }
 
-        let arena = &self.expanded;
-        let mut bounds: Vec<Option<NodeBound>> = vec![None; arena.len()];
-        let mut stack = vec![Task::Visit(self.root)];
+        let term = self.term();
+        let mut bounds = term.dag().side_table(None);
+        let mut stack = vec![Task::Visit(term.root())];
         while let Some(task) = stack.pop() {
             match task {
-                Task::Visit(id) => {
-                    if bounds[id.0 as usize].is_some() {
+                Task::Visit(node) => {
+                    if bounds[node].is_some() {
                         continue;
                     }
-                    let (kids, n) = value_children(arena.node(id));
-                    stack.push(Task::Emit(id));
-                    for kid in &kids[..n] {
-                        stack.push(Task::Visit(*kid));
+                    let (kids, n) = value_children(node);
+                    stack.push(Task::Emit(node));
+                    for kid in kids.into_iter().take(n).flatten() {
+                        stack.push(Task::Visit(kid));
                     }
                 }
-                Task::Emit(id) => {
-                    if bounds[id.0 as usize].is_some() {
+                Task::Emit(node) => {
+                    if bounds[node].is_some() {
                         continue;
                     }
-                    let bound = self.node_bound(id, vars, bindings, &bounds);
-                    bounds[id.0 as usize] = Some(bound);
+                    let bound = self.node_bound(node, vars, bindings, &bounds);
+                    bounds[node] = Some(bound);
                 }
             }
         }
 
-        let root = bounds[self.root.0 as usize].expect("the walk resolves the root");
+        let root = bounds[term.root()].expect("the walk resolves the root");
         PointCheck {
             value: root.value,
             radius: root.radius,
@@ -972,22 +984,22 @@ impl DifferentialCheck {
     /// Value + bound for one node, given its already-resolved children.
     fn node_bound(
         &self,
-        id: ExprId,
-        vars: &[f32; crate::arena::COORD_AXES],
+        node: Node<'_, ExprData>,
+        vars: &[f32; COORD_AXES],
         bindings: &BindingTable<'_>,
-        bounds: &[Option<NodeBound>],
+        bounds: &SideTable<Option<NodeBound>>,
     ) -> NodeBound {
-        let arena = &self.expanded;
-        let child = |c: ExprId| -> NodeBound {
-            bounds[c.0 as usize].expect("post-order resolves children before their parent")
+        let kids: Vec<Node<'_, ExprData>> = node.children().collect();
+        let child = |i: usize| -> NodeBound {
+            bounds[kids[i]].expect("post-order resolves children before their parent")
         };
-        match arena.node(id) {
-            ExprNode::Var(i) => {
-                let i = *i as usize;
+        match (*node, kids.len()) {
+            (ExprData::Var(i), _) => {
+                let i = i as usize;
                 assert!(
-                    i < crate::arena::COORD_AXES,
+                    i < COORD_AXES,
                     "PointCheck: Var({i}) — {}",
-                    if crate::arena::RETIRED_COORD_AXES.contains(&(i as u8)) {
+                    if RETIRED_COORD_AXES.contains(&(i as u8)) {
                         "a retired coordinate axis; a per-call scalar is a Uniform"
                     } else {
                         "a reduction index outside a Reduce"
@@ -995,21 +1007,24 @@ impl DifferentialCheck {
                 );
                 NodeBound::exact(vars[i])
             }
-            ExprNode::Const(v) => NodeBound::exact(*v),
-            ExprNode::Uniform(u) => NodeBound::exact(uniform_value(arena, bindings, *u)),
-            ExprNode::Binary(OpKind::RawGather, buf, idx) => {
-                self.gather_bound(*buf, &[child(*idx)], bindings, GatherKind::Raw)
+            (ExprData::Const(bits), _) => NodeBound::exact(f32::from_bits(bits)),
+            (ExprData::Uniform(u), _) => NodeBound::exact(uniform_value(&self.env, bindings, u)),
+            (ExprData::Op(OpKind::RawGather), 2) => {
+                self.gather_bound(kids[0], &[child(1)], bindings, GatherKind::Raw)
             }
-            ExprNode::Ternary(OpKind::Gather, buf, x, y) => {
-                self.gather_bound(*buf, &[child(*x), child(*y)], bindings, GatherKind::Clamped)
+            (ExprData::Op(OpKind::Gather), 3) => self.gather_bound(
+                kids[0],
+                &[child(1), child(2)],
+                bindings,
+                GatherKind::Clamped,
+            ),
+            (ExprData::Op(OpKind::Select), 3) => select_bound(child(0), child(1), child(2)),
+            (ExprData::Op(op), 1) => unary_bound(op, child(0)),
+            (ExprData::Op(op), 2) => binary_bound(op, child(0), child(1)),
+            (ExprData::Op(op), 3) => ternary_bound(op, child(0), child(1), child(2)),
+            (other, n) => {
+                panic!("PointCheck: {other:?} with {n} children has no bound (screen it out first)")
             }
-            ExprNode::Unary(op, a) => unary_bound(*op, child(*a)),
-            ExprNode::Binary(op, a, b) => binary_bound(*op, child(*a), child(*b)),
-            ExprNode::Ternary(OpKind::Select, c, t, f) => {
-                select_bound(child(*c), child(*t), child(*f))
-            }
-            ExprNode::Ternary(op, a, b, c) => ternary_bound(*op, child(*a), child(*b), child(*c)),
-            other => panic!("PointCheck: {other:?} has no bound (screen it out first)"),
         }
     }
 
@@ -1017,7 +1032,7 @@ impl DifferentialCheck {
     /// select a different cell, in which case the value is not bounded at all.
     fn gather_bound(
         &self,
-        buf: ExprId,
+        buf: Node<'_, ExprData>,
         idx: &[NodeBound],
         bindings: &BindingTable<'_>,
         kind: GatherKind,
@@ -1031,19 +1046,18 @@ impl DifferentialCheck {
     /// legal value.
     fn gather_bound_pinned(
         &self,
-        buf: ExprId,
+        buf: Node<'_, ExprData>,
         idx: &[NodeBound],
         bindings: &BindingTable<'_>,
         kind: GatherKind,
     ) -> NodeBound {
-        let arena = &self.expanded;
-        let id = match arena.node(buf) {
-            ExprNode::Buffer(id) => *id,
+        let id = match *buf {
+            ExprData::Buffer(id) => id,
             other => {
                 panic!("PointCheck: Gather's buffer child must be a Buffer leaf, got {other:?}")
             }
         };
-        let decl = *arena.buffer_decl(id);
+        let decl = self.env.buffer(id);
         let data = bindings.slot(id);
         let divergent = idx.iter().any(|b| b.divergent);
 
@@ -1281,7 +1295,7 @@ fn binary_bound_pinned(op: OpKind, a: NodeBound, b: NodeBound) -> NodeBound {
 /// wrong is how a portable expression gets thrown away: in
 /// `Select(Lt(x, x), Round(-0.25), x)` the `Round` never executes — the
 /// condition is false at every point — yet a walker that flags divergence
-/// "anywhere in the arena" marks every grid point divergent and reports the
+/// "anywhere in the graph" marks every grid point divergent and reports the
 /// expression as having nothing checkable. So divergence, radius and
 /// indeterminacy all propagate from the condition plus the branch this point
 /// actually takes.
@@ -1386,7 +1400,7 @@ fn ternary_bound_pinned(op: OpKind, a: NodeBound, b: NodeBound, c: NodeBound) ->
 ///    method: [`classify_mask_root`](Self::classify_mask_root) for a mask,
 ///    [`verdict`](Self::verdict) for a number.
 /// 3. [`is_well_conditioned`](Self::is_well_conditioned) — only for
-///    *cross-form* comparison, where two algebraically-equal arenas are
+///    *cross-form* comparison, where two algebraically-equal graphs are
 ///    compared to each other rather than each to its own oracle.
 #[derive(Clone, Copy, Debug)]
 pub struct PointCheck {
@@ -1422,7 +1436,7 @@ pub enum PointVerdict {
 
 impl PointCheck {
     /// The oracle's value — the same number [`eval_scalar`] returns for this
-    /// `(arena, root, point)`. Callers do not need to evaluate twice.
+    /// `(term, point)`. Callers do not need to evaluate twice.
     #[must_use]
     pub fn value(self) -> f32 {
         self.value
@@ -1662,61 +1676,62 @@ pub enum MaskVerdict {
 }
 
 /// The immutable evaluation environment threaded through the recursion: the
-/// arena, the coordinate values, the buffer bindings, and the current binding
+/// term, the coordinate values, the buffer bindings, and the current binding
 /// of each reduction index (`Var(REDUCE_BINDER_BASE..)`). Grouping them keeps
-/// the recursive
-/// helpers to a single `ExprId` argument.
+/// the recursive helpers to a single node argument.
 #[derive(Clone, Copy)]
 struct Env<'a> {
-    arena: &'a ExprArena,
-    vars: &'a [f32; crate::arena::COORD_AXES],
+    term: Term<'a>,
+    vars: &'a [f32; COORD_AXES],
     bindings: &'a BindingTable<'a>,
     /// Values bound to the reduction indices from
-    /// [`REDUCE_BINDER_BASE`](crate::arena::REDUCE_BINDER_BASE) by enclosing
+    /// [`REDUCE_BINDER_BASE`](crate::decl::REDUCE_BINDER_BASE) by enclosing
     /// folds.
     reduce_vars: [f32; 4],
-    variance: &'a [crate::variance::Variance],
-    memo: &'a core::cell::RefCell<alloc::vec::Vec<Option<f32>>>,
+    variance: &'a SideTable<crate::variance::Variance>,
+    memo: &'a core::cell::RefCell<SideTable<Option<f32>>>,
 }
 
-impl Env<'_> {
-    fn eval(&self, id: ExprId) -> f32 {
-        let is_memoizable = !self.variance[id.0 as usize].depends_on_binder();
-        if is_memoizable {
-            let cached = self.memo.borrow()[id.0 as usize];
-            if let Some(val) = cached {
-                return val;
-            }
+impl<'a> Env<'a> {
+    fn eval(&self, node: Node<'a, ExprData>) -> f32 {
+        let is_memoizable = !self.variance[node].depends_on_binder();
+        if is_memoizable && let Some(val) = self.memo.borrow()[node] {
+            return val;
         }
-        let val = match self.arena.node(id) {
-            ExprNode::Var(i) => {
-                let i = *i as usize;
+        let kids: Vec<Node<'a, ExprData>> = node.children().collect();
+        let val = match (*node, kids.len()) {
+            (ExprData::Var(i), _) => {
+                let i = i as usize;
                 // Three ranges, and the middle one holds nothing: coordinates
                 // below COORD_AXES, then the reserved retired axes, then the
                 // binders from REDUCE_BINDER_BASE. Reading a retired index as
                 // a binder is off the end of the coordinates and short of the
                 // slots, so say so rather than subtract past zero.
                 assert!(
-                    !crate::arena::RETIRED_COORD_AXES.contains(&(i as u8)),
+                    !RETIRED_COORD_AXES.contains(&(i as u8)),
                     "eval_scalar: Var({i}) was a retired coordinate axis; a \
-                     lattice has {} axes and a per-call scalar is a Uniform",
-                    crate::arena::COORD_AXES
+                     lattice has {COORD_AXES} axes and a per-call scalar is a Uniform",
                 );
-                if i < crate::arena::COORD_AXES {
+                if i < COORD_AXES {
                     self.vars[i]
                 } else {
-                    self.reduce_vars[i - crate::arena::REDUCE_BINDER_BASE as usize]
+                    self.reduce_vars[i - REDUCE_BINDER_BASE as usize]
                 }
             }
-            ExprNode::Const(v) => *v,
-            ExprNode::Uniform(u) => uniform_value(self.arena, self.bindings, *u),
-            ExprNode::Param(p) => panic!("eval_scalar: Param({p}) — substitute params first"),
-            ExprNode::Buffer(b) => panic!(
+            (ExprData::Const(bits), _) => f32::from_bits(bits),
+            (ExprData::Uniform(u), _) => uniform_value(self.term.env(), self.bindings, u),
+            (ExprData::Param(p), _) => {
+                panic!("eval_scalar: Param({p}) — substitute params first")
+            }
+            (ExprData::Buffer(b), _) => panic!(
                 "eval_scalar: bare Buffer({}) is not a value; read it through Gather",
                 b.0
             ),
-            ExprNode::Unary(op, a) => {
-                let x = self.eval(*a);
+            (ExprData::Op(OpKind::RawGather), 2) => self.raw_gather(kids[0], kids[1]),
+            (ExprData::Op(OpKind::Gather), 3) => self.gather(kids[0], kids[1], kids[2]),
+            (ExprData::Op(OpKind::Reduce), 4) => self.reduce(kids[0], kids[1], kids[2], kids[3]),
+            (ExprData::Op(op), 1) => {
+                let x = self.eval(kids[0]);
                 op.eval_unary(x).unwrap_or_else(|| {
                     panic!(
                         "eval_scalar: no scalar eval for unary {op:?} — \
@@ -1724,10 +1739,9 @@ impl Env<'_> {
                     )
                 })
             }
-            ExprNode::Binary(OpKind::RawGather, buf, idx) => self.raw_gather(*buf, *idx),
-            ExprNode::Binary(op, a, b) => {
-                let x = self.eval(*a);
-                let y = self.eval(*b);
+            (ExprData::Op(op), 2) => {
+                let x = self.eval(kids[0]);
+                let y = self.eval(kids[1]);
                 op.eval_binary(x, y).unwrap_or_else(|| {
                     panic!(
                         "eval_scalar: no scalar eval for binary {op:?} — \
@@ -1735,35 +1749,31 @@ impl Env<'_> {
                     )
                 })
             }
-            ExprNode::Ternary(OpKind::Gather, buf, x, y) => self.gather(*buf, *x, *y),
-            ExprNode::Ternary(op, a, b, c) => {
-                let x = self.eval(*a);
-                let y = self.eval(*b);
-                let z = self.eval(*c);
+            (ExprData::Op(op), 3) => {
+                let x = self.eval(kids[0]);
+                let y = self.eval(kids[1]);
+                let z = self.eval(kids[2]);
                 op.eval_ternary(x, y, z)
                     .unwrap_or_else(|| panic!("eval_scalar: no scalar eval for ternary {op:?}"))
             }
-            ExprNode::Nary(OpKind::Reduce, start, len) => {
-                assert_eq!(*len, 4, "Reduce must have 4 children");
-                let ch = self.arena.nary_children_slice(*start, *len);
-                self.reduce(ch[0], ch[1], ch[2], ch[3])
+            (ExprData::Op(op), n) => {
+                panic!("eval_scalar: {op:?} with {n} children is unsupported")
             }
-            ExprNode::Nary(op, _, _) => panic!("eval_scalar: Nary({op:?}) unsupported"),
         };
         if is_memoizable {
-            self.memo.borrow_mut()[id.0 as usize] = Some(val);
+            self.memo.borrow_mut()[node] = Some(val);
         }
         val
     }
 
     /// Read one bound buffer at floored, clamped, row-major indices. This IS the
     /// reference definition of `Gather`.
-    fn gather(&self, buf: ExprId, x: ExprId, y: ExprId) -> f32 {
-        let id = match self.arena.node(buf) {
-            ExprNode::Buffer(id) => *id,
+    fn gather(&self, buf: Node<'a, ExprData>, x: Node<'a, ExprData>, y: Node<'a, ExprData>) -> f32 {
+        let id = match *buf {
+            ExprData::Buffer(id) => id,
             other => panic!("Gather's first child must be a Buffer leaf, got {other:?}"),
         };
-        let decl = self.arena.buffer_decl(id);
+        let decl = self.term.env().buffer(id);
         let data = self.bindings.slot(id);
 
         let xf = self.eval(x);
@@ -1783,9 +1793,9 @@ impl Env<'_> {
     /// of `Gather`). The index is trusted to be in bounds — the lowering clamped
     /// it — so this just truncates and indexes; an out-of-bounds index is a
     /// broken lowering and panics via the slice bounds check.
-    fn raw_gather(&self, buf: ExprId, idx: ExprId) -> f32 {
-        let id = match self.arena.node(buf) {
-            ExprNode::Buffer(id) => *id,
+    fn raw_gather(&self, buf: Node<'a, ExprData>, idx: Node<'a, ExprData>) -> f32 {
+        let id = match *buf {
+            ExprData::Buffer(id) => id,
             other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
         };
         let data = self.bindings.slot(id);
@@ -1797,12 +1807,18 @@ impl Env<'_> {
     /// combining terms with the monoid named by the `combiner` child. This is
     /// the reference definition that the unrolled `expand_reduce` form must
     /// match. `combiner`, `reduce_var`, and `extent` are `Const` children.
-    fn reduce(&self, combiner: ExprId, reduce_var: ExprId, extent: ExprId, body: ExprId) -> f32 {
-        let op = OpKind::from_index(self.const_of(combiner, "reduce combiner") as usize)
+    fn reduce(
+        &self,
+        combiner: Node<'a, ExprData>,
+        reduce_var: Node<'a, ExprData>,
+        extent: Node<'a, ExprData>,
+        body: Node<'a, ExprData>,
+    ) -> f32 {
+        let op = OpKind::from_index(const_of(combiner, "combiner") as usize)
             .expect("reduce combiner must be a valid OpKind index");
-        let var_idx = self.const_of(reduce_var, "reduce var index") as usize;
-        let n = self.const_of(extent, "reduce extent") as usize;
-        let base = crate::arena::REDUCE_BINDER_BASE as usize;
+        let var_idx = const_of(reduce_var, "var index") as usize;
+        let n = const_of(extent, "extent") as usize;
+        let base = REDUCE_BINDER_BASE as usize;
         let slots = base + self.reduce_vars.len();
         assert!(
             (base..slots).contains(&var_idx),
@@ -1824,27 +1840,67 @@ impl Env<'_> {
         }
         acc
     }
+}
 
-    /// Read a `Const` child that encodes an integer parameter.
-    fn const_of(&self, id: ExprId, what: &str) -> f32 {
-        match self.arena.node(id) {
-            ExprNode::Const(v) => *v,
-            other => panic!("reduce {what} must be a Const, got {other:?}"),
-        }
-    }
+/// Read a `Const` child that encodes an integer parameter.
+fn const_of(node: Node<'_, ExprData>, what: &str) -> f32 {
+    node.as_f32()
+        .unwrap_or_else(|| panic!("reduce {what} must be a Const, got {:?}", *node))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::BufferDecl;
+    use crate::decl::{BufferDecl, BufferIdentity};
+    use crate::expr::{ExprBuilder, ExprRef};
     use alloc::vec;
+
+    /// A frozen graph plus its environment, with every node a test wants to
+    /// name kept as an entry point.
+    ///
+    /// A `Term` borrows both halves, so they have to outlive it — which is
+    /// what this owns. `entry(i)` is the i-th node passed to [`freeze`].
+    struct Graph {
+        rooted: Rooted<ExprData>,
+        env: Environment,
+    }
+
+    impl Graph {
+        fn term(&self, i: usize) -> Term<'_> {
+            Term::new(self.rooted.entry_at(i), &self.env)
+        }
+
+        fn node(&self, i: usize) -> Node<'_, ExprData> {
+            self.rooted.entry_at(i)
+        }
+
+        fn eval(&self, i: usize, vars: [f32; 2], bindings: &BindingTable<'_>) -> f32 {
+            eval_scalar(self.term(i), &vars, bindings)
+        }
+
+        fn check(&self, i: usize) -> DifferentialCheck {
+            DifferentialCheck::new(self.term(i))
+        }
+    }
+
+    fn freeze(b: ExprBuilder, roots: &[ExprRef]) -> Graph {
+        let (rooted, env) = b.finish(roots);
+        Graph { rooted, env }
+    }
 
     /// A lattice-invariant leaf holding `default` — what a scalar that used
     /// to ride a retired axis is now.
-    fn uniform_leaf(arena: &mut ExprArena, default: f32) -> ExprId {
-        let slot = arena.declare_uniform(crate::Uniform::new(default).decl());
-        arena.push_uniform(slot)
+    fn uniform_leaf(b: &mut ExprBuilder, default: f32) -> ExprRef {
+        let slot = b.declare_uniform(crate::Uniform::new(default).decl());
+        b.push_uniform(slot)
+    }
+
+    fn buffer(b: &mut ExprBuilder, width: u32, height: u32) -> crate::decl::BufferId {
+        b.declare_buffer(BufferDecl {
+            id: BufferIdentity::mint(),
+            width,
+            height,
+        })
     }
 
     /// Reference re-implementation of `DiscreteManifold::eval`'s index math, so
@@ -1863,17 +1919,14 @@ mod tests {
         let height = 3usize;
         let buf: vec::Vec<f32> = (0..(width * height)).map(|i| i as f32 * 10.0).collect();
 
-        let mut arena = ExprArena::new();
-        let b = arena.declare_buffer(BufferDecl {
-            id: crate::arena::BufferIdentity::mint(),
-            width: width as u32,
-            height: height as u32,
-        });
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let gather = arena.push_gather(b, x, y);
+        let mut b = ExprBuilder::new();
+        let slot = buffer(&mut b, width as u32, height as u32);
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let gather = b.push_gather(slot, x, y);
+        let g = freeze(b, &[gather]);
 
-        let bindings = BindingTable::bind(&arena, &[buf.as_slice()]).unwrap();
+        let bindings = BindingTable::bind(&g.env, &[buf.as_slice()]).unwrap();
 
         // Every in-range cell, plus out-of-range coords that must clamp.
         let coords = [
@@ -1886,7 +1939,7 @@ mod tests {
             (1.9, 0.9),     // floor to (1,0)
         ];
         for (cx, cy) in coords {
-            let got = eval_scalar(&arena, gather, &[cx, cy], &bindings);
+            let got = g.eval(0, [cx, cy], &bindings);
             let want = discrete_eval(&buf, width, height, cx, cy);
             assert_eq!(got, want, "gather at ({cx}, {cy})");
         }
@@ -1894,64 +1947,55 @@ mod tests {
 
     #[test]
     fn lowering_preserves_gather_semantics() {
-        // The crux of M2 slice 1: expand_gather must produce an index
-        // expression that evaluates identically to the high-level Gather.
+        // expand_gather must produce an index expression that evaluates
+        // identically to the high-level Gather.
         use crate::passes::expand_gather;
 
         let width = 5usize;
         let height = 4usize;
         let buf: vec::Vec<f32> = (0..(width * height)).map(|i| i as f32 + 0.5).collect();
 
-        let mut arena = ExprArena::new();
-        let b = arena.declare_buffer(BufferDecl {
-            id: crate::arena::BufferIdentity::mint(),
-            width: width as u32,
-            height: height as u32,
-        });
+        let mut b = ExprBuilder::new();
+        let slot = buffer(&mut b, width as u32, height as u32);
         // Gather with non-trivial index expressions: (X*2, Y+1).
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let two = arena.push_const(2.0);
-        let one = arena.push_const(1.0);
-        let xx = arena.push_binary(OpKind::Mul, x, two);
-        let yy = arena.push_binary(OpKind::Add, y, one);
-        let gather = arena.push_gather(b, xx, yy);
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let two = b.push_const(2.0);
+        let one = b.push_const(1.0);
+        let xx = b.push_binary(OpKind::Mul, x, two);
+        let yy = b.push_binary(OpKind::Add, y, one);
+        let gather = b.push_gather(slot, xx, yy);
+        let g = freeze(b, &[gather]);
 
-        // Lower a clone; the buffer table is preserved, so the same binding works.
-        let mut lowered_arena = arena.clone();
-        let lowered_root = expand_gather(&mut lowered_arena, gather);
+        // The environment is preserved by lowering, so the same binding works.
+        let lowered = expand_gather(g.term(0));
+        let lowered_term = Term::new(lowered.entry(), &g.env);
 
-        // The lowered form REACHABLE from the new root must contain a
-        // RawGather and no high-level Gather. (The arena is append-only, so the
-        // original Gather remains as unreachable garbage in nodes_raw().)
-        let mut reachable = alloc::vec::Vec::new();
-        let mut stack = alloc::vec![lowered_root];
-        while let Some(id) = stack.pop() {
-            reachable.push(lowered_arena.node(id).clone());
-            for c in lowered_arena.children(id) {
-                stack.push(c);
-            }
-        }
+        // The lowered form must contain a RawGather and no high-level Gather.
+        let reachable: vec::Vec<(ExprData, usize)> = lowered_term
+            .root()
+            .descendants()
+            .map(|n| (*n, n.child_count()))
+            .collect();
         assert!(
             reachable
                 .iter()
-                .any(|n| matches!(n, ExprNode::Binary(OpKind::RawGather, _, _)))
+                .any(|(d, n)| *d == ExprData::Op(OpKind::RawGather) && *n == 2)
         );
         assert!(
             !reachable
                 .iter()
-                .any(|n| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
+                .any(|(d, n)| *d == ExprData::Op(OpKind::Gather) && *n == 3)
         );
 
-        let bindings = BindingTable::bind(&arena, &[buf.as_slice()]).unwrap();
-        let lowered_bindings = BindingTable::bind(&lowered_arena, &[buf.as_slice()]).unwrap();
+        let bindings = BindingTable::bind(&g.env, &[buf.as_slice()]).unwrap();
 
         // Sweep coords including fractional and out-of-range values.
         for xi in [-2.0f32, 0.0, 0.7, 1.0, 2.0, 3.0, 10.0] {
             for yi in [-1.0f32, 0.0, 0.4, 1.0, 2.0, 3.0, 8.0] {
                 let vars = [xi, yi];
-                let hi = eval_scalar(&arena, gather, &vars, &bindings);
-                let lo = eval_scalar(&lowered_arena, lowered_root, &vars, &lowered_bindings);
+                let hi = g.eval(0, vars, &bindings);
+                let lo = eval_scalar(lowered_term, &vars, &bindings);
                 assert_eq!(hi, lo, "gather vs lowered at ({xi}, {yi})");
             }
         }
@@ -1961,55 +2005,49 @@ mod tests {
     fn gather_composes_with_arithmetic() {
         // out = buffer[X, 0] * 2 + 1, indices computed by an expression.
         let buf = vec![5.0f32, 6.0, 7.0, 8.0];
-        let mut arena = ExprArena::new();
-        let b = arena.declare_buffer(BufferDecl {
-            id: crate::arena::BufferIdentity::mint(),
-            width: 4,
-            height: 1,
-        });
-        let x = arena.push_var(0);
-        let zero = arena.push_const(0.0);
-        let gather = arena.push_gather(b, x, zero);
-        let two = arena.push_const(2.0);
-        let one = arena.push_const(1.0);
-        let scaled = arena.push_binary(OpKind::Mul, gather, two);
-        let root = arena.push_binary(OpKind::Add, scaled, one);
+        let mut b = ExprBuilder::new();
+        let slot = buffer(&mut b, 4, 1);
+        let x = b.push_var(0);
+        let zero = b.push_const(0.0);
+        let gather = b.push_gather(slot, x, zero);
+        let two = b.push_const(2.0);
+        let one = b.push_const(1.0);
+        let scaled = b.push_binary(OpKind::Mul, gather, two);
+        let root = b.push_binary(OpKind::Add, scaled, one);
+        let g = freeze(b, &[root]);
 
-        let bindings = BindingTable::bind(&arena, &[buf.as_slice()]).unwrap();
+        let bindings = BindingTable::bind(&g.env, &[buf.as_slice()]).unwrap();
         // X = 2 -> buffer[2] = 7 -> 7*2 + 1 = 15
-        let got = eval_scalar(&arena, root, &[2.0, 0.0], &bindings);
-        assert_eq!(got, 15.0);
+        assert_eq!(g.eval(0, [2.0, 0.0], &bindings), 15.0);
     }
 
     #[test]
     fn reduce_sum_of_squares() {
         // sum_{i=0}^{3} (i+1)^2 = 1 + 4 + 9 + 16 = 30, folded over Var(4).
-        let mut arena = ExprArena::new();
-        let i = arena.push_var(4);
-        let one = arena.push_const(1.0);
-        let ip1 = arena.push_binary(OpKind::Add, i, one);
-        let sq = arena.push_binary(OpKind::Mul, ip1, ip1);
-        let root = arena.push_reduce(OpKind::Add, 4, 4, sq);
-
-        let bindings = BindingTable::empty();
-        assert_eq!(eval_scalar(&arena, root, &[0.0; 2], &bindings), 30.0);
+        let mut b = ExprBuilder::new();
+        let i = b.push_var(4);
+        let one = b.push_const(1.0);
+        let ip1 = b.push_binary(OpKind::Add, i, one);
+        let sq = b.push_binary(OpKind::Mul, ip1, ip1);
+        let root = b.push_reduce(OpKind::Add, 4, 4, sq);
+        let g = freeze(b, &[root]);
+        assert_eq!(g.eval(0, [0.0; 2], &BindingTable::empty()), 30.0);
     }
 
     #[test]
     fn reduce_max_and_mul() {
-        // max_{i=0..4} i = 3 ; prod_{i=1..4}(via body i+1) = 2*3*4 = 24.
-        let mut arena = ExprArena::new();
-        let i = arena.push_var(4);
-        let max_root = arena.push_reduce(OpKind::Max, 4, 4, i);
-        let bindings = BindingTable::empty();
-        assert_eq!(eval_scalar(&arena, max_root, &[0.0; 2], &bindings), 3.0);
+        // max_{i=0..4} i = 3 ; Reduce over 0..4 of (i+1) = 1*2*3*4 = 24.
+        let mut b = ExprBuilder::new();
+        let i = b.push_var(4);
+        let max_root = b.push_reduce(OpKind::Max, 4, 4, i);
+        let one = b.push_const(1.0);
+        let ip1 = b.push_binary(OpKind::Add, i, one);
+        let mul_root = b.push_reduce(OpKind::Mul, 4, 4, ip1);
+        let g = freeze(b, &[max_root, mul_root]);
 
-        let one = arena.push_const(1.0);
-        let ip1 = arena.push_binary(OpKind::Add, i, one);
-        // product over i=1..4 of (i+1): i=1->2, 2->3, 3->4  => start at i=0 -> 1
-        // Reduce over 0..4 of (i+1) = 1*2*3*4 = 24.
-        let mul_root = arena.push_reduce(OpKind::Mul, 4, 4, ip1);
-        assert_eq!(eval_scalar(&arena, mul_root, &[0.0; 2], &bindings), 24.0);
+        let bindings = BindingTable::empty();
+        assert_eq!(g.eval(0, [0.0; 2], &bindings), 3.0);
+        assert_eq!(g.eval(1, [0.0; 2], &bindings), 24.0);
     }
 
     #[test]
@@ -2018,10 +2056,11 @@ mod tests {
         // `OpKind::monoid_identity()` — the only place that private value is
         // observable through the public eval_scalar/push_reduce surface.
         fn empty_reduce(combiner: OpKind) -> f32 {
-            let mut arena = ExprArena::new();
-            let body = arena.push_var(4);
-            let root = arena.push_reduce(combiner, 4, 0, body);
-            eval_scalar(&arena, root, &[0.0; 2], &BindingTable::empty())
+            let mut b = ExprBuilder::new();
+            let body = b.push_var(4);
+            let root = b.push_reduce(combiner, 4, 0, body);
+            let g = freeze(b, &[root]);
+            g.eval(0, [0.0; 2], &BindingTable::empty())
         }
 
         assert_eq!(empty_reduce(OpKind::Add), 0.0);
@@ -2040,29 +2079,27 @@ mod tests {
     fn reduce_lowering_preserves_semantics() {
         // Σ over i of (X + i), lowered by expand_reduce, must equal the fold.
         use crate::passes::expand_reduce;
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let i = arena.push_var(4);
-        let body = arena.push_binary(OpKind::Add, x, i);
-        let root = arena.push_reduce(OpKind::Add, 4, 5, body); // Σ_{i=0}^{4}(X+i)
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let i = b.push_var(4);
+        let body = b.push_binary(OpKind::Add, x, i);
+        let root = b.push_reduce(OpKind::Add, 4, 5, body); // Σ_{i=0}^{4}(X+i)
+        let g = freeze(b, &[root]);
 
-        let mut lowered = arena.clone();
-        let lroot = expand_reduce(&mut lowered, root);
-        // No Reduce node remains reachable from the new root.
-        let mut stack = alloc::vec![lroot];
-        while let Some(id) = stack.pop() {
-            assert!(!matches!(
-                lowered.node(id),
-                ExprNode::Nary(OpKind::Reduce, _, _)
-            ));
-            for c in lowered.children(id) {
-                stack.push(c);
-            }
-        }
-        let b = BindingTable::empty();
+        let lowered = expand_reduce(g.term(0));
+        let lowered_term = Term::new(lowered.entry(), &g.env);
+        assert!(
+            !lowered_term
+                .root()
+                .descendants()
+                .any(|n| *n == ExprData::Op(OpKind::Reduce)),
+            "no Reduce node remains reachable from the new root"
+        );
+
+        let bindings = BindingTable::empty();
         for xv in [-2.0f32, 0.0, 3.5, 10.0] {
-            let want = eval_scalar(&arena, root, &[xv, 0.0], &b);
-            let got = eval_scalar(&lowered, lroot, &[xv, 0.0], &b);
+            let want = g.eval(0, [xv, 0.0], &bindings);
+            let got = eval_scalar(lowered_term, &[xv, 0.0], &bindings);
             assert_eq!(want, got, "reduce lowering at X={xv}");
             // Σ_{i=0}^{4}(X+i) = 5X + 10.
             assert_eq!(want, 5.0 * xv + 10.0);
@@ -2072,30 +2109,22 @@ mod tests {
     #[test]
     fn reduce_matmul_dot_over_gather() {
         // out = Σ_i W(i,0) * input(i,0), the matmul kernel body for one output.
-        use crate::arena::BufferDecl;
         let w = alloc::vec![2.0f32, 3.0, 4.0]; // W column
         let inp = alloc::vec![10.0f32, 20.0, 30.0];
-        let mut arena = ExprArena::new();
-        let wb = arena.declare_buffer(BufferDecl {
-            id: crate::arena::BufferIdentity::mint(),
-            width: 3,
-            height: 1,
-        });
-        let ib = arena.declare_buffer(BufferDecl {
-            id: crate::arena::BufferIdentity::mint(),
-            width: 3,
-            height: 1,
-        });
-        let i = arena.push_var(4);
-        let zero = arena.push_const(0.0);
-        let wg = arena.push_gather(wb, i, zero);
-        let ig = arena.push_gather(ib, i, zero);
-        let prod = arena.push_binary(OpKind::Mul, wg, ig);
-        let root = arena.push_reduce(OpKind::Add, 4, 3, prod);
+        let mut b = ExprBuilder::new();
+        let wb = buffer(&mut b, 3, 1);
+        let ib = buffer(&mut b, 3, 1);
+        let i = b.push_var(4);
+        let zero = b.push_const(0.0);
+        let wg = b.push_gather(wb, i, zero);
+        let ig = b.push_gather(ib, i, zero);
+        let prod = b.push_binary(OpKind::Mul, wg, ig);
+        let root = b.push_reduce(OpKind::Add, 4, 3, prod);
+        let g = freeze(b, &[root]);
 
-        let bindings = BindingTable::bind(&arena, &[w.as_slice(), inp.as_slice()]).unwrap();
+        let bindings = BindingTable::bind(&g.env, &[w.as_slice(), inp.as_slice()]).unwrap();
         // 2*10 + 3*20 + 4*30 = 20 + 60 + 120 = 200.
-        assert_eq!(eval_scalar(&arena, root, &[0.0; 2], &bindings), 200.0);
+        assert_eq!(g.eval(0, [0.0; 2], &bindings), 200.0);
     }
 
     const ALL_ONES: f32 = f32::from_bits(u32::MAX);
@@ -2152,83 +2181,86 @@ mod tests {
 
     #[test]
     fn mask_valued_walk_is_linear_on_a_shared_dag() {
-        // The arena is a DAG. `BitAnd(n, n)` chains — the shape e-graph
+        // The graph is a DAG. `BitAnd(n, n)` chains — the shape e-graph
         // extraction produces when it shares aggressively — cost 2^depth to a
         // naive recursion: 29 nodes measured ~1.2s unmemoized, and 60 nodes
         // would never return. Memoized, this is instant, and a regression
         // shows up as a hung test rather than a wrong answer.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let mut masked = arena.push_binary(OpKind::Lt, x, y);
-        let mut numeric = arena.push_binary(OpKind::Add, x, y);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let mut masked = b.push_binary(OpKind::Lt, x, y);
+        let mut numeric = b.push_binary(OpKind::Add, x, y);
         for _ in 0..60 {
-            masked = arena.push_binary(OpKind::BitAnd, masked, masked);
+            masked = b.push_binary(OpKind::BitAnd, masked, masked);
             // Same shape, but one leaf is arithmetic, so the whole chain must
             // resolve false — the memo must not short-circuit into "true".
-            numeric = arena.push_binary(OpKind::BitOr, numeric, numeric);
+            numeric = b.push_binary(OpKind::BitOr, numeric, numeric);
         }
-        assert!(is_mask_valued(&arena, masked));
-        assert!(!is_mask_valued(&arena, numeric));
-
         // Select shares its branches too, and its CONDITION is never visited:
         // a numeric condition under mask branches stays mask-valued.
-        let mut sel = arena.push_binary(OpKind::Ge, x, y);
+        let mut sel = b.push_binary(OpKind::Ge, x, y);
         for _ in 0..60 {
-            sel = arena.push_ternary(OpKind::Select, numeric, sel, sel);
+            sel = b.push_ternary(OpKind::Select, numeric, sel, sel);
         }
-        assert!(is_mask_valued(&arena, sel));
+        let g = freeze(b, &[masked, numeric, sel]);
+
+        assert!(is_mask_valued(g.node(0)));
+        assert!(!is_mask_valued(g.node(1)));
+        assert!(is_mask_valued(g.node(2)));
     }
 
     #[test]
     fn mask_valued_root_detection() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
         // Numeric child under a comparison root — the motivating case
         // Lt(Sin(x), y). Sin isn't scalar-evaluable pre-lowering, but
         // mask-valued-ness is structural, so any numeric child exercises it.
-        let sinx = arena.push_unary(OpKind::Sin, x);
-        let cmp = arena.push_binary(OpKind::Lt, sinx, y);
-        assert!(is_mask_valued(&arena, cmp));
+        let sinx = b.push_unary(OpKind::Sin, x);
+        let cmp = b.push_binary(OpKind::Lt, sinx, y);
+        let ge = b.push_binary(OpKind::Ge, x, y);
+        let add = b.push_binary(OpKind::Add, x, y);
+        let both = b.push_binary(OpKind::BitAnd, cmp, ge);
+        let tainted = b.push_binary(OpKind::BitOr, cmp, add);
+        let sel_masks = b.push_ternary(OpKind::Select, cmp, ge, both);
+        let sel_numeric = b.push_ternary(OpKind::Select, cmp, x, y);
+        let ti = b.push_unary(OpKind::TruncToInt, x);
+        let g = freeze(
+            b,
+            &[cmp, ge, add, both, tainted, sel_masks, sel_numeric, ti],
+        );
 
+        assert!(is_mask_valued(g.node(0)));
         // Every comparison is a mask; arithmetic is not.
-        let ge = arena.push_binary(OpKind::Ge, x, y);
-        assert!(is_mask_valued(&arena, ge));
-        let add = arena.push_binary(OpKind::Add, x, y);
-        assert!(!is_mask_valued(&arena, add));
-
+        assert!(is_mask_valued(g.node(1)));
+        assert!(!is_mask_valued(g.node(2)));
         // BitAnd/BitOr of masks is a mask; of anything else, unknown => false.
-        let both = arena.push_binary(OpKind::BitAnd, cmp, ge);
-        assert!(is_mask_valued(&arena, both));
-        let tainted = arena.push_binary(OpKind::BitOr, cmp, add);
-        assert!(!is_mask_valued(&arena, tainted));
-
+        assert!(is_mask_valued(g.node(3)));
+        assert!(!is_mask_valued(g.node(4)));
         // Select is mask-valued iff both BRANCHES are; the condition is a
         // stencil, not part of the output domain.
-        let sel_masks = arena.push_ternary(OpKind::Select, cmp, ge, both);
-        assert!(is_mask_valued(&arena, sel_masks));
-        let sel_numeric = arena.push_ternary(OpKind::Select, cmp, x, y);
-        assert!(!is_mask_valued(&arena, sel_numeric));
-
+        assert!(is_mask_valued(g.node(5)));
+        assert!(!is_mask_valued(g.node(6)));
         // TruncToInt is bitwise-DOMAIN but not mask-VALUED: its result is an
         // arbitrary integer pattern and must not be forced to all-ones/zeros.
-        let ti = arena.push_unary(OpKind::TruncToInt, x);
         assert!(OpKind::TruncToInt.is_bitwise_domain());
-        assert!(!is_mask_valued(&arena, ti));
+        assert!(!is_mask_valued(g.node(7)));
     }
 
     #[test]
     fn oracle_comparison_root_emits_valid_masks() {
         // End-to-end: eval_scalar's lane for a comparison root passes the
         // root-aware gate against itself and IS a valid pattern.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Lt, x, y);
-        let b = BindingTable::empty();
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let root = b.push_binary(OpKind::Lt, x, y);
+        let g = freeze(b, &[root]);
+        let bindings = BindingTable::empty();
         for (xv, yv, verdict) in [(1.0f32, 2.0f32, true), (2.0, 1.0, false)] {
-            let lane = eval_scalar(&arena, root, &[xv, yv], &b);
+            let lane = g.eval(0, [xv, yv], &bindings);
             assert!(is_valid_mask(lane.to_bits()));
             assert_eq!(lane.to_bits() == u32::MAX, verdict);
             assert_eq!(compare_mask_root(lane, lane), MaskComparison::Agree);
@@ -2269,28 +2301,27 @@ mod tests {
 
     // ───────────────── compositional bound ─────────────────
 
-    /// `recip(x)` squared `2^k` times: the review's amplification case, and the
-    /// shape a max-over-ops fold cannot describe.
-    fn recip_pow2(arena: &mut ExprArena, squarings: usize) -> ExprId {
-        let x = arena.push_var(0);
-        let mut e = arena.push_unary(OpKind::Recip, x);
+    /// `recip(x)` squared `2^k` times: the amplification case, and the shape a
+    /// max-over-ops fold cannot describe.
+    fn recip_pow2(squarings: usize) -> Graph {
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let mut e = b.push_unary(OpKind::Recip, x);
         for _ in 0..squarings {
-            e = arena.push_binary(OpKind::Mul, e, e);
+            e = b.push_binary(OpKind::Mul, e, e);
         }
-        e
+        freeze(b, &[e])
     }
 
     #[test]
     fn estimate_error_amplifies_through_repeated_squaring() {
-        // Codex R1 / smoke B1, concretely: `recip(x)^16` at x = -1. `rcpps` is
-        // a ~12-bit estimate, so the JIT holds -1·(1 ± 3.7e-4); four squarings
-        // multiply that relative width by 16. The measured JIT lane 0.9961009
-        // is 3.9e-3 away from the exact 1.0 — eight times the folded 5e-4
-        // allowance that used to gate it, and well inside the composed bound.
-        let mut arena = ExprArena::new();
-        let root = recip_pow2(&mut arena, 4);
-        let check = DifferentialCheck::new(&arena, root);
-        let point = check.at(&[-1.0, 0.0], &BindingTable::empty());
+        // `recip(x)^16` at x = -1. `rcpps` is a ~12-bit estimate, so the JIT
+        // holds -1·(1 ± 3.7e-4); four squarings multiply that relative width by
+        // 16. The measured JIT lane 0.9961009 is 3.9e-3 away from the exact
+        // 1.0 — eight times the folded 5e-4 allowance that used to gate it, and
+        // well inside the composed bound.
+        let g = recip_pow2(4);
+        let point = g.check(0).at(&[-1.0, 0.0], &BindingTable::empty());
 
         assert_eq!(point.value(), 1.0);
         assert!(!point.is_platform_divergent());
@@ -2322,9 +2353,9 @@ mod tests {
         // it depends on the expression, not just on its worst op.
         let mut prev = 0.0f32;
         for k in 0..5 {
-            let mut arena = ExprArena::new();
-            let root = recip_pow2(&mut arena, k);
-            let bound = DifferentialCheck::new(&arena, root)
+            let g = recip_pow2(k);
+            let bound = g
+                .check(0)
                 .at(&[-1.0, 0.0], &BindingTable::empty())
                 .error_bound();
             assert!(bound > prev, "k={k}: {bound} must exceed {prev}");
@@ -2332,15 +2363,17 @@ mod tests {
         }
     }
 
-    /// `sin(recip(x) * y * y)` — the smoke run's amplification case: an estimate
-    /// seeded at `Recip` and multiplied by the argument before a transcendental.
-    fn sin_of_recip_scaled_square(arena: &mut ExprArena) -> ExprId {
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let k = arena.push_unary(OpKind::Recip, x);
-        let y2 = arena.push_binary(OpKind::Mul, y, y);
-        let arg = arena.push_binary(OpKind::Mul, k, y2);
-        arena.push_unary(OpKind::Sin, arg)
+    /// `sin(recip(x) * y * y)` — an estimate seeded at `Recip` and multiplied
+    /// by the argument before a transcendental.
+    fn sin_of_recip_scaled_square() -> Graph {
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let k = b.push_unary(OpKind::Recip, x);
+        let y2 = b.push_binary(OpKind::Mul, y, y);
+        let arg = b.push_binary(OpKind::Mul, k, y2);
+        let root = b.push_unary(OpKind::Sin, arg);
+        freeze(b, &[root])
     }
 
     #[test]
@@ -2348,9 +2381,8 @@ mod tests {
         // One expression, two points. The smoke run measured relative error 0
         // at argument 0.83, 3.6e-3 at 8.3e3, and 1.0 at 8.3e7 — which is why a
         // single per-expression tolerance cannot be right at both ends.
-        let mut arena = ExprArena::new();
-        let root = sin_of_recip_scaled_square(&mut arena);
-        let check = DifferentialCheck::new(&arena, root);
+        let g = sin_of_recip_scaled_square();
+        let check = g.check(0);
         let b = BindingTable::empty();
 
         // Small argument: the estimate's width never gets multiplied up, so the
@@ -2389,13 +2421,9 @@ mod tests {
     /// motivated this test look like a regression.
     #[test]
     fn sin_past_its_domain_is_exactly_nan_not_amplified() {
-        let mut arena = ExprArena::new();
-        let root = sin_of_recip_scaled_square(&mut arena);
-        let check = DifferentialCheck::new(&arena, root);
-        let b = BindingTable::empty();
-
+        let g = sin_of_recip_scaled_square();
         // y = 9110 puts the argument at ~8.3e7, far past 2^20.
-        let beyond = check.at(&[1.0, 9110.0], &b);
+        let beyond = g.check(0).at(&[1.0, 9110.0], &BindingTable::empty());
         assert!(
             beyond.value().is_nan(),
             "expected the guarded NaN, got {}",
@@ -2406,21 +2434,21 @@ mod tests {
 
     #[test]
     fn indeterminacy_survives_conversion_to_a_number() {
-        // Codex P2 (comment 3744586355): `IntToFloat(Lt(Recip(x), k))` at the
-        // threshold. The comparison is a pattern with radius 0 and
-        // `indeterminate == true`; `IntToFloat` used to take the exact-in
-        // exact-out fast path, copying the flag onto a ZERO radius that nothing
-        // numeric reads. A backend choosing the other legal mask returns 0.0
-        // where the oracle has -1.0 (or the reverse), and the hard bug gate
-        // called that a same-form miscompile.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let k = arena.push_var(1);
-        let r = arena.push_unary(OpKind::Recip, x);
-        let cmp = arena.push_binary(OpKind::Lt, r, k);
-        let root = arena.push_unary(OpKind::IntToFloat, cmp);
+        // `IntToFloat(Lt(Recip(x), k))` at the threshold. The comparison is a
+        // pattern with radius 0 and `indeterminate == true`; `IntToFloat` used
+        // to take the exact-in exact-out fast path, copying the flag onto a
+        // ZERO radius that nothing numeric reads. A backend choosing the other
+        // legal mask returns 0.0 where the oracle has -1.0 (or the reverse),
+        // and the hard bug gate called that a same-form miscompile.
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let k = b.push_var(1);
+        let r = b.push_unary(OpKind::Recip, x);
+        let cmp = b.push_binary(OpKind::Lt, r, k);
+        let root = b.push_unary(OpKind::IntToFloat, cmp);
+        let g = freeze(b, &[root]);
 
-        let check = DifferentialCheck::new(&arena, root);
+        let check = g.check(0);
         // The root is a NUMBER, so the numeric path is what has to know.
         assert!(!check.root_is_mask_valued());
 
@@ -2460,16 +2488,17 @@ mod tests {
         // number, so it composes. `1 + int_to_float(lt(recip(x), k))` is 1.0 or
         // 0.0 at the threshold, and a bound of zero on either would report the
         // other as a miscompile.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let k = arena.push_var(1);
-        let r = arena.push_unary(OpKind::Recip, x);
-        let cmp = arena.push_binary(OpKind::Lt, r, k);
-        let converted = arena.push_unary(OpKind::IntToFloat, cmp);
-        let one = arena.push_const(1.0);
-        let root = arena.push_binary(OpKind::Add, one, converted);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let k = b.push_var(1);
+        let r = b.push_unary(OpKind::Recip, x);
+        let cmp = b.push_binary(OpKind::Lt, r, k);
+        let converted = b.push_unary(OpKind::IntToFloat, cmp);
+        let one = b.push_const(1.0);
+        let root = b.push_binary(OpKind::Add, one, converted);
+        let g = freeze(b, &[root]);
 
-        let point = DifferentialCheck::new(&arena, root).at(&[1.0, 1.0], &BindingTable::empty());
+        let point = g.check(0).at(&[1.0, 1.0], &BindingTable::empty());
         assert_eq!(point.value(), 1.0);
         assert_eq!(point.verdict(1.0), PointVerdict::Accept);
         assert_eq!(point.verdict(0.0), PointVerdict::Accept);
@@ -2483,14 +2512,14 @@ mod tests {
         // The widening must not leak into expressions that never straddle:
         // `int_to_float(lt(x, y))` on exact operands is exactly 0 or -1, and a
         // backend returning the other one IS a miscompile.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let cmp = arena.push_binary(OpKind::Lt, x, y);
-        let root = arena.push_unary(OpKind::IntToFloat, cmp);
-        let check = DifferentialCheck::new(&arena, root);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let cmp = b.push_binary(OpKind::Lt, x, y);
+        let root = b.push_unary(OpKind::IntToFloat, cmp);
+        let g = freeze(b, &[root]);
 
-        let point = check.at(&[0.5, 0.7], &BindingTable::empty());
+        let point = g.check(0).at(&[0.5, 0.7], &BindingTable::empty());
         assert!(!point.mask_is_indeterminate());
         assert_eq!(point.value(), -1.0, "0.5 < 0.7 is all-ones, which is -1");
         assert_eq!(point.error_bound(), 0.0);
@@ -2504,19 +2533,20 @@ mod tests {
         // A mask-valued root must not be turned into a number by the widening:
         // `Select(Lt(recip(x), k), Lt(a, b), 0.0)` is still a pattern, and
         // `classify_mask_root` — not a radius — is what judges it.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let k = arena.push_var(1);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let k = b.push_var(1);
         // Two lattice-invariant leaves — the shape Z and W used to have.
-        let a = uniform_leaf(&mut arena, 1.0);
-        let b = uniform_leaf(&mut arena, 2.0);
-        let r = arena.push_unary(OpKind::Recip, x);
-        let cond = arena.push_binary(OpKind::Lt, r, k);
-        let branch = arena.push_binary(OpKind::Lt, a, b);
-        let zero = arena.push_const(0.0);
-        let root = arena.push_ternary(OpKind::Select, cond, branch, zero);
+        let a = uniform_leaf(&mut b, 1.0);
+        let bb = uniform_leaf(&mut b, 2.0);
+        let r = b.push_unary(OpKind::Recip, x);
+        let cond = b.push_binary(OpKind::Lt, r, k);
+        let branch = b.push_binary(OpKind::Lt, a, bb);
+        let zero = b.push_const(0.0);
+        let root = b.push_ternary(OpKind::Select, cond, branch, zero);
+        let g = freeze(b, &[root]);
 
-        let check = DifferentialCheck::new(&arena, root);
+        let check = g.check(0);
         assert!(check.root_is_mask_valued());
         // cond straddles; the true branch is all-ones, the false branch zero,
         // so the two resolutions disagree and either lane is legal.
@@ -2544,11 +2574,12 @@ mod tests {
         // every point and thereby gave a broken `x * 2e-4` somewhere to hide.
         // Exact inputs through a correctly-rounded op compose to a ZERO bound,
         // so the point is maximally usable and the broken form is rejected.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let small = arena.push_const(1e-4);
-        let root = arena.push_binary(OpKind::Mul, x, small);
-        let check = DifferentialCheck::new(&arena, root);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let small = b.push_const(1e-4);
+        let root = b.push_binary(OpKind::Mul, x, small);
+        let g = freeze(b, &[root]);
+        let check = g.check(0);
         for xv in [1.0f32, -3.5, 1e3, 1e-3] {
             let point = check.at(&[xv, 0.0], &BindingTable::empty());
             assert_eq!(point.error_bound(), 0.0);
@@ -2564,12 +2595,13 @@ mod tests {
         // and survives the subtraction untouched, while the value collapses to
         // zero — so the RELATIVE bound is infinite. That is the conditioning
         // signal, derived rather than guessed.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let r = arena.push_unary(OpKind::Recip, x);
-        let one = arena.push_const(1.0);
-        let root = arena.push_binary(OpKind::Sub, r, one);
-        let point = DifferentialCheck::new(&arena, root).at(&[1.0, 0.0], &BindingTable::empty());
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let r = b.push_unary(OpKind::Recip, x);
+        let one = b.push_const(1.0);
+        let root = b.push_binary(OpKind::Sub, r, one);
+        let g = freeze(b, &[root]);
+        let point = g.check(0).at(&[1.0, 0.0], &BindingTable::empty());
         assert_eq!(point.value(), 0.0);
         assert!(point.error_bound() > 1e-4);
         assert_eq!(point.relative_error_bound(), f32::INFINITY);
@@ -2578,44 +2610,46 @@ mod tests {
 
     #[test]
     fn divergence_respects_the_chosen_select_branch() {
-        // Codex R3: `Select(Lt(x, x), Round(-0.25), x)` is portably `x` — the
-        // condition is false everywhere, so the platform-divergent `Round`
-        // never runs. A walker that flags divergence "anywhere in the arena"
-        // skips every grid point and reports NoCheckablePoints.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let cond = arena.push_binary(OpKind::Lt, x, x);
-        let quarter = arena.push_const(-0.25);
-        let rounded = arena.push_unary(OpKind::Round, quarter);
-        let root = arena.push_ternary(OpKind::Select, cond, rounded, x);
+        // `Select(Lt(x, x), Round(-0.25), x)` is portably `x` — the condition
+        // is false everywhere, so the platform-divergent `Round` never runs. A
+        // walker that flags divergence "anywhere in the graph" skips every grid
+        // point and reports NoCheckablePoints.
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let cond = b.push_binary(OpKind::Lt, x, x);
+        let quarter = b.push_const(-0.25);
+        let rounded = b.push_unary(OpKind::Round, quarter);
+        let root = b.push_ternary(OpKind::Select, cond, rounded, x);
+        // The op is still divergent when the point actually reaches it: same
+        // branches, a condition that is true.
+        let taken = b.push_binary(OpKind::Le, x, x);
+        let reached = b.push_ternary(OpKind::Select, taken, rounded, x);
+        let g = freeze(b, &[root, reached]);
 
-        let check = DifferentialCheck::new(&arena, root);
-        let b = BindingTable::empty();
+        let check = g.check(0);
+        let bindings = BindingTable::empty();
         for xv in [-2.0f32, -0.25, 0.0, 1.0, 7.5] {
-            let point = check.at(&[xv, 0.0], &b);
+            let point = check.at(&[xv, 0.0], &bindings);
             assert!(!point.is_platform_divergent(), "x={xv}");
             assert_eq!(point.value(), xv);
             assert_eq!(point.verdict(xv), PointVerdict::Accept);
         }
 
-        // The op is still divergent when the point actually reaches it: same
-        // branches, a condition that is true.
-        let taken = arena.push_binary(OpKind::Le, x, x);
-        let reached = arena.push_ternary(OpKind::Select, taken, rounded, x);
-        let point = DifferentialCheck::new(&arena, reached).at(&[1.0, 0.0], &b);
+        let point = g.check(1).at(&[1.0, 0.0], &bindings);
         assert!(point.is_platform_divergent());
     }
 
     #[test]
     fn mask_disagreement_needs_proximity_to_be_excused() {
-        // Codex R2: `Lt(0.5, 0.7)` has operands 0.2 apart with zero accumulated
-        // error. A JIT returning the opposite canonical mask is a miscompile,
-        // not a boundary coin flip, and the classification must say so.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Lt, x, y);
-        let check = DifferentialCheck::new(&arena, root);
+        // `Lt(0.5, 0.7)` has operands 0.2 apart with zero accumulated error. A
+        // JIT returning the opposite canonical mask is a miscompile, not a
+        // boundary coin flip, and the classification must say so.
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let root = b.push_binary(OpKind::Lt, x, y);
+        let g = freeze(b, &[root]);
+        let check = g.check(0);
         assert!(check.root_is_mask_valued());
 
         let point = check.at(&[0.5, 0.7], &BindingTable::empty());
@@ -2635,12 +2669,13 @@ mod tests {
     fn mask_disagreement_at_the_threshold_is_contract() {
         // `Lt(recip(x), y)` at x = y = 1: the operands are equal, but the left
         // one carries the estimate's width, so both verdicts are legal answers.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let r = arena.push_unary(OpKind::Recip, x);
-        let root = arena.push_binary(OpKind::Lt, r, y);
-        let point = DifferentialCheck::new(&arena, root).at(&[1.0, 1.0], &BindingTable::empty());
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let r = b.push_unary(OpKind::Recip, x);
+        let root = b.push_binary(OpKind::Lt, r, y);
+        let g = freeze(b, &[root]);
+        let point = g.check(0).at(&[1.0, 1.0], &BindingTable::empty());
 
         assert!(point.mask_is_indeterminate());
         assert!(!point.is_well_conditioned());
@@ -2660,39 +2695,39 @@ mod tests {
 
     #[test]
     fn canonical_mask_constants_are_mask_valued() {
-        // Codex: `Select(cond, Lt(x + y, z), 0.0)` used to degrade to the
-        // numeric path because of the constant branch — and the numeric path's
-        // NaN-vs-NaN rule then accepted a broken 0x7fc00000 against a required
-        // all-ones mask. `0.0` IS `0x00000000`, the false mask.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let z = uniform_leaf(&mut arena, 9.0);
-        let w = uniform_leaf(&mut arena, 0.0);
-        let cond = arena.push_binary(OpKind::Lt, w, x);
-        let sum = arena.push_binary(OpKind::Add, x, y);
-        let cmp = arena.push_binary(OpKind::Lt, sum, z);
+        // `Select(cond, Lt(x + y, z), 0.0)` used to degrade to the numeric path
+        // because of the constant branch — and the numeric path's NaN-vs-NaN
+        // rule then accepted a broken 0x7fc00000 against a required all-ones
+        // mask. `0.0` IS `0x00000000`, the false mask.
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let z = uniform_leaf(&mut b, 9.0);
+        let w = uniform_leaf(&mut b, 0.0);
+        let cond = b.push_binary(OpKind::Lt, w, x);
+        let sum = b.push_binary(OpKind::Add, x, y);
+        let cmp = b.push_binary(OpKind::Lt, sum, z);
 
-        let zero = arena.push_const(0.0);
-        let masked = arena.push_ternary(OpKind::Select, cond, cmp, zero);
-        assert!(is_mask_valued(&arena, masked));
-
-        let ones = arena.push_const(ALL_ONES);
-        let all_ones_branch = arena.push_ternary(OpKind::Select, cond, cmp, ones);
-        assert!(is_mask_valued(&arena, all_ones_branch));
-
+        let zero = b.push_const(0.0);
+        let masked = b.push_ternary(OpKind::Select, cond, cmp, zero);
+        let ones = b.push_const(ALL_ONES);
+        let all_ones_branch = b.push_ternary(OpKind::Select, cond, cmp, ones);
         // A non-mask constant really does make the result a number.
-        let one = arena.push_const(1.0);
-        let numeric = arena.push_ternary(OpKind::Select, cond, cmp, one);
-        assert!(!is_mask_valued(&arena, numeric));
+        let one = b.push_const(1.0);
+        let numeric = b.push_ternary(OpKind::Select, cond, cmp, one);
         // -0.0 is 0x80000000, not a mask.
-        let neg_zero = arena.push_const(-0.0);
-        let signed = arena.push_ternary(OpKind::Select, cond, cmp, neg_zero);
-        assert!(!is_mask_valued(&arena, signed));
+        let neg_zero = b.push_const(-0.0);
+        let signed = b.push_ternary(OpKind::Select, cond, cmp, neg_zero);
+        let g = freeze(b, &[masked, all_ones_branch, numeric, signed]);
+
+        assert!(is_mask_valued(g.node(0)));
+        assert!(is_mask_valued(g.node(1)));
+        assert!(!is_mask_valued(g.node(2)));
+        assert!(!is_mask_valued(g.node(3)));
 
         // And the end-to-end consequence: the mask path now gates the root, so
         // the broken pattern is caught instead of waved through.
-        let point = DifferentialCheck::new(&arena, masked).at(
+        let point = g.check(0).at(
             &[1.0, 2.0], // cond true, x+y = 3 < 9 => all-ones
             &BindingTable::empty(),
         );
@@ -2710,11 +2745,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "would accept a broken mask pattern")]
     fn numeric_verdict_refuses_a_mask_root() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Lt, x, y);
-        let _unreachable = DifferentialCheck::new(&arena, root)
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let root = b.push_binary(OpKind::Lt, x, y);
+        let g = freeze(b, &[root]);
+        let _unreachable = g
+            .check(0)
             .at(&[0.0; 2], &BindingTable::empty())
             .verdict(0.0);
     }
@@ -2722,11 +2759,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "on a numeric root")]
     fn mask_classification_refuses_a_numeric_root() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let root = arena.push_binary(OpKind::Add, x, y);
-        let _unreachable = DifferentialCheck::new(&arena, root)
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let root = b.push_binary(OpKind::Add, x, y);
+        let g = freeze(b, &[root]);
+        let _unreachable = g
+            .check(0)
             .at(&[0.0; 2], &BindingTable::empty())
             .classify_mask_root(0.0);
     }
@@ -2735,25 +2774,26 @@ mod tests {
     fn point_value_agrees_with_eval_scalar() {
         // The bound walk must not become a second semantics: its value is the
         // oracle's value, node for node.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let r = arena.push_unary(OpKind::Recip, x);
-        let s = arena.push_unary(OpKind::Sin, y);
-        let m = arena.push_binary(OpKind::Mul, r, s);
-        let c = arena.push_const(2.0);
-        let fma = arena.push_ternary(OpKind::MulAdd, m, c, y);
-        let root = arena.push_binary(OpKind::Max, fma, m);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let y = b.push_var(1);
+        let r = b.push_unary(OpKind::Recip, x);
+        let s = b.push_unary(OpKind::Sin, y);
+        let m = b.push_binary(OpKind::Mul, r, s);
+        let c = b.push_const(2.0);
+        let fma = b.push_ternary(OpKind::MulAdd, m, c, y);
+        let root = b.push_binary(OpKind::Max, fma, m);
+        let g = freeze(b, &[root]);
 
-        let check = DifferentialCheck::new(&arena, root);
-        let b = BindingTable::empty();
+        let check = g.check(0);
+        let bindings = BindingTable::empty();
         for xv in [0.5f32, -2.0, 7.25] {
             for yv in [0.1f32, -1.75, 3.0] {
                 let vars = [xv, yv];
-                let point = check.at(&vars, &b);
+                let point = check.at(&vars, &bindings);
                 assert_eq!(
                     point.value().to_bits(),
-                    eval_scalar(&arena, root, &vars, &b).to_bits(),
+                    g.eval(0, vars, &bindings).to_bits(),
                     "at ({xv}, {yv})"
                 );
             }
@@ -2786,7 +2826,7 @@ mod tests {
         // (which is where the integer-domain primitives show up), and every
         // operand is inexact so the "exact in, exact out" shortcut cannot hide
         // a missing arm.
-        let b = BindingTable::empty();
+        let bindings = BindingTable::empty();
         for op in OpKind::all() {
             // Leaves, memory, the reduction binder, and the two ops that must
             // be rewritten away carry their own (tested) refusals. A leaf is
@@ -2802,17 +2842,17 @@ mod tests {
             {
                 continue;
             }
-            let arity = op.arity();
-            let mut arena = ExprArena::new();
-            let x = arena.push_var(0);
+            let mut b = ExprBuilder::new();
+            let x = b.push_var(0);
             // An estimate seeds a nonzero radius into every operand.
-            let inexact = arena.push_unary(OpKind::Recip, x);
-            let root = match arity {
-                1 => arena.push_unary(op, inexact),
-                2 => arena.push_binary(op, inexact, inexact),
-                _ => arena.push_ternary(op, inexact, inexact, inexact),
+            let inexact = b.push_unary(OpKind::Recip, x);
+            let root = match op.arity() {
+                1 => b.push_unary(op, inexact),
+                2 => b.push_binary(op, inexact, inexact),
+                _ => b.push_ternary(op, inexact, inexact, inexact),
             };
-            let point = DifferentialCheck::new(&arena, root).at(&[2.0, 2.0], &b);
+            let g = freeze(b, &[root]);
+            let point = g.check(0).at(&[2.0, 2.0], &bindings);
             assert!(point.error_bound() >= 0.0, "{op:?}");
         }
     }
@@ -2821,27 +2861,26 @@ mod tests {
     fn bound_walk_is_linear_on_a_shared_dag() {
         // Same hazard as `is_mask_valued`: a shared DAG re-derived recursively
         // costs 2^depth. A regression hangs the suite rather than lying.
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let mut e = arena.push_unary(OpKind::Recip, x);
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        let mut e = b.push_unary(OpKind::Recip, x);
         for _ in 0..60 {
-            e = arena.push_binary(OpKind::Add, e, e);
+            e = b.push_binary(OpKind::Add, e, e);
         }
-        let point = DifferentialCheck::new(&arena, e).at(&[2.0, 0.0], &BindingTable::empty());
+        let g = freeze(b, &[e]);
+        let point = g.check(0).at(&[2.0, 0.0], &BindingTable::empty());
         assert_eq!(point.value(), 0.5 * (1u64 << 60) as f32);
         assert!(point.error_bound() > 0.0);
     }
 
     #[test]
     fn bind_rejects_wrong_length() {
-        let mut arena = ExprArena::new();
-        let _ = arena.declare_buffer(BufferDecl {
-            id: crate::arena::BufferIdentity::mint(),
-            width: 4,
-            height: 2,
-        });
+        let mut b = ExprBuilder::new();
+        let _ = buffer(&mut b, 4, 2);
+        let x = b.push_var(0);
+        let g = freeze(b, &[x]);
         let short = vec![0.0f32; 7]; // needs 8
-        let err = BindingTable::bind(&arena, &[short.as_slice()]).unwrap_err();
+        let err = BindingTable::bind(&g.env, &[short.as_slice()]).unwrap_err();
         assert!(matches!(
             err,
             crate::binding::BindError::Length {
@@ -2854,13 +2893,11 @@ mod tests {
 
     #[test]
     fn bind_rejects_wrong_count() {
-        let mut arena = ExprArena::new();
-        let _ = arena.declare_buffer(BufferDecl {
-            id: crate::arena::BufferIdentity::mint(),
-            width: 2,
-            height: 2,
-        });
-        let err = BindingTable::bind(&arena, &[]).unwrap_err();
+        let mut b = ExprBuilder::new();
+        let _ = buffer(&mut b, 2, 2);
+        let x = b.push_var(0);
+        let g = freeze(b, &[x]);
+        let err = BindingTable::bind(&g.env, &[]).unwrap_err();
         assert!(matches!(
             err,
             crate::binding::BindError::Count {

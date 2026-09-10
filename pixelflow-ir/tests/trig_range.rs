@@ -13,13 +13,22 @@
 //! cannot define away: `|sin| ≤ 1`.
 
 use pixelflow_ir::passes::TRIG_DOMAIN;
-use pixelflow_ir::{BindingTable, ExprArena, ExprId, OpKind, eval_scalar};
+use pixelflow_ir::{BindingTable, ExprBuilder, ExprRef, OpKind, Term, eval_scalar};
 
-fn eval1(build: impl FnOnce(&mut ExprArena, ExprId) -> ExprId, x: f32) -> f32 {
-    let mut a = ExprArena::new();
-    let v = a.push_var(0);
-    let root = build(&mut a, v);
-    eval_scalar(&a, root, &[x, 0.0], &BindingTable::empty())
+fn eval1(build: impl FnOnce(&mut ExprBuilder, ExprRef) -> ExprRef, x: f32) -> f32 {
+    let mut b = ExprBuilder::new();
+    let v = b.push_var(0);
+    let root = build(&mut b, v);
+    eval_at(b, root, [x, 0.0])
+}
+
+fn eval_at(b: ExprBuilder, root: ExprRef, vars: [f32; 2]) -> f32 {
+    let (rooted, env) = b.finish(&[root]);
+    eval_scalar(
+        Term::new(rooted.entry(), &env),
+        &vars,
+        &BindingTable::empty(),
+    )
 }
 
 fn sin_at(x: f32) -> f32 {
@@ -56,18 +65,18 @@ fn exp2_at(x: f32) -> f32 {
     eval1(|a, v| a.push_unary(OpKind::Exp2, v), x)
 }
 fn atan2_at(y: f32, x: f32) -> f32 {
-    let mut a = ExprArena::new();
-    let vy = a.push_var(0);
-    let vx = a.push_var(1);
-    let root = a.push_binary(OpKind::Atan2, vy, vx);
-    eval_scalar(&a, root, &[y, x], &BindingTable::empty())
+    let mut b = ExprBuilder::new();
+    let vy = b.push_var(0);
+    let vx = b.push_var(1);
+    let root = b.push_binary(OpKind::Atan2, vy, vx);
+    eval_at(b, root, [y, x])
 }
 fn pow_at(a_val: f32, b_val: f32) -> f32 {
-    let mut a = ExprArena::new();
-    let va = a.push_var(0);
-    let vb = a.push_var(1);
-    let root = a.push_binary(OpKind::Pow, va, vb);
-    eval_scalar(&a, root, &[a_val, b_val], &BindingTable::empty())
+    let mut b = ExprBuilder::new();
+    let va = b.push_var(0);
+    let vb = b.push_var(1);
+    let root = b.push_binary(OpKind::Pow, va, vb);
+    eval_at(b, root, [a_val, b_val])
 }
 
 /// Reproducible LCG — a fixed seed keeps a failure reproducible from the
@@ -400,17 +409,22 @@ fn asin_acos_bounded_in_domain_and_nan_outside() {
 /// a shader.
 #[test]
 fn sin_differentiates_through_the_domain_guard() {
-    use pixelflow_ir::passes::lower_dwrt_owned;
+    use pixelflow_ir::passes::lower_dwrt;
 
     for &x in &[0.0f32, 0.7, 1.3, -2.5, 100.0] {
-        let mut a = ExprArena::new();
-        let v = a.push_var(0);
-        let s = a.push_unary(OpKind::Sin, v);
-        let zero = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, s, zero);
-        let (out, out_root) = lower_dwrt_owned(&a, root).expect("d/dx sin must lower");
+        let mut b = ExprBuilder::new();
+        let v = b.push_var(0);
+        let s = b.push_unary(OpKind::Sin, v);
+        let zero = b.push_const(0.0);
+        let root = b.push_binary(OpKind::Dwrt, s, zero);
+        let (rooted, env) = b.finish(&[root]);
+        let out = lower_dwrt(Term::new(rooted.entry(), &env)).expect("d/dx sin must lower");
 
-        let got = eval_scalar(&out, out_root, &[x, 0.0], &BindingTable::empty());
+        let got = eval_scalar(
+            Term::new(out.entry(), &env),
+            &[x, 0.0],
+            &BindingTable::empty(),
+        );
         let want = cos_at(x);
         assert!(
             (got - want).abs() <= 1e-5,

@@ -22,7 +22,8 @@
 //! models, budgets or rule sets. Those belong to one particular optimizer
 //! (`pixelflow_search`'s), not to the notion.
 
-use crate::arena::{ExprArena, ExprId};
+use crate::dag::Rooted;
+use crate::expr::{Environment, ExprData, Term};
 
 /// What one [`Optimize`] step did.
 ///
@@ -32,12 +33,16 @@ use crate::arena::{ExprArena, ExprId};
 /// changes what a pipeline produces when a middle step bails.
 #[derive(Clone)]
 pub enum Rewritten {
-    /// A new term, denoting what the input denoted.
-    Changed(ExprArena, ExprId),
+    /// A new term, denoting what the input denoted, together with the
+    /// declarations its leaves index. The environment travels with it because
+    /// an optimizer may renumber slots — an extraction rebuilds leaves in
+    /// whatever order it visits them — and a graph paired with the wrong
+    /// table reads plausible, wrong memory.
+    Changed(Rooted<ExprData>, Environment),
     /// Nothing to do here; the input stands and the pipeline continues.
     ///
     /// Distinct from returning a clone of the input: an optimizer that has no
-    /// work should not cost an arena copy to say so.
+    /// work should not cost a copy of the whole graph to say so.
     Unchanged,
     /// This term is outside what this optimizer models, and no later step
     /// should run either. The caller keeps its original input.
@@ -47,13 +52,14 @@ pub enum Rewritten {
     Declined,
 }
 
-// `ExprArena` is not `Debug` (it is large, and printing one is never what a
-// caller wants), so report the outcome and the size rather than the term.
+// A rewritten graph is not `Debug` (it is large, and printing one is never
+// what a caller wants), so report the outcome and the size rather than the
+// term.
 impl core::fmt::Debug for Rewritten {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Changed(arena, root) => {
-                write!(f, "Changed({} nodes, root {:?})", arena.len(), root)
+            Self::Changed(rooted, _) => {
+                write!(f, "Changed({} nodes)", rooted.len())
             }
             Self::Unchanged => f.write_str("Unchanged"),
             Self::Declined => f.write_str("Declined"),
@@ -67,9 +73,9 @@ impl Rewritten {
     /// Callers that hold the input already want this: `None` costs them
     /// nothing, where a `Changed` clone of the input would.
     #[must_use]
-    pub fn into_changed(self) -> Option<(ExprArena, ExprId)> {
+    pub fn into_changed(self) -> Option<(Rooted<ExprData>, Environment)> {
         match self {
-            Self::Changed(arena, root) => Some((arena, root)),
+            Self::Changed(rooted, env) => Some((rooted, env)),
             Self::Unchanged | Self::Declined => None,
         }
     }
@@ -88,8 +94,8 @@ impl Rewritten {
 /// else — how hard it tries, what it costs, whether it does anything at all —
 /// is the implementor's business.
 pub trait Optimize {
-    /// Rewrite the term reachable from `root`.
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten;
+    /// Rewrite the term reachable from `term`'s root.
+    fn optimize(&mut self, term: Term<'_>) -> Rewritten;
 }
 
 /// The optimizer that does nothing — `kernel_raw!` as a value.
@@ -100,7 +106,7 @@ pub trait Optimize {
 pub struct Identity;
 
 impl Optimize for Identity {
-    fn optimize(&mut self, _arena: &ExprArena, _root: ExprId) -> Rewritten {
+    fn optimize(&mut self, _term: Term<'_>) -> Rewritten {
         Rewritten::Unchanged
     }
 }
@@ -117,17 +123,19 @@ impl Optimize for Identity {
 pub struct Then<A, B>(pub A, pub B);
 
 impl<A: Optimize, B: Optimize> Optimize for Then<A, B> {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        match self.0.optimize(arena, root) {
+    fn optimize(&mut self, term: Term<'_>) -> Rewritten {
+        match self.0.optimize(term) {
             Rewritten::Declined => Rewritten::Declined,
-            Rewritten::Unchanged => self.1.optimize(arena, root),
-            Rewritten::Changed(a, r) => match self.1.optimize(&a, r) {
-                // `B` declining does not discard `A`'s work: `A` already
-                // produced a valid term, and the caller's input is not more
-                // correct than it — only less optimized.
-                Rewritten::Declined | Rewritten::Unchanged => Rewritten::Changed(a, r),
-                changed => changed,
-            },
+            Rewritten::Unchanged => self.1.optimize(term),
+            Rewritten::Changed(rooted, env) => {
+                match self.1.optimize(Term::new(rooted.entry(), &env)) {
+                    // `B` declining does not discard `A`'s work: `A` already
+                    // produced a valid term, and the caller's input is not
+                    // more correct than it — only less optimized.
+                    Rewritten::Declined | Rewritten::Unchanged => Rewritten::Changed(rooted, env),
+                    changed => changed,
+                }
+            }
         }
     }
 }
@@ -146,73 +154,66 @@ macro_rules! pipeline {
 mod tests {
     use super::*;
     use crate::OpKind;
+    use crate::expr::ExprBuilder;
 
     /// Counts calls, and optionally rewrites `x` to `x + 1.0`.
     struct Bump {
         calls: usize,
-        outcome: fn(&ExprArena, ExprId) -> Rewritten,
+        outcome: fn(Term<'_>) -> Rewritten,
     }
 
-    fn bump(arena: &ExprArena, root: ExprId) -> Rewritten {
-        let mut out = arena.clone();
+    fn bump(term: Term<'_>) -> Rewritten {
+        let mut out = ExprBuilder::new();
+        let copied = out.splice(term);
         let one = out.push_const(1.0);
-        let new_root = out.push_binary(OpKind::Add, root, one);
-        Rewritten::Changed(out, new_root)
+        let root = out.push_binary(OpKind::Add, copied, one);
+        let (rooted, env) = out.finish(&[root]);
+        Rewritten::Changed(rooted, env)
     }
-    fn nothing(_: &ExprArena, _: ExprId) -> Rewritten {
+    fn nothing(_: Term<'_>) -> Rewritten {
         Rewritten::Unchanged
     }
-    fn decline(_: &ExprArena, _: ExprId) -> Rewritten {
+    fn decline(_: Term<'_>) -> Rewritten {
         Rewritten::Declined
     }
 
     impl Optimize for Bump {
-        fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
+        fn optimize(&mut self, term: Term<'_>) -> Rewritten {
             self.calls += 1;
-            (self.outcome)(arena, root)
+            (self.outcome)(term)
         }
     }
 
-    fn seed() -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        (a, x)
+    fn bumper(outcome: fn(Term<'_>) -> Rewritten) -> Bump {
+        Bump { calls: 0, outcome }
+    }
+
+    fn seed() -> (Rooted<ExprData>, Environment) {
+        let mut b = ExprBuilder::new();
+        let x = b.push_var(0);
+        b.finish(&[x])
     }
 
     #[test]
     fn identity_is_the_unit_of_then() {
-        let (arena, root) = seed();
-        let mut left = Then(
-            Identity,
-            Bump {
-                calls: 0,
-                outcome: bump,
-            },
-        );
-        let mut right = Then(
-            Bump {
-                calls: 0,
-                outcome: bump,
-            },
-            Identity,
-        );
-        let l = left.optimize(&arena, root).into_changed().expect("changed");
-        let r = right
-            .optimize(&arena, root)
-            .into_changed()
-            .expect("changed");
+        let (rooted, env) = seed();
+        let term = Term::new(rooted.entry(), &env);
+        let mut left = Then(Identity, bumper(bump));
+        let mut right = Then(bumper(bump), Identity);
+        let l = left.optimize(term).into_changed().expect("changed");
+        let r = right.optimize(term).into_changed().expect("changed");
         assert_eq!(
             l.0.len(),
             r.0.len(),
             "Identity on either side must not change the result"
         );
-        assert_eq!(l.1, r.1);
     }
 
     #[test]
     fn identity_alone_leaves_the_term_alone() {
-        let (arena, root) = seed();
-        assert!(Identity.optimize(&arena, root).into_changed().is_none());
+        let (rooted, env) = seed();
+        let term = Term::new(rooted.entry(), &env);
+        assert!(Identity.optimize(term).into_changed().is_none());
     }
 
     /// The short-circuit: a declining step must stop the ones after it, or a
@@ -220,18 +221,10 @@ mod tests {
     /// was responsible for establishing.
     #[test]
     fn declining_stops_later_steps() {
-        let (arena, root) = seed();
-        let mut pipe = Then(
-            Bump {
-                calls: 0,
-                outcome: decline,
-            },
-            Bump {
-                calls: 0,
-                outcome: bump,
-            },
-        );
-        assert!(matches!(pipe.optimize(&arena, root), Rewritten::Declined));
+        let (rooted, env) = seed();
+        let term = Term::new(rooted.entry(), &env);
+        let mut pipe = Then(bumper(decline), bumper(bump));
+        assert!(matches!(pipe.optimize(term), Rewritten::Declined));
         assert_eq!(pipe.0.calls, 1);
         assert_eq!(pipe.1.calls, 0, "the step after a decline must not run");
     }
@@ -239,18 +232,10 @@ mod tests {
     /// Doing nothing is not declining: later steps still run.
     #[test]
     fn unchanged_does_not_stop_later_steps() {
-        let (arena, root) = seed();
-        let mut pipe = Then(
-            Bump {
-                calls: 0,
-                outcome: nothing,
-            },
-            Bump {
-                calls: 0,
-                outcome: bump,
-            },
-        );
-        assert!(pipe.optimize(&arena, root).into_changed().is_some());
+        let (rooted, env) = seed();
+        let term = Term::new(rooted.entry(), &env);
+        let mut pipe = Then(bumper(nothing), bumper(bump));
+        assert!(pipe.optimize(term).into_changed().is_some());
         assert_eq!(pipe.1.calls, 1, "a no-op step must not stop the pipeline");
     }
 
@@ -258,43 +243,23 @@ mod tests {
     /// throwing the pipeline back to the caller's input.
     #[test]
     fn a_later_decline_keeps_earlier_work() {
-        let (arena, root) = seed();
-        let mut pipe = Then(
-            Bump {
-                calls: 0,
-                outcome: bump,
-            },
-            Bump {
-                calls: 0,
-                outcome: decline,
-            },
-        );
-        let (out, _) = pipe.optimize(&arena, root).into_changed().expect("kept");
+        let (rooted, env) = seed();
+        let term = Term::new(rooted.entry(), &env);
+        let mut pipe = Then(bumper(bump), bumper(decline));
+        let (out, _) = pipe.optimize(term).into_changed().expect("kept");
         assert!(
-            out.len() > arena.len(),
+            out.len() > rooted.len(),
             "the first step's rewrite must survive"
         );
     }
 
     #[test]
     fn pipeline_macro_associates_left_to_right() {
-        let (arena, root) = seed();
-        let mut pipe = crate::pipeline![
-            Bump {
-                calls: 0,
-                outcome: bump
-            },
-            Bump {
-                calls: 0,
-                outcome: bump
-            },
-            Bump {
-                calls: 0,
-                outcome: bump
-            },
-        ];
-        let (out, _) = pipe.optimize(&arena, root).into_changed().expect("changed");
+        let (rooted, env) = seed();
+        let term = Term::new(rooted.entry(), &env);
+        let mut pipe = crate::pipeline![bumper(bump), bumper(bump), bumper(bump)];
+        let (out, _) = pipe.optimize(term).into_changed().expect("changed");
         // Each bump adds a Const and an Add to whatever it was handed.
-        assert_eq!(out.len(), arena.len() + 6);
+        assert_eq!(out.len(), rooted.len() + 6);
     }
 }

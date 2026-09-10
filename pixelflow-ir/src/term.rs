@@ -12,12 +12,12 @@
 //! - [`Ir::embed`] builds one node from already-built children — the fold.
 //!
 //! [`Shape`] is the signature both are phrased in: the pattern functor of
-//! [`ExprNode`](crate::arena::ExprNode), with a reference parameter in place
-//! of `ExprId` and a whole [`BufferDecl`] in place of `BufferId`. The latter
-//! is not an accident of convenience: an e-class outlives any one arena, so a
+//! [`ExprData`](crate::expr::ExprData), with a reference parameter in place of
+//! a DAG edge and a whole [`BufferDecl`] in place of `BufferId`. The latter is
+//! not an accident of convenience: an e-class outlives any one graph, so a
 //! buffer leaf must carry the identity that answers "the same memory?" across
-//! a merge rather than a slot index that only means something to the arena it
-//! came from.
+//! a merge rather than a slot index that only means something to the
+//! environment it came from.
 //!
 //! The trait earns its keep with a single implementor. It names the API the
 //! e-graph is entitled to use against a term language, which is the API tests
@@ -26,14 +26,14 @@
 //! unreachable nodes were inserted, precisely because no such boundary was
 //! written down.
 
-use crate::arena::{BufferDecl, UniformDecl};
+use crate::decl::{BufferDecl, UniformDecl};
 use crate::kind::OpKind;
 
 /// The children of one node, borrowed where they are contiguous.
 ///
-/// Mirrors [`ExprChildren`](crate::arena::ExprChildren): a node with inline
-/// children (unary through ternary) has no slice to lend, so projecting one
-/// must not be forced to allocate or to borrow a temporary.
+/// A node whose children are not held contiguously — a projection computed on
+/// the fly — has no slice to lend, so projecting one must not be forced to
+/// allocate or to borrow a temporary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Children<'a, R> {
     /// A leaf.
@@ -87,7 +87,7 @@ impl<R: Copy> Children<'_, R> {
 
 /// One node of a term language, with children resolved to `R`.
 ///
-/// The signature functor of [`ExprNode`](crate::arena::ExprNode). Every
+/// The signature functor of [`ExprData`](crate::expr::ExprData). Every
 /// variant an e-graph can hold appears here and nothing else does: no spans,
 /// no source syntax, no cost. A term language carrying more than this is free
 /// to keep it — [`Ir::embed`] hands the extra back in whatever the

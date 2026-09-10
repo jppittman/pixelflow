@@ -900,7 +900,6 @@ dependencies = [
 name = "pixelflow-ir"
 version = "0.1.0"
 dependencies = [
- "criterion",
  "hashbrown",
  "libm",
  "pixelflow-ir",

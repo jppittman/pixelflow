@@ -20,11 +20,6 @@ hashbrown = { version = "0.16", optional = true, default-features = false, featu
 # turns the feature on, which is what keeps a tree-walking evaluator out of
 # every shipped build.
 pixelflow-ir = { path = ".", features = ["oracle"] }
-criterion = "0.5"
-
-[[bench]]
-name = "dag_vs_arena"
-harness = false
 
 [features]
 default = ["std", "hash-memo"]
