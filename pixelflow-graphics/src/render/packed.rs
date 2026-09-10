@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use pixelflow_core::{BoundManifold, Manifold, PlaneRegion, UniformBlock};
-use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformDecl};
+use pixelflow_ir::decl::{BufferDecl, BufferIdentity, UniformDecl};
 use pixelflow_ir::{Bits, Kernel};
 
 use crate::scene3d::Rgba;

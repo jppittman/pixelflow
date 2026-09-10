@@ -50,15 +50,11 @@ fn main() {
         &|channels: &[Kernel; 4]| {
             channels
                 .iter()
-                .map(|c| {
-                    let (arena, root) = c.parts();
-                    arena.node_count_subtree(root)
-                })
+                .map(|c| pixelflow_ir::node_count_subtree(c.term().root()))
                 .sum()
         },
         &|mask: &Kernel, if_true: usize, if_false: usize| {
-            let (arena, root) = mask.parts();
-            arena.node_count_subtree(root) + if_true + if_false
+            pixelflow_ir::node_count_subtree(mask.term().root()) + if_true + if_false
         },
     );
 

@@ -73,7 +73,8 @@
 //! with the bug.
 //!
 use pixelflow_graphics::fonts::ttf_curve_analytical::AnalyticalQuad;
-use pixelflow_ir::{eval_scalar, passes::lower_dwrt_owned, BindingTable};
+use pixelflow_ir::expr::Term;
+use pixelflow_ir::{eval_scalar, passes::lower_dwrt, BindingTable};
 
 /// The defect's measured size, pinned. **These are not tolerances — they are
 /// the bug.** A grazing ray must pick up zero winding and picks up most of a
@@ -110,8 +111,9 @@ fn worst_grazing(
     x: f32,
 ) -> (f32, f32) {
     let sum = incoming.kernel().add(&outgoing.kernel());
-    let (arena, root) = sum.parts();
-    let (lowered, r) = lower_dwrt_owned(arena, root).expect("lower");
+    let term = sum.term();
+    let lowered = lower_dwrt(term).expect("lower");
+    let lowered_term = Term::new(lowered.entry(), term.env());
 
     // `next_down`/`next_up`, not bit arithmetic: the extremum here can be
     // exactly 0.0, where `to_bits() - 1` underflows (a debug panic, and in
@@ -123,7 +125,7 @@ fn worst_grazing(
     }
     let (mut worst, mut worst_y) = (0.0f32, y);
     for _ in 0..=(2 * WALK_ULPS) {
-        let v = eval_scalar(&lowered, r, &[x, y], &BindingTable::empty());
+        let v = eval_scalar(lowered_term, &[x, y], &BindingTable::empty());
         assert!(
             v.is_finite(),
             "winding is {v} at y = {y:?} ({:#x}) — a non-finite coverage is a \

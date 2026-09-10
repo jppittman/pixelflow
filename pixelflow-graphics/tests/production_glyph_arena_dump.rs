@@ -22,7 +22,6 @@
 //! cannot drift apart silently.
 
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
 const FONT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -69,10 +68,9 @@ fn dump_production_glyph_arenas() {
                 missing.push((density, ch));
                 continue;
             };
-            let (arena, root) = kernel.parts();
             let name = format!("glyph{tile_px}:U+{:04X}", ch as u32);
             let path = dir.join(format!("glyph{tile_px}_U{:04X}.arena", ch as u32));
-            dump_arena(arena, root, &name, &path);
+            dump_arena(kernel.term(), &name, &path);
             dumped += 1;
         }
     }
@@ -93,22 +91,23 @@ fn dump_production_glyph_arenas() {
 /// from `pixelflow-core/src/lattice/cell_grid.rs`'s test module rather than
 /// shared, because the only crate both dumpers can see is `pixelflow-ir`,
 /// which must not grow a test-only serializer.
-fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Path) {
+fn dump_arena(term: pixelflow_ir::expr::Term<'_>, name: &str, path: &std::path::Path) {
+    use pixelflow_ir::ExprData;
     use std::fmt::Write as _;
-    let len = arena.nodes_raw().len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
+
+    let root = term.root();
+    let env = term.env();
+    let dag = root.dag();
+    let mut reachable = dag.side_table(false);
+    for n in root.descendants() {
+        reachable[n] = true;
     }
+
     let mut out = String::new();
     writeln!(out, "# pixelflow arena dump v1").expect("fmt");
     writeln!(out, "name {name}").expect("fmt");
-    let mut idents: Vec<pixelflow_ir::arena::BufferIdentity> = Vec::new();
-    for decl in arena.buffers() {
+    let mut idents: Vec<pixelflow_ir::decl::BufferIdentity> = Vec::new();
+    for decl in &env.buffers {
         let ord = match idents.iter().position(|i| *i == decl.id) {
             Some(p) => p,
             None => {
@@ -118,36 +117,48 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
         };
         writeln!(out, "buf {ord} {} {}", decl.width, decl.height).expect("fmt");
     }
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
+
+    // Dense ordinals in ascending, topological (children-before-parents)
+    // order over the reachable subgraph — the same two-pass pattern
+    // `expr::encode_into` uses, and for the same reason:
+    // `Node::descendants()` is a parent-first DFS, not a valid dump order on
+    // its own.
+    let mut dense = dag.side_table(None::<u32>);
     let mut next = 0u32;
-    let d = |dense: &[u32], id: ExprId| -> u32 {
-        let v = dense[id.0 as usize];
-        assert_ne!(v, u32::MAX, "child dumped before parent");
-        v
-    };
-    for idx in 0..len {
-        if !reachable[idx] {
+    for node in dag.iter() {
+        if !reachable[node] {
             continue;
         }
-        let id = ExprId(idx as u32);
-        match arena.node(id) {
-            ExprNode::Var(i) => writeln!(out, "V {i}"),
-            ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
-            ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
-            ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-            ExprNode::Binary(k, a, b) => writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b)),
-            ExprNode::Ternary(k, a, b, c) => {
-                writeln!(out, "T {k:?} {} {} {}", d(&dense, *a), d(&dense, *b), d(&dense, *c))
+        let d = |c: pixelflow_ir::Node<'_, ExprData>| -> u32 {
+            dense[c].expect("child dumped before parent")
+        };
+        match *node {
+            ExprData::Var(i) => writeln!(out, "V {i}"),
+            ExprData::Const(bits) => writeln!(out, "C {bits}"),
+            ExprData::Buffer(b) => writeln!(out, "B {}", b.0),
+            ExprData::Uniform(u) => writeln!(out, "Un {}", u.0),
+            ExprData::Op(k) => {
+                let children: Vec<_> = node.children().collect();
+                match children.as_slice() {
+                    [a] => writeln!(out, "U {k:?} {}", d(*a)),
+                    [a, b] => writeln!(out, "Bi {k:?} {} {}", d(*a), d(*b)),
+                    [a, b, c] => writeln!(out, "T {k:?} {} {} {}", d(*a), d(*b), d(*c)),
+                    _ => panic!(
+                        "{name}: production arena contains {k:?} with {} children, \
+                         which optimize_runtime_term bails on",
+                        children.len()
+                    ),
+                }
             }
-            other @ (ExprNode::Param(_) | ExprNode::Nary(..)) => {
-                panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
+            ExprData::Param(i) => {
+                panic!("{name}: production arena contains Param({i}), which optimize_runtime_term bails on")
             }
         }
         .expect("fmt");
-        dense[idx] = next;
+        dense[node] = Some(next);
         next += 1;
     }
-    writeln!(out, "root {}", d(&dense, root)).expect("fmt");
+    let root_ord = dense[root].expect("the root is its own descendant");
+    writeln!(out, "root {root_ord}").expect("fmt");
     std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }

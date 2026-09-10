@@ -13,90 +13,82 @@
 //!   the per-pixel sqrt count.
 //!
 //! These tests count surviving operations through the runtime pipeline
-//! (`optimize_runtime_arena` → `lower_dwrt`) — the exact stages
+//! (`optimize_runtime_term` → `lower_dwrt`) — the exact stages
 //! `Lattice::bake` runs — so a regression in derivative folding or CSE shows
 //! up as a hard number, not a benchmark whisper.
 
 use pixelflow_graphics::fonts::ttf_curve_analytical::{AnalyticalLine, AnalyticalQuad};
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
-use pixelflow_ir::passes::lower_dwrt_owned;
-use pixelflow_ir::OpKind;
+use pixelflow_ir::expr::{Environment, Term};
+use pixelflow_ir::passes::lower_dwrt;
+use pixelflow_ir::{ExprData, Node, OpKind, Rooted};
 
 /// Count reachable nodes matching `pred` from `root`.
-fn count_reachable(arena: &ExprArena, root: ExprId, pred: impl Fn(&ExprNode) -> bool) -> usize {
-    let len = arena.nodes_raw().len();
-    let mut seen = vec![false; len];
-    let mut stack = vec![root];
-    let mut count = 0;
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        if pred(arena.node(id)) {
-            count += 1;
-        }
-        stack.extend(arena.children(id));
-    }
-    count
+fn count_reachable(root: Node<'_, ExprData>, pred: impl Fn(Node<'_, ExprData>) -> bool) -> usize {
+    root.descendants().filter(|n| pred(*n)).count()
 }
 
-fn count_op(arena: &ExprArena, root: ExprId, op: OpKind) -> usize {
-    count_reachable(arena, root, |n| match n {
-        ExprNode::Unary(k, _) => *k == op,
-        ExprNode::Binary(k, _, _) => *k == op,
-        ExprNode::Ternary(k, _, _, _) => *k == op,
-        _ => false,
-    })
+fn count_op(root: Node<'_, ExprData>, op: OpKind) -> usize {
+    count_reachable(root, |n| matches!(*n, ExprData::Op(k) if k == op))
 }
 
-fn total_reachable(arena: &ExprArena, root: ExprId) -> usize {
-    count_reachable(arena, root, |_| true)
+fn total_reachable(root: Node<'_, ExprData>) -> usize {
+    root.descendants().count()
 }
 
 /// Run the same optimization stages `Lattice::bake` runs, then lower any
 /// residual `Dwrt` exactly as the compile entries do, and report the final
-/// (arena, root) the emitter would actually schedule. Prints per-stage
-/// counts so a failure localizes to the stage that dropped the ball.
-fn bake_pipeline(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    let optimized = pixelflow_search::runtime::optimize_runtime_arena(
-        arena,
-        root,
-        pixelflow_ir::LatticeShape::POINT,
-    );
-    let (a, r) = optimized
-        .as_deref()
-        .map(|(a, r)| (a.clone(), *r))
-        .unwrap_or_else(|| (arena.clone(), root));
-    eprintln!(
-        "  post-egraph: total={} sqrt={} dwrt={}",
-        total_reachable(&a, r),
-        count_op(&a, r, OpKind::Sqrt),
-        count_op(&a, r, OpKind::Dwrt),
-    );
-    let (dl, dr) =
-        lower_dwrt_owned(arena, root).expect("dwrt lowering must succeed on winding kernels");
+/// term the emitter would actually schedule. Prints per-stage counts so a
+/// failure localizes to the stage that dropped the ball.
+fn bake_pipeline(term: Term<'_>) -> (Rooted<ExprData>, Environment) {
+    let optimized =
+        pixelflow_search::runtime::optimize_runtime_term(term, pixelflow_ir::LatticeShape::POINT);
+    let dl = lower_dwrt(term).expect("dwrt lowering must succeed on winding kernels");
+    let dl_term = Term::new(dl.entry(), term.env());
     eprintln!(
         "  lower_dwrt-only baseline: total={} sqrt={}",
-        total_reachable(&dl, dr),
-        count_op(&dl, dr, OpKind::Sqrt),
+        total_reachable(dl_term.root()),
+        count_op(dl_term.root(), OpKind::Sqrt),
     );
-    lower_dwrt_owned(&a, r).expect("dwrt lowering must succeed on winding kernels")
+    match optimized.as_deref() {
+        Some((a, env)) => {
+            let opt_term = Term::new(a.entry(), env);
+            eprintln!(
+                "  post-egraph: total={} sqrt={} dwrt={}",
+                total_reachable(opt_term.root()),
+                count_op(opt_term.root(), OpKind::Sqrt),
+                count_op(opt_term.root(), OpKind::Dwrt),
+            );
+            let lowered =
+                lower_dwrt(opt_term).expect("dwrt lowering must succeed on winding kernels");
+            (lowered, env.clone())
+        }
+        None => {
+            eprintln!(
+                "  post-egraph: total={} sqrt={} dwrt={} (declined; same as raw)",
+                total_reachable(term.root()),
+                count_op(term.root(), OpKind::Sqrt),
+                count_op(term.root(), OpKind::Dwrt),
+            );
+            (dl, term.env().clone())
+        }
+    }
 }
 
 #[test]
 fn line_gradient_folds_to_a_constant() {
     let line = AnalyticalLine::from_points([2.0, 1.0], [10.0, 30.0]).expect("non-degenerate");
     let kernel = line.kernel();
-    let (arena, root) = kernel.parts();
+    let term = kernel.term();
 
-    let raw_sqrt = count_op(arena, root, OpKind::Sqrt);
-    let raw_dwrt = count_op(arena, root, OpKind::Dwrt);
-    let raw_total = total_reachable(arena, root);
+    let raw_sqrt = count_op(term.root(), OpKind::Sqrt);
+    let raw_dwrt = count_op(term.root(), OpKind::Dwrt);
+    let raw_total = total_reachable(term.root());
 
-    let (opt, opt_root) = bake_pipeline(arena, root);
-    let opt_sqrt = count_op(&opt, opt_root, OpKind::Sqrt);
-    let opt_dwrt = count_op(&opt, opt_root, OpKind::Dwrt);
-    let opt_total = total_reachable(&opt, opt_root);
+    let (opt, opt_env) = bake_pipeline(term);
+    let opt_term = Term::new(opt.entry(), &opt_env);
+    let opt_sqrt = count_op(opt_term.root(), OpKind::Sqrt);
+    let opt_dwrt = count_op(opt_term.root(), OpKind::Dwrt);
+    let opt_total = total_reachable(opt_term.root());
 
     eprintln!(
         "line: raw total={raw_total} sqrt={raw_sqrt} dwrt={raw_dwrt} -> \
@@ -119,16 +111,17 @@ fn quad_shares_the_discriminant_between_value_and_gradient() {
     // A genuinely quadratic segment (control point off the chord).
     let quad = AnalyticalQuad::new([0.0, 0.0], [8.0, 20.0], [16.0, 0.0]);
     let kernel = quad.kernel();
-    let (arena, root) = kernel.parts();
+    let term = kernel.term();
 
-    let raw_sqrt = count_op(arena, root, OpKind::Sqrt);
-    let raw_dwrt = count_op(arena, root, OpKind::Dwrt);
-    let raw_total = total_reachable(arena, root);
+    let raw_sqrt = count_op(term.root(), OpKind::Sqrt);
+    let raw_dwrt = count_op(term.root(), OpKind::Dwrt);
+    let raw_total = total_reachable(term.root());
 
-    let (opt, opt_root) = bake_pipeline(arena, root);
-    let opt_sqrt = count_op(&opt, opt_root, OpKind::Sqrt);
-    let opt_dwrt = count_op(&opt, opt_root, OpKind::Dwrt);
-    let opt_total = total_reachable(&opt, opt_root);
+    let (opt, opt_env) = bake_pipeline(term);
+    let opt_term = Term::new(opt.entry(), &opt_env);
+    let opt_sqrt = count_op(opt_term.root(), OpKind::Sqrt);
+    let opt_dwrt = count_op(opt_term.root(), OpKind::Dwrt);
+    let opt_total = total_reachable(opt_term.root());
 
     eprintln!(
         "quad: raw total={raw_total} sqrt={raw_sqrt} dwrt={raw_dwrt} -> \
@@ -158,32 +151,21 @@ fn quad_shares_the_discriminant_between_value_and_gradient() {
 fn lowered_winding_ops_are_all_egraph_representable() {
     let line = AnalyticalLine::from_points([2.0, 1.0], [10.0, 30.0]).expect("non-degenerate");
     let kernel = line.kernel();
-    let (arena, root) = kernel.parts();
-    let (lowered, lroot) = lower_dwrt_owned(arena, root).expect("lower");
+    let term = kernel.term();
+    let lowered = lower_dwrt(term).expect("lower");
     let mut missing = std::collections::BTreeSet::new();
-    let len = lowered.nodes_raw().len();
-    let mut seen = vec![false; len];
-    let mut stack = vec![lroot];
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        let kind = match lowered.node(id) {
-            ExprNode::Unary(k, _) => Some(*k),
-            ExprNode::Binary(k, _, _) => Some(*k),
-            ExprNode::Ternary(k, _, _, _) => Some(*k),
-            ExprNode::Param(i) => {
+    for node in lowered.entry().descendants() {
+        match *node {
+            ExprData::Op(k) => {
+                if !pixelflow_search::runtime::is_egraph_representable(k) {
+                    missing.insert(format!("{k:?}"));
+                }
+            }
+            ExprData::Param(i) => {
                 missing.insert(format!("Param({i})"));
-                None
             }
-            _ => None,
-        };
-        if let Some(k) = kind {
-            if !pixelflow_search::runtime::is_egraph_representable(k) {
-                missing.insert(format!("{k:?}"));
-            }
+            _ => {}
         }
-        stack.extend(lowered.children(id));
     }
     assert!(
         missing.is_empty(),
@@ -263,25 +245,25 @@ fn optimized_glyph_matches_raw_within_reassociation_noise() {
             let kernel = font
                 .glyph_kernel_scaled(ch, size as f32)
                 .expect("glyph kernel");
-            let (arena, root) = kernel.parts();
-            let (raw, raw_root) = lower_dwrt_owned(arena, root).expect("lower raw");
+            let term = kernel.term();
+            let raw = lower_dwrt(term).expect("lower raw");
+            let raw_term = Term::new(raw.entry(), term.env());
             // The lattice a bake of this glyph would compile at — the
             // extraction is a function of the shape, and the bake's is the one
             // that reaches pixels.
             let extent = size + size / 2;
-            let optimized = pixelflow_search::runtime::optimize_runtime_arena(
-                arena,
-                root,
+            let optimized = pixelflow_search::runtime::optimize_runtime_term(
+                term,
                 pixelflow_ir::LatticeShape::new([extent, extent]),
             )
             .expect("glyph arenas must optimize (pure arithmetic + Dwrt + masks)");
-            let (opt, opt_root) = (&optimized.0, optimized.1);
+            let opt_term = Term::new(optimized.0.entry(), &optimized.1);
 
             for j in 0..extent as usize {
                 for i in 0..extent as usize {
                     let (x, y) = (i as f32 + 0.5, j as f32 + 0.5);
-                    let want = eval_scalar(&raw, raw_root, &[x, y], &BindingTable::empty());
-                    let got = eval_scalar(opt, opt_root, &[x, y], &BindingTable::empty());
+                    let want = eval_scalar(raw_term, &[x, y], &BindingTable::empty());
+                    let got = eval_scalar(opt_term, &[x, y], &BindingTable::empty());
                     // Before the comparison, not folded into it: `NaN >= x` is
                     // false, so a threshold test *accepts* a non-finite
                     // coverage silently. The `assert!` this loop replaced

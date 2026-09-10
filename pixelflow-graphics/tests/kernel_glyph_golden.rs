@@ -12,7 +12,8 @@ use pixelflow_core::{Kernel, Lattice};
 use pixelflow_graphics::fonts::Font;
 use pixelflow_ir::binding::BindingTable;
 use pixelflow_ir::eval_scalar;
-use pixelflow_ir::passes::lower_dwrt_owned;
+use pixelflow_ir::expr::Term;
+use pixelflow_ir::passes::lower_dwrt;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -42,22 +43,22 @@ fn golden_for(ch: char, size: usize) {
     // same optimized arena; optimization soundness (optimized vs raw, within
     // float-reassociation tolerance) is pinned separately by
     // tests/kernel_glyph_optimize.rs.
-    let (arena, root) = centered.parts();
-    let optimized = pixelflow_search::runtime::optimize_runtime_arena(
-        arena,
-        root,
+    let term = centered.term();
+    let optimized = pixelflow_search::runtime::optimize_runtime_term(
+        term,
         pixelflow_ir::LatticeShape::new([size as u32, size as u32]),
     );
-    let (lowered, lroot) = match optimized.as_deref() {
-        Some((a, r)) => (a.clone(), *r),
-        None => lower_dwrt_owned(arena, root).expect("dwrt lowering"),
+    let (lowered, lowered_env) = match optimized.as_deref() {
+        Some((rooted, env)) => (rooted.clone(), env.clone()),
+        None => (lower_dwrt(term).expect("dwrt lowering"), term.env().clone()),
     };
+    let lowered_term = Term::new(lowered.entry(), &lowered_env);
 
     let mut ink = 0.0f32;
     for j in 0..size {
         for i in 0..size {
             let (x, y) = (i as f32, j as f32);
-            let want = eval_scalar(&lowered, lroot, &[x, y], &BindingTable::empty());
+            let want = eval_scalar(lowered_term, &[x, y], &BindingTable::empty());
             let jit = got[j * size + i];
             assert!(
                 jit.is_finite(),

@@ -251,8 +251,7 @@ mod tests {
     use crate::render::packed::packed_kernel;
     use crate::render::Pixel;
     use pixelflow_core::{CellGridFrame, CellGridProgram};
-    use pixelflow_ir::arena::BufferIdentity;
-    use pixelflow_ir::{ExprArena, ExprId};
+    use pixelflow_ir::decl::BufferIdentity;
 
     /// The 2x1 grid's shape and metric: 4x4-point cells over a 2-tile atlas
     /// of 4x4-content tiles with 1-texel aprons (12x6 texels), in a 12x6
@@ -316,18 +315,8 @@ mod tests {
         dense
     }
 
-    fn reachable_nodes(arena: &ExprArena, root: ExprId) -> usize {
-        let mut seen = vec![false; arena.nodes_raw().len()];
-        let mut stack = vec![root];
-        let mut count = 0;
-        while let Some(id) = stack.pop() {
-            if std::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            count += 1;
-            stack.extend(arena.children(id));
-        }
-        count
+    fn reachable_nodes(term: pixelflow_ir::expr::Term<'_>) -> usize {
+        term.root().descendants().count()
     }
 
     /// Research harness: dump the packed kernel's machine code and hot-loop
@@ -758,7 +747,7 @@ mod tests {
             channels, buffers, ..
         } = shape.channel_kernels();
         let kernel = packed_kernel(&Rgba::from(&channels), RGBA_SHIFTS);
-        let slots = kernel.parts().0.buffers();
+        let slots = &kernel.environment().buffers;
         assert_eq!(
             slots.iter().filter(|d| d.id == buffers.cells).count(),
             1,
@@ -786,9 +775,8 @@ mod tests {
             ..TINY_SHAPE
         };
         let kernel = packed_kernel(&Rgba::from(&shape.channel_kernels().channels), RGBA_SHIFTS);
-        let (arena, root) = kernel.parts();
         assert_eq!(
-            reachable_nodes(arena, root),
+            reachable_nodes(kernel.term()),
             667,
             "composed packed node count (4 channels of 157, plus the pack)"
         );
@@ -919,13 +907,13 @@ mod tests {
                 frame_h: (rows as f32 * cell_h).round() as u32,
             };
             let kernel = packed_kernel(&Rgba::from(&shape.channel_kernels().channels), RGBA_SHIFTS);
-            let (arena, root) = kernel.parts();
+            let term = kernel.term();
             let name = format!("cellgrid:{label}");
             let path = dir.join(format!("cellgrid_{label}.arena"));
-            dump_arena(arena, root, &name, &path);
+            dump_arena(term, &name, &path);
             println!(
                 "{name}: {} reachable nodes -> {}",
-                reachable_nodes(arena, root),
+                reachable_nodes(term),
                 path.display()
             );
         }
@@ -1017,14 +1005,14 @@ mod tests {
 
         for (label, color) in [("chrome", &chrome), ("psychedelic", &psychedelic)] {
             let kernel = packed_kernel(color, RGBA_SHIFTS);
-            let (arena, root) = kernel.parts();
+            let term = kernel.term();
             let name = format!("scene:{label}");
             let path = dir.join(format!("scene_{label}.arena"));
-            dump_arena(arena, root, &name, &path);
+            dump_arena(term, &name, &path);
             println!(
                 "{name}: {} reachable nodes, {} tree nodes -> {}",
-                reachable_nodes(arena, root),
-                arena.node_count_subtree(root),
+                reachable_nodes(term),
+                pixelflow_ir::node_count_subtree(term.root()),
                 path.display()
             );
         }
@@ -1037,28 +1025,23 @@ mod tests {
     /// verbatim in `pixelflow-graphics/tests/production_glyph_arena_dump.rs`
     /// rather than shared, because a unit test and an integration test share no
     /// code, and `pixelflow-ir` must not grow a test-only serializer.
-    fn dump_arena(
-        arena: &ExprArena,
-        root: pixelflow_ir::ExprId,
-        name: &str,
-        path: &std::path::Path,
-    ) {
+    fn dump_arena(term: pixelflow_ir::expr::Term<'_>, name: &str, path: &std::path::Path) {
         use core::fmt::Write as _;
-        use pixelflow_ir::arena::ExprNode;
-        let len = arena.nodes_raw().len();
-        let mut reachable = vec![false; len];
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut reachable[id.0 as usize], true) {
-                continue;
-            }
-            stack.extend(arena.children(id));
+        use pixelflow_ir::ExprData;
+
+        let root = term.root();
+        let env = term.env();
+        let dag = root.dag();
+        let mut reachable = dag.side_table(false);
+        for n in root.descendants() {
+            reachable[n] = true;
         }
+
         let mut out = std::string::String::new();
         writeln!(out, "# pixelflow arena dump v1").expect("fmt");
         writeln!(out, "name {name}").expect("fmt");
         let mut idents: Vec<BufferIdentity> = Vec::new();
-        for decl in arena.buffers() {
+        for decl in &env.buffers {
             let ord = match idents.iter().position(|i| *i == decl.id) {
                 Some(p) => p,
                 None => {
@@ -1072,46 +1055,52 @@ mod tests {
         // loader can redeclare them and `Un <slot>` below names a real slot.
         // (Earlier dumps had `Un` lines and no declarations; nothing that
         // read them could rebuild the uniform table.)
-        for decl in arena.uniforms() {
+        for decl in &env.uniforms {
             writeln!(out, "uni {}", decl.default.to_bits()).expect("fmt");
         }
-        let mut dense: Vec<u32> = vec![u32::MAX; len];
+
+        // Dense ordinals in ascending, topological (children-before-parents)
+        // order over the reachable subgraph — the same two-pass pattern
+        // `expr::encode_into` uses, and for the same reason:
+        // `Node::descendants()` is a parent-first DFS, not a valid dump order
+        // on its own.
+        let mut dense = dag.side_table(None::<u32>);
         let mut next = 0u32;
-        let d = |dense: &[u32], id: pixelflow_ir::ExprId| -> u32 {
-            let v = dense[id.0 as usize];
-            assert_ne!(v, u32::MAX, "child dumped before parent");
-            v
-        };
-        for idx in 0..len {
-            if !reachable[idx] {
+        for node in dag.iter() {
+            if !reachable[node] {
                 continue;
             }
-            let id = pixelflow_ir::ExprId(idx as u32);
-            match arena.node(id) {
-                ExprNode::Var(i) => writeln!(out, "V {i}"),
-                ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
-                ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
-                ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-                ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-                ExprNode::Binary(k, a, b) => {
-                    writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+            let d = |c: pixelflow_ir::Node<'_, ExprData>| -> u32 {
+                dense[c].expect("child dumped before parent")
+            };
+            match *node {
+                ExprData::Var(i) => writeln!(out, "V {i}"),
+                ExprData::Const(bits) => writeln!(out, "C {bits}"),
+                ExprData::Buffer(b) => writeln!(out, "B {}", b.0),
+                ExprData::Uniform(u) => writeln!(out, "Un {}", u.0),
+                ExprData::Op(k) => {
+                    let children: Vec<_> = node.children().collect();
+                    match children.as_slice() {
+                        [a] => writeln!(out, "U {k:?} {}", d(*a)),
+                        [a, b] => writeln!(out, "Bi {k:?} {} {}", d(*a), d(*b)),
+                        [a, b, c] => writeln!(out, "T {k:?} {} {} {}", d(*a), d(*b), d(*c)),
+                        _ => panic!(
+                            "{name}: production arena contains {k:?} with {} children, \
+                             which optimize_runtime_term bails on",
+                            children.len()
+                        ),
+                    }
                 }
-                ExprNode::Ternary(k, a, b, c) => writeln!(
-                    out,
-                    "T {k:?} {} {} {}",
-                    d(&dense, *a),
-                    d(&dense, *b),
-                    d(&dense, *c)
-                ),
-                other @ (ExprNode::Param(_) | ExprNode::Nary(..)) => {
-                    panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
+                ExprData::Param(i) => {
+                    panic!("{name}: production arena contains Param({i}), which optimize_runtime_term bails on")
                 }
             }
             .expect("fmt");
-            dense[idx] = next;
+            dense[node] = Some(next);
             next += 1;
         }
-        writeln!(out, "root {}", d(&dense, root)).expect("fmt");
+        let root_ord = dense[root].expect("the root is its own descendant");
+        writeln!(out, "root {root_ord}").expect("fmt");
         std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     }
 }

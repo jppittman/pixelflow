@@ -61,7 +61,7 @@
 //! ```
 
 use pixelflow_core::{BilinearSampler, DiscreteManifold, Kernel, Lattice};
-use pixelflow_ir::arena::BufferIdentity;
+use pixelflow_ir::decl::BufferIdentity;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -667,17 +667,16 @@ mod tests {
         let font = Font::parse(FONT_DATA).unwrap();
         let kernel = font.glyph_kernel_scaled('A', 32.0).unwrap();
         let cached = CachedGlyph::from_kernel(&kernel, 32, 1.0);
-        let (arena, root) = kernel.parts();
+        let term = kernel.term();
         // `Dwrt` (the antialiasing gradient) has no scalar evaluation until
         // it is lowered, exactly as the compile entries lower it.
-        let (lowered, lowered_root) =
-            pixelflow_ir::passes::lower_dwrt_owned(arena, root).expect("glyph kernel lowers");
+        let lowered = pixelflow_ir::passes::lower_dwrt(term).expect("glyph kernel lowers");
+        let lowered_term = pixelflow_ir::expr::Term::new(lowered.entry(), term.env());
 
         for &(i, j) in &[(4usize, 4usize), (10, 16), (16, 8), (16, 20), (24, 28)] {
             let (x, y) = (i as f32 + 0.5, j as f32 + 0.5);
             let reference = pixelflow_ir::eval_scalar(
-                &lowered,
-                lowered_root,
+                lowered_term,
                 &[x, y],
                 &pixelflow_ir::BindingTable::empty(),
             );
