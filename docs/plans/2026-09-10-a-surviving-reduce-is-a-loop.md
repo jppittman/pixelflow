@@ -450,6 +450,57 @@ types and no producer for them. That middle step is folded into 2b: types with
 no caller are the machinery this plan is supposed to be removing, and the
 byte-identity gate cannot see them either way.
 
+### 2a′, attempted and reverted: the accumulator is *not* an arena node
+
+The question that started it was "how does codegen get the combining `OpKind`
+out of a `Monoid`", since `Monoid::op()` is `pub(crate)` and its doc says the
+closure is deliberate. JP's answer was that the question is backwards, and the
+attempt that followed was `ExprNode::Acc(Binder)`: a leaf naming the value a
+fold carried into this iteration, so that `acc ⊕ f(i)` would be an ordinary
+`Binary` in the graph and codegen would need no opcode from the algebra.
+
+**It was built, it compiled workspace-wide, and it was reverted.** The reason
+is worth keeping, because the mistake is not obvious and the evidence for it
+was sitting in the diff:
+
+> 55 added lines mention `Acc`. **28 of them are refusals** — `panic!`,
+> `Declined::Acc`, `return Err`, `=> false`. `kind()`, the e-graph's `insert`,
+> template instantiation, witness reconstruction, the nnue matcher, four
+> corpus formats, two arena dumps, and the macro tier all decline it. So does
+> `arena_to_schedule` — **the one consumer the node existed to serve.**
+
+A node every consumer refuses, including its target, is not a node in the
+language. Each refusal was the type system reporting that the node is at the
+wrong layer, and writing 28 of them is overriding that report 28 times.
+
+**What it actually was.** The other bound-later leaves — `Var`, `Uniform`,
+`Buffer`, `Ref` — are bound by something *outside* the expression: the
+lattice, the call, the binding, the store. `Acc` is not. Its value is defined
+by the node it appears inside — `acc_next = Binary(⊕, Acc, f)` says *Acc on
+iteration k is this node's value on iteration k−1*. That is a **back edge**,
+in a language whose premise is that it is a DAG with no iteration binder. The
+refusals were all one refusal: it is not a term.
+
+**Where a carried value can live**, which is the thing to settle before trying
+again:
+
+| layer | a fold is | is "previous iteration" meaningful? |
+|---|---|---|
+| Kernel / eDSL | `sum_over(binder, range, f)` | no |
+| Arena / IR | `Reduce { fold, body }` — ⊕ over a *set* | **no** — a set has no order |
+| E-graph / extraction | an e-node with rewrite rules | no |
+| **Schedule** | defs plus a loop with a back edge | **yes — the first layer that has one** |
+| Register allocation | a live range crossing that back edge | yes |
+
+⊕ over a set has no accumulator; that absence is exactly what lets the e-graph
+reassociate it. Iteration is introduced *by lowering*. So the carried value is
+a schedule concept, and putting it in the arena was three layers too low.
+
+Which puts the original question back, unanswered but now correctly placed:
+the schedule boundary is where an algebra has to become an instruction, and
+whether that is a legitimate `Monoid → OpKind` query or a leak is a question
+about *that* boundary, not about the arena.
+
 ### The shape 2b adds
 
 A parent pointer, not recursion. Storage stays flat — one `ScopeCode` per
