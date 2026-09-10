@@ -118,6 +118,43 @@ rather than a third copy of the fixup dance. Gate: a hand-built `⊕_{[0,n)}`
 over a table produces the same buffer looped as unrolled, on both ISAs, for
 `SUM` and `MIN`.
 
+*What R1 looks like in this tree, read off the code rather than guessed at
+(2026-09-10):*
+
+- **The fold's region is `partition_by_scope`, with no new pass.** §4 of
+  [a-kept-structure-is-control-flow](2026-09-10-a-kept-structure-is-control-flow.md)
+  guessed `&[0, 1, 4]`; the binder list is innermost-first (`COLLAPSE_BINDERS
+  = [0, 1]` is X then Y, and `plan_collapse_hoist` is called with the mask of
+  `binders[..=j]` from the outside in), so the fold binder goes at the *front*:
+  `&[4, 0, 1]`. Then `plan.body` is exactly the values that vary with the
+  binder, which is exactly the loop body — and the `Reduce` node itself does
+  not vary with the binder it binds, so it lands outside the loop, which is
+  where an accumulator's final read belongs.
+- **Variance, not reachability, is the right criterion**, and it is already
+  computed. Nothing outside the fold can read the binder, so a body node
+  shared with the outer graph is loop-invariant by construction — the sharing
+  question answers itself.
+- **`plan_collapse_hoist`'s gather refusal does not block this.** It excludes
+  gather-bearing values from the *hoisted* set, so the cost is invariant table
+  reads staying in the loop — a missed optimization (ask B), not a wrong
+  split.
+- **A fold region is shaped like a guard region**, which is the part that
+  makes this tractable: `select_guards` is already a side table of regions
+  with `branch_starts[sched_idx]`/`branch_ends[sched_idx]`, walked in schedule
+  order and bound as the walk passes. A fold differs in two ways only — the
+  branch is a back edge, and there is an accumulator.
+- **The loop's own state can be one slot, not two.** The binder is broadcast
+  across lanes (the body reads it as `Var(4)`), `add_scalar(reg, scratch,
+  1.0)` already steps a broadcast vector by one, and a `u16` trip count is
+  exact in `f32` — so the binder *is* the counter, and the termination test is
+  a scalar compare of its low lane against `hi`. That needs one new backend
+  verb (`ucomiss`+`jae` on x86, `fcmp`+`b.hs` on aarch64 — with no NaN in
+  range, `HS` after `FCMP` is `>=`, so both reuse `Branch::IfAboveOrEqual`).
+  No new GPR, and so no callee-saved push in the prologue.
+- **What is genuinely new**: `ScheduledOp::Reduce` and its `resolve_operands`
+  case, the accumulate step, and a third nesting level in a scaffold that is
+  hardcoded two deep.
+
 **R2 — the cost model prices a loop.** Today `node_op_cost` for a `Reduce` is
 the *unrolled* cost, so extraction has no reason to keep one. A loop costs
 `len × (body + step + branch)` in time but **`body + scaffold` in code size**,
