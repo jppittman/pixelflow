@@ -6,7 +6,7 @@
 //! all-ones/all-zero mask lanes, bitwise `Select`/`BitAnd`/`BitOr`, and
 //! exp/exp2 saturation.
 //!
-//! Part 2 is the property sweep the audit asked for: representative arenas
+//! Part 2 is the property sweep the audit asked for: representative terms
 //! (arithmetic, comparisons+select, transcendentals, fma, estimate ops)
 //! evaluated by the JIT and by `eval_scalar` across magnitude extremes
 //! (1e-4..1e4, negatives, ±0.0), asserted within `equivalence_tolerance` —
@@ -15,9 +15,9 @@
 //! documented caller protocol for these tolerances.
 
 use pixelflow_codegen::jit_cache;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef};
 use pixelflow_ir::{
-    BindingTable, ExprArena, ExprId, ExprNode, OpKind, Tolerance, equivalence_tolerance,
-    eval_scalar,
+    BindingTable, Node, OpKind, Rooted, Term, Tolerance, equivalence_tolerance, eval_scalar,
 };
 
 // ── JIT invocation at this build's width ─────────────────────────────────────
@@ -80,7 +80,7 @@ fn grid_xyzw() -> Vec<Sweep> {
     sweeps
 }
 
-/// The two lattice-invariant arguments a sweep arena may declare, in link
+/// The two lattice-invariant arguments a sweep term may declare, in link
 /// order — what `Var(2)` and `Var(3)` became.
 struct Args {
     z: pixelflow_ir::Uniform,
@@ -88,7 +88,7 @@ struct Args {
 }
 
 /// Declare both arguments in `a` and return their leaves.
-fn args(a: &mut ExprArena) -> (Args, ExprId, ExprId) {
+fn args(a: &mut ExprBuilder) -> (Args, ExprRef, ExprRef) {
     let (z, w) = (
         pixelflow_ir::Uniform::new(0.0),
         pixelflow_ir::Uniform::new(0.0),
@@ -100,25 +100,18 @@ fn args(a: &mut ExprArena) -> (Args, ExprId, ExprId) {
 
 /// The intended caller pattern: fold per-op allowances over the nodes reachable
 /// from the root into one whole-expression tolerance.
-fn expression_tolerance(arena: &ExprArena, root: ExprId) -> Tolerance {
+fn expression_tolerance(root: Node<'_, ExprData>) -> Tolerance {
     let mut tol = Tolerance::BitExact;
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        let op = match arena.node(id) {
-            ExprNode::Var(_) => OpKind::Var,
-            ExprNode::Const(_) => OpKind::Const,
-            ExprNode::Buffer(_) => OpKind::Buffer,
-            ExprNode::Uniform(_) => OpKind::Uniform,
-            ExprNode::Param(p) => panic!("expression_tolerance: unbound Param({p})"),
-            ExprNode::Unary(op, _)
-            | ExprNode::Binary(op, _, _)
-            | ExprNode::Ternary(op, _, _, _)
-            | ExprNode::Nary(op, _, _) => *op,
+    for node in root.descendants() {
+        let op = match *node {
+            ExprData::Var(_) => OpKind::Var,
+            ExprData::Const(_) => OpKind::Const,
+            ExprData::Buffer(_) => OpKind::Buffer,
+            ExprData::Uniform(_) => OpKind::Uniform,
+            ExprData::Param(p) => panic!("expression_tolerance: unbound Param({p})"),
+            ExprData::Op(op) => op,
         };
         tol = tol.loosest(equivalence_tolerance(op));
-        for c in arena.children(id) {
-            stack.push(c);
-        }
     }
     tol
 }
@@ -126,11 +119,17 @@ fn expression_tolerance(arena: &ExprArena, root: ExprId) -> Tolerance {
 /// What a sweep is *of*: the expression, and the arguments it declares.
 struct Subject<'a> {
     name: &'a str,
-    arena: &'a ExprArena,
-    root: ExprId,
-    /// The two lattice-invariant arguments, when the arena declares them.
+    /// The frozen graph and the declarations its leaves index. Held as the
+    /// pair rather than as a [`Term`] because the JIT side needs an owned
+    /// clone of it (a `Kernel` owns its graph) and the oracle side needs a
+    /// term over it, and the two must be the same graph.
+    built: &'a Built,
+    /// The two lattice-invariant arguments, when the term declares them.
     declared: Option<&'a Args>,
 }
+
+/// A frozen graph and the declarations its leaves index.
+type Built = (Rooted<ExprData>, Environment);
 
 /// Compile once, then compare JIT vectors against the oracle across all
 /// non-skipped points in SIMD batches, under the expression's folded tolerance.
@@ -141,15 +140,17 @@ fn assert_jit_matches_oracle(
 ) {
     let Subject {
         name,
-        arena,
-        root,
+        built,
         declared,
     } = subject;
-    let tol = expression_tolerance(arena, root);
-    let k = pixelflow_ir::Kernel::from_parts(arena.clone(), root);
-    let jit = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
-        .unwrap_or_else(|e| panic!("{name}: kernel failed to compile on this backend: {e}"))
-        .kernel;
+    let term = Term::new(built.0.entry(), &built.1);
+    let tol = expression_tolerance(term.root());
+    // `jit_cache` compiles a `Kernel`, which owns its graph — the clone is
+    // what makes one, and it is the same graph the oracle reads below.
+    let k = pixelflow_ir::Kernel::from_rooted(built.0.clone(), built.1.clone());
+    let linked = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
+        .unwrap_or_else(|e| panic!("{name}: kernel failed to compile on this backend: {e}"));
+    let jit = linked.kernel;
     let mut checked = 0usize;
     for sweep in sweeps {
         let block = sweep.block;
@@ -158,13 +159,29 @@ fn assert_jit_matches_oracle(
         let bindings = match declared {
             Some(a) => BindingTable::empty()
                 .bind_uniforms(
-                    arena,
+                    term.env(),
                     &[(a.z.identity(), block[0]), (a.w.identity(), block[1])],
                 )
-                .expect("both arguments are declared in this arena"),
+                .expect("both arguments are declared in this term"),
             None => BindingTable::empty(),
         };
-        let ctx: [*const f32; 1] = [block.as_ptr()];
+        // The block is laid out in LINK order — what the code was compiled
+        // against — not in the order this test happens to name the arguments.
+        // Both sides then read the same value for the same instance: the
+        // oracle by identity above, the kernel by offset here.
+        let by_identity = |id| {
+            declared
+                .map(|a| {
+                    if id == a.z.identity() {
+                        block[0]
+                    } else {
+                        block[1]
+                    }
+                })
+                .expect("a linked uniform means the subject declared arguments")
+        };
+        let laid_out: Vec<f32> = linked.uniforms.iter().map(|d| by_identity(d.id)).collect();
+        let ctx: [*const f32; 1] = [laid_out.as_ptr()];
         let valid: Vec<[f32; 2]> = sweep
             .coords
             .iter()
@@ -189,7 +206,7 @@ fn assert_jit_matches_oracle(
             };
             for (i, c) in chunk.iter().enumerate() {
                 let got = res[i];
-                let want = eval_scalar(arena, root, c, &bindings);
+                let want = eval_scalar(term, c, &bindings);
                 let p = [c[0], c[1], block[0], block[1]];
                 assert!(
                     tol.accepts(got, want),
@@ -210,25 +227,27 @@ fn assert_jit_matches_oracle(
 const T: u32 = u32::MAX; // an all-ones mask lane
 const F: u32 = 0;
 
-fn eval1(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-    eval_scalar(arena, root, &[x, y], &BindingTable::empty())
+fn eval1(t: Term<'_>, x: f32, y: f32) -> f32 {
+    eval_scalar(t, &[x, y], &BindingTable::empty())
 }
 
 #[test]
 fn lt_le_are_ordered_and_results_are_masks() {
     let nan = f32::NAN;
     for op in [OpKind::Lt, OpKind::Le] {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let root = a.push_binary(op, x, y);
+        let built = a.finish(&[root]);
+        let t = Term::new(built.0.entry(), &built.1);
         // Ordered: false for any NaN operand, on every target.
         for (px, py) in [(nan, 1.0), (1.0, nan), (nan, nan)] {
-            assert_eq!(eval1(&a, root, px, py).to_bits(), F, "{op:?}({px}, {py})");
+            assert_eq!(eval1(t, px, py).to_bits(), F, "{op:?}({px}, {py})");
         }
         // And the true/false results are bit patterns, never 1.0/0.0-as-number.
-        assert_eq!(eval1(&a, root, 1.0, 2.0).to_bits(), T, "{op:?}(1, 2)");
-        assert_eq!(eval1(&a, root, 2.0, 1.0).to_bits(), F, "{op:?}(2, 1)");
+        assert_eq!(eval1(t, 1.0, 2.0).to_bits(), T, "{op:?}(1, 2)");
+        assert_eq!(eval1(t, 2.0, 1.0).to_bits(), F, "{op:?}(2, 1)");
     }
 }
 
@@ -237,22 +256,25 @@ fn eq_ne_are_exact_and_nan_aware() {
     let nan = f32::NAN;
     let near = f32::from_bits(0.5f32.to_bits() + 1);
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let eq = a.push_binary(OpKind::Eq, x, y);
     let ne = a.push_binary(OpKind::Ne, x, y);
+    let built = a.finish(&[eq, ne]);
+    let eq = Term::new(built.0.entry_at(0), &built.1);
+    let ne = Term::new(built.0.entry_at(1), &built.1);
 
     // Exact: one-ulp neighbours are NOT equal (no epsilon smearing).
-    assert_eq!(eval1(&a, eq, 0.5, near).to_bits(), F);
-    assert_eq!(eval1(&a, ne, 0.5, near).to_bits(), T);
-    assert_eq!(eval1(&a, eq, 0.5, 0.5).to_bits(), T);
+    assert_eq!(eval1(eq, 0.5, near).to_bits(), F);
+    assert_eq!(eval1(ne, 0.5, near).to_bits(), T);
+    assert_eq!(eval1(eq, 0.5, 0.5).to_bits(), T);
 
     // NaN: never equal, always unequal — agreed by every target.
-    assert_eq!(eval1(&a, eq, nan, nan).to_bits(), F);
-    assert_eq!(eval1(&a, ne, nan, nan).to_bits(), T);
-    assert_eq!(eval1(&a, eq, nan, 1.0).to_bits(), F);
-    assert_eq!(eval1(&a, ne, 1.0, nan).to_bits(), T);
+    assert_eq!(eval1(eq, nan, nan).to_bits(), F);
+    assert_eq!(eval1(ne, nan, nan).to_bits(), T);
+    assert_eq!(eval1(eq, nan, 1.0).to_bits(), F);
+    assert_eq!(eval1(ne, 1.0, nan).to_bits(), T);
 }
 
 /// Gt/Ge on NaN diverge by target (x86 unordered-true, aarch64 ordered-false),
@@ -264,22 +286,24 @@ fn gt_ge_pin_the_documented_unordered_choice() {
     let nan = f32::NAN;
     for op in [OpKind::Gt, OpKind::Ge] {
         assert!(op.fold_is_platform_specific(&[nan, 1.0]));
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let root = a.push_binary(op, x, y);
+        let built = a.finish(&[root]);
+        let t = Term::new(built.0.entry(), &built.1);
         for (px, py) in [(nan, 1.0), (1.0, nan), (nan, nan)] {
-            assert_eq!(eval1(&a, root, px, py).to_bits(), T, "{op:?}({px}, {py})");
+            assert_eq!(eval1(t, px, py).to_bits(), T, "{op:?}({px}, {py})");
         }
         // Away from NaN both targets agree and the oracle must too.
-        assert_eq!(eval1(&a, root, 2.0, 1.0).to_bits(), T);
-        assert_eq!(eval1(&a, root, 1.0, 2.0).to_bits(), F);
+        assert_eq!(eval1(t, 2.0, 1.0).to_bits(), T);
+        assert_eq!(eval1(t, 1.0, 2.0).to_bits(), F);
     }
 }
 
 #[test]
 fn select_is_a_bitwise_blend_not_a_truthy_branch() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let t = a.push_const(7.0);
@@ -288,16 +312,21 @@ fn select_is_a_bitwise_blend_not_a_truthy_branch() {
     // Canonical mask from a comparison: picks each branch exactly.
     let m = a.push_binary(OpKind::Lt, x, y);
     let sel = a.push_ternary(OpKind::Select, m, t, f);
-    assert_eq!(eval1(&a, sel, 1.0, 2.0), 7.0);
-    assert_eq!(eval1(&a, sel, 2.0, 1.0), 9.0);
 
     // Non-canonical "mask" 1.0: the blend is bitwise, so the result is the
     // bit formula's value — NOT 7.0. Spelling true as 1.0 is the mask bug.
     let fake = a.push_const(1.0);
     let sel_fake = a.push_ternary(OpKind::Select, fake, t, f);
+    let built = a.finish(&[sel, sel_fake]);
+    let sel = Term::new(built.0.entry_at(0), &built.1);
+    let sel_fake = Term::new(built.0.entry_at(1), &built.1);
+
+    assert_eq!(eval1(sel, 1.0, 2.0), 7.0);
+    assert_eq!(eval1(sel, 2.0, 1.0), 9.0);
+
     let m_bits = 1.0f32.to_bits();
     let expect = (m_bits & 7.0f32.to_bits()) | (!m_bits & 9.0f32.to_bits());
-    let got = eval1(&a, sel_fake, 0.0, 0.0);
+    let got = eval1(sel_fake, 0.0, 0.0);
     assert_eq!(got.to_bits(), expect);
     assert_ne!(got, 7.0, "a truthy select would have returned the branch");
 }
@@ -306,26 +335,31 @@ fn select_is_a_bitwise_blend_not_a_truthy_branch() {
 fn bitand_bitor_operate_on_lane_bits() {
     let px = f32::from_bits(0xDEAD_BEEF);
     let py = f32::from_bits(0x0F0F_0F0F);
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let and = a.push_binary(OpKind::BitAnd, x, y);
     let or = a.push_binary(OpKind::BitOr, x, y);
-    assert_eq!(eval1(&a, and, px, py).to_bits(), 0xDEAD_BEEF & 0x0F0F_0F0F);
-    assert_eq!(eval1(&a, or, px, py).to_bits(), 0xDEAD_BEEF | 0x0F0F_0F0F);
+    let built = a.finish(&[and, or]);
+    let and = Term::new(built.0.entry_at(0), &built.1);
+    let or = Term::new(built.0.entry_at(1), &built.1);
+    assert_eq!(eval1(and, px, py).to_bits(), 0xDEAD_BEEF & 0x0F0F_0F0F);
+    assert_eq!(eval1(or, px, py).to_bits(), 0xDEAD_BEEF | 0x0F0F_0F0F);
 }
 
 #[test]
 fn exp_and_exp2_saturate_rather_than_overflow() {
     for op in [OpKind::Exp, OpKind::Exp2] {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let root = a.push_unary(op, x);
+        let built = a.finish(&[root]);
+        let t = Term::new(built.0.entry(), &built.1);
         // Past a ±126 exponent std overflows to inf; the expansion clamps.
-        let hi = eval1(&a, root, 200.0, 0.0);
+        let hi = eval1(t, 200.0, 0.0);
         assert!(hi.is_finite(), "{op:?}(200) must saturate, got {hi}");
         assert!(hi > 1e30, "{op:?}(200) saturates high, got {hi}");
-        let lo = eval1(&a, root, -200.0, 0.0);
+        let lo = eval1(t, -200.0, 0.0);
         assert!(lo.is_finite() && lo > 0.0, "{op:?}(-200) got {lo}");
         assert!(lo < 1e-30, "{op:?}(-200) saturates low, got {lo}");
     }
@@ -335,13 +369,18 @@ fn exp_and_exp2_saturate_rather_than_overflow() {
 #[test]
 #[should_panic(expected = "no scalar eval")]
 fn unsupported_op_panics_with_the_op_name() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let zero = a.push_const(0.0);
     let root = a.push_binary(OpKind::Dwrt, x, zero);
+    let built = a.finish(&[root]);
     // Bound (not `let _`) so the workspace's must-use lints hold; the call is
     // expected to panic before the value exists.
-    let _unreachable = eval_scalar(&a, root, &[1.0; 2], &BindingTable::empty());
+    let _unreachable = eval_scalar(
+        Term::new(built.0.entry(), &built.1),
+        &[1.0; 2],
+        &BindingTable::empty(),
+    );
 }
 
 // ── The tolerance table itself ───────────────────────────────────────────────
@@ -445,7 +484,7 @@ fn dwrt_has_no_equivalence_tolerance() {
 #[test]
 fn jit_matches_oracle_arithmetic() {
     // ((X*Y + Z) - W) / (X + 2.5) — exact correctly-rounded ops only.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let (declared, z, w) = args(&mut a);
@@ -455,11 +494,11 @@ fn jit_matches_oracle_arithmetic() {
     let c = a.push_const(2.5);
     let den = a.push_binary(OpKind::Add, x, c);
     let root = a.push_binary(OpKind::Div, d, den);
+    let built = a.finish(&[root]);
     assert_jit_matches_oracle(
         Subject {
             name: "arith",
-            arena: &a,
-            root,
+            built: &built,
             declared: Some(&declared),
         },
         &grid_xyzw(),
@@ -472,7 +511,7 @@ fn jit_matches_oracle_exact_unaries_and_min_max() {
     // sqrt(|X|) + (-ceil(Y)) + min(|Z|, |W| + 1). The min operands are shaped
     // so no sweep point produces the (±0.0, ∓0.0) pair the language declines
     // to promise: |Z| is +0.0 at worst and |W|+1 is at least 1.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let (declared, z, w) = args(&mut a);
@@ -493,11 +532,11 @@ fn jit_matches_oracle_exact_unaries_and_min_max() {
     };
     let t = a.push_binary(OpKind::Add, sq, nc);
     let root = a.push_binary(OpKind::Add, t, mn);
+    let built = a.finish(&[root]);
     assert_jit_matches_oracle(
         Subject {
             name: "exact_unaries",
-            arena: &a,
-            root,
+            built: &built,
             declared: Some(&declared),
         },
         &grid_xyzw(),
@@ -528,15 +567,15 @@ fn jit_matches_oracle_min_max_where_promised() {
     // declines to promise (NaN operands, opposite-signed zeros) — the
     // documented caller protocol for BitExact ops with divergent rows.
     for op in [OpKind::Min, OpKind::Max] {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let root = a.push_binary(op, x, y);
+        let built = a.finish(&[root]);
         assert_jit_matches_oracle(
             Subject {
                 name: op.name(),
-                arena: &a,
-                root,
+                built: &built,
                 declared: None,
             },
             &grid_xy(),
@@ -547,7 +586,7 @@ fn jit_matches_oracle_min_max_where_promised() {
 
 #[test]
 fn jit_matches_oracle_round_away_from_ties() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let root = a.push_unary(OpKind::Round, x);
     let pts = vec![Sweep {
@@ -558,11 +597,11 @@ fn jit_matches_oracle_round_away_from_ties() {
             .map(|&x| [x, 0.0])
             .collect(),
     }];
+    let built = a.finish(&[root]);
     assert_jit_matches_oracle(
         Subject {
             name: "round",
-            arena: &a,
-            root,
+            built: &built,
             declared: None,
         },
         &pts,
@@ -577,7 +616,7 @@ fn jit_matches_oracle_round_away_from_ties() {
 #[test]
 fn jit_matches_oracle_comparisons_and_select() {
     // select(lt(X,Y) & ge(Z,W), X - Y, Z * W): mask plumbing end to end.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let (declared, z, w) = args(&mut a);
@@ -588,11 +627,11 @@ fn jit_matches_oracle_comparisons_and_select() {
     let fb = a.push_binary(OpKind::Mul, z, w);
     let root = a.push_ternary(OpKind::Select, m, tb, fb);
     // The grid holds no NaN, so no comparison lands on a divergent row.
+    let built = a.finish(&[root]);
     assert_jit_matches_oracle(
         Subject {
             name: "cmp_select",
-            arena: &a,
-            root,
+            built: &built,
             declared: Some(&declared),
         },
         &grid_xyzw(),
@@ -605,19 +644,19 @@ fn jit_matches_oracle_mask_root_bit_for_bit() {
     // A mask-valued root: lt(X,Y) | gt(Z,W). Folded tolerance is BitExact, so
     // this asserts the JIT writes the same all-ones/all-zero lanes the oracle
     // does — the mask contract, through compiled code.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let (declared, z, w) = args(&mut a);
     let lt = a.push_binary(OpKind::Lt, x, y);
     let gt = a.push_binary(OpKind::Gt, z, w);
     let root = a.push_binary(OpKind::BitOr, lt, gt);
-    assert_eq!(expression_tolerance(&a, root), Tolerance::BitExact);
+    let built = a.finish(&[root]);
+    assert_eq!(expression_tolerance(built.0.entry()), Tolerance::BitExact);
     assert_jit_matches_oracle(
         Subject {
             name: "mask_root",
-            arena: &a,
-            root,
+            built: &built,
             declared: Some(&declared),
         },
         &grid_xyzw(),
@@ -631,7 +670,7 @@ fn jit_matches_oracle_fma() {
     // bit and an SSE2 target is one product-rounding away, inside
     // `EXACT_ARITH`. No point is skipped: rounding is tolerance, not
     // divergence.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let (declared, z, _w) = args(&mut a);
@@ -645,11 +684,11 @@ fn jit_matches_oracle_fma() {
             coords: coord_grid(),
         })
         .collect();
+    let built = a.finish(&[root]);
     assert_jit_matches_oracle(
         Subject {
             name: "fma",
-            arena: &a,
-            root,
+            built: &built,
             declared: Some(&declared),
         },
         &sweeps,
@@ -660,16 +699,16 @@ fn jit_matches_oracle_fma() {
 #[test]
 fn jit_matches_oracle_recip_rsqrt() {
     for op in [OpKind::Recip, OpKind::Rsqrt] {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let root = a.push_unary(op, x);
         // ±0 → ±inf agrees by bits; negative rsqrt → NaN in both tiers; the
         // finite points must land inside the estimate band vs the exact oracle.
+        let built = a.finish(&[root]);
         assert_jit_matches_oracle(
             Subject {
                 name: op.name(),
-                arena: &a,
-                root,
+                built: &built,
                 declared: None,
             },
             &grid_x(),
@@ -682,15 +721,15 @@ fn jit_matches_oracle_recip_rsqrt() {
 fn jit_matches_oracle_int_primitives() {
     // int_to_float(trunc_to_int(X)) is trunc-toward-zero; every sweep value is
     // in i32 range, where the tiers are bit-identical.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let ti = a.push_unary(OpKind::TruncToInt, x);
     let root = a.push_unary(OpKind::IntToFloat, ti);
+    let built = a.finish(&[root]);
     assert_jit_matches_oracle(
         Subject {
             name: "trunc_int",
-            arena: &a,
-            root,
+            built: &built,
             declared: None,
         },
         &grid_x(),
@@ -716,14 +755,14 @@ fn jit_matches_oracle_transcendentals_unary() {
         OpKind::Acos,
         OpKind::Atan,
     ] {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let root = a.push_unary(op, x);
+        let built = a.finish(&[root]);
         assert_jit_matches_oracle(
             Subject {
                 name: op.name(),
-                arena: &a,
-                root,
+                built: &built,
                 declared: None,
             },
             &grid_x(),
@@ -735,15 +774,15 @@ fn jit_matches_oracle_transcendentals_unary() {
 #[test]
 fn jit_matches_oracle_transcendentals_binary() {
     for op in [OpKind::Atan2, OpKind::Pow] {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let root = a.push_binary(op, x, y);
+        let built = a.finish(&[root]);
         assert_jit_matches_oracle(
             Subject {
                 name: op.name(),
-                arena: &a,
-                root,
+                built: &built,
                 declared: None,
             },
             &grid_xy(),

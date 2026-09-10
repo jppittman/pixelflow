@@ -296,7 +296,8 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
 mod tests {
     use crate::emit::EmitCtx;
     use pixelflow_ir::OpKind;
-    use pixelflow_ir::arena::{ExprArena, ExprId};
+    use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef};
+    use pixelflow_ir::{Rooted, Term};
 
     /// Registers to allocate in the pressure test: small enough that a
     /// deliberately wide expression cannot fit, on every tier.
@@ -304,11 +305,11 @@ mod tests {
 
     /// A wide sum whose terms are all pushed before any is consumed, so more
     /// values are live at once than `TIGHT_POOL` can hold.
-    fn wide_live_range_kernel(terms: usize) -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
+    fn wide_live_range_kernel(terms: usize) -> (Rooted<ExprData>, Environment) {
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
-        let live: Vec<ExprId> = (0..terms)
+        let live: Vec<ExprRef> = (0..terms)
             .map(|i| {
                 let c = a.push_const(0.25 + i as f32 * 0.125);
                 let scaled = a.push_binary(OpKind::Mul, x, c);
@@ -319,7 +320,12 @@ mod tests {
             .iter()
             .skip(1)
             .fold(live[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
-        (a, root)
+        a.finish(&[root])
+    }
+
+    /// The term over a built `(Rooted, Environment)` pair.
+    fn term(built: &(Rooted<ExprData>, Environment)) -> Term<'_> {
+        Term::new(built.0.entry(), &built.1)
     }
 
     /// The completeness property the decorator exists to have: every byte the
@@ -331,9 +337,9 @@ mod tests {
     #[test]
     fn every_emitted_byte_is_attributed_to_exactly_one_scope() {
         for terms in [2usize, 8, 24] {
-            let (arena, root) = wide_live_range_kernel(terms);
+            let built = wide_live_range_kernel(terms);
             let result = EmitCtx::with_max_regs(TIGHT_POOL)
-                .compile(&arena, root)
+                .compile(term(&built))
                 .expect("compile");
             let t = &result.traffic;
             let attributed = t.frame.bytes + t.row.bytes + t.body.bytes + t.scaffold.bytes;
@@ -353,9 +359,9 @@ mod tests {
     /// closed.
     #[test]
     fn a_kernel_that_must_spill_reports_stores_and_loads() {
-        let (arena, root) = wide_live_range_kernel(24);
+        let built = wide_live_range_kernel(24);
         let result = EmitCtx::with_max_regs(TIGHT_POOL)
-            .compile(&arena, root)
+            .compile(term(&built))
             .expect("compile");
         assert!(
             result.spill_count > 0,
@@ -382,11 +388,11 @@ mod tests {
     /// difference between two allocations must not be able to hide there.
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
-        let (arena, root) = wide_live_range_kernel(24);
+        let built = wide_live_range_kernel(24);
         let tight = EmitCtx::with_max_regs(TIGHT_POOL)
-            .compile(&arena, root)
+            .compile(term(&built))
             .expect("compile");
-        let loose = crate::emit::compile(&arena, root).expect("compile");
+        let loose = crate::emit::compile(term(&built)).expect("compile");
         assert_eq!(
             tight.traffic.scaffold, loose.traffic.scaffold,
             "the scaffold changed with the register budget"

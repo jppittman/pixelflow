@@ -164,10 +164,7 @@ pub fn substitute_template(
                 u.0
             ),
             ExprData::Op(op) => {
-                let kids: Vec<ExprRef> = node
-                    .children()
-                    .map(|c| memo[&c])
-                    .collect();
+                let kids: Vec<ExprRef> = node.children().map(|c| memo[&c]).collect();
                 target.push_nary(op, &kids)
             }
         };
@@ -825,12 +822,7 @@ impl BwdGenerator {
             // is the "base" version; if junkification succeeds below the
             // remap entry is overwritten.
             let data = *self.arena.node(r);
-            let kids: Vec<ExprRef> = self
-                .arena
-                .child_refs(r)
-                .iter()
-                .map(|c| remap[c])
-                .collect();
+            let kids: Vec<ExprRef> = self.arena.child_refs(r).iter().map(|c| remap[c]).collect();
             let base_id = match data {
                 ExprData::Var(v) => self.arena.push_var(v),
                 ExprData::Const(bits) => self.arena.push_const(f32::from_bits(bits)),
@@ -899,8 +891,7 @@ impl BwdGenerator {
                     let (Some(pattern), Some(produce)) = (pattern, produce) else {
                         continue;
                     };
-                    let Some(bindings) = pattern_match(&self.arena, base_id, pattern.root())
-                    else {
+                    let Some(bindings) = pattern_match(&self.arena, base_id, pattern.root()) else {
                         continue;
                     };
                     let Some(result_id) =

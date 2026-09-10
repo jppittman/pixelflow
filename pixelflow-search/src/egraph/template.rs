@@ -353,7 +353,11 @@ fn op_of(b: &ExprBuilder, r: ExprRef) -> pixelflow_ir::OpKind {
 ///
 /// `ExprBuilder` is append-only, so this is a rebuild rather than an in-place
 /// edit — which is also what the arena version did, one `push` at a time.
-pub(crate) fn substitute_vars(b: &mut ExprBuilder, root: ExprRef, subs: &[(u8, ExprRef)]) -> ExprRef {
+pub(crate) fn substitute_vars(
+    b: &mut ExprBuilder,
+    root: ExprRef,
+    subs: &[(u8, ExprRef)],
+) -> ExprRef {
     fn go(
         b: &mut ExprBuilder,
         r: ExprRef,
@@ -374,8 +378,7 @@ pub(crate) fn substitute_vars(b: &mut ExprBuilder, root: ExprRef, subs: &[(u8, E
             | ExprData::Uniform(_) => r,
             ExprData::Op(op) => {
                 let kids: Vec<ExprRef> = b.child_refs(r).to_vec();
-                let new_kids: Vec<ExprRef> =
-                    kids.iter().map(|&c| go(b, c, subs, memo)).collect();
+                let new_kids: Vec<ExprRef> = kids.iter().map(|&c| go(b, c, subs, memo)).collect();
                 if new_kids == kids {
                     r
                 } else {
@@ -404,13 +407,7 @@ fn shift_vars(b: &mut ExprBuilder, root: ExprRef, offset: u8) -> ExprRef {
 /// Whether `r`'s subtree (resolving through `subst`) reaches metavariable
 /// `mv` — the occurs check that keeps unification from building a cyclic
 /// substitution (which [`apply_subst_deep`] would recurse forever on).
-fn occurs(
-    b: &ExprBuilder,
-    mv: u8,
-    r: ExprRef,
-    subst: &BTreeMap<u8, ExprRef>,
-    depth: u32,
-) -> bool {
+fn occurs(b: &ExprBuilder, mv: u8, r: ExprRef, subst: &BTreeMap<u8, ExprRef>, depth: u32) -> bool {
     if depth > 64 {
         // A pattern this deep never arises from the rule library this
         // harness composes; treat it as an occurrence rather than risk an
@@ -424,10 +421,9 @@ fn occurs(
                     .get(&v)
                     .is_some_and(|&t| occurs(b, mv, t, subst, depth + 1))
         }
-        ExprData::Const(_)
-        | ExprData::Param(_)
-        | ExprData::Buffer(_)
-        | ExprData::Uniform(_) => false,
+        ExprData::Const(_) | ExprData::Param(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => {
+            false
+        }
         ExprData::Op(_) => b
             .child_refs(r)
             .iter()
@@ -503,10 +499,7 @@ fn apply_subst_deep(b: &mut ExprBuilder, r: ExprRef, subst: &BTreeMap<u8, ExprRe
             Some(&t) => apply_subst_deep(b, t, subst),
             None => r,
         },
-        ExprData::Const(_)
-        | ExprData::Param(_)
-        | ExprData::Buffer(_)
-        | ExprData::Uniform(_) => r,
+        ExprData::Const(_) | ExprData::Param(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => r,
         ExprData::Op(op) => {
             let children: Vec<ExprRef> = b.child_refs(r).to_vec();
             let new_children: Vec<ExprRef> = children

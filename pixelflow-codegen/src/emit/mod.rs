@@ -778,7 +778,7 @@ impl EmitCtx {
         }
     }
 
-    /// Compile an [`ExprArena`] DAG under this configuration.
+    /// Compile a [`Term`](pixelflow_ir::Term) under this configuration.
     ///
     /// The configured spelling of [`compile`]. It is a method rather than a
     /// `compile_with_ctx` free function because the suffix was only ever
@@ -787,16 +787,14 @@ impl EmitCtx {
     ///
     /// # Errors
     ///
-    /// If the arena contains a construct no pass can lower, or the emitter
+    /// If the term contains a construct no pass can lower, or the emitter
     /// cannot allocate a frame for it.
-    pub fn compile(
-        self,
-        arena: &pixelflow_ir::arena::ExprArena,
-        root: pixelflow_ir::arena::ExprId,
-    ) -> Result<CompileResult, CompileError> {
-        let (arena, root) =
-            pixelflow_ir::passes::legalize(arena, root).map_err(CompileError::Legalize)?;
-        let schedule = arena_to_schedule(&arena, root);
+    pub fn compile(self, term: pixelflow_ir::Term<'_>) -> Result<CompileResult, CompileError> {
+        // `legalize` rewrites nodes only — the declaration tables its leaves
+        // index are the term's, unchanged — so the legalized root re-pairs
+        // with the same environment.
+        let legalized = pixelflow_ir::passes::legalize(term).map_err(CompileError::Legalize)?;
+        let schedule = term_to_schedule(pixelflow_ir::Term::new(legalized.entry(), term.env()));
         compile_via_backend(schedule, &mut Native::new(self))
     }
 }
@@ -1564,30 +1562,6 @@ pub enum ScheduledOp {
 // Arena to Schedule (zero-cost linearization)
 // =============================================================================
 
-/// Mark nodes reachable from `root` via DFS.
-///
-/// The arena may contain garbage nodes from junkify passes; only nodes
-/// transitively referenced by `root` should appear in the schedule.
-fn mark_reachable(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
-    reachable: &mut [bool],
-) {
-    let mut stack = alloc::vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if reachable[idx] {
-            continue;
-        }
-        reachable[idx] = true;
-        for child in arena.children(id) {
-            if !reachable[child.0 as usize] {
-                stack.push(child);
-            }
-        }
-    }
-}
-
 /// Narrow a `Const` shift count to the `u8` immediate the hardware encoders
 /// take, refusing anything a 32-bit lane cannot be shifted by.
 ///
@@ -1606,118 +1580,130 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
     count as u8
 }
 
-/// Build a schedule directly from an [`ExprArena`].
+/// Build a schedule directly from a [`Term`](pixelflow_ir::Term).
 ///
-/// The arena stores nodes in topological order (children before parents by
-/// construction). We filter to reachable nodes, remap `ExprId` to `ValueId`,
-/// and translate `ExprNode` to `ScheduledOp`.
+/// A `Dag` stores nodes in topological order (children strictly before parents
+/// by construction). We filter to the nodes reachable from the term's root,
+/// number them as `ValueId`s in that order, and translate each [`ExprData`] to
+/// a [`ScheduledOp`].
 ///
 /// # Panics
 ///
-/// Panics if a `Param` or `Nary` node is encountered (these are not expected
-/// in JIT compilation).
-fn arena_to_schedule(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
-) -> Vec<regalloc::Def> {
-    use pixelflow_ir::arena::{ExprId, ExprNode};
+/// Panics if a `Param` node is encountered, or if an operator node carries an
+/// arity the emitter has no instruction for — see [`unexpected_arity`].
+fn term_to_schedule(term: pixelflow_ir::Term<'_>) -> Vec<regalloc::Def> {
+    use pixelflow_ir::{ExprData, Node};
     use regalloc::ValueId;
 
-    let len = arena.len();
-    let mut reachable = alloc::vec![false; len];
-    mark_reachable(arena, root, &mut reachable);
+    let root = term.root();
+    let dag = term.dag();
+    let mut reachable = dag.side_table(false);
+    for n in root.descendants() {
+        reachable[n] = true;
+    }
 
-    // ExprId to ValueId mapping. u32::MAX = unmapped (unreachable).
-    let mut id_map = alloc::vec![ValueId(u32::MAX); len];
+    // Node to ValueId mapping. u32::MAX = unmapped (unreachable).
+    let mut id_map = dag.side_table(ValueId(u32::MAX));
     let mut schedule = Vec::new();
     let mut next_id = 0u32;
 
-    for idx in 0..len {
-        if !reachable[idx] {
+    // The uniform block's base pointer sits in the context entry after the
+    // buffer slots; a uniform's own offset is its slot index — the link step
+    // (`jit_cache`) renumbers the tables into dense first-occurrence order
+    // before anything reaches here, and a caller compiling a term directly
+    // gets the table order it declared.
+    let block_slot = u16::try_from(term.env().buffers.len())
+        .expect("buffer table index fits the context slot immediate");
+
+    for node in dag.iter() {
+        if !reachable[node] {
             continue;
         }
-        let expr_id = ExprId(idx as u32);
-        let node = arena.node(expr_id);
         let vid = ValueId(next_id);
         next_id += 1;
-        id_map[idx] = vid;
+        id_map[node] = vid;
 
-        let map_child = |child: &ExprId| -> ValueId {
-            let mapped = id_map[child.0 as usize];
+        let map_child = |child: Node<'_, ExprData>| -> ValueId {
+            let mapped = id_map[child];
             assert!(
                 mapped.0 != u32::MAX,
-                "arena_to_schedule: child ExprId({}) not yet mapped -- \
-                 arena is not in topological order or child is unreachable",
-                child.0
+                "term_to_schedule: a child was not yet mapped -- the DAG is \
+                 not in topological order or the child is unreachable"
             );
             mapped
         };
 
-        let sched_op = match node {
-            ExprNode::Var(i) => ScheduledOp::Var(*i),
-            ExprNode::Const(v) => ScheduledOp::Const(*v),
-            ExprNode::Param(i) => panic!(
-                "ExprNode::Param({}) reached the JIT emitter -- \
-                 call substitute_params before compile()",
-                i
+        let sched_op = match *node {
+            ExprData::Var(i) => ScheduledOp::Var(i),
+            ExprData::Const(bits) => ScheduledOp::Const(f32::from_bits(bits)),
+            ExprData::Param(i) => panic!(
+                "ExprData::Param({i}) reached the JIT emitter -- \
+                 call substitute_params before compile()"
             ),
             // A Buffer leaf is always folded into a `Gather`'s `slot` immediate
             // (below), so any Buffer that survives as its own reachable node is a
             // dead operand — never consumed as a value. Emit a harmless dead
             // placeholder occupying its ValueId slot, exactly as ShiftImm leaves
             // its folded shift-count Const as a dead schedule entry.
-            ExprNode::Buffer(_) => ScheduledOp::Const(0.0),
-            // The block pointer sits in the context entry after the buffer
-            // slots; the value's offset is its slot index — the link step
-            // (`jit_cache`) renumbers the table into dense first-occurrence
-            // order before anything reaches here, and a caller compiling an
-            // arena directly gets the table order it declared.
-            ExprNode::Uniform(u) => ScheduledOp::Uniform(UniformLoad {
-                ctx_slot: u16::try_from(arena.buffers().len())
-                    .expect("buffer table index fits the context slot immediate"),
+            ExprData::Buffer(_) => ScheduledOp::Const(0.0),
+            ExprData::Uniform(u) => ScheduledOp::Uniform(UniformLoad {
+                ctx_slot: block_slot,
                 offset: u.0,
             }),
-            ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
-            // Shl/Shr fold their Const shift-count operand into an immediate, so
-            // the count never becomes a scheduled value (matching the imm-only
-            // hardware shift encoders). The count const may still appear as its
-            // own schedule entry (harmless/unused) if shared.
-            ExprNode::Binary(op @ (OpKind::Shl | OpKind::Shr), a, b) => {
-                let amount = match arena.node(*b) {
-                    ExprNode::Const(v) => shift_immediate(*op, *v),
-                    _ => panic!(
-                        "{:?} shift count must be a Const (lowering guarantees this)",
-                        op
+            // Arity is the DAG's edge count now, not a variant tag, so the
+            // dispatch is on `(op, children)` and the unexpected shapes are
+            // the slice patterns nothing below matches.
+            ExprData::Op(op) => {
+                let kids: alloc::vec::Vec<Node<'_, ExprData>> = node.children().collect();
+                match (op, kids.as_slice()) {
+                    // Shl/Shr fold their Const shift-count operand into an
+                    // immediate, so the count never becomes a scheduled value
+                    // (matching the imm-only hardware shift encoders). The count
+                    // const may still appear as its own schedule entry
+                    // (harmless/unused) if shared.
+                    (OpKind::Shl | OpKind::Shr, [a, b]) => {
+                        let amount = match **b {
+                            ExprData::Const(bits) => shift_immediate(op, f32::from_bits(bits)),
+                            _ => panic!(
+                                "{op:?} shift count must be a Const (lowering guarantees this)"
+                            ),
+                        };
+                        ScheduledOp::ShiftImm(op, map_child(*a), amount)
+                    }
+                    // RawGather folds its Buffer leaf into the `slot` immediate
+                    // (like a shift count); only the index operand becomes a
+                    // scheduled value.
+                    (OpKind::RawGather, [buf, idx]) => {
+                        let slot = match **buf {
+                            ExprData::Buffer(id) => id.0,
+                            other => {
+                                panic!(
+                                    "RawGather's first child must be a Buffer leaf, got {other:?}"
+                                )
+                            }
+                        };
+                        ScheduledOp::Gather(map_child(*idx), slot)
+                    }
+                    // Unreachable precondition: every compile entry point runs
+                    // `passes::lower_dwrt` before scheduling, which either rewrites
+                    // all `Dwrt` (autodiff) nodes into chain-rule arithmetic or errors
+                    // loudly on an op it cannot differentiate. A `Dwrt` here means a
+                    // caller bypassed that pipeline. Fail loudly rather than as a
+                    // cryptic instruction-emit panic.
+                    (OpKind::Dwrt, _) => panic!(
+                        "term_to_schedule: a Dwrt (autodiff) node reached the JIT \
+                         emitter. lower_dwrt runs in every compile entry point and \
+                         either eliminates Dwrt or refuses to compile, so a survivor \
+                         means this schedule was built without the lowering pipeline."
                     ),
-                };
-                ScheduledOp::ShiftImm(*op, map_child(a), amount)
+                    (_, [a]) => ScheduledOp::Unary(op, map_child(*a)),
+                    (_, [a, b]) => ScheduledOp::Binary(op, map_child(*a), map_child(*b)),
+                    (_, [a, b, c]) => {
+                        ScheduledOp::Ternary(op, map_child(*a), map_child(*b), map_child(*c))
+                    }
+                    (_, kids) => unexpected_arity(op, kids.len()),
+                }
             }
-            // RawGather folds its Buffer leaf into the `slot` immediate (like a
-            // shift count); only the index operand becomes a scheduled value.
-            ExprNode::Binary(OpKind::RawGather, buf, idx) => {
-                let slot = match arena.node(*buf) {
-                    ExprNode::Buffer(id) => id.0,
-                    other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
-                };
-                ScheduledOp::Gather(map_child(idx), slot)
-            }
-            // Unreachable precondition: every compile entry point runs
-            // `passes::lower_dwrt` before scheduling, which either rewrites
-            // all `Dwrt` (autodiff) nodes into chain-rule arithmetic or errors
-            // loudly on an op it cannot differentiate. A `Dwrt` here means a
-            // caller bypassed that pipeline. Fail loudly rather than as a
-            // cryptic instruction-emit panic.
-            ExprNode::Binary(OpKind::Dwrt, _, _) => panic!(
-                "arena_to_schedule: a Dwrt (autodiff) node reached the JIT \
-                 emitter. lower_dwrt runs in every compile entry point and \
-                 either eliminates Dwrt or refuses to compile, so a survivor \
-                 means this schedule was built without the lowering pipeline."
-            ),
-            ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
-            ExprNode::Ternary(op, a, b, c) => {
-                ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
-            }
-            ExprNode::Nary(_, _, _) => panic!("Nary not supported in JIT arena compilation"),
         };
         schedule.push(regalloc::Def {
             value: vid,
@@ -1725,6 +1711,27 @@ fn arena_to_schedule(
         });
     }
     schedule
+}
+
+/// The arity guard: an operator node reaching codegen with no instruction to
+/// name it.
+///
+/// This is what the old `ExprNode::Nary` match arm was. Arity used to be a
+/// variant tag, so "n-ary" was a case the emitter could refuse by name; it is
+/// now the DAG's edge count, so the same refusal is "a count outside 1..=3".
+/// The invariant it defends is unchanged and still worth defending: everything
+/// variadic — `Reduce`, `Tuple` — is resolved into fixed-arity nodes by
+/// `passes::legalize`, which every entry point here runs first, so a survivor
+/// means a caller assembled a schedule without the lowering pipeline. A
+/// zero-child operator is the same failure from the other side.
+fn unexpected_arity(op: OpKind, arity: usize) -> ! {
+    panic!(
+        "term_to_schedule: {op:?} reached the JIT emitter with {arity} operands. \
+         The emitter has instructions for 1, 2 and 3; every variadic construct \
+         (Reduce, Tuple) is resolved by passes::legalize, which runs in every \
+         compile entry point, so a survivor means this schedule was built \
+         without the lowering pipeline."
+    )
 }
 
 // =============================================================================
@@ -2328,7 +2335,7 @@ type Native = avx2::driver::Avx2Backend;
 ))]
 type Native = x86_64::driver::X86Backend;
 
-/// Compile an [`ExprArena`] DAG into a **collapse** kernel: the X/Y loop nest is
+/// Compile a [`Term`](pixelflow_ir::Term) into a **collapse** kernel: the X/Y loop nest is
 /// emitted *inside* the code, so one call fills `rows * groups` output batches
 /// with no per-row or per-batch Rust↔JIT boundary. This is the internal-loop
 /// realization of a lattice collapse.
@@ -2344,14 +2351,14 @@ type Native = x86_64::driver::X86Backend;
 /// [`KernelFn`](executable::KernelFn) ABI
 /// `(ctx, out, groups, rows, row_skip_bytes, x0, y0, z, w)`.
 ///
-/// The context is one base pointer per declared buffer, in the arena's slot
-/// order, followed — only when the arena declares a uniform — by the uniform
-/// block's base pointer: `f32` values in the arena's uniform-slot order, read
+/// The context is one base pointer per declared buffer, in the environment's
+/// slot order, followed — only when the environment declares a uniform — by the
+/// uniform block's base pointer: `f32` values in its uniform-slot order, read
 /// once per call in the frame prologue.
 ///
 /// # Panics
 ///
-/// Panics if the arena names a retired coordinate axis (`Var(2)`/`Var(3)`,
+/// Panics if the term names a retired coordinate axis (`Var(2)`/`Var(3)`,
 /// the old Z and W). This is the boundary the check belongs on, because it
 /// is the *only* one every route to machine code passes through — the
 /// shape-keyed cache is one caller, and the benchmark harnesses, the corpus
@@ -2366,17 +2373,14 @@ type Native = x86_64::driver::X86Backend;
 /// `COORDS` and `BINDERS` — so the node reads as frame-uniform and LICM
 /// lifts it into the per-call prologue. Plausible pixels, computed once,
 /// from a lane that means nothing.
-pub fn compile(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
-) -> Result<CompileResult, CompileError> {
+pub fn compile(term: pixelflow_ir::Term<'_>) -> Result<CompileResult, CompileError> {
+    let retired = term.root().retired_axis();
     assert!(
-        arena.retired_axis(root).is_none(),
-        "emit::compile: the arena names Var({:?}), a coordinate axis a \
-         lattice no longer has; a per-call scalar is a Uniform",
-        arena.retired_axis(root)
+        retired.is_none(),
+        "emit::compile: the term names Var({retired:?}), a coordinate axis a \
+         lattice no longer has; a per-call scalar is a Uniform"
     );
-    EmitCtx::default().compile(arena, root)
+    EmitCtx::default().compile(term)
 }
 
 /// Drive a schedule to a complete collapse kernel via an
@@ -2587,15 +2591,23 @@ fn compile_via_backend<B: IsaBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::arena::ExprArena;
-    // Only the 128-bit x86 helpers (`run1`, `run_xy`, `run2`) take an `ExprId`
-    // at this level; the wider-ISA submodules import their own.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    use pixelflow_ir::arena::ExprId;
+    use pixelflow_ir::expr::{Environment, ExprBuilder, ExprRef};
+    use pixelflow_ir::{ExprData, Rooted, Term};
+
+    /// A frozen fixture: the graph an [`ExprBuilder`] built, together with the
+    /// declarations its leaves index. Nothing downstream takes the two apart —
+    /// a [`Term`] borrows both at once — so the tests below hold the pair.
+    type Built = (Rooted<ExprData>, Environment);
+
+    /// Freeze `b` at `root`.
+    fn built(b: ExprBuilder, root: ExprRef) -> Built {
+        b.finish(&[root])
+    }
+
+    /// The term over a frozen fixture.
+    fn term(p: &Built) -> Term<'_> {
+        Term::new(p.0.entry(), &p.1)
+    }
 
     // The three helpers below are shared by ISA-gated tests; which subset is
     // live depends on the build's target features, so none is unconditionally
@@ -2641,15 +2653,39 @@ mod tests {
     /// A `Dwrt` that reaches the scheduler (a caller bypassed the lowering
     /// pipeline) must fail loudly at the schedule boundary, not as a cryptic
     /// emit panic. The compile entry points run `lower_dwrt` first, so this
-    /// exercises calling `arena_to_schedule` directly.
+    /// exercises calling `term_to_schedule` directly.
     #[test]
     #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
     fn surviving_dwrt_fails_loudly() {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let v = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, x, v);
-        let _ = arena_to_schedule(&a, root);
+        let p = built(a, root);
+        let _ = term_to_schedule(term(&p));
+    }
+
+    /// A term naming a retired coordinate axis is refused where it would
+    /// become machine code.
+    ///
+    /// This is the *only* route that can still reach the check:
+    /// `Kernel::from_rooted` refuses such a graph outright, so no `Kernel` —
+    /// and therefore nothing going through `jit_cache::compile` — can carry
+    /// one. What can is a caller that comes straight here (a benchmark
+    /// harness, a corpus tool, a rewrite rule instantiating its own
+    /// metavariable), which is exactly why the assertion lives on this
+    /// boundary rather than on the cache's.
+    #[test]
+    #[should_panic(expected = "the term names Var")]
+    fn compile_refuses_a_retired_coordinate_axis() {
+        let mut a = ExprBuilder::new();
+        let x = a.push_var(0);
+        let z = a.push_var(2);
+        let c = a.push_const(7.25);
+        let scaled = a.push_binary(OpKind::Mul, z, c);
+        let root = a.push_binary(OpKind::Add, x, scaled);
+        let p = built(a, root);
+        let _refused = compile(term(&p));
     }
 
     /// The scaffold's size does not depend on the frame it wraps.
@@ -2738,8 +2774,8 @@ mod tests {
     /// dispatch arm — not only the encoder behind it — is what emits here.
     #[test]
     fn every_backend_emits_from_this_host() {
-        use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformIdentity};
-        let mut a = ExprArena::new();
+        use pixelflow_ir::decl::{UniformDecl, UniformIdentity};
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let u = a.declare_uniform(UniformDecl {
@@ -2748,10 +2784,12 @@ mod tests {
         });
         let u = a.push_uniform(u);
         let scaled = a.push_binary(OpKind::Mul, y, u);
-        let root = a.push_binary(OpKind::Add, a.clone().push_var(0).max(x).min(x), scaled);
-        let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
+        let root = a.push_binary(OpKind::Add, x, scaled);
+        let p = built(a, root);
+        let legalized = pixelflow_ir::passes::legalize(term(&p)).expect("legalize");
+        let lowered = Term::new(legalized.entry(), &p.1);
         assert!(
-            arena_to_schedule(&a, root)
+            term_to_schedule(lowered)
                 .iter()
                 .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
             "the schedule must carry the uniform load for the backends to dispatch on"
@@ -2763,7 +2801,7 @@ mod tests {
         let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
         let mut avx512b = avx512::driver::Avx512Backend::new(ctx);
 
-        let neon_len = emit_dag_body(arena_to_schedule(&a, root), &mut neon)
+        let neon_len = emit_dag_body(term_to_schedule(lowered), &mut neon)
             .expect("NEON emit")
             .0
             .len();
@@ -2774,21 +2812,21 @@ mod tests {
         for (name, len) in [
             (
                 "SSE2",
-                emit_dag_body(arena_to_schedule(&a, root), &mut sse2)
+                emit_dag_body(term_to_schedule(lowered), &mut sse2)
                     .expect("SSE2")
                     .0
                     .len(),
             ),
             (
                 "AVX2",
-                emit_dag_body(arena_to_schedule(&a, root), &mut avx2b)
+                emit_dag_body(term_to_schedule(lowered), &mut avx2b)
                     .expect("AVX2")
                     .0
                     .len(),
             ),
             (
                 "AVX-512",
-                emit_dag_body(arena_to_schedule(&a, root), &mut avx512b)
+                emit_dag_body(term_to_schedule(lowered), &mut avx512b)
                     .expect("AVX-512")
                     .0
                     .len(),
@@ -2810,15 +2848,14 @@ mod tests {
     /// unit test on every host.
     #[test]
     fn aarch64_const_pool_appends_across_bodies() {
-        use pixelflow_ir::arena::ExprArena;
-
         fn schedule_for(k: f32) -> Vec<regalloc::Def> {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let c = a.push_const(k);
             let root = a.push_binary(OpKind::Mul, x, c);
-            let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-            arena_to_schedule(&a, root)
+            let p = built(a, root);
+            let legalized = pixelflow_ir::passes::legalize(term(&p)).expect("legalize");
+            term_to_schedule(Term::new(legalized.entry(), &p.1))
         }
 
         // Two constants that genuinely need the pool (not FMOV-immediate).
@@ -2858,7 +2895,7 @@ mod tests {
     /// would then read a register the other scope never wrote.
     #[test]
     fn a_leaf_feeding_both_scopes_is_scheduled_in_both() {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         // One constant, read by an X-invariant term and an X-varying one.
@@ -2867,8 +2904,9 @@ mod tests {
         let varying = a.push_binary(OpKind::Mul, x, k);
         let root = a.push_binary(OpKind::Add, invariant, varying);
 
-        let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-        let schedule = arena_to_schedule(&arena, root);
+        let p = built(a, root);
+        let legalized = pixelflow_ir::passes::legalize(term(&p)).expect("legalize");
+        let schedule = term_to_schedule(Term::new(legalized.entry(), &p.1));
         let variance = schedule_variance(&schedule);
         let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
 
@@ -2894,7 +2932,7 @@ mod tests {
     fn a_shared_leaf_is_placed_once_per_scope() {
         use regalloc::{RegisterAllocator, Scope};
 
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let k = a.push_const(3.5);
@@ -2902,8 +2940,9 @@ mod tests {
         let varying = a.push_binary(OpKind::Mul, x, k);
         let root = a.push_binary(OpKind::Add, invariant, varying);
 
-        let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-        let schedule = arena_to_schedule(&arena, root);
+        let p = built(a, root);
+        let legalized = pixelflow_ir::passes::legalize(term(&p)).expect("legalize");
+        let schedule = term_to_schedule(Term::new(legalized.entry(), &p.1));
         let variance = schedule_variance(&schedule);
         let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
 
@@ -3354,25 +3393,24 @@ mod tests {
     /// Test Select with all-false mask: should return false arm.
     /// Test Select with mixed mask: BSL path, both arms evaluated.
     // =========================================================================
-    // Arena compilation tests
+    // Whole-term compilation tests
     // =========================================================================
 
-    // These three tests call the private `arena_to_schedule`/`arena_to_uses`
+    // These three tests call the private `term_to_schedule`/`arena_to_uses`
     // directly rather than through `compile`: value numbering and
     // dead-node filtering are schedule-shape invariants with no output-value
     // signature (a regression here wastes registers/instructions, it doesn't
     // change what a compiled kernel computes), so there is no public
     // black-box assertion that would catch a break here.
     #[test]
-    fn arena_to_schedule_simple() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
+    fn term_to_schedule_simple() {
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(OpKind::Add, x, y);
 
-        let schedule = arena_to_schedule(&arena, sum);
+        let p = built(arena, sum);
+        let schedule = term_to_schedule(term(&p));
 
         // Should have 3 values: X, Y, X+Y
         assert_eq!(
@@ -3392,16 +3430,15 @@ mod tests {
     }
 
     #[test]
-    fn arena_to_schedule_filters_unreachable() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
+    fn term_to_schedule_filters_unreachable() {
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let _garbage = arena.push_const(999.0); // unreachable
         let y = arena.push_var(1);
         let sum = arena.push_binary(OpKind::Add, x, y);
 
-        let schedule = arena_to_schedule(&arena, sum);
+        let p = built(arena, sum);
+        let schedule = term_to_schedule(term(&p));
 
         // Should have 3 values (garbage node filtered out)
         assert_eq!(
@@ -3413,15 +3450,14 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn arena_compile_simple() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
+    fn term_compile_simple() {
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(OpKind::Add, x, y);
 
-        let result = compile(&arena, sum).expect("arena DAG compile failed");
+        let p = built(arena, sum);
+        let result = compile(term(&p)).expect("term compile failed");
         assert_eq!(result.spill_count, 0);
 
         assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 7.0);
@@ -3429,17 +3465,16 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn arena_compile_with_constant() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
+    fn term_compile_with_constant() {
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let two = arena.push_const(2.0);
         let y = arena.push_var(1);
         let prod = arena.push_binary(OpKind::Mul, x, two);
         let sum = arena.push_binary(OpKind::Add, prod, y);
 
-        let result = compile(&arena, sum).expect("arena DAG compile failed");
+        let p = built(arena, sum);
+        let result = compile(term(&p)).expect("term compile failed");
 
         // 3*2 + 4 = 10
         assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 10.0);
@@ -3460,10 +3495,8 @@ mod tests {
     /// the pool can be made.
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn arena_compile_with_spills() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
+    fn term_compile_with_spills() {
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let mut terms: alloc::vec::Vec<_> = (1..=10u32)
@@ -3485,9 +3518,10 @@ mod tests {
         }
         let root = terms[0];
 
+        let p = built(arena, root);
         let result = EmitCtx::with_max_regs(4)
-            .compile(&arena, root)
-            .expect("arena DAG compile with spills failed");
+            .compile(term(&p))
+            .expect("term compile with spills failed");
 
         assert!(
             result.spill_count > 0,
@@ -3517,7 +3551,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     mod select_guard_driver {
         use super::*;
-        use pixelflow_ir::arena::{ExprArena, ExprId};
 
         /// Padding that makes an arm worth a branch, and what it adds.
         ///
@@ -3528,7 +3561,7 @@ mod tests {
         /// cycles, and every point below stays exact in `f32`.
         const PADDING: f32 = 6.0;
 
-        fn worth_a_branch(a: &mut ExprArena, arm: ExprId) -> ExprId {
+        fn worth_a_branch(a: &mut ExprBuilder, arm: ExprRef) -> ExprRef {
             (1..=3u32).fold(arm, |acc, i| {
                 let c = a.push_const(i as f32);
                 a.push_binary(OpKind::Add, acc, c)
@@ -3546,7 +3579,7 @@ mod tests {
         /// below the arm's body, and the range from there to the arm swallows
         /// the mask. Deriving both arms from one shared value keeps every leaf
         /// out of both arms, which is what leaves the arms' own nodes adjacent.
-        fn guarded_select(a: &mut ExprArena) -> ExprId {
+        fn guarded_select(a: &mut ExprBuilder) -> ExprRef {
             let x = a.push_var(0);
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
@@ -3573,8 +3606,8 @@ mod tests {
         /// Without this the tests below still pass when the guard stops
         /// forming — they would just be testing an ordinary `Select`, which is
         /// the silent-decay shape this file has been bitten by before.
-        fn assert_guard_forms(a: &ExprArena, root: ExprId) {
-            let schedule = arena_to_schedule(a, root);
+        fn assert_guard_forms(p: &Built) {
+            let schedule = term_to_schedule(term(p));
             let guards = analyze_select_guards(&schedule);
             let guarded = guards.iter().any(|g| g.has_guarded_arm());
             assert!(
@@ -3598,7 +3631,7 @@ mod tests {
         /// The two "intruders" are read by the root, so they are shared with
         /// the world outside the arms and can never be skipped; they are what
         /// makes the arms non-contiguous to begin with.
-        fn nested_guarded_selects(a: &mut ExprArena) -> (ExprId, ExprId, ExprId) {
+        fn nested_guarded_selects(a: &mut ExprBuilder) -> (ExprRef, ExprRef, ExprRef) {
             let x = a.push_var(0);
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
@@ -3663,8 +3696,8 @@ mod tests {
 
         /// How many entries each select has under a guard, by schedule
         /// position, for a schedule built the way `compile` builds it.
-        fn guarded_entries(a: &ExprArena, root: ExprId, cluster: bool) -> alloc::vec::Vec<usize> {
-            let schedule = arena_to_schedule(a, root);
+        fn guarded_entries(p: &Built, cluster: bool) -> alloc::vec::Vec<usize> {
+            let schedule = term_to_schedule(term(p));
             let schedule = if cluster {
                 guards::cluster_select_arms(schedule)
             } else {
@@ -3681,11 +3714,12 @@ mod tests {
         /// difference.
         #[test]
         fn clustering_guards_both_levels_of_a_nested_select() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let (root, _outer, _inner) = nested_guarded_selects(&mut a);
+            let p = built(a, root);
 
-            let before = guarded_entries(&a, root, false);
-            let after = guarded_entries(&a, root, true);
+            let before = guarded_entries(&p, false);
+            let after = guarded_entries(&p, true);
             assert!(
                 before.iter().sum::<usize>() < after.iter().sum::<usize>(),
                 "clustering bought nothing: {before:?} -> {after:?}"
@@ -3708,9 +3742,10 @@ mod tests {
         /// there is no tolerance to hide a wrong branch in.
         #[test]
         fn a_nested_guarded_select_agrees_lane_for_lane() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let (root, _outer, _inner) = nested_guarded_selects(&mut a);
-            let result = compile(&a, root).expect("nested guarded select compile");
+            let p = built(a, root);
+            let result = compile(term(&p)).expect("nested guarded select compile");
 
             // One point at a time: all four combinations of the two masks,
             // each of which takes a pair of branches.
@@ -3746,11 +3781,12 @@ mod tests {
         /// arithmetic.
         #[test]
         fn a_guarded_select_takes_every_branch() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let root = guarded_select(&mut a);
-            assert_guard_forms(&a, root);
+            let p = built(a, root);
+            assert_guard_forms(&p);
 
-            let result = compile(&a, root).expect("guarded select compile");
+            let result = compile(term(&p)).expect("guarded select compile");
             for &(x, y) in &[
                 (3.0f32, 4.0f32), // all-true  -> B³
                 (-2.0, 0.5),      // all-false -> 3B
@@ -3785,7 +3821,7 @@ mod tests {
         /// this path never taken.
         #[test]
         fn a_guarded_select_survives_a_spilled_mask() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
@@ -3795,7 +3831,7 @@ mod tests {
 
             // Filler that is all live at once and all consumed *before* the
             // select, so the mask outlives every one of them.
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
+            let terms: alloc::vec::Vec<ExprRef> = (1..=8u32)
                 .map(|i| {
                     let c = a.push_const(i as f32);
                     a.push_binary(OpKind::Add, x, c)
@@ -3816,14 +3852,15 @@ mod tests {
             let sel = a.push_ternary(OpKind::Select, cond, bbb, b3);
             let carried = a.push_binary(OpKind::Sub, x, y);
             let root = a.push_binary(OpKind::Add, sel, carried);
-            assert_guard_forms(&a, root);
+            let p = built(a, root);
+            assert_guard_forms(&p);
 
             // The mask must actually be the value that spills.
             let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
                 .register_file();
             let allocation = {
                 use regalloc::RegisterAllocator;
-                regalloc::LinearScan.allocate(arena_to_schedule(&a, root), &file)
+                regalloc::LinearScan.allocate(term_to_schedule(term(&p)), &file)
             };
             let mask_vid = analyze_select_guards(allocation.body().schedule())
                 .first()
@@ -3836,7 +3873,7 @@ mod tests {
             );
 
             let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
-                .compile(&a, root)
+                .compile(term(&p))
                 .expect("spilled guarded select compile");
 
             for &(px, py) in &[(3.0f32, 2.0f32), (-2.0, 0.5), (0.5, -1.0)] {
@@ -3862,18 +3899,17 @@ mod tests {
         /// because a value in memory anywhere is stored right after its
         /// definition, which is outside the arm.
         ///
-        /// Returns the arena, the root, the value that gets split, and the
+        /// Returns the frozen graph, the value that gets split, and the
         /// select's true-arm range, so the two tests below can assert on the
         /// same shape rather than each rebuilding it.
         fn split_across_a_guarded_arm() -> (
-            ExprArena,
-            ExprId,
+            Built,
             regalloc::ValueId,
             (usize, usize),
             regalloc::NestAllocation,
         ) {
             use regalloc::RegisterAllocator;
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
@@ -3883,7 +3919,7 @@ mod tests {
             let cond = a.push_binary(OpKind::Gt, x, zero);
             let split = a.push_binary(OpKind::Mul, x, y);
 
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
+            let terms: alloc::vec::Vec<ExprRef> = (1..=8u32)
                 .map(|i| {
                     let c = a.push_const(i as f32);
                     a.push_binary(OpKind::Add, x, c)
@@ -3914,16 +3950,17 @@ mod tests {
             let carried = a.push_binary(OpKind::Sub, x, y);
             let root = a.push_binary(OpKind::Add, after, carried);
 
+            let p = built(a, root);
             let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
                 .register_file();
-            let schedule = arena_to_schedule(&a, root);
+            let schedule = term_to_schedule(term(&p));
             let allocation = regalloc::LinearScan.allocate(schedule, &file);
             let guard = analyze_select_guards(allocation.body().schedule())
                 .into_iter()
                 .find(|g| g.is_guarded(SelectArm::True))
                 .expect("the true arm is exclusive and contiguous, so it is guarded");
 
-            // Which `ValueId` the arena's `split` became. `X·Y` is the only
+            // Which `ValueId` the graph's `split` became. `X·Y` is the only
             // product of two `Var`s in this kernel.
             let body = allocation.body().schedule();
             let is_var = |v: regalloc::ValueId| {
@@ -3937,13 +3974,13 @@ mod tests {
                 })
                 .map(|d| d.value)
                 .expect("X·Y is in the schedule");
-            (a, root, split_vid, guard.true_range(), allocation)
+            (p, split_vid, guard.true_range(), allocation)
         }
 
         /// The value is right after the arm, on the path that skips it.
         #[test]
         fn a_split_range_inside_a_guarded_arm_is_correct_when_the_arm_is_skipped() {
-            let (a, root, split_vid, arm, allocation) = split_across_a_guarded_arm();
+            let (p, split_vid, arm, allocation) = split_across_a_guarded_arm();
             assert!(
                 allocation.placement(split_vid).spills(),
                 "the value under test stayed in a register, so nothing is split"
@@ -3959,7 +3996,7 @@ mod tests {
             );
 
             let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
-                .compile(&a, root)
+                .compile(term(&p))
                 .expect("split-across-a-guard compile");
             // x < 0 is the all-false mask: the true arm — and the reload
             // inside it — never runs, and the read after it must still be the
@@ -3990,7 +4027,7 @@ mod tests {
         /// what makes "exactly" a statement about one answer rather than two.
         #[test]
         fn a_kept_reload_inside_a_guarded_arm_ends_at_the_arm() {
-            let (_, _, split_vid, arm, allocation) = split_across_a_guarded_arm();
+            let (_, split_vid, arm, allocation) = split_across_a_guarded_arm();
             let spans: alloc::vec::Vec<regalloc::Span> =
                 allocation.placement(split_vid).spans().collect();
             let kept = spans
@@ -4014,7 +4051,7 @@ mod tests {
         }
     }
 
-    /// Run an arena kernel at `x` (Y = 0) and return lane 0. The
+    /// Run a kernel at `x` (Y = 0) and return lane 0. The
     /// builtin-parity tests below use it. Gated off `+avx512f` (those builtins
     /// aren't in the AVX-512 op set yet anyway).
     #[cfg(all(
@@ -4022,8 +4059,8 @@ mod tests {
         not(target_feature = "avx512f"),
         not(target_feature = "avx2")
     ))]
-    fn run1(arena: &ExprArena, root: ExprId, x: f32) -> f32 {
-        let r = compile(arena, root).expect("compile failed");
+    fn run1(p: &Built, x: f32) -> f32 {
+        let r = compile(term(p)).expect("compile failed");
         eval_point(&r.code, x, 0.0, 0.0, 0.0)
     }
 
@@ -4033,8 +4070,8 @@ mod tests {
         not(target_feature = "avx512f"),
         not(target_feature = "avx2")
     ))]
-    fn run_xy(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-        let r = compile(arena, root).expect("compile failed");
+    fn run_xy(p: &Built, x: f32, y: f32) -> f32 {
+        let r = compile(term(p)).expect("compile failed");
         eval_point(&r.code, x, y, 0.0, 0.0)
     }
 
@@ -4048,7 +4085,7 @@ mod tests {
         not(target_feature = "avx2")
     ))]
     fn dwrt_compiles_to_analytic_derivative() {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let x2 = a.push_binary(OpKind::Mul, x, x);
@@ -4057,9 +4094,10 @@ mod tests {
         let dist = a.push_unary(OpKind::Sqrt, sum);
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, dist, v0);
+        let p = built(a, root);
 
         for (px, py) in [(3.0f32, 4.0f32), (1.0, 1.0), (-2.0, 5.0)] {
-            let got = run_xy(&a, root, px, py);
+            let got = run_xy(&p, px, py);
             let want = px / (px * px + py * py).sqrt();
             assert!(
                 (got - want).abs() <= 1e-3 * want.abs().max(1.0),
@@ -4073,10 +4111,10 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn dwrt_of_gather_refuses_to_compile() {
-        use pixelflow_ir::arena::BufferDecl;
-        let mut a = ExprArena::new();
+        use pixelflow_ir::decl::BufferDecl;
+        let mut a = ExprBuilder::new();
         let buf = a.declare_buffer(BufferDecl {
-            id: pixelflow_ir::arena::BufferIdentity::mint(),
+            id: pixelflow_ir::decl::BufferIdentity::mint(),
             width: 2,
             height: 1,
         });
@@ -4086,7 +4124,8 @@ mod tests {
         let g = a.push_ternary(OpKind::Gather, bufleaf, x, y);
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, g, v0);
-        assert!(compile(&a, root).is_err());
+        let p = built(a, root);
+        assert!(compile(term(&p)).is_err());
     }
 
     /// A spill frame past the 128-byte red zone must allocate a real frame
@@ -4101,7 +4140,7 @@ mod tests {
         not(target_feature = "avx2")
     ))]
     fn spill_frame_beyond_red_zone_compiles_correctly() {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let mut products = alloc::vec::Vec::new();
@@ -4112,11 +4151,12 @@ mod tests {
             products.push(a.push_binary(OpKind::Mul, xa, yb));
         }
         let mut root = products[0];
-        for p in &products[1..] {
-            root = a.push_binary(OpKind::Add, root, *p);
+        for product in &products[1..] {
+            root = a.push_binary(OpKind::Add, root, *product);
         }
+        let p = built(a, root);
 
-        let result = compile(&a, root).expect("large spill frame must compile");
+        let result = compile(term(&p)).expect("large spill frame must compile");
         assert!(
             result.spill_bytes > 128,
             "test did not force a frame beyond the red zone (spill_bytes = {})",
@@ -4124,7 +4164,7 @@ mod tests {
         );
 
         for (px, py) in [(1.5f32, -2.0f32), (0.0, 0.0), (3.0, 4.0)] {
-            let got = run_xy(&a, root, px, py);
+            let got = run_xy(&p, px, py);
             let want: f32 = (0..40)
                 .map(|i| (px + i as f32 + 1.0) * (py + i as f32 + 1.0))
                 .sum();
@@ -4241,11 +4281,12 @@ mod tests {
             ),
         ];
         for &(op, scalar, inputs, tol) in unary {
-            let mut arena = ExprArena::new();
+            let mut arena = ExprBuilder::new();
             let x = arena.push_var(0);
             let root = arena.push_unary(op, x);
+            let p = built(arena, root);
             for &xv in inputs {
-                let got = run1(&arena, root, xv);
+                let got = run1(&p, xv);
                 let want = scalar(xv);
                 let err = (got - want).abs() / (1.0 + want.abs());
                 assert!(
@@ -4265,8 +4306,8 @@ mod tests {
     ))]
     fn x86_binary_ternary_builtins_match_scalar() {
         // Helper: compile f(X, Y) and eval at (x, y).
-        fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-            let r = compile(arena, root).expect("compile failed");
+        fn run2(p: &Built, x: f32, y: f32) -> f32 {
+            let r = compile(term(p)).expect("compile failed");
             eval_point(&r.code, x, y, 0.0, 0.0)
         }
 
@@ -4280,12 +4321,13 @@ mod tests {
             (3.0, -0.5),
         ];
         {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let y = a.push_var(1);
             let x = a.push_var(0);
             let root = a.push_binary(OpKind::Atan2, y, x);
+            let p = built(a, root);
             for &(yv, xv) in &pts {
-                let got = run2(&a, root, xv, yv);
+                let got = run2(&p, xv, yv);
                 let want = yv.atan2(xv);
                 assert!(
                     (got - want).abs() <= 1.5e-2,
@@ -4295,12 +4337,13 @@ mod tests {
         }
         // pow(X, Y)
         {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let root = a.push_binary(OpKind::Pow, x, y);
+            let p = built(a, root);
             for &(xv, yv) in &[(2.0f32, 3.0f32), (9.0, 0.5), (4.0, -1.0), (1.5, 2.0)] {
-                let got = run2(&a, root, xv, yv);
+                let got = run2(&p, xv, yv);
                 let want = xv.powf(yv);
                 let err = (got - want).abs() / (1.0 + want.abs());
                 assert!(err <= 5e-3, "pow({xv},{yv}): {got} vs {want} err={err}");
@@ -4308,15 +4351,16 @@ mod tests {
         }
         // hypot(X, Y) — the sqrt(x² + y²) composition it denotes.
         {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let xx = a.push_binary(OpKind::Mul, x, x);
             let yy = a.push_binary(OpKind::Mul, y, y);
             let sum = a.push_binary(OpKind::Add, xx, yy);
             let root = a.push_unary(OpKind::Sqrt, sum);
+            let p = built(a, root);
             for &(xv, yv) in &[(3.0f32, 4.0f32), (1.0, 1.0), (0.0, 2.0)] {
-                let got = run2(&a, root, xv, yv);
+                let got = run2(&p, xv, yv);
                 let want = xv.hypot(yv);
                 assert!(
                     (got - want).abs() <= 1e-4,
@@ -4329,25 +4373,27 @@ mod tests {
             (OpKind::Min, f32::min as fn(f32, f32) -> f32),
             (OpKind::Max, f32::max as fn(f32, f32) -> f32),
         ] {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let root = a.push_binary(op, x, y);
+            let p = built(a, root);
             for &(xv, yv) in &[(1.0f32, 2.0f32), (3.0, -1.0), (-2.0, -5.0)] {
-                let got = run2(&a, root, xv, yv);
+                let got = run2(&p, xv, yv);
                 assert!((got - f(xv, yv)).abs() <= 1e-6, "{op:?}({xv},{yv})");
             }
         }
         // clamp(X, 0.0, 1.0) — the min/max composition it denotes.
         {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let lo = a.push_const(0.0);
             let hi = a.push_const(1.0);
             let floored = a.push_binary(OpKind::Max, x, lo);
             let root = a.push_binary(OpKind::Min, floored, hi);
+            let p = built(a, root);
             for &xv in &[-0.5f32, 0.25, 0.9, 1.7] {
-                let got = run1(&a, root, xv);
+                let got = run1(&p, xv);
                 assert!(
                     (got - xv.clamp(0.0, 1.0)).abs() <= 1e-6,
                     "clamp({xv})={got}"
@@ -4356,15 +4402,16 @@ mod tests {
         }
         // Select(X >= 0, 1.0, -1.0) == signum-ish
         {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let zero = a.push_const(0.0);
             let cond = a.push_binary(OpKind::Ge, x, zero);
             let pos = a.push_const(1.0);
             let neg = a.push_const(-1.0);
             let root = a.push_ternary(OpKind::Select, cond, pos, neg);
+            let p = built(a, root);
             for &xv in &[-2.0f32, -0.1, 0.1, 3.0] {
-                let got = run1(&a, root, xv);
+                let got = run1(&p, xv);
                 let want = if xv >= 0.0 { 1.0 } else { -1.0 };
                 assert!((got - want).abs() <= 1e-6, "select({xv})={got} want={want}");
             }
@@ -4385,8 +4432,6 @@ mod tests {
     ))]
     mod lowering_tests {
         use super::*;
-        use pixelflow_ir::arena::ExprArena;
-
         // The degree-11 Chebyshev in `passes` measures 6e-7 across the whole
         // reduced interval, so this bound sits an order of magnitude above the
         // measured worst case: tight enough to test the polynomial, loose
@@ -4399,24 +4444,33 @@ mod tests {
             // Range beyond [-π,π] to exercise the floor-based range reduction.
             let pts = [0.0f32, 0.3, 1.0, 2.0, 3.5, -1.7, 6.0, -4.2];
             for &xv in &pts {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let s = a.push_unary(OpKind::Sin, x);
-                assert!((run1(&a, s, xv) - xv.sin()).abs() <= TRIG_TOL, "sin({xv})");
+                assert!(
+                    (run1(&built(a, s), xv) - xv.sin()).abs() <= TRIG_TOL,
+                    "sin({xv})"
+                );
 
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let c = a.push_unary(OpKind::Cos, x);
-                assert!((run1(&a, c, xv) - xv.cos()).abs() <= TRIG_TOL, "cos({xv})");
+                assert!(
+                    (run1(&built(a, c), xv) - xv.cos()).abs() <= TRIG_TOL,
+                    "cos({xv})"
+                );
             }
             // tan away from its poles (ratio of two ~3e-3 approximations).
             for &xv in &[0.0f32, 0.3, 0.7, -0.5, 1.0] {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let t = a.push_unary(OpKind::Tan, x);
                 // tan = sin/cos amplifies both errors by 1/cos²(x); from
                 // 6e-7 apiece that is ~3e-6 at x=1.
-                assert!((run1(&a, t, xv) - xv.tan()).abs() <= 1e-4, "tan({xv})");
+                assert!(
+                    (run1(&built(a, t), xv) - xv.tan()).abs() <= 1e-4,
+                    "tan({xv})"
+                );
             }
         }
 
@@ -4427,29 +4481,32 @@ mod tests {
         fn exp_log_match_scalar() {
             // exp / exp2 over a moderate range.
             for &xv in &[-2.0f32, -0.5, 0.0, 0.7, 1.5, 3.0] {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let e = a.push_unary(OpKind::Exp, x);
-                let rel = (run1(&a, e, xv) - xv.exp()).abs() / xv.exp().max(1.0);
+                let rel = (run1(&built(a, e), xv) - xv.exp()).abs() / xv.exp().max(1.0);
                 assert!(rel <= 1e-2, "exp({xv})");
 
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let e2 = a.push_unary(OpKind::Exp2, x);
-                let rel = (run1(&a, e2, xv) - xv.exp2()).abs() / xv.exp2().max(1.0);
+                let rel = (run1(&built(a, e2), xv) - xv.exp2()).abs() / xv.exp2().max(1.0);
                 assert!(rel <= 1e-2, "exp2({xv})");
             }
             // ln / log2 / log10 over positive inputs.
             for &xv in &[0.25f32, 0.5, 1.0, 2.0, 5.0, 100.0] {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let l = a.push_unary(OpKind::Ln, x);
-                assert!((run1(&a, l, xv) - xv.ln()).abs() <= 3e-2, "ln({xv})");
+                assert!((run1(&built(a, l), xv) - xv.ln()).abs() <= 3e-2, "ln({xv})");
 
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let l2 = a.push_unary(OpKind::Log2, x);
-                assert!((run1(&a, l2, xv) - xv.log2()).abs() <= 3e-2, "log2({xv})");
+                assert!(
+                    (run1(&built(a, l2), xv) - xv.log2()).abs() <= 3e-2,
+                    "log2({xv})"
+                );
             }
         }
 
@@ -4471,29 +4528,29 @@ mod tests {
 
             // atan over a wide range (exercises the |ratio|>1 swap branch).
             for &xv in &[0.0f32, 0.3, 1.0, 2.5, -0.7, -4.0] {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let at = a.push_unary(OpKind::Atan, x);
                 assert!(
-                    (run1(&a, at, xv) - xv.atan()).abs() <= ATAN_TOL,
+                    (run1(&built(a, at), xv) - xv.atan()).abs() <= ATAN_TOL,
                     "atan({xv})"
                 );
             }
             // asin/acos on [-1, 1].
             for &xv in &[-0.9f32, -0.4, 0.0, 0.4, 0.9] {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let s = a.push_unary(OpKind::Asin, x);
                 assert!(
-                    (run1(&a, s, xv) - xv.asin()).abs() <= ATAN_TOL,
+                    (run1(&built(a, s), xv) - xv.asin()).abs() <= ATAN_TOL,
                     "asin({xv})"
                 );
 
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let c = a.push_unary(OpKind::Acos, x);
                 assert!(
-                    (run1(&a, c, xv) - xv.acos()).abs() <= ATAN_TOL,
+                    (run1(&built(a, c), xv) - xv.acos()).abs() <= ATAN_TOL,
                     "acos({xv})"
                 );
             }
@@ -4507,11 +4564,11 @@ mod tests {
                 (0.5, -2.0),
             ];
             for &(yv, xv) in &pts {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let y = a.push_var(0);
                 let x = a.push_var(1);
                 let r = a.push_binary(OpKind::Atan2, y, x);
-                let got = run_xy(&a, r, yv, xv);
+                let got = run_xy(&built(a, r), yv, xv);
                 assert!(
                     (got - yv.atan2(xv)).abs() <= ATAN_TOL,
                     "atan2({yv},{xv}) = {got}"
@@ -4522,20 +4579,18 @@ mod tests {
         /// A transcendental composed inside arithmetic still works: sin(x)·x + 1.
         #[test]
         fn transcendental_in_expression() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let s = a.push_unary(OpKind::Sin, x);
             let sx = a.push_binary(OpKind::Mul, s, x);
             let one = a.push_const(1.0);
             let root = a.push_binary(OpKind::Add, sx, one);
+            let p = built(a, root);
             for &xv in &[0.2f32, 0.9, 2.1, -1.3] {
                 let want = xv.sin() * xv + 1.0;
                 // sin's ~3e-3 error is scaled by |x|, so allow for that.
                 let tol = 3e-3 * (1.0 + xv.abs());
-                assert!(
-                    (run1(&a, root, xv) - want).abs() <= tol,
-                    "sin(x)·x+1 @ {xv}"
-                );
+                assert!((run1(&p, xv) - want).abs() <= tol, "sin(x)·x+1 @ {xv}");
             }
         }
     }
@@ -4562,12 +4617,10 @@ mod tests {
         }
 
         /// Declare one argument in `a` and return its leaf.
-        fn arg_leaf(a: &mut ExprArena, default: f32) -> pixelflow_ir::ExprId {
+        fn arg_leaf(a: &mut ExprBuilder, default: f32) -> ExprRef {
             let slot = a.declare_uniform(pixelflow_ir::Uniform::new(default).decl());
             a.push_uniform(slot)
         }
-
-        use pixelflow_ir::arena::ExprArena;
 
         fn run(res: &CompileResult, x: f32, y: f32, z: f32, w: f32) -> f32 {
             eval_point(&res.code, x, y, z, w)
@@ -4591,7 +4644,7 @@ mod tests {
         fn sched_no_spill_is_correct() {
             // f = sqrt(X*X + Y*Y) - Y*U, a non-commutative shape whose third
             // input is the kernel's argument rather than a third coordinate.
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = arg_leaf(&mut a, 0.0);
@@ -4603,7 +4656,8 @@ mod tests {
             let sub = a.push_binary(OpKind::Sub, dist, yz); // dist - Y*Z
             let root = sub;
 
-            let sched = compile(&a, root).expect("compile");
+            let p = built(a, root);
+            let sched = compile(term(&p)).expect("compile");
             assert_eq!(sched.spill_count, 0, "should fit without spilling");
 
             for &(px, py, pz, _pw) in PTS {
@@ -4619,7 +4673,7 @@ mod tests {
         fn sched_spills_and_is_correct() {
             // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree so the 10
             // products are live together — forcing spills with only 7 regs.
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let mut terms = alloc::vec::Vec::new();
@@ -4643,7 +4697,8 @@ mod tests {
             }
             let root = terms[0];
 
-            let sched = compile(&a, root).expect("scheduled compile");
+            let p = built(a, root);
+            let sched = compile(term(&p)).expect("scheduled compile");
             assert!(
                 sched.spill_count > 0,
                 "expected spilling; widen the expression if this regresses"
@@ -4670,7 +4725,7 @@ mod tests {
         /// out of the body entirely, leaving nothing for a guard to skip.
         #[test]
         fn sched_select_guards() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
@@ -4681,7 +4736,8 @@ mod tests {
             let zzz = a.push_binary(OpKind::Add, zz, x); // false arm: 3X
             let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
 
-            let sched = compile(&a, root).expect("scheduled compile");
+            let p = built(a, root);
+            let sched = compile(term(&p)).expect("scheduled compile");
 
             // x>0 -> all-true -> Y^3 ; x<=0 -> all-false -> 3X.
             for &(px, py, _pz, _pw) in PTS {
@@ -4712,7 +4768,6 @@ mod tests {
     ))]
     mod gather_driver_128 {
         use super::*;
-        use pixelflow_ir::arena::ExprId;
 
         /// Run a compiled gather kernel over one batch: `ctx` is the array of
         /// buffer base pointers. Arch-independent now that the coordinates are
@@ -4730,21 +4785,19 @@ mod tests {
             )
         }
 
-        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
         /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
         /// the reference interpreter, over the same coords and binding. The 16
         /// coordinate pairs run as four 4-lane batches.
         fn check_against_interp(
-            arena: &ExprArena,
-            root: ExprId,
+            p: &Built,
             buffers: &[&[f32]],
             xs: [f32; 16],
             ys: [f32; 16],
             tag: &str,
         ) {
-            let res = compile(arena, root).expect("compile gather kernel");
+            let res = compile(term(p)).expect("compile gather kernel");
             let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
-            let bindings = pixelflow_ir::binding::BindingTable::bind(arena, buffers).unwrap();
+            let bindings = pixelflow_ir::binding::BindingTable::bind(&p.1, buffers).unwrap();
 
             for batch in 0..4 {
                 let mut cx = [0.0f32; 4];
@@ -4753,8 +4806,7 @@ mod tests {
                 cy.copy_from_slice(&ys[batch * 4..batch * 4 + 4]);
                 let got = run4_ctx(&res, &ctx, cx, cy);
                 for i in 0..4 {
-                    let want =
-                        pixelflow_ir::eval::eval_scalar(arena, root, &[cx[i], cy[i]], &bindings);
+                    let want = pixelflow_ir::eval::eval_scalar(term(p), &[cx[i], cy[i]], &bindings);
                     assert_eq!(
                         got[i], want,
                         "{tag} batch {batch} lane {i} (x={}, y={})",
@@ -4781,9 +4833,9 @@ mod tests {
             // 8x4 buffer, gather at (X, Y).
             let (w, h) = (8usize, 4usize);
             let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let b = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
@@ -4791,7 +4843,7 @@ mod tests {
             let y = a.push_var(1);
             let root = a.push_gather(b, x, y);
             let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
+            check_against_interp(&built(a, root), &[buf.as_slice()], xs, ys, "gather");
         }
 
         #[test]
@@ -4800,9 +4852,9 @@ mod tests {
             // mid-expression node, not just a whole-kernel root.
             let (w, h) = (8usize, 4usize);
             let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let b = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
@@ -4813,7 +4865,7 @@ mod tests {
             let scaled = a.push_binary(OpKind::Mul, g, two);
             let root = a.push_binary(OpKind::Add, scaled, y);
             let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
+            check_against_interp(&built(a, root), &[buf.as_slice()], xs, ys, "gather*2+Y");
         }
 
         #[test]
@@ -4823,14 +4875,14 @@ mod tests {
             let (w, h) = (6usize, 6usize);
             let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
             let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
-            let mut a = ExprArena::new();
-            let ba = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let ba = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
-            let bb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let bb = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
@@ -4841,8 +4893,7 @@ mod tests {
             let root = a.push_binary(OpKind::Add, ga, gb);
             let (xs, ys) = idx_lanes();
             check_against_interp(
-                &a,
-                root,
+                &built(a, root),
                 &[buf_a.as_slice(), buf_b.as_slice()],
                 xs,
                 ys,
@@ -4862,14 +4913,14 @@ mod tests {
                 .collect();
             let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
 
-            let mut a = ExprArena::new();
-            let wb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let wb = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: in_dim as u32,
                 height: out_dim as u32,
             });
-            let ib = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let ib = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: in_dim as u32,
                 height: 1,
             });
@@ -4888,7 +4939,7 @@ mod tests {
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
             ];
             let ys = [0.0f32; 16];
-            check_against_interp(&a, root, buffers, xs, ys, "matmul");
+            check_against_interp(&built(a, root), buffers, xs, ys, "matmul");
         }
     }
 
@@ -4899,7 +4950,6 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     mod avx512_driver {
         use super::*;
-        use pixelflow_ir::arena::{ExprArena, ExprId};
 
         /// Run a compiled zmm kernel over 16 distinct lanes per coordinate.
         fn run16(res: &CompileResult, xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
@@ -4946,22 +4996,20 @@ mod tests {
 
         /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
         /// the reference interpreter, over the same coords and binding.
-        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
         fn check_against_interp(
-            arena: &ExprArena,
-            root: ExprId,
+            p: &Built,
             buffers: &[&[f32]],
             xs: [f32; 16],
             ys: [f32; 16],
             tag: &str,
         ) {
-            let res = compile(arena, root).expect("compile gather kernel");
+            let res = compile(term(p)).expect("compile gather kernel");
             let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
             let got = run16_ctx(&res, &ctx, xs, ys);
 
-            let bindings = pixelflow_ir::binding::BindingTable::bind(arena, buffers).unwrap();
+            let bindings = pixelflow_ir::binding::BindingTable::bind(&p.1, buffers).unwrap();
             for (i, &g) in got.iter().enumerate() {
-                let want = pixelflow_ir::eval::eval_scalar(arena, root, &[xs[i], ys[i]], &bindings);
+                let want = pixelflow_ir::eval::eval_scalar(term(p), &[xs[i], ys[i]], &bindings);
                 assert_eq!(g, want, "{tag} lane {i} (x={}, y={})", xs[i], ys[i]);
             }
         }
@@ -4983,9 +5031,9 @@ mod tests {
             // 8x4 buffer, gather at (X, Y).
             let (w, h) = (8usize, 4usize);
             let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let b = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
@@ -4993,7 +5041,7 @@ mod tests {
             let y = a.push_var(1);
             let root = a.push_gather(b, x, y);
             let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
+            check_against_interp(&built(a, root), &[buf.as_slice()], xs, ys, "gather");
         }
 
         #[test]
@@ -5002,9 +5050,9 @@ mod tests {
             // mid-expression node, not just a whole-kernel root.
             let (w, h) = (8usize, 4usize);
             let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let b = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
@@ -5015,7 +5063,7 @@ mod tests {
             let scaled = a.push_binary(OpKind::Mul, g, two);
             let root = a.push_binary(OpKind::Add, scaled, y);
             let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
+            check_against_interp(&built(a, root), &[buf.as_slice()], xs, ys, "gather*2+Y");
         }
 
         #[test]
@@ -5025,14 +5073,14 @@ mod tests {
             let (w, h) = (6usize, 6usize);
             let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
             let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
-            let mut a = ExprArena::new();
-            let ba = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let ba = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
-            let bb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let bb = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: w as u32,
                 height: h as u32,
             });
@@ -5043,8 +5091,7 @@ mod tests {
             let root = a.push_binary(OpKind::Add, ga, gb);
             let (xs, ys) = idx_lanes();
             check_against_interp(
-                &a,
-                root,
+                &built(a, root),
                 &[buf_a.as_slice(), buf_b.as_slice()],
                 xs,
                 ys,
@@ -5064,14 +5111,14 @@ mod tests {
                 .collect();
             let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
 
-            let mut a = ExprArena::new();
-            let wb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let mut a = ExprBuilder::new();
+            let wb = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: in_dim as u32,
                 height: out_dim as u32,
             });
-            let ib = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
+            let ib = a.declare_buffer(pixelflow_ir::decl::BufferDecl {
+                id: pixelflow_ir::decl::BufferIdentity::mint(),
                 width: in_dim as u32,
                 height: 1,
             });
@@ -5090,14 +5137,14 @@ mod tests {
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
             ];
             let ys = [0.0f32; 16];
-            check_against_interp(&a, root, buffers, xs, ys, "matmul");
+            check_against_interp(&built(a, root), buffers, xs, ys, "matmul");
         }
 
         /// sqrt(X*X + Y*Y) - Z, with a non-commutative shape and FMA-able terms,
         /// fitting in registers (no spill).
         #[test]
         fn avx512_arith_no_spill() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_binary(OpKind::Mul, y, x);
@@ -5107,7 +5154,7 @@ mod tests {
             let dist = a.push_unary(OpKind::Sqrt, sum);
             let root = a.push_binary(OpKind::Sub, dist, z);
 
-            let res = compile(&a, root).expect("avx512 compile");
+            let res = compile(term(&built(a, root))).expect("avx512 compile");
             assert_eq!(res.spill_count, 0, "should fit without spilling");
 
             let (xs, ys, zs) = lanes();
@@ -5128,7 +5175,7 @@ mod tests {
         /// so with `with_max_regs` instead of racing the allocator.
         #[test]
         fn avx512_spills_to_real_frame() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let mut terms = alloc::vec::Vec::new();
@@ -5152,7 +5199,7 @@ mod tests {
             let root = terms[0];
 
             let res = EmitCtx::with_max_regs(4)
-                .compile(&a, root)
+                .compile(term(&built(a, root)))
                 .expect("avx512 compile");
             assert!(res.spill_count > 0, "expected spilling");
 
@@ -5175,13 +5222,13 @@ mod tests {
         /// vpternlogd blend path.
         #[test]
         fn avx512_compare_select_blend() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let cond = a.push_binary(OpKind::Lt, x, y);
             let root = a.push_ternary(OpKind::Select, cond, x, y);
 
-            let res = compile(&a, root).expect("avx512 compile");
+            let res = compile(term(&built(a, root))).expect("avx512 compile");
             let (xs, ys, zs) = lanes();
             check(run16(&res, xs, ys, zs), |i| xs[i].min(ys[i]), "lt-select");
         }
@@ -5192,7 +5239,7 @@ mod tests {
         /// blend on mixed input.
         #[test]
         fn avx512_select_guards() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
@@ -5203,7 +5250,7 @@ mod tests {
             let zzz = a.push_binary(OpKind::Add, zz, x);
             let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
 
-            let res = compile(&a, root).expect("avx512 compile");
+            let res = compile(term(&built(a, root))).expect("avx512 compile");
 
             let allpos = [2.0f32; 16];
             let allneg = [-2.0f32; 16];
@@ -5250,10 +5297,10 @@ mod tests {
                     "round",
                 ),
             ] {
-                let mut a = ExprArena::new();
+                let mut a = ExprBuilder::new();
                 let x = a.push_var(0);
                 let root = a.push_unary(op, x);
-                let res = compile(&a, root).expect("avx512 compile");
+                let res = compile(term(&built(a, root))).expect("avx512 compile");
                 check(run16(&res, xs, ones, ones), |i| f(xs[i]), tag);
             }
         }
@@ -5288,7 +5335,7 @@ mod tests {
     // rather than waiting for an unrelated test to trip over the gap.
     mod uniforms {
         use super::*;
-        use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
+        use pixelflow_ir::decl::{UniformDecl, UniformIdentity};
 
         fn decl(default: f32) -> UniformDecl {
             UniformDecl {
@@ -5302,15 +5349,16 @@ mod tests {
         /// holds them — not on timing.
         #[test]
         fn a_uniform_and_what_depends_on_it_alone_land_in_the_frame_prologue() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let u = a.declare_uniform(decl(3.0));
             let x = a.push_var(0);
             let uu = a.push_uniform(u);
             let sq = a.push_binary(OpKind::Mul, uu, uu);
             let root = a.push_binary(OpKind::Add, x, sq);
 
-            let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-            let schedule = arena_to_schedule(&arena, root);
+            let p = built(a, root);
+            let legalized = pixelflow_ir::passes::legalize(term(&p)).expect("legalize");
+            let schedule = term_to_schedule(Term::new(legalized.entry(), &p.1));
             let variance = schedule_variance(&schedule);
             let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
 
@@ -5348,7 +5396,7 @@ mod tests {
         /// product was hoisted.
         #[test]
         fn a_block_is_read_at_the_call_not_at_compile() {
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let u0 = a.declare_uniform(decl(0.0));
             let u1 = a.declare_uniform(decl(0.0));
             let x = a.push_var(0);
@@ -5358,7 +5406,8 @@ mod tests {
             let scaled = a.push_binary(OpKind::Mul, r1, two);
             let sum = a.push_binary(OpKind::Add, x, r0);
             let root = a.push_binary(OpKind::Add, sum, scaled);
-            let res = compile(&a, root).expect("compile");
+            let p = built(a, root);
+            let res = compile(term(&p)).expect("compile");
             assert!(res.hoisted_values >= 1, "2·u₁ is per call");
 
             let xs: [f32; LANES] = core::array::from_fn(|i| i as f32);
@@ -5383,9 +5432,9 @@ mod tests {
         /// a kernel over one buffer reads its block from `ctx[1]`.
         #[test]
         fn the_block_pointer_follows_the_buffer_slots() {
-            use pixelflow_ir::arena::{BufferDecl, BufferIdentity};
+            use pixelflow_ir::decl::{BufferDecl, BufferIdentity};
             let data = [10.0f32, 20.0, 30.0, 40.0];
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let buf = a.declare_buffer(BufferDecl {
                 id: BufferIdentity::mint(),
                 width: 4,
@@ -5397,7 +5446,8 @@ mod tests {
             let g = a.push_gather(buf, x, zero);
             let r = a.push_uniform(u);
             let root = a.push_binary(OpKind::Add, g, r);
-            let res = compile(&a, root).expect("compile");
+            let p = built(a, root);
+            let res = compile(term(&p)).expect("compile");
 
             let block = [0.5f32];
             let ctx = [data.as_ptr(), block.as_ptr()];
@@ -5893,20 +5943,19 @@ mod tests {
         /// A `MulAdd` node really does reach a backend as `FusedMulAdd` when
         /// nothing spills — the property the byte tests above assume, and the
         /// one an upstream change (a legalization pass that decomposed it, an
-        /// arena builder that never emitted it) would silently take away.
+        /// expression builder that never emitted it) would silently take away.
         #[test]
         fn a_muladd_dag_emits_the_fused_encoding() {
-            use pixelflow_ir::arena::ExprArena;
-
-            let mut a = ExprArena::new();
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_binary(OpKind::Add, y, x);
             let root = a.push_ternary(OpKind::MulAdd, x, y, z);
-            let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
+            let p = built(a, root);
+            let legalized = pixelflow_ir::passes::legalize(term(&p)).expect("legalize");
 
             let (code, _, _, _) = emit_dag_body(
-                arena_to_schedule(&a, root),
+                term_to_schedule(Term::new(legalized.entry(), &p.1)),
                 &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
             )
             .expect("AVX2 emit");

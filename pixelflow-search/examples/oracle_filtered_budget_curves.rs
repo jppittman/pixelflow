@@ -578,8 +578,7 @@ fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
     let oracle_rules_len = oracle_rules.ids().len();
 
     let mut oracle_opt = env(oracle_rules);
-    let oracle: AnytimeCurveOutput =
-        run_anytime_curve(&mut oracle_opt, term, APP_CHECKPOINT_GRID);
+    let oracle: AnytimeCurveOutput = run_anytime_curve(&mut oracle_opt, term, APP_CHECKPOINT_GRID);
 
     // Over-approximation looseness — measured on the same snapshot the
     // labels were computed from.

@@ -30,7 +30,8 @@
 
 use pixelflow_codegen::emit::EmitCtx;
 use pixelflow_codegen::{CompiledKernel, Point4};
-use pixelflow_ir::{BindingTable, ExprArena, ExprId, LatticeShape, OpKind, eval_scalar};
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef};
+use pixelflow_ir::{BindingTable, LatticeShape, OpKind, Rooted, Term, eval_scalar};
 
 const LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / 4;
 
@@ -40,8 +41,8 @@ const LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / 4;
 ///
 /// `width` sets how many independent live values compete for the pool, so the
 /// sweep covers schedules that spill in different places rather than one.
-fn kernel(width: u32, after_reads: usize) -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn kernel(width: u32, after_reads: usize) -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
 
@@ -53,7 +54,7 @@ fn kernel(width: u32, after_reads: usize) -> (ExprArena, ExprId) {
     // the pool.
     let split = a.push_binary(OpKind::Mul, x, y);
 
-    let terms: Vec<ExprId> = (1..=width)
+    let terms: Vec<ExprRef> = (1..=width)
         .map(|i| {
             let c = a.push_const(i as f32);
             a.push_binary(OpKind::Add, x, c)
@@ -80,7 +81,7 @@ fn kernel(width: u32, after_reads: usize) -> (ExprArena, ExprId) {
         acc = a.push_binary(OpKind::Add, acc, split);
         acc = a.push_binary(OpKind::Mul, acc, split);
     }
-    (a, acc)
+    a.finish(&[acc])
 }
 
 /// Y's sign decides the mask: all-negative skips the true arm, all-positive
@@ -105,10 +106,9 @@ fn a_reload_at_a_guarded_arms_end_happens_on_the_skipping_path_too() {
     for pool in [6u8, 7, 8, 10] {
         for width in 4u32..24 {
             for after_reads in 1..=4 {
-                let (arena, root) = kernel(width, after_reads);
-                let compiled = EmitCtx::with_max_regs(pool)
-                    .compile(&arena, root)
-                    .expect("compiles");
+                let built = kernel(width, after_reads);
+                let t = Term::new(built.0.entry(), &built.1);
+                let compiled = EmitCtx::with_max_regs(pool).compile(t).expect("compiles");
                 let jit = CompiledKernel::new(compiled.code, LatticeShape::POINT);
                 for kind in 0..3 {
                     let xs: [f32; LANES] = core::array::from_fn(|i| 0.5 + i as f32);
@@ -117,7 +117,7 @@ fn a_reload_at_a_guarded_arms_end_happens_on_the_skipping_path_too() {
                     let got: [f32; LANES] = unsafe { jit.call(Point4::new(xs, ys, zero, zero)) };
                     for lane in 0..LANES {
                         let point = [xs[lane], ys[lane]];
-                        let want = eval_scalar(&arena, root, &point, &bindings);
+                        let want = eval_scalar(t, &point, &bindings);
                         assert_eq!(
                             got[lane].to_bits(),
                             want.to_bits(),
@@ -145,8 +145,8 @@ fn a_reload_at_a_guarded_arms_end_happens_on_the_skipping_path_too() {
 ///
 /// X's and Y's signs carry the two masks, so a caller makes either uniform by
 /// choosing the signs of the batch it samples.
-fn nested_guards(width: u32, depth: usize) -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn nested_guards(width: u32, depth: usize) -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let zero = a.push_const(0.0);
@@ -155,7 +155,7 @@ fn nested_guards(width: u32, depth: usize) -> (ExprArena, ExprId) {
     let inner_mask = a.push_binary(OpKind::Gt, y, zero);
 
     // Live across everything below: computed first, read last.
-    let fillers: Vec<ExprId> = (0..width)
+    let fillers: Vec<ExprRef> = (0..width)
         .map(|i| {
             let c = a.push_const(i as f32 + 1.25);
             a.push_binary(OpKind::Mul, x, c)
@@ -163,7 +163,7 @@ fn nested_guards(width: u32, depth: usize) -> (ExprArena, ExprId) {
         .collect();
 
     // A chain nothing outside its own arm reads.
-    let chain = |a: &mut ExprArena, seed: ExprId, other: ExprId| {
+    let chain = |a: &mut ExprBuilder, seed: ExprRef, other: ExprRef| {
         let mut v = a.push_binary(OpKind::Mul, seed, other);
         for k in 0..depth {
             let c = a.push_const(k as f32 + 0.5);
@@ -189,7 +189,7 @@ fn nested_guards(width: u32, depth: usize) -> (ExprArena, ExprId) {
     for f in fillers {
         acc = a.push_binary(OpKind::Add, acc, f);
     }
-    (a, acc)
+    a.finish(&[acc])
 }
 
 /// Uniform-negative, uniform-positive, or alternating — as a sign on a
@@ -226,10 +226,9 @@ fn a_reservation_inside_a_nested_guarded_arm_always_has_a_register() {
     for pool in [floor, floor + 1, floor + 3] {
         for width in [2u32, 6, 12] {
             for depth in [1usize, 3, 6] {
-                let (arena, root) = nested_guards(width, depth);
-                let compiled = EmitCtx::with_max_regs(pool)
-                    .compile(&arena, root)
-                    .expect("compiles");
+                let built = nested_guards(width, depth);
+                let t = Term::new(built.0.entry(), &built.1);
+                let compiled = EmitCtx::with_max_regs(pool).compile(t).expect("compiles");
                 let jit = CompiledKernel::new(compiled.code, LatticeShape::POINT);
                 for outer in 0..3 {
                     for inner in 0..3 {
@@ -240,7 +239,7 @@ fn a_reservation_inside_a_nested_guarded_arm_always_has_a_register() {
                             unsafe { jit.call(Point4::new(xs, ys, zero, zero)) };
                         for lane in 0..LANES {
                             let point = [xs[lane], ys[lane]];
-                            let want = eval_scalar(&arena, root, &point, &bindings);
+                            let want = eval_scalar(t, &point, &bindings);
                             assert_eq!(
                                 got[lane].to_bits(),
                                 want.to_bits(),

@@ -4297,7 +4297,11 @@ mod tests {
         let extraction = Extraction::from_backfill(&egraph, mul, choices);
         let (arena, _env) = choices_to_rooted(&extraction);
 
-        assert_eq!(arena.len(), 2, "X * X should have exactly 2 nodes (X shared)");
+        assert_eq!(
+            arena.len(),
+            2,
+            "X * X should have exactly 2 nodes (X shared)"
+        );
         assert_eq!(arena.entry().op(), Some(pixelflow_ir::OpKind::Mul));
     }
 
@@ -4335,7 +4339,10 @@ mod tests {
     /// instead of from the choices. Deliberately a second implementation:
     /// the point of `dag_cost_equals_the_materialized_graphs_cost` is that
     /// two walks over two representations agree.
-    fn graph_dag_cost(root: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>, costs: &CostModel) -> usize {
+    fn graph_dag_cost(
+        root: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>,
+        costs: &CostModel,
+    ) -> usize {
         root.descendants()
             .filter_map(|n| n.op())
             .fold(0usize, |total, k| total.saturating_add(costs.cost(k)))

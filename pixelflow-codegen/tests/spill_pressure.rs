@@ -1,11 +1,11 @@
 //! JIT-vs-interpreter equivalence under register pressure.
 //!
-//! The fused font kernels (a whole glyph as one arena) put far more values in
+//! The fused font kernels (a whole glyph as one graph) put far more values in
 //! flight than the allocator has registers, so every *spill* path in
 //! `resolve_operands` becomes load-bearing: reload-into-scratch for unary and
 //! binary ops, the Select mask/branch choreography, decomposed MulAdd/Clamp,
 //! and the beyond-red-zone stack frame. These tests force each of those paths
-//! deliberately — the arena's append-only order IS the schedule, so pushing
+//! deliberately — the graph's append-only order IS the schedule, so pushing
 //! values early and consuming them late pins them live across the middle —
 //! and assert the JIT agrees with the IR interpreter exactly.
 //!
@@ -20,9 +20,10 @@ use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::emit::executable::{Point4, TileSlice};
 use pixelflow_codegen::{CompiledKernel, JIT_VECTOR_BYTES};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::Term;
 use pixelflow_ir::binding::BindingTable;
 use pixelflow_ir::eval_scalar;
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 /// Lanes in one emitted batch.
 const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
@@ -37,7 +38,7 @@ const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 /// it.
 fn eval_point(jit: &CompiledKernel, x: f32, y: f32, z: f32, w: f32) -> f32 {
     let mut out = [0.0f32; LANES];
-    // SAFETY: `out` holds exactly one whole batch, and every arena in this file
+    // SAFETY: `out` holds exactly one whole batch, and every kernel in this file
     // declares no buffers, so the null context is never read.
     unsafe {
         jit.call_collapse(
@@ -57,10 +58,13 @@ fn eval_point(jit: &CompiledKernel, x: f32, y: f32, z: f32, w: f32) -> f32 {
 /// said "Sethi-Ullman number > 6", which stopped being more than the pool the
 /// moment the pool grew, and a scenario that no longer spills asserts nothing.
 fn pool_size() -> usize {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let root = a.push_binary(OpKind::Add, x, x);
-    compile(&a, root).expect("trivial compile").max_regs as usize
+    let built = a.finish(&[root]);
+    compile(Term::new(built.0.entry(), &built.1))
+        .expect("trivial compile")
+        .max_regs as usize
 }
 
 /// Compile, assert the scenario actually spilled, and compare against the
@@ -77,9 +81,8 @@ fn pool_size() -> usize {
 ///
 /// It returns nothing on purpose. Handing back a count that callers were
 /// trusted to test was the shape that let the omission happen.
-fn assert_spills_and_matches_interp(arena: &ExprArena, root: ExprId, label: &str) {
-    let result =
-        compile(arena, root).unwrap_or_else(|e| panic!("{label}: JIT compile failed: {e}"));
+fn assert_spills_and_matches_interp(t: Term<'_>, label: &str) {
+    let result = compile(t).unwrap_or_else(|e| panic!("{label}: JIT compile failed: {e}"));
     let spills = result.spill_count;
     assert!(
         spills > 0,
@@ -92,7 +95,7 @@ fn assert_spills_and_matches_interp(arena: &ExprArena, root: ExprId, label: &str
     let coords = [-2.5f32, -1.0, -0.3, 0.0, 0.4, 1.0, 1.7, 3.0];
     for &x in &coords {
         for &y in &coords {
-            let want = eval_scalar(arena, root, &[x, y], &BindingTable::empty());
+            let want = eval_scalar(t, &[x, y], &BindingTable::empty());
             let got = eval_point(&jit, x, y, 0.1, 0.9);
             assert!(
                 (want.is_nan() && got.is_nan()) || floats_agree(want, got),
@@ -125,7 +128,7 @@ fn floats_agree(want: f32, got: f32) -> bool {
 /// few of these in flight exceed the 6-register x86 budget. Leaves cycle
 /// through coordinates and small constants; ops stay NaN-free (add/sub/mul by
 /// small constants).
-fn tree(a: &mut ExprArena, depth: usize, salt: u32) -> ExprId {
+fn tree(a: &mut ExprBuilder, depth: usize, salt: u32) -> ExprRef {
     if depth == 0 {
         return match salt % 6 {
             0 => a.push_var(0),
@@ -161,7 +164,7 @@ fn tree(a: &mut ExprArena, depth: usize, salt: u32) -> ExprId {
 }
 
 /// Left-fold `Add` over already-pushed values.
-fn fold_add(a: &mut ExprArena, vals: &[ExprId]) -> ExprId {
+fn fold_add(a: &mut ExprBuilder, vals: &[ExprRef]) -> ExprRef {
     let (&first, rest) = vals.split_first().expect("nonempty");
     rest.iter()
         .fold(first, |acc, &v| a.push_binary(OpKind::Add, acc, v))
@@ -172,7 +175,7 @@ fn fold_add(a: &mut ExprArena, vals: &[ExprId]) -> ExprId {
 /// spilled case ('O' glyph shape), plus the spilled-mask case.
 #[test]
 fn select_operands_spilled_across_pressure() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
 
     // Operands first (they must survive the wall).
     let if_true = tree(&mut a, 3, 11);
@@ -182,7 +185,7 @@ fn select_operands_spilled_across_pressure() {
     let mask = a.push_binary(OpKind::Lt, ml, mr);
 
     // The wall: 10 filler trees, all live until the final fold.
-    let fillers: Vec<ExprId> = (0..10).map(|i| tree(&mut a, 2, 100 + i * 7)).collect();
+    let fillers: Vec<ExprRef> = (0..10).map(|i| tree(&mut a, 2, 100 + i * 7)).collect();
 
     // The select fires only now — mask/if_true/if_false have been live across
     // the whole wall and must have been spilled.
@@ -191,8 +194,10 @@ fn select_operands_spilled_across_pressure() {
     let mut all = vec![sel];
     all.extend(fillers);
     let root = fold_add(&mut a, &all);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    assert_spills_and_matches_interp(&a, root, "select_operands_spilled");
+    assert_spills_and_matches_interp(t, "select_operands_spilled");
 }
 
 /// A sum of glyph-shaped terms: each term is `select(lt, contrib, 0)` with wide
@@ -201,7 +206,7 @@ fn select_operands_spilled_across_pressure() {
 /// reloads, not stack reloads).
 #[test]
 fn glyph_shaped_sum_of_selects() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
 
     let mut terms = Vec::new();
     for i in 0..8u32 {
@@ -217,15 +222,17 @@ fn glyph_shaped_sum_of_selects() {
     let abs = a.push_unary(OpKind::Abs, sum);
     let one = a.push_const(1.0);
     let root = a.push_binary(OpKind::Min, abs, one);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    assert_spills_and_matches_interp(&a, root, "glyph_shaped_sum");
+    assert_spills_and_matches_interp(t, "glyph_shaped_sum");
 }
 
 /// Nested selects under pressure: a select whose branches are themselves
 /// selects whose operands crossed the wall.
 #[test]
 fn nested_selects_spilled() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
 
     let t1 = tree(&mut a, 3, 51);
     let f1 = tree(&mut a, 3, 53);
@@ -238,7 +245,7 @@ fn nested_selects_spilled() {
     let outer_ml = tree(&mut a, 2, 79);
     let outer_mr = tree(&mut a, 2, 83);
 
-    let fillers: Vec<ExprId> = (0..8).map(|i| tree(&mut a, 2, 400 + i * 11)).collect();
+    let fillers: Vec<ExprRef> = (0..8).map(|i| tree(&mut a, 2, 400 + i * 11)).collect();
 
     let m1 = a.push_binary(OpKind::Lt, m1l, m1r);
     let m2 = a.push_binary(OpKind::Ge, m2l, m2r);
@@ -250,8 +257,10 @@ fn nested_selects_spilled() {
     let mut all = vec![sel];
     all.extend(fillers);
     let root = fold_add(&mut a, &all);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    assert_spills_and_matches_interp(&a, root, "nested_selects");
+    assert_spills_and_matches_interp(t, "nested_selects");
 }
 
 /// Decomposed `MulAdd` plus a min/max clamp chain, with spilled operands.
@@ -264,7 +273,7 @@ fn nested_selects_spilled() {
 /// past their Sethi-Ullman number.
 #[test]
 fn muladd_and_clamp_spilled() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
 
     let ma_a = tree(&mut a, 7, 91);
     let ma_b = tree(&mut a, 7, 93);
@@ -273,7 +282,7 @@ fn muladd_and_clamp_spilled() {
     let cl_lo = tree(&mut a, 2, 103);
     let cl_hi = tree(&mut a, 2, 107);
 
-    let fillers: Vec<ExprId> = (0..pool_size() as u32 + 2)
+    let fillers: Vec<ExprRef> = (0..pool_size() as u32 + 2)
         .map(|i| tree(&mut a, 2, 500 + i * 19))
         .collect();
 
@@ -286,21 +295,25 @@ fn muladd_and_clamp_spilled() {
     let mut all = vec![ma, cl];
     all.extend(fillers);
     let root = fold_add(&mut a, &all);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    assert_spills_and_matches_interp(&a, root, "muladd_clamp");
+    assert_spills_and_matches_interp(t, "muladd_clamp");
 }
 
 /// Enough simultaneously-live values to overflow the 128-byte red zone
 /// (more than 8 spill slots), forcing the allocated-frame prologue path.
 #[test]
 fn frame_mode_beyond_red_zone() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
 
     // 24 moderate trees, all pinned live until the single final fold.
-    let vals: Vec<ExprId> = (0..24).map(|i| tree(&mut a, 2, 700 + i * 23)).collect();
+    let vals: Vec<ExprRef> = (0..24).map(|i| tree(&mut a, 2, 700 + i * 23)).collect();
     let root = fold_add(&mut a, &vals);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let result = compile(&a, root).expect("frame-mode compile failed");
+    let result = compile(t).expect("frame-mode compile failed");
     assert!(
         result.spill_bytes > 128,
         "scenario stayed inside the red zone (spill_bytes={}), not testing frame mode",
@@ -308,7 +321,7 @@ fn frame_mode_beyond_red_zone() {
     );
     let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
     for &(x, y) in &[(0.3f32, -1.2f32), (2.0, 0.7), (-0.9, 3.1)] {
-        let want = eval_scalar(&a, root, &[x, y], &BindingTable::empty());
+        let want = eval_scalar(t, &[x, y], &BindingTable::empty());
         let got = eval_point(&jit, x, y, 0.1, 0.9);
         assert!(
             want == got,

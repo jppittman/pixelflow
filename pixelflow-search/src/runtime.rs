@@ -34,9 +34,9 @@ use crate::egraph::{EClassId, EGraph, ENode, Optimizer};
 use crate::saturate_pass::Saturate;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
+use pixelflow_ir::Rooted;
 use pixelflow_ir::expr::{Environment, ExprData, Term, encode};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::Rooted;
 use pixelflow_ir::passes::{ExpandReduce, LowerDwrt};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
@@ -547,11 +547,7 @@ mod tests {
             reachable_buffer_identities(term(&input)),
             "extraction must redeclare the same buffers, by identity"
         );
-        assert_gather_semantics_preserved(
-            term(&input),
-            term(&arc),
-            &[(identity, data.as_slice())],
-        );
+        assert_gather_semantics_preserved(term(&input), term(&arc), &[(identity, data.as_slice())]);
     }
 
     #[test]
@@ -605,11 +601,7 @@ mod tests {
             1,
             "the two identical gathers must share one node"
         );
-        assert_gather_semantics_preserved(
-            term(&input),
-            term(&arc),
-            &[(identity, data.as_slice())],
-        );
+        assert_gather_semantics_preserved(term(&input), term(&arc), &[(identity, data.as_slice())]);
     }
 
     /// Slot order is the binding ABI: the JIT loads slot i's base pointer
@@ -1086,8 +1078,7 @@ mod congruence_gap_probe {
         // carry raw `Dwrt` markers at this point.
         let lowered = pixelflow_ir::passes::lower_dwrt(input)
             .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-        let unrolled =
-            pixelflow_ir::passes::expand_reduce(Term::new(lowered.entry(), input.env()));
+        let unrolled = pixelflow_ir::passes::expand_reduce(Term::new(lowered.entry(), input.env()));
         let term = Term::new(unrolled.entry(), input.env());
         let node_count = crate::egraph::reachable_count_term(term);
 
@@ -1956,12 +1947,7 @@ pub(crate) mod production_telemetry {
     /// as parameters so the same function runs the production tier and both
     /// generous runs. `lower_dwrt_owned` (`:120`) and `config_for_node_count`
     /// (`:126-127`) run once in the caller since they are budget-independent.
-    fn run(
-        term: Term<'_>,
-        max_iterations: usize,
-        max_classes: usize,
-        timeout: Duration,
-    ) -> Run {
+    fn run(term: Term<'_>, max_iterations: usize, max_classes: usize, timeout: Duration) -> Run {
         // Driven through `Optimizer` — the one entry point production itself
         // uses since #1108 — with `Budget::Explicit` so the caps stay
         // parameters, which this measurement varies between its production

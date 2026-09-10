@@ -21,7 +21,8 @@ use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::emit::executable::{Point4, TileSlice};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData};
+use pixelflow_ir::{Rooted, Term};
 
 const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 const GROUPS: usize = 3;
@@ -31,14 +32,14 @@ const BIAS: f32 = 1.75;
 /// `X * Y + BIAS` — reads both axes, so every lane and row must differ, and
 /// a scaffold that failed to step X or Y would land on the wrong answer
 /// rather than merely a slow one.
-fn kernel() -> (ExprArena, pixelflow_ir::arena::ExprId) {
-    let mut a = ExprArena::new();
+fn kernel() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let xy = a.push_binary(OpKind::Mul, x, y);
     let bias = a.push_const(BIAS);
     let root = a.push_binary(OpKind::Add, xy, bias);
-    (a, root)
+    a.finish(&[root])
 }
 
 fn lane_x0() -> [f32; LANES] {
@@ -51,8 +52,9 @@ fn lane_x0() -> [f32; LANES] {
 
 #[test]
 fn one_call_per_group_computes_the_kernel() {
-    let (arena, root) = kernel();
-    let code = compile(&arena, root).expect("the smoke kernel must compile");
+    let built = kernel();
+    let code =
+        compile(Term::new(built.0.entry(), &built.1)).expect("the smoke kernel must compile");
     let x0 = lane_x0();
 
     for row in 0..ROWS {
@@ -88,8 +90,9 @@ fn one_call_per_group_computes_the_kernel() {
 
 #[test]
 fn one_call_for_the_whole_frame_computes_the_kernel() {
-    let (arena, root) = kernel();
-    let code = compile(&arena, root).expect("the smoke kernel must compile");
+    let built = kernel();
+    let code =
+        compile(Term::new(built.0.entry(), &built.1)).expect("the smoke kernel must compile");
     let mut out = vec![0.0f32; GROUPS * LANES * ROWS];
 
     unsafe {

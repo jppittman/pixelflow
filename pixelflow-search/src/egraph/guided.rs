@@ -560,11 +560,8 @@ mod tests {
             let out = opt.run(&mut eg, root_class, arena.len());
             let (got, got_env) = out.to_rooted(&eg, root_class);
             for (c, expected) in samples.iter().zip(&want) {
-                let value = eval_scalar(
-                    Term::new(got.entry(), &got_env),
-                    c,
-                    &BindingTable::empty(),
-                );
+                let value =
+                    eval_scalar(Term::new(got.entry(), &got_env), c, &BindingTable::empty());
                 assert!(
                     (value - expected).abs() <= 1e-4 * expected.abs().max(1.0),
                     "L4: guide {label} changed the denotation at {c:?}: {value} vs {expected}"

@@ -12,7 +12,8 @@
 use std::sync::Arc;
 
 use pixelflow_codegen::jit_cache::{compile, entry_count};
-use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformIdentity};
+use pixelflow_ir::decl::{UniformDecl, UniformIdentity};
+use pixelflow_ir::expr::ExprBuilder;
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::{Kernel, LatticeShape};
 
@@ -24,7 +25,7 @@ fn circle(declared_in_order: bool) -> Kernel {
         default,
     };
     let (cx, cy, r) = (decl(0.0), decl(0.0), decl(1.0));
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let (scx, scy, sr) = if declared_in_order {
         (
             a.declare_uniform(cx),
@@ -43,7 +44,8 @@ fn circle(declared_in_order: bool) -> Kernel {
     let d = a.push_binary(OpKind::Sub, x, ucx);
     let scaled = a.push_binary(OpKind::Mul, d, ur);
     let root = a.push_binary(OpKind::Add, scaled, ucy);
-    Kernel::from_parts(a, root)
+    let (rooted, env) = a.finish(&[root]);
+    Kernel::from_rooted(rooted, env)
 }
 
 #[test]

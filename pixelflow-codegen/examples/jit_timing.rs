@@ -2,24 +2,27 @@
 //! samply record cargo run --release -p pixelflow-ir --example jit_timing
 
 #[cfg(target_arch = "aarch64")]
-use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData};
 #[cfg(target_arch = "aarch64")]
 use pixelflow_ir::kind::OpKind;
+#[cfg(target_arch = "aarch64")]
+use pixelflow_ir::{Rooted, Term};
 
 #[cfg(target_arch = "aarch64")]
 fn main() {
     use pixelflow_codegen::emit::compile;
 
     for size in [10, 30, 50, 100, 150, 200] {
-        let (arena, root) = build_expr(size);
-        let actual = arena.len();
+        let built = build_expr(size);
+        let term = Term::new(built.0.entry(), &built.1);
+        let actual = built.0.len();
         for _ in 0..100 {
-            compile(&arena, root).unwrap();
+            compile(term).unwrap();
         }
         let n = 1000;
         let start = std::time::Instant::now();
         for _ in 0..n {
-            std::hint::black_box(compile(&arena, root).unwrap());
+            std::hint::black_box(compile(term).unwrap());
         }
         let us = start.elapsed().as_micros() as f64 / n as f64;
         eprintln!(
@@ -35,8 +38,8 @@ fn main() {
 }
 
 #[cfg(target_arch = "aarch64")]
-fn build_expr(target_nodes: usize) -> (ExprArena, pixelflow_ir::arena::ExprId) {
-    let mut arena = ExprArena::new();
+fn build_expr(target_nodes: usize) -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let y = arena.push_var(1);
     let mut acc = arena.push_binary(OpKind::Mul, x, y);
@@ -71,5 +74,5 @@ fn build_expr(target_nodes: usize) -> (ExprArena, pixelflow_ir::arena::ExprId) {
             }
         }
     }
-    (arena, acc)
+    arena.finish(&[acc])
 }

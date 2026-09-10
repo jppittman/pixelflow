@@ -12,8 +12,7 @@ use pixelflow_ir::{Kernel, Monoid, eval_scalar};
 
 /// Evaluate through the IR interpreter — the language's reference semantics.
 fn interp(k: &Kernel, x: f32, y: f32) -> f32 {
-    let (arena, root) = k.parts();
-    eval_scalar(arena, root, &[x, y], &BindingTable::empty())
+    eval_scalar(k.term(), &[x, y], &BindingTable::empty())
 }
 
 #[test]
@@ -130,36 +129,23 @@ fn nested_binders_do_not_capture() {
 /// `⊕_i (f(i) · c) = c · ⊕_i f(i)` when `deps(c) ∩ {i} = {}`
 /// (docs/designs/REDUCTIONS_AND_FOLDS.md:109). Unrolling gets this for free by
 /// *not copying* `c` into each of the N terms — so the rewrite shows up as one
-/// `Sin` node in the lowered arena rather than N of them. Before the variance
+/// `Sin` node in the lowered graph rather than N of them. Before the variance
 /// analysis could see binders, every reduction index read as depending on
 /// everything, nothing in a body was ever invariant, and `Σ_{i<16} i·sin(Y)+X`
 /// emitted 5882 bytes instead of 962.
 #[test]
 fn unrolling_shares_index_invariant_work() {
     use pixelflow_ir::passes;
-    use pixelflow_ir::{ExprNode, OpKind};
+    use pixelflow_ir::{ExprData, OpKind};
 
     // Count only nodes the root reaches: `expand_reduce` rebuilds in place and
-    // leaves the pre-rebuild nodes behind, so the raw arena over-counts.
+    // leaves the pre-rebuild nodes behind, so the whole graph over-counts.
     let count_sin = |k: &Kernel| {
-        let (arena, root) = k.parts();
-        let (lowered, new_root) = passes::expand_reduce_owned(arena, root);
-        let mut live = vec![false; lowered.len()];
-        let mut stack = vec![new_root];
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut live[id.0 as usize], true) {
-                continue;
-            }
-            stack.extend(lowered.children(id));
-        }
-        (0..lowered.len())
-            .filter(|i| live[*i])
-            .filter(|i| {
-                matches!(
-                    lowered.node(pixelflow_ir::ExprId(*i as u32)),
-                    ExprNode::Unary(OpKind::Sin, _)
-                )
-            })
+        let lowered = passes::expand_reduce(k.term());
+        lowered
+            .entry()
+            .descendants()
+            .filter(|n| **n == ExprData::Op(OpKind::Sin))
             .count()
     };
 

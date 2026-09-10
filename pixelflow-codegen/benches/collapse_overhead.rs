@@ -13,14 +13,15 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::{CompileResult, compile};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData};
+use pixelflow_ir::{Rooted, Term};
 
 const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 const GROUPS: usize = 240;
 const ROWS: usize = 64;
 
-fn arena() -> (ExprArena, pixelflow_ir::arena::ExprId) {
-    let mut arena = ExprArena::new();
+fn expression() -> (Rooted<ExprData>, Environment) {
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let y = arena.push_var(1);
     let scale = arena.push_const(0.013);
@@ -36,12 +37,13 @@ fn arena() -> (ExprArena, pixelflow_ir::arena::ExprId) {
     let ys2 = arena.push_binary(OpKind::Mul, ys, ys);
     let sum = arena.push_binary(OpKind::Add, xy, ys2);
     let root = arena.push_binary(OpKind::Add, sum, bias);
-    (arena, root)
+    arena.finish(&[root])
 }
 
 fn bench_collapse_overhead(c: &mut Criterion) {
-    let (arena, root) = arena();
-    let collapse = compile(&arena, root).expect("collapse compile must succeed");
+    let built = expression();
+    let collapse =
+        compile(Term::new(built.0.entry(), &built.1)).expect("collapse compile must succeed");
     let mut out = vec![0.0f32; GROUPS * LANES * ROWS];
     let seq: Vec<f32> = (0..LANES).map(|lane| lane as f32 + 0.5).collect();
 

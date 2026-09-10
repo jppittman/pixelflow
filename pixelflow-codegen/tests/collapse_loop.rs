@@ -15,14 +15,16 @@
 use pixelflow_codegen::emit::{CompileResult, compile};
 use pixelflow_codegen::{JIT_VECTOR_BYTES, Point4, TileSlice};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId};
+use pixelflow_ir::Term;
 use pixelflow_ir::binding::BindingTable;
+use pixelflow_ir::decl::{BufferDecl, BufferIdentity};
 use pixelflow_ir::eval_scalar;
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 use pixelflow_ir::{DifferentialCheck, PointVerdict, Uniform};
 
 /// Declare `u` in `a` and return its leaf — a scalar invariant across the
 /// lattice, which is what a third and fourth coordinate always were.
-fn arg_leaf(a: &mut ExprArena, u: Uniform) -> ExprId {
+fn arg_leaf(a: &mut ExprBuilder, u: Uniform) -> ExprRef {
     let slot = a.declare_uniform(u.decl());
     a.push_uniform(slot)
 }
@@ -74,20 +76,18 @@ fn run_collapse(res: &CompileResult, ctx: &[*const f32], out: &mut [f32], origin
 /// blind to any bug in the shared body — it could only ever see the scaffold.
 /// `eval_scalar` is an independent implementation, so it sees both.
 fn assert_collapse_matches_interpreter(
-    arena: &ExprArena,
-    root: ExprId,
+    t: Term<'_>,
     bufs: &[&[f32]],
     groups: usize,
     label: &str,
 ) -> CompileResult {
-    let collapse =
-        compile(arena, root).unwrap_or_else(|e| panic!("{label}: collapse compile failed: {e}"));
+    let collapse = compile(t).unwrap_or_else(|e| panic!("{label}: collapse compile failed: {e}"));
 
     let ctx: Vec<*const f32> = bufs.iter().map(|b| b.as_ptr()).collect();
     let bindings = if bufs.is_empty() {
         BindingTable::empty()
     } else {
-        BindingTable::bind(arena, bufs).expect("bind test buffers")
+        BindingTable::bind(t.env(), bufs).expect("bind test buffers")
     };
 
     for &(x0, y, z, w) in &[
@@ -100,7 +100,7 @@ fn assert_collapse_matches_interpreter(
         for (i, &g) in got.iter().enumerate() {
             let xi = x0 + i as f32;
             let vars = [xi, y];
-            let want = eval_scalar(arena, root, &vars, &bindings);
+            let want = eval_scalar(t, &vars, &bindings);
             if (want.is_nan() && g.is_nan()) || g == want {
                 continue;
             }
@@ -115,11 +115,11 @@ fn assert_collapse_matches_interpreter(
             // how far is legal here; a mask root has no such band, so it stays
             // bit-exact.
             assert!(
-                !pixelflow_ir::is_mask_valued(arena, root),
+                !pixelflow_ir::is_mask_valued(t.root()),
                 "{label}: mask-valued root differs — collapse {g:?} != interp {want:?} \
                  at lane {i} of ({x0}, {y}, {z}, {w}); masks are bit patterns, never near-misses"
             );
-            let point = DifferentialCheck::new(arena, root).at(&vars, &bindings);
+            let point = DifferentialCheck::new(t).at(&vars, &bindings);
             assert_eq!(
                 point.verdict(g),
                 PointVerdict::Accept,
@@ -136,22 +136,24 @@ fn assert_collapse_matches_interpreter(
 fn arithmetic_row_matches_the_interpreter() {
     // x*y + (x - 1.5): induction X must advance exactly like the per-batch
     // loop's, and Y must survive every iteration in its slot.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let c = a.push_const(1.5);
     let xy = a.push_binary(OpKind::Mul, x, y);
     let xc = a.push_binary(OpKind::Sub, x, c);
     let root = a.push_binary(OpKind::Add, xy, xc);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let res = assert_collapse_matches_interpreter(&a, root, &[], 5, "arith");
+    let res = assert_collapse_matches_interpreter(t, &[], 5, "arith");
 
     // And anchor to the reference semantics.
     let mut out = vec![0.0f32; 5 * LANES];
     run_collapse(&res, &[], &mut out, Point4::new(2.0, 3.0, 0.0, 0.0));
     for (i, &got) in out.iter().enumerate() {
         let xi = 2.0 + i as f32;
-        let want = eval_scalar(&a, root, &[xi, 3.0], &BindingTable::empty());
+        let want = eval_scalar(t, &[xi, 3.0], &BindingTable::empty());
         assert_eq!(got, want, "arith vs interp at lane {i}");
     }
 }
@@ -161,7 +163,7 @@ fn two_dimensional_collapse_advances_y_preserves_stride_and_hoists_both_scopes()
     // sqrt(u*v + 2), over the kernel's two arguments, is invariant across
     // the whole X/Y nest; sqrt(y + 9) is invariant only across each X row.
     // Both feed the X-dependent body.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let (u, v) = (Uniform::new(0.0), Uniform::new(0.0));
@@ -175,8 +177,10 @@ fn two_dimensional_collapse_advances_y_preserves_stride_and_hoists_both_scopes()
     let row_value = a.push_unary(OpKind::Sqrt, y9);
     let fx = a.push_binary(OpKind::Mul, frame_value, x);
     let root = a.push_binary(OpKind::Add, fx, row_value);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let compiled = compile(&a, root).expect("2D collapse compile");
+    let compiled = compile(t).expect("2D collapse compile");
     assert!(
         compiled.hoisted_values >= 2,
         "frame and row roots must both hoist, got {}",
@@ -192,7 +196,10 @@ fn two_dimensional_collapse_advances_y_preserves_stride_and_hoists_both_scopes()
     let block = [2.0f32, 3.0f32];
     let ctx: [*const f32; 1] = [block.as_ptr()];
     let bindings = BindingTable::empty()
-        .bind_uniforms(&a, &[(u.identity(), block[0]), (v.identity(), block[1])])
+        .bind_uniforms(
+            &built.1,
+            &[(u.identity(), block[0]), (v.identity(), block[1])],
+        )
         .expect("both arguments are declared");
     run_collapse_grid(
         &compiled,
@@ -209,7 +216,7 @@ fn two_dimensional_collapse_advances_y_preserves_stride_and_hoists_both_scopes()
     for row in 0..ROWS {
         for col in 0..GROUPS * LANES {
             let got = out[row * row_len + col];
-            let want = eval_scalar(&a, root, &[x0 + col as f32, y0 + row as f32], &bindings);
+            let want = eval_scalar(t, &[x0 + col as f32, y0 + row as f32], &bindings);
             assert_eq!(got, want, "2D collapse at ({col},{row})");
         }
         assert!(
@@ -226,7 +233,7 @@ fn select_short_circuit_branches_inside_loop() {
     // select(x < t, x*2, y): different batches take different guard paths
     // (all-true, mixed, all-false), so the short-circuit branches and the
     // loop's own branches must patch independently.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let t = a.push_const(8.0);
@@ -234,8 +241,10 @@ fn select_short_circuit_branches_inside_loop() {
     let two = a.push_const(2.0);
     let x2 = a.push_binary(OpKind::Mul, x, two);
     let root = a.push_ternary(OpKind::Select, cond, x2, y);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    assert_collapse_matches_interpreter(&a, root, &[], 6, "select");
+    assert_collapse_matches_interpreter(t, &[], 6, "select");
 }
 
 #[test]
@@ -243,7 +252,7 @@ fn transcendentals_rematerialize_per_iteration() {
     // sin/exp expand to polynomial chains full of constants: on aarch64 they
     // load X17-relative from the pool anchored in the collapse prologue, on
     // x86 they embed/broadcast — every iteration, inside the loop.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let s = a.push_const(0.05);
@@ -251,8 +260,10 @@ fn transcendentals_rematerialize_per_iteration() {
     let sin = a.push_unary(OpKind::Sin, xs);
     let ey = a.push_unary(OpKind::Exp, y);
     let root = a.push_binary(OpKind::Add, sin, ey);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    assert_collapse_matches_interpreter(&a, root, &[], 4, "transcendental");
+    assert_collapse_matches_interpreter(t, &[], 4, "transcendental");
 }
 
 #[test]
@@ -262,9 +273,9 @@ fn gather_reads_ctx_every_iteration() {
     let w = 64usize;
     let buf: Vec<f32> = (0..w * 2).map(|k| (k as f32) * 0.25 - 3.0).collect();
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let b = a.declare_buffer(BufferDecl {
-        id: pixelflow_ir::arena::BufferIdentity::mint(),
+        id: BufferIdentity::mint(),
         width: w as u32,
         height: 2,
     });
@@ -274,16 +285,18 @@ fn gather_reads_ctx_every_iteration() {
     let x01 = a.push_const(0.125);
     let xf = a.push_binary(OpKind::Mul, x, x01);
     let root = a.push_binary(OpKind::Add, g, xf);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
     let ctx = [buf.as_ptr()];
-    let res = assert_collapse_matches_interpreter(&a, root, &[buf.as_slice()], 4, "gather");
+    let res = assert_collapse_matches_interpreter(t, &[buf.as_slice()], 4, "gather");
 
     // Interpreter anchor over one row.
-    let bindings = BindingTable::bind(&a, &[buf.as_slice()]).unwrap();
+    let bindings = BindingTable::bind(&built.1, &[buf.as_slice()]).unwrap();
     let mut out = vec![0.0f32; 4 * LANES];
     run_collapse(&res, &ctx, &mut out, Point4::new(0.0, 1.0, 0.0, 0.0));
     for (i, &got) in out.iter().enumerate() {
-        let want = eval_scalar(&a, root, &[i as f32, 1.0], &bindings);
+        let want = eval_scalar(t, &[i as f32, 1.0], &bindings);
         assert_eq!(got, want, "gather vs interp at lane {i}");
     }
 }
@@ -296,14 +309,14 @@ fn matmul_reduce_one_call_fills_output() {
     let w: Vec<f32> = (0..(in_dim * out_dim)).map(|k| (k as f32).sin()).collect();
     let input: Vec<f32> = (0..in_dim).map(|k| (k as f32 - 2.0) * 0.5).collect();
 
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let wb = a.declare_buffer(BufferDecl {
-        id: pixelflow_ir::arena::BufferIdentity::mint(),
+        id: BufferIdentity::mint(),
         width: in_dim as u32,
         height: out_dim as u32,
     });
     let ib = a.declare_buffer(BufferDecl {
-        id: pixelflow_ir::arena::BufferIdentity::mint(),
+        id: BufferIdentity::mint(),
         width: in_dim as u32,
         height: 1,
     });
@@ -314,16 +327,18 @@ fn matmul_reduce_one_call_fills_output() {
     let ig = a.push_gather(ib, i, zero);
     let prod = a.push_binary(OpKind::Mul, wg, ig);
     let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
     let ctx = [w.as_ptr(), input.as_ptr()];
-    let res = compile(&a, root).expect("matmul collapse compile");
+    let res = compile(t).expect("matmul collapse compile");
 
     let mut out = vec![0.0f32; out_dim];
     run_collapse(&res, &ctx, &mut out, Point4::new(0.0, 0.0, 0.0, 0.0));
 
-    let bindings = BindingTable::bind(&a, &[w.as_slice(), input.as_slice()]).unwrap();
+    let bindings = BindingTable::bind(&built.1, &[w.as_slice(), input.as_slice()]).unwrap();
     for (j, &got) in out.iter().enumerate() {
-        let want = eval_scalar(&a, root, &[j as f32, 0.0], &bindings);
+        let want = eval_scalar(t, &[j as f32, 0.0], &bindings);
         assert_eq!(got, want, "matmul out[{j}]");
     }
 }
@@ -335,7 +350,7 @@ fn hoisted_row_constants_match_the_interpreter() {
     // the loop reloads them. Hoisting reorders nothing within a value's own
     // computation, so the result stays bit-exact against the per-batch kernel
     // (which recomputes them every batch).
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let two = a.push_const(2.0);
@@ -346,8 +361,10 @@ fn hoisted_row_constants_match_the_interpreter() {
     let yd = a.push_binary(OpKind::Div, y, three);
     let sx = a.push_binary(OpKind::Mul, s, x);
     let root = a.push_binary(OpKind::Add, sx, yd);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let res = assert_collapse_matches_interpreter(&a, root, &[], 5, "hoist");
+    let res = assert_collapse_matches_interpreter(t, &[], 5, "hoist");
     assert!(
         res.hoisted_values >= 2,
         "sqrt chain and division must hoist, got {}",
@@ -361,27 +378,32 @@ fn fully_invariant_kernel_degenerates_to_a_store_loop() {
     // body is a bare reload-and-store of the one parked value. `u` and `v`
     // are the kernel's arguments, which are invariant across the lattice
     // outright.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let y = a.push_var(1);
     let (u, v) = (Uniform::new(0.0), Uniform::new(0.0));
     let (z, w) = (arg_leaf(&mut a, u), arg_leaf(&mut a, v));
     let zw = a.push_binary(OpKind::Mul, z, w);
     let yzw = a.push_binary(OpKind::Add, y, zw);
     let root = a.push_unary(OpKind::Sqrt, yzw);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let compiled = compile(&a, root).expect("invariant-root compile");
+    let compiled = compile(t).expect("invariant-root compile");
     assert!(compiled.hoisted_values >= 1);
 
     let block = [0.1f32, 0.9f32];
     let ctx: [*const f32; 1] = [block.as_ptr()];
     let bindings = BindingTable::empty()
-        .bind_uniforms(&a, &[(u.identity(), block[0]), (v.identity(), block[1])])
+        .bind_uniforms(
+            &built.1,
+            &[(u.identity(), block[0]), (v.identity(), block[1])],
+        )
         .expect("both arguments are declared");
     for &(x0, yv) in &[(0.5f32, 0.5f32), (-7.25, 3.5), (100.0, -2.0)] {
         let mut got = vec![0.0f32; 4 * LANES];
         run_collapse(&compiled, &ctx, &mut got, Point4::new(x0, yv, 0.0, 0.0));
         for (i, &g) in got.iter().enumerate() {
-            let want = eval_scalar(&a, root, &[x0 + i as f32, yv], &bindings);
+            let want = eval_scalar(t, &[x0 + i as f32, yv], &bindings);
             assert_eq!(g.to_bits(), want.to_bits(), "invariant-root at lane {i}");
         }
     }
@@ -398,7 +420,7 @@ fn hoisted_guarded_select_still_fills_its_slot() {
     // beside hoisting. Rows are chosen so the invariant select's mask is
     // uniform-true, uniform-false, and (per-batch) mixed across the suite's
     // three (x0, y) rows.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let four = a.push_const(4.0);
@@ -416,8 +438,10 @@ fn hoisted_guarded_select_still_fills_its_slot() {
 
     let prod = a.push_binary(OpKind::Mul, ysel, x);
     let root = a.push_binary(OpKind::Add, prod, xsel);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let res = assert_collapse_matches_interpreter(&a, root, &[], 6, "hoisted-select");
+    let res = assert_collapse_matches_interpreter(t, &[], 6, "hoisted-select");
     assert!(
         res.hoisted_values >= 1,
         "the invariant select must hoist, got {}",
@@ -431,7 +455,7 @@ fn deep_invariant_chain_spills_in_the_prologue() {
     // PROLOGUE's own spill frame must coexist with the loop body's frame
     // (they share the region below the coordinate slots) and with the hoist
     // slots above. The X side is kept wide too so both frames are real.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let mut y_terms = Vec::new();
@@ -446,7 +470,7 @@ fn deep_invariant_chain_spills_in_the_prologue() {
     }
     // Pair each hoisted sqrt with an X term so every one crosses the loop
     // boundary, then sum with a balanced tree to keep many values live.
-    let mut sums: Vec<ExprId> = y_terms
+    let mut sums: Vec<ExprRef> = y_terms
         .iter()
         .zip(&x_terms)
         .map(|(ys, xk)| a.push_binary(OpKind::Mul, *ys, *xk))
@@ -463,8 +487,10 @@ fn deep_invariant_chain_spills_in_the_prologue() {
         sums = next;
     }
     let root = sums[0];
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let res = assert_collapse_matches_interpreter(&a, root, &[], 3, "deep-hoist");
+    let res = assert_collapse_matches_interpreter(t, &[], 3, "deep-hoist");
     assert!(
         res.hoisted_values >= 10,
         "all ten sqrt chains must hoist, got {}",
@@ -482,7 +508,7 @@ fn spill_frame_coexists_with_coordinate_slots() {
     // host happens to select: AVX-512 allocates 22 registers. Twelve products
     // sufficed when every pool was six and silently stopped proving anything
     // when the pools grew, which is what the assertion below now catches.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let mut products = Vec::new();
@@ -505,8 +531,10 @@ fn spill_frame_coexists_with_coordinate_slots() {
         products = next;
     }
     let root = products[0];
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let res = assert_collapse_matches_interpreter(&a, root, &[], 3, "spill");
+    let res = assert_collapse_matches_interpreter(t, &[], 3, "spill");
     assert!(
         res.spill_count > 0,
         "pressure kernel did not spill (budget grew?) — the scenario proves nothing"

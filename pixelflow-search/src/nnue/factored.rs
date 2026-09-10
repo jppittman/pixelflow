@@ -37,8 +37,8 @@ use libm::{logf, sqrtf};
 use crate::egraph::Rewrite;
 use crate::egraph::cost::latency_prior_cycles;
 use crate::egraph::extract::Extraction;
-pub use pixelflow_ir::OpKind;
 use pixelflow_ir::Node;
+pub use pixelflow_ir::OpKind;
 use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef, Term};
 use pixelflow_ir::kind::OpMap;
 
@@ -982,9 +982,7 @@ impl CostDag for ChoicesCostDag<'_> {
 /// [`crate::egraph::extract::Extraction::chosen_variance`], which
 /// materialises the chosen DAG via `choices_to_rooted` and classifies that —
 /// one definition, imported, not restated.
-pub(crate) fn variance_histogram(
-    dag: &pixelflow_ir::Dag<ExprData>,
-) -> [f32; SCALAR_FEATURE_COUNT] {
+pub(crate) fn variance_histogram(dag: &pixelflow_ir::Dag<ExprData>) -> [f32; SCALAR_FEATURE_COUNT] {
     let variance = pixelflow_ir::compute_dag_variance(dag);
     let total = dag.len() as f32;
     if total == 0.0 {

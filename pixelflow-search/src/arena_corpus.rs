@@ -8,9 +8,9 @@
 //! way; a second copy of it is a future divergence, so it lives here once.
 
 use pixelflow_ir::OpKind;
+use pixelflow_ir::Rooted;
 use pixelflow_ir::decl::{BufferDecl, BufferId, BufferIdentity};
 use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef};
-use pixelflow_ir::Rooted;
 use std::path::Path;
 
 /// Inverse of the dumpers' `dump_arena` (`pixelflow-core/src/lattice/cell_grid.rs`,

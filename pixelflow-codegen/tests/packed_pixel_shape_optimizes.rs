@@ -5,27 +5,19 @@
 //! `runtime_op_from_kind` — and the frame benchmark read 1.01x against the
 //! four-plane path because BOTH compiled unoptimized.
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId};
+use pixelflow_ir::Term;
+use pixelflow_ir::decl::{BufferDecl, BufferIdentity};
+use pixelflow_ir::expr::ExprBuilder;
 
-fn reachable(arena: &ExprArena, root: ExprId) -> usize {
-    let mut seen = vec![false; arena.nodes_raw().len()];
-    let mut stack = vec![root];
-    let mut n = 0;
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        n += 1;
-        stack.extend(arena.children(id));
-    }
-    n
+fn reachable(t: Term<'_>) -> usize {
+    t.root().descendants().count()
 }
 
 #[test]
 fn packed_shape_gets_cse() {
     // Four channel fragments sharing geometry, spliced into one root —
     // the packed kernel's shape at reduced scale.
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let cells = a.declare_buffer(BufferDecl {
         id: BufferIdentity::mint(),
         width: 100,
@@ -55,17 +47,15 @@ fn packed_shape_gets_cse() {
     let or2 = a.push_binary(OpKind::BitOr, or1, lanes[2]);
     let root = a.push_binary(OpKind::BitOr, or2, lanes[3]);
 
-    let before = reachable(&a, root);
-    let out = pixelflow_search::runtime::optimize_runtime_arena(
-        &a,
-        root,
-        pixelflow_ir::LatticeShape::POINT,
-    );
+    let built = a.finish(&[root]);
+    let input = Term::new(built.0.entry(), &built.1);
+    let before = reachable(input);
+    let out =
+        pixelflow_search::runtime::optimize_runtime_term(input, pixelflow_ir::LatticeShape::POINT);
     match out {
         None => panic!("optimizer BAILED on the packed shape ({before} nodes)"),
         Some(res) => {
-            let (oa, or_) = (&res.0, res.1);
-            let after = reachable(oa, or_);
+            let after = reachable(Term::new(res.0.entry(), &res.1));
             println!("before={before} after={after}");
             assert!(after < before, "no CSE: {before} -> {after}");
         }

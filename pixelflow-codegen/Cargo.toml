@@ -13,7 +13,7 @@ workspace = true
 
 [features]
 # Forwards to `pixelflow-search/saturation-telemetry`: `jit_cache::compile`
-# calls into `pixelflow_search::runtime::optimize_runtime_arena`, whose
+# calls into `pixelflow_search::runtime::optimize_runtime_term`, whose
 # telemetry hook is what this actually enables.
 saturation-telemetry = ["pixelflow-search/saturation-telemetry"]
 

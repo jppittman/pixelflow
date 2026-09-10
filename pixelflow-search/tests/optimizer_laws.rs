@@ -175,7 +175,11 @@ fn optimize_with(mut optimizer: Optimizer, input: Term<'_>) -> Graph {
 #[test]
 fn extraction_preserves_the_arguments_declaration() {
     let (input, arg) = fixture();
-    assert_eq!(input.1.uniforms.len(), 1, "the fixture declares one argument");
+    assert_eq!(
+        input.1.uniforms.len(),
+        1,
+        "the fixture declares one argument"
+    );
 
     let out = optimize_with(Optimizer::production(), term(&input));
     assert_eq!(

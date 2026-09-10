@@ -25,7 +25,8 @@ use pixelflow_codegen::emit::executable::{Point4, TileSlice};
 use pixelflow_codegen::emit::{EmitCtx, compile};
 use pixelflow_codegen::{CompiledKernel, JIT_VECTOR_BYTES};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::Term;
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 /// Lanes in one emitted batch.
 const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
@@ -39,7 +40,7 @@ const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 fn eval_point(jit: &CompiledKernel, x: f32, y: f32, block: &[f32]) -> f32 {
     let mut out = [0.0f32; LANES];
     let ctx: [*const f32; 1] = [block.as_ptr()];
-    // SAFETY: `out` holds exactly one whole batch; these arenas declare no
+    // SAFETY: `out` holds exactly one whole batch; these kernels declare no
     // buffers, so `ctx[0]` is the block entry and holds one `f32` per
     // declared argument, alive for the call.
     unsafe {
@@ -53,7 +54,7 @@ fn eval_point(jit: &CompiledKernel, x: f32, y: f32, block: &[f32]) -> f32 {
 }
 
 /// Declare an argument in `a` and return its leaf.
-fn arg_leaf(a: &mut ExprArena) -> ExprId {
+fn arg_leaf(a: &mut ExprBuilder) -> ExprRef {
     let slot = a.declare_uniform(pixelflow_ir::Uniform::new(0.0).decl());
     a.push_uniform(slot)
 }
@@ -130,13 +131,15 @@ fn the_reference_forms_disagree_on_these_inputs() {
 /// all SSE2 has.
 #[test]
 fn an_unspilled_muladd_rounds_the_way_this_target_does() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let z = arg_leaf(&mut a);
     let root = a.push_ternary(OpKind::MulAdd, x, y, z);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
-    let result = compile(&a, root).expect("compile MulAdd(X, Y, U)");
+    let result = compile(t).expect("compile MulAdd(X, Y, U)");
     assert_eq!(result.spill_count, 0, "this scenario must not spill");
     let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
     let got = eval_point(&jit, A, B, &[C]);
@@ -181,7 +184,7 @@ fn an_unspilled_muladd_rounds_the_way_this_target_does() {
 /// register.
 #[test]
 fn a_spilled_muladd_rounds_twice_on_every_target() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let z = arg_leaf(&mut a);
@@ -206,7 +209,7 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     // the folder can see. Each term still depends on X, so none is
     // loop-invariant and hoistable out of a collapse body.
     let w = arg_leaf(&mut a);
-    let wall: Vec<ExprId> = (1..=10u32)
+    let wall: Vec<ExprRef> = (1..=10u32)
         .map(|i| {
             let c = a.push_const(i as f32);
             let xi = a.push_binary(OpKind::Add, x, c);
@@ -223,9 +226,11 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
         .fold(wall[0], |acc, &w| a.push_binary(OpKind::Add, acc, w));
     let addend = a.push_binary(OpKind::Add, z, wall_sum);
     let root = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
+    let built = a.finish(&[root]);
+    let t = Term::new(built.0.entry(), &built.1);
 
     let result = EmitCtx::with_max_regs(1)
-        .compile(&a, root)
+        .compile(t)
         .expect("compile spilled MulAdd");
     assert!(
         result.spill_count > 0,

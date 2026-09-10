@@ -47,7 +47,7 @@
 use alloc::vec::Vec;
 
 use crate::dag::{Builder, Id, Node, Rooted, SideTable};
-use crate::expr::{ExprBuilderExt, ExprData, Term, copy_subgraph};
+use crate::expr::{ExprBuilderExt, ExprData, Term};
 use crate::kind::OpKind;
 use crate::variance::Variance;
 
@@ -191,8 +191,33 @@ where
 
 /// The identity of every pass: the reachable subgraph, copied.
 fn copy_only(term: Term<'_>) -> Rooted<ExprData> {
-    let mut out = Builder::with_capacity(term.dag().len(), 0);
-    let root = copy_subgraph(&mut out, term.root());
+    // Ascending index order over the reachable nodes, NOT a DFS copy. A DAG's
+    // index order is already topological, so this reproduces the input's
+    // relative node order exactly — which is what makes the fast path a true
+    // no-op. Downstream, that order IS the schedule (`pixelflow-codegen`'s
+    // `term_to_schedule` walks it), so a DFS copy silently re-orders every
+    // transcendental-free kernel's schedule and perturbs its register
+    // allocation: `emit::tests::sched::sched_spills_and_is_correct` stopped
+    // spilling. The arena-era fast path returned the arena untouched and said
+    // so in a comment; this is that invariant, kept by construction.
+    let dag = term.dag();
+    let mut reachable = dag.side_table(false);
+    for n in term.root().descendants() {
+        reachable[n] = true;
+    }
+    let mut out = Builder::with_capacity(dag.len(), 0);
+    let mut map = dag.side_table(None);
+    for node in dag.iter() {
+        if !reachable[node] {
+            continue;
+        }
+        let kids: Vec<Id> = node
+            .children()
+            .map(|c| map[c].expect("copy_only: child copied before parent"))
+            .collect();
+        map[node] = Some(out.push_unique(*node, &kids));
+    }
+    let root = map[term.root()].expect("copy_only: the root is reachable from itself");
     out.finish(&[root])
 }
 

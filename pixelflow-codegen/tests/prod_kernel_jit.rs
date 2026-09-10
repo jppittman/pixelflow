@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Pipeline exercised:
-//!   ExprArena  ->  e-graph equality saturation (algebra + trig + FMA fusion)
+//!   Term       ->  e-graph equality saturation (algebra + trig + FMA fusion)
 //!              ->  latency-prior extraction (the production policy)
 //!              ->  transcendental lowering + register allocation + codegen
 //!              ->  native machine code, executed on real coordinates.
@@ -19,12 +19,13 @@
 //! policy rather than a test-only one. The point is the *pipeline*, end to end.
 
 use pixelflow_codegen::emit::compile;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData};
+use pixelflow_ir::{OpKind, Rooted, Term};
 use pixelflow_search::egraph::{Budget, Optimizer};
 
-/// Build `sin(sqrt(x*x + y*y) * freq) * amp + bias` as an arena.
-fn build_swirl(freq: f32, amp: f32, bias: f32) -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+/// Build `sin(sqrt(x*x + y*y) * freq) * amp + bias` as a term.
+fn build_swirl(freq: f32, amp: f32, bias: f32) -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let xx = a.push_binary(OpKind::Mul, x, x);
@@ -38,17 +39,17 @@ fn build_swirl(freq: f32, amp: f32, bias: f32) -> (ExprArena, ExprId) {
     let prod = a.push_binary(OpKind::Mul, sn, ka);
     let kb = a.push_const(bias);
     let out = a.push_binary(OpKind::Add, prod, kb);
-    (a, out)
+    a.finish(&[out])
 }
 
 fn reference(x: f32, y: f32, freq: f32, amp: f32, bias: f32) -> f32 {
     (((x * x + y * y).sqrt()) * freq).sin() * amp + bias
 }
 
-/// Optimize `(arena, root)` through the e-graph and the production
-/// extraction policy, returning the extracted DAG. Prints a few diagnostics
-/// so the run is visible.
-fn optimize(arena: &ExprArena, root: ExprId, tag: &str) -> (ExprArena, ExprId) {
+/// Optimize `term` through the e-graph and the production extraction policy,
+/// returning the extracted DAG. Prints a few diagnostics so the run is
+/// visible.
+fn optimize(term: Term<'_>, tag: &str) -> (Rooted<ExprData>, Environment) {
     // The production entry point, held to this test's own round budget.
     let mut optimizer = Optimizer::production().budget(Budget::Explicit {
         iterations: 40,
@@ -56,26 +57,26 @@ fn optimize(arena: &ExprArena, root: ExprId, tag: &str) -> (ExprArena, ExprId) {
         applications: None,
     });
     let mut eg = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term,
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
     let classes_before = eg.num_classes();
 
-    let optimized = optimizer.run(&mut eg, root_class, arena.len());
+    let node_count = pixelflow_search::egraph::reachable_count_term(term);
+    let optimized = optimizer.run(&mut eg, root_class, node_count);
     let classes_after = eg.num_classes();
 
-    let (out_arena, out_root) = optimized.to_arena(&eg, root_class);
+    let out = optimized.to_rooted(&eg, root_class);
 
     eprintln!(
         "[{tag}] egraph {classes_before} -> {classes_after} classes, \
          extracted DAG = {} nodes",
-        out_arena.len(),
+        out.0.len(),
     );
-    (out_arena, out_root)
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -91,13 +92,15 @@ const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 fn prod_swirl_kernel_through_egraph_and_jit() {
     let (freq, amp, bias) = (3.0_f32, 0.5, 0.5);
 
-    let (orig, orig_root) = build_swirl(freq, amp, bias);
-    let (opt, opt_root) = optimize(&orig, orig_root, "swirl");
+    let orig = build_swirl(freq, amp, bias);
+    let orig_term = Term::new(orig.0.entry(), &orig.1);
+    let opt = optimize(orig_term, "swirl");
+    let opt_term = Term::new(opt.0.entry(), &opt.1);
 
     // JIT both the original and the e-graph-optimized DAG. Both paths run the
     // shared transcendental-lowering + regalloc + codegen pipeline.
-    let orig_jit = compile(&orig, orig_root).expect("JIT original");
-    let opt_jit = compile(&opt, opt_root).expect("JIT optimized");
+    let orig_jit = compile(orig_term).expect("JIT original");
+    let opt_jit = compile(opt_term).expect("JIT optimized");
     eprintln!(
         "[swirl] spills: original = {}, optimized = {}",
         orig_jit.spill_count, opt_jit.spill_count
