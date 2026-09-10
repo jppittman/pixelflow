@@ -19,7 +19,7 @@
 /// The compilation tier a saturation runs in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
-    /// Bake time: [`crate::runtime::optimize_runtime_arena`], in an ordinary
+    /// Bake time: [`crate::runtime::optimize_runtime_term`], in an ordinary
     /// process.
     Runtime,
     /// Macro-expansion time, inside rustc — `pixelflow_compiler::kernel`.

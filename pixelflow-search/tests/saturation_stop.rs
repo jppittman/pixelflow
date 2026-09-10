@@ -7,7 +7,15 @@
 use std::time::Duration;
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::Rooted;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, Term};
+
+/// A graph plus the declarations its leaves index.
+type Graph = (Rooted<ExprData>, Environment);
+
+fn term(g: &Graph) -> Term<'_> {
+    Term::new(g.0.entry(), &g.1)
+}
 use pixelflow_search::egraph::{
     EClassId, EGraph, ENode, Rewrite, RewriteAction, SaturationStop, all_rules,
     saturate_with_full_budget,
@@ -18,8 +26,8 @@ const GENEROUS: Duration = Duration::from_secs(60);
 /// `(x + y)² · (x − y) + (x · y + y · x) · (x + y)` — enough shared algebra
 /// (commutativity, distribution, FMA shapes) that saturation wants far more
 /// e-classes than the handful it starts with.
-fn busy_expression() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn busy_expression() -> Graph {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let sum = a.push_binary(OpKind::Add, x, y);
@@ -31,14 +39,13 @@ fn busy_expression() -> (ExprArena, ExprId) {
     let twice = a.push_binary(OpKind::Add, xy, yx);
     let rhs = a.push_binary(OpKind::Mul, twice, sum);
     let root = a.push_binary(OpKind::Add, lhs, rhs);
-    (a, root)
+    a.finish(&[root])
 }
 
-fn egraph_of(arena: &ExprArena, root: ExprId) -> EGraph {
+fn egraph_of(g: &Graph) -> EGraph {
     let mut eg = EGraph::with_rules(all_rules());
-    pixelflow_search::egraph::insert(
-        arena,
-        root,
+    pixelflow_search::egraph::insert_term(
+        term(g),
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
@@ -48,8 +55,8 @@ fn egraph_of(arena: &ExprArena, root: ExprId) -> EGraph {
 
 #[test]
 fn class_cap_reports_class_cap_not_quiesced() {
-    let (arena, root) = busy_expression();
-    let mut eg = egraph_of(&arena, root);
+    let g = busy_expression();
+    let mut eg = egraph_of(&g);
     let cap = eg.num_classes() + 2;
     let result = saturate_with_full_budget(&mut eg, 100, cap, GENEROUS);
     assert_eq!(result.stop, SaturationStop::ClassCap, "{result:?}");
@@ -60,18 +67,18 @@ fn class_cap_reports_class_cap_not_quiesced() {
 }
 
 /// `x + y`: commutativity has one thing to say and then nothing applies.
-fn small_expression() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn small_expression() -> Graph {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let root = a.push_binary(OpKind::Add, x, y);
-    (a, root)
+    a.finish(&[root])
 }
 
 #[test]
 fn full_sweep_with_zero_unions_is_quiesced() {
-    let (arena, root) = small_expression();
-    let mut eg = egraph_of(&arena, root);
+    let g = small_expression();
+    let mut eg = egraph_of(&g);
     let result = saturate_with_full_budget(&mut eg, 100, 10_000, GENEROUS);
     assert_eq!(result.stop, SaturationStop::Quiesced, "{result:?}");
     assert!(result.iterations < 100, "{result:?}");
@@ -82,16 +89,16 @@ fn full_sweep_with_zero_unions_is_quiesced() {
 /// loop reported as converged.
 #[test]
 fn busy_expression_under_production_cap_is_class_capped() {
-    let (arena, root) = busy_expression();
-    let mut eg = egraph_of(&arena, root);
+    let g = busy_expression();
+    let mut eg = egraph_of(&g);
     let result = saturate_with_full_budget(&mut eg, 100, 10_000, GENEROUS);
     assert_eq!(result.stop, SaturationStop::ClassCap, "{result:?}");
 }
 
 #[test]
 fn zero_iterations_is_iteration_ceiling() {
-    let (arena, root) = busy_expression();
-    let mut eg = egraph_of(&arena, root);
+    let g = busy_expression();
+    let mut eg = egraph_of(&g);
     let result = saturate_with_full_budget(&mut eg, 0, 10_000, GENEROUS);
     assert_eq!(result.stop, SaturationStop::IterationCeiling, "{result:?}");
     assert_eq!(result.iterations, 0);
@@ -99,8 +106,8 @@ fn zero_iterations_is_iteration_ceiling() {
 
 #[test]
 fn expired_deadline_is_timeout() {
-    let (arena, root) = busy_expression();
-    let mut eg = egraph_of(&arena, root);
+    let g = busy_expression();
+    let mut eg = egraph_of(&g);
     let result = saturate_with_full_budget(&mut eg, 100, 10_000, Duration::ZERO);
     assert_eq!(result.stop, SaturationStop::Timeout, "{result:?}");
 }
@@ -113,8 +120,8 @@ fn expired_deadline_is_timeout() {
 /// through to the loop's default `IterationCeiling`.
 #[test]
 fn productive_but_class_capped_final_sweep_is_class_cap() {
-    let (arena, root) = busy_expression();
-    let mut eg = egraph_of(&arena, root);
+    let g = busy_expression();
+    let mut eg = egraph_of(&g);
     let cap = eg.num_classes() + 2;
     let result = saturate_with_full_budget(&mut eg, 1, cap, GENEROUS);
     assert!(
@@ -147,7 +154,7 @@ impl Rewrite for SleepyRule {
 /// back `Quiesced` / `saturated`.
 #[test]
 fn deadline_elapsing_inside_a_rule_apply_is_timeout() {
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let root = a.push_var(0);
     let mut eg = EGraph::with_rules(vec![Box::new(SleepyRule)]);
     pixelflow_search::egraph::insert(

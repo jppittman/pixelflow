@@ -6,12 +6,20 @@
 //! nodes?" were properties of whichever helper a call site happened to call.
 //! Naming the boundary is what makes them assertable.
 
-use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprNode, UniformDecl, UniformIdentity};
 use pixelflow_ir::binding::BindingTable;
+use pixelflow_ir::decl::{BufferDecl, BufferIdentity, UniformDecl, UniformIdentity};
 use pixelflow_ir::eval::eval_scalar;
-use pixelflow_ir::{Children, ExprArena, Ir, OpKind, Shape};
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef, Term};
+use pixelflow_ir::{Children, Ir, OpKind, Shape};
 use pixelflow_search::egraph::{Declined, EGraph, Vocabulary, insert, reachable_count};
-use pixelflow_search::runtime::optimize_runtime_arena;
+use pixelflow_search::runtime::optimize_runtime_term;
+
+/// The subtree at `root` paired with the declarations its leaves index. A
+/// builder can be read while it is still being built, so nothing here has to
+/// `finish` one just to look at it.
+fn term_at(a: &ExprBuilder, root: ExprRef) -> Term<'_> {
+    Term::new(a.node(root), a.env())
+}
 
 /// A fresh uniform declaration with the given default.
 fn uniform(default: f32) -> UniformDecl {
@@ -28,11 +36,11 @@ fn uniform(default: f32) -> UniformDecl {
 fn uniform_inserts_and_hash_conses_by_identity() {
     let same = uniform(1.0);
     let other = uniform(1.0);
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let a = arena.embed(Shape::Uniform(same));
     let b = arena.embed(Shape::Uniform(same));
     let c = arena.embed(Shape::Uniform(other));
-    assert_eq!(arena.uniforms().len(), 2, "one slot per identity");
+    assert_eq!(arena.env().uniforms.len(), 2, "one slot per identity");
     let ab = arena.push_binary(OpKind::Add, a, b);
     let root = arena.push_binary(OpKind::Add, ab, c);
 
@@ -56,7 +64,7 @@ fn uniform_inserts_and_hash_conses_by_identity() {
 #[test]
 fn a_uniform_survives_the_optimizer_unfolded() {
     let u = uniform(2.0);
-    let mut a = ExprArena::new();
+    let mut a = ExprBuilder::new();
     let slot = a.declare_uniform(u);
     let ua = a.push_uniform(slot);
     let ub = a.push_uniform(slot);
@@ -68,49 +76,48 @@ fn a_uniform_survives_the_optimizer_unfolded() {
     let prod = a.push_binary(OpKind::Mul, u1, x);
     let root = a.push_binary(OpKind::Add, prod, u1_again);
 
-    let optimized = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
-        .expect("a uniform-bearing arena optimizes rather than bailing");
-    let (oa, oroot) = (&optimized.0, optimized.1);
+    let input = term_at(&a, root);
+    let optimized = optimize_runtime_term(input, pixelflow_ir::LatticeShape::POINT)
+        .expect("a uniform-bearing term optimizes rather than bailing");
+    let opt = Term::new(optimized.0.entry(), &optimized.1);
 
-    assert_eq!(oa.uniforms(), &[u], "extraction redeclares the decl");
-    let leaves = |arena: &ExprArena, root: pixelflow_ir::ExprId| {
-        let mut seen = vec![false; arena.len()];
-        let mut stack = vec![root];
+    assert_eq!(
+        optimized.1.uniforms.as_slice(),
+        &[u],
+        "extraction redeclares the decl"
+    );
+    let leaves = |root: pixelflow_ir::Node<'_, ExprData>| {
         let (mut uniforms, mut consts) = (0usize, Vec::<f32>::new());
-        while let Some(id) = stack.pop() {
-            if std::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            match arena.node(id) {
-                ExprNode::Uniform(_) => uniforms += 1,
-                ExprNode::Const(v) => consts.push(*v),
+        for n in root.descendants() {
+            match *n {
+                ExprData::Uniform(_) => uniforms += 1,
+                ExprData::Const(bits) => consts.push(f32::from_bits(bits)),
                 _ => {}
             }
-            stack.extend(arena.children(id));
         }
         (uniforms, consts)
     };
-    let (uniforms, consts) = leaves(oa, oroot);
+    let (uniforms, consts) = leaves(opt.root());
     assert!(
         uniforms >= 1,
         "the uniform was folded away: {}",
-        oa.display(oroot)
+        pixelflow_ir::display(opt.root())
     );
     assert!(
         !consts.contains(&3.0),
         "`u + 1` was folded with the default into 3: {}",
-        oa.display(oroot)
+        pixelflow_ir::display(opt.root())
     );
     for (block, x) in [(None, 5.0f32), (Some(4.0f32), 5.0), (Some(-1.5), 0.25)] {
-        let bind = |arena: &ExprArena| {
-            let t = BindingTable::bind(arena, &[]).expect("no buffers");
+        let bind = |env: &Environment| {
+            let t = BindingTable::bind(env, &[]).expect("no buffers");
             match block {
-                Some(v) => t.bind_uniforms(arena, &[(u.id, v)]).expect("u is declared"),
+                Some(v) => t.bind_uniforms(env, &[(u.id, v)]).expect("u is declared"),
                 None => t,
             }
         };
-        let want = eval_scalar(&a, root, &[x, 0.0], &bind(&a));
-        let got = eval_scalar(oa, oroot, &[x, 0.0], &bind(oa));
+        let want = eval_scalar(input, &[x, 0.0], &bind(a.env()));
+        let got = eval_scalar(opt, &[x, 0.0], &bind(&optimized.1));
         assert!(
             (want - got).abs() < 1e-5,
             "block {block:?} at x={x}: {want} != {got}"
@@ -171,7 +178,7 @@ fn gather_is_holdable_everywhere_and_nameable_nowhere() {
 /// used to compact first to avoid it; now they do not have to.
 #[test]
 fn insertion_ignores_unreachable_nodes() {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let y = arena.push_var(1);
     let root = arena.push_binary(OpKind::Add, x, y);
@@ -180,7 +187,7 @@ fn insertion_ignores_unreachable_nodes() {
     let g = arena.push_var(2);
     let _garbage = arena.push_binary(OpKind::Mul, g, g);
 
-    assert_eq!(arena.len(), 5, "arena holds the garbage");
+    assert_eq!(arena.len(), 5, "the graph holds the garbage");
     assert_eq!(reachable_count(&arena, root), 3, "but only 3 are reachable");
 
     let mut eg = EGraph::new();
@@ -197,7 +204,7 @@ fn insertion_ignores_unreachable_nodes() {
 /// never required for correctness.
 #[test]
 fn unrepresentable_input_declines_rather_than_panicking() {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let masked = arena.push_binary(OpKind::BitAnd, x, x);
     let mut eg = EGraph::new();
@@ -223,7 +230,7 @@ fn unrepresentable_input_declines_rather_than_panicking() {
 /// the `Runtime` half would pass just as well against that blanket refusal.
 #[test]
 fn a_param_is_held_by_the_macro_vocabulary_and_declined_by_the_runtime_one() {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let p = arena.push_param(3);
 
     let mut templates = EGraph::new();
@@ -247,7 +254,7 @@ fn a_param_is_held_by_the_macro_vocabulary_and_declined_by_the_runtime_one() {
 /// to state it against. There is one now, and it is generic over any `Ir`.
 #[test]
 fn project_then_embed_round_trips() {
-    let mut src = ExprArena::new();
+    let mut src = ExprBuilder::new();
     let x = src.push_var(0);
     let y = src.push_var(1);
     let c = src.push_const(2.5);
@@ -256,8 +263,8 @@ fn project_then_embed_round_trips() {
     let sum = src.push_binary(OpKind::Add, shared, shared);
     let root = src.push_ternary(OpKind::MulAdd, sum, c, x);
 
-    let mut dst = ExprArena::new();
-    let dst_root = src.rebuild_into(root, &mut dst);
+    let mut dst = ExprBuilder::new();
+    let dst_root = pixelflow_ir::rebuild_into(term_at(&src, root), &mut dst);
 
     assert_eq!(
         dst.len(),
@@ -284,11 +291,11 @@ fn embed_declares_one_slot_per_buffer_identity() {
         width: 8,
         height: 4,
     };
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let a = arena.embed(Shape::Buffer(decl));
     let b = arena.embed(Shape::Buffer(decl));
     assert_eq!(
-        arena.buffers().len(),
+        arena.env().buffers.len(),
         1,
         "one identity must claim exactly one slot"
     );
@@ -299,7 +306,7 @@ fn embed_declares_one_slot_per_buffer_identity() {
 /// through `embed` cannot silently drop an operand.
 #[test]
 fn projection_reports_arity() {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let u = arena.push_unary(OpKind::Sqrt, x);
     let b = arena.push_binary(OpKind::Add, x, u);
@@ -326,9 +333,9 @@ fn projection_reports_arity() {
     assert!(matches!(arena.project(x), Shape::Var(0)));
     let c = arena.push_const(1.5);
     assert!(matches!(arena.project(c), Shape::Const(v) if v == 1.5));
-    let _ = Children::<pixelflow_ir::ExprId>::Zero;
+    let _ = Children::<ExprRef>::Zero;
 }
 
-fn alloc_vec(ids: &[pixelflow_ir::ExprId]) -> Vec<pixelflow_ir::ExprId> {
+fn alloc_vec(ids: &[ExprRef]) -> Vec<ExprRef> {
     ids.to_vec()
 }

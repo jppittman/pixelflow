@@ -5,19 +5,17 @@ use alloc::sync::Arc;
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use super::ops::Op;
-use pixelflow_ir::arena::{ExprArena, ExprId};
 
 use pixelflow_ir::Rooted;
-/// A rewrite RHS pattern, shared.
-///
-/// [`ExprArena`] has no `Debug` impl (it is not a debugging-facing type
-/// anywhere else in the codebase), but [`RewriteAction`] derives one for
-/// assertion failures and test output — so `Instantiate`'s pattern arena is
-/// wrapped rather than forcing a `Debug` impl onto `ExprArena` itself,
-/// which would be a wider API surface change than this justifies.
-use pixelflow_ir::expr::ExprData;
+use pixelflow_ir::expr::{ExprBuilder, ExprData, ExprRef};
 
 /// A rewrite RHS pattern, shared.
+///
+/// [`Rooted`] has no `Debug` impl (it is not a debugging-facing type anywhere
+/// else in the codebase), but [`RewriteAction`] derives one for assertion
+/// failures and test output — so `Instantiate`'s pattern graph is wrapped
+/// rather than forcing a `Debug` impl onto `Rooted` itself, which would be a
+/// wider API surface change than this justifies.
 #[derive(Clone)]
 pub struct TemplatePattern(pub Arc<Rooted<ExprData>>);
 
@@ -29,8 +27,8 @@ impl core::fmt::Debug for TemplatePattern {
     }
 }
 
-/// Build a rewrite-rule template directly into an [`ExprArena`], returning the
-/// root [`ExprId`]. The DSL mirrors the structural pattern: `var N` / `cst V` /
+/// Build a rewrite-rule template directly into an [`ExprBuilder`], returning
+/// the root [`ExprRef`]. The DSL mirrors the structural pattern: `var N` / `cst V` /
 /// `par N` leaves, and `un OP, (..)` / `bin OP, (..), (..)` / `tern OP, (..),
 /// (..), (..)` nodes. Metavariables are encoded as `var N` (Var(0) = A, etc.).
 #[macro_export]
@@ -255,7 +253,7 @@ pub trait Rewrite: Send + Sync {
     ///
     /// Returns `None` if the rule doesn't have a defined template.
     /// Rules can opt-in by overriding this method.
-    fn lhs_template(&self, _arena: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, _out: &mut ExprBuilder) -> Option<ExprRef> {
         None
     }
 
@@ -271,7 +269,7 @@ pub trait Rewrite: Send + Sync {
     /// ```
     ///
     /// Returns `None` if the rule doesn't have a defined template.
-    fn rhs_template(&self, _arena: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, _out: &mut ExprBuilder) -> Option<ExprRef> {
         None
     }
 }

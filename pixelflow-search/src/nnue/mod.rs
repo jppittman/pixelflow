@@ -24,11 +24,13 @@ pub mod guide;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use libm::fabsf;
+use pixelflow_ir::Node;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef, Term};
 use pixelflow_ir::kind::OpMap;
-use pixelflow_ir::term::{Children, Ir, Shape};
+use pixelflow_ir::{Rooted, expr};
 
 /// Re-export canonical IR types as the source of truth.
-pub use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
+pub use pixelflow_ir::OpKind;
 
 /// Re-export key types from factored module.
 pub use factored::{CostEdge, EdgeTrace, OpEmbeddings, PeSlot};
@@ -51,219 +53,174 @@ pub use factored::{ArenaRuleTemplates, EMBED_DIM, MLP_HIDDEN, RuleTemplates};
 // ============================================================================
 
 // ============================================================================
-// Arena-native Pattern Match + Substitute
+// Pattern Match + Substitute over an expression graph
 // ============================================================================
 
-/// Arena-native pattern match.
+/// Structural pattern match.
 ///
-/// Matches the subtree rooted at `expr_id` in `arena` against the template
-/// subtree rooted at `template_root` in `template`. Returns `Some(bindings)`
-/// mapping template `Var(n)` indices to `ExprId`s in `arena` on success, or
-/// `None` if the pattern does not match.
+/// Matches the subtree `expr` names in `target` against the template subtree
+/// rooted at `template`. Returns `Some(bindings)` mapping template `Var(n)`
+/// indices to nodes in `target` on success, or `None` if the pattern does not
+/// match.
 ///
-/// Uses an iterative work stack of `(expr_id, template_id)` pairs to avoid
-/// recursion depth issues on deep trees.
+/// Uses an iterative work stack of `(target node, template node)` pairs to
+/// avoid recursion depth issues on deep trees.
 #[must_use]
-pub fn pattern_match_arena(
-    arena: &ExprArena,
-    expr_id: ExprId,
-    template: &ExprArena,
-    template_root: ExprId,
-) -> Option<BTreeMap<u8, ExprId>> {
-    let mut bindings: BTreeMap<u8, ExprId> = BTreeMap::new();
-    // Work stack: pairs of (expr node in `arena`, template node in `template`).
-    let mut stack: Vec<(ExprId, ExprId)> = Vec::with_capacity(16);
-    stack.push((expr_id, template_root));
+pub fn pattern_match(
+    target: &ExprBuilder,
+    expr: ExprRef,
+    template: Node<'_, ExprData>,
+) -> Option<BTreeMap<u8, ExprRef>> {
+    let mut bindings: BTreeMap<u8, ExprRef> = BTreeMap::new();
+    let mut stack: Vec<(ExprRef, Node<'_, ExprData>)> = Vec::with_capacity(16);
+    stack.push((expr, template));
 
-    while let Some((e_id, t_id)) = stack.pop() {
-        let t_node = template.node(t_id);
-        match t_node {
+    while let Some((e, t)) = stack.pop() {
+        match *t {
             // Var(n) is a metavariable: bind or check consistency.
-            ExprNode::Var(n) => {
-                let n = *n;
-                if let Some(&existing) = bindings.get(&n) {
-                    // Already bound — the subtrees must be structurally equal.
-                    // Compare arena-native to avoid Arc allocation.
-                    if !arena.subtree_eq(existing, arena, e_id) {
-                        return None;
-                    }
-                } else {
-                    bindings.insert(n, e_id);
-                }
-            }
-            // Const must match exactly (within epsilon).
-            ExprNode::Const(c) => {
-                let c = *c;
-                match arena.node(e_id) {
-                    ExprNode::Const(e) => {
-                        if fabsf(e - c) >= 1e-6 {
-                            return None;
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            // Param must match the same index.
-            ExprNode::Param(i) => match arena.node(e_id) {
-                ExprNode::Param(j) if i == j => {}
-                _ => return None,
-            },
-            // Buffer must match the same slot.
-            ExprNode::Buffer(b) => match arena.node(e_id) {
-                ExprNode::Buffer(c) if b == c => {}
-                _ => return None,
-            },
-            // Uniform likewise.
-            ExprNode::Uniform(u) => match arena.node(e_id) {
-                ExprNode::Uniform(w) if u == w => {}
-                _ => return None,
-            },
-            // Structural match: op must match, push children onto the stack.
-            ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
-                ExprNode::Unary(e_op, e_a) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
-                }
-                _ => return None,
-            },
-            ExprNode::Binary(t_op, t_a, t_b) => match arena.node(e_id) {
-                ExprNode::Binary(e_op, e_a, e_b) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
-                    stack.push((*e_b, *t_b));
-                }
-                _ => return None,
-            },
-            ExprNode::Ternary(t_op, t_a, t_b, t_c) => match arena.node(e_id) {
-                ExprNode::Ternary(e_op, e_a, e_b, e_c) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
-                    stack.push((*e_b, *t_b));
-                    stack.push((*e_c, *t_c));
-                }
-                _ => return None,
-            },
-            ExprNode::Nary(t_op, _, _) => match arena.node(e_id) {
-                ExprNode::Nary(e_op, _, _) if e_op == t_op => {
-                    let e_children = arena.children(e_id);
-                    let t_children = template.children(t_id);
-                    if e_children.len() == t_children.len() {
-                        for (ec, tc) in e_children.zip(t_children) {
-                            stack.push((ec, tc));
-                        }
-                    } else {
+            ExprData::Var(n) => match bindings.get(&n) {
+                // Already bound — the subtrees must be structurally equal.
+                Some(&existing) => {
+                    if !target.node(existing).subtree_eq(target.node(e)) {
                         return None;
                     }
                 }
+                None => {
+                    bindings.insert(n, e);
+                }
+            },
+            // Const must match within epsilon.
+            ExprData::Const(bits) => match target.node(e).as_f32() {
+                Some(v) if fabsf(v - f32::from_bits(bits)) < 1e-6 => {}
                 _ => return None,
             },
+            // A leaf that names something must name the same thing.
+            ExprData::Param(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => {
+                if *target.node(e) != *t {
+                    return None;
+                }
+            }
+            // Structural match: same op and arity, push children onto the stack.
+            ExprData::Op(op) => {
+                let node = target.node(e);
+                if node.op() != Some(op) || node.child_count() != t.child_count() {
+                    return None;
+                }
+                for (ec, tc) in target.child_refs(e).iter().zip(t.children()) {
+                    stack.push((*ec, tc));
+                }
+            }
         }
     }
 
     Some(bindings)
 }
 
-/// Arena-native template substitution.
+/// Template substitution.
 ///
-/// Walks the template subtree rooted at `template_root` bottom-up, pushing
-/// nodes into `target_arena`. When a `Var(n)` is encountered, the corresponding
-/// `ExprId` from `bindings` (already in `target_arena`) is used directly.
+/// Walks the template subtree rooted at `template` bottom-up, pushing nodes
+/// into `target`. When a `Var(n)` is encountered, the corresponding `ExprRef`
+/// from `bindings` (already in `target`) is used directly.
 ///
 /// Returns `None` if any template `Var(n)` has no binding.
+///
+/// # Panics
+///
+/// Panics on a `Buffer` or `Uniform` leaf: those name memory, which no rewrite
+/// template rewrites.
 #[must_use]
-pub fn substitute_template_arena(
-    target_arena: &mut ExprArena,
-    template: &ExprArena,
-    template_root: ExprId,
-    bindings: &BTreeMap<u8, ExprId>,
-) -> Option<ExprId> {
-    // Post-order traversal: collect nodes reachable from template_root.
-    let t_n = template.len();
-    // Remap: template node index → target_arena ExprId (u32::MAX = not yet mapped).
-    let mut remap: Vec<u32> = alloc::vec![u32::MAX; t_n];
+pub fn substitute_template(
+    target: &mut ExprBuilder,
+    template: Node<'_, ExprData>,
+    bindings: &BTreeMap<u8, ExprRef>,
+) -> Option<ExprRef> {
+    let mut memo: BTreeMap<Node<'_, ExprData>, ExprRef> = BTreeMap::new();
+    let mut stack: Vec<(Node<'_, ExprData>, bool)> = alloc::vec![(template, false)];
 
-    // Collect post-order traversal order.
-    let mut order: Vec<ExprId> = Vec::with_capacity(t_n.min(32));
-    {
-        let mut visit_stack: Vec<ExprId> = Vec::with_capacity(16);
-        let mut pushed: Vec<bool> = alloc::vec![false; t_n];
-        visit_stack.push(template_root);
-        while let Some(id) = visit_stack.pop() {
-            let idx = id.0 as usize;
-            if pushed[idx] {
-                order.push(id);
-            } else {
-                pushed[idx] = true;
-                // Push self again for post-order emission, then push children first.
-                visit_stack.push(id);
-                for child in template.children(id) {
-                    if !pushed[child.0 as usize] {
-                        visit_stack.push(child);
-                    }
+    while let Some((node, children_done)) = stack.pop() {
+        if memo.contains_key(&node) {
+            continue;
+        }
+        if !children_done {
+            stack.push((node, true));
+            for child in node.children() {
+                if !memo.contains_key(&child) {
+                    stack.push((child, false));
                 }
             }
+            continue;
         }
-    }
-
-    // Process in post-order: children are mapped before their parent.
-    for id in &order {
-        let idx = id.0 as usize;
-        let node = template.node(*id).clone();
-        let mapped = match node {
-            ExprNode::Var(n) => {
-                // Fail if the variable has no binding.
-                *bindings.get(&n)?
-            }
-            ExprNode::Const(c) => target_arena.push_const(c),
-            ExprNode::Param(i) => target_arena.push_param(i),
-            ExprNode::Buffer(b) => panic!(
-                "ExprNode::Buffer({}) in a rewrite template — memory ops are not rewritable yet",
+        let mapped = match *node {
+            // Fail if the variable has no binding.
+            ExprData::Var(n) => *bindings.get(&n)?,
+            ExprData::Const(bits) => target.push_const(f32::from_bits(bits)),
+            ExprData::Param(i) => target.push_param(i),
+            ExprData::Buffer(b) => panic!(
+                "Buffer({}) in a rewrite template — memory ops are not rewritable yet",
                 b.0
             ),
-            ExprNode::Uniform(u) => panic!(
-                "ExprNode::Uniform({}) in a rewrite template — uniforms are not rewritable",
+            ExprData::Uniform(u) => panic!(
+                "Uniform({}) in a rewrite template — uniforms are not rewritable",
                 u.0
             ),
-            ExprNode::Unary(op, t_a) => {
-                let a = ExprId(remap[t_a.0 as usize]);
-                target_arena.push_unary(op, a)
-            }
-            ExprNode::Binary(op, t_a, t_b) => {
-                let a = ExprId(remap[t_a.0 as usize]);
-                let b = ExprId(remap[t_b.0 as usize]);
-                target_arena.push_binary(op, a, b)
-            }
-            ExprNode::Ternary(op, t_a, t_b, t_c) => {
-                let a = ExprId(remap[t_a.0 as usize]);
-                let b = ExprId(remap[t_b.0 as usize]);
-                let c = ExprId(remap[t_c.0 as usize]);
-                target_arena.push_ternary(op, a, b, c)
-            }
-            ExprNode::Nary(op, _, _) => {
-                let t_children: Vec<ExprId> = template
-                    .children(*id)
-                    .map(|tc| ExprId(remap[tc.0 as usize]))
+            ExprData::Op(op) => {
+                let kids: Vec<ExprRef> = node
+                    .children()
+                    .map(|c| memo[&c])
                     .collect();
-                target_arena.push_nary(op, &t_children)
+                target.push_nary(op, &kids)
             }
         };
-        remap[idx] = mapped.0;
+        memo.insert(node, mapped);
     }
 
-    Some(ExprId(remap[template_root.0 as usize]))
+    Some(memo[&template])
+}
+
+/// Which way a rewrite template is being read: match its LHS and produce its
+/// RHS, or the mirror. Junkification wants the expanding direction whichever
+/// one that is, so it tries both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Direction {
+    /// Match the LHS, produce the RHS.
+    Forward,
+    /// Match the RHS, produce the LHS.
+    Backward,
 }
 
 // ============================================================================
 // Backward Generation (BWD) - Lample & Charton 2019
 // ============================================================================
 
-/// Arena-backed training pair. Both expressions live inside the arena as [`ExprId`]s.
-pub struct BwdTrainingPairArena {
-    /// The shared arena holding all nodes for both expressions.
-    pub arena: ExprArena,
-    /// Root of the optimized expression in the arena.
-    pub optimized: ExprId,
-    /// Root of the unoptimized expression in the arena.
-    pub unoptimized: ExprId,
+/// A training pair: both expressions in one graph, as its two entries.
+///
+/// Entry 0 is the optimized form, entry 1 the junkified one. Two entries of
+/// one [`Rooted`] rather than two graphs, because the junkified form is built
+/// *out of* the optimized one — they share nodes, and splitting them would
+/// duplicate the shared subterms and lose the sharing that makes the pair a
+/// pair.
+pub struct BwdTrainingPair {
+    /// The graph holding both expressions: `[optimized, unoptimized]`.
+    pub rooted: Rooted<ExprData>,
+    /// The declaration tables the leaves index. Empty — a generated
+    /// expression names no memory — but carried so a [`Term`] can be formed.
+    pub env: Environment,
     /// Number of junkifying rewrites applied.
     pub rewrites_applied: usize,
+}
+
+impl BwdTrainingPair {
+    /// The optimized expression.
+    #[must_use]
+    pub fn optimized(&self) -> Term<'_> {
+        Term::new(self.rooted.entry_at(0), &self.env)
+    }
+
+    /// The junkified (unoptimized) expression.
+    #[must_use]
+    pub fn unoptimized(&self) -> Term<'_> {
+        Term::new(self.rooted.entry_at(1), &self.env)
+    }
 }
 
 /// Configuration for backward expression generation.
@@ -314,12 +271,12 @@ pub struct BwdGenerator {
     pub config: BwdGenConfig,
     /// Random state.
     state: u64,
-    /// Arena-native rule templates. Built once in `new()` from `templates`.
-    /// Used by `junkify_arena_pass` to avoid `to_expr`/`push_expr` round-trips.
+    /// Rule templates as expression graphs. Built once in `new()` from
+    /// `templates`.
     arena_templates: ArenaRuleTemplates,
-    /// Reusable arena for arena-based generation. Cleared each call to
-    /// [`generate_arena`](Self::generate_arena).
-    arena: ExprArena,
+    /// The graph under construction. Replaced by a fresh one each call to
+    /// [`generate`](Self::generate).
+    arena: ExprBuilder,
 }
 
 impl BwdGenerator {
@@ -336,7 +293,7 @@ impl BwdGenerator {
             config,
             state: seed,
             arena_templates,
-            arena: ExprArena::with_capacity(256),
+            arena: ExprBuilder::new(),
         }
     }
 
@@ -369,43 +326,36 @@ impl BwdGenerator {
     /// until at least one junkify rewrite fires.
     const MAX_JUNKIFY_RETRIES: usize = 50;
 
-    /// Generate a backward training pair directly in arena form.
+    /// Generate a backward training pair.
     ///
-    /// Returns a [`BwdTrainingPairArena`] where both the
-    /// optimized and unoptimized expressions are stored as [`ExprId`]s inside a
-    /// single shared [`ExprArena`].
-    ///
-    /// # Layout inside the arena
-    ///
-    /// - Nodes `[0, optimized_node_count)` belong to the optimized subtree.
-    /// - Nodes `[optimized_node_count, arena.len())` belong to the unoptimized
-    ///   subtree (pushed via [`ExprArena::push_expr`] after junkification).
-    ///
-    /// Use `arena.len()` for an O(1) total node count, or
-    /// `arena.node_count_subtree(pair.optimized)` for the optimized subtree
-    /// specifically (O(N) traversal).
+    /// Returns a [`BwdTrainingPair`] whose two entries are the optimized and
+    /// junkified forms of one expression, sharing the subterms junkification
+    /// left alone.
     ///
     /// # Panics
     ///
-    /// Same conditions as [`generate`].
+    /// If generation cannot produce an expression containing a variable, or
+    /// junkification cannot fire a single rewrite, within the retry limits —
+    /// either means the configuration or the RNG is broken, not that the
+    /// corpus is merely unlucky.
     #[must_use]
-    pub fn generate_arena(&mut self) -> BwdTrainingPairArena {
+    pub fn generate(&mut self) -> BwdTrainingPair {
         let mut junkify_attempts = 0;
         loop {
             // Build optimized expression directly in self.arena.
-            self.arena.clear();
+            self.arena = ExprBuilder::new();
             let optimized_id = {
                 let mut attempts = 0;
                 loop {
-                    self.arena.clear();
+                    self.arena = ExprBuilder::new();
                     let id = self.generate_optimized_arena(0);
-                    if self.arena.has_var(id) {
+                    if self.arena.node(id).has_var() {
                         break id;
                     }
                     attempts += 1;
                     assert!(
                         attempts < Self::MAX_GENERATE_RETRIES,
-                        "BwdGenerator::generate_arena failed to produce an expression with \
+                        "BwdGenerator::generate failed to produce an expression with \
                          variables after {} attempts. \
                          Config: max_depth={}, leaf_prob={}, num_vars={}",
                         attempts,
@@ -421,10 +371,10 @@ impl BwdGenerator {
                 self.junkify_arena(optimized_id, self.config.max_junkified_nodes);
 
             assert!(
-                self.arena.has_var(unoptimized_id),
+                self.arena.node(unoptimized_id).has_var(),
                 "BUG: junkification eliminated all variables from expression. \
-                 optimized arena_nodes={}, rewrites={}",
-                self.arena.node_count_subtree(optimized_id),
+                 optimized nodes={}, rewrites={}",
+                self.arena.node(optimized_id).node_count(),
                 rewrites_applied,
             );
 
@@ -432,7 +382,7 @@ impl BwdGenerator {
                 junkify_attempts += 1;
                 assert!(
                     junkify_attempts < Self::MAX_JUNKIFY_RETRIES,
-                    "BwdGenerator::generate_arena failed to apply any junkify rewrites \
+                    "BwdGenerator::generate failed to apply any junkify rewrites \
                      after {} attempts. \
                      Config: max_junkify_passes={}, junkify_prob={:.3}, max_junkified_nodes={}. \
                      Check that junkify_prob > 0.0 and max_junkify_passes >= 1, and that \
@@ -445,14 +395,14 @@ impl BwdGenerator {
                 continue;
             }
 
-            // Both optimized and unoptimized are already in self.arena.
-            // Move the arena out, replacing self.arena with a fresh one.
-            let arena = core::mem::replace(&mut self.arena, ExprArena::with_capacity(256));
+            // Both forms are already in self.arena. Move the builder out,
+            // replacing it with a fresh one, and freeze it at both roots.
+            let builder = core::mem::replace(&mut self.arena, ExprBuilder::new());
+            let (rooted, env) = builder.finish(&[optimized_id, unoptimized_id]);
 
-            return BwdTrainingPairArena {
-                arena,
-                optimized: optimized_id,
-                unoptimized: unoptimized_id,
+            return BwdTrainingPair {
+                rooted,
+                env,
                 rewrites_applied,
             };
         }
@@ -465,7 +415,7 @@ impl BwdGenerator {
     // ── Arena-based generation ─────────────────────────────────────────────────
 
     /// Arena version of `generate_leaf`.
-    fn generate_leaf_arena(&mut self) -> ExprId {
+    fn generate_leaf_arena(&mut self) -> ExprRef {
         if self.rand_f32() < 0.7 {
             let var_idx = self.rand_usize(self.config.num_vars.min(4)) as u8;
             self.arena.push_var(var_idx)
@@ -477,7 +427,7 @@ impl BwdGenerator {
 
     /// Arena version of `guard_positive_nonzero`.
     /// Wraps `inner` id in `abs(inner) + 0.001`, returning the root id.
-    fn guard_positive_nonzero_arena(&mut self, inner: ExprId) -> ExprId {
+    fn guard_positive_nonzero_arena(&mut self, inner: ExprRef) -> ExprRef {
         let abs_id = self.arena.push_unary(OpKind::Abs, inner);
         let eps_id = self.arena.push_const(0.001);
         self.arena.push_binary(OpKind::Add, abs_id, eps_id)
@@ -485,7 +435,7 @@ impl BwdGenerator {
 
     /// Arena version of `guard_nonnegative`.
     /// Wraps `inner` id in `abs(inner)`, returning the root id.
-    fn guard_nonnegative_arena(&mut self, inner: ExprId) -> ExprId {
+    fn guard_nonnegative_arena(&mut self, inner: ExprRef) -> ExprRef {
         self.arena.push_unary(OpKind::Abs, inner)
     }
 
@@ -504,7 +454,7 @@ impl BwdGenerator {
     /// * `work` — pending tasks.  Each entry is either a `Decide` (consume
     ///   RNG, emit a `Combine` + child `Decide`s) or a `Combine` (assemble
     ///   already-resolved children into a parent node).
-    /// * `results` — a LIFO buffer of `ExprId`s produced by completed
+    /// * `results` — a LIFO buffer of `ExprRef`s produced by completed
     ///   sub-trees.  `Combine` variants pop from this.
     ///
     /// Push order for a node with N children:
@@ -517,12 +467,12 @@ impl BwdGenerator {
     /// The `_start_depth` parameter is kept for call-site compatibility with
     /// the former recursive version (callers pass `0`).  The depth ceiling is
     /// always `self.config.max_depth`.
-    fn generate_optimized_arena(&mut self, _start_depth: usize) -> ExprId {
+    fn generate_optimized_arena(&mut self, _start_depth: usize) -> ExprRef {
         let max_depth = self.config.max_depth;
         /// Describes how to assemble a parent node once its children are ready.
         ///
         /// Each variant documents:
-        ///   - How many `ExprId`s it pops from `results` (children, left-to-right).
+        ///   - How many `ExprRef`s it pops from `results` (children, left-to-right).
         ///   - Any inline guard operations applied before the final arena push.
         enum Combine {
             /// Binary op — pop left then right, no guards.
@@ -558,7 +508,7 @@ impl BwdGenerator {
         }
 
         let mut work: Vec<WorkItem> = Vec::with_capacity(64);
-        let mut results: Vec<ExprId> = Vec::with_capacity(64);
+        let mut results: Vec<ExprRef> = Vec::with_capacity(64);
 
         work.push(WorkItem::Decide { depth: 0 });
 
@@ -787,13 +737,11 @@ impl BwdGenerator {
 
     // ── Arena-native junkification ──────────────────────────────────────────
 
-    /// Arena-native junkification: apply rewrites that make the expression
-    /// MORE complex, entirely within the arena. Legacy `Expr` is only
-    /// constructed per-node for template matching (and only for nodes that
-    /// pass the random check AND have a matchable root op).
+    /// Junkification: apply rewrites that make the expression MORE complex,
+    /// entirely within the builder.
     ///
     /// Returns `(new_root_id, total_rewrites_applied)`.
-    fn junkify_arena(&mut self, root: ExprId, max_growth: usize) -> (ExprId, usize) {
+    fn junkify_arena(&mut self, root: ExprRef, max_growth: usize) -> (ExprRef, usize) {
         let original_len = self.arena.len();
         let mut total_applied = 0;
         let mut current_root = root;
@@ -820,65 +768,83 @@ impl BwdGenerator {
         (current_root, total_applied)
     }
 
-    /// Single pass of arena-native junkification.
+    /// Single pass of junkification.
     ///
-    /// Walks nodes `[0..n)` in topological order (guaranteed by arena construction),
-    /// building a `remap` table that maps old ExprIds to new (possibly junkified) ExprIds.
+    /// Walks the subgraph reachable from `root` bottom-up (children before
+    /// parents), building a `remap` from each old node to its new (possibly
+    /// junkified) copy.
     ///
     /// For each node:
     /// 1. Remap its children through the remap table.
     /// 2. If random check passes AND the node's root op is in `root_op_set`:
-    ///    - Try all arena templates in both directions via `pattern_match_arena`.
-    ///    - Collect expanding candidates via `substitute_template_arena`.
+    ///    - Try all rule templates in both directions via [`pattern_match`].
+    ///    - Collect expanding candidates via [`substitute_template`].
     ///    - Pick one randomly.
-    /// 3. Otherwise: push a copy with remapped children.
+    /// 3. Otherwise: keep the copy with remapped children.
     ///
-    /// No `to_expr`/`push_expr` calls occur in this path.
+    /// Reachable-only, where the arena version walked every node the builder
+    /// had ever pushed: a node the current root does not reach can only ever
+    /// be rebuilt into another node nothing reaches, so the answer is the
+    /// same and the garbage is not re-junkified.
     fn junkify_arena_pass(
         &mut self,
-        root: ExprId,
+        root: ExprRef,
         budget: usize,
         root_op_set: &OpMap<bool>,
-    ) -> (ExprId, usize) {
-        let n = self.arena.len();
-        // Identity remap: every node maps to itself initially.
-        let mut remap: Vec<ExprId> = (0..n as u32).map(ExprId).collect();
+    ) -> (ExprRef, usize) {
+        let mut remap: BTreeMap<ExprRef, ExprRef> = BTreeMap::new();
         let mut applied = 0;
         let mut remaining_budget = budget;
 
-        for idx in 0..n {
-            let id = ExprId(idx as u32);
+        // Post-order over the reachable subgraph, so every child is remapped
+        // before its parent is rebuilt.
+        let mut order: Vec<ExprRef> = Vec::new();
+        {
+            let mut seen: alloc::collections::BTreeSet<ExprRef> =
+                alloc::collections::BTreeSet::new();
+            let mut stack: Vec<(ExprRef, bool)> = alloc::vec![(root, false)];
+            while let Some((r, expanded)) = stack.pop() {
+                if expanded {
+                    order.push(r);
+                    continue;
+                }
+                if !seen.insert(r) {
+                    continue;
+                }
+                stack.push((r, true));
+                for &child in self.arena.child_refs(r) {
+                    if !seen.contains(&child) {
+                        stack.push((child, false));
+                    }
+                }
+            }
+        }
 
-            // Remap children to point to their (possibly junkified) versions.
-            // Push the remapped copy into the arena. This is the "base" version;
-            // if junkification succeeds below we'll overwrite the remap entry.
-            let base_id = match self.arena.project(id) {
-                Shape::Var(v) => self.arena.push_var(v),
-                Shape::Const(c) => self.arena.push_const(c),
-                Shape::Param(p) => self.arena.push_param(p),
-                Shape::Buffer(decl) => self.arena.embed(Shape::Buffer(decl)),
-                Shape::Uniform(decl) => self.arena.embed(Shape::Uniform(decl)),
-                Shape::Op(op, children) => match children {
-                    Children::Zero => panic!("junkify: op with 0 children"),
-                    Children::One(a) => self.arena.push_unary(op, remap[a.0 as usize]),
-                    Children::Two(a, b) => {
-                        self.arena
-                            .push_binary(op, remap[a.0 as usize], remap[b.0 as usize])
-                    }
-                    Children::Three(a, b, c) => self.arena.push_ternary(
-                        op,
-                        remap[a.0 as usize],
-                        remap[b.0 as usize],
-                        remap[c.0 as usize],
-                    ),
-                    Children::Many(s) => {
-                        let remapped_children: Vec<ExprId> =
-                            s.iter().map(|c| remap[c.0 as usize]).collect();
-                        self.arena.push_nary(op, &remapped_children)
-                    }
-                },
+        for &r in &order {
+            // Rebuild this node over its (possibly junkified) children. This
+            // is the "base" version; if junkification succeeds below the
+            // remap entry is overwritten.
+            let data = *self.arena.node(r);
+            let kids: Vec<ExprRef> = self
+                .arena
+                .child_refs(r)
+                .iter()
+                .map(|c| remap[c])
+                .collect();
+            let base_id = match data {
+                ExprData::Var(v) => self.arena.push_var(v),
+                ExprData::Const(bits) => self.arena.push_const(f32::from_bits(bits)),
+                ExprData::Param(p) => self.arena.push_param(p),
+                // The slot is already declared in this very builder, so
+                // naming it again is all a copy needs.
+                ExprData::Buffer(b) => self.arena.push_buffer(b),
+                ExprData::Uniform(u) => self.arena.push_uniform(u),
+                ExprData::Op(op) => {
+                    assert!(!kids.is_empty(), "junkify: op with 0 children");
+                    self.arena.push_nary(op, &kids)
+                }
             };
-            remap[idx] = base_id;
+            remap.insert(r, base_id);
 
             // Budget exhausted — just copy remaining nodes.
             if remaining_budget == 0 {
@@ -891,70 +857,62 @@ impl BwdGenerator {
             }
 
             // Op filter: skip if no template can match this node's root op.
-            let node_op = self.arena.kind(base_id);
+            let node_op = factored::kind_of(self.arena.node(base_id));
             if !root_op_set[node_op] {
                 continue;
             }
 
-            let original_cost = self.arena.node_count_subtree(base_id);
+            let original_cost = self.arena.node(base_id).node_count();
 
-            // Try all arena rule templates in both directions.
-            // Candidates are ExprIds pushed into self.arena during substitution.
-            let mut candidates: Vec<ExprId> = Vec::new();
+            // Try every rule template in both directions. Candidates are
+            // nodes pushed into the builder during substitution.
+            let mut candidates: Vec<ExprRef> = Vec::new();
             let mut candidate_costs: Vec<usize> = Vec::new();
 
             for rule_idx in 0..self.arena_templates.len() {
-                let tmpl = &self.arena_templates.arenas[rule_idx];
+                // Both directions need both sides: one to match, one to
+                // produce.
+                let (lhs_op, rhs_op) = {
+                    let tmpl = &self.arena_templates.arenas[rule_idx];
+                    if tmpl.lhs().is_none() || tmpl.rhs().is_none() {
+                        continue;
+                    }
+                    (tmpl.lhs_op, tmpl.rhs_op)
+                };
 
                 // LHS -> RHS direction: match against LHS, substitute RHS.
-                if let (Some(lhs_root), Some(rhs_root)) = (tmpl.lhs, tmpl.rhs) {
-                    if tmpl.lhs_op.is_some() {
-                        // pattern_match_arena borrows self.arena and tmpl.arena immutably.
-                        // We must split the borrow: take a pointer to the template arena
-                        // to satisfy the borrow checker while we later push into self.arena.
-                        let bindings = {
-                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
-                            pattern_match_arena(&self.arena, base_id, tmpl_arena, lhs_root)
-                        };
-                        if let Some(bindings) = bindings {
-                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
-                            if let Some(result_id) = substitute_template_arena(
-                                &mut self.arena,
-                                tmpl_arena,
-                                rhs_root,
-                                &bindings,
-                            ) {
-                                let new_cost = self.arena.node_count_subtree(result_id);
-                                let growth = new_cost.saturating_sub(original_cost);
-                                if new_cost > original_cost && growth <= remaining_budget {
-                                    candidates.push(result_id);
-                                    candidate_costs.push(new_cost);
-                                }
-                            }
-                        }
+                // RHS -> LHS direction: the mirror. Both are the same three
+                // steps, so they are one loop rather than two copies.
+                for direction in [Direction::Forward, Direction::Backward] {
+                    let matchable = match direction {
+                        Direction::Forward => lhs_op.is_some(),
+                        Direction::Backward => rhs_op.is_some(),
+                    };
+                    if !matchable {
+                        continue;
                     }
-                    // RHS -> LHS direction: match against RHS, substitute LHS.
-                    if tmpl.rhs_op.is_some() {
-                        let bindings = {
-                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
-                            pattern_match_arena(&self.arena, base_id, tmpl_arena, rhs_root)
-                        };
-                        if let Some(bindings) = bindings {
-                            let tmpl_arena = &self.arena_templates.arenas[rule_idx].arena;
-                            if let Some(result_id) = substitute_template_arena(
-                                &mut self.arena,
-                                tmpl_arena,
-                                lhs_root,
-                                &bindings,
-                            ) {
-                                let new_cost = self.arena.node_count_subtree(result_id);
-                                let growth = new_cost.saturating_sub(original_cost);
-                                if new_cost > original_cost && growth <= remaining_budget {
-                                    candidates.push(result_id);
-                                    candidate_costs.push(new_cost);
-                                }
-                            }
-                        }
+                    let tmpl = &self.arena_templates.arenas[rule_idx];
+                    let (pattern, produce) = match direction {
+                        Direction::Forward => (tmpl.lhs(), tmpl.rhs()),
+                        Direction::Backward => (tmpl.rhs(), tmpl.lhs()),
+                    };
+                    let (Some(pattern), Some(produce)) = (pattern, produce) else {
+                        continue;
+                    };
+                    let Some(bindings) = pattern_match(&self.arena, base_id, pattern.root())
+                    else {
+                        continue;
+                    };
+                    let Some(result_id) =
+                        substitute_template(&mut self.arena, produce.root(), &bindings)
+                    else {
+                        continue;
+                    };
+                    let new_cost = self.arena.node(result_id).node_count();
+                    let growth = new_cost.saturating_sub(original_cost);
+                    if new_cost > original_cost && growth <= remaining_budget {
+                        candidates.push(result_id);
+                        candidate_costs.push(new_cost);
                     }
                 }
             }
@@ -965,13 +923,13 @@ impl BwdGenerator {
                 let chosen_cost = candidate_costs[chosen_idx];
                 let growth = chosen_cost.saturating_sub(original_cost);
                 remaining_budget = remaining_budget.saturating_sub(growth);
-                remap[idx] = chosen_id;
+                remap.insert(r, chosen_id);
                 applied += 1;
             }
-            // else: remap[idx] already points to base_id (the remapped copy).
+            // else: remap[r] already points to base_id (the remapped copy).
         }
 
-        (remap[root.0 as usize], applied)
+        (remap[&root], applied)
     }
 }
 
@@ -999,9 +957,9 @@ mod tests {
         let mut generator = BwdGenerator::new(42, config, templates);
 
         for _ in 0..10 {
-            let pair = generator.generate_arena();
-            let optimized_nodes = pair.arena.node_count_subtree(pair.optimized);
-            let unoptimized_nodes = pair.arena.node_count_subtree(pair.unoptimized);
+            let pair = generator.generate();
+            let optimized_nodes = pair.optimized().root().node_count();
+            let unoptimized_nodes = pair.unoptimized().root().node_count();
 
             // Both expressions should be valid
             assert!(optimized_nodes > 0);
@@ -1026,14 +984,13 @@ mod tests {
 
         let mut total_fused = 0;
         for _ in 0..20 {
-            let pair = generator.generate_arena();
-            let mut stack = alloc::vec![pair.optimized];
-            while let Some(id) = stack.pop() {
-                if pair.arena.kind(id) == OpKind::MulAdd {
-                    total_fused += 1;
-                }
-                stack.extend(pair.arena.children(id));
-            }
+            let pair = generator.generate();
+            total_fused += pair
+                .optimized()
+                .root()
+                .descendants()
+                .filter(|n| n.op() == Some(OpKind::MulAdd))
+                .count();
         }
 
         // With 80% fused op probability, we should see some fused ops
@@ -1053,9 +1010,9 @@ mod tests {
         // Generate 20 pairs and check they're non-trivial
         let mut total_rewrites = 0;
         for _ in 0..20 {
-            let pair = generator.generate_arena();
-            let optimized_nodes = pair.arena.node_count_subtree(pair.optimized);
-            let unoptimized_nodes = pair.arena.node_count_subtree(pair.unoptimized);
+            let pair = generator.generate();
+            let optimized_nodes = pair.optimized().root().node_count();
+            let unoptimized_nodes = pair.unoptimized().root().node_count();
             assert!(
                 unoptimized_nodes >= optimized_nodes,
                 "unoptimized ({}) should have >= nodes than optimized ({})",

@@ -1,5 +1,5 @@
-//! Generic template rewrite: a rule whose LHS/RHS are data (an [`ExprArena`]
-//! pattern) rather than a hand-written combinator.
+//! Generic template rewrite: a rule whose LHS/RHS are data (an expression
+//! graph pattern) rather than a hand-written combinator.
 //!
 //! Round 2's mode (ii) (docs/plans/2026-09-01-phase3-round2-rule-scaling.md
 //! §2.2, §8) generates rules by composing two existing rules' templates at
@@ -16,7 +16,7 @@
 //! rule's own root, handed in by the sweep — [`match_root`]) or an
 //! [`EClassId`] (every other position, where the pattern may need to try
 //! more than one of that class's representatives — [`match_class`]). Both
-//! read metavariables (`ExprNode::Var`) the same way every existing template
+//! read metavariables (`ExprData::Var`) the same way every existing template
 //! does: `Var(0)` = A, `Var(1)` = B, etc. A repeated metavariable must bind
 //! to the same **canonical** class everywhere it appears — [`Bindings`]
 //! enforces that via `egraph.find`.
@@ -30,18 +30,25 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
-
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use super::rewrite::{Rewrite, RewriteAction, TemplateArena};
 
-use pixelflow_ir::expr::ExprData;
+use pixelflow_ir::expr::{ExprBuilder, ExprData, ExprRef, Term};
 use pixelflow_ir::{Node, Rooted};
 
 /// Metavariable → canonical e-class bindings accumulated while matching one
 /// pattern.
 type Bindings = BTreeMap<u8, EClassId>;
+
+/// The environment a rule pattern indexes: none. A pattern is pure structure —
+/// every matcher and every unifier below refuses a `Buffer`/`Uniform` leaf —
+/// so the tables a [`Term`] pairs with a root are empty here, once, rather
+/// than rebuilt per call.
+static EMPTY_ENV: pixelflow_ir::expr::Environment = pixelflow_ir::expr::Environment {
+    buffers: Vec::new(),
+    uniforms: Vec::new(),
+};
 
 fn bind_var(mv: u8, class: EClassId, egraph: &EGraph, bindings: &mut Bindings) -> bool {
     let class = egraph.find(class);
@@ -143,21 +150,9 @@ fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeS
     }
 }
 
-fn collect_metavars_arena(arena: &ExprArena, id: ExprId, out: &mut std::collections::BTreeSet<u8>) {
-    match arena.node(id) {
-        pixelflow_ir::arena::ExprNode::Var(mv) => {
-            out.insert(*mv);
-        }
-        pixelflow_ir::arena::ExprNode::Const(_)
-        | pixelflow_ir::arena::ExprNode::Param(_)
-        | pixelflow_ir::arena::ExprNode::Buffer(_)
-        | pixelflow_ir::arena::ExprNode::Uniform(_) => {}
-        _ => {
-            for c in arena.children(id) {
-                collect_metavars_arena(arena, c, out);
-            }
-        }
-    }
+/// [`collect_metavars`] over a node still under construction in `b`.
+fn collect_metavars_in(b: &ExprBuilder, r: ExprRef, out: &mut std::collections::BTreeSet<u8>) {
+    collect_metavars(b.node(r), out);
 }
 
 /// A rewrite rule whose LHS/RHS are runtime data instead of a hand-written
@@ -208,10 +203,19 @@ impl TemplateRewrite {
         }
     }
 
-    /// Construct from legacy arena + expr IDs.
+    /// Construct from a builder plus the two pattern roots inside it.
+    ///
+    /// The environment is dropped: a rule pattern names no memory (a `Buffer`
+    /// or `Uniform` leaf is refused by every matcher below), so there is
+    /// nothing in it to keep.
     #[must_use]
-    pub fn from_arena(name: impl Into<String>, arena: ExprArena, lhs: ExprId, rhs: ExprId) -> Self {
-        let (rooted, _) = pixelflow_ir::expr::from_arena_roots(&arena, &[lhs, rhs]);
+    pub fn from_builder(
+        name: impl Into<String>,
+        builder: ExprBuilder,
+        lhs: ExprRef,
+        rhs: ExprRef,
+    ) -> Self {
+        let (rooted, _env) = builder.finish(&[lhs, rhs]);
         Self::new(name, rooted)
     }
 
@@ -262,18 +266,12 @@ impl Rewrite for TemplateRewrite {
         })
     }
 
-    fn lhs_template(&self, out: &mut ExprArena) -> Option<ExprId> {
-        let env = pixelflow_ir::expr::Environment::default();
-        let (arena, roots) =
-            pixelflow_ir::expr::to_arena_roots(&self.rooted, &[self.rooted.entry_at(0)], &env);
-        Some(out.splice(&arena, roots[0]))
+    fn lhs_template(&self, out: &mut ExprBuilder) -> Option<ExprRef> {
+        Some(out.splice(Term::new(self.rooted.entry_at(0), &EMPTY_ENV)))
     }
 
-    fn rhs_template(&self, out: &mut ExprArena) -> Option<ExprId> {
-        let env = pixelflow_ir::expr::Environment::default();
-        let (arena, roots) =
-            pixelflow_ir::expr::to_arena_roots(&self.rooted, &[self.rooted.entry_at(1)], &env);
-        Some(out.splice(&arena, roots[0]))
+    fn rhs_template(&self, out: &mut ExprBuilder) -> Option<ExprRef> {
+        Some(out.splice(Term::new(self.rooted.entry_at(1), &EMPTY_ENV)))
     }
 }
 
@@ -296,21 +294,12 @@ impl Rewrite for TemplateRewrite {
 /// so 64 is a wide, cheap margin rather than a tight bound.
 const B_METAVAR_OFFSET: u8 = 64;
 
-fn push_by_arity(arena: &mut ExprArena, kind: pixelflow_ir::OpKind, children: &[ExprId]) -> ExprId {
-    match children.len() {
-        1 => arena.push_unary(kind, children[0]),
-        2 => arena.push_binary(kind, children[0], children[1]),
-        3 => arena.push_ternary(kind, children[0], children[1], children[2]),
-        _ => arena.push_nary(kind, children),
-    }
-}
-
 /// Every position in the subtree at `root`: the root itself (`[]`) and every
 /// proper subterm, addressed by the path of child indices to reach it.
-pub(crate) fn positions(arena: &ExprArena, root: ExprId) -> Vec<Vec<u8>> {
+pub(crate) fn positions(b: &ExprBuilder, root: ExprRef) -> Vec<Vec<u8>> {
     let mut out = vec![Vec::new()];
-    for (i, c) in arena.children(root).enumerate() {
-        for mut sub in positions(arena, c) {
+    for (i, c) in b.child_refs(root).iter().enumerate() {
+        for mut sub in positions(b, *c) {
             let mut path = vec![i as u8];
             path.append(&mut sub);
             out.push(path);
@@ -319,72 +308,137 @@ pub(crate) fn positions(arena: &ExprArena, root: ExprId) -> Vec<Vec<u8>> {
     out
 }
 
-fn walk_position(arena: &ExprArena, root: ExprId, position: &[u8]) -> ExprId {
+fn walk_position(b: &ExprBuilder, root: ExprRef, position: &[u8]) -> ExprRef {
     let mut cur = root;
     for &i in position {
-        cur = arena
-            .children(cur)
-            .nth(i as usize)
-            .expect("walk_position: path index out of bounds for this arena's arity");
+        cur = *b
+            .child_refs(cur)
+            .get(i as usize)
+            .expect("walk_position: path index out of bounds for this pattern's arity");
     }
     cur
 }
 
 /// Rebuild `root`, replacing the subtree at `position` with `replacement`.
-fn replace_at(arena: &mut ExprArena, root: ExprId, position: &[u8], replacement: ExprId) -> ExprId {
+fn replace_at(
+    b: &mut ExprBuilder,
+    root: ExprRef,
+    position: &[u8],
+    replacement: ExprRef,
+) -> ExprRef {
     let Some((&i, rest)) = position.split_first() else {
         return replacement;
     };
-    let children: Vec<ExprId> = arena.children(root).collect();
+    let children: Vec<ExprRef> = b.child_refs(root).to_vec();
     let idx = i as usize;
     let mut new_children = children.clone();
-    new_children[idx] = replace_at(arena, children[idx], rest, replacement);
-    let kind = arena.kind(root);
-    push_by_arity(arena, kind, &new_children)
+    new_children[idx] = replace_at(b, children[idx], rest, replacement);
+    let op = op_of(b, root);
+    b.push_nary(op, &new_children)
+}
+
+/// The operator at `r`.
+///
+/// # Panics
+///
+/// Panics on a leaf — every caller has already matched `ExprData::Op`.
+fn op_of(b: &ExprBuilder, r: ExprRef) -> pixelflow_ir::OpKind {
+    b.node(r)
+        .op()
+        .expect("op_of: called on a leaf, but the caller matched an Op")
+}
+
+/// Copy the subtree at `root` into `b`, replacing each `Var(v)` for which
+/// `subs` has an entry.
+///
+/// `ExprBuilder` is append-only, so this is a rebuild rather than an in-place
+/// edit — which is also what the arena version did, one `push` at a time.
+pub(crate) fn substitute_vars(b: &mut ExprBuilder, root: ExprRef, subs: &[(u8, ExprRef)]) -> ExprRef {
+    fn go(
+        b: &mut ExprBuilder,
+        r: ExprRef,
+        subs: &[(u8, ExprRef)],
+        memo: &mut BTreeMap<ExprRef, ExprRef>,
+    ) -> ExprRef {
+        if let Some(&hit) = memo.get(&r) {
+            return hit;
+        }
+        let built = match *b.node(r) {
+            ExprData::Var(v) => match subs.iter().find(|(x, _)| *x == v) {
+                Some(&(_, repl)) => repl,
+                None => r,
+            },
+            ExprData::Const(_)
+            | ExprData::Param(_)
+            | ExprData::Buffer(_)
+            | ExprData::Uniform(_) => r,
+            ExprData::Op(op) => {
+                let kids: Vec<ExprRef> = b.child_refs(r).to_vec();
+                let new_kids: Vec<ExprRef> =
+                    kids.iter().map(|&c| go(b, c, subs, memo)).collect();
+                if new_kids == kids {
+                    r
+                } else {
+                    b.push_nary(op, &new_kids)
+                }
+            }
+        };
+        memo.insert(r, built);
+        built
+    }
+    go(b, root, subs, &mut BTreeMap::new())
 }
 
 /// Shift every metavariable in the subtree at `root` by `offset`, giving B's
 /// pattern a namespace disjoint from A's before unification.
-fn shift_vars(arena: &mut ExprArena, root: ExprId, offset: u8) -> ExprId {
+fn shift_vars(b: &mut ExprBuilder, root: ExprRef, offset: u8) -> ExprRef {
     let mut used = std::collections::BTreeSet::new();
-    collect_metavars_arena(arena, root, &mut used);
-    let subs: Vec<(u8, ExprId)> = used
+    collect_metavars_in(b, root, &mut used);
+    let subs: Vec<(u8, ExprRef)> = used
         .into_iter()
-        .map(|v| (v, arena.push_var(offset + v)))
+        .map(|v| (v, b.push_var(offset + v)))
         .collect();
-    arena.substitute_vars_with(root, &subs)
+    substitute_vars(b, root, &subs)
 }
 
-/// Whether `id`'s subtree (resolving through `subst`) reaches metavariable
+/// Whether `r`'s subtree (resolving through `subst`) reaches metavariable
 /// `mv` — the occurs check that keeps unification from building a cyclic
-/// substitution (which `apply_subst_deep` would recurse forever on).
-fn occurs(arena: &ExprArena, mv: u8, id: ExprId, subst: &BTreeMap<u8, ExprId>, depth: u32) -> bool {
+/// substitution (which [`apply_subst_deep`] would recurse forever on).
+fn occurs(
+    b: &ExprBuilder,
+    mv: u8,
+    r: ExprRef,
+    subst: &BTreeMap<u8, ExprRef>,
+    depth: u32,
+) -> bool {
     if depth > 64 {
         // A pattern this deep never arises from the rule library this
         // harness composes; treat it as an occurrence rather than risk an
         // unbounded walk on a construction bug.
         return true;
     }
-    match arena.node(id) {
-        ExprNode::Var(v) => {
-            *v == mv
+    match *b.node(r) {
+        ExprData::Var(v) => {
+            v == mv
                 || subst
-                    .get(v)
-                    .is_some_and(|&t| occurs(arena, mv, t, subst, depth + 1))
+                    .get(&v)
+                    .is_some_and(|&t| occurs(b, mv, t, subst, depth + 1))
         }
-        ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) => {
-            false
-        }
-        _ => arena
-            .children(id)
-            .any(|c| occurs(arena, mv, c, subst, depth + 1)),
+        ExprData::Const(_)
+        | ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_) => false,
+        ExprData::Op(_) => b
+            .child_refs(r)
+            .iter()
+            .any(|&c| occurs(b, mv, c, subst, depth + 1)),
     }
 }
 
-fn resolve(arena: &ExprArena, id: ExprId, subst: &BTreeMap<u8, ExprId>) -> ExprId {
-    let mut cur = id;
-    while let ExprNode::Var(v) = arena.node(cur) {
-        match subst.get(v) {
+fn resolve(b: &ExprBuilder, r: ExprRef, subst: &BTreeMap<u8, ExprRef>) -> ExprRef {
+    let mut cur = r;
+    while let ExprData::Var(v) = *b.node(cur) {
+        match subst.get(&v) {
             Some(&t) => cur = t,
             None => break,
         }
@@ -393,71 +447,76 @@ fn resolve(arena: &ExprArena, id: ExprId, subst: &BTreeMap<u8, ExprId>) -> ExprI
 }
 
 /// First-order syntactic unification of `x` and `y`, extending `subst`.
-/// Read-only over `arena` — unification only ever records bindings, the
+/// Read-only over `b` — unification only ever records bindings, the
 /// substitution is materialized afterward by [`apply_subst_deep`].
-fn unify(arena: &ExprArena, x: ExprId, y: ExprId, subst: &mut BTreeMap<u8, ExprId>) -> bool {
-    let x = resolve(arena, x, subst);
-    let y = resolve(arena, y, subst);
-    match (arena.node(x), arena.node(y)) {
-        (ExprNode::Var(a), ExprNode::Var(b)) if a == b => true,
-        (ExprNode::Var(a), _) => {
-            let a = *a;
-            if occurs(arena, a, y, subst, 0) {
+fn unify(b: &ExprBuilder, x: ExprRef, y: ExprRef, subst: &mut BTreeMap<u8, ExprRef>) -> bool {
+    let x = resolve(b, x, subst);
+    let y = resolve(b, y, subst);
+    match (*b.node(x), *b.node(y)) {
+        (ExprData::Var(a), ExprData::Var(c)) if a == c => true,
+        (ExprData::Var(a), _) => {
+            if occurs(b, a, y, subst, 0) {
                 return false;
             }
             subst.insert(a, y);
             true
         }
-        (_, ExprNode::Var(b)) => {
-            let b = *b;
-            if occurs(arena, b, x, subst, 0) {
+        (_, ExprData::Var(c)) => {
+            if occurs(b, c, x, subst, 0) {
                 return false;
             }
-            subst.insert(b, x);
+            subst.insert(c, x);
             true
         }
-        (ExprNode::Const(cx), ExprNode::Const(cy)) => cx.to_bits() == cy.to_bits(),
-        (ExprNode::Param(_), _) | (_, ExprNode::Param(_)) => false,
-        (ExprNode::Buffer(_), _) | (_, ExprNode::Buffer(_)) => false,
-        (ExprNode::Uniform(_), _) | (_, ExprNode::Uniform(_)) => false,
-        _ => {
-            if arena.kind(x) != arena.kind(y) {
+        // `ExprData::Const` already holds the bit pattern, so this is the
+        // bitwise comparison the arena version spelled `to_bits()`.
+        (ExprData::Const(cx), ExprData::Const(cy)) => cx == cy,
+        (ExprData::Param(_), _) | (_, ExprData::Param(_)) => false,
+        (ExprData::Buffer(_), _) | (_, ExprData::Buffer(_)) => false,
+        (ExprData::Uniform(_), _) | (_, ExprData::Uniform(_)) => false,
+        // A constant and an operator are different terms, as are any two
+        // remaining leaf kinds — only two operators can still unify.
+        (ExprData::Const(_), _) | (_, ExprData::Const(_)) => false,
+        (ExprData::Op(ox), ExprData::Op(oy)) => {
+            if ox != oy {
                 return false;
             }
-            let cx: Vec<ExprId> = arena.children(x).collect();
-            let cy: Vec<ExprId> = arena.children(y).collect();
+            let cx: Vec<ExprRef> = b.child_refs(x).to_vec();
+            let cy: Vec<ExprRef> = b.child_refs(y).to_vec();
             if cx.len() != cy.len() {
                 return false;
             }
             cx.iter()
                 .zip(cy.iter())
-                .all(|(&a, &b)| unify(arena, a, b, subst))
+                .all(|(&a, &c)| unify(b, a, c, subst))
         }
     }
 }
 
-/// Deeply resolve `id` through `subst`, rebuilding whatever changed.
+/// Deeply resolve `r` through `subst`, rebuilding whatever changed.
 /// Unlike [`resolve`] (which only chases `Var` chains at the root), this
 /// walks the whole subtree so a bound metavariable is replaced everywhere it
 /// occurs, including inside sibling structure.
-fn apply_subst_deep(arena: &mut ExprArena, id: ExprId, subst: &BTreeMap<u8, ExprId>) -> ExprId {
-    match arena.node(id).clone() {
-        ExprNode::Var(mv) => match subst.get(&mv) {
-            Some(&t) => apply_subst_deep(arena, t, subst),
-            None => id,
+fn apply_subst_deep(b: &mut ExprBuilder, r: ExprRef, subst: &BTreeMap<u8, ExprRef>) -> ExprRef {
+    match *b.node(r) {
+        ExprData::Var(mv) => match subst.get(&mv) {
+            Some(&t) => apply_subst_deep(b, t, subst),
+            None => r,
         },
-        ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) => id,
-        _ => {
-            let kind = arena.kind(id);
-            let children: Vec<ExprId> = arena.children(id).collect();
-            let new_children: Vec<ExprId> = children
+        ExprData::Const(_)
+        | ExprData::Param(_)
+        | ExprData::Buffer(_)
+        | ExprData::Uniform(_) => r,
+        ExprData::Op(op) => {
+            let children: Vec<ExprRef> = b.child_refs(r).to_vec();
+            let new_children: Vec<ExprRef> = children
                 .iter()
-                .map(|&c| apply_subst_deep(arena, c, subst))
+                .map(|&c| apply_subst_deep(b, c, subst))
                 .collect();
             if new_children == children {
-                id
+                r
             } else {
-                push_by_arity(arena, kind, &new_children)
+                b.push_nary(op, &new_children)
             }
         }
     }
@@ -470,25 +529,25 @@ fn apply_subst_deep(arena: &mut ExprArena, id: ExprId, subst: &BTreeMap<u8, Expr
 /// rewrite (nothing on the LHS would bind it) and is dropped rather than
 /// handed to [`TemplateRewrite::new`]'s assert.
 fn canonicalize_vars(
-    arena: &mut ExprArena,
-    lhs: ExprId,
-    rhs: ExprId,
-) -> Option<(ExprId, ExprId, u8)> {
+    b: &mut ExprBuilder,
+    lhs: ExprRef,
+    rhs: ExprRef,
+) -> Option<(ExprRef, ExprRef, u8)> {
     let mut lhs_vars = std::collections::BTreeSet::new();
-    collect_metavars_arena(arena, lhs, &mut lhs_vars);
+    collect_metavars_in(b, lhs, &mut lhs_vars);
     let mut rhs_vars = std::collections::BTreeSet::new();
-    collect_metavars_arena(arena, rhs, &mut rhs_vars);
+    collect_metavars_in(b, rhs, &mut rhs_vars);
     if !rhs_vars.is_subset(&lhs_vars) {
         return None;
     }
-    let subs: Vec<(u8, ExprId)> = lhs_vars
+    let subs: Vec<(u8, ExprRef)> = lhs_vars
         .iter()
         .enumerate()
-        .map(|(new_i, &old)| (old, arena.push_var(new_i as u8)))
+        .map(|(new_i, &old)| (old, b.push_var(new_i as u8)))
         .collect();
     let count = lhs_vars.len() as u8;
-    let final_lhs = arena.substitute_vars_with(lhs, &subs);
-    let final_rhs = arena.substitute_vars_with(rhs, &subs);
+    let final_lhs = substitute_vars(b, lhs, &subs);
+    let final_rhs = substitute_vars(b, rhs, &subs);
     Some((final_lhs, final_rhs, count))
 }
 
@@ -507,49 +566,48 @@ impl TemplateRewrite {
     /// surviving count, never treat an empty pool as an error by itself.
     #[must_use]
     pub fn compose(a: &dyn Rewrite, b: &dyn Rewrite, position: &[u8]) -> Option<TemplateRewrite> {
-        let mut arena = ExprArena::new();
-        let a_lhs = a.lhs_template(&mut arena)?;
-        let a_rhs = a.rhs_template(&mut arena)?;
+        let mut out = ExprBuilder::new();
+        let a_lhs = a.lhs_template(&mut out)?;
+        let a_rhs = a.rhs_template(&mut out)?;
 
-        let mut b_arena = ExprArena::new();
-        let b_lhs0 = b.lhs_template(&mut b_arena)?;
-        let b_rhs0 = b.rhs_template(&mut b_arena)?;
-        let b_lhs_in_a = arena.splice(&b_arena, b_lhs0);
-        let b_rhs_in_a = arena.splice(&b_arena, b_rhs0);
-        let b_lhs = shift_vars(&mut arena, b_lhs_in_a, B_METAVAR_OFFSET);
-        let b_rhs = shift_vars(&mut arena, b_rhs_in_a, B_METAVAR_OFFSET);
+        // B's sides go into the SAME builder — `lhs_template`/`rhs_template`
+        // splice, so there is no second graph to bridge across.
+        let b_lhs_raw = b.lhs_template(&mut out)?;
+        let b_rhs_raw = b.rhs_template(&mut out)?;
+        let b_lhs = shift_vars(&mut out, b_lhs_raw, B_METAVAR_OFFSET);
+        let b_rhs = shift_vars(&mut out, b_rhs_raw, B_METAVAR_OFFSET);
 
-        let target = walk_position(&arena, a_rhs, position);
+        let target = walk_position(&out, a_rhs, position);
         let mut subst = BTreeMap::new();
-        if !unify(&arena, b_lhs, target, &mut subst) {
+        if !unify(&out, b_lhs, target, &mut subst) {
             return None;
         }
 
         // Filter: B is a no-op at this position (what it matched already
         // equals what it would rewrite to, once both sides are resolved
         // through the unifier).
-        let target_final = apply_subst_deep(&mut arena, target, &subst);
-        let b_rhs_final = apply_subst_deep(&mut arena, b_rhs, &subst);
-        if arena.subtree_eq(target_final, &arena, b_rhs_final) {
+        let target_final = apply_subst_deep(&mut out, target, &subst);
+        let b_rhs_final = apply_subst_deep(&mut out, b_rhs, &subst);
+        if out.node(target_final).subtree_eq(out.node(b_rhs_final)) {
             return None;
         }
 
-        let composed_rhs_pre = replace_at(&mut arena, a_rhs, position, b_rhs);
-        let composed_lhs = apply_subst_deep(&mut arena, a_lhs, &subst);
-        let composed_rhs = apply_subst_deep(&mut arena, composed_rhs_pre, &subst);
+        let composed_rhs_pre = replace_at(&mut out, a_rhs, position, b_rhs);
+        let composed_lhs = apply_subst_deep(&mut out, a_lhs, &subst);
+        let composed_rhs = apply_subst_deep(&mut out, composed_rhs_pre, &subst);
 
         let (final_lhs, final_rhs, _count) =
-            canonicalize_vars(&mut arena, composed_lhs, composed_rhs)?;
+            canonicalize_vars(&mut out, composed_lhs, composed_rhs)?;
 
         // Filter: identity — the composition changed nothing (e.g.
         // commutative∘commutative).
-        if arena.subtree_eq(final_lhs, &arena, final_rhs) {
+        if out.node(final_lhs).subtree_eq(out.node(final_rhs)) {
             return None;
         }
 
         let name = format!("{}\u{2218}{}@{position:?}", a.name(), b.name());
-        Some(TemplateRewrite::from_arena(
-            name, arena, final_lhs, final_rhs,
+        Some(TemplateRewrite::from_builder(
+            name, out, final_lhs, final_rhs,
         ))
     }
 }
@@ -563,7 +621,7 @@ mod tests {
     /// `a - b -> a + neg(b)`, hand-built as a template — should behave
     /// exactly like `math::algebra::Canonicalize::<AddNeg>`.
     fn sub_to_add_neg() -> TemplateRewrite {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let v0 = a.push_var(0);
         let v1 = a.push_var(1);
         let lhs = a.push_binary(OpKind::Sub, v0, v1);
@@ -571,7 +629,7 @@ mod tests {
         let v1b = a.push_var(1);
         let neg = a.push_unary(OpKind::Neg, v1b);
         let rhs = a.push_binary(OpKind::Add, v0b, neg);
-        TemplateRewrite::from_arena("test_sub_to_add_neg", a, lhs, rhs)
+        TemplateRewrite::from_builder("test_sub_to_add_neg", a, lhs, rhs)
     }
 
     #[test]
@@ -596,12 +654,12 @@ mod tests {
     fn compose_matches_a_deeper_pattern_with_a_repeated_metavariable() {
         // (a - a) -> should match a template for Sub(V0, V0) and refuse
         // Sub(V0, V1) style mismatches when the two operands are unrelated.
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let v0 = a.push_var(0);
         let v0b = a.push_var(0);
         let lhs = a.push_binary(OpKind::Sub, v0, v0b);
         let zero = a.push_const(0.0);
-        let rule = TemplateRewrite::from_arena("test_self_sub", a, lhs, zero);
+        let rule = TemplateRewrite::from_builder("test_self_sub", a, lhs, zero);
 
         let mut eg = EGraph::new();
         let x = eg.add(ENode::Var(0));
@@ -630,7 +688,7 @@ mod tests {
     #[test]
     fn dag_builder_template_rewrite() {
         // `x - y`, `x + (-y)`, built directly via `dag::Builder` rather than
-        // derived from an `ExprArena` — the thing this test exists to
+        // through `ExprBuilder` — the thing this test exists to
         // exercise. `Builder`/`Id` are `pub(crate)` to `pixelflow_ir`, so
         // this crate can no longer build that shape itself; the fixture
         // lives in `pixelflow_ir::internal_test_support`, the one place

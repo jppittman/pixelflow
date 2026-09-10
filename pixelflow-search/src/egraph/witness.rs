@@ -575,19 +575,22 @@ pub fn reachable_under(
     out
 }
 
-/// Materialize a choice map as an arena — `Optimized::to_arena` for a map
+/// Materialize a choice map as an expression graph — `Optimized::to_rooted` for a map
 /// this module produced rather than one `Optimizer::run` returned.
 ///
 /// # Panics
 ///
 /// If `choices` is not well-founded from `root`.
 #[must_use]
-pub fn arena_of(
+pub fn rooted_of(
     egraph: &EGraph,
     root: EClassId,
     choices: Vec<Option<usize>>,
-) -> (pixelflow_ir::arena::ExprArena, pixelflow_ir::arena::ExprId) {
-    super::extract::choices_to_arena(&super::extract::Extraction::from_dp(egraph, root, choices))
+) -> (
+    pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+    pixelflow_ir::expr::Environment,
+) {
+    super::extract::choices_to_rooted(&super::extract::Extraction::from_dp(egraph, root, choices))
 }
 
 /// The cycle sentinel both DP passes price an unresolved child at, exported

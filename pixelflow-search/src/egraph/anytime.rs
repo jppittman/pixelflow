@@ -58,7 +58,7 @@
 
 use alloc::vec::Vec;
 
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::expr::Term;
 
 use super::extract::ChoiceCost;
 use super::graph::{EGraph, SaturationStop};
@@ -135,28 +135,7 @@ pub struct AnytimeCurveOutput {
     pub extraction: super::optimizer::Optimized,
 }
 
-/// Number of DISTINCT arena nodes reachable from `root`.
-///
-/// Not `ExprArena::node_count_subtree`, which is documented to count a shared
-/// subtree once per reference (tree size, not DAG size) and so would not
-/// equal `nodes_raw().len()` for any expression with sharing.
-fn reachable_node_count(arena: &ExprArena, root: ExprId) -> usize {
-    let mut seen = alloc::vec![false; arena.nodes_raw().len()];
-    let mut stack = alloc::vec![root];
-    let mut count = 0usize;
-    while let Some(id) = stack.pop() {
-        let slot = &mut seen[id.0 as usize];
-        if *slot {
-            continue;
-        }
-        *slot = true;
-        count += 1;
-        stack.extend(arena.children(id));
-    }
-    count
-}
-
-/// Run one incremental saturation of `(arena, root)` under `optimizer`,
+/// Run one incremental saturation of `term` under `optimizer`,
 /// sampling extraction cost at each application-count target in `grid`.
 ///
 /// The guided and unguided arms differ **only** in whether `optimizer`
@@ -175,13 +154,11 @@ fn reachable_node_count(arena: &ExprArena, root: ExprId) -> usize {
 /// # Panics
 ///
 /// - If `grid` is empty or not strictly increasing.
-/// - If `arena` holds nodes unreachable from `root` (see below).
 /// - If `optimizer`'s wall-clock ceiling is exceeded — offline measurement
 ///   fails loud, never silently truncates.
 pub fn run_anytime_curve(
     optimizer: &mut Optimizer,
-    arena: &ExprArena,
-    root: ExprId,
+    term: Term<'_>,
     grid: &[usize],
 ) -> AnytimeCurveOutput {
     assert!(!grid.is_empty(), "anytime: empty checkpoint grid");
@@ -190,25 +167,19 @@ pub fn run_anytime_curve(
         "anytime: checkpoint grid must be strictly increasing, got {grid:?}"
     );
 
-    // An append-only `ExprArena` that has been rewritten in place carries
-    // abandoned nodes, and saturating them would spend this curve's
-    // application budget rewriting an expression nobody asked about — making
-    // the curve a function of the arena's allocation history rather than of
-    // the expression. This used to be a precondition callers had to meet by
-    // compacting first, asserted here, because `EGraph::add_arena` inserted
-    // every node of `arena` rather than the subtree reachable from `root`.
-    // `egraph::insert` is reachable-only, so the property now holds by
+    // A graph that has been rewritten carries abandoned nodes, and saturating
+    // them would spend this curve's application budget rewriting an expression
+    // nobody asked about — making the curve a function of the graph's
+    // construction history rather than of the expression. This used to be a
+    // precondition callers had to meet by compacting first, asserted here.
+    // `egraph::insert_term` is reachable-only, so the property now holds by
     // construction and the budget is keyed on exactly what was inserted.
-    let node_count = reachable_node_count(arena, root);
+    let node_count = crate::egraph::reachable_count_term(term);
 
     let mut egraph = optimizer.egraph();
-    let root_class = crate::egraph::insert(
-        arena,
-        root,
-        &mut egraph,
-        crate::egraph::Vocabulary::Templates,
-    )
-    .expect("anytime: arena must be e-graph representable");
+    let root_class =
+        crate::egraph::insert_term(term, &mut egraph, crate::egraph::Vocabulary::Templates)
+            .expect("anytime: term must be e-graph representable");
     // Sized after insertion and before any rewrite, as `Optimizer::run`
     // sizes it: the class count here is the hash-consed input.
     let input = super::saturate::InputSize {
@@ -315,9 +286,12 @@ mod tests {
     use super::*;
     use pixelflow_ir::OpKind;
 
-    fn small_expr() -> (ExprArena, ExprId) {
+    fn small_expr() -> (
+        pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+        pixelflow_ir::expr::Environment,
+    ) {
         // (x + y) * (x + y) + 2 * (x + y) — the `redundant` shader shape.
-        let mut a = ExprArena::new();
+        let mut a = pixelflow_ir::expr::ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let s = a.push_binary(OpKind::Add, x, y);
@@ -325,7 +299,7 @@ mod tests {
         let two = a.push_const(2.0);
         let ts = a.push_binary(OpKind::Mul, two, s);
         let out = a.push_binary(OpKind::Add, s2, ts);
-        (a, out)
+        a.finish(&[out])
     }
 
     fn curve_optimizer() -> Optimizer {
@@ -336,10 +310,10 @@ mod tests {
 
     #[test]
     fn curve_has_one_row_per_grid_target_and_monotone_cost() {
-        let (arena, root) = small_expr();
+        let (rooted, env) = small_expr();
         let grid = [25, 50, 100, 200, 400];
         let mut opt = curve_optimizer();
-        let out = run_anytime_curve(&mut opt, &arena, root, &grid);
+        let out = run_anytime_curve(&mut opt, Term::new(rooted.entry(), &env), &grid);
         assert_eq!(out.curve.checkpoints.len(), grid.len());
         for (cp, &target) in out.curve.checkpoints.iter().zip(grid.iter()) {
             assert_eq!(cp.app_target, target);
@@ -369,10 +343,10 @@ mod tests {
     /// prefix sum and this would read far above the grid.
     #[test]
     fn live_checkpoints_land_exactly_on_their_target() {
-        let (arena, root) = small_expr();
+        let (rooted, env) = small_expr();
         let grid = [5, 10, 20];
         let mut opt = curve_optimizer();
-        let out = run_anytime_curve(&mut opt, &arena, root, &grid);
+        let out = run_anytime_curve(&mut opt, Term::new(rooted.entry(), &env), &grid);
         for cp in &out.curve.checkpoints {
             if cp.clamped || cp.stop != SaturationStop::ApplicationBudget {
                 continue;
@@ -387,11 +361,11 @@ mod tests {
 
     #[test]
     fn clamped_rows_freeze_the_final_state() {
-        let (arena, root) = small_expr();
+        let (rooted, env) = small_expr();
         // Absurdly large later targets force clamping after quiescence.
         let grid = [25, 1_000_000, 2_000_000];
         let mut opt = curve_optimizer();
-        let out = run_anytime_curve(&mut opt, &arena, root, &grid);
+        let out = run_anytime_curve(&mut opt, Term::new(rooted.entry(), &env), &grid);
         // Any terminal reason will do — this fixture reaches the registered
         // 2 000-class cap before it quiesces, and which of the two fires is
         // a property of the rule set, not of clamping. What clamping owes is
@@ -419,13 +393,13 @@ mod tests {
         use crate::nnue::guide::Guide;
         use alloc::boxed::Box;
 
-        let (arena, root) = small_expr();
+        let (rooted, env) = small_expr();
         let grid = [25, 50, 100];
         let mut opt = curve_optimizer().guide(Some(Box::new(Guide::new_random(
             OpEmbeddings::new_random(5),
             9,
         ))));
-        let out = run_anytime_curve(&mut opt, &arena, root, &grid);
+        let out = run_anytime_curve(&mut opt, Term::new(rooted.entry(), &env), &grid);
         assert_eq!(out.curve.checkpoints.len(), grid.len());
         assert!(out.curve.checkpoints.iter().all(|c| c.cost.dag > 0));
     }

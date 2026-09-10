@@ -7,10 +7,10 @@
 //! second out by hand.
 
 use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{Term, relink};
 use pixelflow_ir::optimize::{Optimize, Rewritten};
 
-use crate::egraph::{Optimizer, Vocabulary, insert, reachable_count};
+use crate::egraph::{Optimizer, Vocabulary, insert_term, reachable_count_term};
 use crate::tier::Tier;
 
 /// Rewrite a term by equality saturation under `optimizer`.
@@ -71,19 +71,19 @@ impl Saturate {
 }
 
 impl Optimize for Saturate {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
+    fn optimize(&mut self, term: Term<'_>) -> Rewritten {
         let mut egraph = self.optimizer.egraph();
-        let Ok(root_class) = insert(arena, root, &mut egraph, self.vocab) else {
+        let Ok(root_class) = insert_term(term, &mut egraph, self.vocab) else {
             return Rewritten::Declined;
         };
 
-        let node_count = reachable_count(arena, root);
+        let node_count = reachable_count_term(term);
         #[cfg(feature = "saturation-telemetry")]
         let inserted_classes = egraph.num_classes();
         #[cfg(feature = "saturation-telemetry")]
         let telemetry_start = std::time::Instant::now();
         let optimized = self.optimizer.run(&mut egraph, root_class, node_count);
-        let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
+        let (extracted, extracted_env) = optimized.to_rooted(&egraph, root_class);
 
         #[cfg(feature = "saturation-telemetry")]
         crate::telemetry::record(crate::telemetry::SaturationInvocation {
@@ -93,36 +93,25 @@ impl Optimize for Saturate {
             extraction: optimized.extraction,
             stats: &optimized.stats,
             union_count: optimized.stats.unions,
-            extracted_arena: &extracted,
-            extracted_root,
+            extracted: Term::new(extracted.entry(), &extracted_env),
             wall_clock: telemetry_start.elapsed(),
             kernel_label: None,
         });
 
-        // The extracted arena declares buffers in extraction-traversal order,
-        // which need not match the input's — and slot order is ABI: the JIT
-        // loads slot i's base pointer from the caller's context array at i*8,
-        // and callers bind in the order the arena THEY BUILT declared. A
-        // different extraction (a commuted equivalent under another cost
-        // model) must not silently permute their pointers. Re-splicing onto a
-        // table pre-declared in input order makes the invariant structural:
-        // splice dedups buffers by identity onto the existing slots.
-        if arena.buffers().is_empty() {
-            return Rewritten::Changed(extracted, extracted_root);
-        }
-        let mut ordered = ExprArena::new();
-        for decl in arena.buffers() {
-            let _slot = ordered.declare_buffer(*decl);
-        }
-        let new_root = ordered.splice(&extracted, extracted_root);
-        debug_assert!(
-            ordered
-                .buffers()
-                .iter()
-                .zip(arena.buffers())
-                .all(|(a, b)| a.id == b.id),
-            "buffer slot order must survive optimization"
+        // Extraction declares buffers and uniforms in traversal order, which
+        // need not match the input's — and slot order is ABI: the JIT loads
+        // slot i's base pointer from the caller's context array at i*8, and
+        // callers bind in the order the term THEY BUILT declared. A different
+        // extraction (a commuted equivalent under another cost model) must not
+        // silently permute their pointers. `relink` says exactly that: the
+        // same graph, against the input's declaration order, with every
+        // reachable leaf renumbered to its slot there.
+        let input_env = term.env();
+        let (relinked, env) = relink(
+            Term::new(extracted.entry(), &extracted_env),
+            &input_env.buffers,
+            &input_env.uniforms,
         );
-        Rewritten::Changed(ordered, new_root)
+        Rewritten::Changed(relinked, env)
     }
 }

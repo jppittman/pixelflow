@@ -1868,7 +1868,7 @@ impl EGraph {
     /// # Panics
     ///
     /// On a `Param`/`Buffer` node (a rewrite RHS template must never contain
-    /// either), on an `OpKind` with no static [`Op`] (an arena/op-table
+    /// either), on an `OpKind` with no static [`Op`] (an IR/op-table
     /// drift, not a runtime condition), or on a metavariable with no
     /// binding.
     fn instantiate_template(
@@ -2730,9 +2730,12 @@ impl EGraph {
         &self,
         root: EClassId,
         costs: &CostModel,
-    ) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
-        let (arena, arena_root, _cost) = super::extract::extract(self, root, costs);
-        (arena, arena_root)
+    ) -> (
+        pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+        pixelflow_ir::expr::Environment,
+    ) {
+        let (rooted, env, _cost) = super::extract::extract(self, root, costs);
+        (rooted, env)
     }
 
     /// Extract the best expression and its cost.
@@ -2743,7 +2746,11 @@ impl EGraph {
         &self,
         root: EClassId,
         costs: &C,
-    ) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId, usize) {
+    ) -> (
+        pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+        pixelflow_ir::expr::Environment,
+        usize,
+    ) {
         super::extract::extract(self, root, costs)
     }
 
@@ -3221,9 +3228,9 @@ mod tests {
 
         // Extract and verify structure
         let costs = CostModel::default();
-        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
-        eprintln!("Extracted arena: root={:?} len={}", root, arena.len());
-        assert!(arena.node_count_subtree(root) > 0);
+        let (rooted, _env) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Extracted graph: len={}", rooted.len());
+        assert!(rooted.entry().node_count() > 0);
     }
 
     #[test]
@@ -3251,9 +3258,9 @@ mod tests {
         SaturationConfig::compatibility(100).run(&mut eg);
 
         let costs = CostModel::default();
-        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
-        eprintln!("Extracted arena: root={:?} len={}", root, arena.len());
-        assert!(arena.node_count_subtree(root) > 0);
+        let (rooted, _env) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Extracted graph: len={}", rooted.len());
+        assert!(rooted.entry().node_count() > 0);
     }
 
     #[test]
@@ -3280,13 +3287,9 @@ mod tests {
         SaturationConfig::compatibility(100).run(&mut eg);
 
         let costs = CostModel::default();
-        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
-        eprintln!(
-            "Extracted arena with vars: root={:?} len={}",
-            root,
-            arena.len()
-        );
-        assert!(arena.node_count_subtree(root) > 0);
+        let (rooted, _env) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Extracted graph with vars: len={}", rooted.len());
+        assert!(rooted.entry().node_count() > 0);
     }
 
     #[test]
@@ -3314,13 +3317,9 @@ mod tests {
 
         // Use default costs like the kernel! macro does
         let costs = CostModel::new();
-        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
-        eprintln!(
-            "Extracted arena with FMA costs: root={:?} len={}",
-            root,
-            arena.len()
-        );
-        assert!(arena.node_count_subtree(root) > 0);
+        let (rooted, _env) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Extracted graph with FMA costs: len={}", rooted.len());
+        assert!(rooted.entry().node_count() > 0);
     }
 
     #[test]
@@ -3365,9 +3364,9 @@ mod tests {
         SaturationConfig::compatibility(100).run(&mut eg);
 
         let costs = CostModel::new();
-        let (arena, root) = eg.extract_expr_with_costs(result, &costs);
-        eprintln!("Discriminant arena: root={:?} len={}", root, arena.len());
-        assert!(arena.node_count_subtree(root) > 0);
+        let (rooted, _env) = eg.extract_expr_with_costs(result, &costs);
+        eprintln!("Discriminant graph: len={}", rooted.len());
+        assert!(rooted.entry().node_count() > 0);
     }
 
     #[test]
@@ -3414,15 +3413,15 @@ mod tests {
 
         // Extract with default costs (high threshold)
         let default_costs = CostModel::default();
-        let (arena, root) = eg.extract_expr_with_costs(current, &default_costs);
-        assert!(arena.node_count_subtree(root) > 0);
+        let (rooted, _env) = eg.extract_expr_with_costs(current, &default_costs);
+        assert!(rooted.entry().node_count() > 0);
 
         // Extract with shallow costs (low threshold)
         let mut shallow_costs = CostModel::new();
         shallow_costs.depth_threshold = 3;
         shallow_costs.depth_penalty = 1000;
-        let (arena2, root2) = eg.extract_expr_with_costs(current, &shallow_costs);
-        assert!(arena2.node_count_subtree(root2) > 0);
+        let (rooted2, _env2) = eg.extract_expr_with_costs(current, &shallow_costs);
+        assert!(rooted2.entry().node_count() > 0);
     }
 
     // ========================================================================
@@ -4001,7 +4000,7 @@ mod mask_tests {
     /// dominate, which is exactly the regime
     /// [`MaskScope::AllMatchingCandidate`] exists to see through.
     fn mask_fixture() -> (Optimizer, EGraph, EClassId) {
-        let mut arena = pixelflow_ir::ExprArena::new();
+        let mut arena = pixelflow_ir::expr::ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let xx = arena.push_binary(pixelflow_ir::OpKind::Mul, x, x);

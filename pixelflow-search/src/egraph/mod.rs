@@ -22,7 +22,7 @@
 //!
 //! This module is the compile-time-agnostic core: it optimizes an e-graph
 //! regardless of when it was built. [`crate::runtime`] is the runtime-facing
-//! front door — insert an [`pixelflow_ir::arena::ExprArena`] directly, no AST
+//! front door — insert a [`Term`](pixelflow_ir::expr::Term) directly, no AST
 //! involved.
 
 pub mod anytime;
@@ -69,14 +69,14 @@ pub use derivative::{ChainRule, derivative_rules};
 pub use extract::{
     ChoiceCost, ClaimAudit, CostScale, ExtractedDAG, Extraction, ExtractionObjective,
     ExtractionReport, SHARED_DAG_PASS_BYTE_BUDGET, SharedPassStats,
-    build_extracted_dag_from_choices, choices_to_arena, compute_ref_counts, cost_of_choices,
+    build_extracted_dag_from_choices, choices_to_rooted, compute_ref_counts, cost_of_choices,
     extract, extract_dag,
 };
 pub use graph::{
     ApplicationMask, ApplyResult, EGraph, EGraphBatch, HARD_CLASS_LIMIT, MaskScope, RewriteTarget,
     SaturationStats, SaturationStop, ScanStop,
 };
-pub use insert::{Declined, insert, reachable_count};
+pub use insert::{Declined, insert, insert_term, reachable_count, reachable_count_term};
 #[cfg(feature = "provenance-journal")]
 pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
 pub use node::{EClassId, ENode};

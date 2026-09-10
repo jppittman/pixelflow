@@ -32,8 +32,9 @@
 
 use std::collections::BTreeSet;
 
-use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::Node;
 use pixelflow_ir::binding::BindingTable;
+use pixelflow_ir::expr::{ExprBuilder, ExprData, ExprRef, Term};
 
 use crate::egraph::Rewrite;
 
@@ -48,7 +49,7 @@ pub(crate) const MAX_ORACLE_METAVARS: u8 = 4;
 
 /// Coordinate axes a lattice has: metavariables below this many are sampled
 /// as coordinates, the rest as uniforms.
-const COORD_AXES: u8 = pixelflow_ir::arena::COORD_AXES as u8;
+const COORD_AXES: u8 = pixelflow_ir::decl::COORD_AXES as u8;
 
 /// Relative/absolute tolerance for "these are the same real value computed
 /// two different ways" — looser than same-expansion bit-parity (see module
@@ -142,17 +143,10 @@ impl SplitMix64 {
     }
 }
 
-fn collect_metavars(arena: &ExprArena, id: pixelflow_ir::ExprId, out: &mut BTreeSet<u8>) {
-    use pixelflow_ir::arena::ExprNode;
-    match arena.node(id) {
-        ExprNode::Var(mv) => {
-            out.insert(*mv);
-        }
-        ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) => {}
-        _ => {
-            for c in arena.children(id) {
-                collect_metavars(arena, c, out);
-            }
+fn collect_metavars(node: Node<'_, ExprData>, out: &mut BTreeSet<u8>) {
+    for n in node.descendants() {
+        if let ExprData::Var(mv) = *n {
+            out.insert(mv);
         }
     }
 }
@@ -218,17 +212,17 @@ pub(crate) fn cross_form_oracle(
     seed: u64,
     points: usize,
 ) -> Option<OracleVerdict> {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let lhs = rule.lhs_template(&mut arena)?;
     let rhs = rule.rhs_template(&mut arena)?;
 
-    if pixelflow_ir::eval::is_mask_valued(&arena, rhs) {
+    if pixelflow_ir::eval::is_mask_valued(arena.node(rhs)) {
         return None;
     }
 
     let mut vars = BTreeSet::new();
-    collect_metavars(&arena, lhs, &mut vars);
-    collect_metavars(&arena, rhs, &mut vars);
+    collect_metavars(arena.node(lhs), &mut vars);
+    collect_metavars(arena.node(rhs), &mut vars);
     if vars.iter().any(|&v| v >= MAX_ORACLE_METAVARS) {
         return None;
     }
@@ -243,21 +237,24 @@ pub(crate) fn cross_form_oracle(
         .filter(|&v| v >= COORD_AXES)
         .map(|v| (v, pixelflow_ir::Uniform::new(0.0)))
         .collect();
-    let subs: Vec<(u8, pixelflow_ir::ExprId)> = args
+    let subs: Vec<(u8, ExprRef)> = args
         .iter()
         .map(|&(v, u)| {
             let slot = arena.declare_uniform(u.decl());
             (v, arena.push_uniform(slot))
         })
         .collect();
-    let lhs = arena.substitute_vars_with(lhs, &subs);
-    let rhs = arena.substitute_vars_with(rhs, &subs);
+    let lhs = crate::egraph::template::substitute_vars(&mut arena, lhs, &subs);
+    let rhs = crate::egraph::template::substitute_vars(&mut arena, rhs, &subs);
+    let (rooted, env) = arena.finish(&[lhs, rhs]);
+    let lhs = Term::new(rooted.entry_at(0), &env);
+    let rhs = Term::new(rooted.entry_at(1), &env);
 
     let mut rng = SplitMix64(seed ^ 0xD1B5_4A32_9C1E_77F1);
     let mut verdict = OracleVerdict::default();
 
     for _ in 0..points {
-        let mut point = [0.0f32; pixelflow_ir::arena::COORD_AXES];
+        let mut point = [0.0f32; pixelflow_ir::decl::COORD_AXES];
         for &v in vars.iter().filter(|&&v| v < COORD_AXES) {
             point[v as usize] = rng.next_f32(4.0);
         }
@@ -266,10 +263,10 @@ pub(crate) fn cross_form_oracle(
             .map(|&(_, u)| (u.identity(), rng.next_f32(4.0)))
             .collect();
         let bindings = BindingTable::empty()
-            .bind_uniforms(&arena, &values)
+            .bind_uniforms(&env, &values)
             .expect("every argument was declared just above");
-        let got = pixelflow_ir::eval_scalar(&arena, lhs, &point, &bindings);
-        let want = pixelflow_ir::eval_scalar(&arena, rhs, &point, &bindings);
+        let got = pixelflow_ir::eval_scalar(lhs, &point, &bindings);
+        let want = pixelflow_ir::eval_scalar(rhs, &point, &bindings);
         match compare(got, want) {
             PointOutcome::Agree => verdict.agree += 1,
             PointOutcome::IllConditioned => verdict.ill_conditioned += 1,

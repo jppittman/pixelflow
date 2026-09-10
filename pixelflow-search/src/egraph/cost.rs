@@ -476,7 +476,7 @@ mod cost_model_accessors {
     use crate::egraph::ops::op_from_kind;
     use crate::egraph::{EGraph, ENode};
     use pixelflow_ir::OpKind;
-    use pixelflow_ir::arena::{BufferDecl, BufferIdentity};
+    use pixelflow_ir::decl::{BufferDecl, BufferIdentity};
 
     /// `set_cost` followed by `cost` for the same op should observe the
     /// value just written, and must not disturb any other op's price —

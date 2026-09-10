@@ -152,7 +152,7 @@ impl GuidedEpisode {
             .applications
             .map(|n| egraph.application_count().saturating_add(n));
         // The episode's feature constant: the live analogue of the offline
-        // label-minting replay's `arena.nodes_raw().len()` snapshot, taken
+        // label-minting replay's node-count snapshot, taken
         // before saturation runs.
         let expr_node_count = *self
             .expr_node_count
@@ -514,9 +514,10 @@ mod tests {
     #[test]
     fn l4_a_guide_changes_the_order_not_the_denotation() {
         use pixelflow_ir::binding::BindingTable;
-        use pixelflow_ir::{ExprArena, eval_scalar};
+        use pixelflow_ir::eval_scalar;
+        use pixelflow_ir::expr::{ExprBuilder, Term};
 
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(pixelflow_ir::OpKind::Add, x, y);
@@ -528,7 +529,13 @@ mod tests {
             alloc::vec![[0.5, 1.5], [2.0, 3.0], [-1.25, 4.5], [7.0, 0.25],];
         let want: Vec<f32> = samples
             .iter()
-            .map(|c| eval_scalar(&arena, root, c, &BindingTable::empty()))
+            .map(|c| {
+                eval_scalar(
+                    Term::new(arena.node(root), arena.env()),
+                    c,
+                    &BindingTable::empty(),
+                )
+            })
             .collect();
 
         let guides: Vec<(&str, Box<dyn SaturationGuide>)> = alloc::vec![
@@ -550,16 +557,20 @@ mod tests {
             let root_class =
                 crate::egraph::insert(&arena, root, &mut eg, crate::egraph::Vocabulary::Templates)
                     .expect("insert into e-graph");
-            let out = opt.run(&mut eg, root_class, arena.nodes_raw().len());
-            let (got_arena, got_root) = out.to_arena(&eg, root_class);
+            let out = opt.run(&mut eg, root_class, arena.len());
+            let (got, got_env) = out.to_rooted(&eg, root_class);
             for (c, expected) in samples.iter().zip(&want) {
-                let got = eval_scalar(&got_arena, got_root, c, &BindingTable::empty());
+                let value = eval_scalar(
+                    Term::new(got.entry(), &got_env),
+                    c,
+                    &BindingTable::empty(),
+                );
                 assert!(
-                    (got - expected).abs() <= 1e-4 * expected.abs().max(1.0),
-                    "L4: guide {label} changed the denotation at {c:?}: {got} vs {expected}"
+                    (value - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                    "L4: guide {label} changed the denotation at {c:?}: {value} vs {expected}"
                 );
             }
-            shapes.push((label, got_arena.nodes_raw().len()));
+            shapes.push((label, got.len()));
         }
         assert_eq!(shapes.len(), 3);
     }

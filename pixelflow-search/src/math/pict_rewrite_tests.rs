@@ -28,7 +28,7 @@
 use crate::egraph::{EGraph, ENode, saturate_with_budget};
 use crate::math::all_rules;
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::expr::{ExprBuilder, ExprData, ExprRef};
 
 // ============================================================================
 // Pairwise covering-array generator (see the ANSI/SGR POC for the annotated
@@ -101,41 +101,13 @@ fn pairwise(level_counts: &[usize]) -> Vec<Vec<usize>> {
 // E-graph plumbing (mirrors the harness in `math::tests`).
 // ============================================================================
 
-fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::egraph::EClassId {
-    match *arena.node(id) {
-        ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
-        ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
-        ExprNode::Unary(kind, a) => {
-            let ca = expr_to_egraph(arena, a, egraph);
-            let op = crate::egraph::ops::op_from_kind(kind).expect("op");
-            egraph.add(ENode::Op {
-                op,
-                children: vec![ca],
-            })
-        }
-        ExprNode::Binary(kind, a, b) => {
-            let ca = expr_to_egraph(arena, a, egraph);
-            let cb = expr_to_egraph(arena, b, egraph);
-            let op = crate::egraph::ops::op_from_kind(kind).expect("op");
-            egraph.add(ENode::Op {
-                op,
-                children: vec![ca, cb],
-            })
-        }
-        ExprNode::Ternary(kind, a, b, c) => {
-            let ca = expr_to_egraph(arena, a, egraph);
-            let cb = expr_to_egraph(arena, b, egraph);
-            let cc = expr_to_egraph(arena, c, egraph);
-            let op = crate::egraph::ops::op_from_kind(kind).expect("op");
-            egraph.add(ENode::Op {
-                op,
-                children: vec![ca, cb, cc],
-            })
-        }
-        ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) | ExprNode::Nary(..) => {
-            panic!("unsupported node in rewrite POC")
-        }
-    }
+fn expr_to_egraph(
+    arena: &ExprBuilder,
+    id: ExprRef,
+    egraph: &mut EGraph,
+) -> crate::egraph::EClassId {
+    crate::egraph::insert(arena, id, egraph, crate::egraph::Vocabulary::Templates)
+        .expect("unsupported node in rewrite POC")
 }
 
 /// Evaluate an arena expression with **exact** transcendentals.
@@ -154,16 +126,20 @@ fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::
 /// are overridden with the host's exact versions. `pixelflow-search` is a
 /// host-only crate (e-graph + NNUE training), so std math here is fine — it is
 /// a test oracle, never a runtime path.
-fn eval_arena(arena: &ExprArena, id: ExprId, vars: &[f32; 4]) -> f32 {
-    let rec = |c| eval_arena(arena, c, vars);
-    match *arena.node(id) {
-        ExprNode::Var(i) => vars[i as usize],
-        ExprNode::Const(c) => c,
-        ExprNode::Unary(op, a) => exact_unary(op, rec(a)),
-        ExprNode::Binary(op, a, b) => exact_binary(op, rec(a), rec(b)),
-        ExprNode::Ternary(op, a, b, c) => op
-            .eval_ternary(rec(a), rec(b), rec(c))
-            .unwrap_or_else(|| panic!("exact oracle: ternary {op:?}")),
+fn eval_arena(node: pixelflow_ir::Node<'_, ExprData>, vars: &[f32; 4]) -> f32 {
+    let rec = |c| eval_arena(c, vars);
+    let kids: Vec<_> = node.children().collect();
+    match *node {
+        ExprData::Var(i) => vars[i as usize],
+        ExprData::Const(bits) => f32::from_bits(bits),
+        ExprData::Op(op) => match *kids.as_slice() {
+            [a] => exact_unary(op, rec(a)),
+            [a, b] => exact_binary(op, rec(a), rec(b)),
+            [a, b, c] => op
+                .eval_ternary(rec(a), rec(b), rec(c))
+                .unwrap_or_else(|| panic!("exact oracle: ternary {op:?}")),
+            _ => panic!("exact oracle: unsupported arity for {op:?}"),
+        },
         ref other => panic!("exact oracle: unsupported node {other:?}"),
     }
 }
@@ -223,7 +199,7 @@ const CONSTS: [f32; 5] = [0.0, 1.0, 2.0, -1.0, 0.5];
 const SHAPE_COUNT: usize = 10;
 
 /// Build one operand subtree. `konst` is used by the constant-bearing shapes.
-fn build_shape(a: &mut ExprArena, shape: usize, konst: f32) -> ExprId {
+fn build_shape(a: &mut ExprBuilder, shape: usize, konst: f32) -> ExprRef {
     match shape {
         0 => a.push_var(0),
         1 => a.push_var(1),
@@ -269,13 +245,13 @@ fn build_shape(a: &mut ExprArena, shape: usize, konst: f32) -> ExprId {
 }
 
 fn build_expr(
-    a: &mut ExprArena,
+    a: &mut ExprBuilder,
     outer: OpKind,
     wrapper: Option<OpKind>,
     left: usize,
     right: usize,
     konst: f32,
-) -> ExprId {
+) -> ExprRef {
     let l = build_shape(a, left, konst);
     let r = build_shape(a, right, konst);
     let inner = a.push_binary(outer, l, r);
@@ -380,9 +356,9 @@ fn pict_rewrite_rules_preserve_semantics() {
                 let (left, right) = (row[2], row[3]);
                 let konst = CONSTS[row[4]];
 
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let root = build_expr(&mut arena, outer, wrapper, left, right, konst);
-        let orig_str = arena.display(root).to_string();
+        let orig_str = pixelflow_ir::display(arena.node(root)).to_string();
 
         // Optimize the way the compiler does: build e-graph, saturate once,
         // then extract under several cost models — each pulls out a different
@@ -393,16 +369,16 @@ fn pict_rewrite_rules_preserve_semantics() {
         let canon_root = eg.find(root_class);
 
         for (model_name, costs) in adversarial_cost_models() {
-            let (opt_arena, opt_root, _cost) =
+            let (opt_arena, _opt_env, _cost) =
                 crate::egraph::extract::extract(&eg, canon_root, &costs);
-            let opt_str = opt_arena.display(opt_root).to_string();
+            let opt_str = pixelflow_ir::display(opt_arena.entry()).to_string();
             if opt_str != orig_str {
                 changed += 1;
             }
 
             for point in &points {
-                let original = eval_arena(&arena, root, point);
-                let optimized = eval_arena(&opt_arena, opt_root, point);
+                let original = eval_arena(arena.node(root), point);
+                let optimized = eval_arena(opt_arena.entry(), point);
 
                 // Singularities and overflow: "algebra allows" the two forms to
                 // differ here, so this point does not constrain correctness.

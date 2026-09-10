@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 // ============================================================================
 // FunctionInverse Trait
@@ -147,11 +147,11 @@ impl<T: FunctionInverse> Rewrite for ForwardBackward<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un T::forward().kind(), (un T::backward().kind(), (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 0))
     }
 }
@@ -213,11 +213,11 @@ impl<T: FunctionInverse> Rewrite for BackwardForward<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un T::backward().kind(), (un T::forward().kind(), (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 0))
     }
 }
@@ -342,11 +342,11 @@ impl<T: Homomorphism> Rewrite for HomomorphismRule<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un T::func().kind(), (bin T::source_op().kind(), (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // TargetOp(Func(V0), Func(V1))
         let fk = T::func().kind();
         Some(arena_pat!(__a, bin T::target_op().kind(), (un fk, (var 0)), (un fk, (var 1))))
@@ -406,13 +406,13 @@ impl Rewrite for PowerCombine {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Pow, (var 0), (var 1)), (bin OpKind::Pow, (var 0), (var 2))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Pow, (var 0), (bin OpKind::Add, (var 1), (var 2))))
     }
 }

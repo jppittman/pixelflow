@@ -9,7 +9,8 @@
 use std::sync::Mutex;
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::Rooted;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, Term};
 use pixelflow_search::egraph::Optimizer;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -21,8 +22,8 @@ const VAR: &str = "PIXELFLOW_SATURATION_CEILING_MS";
 /// wide margin in the unoptimized `dev` profile `cargo test` runs under —
 /// the same opt-level-0 regime the calibration doc's whole argument is
 /// about.
-fn fixture() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn fixture() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let mut cur = a.push_var(0);
     for i in 0..40u32 {
         let v = a.push_var((i % 4) as u8);
@@ -31,25 +32,27 @@ fn fixture() -> (ExprArena, ExprId) {
         let prod = a.push_binary(OpKind::Mul, sum, c);
         cur = a.push_binary(OpKind::Sub, prod, v);
     }
-    (a, cur)
+    a.finish(&[cur])
 }
 
-fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+/// A structural rendering of the extracted DAG. `expr::encode` is already the
+/// canonical serialization, so this is its bytes rather than a second answer
+/// to "same term?".
+fn arena_shape(g: &(Rooted<ExprData>, Environment)) -> String {
+    format!("{:?}", pixelflow_ir::encode(g.0.entry()))
 }
 
-fn optimize(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+fn optimize(input: &(Rooted<ExprData>, Environment)) -> (Rooted<ExprData>, Environment) {
     let mut optimizer = Optimizer::production();
     let mut eg = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        Term::new(input.0.entry(), &input.1),
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let optimized = optimizer.run(&mut eg, root_class, arena.len());
-    optimized.to_arena(&eg, root_class)
+    let optimized = optimizer.run(&mut eg, root_class, input.0.len());
+    optimized.to_rooted(&eg, root_class)
 }
 
 /// The invariant the calibration doc states outright: the override can only
@@ -59,38 +62,38 @@ fn optimize(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
 #[test]
 fn the_override_changes_only_whether_run_panics_never_what_it_computes() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (arena, root) = fixture();
+    let input = fixture();
 
     // SAFETY: `_guard` holds this test's exclusive claim on the env var for
     // the whole function body — no other test in this binary touches it
     // without first taking the same lock.
     unsafe { std::env::remove_var(VAR) };
-    let baseline = optimize(&arena, root);
+    let baseline = optimize(&input);
 
     unsafe { std::env::set_var(VAR, "1") };
     let panicked =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize(&arena, root))).is_err();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize(&input))).is_err();
     assert!(
         panicked,
         "a 1ms PIXELFLOW_SATURATION_CEILING_MS must panic on a classical-tier run"
     );
 
     unsafe { std::env::set_var(VAR, "600000") };
-    let generous = optimize(&arena, root);
+    let generous = optimize(&input);
 
     unsafe { std::env::set_var(VAR, "off") };
-    let disabled = optimize(&arena, root);
+    let disabled = optimize(&input);
 
     unsafe { std::env::remove_var(VAR) };
 
     assert_eq!(
-        arena_shape(&baseline.0, baseline.1),
-        arena_shape(&generous.0, generous.1),
+        arena_shape(&baseline),
+        arena_shape(&generous),
         "a generous ceiling override must not change the extracted term"
     );
     assert_eq!(
-        arena_shape(&baseline.0, baseline.1),
-        arena_shape(&disabled.0, disabled.1),
+        arena_shape(&baseline),
+        arena_shape(&disabled),
         "disabling the ceiling must not change the extracted term"
     );
 }
@@ -100,10 +103,10 @@ fn the_override_changes_only_whether_run_panics_never_what_it_computes() {
 #[test]
 fn an_unparsable_override_panics_rather_than_picking_a_default() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (arena, root) = fixture();
+    let input = fixture();
 
     unsafe { std::env::set_var(VAR, "banana") };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize(&arena, root)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| optimize(&input)));
     unsafe { std::env::remove_var(VAR) };
 
     assert!(

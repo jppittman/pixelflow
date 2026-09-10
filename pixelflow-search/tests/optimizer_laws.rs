@@ -26,18 +26,26 @@
 //! truncates is inside the same fence, and its own PR should extend the
 //! `POLICIES` table here rather than re-derive the argument.
 
-use pixelflow_ir::arena::{ExprArena, ExprId};
-use pixelflow_ir::{OpKind, Uniform, binding::BindingTable};
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, Term};
+use pixelflow_ir::{OpKind, Rooted, Uniform, binding::BindingTable};
 use pixelflow_search::egraph::{Budget, EClassId, Optimizer, RuleSet, all_rules};
 
-/// Evaluate an arena through the language's own reference interpreter — the
+/// A graph plus the declarations its leaves index — how every fixture below
+/// holds one, and what a [`Term`] is built from.
+type Graph = (Rooted<ExprData>, Environment);
+
+fn term(g: &Graph) -> Term<'_> {
+    Term::new(g.0.entry(), &g.1)
+}
+
+/// Evaluate a term through the language's own reference interpreter — the
 /// same one the rewrite-soundness tests use, so "denotes the same function"
 /// means here what it means there.
-fn eval(arena: &ExprArena, root: ExprId, vars: &[f32; 2], arg: (Uniform, f32)) -> f32 {
+fn eval(g: &Graph, vars: &[f32; 2], arg: (Uniform, f32)) -> f32 {
     let bindings = BindingTable::empty()
-        .bind_uniforms(arena, &[(arg.0.identity(), arg.1)])
-        .expect("the fixture's argument survives every arena built from it");
-    pixelflow_ir::eval_scalar(arena, root, vars, &bindings)
+        .bind_uniforms(&g.1, &[(arg.0.identity(), arg.1)])
+        .expect("the fixture's argument survives every graph built from it");
+    pixelflow_ir::eval_scalar(term(g), vars, &bindings)
 }
 
 /// One argument value per point in [`POINTS`], so the sweep sweeps the
@@ -73,8 +81,8 @@ const POINTS: [[f32; 2]; 7] = [
 /// handle against another call's arena fails in `bind_uniforms`, and it
 /// presents as "the arena lost its declaration" — a very plausible wrong
 /// diagnosis, and one this file already paid for once.
-fn fixture() -> (ExprArena, ExprId, Uniform) {
-    let mut a = ExprArena::new();
+fn fixture() -> (Graph, Uniform) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let arg = Uniform::new(0.75);
@@ -93,7 +101,7 @@ fn fixture() -> (ExprArena, ExprId, Uniform) {
     let with_z = a.push_binary(OpKind::Add, prod, z);
     let neg = a.push_unary(OpKind::Neg, with_z);
     let root = a.push_binary(OpKind::Sub, with_z, neg);
-    (a, root, arg)
+    (a.finish(&[root]), arg)
 }
 
 /// The ordering policies under test, by name. Each permutes the rule
@@ -141,24 +149,23 @@ fn policy(name: &str) -> RuleSet {
 /// *different* argument than the caller holds, and binding the caller's handle
 /// against this arena would fail — which is exactly what it did, and looked
 /// for a while like extraction dropping declarations. It does not: both this
-/// route and `optimize_runtime_arena` carry the declaration through.
-fn optimize_with(mut optimizer: Optimizer, arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+/// route and `optimize_runtime_term` carry the declaration through.
+fn optimize_with(mut optimizer: Optimizer, input: Term<'_>) -> Graph {
     let mut eg = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        input,
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let node_count = arena.len();
+    let node_count = pixelflow_search::egraph::reachable_count_term(input);
     let optimized = optimizer.run(&mut eg, root_class, node_count);
-    optimized.to_arena(&eg, root_class)
+    optimized.to_rooted(&eg, root_class)
 }
 
 /// **Both optimization routes carry a uniform's declaration through.** Not a
 /// law of the e-graph so much as a fact the link step depends on:
-/// `optimize_runtime_arena` maps uniform *identities* to block offsets
+/// `optimize_runtime_term` maps uniform *identities* to block offsets
 /// downstream, and says so in a comment. A comment is what CLAUDE.md warns
 /// something else eventually breaks, so this checks it.
 ///
@@ -167,30 +174,26 @@ fn optimize_with(mut optimizer: Optimizer, arena: &ExprArena, root: ExprId) -> (
 /// not bind.
 #[test]
 fn extraction_preserves_the_arguments_declaration() {
-    let (arena, root, arg) = fixture();
-    assert_eq!(
-        arena.uniforms().len(),
-        1,
-        "the fixture declares one argument"
-    );
+    let (input, arg) = fixture();
+    assert_eq!(input.1.uniforms.len(), 1, "the fixture declares one argument");
 
-    let (out, _) = optimize_with(Optimizer::production(), &arena, root);
+    let out = optimize_with(Optimizer::production(), term(&input));
     assert_eq!(
-        out.uniforms().len(),
+        out.1.uniforms.len(),
         1,
         "e-graph extraction dropped the argument's declaration"
     );
     assert!(
         BindingTable::empty()
-            .bind_uniforms(&out, &[(arg.identity(), 1.0)])
+            .bind_uniforms(&out.1, &[(arg.identity(), 1.0)])
             .is_ok(),
-        "the extracted arena must still answer to the handle the fixture minted"
+        "the extracted graph must still answer to the handle the fixture minted"
     );
 
     let shape = pixelflow_ir::variance::LatticeShape::new([64, 64]);
-    if let Some(o) = pixelflow_search::runtime::optimize_runtime_arena(&arena, root, shape) {
+    if let Some(o) = pixelflow_search::runtime::optimize_runtime_term(term(&input), shape) {
         assert_eq!(
-            o.0.uniforms().len(),
+            o.1.uniforms.len(),
             1,
             "the production route dropped the argument's declaration"
         );
@@ -211,11 +214,11 @@ fn extraction_preserves_the_arguments_declaration() {
 /// rather than a correctness suite.
 #[test]
 fn every_ordering_policy_extracts_the_same_denotation() {
-    let (input, input_root, arg) = fixture();
+    let (input, arg) = fixture();
     let expected: Vec<f32> = POINTS
         .iter()
         .zip(ARGS)
-        .map(|(p, a)| eval(&input, input_root, p, (arg, a)))
+        .map(|(p, a)| eval(&input, p, (arg, a)))
         .collect();
 
     let budgets = [
@@ -237,13 +240,12 @@ fn every_ordering_policy_extracts_the_same_denotation() {
 
     for name in POLICIES {
         for budget in budgets {
-            let (out, out_root) = optimize_with(
+            let out = optimize_with(
                 Optimizer::production().rules(policy(name)).budget(budget),
-                &input,
-                input_root,
+                term(&input),
             );
             for ((point, &want), a) in POINTS.iter().zip(&expected).zip(ARGS) {
-                let got = eval(&out, out_root, point, (arg, a));
+                let got = eval(&out, point, (arg, a));
                 assert!(
                     (got - want).abs() <= 1e-4 * want.abs().max(1.0),
                     "policy {name} at {budget:?} changed the denotation at {point:?}: \
@@ -264,12 +266,11 @@ type Merged = (usize, usize, bool);
 /// Every pair of the input's nodes, classified by whether saturation has
 /// merged them at this budget.
 fn partition(budget: Budget) -> Vec<Merged> {
-    let (arena, root, _arg) = fixture();
+    let (input, _arg) = fixture();
     let mut optimizer = Optimizer::production().budget(budget);
     let mut eg = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        &arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term(&input),
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
@@ -278,18 +279,19 @@ fn partition(budget: Budget) -> Vec<Merged> {
     // Re-add every node of the input to recover its class. `add` is
     // idempotent on an already-present node, so this reads the graph rather
     // than growing it.
-    let ids: Vec<EClassId> = (0..arena.len())
-        .map(|i| {
-            pixelflow_search::egraph::insert(
-                &arena,
-                ExprId(i as u32),
+    let ids: Vec<EClassId> = input
+        .0
+        .iter()
+        .map(|node| {
+            pixelflow_search::egraph::insert_term(
+                Term::new(node, &input.1),
                 &mut eg,
                 pixelflow_search::egraph::Vocabulary::Templates,
             )
             .expect("insert into e-graph")
         })
         .collect();
-    let _ = optimizer.run(&mut eg, root_class, arena.len());
+    let _ = optimizer.run(&mut eg, root_class, input.0.len());
 
     let mut out = Vec::new();
     for a in 0..ids.len() {
@@ -335,16 +337,15 @@ fn a_larger_budget_refines_the_partition() {
 /// denotes the input.
 #[test]
 fn a_starved_budget_still_denotes_the_input() {
-    let (input, input_root, arg) = fixture();
+    let (input, arg) = fixture();
     for n in [0u64, 1, 2, 3, 5, 13, 100] {
-        let (out, out_root) = optimize_with(
+        let out = optimize_with(
             Optimizer::production().budget(Budget::Applications(n)),
-            &input,
-            input_root,
+            term(&input),
         );
         for (point, a) in POINTS.iter().zip(ARGS) {
-            let want = eval(&input, input_root, point, (arg, a));
-            let got = eval(&out, out_root, point, (arg, a));
+            let want = eval(&input, point, (arg, a));
+            let got = eval(&out, point, (arg, a));
             assert!(
                 (got - want).abs() <= 1e-4 * want.abs().max(1.0),
                 "budget of {n} applications changed the denotation at {point:?}: {got} != {want}"
@@ -365,23 +366,21 @@ fn a_starved_budget_still_denotes_the_input() {
 /// graph and comparing canonical ids is the whole implementation.
 #[test]
 fn an_extracted_term_re_adds_into_its_own_class() {
-    let (arena, root, _arg) = fixture();
+    let (input, _arg) = fixture();
     let mut optimizer = Optimizer::production();
     let mut eg = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        &arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term(&input),
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let optimized = optimizer.run(&mut eg, root_class, arena.len());
-    let (out, out_root) = optimized.to_arena(&eg, root_class);
+    let optimized = optimizer.run(&mut eg, root_class, input.0.len());
+    let out = optimized.to_rooted(&eg, root_class);
 
     let mut probe = eg.clone();
-    let re_added = pixelflow_search::egraph::insert(
-        &out,
-        out_root,
+    let re_added = pixelflow_search::egraph::insert_term(
+        term(&out),
         &mut probe,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
@@ -407,13 +406,13 @@ fn an_extracted_term_re_adds_into_its_own_class() {
 /// indistinguishable from a converged one.
 #[test]
 fn the_same_budget_extracts_the_same_term() {
-    let (arena, root, _arg) = fixture();
-    let reference = optimize_with(Optimizer::production(), &arena, root);
+    let (input, _arg) = fixture();
+    let reference = optimize_with(Optimizer::production(), term(&input));
     for _ in 0..8 {
-        let again = optimize_with(Optimizer::production(), &arena, root);
+        let again = optimize_with(Optimizer::production(), term(&input));
         assert_eq!(
-            arena_shape(&again.0, again.1),
-            arena_shape(&reference.0, reference.1),
+            arena_shape(&again),
+            arena_shape(&reference),
             "production extraction must not vary run to run"
         );
     }
@@ -425,17 +424,16 @@ fn the_same_budget_extracts_the_same_term() {
 fn the_stop_reason_names_which_limit_bound() {
     use pixelflow_search::egraph::SaturationStop;
 
-    let (arena, root, _arg) = fixture();
+    let (input, _arg) = fixture();
     let mut starved = Optimizer::production().budget(Budget::Applications(3));
     let mut eg = starved.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        &arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term(&input),
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let out = starved.run(&mut eg, root_class, arena.len());
+    let out = starved.run(&mut eg, root_class, input.0.len());
     assert_eq!(
         out.stats.stop,
         SaturationStop::ApplicationBudget,
@@ -450,12 +448,25 @@ fn the_stop_reason_names_which_limit_bound() {
 
 /// A structural rendering of the extracted DAG, for equality comparisons.
 ///
-/// The arena is append-only and extraction emits children before parents, so
-/// the node vector plus the root is already canonical for a given
-/// configuration: two runs that agree here produced the same term with the
-/// same sharing.
-fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+/// The same shape `expr::encode` writes — nodes in the graph's own
+/// topological order, children named by dense ordinal, so sharing is part of
+/// the rendering — spelled here rather than delegated because `encode`
+/// refuses a binding (a `UniformIdentity` is minted per process and cannot be
+/// written down) and this fixture declares one. Two runs that agree here
+/// produced the same term with the same sharing.
+fn arena_shape(g: &Graph) -> String {
+    use std::fmt::Write as _;
+    let root = g.0.entry();
+    let dag = root.dag();
+    let mut ordinal = dag.side_table(usize::MAX);
+    let mut text = String::new();
+    for (i, node) in dag.iter().enumerate() {
+        ordinal[node] = i;
+        let kids: Vec<usize> = node.children().map(|c| ordinal[c]).collect();
+        writeln!(text, "{i} {:?} {kids:?}", *node).expect("fmt");
+    }
+    write!(text, "root {}", ordinal[root]).expect("fmt");
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -491,18 +502,17 @@ impl pixelflow_search::egraph::Observer for Recorder {
 /// be made optional without changing what the budget meant.
 #[test]
 fn observation_is_optional_and_does_not_move_the_budget() {
-    let (arena, root, _arg) = fixture();
+    let (input, _arg) = fixture();
 
     let mut silent = Optimizer::production();
     let mut eg = silent.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        &arena,
-        root,
+    let root_class = pixelflow_search::egraph::insert_term(
+        term(&input),
         &mut eg,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let quiet = silent.run(&mut eg, root_class, arena.len());
+    let quiet = silent.run(&mut eg, root_class, input.0.len());
     assert_eq!(
         eg.provenance().recorded_count(),
         0,
@@ -516,14 +526,13 @@ fn observation_is_optional_and_does_not_move_the_budget() {
     let recorder = Recorder::default();
     let mut watched = Optimizer::production().observe(Some(Box::new(recorder.clone())));
     let mut eg2 = watched.egraph();
-    let root_class2 = pixelflow_search::egraph::insert(
-        &arena,
-        root,
+    let root_class2 = pixelflow_search::egraph::insert_term(
+        term(&input),
         &mut eg2,
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let loud = watched.run(&mut eg2, root_class2, arena.len());
+    let loud = watched.run(&mut eg2, root_class2, input.0.len());
 
     let seen = recorder.0.lock().expect("recorder lock").len();
     assert_eq!(
@@ -536,11 +545,11 @@ fn observation_is_optional_and_does_not_move_the_budget() {
     );
 
     // Both runs must also agree on the term: observation is observation.
-    let (quiet_arena, quiet_root) = quiet.to_arena(&eg, root_class);
-    let (loud_arena, loud_root) = loud.to_arena(&eg2, root_class2);
+    let quiet_out = quiet.to_rooted(&eg, root_class);
+    let loud_out = loud.to_rooted(&eg2, root_class2);
     assert_eq!(
-        arena_shape(&quiet_arena, quiet_root),
-        arena_shape(&loud_arena, loud_root),
+        arena_shape(&quiet_out),
+        arena_shape(&loud_out),
         "attaching an observer must not change what is extracted"
     );
 }
@@ -575,8 +584,8 @@ use pixelflow_search::saturate_pass::Saturate;
 
 /// `eval` for terms with no uniform to bind — the corpus below is built
 /// through the public `Kernel` API, which mints none.
-fn eval_plain(arena: &ExprArena, root: ExprId, vars: &[f32; 2]) -> f32 {
-    pixelflow_ir::eval_scalar(arena, root, vars, &BindingTable::empty())
+fn eval_plain(t: Term<'_>, vars: &[f32; 2]) -> f32 {
+    pixelflow_ir::eval_scalar(t, vars, &BindingTable::empty())
 }
 
 /// L5's own sample points, strictly inside the corpus's domain.
@@ -657,20 +666,20 @@ fn assert_preserves_denotation(label: &str, opt: &mut dyn Optimize) -> usize {
     let mut changed = 0;
 
     for (name, kernel) in denotation_corpus() {
-        let (arena, root) = kernel.parts();
+        let input = kernel.term();
 
-        let (out, out_root) = match opt.optimize(arena, root) {
+        let out = match opt.optimize(input) {
             // A declined term compiles unoptimized; nothing to compare.
             Rewritten::Declined | Rewritten::Unchanged => continue,
-            Rewritten::Changed(a, r) => {
+            Rewritten::Changed(rooted, env) => {
                 changed += 1;
-                (a, r)
+                (rooted, env)
             }
         };
 
         for point in &IN_DOMAIN_POINTS {
-            let want = eval_plain(arena, root, point);
-            let got = eval_plain(&out, out_root, point);
+            let want = eval_plain(input, point);
+            let got = eval_plain(term(&out), point);
 
             // NaN counts as agreeing with NaN: an optimizer is not required to
             // invent a value where the input had none.
@@ -715,18 +724,16 @@ fn the_identity_optimizer_rewrites_nothing() {
 /// is on the table; range is not": the JIT and its oracle shared an expansion,
 /// agreed bit-for-bit on garbage, and every same-form test passed).
 fn assert_lowers_to_oracle(label: &str, opt: &mut dyn Optimize, subject: &Kernel, oracle: &Kernel) {
-    let (arena, root) = subject.parts();
-    let (out, out_root) = match opt.optimize(arena, root) {
-        Rewritten::Changed(a, r) => (a, r),
+    let out = match opt.optimize(subject.term()) {
+        Rewritten::Changed(rooted, env) => (rooted, env),
         // Not a skip. A pass whose whole job is to eliminate a construct has
         // failed if it leaves one standing.
         other => panic!("{label} must rewrite a term carrying its construct, got {other:?}"),
     };
 
-    let (oracle_arena, oracle_root) = oracle.parts();
     for point in &IN_DOMAIN_POINTS {
-        let want = eval_plain(oracle_arena, oracle_root, point);
-        let got = eval_plain(&out, out_root, point);
+        let want = eval_plain(oracle.term(), point);
+        let got = eval_plain(term(&out), point);
         let agrees =
             (want.is_nan() && got.is_nan()) || (got - want).abs() <= 1e-4 * want.abs().max(1.0);
         assert!(

@@ -4,14 +4,15 @@
 //!
 //! Run: `cargo run --release -p pixelflow-search --example rule_report`
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, Term};
+use pixelflow_ir::{OpKind, Rooted};
 use pixelflow_search::egraph::run_episode;
 use pixelflow_search::math::all_rules;
 use std::collections::BTreeMap;
 
 /// sin(sqrt(x*x + y*y) * freq) * amp + bias — the swirl shader core.
-fn swirl() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn swirl() -> Graph {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let xx = a.push_binary(OpKind::Mul, x, x);
@@ -25,12 +26,12 @@ fn swirl() -> (ExprArena, ExprId) {
     let prod = a.push_binary(OpKind::Mul, sn, ka);
     let kb = a.push_const(0.5);
     let out = a.push_binary(OpKind::Add, prod, kb);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// Circle SDF: sqrt((x-cx)^2 + (y-cy)^2) - r.
-fn circle_sdf() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn circle_sdf() -> Graph {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let cx = a.push_const(0.3);
@@ -43,12 +44,12 @@ fn circle_sdf() -> (ExprArena, ExprId) {
     let dist = a.push_unary(OpKind::Sqrt, sum);
     let r = a.push_const(0.5);
     let out = a.push_binary(OpKind::Sub, dist, r);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// FMA-bait polynomial: a*x*x + b*x + c (Horner-able, fusion-able).
-fn poly() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn poly() -> Graph {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let ka = a.push_const(2.0);
     let kb = a.push_const(-3.0);
@@ -58,12 +59,12 @@ fn poly() -> (ExprArena, ExprId) {
     let bx = a.push_binary(OpKind::Mul, kb, x);
     let s1 = a.push_binary(OpKind::Add, ax2, bx);
     let out = a.push_binary(OpKind::Add, s1, kc);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// Redundancy bait: (x+y)*(x+y) + 2*(x+y) — CSE + distribution territory.
-fn redundant() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn redundant() -> Graph {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let s = a.push_binary(OpKind::Add, x, y);
@@ -71,12 +72,12 @@ fn redundant() -> (ExprArena, ExprId) {
     let two = a.push_const(2.0);
     let ts = a.push_binary(OpKind::Mul, two, s);
     let out = a.push_binary(OpKind::Add, s2, ts);
-    (a, out)
+    a.finish(&[out])
 }
 
 /// Division/sqrt bait: x / sqrt(x*x + y*y) (normalize — rsqrt rewrites).
-fn normalize() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn normalize() -> Graph {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let xx = a.push_binary(OpKind::Mul, x, x);
@@ -84,11 +85,14 @@ fn normalize() -> (ExprArena, ExprId) {
     let d = a.push_binary(OpKind::Add, xx, yy);
     let s = a.push_unary(OpKind::Sqrt, d);
     let out = a.push_binary(OpKind::Div, x, s);
-    (a, out)
+    a.finish(&[out])
 }
 
+/// A graph plus the declarations its leaves index.
+type Graph = (Rooted<ExprData>, Environment);
+
 /// A named kernel builder: (label, constructor).
-type KernelCase = (&'static str, fn() -> (ExprArena, ExprId));
+type KernelCase = (&'static str, fn() -> Graph);
 
 fn main() {
     let cases: Vec<KernelCase> = vec![
@@ -103,8 +107,8 @@ fn main() {
     let mut agg: BTreeMap<String, (usize, usize)> = BTreeMap::new();
 
     for (name, build) in &cases {
-        let (arena, root) = build();
-        let ep = run_episode(&arena, root, all_rules());
+        let (rooted, env) = build();
+        let ep = run_episode(Term::new(rooted.entry(), &env), all_rules());
         println!("=== {name} ===");
         println!(
             "  e-graph: {} classes; applications: {}; load-bearing: {}",

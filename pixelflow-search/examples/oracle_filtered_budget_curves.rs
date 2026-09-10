@@ -138,8 +138,8 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pixelflow_ir::arena::ExprNode;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, Term};
+use pixelflow_ir::{OpKind, Rooted};
 use pixelflow_search::egraph::{
     APP_CHECKPOINT_GRID, AnytimeCurveOutput, Budget, CostModel, EClassId, EGraph, ENodeId,
     EpisodeLabels, KeepJournal, Optimizer, Origin, RuleId, RuleSet, SaturationStop, all_rules,
@@ -233,74 +233,27 @@ const SAMPLES_PER_BAND: usize = 22;
 /// below) is reproducible byte-for-byte from this one constant.
 const BASE_SEED: u64 = 20260830;
 
-/// Compact the reachable subtree of `root` in `src` into a fresh, minimal
-/// arena, remapping `ExprId`s along the way.
+/// Copy the subtree reachable from `term`'s root into a fresh, minimal graph.
 ///
-/// `EGraph::add_arena` walks `0..arena.len()` unconditionally (it requires
-/// topological order from 0, not just reachability from `root`).
-/// `BwdGenerator::generate_arena` packs BOTH the optimized and unoptimized
-/// subtree of one `BwdTrainingPairArena` side by side in a single arena, so
-/// passing that raw arena straight to `add_arena` would silently add the
-/// disconnected sibling subtree's nodes into the e-graph too, polluting every
-/// work/cost measurement with rule matches against an expression nobody
-/// asked to saturate (the same B3 bug `pixelflow-pipeline`'s corpus writer
-/// documents closing).
-fn compact_subtree(
-    src: &ExprArena,
-    root: ExprId,
-    dst: &mut ExprArena,
-    memo: &mut HashMap<u32, ExprId>,
-) -> ExprId {
-    if let Some(&id) = memo.get(&root.0) {
-        return id;
-    }
-    let node = src.node(root).clone();
-    let new_id = match node {
-        ExprNode::Var(v) => dst.push_var(v),
-        ExprNode::Const(v) => dst.push_const(v),
-        ExprNode::Unary(op, c) => {
-            let nc = compact_subtree(src, c, dst, memo);
-            dst.push_unary(op, nc)
-        }
-        ExprNode::Binary(op, a, b) => {
-            let na = compact_subtree(src, a, dst, memo);
-            let nb = compact_subtree(src, b, dst, memo);
-            dst.push_binary(op, na, nb)
-        }
-        ExprNode::Ternary(op, a, b, c) => {
-            let na = compact_subtree(src, a, dst, memo);
-            let nb = compact_subtree(src, b, dst, memo);
-            let nc = compact_subtree(src, c, dst, memo);
-            dst.push_ternary(op, na, nb, nc)
-        }
-        ExprNode::Nary(op, _, _) => {
-            let kids: Vec<ExprId> = src
-                .children(root)
-                .map(|c| compact_subtree(src, c, dst, memo))
-                .collect();
-            dst.push_nary(op, &kids)
-        }
-        ExprNode::Param(i) => panic!(
-            "compact_subtree: unexpected Param({i}) in a BwdGenerator expression \
-             (the generator never produces Param nodes)"
-        ),
-        ExprNode::Uniform(_) => panic!(
-            "compact_subtree: unexpected Uniform node in a BwdGenerator expression \
-             (the generator never produces Uniform nodes)"
-        ),
-        ExprNode::Buffer(_) => panic!(
-            "compact_subtree: unexpected Buffer node in a BwdGenerator expression \
-             (the generator never produces memory ops)"
-        ),
-    };
-    memo.insert(root.0, new_id);
-    new_id
+/// A [`BwdTrainingPair`](pixelflow_search::nnue::BwdTrainingPair) holds BOTH
+/// the optimized and the junkified form as two entries of one graph, sharing
+/// whatever junkification left alone. Saturating that whole graph would add
+/// the sibling subtree's nodes too, polluting every work/cost measurement with
+/// rule matches against an expression nobody asked to saturate (the same B3
+/// bug `pixelflow-pipeline`'s corpus writer documents closing). `splice` is
+/// reachable-only, so copying through it is the compaction.
+fn compact(term: Term<'_>) -> Graph {
+    let mut out = ExprBuilder::new();
+    let root = out.splice(term);
+    out.finish(&[root])
 }
+
+/// A graph plus the declarations its leaves index.
+type Graph = (Rooted<ExprData>, Environment);
 
 struct CorpusItem {
     name: String,
-    arena: ExprArena,
-    root: ExprId,
+    graph: Graph,
     node_count: usize,
     /// `true` for the five named realistic kernels (the "shaders in-sample"
     /// check); `false` for synthetic band-generated expressions.
@@ -320,15 +273,12 @@ fn build_synthetic_corpus() -> Vec<CorpusItem> {
             ..BwdGenConfig::default()
         };
         for sample in 0..SAMPLES_PER_BAND {
-            let pair = generator.generate_arena();
-            let mut dst = ExprArena::with_capacity(pair.arena.node_count_subtree(pair.unoptimized));
-            let mut memo = HashMap::new();
-            let new_root = compact_subtree(&pair.arena, pair.unoptimized, &mut dst, &mut memo);
-            let node_count = dst.len();
+            let pair = generator.generate();
+            let graph = compact(pair.unoptimized());
+            let node_count = graph.0.len();
             corpus.push(CorpusItem {
                 name: format!("band{band_idx}_depth{}_s{sample}", band.max_depth),
-                arena: dst,
-                root: new_root,
+                graph,
                 node_count,
                 is_named_shader: false,
             });
@@ -340,8 +290,8 @@ fn build_synthetic_corpus() -> Vec<CorpusItem> {
 /// The five named realistic kernels from `rule_report.rs`, for the
 /// shaders-in-sample check.
 fn named_shader_corpus() -> Vec<CorpusItem> {
-    fn swirl() -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
+    fn swirl() -> Graph {
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let xx = a.push_binary(OpKind::Mul, x, x);
@@ -355,10 +305,10 @@ fn named_shader_corpus() -> Vec<CorpusItem> {
         let prod = a.push_binary(OpKind::Mul, sn, ka);
         let kb = a.push_const(0.5);
         let out = a.push_binary(OpKind::Add, prod, kb);
-        (a, out)
+        a.finish(&[out])
     }
-    fn circle_sdf() -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
+    fn circle_sdf() -> Graph {
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let cx = a.push_const(0.3);
@@ -371,10 +321,10 @@ fn named_shader_corpus() -> Vec<CorpusItem> {
         let dist = a.push_unary(OpKind::Sqrt, sum);
         let r = a.push_const(0.5);
         let out = a.push_binary(OpKind::Sub, dist, r);
-        (a, out)
+        a.finish(&[out])
     }
-    fn poly() -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
+    fn poly() -> Graph {
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let ka = a.push_const(2.0);
         let kb = a.push_const(-3.0);
@@ -384,10 +334,10 @@ fn named_shader_corpus() -> Vec<CorpusItem> {
         let bx = a.push_binary(OpKind::Mul, kb, x);
         let s1 = a.push_binary(OpKind::Add, ax2, bx);
         let out = a.push_binary(OpKind::Add, s1, kc);
-        (a, out)
+        a.finish(&[out])
     }
-    fn redundant() -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
+    fn redundant() -> Graph {
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let s = a.push_binary(OpKind::Add, x, y);
@@ -395,10 +345,10 @@ fn named_shader_corpus() -> Vec<CorpusItem> {
         let two = a.push_const(2.0);
         let ts = a.push_binary(OpKind::Mul, two, s);
         let out = a.push_binary(OpKind::Add, s2, ts);
-        (a, out)
+        a.finish(&[out])
     }
-    fn normalize() -> (ExprArena, ExprId) {
-        let mut a = ExprArena::new();
+    fn normalize() -> Graph {
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let xx = a.push_binary(OpKind::Mul, x, x);
@@ -406,10 +356,10 @@ fn named_shader_corpus() -> Vec<CorpusItem> {
         let d = a.push_binary(OpKind::Add, xx, yy);
         let s = a.push_unary(OpKind::Sqrt, d);
         let out = a.push_binary(OpKind::Div, x, s);
-        (a, out)
+        a.finish(&[out])
     }
 
-    type ShaderBuilder = fn() -> (ExprArena, ExprId);
+    type ShaderBuilder = fn() -> Graph;
     let cases: Vec<(&str, ShaderBuilder)> = vec![
         ("shader_swirl", swirl),
         ("shader_circle_sdf", circle_sdf),
@@ -420,12 +370,11 @@ fn named_shader_corpus() -> Vec<CorpusItem> {
     cases
         .into_iter()
         .map(|(name, build)| {
-            let (arena, root) = build();
-            let node_count = arena.node_count_subtree(root);
+            let graph = build();
+            let node_count = graph.0.entry().node_count();
             CorpusItem {
                 name: name.to_string(),
-                arena,
-                root,
+                graph,
                 node_count,
                 is_named_shader: true,
             }
@@ -558,12 +507,9 @@ fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
     // silently rule-free "oracle" arm. Only the arms whose journal is read
     // pay for it.
     let mut unguided_opt = env(RuleSet::new(all_rules())).observe(Some(Box::new(KeepJournal)));
-    let unguided: AnytimeCurveOutput = run_anytime_curve(
-        &mut unguided_opt,
-        &item.arena,
-        item.root,
-        APP_CHECKPOINT_GRID,
-    );
+    let term = Term::new(item.graph.0.entry(), &item.graph.1);
+    let unguided: AnytimeCurveOutput =
+        run_anytime_curve(&mut unguided_opt, term, APP_CHECKPOINT_GRID);
 
     // The oracle is defined against the BEST cost the unguided arm reaches
     // over the grid, and `extract_dag` is explicitly non-monotonic along a
@@ -586,12 +532,7 @@ fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
     let at_best: Option<AnytimeCurveOutput> =
         (best_idx + 1 < APP_CHECKPOINT_GRID.len()).then(|| {
             let mut opt = env(RuleSet::new(all_rules())).observe(Some(Box::new(KeepJournal)));
-            run_anytime_curve(
-                &mut opt,
-                &item.arena,
-                item.root,
-                &APP_CHECKPOINT_GRID[..=best_idx],
-            )
+            run_anytime_curve(&mut opt, term, &APP_CHECKPOINT_GRID[..=best_idx])
         });
     let best_out = at_best.as_ref().unwrap_or(&unguided);
     // Fail loud rather than mint an empty oracle: a graph that applied rules
@@ -638,7 +579,7 @@ fn measure_expression(item: &CorpusItem) -> ExprMeasurement {
 
     let mut oracle_opt = env(oracle_rules);
     let oracle: AnytimeCurveOutput =
-        run_anytime_curve(&mut oracle_opt, &item.arena, item.root, APP_CHECKPOINT_GRID);
+        run_anytime_curve(&mut oracle_opt, term, APP_CHECKPOINT_GRID);
 
     // Over-approximation looseness — measured on the same snapshot the
     // labels were computed from.

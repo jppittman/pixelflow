@@ -146,7 +146,7 @@ impl EpisodeLabels {
     ///
     /// Panics if `choices` is missing an entry (or has an out-of-range node
     /// index) for a class actually reachable from `root` via the chosen
-    /// nodes — the same invariant `choices_to_arena` enforces, and for the
+    /// nodes — the same invariant `choices_to_rooted` enforces, and for the
     /// same reason: silently defaulting to node 0 here would fabricate a
     /// label for a node that was never really "chosen," corrupting the
     /// training signal instead of surfacing the extractor bug that produced
@@ -378,18 +378,13 @@ pub struct EpisodeResult {
 /// rule set explicitly (mirroring [`EGraph::with_rules`] everywhere else in
 /// this crate); use [`super::all_rules`] for the full library.
 pub fn run_episode(
-    arena: &pixelflow_ir::ExprArena,
-    root: pixelflow_ir::ExprId,
+    term: pixelflow_ir::expr::Term<'_>,
     rules: Vec<Box<dyn Rewrite>>,
 ) -> EpisodeResult {
     let mut egraph = EGraph::with_rules(rules);
-    let root_class = crate::egraph::insert(
-        arena,
-        root,
-        &mut egraph,
-        crate::egraph::Vocabulary::Templates,
-    )
-    .expect("insert into e-graph");
+    let root_class =
+        crate::egraph::insert_term(term, &mut egraph, crate::egraph::Vocabulary::Templates)
+            .expect("insert into e-graph");
     SaturationConfig::compatibility(100).run(&mut egraph);
 
     let costs = CostModel::latency_prior();
@@ -589,16 +584,17 @@ mod tests {
     /// reconcile against the flat label map / provenance log.
     #[test]
     fn aggregate_counts_reconcile() {
-        use pixelflow_ir::ExprArena;
+        use pixelflow_ir::expr::{ExprBuilder, Term};
 
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(pixelflow_ir::OpKind::Add, x, y);
         let doubled = arena.push_binary(pixelflow_ir::OpKind::Mul, sum, sum);
         let root = arena.push_binary(pixelflow_ir::OpKind::Sub, doubled, doubled);
+        let (rooted, env) = arena.finish(&[root]);
 
-        let result = run_episode(&arena, root, crate::egraph::all_rules());
+        let result = run_episode(Term::new(rooted.entry(), &env), crate::egraph::all_rules());
 
         let total_fired: usize = result.labels.rule_stats.values().map(|s| s.fired).sum();
         let total_load_bearing: usize = result
@@ -682,19 +678,19 @@ mod tests {
     /// the loose one would look exactly like a tighter bound.
     #[test]
     fn the_three_bounds_are_ordered_and_all_well_formed() {
-        use pixelflow_ir::ExprArena;
+        use pixelflow_ir::expr::{ExprBuilder, Term};
 
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(pixelflow_ir::OpKind::Add, x, y);
         let doubled = arena.push_binary(pixelflow_ir::OpKind::Mul, sum, sum);
         let root = arena.push_binary(pixelflow_ir::OpKind::Sub, doubled, doubled);
+        let (rooted, env) = arena.finish(&[root]);
 
         let mut egraph = EGraph::with_rules(crate::egraph::all_rules());
-        let root_class = crate::egraph::insert(
-            &arena,
-            root,
+        let root_class = crate::egraph::insert_term(
+            Term::new(rooted.entry(), &env),
             &mut egraph,
             crate::egraph::Vocabulary::Templates,
         )

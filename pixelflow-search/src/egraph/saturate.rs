@@ -169,7 +169,7 @@ pub fn saturate_with_full_budget(
 /// independent limits, any one tripping ends the run. This is the policy
 /// knob; [`saturate_with_full_budget`] is the mechanism both the AOT macro
 /// tier (`pixelflow-compiler`) and the runtime tier
-/// ([`crate::runtime::optimize_runtime_arena`]) drive with it.
+/// ([`crate::runtime::optimize_runtime_term`]) drive with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaturationConfig {
     /// Rewrite-round budget (each round applies every rule once).

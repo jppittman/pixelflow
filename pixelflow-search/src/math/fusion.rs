@@ -14,7 +14,7 @@
 use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 // ============================================================================
 // FMA Fusion
@@ -77,11 +77,11 @@ impl Rewrite for FmaFusion {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Add, (bin OpKind::Mul, (var 0), (var 1)), (var 2)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, tern OpKind::MulAdd, (var 0), (var 1), (var 2)))
     }
 }
@@ -152,11 +152,11 @@ impl Rewrite for RecipSqrt {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Recip, (un OpKind::Sqrt, (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Rsqrt, (var 0)))
     }
 }

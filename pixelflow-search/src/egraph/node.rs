@@ -2,7 +2,7 @@
 
 use super::ops::Op;
 use alloc::vec::Vec;
-use pixelflow_ir::arena::{BufferDecl, UniformDecl};
+use pixelflow_ir::decl::{BufferDecl, UniformDecl};
 
 /// Identifier for an equivalence class in the e-graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

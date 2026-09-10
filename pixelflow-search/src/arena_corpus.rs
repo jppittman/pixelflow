@@ -1,4 +1,4 @@
-//! The real-kernel arena corpus, and the summary statistics the offline
+//! The real-kernel `.arena` corpus, and the summary statistics the offline
 //! probes report over it.
 //!
 //! Two `#[ignore]`d measurement probes now read the same corpus of `.arena`
@@ -8,16 +8,24 @@
 //! way; a second copy of it is a future divergence, so it lives here once.
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{BufferDecl, BufferId, BufferIdentity, ExprArena, ExprId};
+use pixelflow_ir::decl::{BufferDecl, BufferId, BufferIdentity};
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef};
+use pixelflow_ir::Rooted;
 use std::path::Path;
 
 /// Inverse of the dumpers' `dump_arena` (`pixelflow-core/src/lattice/cell_grid.rs`,
 /// `pixelflow-graphics/tests/production_glyph_arena_dump.rs`,
 /// `pixelflow-pipeline/tests/shader_and_psychedelic_arena_dump.rs`):
 /// replays reachable nodes in original id order through the public
-/// `push_*` API, which never hash-conses, so the rebuilt arena has
+/// `push_*` API, which never hash-conses, so the rebuilt graph has
 /// exactly the dumped node multiset.
-pub fn load_arena_dump(path: &Path) -> (String, ExprArena, ExprId) {
+///
+/// The dump names children by their ordinal in the file, so the replay keeps
+/// a dense `Vec<ExprRef>` of what it has pushed and reads a child off it. That
+/// is what the old loader's raw-index synthesis was doing by hand; the
+/// difference is that the vector is the loader's own and cannot be confused
+/// with the graph's internal naming, which is no longer nameable.
+pub fn load_arena_dump(path: &Path) -> (String, Rooted<ExprData>, Environment) {
     let text =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut lines = text.lines();
@@ -28,21 +36,20 @@ pub fn load_arena_dump(path: &Path) -> (String, ExprArena, ExprId) {
         path.display()
     );
     let mut name = None;
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let mut idents: Vec<BufferIdentity> = Vec::new();
-    let mut root = None;
-    let mut next_id: u32 = 0;
+    let mut root: Option<usize> = None;
+    // Ordinal in the dump → the node the replay built for it.
+    let mut refs: Vec<ExprRef> = Vec::new();
     let mut buf_count: u16 = 0;
     let op = |s: &str| -> OpKind {
         OpKind::all()
             .find(|k| format!("{k:?}") == s)
             .unwrap_or_else(|| panic!("{}: unknown OpKind {s:?}", path.display()))
     };
-    let id = |s: &str| -> ExprId {
-        ExprId(
-            s.parse()
-                .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display())),
-        )
+    let ordinal = |s: &str| -> usize {
+        s.parse()
+            .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display()))
     };
     for line in lines {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -71,28 +78,28 @@ pub fn load_arena_dump(path: &Path) -> (String, ExprArena, ExprId) {
                 continue;
             }
             ["root", r] => {
-                root = Some(id(r));
+                root = Some(ordinal(r));
                 continue;
             }
             ["V", i] => arena.push_var(i.parse().expect("var index")),
             ["C", bits] => arena.push_const(f32::from_bits(bits.parse().expect("const bits"))),
             ["B", slot] => arena.push_buffer(BufferId(slot.parse().expect("buffer slot"))),
-            ["U", k, a] => arena.push_unary(op(k), id(a)),
-            ["Bi", k, a, b] => arena.push_binary(op(k), id(a), id(b)),
-            ["T", k, a, b, c] => arena.push_ternary(op(k), id(a), id(b), id(c)),
+            ["U", k, a] => arena.push_unary(op(k), refs[ordinal(a)]),
+            ["Bi", k, a, b] => arena.push_binary(op(k), refs[ordinal(a)], refs[ordinal(b)]),
+            ["T", k, a, b, c] => {
+                arena.push_ternary(op(k), refs[ordinal(a)], refs[ordinal(b)], refs[ordinal(c)])
+            }
             other => panic!("{}: unparseable line {other:?}", path.display()),
         };
-        assert_eq!(
-            pushed,
-            ExprId(next_id),
-            "{}: replay drifted from dumped ids",
-            path.display()
-        );
-        next_id += 1;
+        refs.push(pushed);
     }
     let name = name.unwrap_or_else(|| panic!("{}: no name line", path.display()));
     let root = root.unwrap_or_else(|| panic!("{}: no root line", path.display()));
-    (name, arena, root)
+    let root = *refs
+        .get(root)
+        .unwrap_or_else(|| panic!("{}: root ordinal past the end", path.display()));
+    let (rooted, env) = arena.finish(&[root]);
+    (name, rooted, env)
 }
 
 /// Which dumper produced a file, read off its name.

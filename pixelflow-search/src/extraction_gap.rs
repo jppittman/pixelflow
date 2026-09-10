@@ -61,14 +61,15 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use pixelflow_ir::{ExprArena, ExprId, LatticeShape};
+use pixelflow_ir::LatticeShape;
+use pixelflow_ir::expr::Term;
 
 use crate::arena_corpus::{category_of, load_arena_dump, median, percentile};
 use crate::egraph::extract::{
     ExtractedDAG, extract_dag_objectives, extract_dag_scoped, extract_dag_tree_arm,
 };
 use crate::egraph::{Budget, CostModel, EClassId, EGraph, ENode, Extraction, Optimizer};
-use crate::egraph::{Vocabulary, insert, reachable_count};
+use crate::egraph::{Vocabulary, insert_term, reachable_count_term};
 
 // ---------------------------------------------------------------------------
 // The instance: one saturated e-graph, reduced to what a chooser must decide
@@ -1035,23 +1036,23 @@ fn measure(
     category: &'static str,
     budget: Budget,
     budget_label: &'static str,
-    arena: &ExprArena,
-    root: ExprId,
+    input: Term<'_>,
     time_limit: Duration,
     max_expansions: u64,
 ) -> Measured {
-    // The same two lowering passes `optimize_runtime_arena_uncached` runs
-    // before the e-graph sees the arena.
-    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
+    // The same two lowering passes `optimize_runtime_term_uncached` runs
+    // before the e-graph sees the term.
+    let lowered = pixelflow_ir::passes::lower_dwrt(input)
         .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-    let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
-    let node_count = reachable_count(&arena, root);
+    let unrolled = pixelflow_ir::passes::expand_reduce(Term::new(lowered.entry(), input.env()));
+    let term = Term::new(unrolled.entry(), input.env());
+    let node_count = reachable_count_term(term);
 
     let mut optimizer = Optimizer::production().budget(budget);
     let mut egraph = optimizer.egraph();
-    let root_class = insert(&arena, root, &mut egraph, Vocabulary::Runtime)
+    let root_class = insert_term(term, &mut egraph, Vocabulary::Runtime)
         .ok()
-        .unwrap_or_else(|| panic!("{name}: arena_to_egraph returned None (unsupported node)"));
+        .unwrap_or_else(|| panic!("{name}: insert declined (unsupported node)"));
     let optimized = optimizer.run(&mut egraph, root_class, node_count);
 
     let model = CostModel::latency_prior();
@@ -1283,15 +1284,14 @@ fn extraction_gap_measurement() {
 
     // --- 1. Real kernels, production regime -------------------------------
     for path in paths.iter().take(limit_kernels) {
-        let (name, arena, root) = load_arena_dump(path);
+        let (name, rooted, env) = load_arena_dump(path);
         let category = category_of(&path.file_name().unwrap().to_string_lossy());
         let m = measure(
             &name,
             category,
             Budget::Production,
             "production",
-            &arena,
-            root,
+            Term::new(rooted.entry(), &env),
             time_limit,
             max_expansions,
         );
@@ -1326,15 +1326,14 @@ fn extraction_gap_measurement() {
                     config,
                     templates.clone(),
                 );
-                let pair = generator.generate_arena();
+                let pair = generator.generate();
                 let name = format!("synth_d{max_depth}_s{seed}");
                 let m = measure(
                     &name,
                     "synthetic",
                     Budget::Production,
                     "production",
-                    &pair.arena,
-                    pair.unoptimized,
+                    pair.unoptimized(),
                     time_limit,
                     max_expansions,
                 );
@@ -1362,7 +1361,7 @@ fn extraction_gap_measurement() {
         else {
             continue;
         };
-        let (name, arena, root) = load_arena_dump(path);
+        let (name, rooted, env) = load_arena_dump(path);
         let category = category_of(&path.file_name().unwrap().to_string_lossy());
         for (budget, label) in [
             (Budget::Production, "production"),
@@ -1380,8 +1379,7 @@ fn extraction_gap_measurement() {
                 category,
                 budget,
                 label,
-                &arena,
-                root,
+                Term::new(rooted.entry(), &env),
                 time_limit,
                 max_expansions,
             );
@@ -2100,15 +2098,14 @@ fn extraction_objective_measurement() {
 
     // --- 1. Real kernels, production regime -------------------------------
     for path in paths.iter().take(limit_kernels) {
-        let (name, arena, root) = load_arena_dump(path);
+        let (name, rooted, env) = load_arena_dump(path);
         let category = category_of(&path.file_name().unwrap().to_string_lossy());
         let m = measure(
             &name,
             category,
             Budget::Production,
             "production",
-            &arena,
-            root,
+            Term::new(rooted.entry(), &env),
             time_limit,
             max_expansions,
         );
@@ -2141,15 +2138,14 @@ fn extraction_objective_measurement() {
                     config,
                     templates.clone(),
                 );
-                let pair = generator.generate_arena();
+                let pair = generator.generate();
                 let name = format!("synth_d{max_depth}_s{seed}");
                 let m = measure(
                     &name,
                     "synthetic",
                     Budget::Production,
                     "production",
-                    &pair.arena,
-                    pair.unoptimized,
+                    pair.unoptimized(),
                     time_limit,
                     max_expansions,
                 );
@@ -2838,15 +2834,10 @@ mod self_check {
                 ..Default::default()
             };
             let mut generator = BwdGenerator::new(seed, config, templates.clone());
-            let pair = generator.generate_arena();
+            let pair = generator.generate();
             let mut egraph = Optimizer::production().egraph();
-            let Some(root) = insert(
-                &pair.arena,
-                pair.unoptimized,
-                &mut egraph,
-                Vocabulary::Runtime,
-            )
-            .ok() else {
+            let Some(root) = insert_term(pair.unoptimized(), &mut egraph, Vocabulary::Runtime).ok()
+            else {
                 continue;
             };
             // Deliberately tiny budget: the point is an instance small

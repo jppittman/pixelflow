@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::expr::ExprBuilder;
 
 use super::all_rules;
 use super::round2_rules;
@@ -491,10 +491,10 @@ impl Rewrite for DuplicateRule {
     fn is_destructive(&self) -> bool {
         self.inner.is_destructive()
     }
-    fn lhs_template(&self, out: &mut ExprArena) -> Option<pixelflow_ir::ExprId> {
+    fn lhs_template(&self, out: &mut ExprBuilder) -> Option<pixelflow_ir::expr::ExprRef> {
         self.inner.lhs_template(out)
     }
-    fn rhs_template(&self, out: &mut ExprArena) -> Option<pixelflow_ir::ExprId> {
+    fn rhs_template(&self, out: &mut ExprBuilder) -> Option<pixelflow_ir::expr::ExprRef> {
         self.inner.rhs_template(out)
     }
 }
@@ -567,7 +567,7 @@ pub struct Composition {
 /// Whether `r` has both an LHS and an RHS template — the composable subset
 /// (30 of 62 in the production library, per §2.2).
 fn is_templated(r: &dyn Rewrite) -> bool {
-    let mut scratch = ExprArena::new();
+    let mut scratch = ExprBuilder::new();
     r.lhs_template(&mut scratch).is_some() && r.rhs_template(&mut scratch).is_some()
 }
 
@@ -596,7 +596,7 @@ pub fn compose_rules(base: &[Box<dyn Rewrite>]) -> Vec<Composition> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
 
     for (a_idx, a) in base.iter().enumerate() {
-        let mut probe = ExprArena::new();
+        let mut probe = ExprBuilder::new();
         let (Some(a_lhs), Some(a_rhs)) = (a.lhs_template(&mut probe), a.rhs_template(&mut probe))
         else {
             continue;
@@ -610,14 +610,17 @@ pub fn compose_rules(base: &[Box<dyn Rewrite>]) -> Vec<Composition> {
                 let Some(rule) = TemplateRewrite::compose(a.as_ref(), b.as_ref(), pos) else {
                     continue;
                 };
-                let mut disp = ExprArena::new();
+                let mut disp = ExprBuilder::new();
                 let lhs = rule
                     .lhs_template(&mut disp)
                     .expect("TemplateRewrite always has both templates");
                 let rhs = rule
                     .rhs_template(&mut disp)
                     .expect("TemplateRewrite always has both templates");
-                let key = (disp.display(lhs).to_string(), disp.display(rhs).to_string());
+                let key = (
+                    pixelflow_ir::display(disp.node(lhs)).to_string(),
+                    pixelflow_ir::display(disp.node(rhs)).to_string(),
+                );
                 if seen.insert(key) {
                     out.push(Composition {
                         a_idx,
@@ -857,8 +860,8 @@ mod tests {
         // Same LHS/RHS templates (or lack thereof) as a fresh copy of the
         // same rule at the same index.
         let fresh = &all_rules()[0];
-        let mut a = ExprArena::new();
-        let mut b = ExprArena::new();
+        let mut a = ExprBuilder::new();
+        let mut b = ExprBuilder::new();
         assert_eq!(
             dup.lhs_template(&mut a).is_some(),
             fresh.lhs_template(&mut b).is_some()

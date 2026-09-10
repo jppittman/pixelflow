@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 // ============================================================================
 // Parity Trait
@@ -339,11 +339,11 @@ impl<T: Parity> Rewrite for ParityNegation<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un T::op().kind(), (un OpKind::Neg, (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         match T::parity() {
             // Neg(Op(V0))
             ParityKind::Odd => Some(arena_pat!(__a, un OpKind::Neg, (un T::op().kind(), (var 0)))),

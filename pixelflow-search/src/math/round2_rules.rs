@@ -42,7 +42,7 @@ use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, TemplatePattern, ops};
 use core::f32::consts::{LN_2, LOG2_E, LOG10_2};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 // ============================================================================
 // Shared helpers (module-local; see fusion.rs / power.rs for the established
@@ -65,7 +65,7 @@ use pixelflow_ir::arena::{ExprArena, ExprId};
 ///
 /// If `rule` has no `rhs_template`.
 fn instantiate_rhs(rule: &dyn Rewrite, bindings: Vec<EClassId>) -> RewriteAction {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let root = rule.rhs_template(&mut arena).unwrap_or_else(|| {
         panic!(
             "round2_rules: {} has no rhs_template — every rule in this module \
@@ -73,7 +73,7 @@ fn instantiate_rhs(rule: &dyn Rewrite, bindings: Vec<EClassId>) -> RewriteAction
             rule.name()
         )
     });
-    let (rooted, _) = pixelflow_ir::expr::from_arena(&arena, root);
+    let (rooted, _env) = arena.finish(&[root]);
     RewriteAction::Instantiate {
         template: TemplatePattern(Arc::new(rooted)),
         entry: 0,
@@ -142,11 +142,11 @@ impl Rewrite for MinMaxDuality {
         Some(instantiate_rhs(self, vec![children[0], children[1]]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin self.from, (var 0), (var 1)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Neg,
             (bin self.dual, (un OpKind::Neg, (var 0)), (un OpKind::Neg, (var 1)))))
     }
@@ -202,11 +202,11 @@ impl Rewrite for MinMaxAbsorption {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin self.outer, (var 0), (bin self.inner, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 0))
     }
 }
@@ -268,11 +268,11 @@ impl Rewrite for MinMaxTranslate {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Add, (bin self.minmax, (var 0), (var 1)), (var 2)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin self.minmax,
             (bin OpKind::Add, (var 0), (var 2)), (bin OpKind::Add, (var 1), (var 2))))
     }
@@ -335,11 +335,11 @@ impl Rewrite for MinScaledByNonnegLiteral {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (cst 2.0), (bin OpKind::Min, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Min,
             (bin OpKind::Mul, (cst 2.0), (var 0)), (bin OpKind::Mul, (cst 2.0), (var 1))))
     }
@@ -379,11 +379,11 @@ impl Rewrite for MinMaxDistributive {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Min, (var 0), (bin OpKind::Max, (var 1), (var 2))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Max,
             (bin OpKind::Min, (var 0), (var 1)), (bin OpKind::Min, (var 0), (var 2))))
     }
@@ -412,11 +412,11 @@ impl Rewrite for AbsAsMax {
         Some(instantiate_rhs(self, vec![children[0]]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Abs, (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Max, (var 0), (un OpKind::Neg, (var 0))))
     }
 }
@@ -449,11 +449,11 @@ impl Rewrite for MaxSelfNegAsAbs {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Max, (var 0), (un OpKind::Neg, (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Abs, (var 0)))
     }
 }
@@ -485,11 +485,11 @@ impl Rewrite for SelectSameBranch {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, tern OpKind::Select, (var 0), (var 1), (var 1)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 1))
     }
 }
@@ -527,13 +527,13 @@ impl Rewrite for SelectLtToMin {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, tern OpKind::Select, (bin OpKind::Lt, (var 0), (var 1)), (var 0), (var 1)),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Min, (var 0), (var 1)))
     }
 }
@@ -565,13 +565,13 @@ impl Rewrite for SelectLtToMax {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, tern OpKind::Select, (bin OpKind::Lt, (var 0), (var 1)), (var 1), (var 0)),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Max, (var 0), (var 1)))
     }
 }
@@ -607,13 +607,13 @@ impl Rewrite for SelectHoistUnary {
         Some(instantiate_rhs(self, vec![m, a, b]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, tern OpKind::Select, (var 0), (un self.func, (var 1)), (un self.func, (var 2))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un self.func, (tern OpKind::Select, (var 0), (var 1), (var 2))))
     }
 }
@@ -662,11 +662,11 @@ impl Rewrite for CompareFlipLt {
         }))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Lt, (var 0), (var 1)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Gt, (var 1), (var 0)))
     }
 }
@@ -695,11 +695,11 @@ impl Rewrite for TanDefinition {
         Some(instantiate_rhs(self, vec![children[0]]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Tan, (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul,
             (un OpKind::Sin, (var 0)), (un OpKind::Recip, (un OpKind::Cos, (var 0)))))
     }
@@ -740,12 +740,12 @@ impl Rewrite for TanFusion {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul,
             (un OpKind::Sin, (var 0)), (un OpKind::Recip, (un OpKind::Cos, (var 0)))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Tan, (var 0)))
     }
 }
@@ -777,11 +777,11 @@ impl Rewrite for ExpAsExp2 {
         Some(instantiate_rhs(self, vec![children[0]]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Exp, (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Exp2, (bin OpKind::Mul, (var 0), (cst LOG2_E))))
     }
 }
@@ -804,11 +804,11 @@ impl Rewrite for LnAsLog2 {
         Some(instantiate_rhs(self, vec![children[0]]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Ln, (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (un OpKind::Log2, (var 0)), (cst LN_2)))
     }
 }
@@ -831,11 +831,11 @@ impl Rewrite for Log10AsLog2 {
         Some(instantiate_rhs(self, vec![children[0]]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Log10, (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (un OpKind::Log2, (var 0)), (cst LOG10_2)))
     }
 }
@@ -867,13 +867,13 @@ impl Rewrite for SqrtProduct {
         Some(instantiate_rhs(self, vec![x, y]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Mul, (un OpKind::Sqrt, (var 0)), (un OpKind::Sqrt, (var 1))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Sqrt, (bin OpKind::Mul, (var 0), (var 1))))
     }
 }
@@ -910,13 +910,13 @@ impl Rewrite for RsqrtSquareAsRecip {
         }))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Mul, (un OpKind::Rsqrt, (var 0)), (un OpKind::Rsqrt, (var 0))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Recip, (var 0)))
     }
 }
@@ -951,11 +951,11 @@ impl Rewrite for NormalizeAsSqrt {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (var 0), (un OpKind::Rsqrt, (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Sqrt, (var 0)))
     }
 }
@@ -985,13 +985,13 @@ impl Rewrite for RecipProduct {
         Some(instantiate_rhs(self, vec![x, y]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Mul, (un OpKind::Recip, (var 0)), (un OpKind::Recip, (var 1))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Recip, (bin OpKind::Mul, (var 0), (var 1))))
     }
 }
@@ -1018,11 +1018,11 @@ impl Rewrite for RecipOfProduct {
         Some(instantiate_rhs(self, vec![a, b]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Recip, (bin OpKind::Mul, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Mul, (un OpKind::Recip, (var 0)), (un OpKind::Recip, (var 1))),
         )
@@ -1057,11 +1057,11 @@ impl Rewrite for FmaUnfuse {
         ))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, tern OpKind::MulAdd, (var 0), (var 1), (var 2)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Add, (bin OpKind::Mul, (var 0), (var 1)), (var 2)))
     }
 }
@@ -1091,11 +1091,11 @@ impl Rewrite for FmaMulIdentity {
         }))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, tern OpKind::MulAdd, (var 0), (cst 1.0), (var 1)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Add, (var 0), (var 1)))
     }
 }
@@ -1125,11 +1125,11 @@ impl Rewrite for FmaAddIdentity {
         }))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, tern OpKind::MulAdd, (var 0), (var 1), (cst 0.0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (var 0), (var 1)))
     }
 }
@@ -1157,11 +1157,11 @@ impl Rewrite for NegDistributesAdd {
         Some(instantiate_rhs(self, vec![a, b]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Neg, (bin OpKind::Add, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Add, (un OpKind::Neg, (var 0)), (un OpKind::Neg, (var 1))))
     }
 }
@@ -1185,11 +1185,11 @@ impl Rewrite for NegDistributesMul {
         Some(instantiate_rhs(self, vec![a, b]))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Neg, (bin OpKind::Mul, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (un OpKind::Neg, (var 0)), (var 1)))
     }
 }
@@ -1229,9 +1229,9 @@ impl Rewrite for DivByLiteral {
         // constant is `1/k` for the literal `k` this match found, so the
         // pattern is built here. `rhs_template` below still spells the
         // shape, with a representative literal, for the oracle test.
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let root = arena_pat!(arena, bin OpKind::Mul, (var 0), (cst 1.0 / k));
-        let (rooted, _) = pixelflow_ir::expr::from_arena(&arena, root);
+        let (rooted, _env) = arena.finish(&[root]);
         Some(RewriteAction::Instantiate {
             template: TemplatePattern(Arc::new(rooted)),
             entry: 0,
@@ -1239,11 +1239,11 @@ impl Rewrite for DivByLiteral {
         })
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Div, (var 0), (cst 2.0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (var 0), (cst 0.5)))
     }
 }
@@ -1302,6 +1302,7 @@ mod tests {
     use pixelflow_ir::Uniform;
     use pixelflow_ir::binding::BindingTable;
     use pixelflow_ir::eval_scalar;
+    use pixelflow_ir::expr::Term;
 
     /// Well-conditioned sample points, seeded and fixed: finite, moderate
     /// magnitude, no zeros (avoids `Recip`/`Rsqrt` poles), all-positive
@@ -1353,20 +1354,20 @@ mod tests {
     /// — a lattice has two axes — and a value invariant across the lattice is
     /// exactly what an arbitrary subterm's stand-in should be.
     fn bind_metavars_past_the_axes(
-        arena: &mut ExprArena,
-        root: ExprId,
+        arena: &mut ExprBuilder,
+        root: ExprRef,
         args: &[Uniform],
-    ) -> ExprId {
-        let subs: Vec<(u8, ExprId)> = args
+    ) -> ExprRef {
+        let subs: Vec<(u8, ExprRef)> = args
             .iter()
             .enumerate()
             .map(|(i, u)| {
                 let slot = arena.declare_uniform(u.decl());
-                let axis = pixelflow_ir::arena::COORD_AXES as u8 + i as u8;
+                let axis = pixelflow_ir::decl::COORD_AXES as u8 + i as u8;
                 (axis, arena.push_uniform(slot))
             })
             .collect();
-        arena.substitute_vars_with(root, &subs)
+        crate::egraph::template::substitute_vars(arena, root, &subs)
     }
 
     /// Evaluate `rule`'s LHS and RHS templates at every point in `points`
@@ -1381,12 +1382,12 @@ mod tests {
         // slots through the block. The same handles go into both arenas, so
         // the two sides read one value per metavariable.
         let args = [Uniform::new(0.0), Uniform::new(0.0)];
-        let mut lhs_arena = ExprArena::new();
+        let mut lhs_arena = ExprBuilder::new();
         let lhs_root = rule
             .lhs_template(&mut lhs_arena)
             .unwrap_or_else(|| panic!("{}: missing lhs_template", rule.name()));
         let lhs_root = bind_metavars_past_the_axes(&mut lhs_arena, lhs_root, &args);
-        let mut rhs_arena = ExprArena::new();
+        let mut rhs_arena = ExprBuilder::new();
         let rhs_root = rule
             .rhs_template(&mut rhs_arena)
             .unwrap_or_else(|| panic!("{}: missing rhs_template", rule.name()));
@@ -1399,13 +1400,15 @@ mod tests {
             ];
             let coords = [point[0], point[1]];
             let lhs_bindings = BindingTable::empty()
-                .bind_uniforms(&lhs_arena, &values)
+                .bind_uniforms(lhs_arena.env(), &values)
                 .expect("declared just above");
             let rhs_bindings = BindingTable::empty()
-                .bind_uniforms(&rhs_arena, &values)
+                .bind_uniforms(rhs_arena.env(), &values)
                 .expect("declared just above");
-            let lhs = eval_scalar(&lhs_arena, lhs_root, &coords, &lhs_bindings);
-            let rhs = eval_scalar(&rhs_arena, rhs_root, &coords, &rhs_bindings);
+            let lhs_term = Term::new(lhs_arena.node(lhs_root), lhs_arena.env());
+            let rhs_term = Term::new(rhs_arena.node(rhs_root), rhs_arena.env());
+            let lhs = eval_scalar(lhs_term, &coords, &lhs_bindings);
+            let rhs = eval_scalar(rhs_term, &coords, &rhs_bindings);
             if lhs.is_nan() && rhs.is_nan() {
                 continue;
             }
@@ -1419,8 +1422,8 @@ mod tests {
                 "{}: LHS/RHS disagree at well-conditioned point {point:?}: \
                  lhs={lhs} rhs={rhs} (threshold {threshold})\n  lhs = {}\n  rhs = {}",
                 rule.name(),
-                lhs_arena.display(lhs_root),
-                rhs_arena.display(rhs_root),
+                pixelflow_ir::display(lhs_arena.node(lhs_root)),
+                pixelflow_ir::display(rhs_arena.node(rhs_root)),
             );
         }
     }
@@ -1657,9 +1660,9 @@ mod tests {
             // cost of exactly 0 is a legitimate outcome (e.g. min-max
             // absorption reducing the whole expression to a bare Var, whose
             // latency_prior cost is 0), not a failure.
-            let (arena, id, _cost) = extract(&eg, eg.find(root), &costs);
+            let (arena, _env, _cost) = extract(&eg, eg.find(root), &costs);
             assert!(
-                !format!("{}", arena.display(id)).is_empty(),
+                !format!("{}", pixelflow_ir::display(arena.entry())).is_empty(),
                 "{case_name}: extraction produced an empty expression"
             );
         }

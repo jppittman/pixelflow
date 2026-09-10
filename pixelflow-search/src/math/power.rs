@@ -31,7 +31,7 @@
 use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 const EPSILON: f32 = 1e-6;
 
@@ -111,11 +111,11 @@ impl Rewrite for PowSpecialValue {
         }
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Pow, (var 0), (cst self.target_exponent)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         match &self.result {
             PowResult::Constant(c) => Some(arena_pat!(__a, cst * c)),
             PowResult::Identity => Some(arena_pat!(__a, var 0)),
@@ -221,11 +221,11 @@ impl Rewrite for PowerRecurrence {
         })
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Pow, (var 0), (var 1)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         None
     }
 }
@@ -295,12 +295,12 @@ impl Rewrite for LogPower {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         let lk = self.log_op.kind();
         Some(arena_pat!(__a, un lk, (bin OpKind::Pow, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         let lk = self.log_op.kind();
         Some(arena_pat!(__a, bin OpKind::Mul, (var 1), (un lk, (var 0))))
     }
@@ -362,11 +362,11 @@ impl Rewrite for ExpandSquare {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Pow, (bin OpKind::Add, (var 0), (var 1)), (cst 2.0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // a² + 2ab + b²
         let a2 = arena_pat!(__a, bin OpKind::Mul, (var 0), (var 0));
         let b2 = arena_pat!(__a, bin OpKind::Mul, (var 1), (var 1));
@@ -417,13 +417,13 @@ impl Rewrite for DiffOfSquares {
         Some(RewriteAction::DiffOfSquares { a, b })
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Sub, (bin OpKind::Mul, (var 0), (var 0)), (bin OpKind::Mul, (var 1), (var 1))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Mul, (bin OpKind::Add, (var 0), (var 1)), (bin OpKind::Sub, (var 0), (var 1))),
         )

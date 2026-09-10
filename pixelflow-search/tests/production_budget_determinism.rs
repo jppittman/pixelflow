@@ -4,7 +4,8 @@
 //! from.
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::Rooted;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, Term};
 use pixelflow_search::egraph::{
     APPLICATIONS_PER_CLASS, Budget, CLASSICAL_CLASS_CEILING, CLASSICAL_CLASS_CEILING_CALIBRATED,
     CLASSICAL_CLASS_FLOOR, CLASSICAL_CLASSES_PER_INSERTED_CLASS, HARD_CLASS_LIMIT, InputSize,
@@ -15,8 +16,8 @@ use pixelflow_search::egraph::{
 /// the same shape `optimizer_laws.rs`'s fixture uses, duplicated here rather
 /// than shared across `tests/` binaries (each integration test file is its
 /// own crate).
-fn fixture() -> (ExprArena, ExprId) {
-    let mut a = ExprArena::new();
+fn fixture() -> (Rooted<ExprData>, Environment) {
+    let mut a = ExprBuilder::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let z = a.push_var(2);
@@ -32,14 +33,16 @@ fn fixture() -> (ExprArena, ExprId) {
     let with_z = a.push_binary(OpKind::Add, prod, z);
     let neg = a.push_unary(OpKind::Neg, with_z);
     let root = a.push_binary(OpKind::Sub, with_z, neg);
-    (a, root)
+    a.finish(&[root])
 }
 
-/// A structural rendering of the extracted DAG, for equality comparisons —
-/// the arena is append-only and extraction emits children before parents,
-/// so this is already canonical for a given configuration.
-fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+/// A structural rendering of the extracted DAG, for equality comparisons.
+///
+/// `expr::encode` is already the canonical serialization — reachable nodes in
+/// topological order, dense ordinals, children named by ordinal — so this is
+/// its bytes rather than a second answer to "same term?".
+fn arena_shape(root: pixelflow_ir::Node<'_, ExprData>) -> String {
+    format!("{:?}", pixelflow_ir::encode(root))
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +272,7 @@ fn saturation_is_deterministic_under_cpu_contention() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    let (arena, root) = fixture();
+    let input = fixture();
 
     let stop = Arc::new(AtomicBool::new(false));
     let spinners: Vec<_> = (0..8)
@@ -293,17 +296,16 @@ fn saturation_is_deterministic_under_cpu_contention() {
     for _ in 0..6 {
         let mut optimizer = Optimizer::production();
         let mut eg = optimizer.egraph();
-        let root_class = pixelflow_search::egraph::insert(
-            &arena,
-            root,
+        let root_class = pixelflow_search::egraph::insert_term(
+            Term::new(input.0.entry(), &input.1),
             &mut eg,
             pixelflow_search::egraph::Vocabulary::Templates,
         )
         .expect("insert into e-graph");
-        let optimized = optimizer.run(&mut eg, root_class, arena.len());
+        let optimized = optimizer.run(&mut eg, root_class, input.0.len());
         let stop_reason = optimized.stats.stop;
-        let (out, out_root) = optimized.to_arena(&eg, root_class);
-        runs.push((stop_reason, arena_shape(&out, out_root)));
+        let (out, _out_env) = optimized.to_rooted(&eg, root_class);
+        runs.push((stop_reason, arena_shape(out.entry())));
     }
 
     stop.store(true, Ordering::Relaxed);

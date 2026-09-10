@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 // ============================================================================
 // InversePair: The Core Algebraic Relationship
@@ -139,11 +139,11 @@ impl<T: InversePair> Rewrite for Canonicalize<T> {
         })
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin T::derived().kind(), (var 0), (var 1)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin T::base().kind(), (var 0), (un T::inverse().kind(), (var 1))))
     }
 }
@@ -201,13 +201,13 @@ impl<T: InversePair> Rewrite for Involution<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Inverse(Inverse(V0))
         let inv = T::inverse().kind();
         Some(arena_pat!(__a, un inv, (un inv, (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 0))
     }
 }
@@ -266,13 +266,13 @@ impl<T: InversePair> Rewrite for Cancellation<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin T::derived().kind(), (bin T::base().kind(), (var 0), (var 1)), (var 1)),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 0))
     }
 }
@@ -336,11 +336,11 @@ impl<T: InversePair> Rewrite for InverseAnnihilation<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin T::base().kind(), (var 0), (un T::inverse().kind(), (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, cst T::identity()))
     }
 }
@@ -396,13 +396,13 @@ impl Rewrite for Associative {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Op(Op(V0, V1), V2)
         let k = self.op.kind();
         Some(arena_pat!(__a, bin k, (bin k, (var 0), (var 1)), (var 2)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Op(V0, Op(V1, V2))
         let k = self.op.kind();
         Some(arena_pat!(__a, bin k, (var 0), (bin k, (var 1), (var 2))))
@@ -457,13 +457,13 @@ impl Rewrite for ReverseAssociative {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Op(V0, Op(V1, V2))
         let k = self.op.kind();
         Some(arena_pat!(__a, bin k, (var 0), (bin k, (var 1), (var 2))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Op(Op(V0, V1), V2)
         let k = self.op.kind();
         Some(arena_pat!(__a, bin k, (bin k, (var 0), (var 1)), (var 2)))
@@ -508,11 +508,11 @@ impl Rewrite for Commutative {
         Some(RewriteAction::Create(swapped))
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin self.op.kind(), (var 0), (var 1)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin self.op.kind(), (var 1), (var 0)))
     }
 }
@@ -564,13 +564,13 @@ impl Rewrite for Distributive {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin self.outer.kind(), (var 0), (bin self.inner.kind(), (var 1), (var 2))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Inner(Outer(V0, V1), Outer(V0, V2))
         let ok = self.outer.kind();
         let ik = self.inner.kind();
@@ -641,14 +641,14 @@ impl Rewrite for Factor {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Outer(Inner(V0, V1), Inner(V0, V2))
         let ok = self.outer.kind();
         let ik = self.inner.kind();
         Some(arena_pat!(__a, bin ok, (bin ik, (var 0), (var 1)), (bin ik, (var 0), (var 2))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin self.inner.kind(), (var 0), (bin self.outer.kind(), (var 1), (var 2))),
         )
@@ -696,13 +696,13 @@ impl Rewrite for Identity {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Op(V0, Const(identity))
         let id_val = self.op.identity()?;
         Some(arena_pat!(__a, bin self.op.kind(), (var 0), (cst id_val)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 0))
     }
 }
@@ -741,13 +741,13 @@ impl Rewrite for Annihilator {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Op(V0, Const(annihilator))
         let ann = self.op.annihilator()?;
         Some(arena_pat!(__a, bin self.op.kind(), (var 0), (cst ann)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Const(annihilator)
         let ann = self.op.annihilator()?;
         Some(arena_pat!(__a, cst ann))
@@ -791,11 +791,11 @@ impl Rewrite for Idempotent {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin self.op.kind(), (var 0), (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, var 0))
     }
 }
@@ -849,11 +849,11 @@ impl Rewrite for Doubling {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Add, (var 0), (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (cst 2.0), (var 0)))
     }
 }
@@ -901,11 +901,11 @@ impl Rewrite for Halving {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (cst 2.0), (var 0)))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Add, (var 0), (var 0)))
     }
 }

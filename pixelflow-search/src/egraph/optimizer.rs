@@ -47,12 +47,13 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use pixelflow_ir::{ExprArena, ExprId, LatticeShape};
+use pixelflow_ir::expr::{Environment, ExprData};
+use pixelflow_ir::{LatticeShape, Rooted};
 
 use super::cost::CostModel;
 use super::extract::{
     ChoiceCost, Extraction, ExtractionObjective, ExtractionReport, IncrementalExtractor, Reranker,
-    choices_to_arena,
+    choices_to_rooted,
 };
 use super::graph::{ApplicationMask, EGraph, SaturationStats, SaturationStop};
 use super::guided::GuidedEpisode;
@@ -220,10 +221,10 @@ pub struct OptimizerStats {
 /// The result of [`Optimizer::run`]: the per-e-class extraction choices, and
 /// what the run did to get them.
 ///
-/// Choices rather than an arena because the three tiers materialise
+/// Choices rather than a graph because the three tiers materialise
 /// differently — the macro tier needs `ExtractedDAG` ref counts to place
-/// let-bindings, the arena tiers need an [`ExprArena`]. [`Optimized::to_arena`]
-/// is the arena half.
+/// let-bindings, the IR tiers need a [`Rooted<ExprData>`](Rooted).
+/// [`Optimized::to_rooted`] is the graph half.
 #[derive(Clone, Debug)]
 pub struct Optimized {
     /// One node index per canonical e-class, well-founded from the root.
@@ -231,7 +232,7 @@ pub struct Optimized {
     /// What [`Self::choices`] costs, in both the shape the extraction DP
     /// minimizes ([`ChoiceCost::tree`]) and the shape the emitted kernel pays
     /// ([`ChoiceCost::dag`]). Read from the settled choices, so it describes
-    /// the term [`Self::to_arena`] materializes — including under a
+    /// the term [`Self::to_rooted`] materializes — including under a
     /// [`Reranker`], whose search has its own scale and never produced this
     /// number before.
     pub cost: ChoiceCost,
@@ -244,13 +245,14 @@ pub struct Optimized {
 }
 
 impl Optimized {
-    /// Materialise the extracted DAG as an arena.
+    /// Materialise the extracted DAG as a rooted expression graph plus the
+    /// declaration tables its leaves index.
     ///
     /// `egraph` and `root` must be the ones [`Optimizer::run`] was given;
     /// the choices index that graph's classes.
     #[must_use]
-    pub fn to_arena(&self, egraph: &EGraph, root: EClassId) -> (ExprArena, ExprId) {
-        choices_to_arena(&Extraction::from_dp(egraph, root, self.choices.clone()))
+    pub fn to_rooted(&self, egraph: &EGraph, root: EClassId) -> (Rooted<ExprData>, Environment) {
+        choices_to_rooted(&Extraction::from_dp(egraph, root, self.choices.clone()))
     }
 }
 
@@ -261,12 +263,12 @@ impl Optimized {
 /// let mut egraph = optimizer.egraph();          // carries the rule set
 /// let root = /* insert your term */;
 /// let out = optimizer.run(&mut egraph, root, node_count);
-/// let (arena, arena_root) = out.to_arena(&egraph, root);
+/// let (rooted, env) = out.to_rooted(&egraph, root);
 /// ```
 ///
 /// The two-step — build the graph, then run — is not ceremony: the three
-/// tiers insert their terms differently (an AST through `EGraphContext`, an
-/// arena through `add_arena`), and that boundary is genuinely theirs. What
+/// tiers insert their terms differently, and that boundary is genuinely
+/// theirs. What
 /// they must not each decide for themselves is the rule set, the budget, the
 /// cost model, and the extractor, which is exactly what this type owns.
 pub struct Optimizer {

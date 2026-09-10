@@ -21,7 +21,7 @@ use std::marker::PhantomData;
 use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Op, Rewrite, RewriteAction, ops};
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::expr::{ExprBuilder, ExprRef};
 
 // ============================================================================
 // AngleAddition Trait
@@ -174,11 +174,11 @@ impl<T: AngleAddition> Rewrite for AngleAdditionRule<T> {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un T::op().kind(), (bin OpKind::Add, (var 0), (var 1))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         let exp = T::expansion();
         // term1: Mul(term1_op1(V0), term1_op2(V1))
         let term1 = arena_pat!(
@@ -253,7 +253,7 @@ impl Rewrite for Pythagorean {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         // Add(Mul(Sin(V0), Sin(V0)), Mul(Cos(V0), Cos(V0)))
         let sin_l = arena_pat!(__a, un OpKind::Sin, (var 0));
         let sin_r = arena_pat!(__a, un OpKind::Sin, (var 0));
@@ -264,7 +264,7 @@ impl Rewrite for Pythagorean {
         Some(__a.push_binary(OpKind::Add, sin_sq, cos_sq))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, cst 1.0))
     }
 }
@@ -395,13 +395,13 @@ impl Rewrite for ReverseAngleAddition {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Add, (bin OpKind::Mul, (un OpKind::Sin, (var 0)), (un OpKind::Cos, (var 1))), (bin OpKind::Mul, (un OpKind::Cos, (var 0)), (un OpKind::Sin, (var 1)))),
         )
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, un OpKind::Sin, (bin OpKind::Add, (var 0), (var 1))))
     }
 }
@@ -570,11 +570,11 @@ impl Rewrite for HalfAngleProduct {
         None
     }
 
-    fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn lhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(arena_pat!(__a, bin OpKind::Mul, (un OpKind::Sin, (var 0)), (un OpKind::Cos, (var 0))))
     }
 
-    fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
+    fn rhs_template(&self, __a: &mut ExprBuilder) -> Option<ExprRef> {
         Some(
             arena_pat!(__a, bin OpKind::Div, (un OpKind::Sin, (bin OpKind::Add, (var 0), (var 0))), (cst 2.0)),
         )

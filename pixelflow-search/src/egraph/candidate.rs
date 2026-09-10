@@ -57,7 +57,7 @@
 //! iteration/sweep counter and never wall-clock.
 
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{BufferDecl, UniformDecl};
+use pixelflow_ir::decl::{BufferDecl, UniformDecl};
 
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
@@ -435,9 +435,9 @@ mod tests {
     #[cfg(feature = "provenance-journal")]
     #[test]
     fn repeated_idempotent_refires_share_a_candidate_key() {
-        use pixelflow_ir::ExprArena;
+        use pixelflow_ir::expr::ExprBuilder;
 
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(pixelflow_ir::OpKind::Add, x, y);

@@ -2,7 +2,7 @@
 //!
 //! An e-graph compresses many equivalent expressions. Extraction picks
 //! the "best" one according to a cost model and materialises it as an
-//! [`pixelflow_ir::ExprArena`].
+//! [`pixelflow_ir::Rooted<ExprData>`](pixelflow_ir::Rooted).
 
 use super::cost::{CostFunction, CostModel};
 use super::deps::var_variance;
@@ -21,7 +21,7 @@ use pixelflow_ir::{LatticeShape, Variance};
 /// the choice graph is acyclic (bottom-up realizable). Those two properties
 /// are exactly what let a choice function be materialised at all — an
 /// unvalidated `Vec<Option<usize>>` can loop forever when walked (a real
-/// 2.7GB OOM, see `choices_to_arena`'s doc comment), and a call site that
+/// 2.7GB OOM, see `choices_to_rooted`'s doc comment), and a call site that
 /// forgets to repair or backfill it produces that bug silently.
 ///
 /// `Extraction` makes the bug class unrepresentable: the only ways to
@@ -29,7 +29,7 @@ use pixelflow_ir::{LatticeShape, Variance};
 /// [`repair_choices_well_founded`]) and [`Extraction::from_backfill`]
 /// (wraps [`backfill_well_founded`]) — both establish well-foundedness as
 /// part of construction, so a bare unvalidated vector can never cross into
-/// [`choices_to_arena`] or the edge walker
+/// [`choices_to_rooted`] or the edge walker
 /// ([`crate::nnue::EdgeTrace::from_extraction`]), which accept only
 /// `&Extraction`. See docs/plans/2026-08-17-cost-model-domain.md §1
 /// "Extraction (J2)".
@@ -115,7 +115,7 @@ impl<'g> Extraction<'g> {
         &self.choices
     }
 
-    /// The choice vector [`choices_to_arena`] will actually materialise:
+    /// The choice vector [`choices_to_rooted`] will actually materialise:
     /// every `Shl`/`Shr` count child re-pinned to a `Const` representative of
     /// its class ([`pin_shift_counts`]), because the emitter's shift lowering
     /// requires an immediate and a count class can legitimately hold
@@ -123,7 +123,7 @@ impl<'g> Extraction<'g> {
     /// (e.g. `Y - Y` merged with `Const(0)`).
     ///
     /// Any consumer that walks an `Extraction` — not just
-    /// [`choices_to_arena`] itself — must walk this view, not [`Self::choices`]
+    /// [`choices_to_rooted`] itself — must walk this view, not [`Self::choices`]
     /// directly: describing the raw (possibly non-`Const`) choice for a
     /// count class would describe a DAG that is not the one actually
     /// compiled. `ChoicesCostDag` in `crate::nnue::factored` takes this view
@@ -136,7 +136,7 @@ impl<'g> Extraction<'g> {
     /// / pixel-varying) of the CHOSEN nodes, not the class-wide meet
     /// [`super::DepsAnalysis`] would compute over the whole e-graph.
     ///
-    /// Materialises the choice function once via [`choices_to_arena`] and
+    /// Materialises the choice function once via [`choices_to_rooted`] and
     /// classifies that arena — P1(c) of
     /// docs/plans/2026-08-17-cost-model-domain.md: once a rewrite merges a
     /// pixel-varying node into a class alongside a constant one, the
@@ -145,8 +145,8 @@ impl<'g> Extraction<'g> {
     /// what was picked.
     #[must_use]
     pub fn chosen_variance(&self) -> [f32; crate::nnue::factored::SCALAR_FEATURE_COUNT] {
-        let (arena, _root) = choices_to_arena(self);
-        crate::nnue::factored::variance_histogram(&arena)
+        let (rooted, _env) = choices_to_rooted(self);
+        crate::nnue::factored::variance_histogram(&rooted)
     }
 
     /// Unwrap into the raw choice vector.
@@ -198,7 +198,7 @@ impl<'g> Extraction<'g> {
     /// unreachable-hence-irrelevant, or the reverse). That disagreement
     /// never reaches an observable output, though: every consumer that
     /// scores or materialises a candidate walks forward from `root` only
-    /// ([`choices_to_arena`], which is what a [`Reranker`]'s score is
+    /// ([`choices_to_rooted`], which is what a [`Reranker`]'s score is
     /// computed from), so a `canonical` unreachable from root is invisible
     /// to it regardless of what this function decides; accept or reject,
     /// the candidate's score is bit-identical to `current_cost` and it
@@ -268,10 +268,14 @@ impl<'g> Extraction<'g> {
 /// residual reranker over the additive latency-prior table plugs into; only
 /// test-only rerankers exist today (see `egraph::extract::tests`).
 pub trait Reranker {
-    /// Score the DAG `extraction` selects, materialised as `arena` — the
-    /// same `(arena, root)` pair [`choices_to_arena`] would return for
-    /// `extraction`, computed once per candidate by the search loop.
-    fn score(&self, extraction: &Extraction<'_>, arena: &pixelflow_ir::ExprArena) -> f64;
+    /// Score the DAG `extraction` selects, materialised as `rooted` — the
+    /// same graph [`choices_to_rooted`] would return for `extraction`,
+    /// computed once per candidate by the search loop.
+    fn score(
+        &self,
+        extraction: &Extraction<'_>,
+        rooted: &pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+    ) -> f64;
 }
 
 /// Incremental swap-refinement extractor, generic over a [`Reranker`].
@@ -297,7 +301,7 @@ impl<'a, R: Reranker + ?Sized> IncrementalExtractor<'a, R> {
 
     /// Run the extraction refinement loop and return `(score, extraction)`.
     ///
-    /// Call [`choices_to_arena`] on the returned [`Extraction`] to
+    /// Call [`choices_to_rooted`] on the returned [`Extraction`] to
     /// materialise the extracted DAG.
     pub fn extract_choices_only<'g>(
         &self,
@@ -392,8 +396,8 @@ impl<'a, R: Reranker + ?Sized> IncrementalExtractor<'a, R> {
 
     /// Materialise `extraction` and hand it to `self.reranker`.
     fn score(&self, extraction: &Extraction<'_>) -> f64 {
-        let (arena, _root) = choices_to_arena(extraction);
-        self.reranker.score(extraction, &arena)
+        let (rooted, _env) = choices_to_rooted(extraction);
+        self.reranker.score(extraction, &rooted)
     }
 
     /// Walk the current best tree and collect active (reachable) e-class IDs.
@@ -442,7 +446,7 @@ impl<'a, R: Reranker + ?Sized> IncrementalExtractor<'a, R> {
 ///
 /// This restores the invariant relied on throughout `extract_choices_only`
 /// and its helpers (`get_active_classes`, the refinement loop, and
-/// `choices_to_arena`): every e-class reachable from the root via the
+/// `choices_to_rooted`): every e-class reachable from the root via the
 /// *currently chosen* nodes has a `Some` entry in `choices`, and the choice
 /// graph is a DAG.
 ///
@@ -452,7 +456,7 @@ impl<'a, R: Reranker + ?Sized> IncrementalExtractor<'a, R> {
 /// hold a node referencing the other at index 0 and the node-0 choice
 /// function is CYCLIC. A cyclic bootstrap is unrecoverable downstream: every
 /// refinement swap fails the cycle check (the pre-existing cycle is reachable
-/// no matter what is swapped) and the cyclic set flows to `choices_to_arena`
+/// no matter what is swapped) and the cyclic set flows to `choices_to_rooted`
 /// (observed: a full-DEV bench run died by OOM there; the restart-DFS
 /// `break_choice_cycles` repair did not terminate on the same graph).
 ///
@@ -600,7 +604,7 @@ fn choices_have_cycle_from(egraph: &EGraph, root: EClassId, choices: &[Option<us
         // report a cycle that is not there (a rejected swap, i.e. cost),
         // never miss one that is. Nothing materialised comes out of here;
         // the one place a missing choice would become a wrong *term* is
-        // `choices_to_arena`, which panics on it instead.
+        // `choices_to_rooted`, which panics on it instead.
         let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or(0);
         if let Some(ENode::Op { children, .. }) = egraph.nodes(canonical).get(node_idx) {
             for &child in children.iter().rev() {
@@ -862,7 +866,11 @@ pub fn extract<C: CostFunction>(
     egraph: &EGraph,
     root: EClassId,
     costs: &C,
-) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId, usize) {
+) -> (
+    pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+    pixelflow_ir::expr::Environment,
+    usize,
+) {
     // Cap for cycle/self-referential costs - high but not astronomical
     const CYCLE_COST: usize = 1_000_000;
 
@@ -970,8 +978,8 @@ pub fn extract<C: CostFunction>(
         LatticeShape::POINT,
     )
     .tree;
-    let (arena, root_id) = choices_to_arena(&extraction);
-    (arena, root_id, total_cost)
+    let (rooted, env) = choices_to_rooted(&extraction);
+    (rooted, env, total_cost)
 }
 
 // ============================================================================
@@ -1104,27 +1112,29 @@ pub fn build_extracted_dag_from_choices(
 }
 
 // ============================================================================
-// Arena-Direct Extraction (EGraph → ExprArena)
+// Direct Extraction (EGraph → Rooted<ExprData>)
 // ============================================================================
 
-/// Walk extraction choices and materialise directly into an [`pixelflow_ir::ExprArena`].
+/// Walk extraction choices and materialise directly through an
+/// [`ExprBuilder`](pixelflow_ir::expr::ExprBuilder).
 ///
-/// Each reachable e-class maps to exactly one [`pixelflow_ir::ExprId`]. Shared
-/// e-classes naturally share `ExprId`s (DAG output — nodes are not duplicated).
+/// Each reachable e-class maps to exactly one node. Shared e-classes naturally
+/// share nodes (DAG output — nodes are not duplicated).
 ///
 /// ## Algorithm
 ///
-/// Iterative post-order traversal with a `Vec<Option<ExprId>>` cache indexed by
-/// canonical e-class id:
+/// Iterative post-order traversal with a `Vec<Option<ExprRef>>` cache indexed
+/// by canonical e-class id:
 ///
-/// - If an e-class already has a cached `ExprId`, reuse it (O(1), `ExprId` is `Copy`).
+/// - If an e-class already has a cached `ExprRef`, reuse it (O(1), `ExprRef` is
+///   `Copy`).
 /// - Otherwise push children for visiting (in reverse so they are processed
 ///   left-to-right), then push a `Complete` task for the current e-class.
-/// - On `Complete`: pop the children `ExprId`s from the result stack, push a new
-///   node into the arena, and record the `ExprId` in the cache.
+/// - On `Complete`: pop the children `ExprRef`s from the result stack, push a
+///   new node, and record the `ExprRef` in the cache.
 ///
-/// Post-order guarantees nodes are appended in topological order (children before
-/// parents), which is a requirement of [`pixelflow_ir::ExprArena`].
+/// Post-order guarantees nodes are built in topological order (children before
+/// parents), which is what a `Dag` edge requires.
 /// Re-pin every `Shl`/`Shr` count child to a `Const` representative.
 ///
 /// The emitter lowers shifts to hardware immediates, so the count child MUST
@@ -1136,7 +1146,7 @@ pub fn build_extracted_dag_from_choices(
 /// by definition: same class means equal value.
 ///
 /// Scoped to classes reachable from `root` via the ORIGINAL (unpinned)
-/// `choices` — the same traversal [`choices_to_arena`] performs once pinning
+/// `choices` — the same traversal [`choices_to_rooted`] performs once pinning
 /// has settled. `choices` can
 /// (and, on a graph whose choices were built up by several backfill
 /// passes, routinely does) hold `Some` entries for classes no longer
@@ -1145,13 +1155,13 @@ pub fn build_extracted_dag_from_choices(
 /// candidate. Walking `0..egraph.num_classes()`
 /// unconditionally, as this used to, re-derives and re-pins every one of
 /// those stale entries even though nothing downstream ever reads them
-/// (`choices_to_arena` only ever visits classes reachable
+/// (`choices_to_rooted` only ever visits classes reachable
 /// from `root`) — pure wasted work on a saturated e-graph's full class
 /// count, not the reachable subtree's.
 ///
 /// Using unpinned `choices` (rather than the pins already decided so far in
 /// this same walk) to decide which children to descend into is deliberately
-/// a superset of the classes [`choices_to_arena`] will actually visit once
+/// a superset of the classes [`choices_to_rooted`] will actually visit once
 /// pinning is final: pinning a count class to a `Const` can only ever REMOVE
 /// reachability (a `Const` has no children to recurse into), never add it,
 /// so this walk's reachable set is never missing a class the final pinned
@@ -1230,10 +1240,14 @@ fn pin_shift_counts(
     pinned
 }
 
-pub fn choices_to_arena(
+pub fn choices_to_rooted(
     extraction: &Extraction<'_>,
-) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
-    use pixelflow_ir::{Children, ExprArena, ExprId, Ir, Shape};
+) -> (
+    pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+    pixelflow_ir::expr::Environment,
+) {
+    use pixelflow_ir::expr::{ExprBuilder, ExprRef};
+    use pixelflow_ir::{Children, Ir, Shape};
 
     let egraph = extraction.egraph();
     let root = extraction.root();
@@ -1247,15 +1261,15 @@ pub fn choices_to_arena(
         /// Visit an e-class: push it to the result stack if cached, otherwise
         /// schedule children + a Complete task.
         Visit(EClassId),
-        /// All children of this e-class have been processed; pop their ExprIds,
-        /// push a new arena node, and cache the result.
+        /// All children of this e-class have been processed; pop their
+        /// `ExprRef`s, push a new node, and cache the result.
         Complete { canonical_id: u32, node_idx: usize },
     }
 
     let num_classes = egraph.num_classes();
-    let mut arena = ExprArena::with_capacity(num_classes);
-    // Cache: canonical e-class id → ExprId (None = not yet visited).
-    let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; num_classes];
+    let mut arena = ExprBuilder::new();
+    // Cache: canonical e-class id → ExprRef (None = not yet visited).
+    let mut id_map: Vec<Option<ExprRef>> = alloc::vec![None; num_classes];
     // DFS color per canonical class: 0 = unvisited, 1 = on the current path
     // (children scheduled, Complete pending). Re-entering a gray class means
     // the choice graph reaches a class through its own descendants — a CYCLE.
@@ -1264,7 +1278,7 @@ pub fn choices_to_arena(
     // SIGKILLed at 2.7GB inside this loop). A cyclic choice set is an
     // extractor bug and must be reported as one, loudly, with the class id.
     let mut color: Vec<u8> = alloc::vec![0; num_classes];
-    let mut result_stack: Vec<ExprId> = Vec::new();
+    let mut result_stack: Vec<ExprRef> = Vec::new();
     let mut task_stack: Vec<Task> = alloc::vec![Task::Visit(root)];
 
     while let Some(task) = task_stack.pop() {
@@ -1273,7 +1287,7 @@ pub fn choices_to_arena(
                 let canonical = egraph.find(class);
                 let idx = canonical.0 as usize;
 
-                // Already materialised — reuse without any clone (ExprId is Copy).
+                // Already materialised — reuse without any clone (ExprRef is Copy).
                 if let Some(cached_id) = id_map.get(idx).and_then(|o| *o) {
                     result_stack.push(cached_id);
                     continue;
@@ -1289,7 +1303,7 @@ pub fn choices_to_arena(
                 // at the source rather than surfacing as a subtly wrong kernel.
                 let node_idx = choices.get(idx).and_then(|o| *o).unwrap_or_else(|| {
                     panic!(
-                        "choices_to_arena: e-class {} is reachable from root {} but has \
+                        "choices_to_rooted: e-class {} is reachable from root {} but has \
                          no recorded extraction choice — the extractor that produced \
                          `choices` must guarantee every reachable e-class has Some(idx)",
                         idx, root.0
@@ -1299,7 +1313,7 @@ pub fn choices_to_arena(
                 let nodes = egraph.nodes(canonical);
                 assert!(
                     node_idx < nodes.len(),
-                    "choices_to_arena: node_idx {} out of bounds ({}) for e-class {}",
+                    "choices_to_rooted: node_idx {} out of bounds ({}) for e-class {}",
                     node_idx,
                     nodes.len(),
                     idx
@@ -1324,7 +1338,7 @@ pub fn choices_to_arena(
                     ENode::Buffer(decl) => {
                         // One slot per distinct identity, and the assertion
                         // that a repeat identity agrees on extents, both live
-                        // in `ExprArena`'s `embed`: declaring a buffer is what
+                        // in `ExprBuilder`'s `embed`: declaring a buffer is what
                         // the destination representation does, not what the
                         // walk over the e-graph does.
                         let expr_id = arena.embed(Shape::Buffer(*decl));
@@ -1356,7 +1370,7 @@ pub fn choices_to_arena(
                     ENode::Op { children, .. } => {
                         assert!(
                             color[idx] != 1,
-                            "choices_to_arena: extraction choices are CYCLIC — e-class {} is \
+                            "choices_to_rooted: extraction choices are CYCLIC — e-class {} is \
                              reached again through its own chosen descendants (root {}). The \
                              extractor that produced these choices must guarantee a \
                              well-founded choice DAG; materializing this one would loop until \
@@ -1398,7 +1412,7 @@ pub fn choices_to_arena(
                 let ENode::Op { op, children } = node else {
                     // Leaves are handled in Visit; reaching here would be a bug.
                     panic!(
-                        "choices_to_arena: Complete task for non-Op node (e-class {})",
+                        "choices_to_rooted: Complete task for non-Op node (e-class {})",
                         canonical_id
                     );
                 };
@@ -1406,13 +1420,13 @@ pub fn choices_to_arena(
                 let arity = children.len();
                 let start = result_stack.len().checked_sub(arity).unwrap_or_else(|| {
                     panic!(
-                        "choices_to_arena: result_stack underflow (arity={}, len={}, e-class={})",
+                        "choices_to_rooted: result_stack underflow (arity={}, len={}, e-class={})",
                         arity,
                         result_stack.len(),
                         canonical_id
                     )
                 });
-                let child_ids: Vec<pixelflow_ir::ExprId> = result_stack.drain(start..).collect();
+                let child_ids: Vec<ExprRef> = result_stack.drain(start..).collect();
 
                 // Arity dispatch is the destination's business: `embed` picks
                 // the unary/binary/ternary/n-ary node. A zero-arity `Op` is
@@ -1431,8 +1445,8 @@ pub fn choices_to_arena(
 
     let root_id = result_stack
         .pop()
-        .unwrap_or_else(|| panic!("choices_to_arena: empty result stack after traversal"));
-    (arena, root_id)
+        .unwrap_or_else(|| panic!("choices_to_rooted: empty result stack after traversal"));
+    arena.finish(&[root_id])
 }
 
 // ============================================================================
@@ -1482,7 +1496,7 @@ pub struct ExtractedDAG {
 
     /// **DAG** cost of the term in [`Self::choices`]: each distinct chosen
     /// e-class priced once, which is what the emitted kernel pays.
-    /// [`choices_to_arena`] materializes one arena node per reachable
+    /// [`choices_to_rooted`] materializes one arena node per reachable
     /// e-class and codegen let-binds the shared ones, so under
     /// [`LatticeShape::POINT`] this equals the latency-prior cost of that
     /// arena — the property every measurement in this repo assumes when it
@@ -1734,7 +1748,7 @@ pub struct ChoiceCost {
     pub tree: usize,
 
     /// Each distinct chosen e-class priced **once** — what the emitted kernel
-    /// actually pays, since [`choices_to_arena`] materializes exactly one
+    /// actually pays, since [`choices_to_rooted`] materializes exactly one
     /// arena node per reachable e-class and codegen let-binds the shared ones.
     ///
     /// A caller asking "what will this kernel cost?" wants this number.
@@ -1755,7 +1769,7 @@ pub struct ChoiceCost {
 /// so a Z-only subexpression is priced once per frame and an X-dependent one
 /// once per sample. Leaves are free ([`CostModel::node_op_cost`]), so under
 /// [`LatticeShape::POINT`] `ChoiceCost::dag` equals the latency-prior cost of
-/// the arena `choices_to_arena` builds from the same map.
+/// the arena `choices_to_rooted` builds from the same map.
 ///
 /// # Panics
 ///
@@ -2594,7 +2608,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
 /// (a [`Reach`]), and a candidate unions its children's sets, adding a
 /// class's own cost the first time that class enters the union. Two siblings
 /// that both reach `sin(X)` therefore pay for it once, which is what the
-/// emitted kernel does: `choices_to_arena` materializes one node per
+/// emitted kernel does: `choices_to_rooted` materializes one node per
 /// reachable class and codegen let-binds the shared ones.
 ///
 /// A union is taken by stamping: every member of every child's set is
@@ -3259,8 +3273,9 @@ mod tests {
     /// small explicit budget: a graph with variants, cycles and shared
     /// classes, as the passes meet them in production.
     fn saturated_sdf_egraph(target_nodes: usize) -> (EGraph, EClassId) {
-        use pixelflow_ir::{ExprArena, OpKind};
-        let mut arena = ExprArena::new();
+        use pixelflow_ir::OpKind;
+        use pixelflow_ir::expr::{ExprBuilder, Term};
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let c = arena.push_const(0.37);
@@ -3496,10 +3511,11 @@ mod tests {
         let x = egraph.add(ENode::Var(0));
 
         let costs = CostModel::default();
-        let (arena, root, cost) = extract(&egraph, x, &costs);
+        let (arena, _env, cost) = extract(&egraph, x, &costs);
+        let root = arena.entry();
 
         assert_eq!(arena.len(), 1);
-        assert_eq!(root.0, 0);
+        assert_eq!(*root, pixelflow_ir::expr::ExprData::Var(0));
         assert_eq!(cost, 0); // Leaf nodes (Var/Const) have cost 0
     }
 
@@ -3514,10 +3530,11 @@ mod tests {
         });
 
         let costs = CostModel::default();
-        let (arena, root, _cost) = extract(&egraph, sum, &costs);
+        let (arena, _env, _cost) = extract(&egraph, sum, &costs);
+        let root = arena.entry();
 
         assert_eq!(arena.len(), 3); // Add + X + Y
-        assert_eq!(root.0, 2);
+        assert_eq!(root.op(), Some(pixelflow_ir::OpKind::Add));
     }
 
     #[test]
@@ -3551,18 +3568,17 @@ mod tests {
             "test assumes Add is strictly cheaper than Mul in the latency prior"
         );
 
-        let (arena, root, cost) = extract(&egraph, egraph.find(x_plus_x), &costs);
+        let (arena, _env, cost) = extract(&egraph, egraph.find(x_plus_x), &costs);
+        let root = arena.entry();
 
         // Cheapest form is `x + x`: Add(4) + Var(0) + Var(0) = 4.
         assert_eq!(cost, costs.cost(pixelflow_ir::OpKind::Add));
 
-        let root_node = arena.node(root);
-        assert!(
-            matches!(
-                root_node,
-                pixelflow_ir::arena::ExprNode::Binary(pixelflow_ir::OpKind::Add, _, _)
-            ),
-            "extraction with the latency-prior cost model should pick the Add form, got {root_node:?}"
+        assert_eq!(
+            root.op(),
+            Some(pixelflow_ir::OpKind::Add),
+            "extraction with the latency-prior cost model should pick the Add form, got {}",
+            pixelflow_ir::display(root)
         );
     }
 
@@ -3575,20 +3591,22 @@ mod tests {
     /// additive latency-prior table [`extract_dag`] minimizes, just summed
     /// over the arena instead of folded bottom-up through the e-graph. No
     /// sharing discount (each arena node is already deduped by
-    /// `choices_to_arena`, so this is a DAG cost, not a tree cost) — fine
+    /// `choices_to_rooted`, so this is a DAG cost, not a tree cost) — fine
     /// for the sharing-free graphs these tests build.
     struct TableReranker<'a> {
         costs: &'a CostModel,
     }
 
     impl Reranker for TableReranker<'_> {
-        fn score(&self, _extraction: &Extraction<'_>, arena: &pixelflow_ir::ExprArena) -> f64 {
-            let mut total = 0.0f64;
-            for i in 0..arena.len() {
-                let id = pixelflow_ir::ExprId(i as u32);
-                total += self.costs.cost(arena.kind(id)) as f64;
-            }
-            total
+        fn score(
+            &self,
+            _extraction: &Extraction<'_>,
+            rooted: &pixelflow_ir::Rooted<pixelflow_ir::expr::ExprData>,
+        ) -> f64 {
+            rooted
+                .iter()
+                .map(|n| self.costs.cost(crate::nnue::factored::kind_of(n)) as f64)
+                .sum()
         }
     }
 
@@ -3620,19 +3638,17 @@ mod tests {
         let reranker = TableReranker { costs: &costs };
         let extractor = IncrementalExtractor::new(&reranker, 8);
         let (search_cost, extraction) = extractor.extract_choices_only(&egraph, merged);
-        let (arena, root) = choices_to_arena(&extraction);
+        let (arena, _env) = choices_to_rooted(&extraction);
 
         assert_eq!(
             search_cost, dag.total_cost as f64,
             "swap-refinement search must reach the same additive cost as extract_dag's DP"
         );
-        let root_node = arena.node(root);
-        assert!(
-            matches!(
-                root_node,
-                pixelflow_ir::arena::ExprNode::Binary(pixelflow_ir::OpKind::Add, _, _)
-            ),
-            "swap search should have converged on the Add form, got {root_node:?}"
+        assert_eq!(
+            arena.entry().op(),
+            Some(pixelflow_ir::OpKind::Add),
+            "swap search should have converged on the Add form, got {}",
+            pixelflow_ir::display(arena.entry())
         );
     }
 
@@ -3650,9 +3666,8 @@ mod tests {
         let reranker = TableReranker { costs: &costs };
         let extractor = IncrementalExtractor::new(&reranker, 8);
         let (_cost, extraction) = extractor.extract_choices_only(&egraph, merged);
-        let (arena, root) = choices_to_arena(&extraction);
-        assert!(arena.len() >= 1);
-        assert!(root.0 < arena.len() as u32);
+        let (arena, _env) = choices_to_rooted(&extraction);
+        assert!(!arena.is_empty());
     }
 
     // ========================================================================
@@ -3688,14 +3703,14 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "CYCLIC")]
-    fn choices_to_arena_refuses_a_cyclic_choice_set() {
+    fn choices_to_rooted_refuses_a_cyclic_choice_set() {
         // Before the gray-marking assert, this walk re-scheduled the cycle
         // forever: a full-DEV bench run grew to 2.7GB and died by SIGKILL
         // with zero diagnostics. The cycle must be a loud extractor
         // accusation instead. `Extraction`'s own constructors now refuse a
         // cyclic choice set before this point is ever reached (see
         // `extraction_constructors_refuse_a_cyclic_choice_set`) — this test
-        // exercises `choices_to_arena`'s own belt-and-suspenders check by
+        // exercises `choices_to_rooted`'s own belt-and-suspenders check by
         // constructing the `Extraction` directly (private-field literal,
         // valid from within this module), bypassing the smart constructors
         // on purpose.
@@ -3710,7 +3725,7 @@ mod tests {
             root: egraph.find(merged),
             choices,
         };
-        let _ = choices_to_arena(&extraction);
+        let _ = choices_to_rooted(&extraction);
     }
 
     #[test]
@@ -3718,7 +3733,7 @@ mod tests {
     fn extraction_constructors_refuse_a_cyclic_choice_set() {
         // The type-level guarantee J2 adds: a cyclic choice vector can no
         // longer become an `Extraction` at all, so the 2.7GB-OOM class of
-        // bug can't reach `choices_to_arena` in the first place.
+        // bug can't reach `choices_to_rooted` in the first place.
         let (egraph, merged, n1) = cyclic_capable_egraph();
         let mut choices: Vec<Option<usize>> = alloc::vec![None; egraph.num_classes()];
         let m = egraph.find(merged).0 as usize;
@@ -3753,8 +3768,8 @@ mod tests {
             root: egraph.find(merged),
             choices,
         };
-        let (arena, root) = choices_to_arena(&extraction);
-        assert!(root.0 < arena.len() as u32);
+        let (arena, _env) = choices_to_rooted(&extraction);
+        assert!(!arena.is_empty());
 
         // And a set that is ALREADY acyclic passes through untouched.
         let mut acyclic: Vec<Option<usize>> = alloc::vec![None; egraph.num_classes()];
@@ -4019,20 +4034,21 @@ mod tests {
     // Arena/extraction edge-walk equivalence (2026-08 round-0 skew guard)
     // =========================================================================
 
-    /// The arena walk (`EdgeTrace::from_arena_dag`) and the e-graph walk
+    /// The term walk (`EdgeTrace::from_term`) and the e-graph walk
     /// (`EdgeTrace::from_extraction`) are thin adapters over one walker, and
     /// this test pins that: for the same DAG — shared subexpressions, shared
     /// leaves — the two paths must record the identical edge stream. If a
     /// future change gives either path its own edge policy, this fails.
     #[test]
-    fn arena_and_extraction_walks_record_the_same_edge_stream() {
+    fn term_and_extraction_walks_record_the_same_edge_stream() {
         use crate::nnue::EdgeTrace;
-        use pixelflow_ir::{ExprArena, OpKind};
+        use pixelflow_ir::OpKind;
+        use pixelflow_ir::expr::{ExprBuilder, Term};
 
-        // Arena: (sin(Z * 0.3) * (X + Y) + sin(Z * 0.3)) + Y * 0.3
+        // Graph: (sin(Z * 0.3) * (X + Y) + sin(Z * 0.3)) + Y * 0.3
         // - sin(Z * 0.3) is SHARED (register reload on the second reference)
         // - Y and 0.3 are shared leaves (leaf reload policy)
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let z = arena.push_var(2);
         let c = arena.push_const(0.3);
         let zm = arena.push_binary(OpKind::Mul, z, c);
@@ -4044,6 +4060,7 @@ mod tests {
         let a = arena.push_binary(OpKind::Add, m, sin);
         let yc = arena.push_binary(OpKind::Mul, y, c);
         let root = arena.push_binary(OpKind::Add, a, yc);
+        let built = arena.finish(&[root]);
 
         // The SAME DAG as an e-graph (sharing preserved node for node).
         use crate::egraph::ops;
@@ -4084,24 +4101,24 @@ mod tests {
         let choices: Vec<Option<usize>> = alloc::vec![None; eg.num_classes()];
         let extraction = Extraction::from_backfill(&eg, eroot, choices);
 
-        let from_arena = EdgeTrace::from_arena_dag(&arena, root);
+        let from_term = EdgeTrace::from_term(Term::new(built.0.entry(), &built.1));
         let from_egraph = EdgeTrace::from_extraction(&extraction);
 
-        assert_eq!(from_arena.node_count(), 11, "11 distinct nodes");
+        assert_eq!(from_term.node_count(), 11, "11 distinct nodes");
         assert_eq!(
-            from_arena, from_egraph,
-            "the arena walk and the e-graph walk must record the identical edge stream"
+            from_term, from_egraph,
+            "the term walk and the e-graph walk must record the identical edge stream"
         );
 
         // ---------------------------------------------------------------
         // Shift-count pinning (review thread on PR #1019): a Shl/Shr count
         // e-class can legitimately hold both a Const and a value-equal
-        // varying-shaped alternative. `choices_to_arena` always pins that
+        // varying-shaped alternative. `choices_to_rooted` always pins that
         // child to the Const representative (`pin_shift_counts` — the
         // emitter's shift lowering requires an immediate), so if the
         // extraction chose the varying node, the e-graph walk must describe
         // the PINNED arena, not the raw choice — otherwise it records nodes
-        // `choices_to_arena` never emits.
+        // `choices_to_rooted` never emits.
         // ---------------------------------------------------------------
         struct ShlOp;
         impl crate::egraph::ops::Op for ShlOp {
@@ -4110,14 +4127,15 @@ mod tests {
             }
         }
 
-        // The arena `choices_to_arena` will actually materialise: pinning
+        // The graph `choices_to_rooted` will actually materialise: pinning
         // always wins, so the compiled form is `Shl(X, Const(0))` no matter
         // which node the count class's extraction chose.
-        let mut arena3 = ExprArena::new();
+        let mut arena3 = ExprBuilder::new();
         let x3 = arena3.push_var(0);
         let zero3 = arena3.push_const(0.0);
         let shl3 = arena3.push_binary(OpKind::Shl, x3, zero3);
-        let from_arena3 = EdgeTrace::from_arena_dag(&arena3, shl3);
+        let built3 = arena3.finish(&[shl3]);
+        let from_term3 = EdgeTrace::from_term(Term::new(built3.0.entry(), &built3.1));
 
         let mut eg3 = EGraph::new();
         let ex3 = eg3.add(ENode::Var(0));
@@ -4153,9 +4171,9 @@ mod tests {
         let from_egraph3 = EdgeTrace::from_extraction(&extraction3);
 
         assert_eq!(
-            from_arena3, from_egraph3,
+            from_term3, from_egraph3,
             "the e-graph walk must not walk into Sub(Y, Y) once the count is pinned to \
-             Const(0), or its stream will disagree with the arena choices_to_arena emits"
+             Const(0), or its stream will disagree with the graph choices_to_rooted emits"
         );
     }
 
@@ -4165,14 +4183,15 @@ mod tests {
     // `crate::nnue::factored::variance_histogram`)
     // =========================================================================
 
-    /// A known const/frame/scanline/pixel mix, built once as an arena and
+    /// A known const/frame/scanline/pixel mix, built once as a graph and
     /// once as the equivalent e-graph, must classify identically through
     /// both entry points — mirroring
-    /// `arena_and_extraction_walks_record_the_same_edge_stream` above.
+    /// `term_and_extraction_walks_record_the_same_edge_stream` above.
     #[test]
-    fn arena_and_extraction_classify_a_known_variance_mix_identically() {
+    fn graph_and_extraction_classify_a_known_variance_mix_identically() {
         use crate::nnue::factored::variance_histogram;
-        use pixelflow_ir::{ExprArena, OpKind};
+        use pixelflow_ir::OpKind;
+        use pixelflow_ir::expr::ExprBuilder;
 
         // Add(Add(Const(2.0), W), Add(Y, X)):
         // - Const(2.0)        -> const
@@ -4183,7 +4202,7 @@ mod tests {
         // - Add(Y, X)         -> pixel     (depends on X)
         // - root Add          -> pixel     (depends on X)
         // 1 const, 2 frame, 1 scanline, 3 pixel of 7 nodes.
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let c = arena.push_const(2.0);
         let w = arena.push_var(3);
         let frame_sum = arena.push_binary(OpKind::Add, c, w);
@@ -4191,6 +4210,9 @@ mod tests {
         let x = arena.push_var(0);
         let xy = arena.push_binary(OpKind::Add, y, x);
         let root = arena.push_binary(OpKind::Add, frame_sum, xy);
+        // Classification is over every node in the graph, which here is
+        // exactly the root's subtree.
+        let (built, _env) = arena.finish(&[root]);
 
         use crate::egraph::ops;
         let mut eg = EGraph::new();
@@ -4214,28 +4236,27 @@ mod tests {
         let choices: Vec<Option<usize>> = alloc::vec![None; eg.num_classes()];
         let extraction = Extraction::from_backfill(&eg, eroot, choices);
 
-        let from_arena = variance_histogram(&arena);
+        let from_graph = variance_histogram(&built);
         let from_extraction = extraction.chosen_variance();
 
         assert_eq!(
-            from_arena, from_extraction,
-            "arena and extraction must classify the same DAG identically"
+            from_graph, from_extraction,
+            "graph and extraction must classify the same DAG identically"
         );
         assert_eq!(
-            from_arena,
+            from_graph,
             [1.0 / 7.0, 2.0 / 7.0, 1.0 / 7.0, 3.0 / 7.0],
-            "known const/frame/scanline/pixel mix: {from_arena:?}"
+            "known const/frame/scanline/pixel mix: {from_graph:?}"
         );
-        let _ = root; // arena root; classification is over every node.
     }
 
     // =========================================================================
-    // choices_to_arena tests
+    // choices_to_rooted tests
     // =========================================================================
 
-    /// X + Y should produce an arena with exactly 3 nodes: Var(0), Var(1), Add.
+    /// X + Y should produce a graph with exactly 3 nodes: Var(0), Var(1), Add.
     #[test]
-    fn choices_to_arena_simple() {
+    fn choices_to_rooted_simple() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -4251,17 +4272,16 @@ mod tests {
         choices[egraph.find(y).0 as usize] = Some(0);
 
         let extraction = Extraction::from_backfill(&egraph, add, choices);
-        let (arena, root_id) = choices_to_arena(&extraction);
+        let (arena, _env) = choices_to_rooted(&extraction);
 
-        assert_eq!(arena.len(), 3, "X + Y should have exactly 3 arena nodes");
-        // Root should be the last node (post-order: X, Y, Add)
-        assert_eq!(root_id.0, 2, "root ExprId should be 2 (the Add node)");
+        assert_eq!(arena.len(), 3, "X + Y should have exactly 3 nodes");
+        assert_eq!(arena.entry().op(), Some(pixelflow_ir::OpKind::Add));
     }
 
-    /// X * X should produce an arena with exactly 2 nodes: Var(0) and Mul.
-    /// The shared Var(0) e-class must reuse one ExprId rather than being duplicated.
+    /// X * X should produce a graph with exactly 2 nodes: Var(0) and Mul.
+    /// The shared Var(0) e-class must reuse one node rather than being duplicated.
     #[test]
-    fn choices_to_arena_shared() {
+    fn choices_to_rooted_shared() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let mul = egraph.add(ENode::Op {
@@ -4275,19 +4295,15 @@ mod tests {
         choices[egraph.find(x).0 as usize] = Some(0);
 
         let extraction = Extraction::from_backfill(&egraph, mul, choices);
-        let (arena, root_id) = choices_to_arena(&extraction);
+        let (arena, _env) = choices_to_rooted(&extraction);
 
-        assert_eq!(
-            arena.len(),
-            2,
-            "X * X should have exactly 2 arena nodes (X shared)"
-        );
-        assert_eq!(root_id.0, 1, "root ExprId should be 1 (the Mul node)");
+        assert_eq!(arena.len(), 2, "X * X should have exactly 2 nodes (X shared)");
+        assert_eq!(arena.entry().op(), Some(pixelflow_ir::OpKind::Mul));
     }
 
-    /// Direct extraction and explicit `choices_to_arena` should agree for tree-shaped inputs.
+    /// Direct extraction and explicit `choices_to_rooted` should agree for tree-shaped inputs.
     #[test]
-    fn extract_matches_choices_to_arena() {
+    fn extract_matches_choices_to_rooted() {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let y = egraph.add(ENode::Var(1));
@@ -4303,51 +4319,26 @@ mod tests {
         choices[egraph.find(y).0 as usize] = Some(0);
 
         let extraction = Extraction::from_backfill(&egraph, add, choices);
-        let (arena, root_id) = choices_to_arena(&extraction);
-        let (extracted_arena, extracted_root, _cost) = extract(&egraph, add, &CostModel::default());
-        assert_eq!(arena.len(), extracted_arena.len());
-        assert_eq!(root_id, extracted_root);
+        let (arena, _env) = choices_to_rooted(&extraction);
+        let (extracted, _extracted_env, _cost) = extract(&egraph, add, &CostModel::default());
+        assert_eq!(arena.len(), extracted.len());
+        assert!(arena.entry().subtree_eq(extracted.entry()));
     }
 
     // ========================================================================
     // The reported cost describes the returned term (#1111)
     // ========================================================================
 
-    /// Latency-prior DAG cost of a materialized arena: every reachable
+    /// Latency-prior DAG cost of a materialized graph: every reachable
     /// operation priced once, leaves free — the independent statement of
-    /// what [`ExtractedDAG::dag_cost`] claims, computed from the arena
+    /// what [`ExtractedDAG::dag_cost`] claims, computed from the graph
     /// instead of from the choices. Deliberately a second implementation:
-    /// the point of `dag_cost_equals_the_materialized_arenas_cost` is that
+    /// the point of `dag_cost_equals_the_materialized_graphs_cost` is that
     /// two walks over two representations agree.
-    fn arena_dag_cost(
-        arena: &pixelflow_ir::ExprArena,
-        root: pixelflow_ir::ExprId,
-        costs: &CostModel,
-    ) -> usize {
-        use pixelflow_ir::arena::ExprNode;
-        let mut seen = alloc::vec![false; arena.nodes_raw().len()];
-        let mut stack = alloc::vec![root];
-        let mut total = 0usize;
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            let kind = match arena.node(id) {
-                ExprNode::Var(_)
-                | ExprNode::Const(_)
-                | ExprNode::Buffer(_)
-                | ExprNode::Uniform(_) => None,
-                ExprNode::Unary(k, _)
-                | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
-                other => panic!("unexpected extracted node {other:?}"),
-            };
-            if let Some(k) = kind {
-                total = total.saturating_add(costs.cost(k));
-            }
-            stack.extend(arena.children(id));
-        }
-        total
+    fn graph_dag_cost(root: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>, costs: &CostModel) -> usize {
+        root.descendants()
+            .filter_map(|n| n.op())
+            .fold(0usize, |total, k| total.saturating_add(costs.cost(k)))
     }
 
     /// `sin(X) * sin(X) + sin(X)` — one `Sin` reached three times, so the
@@ -4480,19 +4471,19 @@ mod tests {
     /// harness): `dag_cost` IS that number, so the workaround and the field
     /// agree.
     #[test]
-    fn dag_cost_equals_the_materialized_arenas_cost() {
+    fn dag_cost_equals_the_materialized_graphs_cost() {
         let (egraph, root) = shared_sin_egraph();
         let costs = CostModel::latency_prior();
         let dag = extract_dag(&egraph, root, &costs);
 
         let extraction = Extraction::from_dp(&egraph, root, dag.choices.clone());
-        let (arena, arena_root) = choices_to_arena(&extraction);
+        let (arena, _env) = choices_to_rooted(&extraction);
 
         assert_eq!(
             dag.dag_cost,
-            arena_dag_cost(&arena, arena_root, &costs),
-            "ExtractedDAG::dag_cost must equal the latency-prior cost of the arena \
-             choices_to_arena builds from the same choices"
+            graph_dag_cost(arena.entry(), &costs),
+            "ExtractedDAG::dag_cost must equal the latency-prior cost of the graph \
+             choices_to_rooted builds from the same choices"
         );
     }
 
@@ -4635,11 +4626,9 @@ mod tests {
 
         // The whole term still materializes, and still costs what was said.
         let extraction = Extraction::from_dp(&egraph, merged, dag.choices.clone());
-        let (arena, arena_root) = choices_to_arena(&extraction);
-        assert!(matches!(
-            arena.node(arena_root),
-            pixelflow_ir::arena::ExprNode::Unary(pixelflow_ir::OpKind::Sin, _)
-        ));
+        let (arena, _env) = choices_to_rooted(&extraction);
+        assert_eq!(arena.entry().op(), Some(pixelflow_ir::OpKind::Sin));
+        assert_eq!(arena.entry().child_count(), 1);
     }
 
     /// `cost_of_choices` costs the map it is handed and nothing else — a

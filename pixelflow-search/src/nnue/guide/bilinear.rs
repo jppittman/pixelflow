@@ -81,7 +81,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use pixelflow_ir::{ExprArena, ExprId};
+use pixelflow_ir::expr::Term;
 
 use super::linear::GuideError;
 use super::scoring::backward::{Activations, HeadGradients};
@@ -159,19 +159,18 @@ impl BilinearWeights {
 /// `None` (a side the rule does not define) pools to the zero vector, which
 /// is the honest encoding of "this rule declares no such side" and is
 /// visible to the caller as a zero block in the concatenation.
-fn pool_template_side(
-    embeddings: &OpEmbeddings,
-    arena: &ExprArena,
-    root: Option<ExprId>,
-) -> [f32; EMBED_DIM] {
-    let Some(root) = root else {
+fn pool_template_side(embeddings: &OpEmbeddings, side: Option<Term<'_>>) -> [f32; EMBED_DIM] {
+    let Some(side) = side else {
         return [0.0; EMBED_DIM];
     };
     let mut bound: Vec<[f32; K]> = Vec::new();
-    let mut stack = alloc::vec![(root, 0usize)];
-    while let Some((id, depth)) = stack.pop() {
-        bound.push(shift_by(embeddings.get(arena.kind(id)), depth));
-        stack.extend(arena.children(id).map(|child| (child, depth + 1)));
+    let mut stack = alloc::vec![(side.root(), 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        bound.push(shift_by(
+            embeddings.get(crate::nnue::factored::kind_of(node)),
+            depth,
+        ));
+        stack.extend(node.children().map(|child| (child, depth + 1)));
     }
     let scale = 1.0 / libm::sqrtf(bound.len() as f32);
     let mut out = [0.0f32; EMBED_DIM];
@@ -204,13 +203,13 @@ fn rule_concats(
     let mut templateless = Vec::new();
     for (idx, rule) in shared.iter().enumerate() {
         let template = ArenaRuleTemplate::from_rule(rule.as_ref());
-        if template.lhs.is_none() && template.rhs.is_none() {
+        if template.lhs().is_none() && template.rhs().is_none() {
             if let Some(label) = rules.label_of(idx) {
                 templateless.push(label);
             }
         }
-        let z_lhs = pool_template_side(embeddings, &template.arena, template.lhs);
-        let z_rhs = pool_template_side(embeddings, &template.arena, template.rhs);
+        let z_lhs = pool_template_side(embeddings, template.lhs());
+        let z_rhs = pool_template_side(embeddings, template.rhs());
         map.insert(ids[idx], rule_concat(&z_lhs, &z_rhs));
     }
     (map, templateless)

@@ -8,23 +8,13 @@
 //! DEFAULT extraction policy kept `Pow(x, 0.5)` instead of rewriting it to
 //! `Sqrt(x)`, a measured 2.8x kernel slowdown on the affected kernel.
 
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
-use pixelflow_search::runtime::optimize_runtime_arena;
+use pixelflow_ir::OpKind;
+use pixelflow_ir::expr::{ExprBuilder, Term};
+use pixelflow_search::runtime::optimize_runtime_term;
 
 /// Collect the OpKinds reachable from `root`.
-fn reachable_kinds(arena: &ExprArena, root: ExprId) -> Vec<OpKind> {
-    let mut seen = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut kinds = Vec::new();
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if std::mem::replace(&mut seen[idx], true) {
-            continue;
-        }
-        kinds.push(arena.kind(id));
-        stack.extend(arena.children(id));
-    }
-    kinds
+fn reachable_kinds(root: pixelflow_ir::Node<'_, pixelflow_ir::expr::ExprData>) -> Vec<OpKind> {
+    root.descendants().filter_map(|n| n.op()).collect()
 }
 
 /// `Pow(x, 0.5)` must extract as the hardware `Sqrt`, not survive as `Pow`.
@@ -35,16 +25,19 @@ fn reachable_kinds(arena: &ExprArena, root: ExprId) -> Vec<OpKind> {
 /// hardware primitive must win.
 #[test]
 fn pow_half_extracts_to_hardware_sqrt() {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let half = arena.push_const(0.5);
     let root = arena.push_binary(OpKind::Pow, x, half);
+    let (rooted, env) = arena.finish(&[root]);
 
-    let optimized = optimize_runtime_arena(&arena, root, pixelflow_ir::LatticeShape::POINT)
-        .expect("pure arithmetic arena must be e-graph representable");
-    let (opt_arena, opt_root) = (&optimized.0, optimized.1);
+    let optimized = optimize_runtime_term(
+        Term::new(rooted.entry(), &env),
+        pixelflow_ir::LatticeShape::POINT,
+    )
+    .expect("pure arithmetic term must be e-graph representable");
 
-    let kinds = reachable_kinds(opt_arena, opt_root);
+    let kinds = reachable_kinds(optimized.0.entry());
     assert!(
         kinds.contains(&OpKind::Sqrt),
         "Pow(x, 0.5) should extract to a hardware Sqrt; got {kinds:?}"
@@ -60,14 +53,18 @@ fn pow_half_extracts_to_hardware_sqrt() {
 /// (estimate + Newton chain), but still ~9x cheaper than the lowered `Pow`.
 #[test]
 fn pow_neg_half_does_not_survive_as_pow() {
-    let mut arena = ExprArena::new();
+    let mut arena = ExprBuilder::new();
     let x = arena.push_var(0);
     let exp = arena.push_const(-0.5);
     let root = arena.push_binary(OpKind::Pow, x, exp);
+    let (rooted, env) = arena.finish(&[root]);
 
-    let optimized = optimize_runtime_arena(&arena, root, pixelflow_ir::LatticeShape::POINT)
-        .expect("pure arithmetic arena must be e-graph representable");
-    let kinds = reachable_kinds(&optimized.0, optimized.1);
+    let optimized = optimize_runtime_term(
+        Term::new(rooted.entry(), &env),
+        pixelflow_ir::LatticeShape::POINT,
+    )
+    .expect("pure arithmetic term must be e-graph representable");
+    let kinds = reachable_kinds(optimized.0.entry());
     assert!(
         !kinds.contains(&OpKind::Pow),
         "Pow(x, -0.5) must lower to a cheaper primitive form; got {kinds:?}"

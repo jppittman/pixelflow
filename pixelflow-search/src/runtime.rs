@@ -2,15 +2,15 @@
 //!
 //! `kernel!` already runs full saturation at macro-expansion
 //! time: `pixelflow-compiler::optimize` builds an e-graph from the parsed
-//! AST, saturates, and extracts before ever touching an
-//! [`ExprArena`](pixelflow_ir::ExprArena). Anything stamped by those macros
-//! reaches `pixelflow_codegen::jit_cache` already optimized.
+//! AST, saturates, and extracts before ever building the expression graph.
+//! Anything stamped by those macros reaches `pixelflow_codegen::jit_cache`
+//! already optimized.
 //!
 //! `Kernel` values composed directly at runtime — `Kernel::over`, `.at()`,
-//! `.select()`, arithmetic — never go through that macro, so their arenas hit
+//! `.select()`, arithmetic — never go through that macro, so their graphs hit
 //! [`pixelflow_codegen::jit_cache::compile`] raw:
-//! no CSE, no FMA fusion, no algebraic simplification. [`optimize_runtime_arena`]
-//! is the same pipeline applied to an arena directly, for exactly that gap —
+//! no CSE, no FMA fusion, no algebraic simplification. [`optimize_runtime_term`]
+//! is the same pipeline applied to a term directly, for exactly that gap —
 //! today's highest-volume instance is the font glyph bake
 //! (`pixelflow-graphics`'s `Font::glyph_kernel_scaled`, cached per
 //! `(codepoint, size, density)` bucket).
@@ -20,7 +20,7 @@
 //! docs/plans/2026-07-20-kernel-unification.md), so this cannot live inside
 //! `jit_cache`. Callers that want optimized runtime kernels — today,
 //! `pixelflow-core`'s `Lattice::bake` — call this function before handing the
-//! arena to `jit_cache`.
+//! term to `jit_cache`.
 //!
 //! # Saturation telemetry
 //!
@@ -34,14 +34,15 @@ use crate::egraph::{EClassId, EGraph, ENode, Optimizer};
 use crate::saturate_pass::Saturate;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode};
+use pixelflow_ir::expr::{Environment, ExprData, Term, encode};
 use pixelflow_ir::optimize::{Identity, Optimize};
+use pixelflow_ir::Rooted;
 use pixelflow_ir::passes::{ExpandReduce, LowerDwrt};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Optimize a runtime-built arena via bounded e-graph saturation, through
+/// Optimize a runtime-built term via bounded e-graph saturation, through
 /// the same [`Optimizer`] entry point — rule set, budget, cost model,
 /// extractor — as the `kernel!` macro.
 ///
@@ -49,17 +50,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// e-graph as opaque structure — no rewrite rule can name them, so their
 /// gain is hash-consing CSE (splice-duplicated sampler subtrees collapse to
 /// one node) plus ordinary rewriting of the coordinate arithmetic that feeds
-/// them. Extraction redeclares each distinct `BufferIdentity` once in the
-/// output arena.
+/// them. Extraction redeclares each distinct `BufferIdentity` once, and the
+/// result is relinked onto the input's slot order.
 ///
-/// Returns `None`, unchanged, when the subgraph reachable from `root`
+/// Returns `None`, unchanged, when the subgraph reachable from the term's root
 /// contains a construct the e-graph doesn't model:
 ///
 /// - `RawGather` — produced by lowering, after the e-graph's place in the
-///   pipeline; reaching one here means the arena is already lowered.
-/// - `Nary` other than `Reduce` (`Tuple`) — not modelled. `Reduce` itself
+///   pipeline; reaching one here means the term is already lowered.
+/// - N-ary ops other than `Reduce` (`Tuple`) — not modelled. `Reduce` itself
 ///   is unrolled first (`passes::expand_reduce`, the same unroll `legalize`
-///   performs later): the arena the e-graph sees is binder-free, so factoring
+///   performs later): the term the e-graph sees is binder-free, so factoring
 ///   across the unrolled terms is ordinary rewriting rather than rewriting
 ///   under a binder.
 /// - `Param` — a `pixelflow-compiler` macro-parameter slot that should never
@@ -68,8 +69,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `Uniform` leaves are representable like `Buffer`: opaque to every rule,
 /// hash-consed by identity, redeclared by extraction. Nothing folds one.
 ///
-/// Callers compile the original arena unchanged in that case — `optimize_runtime_arena`
-/// is strictly an optimization, never required for correctness.
+/// Callers compile the original term unchanged in that case —
+/// `optimize_runtime_term` is strictly an optimization, never required for
+/// correctness.
 ///
 /// `shape` is the extent of the lattice the kernel is compiled for. It is
 /// part of the cache key and is consulted by no rewrite yet (stage 0′ of
@@ -82,45 +84,50 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `pixelflow_codegen::jit_cache`'s own canonical-key cache): a caller that bakes
 /// the same `Kernel` across many frames — every glyph, on the common path
 /// through `GlyphCache` — pays saturation once, not once per bake. Skipping
-/// this cache would make `optimize_runtime_arena` slower than not optimizing
+/// this cache would make `optimize_runtime_term` slower than not optimizing
 /// at all for any repeatedly-baked kernel, since the JIT compile it feeds is
 /// itself cached downstream.
 ///
 /// The cached value is `Arc`-wrapped for the same reason `jit_cache` hands
 /// back `Arc<CompiledKernel>` rather than owned code: a hit must be an atomic
 /// refcount bump, not a deep clone of the (potentially large — real glyph
-/// arenas run to thousands of nodes once construction garbage is counted)
-/// optimized `ExprArena`. Returning an owned tuple here would silently
-/// reintroduce a per-call cost the cache exists to eliminate.
+/// graphs run to thousands of nodes once construction garbage is counted)
+/// optimized graph. Returning an owned tuple here would silently reintroduce a
+/// per-call cost the cache exists to eliminate.
 #[must_use]
-pub fn optimize_runtime_arena(
-    arena: &ExprArena,
-    root: ExprId,
+pub fn optimize_runtime_term(
+    term: Term<'_>,
     shape: LatticeShape,
-) -> Option<Arc<(ExprArena, ExprId)>> {
-    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Option<Arc<(ExprArena, ExprId)>>>>> =
-        OnceLock::new();
+) -> Option<Arc<(Rooted<ExprData>, Environment)>> {
+    type Cached = Option<Arc<(Rooted<ExprData>, Environment)>>;
+    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Cached>>> = OnceLock::new();
 
-    // Buffer-bearing arenas bypass the cache entirely: `BufferIdentity` is
+    // Buffer-bearing terms bypass the cache entirely: `BufferIdentity` is
     // process-unique and minted per construction, so two compiles never
     // share a key — every lookup would miss while every insert stayed
     // forever (the cache is static and unbounded). A terminal resizing all
-    // day would leak one full optimized arena per recompile for zero hits.
+    // day would leak one full optimized graph per recompile for zero hits.
     //
-    // Uniform-bearing arenas bypass it for the same reason and one more: the
-    // optimized arena carries its uniforms' identities, and the link step
+    // Uniform-bearing terms bypass it for the same reason and one more: the
+    // optimized graph carries its uniforms' identities, and the link step
     // downstream maps *those* to block offsets. A hit keyed on structure
-    // alone would hand a second composition an arena naming the first one's
+    // alone would hand a second composition a graph naming the first one's
     // instances. The JIT cache in front of this one is keyed on structure
     // (dense offsets, not identities), so the saturation is still paid once
     // per shape.
-    if !arena.buffers().is_empty() || !arena.uniforms().is_empty() {
-        return optimize_runtime_arena_uncached(arena, root, shape).map(Arc::new);
+    //
+    // That bypass is also what makes `encode` the key below: a binding cannot
+    // be written down (its identity is minted per process), and `encode`
+    // refuses one loudly rather than serializing a slot index that means
+    // nothing outside its own environment.
+    let env = term.env();
+    if !env.buffers.is_empty() || !env.uniforms.is_empty() {
+        return optimize_runtime_term_uncached(term, shape).map(Arc::new);
     }
 
-    let mut key = canonical_key(arena, root);
+    let mut key = canonical_key(term);
     key.extend_from_slice(&shape.key_bytes());
-    // Optimization is a deterministic function of the arena, the shape, and
+    // Optimization is a deterministic function of the term, the shape, and
     // the *optimizer configuration* — the third term was missing, and the
     // claim that the first two suffice becomes false the moment two
     // configurations coexist in a process (a warm-up at one budget and
@@ -132,26 +139,25 @@ pub fn optimize_runtime_arena(
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache
         .lock()
-        .expect("optimize_runtime_arena: lock poisoned")
+        .expect("optimize_runtime_term: lock poisoned")
         .get(&key)
     {
         return hit.clone();
     }
 
-    let result = optimize_runtime_arena_uncached(arena, root, shape).map(Arc::new);
+    let result = optimize_runtime_term_uncached(term, shape).map(Arc::new);
     cache
         .lock()
-        .expect("optimize_runtime_arena: lock poisoned")
+        .expect("optimize_runtime_term: lock poisoned")
         .entry(key)
         .or_insert(result)
         .clone()
 }
 
-fn optimize_runtime_arena_uncached(
-    arena: &ExprArena,
-    root: ExprId,
+fn optimize_runtime_term_uncached(
+    term: Term<'_>,
     shape: LatticeShape,
-) -> Option<(ExprArena, ExprId)> {
+) -> Option<(Rooted<ExprData>, Environment)> {
     // The tier's pipeline, as a composition rather than three hand-sequenced
     // calls. The order is load-bearing and is now the expression itself:
     //
@@ -167,18 +173,18 @@ fn optimize_runtime_arena_uncached(
     // binder-free arithmetic it can CSE and fold across the unrolled terms.
     //
     // A declining step short-circuits the rest and yields `None` here, which
-    // means exactly what it always meant: the caller compiles its own arena
+    // means exactly what it always meant: the caller compiles its own term
     // unchanged, unoptimized but correct.
     match saturation_switch() {
         SaturationSwitch::On => pipeline![LowerDwrt, ExpandReduce, Saturate::runtime(shape)]
-            .optimize(arena, root)
+            .optimize(term)
             .into_changed(),
         // The `Identity` path: the same legalizing prefix, no saturation.
         // What `Lattice::bake` would emit if the e-graph did not exist —
         // the "F" column of docs/plans/2026-09-06-egraph-at-production-scale.md
         // §7, measured by docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
         SaturationSwitch::Off => pipeline![LowerDwrt, ExpandReduce, Identity]
-            .optimize(arena, root)
+            .optimize(term)
             .into_changed(),
     }
 }
@@ -224,108 +230,34 @@ fn saturation_switch() -> SaturationSwitch {
     })
 }
 
-/// Canonical serialization of the subgraph reachable from `root`: nodes in
-/// ascending original id order (the arena is append-only, so children always
-/// precede parents), child references remapped to dense indices — the same
-/// shape as `pixelflow_codegen::jit_cache`'s private `canonical_key`, reimplemented
-/// here since that one isn't exported and this cache's correctness condition
-/// is different (it needs a key for *every* reachable node kind, including
-/// `Buffer`/`Nary`, to memoize the bail-out case too, not just the
-/// e-graph-representable ones).
-fn canonical_key(arena: &ExprArena, root: ExprId) -> Vec<u8> {
-    let len = arena.len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if core::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
-    }
-
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
-    let mut next = 0u32;
-    let mut key: Vec<u8> = Vec::with_capacity(len * 8);
-
-    let push_id = |key: &mut Vec<u8>, dense: &[u32], id: ExprId| {
-        let d = dense[id.0 as usize];
-        debug_assert_ne!(d, u32::MAX, "canonical_key: child densified before parent");
-        key.extend_from_slice(&d.to_le_bytes());
-    };
-
-    for idx in 0..len {
-        if !reachable[idx] {
-            continue;
-        }
-        let id = ExprId(idx as u32);
-        match arena.node(id) {
-            &ExprNode::Var(i) => {
-                key.push(0);
-                key.push(i);
-            }
-            &ExprNode::Const(v) => {
-                key.push(1);
-                key.extend_from_slice(&v.to_bits().to_le_bytes());
-            }
-            &ExprNode::Param(i) => {
-                key.push(2);
-                key.push(i);
-            }
-            &ExprNode::Buffer(b) => {
-                key.push(3);
-                // Key by process-unique BufferIdentity, NOT the arena-local
-                // slot index: two arenas can both call their own buffer "slot
-                // 0" with equal extents while naming different memory, and a
-                // slot-keyed cache would hand one of them the other's
-                // optimized arena — whose redeclared identity binds the wrong
-                // pixels. Identity is process-local, which is exactly the
-                // lifetime of this in-process cache. It has no byte accessor,
-                // so serialize its (injective) Debug form.
-                let BufferDecl { id, width, height } = *arena.buffer_decl(b);
-                key.extend_from_slice(alloc::format!("{id:?}").as_bytes());
-                key.extend_from_slice(&width.to_le_bytes());
-                key.extend_from_slice(&height.to_le_bytes());
-            }
-            &ExprNode::Uniform(u) => {
-                // Keyed by identity for the reason `Buffer` is; unreachable
-                // in practice, since uniform-bearing arenas bypass the cache.
-                key.push(8);
-                let decl = *arena.uniform_decl(u);
-                key.extend_from_slice(alloc::format!("{:?}", decl.id).as_bytes());
-                key.extend_from_slice(&decl.default.to_bits().to_le_bytes());
-            }
-            &ExprNode::Unary(op, a) => {
-                key.push(4);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, a);
-            }
-            &ExprNode::Binary(op, a, b) => {
-                key.push(5);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, a);
-                push_id(&mut key, &dense, b);
-            }
-            &ExprNode::Ternary(op, a, b, c) => {
-                key.push(6);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, a);
-                push_id(&mut key, &dense, b);
-                push_id(&mut key, &dense, c);
-            }
-            &ExprNode::Nary(op, _start, n) => {
-                key.push(7);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                key.extend_from_slice(&n.to_le_bytes());
-                for child in arena.children(id) {
-                    push_id(&mut key, &dense, child);
-                }
-            }
-        }
-        dense[idx] = next;
-        next += 1;
-    }
-
-    key
+/// Canonical serialization of the subgraph reachable from `term`'s root — the
+/// cache key above.
+///
+/// This *is* [`encode`], and deliberately nothing more. There used to be a
+/// second serializer here, hand-written over the arena's raw node vector: it
+/// walked ids in ascending order (relying on "children precede parents" as an
+/// append-order accident), assigned dense ordinals into a `Vec<u32>` indexed
+/// by raw id, and emitted a tag byte plus payload per node. `encode` does
+/// exactly that — reachable nodes in the DAG's own topological order, dense
+/// ordinals, one tagged record each, children named by ordinal — and it is the
+/// definition the corpus format already depends on being canonical. Two
+/// spellings of one canonicalization is one chance for two of them to disagree
+/// about which graphs are the same graph, and the disagreement would surface
+/// as a cache hit returning another kernel's code.
+///
+/// The old copy carried `Buffer` and `Uniform` arms, keyed on identity, that
+/// `encode` refuses. They were unreachable — a term declaring either bypasses
+/// this cache above, as the `Uniform` arm's own comment said — so what the
+/// refusal changes is that the bypass is now enforced rather than merely
+/// documented: reaching here with a binding panics instead of minting a key
+/// out of a process-local identity.
+///
+/// # Panics
+///
+/// Panics if the term reaches a `Buffer` or `Uniform` leaf. See above: the
+/// caller must bypass the cache for those, and does.
+fn canonical_key(term: Term<'_>) -> Vec<u8> {
+    encode(term.root())
 }
 
 /// Whether the runtime tier can represent `kind` in its e-graph — i.e.,
@@ -341,31 +273,95 @@ pub fn is_egraph_representable(kind: OpKind) -> bool {
 mod tests {
     use super::*;
     use pixelflow_ir::OpKind;
-    use pixelflow_ir::arena::BufferDecl;
     use pixelflow_ir::binding::BindingTable;
+    use pixelflow_ir::decl::{BufferDecl, BufferIdentity};
     use pixelflow_ir::eval_scalar;
+    use pixelflow_ir::expr::ExprBuilder;
 
-    /// Every optimization must preserve the arena's denoted value, over a
+    /// A term over a `(Rooted, Environment)` pair, which is how every fixture
+    /// below holds one.
+    fn term(pair: &(Rooted<ExprData>, Environment)) -> Term<'_> {
+        Term::new(pair.0.entry(), &pair.1)
+    }
+
+    /// Every optimization must preserve the term's denoted value, over a
     /// spread of coordinates — the load-bearing property. Anything that ever
     /// broke this would silently mis-render, not fail loudly.
-    fn assert_semantics_preserved(
-        arena: &ExprArena,
-        root: ExprId,
-        optimized: &(ExprArena, ExprId),
-    ) {
-        let (opt_arena, opt_root) = optimized;
-        let coords: &[(f32, f32, f32, f32)] = &[
-            (0.0, 0.0, 0.0, 0.0),
-            (1.0, 2.0, 3.0, 4.0),
-            (-1.5, 0.5, 2.25, -3.0),
-            (3.7, -4.1, 0.0, 1.0),
-        ];
-        for &(x, y, z, w) in coords {
-            let want = eval_scalar(arena, root, &[x, y], &BindingTable::empty());
-            let got = eval_scalar(opt_arena, *opt_root, &[x, y], &BindingTable::empty());
+    fn assert_semantics_preserved(input: Term<'_>, optimized: Term<'_>) {
+        let coords: &[(f32, f32)] = &[(0.0, 0.0), (1.0, 2.0), (-1.5, 0.5), (3.7, -4.1)];
+        for &(x, y) in coords {
+            let want = eval_scalar(input, &[x, y], &BindingTable::empty());
+            let got = eval_scalar(optimized, &[x, y], &BindingTable::empty());
             assert!(
                 (want - got).abs() < 1e-3 || (want.is_nan() && got.is_nan()),
-                "optimize_runtime_arena changed semantics at ({x},{y},{z},{w}): {want} != {got}"
+                "optimize_runtime_term changed semantics at ({x},{y}): {want} != {got}"
+            );
+        }
+    }
+
+    /// Whether any node reachable from `t`'s root has four or more children —
+    /// the `Reduce` binder's shape, which unrolling must remove.
+    fn reaches_nary(t: Term<'_>) -> bool {
+        t.root().descendants().any(|n| n.child_count() >= 4)
+    }
+
+    /// How many `Gather` nodes `t` reaches.
+    fn count_gathers(t: Term<'_>) -> usize {
+        t.root()
+            .descendants()
+            .filter(|n| n.op() == Some(OpKind::Gather))
+            .count()
+    }
+
+    /// Identities of buffers referenced by reachable `Buffer` leaves.
+    fn reachable_buffer_identities(t: Term<'_>) -> std::collections::BTreeSet<BufferIdentity> {
+        t.root()
+            .descendants()
+            .filter_map(|n| match *n {
+                ExprData::Buffer(b) => Some(t.env().buffer(b).id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Bind slices to a term by buffer *identity*, not slot order: extraction
+    /// redeclares buffers in traversal order, so slot numbering can differ
+    /// from the input's.
+    fn bind_by_identity<'a>(
+        env: &Environment,
+        by_id: &[(BufferIdentity, &'a [f32])],
+    ) -> BindingTable<'a> {
+        let slices: Vec<&[f32]> = env
+            .buffers
+            .iter()
+            .map(|d| {
+                by_id
+                    .iter()
+                    .find(|(id, _)| *id == d.id)
+                    .unwrap_or_else(|| panic!("no slice for buffer identity {:?}", d.id))
+                    .1
+            })
+            .collect();
+        BindingTable::bind(env, &slices).expect("bind_by_identity")
+    }
+
+    /// Eval parity for buffer-bearing terms, both sides bound by identity.
+    fn assert_gather_semantics_preserved(
+        input: Term<'_>,
+        optimized: Term<'_>,
+        by_id: &[(BufferIdentity, &[f32])],
+    ) {
+        let want_bind = bind_by_identity(input.env(), by_id);
+        let got_bind = bind_by_identity(optimized.env(), by_id);
+        // Coordinates chosen off integer boundaries so Gather's floor cannot
+        // flip cells on rounding differences introduced by rewrites.
+        let coords: &[(f32, f32)] = &[(0.3, 0.4), (1.5, 0.6), (2.2, 1.7), (3.6, 2.4), (-1.2, 9.5)];
+        for &(cx, cy) in coords {
+            let want = eval_scalar(input, &[cx, cy], &want_bind);
+            let got = eval_scalar(optimized, &[cx, cy], &got_bind);
+            assert!(
+                (want - got).abs() < 1e-3,
+                "gather optimization changed semantics at ({cx},{cy}): {want} != {got}"
             );
         }
     }
@@ -389,7 +385,7 @@ mod tests {
     #[test]
     fn repeated_bake_of_the_same_kernel_hits_the_cache() {
         // The exact regression this cache exists to close: Lattice::bake
-        // calls optimize_runtime_arena on EVERY bake of a Kernel, but real
+        // calls optimize_runtime_term on EVERY bake of a Kernel, but real
         // callers (GlyphCache, and criterion benches that measure "the JIT
         // compile is cached, so iterations measure tabulation") bake the
         // *same* kernel repeatedly. Without caching, every one of those
@@ -402,8 +398,8 @@ mod tests {
         // sub-multiplications an FMA pass and commutativity/associativity
         // actually have to chew on), so a cold run takes measurably longer
         // than a hash lookup.
-        fn build_arena() -> (ExprArena, ExprId) {
-            let mut a = ExprArena::new();
+        fn build_graph() -> (Rooted<ExprData>, Environment) {
+            let mut a = ExprBuilder::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let mut acc = a.push_const(0.0);
@@ -411,45 +407,43 @@ mod tests {
                 let c = a.push_const(1.0 + k as f32 * 0.37);
                 let xc = a.push_binary(OpKind::Mul, x, c);
                 let yc = a.push_binary(OpKind::Mul, y, c);
-                let term = a.push_binary(OpKind::Add, xc, yc);
-                acc = a.push_binary(OpKind::Add, acc, term);
+                let t = a.push_binary(OpKind::Add, xc, yc);
+                acc = a.push_binary(OpKind::Add, acc, t);
             }
-            (a, acc)
+            a.finish(&[acc])
         }
 
-        let (a1, r1) = build_arena();
+        let g1 = build_graph();
         let cold_start = std::time::Instant::now();
-        let arc1 = optimize_runtime_arena(&a1, r1, pixelflow_ir::LatticeShape::POINT)
+        let arc1 = optimize_runtime_term(term(&g1), pixelflow_ir::LatticeShape::POINT)
             .expect("must optimize");
-        let opt1 = &arc1.0;
         let cold = cold_start.elapsed();
 
-        // A freshly built, structurally identical (but not reused) arena:
+        // A freshly built, structurally identical (but not reused) graph:
         // proves the cache keys on shape, not on the first call's identity.
-        let (a2, r2) = build_arena();
+        let g2 = build_graph();
         let warm_start = std::time::Instant::now();
-        let arc2 = optimize_runtime_arena(&a2, r2, pixelflow_ir::LatticeShape::POINT)
+        let arc2 = optimize_runtime_term(term(&g2), pixelflow_ir::LatticeShape::POINT)
             .expect("must optimize");
-        let opt2 = &arc2.0;
         let warm = warm_start.elapsed();
 
         assert_eq!(
-            opt1.nodes_raw().len(),
-            opt2.nodes_raw().len(),
+            arc1.0.len(),
+            arc2.0.len(),
             "cached and fresh optimization must agree on the result shape"
         );
         assert!(
             warm < cold / 2 || warm < std::time::Duration::from_micros(200),
             "expected the second call to hit the cache (warm {warm:?} vs cold {cold:?}) — \
-             a regression here means optimize_runtime_arena is re-saturating every bake"
+             a regression here means optimize_runtime_term is re-saturating every bake"
         );
     }
 
     #[test]
-    fn fma_fusion_applies_to_a_runtime_arena() {
-        // a*b + c, built directly as an arena (no macro involved) — exactly
+    fn fma_fusion_applies_to_a_runtime_term() {
+        // a*b + c, built directly as a graph (no macro involved) — exactly
         // the shape Kernel::over/.at() composition produces at runtime.
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         // The addend is the kernel's argument: a lattice has two axes, so a
@@ -458,37 +452,35 @@ mod tests {
         let z = a.push_uniform(slot);
         let mul = a.push_binary(OpKind::Mul, x, y);
         let root = a.push_binary(OpKind::Add, mul, z);
+        let input = a.finish(&[root]);
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
-            .expect("pure arithmetic arena must optimize");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
+            .expect("pure arithmetic term must optimize");
+        let opt = term(&arc);
 
-        assert_semantics_preserved(&a, root, &(opt_arena.clone(), opt_root));
+        assert_semantics_preserved(term(&input), opt);
         assert!(
-            matches!(
-                opt_arena.node(opt_root),
-                ExprNode::Ternary(OpKind::MulAdd, ..)
-            ),
-            "expected a*b+c fused to MulAdd, got {:?}",
-            opt_arena.node(opt_root)
+            opt.root().op() == Some(OpKind::MulAdd) && opt.root().child_count() == 3,
+            "expected a*b+c fused to MulAdd, got {}",
+            pixelflow_ir::display(opt.root())
         );
     }
 
     #[test]
     fn shared_subexpressions_stay_shared_and_correct() {
         // sin(X)*sin(X) + sin(X): the repeated sin(X) subtree must convert
-        // to the e-graph once (via the ExprId memo) and extract back
+        // to the e-graph once (via the per-node memo) and extract back
         // correctly regardless of how many times it's referenced.
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let s = a.push_unary(OpKind::Sin, x);
         let sq = a.push_binary(OpKind::Mul, s, s);
         let root = a.push_binary(OpKind::Add, sq, s);
+        let input = a.finish(&[root]);
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
-            .expect("trig arena must optimize");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
-        assert_semantics_preserved(&a, root, &(opt_arena, opt_root));
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
+            .expect("trig term must optimize");
+        assert_semantics_preserved(term(&input), term(&arc));
     }
 
     #[test]
@@ -496,7 +488,7 @@ mod tests {
         // The font-coverage shape: X - ((Y - y0) * k + x0), differentiated.
         // Dwrt is representable in the e-graph (ChainRule reduces it), so
         // this must NOT bail out.
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let y0 = a.push_const(0.3);
@@ -508,111 +500,33 @@ mod tests {
         let d = a.push_binary(OpKind::Sub, x, line);
         let var_x = a.push_const(0.0); // Dwrt's second child is the var index, wrt X (0)
         let dx = a.push_binary(OpKind::Dwrt, d, var_x);
+        let input = a.finish(&[dx]);
 
-        let arc = optimize_runtime_arena(&a, dx, pixelflow_ir::LatticeShape::POINT)
-            .expect("Dwrt-bearing arena must optimize");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
+            .expect("Dwrt-bearing term must optimize");
 
         // eval_scalar refuses a raw Dwrt (the interpreter evaluates the
         // post-calculus program, same as the JIT) — lower both sides before
         // comparing, cross-checking the e-graph's ChainRule reduction
         // against the dedicated lower_dwrt pass.
-        use pixelflow_ir::passes::lower_dwrt_owned;
-        let (want_arena, want_root) = lower_dwrt_owned(&a, dx).expect("lower original");
-        let (got_arena, got_root) =
-            lower_dwrt_owned(&opt_arena, opt_root).expect("lower optimized");
-        assert_semantics_preserved(&want_arena, want_root, &(got_arena, got_root));
-    }
-
-    /// Ids of every node reachable from `root`, discovery order.
-    fn reachable_ids(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
-        let mut seen = vec![false; arena.nodes_raw().len()];
-        let mut stack = vec![root];
-        let mut out = Vec::new();
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            out.push(id);
-            stack.extend(arena.children(id));
-        }
-        out
-    }
-
-    fn count_gathers(arena: &ExprArena, root: ExprId) -> usize {
-        reachable_ids(arena, root)
-            .iter()
-            .filter(|&&id| matches!(arena.node(id), ExprNode::Ternary(OpKind::Gather, ..)))
-            .count()
-    }
-
-    /// Identities of buffers referenced by reachable `Buffer` leaves.
-    fn reachable_buffer_identities(
-        arena: &ExprArena,
-        root: ExprId,
-    ) -> std::collections::BTreeSet<pixelflow_ir::arena::BufferIdentity> {
-        reachable_ids(arena, root)
-            .iter()
-            .filter_map(|&id| match arena.node(id) {
-                &ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Bind slices to an arena by buffer *identity*, not slot order: the
-    /// optimizer redeclares buffers in extraction-traversal order, so the
-    /// optimized arena's slot numbering can differ from the input's.
-    fn bind_by_identity<'a>(
-        arena: &ExprArena,
-        by_id: &[(pixelflow_ir::arena::BufferIdentity, &'a [f32])],
-    ) -> BindingTable<'a> {
-        let slices: Vec<&[f32]> = arena
-            .buffers()
-            .iter()
-            .map(|d| {
-                by_id
-                    .iter()
-                    .find(|(id, _)| *id == d.id)
-                    .unwrap_or_else(|| panic!("no slice for buffer identity {:?}", d.id))
-                    .1
-            })
-            .collect();
-        BindingTable::bind(arena, &slices).expect("bind_by_identity")
-    }
-
-    /// Eval parity for buffer-bearing arenas, both sides bound by identity.
-    fn assert_gather_semantics_preserved(
-        arena: &ExprArena,
-        root: ExprId,
-        optimized: &(ExprArena, ExprId),
-        by_id: &[(pixelflow_ir::arena::BufferIdentity, &[f32])],
-    ) {
-        let (opt_arena, opt_root) = optimized;
-        let want_bind = bind_by_identity(arena, by_id);
-        let got_bind = bind_by_identity(opt_arena, by_id);
-        // Coordinates chosen off integer boundaries so Gather's floor cannot
-        // flip cells on rounding differences introduced by rewrites.
-        let coords: &[(f32, f32)] = &[(0.3, 0.4), (1.5, 0.6), (2.2, 1.7), (3.6, 2.4), (-1.2, 9.5)];
-        for &(cx, cy) in coords {
-            let want = eval_scalar(arena, root, &[cx, cy], &want_bind);
-            let got = eval_scalar(opt_arena, *opt_root, &[cx, cy], &got_bind);
-            assert!(
-                (want - got).abs() < 1e-3,
-                "gather optimization changed semantics at ({cx},{cy}): {want} != {got}"
-            );
-        }
+        use pixelflow_ir::passes::lower_dwrt;
+        let want = lower_dwrt(term(&input)).expect("lower original");
+        let got = lower_dwrt(term(&arc)).expect("lower optimized");
+        assert_semantics_preserved(
+            Term::new(want.entry(), &input.1),
+            Term::new(got.entry(), &arc.1),
+        );
     }
 
     #[test]
-    fn gather_arena_round_trips_through_the_egraph() {
+    fn gather_term_round_trips_through_the_egraph() {
         // BilinearSampler-shaped: the e-graph must now carry the Gather as
-        // opaque structure and hand back an arena that declares the same
+        // opaque structure and hand back a graph that declares the same
         // buffer (by identity) and evaluates identically.
-        let identity = pixelflow_ir::arena::BufferIdentity::mint();
+        let identity = BufferIdentity::mint();
         let data: Vec<f32> = (0..16).map(|i| i as f32 * 3.0 + 1.0).collect();
 
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let buf = a.declare_buffer(BufferDecl {
             id: identity,
             width: 4,
@@ -623,20 +537,19 @@ mod tests {
         let g = a.push_gather(buf, x, y);
         let one = a.push_const(1.0);
         let root = a.push_binary(OpKind::Add, g, one);
+        let input = a.finish(&[root]);
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
-            .expect("a Gather-bearing arena must optimize, not bail");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
+            .expect("a Gather-bearing term must optimize, not bail");
 
         assert_eq!(
-            reachable_buffer_identities(&opt_arena, opt_root),
-            reachable_buffer_identities(&a, root),
+            reachable_buffer_identities(term(&arc)),
+            reachable_buffer_identities(term(&input)),
             "extraction must redeclare the same buffers, by identity"
         );
         assert_gather_semantics_preserved(
-            &a,
-            root,
-            &(opt_arena, opt_root),
+            term(&input),
+            term(&arc),
             &[(identity, data.as_slice())],
         );
     }
@@ -647,10 +560,10 @@ mod tests {
         // sampler Kernel re-splices its fragment, so the SAME gather (same
         // buffer identity, same coordinate subtree) appears twice as two
         // disjoint copies. Hash-consing must collapse them to one node.
-        let identity = pixelflow_ir::arena::BufferIdentity::mint();
+        let identity = BufferIdentity::mint();
         let data: Vec<f32> = (0..16).map(|i| (i * i) as f32).collect();
 
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let buf = a.declare_buffer(BufferDecl {
             id: identity,
             width: 4,
@@ -658,7 +571,7 @@ mod tests {
         });
         // Two structurally identical copies, pushed separately — exactly what
         // splice produces.
-        let push_dup = |a: &mut ExprArena| {
+        let mut push_dup = |a: &mut ExprBuilder| {
             let x = a.push_var(0);
             let y = a.push_var(1);
             let one = a.push_const(1.0);
@@ -670,32 +583,31 @@ mod tests {
         // Mul (not Add) so the doubling rule can't restructure the root and
         // muddy the count assertions.
         let root = a.push_binary(OpKind::Mul, g1, g2);
+        let input = a.finish(&[root]);
 
-        let before = crate::egraph::reachable_count(&a, root);
+        let before = crate::egraph::reachable_count_term(term(&input));
         assert_eq!(
-            count_gathers(&a, root),
+            count_gathers(term(&input)),
             2,
             "input must contain the duplicate"
         );
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
             .expect("must optimize");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
-        let after = crate::egraph::reachable_count(&opt_arena, opt_root);
+        let after = crate::egraph::reachable_count_term(term(&arc));
 
         assert!(
             after < before,
-            "CSE must strictly shrink the arena (before={before}, after={after})"
+            "CSE must strictly shrink the graph (before={before}, after={after})"
         );
         assert_eq!(
-            count_gathers(&opt_arena, opt_root),
+            count_gathers(term(&arc)),
             1,
             "the two identical gathers must share one node"
         );
         assert_gather_semantics_preserved(
-            &a,
-            root,
-            &(opt_arena, opt_root),
+            term(&input),
+            term(&arc),
             &[(identity, data.as_slice())],
         );
     }
@@ -708,14 +620,14 @@ mod tests {
     /// caller's two pointers and read the wrong memory.
     #[test]
     fn optimization_preserves_buffer_slot_order() {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let buf_a = a.declare_buffer(BufferDecl {
-            id: pixelflow_ir::arena::BufferIdentity::mint(),
+            id: BufferIdentity::mint(),
             width: 4,
             height: 1,
         });
         let buf_b = a.declare_buffer(BufferDecl {
-            id: pixelflow_ir::arena::BufferIdentity::mint(),
+            id: BufferIdentity::mint(),
             width: 8,
             height: 1,
         });
@@ -725,10 +637,11 @@ mod tests {
         let ga = a.push_gather(buf_a, x, y);
         let root = a.push_binary(OpKind::Add, gb, ga);
 
-        let out = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
+        let built = a.finish(&[root]);
+        let out = optimize_runtime_term(term(&built), pixelflow_ir::LatticeShape::POINT)
             .expect("buffer kernel must optimize");
-        let input: Vec<_> = a.buffers().iter().map(|d| d.id).collect();
-        let output: Vec<_> = out.0.buffers().iter().map(|d| d.id).collect();
+        let input: Vec<_> = built.1.buffers.iter().map(|d| d.id).collect();
+        let output: Vec<_> = out.1.buffers.iter().map(|d| d.id).collect();
         assert_eq!(input, output, "slot order must survive optimization");
     }
 
@@ -736,12 +649,12 @@ mod tests {
     fn distinct_buffer_identities_never_merge() {
         // Equal extents and identical coordinates are a coincidence, not the
         // same memory: gathers of different identities must stay distinct.
-        let id_a = pixelflow_ir::arena::BufferIdentity::mint();
-        let id_b = pixelflow_ir::arena::BufferIdentity::mint();
+        let id_a = BufferIdentity::mint();
+        let id_b = BufferIdentity::mint();
         let data_a: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let data_b: Vec<f32> = (0..16).map(|i| 1000.0 - i as f32).collect();
 
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let buf_a = a.declare_buffer(BufferDecl {
             id: id_a,
             width: 4,
@@ -757,25 +670,24 @@ mod tests {
         let ga = a.push_gather(buf_a, x, y);
         let gb = a.push_gather(buf_b, x, y);
         let root = a.push_binary(OpKind::Sub, ga, gb);
+        let input = a.finish(&[root]);
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
             .expect("must optimize");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
 
         assert_eq!(
-            count_gathers(&opt_arena, opt_root),
+            count_gathers(term(&arc)),
             2,
             "different identities with identical extents/coords must not merge"
         );
         assert_eq!(
-            reachable_buffer_identities(&opt_arena, opt_root).len(),
+            reachable_buffer_identities(term(&arc)).len(),
             2,
             "both identities must survive extraction"
         );
         assert_gather_semantics_preserved(
-            &a,
-            root,
-            &(opt_arena, opt_root),
+            term(&input),
+            term(&arc),
             &[(id_a, data_a.as_slice()), (id_b, data_b.as_slice())],
         );
     }
@@ -787,12 +699,12 @@ mod tests {
         // gathers of one buffer (glyph atlas channels) and 4 of another
         // (color planes), with the coordinate subtree re-spliced VERBATIM for
         // every gather — exactly the duplication Kernel composition produces.
-        let atlas_id = pixelflow_ir::arena::BufferIdentity::mint();
-        let color_id = pixelflow_ir::arena::BufferIdentity::mint();
+        let atlas_id = BufferIdentity::mint();
+        let color_id = BufferIdentity::mint();
         let atlas: Vec<f32> = (0..(64 * 32)).map(|i| (i % 97) as f32).collect();
         let colors: Vec<f32> = (0..(64 * 32)).map(|i| (i % 251) as f32 * 0.5).collect();
 
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let atlas_buf = a.declare_buffer(BufferDecl {
             id: atlas_id,
             width: 64,
@@ -810,7 +722,7 @@ mod tests {
         // screen cell size (8, 16) so no algebraic rule can cancel the
         // arithmetic away — deduplication must come from hash-consing, as in
         // the real kernel.
-        let push_coords = |a: &mut ExprArena| {
+        let mut push_coords = |a: &mut ExprBuilder| {
             let x = a.push_var(0);
             let y = a.push_var(1);
             let cw = a.push_const(8.0);
@@ -841,15 +753,14 @@ mod tests {
             let wg = a.push_binary(OpKind::Mul, g, w);
             acc = a.push_binary(OpKind::Add, acc, wg);
         }
-        let root = acc;
+        let input = a.finish(&[acc]);
 
-        let before = crate::egraph::reachable_count(&a, root);
-        assert_eq!(count_gathers(&a, root), 9);
+        let before = crate::egraph::reachable_count_term(term(&input));
+        assert_eq!(count_gathers(term(&input)), 9);
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
             .expect("must optimize");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
-        let after = crate::egraph::reachable_count(&opt_arena, opt_root);
+        let after = crate::egraph::reachable_count_term(term(&arc));
 
         // Report shape for the record: 9 duplicated ~13-node coordinate
         // subtrees must collapse to (at most) one shared copy, and the 5+4
@@ -859,14 +770,13 @@ mod tests {
             "composed kernel must come back deduplicated (before={before}, after={after})"
         );
         assert_eq!(
-            count_gathers(&opt_arena, opt_root),
+            count_gathers(term(&arc)),
             2,
             "5 atlas + 4 color gathers of identical coords must CSE to one each"
         );
         assert_gather_semantics_preserved(
-            &a,
-            root,
-            &(opt_arena, opt_root),
+            term(&input),
+            term(&arc),
             &[(atlas_id, atlas.as_slice()), (color_id, colors.as_slice())],
         );
 
@@ -883,7 +793,7 @@ mod tests {
     /// far saturation got.
     #[test]
     fn scope_weighted_extraction_preserves_semantics() {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         // The per-call term is a uniform, which is `CONST` — the deepest
         // scope there is, and so the one the weighting most wants to hoist.
@@ -892,18 +802,18 @@ mod tests {
         let z = a.push_uniform(slot);
         let inner = a.push_binary(OpKind::Add, x, z);
         let root = a.push_binary(OpKind::Add, inner, z);
+        let input = a.finish(&[root]);
 
         let frame = pixelflow_ir::LatticeShape::new([256, 256]);
-        let arc = optimize_runtime_arena(&a, root, frame).expect("must optimize");
-        let (opt, opt_root) = &*arc;
+        let arc = optimize_runtime_term(term(&input), frame).expect("must optimize");
         for (x, zv) in [(0.0f32, 0.0f32), (1.5, -2.0), (-3.25, 7.5)] {
-            let bind = |arena: &ExprArena| {
+            let bind = |env: &Environment| {
                 BindingTable::empty()
-                    .bind_uniforms(arena, &[(u.identity(), zv)])
+                    .bind_uniforms(env, &[(u.identity(), zv)])
                     .expect("the argument survives extraction")
             };
-            let want = eval_scalar(&a, root, &[x, 0.0], &bind(&a));
-            let got = eval_scalar(opt, *opt_root, &[x, 0.0], &bind(opt));
+            let want = eval_scalar(term(&input), &[x, 0.0], &bind(&input.1));
+            let got = eval_scalar(term(&arc), &[x, 0.0], &bind(&arc.1));
             assert_eq!(got, want, "at X={x}, U={zv}");
         }
     }
@@ -920,78 +830,66 @@ mod tests {
         // of the machine, not of the compiler. Asserting `Const(14.0)` here
         // passed locally and failed on a loaded CI runner, which is the
         // assertion being wrong rather than the code.
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let i = a.push_var(4);
         let body = a.push_binary(OpKind::Mul, i, i);
         let root = a.push_reduce(OpKind::Add, 4, 4, body);
+        let input = a.finish(&[root]);
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
-            .expect("a Reduce-bearing arena must optimize once distributed");
-        let (opt, opt_root) = &*arc;
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
+            .expect("a Reduce-bearing term must optimize once distributed");
         assert!(
-            !reaches_nary(opt, *opt_root),
-            "the binder must be gone from the optimized arena"
+            !reaches_nary(term(&arc)),
+            "the binder must be gone from the optimized graph"
         );
         assert_eq!(
-            eval_scalar(opt, *opt_root, &[0.0; 2], &BindingTable::empty()),
+            eval_scalar(term(&arc), &[0.0; 2], &BindingTable::empty()),
             14.0,
             "Σ_{{i<4}} i² = 0 + 1 + 4 + 9"
         );
 
         // Σ_{i<3} X·i: the surviving terms depend on X, and the optimized
         // form agrees with the interpreter on the distributed original.
-        let mut b = ExprArena::new();
+        let mut b = ExprBuilder::new();
         let x = b.push_var(0);
         let j = b.push_var(5);
         let body = b.push_binary(OpKind::Mul, x, j);
         let root = b.push_reduce(OpKind::Add, 5, 3, body);
-        let (unrolled, unrolled_root) = pixelflow_ir::passes::expand_reduce_owned(&b, root);
-        let arc = optimize_runtime_arena(&b, root, pixelflow_ir::LatticeShape::POINT)
+        let folded = b.finish(&[root]);
+        let unrolled = pixelflow_ir::passes::expand_reduce(term(&folded));
+        let arc = optimize_runtime_term(term(&folded), pixelflow_ir::LatticeShape::POINT)
             .expect("X-dependent Reduce must optimize");
-        let (opt, opt_root) = &*arc;
-        assert!(!reaches_nary(opt, *opt_root));
+        assert!(!reaches_nary(term(&arc)));
         for x in [0.0f32, 1.5, -2.25, 7.0] {
-            let want = eval_scalar(&unrolled, unrolled_root, &[x, 0.0], &BindingTable::empty());
-            let got = eval_scalar(opt, *opt_root, &[x, 0.0], &BindingTable::empty());
+            let want = eval_scalar(
+                Term::new(unrolled.entry(), &folded.1),
+                &[x, 0.0],
+                &BindingTable::empty(),
+            );
+            let got = eval_scalar(term(&arc), &[x, 0.0], &BindingTable::empty());
             assert_eq!(got, want, "Σ_{{i<3}} X·i at X={x}");
         }
     }
 
-    /// Whether any `Nary` (the `Reduce` binder) is reachable from `root`.
-    fn reaches_nary(arena: &ExprArena, root: ExprId) -> bool {
-        let mut seen = vec![false; arena.nodes_raw().len()];
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            if matches!(arena.node(id), ExprNode::Nary(..)) {
-                return true;
-            }
-            stack.extend(arena.children(id));
-        }
-        false
-    }
-
     #[test]
     fn constant_folds_through_bounded_saturation() {
-        let mut a = ExprArena::new();
+        let mut a = ExprBuilder::new();
         let x = a.push_var(0);
         let one = a.push_const(1.0);
         let zero = a.push_const(0.0);
         let plus_zero = a.push_binary(OpKind::Add, x, zero);
         let times_one = a.push_binary(OpKind::Mul, plus_zero, one);
-        let root = times_one;
+        let input = a.finish(&[times_one]);
 
-        let arc = optimize_runtime_arena(&a, root, pixelflow_ir::LatticeShape::POINT)
-            .expect("identity arena must optimize");
-        let (opt_arena, opt_root) = (arc.0.clone(), arc.1);
-        assert_semantics_preserved(&a, root, &(opt_arena.clone(), opt_root));
+        let arc = optimize_runtime_term(term(&input), pixelflow_ir::LatticeShape::POINT)
+            .expect("identity term must optimize");
+        assert_semantics_preserved(term(&input), term(&arc));
         // x + 0.0, then * 1.0 should collapse to bare X.
-        assert!(
-            matches!(opt_arena.node(opt_root), ExprNode::Var(0)),
-            "expected identities to collapse to bare X, got {:?}",
-            opt_arena.node(opt_root)
+        assert_eq!(
+            *arc.0.entry(),
+            ExprData::Var(0),
+            "expected identities to collapse to bare X, got {}",
+            pixelflow_ir::display(arc.0.entry())
         );
     }
 }
@@ -1005,14 +903,14 @@ mod tests {
 ///
 /// Everything here is offline: it clones the post-saturation e-graph and
 /// runs a from-scratch upward-closure sweep to fixpoint on the clone. It
-/// changes nothing about production `optimize_runtime_arena` or `all_rules()`
+/// changes nothing about production `optimize_runtime_term` or `all_rules()`
 /// ordering — this is measurement only, not the fix.
 #[cfg(test)]
 mod congruence_gap_probe {
     use super::*;
     use crate::arena_corpus::{category_of, load_arena_dump, median, percentile};
     use crate::egraph::rule_order::{RuleOrder, build_rule_set};
-    use crate::egraph::{CostModel, RuleSet, SaturationStop, choices_to_arena};
+    use crate::egraph::{CostModel, RuleSet, SaturationStop, choices_to_rooted};
     use crate::nnue::{BwdGenConfig, BwdGenerator};
     use std::path::{Path, PathBuf};
 
@@ -1098,34 +996,18 @@ mod congruence_gap_probe {
     }
 
     /// Sum of per-op latency-prior cost over the nodes reachable from `root`
-    /// — the "materialized extracted arena's real cost" the rule-order
-    /// harness this probe borrows its corpus from also uses (`arena_cost` in
+    /// — the "materialized extraction's real cost" the rule-order harness
+    /// this probe borrows its corpus from also uses (`arena_cost` in
     /// `docs/results/2026-09-01-rule-order-real-kernels.md`), not
     /// `ExtractedDAG::total_cost`, which is a TREE cost and prices a shared
     /// subterm once per use. Since #1111 `ExtractedDAG::dag_cost` is the same
-    /// quantity this computes; the arena walk is kept as the independent
+    /// quantity this computes; the graph walk is kept as the independent
     /// check that they agree.
-    fn arena_static_cost(model: &CostModel, arena: &ExprArena, root: ExprId) -> usize {
-        let len = arena.nodes_raw().len();
-        let mut seen = vec![false; len];
-        let mut stack = vec![root];
-        let mut total = 0usize;
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            let kind = match arena.node(id) {
-                ExprNode::Unary(k, _)
-                | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
-                _ => None,
-            };
-            if let Some(k) = kind {
-                total += model.cost(k);
-            }
-            stack.extend(arena.children(id));
-        }
-        total
+    fn arena_static_cost(model: &CostModel, root: pixelflow_ir::Node<'_, ExprData>) -> usize {
+        root.descendants()
+            .filter_map(|n| n.op())
+            .map(|k| model.cost(k))
+            .sum()
     }
 
     #[derive(Clone, Debug)]
@@ -1191,30 +1073,26 @@ mod congruence_gap_probe {
 
     /// Run the production regime — `config_for_node_count` +
     /// `saturate_with_full_budget`, exactly as
-    /// `optimize_runtime_arena_uncached` calls them — under rule order
+    /// `optimize_runtime_term_uncached` calls them — under rule order
     /// `order`, and extract. Every probe in this module goes through here:
     /// a second transcription of the production call sequence is a future
     /// divergence, and the whole point of these measurements is that they
     /// measure production.
-    fn run_production(
-        name: &str,
-        order: RuleOrder,
-        arena: &ExprArena,
-        root: ExprId,
-    ) -> ProductionRun {
-        // Same two lowering passes `optimize_runtime_arena_uncached` runs
-        // before the e-graph ever sees the arena (Dwrt resolved first so
+    fn run_production(name: &str, order: RuleOrder, input: Term<'_>) -> ProductionRun {
+        // Same two lowering passes `optimize_runtime_term_uncached` runs
+        // before the e-graph ever sees the term (Dwrt resolved first so
         // ConstantFold can cascade over the constants it manufactures, then
         // Reduce unrolled). Real production dumps (the glyph corpus) still
-        // carry raw `Dwrt` markers at this point — `Font::glyph_kernel_scaled`
-        // returns `kernel.parts()` before this step runs.
-        let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
+        // carry raw `Dwrt` markers at this point.
+        let lowered = pixelflow_ir::passes::lower_dwrt(input)
             .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-        let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
-        let node_count = crate::egraph::reachable_count(&arena, root);
+        let unrolled =
+            pixelflow_ir::passes::expand_reduce(Term::new(lowered.entry(), input.env()));
+        let term = Term::new(unrolled.entry(), input.env());
+        let node_count = crate::egraph::reachable_count_term(term);
 
         // THE production regime, through the one entry point
-        // `optimize_runtime_arena_uncached` itself now calls
+        // `optimize_runtime_term_uncached` itself now calls
         // (pixelflow-search#1108, "one optimizer entry point"):
         // `Optimizer::production()` bundles the rule set, `Budget::Production`
         // (== `config_for_node_count`'s tiers), `CostModel::latency_prior`,
@@ -1225,21 +1103,18 @@ mod congruence_gap_probe {
             other => Optimizer::production().rules(RuleSet::new(build_rule_set(other))),
         };
         let mut egraph = optimizer.egraph();
-        let root_class = crate::egraph::insert(
-            &arena,
-            root,
-            &mut egraph,
-            crate::egraph::Vocabulary::Runtime,
-        )
-        .unwrap_or_else(|e| panic!("{name}: insert declined ({e:?})"));
+        let root_class =
+            crate::egraph::insert_term(term, &mut egraph, crate::egraph::Vocabulary::Runtime)
+                .unwrap_or_else(|e| panic!("{name}: insert declined ({e:?})"));
 
         let optimized = optimizer.run(&mut egraph, root_class, node_count);
         let max_classes = optimized.stats.limits.classes;
 
         let model = CostModel::latency_prior();
-        let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
-        let cost = arena_static_cost(&model, &extracted, extracted_root);
-        let extracted_nodes = crate::egraph::reachable_count(&extracted, extracted_root);
+        let (extracted, extracted_env) = optimized.to_rooted(&egraph, root_class);
+        let cost = arena_static_cost(&model, extracted.entry());
+        let extracted_nodes =
+            crate::egraph::reachable_count_term(Term::new(extracted.entry(), &extracted_env));
 
         ProductionRun {
             egraph,
@@ -1258,8 +1133,7 @@ mod congruence_gap_probe {
         name: &str,
         category: &'static str,
         order: RuleOrder,
-        arena: &ExprArena,
-        root: ExprId,
+        input: Term<'_>,
     ) -> CongruenceRow {
         let ProductionRun {
             egraph,
@@ -1269,7 +1143,7 @@ mod congruence_gap_probe {
             stop,
             cost: cost_before,
             ..
-        } = run_production(name, order, arena, root);
+        } = run_production(name, order, input);
         let hit_class_cap = stop == SaturationStop::ClassCap;
         let live_before = live_class_count(&egraph);
         let model = CostModel::latency_prior();
@@ -1292,8 +1166,8 @@ mod congruence_gap_probe {
             root_class_closed,
             dag_after.choices,
         );
-        let (extracted_after, extracted_after_root) = choices_to_arena(&extraction_after);
-        let cost_after = arena_static_cost(&model, &extracted_after, extracted_after_root);
+        let (extracted_after, _env_after) = choices_to_rooted(&extraction_after);
+        let cost_after = arena_static_cost(&model, extracted_after.entry());
 
         let reduction_frac = if live_before > 0 {
             closure_unions as f64 / live_before as f64
@@ -1345,14 +1219,13 @@ mod congruence_gap_probe {
 
         let mut rows: Vec<CongruenceRow> = Vec::new();
         for path in &paths {
-            let (name, arena, root) = load_arena_dump(path);
+            let (name, rooted, env) = load_arena_dump(path);
             let category = category_of(&path.file_name().unwrap().to_string_lossy());
             rows.push(measure_one(
                 &name,
                 category,
                 RuleOrder::Production,
-                &arena,
-                root,
+                Term::new(rooted.entry(), &env),
             ));
         }
         let real_kernel_count = rows.len();
@@ -1371,21 +1244,19 @@ mod congruence_gap_probe {
                 .iter()
                 .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix))
             {
-                let (name, arena, root) = load_arena_dump(path);
+                let (name, rooted, env) = load_arena_dump(path);
                 let category = category_of(&path.file_name().unwrap().to_string_lossy());
                 hb_rows.push(measure_one(
                     &format!("{name} [production]"),
                     category,
                     RuleOrder::Production,
-                    &arena,
-                    root,
+                    Term::new(rooted.entry(), &env),
                 ));
                 hb_rows.push(measure_one(
                     &format!("{name} [numeric-first]"),
                     category,
                     RuleOrder::NumericFirst,
-                    &arena,
-                    root,
+                    Term::new(rooted.entry(), &env),
                 ));
             }
         }
@@ -1406,14 +1277,13 @@ mod congruence_gap_probe {
                     config,
                     templates.clone(),
                 );
-                let pair = generator.generate_arena();
+                let pair = generator.generate();
                 let name = format!("synth_d{max_depth}_s{seed}");
                 rows.push(measure_one(
                     &name,
                     "synthetic",
                     RuleOrder::Production,
-                    &pair.arena,
-                    pair.unoptimized,
+                    pair.unoptimized(),
                 ));
             }
         }
@@ -1615,9 +1485,13 @@ mod congruence_gap_probe {
 
         let mut rows: Vec<RepairRow> = Vec::new();
         for path in &paths {
-            let (name, arena, root) = load_arena_dump(path);
+            let (name, rooted, env) = load_arena_dump(path);
             let category = category_of(&path.file_name().unwrap().to_string_lossy());
-            let run = run_production(&name, RuleOrder::Production, &arena, root);
+            let run = run_production(
+                &name,
+                RuleOrder::Production,
+                Term::new(rooted.entry(), &env),
+            );
             rows.push(RepairRow {
                 name,
                 category,
@@ -1691,8 +1565,12 @@ mod congruence_gap_probe {
     #[ignore = "corpus invariant, needs the arena dumps: PIXELFLOW_CONGRUENCE_ARENA_DIR=<dir of .arena dumps> cargo test -p pixelflow-search --release --lib -- --ignored saturation_strands_no_enodes"]
     fn saturation_strands_no_enodes() {
         for path in &arena_corpus_paths() {
-            let (name, arena, root) = load_arena_dump(path);
-            let run = run_production(&name, RuleOrder::Production, &arena, root);
+            let (name, rooted, env) = load_arena_dump(path);
+            let run = run_production(
+                &name,
+                RuleOrder::Production,
+                Term::new(rooted.entry(), &env),
+            );
             assert_eq!(
                 orphaned_node_count(&run.egraph),
                 0,
@@ -1829,7 +1707,7 @@ mod congruence_gap_probe {
             out,
             "Read-only offline probe: after production saturation \
              (`config_for_node_count` + `saturate_with_full_budget`, exactly as \
-             `optimize_runtime_arena_uncached` calls them), clone the e-graph and \
+             `optimize_runtime_term_uncached` calls them), clone the e-graph and \
              run a full upward-congruence-closure sweep to fixpoint. Reports how \
              much congruence production's `union`/`rebuild_budgeted` missed \
              because no e-node parent list exists.\n"
@@ -1994,7 +1872,7 @@ mod congruence_gap_probe {
 pub(crate) mod production_telemetry {
     use super::*;
     use crate::egraph::{Budget, CostModel, Optimizer, SaturationConfig, SaturationStop};
-    use pixelflow_ir::arena::{BufferDecl, BufferIdentity};
+    use pixelflow_ir::decl::{BufferDecl, BufferIdentity};
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -2017,127 +1895,31 @@ pub(crate) mod production_telemetry {
         std::env::var(var).unwrap_or_else(|e| panic!("{var} must be set ({e})"))
     }
 
-    /// Inverse of the dumpers' `dump_arena` (cell_grid.rs tests /
-    /// pixelflow-graphics/tests/production_glyph_arena_dump.rs): replays
-    /// reachable nodes in original id order through the public `push_*`
-    /// API, which never hash-conses, so the rebuilt arena has exactly the
-    /// dumped node multiset and `reachable_count` is preserved. Buffer
-    /// identities are re-minted per distinct dumped ordinal, preserving the
-    /// equality structure (two slots naming one buffer still share an
-    /// identity) without depending on the dumping process's counter.
-    pub(crate) fn load_arena(path: &Path) -> (String, ExprArena, ExprId) {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let mut lines = text.lines();
-        assert_eq!(
-            lines.next(),
-            Some("# pixelflow arena dump v1"),
-            "{}: bad header",
-            path.display()
-        );
-        let mut name = None;
-        let mut arena = ExprArena::new();
-        let mut idents: Vec<BufferIdentity> = Vec::new();
-        let mut root = None;
-        let mut next_id: u32 = 0;
-        let mut buf_count: u16 = 0;
-        let op = |s: &str| -> OpKind {
-            OpKind::all()
-                .find(|k| format!("{k:?}") == s)
-                .unwrap_or_else(|| panic!("{}: unknown OpKind {s:?}", path.display()))
-        };
-        let id = |s: &str| -> ExprId {
-            ExprId(
-                s.parse()
-                    .unwrap_or_else(|e| panic!("{}: bad id {s:?}: {e}", path.display())),
-            )
-        };
-        for line in lines {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            let pushed = match f.as_slice() {
-                ["name", n] => {
-                    name = Some((*n).to_string());
-                    continue;
-                }
-                ["buf", ord, w, h] => {
-                    let ord: usize = ord.parse().expect("buf ordinal");
-                    while idents.len() <= ord {
-                        idents.push(BufferIdentity::mint());
-                    }
-                    let slot = arena.declare_buffer(BufferDecl {
-                        id: idents[ord],
-                        width: w.parse().expect("buf width"),
-                        height: h.parse().expect("buf height"),
-                    });
-                    assert_eq!(
-                        slot.0,
-                        buf_count,
-                        "{}: buffer slot order drifted",
-                        path.display()
-                    );
-                    buf_count += 1;
-                    continue;
-                }
-                ["root", r] => {
-                    root = Some(id(r));
-                    continue;
-                }
-                ["V", i] => arena.push_var(i.parse().expect("var index")),
-                ["C", bits] => arena.push_const(f32::from_bits(bits.parse().expect("const bits"))),
-                ["B", slot] => arena.push_buffer(pixelflow_ir::arena::BufferId(
-                    slot.parse().expect("buffer slot"),
-                )),
-                ["U", k, a] => arena.push_unary(op(k), id(a)),
-                ["Bi", k, a, b] => arena.push_binary(op(k), id(a), id(b)),
-                ["T", k, a, b, c] => arena.push_ternary(op(k), id(a), id(b), id(c)),
-                other => panic!("{}: unparseable line {other:?}", path.display()),
-            };
-            assert_eq!(
-                pushed,
-                ExprId(next_id),
-                "{}: replay drifted from dumped ids",
-                path.display()
-            );
-            next_id += 1;
-        }
-        let name = name.unwrap_or_else(|| panic!("{}: no name line", path.display()));
-        let root = root.unwrap_or_else(|| panic!("{}: no root line", path.display()));
-        (name, arena, root)
-    }
+    /// The `.arena` corpus loader, imported rather than restated. This
+    /// module used to carry its own transcription of the dump format's
+    /// inverse; two loaders for one format is one chance for two probes to
+    /// disagree about what a dump means.
+    pub(crate) use crate::arena_corpus::load_arena_dump as load_arena;
 
-    /// Latency-prior cost of the arena the JIT would actually execute: the
+    /// Latency-prior cost of the graph the JIT would actually execute: the
     /// per-op table summed over every reachable operation once (DAG cost;
     /// leaves are free, as in `CostModel::node_op_cost`). This is the
     /// quality metric — NOT `ExtractedDAG::total_cost`, which is a TREE cost
     /// and pays a shared subterm once per use. `ExtractedDAG::dag_cost`
     /// (#1111) is this same number read off the choices instead of the
-    /// materialized arena; this walk stays as the independent check.
-    fn arena_cost(arena: &ExprArena, root: ExprId, costs: &CostModel) -> usize {
-        let len = arena.nodes_raw().len();
-        let mut seen = vec![false; len];
-        let mut stack = vec![root];
+    /// materialized graph; this walk stays as the independent check.
+    fn arena_cost(root: pixelflow_ir::Node<'_, ExprData>, costs: &CostModel) -> usize {
         let mut total = 0usize;
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            let kind = match arena.node(id) {
-                ExprNode::Var(_)
-                | ExprNode::Const(_)
-                | ExprNode::Buffer(_)
-                | ExprNode::Uniform(_) => None,
-                ExprNode::Unary(k, _)
-                | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
-                other @ (ExprNode::Param(_) | ExprNode::Nary(..)) => {
-                    panic!("extracted arena contains {other:?}")
-                }
-            };
-            if let Some(k) = kind {
+        for n in root.descendants() {
+            assert!(
+                !matches!(*n, ExprData::Param(_)),
+                "extracted graph contains {:?}",
+                *n
+            );
+            if let Some(k) = n.op() {
                 assert_ne!(k, OpKind::Dwrt, "Dwrt survived extraction");
                 total += costs.cost(k);
             }
-            stack.extend(arena.children(id));
         }
         total
     }
@@ -2169,14 +1951,13 @@ pub(crate) mod production_telemetry {
         }
     }
 
-    /// The production sequence of `optimize_runtime_arena_uncached`
+    /// The production sequence of `optimize_runtime_term_uncached`
     /// (`runtime.rs:106-137`) from the e-graph build onward, with the budget
     /// as parameters so the same function runs the production tier and both
     /// generous runs. `lower_dwrt_owned` (`:120`) and `config_for_node_count`
     /// (`:126-127`) run once in the caller since they are budget-independent.
     fn run(
-        arena: &ExprArena,
-        root: ExprId,
+        term: Term<'_>,
         max_iterations: usize,
         max_classes: usize,
         timeout: Duration,
@@ -2201,18 +1982,18 @@ pub(crate) mod production_telemetry {
 
         let mut egraph = optimizer.egraph();
         let root_class =
-            crate::egraph::insert(arena, root, &mut egraph, crate::egraph::Vocabulary::Runtime)
-                .expect("production arena must be e-graph representable (no Param/Nary)");
+            crate::egraph::insert_term(term, &mut egraph, crate::egraph::Vocabulary::Runtime)
+                .expect("production term must be e-graph representable (no Param/Tuple)");
 
         let started = Instant::now();
         let optimized = optimizer.run(
             &mut egraph,
             root_class,
-            crate::egraph::reachable_count(arena, root),
+            crate::egraph::reachable_count_term(term),
         );
         let elapsed = started.elapsed();
 
-        let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
+        let (extracted, extracted_env) = optimized.to_rooted(&egraph, root_class);
 
         let costs = CostModel::latency_prior();
         // The DP's own objective value for the term it returned: a TREE cost,
@@ -2232,9 +2013,12 @@ pub(crate) mod production_telemetry {
             applications: optimized.stats.applications as usize,
             journal_unions: egraph.provenance().union_count(),
             elapsed,
-            cost: arena_cost(&extracted, extracted_root, &costs),
+            cost: arena_cost(extracted.entry(), &costs),
             dp_cost,
-            extracted_nodes: crate::egraph::reachable_count(&extracted, extracted_root),
+            extracted_nodes: crate::egraph::reachable_count_term(Term::new(
+                extracted.entry(),
+                &extracted_env,
+            )),
         }
     }
 
@@ -2355,19 +2139,18 @@ pub(crate) mod production_telemetry {
         let mut rows: Vec<Row> = Vec::new();
 
         for path in &files {
-            let (name, raw_arena, raw_root) = load_arena(path);
+            let (name, raw, env) = load_arena(path);
             let group = name.split(':').next().expect("group prefix").to_string();
 
-            // runtime.rs:120
-            let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(&raw_arena, raw_root)
+            // The legalizing prefix, as `optimize_runtime_term_uncached` runs it.
+            let lowered = pixelflow_ir::passes::lower_dwrt(Term::new(raw.entry(), &env))
                 .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-            // runtime.rs:126-127
-            let node_count = crate::egraph::reachable_count(&arena, root);
+            let term = Term::new(lowered.entry(), &env);
+            let node_count = crate::egraph::reachable_count_term(term);
             let config = crate::egraph::saturate::config_for_node_count(node_count);
 
             let prod = run(
-                &arena,
-                root,
+                term,
                 config.max_iterations,
                 config.max_classes,
                 config.safety_ceiling,
@@ -2379,9 +2162,9 @@ pub(crate) mod production_telemetry {
             // the class cap too (the whole budget's bite).
             let ref_iters = config.max_iterations * mult;
             let lifted_classes = config.max_classes * mult;
-            let refr = run(&arena, root, ref_iters, config.max_classes, ceiling);
+            let refr = run(term, ref_iters, config.max_classes, ceiling);
             let remaining = ceiling.saturating_sub(refr.elapsed);
-            let lifted = run(&arena, root, ref_iters, lifted_classes, remaining);
+            let lifted = run(term, ref_iters, lifted_classes, remaining);
 
             let loss_vs_ref = loss_pct(&prod, &refr);
             let loss_vs_lifted = loss_pct(&prod, &lifted);
@@ -2642,31 +2425,19 @@ mod production_equivalence {
     const DIR_VAR: &str = "PIXELFLOW_EQUIV_DIR";
     const OUT_VAR: &str = "PIXELFLOW_EQUIV_OUT";
 
-    /// FNV-1a over the optimized arena's canonical serialization — the same
+    /// FNV-1a over the optimized graph's canonical serialization — the same
     /// stable digest [`RuleId`](crate::egraph::RuleId) uses, for the same
     /// reason: it has to be reproducible by a different build.
-    fn digest(arena: &ExprArena, root: ExprId) -> String {
-        let mut text = String::new();
-        let len = arena.nodes_raw().len();
-        let mut reachable = vec![false; len];
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut reachable[id.0 as usize], true) {
-                continue;
-            }
-            stack.extend(arena.children(id));
-        }
-        let mut nodes = 0usize;
-        for (idx, live) in reachable.iter().enumerate() {
-            if !*live {
-                continue;
-            }
-            nodes += 1;
-            writeln!(text, "{idx} {:?}", arena.node(ExprId(idx as u32))).expect("fmt");
-        }
-        writeln!(text, "root {}", root.0).expect("fmt");
+    ///
+    /// The serialization is `expr::encode`'s: reachable nodes in topological
+    /// order, dense ordinals, children named by ordinal. Hand-rolling a
+    /// second one here would be a second answer to "are these the same
+    /// graph", which is the question the digest exists to answer.
+    fn digest(root: pixelflow_ir::Node<'_, ExprData>) -> String {
+        let bytes = pixelflow_ir::encode(root);
+        let nodes = root.node_count();
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in text.as_bytes() {
+        for b in &bytes {
             h ^= u64::from(*b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -2692,14 +2463,17 @@ mod production_equivalence {
 
         let mut text = String::new();
         for path in &paths {
-            let (name, arena, root) = load_arena(path);
+            let (name, rooted, env) = load_arena(path);
             // The production entry point itself, uncached — a static cache
-            // would make the second kernel with an equal arena report the
+            // would make the second kernel with an equal graph report the
             // first one's answer rather than recomputing it.
-            let line = match optimize_runtime_arena_uncached(&arena, root, LatticeShape::POINT) {
-                Some((opt, opt_root)) => digest(&opt, opt_root),
-                // `None` is a real production outcome (an arena
-                // `optimize_runtime_arena` bails on), and it must stay the
+            let line = match optimize_runtime_term_uncached(
+                Term::new(rooted.entry(), &env),
+                LatticeShape::POINT,
+            ) {
+                Some((opt, _opt_env)) => digest(opt.entry()),
+                // `None` is a real production outcome (a term
+                // `optimize_runtime_term` bails on), and it must stay the
                 // same outcome across the change, so it is a row, not a skip.
                 None => String::from("BAILED\t0"),
             };
@@ -2707,7 +2481,7 @@ mod production_equivalence {
         }
         std::fs::write(&out, &text).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
         println!(
-            "digested {} production arenas -> {}",
+            "digested {} production graphs -> {}",
             paths.len(),
             out.display()
         );

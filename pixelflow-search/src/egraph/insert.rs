@@ -9,6 +9,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use pixelflow_ir::expr::{ExprBuilder, Term};
 use pixelflow_ir::{Children, Ir, Shape};
 
 use super::graph::EGraph;
@@ -132,6 +133,32 @@ pub fn insert<I: Ir>(
     }
 
     Ok(built.pop().expect("insert: root produced no e-class"))
+}
+
+/// [`insert`], for a finished [`Term`].
+///
+/// The generic entry point needs an [`Ir`], and the only implementor
+/// `pixelflow-ir` publishes is [`ExprBuilder`] — a finished graph is read
+/// through [`Node`](pixelflow_ir::Node) handles, which are not `Ir` refs. So
+/// the term is spliced into a fresh builder first. The splice is
+/// reachable-only and preserves sharing, so what reaches the e-graph is the
+/// term's own DAG and nothing else; what it costs is one rebuild of a graph
+/// that is about to be rebuilt as e-nodes anyway.
+pub fn insert_term(
+    term: Term<'_>,
+    egraph: &mut EGraph,
+    vocab: Vocabulary,
+) -> Result<EClassId, Declined> {
+    let mut builder = ExprBuilder::new();
+    let root = builder.splice(term);
+    insert(&builder, root, egraph, vocab)
+}
+
+/// [`reachable_count`], for a finished [`Term`] — the distinct nodes its root
+/// reaches, which is what [`insert_term`] puts in the graph.
+#[must_use]
+pub fn reachable_count_term(term: Term<'_>) -> usize {
+    term.root().node_count()
 }
 
 /// Count the nodes reachable from `root` — the rough size measure saturation

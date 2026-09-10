@@ -4,7 +4,7 @@
 //!
 //! # Why a side channel, not a return value
 //!
-//! `EGraph::optimize_runtime_arena` (this crate's [`crate::runtime`]) and
+//! `optimize_runtime_term` (this crate's [`crate::runtime`]) and
 //! `pixelflow_compiler::optimize::optimize` keep their existing signatures
 //! and return types unchanged — telemetry is never threaded through what
 //! either function hands back. Each production call site calls
@@ -46,7 +46,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use crate::egraph::{CostModel, ExtractionReport, OptimizerStats, SaturationStop};
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::expr::Term;
 
 pub use crate::tier::Tier;
 
@@ -96,11 +96,10 @@ pub struct SaturationInvocation<'a> {
     /// `pixelflow-compiler` and `core-term` must be able to enable
     /// `saturation-telemetry` without pulling `provenance-journal` in.
     pub union_count: usize,
-    /// The arena and root this invocation extracted, so [`record`] can cost
-    /// it under the static latency-prior model independently of whatever
-    /// extraction policy actually chose it.
-    pub extracted_arena: &'a ExprArena,
-    pub extracted_root: ExprId,
+    /// The term this invocation extracted, so [`record`] can cost it under
+    /// the static latency-prior model independently of whatever extraction
+    /// policy actually chose it.
+    pub extracted: Term<'a>,
     /// Wall-clock of saturate+extract together. Indicative only — see
     /// `CLAUDE.md`'s floating-point-at-the-edges notes on why timing is a
     /// measurement, not a promised bound.
@@ -116,7 +115,7 @@ pub struct SaturationInvocation<'a> {
 /// Emit one JSONL telemetry record for `inv`. See the module docs for the
 /// sink and its failure behavior.
 pub fn record(inv: SaturationInvocation<'_>) {
-    let cost = latency_prior_cost(inv.extracted_arena, inv.extracted_root);
+    let cost = latency_prior_cost(inv.extracted);
     let line = format!(
         "{{\"tier\":\"{tier}\",\"node_count\":{node_count},\"inserted_classes\":{inserted_classes},\
          \"max_iterations\":{max_iterations},\
@@ -212,38 +211,16 @@ fn escape_json(s: &str) -> String {
 }
 
 /// Sum of `CostModel::latency_prior()` over every node reachable from
-/// `root`. Computed independently here rather than threaded out of
-/// extraction because neither `Extraction` nor `choices_to_arena`'s output
+/// `term`'s root. Computed independently here rather than threaded out of
+/// extraction because neither `Extraction` nor `choices_to_rooted`'s output
 /// carries a total cost of its own (extraction tracks per-e-class best cost
-/// internally, not on the materialized arena) — this mirrors
-/// `crate::runtime`'s own `reachable_count` traversal shape.
-fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
+/// internally, not on the materialized graph).
+fn latency_prior_cost(term: Term<'_>) -> usize {
     let costs = CostModel::latency_prior();
-    let len = arena.nodes_raw().len();
-    let mut seen = vec![false; len];
-    let mut stack = vec![root];
-    let mut total = 0usize;
-    while let Some(id) = stack.pop() {
-        if core::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        let op = match arena.node(id) {
-            ExprNode::Unary(op, _)
-            | ExprNode::Binary(op, _, _)
-            | ExprNode::Ternary(op, _, _, _)
-            | ExprNode::Nary(op, _, _) => Some(*op),
-            ExprNode::Var(_)
-            | ExprNode::Const(_)
-            | ExprNode::Param(_)
-            | ExprNode::Buffer(_)
-            | ExprNode::Uniform(_) => None,
-        };
-        if let Some(op) = op {
-            total += costs.cost(op);
-        }
-        stack.extend(arena.children(id));
-    }
-    total
+    term.root()
+        .descendants()
+        .filter_map(|n| n.op())
+        .fold(0usize, |total, op| total + costs.cost(op))
 }
 
 /// Append one line to the sink named by `PIXELFLOW_SATURATION_TELEMETRY`, or

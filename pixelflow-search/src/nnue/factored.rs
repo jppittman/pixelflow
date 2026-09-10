@@ -9,7 +9,7 @@
 //!   carries a sane cost prior and the embedding shares a scale with the
 //!   table the extractor actually uses.
 //!
-//! - The typed edge stream: a walk over an expression DAG — an [`ExprArena`]
+//! - The typed edge stream: a walk over an expression DAG — a [`Term`]
 //!   subtree, or an e-graph [`Extraction`](crate::egraph::extract::Extraction)
 //!   — emits one [`CostEdge`] per parent→child slot, bound at a depth-encoded
 //!   [`PeSlot`]. A second reference to a shared node is a register reload
@@ -38,7 +38,8 @@ use crate::egraph::Rewrite;
 use crate::egraph::cost::latency_prior_cycles;
 use crate::egraph::extract::Extraction;
 pub use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::Node;
+use pixelflow_ir::expr::{Environment, ExprBuilder, ExprData, ExprRef, Term};
 use pixelflow_ir::kind::OpMap;
 
 // ============================================================================
@@ -92,11 +93,11 @@ pub const MLP_HIDDEN: usize = 16;
 /// - `z_RHS`: what it PRODUCES (production prediction)
 /// - `z_LHS - z_RHS`: what CHANGED (the delta)
 /// - `z_LHS * z_RHS`: what's SHARED (preserved structure)
-/// Arena-backed rule templates: one [`ArenaRuleTemplate`] per rule index.
+/// Graph-backed rule templates: one [`ArenaRuleTemplate`] per rule index.
 ///
 /// `None` slots are rules that define no structural template (or only one
 /// side). Built from the [`Rewrite`] trait via [`RuleTemplates::build`], which
-/// reads each rule's LHS/RHS directly into a per-rule [`ExprArena`].
+/// reads each rule's LHS/RHS directly into a per-rule [`Rooted<ExprData>`].
 #[derive(Clone, Default)]
 pub struct RuleTemplates {
     /// One optional arena-backed template per rule, indexed by rule_idx.
@@ -127,12 +128,12 @@ impl RuleTemplates {
             self.rules.resize_with(rule_idx + 1, || None);
         }
         let tmpl = ArenaRuleTemplate::from_rule(rule);
-        if tmpl.lhs.is_some() && tmpl.rhs.is_some() {
+        if tmpl.lhs_present && tmpl.rhs_present {
             self.rules[rule_idx] = Some(tmpl);
         }
     }
 
-    /// Get the arena-backed template for a rule, if defined.
+    /// Get the graph-backed template for a rule, if defined.
     #[must_use]
     pub fn get(&self, rule_idx: usize) -> Option<&ArenaRuleTemplate> {
         self.rules.get(rule_idx).and_then(|o| o.as_ref())
@@ -185,18 +186,26 @@ impl RuleTemplates {
 // Arena Rule Templates
 // ============================================================================
 
-/// A single rule stored as two subtrees inside one shared [`ExprArena`].
+/// A single rule stored as two subtrees inside one shared expression graph.
 ///
-/// `lhs` and `rhs` are roots inside `arena`. Either may be `None` when the
-/// corresponding side was not provided by the rule.
+/// The graph carries up to two entries in a fixed order: entry 0 is the LHS
+/// when [`Self::lhs`] says there is one, and the RHS follows. Either side may
+/// be absent when the rule did not provide it — which is why the two flags
+/// are here rather than "the graph has two entries" being assumed.
+///
+/// A rule pattern names no memory, so the environment its leaves would index
+/// is empty; it is kept beside the graph because a [`Term`] is the pair, and
+/// splitting them at a call site is what this crate stopped doing.
 #[derive(Clone)]
 pub struct ArenaRuleTemplate {
-    /// Shared arena holding both the LHS and RHS subtrees.
-    pub arena: ExprArena,
-    /// Root of the LHS pattern, or `None`.
-    pub lhs: Option<ExprId>,
-    /// Root of the RHS pattern, or `None`.
-    pub rhs: Option<ExprId>,
+    /// The graph holding the LHS and RHS subtrees, in that order.
+    rooted: pixelflow_ir::Rooted<ExprData>,
+    /// The (empty) declaration tables the subtrees' leaves index.
+    env: Environment,
+    /// Whether the graph carries an LHS entry.
+    lhs_present: bool,
+    /// Whether the graph carries an RHS entry.
+    rhs_present: bool,
     /// Precomputed: LHS root op kind (if LHS is not a bare Var).
     pub lhs_op: Option<OpKind>,
     /// Precomputed: RHS root op kind (if RHS is not a bare Var).
@@ -204,39 +213,87 @@ pub struct ArenaRuleTemplate {
 }
 
 impl ArenaRuleTemplate {
-    /// Build the LHS/RHS templates of `rule` directly into a fresh arena.
+    /// Build the LHS/RHS templates of `rule` directly into a fresh graph.
     #[must_use]
     pub fn from_rule(rule: &dyn Rewrite) -> Self {
-        let mut arena = ExprArena::with_capacity(16);
-        let lhs = rule.lhs_template(&mut arena);
-        let rhs = rule.rhs_template(&mut arena);
+        let mut builder = ExprBuilder::new();
+        let lhs = rule.lhs_template(&mut builder);
+        let rhs = rule.rhs_template(&mut builder);
 
-        let lhs_op = lhs.and_then(|id| {
-            if matches!(arena.node(id), ExprNode::Var(_)) {
-                None
-            } else {
-                Some(arena.kind(id))
+        let root_op = |r: ExprRef, b: &ExprBuilder| -> Option<OpKind> {
+            let node = b.node(r);
+            match *node {
+                ExprData::Var(_) => None,
+                _ => Some(kind_of(node)),
             }
-        });
-        let rhs_op = rhs.and_then(|id| {
-            if matches!(arena.node(id), ExprNode::Var(_)) {
-                None
-            } else {
-                Some(arena.kind(id))
-            }
-        });
+        };
+        let lhs_op = lhs.and_then(|r| root_op(r, &builder));
+        let rhs_op = rhs.and_then(|r| root_op(r, &builder));
+
+        let entries: Vec<ExprRef> = lhs.into_iter().chain(rhs).collect();
+        let (rooted, env) = builder.finish(&entries);
 
         Self {
-            arena,
-            lhs,
-            rhs,
+            rooted,
+            env,
+            lhs_present: lhs.is_some(),
+            rhs_present: rhs.is_some(),
             lhs_op,
             rhs_op,
         }
     }
+
+    /// An empty template: neither side defined.
+    #[must_use]
+    pub fn empty() -> Self {
+        let (rooted, env) = ExprBuilder::new().finish(&[]);
+        Self {
+            rooted,
+            env,
+            lhs_present: false,
+            rhs_present: false,
+            lhs_op: None,
+            rhs_op: None,
+        }
+    }
+
+    /// The LHS pattern, if the rule defined one.
+    #[must_use]
+    pub fn lhs(&self) -> Option<Term<'_>> {
+        self.lhs_present
+            .then(|| Term::new(self.rooted.entry_at(0), &self.env))
+    }
+
+    /// The RHS pattern, if the rule defined one.
+    #[must_use]
+    pub fn rhs(&self) -> Option<Term<'_>> {
+        self.rhs_present.then(|| {
+            Term::new(
+                self.rooted.entry_at(usize::from(self.lhs_present)),
+                &self.env,
+            )
+        })
+    }
 }
 
-/// Arena-backed rule template storage for the mask head.
+/// The [`OpKind`] naming what kind of node this is — an operator's own kind,
+/// or the leaf pseudo-op standing for the leaf's shape.
+///
+/// The op vocabulary the embeddings and the edge stream are indexed by has a
+/// slot per leaf kind, so a walk over a term needs one answer for every node.
+#[must_use]
+pub(crate) fn kind_of(node: Node<'_, ExprData>) -> OpKind {
+    match *node {
+        ExprData::Var(_) => OpKind::Var,
+        ExprData::Const(_) => OpKind::Const,
+        ExprData::Param(_) => OpKind::Param,
+        ExprData::Buffer(_) => OpKind::Buffer,
+        ExprData::Uniform(_) => OpKind::Uniform,
+        ExprData::Op(op) => op,
+    }
+}
+
+/// Dense rule-template storage for the mask head.
 pub struct ArenaRuleTemplates {
     /// One arena-backed template per rule, indexed by rule_idx.
     pub arenas: Vec<ArenaRuleTemplate>,
@@ -245,7 +302,7 @@ pub struct ArenaRuleTemplates {
 }
 
 impl ArenaRuleTemplates {
-    /// Convert [`RuleTemplates`] into dense arena form (one entry per rule).
+    /// Convert [`RuleTemplates`] into dense form (one entry per rule).
     #[must_use]
     pub fn from_rule_templates(templates: &RuleTemplates) -> Self {
         let mut arenas = Vec::with_capacity(templates.len());
@@ -254,13 +311,7 @@ impl ArenaRuleTemplates {
         for slot in &templates.rules {
             let tmpl = match slot {
                 Some(t) => t.clone(),
-                None => ArenaRuleTemplate {
-                    arena: ExprArena::new(),
-                    lhs: None,
-                    rhs: None,
-                    lhs_op: None,
-                    rhs_op: None,
-                },
+                None => ArenaRuleTemplate::empty(),
             };
             if let Some(op) = tmpl.lhs_op {
                 root_op_set[op] = true;
@@ -584,7 +635,7 @@ pub struct CostEdge {
 /// Denotation: an `EdgeTrace` is an expression DAG *as an edge multiset with
 /// order*. Two DAGs that emit the same trace are indistinguishable to every
 /// embedding-based consumer, which is why the train-side
-/// ([`EdgeTrace::from_arena_dag`]) and deploy-side
+/// ([`EdgeTrace::from_term`]) and deploy-side
 /// ([`EdgeTrace::from_extraction`]) adapters share one walker: there is no
 /// second edge policy left to drift (pinned by
 /// `edge_traces_from_arena_and_extraction_agree` in `egraph::extract`).
@@ -595,23 +646,23 @@ pub struct EdgeTrace {
 }
 
 impl EdgeTrace {
-    /// Walk an arena subtree. Sharing is by `ExprId` — exactly the sharing
-    /// the JIT's let-binding emitter sees when this arena is compiled, so the
+    /// Walk a term's subtree. Sharing is by node — exactly the sharing the
+    /// JIT's let-binding emitter sees when this graph is compiled, so the
     /// reload-edge policy describes the emitted object.
     ///
     /// # Panics
     ///
-    /// Panics if the subtree contains `ExprNode::Param` — substitute
+    /// Panics if the subtree contains `ExprData::Param` — substitute
     /// parameters before walking.
     #[must_use]
-    pub fn from_arena_dag(arena: &ExprArena, root: ExprId) -> Self {
-        Self::walk(&ArenaCostDag { arena, root })
+    pub fn from_term(term: Term<'_>) -> Self {
+        Self::walk(&TermCostDag::new(term))
     }
 
     /// Walk the DAG an [`Extraction`] will materialise: its chosen node per
     /// reachable e-class, with every `Shl`/`Shr` count child pinned to its
     /// class's `Const` representative ([`Extraction::pinned_choices`]) — the
-    /// same view `choices_to_arena` emits, so the trace describes the
+    /// same view `choices_to_rooted` emits, so the trace describes the
     /// compiled DAG and not whichever node the extraction happened to record
     /// for a count class.
     #[must_use]
@@ -668,7 +719,7 @@ impl EdgeSink for Vec<CostEdge> {
 /// nodes expanded.
 ///
 /// This is the ONLY function that turns an expression DAG into feature
-/// edges, whether the DAG lives in an [`ExprArena`] or in an e-graph with
+/// edges, whether the DAG lives in a [`Term`] or in an e-graph with
 /// extraction choices. The 2026-08 round-0 audit found two walkers with
 /// different edge policies (no reload edges on one side) biasing a deployed
 /// model by −0.29 log-ns; one walker makes that divergence unrepresentable.
@@ -769,36 +820,63 @@ trait CostDag {
     fn child_kind(&self, id: u32) -> Option<OpKind>;
 }
 
-/// An [`ExprArena`] subtree as a [`CostDag`].
-struct ArenaCostDag<'a> {
-    arena: &'a ExprArena,
-    root: ExprId,
+/// A [`Term`]'s subtree as a [`CostDag`].
+///
+/// The walker names nodes by `u32`, and a finished graph's own indices are not
+/// public — deliberately, they are a `Dag`'s business — so this assigns dense
+/// ordinals over the whole graph in its topological (children-before-parents)
+/// order, exactly as `expr::encode_into` does for the same reason. Structural
+/// sharing survives, which is what the reload-edge policy keys on.
+struct TermCostDag<'a> {
+    /// Ordinal → node.
+    nodes: Vec<Node<'a, ExprData>>,
+    /// Node → ordinal.
+    ordinal: pixelflow_ir::SideTable<u32>,
+    root: u32,
 }
 
-impl CostDag for ArenaCostDag<'_> {
+impl<'a> TermCostDag<'a> {
+    fn new(term: Term<'a>) -> Self {
+        let dag = term.dag();
+        let mut ordinal = dag.side_table(u32::MAX);
+        let mut nodes = Vec::with_capacity(dag.len());
+        for node in dag.iter() {
+            ordinal[node] = nodes.len() as u32;
+            nodes.push(node);
+        }
+        let root = ordinal[term.root()];
+        Self {
+            nodes,
+            ordinal,
+            root,
+        }
+    }
+}
+
+impl CostDag for TermCostDag<'_> {
     fn id_bound(&self) -> usize {
-        self.arena.len()
+        self.nodes.len()
     }
 
     fn root(&self) -> u32 {
-        self.root.0
+        self.root
     }
 
     fn resolve(&self, id: u32, out: &mut Vec<u32>) -> Option<OpKind> {
-        let eid = ExprId(id);
-        if let ExprNode::Param(i) = self.arena.node(eid) {
-            panic!("ExprNode::Param({i}) reached the edge walker — substitute params first");
+        let node = self.nodes[id as usize];
+        if let ExprData::Param(i) = *node {
+            panic!("ExprData::Param({i}) reached the edge walker — substitute params first");
         }
-        for child in self.arena.children(eid) {
-            out.push(child.0);
+        for child in node.children() {
+            out.push(self.ordinal[child]);
         }
-        Some(self.arena.kind(eid))
+        Some(kind_of(node))
     }
 
     fn child_kind(&self, id: u32) -> Option<OpKind> {
-        // `arena.kind` maps Param to Const; the child itself is expanded (and
-        // `resolve` panics) right after, so a Param still fails loudly.
-        Some(self.arena.kind(ExprId(id)))
+        // A `Param` child answers with its own kind here; the child itself is
+        // expanded (and `resolve` panics) right after, so it still fails loudly.
+        Some(kind_of(self.nodes[id as usize]))
     }
 }
 
@@ -807,11 +885,11 @@ impl CostDag for ArenaCostDag<'_> {
 struct ChoicesCostDag<'a> {
     extraction: &'a Extraction<'a>,
     /// [`Extraction::pinned_choices`] — the same `Shl`/`Shr` count
-    /// substitution `choices_to_arena` applies, computed once so `resolve`
-    /// and `child_kind` walk the DAG `choices_to_arena` will actually
+    /// substitution `choices_to_rooted` applies, computed once so `resolve`
+    /// and `child_kind` walk the DAG `choices_to_rooted` will actually
     /// materialise. Using the raw (unpinned) `extraction.choice` here would
     /// let the walker descend into a count class's non-`Const` alternative,
-    /// inflating the trace with nodes `choices_to_arena` never emits.
+    /// inflating the trace with nodes `choices_to_rooted` never emits.
     pinned: Vec<Option<usize>>,
 }
 
@@ -900,19 +978,21 @@ impl CostDag for ChoicesCostDag<'_> {
 
 /// Classify every node of `arena` into const / frame-uniform / scanline-
 /// uniform / pixel-varying, and return the fraction in each bucket. Shared
-/// by any caller that classifies an [`ExprArena`] directly and by
+/// by any caller that classifies an expression graph directly and by
 /// [`crate::egraph::extract::Extraction::chosen_variance`], which
-/// materialises the chosen DAG via `choices_to_arena` and classifies that —
+/// materialises the chosen DAG via `choices_to_rooted` and classifies that —
 /// one definition, imported, not restated.
-pub(crate) fn variance_histogram(arena: &ExprArena) -> [f32; SCALAR_FEATURE_COUNT] {
-    let variance = pixelflow_ir::variance::compute_arena_variance(arena);
-    let total = variance.len() as f32;
+pub(crate) fn variance_histogram(
+    dag: &pixelflow_ir::Dag<ExprData>,
+) -> [f32; SCALAR_FEATURE_COUNT] {
+    let variance = pixelflow_ir::compute_dag_variance(dag);
+    let total = dag.len() as f32;
     if total == 0.0 {
         return [0.0; SCALAR_FEATURE_COUNT];
     }
 
     let (mut n_const, mut n_frame, mut n_scanline, mut n_pixel) = (0u32, 0u32, 0u32, 0u32);
-    for v in &variance {
+    for v in dag.iter().map(|n| variance[n]) {
         if v.is_const() {
             n_const += 1;
         } else if v.is_x_invariant() && !v.depends_on_y() {
@@ -942,8 +1022,8 @@ mod tests {
     /// An arena exercising every edge kind the walker emits: a shared
     /// subexpression (first reference = computation edge, second = register
     /// reload), a shared leaf, unary and binary ops.
-    fn arena_with_sharing() -> (ExprArena, ExprId) {
-        let mut arena = ExprArena::new();
+    fn arena_with_sharing() -> (pixelflow_ir::Rooted<ExprData>, Environment) {
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let sq = arena.push_binary(OpKind::Mul, x, x);
         let s = arena.push_unary(OpKind::Sqrt, sq);
@@ -952,13 +1032,13 @@ mod tests {
         let sum = arena.push_binary(OpKind::Add, s, s);
         let c = arena.push_const(2.0);
         let root = arena.push_binary(OpKind::Mul, sum, c);
-        (arena, root)
+        arena.finish(&[root])
     }
 
     #[test]
     fn trace_records_one_reload_edge_per_extra_reference_to_a_shared_node() {
-        let (arena, root) = arena_with_sharing();
-        let trace = EdgeTrace::from_arena_dag(&arena, root);
+        let (rooted, env) = arena_with_sharing();
+        let trace = EdgeTrace::from_term(Term::new(rooted.entry(), &env));
 
         // Six distinct nodes: x, x*x, sqrt, add, 2.0, root.
         assert_eq!(trace.node_count(), 6);
@@ -978,8 +1058,8 @@ mod tests {
 
     #[test]
     fn trace_binds_sibling_slots_to_distinct_pe_rows() {
-        let (arena, root) = arena_with_sharing();
-        let trace = EdgeTrace::from_arena_dag(&arena, root);
+        let (rooted, env) = arena_with_sharing();
+        let trace = EdgeTrace::from_term(Term::new(rooted.entry(), &env));
 
         // The root's two children sit at effective depths 0 and 1 — the
         // child-index term is what breaks left/right symmetry.
@@ -1028,12 +1108,13 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn variance_histogram_classifies_a_pure_constant_arena_as_all_const() {
-        let mut arena = ExprArena::new();
+    fn variance_histogram_classifies_a_pure_constant_graph_as_all_const() {
+        let mut arena = ExprBuilder::new();
         let root = arena.push_const(2.0);
-        let hist = variance_histogram(&arena);
-        assert_eq!(hist, [1.0, 0.0, 0.0, 0.0]);
-        let _ = root; // arena root; histogram is over every node in `arena`.
+        let (rooted, _env) = arena.finish(&[root]);
+        // The histogram is over every node in the graph, not only the root's
+        // subtree — here they coincide.
+        assert_eq!(variance_histogram(&rooted), [1.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1041,12 +1122,13 @@ mod tests {
         // Add(X, Y): X (var 0) is pixel-varying, Y (var 1) is scanline-
         // uniform, and Add inherits X's dependency so it is pixel-varying
         // too. 2 of 3 nodes pixel, 1 of 3 scanline.
-        let mut arena = ExprArena::new();
+        let mut arena = ExprBuilder::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
-        let _root = arena.push_binary(OpKind::Add, x, y);
+        let root = arena.push_binary(OpKind::Add, x, y);
+        let (rooted, _env) = arena.finish(&[root]);
 
-        let hist = variance_histogram(&arena);
+        let hist = variance_histogram(&rooted);
         assert_eq!(hist[0], 0.0, "no const nodes");
         assert_eq!(hist[1], 0.0, "no frame-uniform nodes (no Z/W)");
         assert!(
