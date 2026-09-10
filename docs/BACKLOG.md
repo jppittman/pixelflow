@@ -122,17 +122,37 @@ area has already produced three constants whose stated derivations did not
 survive measurement (`EXTENT_SLOP`, `CLUSTER_ROUNDS_PER_SELECT`,
 `DISC_BAND_ULPS`). **Do not fix this with a size cutoff.**
 
-See **H5**, and note that **D5 deletes the question**: with a demand
-predicate, values of equal demand are contiguous *by construction*, so there
-is nothing to cluster and no round count to choose. That plan is no longer
-only an elegance argument — it is the largest measured item in the tree.
+See **H5**.
+
+**Correction (same day).** This section first said "D5 deletes the question:
+with a demand predicate, values of equal demand are contiguous *by
+construction*, so there is nothing to cluster." That is **false**, and the
+tree already knew it. `pixelflow-codegen/src/emit/demand.rs` computes the
+predicate today and refutes the scheduling claim in its own module docs, with
+two counterexamples pinned by tests:
+
+- **A select arm breaks superset.** For `S = Select(m, a, b)` at the root,
+  `demand(S)` is `true` and `demand(a)` is `m`, yet `a` produces `S`. Sorting
+  weakest-first puts the select before the arm it consumes.
+- **A value shared across both arms breaks subset.** `demand(p) = m ∨ ¬m`
+  while its consumer in the true arm has demand `m`, so strongest-first puts
+  the consumer before `p`. That is what CSE across arms produces — the common
+  case, not a corner.
+
+Its conclusion, verbatim: *"demand orders neither way on its own, and a
+schedule keyed by it is not topological. What survives is demand as a
+property … Making regions contiguous remains real work, which is what
+`cluster_select_arms` is, and this module does not delete it."*
+
+So the clustering is not an accident of a missing sort key, and D5 does not
+dissolve it. What is unbounded is the **search**, not the need.
 
 | | what | where |
 |---|---|---|
 | **H1** | **S3 — one program for the font.** Font-wide extent, table padded with monoid identities, so every glyph compiles to the same program and a glyph becomes a table write. 95 compiles → 1. With H2 measured, this is the whole hump. | [glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S3 |
 | **H2** | ~~Split the 331 ms between compile and collapse.~~ **Done** — see above. | — |
 | **H3** | **Hash-consing in `ExprArena`.** Prototyped and measured: arena 2,721 → 154 nodes, 2.1–2.2× on the glyph suites, extracted kernel unchanged. In flight (JP). Lands on the compile half, so it compounds with H1 rather than competing. | [exprarena-on-dag](plans/2026-09-09-exprarena-on-dag.md) §5.2 |
-| **H5** | **Bound the guard search by what a guard can pay.** `cluster_select_arms` is 73% of a glyph bake and finds a constant 282 bytes (X1 above). Derive the bound from `n` and the `LatticeShape`'s trip count, both of which the call site already has — **not** a schedule-size cutoff. Needs a decision on who owns the trade: a bake collapses once, a frame kernel collapses forever, and the compiler currently cannot tell them apart. Superseded outright by D5 if that lands first. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
+| **H5** | **Bound the guard search by what a guard can pay.** A `Select` is a blend — both arms run every batch — and a *guard* is a real branch skipping an arm when no lane in the batch wants it (worth ~2× per row on `O`@32, per the demand plan's C1 numbers). A branch skips a contiguous range, so an arm is only guardable when the values it owns form one unbroken run; `cluster_select_arms` permutes the schedule to make that so, in up to `MAX_CLUSTER_ROUNDS = 8` rounds, each recomputing every arm's transitive closure. That search is 73% of a glyph bake and finds a constant 282 bytes (X1 above). **Contiguity is real work** — demand does not give it for free, see the correction above — so the target is the search's cost, not its existence. Two leads, in order: (a) `demand.rs` names one, *"a partition that ordered within its groups"*, which would replace repeated trial with one pass; (b) failing that, bound when to search at all, derived from `n` and the `LatticeShape`'s trip count, both already at the call site — **not** a schedule-size cutoff. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
 | **H4** | **Ask B — hoist binder-only work out of the pixel loop.** ~~On the hump.~~ **Demoted by H2**: it optimizes *collapse*, which is 0.2% of a bake, and a glyph bakes once into the atlas and is a gather forever after. Still real for per-frame kernels that are not atlas-cached; not the terminal's startup problem. **Do not patch `contains_gather`** (N1) and do not write a new hoist (N5). | [a-glyph-is-a-circle](plans/2026-09-09-a-glyph-is-a-circle.md) §B |
 
 S3's own doc calls itself "a trade, not a win — fewer compiles against
@@ -159,7 +179,7 @@ H1 is picked up.
 | **D2** | Lowering 1 — emit the split: select over the derived range, root specialized at `m ≡ false` over the complement. | *ibid.* |
 | **D3** | Bind-time tier, and splitting `IndexRange` into a derived region and a requested band. | *ibid.* |
 | **D4** | Interval evaluation, target-aware and rounding outward. Unlocks glyph supports, which the symbolic tier cannot reach (a compound glyph's affine mixes X and Y). | *ibid.* |
-| **D5** | Lowering 2 on the general predicate — the superseded demand plan's §1–§2, as the third case rather than the whole subject. **Promoted by X1**: it deletes `cluster_select_arms` rather than speeding it up ("values with equal demand are contiguous by construction; there is nothing to cluster and no round count to choose"), and that function is 73% of a glyph bake. The demand plan's own §"Why now" argued this on shape; it now has the number. | *ibid.* |
+| **D5** | Lowering 2 on the general predicate — the superseded demand plan's §1–§2, as the third case rather than the whole subject. **Does not delete `cluster_select_arms`**: `emit/demand.rs` already computes the predicate and disproved that plan's scheduling claim (see the correction above). What it buys is *more* exclusivity than `guards` finds — the per-select `demand_exclusive` vs `exclusive` gap under `PIXELFLOW_GUARD_TELEMETRY` — and `demand.rs` says outright that this gap, not the scheduling claim, is what C1b should be justified by. Read that measurement before starting. | *ibid.* |
 
 D1 → D2 unblocks **S2**: deleting `cells`, `contour_bounds`, the `Union`
 plumbing, `TEXT_CELL`, `min_of`, `may_be_interior` and `chord_winding` —
