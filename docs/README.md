@@ -3,6 +3,11 @@
 This page is the landing page for repository documentation. A document's classification
 describes how it should be read today; directory names alone do not establish currency.
 
+**[`BACKLOG.md`](BACKLOG.md) is what is open right now** — an index of in-flight and
+unstarted work, one line per item, each pointing at the document that owns the detail.
+Start there; this page is the map of what has been *written*, which is a different
+question. Edit the backlog in the same CL as the work.
+
 ## Classification vocabulary
 
 - **Current architecture** — describes the system as it exists now.
