@@ -2448,6 +2448,10 @@ fn partition_by_scope(
     regalloc::ScopedSchedule {
         regions,
         body: remaining,
+        // No fold survives extraction yet: `ExpandReduce` unrolls every one
+        // before a schedule is built, so there is never a loop to open here.
+        // Deleting that pass is what fills this in.
+        folds: Vec::new(),
     }
 }
 

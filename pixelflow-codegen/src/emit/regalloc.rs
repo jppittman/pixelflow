@@ -535,12 +535,24 @@ impl RegisterFile {
 /// what a surviving `Reduce` is: `body`'s own defs sit on both sides of the
 /// fold's. So the ordering moved to where it is always meaningful — within
 /// one scope — and this is now only the key that says which one.
+///
+/// With [`Scope::Fold`] the nest stops being a chain at all and becomes a
+/// **tree**: the regions are still a spine, because they are the collapse
+/// nest and a `Reduce` does not reorder them, but a fold hangs off whichever
+/// scope holds its def, and off other folds. The derived `Ord` is therefore
+/// **not** nesting order — it is a total order over names, for deterministic
+/// keying, and reading it as "inside" would put a fold in `Region(0)` outside
+/// `Region(1)` when neither contains the other.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// An enclosing region; `Region(0)` is the outermost.
     Region(usize),
     /// The innermost body, inside every back edge.
     Body,
+    /// A surviving `Reduce`'s loop body, indexing
+    /// [`NestAllocation::folds`]. Unlike a region it opens in the *middle* of
+    /// its parent's schedule, which is what makes the nest a tree.
+    Fold(usize),
 }
 
 /// A program point: a position in one scope's schedule.
@@ -936,6 +948,32 @@ pub struct NestAllocation {
     regions: Vec<ScopeCode>,
     /// The innermost body.
     body: ScopeCode,
+    /// The surviving folds, indexed by [`Scope::Fold`]. Flat storage; the tree
+    /// is each entry's [`FoldScope::parent`].
+    folds: Vec<FoldScope>,
+}
+
+/// A surviving `Reduce`'s loop body: a scope, plus where it opens.
+///
+/// The parent is a pointer rather than recursion, so storage stays flat —
+/// which is what the dense placement vectors want — and depth is never a case
+/// anything special-cases. A fold inside a fold is simply `parent:
+/// Scope::Fold(j)`.
+#[derive(Debug)]
+struct FoldScope {
+    /// The scope whose schedule holds this loop's def.
+    parent: Scope,
+    /// Which def — the position in `parent`'s schedule of the `Reduce` this is
+    /// the body of. A fold opens in the *middle* of its parent, and this is
+    /// where.
+    at: usize,
+    /// Everything else a scope has.
+    ///
+    /// A whole [`ScopeCode`], not a bare schedule: the value a fold carries
+    /// lives across its back edge, and where a value lives is a *placement*.
+    /// A fold scope given only an evaluation order would be the one scope that
+    /// exists for a carried value with nowhere to record where that value is.
+    code: ScopeCode,
 }
 
 impl NestAllocation {
@@ -968,7 +1006,46 @@ impl NestAllocation {
         match scope {
             Scope::Region(i) => self.regions.get(i),
             Scope::Body => Some(&self.body),
+            Scope::Fold(i) => self.folds.get(i).map(|f| &f.code),
         }
+    }
+
+    /// The scope `scope` opens inside, or `None` for one that opens inside
+    /// nothing.
+    ///
+    /// The regions are a chain and the body is inside all of them, so their
+    /// answers are positional; only a fold stores a parent, because only a
+    /// fold can hang anywhere.
+    fn parent_of(&self, scope: Scope) -> Option<Scope> {
+        match scope {
+            Scope::Region(0) => None,
+            Scope::Region(i) => Some(Scope::Region(i - 1)),
+            Scope::Body => self.regions.len().checked_sub(1).map(Scope::Region),
+            Scope::Fold(i) => self.folds.get(i).map(|f| f.parent),
+        }
+    }
+
+    /// Every scope of this nest, in no particular order.
+    fn scopes(&self) -> impl Iterator<Item = Scope> + use<'_> {
+        (0..self.regions.len())
+            .map(Scope::Region)
+            .chain(core::iter::once(Scope::Body))
+            .chain((0..self.folds.len()).map(Scope::Fold))
+    }
+
+    /// Whether `outer` contains `inner` — i.e. `outer`'s code runs `inner`.
+    ///
+    /// Reflexive: a scope encloses itself, so "is this value in scope here"
+    /// needs no special case for the scope asking.
+    fn encloses(&self, outer: Scope, inner: Scope) -> bool {
+        let mut at = Some(inner);
+        while let Some(scope) = at {
+            if scope == outer {
+                return true;
+            }
+            at = self.parent_of(scope);
+        }
+        false
     }
 
     /// The register a root is **carried** in across the loops inside the
@@ -1003,6 +1080,7 @@ impl NestAllocation {
         let code = match scope {
             Scope::Region(i) => &mut self.regions[i],
             Scope::Body => &mut self.body,
+            Scope::Fold(i) => &mut self.folds[i].code,
         };
         code.placements[v.0 as usize] = Some(Placement::new(Span { from, at }));
     }
@@ -1103,19 +1181,42 @@ impl<'a> Allocation<'a> {
         self.placement(v).spans().map(|s| (s.from.index, s.at))
     }
 
-    /// The scopes inside this one, outermost first.
+    /// Where this scope opens in its parent: the parent, and the position in
+    /// its schedule. `None` for a scope that wraps all of its parent rather
+    /// than opening partway through it.
+    ///
+    /// Only a fold answers. A region surrounds everything inside it and the
+    /// body is inside every back edge, so for those "where does it open" is
+    /// the head — there is no position to name. It is a fold that starts at a
+    /// def, which is exactly what makes the nest a tree, so this is the query
+    /// that distinguishes the two.
+    #[must_use]
+    pub fn opens_at(&self) -> Option<(Scope, usize)> {
+        match self.scope {
+            Scope::Fold(i) => {
+                let fold = &self.nest.folds[i];
+                Some((fold.parent, fold.at))
+            }
+            Scope::Region(_) | Scope::Body => None,
+        }
+    }
+
+    /// The scopes inside this one, in no particular order.
     ///
     /// A root this scope parks is picked up by each of them, so "where does
     /// the code within keep it" is a question about all of them together.
+    ///
+    /// A **subtree** walk, not a suffix of a chain. Those coincide while the
+    /// nest is a spine of regions — every later region is inside every earlier
+    /// one — and stop the moment a fold hangs off one: a fold in `Region(0)`
+    /// and `Region(1)` are siblings, each inside region 0 and neither inside
+    /// the other. Answering "inside" positionally would put a fold's carried
+    /// value under a region that never runs it.
     pub fn within(self) -> impl Iterator<Item = Allocation<'a>> + use<'a> {
         let nest = self.nest;
-        let first = match self.scope {
-            Scope::Region(i) => i + 1,
-            Scope::Body => usize::MAX,
-        };
-        (first..nest.regions.len())
-            .map(Scope::Region)
-            .chain((first != usize::MAX).then_some(Scope::Body))
+        let me = self.scope;
+        nest.scopes()
+            .filter(move |s| *s != me && nest.encloses(me, *s))
             .map(move |scope| Allocation { nest, scope })
     }
 
@@ -1127,15 +1228,21 @@ impl<'a> Allocation<'a> {
     /// this frame's to place. Narrower than "defined elsewhere": a `Const`
     /// leaf shared with an enclosing region is genuinely computed here too,
     /// and does need a location of its own.
+    ///
+    /// Walks up [`NestAllocation::parent_of`] rather than slicing a prefix of
+    /// the regions, for the reason [`Allocation::within`] walks a subtree: a
+    /// scope's ancestors are the scopes that actually run it, and with a fold
+    /// in the nest those are no longer the ones that precede it.
     #[must_use]
     pub fn parked_by_an_enclosing_scope(&self, v: ValueId) -> bool {
-        let outside = match self.scope {
-            Scope::Region(i) => i,
-            Scope::Body => self.nest.regions.len(),
-        };
-        self.nest.regions[..outside]
-            .iter()
-            .any(|r| r.roots.contains(&v))
+        let mut at = self.nest.parent_of(self.scope);
+        while let Some(scope) = at {
+            if self.nest.code(scope).is_some_and(|c| c.roots.contains(&v)) {
+                return true;
+            }
+            at = self.nest.parent_of(scope);
+        }
+        false
     }
 
     fn code(&self) -> &'a ScopeCode {
@@ -1192,6 +1299,7 @@ pub trait RegisterAllocator {
             ScopedSchedule {
                 regions: Vec::new(),
                 body: dag,
+                folds: Vec::new(),
             },
             file,
         )
@@ -1217,6 +1325,13 @@ pub struct ScopedSchedule {
     pub regions: Vec<ScopeRegion>,
     /// The innermost region: evaluated at every sample.
     pub body: Vec<Def>,
+    /// The surviving folds, in [`Scope::Fold`] order. Empty for a nest whose
+    /// every `Reduce` was unrolled, which today is all of them.
+    ///
+    /// Its own field for the same reason `body` is: a fold is not a region.
+    /// It opens partway through its parent's schedule rather than around all
+    /// of it, so a list that could hold both would let the two be confused.
+    pub folds: Vec<ScopeFold>,
 }
 
 /// One scope of a [`ScopedSchedule`].
@@ -1224,6 +1339,19 @@ pub struct ScopeRegion {
     /// Values this region computes for the ones inside it.
     pub roots: Vec<ValueId>,
     /// What it computes, in topological order.
+    pub schedule: Vec<Def>,
+}
+
+/// One surviving fold of a [`ScopedSchedule`]: a region that opens in the
+/// middle of another scope.
+pub struct ScopeFold {
+    /// The scope whose schedule holds this loop's def.
+    pub parent: Scope,
+    /// Which def of `parent` — the `Reduce` this is the body of.
+    pub at: usize,
+    /// Values this fold computes for the scopes inside it.
+    pub roots: Vec<ValueId>,
+    /// The loop body, in topological order.
     pub schedule: Vec<Def>,
 }
 
@@ -1361,6 +1489,42 @@ impl RegisterAllocator for LinearScan {
 
         let body = self.scan(nest.body, &file.inside(carried), &parked);
 
+        // Each surviving fold, against the pool and the parks its ancestors
+        // left it. `carried` and `parked` are the fully accumulated state
+        // rather than a per-branch one, which is *conservative* and not wrong:
+        // a fold sees every park, including those of scopes that are its
+        // siblings rather than its ancestors. It therefore keeps a sibling's
+        // carry reserved across itself, costing a register it could have had.
+        // Releasing that is a separate change; the tree is what this one adds.
+        //
+        // Reading a sibling's park would be a real error rather than a waste,
+        // so it is checked below instead of being left to the conservatism.
+        let mut folds: Vec<FoldScope> = Vec::with_capacity(nest.folds.len());
+        for (index, fold) in nest.folds.into_iter().enumerate() {
+            assert!(
+                match fold.parent {
+                    // A fold nested in a fold needs its parent's answer, so
+                    // parents come first. Also makes a parent cycle unsayable.
+                    Scope::Fold(j) => j < index,
+                    Scope::Region(i) => i < regions.len(),
+                    Scope::Body => true,
+                },
+                "Fold({index})'s parent {:?} is not an earlier scope",
+                fold.parent
+            );
+            let scan = self.scan(fold.schedule, &file.inside(carried), &parked);
+            folds.push(FoldScope {
+                parent: fold.parent,
+                at: fold.at,
+                code: ScopeCode {
+                    placements: record(&scan, &parked),
+                    schedule: scan.schedule,
+                    scratch: scan.scratch,
+                    roots: fold.roots,
+                },
+            });
+        }
+
         NestAllocation {
             regions,
             body: ScopeCode {
@@ -1369,6 +1533,7 @@ impl RegisterAllocator for LinearScan {
                 scratch: body.scratch,
                 roots: Vec::new(),
             },
+            folds,
         }
     }
 }
@@ -2761,6 +2926,162 @@ mod tests {
         }
     }
 
+    /// A nest with two regions and a fold hanging off the outer one.
+    ///
+    /// The shape every test below needs, and the smallest one where a chain
+    /// and a tree give different answers: `Region(0)` contains both
+    /// `Region(1)` and `Fold(0)`, and those two contain each other not at all.
+    fn nest_with_a_fold() -> NestAllocation {
+        let outer_root = ValueId(1);
+        let inner_root = ValueId(11);
+        LinearScan.allocate_nest(
+            ScopedSchedule {
+                regions: vec![
+                    ScopeRegion {
+                        roots: vec![outer_root],
+                        schedule: vec![
+                            def(0, ScheduledOp::Var(1)),
+                            def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                        ],
+                    },
+                    ScopeRegion {
+                        roots: vec![inner_root],
+                        schedule: vec![def(11, ScheduledOp::Unary(OpKind::Neg, outer_root))],
+                    },
+                ],
+                body: vec![def(
+                    100,
+                    ScheduledOp::Binary(OpKind::Add, inner_root, outer_root),
+                )],
+                folds: vec![ScopeFold {
+                    parent: Scope::Region(0),
+                    at: 1,
+                    roots: Vec::new(),
+                    schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, outer_root))],
+                }],
+            },
+            &NEST_FILE,
+        )
+    }
+
+    /// `within` is a subtree, not a suffix of a chain.
+    ///
+    /// This is the whole of 2b in one assertion. A fold opens in the *middle*
+    /// of its parent, so it is a sibling of the regions nested further in —
+    /// `Region(0)` runs both, and neither runs the other. Answering positionally
+    /// (everything after me) would report `Fold(0)` as inside `Region(1)`, and
+    /// the register the fold carries across its back edge would be handed out
+    /// inside a loop that never runs it.
+    #[test]
+    fn a_fold_and_a_deeper_region_are_siblings_not_nested() {
+        let alloc = nest_with_a_fold();
+        let within = |s: Scope| {
+            let mut v: Vec<Scope> = alloc.scope(s).within().map(|a| a.scope).collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut all_inside = vec![Scope::Region(1), Scope::Body, Scope::Fold(0)];
+        all_inside.sort_unstable();
+        assert_eq!(
+            within(Scope::Region(0)),
+            all_inside,
+            "region 0 runs everything"
+        );
+        assert_eq!(
+            within(Scope::Region(1)),
+            vec![Scope::Body],
+            "the fold is beside region 1, not inside it"
+        );
+        assert_eq!(
+            within(Scope::Fold(0)),
+            Vec::new(),
+            "and region 1 is not inside the fold either"
+        );
+    }
+
+    /// A fold opens at a def of its parent; a region and the body do not open
+    /// anywhere, because they wrap the whole of what is inside them.
+    ///
+    /// This is the query 2c emits from — it is where the back edge goes — and
+    /// the one question whose answer differs between a scope that surrounds
+    /// its parent's code and one that interrupts it.
+    #[test]
+    fn only_a_fold_opens_partway_through_its_parent() {
+        let alloc = nest_with_a_fold();
+        assert_eq!(
+            alloc.scope(Scope::Fold(0)).opens_at(),
+            Some((Scope::Region(0), 1)),
+            "the fold opens at the def it is the body of"
+        );
+        assert_eq!(alloc.scope(Scope::Region(1)).opens_at(), None);
+        assert_eq!(alloc.body().opens_at(), None);
+    }
+
+    /// A scope encloses itself, so "is this in scope here" needs no special
+    /// case for the asker — but `within` still excludes it, because the
+    /// question there is what the code *inside* does.
+    #[test]
+    fn enclosing_is_reflexive_and_within_is_not() {
+        let alloc = nest_with_a_fold();
+        for scope in alloc.scopes() {
+            assert!(alloc.encloses(scope, scope), "{scope:?} encloses itself");
+            assert!(
+                !alloc.scope(scope).within().any(|a| a.scope == scope),
+                "{scope:?} is not within itself"
+            );
+        }
+    }
+
+    /// A fold reads its *ancestors'* parks, and a value parked by a scope
+    /// beside it is not one of them.
+    ///
+    /// The prefix-of-the-chain form answered this by position, which for a
+    /// fold at `Region(0)` would have counted `Region(1)`'s roots — values
+    /// computed by a loop the fold never enters.
+    #[test]
+    fn a_fold_is_parked_by_its_ancestors_only() {
+        let alloc = nest_with_a_fold();
+        let fold = alloc.scope(Scope::Fold(0));
+
+        assert!(
+            fold.parked_by_an_enclosing_scope(ValueId(1)),
+            "region 0 is the fold's parent, so its root is parked for the fold"
+        );
+        assert!(
+            !fold.parked_by_an_enclosing_scope(ValueId(11)),
+            "region 1 is beside the fold, so its root is not"
+        );
+        assert!(
+            alloc.body().parked_by_an_enclosing_scope(ValueId(11)),
+            "the body *is* inside region 1, so the same value is parked for it"
+        );
+    }
+
+    /// A fold whose parent is a later fold is refused rather than allocated.
+    ///
+    /// Parents are allocated first, so a forward reference is both unanswerable
+    /// and the only way to write a cycle. Refusing it here makes the cycle
+    /// unrepresentable in an allocation rather than an infinite walk in
+    /// `encloses`.
+    #[test]
+    #[should_panic(expected = "is not an earlier scope")]
+    fn a_folds_parent_must_already_exist() {
+        let _ = LinearScan.allocate_nest(
+            ScopedSchedule {
+                regions: Vec::new(),
+                body: vec![def(0, ScheduledOp::Var(0))],
+                folds: vec![ScopeFold {
+                    parent: Scope::Fold(1),
+                    at: 0,
+                    roots: Vec::new(),
+                    schedule: vec![def(50, ScheduledOp::Var(0))],
+                }],
+            },
+            &NEST_FILE,
+        );
+    }
+
     /// A carried register is untouched by every scope inside the loop.
     ///
     /// This is the whole safety property of showing the allocator the nest. A
@@ -2796,6 +3117,7 @@ mod tests {
                 schedule: outer,
             }],
             body,
+            folds: Vec::new(),
         };
         let alloc = LinearScan.allocate_nest(nest, &NEST_FILE);
 
@@ -2865,6 +3187,7 @@ mod tests {
                     schedule: outer,
                 }],
                 body,
+                folds: Vec::new(),
             },
             &NEST_FILE,
         );
