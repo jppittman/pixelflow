@@ -600,6 +600,46 @@ gate is what stops a peel from unrolling the whole fold by accident — and
 applying a named body per iteration is L5's ABI. The loop *is* the call,
 applied N times.
 
+### What decides 2c is a tie-break, not the cost model (2026-09-11)
+
+Before building 2c it is worth knowing whether extraction would *keep* a
+surviving fold at all, since 2c changes nothing if it never does. Reading the
+cost path answers it, and the answer is neither of the two guesses that
+preceded it — not "the cost model has no notion of a schedule so it will
+always unroll", and not "a fold is one node so it will always be kept":
+
+| | priced as |
+|---|---|
+| `ENode::Reduce` | `(len-1) × cost(⊕)` — `cost.rs`'s fold arm |
+| its body | `× len`, applied by the DP — `extract.rs`'s `fold_body_multiple` |
+| the unrolled chain | `len` body copies + `(len-1)` combines |
+
+**Those are equal.** A loop and its unrolling do the same arithmetic, so a
+latency prior that called them anything else would be wrong. The cost model is
+being honest, and the first guess above was simply a failure to read the
+comment at `cost.rs`'s fold arm, which says outright that the body's `len`
+evaluations are applied in the DP rather than in the node.
+
+So the choice falls to whatever breaks an exact tie — and that is already a
+typed policy rather than an accident: `Dp`'s `ties` knob, instantiated in
+production as `Insertion`, whose `prefer` returns `false` unconditionally. The
+DP takes a new node only on strict `<`, so the winner is **whichever node the
+class happened to hold first**.
+
+That is the real finding for 2c. Emitting 34,993 straight-line instructions
+versus a loop currently turns on e-node insertion order. 2c therefore needs a
+deliberate reason to prefer the fold, and it cannot come from latency, because
+by latency they genuinely tie. It has to come from the thing that motivates
+this whole plan: **`emit` is ~O(n^1.6) in straight-line instruction count**, so
+the loop is cheaper to *compile* and smaller in I-cache while costing the same
+to run. That is a second cost axis, not a correction to the first.
+
+The seam for it exists — a `TieBreak` impl is a type, and there is already a
+research arm (`Content`) beside `Insertion` — so 2c's extraction half is
+choosing a policy, not building one. Note this is read off the code, not
+measured; the measurement to take right after 2c is whether a real glyph bake
+keeps its fold.
+
 ### The shape 2b adds
 
 A parent pointer, not recursion. Storage stays flat — one `ScopeCode` per
