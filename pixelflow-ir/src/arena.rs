@@ -261,18 +261,24 @@ pub enum ExprNode {
     },
 }
 
-// `Guard` carries two `KernelKey`s (8 bytes each) plus its mask `ExprId` (4
-// bytes) — 20 bytes of payload, more than any single `KernelKey` leaf needs,
-// which is why this bound grew past the 16 it held when `Ref`'s one key was
-// the largest payload any variant carried (see `KernelKey`'s doc in `key.rs`
-// for why *that* is 64 rather than 128 bits). 24 is `Guard`'s own payload
-// rounded up to this type's 8-byte alignment (forced by `KernelKey` already,
-// so `Guard` fits with no further alignment cost) plus its discriminant —
-// paid by every node of every kernel, not only a `Guard`, so a future node
-// that needs three keys or wider ones should not raise this casually.
+// A tripwire against an accident, **not** a design constraint, and the
+// distinction is the point: nothing in this workspace depends on a node's
+// width — no serialization format, no fixed-width record, no mapped file, no
+// alignment requirement beyond what `KernelKey` already forces. Assert a
+// bound so that boxing something large, or storing a `String`, fails a build
+// instead of quietly costing every node in every kernel. Do not read it as a
+// budget to design against.
+//
+// It used to be 16, which was not chosen either — it was whatever `Ref`'s one
+// `KernelKey` happened to need, recorded as though it were a requirement.
+// That is how `Fold` came to carry `u16` ends "so the two fit the node in the
+// 16 bytes `ExprNode` is capped at", making a self-imposed width into a cap
+// on how many terms a reduction may have. A number nothing depends on should
+// never propagate into the language's semantics, so this one is now loose
+// enough that adding a node is not a conversation about bytes.
 const _: () = assert!(
-    core::mem::size_of::<ExprNode>() <= 24,
-    "ExprNode must fit in 24 bytes"
+    core::mem::size_of::<ExprNode>() <= 32,
+    "ExprNode must fit in 32 bytes"
 );
 
 // ───────────────────────────────────── ExprChildren ──────────────────────────
@@ -1988,14 +1994,16 @@ mod tests {
         );
     }
 
+    /// A node stays small enough that nobody boxed anything by accident.
+    ///
+    /// The bound is a tripwire and not a budget — see the compile-time
+    /// assertion's comment. It is deliberately loose, so a new variant is a
+    /// question about what the language means rather than about bytes.
     #[test]
     fn size_of_expr_node() {
-        // Compile-time assertion exists above, but also verify at runtime.
-        // 24, not 16: `Guard` carries two `KernelKey`s plus its mask
-        // `ExprId`, which no single-`KernelKey` variant (`Ref`) needed to.
         assert!(
-            core::mem::size_of::<ExprNode>() <= 24,
-            "ExprNode is {} bytes, expected <= 24",
+            core::mem::size_of::<ExprNode>() <= 32,
+            "ExprNode is {} bytes, expected <= 32",
             core::mem::size_of::<ExprNode>()
         );
     }

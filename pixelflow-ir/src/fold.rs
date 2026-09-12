@@ -170,14 +170,26 @@ pub struct Fold {
 impl Fold {
     /// The largest index a fold may run to.
     ///
-    /// This is not an arbitrary truncation of a `u32`. **A `Reduce` is not a
-    /// loop**: the language is a DAG with no iteration binder, so a fold that
-    /// survives to codegen is emitted as `len()` copies of its body. A trip
-    /// count is therefore bounded by what one can afford to *emit* — the
-    /// e-graph's `max_classes` budget dies orders of magnitude below this
-    /// ceiling — and a range that does not fit is a program that was never
-    /// going to compile. [`Fold::new`] rejects it rather than wrapping, and
-    /// the two ends fit the node in the 16 bytes `ExprNode` is capped at.
+    /// **A `Reduce` is not a loop**: the language is a DAG with no iteration
+    /// binder, so a fold that survives to codegen is emitted as `len()` copies
+    /// of its body. A trip count is therefore bounded by what one can afford
+    /// to *emit* — the e-graph's `max_classes` budget dies orders of magnitude
+    /// below this ceiling — and a range that does not fit is a program that
+    /// was never going to compile. [`Fold::new`] rejects it rather than
+    /// wrapping.
+    ///
+    /// This doc used to add "and the two ends fit the node in the 16 bytes
+    /// `ExprNode` is capped at", which was circular: that width was itself
+    /// only whatever the largest variant then needed, and nothing depends on
+    /// it (see `arena.rs`'s assertion). A number nothing depends on had become
+    /// a cap on how many terms a reduction may have.
+    ///
+    /// **The remaining reason is on its way out too.** Once a surviving
+    /// `Reduce` is emitted as a loop rather than unrolled
+    /// (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md, stage 2c), a
+    /// large trip count costs a counter rather than `len()` copies, and the
+    /// "cannot afford to emit it" argument goes with it. Revisit `u16` then,
+    /// on its merits — not because of a byte budget.
     pub const MAX_INDEX: u32 = u16::MAX as u32;
 
     /// The fold of `monoid` over `range`, binding `binder`.
@@ -587,13 +599,14 @@ mod tests {
         );
         assert!(
             core::mem::size_of::<Fold>() + core::mem::size_of::<crate::arena::ExprId>() <= 16,
-            "a Reduce node (a Fold plus one ExprId) should still fit in the \
-             pre-Guard 16-byte budget on its own, regardless of what the \
-             crate-wide ceiling has grown to for other variants"
+            "a Reduce node is a Fold plus one ExprId, and stays small on its \
+             own — this is a fact about Reduce, not a budget Fold's fields \
+             were chosen to meet; see MAX_INDEX"
         );
         assert!(
-            core::mem::size_of::<crate::arena::ExprNode>() <= 24,
-            "see arena.rs's own assertion and its comment on why 24, not 16"
+            core::mem::size_of::<crate::arena::ExprNode>() <= 32,
+            "see arena.rs's assertion: a tripwire against an accident, not a \
+             width anything depends on"
         );
     }
 }
