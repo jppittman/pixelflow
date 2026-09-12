@@ -68,6 +68,37 @@ Note the `Ref` here is a **naming device for extent, not a call**. A guarded arm
 is inlined at its site as a region; it does not need L5's calling convention.
 L5 remains a separate question about a `Ref` that survives *unguarded*.
 
+### The arms are fields, not children (JP, 2026-09-12)
+
+> *"Do we have inline kernel refs vs reference kernel refs? We should do the
+> same thing here as hard vs soft select."*
+
+**We do not** — and that is a trap this design has to step around rather than
+build on. `passes::expand_refs` runs **unconditionally in every compile entry
+point** (`jit_cache.rs`), so no `Ref` ever reaches codegen. Inline-versus-by-
+reference is not a choice today; making it one is L4, and L5 is what a
+survivor would mean. Both are pending.
+
+So if a `Guard`'s arms were `ExprNode::Ref` *children*, `expand_refs` would
+splice them in before codegen and destroy the very boundary this rests on.
+The arms are therefore **fields**:
+
+```rust
+ExprNode::Guard { mask: ExprId, on: KernelKey, off: KernelKey }
+```
+
+One child — the mask — and two names. `expand_refs` rewrites `ExprNode::Ref`
+and nothing else, so it cannot reach them; codegen expands them itself, as
+regions. It also makes a non-`Ref` arm **unrepresentable** rather than
+forbidden by a comment, which is the same move `Fold` made when it stopped
+encoding an `OpKind` as a `Const(f32)`.
+
+This also names the pattern properly. `expand_refs` inlines every `Ref`,
+`ExpandReduce` unrolls every fold, and `guards` reconstructs every branch:
+**three unconditional passes that destroy structure, and three later stages
+that pay to rebuild it.** That is N5, and it is the backlog's opening
+sentence. This plan removes the third; L4 and 2c remove the others.
+
 ## 3. What each consumer becomes
 
 **The emitter** reads the node and emits:
@@ -100,11 +131,25 @@ hard = test + branch + P·cost(a) + (1−P)·cost(b) + (1−coherence)·MISPREDI
 its existing derivation — no tuned constant stands in for it.
 
 `P` — how coherent a mask is across a batch — is **not a static property of the
-graph**, and this is exactly the residual the schedule-cost denotation reserves
-the `Reranker` seam for: the analytic table plus a learned non-additive
-schedule term. The Halide-style learned model belongs here and nowhere else in
-this plan. Until it exists, a static coherence prior is the placeholder, and it
-must be documented as a placeholder.
+graph**, so it is the part a learned model would supply.
+
+**It supplies it as a term in the cost function, not as a stage after
+extraction** (JP, 2026-09-12):
+
+> *"Decisions between equivalent forms will be made at extraction. The whole
+> reranker concept is bringing traditional passes where they don't belong."*
+
+This supersedes the framing an earlier draft of this document used. A
+`Reranker` re-orders candidates *after* the DP has chosen — which is a second
+pass bolted onto the first, and reintroduces exactly the extract-then-repair
+shape this plan exists to delete. The choice between two equal forms is the
+cost function's, evaluated inside the DP, once.
+
+The consequence is worth stating plainly: **this plan does not use the
+`Reranker` seam**, and the seam's own justification (CLAUDE.md, "Cost Model and
+the Guide") should be revisited rather than quietly relied on. Until a learned
+term exists, a static coherence prior stands in, and it must be documented as a
+placeholder rather than as a bound.
 
 ## 5. The question this withdraws
 
@@ -143,11 +188,11 @@ the first that can pay.
 
 ## 8. Open, and not for me to settle
 
-1. **Does a `Guard` arm always become a `Ref`, or only when it is large
-   enough to pay?** Naming every arm pressures `KernelStore` and the
-   `KernelKey` space. A threshold is a tuned constant, which §7 is against —
-   so either every arm is named, or the naming is driven by the same cost that
-   picks hard over soft.
+1. ~~Does a `Guard` arm always become a `Ref`, or only when it is large enough
+   to pay?~~ **Settled (JP, 2026-09-12): every arm is a `Ref`.** No threshold,
+   so no tuned constant, and §2's unrepresentability argument holds for every
+   guard rather than most of them. `KernelStore` pressure is a consequence to
+   measure, not a reason to special-case.
 2. **The `'8'` waist bug (C2) lives in this area** and is open on `main`. G3
    changes what is computed under a mask, so it may move that bug in either
    direction. It should be measured across G3 rather than discovered later.
