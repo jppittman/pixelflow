@@ -195,24 +195,107 @@ impl SelectGuard {
     }
 }
 
+/// A dense bitset over `0..capacity`.
+///
+/// Every set this module builds is over one of two spaces this file already
+/// treats as dense and sequential — `ValueId.0` (`schedule_ops`,
+/// `vid_to_sched_idx`, `consumers` are all dense `Vec`s indexed by it) or a
+/// schedule position — so `contains` is one shift and one mask instead of a
+/// tree descent, `difference` is one word-wise pass instead of a walk with a
+/// rebuild, and there is nothing here for an allocator to do per element:
+/// `transitive_deps` alone runs 1,445 times over one glyph's worst compile,
+/// and a `BTreeSet` node is a heap allocation per member.
+#[derive(Clone)]
+struct IndexSet {
+    bits: alloc::vec::Vec<u64>,
+}
+
+impl IndexSet {
+    const BITS: usize = u64::BITS as usize;
+
+    fn empty(capacity: usize) -> Self {
+        Self {
+            bits: alloc::vec![0u64; capacity.div_ceil(Self::BITS)],
+        }
+    }
+
+    #[inline]
+    fn contains(&self, i: usize) -> bool {
+        self.bits
+            .get(i / Self::BITS)
+            .is_some_and(|word| word & (1u64 << (i % Self::BITS)) != 0)
+    }
+
+    #[inline]
+    fn insert(&mut self, i: usize) {
+        self.bits[i / Self::BITS] |= 1u64 << (i % Self::BITS);
+    }
+
+    #[inline]
+    fn remove(&mut self, i: usize) {
+        if let Some(word) = self.bits.get_mut(i / Self::BITS) {
+            *word &= !(1u64 << (i % Self::BITS));
+        }
+    }
+
+    /// Every member this set has in common with `other`, `self` loses.
+    ///
+    /// Word-wise: an `&!` per word this set and `other` both cover, not a
+    /// walk of `other` with a lookup into `self` per member.
+    fn difference_with(&mut self, other: &Self) {
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a &= !b;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// The smallest member, if any.
+    fn min(&self) -> Option<usize> {
+        self.bits
+            .iter()
+            .enumerate()
+            .find(|&(_, &w)| w != 0)
+            .map(|(wi, &w)| wi * Self::BITS + w.trailing_zeros() as usize)
+    }
+
+    /// The largest member, if any.
+    fn max(&self) -> Option<usize> {
+        self.bits
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(_, &w)| w != 0)
+            .map(|(wi, &w)| wi * Self::BITS + (Self::BITS - 1 - w.leading_zeros() as usize))
+    }
+
+    /// Every member, ascending — the bit pattern read back out.
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(wi, &w)| {
+            (0..Self::BITS as u32)
+                .filter(move |b| w & (1u64 << b) != 0)
+                .map(move |b| wi * Self::BITS + b as usize)
+        })
+    }
+}
+
 /// Compute the transitive dependencies of a ValueId in the schedule.
 ///
 /// `schedule_ops` is a dense Vec indexed by `ValueId.0`, pre-built by the
 /// caller so each lookup is O(1) instead of O(n).
-fn transitive_deps(
-    vid: ValueId,
-    schedule_ops: &[Option<ScheduledOp>],
-) -> alloc::collections::BTreeSet<ValueId> {
-    use alloc::collections::BTreeSet;
-
-    let mut deps = BTreeSet::new();
+fn transitive_deps(vid: ValueId, schedule_ops: &[Option<ScheduledOp>]) -> IndexSet {
+    let mut deps = IndexSet::empty(schedule_ops.len());
     let mut worklist = alloc::vec![vid];
     while let Some(v) = worklist.pop() {
-        if !deps.insert(v) {
+        let idx = v.0 as usize;
+        if deps.contains(idx) {
             continue;
         }
+        deps.insert(idx);
         // O(1) lookup via dense Vec indexed by ValueId.0
-        if let Some(Some(sop)) = schedule_ops.get(v.0 as usize) {
+        if let Some(Some(sop)) = schedule_ops.get(idx) {
             match sop {
                 ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => {}
                 ScheduledOp::Unary(_, c)
@@ -271,11 +354,11 @@ struct SelectArms {
     /// Where the mask lands, or `usize::MAX` when it is not in this scope's
     /// schedule (a live-in from an enclosing one).
     mask_idx: usize,
-    indices: ArmPair<alloc::collections::BTreeSet<usize>>,
+    indices: ArmPair<IndexSet>,
     /// Everything the select reads, transitively, as schedule positions —
     /// which is also, by complement, everything between the mask and the
     /// select that the select does NOT need.
-    cone: alloc::collections::BTreeSet<usize>,
+    cone: IndexSet,
     /// What each arm's own entries cost, in latency-prior cycles — what a
     /// guard on that arm could save, against what the branch costs when it
     /// does not.
@@ -299,12 +382,11 @@ impl SelectArms {
         if cycles <= MISPREDICT_PENALTY_CYCLES {
             return (self.select_idx, self.select_idx);
         }
-        let (Some(&start), Some(&last)) = (indices.iter().next(), indices.iter().next_back())
-        else {
+        let (Some(start), Some(last)) = (indices.min(), indices.max()) else {
             return (self.select_idx, self.select_idx);
         };
         let end = last + 1;
-        let one_run = (start..end).all(|idx| indices.contains(&idx));
+        let one_run = (start..end).all(|idx| indices.contains(idx));
         if one_run && self.mask_idx < start {
             (start, end)
         } else {
@@ -409,8 +491,6 @@ pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
 
 /// Every `Select` in the schedule, with the entries exclusive to each arm.
 fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
-    use alloc::collections::BTreeSet;
-
     let mut arms = Vec::new();
 
     if schedule.is_empty() {
@@ -499,28 +579,26 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
             // set from the start still dooms its producer), and every
             // removal pushes that value's operands back on to be
             // re-examined, rather than re-walking everyone.
-            let closed_exclusive = |cone: &BTreeSet<ValueId>, other: &BTreeSet<ValueId>| {
-                let mut set: BTreeSet<ValueId> = cone
-                    .difference(&mask_deps)
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    .difference(other)
-                    .copied()
-                    .collect();
-                let mut worklist: alloc::vec::Vec<ValueId> = set.iter().copied().collect();
+            let closed_exclusive = |cone: &IndexSet, other: &IndexSet| {
+                let mut set = cone.clone();
+                set.difference_with(&mask_deps);
+                set.difference_with(other);
+                let mut worklist: alloc::vec::Vec<ValueId> =
+                    set.iter().map(|i| ValueId(i as u32)).collect();
                 while let Some(v) = worklist.pop() {
-                    if !set.contains(&v) {
+                    let idx = v.0 as usize;
+                    if !set.contains(idx) {
                         continue; // already removed by an earlier pop
                     }
-                    let doomed = consumers[v.0 as usize]
+                    let doomed = consumers[idx]
                         .iter()
-                        .any(|c| *c != *sel_vid && !set.contains(c));
+                        .any(|c| *c != *sel_vid && !set.contains(c.0 as usize));
                     if !doomed {
                         continue;
                     }
-                    set.remove(&v);
+                    set.remove(idx);
                     for operand in operands_of(v, &schedule_ops).into_iter().flatten() {
-                        if set.contains(&operand) {
+                        if set.contains(operand.0 as usize) {
                             worklist.push(operand);
                         }
                     }
@@ -532,40 +610,42 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
             let false_exclusive = closed_exclusive(&false_deps, &true_deps);
 
             // Map to schedule indices using dense O(1) lookup
-            let true_indices: BTreeSet<usize> = true_exclusive
-                .iter()
-                .filter_map(|v| {
-                    let idx = *vid_to_sched_idx.get(v.0 as usize)?;
-                    if idx == usize::MAX { None } else { Some(idx) }
-                })
-                .collect();
-            let false_indices: BTreeSet<usize> = false_exclusive
-                .iter()
-                .filter_map(|v| {
-                    let idx = *vid_to_sched_idx.get(v.0 as usize)?;
-                    if idx == usize::MAX { None } else { Some(idx) }
-                })
-                .collect();
+            let to_schedule_indices = |exclusive: &IndexSet| -> IndexSet {
+                let mut indices = IndexSet::empty(schedule.len());
+                for vid in exclusive.iter() {
+                    if let Some(&idx) = vid_to_sched_idx.get(vid)
+                        && idx != usize::MAX
+                    {
+                        indices.insert(idx);
+                    }
+                }
+                indices
+            };
+            let true_indices = to_schedule_indices(&true_exclusive);
+            let false_indices = to_schedule_indices(&false_exclusive);
 
             let mask_idx = vid_to_sched_idx
                 .get(mask_vid.0 as usize)
                 .copied()
                 .unwrap_or(usize::MAX);
 
-            let cone: BTreeSet<usize> = mask_deps
+            let mut cone = IndexSet::empty(schedule.len());
+            for vid in mask_deps
                 .iter()
                 .chain(true_deps.iter())
                 .chain(false_deps.iter())
-                .filter_map(|v| {
-                    let idx = *vid_to_sched_idx.get(v.0 as usize)?;
-                    if idx == usize::MAX { None } else { Some(idx) }
-                })
-                .collect();
+            {
+                if let Some(&idx) = vid_to_sched_idx.get(vid)
+                    && idx != usize::MAX
+                {
+                    cone.insert(idx);
+                }
+            }
 
-            let arm_cycles = |indices: &BTreeSet<usize>| -> usize {
+            let arm_cycles = |indices: &IndexSet| -> usize {
                 indices
                     .iter()
-                    .map(|&idx| match &schedule[idx].op {
+                    .map(|idx| match &schedule[idx].op {
                         ScheduledOp::Var(_) | ScheduledOp::Const(_) => 0,
                         // One broadcast load; priced as the leaf it is
                         // in the prologue, where it lands.
@@ -700,7 +780,6 @@ fn partition_around(schedule: &[Def], select: &SelectArms) -> Vec<Def> {
     let first_arm = select.indices[SelectArm::True]
         .iter()
         .chain(select.indices[SelectArm::False].iter())
-        .copied()
         .min();
     let Some(first_arm) = first_arm else {
         return schedule.to_vec();
@@ -714,9 +793,11 @@ fn partition_around(schedule: &[Def], select: &SelectArms) -> Vec<Def> {
     // when the select IS the root, the strangers stay ahead of the arms.
     let sink_past_select = select.select_idx + 1 < schedule.len();
     let in_any_arm = |i: &usize| {
-        select.indices[SelectArm::True].contains(i) || select.indices[SelectArm::False].contains(i)
+        select.indices[SelectArm::True].contains(*i)
+            || select.indices[SelectArm::False].contains(*i)
     };
-    let stays_before = |i: &usize| (select.cone.contains(i) || !sink_past_select) && !in_any_arm(i);
+    let stays_before =
+        |i: &usize| (select.cone.contains(*i) || !sink_past_select) && !in_any_arm(i);
 
     let mut out = Vec::with_capacity(schedule.len());
     out.extend_from_slice(&schedule[..start]);
@@ -733,7 +814,7 @@ fn partition_around(schedule: &[Def], select: &SelectArms) -> Vec<Def> {
             select.indices[arm]
                 .iter()
                 .filter(|i| region.contains(i))
-                .map(|i| schedule[*i].clone()),
+                .map(|i| schedule[i].clone()),
         );
     }
     out.push(schedule[select.select_idx].clone());
@@ -832,8 +913,8 @@ struct SelectStat {
 
 /// Entries inside `[min(arm), max(arm)]` that the arm does not own, and how
 /// many of those are leaves (a `Const` or a coordinate). Diagnosis only.
-fn intruders(arm: &alloc::collections::BTreeSet<usize>, schedule: &[Def]) -> IntruderStats {
-    let (Some(&start), Some(&end)) = (arm.iter().next(), arm.iter().next_back()) else {
+fn intruders(arm: &IndexSet, schedule: &[Def]) -> IntruderStats {
+    let (Some(start), Some(end)) = (arm.min(), arm.max()) else {
         return IntruderStats {
             total: 0,
             leaves: 0,
@@ -842,7 +923,7 @@ fn intruders(arm: &alloc::collections::BTreeSet<usize>, schedule: &[Def]) -> Int
     let mut total = 0;
     let mut leaves = 0;
     for (idx, def) in schedule.iter().enumerate().take(end + 1).skip(start) {
-        if arm.contains(&idx) {
+        if arm.contains(idx) {
             continue;
         }
         total += 1;
@@ -933,6 +1014,67 @@ impl Telemetry {
 mod tests {
     use super::*;
     use pixelflow_ir::kind::OpKind;
+
+    mod index_set {
+        use super::IndexSet;
+
+        /// Round-trips across a word boundary: 64 is the first bit that must
+        /// land in the second `u64`, so this alone would catch an off-by-one
+        /// in the `/`/`%` split.
+        #[test]
+        fn insert_contains_remove_survive_a_word_boundary() {
+            let mut set = IndexSet::empty(130);
+            for i in [0usize, 1, 63, 64, 65, 127, 128, 129] {
+                set.insert(i);
+            }
+            for i in [0usize, 1, 63, 64, 65, 127, 128, 129] {
+                assert!(set.contains(i), "{i} was inserted");
+            }
+            for i in [2usize, 62, 66, 126] {
+                assert!(!set.contains(i), "{i} was never inserted");
+            }
+            set.remove(64);
+            assert!(!set.contains(64));
+            assert!(set.contains(65), "removing 64 must not touch its neighbor");
+        }
+
+        #[test]
+        fn min_and_max_span_words() {
+            let mut set = IndexSet::empty(200);
+            assert_eq!(set.min(), None, "an empty set has no minimum");
+            assert_eq!(set.max(), None, "an empty set has no maximum");
+            set.insert(150);
+            set.insert(3);
+            set.insert(70);
+            assert_eq!(set.min(), Some(3));
+            assert_eq!(set.max(), Some(150));
+        }
+
+        #[test]
+        fn difference_with_is_word_wise_and_asymmetric() {
+            let mut a = IndexSet::empty(128);
+            for i in [1usize, 64, 100] {
+                a.insert(i);
+            }
+            let mut b = IndexSet::empty(128);
+            for i in [64usize, 65] {
+                b.insert(i);
+            }
+            a.difference_with(&b);
+            let left: alloc::vec::Vec<usize> = a.iter().collect();
+            assert_eq!(left, alloc::vec![1, 100], "only b's members leave a");
+        }
+
+        #[test]
+        fn iter_matches_insertion_ascending_regardless_of_order() {
+            let mut set = IndexSet::empty(80);
+            for i in [70usize, 0, 65, 3, 1] {
+                set.insert(i);
+            }
+            let seen: alloc::vec::Vec<usize> = set.iter().collect();
+            assert_eq!(seen, alloc::vec![0, 1, 3, 65, 70]);
+        }
+    }
 
     fn def(value: u32, op: ScheduledOp) -> Def {
         Def {
