@@ -57,13 +57,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 ///
 /// - `RawGather` — produced by lowering, after the e-graph's place in the
 ///   pipeline; reaching one here means the arena is already lowered.
-/// - `Nary` other than `Reduce` (`Tuple`) — not modelled. `Reduce` itself
-///   is unrolled first (`passes::expand_reduce`, the same unroll `legalize`
-///   performs later): the arena the e-graph sees is binder-free, so factoring
-///   across the unrolled terms is ordinary rewriting rather than rewriting
-///   under a binder.
+/// - `Nary` other than `Reduce` (`Tuple`) — not modelled.
 /// - `Param` — a `pixelflow-compiler` macro-parameter slot that should never
 ///   reach a runtime-built `Kernel` in the first place.
+///
+/// `Reduce` itself *is* modelled (`ENode::Reduce`) — the graph reasons about
+/// the monoidal form directly (`egraph::fold_rules`: peeling, halving), and
+/// whether the surviving extraction keeps the fold or the extractor's DP
+/// unrolled it is a cost/tie-break question for extraction, not something
+/// this function decides (stage 2c,
+/// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md).
 ///
 /// `Uniform` leaves are representable like `Buffer`: opaque to every rule,
 /// hash-consed by identity, redeclared by extraction. Nothing folds one.
@@ -183,6 +186,22 @@ fn optimize_runtime_arena_uncached(
     // rises when the legalizer moves back, and that is the trade being made,
     // not a regression: the e-graph gets to see the small, high-level program
     // it can actually reason about.
+    //
+    // `ExpandReduce` still runs unconditionally, deliberately, even though
+    // stage 2c's codegen *can* compile a surviving `Reduce` as a loop
+    // (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md) — tested
+    // directly against hand-built arenas. A `Reduce` combined with a
+    // `Select` (a fold whose own body selects on a name-composed,
+    // genuinely-transitioning winding — exactly `Glyph::over`'s
+    // `inside.select(&distance.0, &ceiling)`) was found to compute a
+    // uniformly wrong answer once real glyph geometry exercised it.
+    // `ExpandNestedReduce` exists and is correct on its own (it unrolls
+    // only a `Reduce` nested inside another's body, the one shape
+    // `extract_folds` cannot carve out at all), but until the `Select`
+    // interaction above is root-caused this pipeline does not lean on a
+    // non-nested `Reduce` surviving either — see
+    // `pixelflow-ir::passes::legalize`'s own doc comment, which this
+    // mirrors.
     //
     // A declining step short-circuits the rest and yields `None` here, which
     // means exactly what it always meant: the caller compiles its own arena
@@ -785,10 +804,12 @@ mod congruence_gap_probe {
         root: ExprId,
     ) -> ProductionRun {
         // What `optimize_runtime_arena_uncached` hands the e-graph:
-        // `ExpandRefs` and nothing else. `LowerDwrt`/`ExpandReduce` run after
-        // saturation — a `Dwrt` and a `Reduce` are both things the rule set
-        // knows, and legalization is the fallback for what it declined — so
-        // lowering here would measure a pipeline that no longer exists.
+        // `ExpandRefs` and nothing else. `LowerDwrt` runs after saturation —
+        // a `Dwrt` is a thing the rule set knows, and legalization is the
+        // fallback for what it declined — so lowering here would measure a
+        // pipeline that no longer exists. `Reduce` needs no such fallback any
+        // more (stage 2c): the graph reasons about it directly and a
+        // surviving one is legal all the way to codegen.
         let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
         let node_count = crate::egraph::reachable_count(&arena, root);
 

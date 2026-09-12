@@ -2158,6 +2158,35 @@ impl LinearScan {
             }
             pass.expire(i);
 
+            // A surviving `Reduce`'s own body is emitted through a wholly
+            // separate, nested register allocation (`allocate_nest`'s fold
+            // scope, recursed into via `Allocation::sibling`) that starts
+            // fresh over the whole pool -- it has no visibility into what
+            // *this* scope currently holds resident, and no reason not to
+            // reuse any of it. A value this scope still needs after the
+            // loop must therefore not be sitting in a register *across*
+            // it: evict everything resident into its slot here, exactly as
+            // a call to something that clobbers the whole register file
+            // would force a caller to. `split_out` is the same eviction
+            // every ordinary loser of the destination contest below goes
+            // through (constants remat instead of spilling); the only
+            // difference is that here it runs for every occupant at once,
+            // pre-emptively, rather than one at a time as something else
+            // claims the slot. Without this, `extract_folds`'s "a shared
+            // invariant leaf stays in both places, recomputed" is only
+            // true of the arena -- the register that held the outer
+            // copy's result can be clobbered by the fold's own recompute
+            // of the identical value, and whichever one the loop's last
+            // iteration leaves behind is read back instead of the outer
+            // scope's own answer.
+            if matches!(def.op, ScheduledOp::Reduce(..)) {
+                for slot in 0..pass.owner.len() {
+                    if pass.owner[slot].is_some() {
+                        pass.split_out(slot, i);
+                    }
+                }
+            }
+
             let mut reads: Vec<ValueId> = Vec::new();
             for operand in operands(&def.op) {
                 if !reads.contains(&operand) {

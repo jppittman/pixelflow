@@ -3676,6 +3676,63 @@ mod tests {
         }
     }
 
+    /// A surviving fold's own per-iteration recompute of a shared invariant
+    /// leaf must not clobber the outer scope's copy of that same value.
+    ///
+    /// Same DAG as `a_surviving_reduce_shares_a_leaf_and_feeds_further_arithmetic`
+    /// (`shared` read once inside the fold's body, once again after it),
+    /// but pushed to the arena in the *interleaved* order a real unroll
+    /// produces (const, add, const, add, const, add — see
+    /// `unroll_reduce`'s substitution) rather than all three constants
+    /// first. That reordering alone, with no change to the DAG's shape,
+    /// used to compute `24` instead of `21`: the outer scope's own copy of
+    /// `shared` shared a register with the fold's own per-iteration
+    /// recompute of it, and the fold's internal register allocation —
+    /// `allocate_nest`'s fold scope, recursed into via `Allocation::sibling`
+    /// — has no visibility into what the enclosing scope holds resident, so
+    /// its last iteration's write clobbered it. Fixed by evicting every
+    /// register the enclosing scope holds resident at a `Reduce`'s own
+    /// schedule position (`regalloc::Pass::split_out`, called for every
+    /// occupied slot right after `pass.expire` in `scan`), exactly as a
+    /// call to something that clobbers the whole register file would force
+    /// a caller to save first.
+    ///
+    /// `shared = (X+0)+(X+1)+(X+2) = 3X+3`;
+    /// `reduce = sum_{i=0}^{3}(shared + i) = 4*shared + 6`;
+    /// `root = shared + reduce = 5*shared + 6`.
+    #[test]
+    fn a_surviving_reduces_own_recompute_of_a_shared_leaf_does_not_clobber_the_outer_copy() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let c0 = a.push_const(0.0);
+        let t0 = a.push_binary(OpKind::Add, x, c0);
+        let c1 = a.push_const(1.0);
+        let t1 = a.push_binary(OpKind::Add, x, c1);
+        let c2 = a.push_const(2.0);
+        let t2 = a.push_binary(OpKind::Add, x, c2);
+        let s01 = a.push_binary(OpKind::Add, t0, t1);
+        let shared = a.push_binary(OpKind::Add, s01, t2);
+        let binder = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(binder.var());
+        let body = a.push_binary(OpKind::Add, shared, i);
+        let fold = Fold::new(Monoid::SUM, binder, 0..4);
+        let reduce = a.push_reduce(fold, body);
+        let root = a.push_binary(OpKind::Add, shared, reduce);
+
+        let schedule = arena_to_schedule(&a, root);
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("interleaved shared-leaf order compiles");
+
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+            let shared_val = 3.0 * x + 3.0;
+            let want = shared_val + (4.0 * shared_val + 6.0);
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
     /// The scaffold's size does not depend on the frame it wraps.
     ///
     /// Every backend now shares one `emit_collapse_loop`, so the loop nest's
