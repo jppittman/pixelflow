@@ -22,7 +22,7 @@
 //! than a silently dropped term.
 
 use super::regalloc::ValueId;
-use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload};
+use super::{Binding, InstructionPlan, IsaBackend, KReg, Loc, Reg, Reload};
 use crate::error::CompileError;
 
 /// Emitted traffic within one scope of the collapse nest.
@@ -135,9 +135,7 @@ impl<'a, B: IsaBackend> Counting<'a, B> {
 }
 
 impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
-    fn jump(&mut self, asm: &mut super::Assembly, label: super::Label) {
-        self.inner.jump(asm, label);
-    }
+    type Branch = B::Branch;
 
     fn register_file(&self) -> super::regalloc::RegisterFile {
         self.inner.register_file()
@@ -199,13 +197,34 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.emit_resolve(code, vid, target, locs)
     }
 
-    fn branch_if_arm_is_dead(
+    fn emit_skip_if_all_false(
         &mut self,
-        asm: &mut super::Assembly,
-        test: super::MaskTest,
-        label: super::Label,
-    ) {
-        self.inner.branch_if_arm_is_dead(asm, test, label);
+        code: &mut Vec<u8>,
+        mask_reg: Reg,
+        scratch: Option<Reg>,
+        mask_scratch: Option<KReg>,
+    ) -> Self::Branch {
+        self.inner
+            .emit_skip_if_all_false(code, mask_reg, scratch, mask_scratch)
+    }
+
+    fn emit_skip_if_all_true(
+        &mut self,
+        code: &mut Vec<u8>,
+        mask_reg: Reg,
+        scratch: Option<Reg>,
+        mask_scratch: Option<KReg>,
+    ) -> Self::Branch {
+        self.inner
+            .emit_skip_if_all_true(code, mask_reg, scratch, mask_scratch)
+    }
+
+    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch {
+        self.inner.emit_jump(code)
+    }
+
+    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Self::Branch, target: usize) {
+        self.inner.patch_branch(code, branch, target);
     }
 
     fn body_frame_bytes(&self, frame_size: u32) -> u32 {
@@ -220,12 +239,12 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.frame_free(code, bytes);
     }
 
-    fn scaffold_anchor(&mut self, asm: &mut super::Assembly) {
-        self.inner.scaffold_anchor(asm);
+    fn scaffold_anchor(&mut self, code: &mut Vec<u8>) {
+        self.inner.scaffold_anchor(code);
     }
 
-    fn scaffold_finish(&mut self, asm: &mut super::Assembly) {
-        self.inner.scaffold_finish(asm);
+    fn scaffold_finish(&mut self, code: &mut Vec<u8>) {
+        self.inner.scaffold_finish(code);
     }
 
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
@@ -254,11 +273,10 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
 
     fn branch_if_counter_done(
         &mut self,
-        asm: &mut super::Assembly,
+        code: &mut Vec<u8>,
         counter: super::Counter,
-        label: super::Label,
-    ) {
-        self.inner.branch_if_counter_done(asm, counter, label);
+    ) -> Self::Branch {
+        self.inner.branch_if_counter_done(code, counter)
     }
 
     fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -271,35 +289,6 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
 
     fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
         self.inner.add_scalar(code, dst, scratch, scalar);
-    }
-
-    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
-        self.inner.load_const(code, dst, val);
-    }
-
-    fn alu(
-        &mut self,
-        code: &mut Vec<u8>,
-        op: pixelflow_ir::kind::OpKind,
-        dst: Reg,
-        srcs: [Reg; 2],
-    ) {
-        self.inner.alu(code, op, dst, srcs);
-    }
-
-    // Explicit rather than inherited: the trait's default for `test_ge`
-    // calls `self.alu`, which through this wrapper would call `Counting`'s
-    // own `alu` — never reaching a backend's own `test_ge` override (only
-    // AVX-512 has one). Forwarding the call itself, not its default body, is
-    // what keeps that override reachable through the decorator.
-    fn test_ge(
-        &mut self,
-        code: &mut Vec<u8>,
-        dst: Reg,
-        srcs: [Reg; 2],
-        mask_scratch: Option<super::KReg>,
-    ) {
-        self.inner.test_ge(code, dst, srcs, mask_scratch);
     }
 
     fn emit_ret(&mut self, code: &mut Vec<u8>) {
