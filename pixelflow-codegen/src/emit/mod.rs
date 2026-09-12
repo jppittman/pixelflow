@@ -687,13 +687,19 @@ pub struct FrameLayout {
 }
 
 impl FrameLayout {
-    /// Give every spilled value in this scope a stack address.
+    /// Give every spilled value in this scope a stack address, from `base` up.
     ///
-    /// Pure: (scope allocation, slot stride) → layout. The collapse driver
-    /// runs this twice for one region and relies on both runs agreeing.
+    /// Pure: (scope allocation, slot stride, base) → layout. The collapse
+    /// driver runs this twice for one region and relies on both runs agreeing.
+    ///
+    /// `base` is what keeps a nested scope off its parent's slots — see
+    /// [`StackFrame::with_base`]. [`Self::frame_size`] is the resulting total
+    /// extent, base included, so a parent's frame size is exactly the base to
+    /// hand whatever runs inside it.
     pub fn resolve(
         allocation: regalloc::Allocation<'_>,
         vector_bytes: u32,
+        base: u32,
     ) -> Result<Self, CompileError> {
         let schedule = allocation.schedule();
         let len = schedule
@@ -703,7 +709,7 @@ impl FrameLayout {
             .unwrap_or(0);
         let mut locs: alloc::vec::Vec<Option<Binding>> = alloc::vec![None; len];
 
-        let mut frame = StackFrame::new(vector_bytes);
+        let mut frame = StackFrame::with_base(vector_bytes, base);
         let mut slot: alloc::vec::Vec<Option<Slot>> = alloc::vec![None; len];
         let mut slots = 0u32;
         for (i, def) in schedule.iter().enumerate() {
@@ -1663,9 +1669,36 @@ fn emit_dag_body<B: IsaBackend>(
         nest.body(),
         backend,
         HoistCtx::None,
-        None,
-        &alloc::collections::BTreeMap::new(),
+        FramePlan {
+            override_size: None,
+            fold_slots: &alloc::collections::BTreeMap::new(),
+            slot_base: 0,
+        },
     )
+}
+
+/// Where one scope's memory is, as its driver decided it — the three answers
+/// [`emit_dag_body_hoisted`] cannot work out for itself because they are all
+/// facts about the *nest*, not about the scope.
+#[derive(Clone, Copy)]
+struct FramePlan<'a> {
+    /// Frame size to latch instead of this scope's own. The collapse driver
+    /// hands every scope the same `m` so they all address the shared hoist
+    /// slots consistently (and, on x86, all latch the same allocated-frame
+    /// mode). `None` for a scope that is the whole function.
+    override_size: Option<u32>,
+    /// Each surviving fold's accumulator slot, by its `Reduce`'s own
+    /// `ValueId`: a slot outside any single scope's frame, because the scope
+    /// that opens the loop and the loop itself both address it. Empty
+    /// wherever nothing here can open a fold.
+    fold_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
+    /// Where this scope's own spill slots start. Zero for a scope that has
+    /// the frame to itself for as long as its values live — the two collapse
+    /// prologues and the body, which run one after another. A fold's body is
+    /// the case that is not that: it runs nested inside its parent's
+    /// schedule, with the parent's spilled values still live across it, so it
+    /// is based at the parent's `layout.frame_size` and the two cannot alias.
+    slot_base: u32,
 }
 
 /// Emit one region's body from a finished allocation, with collapse-loop
@@ -1683,21 +1716,34 @@ fn emit_dag_body<B: IsaBackend>(
 /// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "the design
 /// decision that makes this tractable"). Empty wherever nothing here can
 /// open a fold — every caller but the collapse driver's own body/fold calls.
+///
+/// `slot_base` is where this scope's own spill slots start. Zero for a scope
+/// that has the frame to itself for as long as its values live — the two
+/// collapse prologues and the body, which run one after another. A fold's
+/// body is the case that is *not* that: it runs nested inside its parent's
+/// schedule, with the parent's spilled values still live across it, so it is
+/// based at the parent's `layout.frame_size` and the two cannot alias.
 fn emit_dag_body_hoisted<B: IsaBackend>(
     allocation: regalloc::Allocation<'_>,
     backend: &mut B,
     hoist: HoistCtx<'_>,
-    frame_override: Option<u32>,
-    fold_slots: &alloc::collections::BTreeMap<regalloc::ValueId, u32>,
+    frame: FramePlan<'_>,
 ) -> Result<(Vec<u8>, Reg, u32, u32), CompileError> {
+    let FramePlan {
+        override_size: frame_override,
+        fold_slots,
+        slot_base,
+    } = frame;
     let file = backend.register_file();
     // Allocation happened before this call — once per region, over the whole
     // nest. The allocator chooses the evaluation order, so everything here —
     // guard ranges, program points, the emit loop itself — reads the schedule
     // it handed back rather than the one it was given.
     let schedule = allocation.schedule();
-    let mut layout = FrameLayout::resolve(allocation, file.vector_bytes)?;
+    let mut layout = FrameLayout::resolve(allocation, file.vector_bytes, slot_base)?;
     let real_spill_count = layout.slots;
+    // This scope's top is exactly the base for anything nested inside it.
+    let nested_slot_base = layout.frame_size;
 
     // A value an enclosing region parked has no address in this frame — its
     // slot is the driver's hoist slot, which outlives every region's frame.
@@ -2007,8 +2053,11 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 fold_alloc,
                 backend,
                 HoistCtx::None,
-                Some(frame_size),
-                fold_slots,
+                FramePlan {
+                    override_size: Some(frame_size),
+                    fold_slots,
+                    slot_base: nested_slot_base,
+                },
             )?;
             asm.code.extend_from_slice(&fold_code);
 
@@ -2200,8 +2249,9 @@ pub enum ScheduledOp {
     /// than once per batch.
     Uniform(UniformLoad),
     /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
-    /// body is the value named by the second field — in the *arena's*
-    /// numbering, before [`extract_folds`] carves the body out into its own
+    /// body is the value named by the second field — in *this schedule's*
+    /// numbering (`arena_to_schedule` maps it like any other child), before
+    /// [`extract_folds`] carves the body out into its own
     /// [`regalloc::ScopeFold`]. Kept only so [`schedule_variance`] can look
     /// the body's variance up (`Reduce`'s own result is the body's variance
     /// with the binder's own bit removed) and so [`extract_folds`] can find
@@ -3301,8 +3351,11 @@ fn compile_via_backend<B: IsaBackend>(
             body_alloc,
             &mut counting,
             HoistCtx::None,
-            None,
-            &alloc::collections::BTreeMap::new(),
+            FramePlan {
+                override_size: None,
+                fold_slots: &alloc::collections::BTreeMap::new(),
+                slot_base: 0,
+            },
         )?;
         let body_traffic = counting.take(body.len() as u32);
         let code = counting.emit_collapse_loop(&CollapseBody {
@@ -3351,15 +3404,40 @@ fn compile_via_backend<B: IsaBackend>(
     // which sit at `m + k·vector_bytes`, stay naturally aligned. Every fold's
     // own frame has to fit under the same `m` too — its emission below is
     // handed the same override, exactly as the two prologues are.
+    //
+    // **The frame is a tree, not a max.** The two prologues and the body run
+    // one after another, each parking what the next needs in a hoist slot
+    // above `m`, so their own frames are dead by the time the next one opens
+    // and all three share a base of 0. A fold is the one scope that is not
+    // like that: its loop runs *in the middle of* its parent's schedule, with
+    // the parent's spilled values still live across it, so it is based at its
+    // parent's top and the two cannot alias. Taking a plain max over scopes
+    // sized the frame correctly and let a fold's spills land on its parent's
+    // slots — a glyph's 2,472-def fold body over its parent's 2,130, which is
+    // every slot the parent had.
+    let mut top_of: alloc::collections::BTreeMap<regalloc::Scope, u32> =
+        alloc::collections::BTreeMap::new();
     let mut m = RED_ZONE_FLOOR;
-    for allocation in [frame_alloc, row_alloc, body_alloc]
-        .into_iter()
-        .chain((0..nest.fold_count()).map(|j| nest.scope(regalloc::Scope::Fold(j))))
-    {
-        if allocation.schedule().is_empty() {
-            continue;
-        }
-        m = m.max(FrameLayout::resolve(allocation, vector_bytes)?.frame_size);
+    // Regions first, then the body, then the folds in nest order: a fold's
+    // parent is always an earlier scope (asserted where the nest is built),
+    // so every `top_of` lookup below is already populated.
+    let scopes = (0..nest.regions())
+        .map(regalloc::Scope::Region)
+        .chain(core::iter::once(regalloc::Scope::Body))
+        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+    for scope in scopes {
+        let base = match scope {
+            regalloc::Scope::Region(_) | regalloc::Scope::Body => 0,
+            regalloc::Scope::Fold(j) => top_of[&nest.fold_parent(j)],
+        };
+        let allocation = nest.scope(scope);
+        let top = if allocation.schedule().is_empty() {
+            base
+        } else {
+            FrameLayout::resolve(allocation, vector_bytes, base)?.frame_size
+        };
+        top_of.insert(scope, top);
+        m = m.max(top);
     }
     let m = m.next_multiple_of(vector_bytes);
     // Hoist slot k sits above the scaffold's five coordinate slots.
@@ -3402,8 +3480,11 @@ fn compile_via_backend<B: IsaBackend>(
                 preloaded: None,
                 parked: &frame_map,
             },
-            Some(m),
-            &fold_map,
+            FramePlan {
+                override_size: Some(m),
+                fold_slots: &fold_map,
+                slot_base: 0,
+            },
         )?;
         (code, spills)
     };
@@ -3422,8 +3503,11 @@ fn compile_via_backend<B: IsaBackend>(
                 },
                 parked: &row_map,
             },
-            Some(m),
-            &fold_map,
+            FramePlan {
+                override_size: Some(m),
+                fold_slots: &fold_map,
+                slot_base: 0,
+            },
         )?;
         (code, spills)
     };
@@ -3432,8 +3516,11 @@ fn compile_via_backend<B: IsaBackend>(
         body_alloc,
         &mut counting,
         HoistCtx::Body { slots: &hoist_map },
-        Some(m),
-        &fold_map,
+        FramePlan {
+            override_size: Some(m),
+            fold_slots: &fold_map,
+            slot_base: 0,
+        },
     )?;
     let body_traffic = counting.take(body.len() as u32);
 
@@ -3730,6 +3817,102 @@ mod tests {
             let shared_val = 3.0 * x + 3.0;
             let want = shared_val + (4.0 * shared_val + 6.0);
             assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// A fold's spill slots do not alias its parent's.
+    ///
+    /// The frame used to be sized as a plain `max` over the nest's scopes,
+    /// with every one of them handing out slots from offset 0. That is right
+    /// for the two collapse prologues and the body — they run one after
+    /// another, each parking what the next needs in a *hoist* slot above the
+    /// frame, so an earlier scope's own slots are dead by the time a later one
+    /// opens. A fold is the scope that is not like that: its loop runs in the
+    /// middle of its parent's schedule, and the parent's spilled values are
+    /// live across it. Sharing a base meant the fold's body wrote its own
+    /// temporaries over them.
+    ///
+    /// It took real pressure on both sides to see: for a glyph, a 2,472-def
+    /// fold body over a 2,130-def parent, which is every slot the parent had,
+    /// and the whole atlas came out blank. So this builds that shape rather
+    /// than a minimal fold — `K` values live across the loop and `K` more
+    /// inside it, all defined before anything consumes them, which is what
+    /// forces both scopes past the register file and into slots.
+    ///
+    /// `p_k = X + k`; `B(i) = Σ_j (i + j)·p_j`; `reduce = Σ_{i<R} B(i)`;
+    /// `root = Σ_k (p_k + reduce)`.
+    #[test]
+    fn a_folds_spill_slots_do_not_alias_its_parents() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        const K: usize = 20;
+        const R: u32 = 3;
+
+        // A balanced sum, pushed level by level: every leaf is defined before
+        // the first combine, so they are all live at once.
+        fn tree_sum(a: &mut ExprArena, mut ids: alloc::vec::Vec<ExprId>) -> ExprId {
+            while ids.len() > 1 {
+                let mut next = alloc::vec::Vec::new();
+                for pair in ids.chunks(2) {
+                    next.push(match pair {
+                        [l, r] => a.push_binary(OpKind::Add, *l, *r),
+                        [only] => *only,
+                        _ => unreachable!("chunks(2) yields 1 or 2"),
+                    });
+                }
+                ids = next;
+            }
+            ids[0]
+        }
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        // Live across the loop: defined here, consumed only past the `Reduce`.
+        let p: alloc::vec::Vec<ExprId> = (0..K)
+            .map(|k| {
+                let c = a.push_const(k as f32);
+                a.push_binary(OpKind::Add, x, c)
+            })
+            .collect();
+
+        let binder = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(binder.var());
+        // Live inside the loop, and sharing every `p_j` with the parent.
+        let q: alloc::vec::Vec<ExprId> = (0..K)
+            .map(|j| {
+                let c = a.push_const(j as f32);
+                let ij = a.push_binary(OpKind::Add, i, c);
+                a.push_binary(OpKind::Mul, ij, p[j])
+            })
+            .collect();
+        let body = tree_sum(&mut a, q);
+        let reduce = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..R), body);
+
+        let joined: alloc::vec::Vec<ExprId> = p
+            .iter()
+            .map(|&pk| a.push_binary(OpKind::Add, pk, reduce))
+            .collect();
+        let root = tree_sum(&mut a, joined);
+
+        let schedule = arena_to_schedule(&a, root);
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("a fold under register pressure compiles");
+
+        for xv in [0.0f32, 1.0, -2.5, 7.0] {
+            let got = eval_point(&code.code, xv, 0.0, 0.0, 0.0);
+            let pv = |k: usize| xv + k as f32;
+            let reduce_v: f32 = (0..R)
+                .map(|iv| (0..K).map(|j| (iv as f32 + j as f32) * pv(j)).sum::<f32>())
+                .sum();
+            let want: f32 = (0..K).map(|k| pv(k) + reduce_v).sum();
+            // Summation order differs from the emitted tree's, so this is a
+            // tolerance on rounding — the bug it guards was off by the whole
+            // value, not the last bits.
+            let tol = want.abs() * 1e-4 + 1e-3;
+            assert!(
+                (got - want).abs() <= tol,
+                "at x={xv}: got {got}, want {want}"
+            );
         }
     }
 
@@ -4040,7 +4223,7 @@ mod tests {
     #[test]
     fn an_allocation_with_no_spills_needs_no_frame() {
         let a = allocation_of(&[(0, regalloc::Where::Reg(Reg(4)))]);
-        let layout = FrameLayout::resolve(a.body(), 16).unwrap();
+        let layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
         assert_eq!(layout.frame_size, 0);
         assert_eq!(layout.of(regalloc::ValueId(0)), Loc::Reg(Reg(4)).into());
     }
@@ -4048,7 +4231,7 @@ mod tests {
     #[test]
     fn one_spill_takes_one_slot() {
         let a = allocation_of(&[(5, regalloc::Where::Spilled)]);
-        let layout = FrameLayout::resolve(a.body(), 16).unwrap();
+        let layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
         assert_eq!(layout.frame_size, 16);
         assert_eq!(
             layout.of(regalloc::ValueId(5)),
@@ -4070,7 +4253,7 @@ mod tests {
             [(16u32, [0, 16, 32]), (32, [0, 32, 64]), (64, [0, 64, 128])]
         {
             let a = allocation_of(&spilled);
-            let layout = FrameLayout::resolve(a.body(), vector_bytes).unwrap();
+            let layout = FrameLayout::resolve(a.body(), vector_bytes, 0).unwrap();
             assert_eq!(layout.frame_size, 3 * vector_bytes);
             for (i, off) in expected.iter().enumerate() {
                 assert_eq!(
@@ -4089,7 +4272,7 @@ mod tests {
             (0, regalloc::Where::Remat(1.0f32.to_bits())),
             (1, regalloc::Where::Spilled),
         ]);
-        let layout = FrameLayout::resolve(a.body(), 16).unwrap();
+        let layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
         assert_eq!(layout.frame_size, 16, "only the spill takes a slot");
         assert_eq!(
             layout.of(regalloc::ValueId(0)),
@@ -4106,7 +4289,7 @@ mod tests {
     #[test]
     fn a_slot_can_be_pinned_over_the_frames_own_layout() {
         let a = allocation_of(&[(0, regalloc::Where::Reg(Reg(4)))]);
-        let mut layout = FrameLayout::resolve(a.body(), 16).unwrap();
+        let mut layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
         let v = regalloc::ValueId(0);
         assert_eq!(layout.slot_of(v), None, "a resident value needs no slot");
         let pin = Slot::new(256, 16);

@@ -36,7 +36,7 @@ use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandReduce, ExpandRefs, LowerDwrt};
+use pixelflow_ir::passes::{ExpandNestedReduce, ExpandRefs, LowerDwrt};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -169,7 +169,7 @@ fn optimize_runtime_arena_uncached(
     // `egraph::fold_rules`), so the graph resolves what it judges worth
     // resolving and keeps the rest folded.
     //
-    // **`LowerDwrt` and `ExpandReduce` come last, and that is the whole
+    // **`LowerDwrt` and the reduce legalizer come last, and that is the whole
     // point.** Legalization is the *fallback*: it takes whatever illegal
     // shape survived saturation — a `Dwrt` the chain rule did not reach, a
     // `Reduce` the graph declined to peel — and makes it emittable. It owns
@@ -187,21 +187,13 @@ fn optimize_runtime_arena_uncached(
     // not a regression: the e-graph gets to see the small, high-level program
     // it can actually reason about.
     //
-    // `ExpandReduce` still runs unconditionally, deliberately, even though
-    // stage 2c's codegen *can* compile a surviving `Reduce` as a loop
-    // (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md) — tested
-    // directly against hand-built arenas. A `Reduce` combined with a
-    // `Select` (a fold whose own body selects on a name-composed,
-    // genuinely-transitioning winding — exactly `Glyph::over`'s
-    // `inside.select(&distance.0, &ceiling)`) was found to compute a
-    // uniformly wrong answer once real glyph geometry exercised it.
-    // `ExpandNestedReduce` exists and is correct on its own (it unrolls
-    // only a `Reduce` nested inside another's body, the one shape
-    // `extract_folds` cannot carve out at all), but until the `Select`
-    // interaction above is root-caused this pipeline does not lean on a
-    // non-nested `Reduce` surviving either — see
-    // `pixelflow-ir::passes::legalize`'s own doc comment, which this
-    // mirrors.
+    // `ExpandNestedReduce`, not `ExpandReduce`: stage 2c's codegen compiles a
+    // surviving `Reduce` as a loop, so legalization only has to unroll the one
+    // shape `extract_folds` cannot carve out — a `Reduce` nested inside
+    // another's own body, which is what `Kernel::by_ref` composition plus
+    // `ExpandRefs` produces. Everything else stays folded all the way to the
+    // assembler. Mirrors `pixelflow-ir::passes::legalize`, which says the same
+    // thing at the other compile entry.
     //
     // A declining step short-circuits the rest and yields `None` here, which
     // means exactly what it always meant: the caller compiles its own arena
@@ -213,7 +205,7 @@ fn optimize_runtime_arena_uncached(
             ExpandRefs,
             Saturate::runtime(shape),
             LowerDwrt,
-            ExpandReduce
+            ExpandNestedReduce
         ]
         .optimize(arena, root)
         .into_changed(),
@@ -221,7 +213,7 @@ fn optimize_runtime_arena_uncached(
         // What `Lattice::bake` would emit if the e-graph did not exist —
         // the "F" column of docs/plans/2026-09-06-egraph-at-production-scale.md
         // §7, measured by docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
-        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandReduce]
+        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandNestedReduce]
             .optimize(arena, root)
             .into_changed(),
     }

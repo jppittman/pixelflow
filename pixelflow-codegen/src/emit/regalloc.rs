@@ -992,6 +992,26 @@ impl NestAllocation {
         self.folds.len()
     }
 
+    /// The scope fold `j`'s loop opens inside.
+    ///
+    /// A region is a *prologue*: it runs to completion and hands its results
+    /// on through hoist slots, so its own frame is dead by the time the next
+    /// scope needs one, and every region and the body can share one base. A
+    /// fold is the case that is not that — its loop runs in the middle of its
+    /// parent's schedule, with the parent's spilled values live across it —
+    /// which is why the frame is laid out as a tree and only a fold needs its
+    /// parent named. See [`StackFrame::with_base`](crate::emit::StackFrame::with_base).
+    ///
+    /// # Panics
+    /// If `j` names no fold in this nest.
+    #[must_use]
+    pub(crate) fn fold_parent(&self, j: usize) -> Scope {
+        self.folds
+            .get(j)
+            .unwrap_or_else(|| panic!("Fold({j}) is not a fold of this nest"))
+            .parent
+    }
+
     /// The `ValueId` fold `j`'s `Reduce` def names — its accumulator's own
     /// identity, for a driver assigning it a slot address before any scope
     /// is emitted.

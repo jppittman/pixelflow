@@ -29,7 +29,7 @@ the stage.**
 
 | plan | landed | next | note |
 |---|---|---|---|
-| [a surviving `Reduce` is a loop](plans/2026-09-10-a-surviving-reduce-is-a-loop.md) | R0 (labels), 2a (per-scope placements), 2b (the nest is a tree) | **2c** — codegen accepts a surviving `Reduce`; drop `ExpandReduce` | 2b is *additive*: `Scope::Fold` and `opens_at()` exist, and `arena_to_schedule` still panics on a `Reduce`, so nothing produces a fold scope. `HalveFold` (E1b) landed separately. |
+| [a surviving `Reduce` is a loop](plans/2026-09-10-a-surviving-reduce-is-a-loop.md) | R0, 2a, 2b, **2c** (a fold reaches codegen as a loop) | **nested fold loops** — `extract_folds` carves one level; the winding fold is still unrolled because it is the nested one | `ExpandReduce` is demoted, not deleted: both compile entries run `ExpandNestedReduce`, which unrolls only a `Reduce` inside another's body. Emit −61%, atlas −22%. `HalveFold` (E1b) landed separately. |
 | [emit should just emit](plans/2026-09-12-emit-should-just-emit.md) | G1 (`Guard` node, unchosen) | **G2** — emitter emits it, allocator reads regions off structure, the analysis deletes | G1 is additive by design: nothing constructs a `Guard`, and `arena_to_schedule` panics on one. |
 | [composition is linking](plans/2026-09-09-composition-is-linking.md) | L1, L2, L3 | **L4** — `Ref(k) ⟷ body(k)` as a growth-gated rule | `expand_refs` still inlines every `Ref` unconditionally, so inline-vs-by-reference is not yet a choice. L5 (a survivor is a call) follows. |
 | [one conditional, three lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) | D1 (`mask_support`) | D2 — emit the split | D1 derives the range and checks it; nothing is lowered. |
@@ -38,6 +38,15 @@ the stage.**
 Measured, at `9643f3b`, tile 16, 95 glyphs: optimize ~1,896 ms, emit ~3,704 ms
 (down 76% from the guard fixes), and **21.1 MB of emitted code, mean 227
 KB/glyph**. The code-size number is what 2c exists to collapse.
+
+**After 2c**, same harness and tile, re-baselined on one host (before: emit
+4,640 ms, 21.1 MB): emit **1,431 ms** (−69%), atlas **15.8 MB**, mean **174
+KB/glyph** (−25%), `'@'` alone 478,404 B (−27%), and saturation unmoved at
+~2.5 s. It did not
+collapse, and the reason is named: a glyph's winding fold is nested inside its
+distance fold (`Kernel::by_ref` + `expand_refs`), and `extract_folds` carves
+one level, so the winding is still unrolled. **Nested fold loops** is where the
+rest of that 15.8 MB is.
 
 ---
 
@@ -49,7 +58,7 @@ partially reconstructing it:
 
 | the structure | destroyed by | reconstructed by |
 |---|---|---|
-| a fold — a **loop** | `ExpandReduce`, unconditionally, every time | nothing; the loop is simply gone, so `partition_by_scope` is handed `[0,1]` and can never hoist out of a fold (**N5**, H4) |
+| a fold — a **loop** | ~~`ExpandReduce`, unconditionally~~ → `ExpandNestedReduce`, only a fold inside a fold's body | a fold survives to codegen as a loop (2c); the *nested* one is still unrolled, so a glyph's winding fold is the remaining instance (**N5**, H4) |
 | a reference — a **call** or a block | `ExpandRefs`, unconditionally, *before* saturation | nothing; extraction never sees a boundary to keep (**N2**, N3) |
 | a tabulation — a **name for memory** | `push_gather` in `DiscreteManifold::kernel_for` | a `Gather` case in every pass — `contains_gather`, `lower_dwrt`'s table rule, `MAX_BOUND_BUFFERS` (**N1**, N4) |
 | a select's arms — **blocks** | flattening the DAG to a linear schedule | `cluster_select_arms`, which was a permutation *search* and 73% of a glyph bake (**H5**, now one pass) |

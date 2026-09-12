@@ -74,27 +74,22 @@ pub fn legalize(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), 
     // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
     // has to precede the pass that expands them.
     let (arena, root) = lower_dwrt_owned(&arena, root)?;
-    // `expand_reduce` unconditionally, still: stage 2c's codegen *can*
-    // compile a surviving `Reduce` as a loop (see `pixelflow-codegen`'s
-    // `ScheduledOp::Reduce` handling and its own hand-built tests), but a
-    // `Reduce` combined with a `Select` — exactly `Glyph::over`'s
-    // `inside.select(&distance.0, &ceiling)`, wrapping a fold whose own
-    // per-piece body itself selects on a name-composed (`Kernel::by_ref`)
-    // winding with genuinely *transitioning* per-piece conditions — was
-    // found to compute a wrong, uniformly-wrong answer once real glyph
-    // geometry exercised it; every simpler shape tried first (a shared
-    // invariant leaf alone, a large body, `.dx()`/`.dy()`, a lane- or
-    // row-varying mask, an always-boundary OR, each alone or pairwise)
-    // compiled correctly, so the interaction is narrow but real and not
-    // yet root-caused. `expand_nested_reduce`/`ExpandNestedReduce` below
-    // are kept and correct on their own (they unroll only a `Reduce`
-    // nested inside another's body, which `extract_folds` cannot carve out
-    // at all), but nothing calls them here or from
-    // `pixelflow-search::runtime`'s pipeline yet — both still take this
-    // same unconditional `expand_reduce`, so no `Reduce` reaches a backend
-    // through either compile entry until the `Select` interaction above is
-    // understood.
-    let (arena, root) = expand_reduce_owned(&arena, root);
+    // `expand_nested_reduce`, not `expand_reduce`: a `Reduce` is legal for
+    // codegen now (stage 2c — `pixelflow-codegen` emits a surviving fold as a
+    // loop), so the legalizer's job here shrank to the one shape codegen's
+    // `extract_folds` genuinely cannot carve out — a `Reduce` inside another
+    // `Reduce`'s own body, which `Kernel::by_ref` produces whenever two folds
+    // are composed by name and `expand_refs` splices one into the other. That
+    // one is unrolled; every other fold is left standing.
+    //
+    // This is the whole of the trade stage 2c was for. Unrolling every fold
+    // here meant the assembler saw N copies of a body the language had
+    // written once, and for a glyph N is the piece count. Over a 95-glyph
+    // tile-16 atlas, same host, before and after: emit 4,640 ms -> 1,431 ms,
+    // the emitted atlas 21.1 MB -> 15.8 MB, and `'@'` alone 655,866 B ->
+    // 478,404 B, on nothing but declining to unroll. Saturation is unmoved
+    // (2,534 ms -> 2,569 ms), which is the point of legalizing last.
+    let (arena, root) = expand_nested_reduce_owned(&arena, root);
     let (arena, root) = expand_gather_owned(&arena, root);
     Ok(expand_transcendentals_owned(&arena, root))
 }
@@ -2172,6 +2167,21 @@ fn nested_reduce_bodies(arena: &ExprArena, root: ExprId) -> BTreeSet<ExprId> {
         }
     }
     nested
+}
+
+/// [`expand_nested_reduce`] as an owned rewrite, for [`legalize`]'s chain.
+///
+/// The fast path is the common one: an arena with no `Reduce` nested inside
+/// another's body is handed straight back, which after `expand_refs` is every
+/// kernel that does not compose two folds by name.
+#[must_use]
+pub fn expand_nested_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+    if nested_reduce_bodies(arena, root).is_empty() {
+        return (arena.clone(), root);
+    }
+    let mut owned = arena.clone();
+    let new_root = expand_nested_reduce(&mut owned, root);
+    (owned, new_root)
 }
 
 /// Unroll only the `Reduce`s [`nested_reduce_bodies`] finds, leaving every

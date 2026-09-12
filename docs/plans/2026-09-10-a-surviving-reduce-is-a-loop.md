@@ -443,7 +443,66 @@ load-bearing until the last step. That buys a gate for each piece:
 |---|---|---|
 | **2a** | placements become per-scope | byte-identity — **done**, `cb740e4` |
 | **2b** | a surviving `Reduce` is a def plus a scope | additive — no kernel has one yet |
-| **2c** | delete `ExpandReduce`; the e-graph decides | behaviour |
+| **2c** | delete `ExpandReduce`; the e-graph decides | behaviour — **done** |
+
+**2c, as landed.** `ExpandReduce` is not deleted; it is *demoted*. Legalization
+still has to unroll one shape — a `Reduce` inside another `Reduce`'s own body,
+which `extract_folds` carves out one level at a time and refuses beyond — so
+both compile entries run `ExpandNestedReduce` instead, and every other fold
+reaches the assembler folded. That shape is not hypothetical: `Kernel::by_ref`
+composes a glyph's distance fold with its winding fold by name, and
+`expand_refs` splices the winding's `Reduce` straight into the distance fold's
+body.
+
+Measured over a 95-glyph tile-16 atlas (`pixelflow-pipeline`'s
+`glyph_phase_split`):
+
+| | before | after | |
+|---|---|---|---|
+| emit | 4,640 ms | **1,431 ms** | −69% |
+| optimize | 2,534 ms | 2,569 ms | +1% (unmoved) |
+| atlas code | 21.1 MB | **15.8 MB** | −25% |
+| `'@'` alone | 655,866 B | **478,404 B** | −27% |
+| `'@'` nodes | 7,666 | **2,424** | −68% |
+
+(Both columns measured on the same host in one sitting. BACKLOG's older
+`9643f3b` reading of 3,704 ms for emit was a different machine; the ratio is
+what transfers, not the absolute.)
+
+Code size does **not** collapse, and the reason is the row above it: the
+winding fold is still unrolled, because it is the nested one. Getting the rest
+needs nested fold loops — 2c's own §5 ("No nested reduce loops") is the next
+bite, not a caveat on this one.
+
+### What 2c actually cost: a fold's slots aliased its parent's
+
+Worth recording because it was invisible to every gate until real geometry hit
+it, and because the shape of the mistake is this plan's own subject.
+
+`FrameLayout::resolve` handed every scope slots from offset 0, and the driver
+sized the frame as a plain `max` over scopes. That is *correct* for the two
+collapse prologues and the body: they run one after another, each parking what
+the next needs in a hoist slot above the frame, so an earlier scope's own slots
+are dead by the time a later one opens. A fold is the scope that is not like
+that — its loop runs in the middle of its parent's schedule, with the parent's
+spilled values live across it. Sharing a base meant a glyph's 2,472-def fold
+body wrote its temporaries over all 2,130 of its parent's, and the atlas came
+out blank.
+
+**The frame is a tree, not a max.** `StackFrame::with_base` and a `base`
+parameter on `resolve` say so in the types; the driver walks the scope tree
+(regions and body at 0, each fold at its parent's top) instead of taking a max
+over a flat list. `a_folds_spill_slots_do_not_alias_its_parents` is the guard —
+it needs `K` values live across the loop and `K` more inside it to reach the
+bug, which is why the earlier, smaller hand-built folds all passed.
+
+This also explains a fix that did not work. `7b6ac81` evicts every resident
+register into its slot at a `Reduce`'s position, against the same hazard one
+level up (the fold's nested allocation starts fresh over the whole pool). That
+is a real bug and the eviction is kept — but on its own it made the glyphs
+*worse*, because it pushed more of the parent's live values into exactly the
+slots the fold was about to overwrite. A register fix and a slot fix, and only
+the pair of them is correct.
 
 2a and 2b were planned as three steps, with a middle one that added the tree
 types and no producer for them. That middle step is folded into 2b: types with
