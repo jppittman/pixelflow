@@ -86,12 +86,26 @@ fn bucket(n: u32) -> u32 {
     n.max(1).next_power_of_two()
 }
 
+/// Restrict the walk to one character and one density, for putting a single
+/// compile under a profiler: `PIXELFLOW_GLYPH_ONLY='@'`. A profiler costs
+/// ~50× and the whole walk is ~15 s, so the worst glyph alone is the only
+/// tractable subject.
+fn only() -> Option<char> {
+    std::env::var("PIXELFLOW_GLYPH_ONLY")
+        .ok()
+        .and_then(|s| s.chars().next())
+}
+
 fn main() {
     let data = std::fs::read(FONT_PATH).unwrap_or_else(|e| panic!("read {FONT_PATH}: {e}"));
     let font = Font::parse(&data).expect("parse the production font");
+    let only = only();
 
     println!("kernel\ttile\toptimize_ms\temit_ms\tnodes_in\tnodes_out\tbytes\ttrips");
     for density in DENSITIES {
+        if only.is_some() && density != DENSITIES[0] {
+            break;
+        }
         let tile = tile_for(density);
         let mut opt_ms = 0.0f64;
         let mut emit_ms = 0.0f64;
@@ -105,6 +119,9 @@ fn main() {
         let mut trip_histogram: BTreeMap<u32, usize> = BTreeMap::new();
 
         for ch in WARM_RANGE {
+            if only.is_some_and(|c| c != ch) {
+                continue;
+            }
             let Some(glyph) = font.glyph_kernel_scaled(ch, tile as f32) else {
                 continue;
             };
