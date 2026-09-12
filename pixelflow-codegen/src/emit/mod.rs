@@ -3843,6 +3843,9 @@ mod tests {
     /// `root = Σ_k (p_k + reduce)`.
     #[test]
     fn a_folds_spill_slots_do_not_alias_its_parents() {
+        // Its own `ExprId`, not the module's: that one is imported only for
+        // the 128-bit x86 baseline, and this test is target-agnostic.
+        use pixelflow_ir::arena::ExprId;
         use pixelflow_ir::fold::{Binder, Fold, Monoid};
 
         const K: usize = 20;
