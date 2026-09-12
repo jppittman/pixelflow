@@ -69,6 +69,11 @@ pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 use pixelflow_ir::kind::OpKind;
 
 pub use guards::SelectArm;
+// Production code reads guards off the allocation (`Allocation::select_guards`)
+// rather than calling this directly — see `emit_dag_body_hoisted`. Only the
+// tests, which exercise the analysis against hand-built schedules the
+// allocator never sees, call it themselves.
+#[cfg(test)]
 use guards::analyze_select_guards;
 use traffic::{Counting, EmitTraffic, ScopeTraffic};
 
@@ -1656,10 +1661,14 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     backend.frame_ready(frame_size);
 
     // Select short-circuit guards (disabled in the prologue — see HoistCtx).
-    let select_guards = if hoist.parks_values() {
-        Vec::new()
+    // Read off the allocation rather than recomputed: `schedule` above is
+    // `allocation.schedule()` verbatim, and the allocator already ran this
+    // same analysis against it to place split ranges around each arm (see
+    // `regalloc::Allocation::select_guards`).
+    let select_guards: &[guards::SelectGuard] = if hoist.parks_values() {
+        &[]
     } else {
-        analyze_select_guards(schedule)
+        allocation.select_guards()
     };
     let sched_len = schedule.len();
 

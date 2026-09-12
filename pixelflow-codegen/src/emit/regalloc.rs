@@ -736,6 +736,9 @@ struct ScopeCode {
     /// Values this scope computes for the scopes inside it, in slot order.
     /// Empty for the body, which parks nothing.
     roots: Vec<ValueId>,
+    /// This scope's `Select` guards, straight from the [`Scan`] that produced
+    /// `schedule` — see [`Allocation::select_guards`].
+    guards: Vec<SelectGuard>,
 }
 
 /// The registers one instruction may destroy for its own duration.
@@ -1108,6 +1111,18 @@ impl<'a> Allocation<'a> {
     #[must_use]
     pub fn roots(&self) -> &'a [ValueId] {
         &self.code().roots
+    }
+
+    /// This scope's `Select` short-circuit guards, as analyzed once during
+    /// allocation.
+    ///
+    /// The schedule an emitter reads here is the one the allocator scanned —
+    /// [`schedule`](Self::schedule) never reorders it — so the guard analysis
+    /// is the same question asked and answered twice. This is the answer on
+    /// file; nothing downstream needs to ask again.
+    #[must_use]
+    pub(crate) fn select_guards(&self) -> &'a [SelectGuard] {
+        &self.code().guards
     }
 
     /// The scratch the instruction at schedule position `i` may destroy.
@@ -1484,6 +1499,7 @@ impl RegisterAllocator for LinearScan {
                 schedule: scan.schedule,
                 scratch: scan.scratch,
                 roots: region.roots,
+                guards: scan.guards,
             });
         }
 
@@ -1521,6 +1537,7 @@ impl RegisterAllocator for LinearScan {
                     schedule: scan.schedule,
                     scratch: scan.scratch,
                     roots: fold.roots,
+                    guards: scan.guards,
                 },
             });
         }
@@ -1532,6 +1549,7 @@ impl RegisterAllocator for LinearScan {
                 schedule: body.schedule,
                 scratch: body.scratch,
                 roots: Vec::new(),
+                guards: body.guards,
             },
             folds,
         }
@@ -1593,6 +1611,11 @@ struct Scan {
     /// increasing schedule order. Empty for a value this scope does not place.
     ranges: Vec<Vec<(usize, Where)>>,
     scratch: Vec<Scratch>,
+    /// This scope's `Select` guards, analyzed once against `schedule` here and
+    /// carried into its [`ScopeCode`] rather than recomputed at emission: the
+    /// schedule a scope emits is the one it was scanned with, unchanged, so a
+    /// second analysis of it would answer a question already on file.
+    guards: Vec<SelectGuard>,
 }
 
 impl Scan {
@@ -1977,6 +2000,7 @@ impl LinearScan {
                 schedule: dag,
                 ranges: Vec::new(),
                 scratch: scratch_for,
+                guards: Vec::new(),
             };
         }
 
@@ -2259,6 +2283,7 @@ impl LinearScan {
             schedule: dag,
             ranges: pass.ranges,
             scratch: scratch_for,
+            guards,
         }
     }
 }
