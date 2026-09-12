@@ -2216,6 +2216,21 @@ fn arena_to_schedule(
             ExprNode::Reduce { .. } => {
                 panic!("a bounded fold reached the JIT emitter -- run passes::expand_reduce first")
             }
+            // G1 only makes `Guard` constructible; nothing chooses one
+            // (extraction has no price for it yet, G3) and nothing lowers
+            // one away (there is no legalization pass for it, unlike
+            // `Reduce`/`Ref` above — a `Guard` is not meant to be expanded
+            // before codegen, it is meant to be *emitted*, which is G2's
+            // job: "a mask test, a branch to a label, the arm's body, the
+            // join" (docs/plans/2026-09-12-emit-should-just-emit.md §3). So
+            // a `Guard` reaching this emitter today can only mean it was
+            // constructed and compiled directly, bypassing every stage that
+            // is supposed to gate it.
+            ExprNode::Guard { mask, on, off } => panic!(
+                "arena_to_schedule: Guard(mask={mask:?}, on={on:?}, off={off:?}) \
+                 reached the JIT emitter -- the emitter cannot emit one yet \
+                 (G2, docs/plans/2026-09-12-emit-should-just-emit.md)"
+            ),
         };
         schedule.push(regalloc::Def {
             value: vid,

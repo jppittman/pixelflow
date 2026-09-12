@@ -569,12 +569,15 @@ mod tests {
         assert_eq!(Fold::from_bits(bits), None);
     }
 
-    /// `ExprNode` is capped at 16 bytes (see the static assertion in
-    /// `arena.rs`), and a `Reduce` node holds a `Fold` plus one `ExprId`.
-    /// Adding `stride` grew `Fold` by a `u16` — pinned here as a byte count
+    /// `ExprNode`'s crate-wide budget (see the static assertion in
+    /// `arena.rs`) is a ceiling every variant shares, not a per-variant
+    /// promise — it grew from 16 to 24 when `Guard` arrived with two
+    /// `KernelKey`s, and `Reduce`'s own contribution (a `Fold` plus one
+    /// `ExprId`) is untouched by that move. Pinned here as a byte count
     /// rather than left to the crate-wide assertion alone, so a future field
-    /// that also fits *that* check but pushes `Fold` itself past what a
-    /// `Reduce` node can spare fails here with a number, not just "too big".
+    /// that also fits the crate-wide check but pushes `Fold` itself past
+    /// what a `Reduce` node ought to need fails here with a number, not
+    /// just "too big".
     #[test]
     fn fold_and_expr_node_stay_within_the_sixteen_byte_budget() {
         assert_eq!(
@@ -583,8 +586,14 @@ mod tests {
             "Fold: monoid(1) + binder(1) + lo(2) + hi(2) + stride(2), no padding"
         );
         assert!(
-            core::mem::size_of::<crate::arena::ExprNode>() <= 16,
-            "a Reduce node is a Fold plus one ExprId; see arena.rs's own assertion"
+            core::mem::size_of::<Fold>() + core::mem::size_of::<crate::arena::ExprId>() <= 16,
+            "a Reduce node (a Fold plus one ExprId) should still fit in the \
+             pre-Guard 16-byte budget on its own, regardless of what the \
+             crate-wide ceiling has grown to for other variants"
+        );
+        assert!(
+            core::mem::size_of::<crate::arena::ExprNode>() <= 24,
+            "see arena.rs's own assertion and its comment on why 24, not 16"
         );
     }
 }

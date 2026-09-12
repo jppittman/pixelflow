@@ -188,6 +188,15 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
             arena.push_nary(*op, &mapped)
         }
         ExprNode::Reduce { fold, body } => arena.push_reduce(*fold, m(*body)),
+        // `on`/`off` are names, copied unchanged exactly as `Ref`'s key is
+        // just above — this is the fallback every pass in this module falls
+        // through to when it has no rule for a node, and for a `Guard` that
+        // must mean "leave the arms alone": `expand_refs` in particular
+        // relies on reaching here for `Guard` (it has no rule for one
+        // either), which is what keeps a `Ref` inside an arm unexpanded by
+        // this pass while the mask — a real child, rebuilt through `m` like
+        // any other child — is legalized like the rest of the graph.
+        ExprNode::Guard { mask, on, off } => arena.push_guard(m(*mask), *on, *off),
     }
 }
 
@@ -591,6 +600,14 @@ impl<'a> Substitution<'a> {
                 let body = self.apply(arena, body);
                 arena.push_reduce(fold, body)
             }
+            // Same reasoning as `Ref` just above: an arm names a closed
+            // kernel binding its own indices, so this fold's substitution
+            // cannot reach inside it. Only the mask, a real child of this
+            // arena, can hold the index and is recursed into.
+            ExprNode::Guard { mask, on, off } => {
+                let mask = self.apply(arena, mask);
+                arena.push_guard(mask, on, off)
+            }
         };
         if let Some(slot) = self.memo.get_mut(idx) {
             *slot = Some(new);
@@ -808,6 +825,14 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
         ExprNode::Nary(_, _, _) => {}
         // No rule: `diff_node` raises the error for the fold itself.
         ExprNode::Reduce { .. } => {}
+        // No rule: differentiating a branch is not a question this design
+        // answers (a `Guard`'s two arms are two different functions, and
+        // `Select`'s own rule below blends their derivatives on the primal
+        // mask — whether a `Guard` should do the same, or refuse, is a
+        // decision for whichever stage first composes `Guard` with the
+        // calculus, not G1). `diff_node` raises the error for the node
+        // itself, so nothing here needs its mask's derivative.
+        ExprNode::Guard { .. } => {}
     }
 }
 
@@ -1046,6 +1071,12 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
         // this lowering is a *fallback*; the place for it is the rule set,
         // where the e-graph can also decline it.
         ExprNode::Reduce { .. } => Err("lower_dwrt: no derivative rule for a bounded fold"),
+        // `Select`'s rule blends the branch derivatives on the primal mask;
+        // whether a `Guard` should do the same or refuse outright is a
+        // question for whichever stage first composes `Guard` with the
+        // calculus. G1 only makes the node constructible, so this declines
+        // rather than guess.
+        ExprNode::Guard { .. } => Err("lower_dwrt: no derivative rule for a Guard"),
     }
 }
 
@@ -1660,6 +1691,29 @@ mod dwrt_tests {
         assert!(lower_dwrt_owned(&a, root).is_err());
     }
 
+    /// Same refusal, for the same reason, on a `Guard`: differentiating a
+    /// branch is a decision for whichever stage first composes `Guard` with
+    /// the calculus, not G1 (which only makes the node constructible).
+    #[test]
+    fn differentiating_a_guard_errors_loudly() {
+        let mut a = ExprArena::new();
+        let mask = a.push_var(0);
+        let guard = a.push_guard(
+            mask,
+            crate::key::KernelKey::from_bits(1),
+            crate::key::KernelKey::from_bits(2),
+        );
+        let v0 = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, guard, v0);
+        match lower_dwrt_owned(&a, root) {
+            Err(msg) => assert!(
+                msg.contains("no derivative rule for a Guard"),
+                "unexpected message: {msg}"
+            ),
+            Ok(_) => panic!("lower_dwrt must refuse a Guard"),
+        }
+    }
+
     /// A uniform is a value, never an extent — and that used to need a test,
     /// because the extent was a `Const` child and an arena could be
     /// hand-built (or *rewritten*) into holding a `Uniform` there, at which
@@ -2121,5 +2175,57 @@ mod ref_expansion_tests {
     #[should_panic(expected = "an open term has no identity")]
     fn naming_an_open_term_is_refused() {
         let _refused = Kernel::sum_over(3, |i| i.by_ref());
+    }
+
+    /// **The load-bearing property of G1.** `expand_refs` rewrites
+    /// `ExprNode::Ref` and nothing else, so a `Guard`'s two names — fields,
+    /// not children — are simply not a shape this pass can reach: they
+    /// survive expansion exactly as written. The mask, a real child in this
+    /// arena, has no such protection and is expanded like any other node —
+    /// this is what tells the test apart from a pass that does nothing at
+    /// all.
+    #[test]
+    fn expand_refs_leaves_a_guards_arms_intact() {
+        let on_key = Kernel::x().sqrt().by_ref();
+        let off_key = Kernel::y().neg().by_ref();
+        let on_key = match on_key.parts().0.node(on_key.parts().1) {
+            ExprNode::Ref(k) => *k,
+            other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
+        };
+        let off_key = match off_key.parts().0.node(off_key.parts().1) {
+            ExprNode::Ref(k) => *k,
+            other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
+        };
+
+        // The mask itself is a `Ref` — real expansion work to do, so a
+        // no-op pass could not accidentally pass this test.
+        let named_x = Kernel::x().by_ref();
+        let (mask_arena, mask_root) = named_x.parts();
+        assert!(
+            matches!(mask_arena.node(mask_root), ExprNode::Ref(_)),
+            "test setup: the mask must actually be a Ref"
+        );
+
+        let mut arena = mask_arena.clone();
+        let guard = arena.push_guard(mask_root, on_key, off_key);
+
+        let (expanded, expanded_root) = expand_refs_owned(&arena, guard);
+
+        match expanded.node(expanded_root) {
+            ExprNode::Guard { mask, on, off } => {
+                assert_eq!(*on, on_key, "on must survive expand_refs untouched");
+                assert_eq!(*off, off_key, "off must survive expand_refs untouched");
+                assert!(
+                    !matches!(expanded.node(*mask), ExprNode::Ref(_)),
+                    "the mask, a real child, must still be expanded — got {:?}",
+                    expanded.node(*mask)
+                );
+                assert!(
+                    matches!(expanded.node(*mask), ExprNode::Var(0)),
+                    "the mask named X, so its expansion must read X directly"
+                );
+            }
+            other => panic!("expand_refs must not splice a Guard's arms away, got {other:?}"),
+        }
     }
 }

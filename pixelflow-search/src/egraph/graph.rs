@@ -2876,6 +2876,13 @@ fn instantiate_template<S: NodeSink>(
                 children,
             })
         }
+        // No rule rewrites *into* a `Guard` yet — extraction cannot choose
+        // one over the `Select` it equals (G3), so no RHS template has a
+        // reason to build one, and the e-graph has no `ENode::Guard` for
+        // `sink.make` to produce even if one tried.
+        ExprData::Guard { on, off, .. } => {
+            panic!("instantiate_template: Guard(on={on:?}, off={off:?}) in a rewrite RHS template")
+        }
     }
 }
 

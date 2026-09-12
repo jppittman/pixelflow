@@ -189,6 +189,30 @@ fn a_reference_is_declined_by_every_vocabulary() {
     }
 }
 
+/// A `Guard` is declined too, for a reason specific to this stage rather than
+/// a standing one: extraction has no price for choosing a `Guard` over the
+/// `Select` it equals yet (G3, docs/plans/2026-09-12-emit-should-just-emit.md),
+/// so there is nothing for the e-graph to gain by holding one, and its arms
+/// are unrepresentable as structure for the same reason a `Ref`'s referent
+/// is — nothing here can rewrite inside a name.
+#[test]
+fn a_guard_is_declined_by_every_vocabulary() {
+    let on = KernelStore::intern(&Kernel::x().sqrt());
+    let off = KernelStore::intern(&Kernel::y().neg());
+    let mut arena = ExprArena::new();
+    let mask = arena.push_var(0);
+    let guard = arena.push_guard(mask, on, off);
+
+    for vocab in [Vocabulary::Runtime, Vocabulary::Templates] {
+        let mut eg = EGraph::new();
+        assert_eq!(
+            insert(&arena, guard, &mut eg, vocab),
+            Err(Declined::Guard),
+            "{vocab:?} must decline a Guard"
+        );
+    }
+}
+
 /// And the runtime tier as a whole does not decline it: `ExpandRefs` runs
 /// first, so what reaches the e-graph is the referent's body and the kernel
 /// optimizes exactly as the spliced composition does.
