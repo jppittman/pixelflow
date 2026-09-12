@@ -3,7 +3,7 @@
 //! Each function emits raw machine code bytes for one instruction (or a small fixed sequence).
 //! These are the "atoms" that compound operations are built from.
 
-use super::{AsmInsn, AsmProgram, Gpr, PtrReg, Reg, assemble, unimplemented_op};
+use super::{AsmInsn, AsmProgram, Gpr, Label, LabelRef, PtrReg, Reg, assemble, unimplemented_op};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -85,6 +85,11 @@ pub enum Inst {
     // Control & GPR
     Ret,
     Raw(u32),
+
+    B(B),
+    BCond(BCond),
+    CbzW16(CbzW16),
+    AdrpAdd(AdrpAdd),
 }
 
 impl Inst {
@@ -202,6 +207,17 @@ impl Inst {
             Inst::FmovToGp(src) => FmovToGp::new(src).encode(),
             Inst::Ret => Ret.encode(),
             Inst::Raw(w) => w,
+            // A branch's word is not a pure function of the instruction: its
+            // displacement is not known until the label lands, so it is
+            // written by the assembler and there is nothing to encode here.
+            Inst::B(_) => 0x1400_0000,
+            Inst::BCond(b) => 0x5400_0000 | b.condition as u32,
+            Inst::CbzW16(_) => 0x3400_0010,
+            // Two words, not one — `encode` is for single-word instructions
+            // only, same exclusion as `Ldr`/`Str` above.
+            Inst::AdrpAdd(_) => {
+                panic!("AdrpAdd must be emitted via emit_into or AsmProgram")
+            }
         }
     }
 }
@@ -259,10 +275,56 @@ impl From<table::MvnW> for Inst {
     }
 }
 
+impl From<B> for Inst {
+    #[inline(always)]
+    fn from(b: B) -> Self {
+        Inst::B(b)
+    }
+}
+
+impl From<BCond> for Inst {
+    #[inline(always)]
+    fn from(b: BCond) -> Self {
+        Inst::BCond(b)
+    }
+}
+
+impl From<CbzW16> for Inst {
+    #[inline(always)]
+    fn from(b: CbzW16) -> Self {
+        Inst::CbzW16(b)
+    }
+}
+
+impl From<AdrpAdd> for Inst {
+    #[inline(always)]
+    fn from(a: AdrpAdd) -> Self {
+        Inst::AdrpAdd(a)
+    }
+}
+
 impl crate::emit::AsmInsn for Inst {
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        // A branch is an ordinary instruction whose operand happens to be a
+        // name: `emit_into` writes its word with a zero displacement, and this
+        // says which label the assembler should measure it against.
+        match self {
+            Inst::B(b) => b.label_ref(),
+            Inst::BCond(b) => b.label_ref(),
+            Inst::CbzW16(b) => b.label_ref(),
+            Inst::AdrpAdd(a) => a.label_ref(),
+            _ => None,
+        }
+    }
+
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         match self {
+            Inst::B(b) => b.emit_into(code),
+            Inst::BCond(b) => b.emit_into(code),
+            Inst::CbzW16(b) => b.emit_into(code),
+            Inst::AdrpAdd(a) => a.emit_into(code),
             Inst::Ldr(ldr) => ldr.emit_into(code),
             Inst::Str(str) => str.emit_into(code),
             Inst::Mov(dst, src) => {
@@ -415,74 +477,110 @@ pub fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 // Constant Pool Support
 // =============================================================================
 
+/// What the constant pool is called.
+///
+/// One name per emitted function, because there is one pool per emitted
+/// function: the anchor branches to it before a single constant is known, and
+/// the pool is written where it lands. Nothing is carried between the two —
+/// they agree because they spell the same thing.
+pub const CONST_POOL: &str = "const_pool";
+
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
 pub fn needs_const_pool(val: f32) -> bool {
     val.to_bits() != 0 && try_encode_fmov_imm8(val).is_none()
 }
 
-/// Emit `ADR X17, #0` as a placeholder. Returns the code offset for later patching.
+/// `adrp xd, #0` + `add xd, xd, #0`, sharing one [`Label`]: materialize the
+/// constant pool's address in `dst`.
 ///
-/// ADR encodes a PC-relative offset into X17 (IP1, platform scratch register).
-/// The offset is patched after the constant pool position is known.
-pub fn emit_adr_x17_placeholder(code: &mut Vec<u8>) -> usize {
-    let pos = code.len();
-    // ADR X17, #0 — will be patched. Encoding: 0x10000011 (Rd=X17=17, imm=0)
-    emit32(code, 0x10000011);
-    pos
+/// **Two instructions, because A64 is fixed 32-bit** — no single instruction
+/// holds a 64-bit address. `ADR` reaches ±1 MiB by spending a 21-bit *byte*
+/// displacement; `ADRP` spends the same 21 bits on 4 KiB *pages* instead —
+/// `(PC & !0xFFF) + (imm21 << 12)`, ±4 GiB — and hands back the base of the
+/// target's page, not the target itself. The `ADD`'s 12-bit immediate is
+/// exactly one page wide, so it recovers the low bits `ADRP` had to discard.
+///
+/// **Always both, never the one-instruction `ADR`.** Which one is reachable
+/// depends on the distance to the pool; the pool's position depends on where
+/// every instruction ahead of it landed; and this instruction's own size is
+/// one of those — so choosing the short form is branch relaxation, and
+/// resolving it needs layout iterated to a fixed point to save four bytes
+/// once per compiled function. The alternative this replaced tried to dodge
+/// that fixed point instead of running it: emit `ADR` optimistically,
+/// *estimate* the distance to the not-yet-emitted pool with a magic margin,
+/// and — when the estimate crossed it — splice four bytes into the middle of
+/// already-emitted code to widen it to `ADRP`+`ADD` after the fact. That
+/// splice was sound only because the anchor sits above the whole loop nest,
+/// so every branch in the body had both endpoints on the same side of it; a
+/// branch spanning it would have broken silently. `AdrpAdd` has no estimate
+/// and nothing to splice — its size is fixed before a single byte is laid
+/// out, like every other instruction here.
+///
+/// # Alignment invariant
+///
+/// [`AsmInsn::label_ref`]'s patch below computes pages by masking *buffer
+/// offsets* — positions within the `Vec<u8>` this crate is building, not
+/// runtime addresses. That is correct only because the executable mapping
+/// this buffer is copied into starts on a 4 KiB boundary: `(map + pos) &
+/// !0xFFF == map + (pos & !0xFFF)` for every `pos` exactly when `map` is a
+/// multiple of 4 KiB, which is what lets a page found by masking an offset
+/// stand in for the page a masked address would find. Copy these bytes to an
+/// address that is not 4 KiB-aligned and every `ADRP` here is off by a page.
+///
+/// Two things hold it up, and both are checked rather than assumed:
+/// [`CodePage::from_code`](crate::emit::executable::CodePage::from_code)
+/// writes the buffer at offset 0 of a mapping whose size — and therefore
+/// whose base — is a whole number of pages, pinned by
+/// `page_size_is_a_sane_power_of_two`; and an [`Assembly`] position is an
+/// offset into the *whole* buffer rather than into the part one program
+/// contributed, which is why [`Assembly::from_code`] keeps no base to
+/// subtract. A displacement cannot tell those two apart. A page can.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AdrpAdd {
+    /// Where the address is materialized.
+    pub dst: Gpr,
+    /// The constant pool's position.
+    pub target: Label,
 }
 
-/// Patch a previously emitted `ADR X17` placeholder at `adr_pos` to point to `target_pos`.
-/// If `is_adrp` is true, assumes 8 bytes are reserved and patches `ADRP X17` + `ADD X17`.
-pub fn patch_adr_or_adrp(code: &mut [u8], adr_pos: usize, target_pos: usize, is_adrp: bool) {
-    if is_adrp {
-        assert!(
-            adr_pos + 8 <= code.len(),
-            "patch_adr_or_adrp: adr_pos {} + 8 exceeds code length {}",
-            adr_pos,
-            code.len()
-        );
+impl AsmInsn for AdrpAdd {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        let rd = u32::from(self.dst.0);
+        // ADRP Xd, #0 — page immediate patched by `label_ref` below.
+        emit32(code, 0x9000_0000 | rd);
+        // ADD Xd, Xd, #0 (64-bit immediate form) — within-page offset
+        // patched by `label_ref` below.
+        emit32(code, 0x9100_0000 | (rd << 5) | rd);
+    }
 
-        let pc_page = (adr_pos as i64) & !0xFFF;
-        let target_page = (target_pos as i64) & !0xFFF;
-        let page_offset = (target_page - pc_page) >> 12;
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            // `at` is the ADRP word `emit_into` placed; the ADD it placed
+            // right after sits at `at + 4`. Both words already carry their
+            // opcode and register fields, so this only ORs the immediate in.
+            patch: |code, at, target| {
+                let page = |pos: usize| (pos as i64) & !0xFFF;
+                let pages = (page(target) - page(at)) >> 12;
+                assert!(
+                    (-(1i64 << 20)..(1i64 << 20)).contains(&pages),
+                    "ADRP page offset {pages} out of range (±4GiB)"
+                );
+                let imm = (pages as u32) & 0x1F_FFFF;
+                let immlo = imm & 0x3;
+                let immhi = (imm >> 2) & 0x7_FFFF;
+                let adrp = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                code[at..at + 4]
+                    .copy_from_slice(&(adrp | (immlo << 29) | (immhi << 5)).to_le_bytes());
 
-        assert!(
-            (-(1 << 20)..(1 << 20)).contains(&page_offset),
-            "ADRP page offset {} out of range (±4GB)",
-            page_offset
-        );
-
-        // 1. Patch ADRP
-        let imm_bits = (page_offset as u32) & 0x1F_FFFF;
-        let immlo = imm_bits & 0x3;
-        let immhi = (imm_bits >> 2) & 0x7FFFF;
-        let adrp_inst = 0x90000011 | (immlo << 29) | (immhi << 5);
-        code[adr_pos..adr_pos + 4].copy_from_slice(&adrp_inst.to_le_bytes());
-
-        // 2. Patch ADD (immediate)
-        // ADD X17, X17, #target_pos_within_page
-        let page_inner_offset = (target_pos as u32) & 0xFFF;
-        let add_inst = 0x91000231 | (page_inner_offset << 10);
-        code[adr_pos + 4..adr_pos + 8].copy_from_slice(&add_inst.to_le_bytes());
-    } else {
-        assert!(
-            adr_pos + 4 <= code.len(),
-            "patch_adr_or_adrp: adr_pos {} + 4 exceeds code length {}",
-            adr_pos,
-            code.len()
-        );
-        let offset = (target_pos as i64) - (adr_pos as i64);
-        assert!(
-            (-(1 << 20)..(1 << 20)).contains(&offset),
-            "ADR offset {} out of range (±1MB)",
-            offset
-        );
-        let offset_bits = (offset as u32) & 0x1F_FFFF;
-        let immlo = offset_bits & 0x3;
-        let immhi = (offset_bits >> 2) & 0x7FFFF;
-        let inst = 0x10000011 | (immlo << 29) | (immhi << 5);
-        code[adr_pos..adr_pos + 4].copy_from_slice(&inst.to_le_bytes());
+                let within_page = (target as u32) & 0xFFF;
+                let add = u32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap());
+                code[at + 4..at + 8].copy_from_slice(&(add | (within_page << 10)).to_le_bytes());
+            },
+        })
     }
 }
 
@@ -1132,6 +1230,7 @@ pub fn dump_jit_asm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::Assembly;
 
     #[test]
     fn fmov_imm8_common_values() {
@@ -1159,6 +1258,98 @@ mod tests {
         assert_eq!(try_encode_fmov_imm8(f32::NAN), None);
         assert_eq!(try_encode_fmov_imm8(f32::INFINITY), None);
         assert_eq!(try_encode_fmov_imm8(100.0), None);
+    }
+
+    /// Read an `ADRP`+`ADD` pair back to the buffer offset it materializes.
+    ///
+    /// Written from the ARM ARM's field layout rather than from `AdrpAdd`'s
+    /// patch, so agreeing with it is evidence rather than a tautology.
+    /// `ADRP` is `1 immlo 10000 immhi Rd` with the 21-bit immediate split
+    /// across bits 30:29 and 23:5, counting *pages* from the one holding the
+    /// instruction; `ADD (immediate)` is `1 0 0 100010 sh imm12 Rn Rd`.
+    fn decode_adrp_add(code: &[u8], at: usize) -> (Gpr, i64) {
+        let word = |i: usize| u32::from_le_bytes(code[i..i + 4].try_into().unwrap());
+
+        let adrp = word(at);
+        assert_eq!(adrp & 0x9F00_0000, 0x9000_0000, "not an ADRP: {adrp:#010x}");
+        let imm21 = i64::from(((adrp >> 5) & 0x7_FFFF) << 2 | (adrp >> 29) & 0x3);
+        // Sign-extend from bit 20 — the reach is ±4 GiB, not +8 GiB.
+        let pages = (imm21 << 43) >> 43;
+        let page_base = ((at as i64) & !0xFFF) + (pages << 12);
+
+        let add = word(at + 4);
+        assert_eq!(add & 0xFFC0_0000, 0x9100_0000, "not an ADD: {add:#010x}");
+        let dst = Gpr((add & 0x1F) as u8);
+        assert_eq!(
+            Gpr(((add >> 5) & 0x1F) as u8),
+            dst,
+            "the ADD must accumulate into the register ADRP wrote"
+        );
+
+        (dst, page_base + i64::from((add >> 10) & 0xFFF))
+    }
+
+    /// The pair reaches its label whichever side of a page boundary the label
+    /// falls on — which is the whole reason it is a pair, and which the
+    /// `ADR`-with-a-margin scheme it replaced only ever exercised for pools
+    /// past 1 MiB, i.e. never.
+    #[test]
+    fn adrp_add_reaches_across_pages() {
+        // Distances chosen around 0x1000 so the page delta is 0, then 1, then
+        // more; the last is far enough that no `ADR` would have reached it
+        // under the old scheme's margin either.
+        for gap in [0, 4, 0xFFC, 0x1000, 0x1004, 0x2000, 3 << 20] {
+            let mut asm = Assembly::default();
+            let pool = Label::new(CONST_POOL);
+            asm.push(AdrpAdd {
+                dst: Gpr(17),
+                target: pool,
+            });
+            asm.code.resize(8 + gap, 0);
+            asm.bind(pool);
+
+            let code = asm.finish();
+            assert_eq!(
+                decode_adrp_add(&code, 0),
+                (Gpr(17), (8 + gap) as i64),
+                "gap {gap:#x}"
+            );
+        }
+    }
+
+    /// A label bound *before* the pair still resolves: the page delta is
+    /// negative, and its 21 bits are two's complement rather than a magnitude.
+    /// Nothing emits this today — the pool always trails the anchor — but the
+    /// sign is the easy half of the encoding to get wrong, and it costs one
+    /// test to find out here instead of the first time a label moves.
+    #[test]
+    fn adrp_add_reaches_backwards() {
+        for gap in [0usize, 4, 0x1000, 0x2004] {
+            let mut asm = Assembly::default();
+            let pool = Label::new(CONST_POOL);
+            asm.bind(pool);
+            asm.code.resize(gap, 0);
+            asm.push(AdrpAdd {
+                dst: Gpr(17),
+                target: pool,
+            });
+
+            let code = asm.finish();
+            assert_eq!(decode_adrp_add(&code, gap), (Gpr(17), 0), "gap {gap:#x}");
+        }
+    }
+
+    /// `Inst::encode` is for single-word instructions; `AdrpAdd` is two, like
+    /// `Ldr` and `Str`, and says so rather than handing back half of itself.
+    #[test]
+    #[should_panic(expected = "AdrpAdd")]
+    fn adrp_add_has_no_single_word_encoding() {
+        let word = Inst::from(AdrpAdd {
+            dst: Gpr(17),
+            target: Label::new("end"),
+        })
+        .encode();
+        unreachable!("encode handed back {word:#010x} for a two-word instruction");
     }
 
     #[test]
@@ -1670,12 +1861,6 @@ pub(crate) mod driver {
         }
     }
 
-    /// A pending aarch64 branch: 19-bit conditional or 26-bit unconditional.
-    pub(crate) enum Aarch64Branch {
-        Cond(super::Cond19),
-        Uncond(super::Rel26),
-    }
-
     /// aarch64 implementation of the shared driver's leaf operations.
     ///
     /// Mechanically wraps the existing aarch64 encoders + constant pool, so the
@@ -1751,8 +1936,7 @@ pub(crate) mod driver {
     }
 
     pub(crate) struct Aarch64Backend {
-        pool: ConstPool,
-        adr_patch_pos: usize,
+        consts: ConstPool,
         file: regalloc::RegisterFile,
     }
 
@@ -1765,43 +1949,21 @@ pub(crate) mod driver {
         /// regression.
         #[cfg(test)]
         pub(crate) fn pool_entries(&self) -> &[u32] {
-            &self.pool.entries
+            &self.consts.entries
         }
 
         pub(crate) fn new(ctx: EmitCtx) -> Self {
             Self {
-                pool: ConstPool::new(),
-                adr_patch_pos: 0,
+                consts: ConstPool::new(),
                 file: AARCH64_FILE.capped(ctx.max_regs),
             }
-        }
-
-        /// Append the constant pool after the final RET and patch the ADR anchor
-        /// (upgrading to ADRP+ADD when the pool is out of ADR range). Shared by
-        /// the per-batch epilogue and the collapse-loop scaffold.
-        fn finish_pool(&mut self, code: &mut Vec<u8>) {
-            if self.pool.is_empty() {
-                return;
-            }
-            let adr_pos = self.adr_patch_pos;
-            let estimated_offset = (code.len() as i64) - (adr_pos as i64);
-            let needs_adrp = estimated_offset >= (1 << 20) - 32;
-            if needs_adrp {
-                code.splice(adr_pos + 4..adr_pos + 4, [0, 0, 0, 0]);
-            }
-            while !code.len().is_multiple_of(16) {
-                code.push(0);
-            }
-            let pool_start = code.len();
-            for &bits in &self.pool.entries {
-                super::emit_pool_entry(code, bits);
-            }
-            super::patch_adr_or_adrp(code, adr_pos, pool_start, needs_adrp);
         }
     }
 
     impl IsaBackend for Aarch64Backend {
-        type Branch = Aarch64Branch;
+        fn jump(&mut self, asm: &mut Assembly, label: Label) {
+            asm.push(B { target: label });
+        }
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1820,14 +1982,14 @@ pub(crate) mod driver {
                 if let ScheduledOp::Const(val) = def.op
                     && super::needs_const_pool(val)
                 {
-                    self.pool.push_f32(val)?;
+                    self.consts.push_f32(val)?;
                 }
             }
             // Builtins add up to ~60 polynomial coefficients during emission; bail
             // if the expression constants + headroom would exceed the 12-bit LDR
             // offset limit.
             const BUILTIN_HEADROOM: usize = 128;
-            if self.pool.entries.len() + BUILTIN_HEADROOM > 4095 {
+            if self.consts.entries.len() + BUILTIN_HEADROOM > 4095 {
                 return Err(CompileError::BudgetExceeded(
                     "expression too large: constant pool would exceed 12-bit LDR offset limit",
                 ));
@@ -1840,7 +2002,7 @@ pub(crate) mod driver {
             code: &mut Vec<u8>,
             plan: &InstructionPlan,
         ) -> Result<(), CompileError> {
-            emit_instruction_plan(code, plan, &mut self.pool)
+            emit_instruction_plan(code, plan, &mut self.consts)
         }
 
         fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
@@ -1867,7 +2029,7 @@ pub(crate) mod driver {
             match location_of(locs, vid) {
                 Binding::Loc(Loc::Reg(reg)) => reg,
                 Binding::Remat(bits) => {
-                    emit_const_load(code, target, bits, &self.pool);
+                    emit_const_load(code, target, bits, &self.consts);
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
@@ -1880,49 +2042,27 @@ pub(crate) mod driver {
 
         /// `scratch` is this instruction's own reservation, live for these two
         /// instructions only — the allocator makes it because this backend's
-        /// `guard_temps` asks for one. `_mask_scratch` is unused: this tier
-        /// has no mask-register file, so the reduction stays in the vector
-        /// pool.
-        fn emit_skip_if_all_false(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            scratch: Option<Reg>,
-            _mask_scratch: Option<KReg>,
-        ) -> Aarch64Branch {
-            let scratch = guard_scratch(scratch, mask_reg);
-            AsmProgram::from([Inst::Umaxv(scratch, mask_reg), Inst::FmovToGp(scratch)])
-                .assemble(code);
-            Aarch64Branch::Cond(super::cbz_w16(code))
-        }
-
-        /// `_mask_scratch` is unused — see `emit_skip_if_all_false`.
-        fn emit_skip_if_all_true(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            scratch: Option<Reg>,
-            _mask_scratch: Option<KReg>,
-        ) -> Aarch64Branch {
-            let scratch = guard_scratch(scratch, mask_reg);
-            AsmProgram::from([
-                Inst::Uminv(scratch, mask_reg),
-                Inst::FmovToGp(scratch),
-                Inst::mvn_w(X16, X16),
-            ])
-            .assemble(code);
-            Aarch64Branch::Cond(super::cbz_w16(code))
-        }
-
-        fn emit_jump(&mut self, code: &mut Vec<u8>) -> Aarch64Branch {
-            Aarch64Branch::Uncond(super::b_placeholder(code))
-        }
-
-        fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Aarch64Branch, target: usize) {
-            match branch {
-                Aarch64Branch::Cond(c) => c.patch(code, target),
-                Aarch64Branch::Uncond(b) => b.patch(code, target),
+        /// `guard_temps` asks for one.
+        /// Both polarities end in `cbz w16`, so the arm chooses the
+        /// *reduction*: a horizontal max is zero exactly when no lane is set,
+        /// and an inverted horizontal min is zero exactly when every lane is.
+        fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+            let scratch = guard_scratch(test.scratch, test.reg);
+            match test.arm {
+                SelectArm::True => {
+                    AsmProgram::from([Inst::Umaxv(scratch, test.reg), Inst::FmovToGp(scratch)])
+                        .assemble(&mut asm.code);
+                }
+                SelectArm::False => {
+                    AsmProgram::from([
+                        Inst::Uminv(scratch, test.reg),
+                        Inst::FmovToGp(scratch),
+                        Inst::mvn_w(X16, X16),
+                    ])
+                    .assemble(&mut asm.code);
+                }
             }
+            asm.push(CbzW16 { target: label });
         }
 
         // AAPCS64: x0 = ctx (read-only in the body's gathers), x1 = out,
@@ -1962,12 +2102,33 @@ pub(crate) mod driver {
 
         /// The prologue's and body's constant loads are X17-relative, so the
         /// anchor has to be inside the emitted function, after the frame.
-        fn scaffold_anchor(&mut self, code: &mut Vec<u8>) {
-            self.adr_patch_pos = super::emit_adr_x17_placeholder(code);
+        fn scaffold_anchor(&mut self, asm: &mut Assembly) {
+            asm.push(AdrpAdd {
+                dst: X17.into(),
+                target: Label::new(CONST_POOL),
+            });
         }
 
-        fn scaffold_finish(&mut self, code: &mut Vec<u8>) {
-            self.finish_pool(code);
+        /// Append the constant pool after the final `RET`.
+        ///
+        /// `scaffold_anchor` branches to [`CONST_POOL`] unconditionally —
+        /// whether this compile needed the pool is not known until every
+        /// constant has been emitted — so the name must be written here even
+        /// when there is nothing to append: `Assembly::finish` panics on a
+        /// name nobody wrote, and an unpatched `AdrpAdd` would leave X17
+        /// pointing at itself, same as the unpatched `ADR` this replaced.
+        fn scaffold_finish(&mut self, asm: &mut Assembly) {
+            if self.consts.is_empty() {
+                asm.bind(CONST_POOL);
+                return;
+            }
+            while !asm.code.len().is_multiple_of(16) {
+                asm.code.push(0);
+            }
+            asm.bind(CONST_POOL);
+            for &bits in &self.consts.entries {
+                super::emit_pool_entry(&mut asm.code, bits);
+            }
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
@@ -1987,14 +2148,11 @@ pub(crate) mod driver {
             AsmProgram::from([table::AddI64::new(r, r, table::Imm12(1))]).assemble(code);
         }
 
-        fn branch_if_counter_done(
-            &mut self,
-            code: &mut Vec<u8>,
-            counter: Counter,
-        ) -> Aarch64Branch {
+        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
             AsmProgram::from([table::CmpI64::new(counter_reg(counter), bound_reg(counter))])
-                .assemble(code);
-            Aarch64Branch::Cond(super::b_hs(code))
+                .assemble(&mut asm.code);
+            // The counter runs up to an unsigned bound, so "done" is `>=`.
+            asm.push(BCond::hs(label));
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -2399,90 +2557,394 @@ pub fn ret(code: &mut Vec<u8>) {
     emit32(code, 0xD65F_03C0);
 }
 
-/// A conditional branch whose 19-bit displacement is not filled in yet.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[must_use = "an unpatched branch falls through to itself"]
-pub struct Cond19(usize);
+// =============================================================================
+// Branches as program items
+// =============================================================================
 
-impl Cond19 {
-    /// Point the branch at `target`, a byte offset into the same buffer.
-    #[inline(always)]
-    pub fn patch(self, code: &mut [u8], target: usize) {
-        let offset = ((target as i64 - self.0 as i64) / 4) as i32;
-        assert!(
-            (-(1 << 18)..(1 << 18)).contains(&offset),
-            "19-bit branch offset {offset} out of range (±1MB)"
-        );
-        let imm19 = (offset as u32) & 0x7FFFF;
-        let existing = u32::from_le_bytes([
-            code[self.0],
-            code[self.0 + 1],
-            code[self.0 + 2],
-            code[self.0 + 3],
-        ]);
-        let patched = (existing & 0xFF00_001F) | (imm19 << 5);
-        code[self.0..self.0 + 4].copy_from_slice(&patched.to_le_bytes());
-    }
-}
-
-/// An unconditional branch whose 26-bit displacement is not filled in yet.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[must_use = "an unpatched branch falls through to itself"]
-pub struct Rel26(usize);
-
-impl Rel26 {
-    /// Point the branch at `target`, a byte offset into the same buffer.
-    #[inline(always)]
-    pub fn patch(self, code: &mut [u8], target: usize) {
-        let offset = ((target as i64 - self.0 as i64) / 4) as i32;
-        assert!(
-            (-(1 << 25)..(1 << 25)).contains(&offset),
-            "26-bit branch offset {offset} out of range (±128MB)"
-        );
-        let imm26 = (offset as u32) & 0x03FF_FFFF;
-        let existing = u32::from_le_bytes([
-            code[self.0],
-            code[self.0 + 1],
-            code[self.0 + 2],
-            code[self.0 + 3],
-        ]);
-        let patched = (existing & 0xFC00_0000) | imm26;
-        code[self.0..self.0 + 4].copy_from_slice(&patched.to_le_bytes());
-    }
-}
-
-/// `cbz w16, #0` — branch if W16 == 0 (mask all-false), awaiting patch.
-#[inline(always)]
-pub fn cbz_w16(code: &mut Vec<u8>) -> Cond19 {
-    let at = code.len();
-    emit32(code, 0x3400_0010);
-    Cond19(at)
-}
-
-/// `b.hs` — taken when the previous [`cmp`] found `lhs >= rhs` unsigned.
-#[inline(always)]
-pub fn b_hs(code: &mut Vec<u8>) -> Cond19 {
-    let at = code.len();
-    emit32(code, 0x5400_0002);
-    Cond19(at)
-}
-
-/// `b #0` — unconditional forward branch placeholder awaiting patch.
-#[inline(always)]
-pub fn b_placeholder(code: &mut Vec<u8>) -> Rel26 {
-    let at = code.len();
-    emit32(code, 0x1400_0000);
-    Rel26(at)
-}
-
-/// `b target` — an unconditional branch to an already-known offset.
+/// Where a branch keeps its displacement, and how far it reaches.
 ///
-/// Unlike the x86 counterpart this needs no fixup token: every use in the
-/// scaffold jumps *backwards* to a label already emitted.
-#[inline(always)]
-pub fn b(code: &mut Vec<u8>, target: usize) {
-    let rel = ((target as i64 - code.len() as i64) / 4) as i32;
-    emit32(code, 0x1400_0000 | ((rel as u32) & 0x03FF_FFFF));
+/// A64 has no single `rel32`: `B` carries a 26-bit word displacement in the low
+/// bits, and `B.cond`/`CBZ` carry a 19-bit one starting at bit 5. Two fields,
+/// two ranges — so which one a branch uses is part of what the branch *is*.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct DispField {
+    /// Bit position of the field's low end.
+    shift: u32,
+    /// Field width in bits.
+    bits: u32,
+}
+
+impl DispField {
+    /// `B`'s imm26, at bit 0 — ±128 MiB.
+    const IMM26: Self = Self { shift: 0, bits: 26 };
+    /// `B.cond`'s and `CBZ`'s imm19, at bit 5 — ±1 MiB.
+    const IMM19: Self = Self { shift: 5, bits: 19 };
+
+    /// Overwrite this field of the instruction word at `at` so the branch
+    /// reaches `target`, leaving every other bit — opcode, condition, register
+    /// — exactly as placed.
+    ///
+    /// # Panics
+    ///
+    /// If the displacement is not a whole number of instructions, or does not
+    /// fit. The first is a bug in this crate; the second is a real limit of the
+    /// encoding, though unreachable for anything that compiles — the widest
+    /// body this emitter has produced is 34,993 instructions against `B.cond`'s
+    /// 262,144-word reach.
+    fn write(self, code: &mut [u8], at: usize, target: usize) {
+        let bytes = target as i64 - at as i64;
+        assert!(
+            bytes % 4 == 0,
+            "aarch64 branch displacement is not a whole number of instructions"
+        );
+        let words = bytes / 4;
+        let limit = 1i64 << (self.bits - 1);
+        assert!(
+            (-limit..limit).contains(&words),
+            "branch displacement {words} does not fit {} bits",
+            self.bits
+        );
+        let mask = ((1u32 << self.bits) - 1) << self.shift;
+        let field = ((words as u32) << self.shift) & mask;
+        let existing = u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]);
+        code[at..at + 4].copy_from_slice(&((existing & !mask) | field).to_le_bytes());
+    }
+}
+
+/// The 4-bit condition an A64 `B.cond` tests — the whole field, not a
+/// selection.
+///
+/// `B.cond` is one instruction whose low nibble *is* this value, so the
+/// assembler encodes it by casting. Named by the ARM ARM's mnemonics.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Cond {
+    /// Equal — Z set.
+    Eq = 0x0,
+    /// Not equal — Z clear.
+    Ne = 0x1,
+    /// `HS` / `CS` — C set; unsigned `>=`, and after `FCMP` also "or
+    /// unordered".
+    Hs = 0x2,
+    /// `LO` / `CC` — C clear; unsigned `<`.
+    Lo = 0x3,
+    /// Minus — N set.
+    Mi = 0x4,
+    /// Plus — N clear.
+    Pl = 0x5,
+    /// Overflow set.
+    Vs = 0x6,
+    /// Overflow clear.
+    Vc = 0x7,
+    /// Unsigned `>`.
+    Hi = 0x8,
+    /// Unsigned `<=`.
+    Ls = 0x9,
+    /// Signed `>=`.
+    Ge = 0xA,
+    /// Signed `<`.
+    Lt = 0xB,
+    /// Signed `>`.
+    Gt = 0xC,
+    /// Signed `<=`.
+    Le = 0xD,
+    /// Always.
+    Al = 0xE,
+    /// Never — the encoding exists; the branch is not taken.
+    Nv = 0xF,
+}
+
+/// `b target` — an unconditional branch to a [`Label`], ±128 MiB.
+///
+/// A struct, like every other instruction here, and its label is an operand
+/// like any other. It emits a zero displacement; the assembler writes the real
+/// one once the label lands, which is what [`AsmInsn::label_ref`] tells it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct B {
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl AsmInsn for B {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        emit32(code, 0x1400_0000);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| DispField::IMM26.write(code, at, target),
+        })
+    }
+}
+
+/// `b.cond target` — a conditional branch to a [`Label`], ±1 MiB.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BCond {
+    /// What must hold for the branch to be taken.
+    pub condition: Cond,
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl BCond {
+    /// One constructor per mnemonic, so a call site reads like the assembly it
+    /// is: `BCond::hs(exit)` for `b.hs exit`.
+    ///
+    /// Sugar over the one encoder, not sixteen types: `B.cond` is a single
+    /// instruction whose low nibble is [`Cond`].
+    #[must_use]
+    #[inline(always)]
+    pub const fn eq(target: Label) -> Self {
+        Self::on(Cond::Eq, target)
+    }
+    /// `b.ne`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn ne(target: Label) -> Self {
+        Self::on(Cond::Ne, target)
+    }
+    /// `b.hs` / `b.cs` — unsigned `>=`, and after `FCMP` also "or unordered".
+    #[must_use]
+    #[inline(always)]
+    pub const fn hs(target: Label) -> Self {
+        Self::on(Cond::Hs, target)
+    }
+    /// `b.lo` / `b.cc` — unsigned `<`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn lo(target: Label) -> Self {
+        Self::on(Cond::Lo, target)
+    }
+    /// `b.hi` — unsigned `>`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn hi(target: Label) -> Self {
+        Self::on(Cond::Hi, target)
+    }
+    /// `b.ls` — unsigned `<=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn ls(target: Label) -> Self {
+        Self::on(Cond::Ls, target)
+    }
+    /// `b.ge` — signed `>=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn ge(target: Label) -> Self {
+        Self::on(Cond::Ge, target)
+    }
+    /// `b.lt` — signed `<`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn lt(target: Label) -> Self {
+        Self::on(Cond::Lt, target)
+    }
+    /// `b.gt` — signed `>`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn gt(target: Label) -> Self {
+        Self::on(Cond::Gt, target)
+    }
+    /// `b.le` — signed `<=`.
+    #[must_use]
+    #[inline(always)]
+    pub const fn le(target: Label) -> Self {
+        Self::on(Cond::Le, target)
+    }
+    /// `b.mi` — negative.
+    #[must_use]
+    #[inline(always)]
+    pub const fn mi(target: Label) -> Self {
+        Self::on(Cond::Mi, target)
+    }
+    /// `b.pl` — non-negative.
+    #[must_use]
+    #[inline(always)]
+    pub const fn pl(target: Label) -> Self {
+        Self::on(Cond::Pl, target)
+    }
+    /// `b.vs` — overflow set.
+    #[must_use]
+    #[inline(always)]
+    pub const fn vs(target: Label) -> Self {
+        Self::on(Cond::Vs, target)
+    }
+    /// `b.vc` — overflow clear.
+    #[must_use]
+    #[inline(always)]
+    pub const fn vc(target: Label) -> Self {
+        Self::on(Cond::Vc, target)
+    }
+
+    /// The branch on a condition chosen at run time, where no single mnemonic
+    /// names it.
+    #[must_use]
+    #[inline(always)]
+    pub const fn on(condition: Cond, target: Label) -> Self {
+        Self { condition, target }
+    }
+}
+
+impl AsmInsn for BCond {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        emit32(code, 0x5400_0000 | self.condition as u32);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| DispField::IMM19.write(code, at, target),
+        })
+    }
+}
+
+/// `cbz w16, target` — taken when W16 is zero. ±1 MiB.
+///
+/// W16 rather than a register operand because W16 *is* the branch-test scratch
+/// in this backend's ABI: the guard path reduces a mask into it with
+/// `umaxv`/`uminv` + `fmov`, and nothing else may hold a value there. A
+/// register parameter would suggest a choice the ABI does not offer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CbzW16 {
+    /// Where it goes.
+    pub target: Label,
+}
+
+impl AsmInsn for CbzW16 {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        emit32(code, 0x3400_0010);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| DispField::IMM19.write(code, at, target),
+        })
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::emit::{AsmProgram, Item, Label};
+
+    /// One known word, so a test can measure distances in instructions without
+    /// depending on any real encoding.
+    const NOP: Inst = Inst::Raw(0xD503_201F);
+
+    fn assemble(items: impl IntoIterator<Item = Item<Inst>>) -> Vec<u8> {
+        let mut code = Vec::new();
+        AsmProgram::new(items).assemble(&mut code);
+        code
+    }
+
+    fn word_at(code: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+    }
+
+    #[test]
+    fn forward_branch_counts_instructions_not_bytes() {
+        let end = Label::new("end");
+        let code = assemble([
+            Item::Inst(B { target: end }.into()),
+            Item::Inst(NOP),
+            Item::Inst(NOP),
+            Item::Label(end),
+        ]);
+        // Three instructions ahead of the branch's own address.
+        assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 3);
+    }
+
+    #[test]
+    fn a_back_edge_is_negative() {
+        let top = Label::new("end");
+        let code = assemble([
+            Item::Label(top),
+            Item::Inst(NOP),
+            Item::Inst(NOP),
+            Item::Inst(B { target: top }.into()),
+        ]);
+        // The branch sits two instructions past the label, so -2 words, in
+        // imm26's two's complement.
+        assert_eq!(
+            word_at(&code, 8) & 0x03FF_FFFF,
+            (-2i32 as u32) & 0x03FF_FFFF
+        );
+    }
+
+    #[test]
+    fn a_conditional_writes_imm19_and_keeps_its_condition() {
+        let exit = Label::new("end");
+        let code = assemble([
+            Item::Inst(BCond::hs(exit).into()),
+            Item::Inst(NOP),
+            Item::Label(exit),
+        ]);
+        let w = word_at(&code, 0);
+        assert_eq!((w >> 5) & 0x7FFFF, 2, "two words ahead");
+        // Opcode and cond field (HS = 0b0010) survive the field write.
+        assert_eq!(w & 0xFF00_001F, 0x5400_0002);
+    }
+
+    #[test]
+    fn cbz_keeps_its_register() {
+        let exit = Label::new("end");
+        let code = assemble([
+            Item::Inst(CbzW16 { target: exit }.into()),
+            Item::Inst(NOP),
+            Item::Label(exit),
+        ]);
+        let w = word_at(&code, 0);
+        assert_eq!((w >> 5) & 0x7FFFF, 2);
+        assert_eq!(w & 0xFF00_001F, 0x3400_0010, "still cbz w16");
+    }
+
+    /// A label may name a position no instruction occupies — the end of the
+    /// program. That is why a label is an item of its own rather than a field
+    /// on an instruction: there is nothing here to hang it on.
+    #[test]
+    fn a_label_can_end_the_program() {
+        let end = Label::new("end");
+        let code = assemble([Item::Inst(B { target: end }.into()), Item::Label(end)]);
+        assert_eq!(code.len(), 4);
+        assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 1);
+    }
+
+    #[test]
+    fn a_program_is_position_independent() {
+        let end = Label::new("end");
+        let items = [
+            Item::Inst(B { target: end }.into()),
+            Item::Inst(NOP),
+            Item::Label(end),
+        ];
+        let mut offset = alloc::vec![0xAAu8; 4];
+        AsmProgram::new(items).assemble(&mut offset);
+        assert_eq!(&assemble(items)[..], &offset[4..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit 19 bits")]
+    fn a_conditional_refuses_what_it_cannot_reach() {
+        let mut code = alloc::vec![0u8; 4];
+        DispField::IMM19.write(&mut code, 0, 1 << 20);
+    }
+
+    /// A64 is fixed-width, so a displacement that is not a whole number of
+    /// instructions means this crate laid something out unaligned.
+    #[test]
+    #[should_panic(expected = "not a whole number of instructions")]
+    fn an_unaligned_displacement_is_a_bug() {
+        let mut code = alloc::vec![0u8; 4];
+        DispField::IMM26.write(&mut code, 0, 2);
+    }
 }
 
 #[cfg(test)]
@@ -2540,30 +3002,6 @@ mod xr_tests {
             "immediate form"
         );
         assert_eq!(word(|c| add(c, X1, X1, X4)) >> 24, 0x8B, "register form");
-    }
-
-    /// A conditional branch is emitted as a placeholder and patched to a
-    /// forward target; the displacement counts instructions, not bytes.
-    #[test]
-    fn conditional_branches_patch_forward_in_instructions() {
-        let mut c = Vec::new();
-        let br = b_hs(&mut c);
-        c.resize(24, 0); // three more instructions
-        br.patch(&mut c, 24);
-        let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        assert_eq!((w >> 5) & 0x7FFFF, 6, "24 bytes ahead is 6 instructions");
-        assert_eq!(w & 0xF, 0x2, "cond = HS");
-    }
-
-    /// An unconditional backward branch encodes a negative instruction count.
-    #[test]
-    fn unconditional_branches_go_backwards() {
-        let mut c = vec![0u8; 16];
-        b(&mut c, 0);
-        let w = u32::from_le_bytes([c[16], c[17], c[18], c[19]]);
-        assert_eq!(w >> 26, 0x05, "B opcode");
-        // -4 instructions, in 26-bit two's complement.
-        assert_eq!(w & 0x03FF_FFFF, (-4i32 as u32) & 0x03FF_FFFF);
     }
 
     /// `Xr` and `Reg` name different files; the same index is a different

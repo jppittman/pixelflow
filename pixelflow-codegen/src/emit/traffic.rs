@@ -22,7 +22,7 @@
 //! than a silently dropped term.
 
 use super::regalloc::ValueId;
-use super::{Binding, InstructionPlan, IsaBackend, KReg, Loc, Reg, Reload};
+use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload};
 use crate::error::CompileError;
 
 /// Emitted traffic within one scope of the collapse nest.
@@ -135,7 +135,9 @@ impl<'a, B: IsaBackend> Counting<'a, B> {
 }
 
 impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
-    type Branch = B::Branch;
+    fn jump(&mut self, asm: &mut super::Assembly, label: super::Label) {
+        self.inner.jump(asm, label);
+    }
 
     fn register_file(&self) -> super::regalloc::RegisterFile {
         self.inner.register_file()
@@ -197,34 +199,13 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.emit_resolve(code, vid, target, locs)
     }
 
-    fn emit_skip_if_all_false(
+    fn branch_if_arm_is_dead(
         &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-        mask_scratch: Option<KReg>,
-    ) -> Self::Branch {
-        self.inner
-            .emit_skip_if_all_false(code, mask_reg, scratch, mask_scratch)
-    }
-
-    fn emit_skip_if_all_true(
-        &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-        mask_scratch: Option<KReg>,
-    ) -> Self::Branch {
-        self.inner
-            .emit_skip_if_all_true(code, mask_reg, scratch, mask_scratch)
-    }
-
-    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch {
-        self.inner.emit_jump(code)
-    }
-
-    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Self::Branch, target: usize) {
-        self.inner.patch_branch(code, branch, target);
+        asm: &mut super::Assembly,
+        test: super::MaskTest,
+        label: super::Label,
+    ) {
+        self.inner.branch_if_arm_is_dead(asm, test, label);
     }
 
     fn body_frame_bytes(&self, frame_size: u32) -> u32 {
@@ -239,12 +220,12 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.frame_free(code, bytes);
     }
 
-    fn scaffold_anchor(&mut self, code: &mut Vec<u8>) {
-        self.inner.scaffold_anchor(code);
+    fn scaffold_anchor(&mut self, asm: &mut super::Assembly) {
+        self.inner.scaffold_anchor(asm);
     }
 
-    fn scaffold_finish(&mut self, code: &mut Vec<u8>) {
-        self.inner.scaffold_finish(code);
+    fn scaffold_finish(&mut self, asm: &mut super::Assembly) {
+        self.inner.scaffold_finish(asm);
     }
 
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
@@ -273,10 +254,11 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
 
     fn branch_if_counter_done(
         &mut self,
-        code: &mut Vec<u8>,
+        asm: &mut super::Assembly,
         counter: super::Counter,
-    ) -> Self::Branch {
-        self.inner.branch_if_counter_done(code, counter)
+        label: super::Label,
+    ) {
+        self.inner.branch_if_counter_done(asm, counter, label);
     }
 
     fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {

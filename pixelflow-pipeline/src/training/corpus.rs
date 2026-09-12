@@ -261,6 +261,15 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                          kernel interned in this process — a corpus outlives the process, so \
                          the key would read back naming nothing"
                     ),
+                    // Same reasoning as `Ref`: `on`/`off` name kernels in
+                    // this process's `KernelStore` too, and nothing produces
+                    // a `Guard` for a corpus entry to hold yet (G1: never
+                    // chosen).
+                    ExprNode::Guard { mask: _, on, off } => panic!(
+                        "reachable_subtree: expression references Guard(on={on:?}, \
+                         off={off:?}) — a corpus outlives the process these keys are \
+                         interned in"
+                    ),
                     ExprNode::Unary(op, a) => out_arena.push_unary(*op, map(*a)),
                     ExprNode::Binary(op, a, b) => out_arena.push_binary(*op, map(*a), map(*b)),
                     ExprNode::Ternary(op, a, b, c) => {
@@ -406,6 +415,19 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Ref({k:?}) has no corpus encoding: it names a process-local kernel"),
+            ));
+        }
+        // Same reasoning as `Ref`, and unreachable for the same practical
+        // one: `write_entry` compacts through `reachable_subtree` first,
+        // which already refuses a `Guard`. Kept exhaustive rather than
+        // relying on that ordering.
+        ExprNode::Guard { mask: _, on, off } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Guard(on={on:?}, off={off:?}) has no corpus encoding: its arms name \
+                     process-local kernels"
+                ),
             ));
         }
     }

@@ -40,6 +40,17 @@ pub enum Declined {
     /// rewrite, and inlining it inside saturation is a rule that does not
     /// exist yet (docs/plans/2026-09-09-composition-is-linking.md §3).
     Ref(pixelflow_ir::KernelKey),
+    /// A `Guard` — the hard lowering of a `Select`
+    /// (docs/plans/2026-09-12-emit-should-just-emit.md). Declined for a
+    /// reason specific to this stage (G1), not a standing one: extraction
+    /// has no price for choosing a `Guard` over the `Select` it is equal to,
+    /// so there is nothing yet for the e-graph to gain by holding one — the
+    /// same position `Ref` is in, but temporary rather than structural.
+    /// `Guard`'s arms name kernels the same way a `Ref` does, and are
+    /// unrepresentable as e-graph structure for the same reason: nothing
+    /// here can rewrite inside a name. G3 is what gives extraction a price
+    /// and this decline something to change.
+    Guard,
 }
 
 /// Insert the subgraph reachable from `root` into `egraph`, returning the
@@ -97,6 +108,7 @@ pub fn insert<I: Ir>(
                         Vocabulary::Runtime => return Err(Declined::Param(i)),
                     },
                     Shape::Ref(key) => return Err(Declined::Ref(key)),
+                    Shape::Guard { .. } => return Err(Declined::Guard),
                     Shape::Buffer(decl) => egraph.add(ENode::Buffer(decl)),
                     Shape::Uniform(decl) => egraph.add(ENode::Uniform(decl)),
                     Shape::Op(kind, children) => {
@@ -179,6 +191,7 @@ pub fn reachable_count<I: Ir>(term: &I, root: I::Ref) -> usize {
                 }
             },
             Shape::Reduce { body, .. } => stack.push(body),
+            Shape::Guard { mask, .. } => stack.push(mask),
             _ => {}
         }
     }

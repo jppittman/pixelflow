@@ -60,6 +60,21 @@ pub enum ExprData {
     /// contain. What it names is a *kernel*, which is what makes it the one
     /// of the three that can be resolved back into graph.
     Ref(KernelKey),
+    /// The hard lowering of [`OpKind::Select`](crate::kind::OpKind::Select):
+    /// a branch, where only the taken arm's body runs, denoting the same
+    /// function as the soft (blend) form
+    /// (docs/plans/2026-09-12-emit-should-just-emit.md §1). Mirrors
+    /// [`crate::arena::ExprNode::Guard`], whose doc has the full reasoning
+    /// for why the arms are names and not children.
+    ///
+    /// One field short of its arena twin: `on`/`off` are carried here, same
+    /// as there, but the mask is not — a `Dag` node's one child is already
+    /// the edge the builder passed at construction (see [`Reduce`](Self::Reduce),
+    /// whose body is the same kind of implicit edge), so repeating it as a
+    /// field here would be two names for one thing rather than the deliberate
+    /// two names [`ExprNode::Guard`](crate::arena::ExprNode::Guard) gives the
+    /// arms.
+    Guard { on: KernelKey, off: KernelKey },
 }
 
 impl ExprData {
@@ -114,6 +129,7 @@ pub(crate) trait ExprBuilderExt {
     fn push_nary(&mut self, op: OpKind, children: &[Id]) -> Id;
     fn push_reduce(&mut self, fold: Fold, body: Id) -> Id;
     fn push_ref(&mut self, key: KernelKey) -> Id;
+    fn push_guard(&mut self, mask: Id, on: KernelKey, off: KernelKey) -> Id;
 }
 
 impl ExprBuilderExt for Builder<ExprData> {
@@ -170,6 +186,11 @@ impl ExprBuilderExt for Builder<ExprData> {
     #[inline]
     fn push_ref(&mut self, key: KernelKey) -> Id {
         self.push_unique(ExprData::Ref(key), &[])
+    }
+
+    #[inline]
+    fn push_guard(&mut self, mask: Id, on: KernelKey, off: KernelKey) -> Id {
+        self.push_unique(ExprData::Guard { on, off }, &[mask])
     }
 }
 
@@ -365,6 +386,7 @@ pub fn from_arena_roots(
                     ExprNode::Uniform(uni) => b.push_uniform(uni),
                     ExprNode::Ref(key) => b.push_ref(key),
                     ExprNode::Reduce { fold, .. } => b.push_reduce(fold, child_ids[0]),
+                    ExprNode::Guard { on, off, .. } => b.push_guard(child_ids[0], on, off),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _)
@@ -425,6 +447,7 @@ pub fn to_arena_roots(
             ExprData::Uniform(u) => arena.push_uniform(u),
             ExprData::Ref(key) => arena.push_ref(key),
             ExprData::Reduce(fold) => arena.push_reduce(fold, child_ids[0]),
+            ExprData::Guard { on, off } => arena.push_guard(child_ids[0], on, off),
             ExprData::Op(op) => match child_ids.len() {
                 1 => arena.push_unary(op, child_ids[0]),
                 2 => arena.push_binary(op, child_ids[0], child_ids[1]),

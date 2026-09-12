@@ -334,6 +334,15 @@ fn canonical_key(arena: &ExprArena, root: ExprId) -> Vec<u8> {
                 key.extend_from_slice(&fold.to_bits().to_le_bytes());
                 push_id(&mut key, &dense, body);
             }
+            // Same shape as `pixelflow_ir::key`'s canonical form: the mask
+            // densifies as a child, `on`/`off` are content-addressed and go
+            // in directly.
+            &ExprNode::Guard { mask, on, off } => {
+                key.push(11);
+                push_id(&mut key, &dense, mask);
+                key.extend_from_slice(&on.bits().to_le_bytes());
+                key.extend_from_slice(&off.bits().to_le_bytes());
+            }
             &ExprNode::Unary(op, a) => {
                 key.push(4);
                 key.extend_from_slice(&op.marshal().to_bytes());
@@ -1702,7 +1711,10 @@ pub(crate) mod production_telemetry {
                 // A fold survives extraction now; the legalizer unrolls it
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),
-                other @ (ExprNode::Param(_) | ExprNode::Nary(..) | ExprNode::Ref(_)) => {
+                other @ (ExprNode::Param(_)
+                | ExprNode::Nary(..)
+                | ExprNode::Ref(_)
+                | ExprNode::Guard { .. }) => {
                     panic!("extracted arena contains {other:?}")
                 }
             };

@@ -999,7 +999,9 @@ pub(crate) mod driver {
     }
 
     impl IsaBackend for Avx2Backend {
-        type Branch = usize;
+        fn jump(&mut self, asm: &mut Assembly, label: Label) {
+            asm.push(x86::Jmp { target: label });
+        }
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1169,41 +1171,18 @@ pub(crate) mod driver {
         // X86Backend's MOVMSKPS guards but 8 lanes wide (al == 0xFF for
         // all-true, not 0x0F — see `super::emit_cmp_al_imm8`'s doc for why the
         // sign-extending `cmp eax, imm8` X86Backend uses doesn't work here).
-        /// `_scratch`/`_mask_scratch` are unused: this tier's guard reduces
-        /// the mask with `movmskps`/`kortest` into the flags, needing no
-        /// vector or mask register.
-        fn emit_skip_if_all_false(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-            _mask_scratch: Option<KReg>,
-        ) -> usize {
-            super::emit_movmskps_eax(code, mask_reg);
-            x86_64::emit_test_eax(code);
-            x86_64::je(code).field() // ZF set when eax == 0 (all lanes false)
-        }
-
-        /// `_scratch`/`_mask_scratch` are unused: this tier's guard reduces
-        /// the mask with `movmskps`/`kortest` into the flags, needing no
-        /// vector or mask register.
-        fn emit_skip_if_all_true(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-            _mask_scratch: Option<KReg>,
-        ) -> usize {
-            super::emit_movmskps_eax(code, mask_reg);
-            super::emit_cmp_al_imm8(code, 0xFF);
-            x86_64::je(code).field() // ZF set when al == 0xFF (all lanes true)
-        }
-
-        fn emit_jump(&mut self, code: &mut Vec<u8>) -> usize {
-            x86_64::emit_jmp_rel32(code)
-        }
-        fn patch_branch(&mut self, code: &mut Vec<u8>, branch: usize, target: usize) {
-            x86_64::patch_rel32(code, branch, target);
+        /// [`MaskTest::scratch`] and [`MaskTest::mask_scratch`] are both
+        /// unused: this tier reduces the mask with `movmskps` into the
+        /// flags, needing neither a vector nor a mask register.
+        fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+            super::emit_movmskps_eax(&mut asm.code, test.reg);
+            match test.arm {
+                // ZF set when eax == 0: no lane is true, so the true arm is dead.
+                SelectArm::True => x86_64::emit_test_eax(&mut asm.code),
+                // ZF set when al == 0xFF: every lane is true, so the false arm is.
+                SelectArm::False => super::emit_cmp_al_imm8(&mut asm.code, 0xFF),
+            }
+            asm.push(x86::Jcc::je(label));
         }
 
         // Same scaffold register roles as SSE2 — see `x86_64::scaffold` — at
@@ -1247,8 +1226,8 @@ pub(crate) mod driver {
             x86::scaffold::counter_step(code, counter);
         }
 
-        fn branch_if_counter_done(&mut self, code: &mut Vec<u8>, counter: Counter) -> usize {
-            x86::scaffold::branch_if_counter_done(code, counter)
+        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
+            x86::scaffold::branch_if_counter_done(asm, counter, label);
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -1271,6 +1250,7 @@ pub(crate) mod driver {
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
         }
 
+        /// `ucomiss` is scalar, so this tier's wider broadcast makes no
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
             AsmProgram::from([x86::Inst::Ret]).assemble(code);
         }

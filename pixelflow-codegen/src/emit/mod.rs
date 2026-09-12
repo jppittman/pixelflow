@@ -69,6 +69,11 @@ pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 use pixelflow_ir::kind::OpKind;
 
 pub use guards::SelectArm;
+// Production code reads guards off the allocation (`Allocation::select_guards`)
+// rather than calling this directly — see `emit_dag_body_hoisted`. Only the
+// tests, which exercise the analysis against hand-built schedules the
+// allocator never sees, call it themselves.
+#[cfg(test)]
 use guards::analyze_select_guards;
 use traffic::{Counting, EmitTraffic, ScopeTraffic};
 
@@ -80,6 +85,18 @@ use crate::error::CompileError;
 pub trait AsmInsn: Copy {
     /// Emit the instruction's encoded bytes into the output buffer.
     fn emit_into(self, code: &mut Vec<u8>);
+
+    /// The position this instruction's bytes depend on, if any.
+    ///
+    /// Almost every instruction is position-independent and takes the default.
+    /// A branch is not: it emits a placeholder displacement in `emit_into` and
+    /// says here which [`Label`] it is waiting on and how to fill the
+    /// placeholder in. That is the whole of what a branch adds — it is an
+    /// ordinary instruction that takes a name instead of a number.
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        None
+    }
 }
 
 /// A declarative sequence of assembly instructions.
@@ -103,9 +120,18 @@ impl<S> AsmProgram<S> {
     }
 }
 
-impl<I: AsmInsn, const N: usize> From<[I; N]> for AsmProgram<[I; N]> {
+impl<I: AsmInsn, const N: usize> From<[I; N]> for AsmProgram<[Item<I>; N]> {
     #[inline(always)]
     fn from(insts: [I; N]) -> Self {
+        Self {
+            insts: insts.map(Item::Inst),
+        }
+    }
+}
+
+impl<I: AsmInsn, const N: usize> From<[Item<I>; N]> for AsmProgram<[Item<I>; N]> {
+    #[inline(always)]
+    fn from(insts: [Item<I>; N]) -> Self {
         Self { insts }
     }
 }
@@ -124,17 +150,33 @@ impl<'a, I: AsmInsn> From<&'a [I]> for AsmProgram<&'a [I]> {
     }
 }
 
-impl<I: AsmInsn, S: IntoIterator<Item = I>> AsmProgram<S> {
+impl<I: AsmInsn, S: IntoIterator<Item = Item<I>>> AsmProgram<S> {
     /// Assemble the program into the machine-code buffer.
+    ///
+    /// Lay the items out, then fill in the displacements that could not be
+    /// known until the layout was. A program with no [`Item::Label`] in it
+    /// never reaches the second pass, which is why it used to be a one-pass
+    /// map — that is the only thing labels changed.
+    ///
+    /// # Panics
+    ///
+    /// If a label is bound twice, or a branch names one that nothing bound.
+    /// Only this crate writes these programs, so either is a bug here rather
+    /// than a fact about the kernel being compiled.
     #[inline]
     pub fn assemble(self, code: &mut Vec<u8>) {
-        for inst in self.insts {
-            inst.emit_into(code);
+        let mut asm = Assembly::from_code(core::mem::take(code));
+        for item in self.insts {
+            match item {
+                Item::Inst(inst) => asm.push(inst),
+                Item::Label(label) => asm.bind(label),
+            }
         }
+        *code = asm.finish();
     }
 }
 
-impl<I: AsmInsn, S: IntoIterator<Item = I> + Copy> AsmInsn for AsmProgram<S> {
+impl<I: AsmInsn, S: IntoIterator<Item = Item<I>> + Copy> AsmInsn for AsmProgram<S> {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         self.assemble(code);
@@ -144,7 +186,224 @@ impl<I: AsmInsn, S: IntoIterator<Item = I> + Copy> AsmInsn for AsmProgram<S> {
 /// Free-function fold: assemble a declarative sequence directly into `code`.
 #[inline]
 pub fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = I>) {
-    AsmProgram::new(insts).assemble(code);
+    AsmProgram::new(insts.into_iter().map(Item::Inst)).assemble(code);
+}
+
+// =============================================================================
+// Labels: a name for a position, bound at assembly time
+// =============================================================================
+
+/// A name for a position in the emitted program.
+///
+/// Most instructions are position-*independent*: they write their own bytes and
+/// do not care where they sit. A branch is the exception, and it used to be
+/// handled outside the assembler entirely — `emit_jump` returned a fixup token,
+/// the caller carried it to a `patch_branch` twenty lines later, and the target
+/// was a `code.len()` read off at the one point in the sequence where that was
+/// correct.
+///
+/// A label is the missing name, and it makes a branch an ordinary instruction
+/// again: [`x86_64::Jmp`] and friends *take a `Label`*. Assembling is then two
+/// passes instead of one — lay the items out, then fill in the displacements
+/// that could not be known until the layout was — which is the only thing that
+/// changed.
+/// A label is a **name**.
+///
+/// That is the whole of it. You write instructions and labels, you assemble,
+/// you get a binary; addresses never come back out, and the caller is not a
+/// participant in working them out. Mapping names to hex is the assembler's
+/// job, which is the only reason to have one.
+///
+/// So this is not a handle. There is nothing to mint, nothing to keep, and no
+/// table to look a name up in — a branch to `"row_top"` and the `"row_top"`
+/// written later in the stream are the same label because they are the same
+/// name. Whatever the emitter uses to *build* a name — a schedule index, a
+/// `ValueId`, a guard arm — is its own business and stops here.
+///
+/// The name is inline rather than a `String` so that a label is `Copy`: a
+/// branch instruction holds one, and [`AsmInsn`] is `Copy`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Label {
+    name: [u8; Self::CAPACITY],
+    len: u8,
+}
+
+impl Label {
+    /// The longest a name may be. Generous for the names this emitter writes
+    /// (`"batch_exit"`, `"v1234_past_true"`) and small enough that carrying
+    /// one inside an instruction is free.
+    pub const CAPACITY: usize = 31;
+
+    /// The label called `name`.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is longer than [`Label::CAPACITY`]. Only this crate writes
+    /// these programs, and a truncated name is one that silently aliases
+    /// another — so it refuses rather than trims.
+    #[must_use]
+    pub fn new(name: &str) -> Self {
+        let bytes = name.as_bytes();
+        assert!(
+            bytes.len() <= Self::CAPACITY,
+            "label {name:?} is longer than {} bytes",
+            Self::CAPACITY
+        );
+        let mut buffer = [0u8; Self::CAPACITY];
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            name: buffer,
+            len: bytes.len() as u8,
+        }
+    }
+
+    /// The name, as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.len as usize])
+            .unwrap_or_else(|_| unreachable!("built from a &str"))
+    }
+}
+
+impl From<&str> for Label {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl core::fmt::Display for Label {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::fmt::Debug for Label {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+/// How an instruction whose bytes depend on a position gets those bytes.
+///
+/// Returned by [`AsmInsn::label_ref`]. The instruction emits a placeholder in
+/// `emit_into`; `patch` fills the displacement in once the label's position is
+/// known. A function pointer rather than a trait object or a type parameter
+/// because the encoding is the instruction's own business and nothing else in
+/// the assembler needs to know it — an x86 `rel32` four bytes in, an aarch64
+/// `imm19` five bits up in the word.
+#[derive(Copy, Clone)]
+pub struct LabelRef {
+    /// The position this instruction is waiting on.
+    pub label: Label,
+    /// Fill in the displacement of an instruction that was emitted at `at`, so
+    /// that it reaches `target`. Both are offsets from the start of the
+    /// program.
+    pub patch: fn(code: &mut [u8], at: usize, target: usize),
+}
+
+/// One item of an assembly program.
+///
+/// An instruction, or a name bound to this position. That is the whole of what
+/// an assembler takes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Item<I> {
+    /// Bytes.
+    Inst(I),
+    /// Bind `label` here. Emits nothing.
+    Label(Label),
+}
+
+impl<I> From<I> for Item<I> {
+    #[inline]
+    fn from(i: I) -> Self {
+        Item::Inst(i)
+    }
+}
+
+/// A program being assembled: its bytes, and the names in it.
+///
+/// The imperative face of the same assembler [`AsmProgram`] is the declarative
+/// face of. An emitter that walks a schedule cannot hand over a finished list
+/// of [`Item`]s — it discovers them as it goes, calling `&mut self` backend
+/// verbs for each — so it pushes into one of these instead. Same label map,
+/// same two passes.
+#[derive(Default)]
+pub struct Assembly {
+    /// The bytes so far. Public because emitting into it is what a backend verb
+    /// does.
+    pub code: Vec<u8>,
+    bound: alloc::collections::BTreeMap<Label, usize>,
+    pending: Vec<(usize, LabelRef)>,
+}
+
+impl Assembly {
+    /// An empty program with room for `capacity` bytes.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            code: Vec::with_capacity(capacity),
+            ..Self::default()
+        }
+    }
+
+    /// Continue a program whose first bytes are already emitted.
+    ///
+    /// Positions are offsets into the whole buffer, not into the part this
+    /// program contributed. A displacement cannot tell the difference — it is
+    /// `target - at` either way — but a *page* can, and `AdrpAdd` asks for
+    /// one, so there is exactly one answer to what a position means here and
+    /// this is it.
+    #[must_use]
+    pub fn from_code(code: Vec<u8>) -> Self {
+        Self {
+            code,
+            ..Self::default()
+        }
+    }
+
+    /// Write a label here — the name of this position.
+    ///
+    /// A branch may name a position before it exists, which is every forward
+    /// branch and the exit of every loop, so nothing here checks that anything
+    /// refers to it. [`Assembly::finish`] is where a name nobody wrote is
+    /// reported.
+    ///
+    /// # Panics
+    ///
+    /// If this name is already written elsewhere in the program. A name that
+    /// means two positions is not a name, and only this crate writes these
+    /// programs, so that is a bug here rather than anything about the kernel
+    /// being compiled.
+    pub fn bind(&mut self, label: impl Into<Label>) {
+        let (label, at) = (label.into(), self.code.len());
+        let previously = self.bound.insert(label, at);
+        assert!(previously.is_none(), "{label} was written twice");
+    }
+
+    /// Emit one instruction, recording the name it waits on if it has one.
+    pub fn push(&mut self, inst: impl AsmInsn) {
+        let at = self.code.len();
+        inst.emit_into(&mut self.code);
+        if let Some(reference) = inst.label_ref() {
+            self.pending.push((at, reference));
+        }
+    }
+
+    /// Fill in every deferred displacement and hand back the bytes.
+    ///
+    /// # Panics
+    ///
+    /// If a branch names a label nothing bound.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<u8> {
+        for (at, reference) in core::mem::take(&mut self.pending) {
+            let Some(&target) = self.bound.get(&reference.label) else {
+                panic!("{} is branched to but never written", reference.label)
+            };
+            (reference.patch)(&mut self.code, at, target);
+        }
+        self.code
+    }
 }
 
 /// Physical vector register index (v0..v31 on AArch64, xmm/ymm/zmm0..zmm31 on x86).
@@ -863,10 +1122,13 @@ pub struct CompileResult {
 /// aarch64's constant pool). Both backends therefore run the *same* driver: there is one
 /// place that decides when to emit a guard branch, where the root goes, etc.
 ///
-/// `Branch` is an opaque per-backend fixup token (aarch64 distinguishes CBZ from
-/// B; x86 uses a uniform rel32), patched later by `patch_branch`.
+/// Control flow crosses this seam as *"branch to this [`Label`]"*. It used to
+/// cross as an opaque per-backend fixup token that the driver placed with
+/// `emit_jump` and later handed back to `patch_branch` along with an offset it
+/// had tracked itself — which is a label, minus the name.
 trait IsaBackend {
-    type Branch;
+    /// Jump to `label`, unconditionally.
+    fn jump(&mut self, asm: &mut Assembly, label: Label);
 
     /// This backend's register file: the whole of what allocation and frame
     /// layout need to know about the target.
@@ -906,7 +1168,12 @@ trait IsaBackend {
         locs: &[Option<Binding>],
     ) -> Reg;
 
-    /// Branch taken when `mask_reg` is all-false (skip the true arm).
+    /// Jump to `label` when **no lane selects `test.arm`**, so the arm can be
+    /// skipped.
+    ///
+    /// One verb rather than a `skip_if_all_false`/`skip_if_all_true` pair: the
+    /// two differ only in which uniform mask lets an arm go, which is what
+    /// [`SelectArm`] already names.
     ///
     /// `scratch` is a vector register the backend may destroy, present exactly
     /// when its [`RegisterFile::guard_temps`](regalloc::RegisterFile::guard_temps)
@@ -914,31 +1181,7 @@ trait IsaBackend {
     /// writes a scalar into a vector register before it can reach a GP
     /// register — so the x86 tiers, whose guards go through
     /// `movmskps`/`kortest` and the flags, receive `None` and want nothing.
-    ///
-    /// `mask_scratch` is the mask-class mirror, present exactly when
-    /// [`RegisterFile::mask_guard_temps`](regalloc::RegisterFile::mask_guard_temps)
-    /// asked for one. Only AVX-512 does — `vptestmd` writes its result into a
-    /// `k`-register before `kortestw` can read it into the flags.
-    fn emit_skip_if_all_false(
-        &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-        mask_scratch: Option<KReg>,
-    ) -> Self::Branch;
-    /// Branch taken when `mask_reg` is all-true (skip the false arm). See
-    /// [`IsaBackend::emit_skip_if_all_false`] for `scratch`/`mask_scratch`.
-    fn emit_skip_if_all_true(
-        &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-        mask_scratch: Option<KReg>,
-    ) -> Self::Branch;
-    /// Unconditional jump.
-    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch;
-    /// Patch a previously emitted branch to land at `target`.
-    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Self::Branch, target: usize);
+    fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label);
 
     // -------------------------------------------------------------------------
     // Collapse-loop scaffold
@@ -966,11 +1209,15 @@ trait IsaBackend {
     /// Anchor whatever the body's constant loads are relative to, once the
     /// frame exists. Default: nothing to anchor (x86 const loads are
     /// self-contained).
-    fn scaffold_anchor(&mut self, _code: &mut Vec<u8>) {}
+    ///
+    /// Takes the whole [`Assembly`], not just its `code`, because aarch64's
+    /// anchor names a [`Label`] — the constant pool's not-yet-known position —
+    /// rather than a `code.len()` read off and carried by hand.
+    fn scaffold_anchor(&mut self, _asm: &mut Assembly) {}
 
     /// Append whatever must trail the emitted function — a constant pool and
-    /// the fixup that points at it. Default: nothing trails.
-    fn scaffold_finish(&mut self, _code: &mut Vec<u8>) {}
+    /// the label that names it. Default: nothing trails.
+    fn scaffold_finish(&mut self, _asm: &mut Assembly) {}
 
     /// Save / restore one of the scaffold's coordinate slots.
     ///
@@ -988,8 +1235,14 @@ trait IsaBackend {
     fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter);
     /// `counter += 1`.
     fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter);
-    /// Branch taken once `counter` has reached the bound it is compared against.
-    fn branch_if_counter_done(&mut self, code: &mut Vec<u8>, counter: Counter) -> Self::Branch;
+
+    /// Jump to `label` once `counter` has reached the bound it is compared
+    /// against.
+    ///
+    /// The compare and the branch are one verb because they are one fact:
+    /// flags mean nothing apart from the comparison that set them, and keeping
+    /// them together makes testing the wrong one unsayable.
+    fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label);
 
     /// Store one batch of results through the output pointer.
     fn store_result(&mut self, code: &mut Vec<u8>, src: Reg);
@@ -1001,6 +1254,62 @@ trait IsaBackend {
 
     /// Function return.
     fn emit_ret(&mut self, code: &mut Vec<u8>);
+
+    /// A counted loop: clear the variable, test it, run `body`, step it, and
+    /// go back.
+    ///
+    /// **Every loop codegen emits goes through here** — the collapse nest's
+    /// rows and batches, and a fold that survived extraction. Writing it once
+    /// is the point: the three of them differ only in what the variable is and
+    /// what the body does, which is what the two parameters say, and nothing
+    /// about a back edge is worth spelling three times.
+    ///
+    /// The body is a closure rather than a byte slice because a loop nests: the
+    /// row loop's body *is* the batch loop, and an inner loop needs the same
+    /// `&mut self` and the same [`Assembly`] the outer one is holding. Passing
+    /// them through is why they are one struct.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `body` returns.
+    fn emit_loop(
+        &mut self,
+        asm: &mut Assembly,
+        counter: Counter,
+        body: impl FnOnce(&mut Self, &mut Assembly) -> Result<(), CompileError>,
+    ) -> Result<(), CompileError>
+    where
+        Self: Sized,
+    {
+        let frame = self.loop_open(asm, counter);
+        body(self, asm)?;
+        self.loop_close(asm, frame);
+        Ok(())
+    }
+
+    /// Start a loop: initialise the variable, and emit the test that leaves.
+    ///
+    /// The half of [`IsaBackend::emit_loop`] that a *linear walk* can use. An
+    /// emitter stepping through a schedule cannot pass its remaining work as a
+    /// closure, but it can push the returned frame on a stack and pop it when
+    /// the region ends — which is exactly how the `Select` guards' branch spans
+    /// are already handled a few hundred lines below.
+    fn loop_open(&mut self, asm: &mut Assembly, counter: Counter) -> LoopFrame {
+        // Named after what drives the loop, because that is what tells one
+        // from the loop it nests inside.
+        let (top, exit) = (counter.label("top"), counter.label("exit"));
+        self.counter_clear(&mut asm.code, counter);
+        asm.bind(top);
+        self.branch_if_counter_done(asm, counter, exit);
+        LoopFrame { counter, top, exit }
+    }
+
+    /// Close a loop: step the counter, go back, and land the exit.
+    fn loop_close(&mut self, asm: &mut Assembly, frame: LoopFrame) {
+        self.counter_step(&mut asm.code, frame.counter);
+        self.jump(asm, frame.top);
+        asm.bind(frame.exit);
+    }
 
     /// Wrap a [`CollapseBody`] in the collapse loop scaffold, producing a
     /// complete [`KernelFn`](executable::KernelFn): the
@@ -1024,84 +1333,152 @@ trait IsaBackend {
     ///
     /// The two LICM tiers in [`CollapseBody`] park their results in vector
     /// slots directly above the coordinate slots reserved here.
-    fn emit_collapse_loop(&mut self, emitted: &CollapseBody<'_>) -> Vec<u8> {
+    ///
+    /// Every position here is a [`Label`] — a name bound when the scaffold
+    /// reaches it. It used to be a `code.len()` the scaffold read off and
+    /// carried by hand to a `patch_branch` twenty lines later, which is the
+    /// same thing minus the name, and which is why `row_end` had to be computed
+    /// at exactly the one point in the sequence where it was correct.
+    ///
+    /// # Errors
+    ///
+    /// None of its own; the signature carries the body closure's.
+    fn emit_collapse_loop(&mut self, emitted: &CollapseBody<'_>) -> Result<Vec<u8>, CompileError>
+    where
+        Self: Sized,
+    {
         let vw = self.register_file().vector_bytes;
         let base = self.body_frame_bytes(emitted.frame_size);
         let total = base + (COORD_SLOTS + emitted.hoist_slots) * vw;
         let slot = |k: u32| base + k * vw;
-        let mut code: Vec<u8> = Vec::with_capacity(
+        let mut asm = Assembly::with_capacity(
             emitted.frame_hoist.len()
                 + emitted.row_hoist.len()
                 + emitted.batch.len()
                 + SCAFFOLD_HEADROOM,
         );
 
-        self.frame_alloc(&mut code, total);
-        self.scaffold_anchor(&mut code);
+        self.frame_alloc(&mut asm.code, total);
+        self.scaffold_anchor(&mut asm);
         for k in 0..INPUT_COORDS {
-            self.slot_store(&mut code, coord_reg(k), slot(k));
+            self.slot_store(&mut asm.code, coord_reg(k), slot(k));
         }
-        self.slot_store(&mut code, coord_reg(SLOT_X), slot(SLOT_ROW_START_X));
+        self.slot_store(&mut asm.code, coord_reg(SLOT_X), slot(SLOT_ROW_START_X));
         // Frame LICM: X/Y-invariant values, computed once per call.
-        code.extend_from_slice(emitted.frame_hoist);
-        self.latch_bounds(&mut code);
-        self.counter_clear(&mut code, Counter::Row);
+        asm.code.extend_from_slice(emitted.frame_hoist);
+        self.latch_bounds(&mut asm.code);
 
-        let row_top = code.len();
-        let rows_done = self.branch_if_counter_done(&mut code, Counter::Row);
+        // The nest, outermost first. Two levels today because a lattice has two
+        // axes; nothing here counts them, which is what a surviving `Reduce`
+        // needs — a fold is another level, not another mechanism.
+        let levels = [
+            Level {
+                counter: Counter::Row,
+                // X-invariant values, recomputed once per row.
+                hoist: emitted.row_hoist,
+                // Each row starts where the last one did, whatever the batches
+                // inside it did to X.
+                restore: Some((SLOT_X, SLOT_ROW_START_X)),
+                advance: (SLOT_Y, 1.0),
+                out: OutStep::RowSkip,
+            },
+            Level {
+                counter: Counter::Batch,
+                hoist: emitted.batch,
+                restore: None,
+                advance: (SLOT_X, (vw / BYTES_PER_LANE) as f32),
+                out: OutStep::Batch,
+            },
+        ];
+        self.emit_nest(&mut asm, &levels, emitted, &slot)?;
 
-        // Row LICM: X-invariant values, recomputed once per row. Reload the
-        // coordinates first — the previous body and Y-step clobbered them.
-        for k in 0..INPUT_COORDS {
-            self.slot_load(&mut code, coord_reg(k), slot(k));
-        }
-        code.extend_from_slice(emitted.row_hoist);
-        self.counter_clear(&mut code, Counter::Batch);
-
-        let batch_top = code.len();
-        let batches_done = self.branch_if_counter_done(&mut code, Counter::Batch);
-
-        for k in 0..INPUT_COORDS {
-            self.slot_load(&mut code, coord_reg(k), slot(k));
-        }
-        code.extend_from_slice(emitted.batch);
-
-        self.store_result(&mut code, emitted.result);
-        self.advance_out(&mut code, OutStep::Batch);
-
-        // X += one batch of lanes. The coordinate registers are reloaded at
-        // the top of the next iteration, so they are free scratch here.
-        let lanes = (vw / BYTES_PER_LANE) as f32;
-        self.slot_load(&mut code, SCAFFOLD_ACC, slot(SLOT_X));
-        self.add_scalar(&mut code, SCAFFOLD_ACC, SCAFFOLD_SCRATCH, lanes);
-        self.slot_store(&mut code, SCAFFOLD_ACC, slot(SLOT_X));
-
-        self.counter_step(&mut code, Counter::Batch);
-        let repeat_batch = self.emit_jump(&mut code);
-        self.patch_branch(&mut code, repeat_batch, batch_top);
-
-        let row_end = code.len();
-        self.patch_branch(&mut code, batches_done, row_end);
-
-        // Reset X, advance Y, and skip any scalar tail in the output row.
-        self.slot_load(&mut code, SCAFFOLD_ACC, slot(SLOT_ROW_START_X));
-        self.slot_store(&mut code, SCAFFOLD_ACC, slot(SLOT_X));
-        self.slot_load(&mut code, SCAFFOLD_ACC, slot(SLOT_Y));
-        self.add_scalar(&mut code, SCAFFOLD_ACC, SCAFFOLD_SCRATCH, 1.0);
-        self.slot_store(&mut code, SCAFFOLD_ACC, slot(SLOT_Y));
-        self.advance_out(&mut code, OutStep::RowSkip);
-
-        self.counter_step(&mut code, Counter::Row);
-        let repeat_row = self.emit_jump(&mut code);
-        self.patch_branch(&mut code, repeat_row, row_top);
-
-        let end = code.len();
-        self.patch_branch(&mut code, rows_done, end);
-        self.frame_free(&mut code, total);
-        self.emit_ret(&mut code);
-        self.scaffold_finish(&mut code);
-        code
+        self.frame_free(&mut asm.code, total);
+        self.emit_ret(&mut asm.code);
+        // Everything the function needs — the loop nest's branches and
+        // whatever trails the `ret`, aarch64's constant pool included — is one
+        // `Assembly` now, so one `finish` resolves every name in it. It used
+        // to be two: the loop nest's labels were resolved here and the
+        // constant pool's fixup was a separate hand-tracked offset patched
+        // afterward, which is what made the offset's *estimate* — and the
+        // byte-splice when the estimate was wrong — necessary in the first
+        // place. A label the pool binds is just one more name in this pass.
+        self.scaffold_finish(&mut asm);
+        Ok(asm.finish())
     }
+
+    /// Emit `levels` as a loop nest, outermost first.
+    ///
+    /// One iteration of a level is the same four things at every depth: reload
+    /// the coordinates the level below clobbered, run this level's
+    /// loop-invariant code, run everything inside it, then advance. The
+    /// innermost level's "loop-invariant code" is the body itself, and its
+    /// advance is the one that stores a result — which is not a special case so
+    /// much as the observation that a collapse's loop-carried value is its
+    /// output pointer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend's own emission returns.
+    fn emit_nest(
+        &mut self,
+        asm: &mut Assembly,
+        levels: &[Level<'_>],
+        emitted: &CollapseBody<'_>,
+        slot: &impl Fn(u32) -> u32,
+    ) -> Result<(), CompileError>
+    where
+        Self: Sized,
+    {
+        let Some((level, inner)) = levels.split_first() else {
+            return Ok(());
+        };
+        self.emit_loop(asm, level.counter, |b, asm| {
+            // Reload first: the level below, and this level's own advance, left
+            // the coordinate registers holding something else.
+            for k in 0..INPUT_COORDS {
+                b.slot_load(&mut asm.code, coord_reg(k), slot(k));
+            }
+            asm.code.extend_from_slice(level.hoist);
+            b.emit_nest(asm, inner, emitted, slot)?;
+
+            if inner.is_empty() {
+                b.store_result(&mut asm.code, emitted.result);
+            }
+            if let Some((coord, from)) = level.restore {
+                b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(from));
+                b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(coord));
+            }
+            // The coordinate registers are reloaded at the top of the next
+            // iteration, so they are free scratch here.
+            let (coord, by) = level.advance;
+            b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(coord));
+            b.add_scalar(&mut asm.code, SCAFFOLD_ACC, SCAFFOLD_SCRATCH, by);
+            b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(coord));
+            b.advance_out(&mut asm.code, level.out);
+            Ok(())
+        })
+    }
+}
+
+/// One level of the collapse nest.
+///
+/// The two levels a lattice has differ only in these values, which is the whole
+/// content of "a loop is a loop": what bounds it, what runs at the top of an
+/// iteration, which coordinate it advances and by how much, and how far the
+/// output moves when the iteration ends.
+struct Level<'a> {
+    /// What ends this level.
+    counter: Counter,
+    /// Code at the top of each iteration: this level's LICM tier, or — at the
+    /// innermost — the body.
+    hoist: &'a [u8],
+    /// A coordinate to put back before advancing, and where its start was
+    /// saved. The level inside this one moved it.
+    restore: Option<(u32, u32)>,
+    /// The coordinate this level advances, and by how much per iteration.
+    advance: (u32, f32),
+    /// How far the output pointer moves per iteration.
+    out: OutStep,
 }
 
 /// The emitted code a collapse loop wraps: the per-batch body, plus the two
@@ -1125,6 +1502,44 @@ struct CollapseBody<'a> {
     hoist_slots: u32,
 }
 
+/// A loop that has been opened and not yet closed.
+///
+/// Carries the two names the back edge and the exit branch are waiting on, so
+/// [`IsaBackend::loop_close`] needs no argument the caller had to remember.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[must_use = "an opened loop that is never closed has no back edge and no exit"]
+struct LoopFrame {
+    counter: Counter,
+    top: Label,
+    exit: Label,
+}
+
+/// A guard's question: is this arm dead for the whole batch?
+///
+/// One struct because the three travel together and mean nothing apart — the
+/// mask register is what is reduced, the scratch is what the reduction may
+/// destroy, and the arm says which uniform answer lets the arm go.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct MaskTest {
+    /// The mask to reduce.
+    reg: Reg,
+    /// A vector register the reduction may destroy, present exactly when this
+    /// backend's [`RegisterFile::guard_temps`](regalloc::RegisterFile::guard_temps)
+    /// asked for one. Only aarch64 does — reducing a mask with `UMAXV`/`UMINV`
+    /// writes a scalar into a vector register before it can reach a GP register
+    /// — so the x86 tiers, whose guards go through `movmskps`/`kortest` and the
+    /// flags, receive `None` and want nothing.
+    scratch: Option<Reg>,
+    /// The mask-class mirror of `scratch`, present exactly when this backend's
+    /// [`RegisterFile::mask_guard_temps`](regalloc::RegisterFile::mask_guard_temps)
+    /// asked for one. Only AVX-512 does — `vptestmd` writes its result into a
+    /// `k`-register before `kortestw` can read it into the flags — so every
+    /// other tier receives `None` and wants nothing.
+    mask_scratch: Option<KReg>,
+    /// Which arm is being skipped.
+    arm: SelectArm,
+}
+
 /// Which of the collapse loop's two counters a scaffold verb addresses.
 ///
 /// Each is compared against a bound the caller passed in a register, which is
@@ -1135,6 +1550,17 @@ enum Counter {
     Batch,
     /// Rows, against the caller's row count.
     Row,
+}
+
+impl Counter {
+    /// This loop's `part`, as a label: `batch_top`, `row_exit`.
+    fn label(self, part: &str) -> Label {
+        let name = match self {
+            Self::Batch => "batch",
+            Self::Row => "row",
+        };
+        Label::new(&alloc::format!("{name}_{part}"))
+    }
 }
 
 /// How far the output pointer moves.
@@ -1207,8 +1633,6 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     hoist: HoistCtx<'_>,
     frame_override: Option<u32>,
 ) -> Result<(Vec<u8>, Reg, u32, u32), CompileError> {
-    use alloc::collections::BTreeMap;
-
     let file = backend.register_file();
     // Allocation happened before this call — once per region, over the whole
     // nest. The allocator chooses the evaluation order, so everything here —
@@ -1237,10 +1661,14 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     backend.frame_ready(frame_size);
 
     // Select short-circuit guards (disabled in the prologue — see HoistCtx).
-    let select_guards = if hoist.parks_values() {
-        Vec::new()
+    // Read off the allocation rather than recomputed: `schedule` above is
+    // `allocation.schedule()` verbatim, and the allocator already ran this
+    // same analysis against it to place split ranges around each arm (see
+    // `regalloc::Allocation::select_guards`).
+    let select_guards: &[guards::SelectGuard] = if hoist.parks_values() {
+        &[]
     } else {
-        analyze_select_guards(schedule)
+        allocation.select_guards()
     };
     let sched_len = schedule.len();
 
@@ -1250,7 +1678,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     }
     let mut branch_starts: alloc::vec::Vec<alloc::vec::Vec<PendingBranch>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
-    let mut branch_ends: alloc::vec::Vec<alloc::vec::Vec<usize>> =
+    let mut branch_ends: alloc::vec::Vec<alloc::vec::Vec<PendingBranch>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     for (gi, guard) in select_guards.iter().enumerate() {
         for arm in SelectArm::ALL {
@@ -1258,11 +1686,27 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             if range.0 != range.1 {
                 branch_starts[range.0].push(PendingBranch { guard_idx: gi, arm });
                 if range.1 < sched_len {
-                    branch_ends[range.1].push(gi);
+                    // The arm too, not just the guard: an end used to name the
+                    // guard alone and recover the arm by trying both, which
+                    // meant a guard whose arms end together was visited twice.
+                    branch_ends[range.1].push(PendingBranch { guard_idx: gi, arm });
                 }
             }
         }
     }
+
+    // What to call the point past one arm of one guard. The `Select`'s own
+    // `ValueId` rather than its index in `select_guards`, because the node is
+    // the identity and the index is a position in a scratch vector — and
+    // because two guards can share a mask, so the mask would alias.
+    let arm_join = |guard: &guards::SelectGuard, arm: SelectArm| {
+        let select = schedule[guard.select_idx].value;
+        let side = match arm {
+            SelectArm::True => "true",
+            SelectArm::False => "false",
+        };
+        Label::new(&alloc::format!("v{}_past_{side}", select.0))
+    };
 
     // One dense ValueId -> Binding lookup for the hot loop, carried *forward*: a
     // placement is a schedule, so the answer changes at program points, and
@@ -1304,7 +1748,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     backend.begin(schedule)?;
 
     // No prologue here — the caller frames the body (see the fn doc).
-    let mut code: Vec<u8> = Vec::new();
+    let mut asm = Assembly::default();
 
     // The scope's head, where the previous iteration's tail flows back in. A
     // value live across this scope's back edge may end an iteration somewhere
@@ -1328,7 +1772,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 continue;
             }
             let placement = allocation.placement(vid);
-            let at_head = allocation.where_at(vid, 0);
+            let at_head = allocation.at_head(vid);
             let head = layout.binding(vid, at_head);
             if let Binding::Loc(Loc::Reg(r)) = head
                 && placement.at(regalloc::Point::TAIL) != at_head
@@ -1340,14 +1784,12 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                         unreachable!("a value that never leaves a register never changes register")
                     });
                 locs[vid.0 as usize] = Some(layout.binding(vid, from_memory));
-                let got = backend.emit_resolve(&mut code, vid, r, &locs);
+                let got = backend.emit_resolve(&mut asm.code, vid, r, &locs);
                 debug_assert_eq!(got, r, "a value out of a register reloads into the target");
             }
             locs[vid.0 as usize] = Some(head);
         }
     }
-
-    let mut pending_patches: BTreeMap<(usize, SelectArm), B::Branch> = BTreeMap::new();
 
     for (sched_idx, def) in schedule.iter().enumerate() {
         let (vid, sched_op) = (&def.value, &def.op);
@@ -1364,13 +1806,8 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // claiming otherwise. Ordering it first costs nothing when there is
         // nothing to reconcile — which is every kernel that reaches this
         // without a split live range.
-        for &gi in &branch_ends[sched_idx] {
-            let target = code.len();
-            for arm in SelectArm::ALL {
-                if let Some(branch) = pending_patches.remove(&(gi, arm)) {
-                    backend.patch_branch(&mut code, branch, target);
-                }
-            }
+        for pb in &branch_ends[sched_idx] {
+            asm.bind(arm_join(&select_guards[pb.guard_idx], pb.arm));
         }
 
         // Ranges that begin here. A register range starting away from the
@@ -1379,9 +1816,9 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // being fetched into a scratch at every read.
         for (v, to) in core::mem::take(&mut moves[sched_idx]) {
             if let Binding::Loc(Loc::Reg(r)) = to {
-                let src = backend.emit_resolve(&mut code, v, r, &locs);
+                let src = backend.emit_resolve(&mut asm.code, v, r, &locs);
                 if src != r {
-                    backend.emit_mov(&mut code, r, src);
+                    backend.emit_mov(&mut asm.code, r, src);
                 }
             }
             locs[v.0 as usize] = Some(to);
@@ -1407,17 +1844,16 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let guard = &select_guards[guard_idx];
             let mask_reg = match location_of(&locs, guard.mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut code, guard.mask_vid, guard_mask(), &locs),
+                _ => backend.emit_resolve(&mut asm.code, guard.mask_vid, guard_mask(), &locs),
             };
-            let branch = match arm {
-                SelectArm::True => {
-                    backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp, mask_guard_temp)
-                }
-                SelectArm::False => {
-                    backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp, mask_guard_temp)
-                }
+            let past_arm = arm_join(guard, arm);
+            let test = MaskTest {
+                reg: mask_reg,
+                scratch: guard_temp,
+                mask_scratch: mask_guard_temp,
+                arm,
             };
-            pending_patches.insert((guard_idx, arm), branch);
+            backend.branch_if_arm_is_dead(&mut asm, test, past_arm);
         }
 
         // A hoisted value's placeholder def emits nothing — the prologue
@@ -1438,7 +1874,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         {
             let mask_reg = match location_of(&locs, *mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut code, *mask_vid, guard_mask(), &locs),
+                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs),
             };
             let dst = dst_loc.reg();
             let in_reg = |v: regalloc::ValueId| match location_of(&locs, v) {
@@ -1448,51 +1884,55 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let true_reg = in_reg(*true_vid);
             let false_reg = in_reg(*false_vid);
 
+            // Named after the `Select` they belong to, so two of these in one
+            // schedule cannot collide however they interleave.
+            let part = |part: &str| Label::new(&alloc::format!("v{}_{part}", vid.0));
+            let (only_false, only_true, join) =
+                (part("only_false"), part("only_true"), part("join"));
+
             // Both guards read `mask_reg`, which is why the reduction
             // scratch is a reservation of its own rather than whichever
             // register the mask was resolved into.
-            let all_false =
-                backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp, mask_guard_temp);
-            let all_true =
-                backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp, mask_guard_temp);
+            let test = |arm| MaskTest {
+                reg: mask_reg,
+                scratch: guard_temp,
+                mask_scratch: mask_guard_temp,
+                arm,
+            };
+            backend.branch_if_arm_is_dead(&mut asm, test(SelectArm::True), only_false);
+            backend.branch_if_arm_is_dead(&mut asm, test(SelectArm::False), only_true);
 
             // Mixed lanes: the real select.
-            backend.emit_plan(&mut code, &plan)?;
-            let skip_end = backend.emit_jump(&mut code);
+            backend.emit_plan(&mut asm.code, &plan)?;
+            backend.jump(&mut asm, join);
 
-            // All-false: dst <- false arm.
-            let all_false_target = code.len();
+            asm.bind(only_false);
             if let Some(freg) = false_reg {
-                backend.emit_mov(&mut code, dst, freg);
+                backend.emit_mov(&mut asm.code, dst, freg);
             } else {
-                backend.emit_resolve(&mut code, *false_vid, dst, &locs);
+                backend.emit_resolve(&mut asm.code, *false_vid, dst, &locs);
             }
-            let skip_end2 = backend.emit_jump(&mut code);
+            backend.jump(&mut asm, join);
 
-            // All-true: dst <- true arm.
-            let all_true_target = code.len();
+            asm.bind(only_true);
             if let Some(treg) = true_reg {
-                backend.emit_mov(&mut code, dst, treg);
+                backend.emit_mov(&mut asm.code, dst, treg);
             } else {
-                backend.emit_resolve(&mut code, *true_vid, dst, &locs);
+                backend.emit_resolve(&mut asm.code, *true_vid, dst, &locs);
             }
 
-            let end_target = code.len();
-            backend.patch_branch(&mut code, all_false, all_false_target);
-            backend.patch_branch(&mut code, all_true, all_true_target);
-            backend.patch_branch(&mut code, skip_end, end_target);
-            backend.patch_branch(&mut code, skip_end2, end_target);
+            asm.bind(join);
 
             if let Some(offset) = store_after_def[sched_idx] {
-                backend.emit_store(&mut code, dst, offset)?;
+                backend.emit_store(&mut asm.code, dst, offset)?;
             }
             continue;
         }
 
-        backend.emit_plan(&mut code, &plan)?;
+        backend.emit_plan(&mut asm.code, &plan)?;
 
         if let Some(offset) = store_after_def[sched_idx] {
-            backend.emit_store(&mut code, dst_loc.reg(), offset)?;
+            backend.emit_store(&mut asm.code, dst_loc.reg(), offset)?;
         }
 
         // Prologue mode: hand each hoist root over to the scopes inside, right
@@ -1509,31 +1949,37 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let r = dst_loc.reg();
             // The slot is written unless nothing inside will ever read it —
             // which is exactly the case where the value holds one register at
-            // every point of every scope within. Read off the placement, not
-            // off a flag beside it.
-            let inside = allocation.inner_head();
-            let head = allocation.placement(*vid).at(inside);
+            // every point of every scope within. Read off the placements, not
+            // off a flag beside them.
+            //
+            // Every scope within, not just the first: a root parked here is
+            // live across all of them, and one of them keeping it somewhere
+            // else is what makes the slot load-bearing. A scope that never
+            // reads it has no opinion.
+            let head = allocation
+                .within()
+                .next()
+                .map_or(regalloc::Where::Spilled, |inner| inner.at_head(*vid));
             let resident_throughout = matches!(head, regalloc::Where::Reg(_))
-                && allocation
-                    .placement(*vid)
-                    .spans()
-                    .all(|s| s.from <= inside || s.at == head);
+                && allocation.within().all(|inner| {
+                    inner
+                        .placement_of(*vid)
+                        .is_none_or(|p| p.locations().all(|at| at == head))
+                });
             if !resident_throughout {
-                backend.emit_store(&mut code, r, offset)?;
+                backend.emit_store(&mut asm.code, r, offset)?;
             }
             if let regalloc::Where::Reg(head_reg) = head
                 && head_reg != r
             {
-                backend.emit_mov(&mut code, head_reg, r);
+                backend.emit_mov(&mut asm.code, head_reg, r);
             }
         }
     }
 
-    assert!(
-        pending_patches.is_empty(),
-        "BUG: {} Select short-circuit branches were never patched",
-        pending_patches.len()
-    );
+    // No "did every branch get its landing point" assertion here any more:
+    // `Assembly::finish` panics on a name nobody wrote, which is the same
+    // check, stated once, for every branch rather than only these.
 
     // The scope's result, in a register for the scaffold to store. Usually the
     // last instruction's own destination; not when the body's root was hoisted
@@ -1550,11 +1996,11 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 .scratch(sched_len - 1)
                 .result
                 .expect("the allocator reserves a result target on every scope's last instruction");
-            backend.emit_resolve(&mut code, root, target, &locs)
+            backend.emit_resolve(&mut asm.code, root, target, &locs)
         }
     };
 
-    Ok((code, result_reg, frame_size, real_spill_count))
+    Ok((asm.finish(), result_reg, frame_size, real_spill_count))
 }
 
 /// Info about an operation in the schedule.
@@ -1770,6 +2216,21 @@ fn arena_to_schedule(
             ExprNode::Reduce { .. } => {
                 panic!("a bounded fold reached the JIT emitter -- run passes::expand_reduce first")
             }
+            // G1 only makes `Guard` constructible; nothing chooses one
+            // (extraction has no price for it yet, G3) and nothing lowers
+            // one away (there is no legalization pass for it, unlike
+            // `Reduce`/`Ref` above — a `Guard` is not meant to be expanded
+            // before codegen, it is meant to be *emitted*, which is G2's
+            // job: "a mask test, a branch to a label, the arm's body, the
+            // join" (docs/plans/2026-09-12-emit-should-just-emit.md §3). So
+            // a `Guard` reaching this emitter today can only mean it was
+            // constructed and compiled directly, bypassing every stage that
+            // is supposed to gate it.
+            ExprNode::Guard { mask, on, off } => panic!(
+                "arena_to_schedule: Guard(mask={mask:?}, on={on:?}, off={off:?}) \
+                 reached the JIT emitter -- the emitter cannot emit one yet \
+                 (G2, docs/plans/2026-09-12-emit-should-just-emit.md)"
+            ),
         };
         schedule.push(regalloc::Def {
             value: vid,
@@ -2011,6 +2472,10 @@ fn partition_by_scope(
     regalloc::ScopedSchedule {
         regions,
         body: remaining,
+        // No fold survives extraction yet: `ExpandReduce` unrolls every one
+        // before a schedule is built, so there is never a loop to open here.
+        // Deleting that pass is what fills this in.
+        folds: Vec::new(),
     }
 }
 
@@ -2486,7 +2951,7 @@ fn compile_via_backend<B: IsaBackend>(
             result: result_reg,
             frame_size,
             hoist_slots: 0,
-        });
+        })?;
         let scaffold = counting.take(code.len() as u32 - body.len() as u32);
         let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
         return Ok(CompileResult {
@@ -2599,7 +3064,7 @@ fn compile_via_backend<B: IsaBackend>(
         result: result_reg,
         frame_size: m,
         hoist_slots: hoisted_values,
-    });
+    })?;
     let emitted = (frame_code.len() + row_code.len() + body.len()) as u32;
     let scaffold = counting.take(code.len() as u32 - emitted);
     // A parked root that holds a register at the head of the scopes inside it
@@ -2775,22 +3240,21 @@ mod tests {
             let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
             neon.frame_ready(frame_size);
 
-            let neon_code = neon.emit_collapse_loop(&wrapped(Reg(16), frame_size, hoist_slots));
+            let scaffold = |code: Result<alloc::vec::Vec<u8>, CompileError>| {
+                code.expect("the scaffold's own branches always reach")
+                    .len()
+            };
+            let neon_code =
+                scaffold(neon.emit_collapse_loop(&wrapped(Reg(16), frame_size, hoist_slots)));
             assert!(
-                neon_code.len().is_multiple_of(4),
-                "aarch64 is fixed-width, got {} bytes",
-                neon_code.len()
+                neon_code.is_multiple_of(4),
+                "aarch64 is fixed-width, got {neon_code} bytes"
             );
             sizes.push([
-                sse2.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                avx2b
-                    .emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                avx512b
-                    .emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))
-                    .len(),
-                neon_code.len(),
+                scaffold(sse2.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
+                scaffold(avx2b.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
+                scaffold(avx512b.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
+                neon_code,
             ]);
         }
         assert!(sizes[0].iter().all(|&n| n > 0), "every backend emits");
@@ -3036,7 +3500,7 @@ mod tests {
             .collect();
         let mut a = regalloc::LinearScan.allocate(schedule, &TEST_FILE);
         for &(v, p) in placements {
-            a.place(ValueId(v), p);
+            a.place(regalloc::Scope::Body, ValueId(v), p);
         }
         a
     }
@@ -3920,7 +4384,7 @@ mod tests {
                 .expect("a guard formed above")
                 .mask_vid;
             assert!(
-                allocation.placement(mask_vid).spills(),
+                allocation.body().placement(mask_vid).spills(),
                 "the mask stayed in a register, so the spilled-mask path this \
                  test exists for is never reached"
             );
@@ -4035,10 +4499,11 @@ mod tests {
         fn a_split_range_inside_a_guarded_arm_is_correct_when_the_arm_is_skipped() {
             let (a, root, split_vid, arm, allocation) = split_across_a_guarded_arm();
             assert!(
-                allocation.placement(split_vid).spills(),
+                allocation.body().placement(split_vid).spills(),
                 "the value under test stayed in a register, so nothing is split"
             );
             let kept = allocation
+                .body()
                 .placement(split_vid)
                 .spans()
                 .any(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0);
@@ -4082,7 +4547,7 @@ mod tests {
         fn a_kept_reload_inside_a_guarded_arm_ends_at_the_arm() {
             let (_, _, split_vid, arm, allocation) = split_across_a_guarded_arm();
             let spans: alloc::vec::Vec<regalloc::Span> =
-                allocation.placement(split_vid).spans().collect();
+                allocation.body().placement(split_vid).spans().collect();
             let kept = spans
                 .iter()
                 .position(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0)

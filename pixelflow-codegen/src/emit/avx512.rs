@@ -1147,7 +1147,9 @@ pub(crate) mod driver {
     }
 
     impl IsaBackend for Avx512Backend {
-        type Branch = usize;
+        fn jump(&mut self, asm: &mut Assembly, label: Label) {
+            asm.push(x86::Jmp { target: label });
+        }
 
         fn register_file(&self) -> regalloc::RegisterFile {
             self.file
@@ -1324,39 +1326,21 @@ pub(crate) mod driver {
         // Select short-circuit guards: reduce the vector mask to flags (vptestmd +
         // kortestw) and branch. jz = all-false (skip true arm); jc = all-true (skip
         // false arm). Mirrors the SSE2 MOVMSKPS guards, k-register-based.
-        /// `_scratch` is unused: this tier's guard needs no vector register.
-        /// `mask_scratch` is `AVX512_FILE.mask_guard_temps`'s reservation —
-        /// `vptestmd`'s k-register destination, reduced to flags by
-        /// `kortestw`.
-        fn emit_skip_if_all_false(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-            mask_scratch: Option<KReg>,
-        ) -> usize {
-            let k = crate::emit::declared_mask_temp(mask_scratch);
-            super::emit_mask_flags(code, mask_reg, k);
-            x86_64::je(code).field() // ZF set when k == 0 (all false)
-        }
-        /// `_scratch` is unused: this tier's guard needs no vector register.
-        /// See `emit_skip_if_all_false` above for `mask_scratch`.
-        fn emit_skip_if_all_true(
-            &mut self,
-            code: &mut Vec<u8>,
-            mask_reg: Reg,
-            _scratch: Option<Reg>,
-            mask_scratch: Option<KReg>,
-        ) -> usize {
-            let k = crate::emit::declared_mask_temp(mask_scratch);
-            super::emit_mask_flags(code, mask_reg, k);
-            x86_64::jc(code).field() // CF set when k == 0xFFFF (all true)
-        }
-        fn emit_jump(&mut self, code: &mut Vec<u8>) -> usize {
-            x86_64::emit_jmp_rel32(code)
-        }
-        fn patch_branch(&mut self, code: &mut Vec<u8>, branch: usize, target: usize) {
-            x86_64::patch_rel32(code, branch, target);
+        /// [`MaskTest::scratch`] is unused: this tier reduces the mask with
+        /// `kortest` into the flags, needing no *vector* register. It is the
+        /// one tier that wants [`MaskTest::mask_scratch`], because `vptestmd`
+        /// lands in a `k`-register before `kortestw` can read it.
+        fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+            let k = crate::emit::declared_mask_temp(test.mask_scratch);
+            super::emit_mask_flags(&mut asm.code, test.reg, k);
+            // One `kortest` sets both answers at once, so the arm picks the
+            // condition rather than a different reduction.
+            asm.push(match test.arm {
+                // ZF set when k1 == 0: no lane is true, so the true arm is dead.
+                SelectArm::True => x86::Jcc::je(label),
+                // CF set when k1 == 0xFFFF: every lane is, so the false arm is.
+                SelectArm::False => x86::Jcc::jb(label),
+            });
         }
 
         // Same scaffold register roles as SSE2 — see `x86_64::scaffold` — at
@@ -1400,8 +1384,8 @@ pub(crate) mod driver {
             x86::scaffold::counter_step(code, counter);
         }
 
-        fn branch_if_counter_done(&mut self, code: &mut Vec<u8>, counter: Counter) -> usize {
-            x86::scaffold::branch_if_counter_done(code, counter)
+        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
+            x86::scaffold::branch_if_counter_done(asm, counter, label);
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -1424,6 +1408,7 @@ pub(crate) mod driver {
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
         }
 
+        /// `ucomiss` is scalar, so this tier's wider broadcast makes no
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
             AsmProgram::from([x86::Inst::Ret]).assemble(code);
         }

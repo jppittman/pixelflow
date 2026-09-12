@@ -369,6 +369,18 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             ExprNode::Reduce { fold, body } => {
                 result[body.0 as usize].without(Variance::from_var(fold.binder().var()))
             }
+            // A `Guard` varies with its mask (a real child, in this arena)
+            // and with whatever either arm varies with — resolved through
+            // the same `referent_variance` a `Ref` leaf uses, and for the
+            // same reason: the arms are names, and resolving is the only way
+            // to know what a name denotes. Both arms, not just the taken
+            // one: nothing here knows which arm a mask selects per-lane (and
+            // a `Guard`'s whole point is that lanes may disagree), so the
+            // honest answer is the union of every value the branch could
+            // read, exactly as `Select`'s soft form already does.
+            ExprNode::Guard { mask, on, off } => result[mask.0 as usize]
+                .union(referent_variance(*on))
+                .union(referent_variance(*off)),
             ExprNode::Nary(_, start, len) => {
                 let children = arena.nary_children_slice(*start, *len);
                 let mut v = Variance::CONST;
@@ -429,6 +441,19 @@ pub fn compute_dag_variance(
             // what it depends on; `ALL` is the sound answer, and the linker
             // (`passes::expand_refs`) is what turns it into a real one.
             ExprData::Ref(_) => Variance::ALL,
+            // A `Guard` varies with its mask (the one real child here) and
+            // with whatever either arm varies with, resolved the same way a
+            // `Ref` leaf's variance is: both arms union in, since nothing at
+            // this level knows which one a lane-varying mask will take.
+            ExprData::Guard { on, off } => {
+                let mask = node
+                    .children()
+                    .next()
+                    .expect("Guard has one child: the mask");
+                table[mask]
+                    .union(referent_variance(on))
+                    .union(referent_variance(off))
+            }
             ExprData::Op(_) => {
                 let mut v = Variance::CONST;
                 for child in node.children() {
@@ -839,6 +864,56 @@ mod tests {
         let orphan = orphaned.push_ref(crate::key::KernelKey::of(never_arena, never_root));
         assert_eq!(
             super::compute_arena_variance(&orphaned)[orphan.0 as usize],
+            Variance::ALL
+        );
+    }
+
+    /// A `Guard` varies with its mask (a real child) *and* with whatever
+    /// either arm varies with — both, not just one, because nothing at this
+    /// level knows which arm a lane-varying mask will actually take. Same
+    /// resolution path as a `Ref`: the arms are names, and `referent_variance`
+    /// is how their variance is read at all.
+    #[test]
+    fn a_guard_varies_with_its_mask_and_both_arms() {
+        use crate::arena::ExprArena;
+        use crate::kernel::Kernel;
+        use crate::kind::OpKind;
+        use crate::store::KernelStore;
+
+        // mask: Y > 0 → {Y}. on: X-only. off: constant.
+        let on_key = KernelStore::intern(&Kernel::x().sqrt());
+        let off_key = KernelStore::intern(&Kernel::constant(1.0));
+
+        let mut arena = ExprArena::new();
+        let y = arena.push_var(1);
+        let zero = arena.push_const(0.0);
+        let mask = arena.push_binary(OpKind::Gt, y, zero);
+        let guard = arena.push_guard(mask, on_key, off_key);
+
+        let v = super::compute_arena_variance(&arena);
+        assert_eq!(
+            v[guard.0 as usize],
+            Variance::Y.union(Variance::X),
+            "mask contributes Y, `on` contributes X, `off` contributes nothing"
+        );
+
+        // Swap in a Y-varying `off` arm too: now every one of the three
+        // sources agrees on Y, and the union still carries X from `on`.
+        let off_key_y = KernelStore::intern(&Kernel::y().neg());
+        let guard_all_y_and_x = arena.push_guard(mask, on_key, off_key_y);
+        assert_eq!(
+            super::compute_arena_variance(&arena)[guard_all_y_and_x.0 as usize],
+            Variance::X.union(Variance::Y)
+        );
+
+        // An unresolvable arm claims everything, exactly as an unresolvable
+        // `Ref` does — the conservative answer when nothing can be resolved.
+        let never = Kernel::x().mul(&Kernel::constant(1.0e-27));
+        let (never_arena, never_root) = never.parts();
+        let orphan_key = crate::key::KernelKey::of(never_arena, never_root);
+        let orphan_guard = arena.push_guard(mask, orphan_key, off_key);
+        assert_eq!(
+            super::compute_arena_variance(&arena)[orphan_guard.0 as usize],
             Variance::ALL
         );
     }

@@ -441,6 +441,13 @@ fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
         | ExprNode::Ternary(op, _, _, _)
         | ExprNode::Nary(op, _, _) => Some(*op),
         ExprNode::Reduce { .. } => Some(OpKind::Reduce),
+        // A `Guard` carries no `OpKind` — same as `Ref`, and for the same
+        // reason (`ExprArena::kind` panics on either): it names something
+        // rather than computing something, so it is excluded from the
+        // stratification rule like any other name. Moot in practice: no
+        // corpus arena holds one (G1, and the corpus writer refuses to
+        // serialize one at all).
+        ExprNode::Guard { .. } => None,
     }
 }
 
