@@ -36,7 +36,7 @@ use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandNestedReduce, ExpandRefs, LowerDwrt};
+use pixelflow_ir::passes::{ExpandReduce, ExpandRefs, LowerDwrt};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -57,16 +57,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 ///
 /// - `RawGather` — produced by lowering, after the e-graph's place in the
 ///   pipeline; reaching one here means the arena is already lowered.
-/// - `Nary` other than `Reduce` (`Tuple`) — not modelled.
+/// - `Nary` other than `Reduce` (`Tuple`) — not modelled. `Reduce` itself
+///   is unrolled first (`passes::expand_reduce`, the same unroll `legalize`
+///   performs later): the arena the e-graph sees is binder-free, so factoring
+///   across the unrolled terms is ordinary rewriting rather than rewriting
+///   under a binder.
 /// - `Param` — a `pixelflow-compiler` macro-parameter slot that should never
 ///   reach a runtime-built `Kernel` in the first place.
-///
-/// `Reduce` itself *is* modelled (`ENode::Reduce`) — the graph reasons about
-/// the monoidal form directly (`egraph::fold_rules`: peeling, halving), and
-/// whether the surviving extraction keeps the fold or the extractor's DP
-/// unrolled it is a cost/tie-break question for extraction, not something
-/// this function decides (stage 2c,
-/// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md).
 ///
 /// `Uniform` leaves are representable like `Buffer`: opaque to every rule,
 /// hash-consed by identity, redeclared by extraction. Nothing folds one.
@@ -169,7 +166,7 @@ fn optimize_runtime_arena_uncached(
     // `egraph::fold_rules`), so the graph resolves what it judges worth
     // resolving and keeps the rest folded.
     //
-    // **`LowerDwrt` and the reduce legalizer come last, and that is the whole
+    // **`LowerDwrt` and `ExpandReduce` come last, and that is the whole
     // point.** Legalization is the *fallback*: it takes whatever illegal
     // shape survived saturation — a `Dwrt` the chain rule did not reach, a
     // `Reduce` the graph declined to peel — and makes it emittable. It owns
@@ -187,14 +184,6 @@ fn optimize_runtime_arena_uncached(
     // not a regression: the e-graph gets to see the small, high-level program
     // it can actually reason about.
     //
-    // `ExpandNestedReduce`, not `ExpandReduce`: stage 2c's codegen compiles a
-    // surviving `Reduce` as a loop, so legalization only has to unroll the one
-    // shape `extract_folds` cannot carve out — a `Reduce` nested inside
-    // another's own body, which is what `Kernel::by_ref` composition plus
-    // `ExpandRefs` produces. Everything else stays folded all the way to the
-    // assembler. Mirrors `pixelflow-ir::passes::legalize`, which says the same
-    // thing at the other compile entry.
-    //
     // A declining step short-circuits the rest and yields `None` here, which
     // means exactly what it always meant: the caller compiles its own arena
     // unchanged, unoptimized but correct — and legalizes it itself, since
@@ -205,7 +194,7 @@ fn optimize_runtime_arena_uncached(
             ExpandRefs,
             Saturate::runtime(shape),
             LowerDwrt,
-            ExpandNestedReduce
+            ExpandReduce
         ]
         .optimize(arena, root)
         .into_changed(),
@@ -213,7 +202,7 @@ fn optimize_runtime_arena_uncached(
         // What `Lattice::bake` would emit if the e-graph did not exist —
         // the "F" column of docs/plans/2026-09-06-egraph-at-production-scale.md
         // §7, measured by docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
-        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandNestedReduce]
+        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandReduce]
             .optimize(arena, root)
             .into_changed(),
     }
@@ -344,15 +333,6 @@ fn canonical_key(arena: &ExprArena, root: ExprId) -> Vec<u8> {
                 key.push(10);
                 key.extend_from_slice(&fold.to_bits().to_le_bytes());
                 push_id(&mut key, &dense, body);
-            }
-            // Same shape as `pixelflow_ir::key`'s canonical form: the mask
-            // densifies as a child, `on`/`off` are content-addressed and go
-            // in directly.
-            &ExprNode::Guard { mask, on, off } => {
-                key.push(11);
-                push_id(&mut key, &dense, mask);
-                key.extend_from_slice(&on.bits().to_le_bytes());
-                key.extend_from_slice(&off.bits().to_le_bytes());
             }
             &ExprNode::Unary(op, a) => {
                 key.push(4);
@@ -796,12 +776,10 @@ mod congruence_gap_probe {
         root: ExprId,
     ) -> ProductionRun {
         // What `optimize_runtime_arena_uncached` hands the e-graph:
-        // `ExpandRefs` and nothing else. `LowerDwrt` runs after saturation —
-        // a `Dwrt` is a thing the rule set knows, and legalization is the
-        // fallback for what it declined — so lowering here would measure a
-        // pipeline that no longer exists. `Reduce` needs no such fallback any
-        // more (stage 2c): the graph reasons about it directly and a
-        // surviving one is legal all the way to codegen.
+        // `ExpandRefs` and nothing else. `LowerDwrt`/`ExpandReduce` run after
+        // saturation — a `Dwrt` and a `Reduce` are both things the rule set
+        // knows, and legalization is the fallback for what it declined — so
+        // lowering here would measure a pipeline that no longer exists.
         let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
         let node_count = crate::egraph::reachable_count(&arena, root);
 
@@ -1724,10 +1702,7 @@ pub(crate) mod production_telemetry {
                 // A fold survives extraction now; the legalizer unrolls it
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),
-                other @ (ExprNode::Param(_)
-                | ExprNode::Nary(..)
-                | ExprNode::Ref(_)
-                | ExprNode::Guard { .. }) => {
+                other @ (ExprNode::Param(_) | ExprNode::Nary(..) | ExprNode::Ref(_)) => {
                     panic!("extracted arena contains {other:?}")
                 }
             };
