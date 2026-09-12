@@ -152,7 +152,10 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
             ExprNode::Reduce { fold, body } => {
                 writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
             }
-            other @ (ExprNode::Param(_) | ExprNode::Nary(..) | ExprNode::Ref(_)) => {
+            other @ (ExprNode::Param(_)
+            | ExprNode::Nary(..)
+            | ExprNode::Ref(_)
+            | ExprNode::Guard { .. }) => {
                 panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
             }
         }

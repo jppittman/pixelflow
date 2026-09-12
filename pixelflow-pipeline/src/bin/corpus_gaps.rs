@@ -493,6 +493,13 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
                 "hash_cons: Ref({k:?}) names a kernel interned in this process; \
                  corpus arenas are self-contained, so expand_refs first"
             ),
+            // Same reasoning as `Ref`: `on`/`off` name kernels in this
+            // process's `KernelStore` too, and no corpus arena holds a
+            // `Guard` yet (G1: never chosen).
+            ExprNode::Guard { on, off, .. } => panic!(
+                "hash_cons: Guard(on={on:?}, off={off:?}) names kernels interned in this \
+                 process; corpus arenas are self-contained"
+            ),
             ExprNode::Reduce { fold, body } => {
                 let body = ExprId(m(body, &map));
                 (

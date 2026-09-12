@@ -61,7 +61,8 @@ pub enum ENode {
         op: &'static dyn Op,
         children: Vec<EClassId>,
     },
-    /// A bounded fold: `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
+    /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
+    /// `fold`'s own visited indices (see `Fold`'s doc, in `pixelflow-ir`).
     ///
     /// The one node in the graph that *binds*, and the reason it can be in
     /// the graph at all: its algebra, binder and range live in the node's

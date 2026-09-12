@@ -19,6 +19,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Minimal public API** - Do NOT change visibility of internal APIs without explicit permission. Keep `pub(crate)` and private items encapsulated. Compose `Kernel` values instead of exposing internals.
 - **Subtract before you add.** The good version of a primitive is reached by removing machinery, not stacking it. If a type's signature already refuses the wrong shape, you don't need a macro, a lint, or a doc to forbid it — the opinion lives in the types. Reach for a new dependency or a new abstraction only after subtraction has failed.
 
+- **The control plane is 64-bit.** Every index, id, count, extent and bound describing *a program* — `ExprId`, `ValueId`, a fold's ends, a binder slot, a class id — is 64 bits wide. A narrower one needs a **documented reason that came from a profiler**, in the type's own doc, naming the measurement. "It fits today" is not a reason, and neither is a byte budget: see the `ExprNode` size assertion, which is a tripwire against an accident and explicitly not a width to design against.
+
+  This is not about memory being free. It is about **which mistake is recoverable**. A control-plane value sized to the biggest program anyone has written so far is a limit on what the language can express, discovered later by someone whose program is bigger — and by then it is load-bearing. `Fold`'s `u16` ends capped a reduction at 65,535 terms because a 16-byte node budget, itself only "whatever the largest variant then needed", was mistaken for a requirement. The design was tuned on a psychedelic shader and broke on a glyph.
+
+  The **data** plane is the opposite and stays narrow on purpose: `f32` lanes, `u32` pixels, ISA-defined encoding fields (`imm12`, `rel32`, register numbers). Those widths are dictated by the hardware or the format, not chosen by us, and they are what the SIMD work is for.
+
 - **Denote before you build.** Say what a thing *means* — as a mathematical object, in the type system — before writing the code that manipulates it. Design is choosing the denotation; the implementation is then obliged to it. Where this codebase is good, it already works this way: `Lattice`/`DiscreteManifold` are a representable functor whose law is written down (`index(collapse(f)) = f`), and that law is *why* a buffer can BE a manifold rather than merely back one.
 
   Where it is bad, the meaning lives in a comment instead of a type, and every such place has cost us a bug. One `f32` lane carries continuous values, integers, and bit patterns at once — `OpKind::is_bitwise_domain()` exists to recover at runtime what a type would have given for free, and a mask (all-ones, i.e. NaN read as a number) is one careless fold away from corruption. `Var(u8)` means a coordinate axis or a reduce binder depending on magic ranges — it used to mean a manifold-param slot as well, and that third meaning went out with the macro parameter that needed it. `push_reduce` encodes an `OpKind` as a `Const(f32)`. Each convention held right up until the optimizer grew strong enough to violate it — **a convention written in a comment is an invariant something else will eventually break.**
@@ -51,8 +57,10 @@ Behavior every target agrees on, pinned by
 | `exp`, `exp2` | saturate past ±126 exponents rather than overflowing to `inf` |
 
 A mask is a bit pattern, not a number, and that is a load-bearing distinction:
-`Select` is a bitwise blend on every backend (`andps`/`andnps`/`orps`,
-`vpternlogd 0xCA`, `BSL`) and `BitAnd`/`BitOr` are literal bitwise ops. Spell a
+`Select`'s **mixed-lane path** is a bitwise blend on every backend
+(`andps`/`andnps`/`orps`, `vpternlogd 0xCA`, `BSL`) and `BitAnd`/`BitOr` are
+literal bitwise ops. (The blend is the path a *lane-varying* mask takes, not
+what `Select` is — see "Select contains an if" below.) Spell a
 true mask `1.0` and `mask & 1.0` is `0x3f800000`, which blends `7.0` against
 `9.0` into `4.5` — a value neither branch held. `OpKind::mask(bool)` is the only
 constructor, `OpKind::is_bitwise_domain()` marks the ops whose results are
@@ -387,30 +395,37 @@ Priority: AVX-512 > SSE2 (x86-64), NEON (aarch64) — no scalar fallback for oth
 
   **Branchless is the limit**: no case survives to runtime at all, because one
   expression is correct for every input. It is what this codebase is made of —
-  `Select` is a bitwise blend on every backend, a comparison yields a mask
-  rather than a `bool`, and the language is a DAG with no binder — so take it
-  wherever the hardware offers it. What it does not license is hand-rolling a
+  a comparison yields a mask rather than a `bool`, and the language is a DAG
+  with no binder — so take it wherever the hardware offers it. `Select` is
+  **not** an example of it, however much it looks like one; see "Select
+  contains an if" below. What it does not license is hand-rolling a
   *worse* branchless form than the instruction already there: the retired
   `Round` expansion (`(x + 0.5).floor()`, two instructions where `roundps` is
   one, and not any IEEE rounding mode) is the worked counter-example, and
   "Floating point at the edges" above is the long version.
 
-  Note *what* is branchless, because `Select` is not the example it looks like.
-  The **instruction stream** is branchless: a bitwise blend, every lane, always.
-  The **denotation is a conditional** — `Select(m, a, b)` *means* `if m then a
-  else b`, and that is two cases, not one. Both arms stay live and everything
+  **Select contains an if.** `Select(m, a, b)` *means* `if m then a else b`,
+  and that is two cases, not one. Both arms stay live and everything
   downstream carries both. By this section's own taxonomy `Select` is
-  **dispatch**, not a fold. It is the cheapest dispatch the hardware sells and
-  worth reaching for on those grounds, but it collapses no case and must not be
-  read as if it did.
+  **dispatch**, not a fold — it collapses no case and must not be read as if
+  it did.
 
-  Codegen may then put a real branch back: a short-circuit skipping an arm no
-  lane selected (`emit/guards.rs`, bought only where the arm outcosts
-  `MISPREDICT_PENALTY_CYCLES`, since mask coherence is a property of the data
-  that no static analysis can know). That branch changes the work done, never
-  the value — sound precisely *because* the meaning already carried the case.
-  It is not smuggling a condition in; it is spending one the language always
-  had.
+  So the jump is not an optimization codegen may buy; **the jump is what
+  `Select` is.** A batch whose mask is uniform takes an arm — that is the
+  conditional, executed. A batch whose mask varies *by lane* is the case a
+  jump cannot serve, because different lanes want different arms, and the
+  bitwise blend is the fallback for exactly that case. Blend is the
+  lane-varying path, not the definition.
+
+  Getting that default backwards is what produced `emit/guards.rs`: with
+  blend as the definition, a branch has to be *bought* per select
+  (`MISPREDICT_PENALTY_CYCLES`) and, worse, an arm is only eligible when the
+  values it owns happen to be one contiguous run of a flat schedule — so
+  `cluster_select_arms` permutes the schedule looking for that, in rounds,
+  and it measured **73% of a glyph bake** while finding a constant 282 bytes
+  (docs/BACKLOG.md, X1). Emit the arms as blocks and there is nothing to
+  search for: contiguity is a consequence of building the structure rather
+  than a property to be recovered after destroying it.
 
   The distinction is load-bearing, and getting it backwards has already cost.
   If a select's meaning carries one case, then "which values does this arm

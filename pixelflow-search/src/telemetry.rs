@@ -248,6 +248,15 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             // Priced as the node it is, which is what `CostModel` says about
             // it — see `node_op_cost`'s note on why that is a sentinel.
             ExprNode::Reduce { .. } => Some(pixelflow_ir::OpKind::Reduce),
+            // Same reasoning as `Ref`: a `Guard` has no cost of its own to
+            // stand in for (it names two whole arms, not one operation), and
+            // `egraph::insert` declines a `Guard` exactly as it declines a
+            // `Ref` (G1 — extraction cannot choose one), so a saturated
+            // arena reaching telemetry cannot hold one either.
+            ExprNode::Guard { mask: _, on, off } => panic!(
+                "latency_prior_cost: Guard(on={on:?}, off={off:?}) — insert declines a \
+                 Guard, so one here means this arena never went through the pipeline"
+            ),
         };
         if let Some(op) = op {
             total += costs.cost(op);
