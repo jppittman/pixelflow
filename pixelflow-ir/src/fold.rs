@@ -223,6 +223,23 @@ impl Fold {
         self.monoid
     }
 
+    /// The combining opcode, for a backend that has decided to *emit* this
+    /// fold as a loop rather than have the e-graph reason about it further.
+    ///
+    /// `Monoid::op` stays crate-private — "consumers name algebras, not
+    /// opcodes" is right for anything still inside the algebra (rewrite
+    /// rules, extraction, the cost model). Codegen is not that: once a
+    /// `Reduce` has survived extraction, the surviving loop's own combine
+    /// instruction has to be *some* opcode, and this is the one narrow door
+    /// for the one consumer past the e-graph that needs it (see
+    /// `pixelflow-codegen`'s `IsaBackend::alu`, and
+    /// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "2a″" for why
+    /// the combine could not live in the arena instead).
+    #[must_use]
+    pub fn combine_op(self) -> OpKind {
+        self.monoid.op()
+    }
+
     /// The index this fold binds.
     #[must_use]
     pub fn binder(self) -> Binder {

@@ -986,6 +986,34 @@ impl NestAllocation {
         self.regions.len()
     }
 
+    /// How many surviving folds this nest has.
+    #[must_use]
+    pub fn fold_count(&self) -> usize {
+        self.folds.len()
+    }
+
+    /// The `ValueId` fold `j`'s `Reduce` def names — its accumulator's own
+    /// identity, for a driver assigning it a slot address before any scope
+    /// is emitted.
+    ///
+    /// # Panics
+    /// If `j` names no fold in this nest, or its parent's schedule does not
+    /// reach the position it opens at (an inconsistency between this nest's
+    /// own folds and the schedule that produced them).
+    #[must_use]
+    pub fn fold_reduce_vid(&self, j: usize) -> ValueId {
+        let fold = &self.folds[j];
+        self.code(fold.parent)
+            .and_then(|c| c.schedule.get(fold.at))
+            .map(|def| def.value)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Fold({j})'s parent {:?} has no def at {}",
+                    fold.parent, fold.at
+                )
+            })
+    }
+
     /// The allocation as `scope` reads it.
     ///
     /// # Panics
@@ -1214,6 +1242,42 @@ impl<'a> Allocation<'a> {
             }
             Scope::Region(_) | Scope::Body => None,
         }
+    }
+
+    /// Which scope this allocation answers for.
+    ///
+    /// Not a coordinate — see [`Scope`]'s own doc — but the key an emitter
+    /// needs to ask [`Allocation::fold_opening_at`] from the right place.
+    #[must_use]
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// The scope of this same nest that opens *at* `at` in this schedule —
+    /// [`Allocation::opens_at`]'s query from the other end, asked by the
+    /// emitter walking a schedule position by position rather than by a
+    /// fold looking for its own parent.
+    ///
+    /// A linear scan of the nest's folds: there are a handful per kernel at
+    /// most, and this is asked once per schedule position during emission.
+    #[must_use]
+    pub fn fold_opening_at(&self, at: usize) -> Option<Scope> {
+        self.nest
+            .folds
+            .iter()
+            .position(|f| f.parent == self.scope && f.at == at)
+            .map(Scope::Fold)
+    }
+
+    /// This nest's own view of `scope` — a sibling, an ancestor, or a
+    /// descendant of the scope this [`Allocation`] answers for.
+    ///
+    /// # Panics
+    /// If `scope` names a scope this nest does not have (see
+    /// [`NestAllocation::scope`]).
+    #[must_use]
+    pub fn sibling(&self, scope: Scope) -> Self {
+        self.nest.scope(scope)
     }
 
     /// The scopes inside this one, in no particular order.
@@ -1528,12 +1592,68 @@ impl RegisterAllocator for LinearScan {
                 "Fold({index})'s parent {:?} is not an earlier scope",
                 fold.parent
             );
-            let scan = self.scan(fold.schedule, &file.inside(carried), &parked);
+
+            // The `Reduce` def this fold is the body of — read back out of
+            // whichever scope's schedule holds it, the same schedule
+            // `Allocation::opens_at` names, so the fold's own metadata (its
+            // monoid, its binder, its range) never needs restating on
+            // `ScopeFold` itself.
+            let parent_schedule: &[Def] = match fold.parent {
+                Scope::Region(i) => &regions[i].schedule,
+                Scope::Body => &body.schedule,
+                Scope::Fold(j) => &folds[j].code.schedule,
+            };
+            let ScheduledOp::Reduce(fold_meta, _) = &parent_schedule[fold.at].op else {
+                panic!(
+                    "Fold({index})'s parent def at {:?}[{}] is not a Reduce",
+                    fold.parent, fold.at
+                );
+            };
+            // The temps `scan()` reserved for that def, at the position the
+            // schedule it opens at reserved them: three, one persistent (the
+            // binder) and two transient (the trip test, the accumulate) —
+            // see `emit_dag_body_hoisted`'s `Reduce` arm for what each does.
+            let parent_scratch: &Scratch = match fold.parent {
+                Scope::Region(i) => &regions[i].scratch[fold.at],
+                Scope::Body => &body.scratch[fold.at],
+                Scope::Fold(j) => &folds[j].code.scratch[fold.at],
+            };
+            let reserved: Vec<Reg> = (0..3).filter_map(|k| parent_scratch.temp(k)).collect();
+
+            // The binder's own `Var` leaf, if the body reads it (an unusual
+            // but valid fold never does) — parked to the persistent temp the
+            // same way an enclosing region's root is parked for a scope
+            // inside it, which is the general mechanism this reuses rather
+            // than a bespoke one: the binder is a value defined *outside*
+            // this scope, at a fixed register for the scope's whole life.
+            let binder_var = fold_meta.binder().var();
+            let binder_vid = fold
+                .schedule
+                .iter()
+                .find(|d| matches!(d.op, ScheduledOp::Var(v) if v == binder_var))
+                .map(|d| d.value);
+            let mut fold_parked = parked.clone();
+            if let Some(bv) = binder_vid {
+                let t0 = *reserved.first().unwrap_or_else(|| {
+                    panic!(
+                        "Fold({index}) reads its own binder but its Reduce \
+                         def reserved no temps -- temps_for must return at \
+                         least one for ScheduledOp::Reduce"
+                    )
+                });
+                fold_parked.insert(bv, Where::Reg(t0));
+            }
+
+            let scan = self.scan(
+                fold.schedule,
+                &file.inside(carried).inside(RegSet::of(&reserved)),
+                &fold_parked,
+            );
             folds.push(FoldScope {
                 parent: fold.parent,
                 at: fold.at,
                 code: ScopeCode {
-                    placements: record(&scan, &parked),
+                    placements: record(&scan, &fold_parked),
                     schedule: scan.schedule,
                     scratch: scan.scratch,
                     roots: fold.roots,
@@ -2162,7 +2282,14 @@ impl LinearScan {
             // A guard's own two registers, on the instruction it is emitted
             // before. The mask needs one only when it is not in a register
             // here — which the kept reloads above may just have changed.
-            if !sites[i].is_empty() {
+            //
+            // A surviving `Reduce`'s own trip test needs exactly the same
+            // thing (a mask reduced to a branch condition) and is emitted
+            // the same way, in place of this instruction — so it reserves
+            // through the same gate rather than a second one, even though
+            // `sites[i]` (built from `Select`s alone) never names it.
+            let is_reduce = matches!(def.op, ScheduledOp::Reduce(..));
+            if !sites[i].is_empty() || is_reduce {
                 if sites[i].iter().any(|m| !pass.is_resident(*m)) {
                     scratch_for[i].guard_mask = Some(pass.reserve(i, &mut taken, &live_here));
                 }
@@ -2196,13 +2323,17 @@ impl LinearScan {
             }
 
             // The scope's result is materialized after its last instruction,
-            // and it needs a register of its own in exactly one case: the
-            // whole body was hoisted out, so its root is read from a park
-            // rather than computed. Every other root is the last
-            // instruction's own destination, which is a register.
+            // and it needs a register of its own in two cases: the whole
+            // body was hoisted out, so its root is read from a park rather
+            // than computed, or a surviving fold's own `Reduce` is the
+            // schedule's root, whose accumulator is a slot by construction
+            // (see the `ScheduledOp::Reduce` arm above) — both never resident
+            // for the same reason, a value with no register to be the "last
+            // instruction's own destination" in. Every other root is exactly
+            // that destination.
             if i + 1 == dag.len()
-                && pass.live_in[def.value.0 as usize]
                 && !pass.is_resident(def.value)
+                && (pass.live_in[def.value.0 as usize] || matches!(def.op, ScheduledOp::Reduce(..)))
             {
                 scratch_for[i].result = Some(pass.reserve(i, &mut taken, &live_here));
             }
@@ -2218,6 +2349,21 @@ impl LinearScan {
             // value never competes for one.
             if let ScheduledOp::Var(k) = def.op {
                 pass.place(def.value, i, Where::Reg(input_register(file, k)));
+                continue;
+            }
+
+            // A surviving `Reduce`'s accumulator lives in a slot, never a
+            // register — the whole point of pinning it there is that nothing
+            // is live across the loop's back edge for `LinearScan` to reason
+            // about (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md
+            // §"the design decision that makes this tractable"). Forcing it
+            // here, the same way a coordinate input is forced above, is what
+            // keeps it out of the ordinary destination contest below; the
+            // driver pins the real address afterward
+            // (`FrameLayout::pin_slot`), the same way it does for a value an
+            // enclosing region parked.
+            if let ScheduledOp::Reduce(..) = def.op {
+                pass.place(def.value, i, Where::Spilled);
                 continue;
             }
 
@@ -2323,9 +2469,19 @@ pub fn no_temps(_op: &ScheduledOp) -> u8 {
 }
 
 /// The values an operation reads, in operand order.
+///
+/// A `Reduce` is a leaf here, the same as `Uniform` — by the time one reaches
+/// a schedule this function walks, `extract_folds` has already carved its
+/// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
+/// still carries is `schedule_variance`'s and `extract_folds`'s own concern
+/// (they run before extraction, and after respectively, over different
+/// schedules), never an operand this scope's allocation resolves.
 pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
     let (a, b, c) = match sop {
-        ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => (None, None, None),
+        ScheduledOp::Var(_)
+        | ScheduledOp::Const(_)
+        | ScheduledOp::Uniform(_)
+        | ScheduledOp::Reduce(..) => (None, None, None),
         ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) | ScheduledOp::Gather(a, _) => {
             (Some(*a), None, None)
         }
@@ -2957,8 +3113,14 @@ mod tests {
     /// and a tree give different answers: `Region(0)` contains both
     /// `Region(1)` and `Fold(0)`, and those two contain each other not at all.
     fn nest_with_a_fold() -> NestAllocation {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
         let outer_root = ValueId(1);
         let inner_root = ValueId(11);
+        let fold_meta = Fold::new(
+            Monoid::SUM,
+            Binder::from_slot(0).expect("slot 0 exists"),
+            0..4,
+        );
         LinearScan.allocate_nest(
             ScopedSchedule {
                 regions: vec![
@@ -2966,7 +3128,11 @@ mod tests {
                         roots: vec![outer_root],
                         schedule: vec![
                             def(0, ScheduledOp::Var(1)),
-                            def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                            // A fold's parent def is always a `Reduce` — this
+                            // is the query 2c's `allocate_nest` reads back
+                            // out to find the binder and the fold's own
+                            // metadata, so the fixture has to be one.
+                            def(1, ScheduledOp::Reduce(fold_meta, ValueId(0))),
                         ],
                     },
                     ScopeRegion {

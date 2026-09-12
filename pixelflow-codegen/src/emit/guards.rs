@@ -297,7 +297,10 @@ fn transitive_deps(vid: ValueId, schedule_ops: &[Option<ScheduledOp>]) -> IndexS
         // O(1) lookup via dense Vec indexed by ValueId.0
         if let Some(Some(sop)) = schedule_ops.get(idx) {
             match sop {
-                ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => {}
+                ScheduledOp::Var(_)
+                | ScheduledOp::Const(_)
+                | ScheduledOp::Uniform(_)
+                | ScheduledOp::Reduce(..) => {}
                 ScheduledOp::Unary(_, c)
                 | ScheduledOp::ShiftImm(_, c, _)
                 | ScheduledOp::Gather(c, _) => {
@@ -333,7 +336,10 @@ fn operands_of(vid: ValueId, schedule_ops: &[Option<ScheduledOp>]) -> [Option<Va
         return [None; 3];
     };
     match op {
-        ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => [None; 3],
+        ScheduledOp::Var(_)
+        | ScheduledOp::Const(_)
+        | ScheduledOp::Uniform(_)
+        | ScheduledOp::Reduce(..) => [None; 3],
         ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) | ScheduledOp::Gather(c, _) => {
             [Some(*c), None, None]
         }
@@ -532,7 +538,10 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
             }
         };
         match &def.op {
-            ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => {}
+            ScheduledOp::Var(_)
+            | ScheduledOp::Const(_)
+            | ScheduledOp::Uniform(_)
+            | ScheduledOp::Reduce(..) => {}
             ScheduledOp::Unary(_, c)
             | ScheduledOp::ShiftImm(_, c, _)
             | ScheduledOp::Gather(c, _) => add(*c),
@@ -656,6 +665,15 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
                         ScheduledOp::ShiftImm(op, _, _) => cycles.cost(*op),
                         ScheduledOp::Ternary(op, _, _, _) => cycles.cost(*op),
                         ScheduledOp::Gather(_, _) => cycles.cost(OpKind::RawGather),
+                        // A whole loop, not one instruction — this heuristic
+                        // is a cluster-ordering cost estimate (docs/BACKLOG.md
+                        // X1), not a correctness question, and a surviving
+                        // fold reaching a select's mask/arm cone is rare
+                        // enough that a coarse estimate costs nothing to be
+                        // conservative about.
+                        ScheduledOp::Reduce(fold, _) => {
+                            cycles.cost(OpKind::Reduce) * fold.len() as usize
+                        }
                     })
                     .sum()
             };
@@ -858,7 +876,10 @@ fn is_topological(schedule: &[Def]) -> bool {
     for def in schedule {
         let ready = |c: &ValueId| seen.contains(c) || !defined.contains(c);
         let ok = match &def.op {
-            ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => true,
+            ScheduledOp::Var(_)
+            | ScheduledOp::Const(_)
+            | ScheduledOp::Uniform(_)
+            | ScheduledOp::Reduce(..) => true,
             ScheduledOp::Unary(_, c)
             | ScheduledOp::ShiftImm(_, c, _)
             | ScheduledOp::Gather(c, _) => ready(c),

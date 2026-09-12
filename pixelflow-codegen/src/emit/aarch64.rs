@@ -699,6 +699,10 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         ScheduledOp::Unary(OpKind::Rsqrt | OpKind::Recip, _) => 1,
         // The gather's truncated-index lanes.
         ScheduledOp::Gather(..) => 1,
+        // A surviving fold's own loop scaffold: the persistent binder
+        // register plus two transient registers for the trip test and the
+        // accumulate — see `emit_dag_body_hoisted`'s `Reduce` arm.
+        ScheduledOp::Reduce(..) => 3,
         _ => 0,
     }
 }
@@ -2185,6 +2189,14 @@ pub(crate) mod driver {
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
             super::emit_fmov_imm(code, scratch, scalar);
             AsmProgram::from([Inst::Fadd(dst, dst, scratch)]).assemble(code);
+        }
+
+        fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+            super::emit_fmov_imm(code, dst, val);
+        }
+
+        fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
+            super::emit_binary(code, op, dst, srcs[0], srcs[1]);
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {

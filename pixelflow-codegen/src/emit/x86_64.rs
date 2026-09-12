@@ -732,6 +732,12 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // The gather truncates the float indices into one vector register and
         // loads each element through another.
         ScheduledOp::Gather(..) => 2,
+        // A surviving fold's own loop scaffold: the persistent binder
+        // register (broadcast, stepped once per iteration) plus two
+        // transient registers for the trip test's bound and the
+        // accumulate's slot round-trip — see `emit_dag_body_hoisted`'s
+        // `Reduce` arm.
+        ScheduledOp::Reduce(..) => 3,
         _ => 0,
     }
 }
@@ -1636,6 +1642,14 @@ pub(crate) mod driver {
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
             super::emit_const(code, scratch, scalar);
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
+        }
+
+        fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+            super::emit_const(code, dst, val);
+        }
+
+        fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
+            super::emit_binary(code, op, dst, srcs[0], srcs[1]);
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {

@@ -273,6 +273,35 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.add_scalar(code, dst, scratch, scalar);
     }
 
+    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+        self.inner.load_const(code, dst, val);
+    }
+
+    fn alu(
+        &mut self,
+        code: &mut Vec<u8>,
+        op: pixelflow_ir::kind::OpKind,
+        dst: Reg,
+        srcs: [Reg; 2],
+    ) {
+        self.inner.alu(code, op, dst, srcs);
+    }
+
+    // Explicit rather than inherited: the trait's default for `test_ge`
+    // calls `self.alu`, which through this wrapper would call `Counting`'s
+    // own `alu` — never reaching a backend's own `test_ge` override (only
+    // AVX-512 has one). Forwarding the call itself, not its default body, is
+    // what keeps that override reachable through the decorator.
+    fn test_ge(
+        &mut self,
+        code: &mut Vec<u8>,
+        dst: Reg,
+        srcs: [Reg; 2],
+        mask_scratch: Option<super::KReg>,
+    ) {
+        self.inner.test_ge(code, dst, srcs, mask_scratch);
+    }
+
     fn emit_ret(&mut self, code: &mut Vec<u8>) {
         self.inner.emit_ret(code);
     }

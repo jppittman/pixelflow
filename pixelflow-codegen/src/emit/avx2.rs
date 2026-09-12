@@ -459,6 +459,10 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // index and value registers, plus one of each to carry the high half
         // while the low one is assembled in `dst`.
         ScheduledOp::Gather(..) => 4,
+        // A surviving fold's own loop scaffold: the persistent binder
+        // register plus two transient registers for the trip test and the
+        // accumulate — see `emit_dag_body_hoisted`'s `Reduce` arm.
+        ScheduledOp::Reduce(..) => 3,
         _ => 0,
     }
 }
@@ -1250,7 +1254,14 @@ pub(crate) mod driver {
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
         }
 
-        /// `ucomiss` is scalar, so this tier's wider broadcast makes no
+        fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+            super::emit_const(code, dst, val);
+        }
+
+        fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
+            super::emit_binary(code, op, dst, srcs[0], srcs[1]);
+        }
+
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
             AsmProgram::from([x86::Inst::Ret]).assemble(code);
         }
