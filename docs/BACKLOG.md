@@ -18,6 +18,29 @@ Ordering inside a section is rough priority, not a commitment.
 
 ---
 
+## Where the staged work actually is
+
+The sections below are organised by *subject*, which is right for finding
+things and wrong for answering "is that done?". Several plans land in numbered
+stages, and a stage that is deliberately additive — built, correct, and with
+no production caller yet — reads exactly like a stage that is finished. This
+table is the one place that distinguishes them. **Update it in the same CL as
+the stage.**
+
+| plan | landed | next | note |
+|---|---|---|---|
+| [a surviving `Reduce` is a loop](plans/2026-09-10-a-surviving-reduce-is-a-loop.md) | R0 (labels), 2a (per-scope placements), 2b (the nest is a tree) | **2c** — codegen accepts a surviving `Reduce`; drop `ExpandReduce` | 2b is *additive*: `Scope::Fold` and `opens_at()` exist, and `arena_to_schedule` still panics on a `Reduce`, so nothing produces a fold scope. `HalveFold` (E1b) landed separately. |
+| [emit should just emit](plans/2026-09-12-emit-should-just-emit.md) | G1 (`Guard` node, unchosen) | **G2** — emitter emits it, allocator reads regions off structure, the analysis deletes | G1 is additive by design: nothing constructs a `Guard`, and `arena_to_schedule` panics on one. |
+| [composition is linking](plans/2026-09-09-composition-is-linking.md) | L1, L2, L3 | **L4** — `Ref(k) ⟷ body(k)` as a growth-gated rule | `expand_refs` still inlines every `Ref` unconditionally, so inline-vs-by-reference is not yet a choice. L5 (a survivor is a call) follows. |
+| [one conditional, three lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) | D1 (`mask_support`) | D2 — emit the split | D1 derives the range and checks it; nothing is lowered. |
+| [glyph as a fold execution](plans/2026-09-09-glyph-as-a-fold-execution.md) | S0, S1, S1b | S3 — one program per font, **reframed**: bucket trip counts, 95 → 6 programs | S2's `cells` is on no production path. S3-as-written (one global program) is a worse trade than bucketing. |
+
+Measured, at `9643f3b`, tile 16, 95 glyphs: optimize ~1,896 ms, emit ~3,704 ms
+(down 76% from the guard fixes), and **21.1 MB of emitted code, mean 227
+KB/glyph**. The code-size number is what 2c exists to collapse.
+
+---
+
 ## The shape
 
 **Almost everything below is one pattern.** A structure the language has is
