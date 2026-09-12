@@ -234,6 +234,31 @@ fn transitive_deps(
     }
     deps
 }
+
+/// The immediate operands of `vid`, or all-`None` for a leaf or a hole (a
+/// `ValueId` absent from `schedule_ops` — see [`transitive_deps`]).
+///
+/// Fixed-size rather than a `Vec`: every caller only ever iterates this once,
+/// so an allocation here would be pure overhead. Three slots because a
+/// `Ternary` is the widest op; unfilled slots are `None` rather than a
+/// repeated sentinel `ValueId`; padding with something is what one caller,
+/// [`SelectArms`]'s worklist, needs to be able to ask "which of `v`'s
+/// operands survive" without matching on `ScheduledOp` itself.
+#[inline]
+fn operands_of(vid: ValueId, schedule_ops: &[Option<ScheduledOp>]) -> [Option<ValueId>; 3] {
+    let Some(Some(op)) = schedule_ops.get(vid.0 as usize) else {
+        return [None; 3];
+    };
+    match op {
+        ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => [None; 3],
+        ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) | ScheduledOp::Gather(c, _) => {
+            [Some(*c), None, None]
+        }
+        ScheduledOp::Binary(_, l, r) => [Some(*l), Some(*r), None],
+        ScheduledOp::Ternary(_, a, b, c) => [Some(*a), Some(*b), Some(*c)],
+    }
+}
+
 /// One `Select`'s arms as schedule positions: the entries each arm computes
 /// for itself and nothing else.
 ///
@@ -461,9 +486,19 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
             //
             // So exclusivity is a closure, not a filter. Seed it with the
             // values only this arm's cone reaches, then drop any whose
-            // consumers are not themselves in the set, repeatedly, until the
-            // set stops shrinking — the greatest set closed under "my
-            // consumers are skipped with me".
+            // consumers are not themselves in the set — the greatest set
+            // closed under "my consumers are skipped with me".
+            //
+            // A worklist rather than a rescan-to-fixpoint: `v` can only
+            // become newly doomed when a consumer of it just left the set
+            // (removing `u` never *adds* an in-set consumer to anything, so
+            // doomed-ness only ever gains evidence), and the only values a
+            // removal can affect that way are `u`'s own operands — `u` was
+            // one of *their* consumers. So the initial set is the seed
+            // (nothing has been triggered yet, but a consumer outside the
+            // set from the start still dooms its producer), and every
+            // removal pushes that value's operands back on to be
+            // re-examined, rather than re-walking everyone.
             let closed_exclusive = |cone: &BTreeSet<ValueId>, other: &BTreeSet<ValueId>| {
                 let mut set: BTreeSet<ValueId> = cone
                     .difference(&mask_deps)
@@ -472,23 +507,25 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
                     .difference(other)
                     .copied()
                     .collect();
-                loop {
-                    let doomed: alloc::vec::Vec<ValueId> = set
-                        .iter()
-                        .copied()
-                        .filter(|v| {
-                            consumers[v.0 as usize]
-                                .iter()
-                                .any(|c| *c != *sel_vid && !set.contains(c))
-                        })
-                        .collect();
-                    if doomed.is_empty() {
-                        return set;
+                let mut worklist: alloc::vec::Vec<ValueId> = set.iter().copied().collect();
+                while let Some(v) = worklist.pop() {
+                    if !set.contains(&v) {
+                        continue; // already removed by an earlier pop
                     }
-                    for v in doomed {
-                        set.remove(&v);
+                    let doomed = consumers[v.0 as usize]
+                        .iter()
+                        .any(|c| *c != *sel_vid && !set.contains(c));
+                    if !doomed {
+                        continue;
+                    }
+                    set.remove(&v);
+                    for operand in operands_of(v, &schedule_ops).into_iter().flatten() {
+                        if set.contains(&operand) {
+                            worklist.push(operand);
+                        }
                     }
                 }
+                set
             };
 
             let true_exclusive = closed_exclusive(&true_deps, &false_deps);
