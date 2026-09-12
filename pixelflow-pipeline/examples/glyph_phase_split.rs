@@ -40,6 +40,7 @@ use std::time::Instant;
 
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_pipeline::schema::fnv1a64_hex;
 
 /// core-term's font asset (`terminal_app.rs`: `FONT_FILENAME`).
 const FONT_PATH: &str = concat!(
@@ -101,7 +102,10 @@ fn main() {
     let font = Font::parse(&data).expect("parse the production font");
     let only = only();
 
-    println!("kernel\ttile\toptimize_ms\temit_ms\tnodes_in\tnodes_out\tbytes\ttrips");
+    // `bytes_hash` is FNV-1a over the emitted code, not a length: a byte-level
+    // guard-analysis change (reuse, worklist, bitset — see guards.rs) must not
+    // move a single emitted byte, and a count alone cannot see a transposition.
+    println!("kernel\ttile\toptimize_ms\temit_ms\tnodes_in\tnodes_out\tbytes\tbytes_hash\ttrips");
     for density in DENSITIES {
         if only.is_some() && density != DENSITIES[0] {
             break;
@@ -159,9 +163,10 @@ fn main() {
             bucketed.insert(trips.iter().copied().map(bucket).collect());
 
             println!(
-                "glyph{tile}_U{:04X}\t{tile}\t{opt:.3}\t{emit:.3}\t{nodes_in}\t{nodes_out}\t{}\t{:?}",
+                "glyph{tile}_U{:04X}\t{tile}\t{opt:.3}\t{emit:.3}\t{nodes_in}\t{nodes_out}\t{}\t{}\t{:?}",
                 ch as u32,
                 result.code.len(),
+                fnv1a64_hex(result.code.as_bytes()),
                 trips
             );
             opt_ms += opt;
