@@ -266,7 +266,6 @@ fn it_should_return_cursor_to_column_zero_and_overwrite_on_carriage_return() {
     assert_screen_state(&snapshot, &["DBC       "], Some((0, 1)));
 }
 
-
 // --- Helpers for Selection Integration Tests ---
 // MouseEventType is not defined in term::action, using a placeholder for now
 fn send_mouse_input(
