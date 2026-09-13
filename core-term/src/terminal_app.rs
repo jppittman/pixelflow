@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_control_resize() {
+    fn it_should_resize_the_emulator_and_forward_a_pty_resize_on_control_resize() {
         let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
@@ -1256,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_management_keydown() {
+    fn it_should_write_the_typed_character_to_the_pty_on_keydown() {
         let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
             Some(v) => v,
             None => return,
