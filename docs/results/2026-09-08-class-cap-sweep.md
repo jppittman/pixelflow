@@ -24,7 +24,7 @@ The two glyph tiles are pairwise identical in every deterministic column at ever
 
 The first round of the production rule set grows every glyph to between 6× and 7× its inserted (hash-consed) class count — a cliff, not a slope: at 6 the same 44 glyphs clip, none of them marginally, at 7 none do. The flat caps clip in order of input size (need = 10,000 for 827–1,444 inserted classes, 20,000 for 1,707–2,844, 50,000 for 3,405–3,994), which is why a flat number cannot be right for both `U+0025` (3,994 inserted) and `K` (≈150 inserted, which at 50,000 runs seven rounds to 37,540 classes in 77 s for a 649 → 492 `dag_cost` that the shipped rule gets in 93 ms at the floor). The node count is the wrong key for the same rule (`capx` arms): chrome's `Kernel` is a 390,815-node tree that inserts to 465 classes, so 4 per node hands it the 100,000 ceiling and +42% `dag_cost`, while 8 per inserted class keeps it at the floor. Even 12 per inserted class moves chrome to 5,580 and +1.4% bytes.
 
-The application budget never bound on any arm at the plan's 40-per-class ratio, and bound only once with the cap held at 200,000 (one glyph at 20,000, one shader at 50,000): applications per class at stop stay under 2 at every cap (chrome 142,134 at 85,977 classes; cell grid 165,997 at 90,816). The two application arms are otherwise identical, so the budget dimensions separate cleanly: the class cap is the only one that binds. The safety ceiling never fired on any completed arm, including the flat 100,000 on chrome (3.6 s), the cell grid (0.5 s) and the shaders (139 s for twelve). The glyph families at 100,000 were still in flight when this was written (see the appendix note); the flat 50,000 already costs 1,662 s per 95 glyphs, with the small straight glyphs (`Y` 86 s, `K` 77 s, `V` 71 s) saturating seven rounds to 35,000 classes.
+The application budget never bound on any arm at the plan's 40-per-class ratio, and bound only once with the cap held at 200,000 (one glyph at 20,000, one shader at 50,000): applications per class at stop stay under 2 at every cap (chrome 142,134 at 85,977 classes; cell grid 165,997 at 90,816). The two application arms are otherwise identical, so the budget dimensions separate cleanly: the class cap is the only one that binds. The safety ceiling never fired on any completed arm, including the flat 100,000 on chrome (3.6 s), the cell grid (0.5 s) and the shaders (139 s for twelve). The glyph families at 100,000 were still in flight when this was written — 26 of 95 glyph16 rows after 16 minutes, the first 26 stopping on the class cap in rounds 2–7 at 49,902–93,819 classes and taking up to 93 s each; they are left out of the tables — and the flat 50,000 already costs 1,662 s per 95 glyphs, with the small straight glyphs (`Y` 86 s, `K` 77 s, `V` 71 s) saturating seven rounds to 35,000 classes. With the application cap held at 200,000 the 50,000 arm stops 4 of 95 glyphs on the application budget instead of the class cap and extracts the identical term for every glyph (Σ bytes and `dag_cost` equal to the digit).
 
 ## Does quality improve with budget? Per family
 
@@ -64,7 +64,7 @@ The application budget never bound on any arm at the plan's 40-per-class ratio, 
 | bench (32 pt A/O/S, + O wide) | 4 | 3 | +0.5% / −4.7% | −18.0% / −20.1% | | | 0 | 12–18× |
 | cellgrid, psychedelic, shader ×12, chrome ×2 | 17 | 0 | identical | identical | identical | identical | 0 | 1.07–1.23× (load) |
 
-The +290% on the glyph warm is the cost the directive buys; it is 44 glyphs at 0.1–2.5 s each, and it is entirely saturation (`sat_wall_ms` ≈ `optimize_ms`; emission is unchanged at ~8 ms per glyph and the extraction pass's reach sets are ≤ 1.4 MB). The clock sign for a 95-glyph warm at load < 8 was not obtainable on this host during the run; the alternated base/ship pairs taken at load 37–99 (`rows/clock`) are recorded but not quoted.
+The +290% on the glyph warm is the cost the directive buys; it is 44 glyphs at 0.1–2.5 s each, and it is entirely saturation (`sat_wall_ms` ≈ `optimize_ms`; emission is unchanged at ~8 ms per glyph and the extraction pass's reach sets are ≤ 1.4 MB). **The clock sign**, taken once the host quietened: alternated flat-5,000 / 8-per-inserted-class glyph16 warms, one process per arm, two rounds, 1-minute load 8.0–8.4 (at the protocol's boundary, two sweep processes still running): round 1 **6,547 ms → 26,246 ms (×4.01)**, round 2 **6,628 ms → 25,613 ms (×3.86)**, saturation 5.5 s → 25 s of it; the deterministic columns of all four runs are identical to the rows above.
 
 **What blocked it.** At the production tiles (16 and 32 px) the raised `'8'` is clean — cross-form |Δ| against the raw arena ≤ 6.4e-6 on every glyph, pictures differ only in the last bit (87 of 190 hashes, FMA rounding). At 13, 15, 17, 19 and 21 px it is not: `kernel_glyph_optimize` reports 37 texels on `'8'` where the optimized arena has ~0.5 coverage and the raw arena 0, and the FreeType oracle's new optimized arm finds 15 of them with no ink within a texel in FreeType's rendering — the waist smear. Both tests are green with the ceiling pinned at the floor. The fix belongs to the kernel: `disc >= 0` at a shared extremum is exact zero, one rounding of `Y·slope + c` (fused) against two (raw) decides it, and the sweep changes which fusion the extractor prefers for `'8'` because it changes what the e-graph holds. Five earlier attempts at that fix are recorded in `freetype_oracle.rs`; it is the correctness stream's, and this sweep's raise waits on it.
 
@@ -72,7 +72,7 @@ The +290% on the glyph warm is the cost the directive buys; it is 44 glyphs at 0
 
 Everything below is `egraph_off_on cap-sweep` over the row files (per-kernel rows in the `.csv`, cells and movement in the `.json`).
 
-Arms: flat class caps 5,000 / 10,000 / 20,000 / 50,000 / 100,000 with the application cap at the plan's 40 per class of cap and, separately, held at 200,000; per-inserted-class caps 6 / 7 / 8 / 10 / 12 (`caph<R>-5000-50000`), the shipped rule being `caph8`; and per-node caps 4 / 6 / 8 (`capx<R>-5000-100000`), the arm that showed the node count is the wrong key. Glyph families at 50,000 with the application cap held at 200,000, and at 100,000, are the arms still in flight when this was generated (see the prose).
+Arms: flat class caps 5,000 / 10,000 / 20,000 / 50,000 / 100,000 with the application cap at the plan's 40 per class of cap and, separately, held at 200,000; per-inserted-class caps 6 / 7 / 8 / 10 / 12 (`caph<R>-5000-50000`), the calibrated rule being `caph8` (pinned off in the tree — see the prose); and per-node caps 4 / 6 / 8 (`capx<R>-5000-100000`), the arm that showed the node count is the wrong key. The flat 100,000 arms on the glyph families were still in flight when this was generated (26 of 95 glyph16 rows and 14 of 95 glyph32 rows after 16 minutes; the small straight glyphs take minutes each there) and are left out of the tables.
 
 ## Per family, per arm
 
@@ -154,13 +154,15 @@ Arms: flat class caps 5,000 / 10,000 / 20,000 / 50,000 / 100,000 with the applic
 | cellgrid | cap50000-app200000 | 50000 | 200000 | 1 | class_cap 1/1 | 0 | 4 / 4 | 70275 / 70275 | 44441 / 44441 | 8233 | shared 1/1 | 117 | 2560 (-0.6%) | 427 (-0.2%) | 0/217 | 5 | 0 / 0.000e0 | 142 | 21.7 |
 | chrome | cap50000-app200000 | 50000 | 200000 | 1 | class_cap 1/1 | 0 | 3 / 3 | 78903 / 78903 | 46074 / 46074 | 10256 | shared 1/1 | 518 | 4000 (+16.8%) | 2214 (+32.7%) | 824/512 | 33 | 0 / 0.000e0 | 2479 | 43.2 |
 | chrome_channel | cap50000-app200000 | 50000 | 200000 | 1 | class_cap 1/1 | 0 | 3 / 3 | 77581 / 77581 | 45777 / 45777 | 10205 | shared 1/1 | 428 | 3232 (+22.4%) | 2002 (+41.2%) | 657/425 | 34 | 0 / 1.848e-5 | 2551 | 29.0 |
+| glyph16 | cap50000-app200000 | 50000 | 200000 | 95 | application_budget 4/95, class_cap 81/95, quiesced 10/95 | 0 | 3 / 31 | 82466 / 200000 | 39811 / 48083 | 12932 | shared 47/95, tree_cheaper 48/95 | 80889 | 790196 (-7.3%) | 350192 (-10.8%) | 38260/22145 | 86 | 0 / 3.379e-6 | 1861425 | 23.1 |
+| glyph32 | cap50000-app200000 | 50000 | 200000 | 95 | application_budget 4/95, class_cap 81/95, quiesced 10/95 | 0 | 3 / 31 | 82466 / 200000 | 39811 / 48083 | 12932 | shared 47/95, tree_cheaper 48/95 | 80893 | 790228 (-7.3%) | 350194 (-10.8%) | 38260/22145 | 86 | 0 / 5.126e-6 | 1586043 | 23.1 |
 | psychedelic | cap50000-app200000 | 50000 | 200000 | 1 | class_cap 1/1 | 0 | 5 / 5 | 103075 / 103075 | 47130 / 47130 | 7712 | tree_cheaper 1/1 | 111 | 2352 (-0.7%) | 829 (+0.5%) | 29/127 | 0 | 0 / 0.000e0 | 249 | 21.6 |
 | shader | cap50000-app200000 | 50000 | 200000 | 12 | application_budget 1/12, class_cap 6/12, quiesced 5/12 | 0 | 6.5 / 20 | 69623.5 / 200000 | 18599 / 44384 | 10173 | shared 2/12, tree_cheaper 10/12 | 723 | 15696 (+4.1%) | 4964 (+7.5%) | 720/1458 | 0 | 0 / 6.109e-6 | 20376 | 21.8 |
 | cellgrid | cap50000-app2000000 | 50000 | 2000000 | 1 | class_cap 1/1 | 0 | 4 / 4 | 70275 / 70275 | 44441 / 44441 | 8233 | shared 1/1 | 117 | 2560 (-0.6%) | 427 (-0.2%) | 0/217 | 5 | 0 / 0.000e0 | 144 | 21.7 |
 | chrome | cap50000-app2000000 | 50000 | 2000000 | 1 | class_cap 1/1 | 0 | 3 / 3 | 78903 / 78903 | 46074 / 46074 | 10256 | shared 1/1 | 518 | 4000 (+16.8%) | 2214 (+32.7%) | 824/512 | 33 | 0 / 0.000e0 | 2462 | 43.2 |
 | chrome_channel | cap50000-app2000000 | 50000 | 2000000 | 1 | class_cap 1/1 | 0 | 3 / 3 | 77581 / 77581 | 45777 / 45777 | 10205 | shared 1/1 | 428 | 3232 (+22.4%) | 2002 (+41.2%) | 657/425 | 34 | 0 / 1.848e-5 | 2508 | 29.0 |
 | glyph16 | cap50000-app2000000 | 50000 | 2000000 | 95 | class_cap 85/95, quiesced 10/95 | 0 | 3 / 91 | 82466 / 1449603 | 39811 / 48083 | 12932 | shared 47/95, tree_cheaper 48/95 | 80889 | 790196 (-7.3%) | 350192 (-10.8%) | 38260/22145 | 86 | 0 / 3.379e-6 | 1662068 | 23.1 |
-| glyph32 | cap50000-app2000000 | 50000 | 2000000 | 78 | class_cap 68/78, quiesced 10/78 | 0 | 6 / 91 | 80308.5 / 1449603 | 38326.5 / 48083 | 12932 | shared 36/78, tree_cheaper 42/78 | 64670 | 634596 (-25.5%) | 279919 (-28.7%) | 31166/17874 | 54 | 0 / 3.815e-6 | 1446638 | 23.1 |
+| glyph32 | cap50000-app2000000 | 50000 | 2000000 | 95 | class_cap 85/95, quiesced 10/95 | 0 | 3 / 91 | 82466 / 1449603 | 39811 / 48083 | 12932 | shared 47/95, tree_cheaper 48/95 | 80893 | 790228 (-7.3%) | 350194 (-10.8%) | 38260/22145 | 86 | 0 / 5.126e-6 | 1952508 | 23.1 |
 | psychedelic | cap50000-app2000000 | 50000 | 2000000 | 1 | class_cap 1/1 | 0 | 5 / 5 | 103075 / 103075 | 47130 / 47130 | 7712 | tree_cheaper 1/1 | 111 | 2352 (-0.7%) | 829 (+0.5%) | 29/127 | 0 | 0 / 0.000e0 | 246 | 21.6 |
 | shader | cap50000-app2000000 | 50000 | 2000000 | 12 | class_cap 7/12, quiesced 5/12 | 0 | 6.5 / 30 | 69623.5 / 561412 | 22403.5 / 44384 | 10173 | shared 3/12, tree_cheaper 9/12 | 723 | 15696 (+4.1%) | 4976 (+7.8%) | 720/1457 | 0 | 0 / 6.109e-6 | 22207 | 21.8 |
 | cellgrid | cap100000-app200000 | 100000 | 200000 | 1 | class_cap 1/1 | 0 | 5 / 5 | 165997 / 165997 | 90816 / 90816 | 15172 | shared 1/1 | 117 | 2560 (-0.6%) | 427 (-0.2%) | 0/217 | 5 | 0 / 0.000e0 | 471 | 43.1 |
@@ -1269,20 +1271,7 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U007D | -1376 | -1588 |
 | glyph32_U007D | -1376 | -1588 |
 
-### cap50000-app200000: 2 better, 6 worse, 8 unchanged
-
-| kernel | Δ bytes | Δ dag_cost |
-|---|---:|---:|
-| chrome_R | +592 | +584 |
-| chrome_packed | +576 | +546 |
-| shader_julia_set | +304 | +187 |
-| shader_mandelbrot_distance | +208 | +77 |
-| shader_metaballs | +144 | +100 |
-| psychedelic_packed | -16 | +4 |
-| cellgrid_80x24_d2 | -16 | -1 |
-| shader_domain_warp_fbm | -32 | -18 |
-
-### cap50000-app2000000: 100 better, 47 worse, 42 unchanged
+### cap50000-app200000: 110 better, 52 worse, 44 unchanged
 
 | kernel | Δ bytes | Δ dag_cost |
 |---|---:|---:|
@@ -1291,6 +1280,7 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U0068 | +880 | +540 |
 | glyph32_U0068 | +880 | +540 |
 | glyph16_U0072 | +720 | +669 |
+| glyph32_U0072 | +720 | +669 |
 | glyph16_U0066 | +704 | +679 |
 | glyph32_U0066 | +704 | +679 |
 | glyph16_U0029 | +624 | +709 |
@@ -1298,6 +1288,7 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U0050 | +528 | +707 |
 | glyph32_U0050 | +528 | +707 |
 | glyph16_U0075 | +592 | +612 |
+| glyph32_U0075 | +592 | +612 |
 | chrome_R | +592 | +584 |
 | chrome_packed | +576 | +546 |
 | glyph16_U0028 | +480 | +641 |
@@ -1306,15 +1297,17 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph32_U0044 | +432 | +619 |
 | glyph16_U004A | +224 | +574 |
 | glyph32_U004A | +224 | +572 |
+| glyph32_U0074 | +368 | +311 |
 | glyph16_U0074 | +368 | +306 |
 | glyph16_U006E | +208 | +455 |
+| glyph32_U006E | +208 | +455 |
 | shader_julia_set | +304 | +187 |
 | glyph16_U006C | +0 | +471 |
 | glyph32_U006C | +0 | +471 |
 | glyph16_U0079 | +240 | +120 |
+| glyph32_U0079 | +240 | +120 |
 | shader_mandelbrot_distance | +208 | +77 |
 | shader_metaballs | +144 | +100 |
-| shader_smooth_min_scene | +0 | +12 |
 | psychedelic_packed | -16 | +4 |
 | glyph16_U002A | +224 | -237 |
 | glyph32_U002A | +224 | -237 |
@@ -1341,6 +1334,7 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U006B | +32 | -157 |
 | glyph32_U006B | +32 | -157 |
 | glyph16_U007A | -48 | -79 |
+| glyph32_U007A | -48 | -79 |
 | glyph16_U0059 | -16 | -124 |
 | glyph32_U0059 | -16 | -124 |
 | glyph16_U0034 | -64 | -82 |
@@ -1358,14 +1352,17 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U005A | -96 | -83 |
 | glyph32_U005A | -96 | -83 |
 | glyph16_U0076 | -64 | -116 |
+| glyph32_U0076 | -64 | -116 |
 | glyph16_U0031 | -112 | -86 |
 | glyph32_U0031 | -112 | -86 |
 | glyph16_U005E | -96 | -108 |
 | glyph32_U005E | -96 | -108 |
 | glyph16_U0078 | +48 | -253 |
+| glyph32_U0078 | +48 | -253 |
 | glyph16_U0056 | -176 | -147 |
 | glyph32_U0056 | -176 | -147 |
 | glyph16_U0077 | -96 | -232 |
+| glyph32_U0077 | -96 | -232 |
 | glyph16_U0057 | -96 | -258 |
 | glyph32_U0057 | -96 | -258 |
 | glyph16_U0021 | -256 | -106 |
@@ -1375,6 +1372,7 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U0039 | -1072 | -790 |
 | glyph32_U0039 | -1072 | -790 |
 | glyph16_U0071 | -1456 | -811 |
+| glyph32_U0071 | -1456 | -811 |
 | glyph16_U0052 | -1344 | -966 |
 | glyph32_U0052 | -1344 | -966 |
 | glyph16_U0062 | -1520 | -888 |
@@ -1410,6 +1408,7 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U0065 | -1936 | -1497 |
 | glyph32_U0065 | -1936 | -1497 |
 | glyph16_U006F | -2400 | -1164 |
+| glyph32_U006F | -2400 | -1164 |
 | glyph16_U0032 | -2144 | -1432 |
 | glyph32_U0032 | -2144 | -1432 |
 | glyph16_U0030 | -2608 | -1010 |
@@ -1419,12 +1418,185 @@ For each arm, the kernels whose emitted bytes or `dag_cost` differ from the same
 | glyph16_U0038 | -1312 | -2524 |
 | glyph32_U0038 | -1312 | -2524 |
 | glyph16_U0073 | -2416 | -1470 |
+| glyph32_U0073 | -2416 | -1470 |
 | glyph16_U007D | -2768 | -1157 |
+| glyph32_U007D | -2768 | -1157 |
 | glyph16_U0026 | -912 | -3014 |
 | glyph32_U0026 | -912 | -3014 |
 | glyph16_U0070 | -2480 | -1471 |
+| glyph32_U0070 | -2480 | -1471 |
 | glyph16_U007B | -2784 | -1246 |
+| glyph32_U007B | -2784 | -1246 |
 | glyph16_U007E | -2480 | -1622 |
+| glyph32_U007E | -2480 | -1622 |
+| glyph16_U0036 | -2624 | -1502 |
+| glyph32_U0036 | -2624 | -1502 |
+| glyph16_U0067 | -3088 | -1223 |
+| glyph32_U0067 | -3088 | -1223 |
+| glyph16_U0053 | -2832 | -1636 |
+| glyph32_U0053 | -2832 | -1636 |
+| glyph16_U0024 | -3632 | -1546 |
+| glyph32_U0024 | -3632 | -1546 |
+
+### cap50000-app2000000: 110 better, 53 worse, 43 unchanged
+
+| kernel | Δ bytes | Δ dag_cost |
+|---|---:|---:|
+| glyph16_U006A | +1264 | +704 |
+| glyph32_U006A | +1264 | +704 |
+| glyph16_U0068 | +880 | +540 |
+| glyph32_U0068 | +880 | +540 |
+| glyph16_U0072 | +720 | +669 |
+| glyph32_U0072 | +720 | +669 |
+| glyph16_U0066 | +704 | +679 |
+| glyph32_U0066 | +704 | +679 |
+| glyph16_U0029 | +624 | +709 |
+| glyph32_U0029 | +624 | +709 |
+| glyph16_U0050 | +528 | +707 |
+| glyph32_U0050 | +528 | +707 |
+| glyph16_U0075 | +592 | +612 |
+| glyph32_U0075 | +592 | +612 |
+| chrome_R | +592 | +584 |
+| chrome_packed | +576 | +546 |
+| glyph16_U0028 | +480 | +641 |
+| glyph32_U0028 | +480 | +641 |
+| glyph16_U0044 | +432 | +619 |
+| glyph32_U0044 | +432 | +619 |
+| glyph16_U004A | +224 | +574 |
+| glyph32_U004A | +224 | +572 |
+| glyph32_U0074 | +368 | +311 |
+| glyph16_U0074 | +368 | +306 |
+| glyph16_U006E | +208 | +455 |
+| glyph32_U006E | +208 | +455 |
+| shader_julia_set | +304 | +187 |
+| glyph16_U006C | +0 | +471 |
+| glyph32_U006C | +0 | +471 |
+| glyph16_U0079 | +240 | +120 |
+| glyph32_U0079 | +240 | +120 |
+| shader_mandelbrot_distance | +208 | +77 |
+| shader_metaballs | +144 | +100 |
+| shader_smooth_min_scene | +0 | +12 |
+| psychedelic_packed | -16 | +4 |
+| glyph16_U002A | +224 | -237 |
+| glyph32_U002A | +224 | -237 |
+| cellgrid_80x24_d2 | -16 | -1 |
+| glyph16_U0069 | -32 | -5 |
+| glyph32_U0069 | -32 | -5 |
+| shader_domain_warp_fbm | -32 | -18 |
+| glyph16_U003E | +48 | -109 |
+| glyph32_U003E | +48 | -109 |
+| glyph16_U002C | -32 | -38 |
+| glyph32_U002C | -32 | -38 |
+| glyph16_U003C | +32 | -109 |
+| glyph32_U003C | +32 | -109 |
+| glyph16_U002F | -48 | -38 |
+| glyph16_U005C | -48 | -38 |
+| glyph32_U002F | -48 | -38 |
+| glyph32_U005C | -48 | -38 |
+| glyph16_U0023 | +144 | -237 |
+| glyph32_U0023 | +144 | -237 |
+| glyph16_U004B | +48 | -157 |
+| glyph32_U004B | +48 | -157 |
+| glyph16_U0060 | -64 | -48 |
+| glyph32_U0060 | -64 | -48 |
+| glyph16_U006B | +32 | -157 |
+| glyph32_U006B | +32 | -157 |
+| glyph16_U007A | -48 | -79 |
+| glyph32_U007A | -48 | -79 |
+| glyph16_U0059 | -16 | -124 |
+| glyph32_U0059 | -16 | -124 |
+| glyph16_U0034 | -64 | -82 |
+| glyph32_U0034 | -64 | -82 |
+| glyph16_U004E | -96 | -54 |
+| glyph32_U004E | -96 | -54 |
+| glyph16_U0037 | -96 | -58 |
+| glyph32_U0037 | -96 | -58 |
+| glyph16_U0058 | +80 | -236 |
+| glyph32_U0058 | +80 | -236 |
+| glyph16_U003B | -80 | -79 |
+| glyph32_U003B | -80 | -79 |
+| glyph16_U004D | -32 | -137 |
+| glyph32_U004D | -32 | -137 |
+| glyph16_U005A | -96 | -83 |
+| glyph32_U005A | -96 | -83 |
+| glyph16_U0076 | -64 | -116 |
+| glyph32_U0076 | -64 | -116 |
+| glyph16_U0031 | -112 | -86 |
+| glyph32_U0031 | -112 | -86 |
+| glyph16_U005E | -96 | -108 |
+| glyph32_U005E | -96 | -108 |
+| glyph16_U0078 | +48 | -253 |
+| glyph32_U0078 | +48 | -253 |
+| glyph16_U0056 | -176 | -147 |
+| glyph32_U0056 | -176 | -147 |
+| glyph16_U0077 | -96 | -232 |
+| glyph32_U0077 | -96 | -232 |
+| glyph16_U0057 | -96 | -258 |
+| glyph32_U0057 | -96 | -258 |
+| glyph16_U0021 | -256 | -106 |
+| glyph32_U0021 | -256 | -106 |
+| glyph16_U0041 | -224 | -230 |
+| glyph32_U0041 | -224 | -230 |
+| glyph16_U0039 | -1072 | -790 |
+| glyph32_U0039 | -1072 | -790 |
+| glyph16_U0071 | -1456 | -811 |
+| glyph32_U0071 | -1456 | -811 |
+| glyph16_U0052 | -1344 | -966 |
+| glyph32_U0052 | -1344 | -966 |
+| glyph16_U0062 | -1520 | -888 |
+| glyph32_U0062 | -1520 | -888 |
+| glyph16_U0025 | +416 | -2834 |
+| glyph32_U0025 | +416 | -2834 |
+| glyph16_U0033 | -1680 | -946 |
+| glyph32_U0033 | -1680 | -946 |
+| glyph16_U0051 | -1712 | -975 |
+| glyph32_U0051 | -1712 | -975 |
+| glyph16_U0061 | -2208 | -673 |
+| glyph32_U0061 | -2208 | -673 |
+| glyph16_U0055 | -1824 | -1067 |
+| glyph32_U0055 | -1824 | -1067 |
+| glyph16_U0042 | -1616 | -1343 |
+| glyph32_U0042 | -1616 | -1343 |
+| glyph16_U004F | -1888 | -1175 |
+| glyph32_U004F | -1888 | -1175 |
+| glyph16_U0063 | -1936 | -1144 |
+| glyph32_U0063 | -1936 | -1144 |
+| glyph16_U0035 | -1856 | -1290 |
+| glyph32_U0035 | -1856 | -1290 |
+| glyph16_U006D | -2240 | -919 |
+| glyph32_U006D | -2240 | -919 |
+| glyph16_U0043 | -2016 | -1173 |
+| glyph32_U0043 | -2016 | -1173 |
+| glyph16_U0047 | -2064 | -1186 |
+| glyph32_U0047 | -2064 | -1186 |
+| glyph16_U0040 | -736 | -2559 |
+| glyph32_U0040 | -752 | -2565 |
+| glyph16_U0064 | -1952 | -1436 |
+| glyph32_U0064 | -1952 | -1436 |
+| glyph16_U0065 | -1936 | -1497 |
+| glyph32_U0065 | -1936 | -1497 |
+| glyph16_U006F | -2400 | -1164 |
+| glyph32_U006F | -2400 | -1164 |
+| glyph16_U0032 | -2144 | -1432 |
+| glyph32_U0032 | -2144 | -1432 |
+| glyph16_U0030 | -2608 | -1010 |
+| glyph32_U0030 | -2608 | -1010 |
+| glyph16_U003F | -2784 | -1041 |
+| glyph32_U003F | -2784 | -1041 |
+| glyph16_U0038 | -1312 | -2524 |
+| glyph32_U0038 | -1312 | -2524 |
+| glyph16_U0073 | -2416 | -1470 |
+| glyph32_U0073 | -2416 | -1470 |
+| glyph16_U007D | -2768 | -1157 |
+| glyph32_U007D | -2768 | -1157 |
+| glyph16_U0026 | -912 | -3014 |
+| glyph32_U0026 | -912 | -3014 |
+| glyph16_U0070 | -2480 | -1471 |
+| glyph32_U0070 | -2480 | -1471 |
+| glyph16_U007B | -2784 | -1246 |
+| glyph32_U007B | -2784 | -1246 |
+| glyph16_U007E | -2480 | -1622 |
+| glyph32_U007E | -2480 | -1622 |
 | glyph16_U0036 | -2624 | -1502 |
 | glyph32_U0036 | -2624 | -1502 |
 | glyph16_U0067 | -3088 | -1223 |
