@@ -55,7 +55,7 @@ Each of these gets a dated "Retracted/Superseded" block at the top of its result
 | L054, L058–L061 | class-cap cost 8.66%; ghost recovery 2.35%; live cap +2.03%; cap-break; congruence −0.07% | tree-DP costs on real kernels; sign contradicted by the chrome clock |
 | L004, L006, L007 | self-play era ns numbers | corpus unrecorded; the 08-05 audit's H1/H2/H3. **Not the 41.67× timebase**: all three are ratios (L004 `ns ratio`, L006 `speedup`, L007 1.0669/0.6676/31×), and `2026-07-20-jit-compile-cost.md:29-33` states that a uniform scale factor leaves ratios and orderings unaffected. The verdicts stand on the other grounds |
 | L013–L017 | the paper's parity rounds and calibration | overhead-biased ratio, cross-population ρ, unreproducible artifacts, confounded init |
-| L028, L031, L036, L041 | headroom ρ, oracle-filtered curves, linear-vs-lookup AUC, tightened labeler | own banner: predates fixes, never re-run |
+| L031, L036, L041 | oracle-filtered curves, linear-vs-lookup AUC, tightened labeler | own banner: predates fixes, never re-run |
 | L065 | latency-prior remeasure absolute numbers | 4× optimistic; table shift was sound but #1157 moved trig again — re-measure |
 | L082 | a tight Y-extent gate fixes the `'8'` waist | an always-true gate fixed it equally; font thread |
 
@@ -148,21 +148,32 @@ INSTRUMENT DEFECT 18→18, NEVER TESTED ON REAL 13→14, total rows 92→91 (L07
 
 ### Untuned models (added 2026-09-08)
 
-11. **Every learned-model row in this ledger was trained at one hand-picked configuration**,
-    with no hyperparameter search. JP, 2026-09-08: *"none of my models worked at all until I ran
-    optuna. We haven't run optuna once since I stopped following this closely."* The previous
-    sweep harness (`optuna_unified.py` driving `train_unified --server <unix socket>`) was
-    deleted with the RL loop in `fb8136e3`, and nothing has swept since. The rows this applies
-    to, none of whose verdicts change here — the caveat is about what the *evidence* can support,
-    not about which way a number went:
+11. **No learned-model row in this ledger had its configuration swept.** JP, 2026-09-08:
+    *"none of my models worked at all until I ran optuna. We haven't run optuna once since I
+    stopped following this closely."* The previous sweep harness (`optuna_unified.py` driving
+    `train_unified --server <unix socket>`) was deleted with the RL loop in `fb8136e3`, and
+    nothing has swept since. The rows this applies to, none of whose verdicts change here — the
+    caveat is about what the *evidence* can support, not about which way a number went:
 
-    - the extraction head: **L005, L006, L007, L011, L012, L013, L015, L017**;
+    - the extraction head: **L005, L006, L007, L011, L012, L013, L014, L015, L016, L017, L018**
+      — every trained-head row, including the contrastive objective (L014), the random-init
+      arm (L016) and the bootstrap learning curve (L018);
     - the Guide programme, linear: **L034, L035, L036, L037, L038**;
     - return-to-go: **L044, L045, L046**;
-    - bilinear: **L047, L048**;
-    - and the bilinear rules × nodes filter's null, which is not a row here — it is registered in
-      `docs/plans/2026-09-08-rules-filter-bilinear-registration.md` and reported in
-      `docs/results/2026-09-08-rules-filter-bilinear.md`.
+    - bilinear: **L047, L048** — with one qualification, below;
+    - and the bilinear rules × nodes filter's null, which is not a row here. It is registered
+      in `docs/plans/2026-09-08-rules-filter-bilinear-registration.md` and reported in
+      `docs/results/2026-09-08-rules-filter-bilinear.md`, **neither of which is in this tree**:
+      both are on the open PR #1228 (`claude/rules-by-nodes-filter`) and are unauditable from
+      here until it lands.
+
+    The qualification on the bilinear rows: "one hand-picked configuration" would be too
+    strong for L047/L048. `docs/results/2026-09-02-bilinear-guide-training.md:213-237` records
+    a learning-rate grid selected on a TRAIN-internal holdout, widened after an earlier grid
+    selected its own boundary. That is a real, honestly-run one-dimensional search — it is not
+    an Optuna sweep, and every other hyperparameter (embedding width, regularization, epochs)
+    remains unswept, which is what the caveat is for. The distinction matters because a null
+    from a model with a tuned learning rate is stronger evidence than a null from one without.
 
     A null from an untuned model is weak evidence against the *shape* it was testing: it cannot
     separate "this architecture does not carry the signal" from "this learning rate does not".
@@ -173,5 +184,31 @@ INSTRUMENT DEFECT 18→18, NEVER TESTED ON REAL 13→14, total rows 92→91 (L07
     **The rule going forward: no learned model's extrinsic number is quoted — in this ledger or
     anywhere else — without an Optuna sweep on the intrinsic metric first, with the untuned
     configuration enqueued as trial 0 so the tuned and untuned numbers appear in the same table.**
-    The first application of the rule is the rules × nodes filter:
-    `docs/results/2026-09-08-optuna-rules-filter.md`.
+    The first application of the rule is the rules × nodes filter,
+    `docs/results/2026-09-08-optuna-rules-filter.md` — **also not in this tree**, and on the
+    same open PR #1228 as the two artifacts above. Until #1228 lands, the rule is stated here
+    but its first application cannot be checked from this commit.
+
+### Round 4 (2026-09-15)
+
+12. **L028 removed from the §4 "never re-run" retraction row.** That row still listed L028
+    alongside L031/L036/L041 under "own banner: predates fixes, never re-run", contradicting
+    revision 5 above and §2, both of which record that L028 *was* re-run twice (ρ 0.35 and
+    0.186) and that the difference is sampling variance rather than a provenance failure. §2's
+    count already read three rows; the table now matches it. L028's own verdict
+    (NEVER TESTED ON REAL, on the synthetic-corpus ground) is unchanged.
+
+13. **The extraction-head list under revision 11 completed.** It named L005–L007, L011–L013,
+    L015 and L017 while skipping three plainly learned rows in the same family: L014
+    (a trained contrastive objective), L016 (a random-init trained head) and L018 (a bootstrap
+    learning curve). The caveat claims to cover every learned-model row, so those three are
+    now in it.
+
+14. **The blanket "no hyperparameter search" narrowed for L047/L048**, which did have a
+    learning-rate grid selected on a TRAIN-internal holdout. See the qualification under
+    revision 11.
+
+15. **Three forward references marked as not-in-tree.** The two bilinear rules × nodes filter
+    artifacts and the Optuna report cited as the rule's first application live only on the open
+    PR #1228 and cannot be opened from this commit. Marked as such rather than left reading as
+    though they were landed evidence — which is the ledger's own fifth failure mode.
