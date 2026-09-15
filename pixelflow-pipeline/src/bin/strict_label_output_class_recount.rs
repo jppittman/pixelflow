@@ -153,6 +153,7 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
         ENode::Const(bits) => format!("{}", f32::from_bits(*bits)),
         ENode::Buffer(_) => "buf".to_string(),
         ENode::Uniform(_) => "uniform".to_string(),
+        ENode::Param(i) => format!("p{i}"),
         ENode::Op { op, children } => {
             let kids: Vec<String> = children
                 .iter()
@@ -160,6 +161,12 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
                 .collect();
             format!("{:?}({})", op.kind(), kids.join(", "))
         }
+        ENode::Reduce { fold, body } => format!(
+            "Reduce[{}..{}]({})",
+            fold.range().start,
+            fold.range().end,
+            render_chosen(eg, choices, *body)
+        ),
     }
 }
 

@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L047.** The H_form-null verdict was taken with a tree-objective extractor on generator families; it is re-taken under #1192 only if the linear Guide is non-null at the real regime (re-validation item 5), and the finding that guidance of any kind is a net cost on trig-structured kernels at B <= 200 is the reason to expect a null. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # The bilinear Guide: does a rule-by-context interaction buy a domain-conditional advantage?
 
 **Date:** 2026-09-02  

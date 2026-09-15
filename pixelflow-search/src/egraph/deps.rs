@@ -15,7 +15,8 @@
 //! - `BinaryOp(a, b)` → `variance(a).union(variance(b))`
 //! - Across e-nodes in the same class: `meet` (pick lowest-deps representative)
 
-use std::collections::{HashMap, VecDeque};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 use pixelflow_ir::Variance;
 
@@ -70,12 +71,12 @@ impl DepsAnalysis {
     /// This is O(n) since deps only flow upward through the DAG.
     #[must_use]
     pub fn analyze(egraph: &EGraph) -> Self {
-        let mut deps: HashMap<EClassId, Variance> = HashMap::new();
-        let mut in_degree: HashMap<EClassId, usize> = HashMap::new();
-        let mut dependents: HashMap<EClassId, Vec<EClassId>> = HashMap::new();
+        let mut deps: HashMap<EClassId, Variance> = HashMap::default();
+        let mut in_degree: HashMap<EClassId, usize> = HashMap::default();
+        let mut dependents: HashMap<EClassId, Vec<EClassId>> = HashMap::default();
 
         // Collect canonical class IDs (deduplicate after union-find)
-        let mut seen_classes = std::collections::HashSet::new();
+        let mut seen_classes = HashSet::default();
 
         // Build reverse graph and compute in-degrees
         for idx in 0..egraph.classes.len() {
@@ -89,7 +90,7 @@ impl DepsAnalysis {
 
             // Collect the union of all children across all e-nodes.
             // This determines when the class is "ready" for evaluation.
-            let mut children_set = std::collections::HashSet::new();
+            let mut children_set = HashSet::default();
             // Track whether any node is a leaf (has known deps immediately)
             let mut has_leaf = false;
 
@@ -189,7 +190,7 @@ impl DepsAnalysis {
             // A buffer reference is coordinate-invariant — the *read* varies
             // through Gather's x/y children, which the Op arm unions in. A
             // uniform is invariant across the lattice by definition.
-            ENode::Buffer(_) | ENode::Uniform(_) => Variance::CONST,
+            ENode::Buffer(_) | ENode::Uniform(_) | ENode::Param(_) => Variance::CONST,
             ENode::Var(v) => var_variance(*v),
             ENode::Op { children, .. } => {
                 let mut v = Variance::CONST; // Identity for union
@@ -205,6 +206,16 @@ impl DepsAnalysis {
                 }
                 v
             }
+            // The binder is bound, so it is not free in the fold's result —
+            // the only node in the graph that *removes* a dependency.
+            ENode::Reduce { fold, body } => {
+                let child = egraph.find(*body);
+                if child == self_id {
+                    return Variance::ALL;
+                }
+                let child_v = resolved.get(&child).copied().unwrap_or(Variance::ALL);
+                child_v.without(Variance::from_var(fold.binder().var()))
+            }
         }
     }
 
@@ -212,9 +223,12 @@ impl DepsAnalysis {
     fn leaf_deps_and_children(node: &ENode) -> (Option<Variance>, Vec<EClassId>) {
         match node {
             ENode::Const(_) => (Some(Variance::CONST), vec![]),
-            ENode::Buffer(_) | ENode::Uniform(_) => (Some(Variance::CONST), vec![]),
+            ENode::Buffer(_) | ENode::Uniform(_) | ENode::Param(_) => {
+                (Some(Variance::CONST), vec![])
+            }
             ENode::Var(v) => (Some(var_variance(*v)), vec![]),
             ENode::Op { children, .. } => (None, children.clone()),
+            ENode::Reduce { body, .. } => (None, vec![*body]),
         }
     }
 
@@ -235,7 +249,7 @@ impl DepsAnalysis {
     #[must_use]
     pub fn find_hoistable(&self, egraph: &EGraph, root: EClassId) -> Vec<EClassId> {
         let mut hoistable = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = HashSet::default();
 
         self.find_hoistable_recursive(egraph, root, &mut hoistable, &mut visited);
 
@@ -247,7 +261,7 @@ impl DepsAnalysis {
         egraph: &EGraph,
         id: EClassId,
         hoistable: &mut Vec<EClassId>,
-        visited: &mut std::collections::HashSet<EClassId>,
+        visited: &mut HashSet<EClassId>,
     ) {
         let id = egraph.find(id);
         if !visited.insert(id) {
@@ -258,7 +272,7 @@ impl DepsAnalysis {
 
         // Visit children
         for node in egraph.nodes(id) {
-            for child_id in node.children() {
+            for &child_id in node.children_slice() {
                 let child_v = self.get(egraph, child_id);
 
                 // If I depend on X and child doesn't (and child isn't const), child is hoistable

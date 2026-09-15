@@ -292,7 +292,7 @@ impl HeadGradients {
 
     /// Multiply every accumulated gradient by `factor`.
     pub(crate) fn scale(&mut self, factor: f32) {
-        let mut f = |v: &mut f32| *v *= factor;
+        let f = |v: &mut f32| *v *= factor;
         for row in &mut self.candidate_w1 {
             for v in row {
                 f(v);

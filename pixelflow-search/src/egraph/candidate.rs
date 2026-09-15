@@ -58,6 +58,7 @@
 
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
+use pixelflow_ir::fold::Fold;
 
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
@@ -98,7 +99,11 @@ enum NodeShape {
     Const(u32),
     Buffer(BufferDecl),
     Uniform(UniformDecl),
+    Param(u8),
     Op(OpKind, Vec<u32>),
+    /// A fold's shape is its metadata plus its body's class — the metadata
+    /// is part of the node's identity, so it is part of its shape.
+    Reduce(Fold, u32),
 }
 
 impl NodeShape {
@@ -108,6 +113,7 @@ impl NodeShape {
             ENode::Const(bits) => NodeShape::Const(*bits),
             ENode::Buffer(decl) => NodeShape::Buffer(*decl),
             ENode::Uniform(decl) => NodeShape::Uniform(*decl),
+            ENode::Param(i) => NodeShape::Param(*i),
             ENode::Op { op, children } => NodeShape::Op(
                 op.kind(),
                 children
@@ -115,6 +121,9 @@ impl NodeShape {
                     .map(|&c| egraph.find(c).index() as u32)
                     .collect(),
             ),
+            ENode::Reduce { fold, body } => {
+                NodeShape::Reduce(*fold, egraph.find(*body).index() as u32)
+            }
         }
     }
 
@@ -287,7 +296,7 @@ impl CandidateFeatures {
 fn neighborhood_ops(egraph: &EGraph, canonical: EClassId) -> Vec<OpKind> {
     let mut ops = Vec::new();
     for node in egraph.nodes(canonical) {
-        for child in node.children() {
+        for &child in node.children_slice() {
             let child_canonical = egraph.find(child);
             for child_node in egraph.nodes(child_canonical) {
                 if let ENode::Op { op, .. } = child_node {

@@ -54,14 +54,21 @@ pub mod avx2;
 pub mod avx512;
 #[cfg(test)]
 pub(crate) mod coverage;
+pub(crate) mod demand;
+pub mod encoded;
 pub mod executable;
 mod guards;
 pub mod regalloc;
+pub mod storage;
 pub mod traffic;
 pub mod x86_64;
 
+pub use encoded::EncodedInst;
+pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
+
 use pixelflow_ir::kind::OpKind;
 
+pub use guards::SelectArm;
 use guards::analyze_select_guards;
 use traffic::{Counting, EmitTraffic, ScopeTraffic};
 
@@ -69,20 +76,132 @@ use alloc::vec::Vec;
 
 use crate::error::CompileError;
 
-/// Physical register index.
+/// The one contract every backend's instruction types satisfy.
+pub trait AsmInsn: Copy {
+    /// Emit the instruction's encoded bytes into the output buffer.
+    fn emit_into(self, code: &mut Vec<u8>);
+}
+
+/// A declarative sequence of assembly instructions.
+///
+/// Written as an array or collection of instructions, then assembled into machine code:
+/// ```ignore
+/// AsmProgram::from([
+///     Inst::Mov { src: AX, dst: RX },
+/// ]).assemble(&mut buff);
+/// ```
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AsmProgram<S> {
+    insts: S,
+}
+
+impl<S> AsmProgram<S> {
+    /// Create a new assembly program wrapping an instruction sequence.
+    #[inline(always)]
+    pub const fn new(insts: S) -> Self {
+        Self { insts }
+    }
+}
+
+impl<I: AsmInsn, const N: usize> From<[I; N]> for AsmProgram<[I; N]> {
+    #[inline(always)]
+    fn from(insts: [I; N]) -> Self {
+        Self { insts }
+    }
+}
+
+impl<I: AsmInsn> From<alloc::vec::Vec<I>> for AsmProgram<alloc::vec::Vec<I>> {
+    #[inline(always)]
+    fn from(insts: alloc::vec::Vec<I>) -> Self {
+        Self { insts }
+    }
+}
+
+impl<'a, I: AsmInsn> From<&'a [I]> for AsmProgram<&'a [I]> {
+    #[inline(always)]
+    fn from(insts: &'a [I]) -> Self {
+        Self { insts }
+    }
+}
+
+impl<I: AsmInsn, S: IntoIterator<Item = I>> AsmProgram<S> {
+    /// Assemble the program into the machine-code buffer.
+    #[inline]
+    pub fn assemble(self, code: &mut Vec<u8>) {
+        for inst in self.insts {
+            inst.emit_into(code);
+        }
+    }
+}
+
+impl<I: AsmInsn, S: IntoIterator<Item = I> + Copy> AsmInsn for AsmProgram<S> {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        self.assemble(code);
+    }
+}
+
+/// Free-function fold: assemble a declarative sequence directly into `code`.
+#[inline]
+pub fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = I>) {
+    AsmProgram::new(insts).assemble(code);
+}
+
+/// Physical vector register index (v0..v31 on AArch64, xmm/ymm/zmm0..zmm31 on x86).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Reg(pub u8);
 
-/// Location of a value: either in a register or spilled to stack.
+/// Canonical alias for vector values allocated to DAG nodes.
+pub type VReg = Reg;
+
+/// Physical 64-bit general-purpose register index (x0..x31 on AArch64, rax..r15 on x86).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Gpr(pub u8);
+
+/// Physical pointer register index holding a memory address (x0..x31/sp on AArch64, rax..r15/rsp on x86).
+///
+/// Distinct from [`Gpr`] (integers, counters, indices) and [`Reg`] (SIMD vectors).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PtrReg(pub u8);
+
+impl PtrReg {
+    /// Conversion to raw register index.
+    #[inline(always)]
+    #[must_use]
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    /// View as general-purpose register for instructions that manipulate pointers as raw 64-bit values.
+    #[inline(always)]
+    #[must_use]
+    pub const fn as_gpr(self) -> Gpr {
+        Gpr(self.0)
+    }
+}
+
+impl From<PtrReg> for Gpr {
+    #[inline(always)]
+    fn from(p: PtrReg) -> Self {
+        p.as_gpr()
+    }
+}
+
+/// Physical mask/predicate register index (k0..k7 on AVX-512).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KReg(pub u8);
+
+/// A physical location where a value resides: in a register or on the stack.
+///
+/// Every variant of `Loc` is a writable, addressable storage location, which
+/// is why `Loc` implements [`StoreTarget`] — the conversion is total.
+/// A rematerialized constant has no location; it is a [`Binding`], not a `Loc`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Loc {
     /// Value is in a register.
     Reg(Reg),
-    /// Value is spilled to stack at this byte offset from SP.
-    Spill(u32),
-    /// Value is a constant (these are its `f32` bits): it lives nowhere and is
-    /// re-emitted at each use.
-    Remat(u32),
+    /// Value is spilled to a stack slot.
+    Slot(Slot),
 }
 
 impl Loc {
@@ -91,8 +210,178 @@ impl Loc {
     pub fn reg(self) -> Reg {
         match self {
             Loc::Reg(r) => r,
-            Loc::Spill(off) => panic!("expected register, got spill slot {off}"),
-            Loc::Remat(bits) => panic!("expected register, got rematerialized {bits:#x}"),
+            Loc::Slot(s) => panic!("expected register, got stack slot {}", s.offset()),
+        }
+    }
+
+    /// Physical storage location.
+    #[must_use]
+    pub fn storage(self) -> Storage {
+        match self {
+            Loc::Reg(r) => Storage::Reg(r),
+            Loc::Slot(s) => Storage::Slot(s),
+        }
+    }
+}
+
+impl From<Reg> for Loc {
+    #[inline]
+    fn from(r: Reg) -> Self {
+        Loc::Reg(r)
+    }
+}
+
+impl From<Slot> for Loc {
+    #[inline]
+    fn from(s: Slot) -> Self {
+        Loc::Slot(s)
+    }
+}
+
+impl StoreTarget for Loc {
+    #[inline]
+    fn target_storage(self) -> Storage {
+        self.storage()
+    }
+    #[inline]
+    fn target_reg(self) -> Option<Reg> {
+        match self {
+            Loc::Reg(r) => Some(r),
+            Loc::Slot(_) => None,
+        }
+    }
+    #[inline]
+    fn target_slot(self) -> Option<Slot> {
+        match self {
+            Loc::Reg(_) => None,
+            Loc::Slot(s) => Some(s),
+        }
+    }
+}
+
+impl SourceOperand for Loc {
+    #[inline]
+    fn source_storage(self) -> Option<Storage> {
+        Some(self.storage())
+    }
+    #[inline]
+    fn source_reg(self) -> Option<Reg> {
+        match self {
+            Loc::Reg(r) => Some(r),
+            Loc::Slot(_) => None,
+        }
+    }
+    #[inline]
+    fn source_slot(self) -> Option<Slot> {
+        match self {
+            Loc::Reg(_) => None,
+            Loc::Slot(s) => Some(s),
+        }
+    }
+    #[inline]
+    fn source_const(self) -> Option<u32> {
+        None
+    }
+}
+
+/// The binding of a value after register allocation: a physical location
+/// or a constant that is rematerialized at every use.
+///
+/// `Binding` is the register allocator's full answer — "where did this value
+/// end up?" — and includes [`Remat`](Binding::Remat) for constants that live
+/// nowhere. For a writable physical location, use [`Loc`] instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// Value lives in a physical location (register or stack slot).
+    Loc(Loc),
+    /// Value is a constant (these are its `f32` bits): it lives nowhere and is
+    /// re-emitted at each use.
+    Remat(u32),
+}
+
+impl Binding {
+    /// Get the register, panicking if the value is not in one.
+    #[must_use]
+    pub fn reg(self) -> Reg {
+        match self {
+            Binding::Loc(loc) => loc.reg(),
+            Binding::Remat(bits) => panic!("expected register, got rematerialized {bits:#x}"),
+        }
+    }
+
+    /// Physical storage location if not rematerialized.
+    #[must_use]
+    pub fn as_loc(self) -> Option<Loc> {
+        match self {
+            Binding::Loc(loc) => Some(loc),
+            Binding::Remat(_) => None,
+        }
+    }
+
+    /// Physical storage as the canonical enum, if not rematerialized.
+    #[must_use]
+    pub fn as_storage(self) -> Option<Storage> {
+        self.as_loc().map(|l| l.storage())
+    }
+
+    /// Stack slot if spilled to stack.
+    #[must_use]
+    pub fn as_slot(self) -> Option<Slot> {
+        match self {
+            Binding::Loc(Loc::Slot(s)) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+impl From<Loc> for Binding {
+    #[inline]
+    fn from(loc: Loc) -> Self {
+        Binding::Loc(loc)
+    }
+}
+
+impl From<Reg> for Binding {
+    #[inline]
+    fn from(r: Reg) -> Self {
+        Binding::Loc(Loc::Reg(r))
+    }
+}
+
+impl From<Slot> for Binding {
+    #[inline]
+    fn from(s: Slot) -> Self {
+        Binding::Loc(Loc::Slot(s))
+    }
+}
+
+impl SourceOperand for Binding {
+    #[inline]
+    fn source_storage(self) -> Option<Storage> {
+        self.as_storage()
+    }
+
+    #[inline]
+    fn source_reg(self) -> Option<Reg> {
+        match self {
+            Binding::Loc(Loc::Reg(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn source_slot(self) -> Option<Slot> {
+        match self {
+            Binding::Loc(Loc::Slot(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn source_const(self) -> Option<u32> {
+        match self {
+            Binding::Remat(bits) => Some(bits),
+            _ => None,
         }
     }
 }
@@ -101,7 +390,7 @@ impl Loc {
 ///
 /// [`regalloc::Where`] says *that* a value spills; this says *where*. The
 /// two are separate decisions, and this is the arrow between them: it consumes
-/// one scope's [`Allocation`](regalloc::Allocation) and produces the [`Loc`]
+/// one scope's [`Allocation`](regalloc::Allocation) and produces the [`Binding`]
 /// the emitter encodes for every value in it.
 ///
 /// Slots are laid out at the backend's own vector stride, so every offset
@@ -122,7 +411,7 @@ pub struct FrameLayout {
     /// reaches it — at its definition for the values this scope computes.
     /// Total over the scope's schedule; the emitter carries it forward from
     /// here as the placement's later ranges take effect.
-    locs: alloc::vec::Vec<Option<Loc>>,
+    locs: alloc::vec::Vec<Option<Binding>>,
     /// Dense by `ValueId.0`: the address of the value's slot, for every value
     /// this scope ever spills.
     ///
@@ -130,7 +419,7 @@ pub struct FrameLayout {
     /// hold a register for part of this scope and its slot for the rest, so
     /// *that* it needs an address is a property of its whole life here, not of
     /// the one point its definition sits at.
-    slot: alloc::vec::Vec<Option<u32>>,
+    slot: alloc::vec::Vec<Option<Slot>>,
     /// Total frame size in bytes, a whole number of slots.
     pub frame_size: u32,
     /// How many values this frame gives a slot to.
@@ -146,19 +435,16 @@ impl FrameLayout {
         allocation: regalloc::Allocation<'_>,
         vector_bytes: u32,
     ) -> Result<Self, CompileError> {
-        // 2MB max frame — generous but prevents runaway allocations.
-        const MAX_FRAME: u32 = 2 * 1024 * 1024;
-
         let schedule = allocation.schedule();
         let len = schedule
             .iter()
             .map(|def| def.value.0 as usize + 1)
             .max()
             .unwrap_or(0);
-        let mut locs: alloc::vec::Vec<Option<Loc>> = alloc::vec![None; len];
+        let mut locs: alloc::vec::Vec<Option<Binding>> = alloc::vec![None; len];
 
-        let mut slot: alloc::vec::Vec<Option<u32>> = alloc::vec![None; len];
-        let mut offset = 0u32;
+        let mut frame = StackFrame::new(vector_bytes);
+        let mut slot: alloc::vec::Vec<Option<Slot>> = alloc::vec![None; len];
         let mut slots = 0u32;
         for (i, def) in schedule.iter().enumerate() {
             // A value an enclosing region parked is read here from its hoist
@@ -177,19 +463,14 @@ impl FrameLayout {
                     .transitions(v)
                     .any(|(_, at)| at == regalloc::Where::Spilled);
             if spills_here {
-                if offset > MAX_FRAME - vector_bytes {
-                    return Err(CompileError::BudgetExceeded(
-                        "spill frame overflow: exceeds 2MB stack limit",
-                    ));
-                }
-                slot[v.0 as usize] = Some(offset);
-                offset += vector_bytes;
+                let s = frame.alloc_slot()?;
+                slot[v.0 as usize] = Some(s);
                 slots += 1;
             }
             locs[v.0 as usize] = Some(match allocation.where_at(v, i) {
-                regalloc::Where::Reg(r) => Loc::Reg(r),
-                regalloc::Where::Remat(bits) => Loc::Remat(bits),
-                regalloc::Where::Spilled => Loc::Spill(
+                regalloc::Where::Reg(r) => Binding::from(Reg(r.0)),
+                regalloc::Where::Remat(bits) => Binding::Remat(bits),
+                regalloc::Where::Spilled => Binding::from(
                     slot[v.0 as usize].unwrap_or_else(|| unreachable!("just given a slot")),
                 ),
             });
@@ -198,9 +479,7 @@ impl FrameLayout {
         Ok(Self {
             locs,
             slot,
-            // Already a whole number of slots, and a slot is at least the
-            // 16 bytes both ABIs align SP to.
-            frame_size: offset,
+            frame_size: frame.frame_size(),
             slots,
         })
     }
@@ -216,19 +495,19 @@ impl FrameLayout {
     /// # Panics
     /// If `at` is `Spilled` and `v` has no slot in this frame.
     #[must_use]
-    pub fn loc(&self, v: regalloc::ValueId, at: regalloc::Where) -> Loc {
+    pub fn binding(&self, v: regalloc::ValueId, at: regalloc::Where) -> Binding {
         match at {
-            regalloc::Where::Reg(r) => Loc::Reg(r),
-            regalloc::Where::Remat(bits) => Loc::Remat(bits),
-            regalloc::Where::Spilled => Loc::Spill(self.slot_of(v).unwrap_or_else(|| {
+            regalloc::Where::Reg(r) => Binding::from(Reg(r.0)),
+            regalloc::Where::Remat(bits) => Binding::Remat(bits),
+            regalloc::Where::Spilled => Binding::from(self.slot_of(v).unwrap_or_else(|| {
                 panic!("{v:?} is spilled somewhere in this scope but has no slot")
             })),
         }
     }
 
-    /// The address of `v`'s slot, if it has one here.
+    /// The slot of `v`, if it has one here.
     #[must_use]
-    pub fn slot_of(&self, v: regalloc::ValueId) -> Option<u32> {
+    pub fn slot_of(&self, v: regalloc::ValueId) -> Option<Slot> {
         self.slot.get(v.0 as usize).copied().flatten()
     }
 
@@ -237,33 +516,33 @@ impl FrameLayout {
     /// # Panics
     /// If `v` is not in the allocation this was resolved from.
     #[must_use]
-    pub fn of(&self, v: regalloc::ValueId) -> Loc {
+    pub fn of(&self, v: regalloc::ValueId) -> Binding {
         self.locs
             .get(v.0 as usize)
             .copied()
             .flatten()
-            .unwrap_or_else(|| panic!("{v:?} has no location in this frame"))
+            .unwrap_or_else(|| panic!("{v:?} has no binding in this frame"))
     }
 
-    /// Every value's location, dense by `ValueId.0`, for the hot emit loop.
+    /// Every value's binding, dense by `ValueId.0`, for the hot emit loop.
     #[must_use]
-    pub fn locations(&self) -> &[Option<Loc>] {
+    pub fn bindings(&self) -> &[Option<Binding>] {
         &self.locs
     }
 
-    /// Give `v` an address this frame did not lay out.
+    /// Give `v` a slot this frame did not lay out.
     ///
     /// The collapse-loop LICM parks a hoisted value in a slot the enclosing
     /// prologue wrote, which outlives every region's frame — so a scope inside
     /// reads and writes *that* address rather than one of its own. Only the
     /// address is pinned: where the value is at each point remains the
     /// placement's answer.
-    pub fn pin_slot(&mut self, v: regalloc::ValueId, offset: u32) {
+    pub fn pin_slot(&mut self, v: regalloc::ValueId, slot: Slot) {
         let idx = v.0 as usize;
         if idx >= self.slot.len() {
             self.slot.resize(idx + 1, None);
         }
-        self.slot[idx] = Some(offset);
+        self.slot[idx] = Some(slot);
     }
 }
 
@@ -342,8 +621,8 @@ pub struct UniformLoad {
 /// A deferred reload: value loaded mid-instruction (after a partial computation).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeferredReload {
-    /// Load from stack at the given SP offset.
-    FromStack(u32),
+    /// Load from stack slot.
+    FromStack(Slot),
     /// Rematerialize a constant.
     Const(u32),
 }
@@ -353,8 +632,8 @@ pub enum DeferredReload {
 /// Either reload from stack (spilled) or rematerialize a constant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reload {
-    /// Load from stack at the given SP offset.
-    FromStack { target: Reg, offset: u32 },
+    /// Load from stack slot.
+    FromStack { target: Reg, slot: Slot },
     /// Rematerialize a constant (emit FMOV immediate).
     Const { target: Reg, val_bits: u32 },
 }
@@ -473,6 +752,22 @@ pub fn reloads_wanted(sources: [OperandSource; 3]) -> usize {
 #[track_caller]
 pub(crate) fn declared_temp(temp: Option<Reg>) -> Reg {
     temp.expect("this encoding needs a temp that `RegisterFile::temps_for` did not ask for")
+}
+
+/// The GPR-class mirror of [`declared_temp`], for
+/// [`regalloc::RegisterFile::gpr_temps_for`].
+#[track_caller]
+pub(crate) fn declared_gpr_temp(temp: Option<Gpr>) -> Gpr {
+    temp.expect("this encoding needs a GPR that `RegisterFile::gpr_temps_for` did not ask for")
+}
+
+/// The mask-class mirror of [`declared_temp`], for
+/// [`regalloc::RegisterFile::mask_temps_for`].
+#[track_caller]
+pub(crate) fn declared_mask_temp(temp: Option<KReg>) -> KReg {
+    temp.expect(
+        "this encoding needs a mask register that `RegisterFile::mask_temps_for` did not ask for",
+    )
 }
 
 /// Emission context with register budget for ML training.
@@ -608,7 +903,7 @@ trait IsaBackend {
         code: &mut Vec<u8>,
         vid: regalloc::ValueId,
         target: Reg,
-        locs: &[Option<Loc>],
+        locs: &[Option<Binding>],
     ) -> Reg;
 
     /// Branch taken when `mask_reg` is all-false (skip the true arm).
@@ -619,19 +914,26 @@ trait IsaBackend {
     /// writes a scalar into a vector register before it can reach a GP
     /// register — so the x86 tiers, whose guards go through
     /// `movmskps`/`kortest` and the flags, receive `None` and want nothing.
+    ///
+    /// `mask_scratch` is the mask-class mirror, present exactly when
+    /// [`RegisterFile::mask_guard_temps`](regalloc::RegisterFile::mask_guard_temps)
+    /// asked for one. Only AVX-512 does — `vptestmd` writes its result into a
+    /// `k`-register before `kortestw` can read it into the flags.
     fn emit_skip_if_all_false(
         &mut self,
         code: &mut Vec<u8>,
         mask_reg: Reg,
         scratch: Option<Reg>,
+        mask_scratch: Option<KReg>,
     ) -> Self::Branch;
     /// Branch taken when `mask_reg` is all-true (skip the false arm). See
-    /// [`IsaBackend::emit_skip_if_all_false`] for `scratch`.
+    /// [`IsaBackend::emit_skip_if_all_false`] for `scratch`/`mask_scratch`.
     fn emit_skip_if_all_true(
         &mut self,
         code: &mut Vec<u8>,
         mask_reg: Reg,
         scratch: Option<Reg>,
+        mask_scratch: Option<KReg>,
     ) -> Self::Branch;
     /// Unconditional jump.
     fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch;
@@ -922,7 +1224,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     // register, at each point, is the placement's answer.
     if let Some(hoisted) = hoist.preloaded() {
         for (vid, &offset) in hoisted {
-            layout.pin_slot(*vid, offset);
+            layout.pin_slot(*vid, Slot::new(offset, file.vector_bytes));
         }
     }
 
@@ -944,40 +1246,31 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
 
     struct PendingBranch {
         guard_idx: usize,
-        arm: u8,
+        arm: SelectArm,
     }
     let mut branch_starts: alloc::vec::Vec<alloc::vec::Vec<PendingBranch>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     let mut branch_ends: alloc::vec::Vec<alloc::vec::Vec<usize>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     for (gi, guard) in select_guards.iter().enumerate() {
-        if guard.true_range.0 != guard.true_range.1 {
-            branch_starts[guard.true_range.0].push(PendingBranch {
-                guard_idx: gi,
-                arm: 0,
-            });
-            if guard.true_range.1 < sched_len {
-                branch_ends[guard.true_range.1].push(gi);
-            }
-        }
-        if guard.false_range.0 != guard.false_range.1 {
-            branch_starts[guard.false_range.0].push(PendingBranch {
-                guard_idx: gi,
-                arm: 1,
-            });
-            if guard.false_range.1 < sched_len {
-                branch_ends[guard.false_range.1].push(gi);
+        for arm in SelectArm::ALL {
+            let range = guard.range(arm);
+            if range.0 != range.1 {
+                branch_starts[range.0].push(PendingBranch { guard_idx: gi, arm });
+                if range.1 < sched_len {
+                    branch_ends[range.1].push(gi);
+                }
             }
         }
     }
 
-    // One dense ValueId -> Loc lookup for the hot loop, carried *forward*: a
+    // One dense ValueId -> Binding lookup for the hot loop, carried *forward*: a
     // placement is a schedule, so the answer changes at program points, and
     // this is that schedule played out. Each range of each value's life
     // becomes one write here at the point it starts — O(total ranges), not a
     // lookup per operand per instruction.
-    let mut locs: alloc::vec::Vec<Option<Loc>> = layout.locations().to_vec();
-    let mut moves: alloc::vec::Vec<alloc::vec::Vec<(regalloc::ValueId, Loc)>> =
+    let mut locs: alloc::vec::Vec<Option<Binding>> = layout.bindings().to_vec();
+    let mut moves: alloc::vec::Vec<alloc::vec::Vec<(regalloc::ValueId, Binding)>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     // A value that is in a slot anywhere in this scope is stored there right
     // after its definition, from the register the definition wrote. That is
@@ -996,15 +1289,15 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             if index <= i {
                 continue; // The definition itself; the instruction writes it.
             }
-            moves[index].push((v, layout.loc(v, at)));
+            moves[index].push((v, layout.binding(v, at)));
         }
-        if let Some(offset) = layout.slot_of(v)
-            && matches!(locs[v.0 as usize], Some(Loc::Reg(_)))
+        if let Some(slot) = layout.slot_of(v)
+            && matches!(locs[v.0 as usize], Some(Binding::Loc(Loc::Reg(_))))
         {
             // Every definition writes a register, so this is the only place a
             // value reaches its slot — and it is the place that makes the slot
             // valid on both sides of every guard.
-            store_after_def[i] = Some(offset);
+            store_after_def[i] = Some(slot.offset());
         }
     }
 
@@ -1036,8 +1329,8 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             }
             let placement = allocation.placement(vid);
             let at_head = allocation.where_at(vid, 0);
-            let head = layout.loc(vid, at_head);
-            if let Loc::Reg(r) = head
+            let head = layout.binding(vid, at_head);
+            if let Binding::Loc(Loc::Reg(r)) = head
                 && placement.at(regalloc::Point::TAIL) != at_head
             {
                 let from_memory = placement
@@ -1046,7 +1339,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                     .unwrap_or_else(|| {
                         unreachable!("a value that never leaves a register never changes register")
                     });
-                locs[vid.0 as usize] = Some(layout.loc(vid, from_memory));
+                locs[vid.0 as usize] = Some(layout.binding(vid, from_memory));
                 let got = backend.emit_resolve(&mut code, vid, r, &locs);
                 debug_assert_eq!(got, r, "a value out of a register reloads into the target");
             }
@@ -1054,7 +1347,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         }
     }
 
-    let mut pending_patches: BTreeMap<(usize, u8), B::Branch> = BTreeMap::new();
+    let mut pending_patches: BTreeMap<(usize, SelectArm), B::Branch> = BTreeMap::new();
 
     for (sched_idx, def) in schedule.iter().enumerate() {
         let (vid, sched_op) = (&def.value, &def.op);
@@ -1073,7 +1366,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // without a split live range.
         for &gi in &branch_ends[sched_idx] {
             let target = code.len();
-            for arm in 0..2 {
+            for arm in SelectArm::ALL {
                 if let Some(branch) = pending_patches.remove(&(gi, arm)) {
                     backend.patch_branch(&mut code, branch, target);
                 }
@@ -1085,7 +1378,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // value comes back into a pool register and stays there, instead of
         // being fetched into a scratch at every read.
         for (v, to) in core::mem::take(&mut moves[sched_idx]) {
-            if let Loc::Reg(r) = to {
+            if let Binding::Loc(Loc::Reg(r)) = to {
                 let src = backend.emit_resolve(&mut code, v, r, &locs);
                 if src != r {
                     backend.emit_mov(&mut code, r, src);
@@ -1106,18 +1399,23 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             )
         };
         let guard_temp = scratch.guard_temp;
+        let mask_guard_temp = scratch.mask_guard_temp;
 
         // Guard branches that begin before this instruction.
         for pb in &branch_starts[sched_idx] {
             let (guard_idx, arm) = (pb.guard_idx, pb.arm);
             let guard = &select_guards[guard_idx];
             let mask_reg = match location_of(&locs, guard.mask_vid) {
-                Loc::Reg(r) => r,
+                Binding::Loc(Loc::Reg(r)) => r,
                 _ => backend.emit_resolve(&mut code, guard.mask_vid, guard_mask(), &locs),
             };
             let branch = match arm {
-                0 => backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp),
-                _ => backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp),
+                SelectArm::True => {
+                    backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp, mask_guard_temp)
+                }
+                SelectArm::False => {
+                    backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp, mask_guard_temp)
+                }
             };
             pending_patches.insert((guard_idx, arm), branch);
         }
@@ -1136,60 +1434,59 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // Select with a guard region: emit a uniform-mask short-circuit wrapper.
         if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sched_op
             && let Some(guard) = select_guards.iter().find(|g| g.select_idx == sched_idx)
+            && guard.has_guarded_arm()
         {
-            let has_true = guard.true_range.0 != guard.true_range.1;
-            let has_false = guard.false_range.0 != guard.false_range.1;
-            if has_true || has_false {
-                let mask_reg = match location_of(&locs, *mask_vid) {
-                    Loc::Reg(r) => r,
-                    _ => backend.emit_resolve(&mut code, *mask_vid, guard_mask(), &locs),
-                };
-                let dst = dst_loc.reg();
-                let in_reg = |v: regalloc::ValueId| match location_of(&locs, v) {
-                    Loc::Reg(r) => Some(r),
-                    _ => None,
-                };
-                let true_reg = in_reg(*true_vid);
-                let false_reg = in_reg(*false_vid);
+            let mask_reg = match location_of(&locs, *mask_vid) {
+                Binding::Loc(Loc::Reg(r)) => r,
+                _ => backend.emit_resolve(&mut code, *mask_vid, guard_mask(), &locs),
+            };
+            let dst = dst_loc.reg();
+            let in_reg = |v: regalloc::ValueId| match location_of(&locs, v) {
+                Binding::Loc(Loc::Reg(r)) => Some(r),
+                _ => None,
+            };
+            let true_reg = in_reg(*true_vid);
+            let false_reg = in_reg(*false_vid);
 
-                // Both guards read `mask_reg`, which is why the reduction
-                // scratch is a reservation of its own rather than whichever
-                // register the mask was resolved into.
-                let all_false = backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp);
-                let all_true = backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp);
+            // Both guards read `mask_reg`, which is why the reduction
+            // scratch is a reservation of its own rather than whichever
+            // register the mask was resolved into.
+            let all_false =
+                backend.emit_skip_if_all_false(&mut code, mask_reg, guard_temp, mask_guard_temp);
+            let all_true =
+                backend.emit_skip_if_all_true(&mut code, mask_reg, guard_temp, mask_guard_temp);
 
-                // Mixed lanes: the real select.
-                backend.emit_plan(&mut code, &plan)?;
-                let skip_end = backend.emit_jump(&mut code);
+            // Mixed lanes: the real select.
+            backend.emit_plan(&mut code, &plan)?;
+            let skip_end = backend.emit_jump(&mut code);
 
-                // All-false: dst <- false arm.
-                let all_false_target = code.len();
-                if let Some(freg) = false_reg {
-                    backend.emit_mov(&mut code, dst, freg);
-                } else {
-                    backend.emit_resolve(&mut code, *false_vid, dst, &locs);
-                }
-                let skip_end2 = backend.emit_jump(&mut code);
-
-                // All-true: dst <- true arm.
-                let all_true_target = code.len();
-                if let Some(treg) = true_reg {
-                    backend.emit_mov(&mut code, dst, treg);
-                } else {
-                    backend.emit_resolve(&mut code, *true_vid, dst, &locs);
-                }
-
-                let end_target = code.len();
-                backend.patch_branch(&mut code, all_false, all_false_target);
-                backend.patch_branch(&mut code, all_true, all_true_target);
-                backend.patch_branch(&mut code, skip_end, end_target);
-                backend.patch_branch(&mut code, skip_end2, end_target);
-
-                if let Some(offset) = store_after_def[sched_idx] {
-                    backend.emit_store(&mut code, dst, offset)?;
-                }
-                continue;
+            // All-false: dst <- false arm.
+            let all_false_target = code.len();
+            if let Some(freg) = false_reg {
+                backend.emit_mov(&mut code, dst, freg);
+            } else {
+                backend.emit_resolve(&mut code, *false_vid, dst, &locs);
             }
+            let skip_end2 = backend.emit_jump(&mut code);
+
+            // All-true: dst <- true arm.
+            let all_true_target = code.len();
+            if let Some(treg) = true_reg {
+                backend.emit_mov(&mut code, dst, treg);
+            } else {
+                backend.emit_resolve(&mut code, *true_vid, dst, &locs);
+            }
+
+            let end_target = code.len();
+            backend.patch_branch(&mut code, all_false, all_false_target);
+            backend.patch_branch(&mut code, all_true, all_true_target);
+            backend.patch_branch(&mut code, skip_end, end_target);
+            backend.patch_branch(&mut code, skip_end2, end_target);
+
+            if let Some(offset) = store_after_def[sched_idx] {
+                backend.emit_store(&mut code, dst, offset)?;
+            }
+            continue;
         }
 
         backend.emit_plan(&mut code, &plan)?;
@@ -1247,7 +1544,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         .map(|def| def.value)
         .expect("empty schedule");
     let result_reg = match location_of(&locs, root) {
-        Loc::Reg(r) => r,
+        Binding::Loc(Loc::Reg(r)) => r,
         _ => {
             let target = allocation
                 .scratch(sched_len - 1)
@@ -1451,7 +1748,28 @@ fn arena_to_schedule(
             ExprNode::Ternary(op, a, b, c) => {
                 ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
             }
+            // Same unreachable precondition as `Dwrt` above: `passes::legalize`
+            // runs `expand_refs` first in every compile entry point, so a
+            // reference here means this schedule was built without the
+            // lowering pipeline. Refusing is not a limitation to lift — a
+            // surviving reference is a *call*, and codegen emits one flat
+            // function per kernel with no ABI for one
+            // (docs/plans/2026-09-09-composition-is-linking.md §5.2).
+            ExprNode::Ref(key) => panic!(
+                "arena_to_schedule: {key:?} names a kernel whose body is not in \
+                 this arena. expand_refs runs first in every compile entry \
+                 point, so a survivor means this schedule was built without \
+                 the lowering pipeline."
+            ),
             ExprNode::Nary(_, _, _) => panic!("Nary not supported in JIT arena compilation"),
+            // **The emitter has no iteration binder.** A fold reaching here
+            // means `passes::expand_reduce` did not run — that pass is what
+            // turns a fold into the `len()` copies of its body the machine
+            // actually executes, and it is the reason a surviving `Reduce`
+            // is priced out of extraction rather than emitted.
+            ExprNode::Reduce { .. } => {
+                panic!("a bounded fold reached the JIT emitter -- run passes::expand_reduce first")
+            }
         };
         schedule.push(regalloc::Def {
             value: vid,
@@ -1762,17 +2080,17 @@ impl<'a> HoistCtx<'a> {
 /// is no such register any more.
 pub fn resolve_operands(
     op: &ScheduledOp,
-    dst_loc: Loc,
-    locs: &[Option<Loc>],
+    dst_loc: Binding,
+    locs: &[Option<Binding>],
     scratch: regalloc::Scratch,
 ) -> Result<InstructionPlan, CompileError> {
     let dst = match dst_loc {
-        Loc::Reg(r) => r,
+        Binding::Loc(Loc::Reg(r)) => r,
         // A rematerialized constant: it lives nowhere and is rebuilt at each
         // use, so its definition computes nothing. Emitting a load into a
         // register nobody reads is what the fixed destination register used to
         // buy.
-        Loc::Remat(_) => {
+        Binding::Remat(_) => {
             return Ok(InstructionPlan {
                 reloads: Vec::new(),
                 op: ResolvedOp::Nop,
@@ -1780,10 +2098,11 @@ pub fn resolve_operands(
                 scratch,
             });
         }
-        Loc::Spill(offset) => panic!(
-            "a definition landed in stack slot {offset} — the allocator owes \
+        Binding::Loc(Loc::Slot(slot)) => panic!(
+            "a definition landed in stack slot {} — the allocator owes \
              every definition a register, since there is none outside the pool \
-             to compute into"
+             to compute into",
+            slot.offset()
         ),
     };
 
@@ -1791,15 +2110,15 @@ pub fn resolve_operands(
     let mut setup_mov = None;
 
     // Resolve a value to its register, or plan a reload from stack/constant into `target`.
-    let loc_of = |v: regalloc::ValueId| -> Loc {
+    let loc_of = |v: regalloc::ValueId| -> Binding {
         locs.get(v.0 as usize)
             .copied()
             .flatten()
-            .unwrap_or_else(|| panic!("{v:?} has no location"))
+            .unwrap_or_else(|| panic!("{v:?} has no binding"))
     };
     // "Not in a register" — a rematerialized value needs a reload target just
     // as a spilled one does, so both answer false here.
-    let in_register = |v: &regalloc::ValueId| matches!(loc_of(*v), Loc::Reg(_));
+    let in_register = |v: &regalloc::ValueId| matches!(loc_of(*v), Binding::Loc(Loc::Reg(_)));
 
     // Where each operand comes from, and so which register each reload lands
     // in. The same call the allocator made when it decided how many to
@@ -1828,16 +2147,16 @@ pub fn resolve_operands(
 
     let resolve = |v: regalloc::ValueId, target: Reg, reloads: &mut Vec<Reload>| -> Reg {
         match loc_of(v) {
-            Loc::Reg(reg) => reg,
-            Loc::Remat(bits) => {
+            Binding::Loc(Loc::Reg(reg)) => reg,
+            Binding::Remat(bits) => {
                 reloads.push(Reload::Const {
                     target,
                     val_bits: bits,
                 });
                 target
             }
-            Loc::Spill(offset) => {
-                reloads.push(Reload::FromStack { target, offset });
+            Binding::Loc(Loc::Slot(slot)) => {
+                reloads.push(Reload::FromStack { target, slot });
                 target
             }
         }
@@ -1940,10 +2259,12 @@ pub fn resolve_operands(
                         let b_reg = operand(1, *b, &mut reloads);
                         // c is deferred — don't add to upfront reloads.
                         let (c_reg, c_deferred) = match loc_of(*c) {
-                            Loc::Reg(reg) => (reg, None),
-                            Loc::Remat(bits) => (target_for(2), Some(DeferredReload::Const(bits))),
-                            Loc::Spill(offset) => {
-                                (target_for(2), Some(DeferredReload::FromStack(offset)))
+                            Binding::Loc(Loc::Reg(reg)) => (reg, None),
+                            Binding::Remat(bits) => {
+                                (target_for(2), Some(DeferredReload::Const(bits)))
+                            }
+                            Binding::Loc(Loc::Slot(slot)) => {
+                                (target_for(2), Some(DeferredReload::FromStack(slot)))
                             }
                         };
                         ResolvedOp::DecomposedMulAdd {
@@ -2010,13 +2331,13 @@ pub fn resolve_operands(
 /// Where a value lives, from the dense slice the emit loop carries.
 ///
 /// One lookup, indexed by `ValueId.0`. It replaced three parallel slices whose
-/// disagreement was a runtime check; a [`Loc`] is one answer, so there is
+/// disagreement was a runtime check; a [`Binding`] is one answer, so there is
 /// nothing left to disagree.
-fn location_of(locs: &[Option<Loc>], vid: regalloc::ValueId) -> Loc {
+fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
     locs.get(vid.0 as usize)
         .copied()
         .flatten()
-        .unwrap_or_else(|| panic!("{vid:?} has no location"))
+        .unwrap_or_else(|| panic!("{vid:?} has no binding"))
 }
 
 // =============================================================================
@@ -2383,6 +2704,38 @@ mod tests {
         let _ = arena_to_schedule(&a, root);
     }
 
+    /// And the same for a `Ref`: its body is not in this arena at all, so a
+    /// survivor is a schedule built without `expand_refs`. `compile` runs
+    /// `legalize` first, so this too has to call the scheduler directly.
+    #[test]
+    #[should_panic(expected = "names a kernel whose body is not in")]
+    fn a_surviving_reference_fails_loudly() {
+        let named = pixelflow_ir::Kernel::x()
+            .mul(&pixelflow_ir::Kernel::constant(3.0))
+            .by_ref();
+        let (arena, root) = named.parts();
+        let _ = arena_to_schedule(arena, root);
+    }
+
+    /// The route that *does* work: the compile entry expands the reference
+    /// before it schedules, so a kernel composed by reference emits exactly
+    /// what the spliced composition emits.
+    #[test]
+    fn a_reference_compiles_through_the_entry_point() {
+        let body = pixelflow_ir::Kernel::x().mul(&pixelflow_ir::Kernel::constant(3.0));
+        let named = body.by_ref().add(&pixelflow_ir::Kernel::y());
+        let direct = body.add(&pixelflow_ir::Kernel::y());
+        let (n_arena, n_root) = named.parts();
+        let (d_arena, d_root) = direct.parts();
+        let named_code = compile(n_arena, n_root).expect("a named kernel compiles");
+        let direct_code = compile(d_arena, d_root).expect("and so does the spliced one");
+        for (x, y) in [(0.0f32, 0.0f32), (1.5, -2.0), (-3.25, 7.5)] {
+            let want = eval_point(&direct_code.code, x, y, 0.0, 0.0);
+            let got = eval_point(&named_code.code, x, y, 0.0, 0.0);
+            assert_eq!(got, want, "at ({x}, {y})");
+        }
+    }
+
     /// The scaffold's size does not depend on the frame it wraps.
     ///
     /// Every backend now shares one `emit_collapse_loop`, so the loop nest's
@@ -2693,7 +3046,7 @@ mod tests {
         let a = allocation_of(&[(0, regalloc::Where::Reg(Reg(4)))]);
         let layout = FrameLayout::resolve(a.body(), 16).unwrap();
         assert_eq!(layout.frame_size, 0);
-        assert_eq!(layout.of(regalloc::ValueId(0)), Loc::Reg(Reg(4)));
+        assert_eq!(layout.of(regalloc::ValueId(0)), Loc::Reg(Reg(4)).into());
     }
 
     #[test]
@@ -2701,7 +3054,10 @@ mod tests {
         let a = allocation_of(&[(5, regalloc::Where::Spilled)]);
         let layout = FrameLayout::resolve(a.body(), 16).unwrap();
         assert_eq!(layout.frame_size, 16);
-        assert_eq!(layout.of(regalloc::ValueId(5)), Loc::Spill(0));
+        assert_eq!(
+            layout.of(regalloc::ValueId(5)),
+            Loc::Slot(Slot::new(0, 16)).into()
+        );
     }
 
     /// Slots are laid out at the backend's own stride, so the offsets a wide
@@ -2723,7 +3079,7 @@ mod tests {
             for (i, off) in expected.iter().enumerate() {
                 assert_eq!(
                     layout.of(regalloc::ValueId(i as u32 + 1)),
-                    Loc::Spill(*off),
+                    Loc::Slot(Slot::new(*off, vector_bytes)).into(),
                     "vector_bytes={vector_bytes}"
                 );
             }
@@ -2741,9 +3097,12 @@ mod tests {
         assert_eq!(layout.frame_size, 16, "only the spill takes a slot");
         assert_eq!(
             layout.of(regalloc::ValueId(0)),
-            Loc::Remat(1.0f32.to_bits())
+            Binding::Remat(1.0f32.to_bits())
         );
-        assert_eq!(layout.of(regalloc::ValueId(1)), Loc::Spill(0));
+        assert_eq!(
+            layout.of(regalloc::ValueId(1)),
+            Loc::Slot(Slot::new(0, 16)).into()
+        );
     }
 
     /// The collapse LICM pins a hoisted value to the slot its prologue wrote,
@@ -2754,12 +3113,16 @@ mod tests {
         let mut layout = FrameLayout::resolve(a.body(), 16).unwrap();
         let v = regalloc::ValueId(0);
         assert_eq!(layout.slot_of(v), None, "a resident value needs no slot");
-        layout.pin_slot(v, 256);
-        assert_eq!(layout.slot_of(v), Some(256));
-        assert_eq!(layout.loc(v, regalloc::Where::Spilled), Loc::Spill(256));
+        let pin = Slot::new(256, 16);
+        layout.pin_slot(v, pin);
+        assert_eq!(layout.slot_of(v), Some(pin));
         assert_eq!(
-            layout.loc(v, regalloc::Where::Reg(Reg(7))),
-            Loc::Reg(Reg(7)),
+            layout.binding(v, regalloc::Where::Spilled),
+            Loc::Slot(pin).into()
+        );
+        assert_eq!(
+            layout.binding(v, regalloc::Where::Reg(Reg(7))),
+            Loc::Reg(Reg(7)).into(),
             "pinning an address says nothing about where the value is"
         );
     }
@@ -2778,6 +3141,12 @@ mod tests {
         temps_for: regalloc::no_temps,
         guard_temps: 0,
         vector_bytes: 16,
+        gpr_ctx: None,
+        gpr_scratch: regalloc::GprSet::EMPTY,
+        gpr_temps_for: regalloc::no_temps,
+        mask_scratch: regalloc::MaskSet::EMPTY,
+        mask_temps_for: regalloc::no_temps,
+        mask_guard_temps: 0,
     }
     .checked();
 
@@ -2790,8 +3159,11 @@ mod tests {
     const TEST_SCRATCH: regalloc::Scratch =
         regalloc::Scratch::for_test(None, [Some(RELOAD[0]), Some(RELOAD[1])]);
 
-    /// Dense `ValueId -> Loc`, as the emit loop builds it.
-    fn make_locs(assigned: &[(u32, u8)], spilled: &[(u32, u32)]) -> alloc::vec::Vec<Option<Loc>> {
+    /// Dense `ValueId -> Binding`, as the emit loop builds it.
+    fn make_locs(
+        assigned: &[(u32, u8)],
+        spilled: &[(u32, u32)],
+    ) -> alloc::vec::Vec<Option<Binding>> {
         let len = assigned
             .iter()
             .map(|&(v, _)| v)
@@ -2800,10 +3172,10 @@ mod tests {
             .map_or(0, |m| m as usize + 1);
         let mut locs = alloc::vec![None; len];
         for &(v, r) in assigned {
-            locs[v as usize] = Some(Loc::Reg(Reg(r)));
+            locs[v as usize] = Some(Binding::Loc(Loc::Reg(Reg(r))));
         }
         for &(v, off) in spilled {
-            locs[v as usize] = Some(Loc::Spill(off));
+            locs[v as usize] = Some(Binding::Loc(Loc::Slot(Slot::new(off, 16))));
         }
         locs
     }
@@ -2813,7 +3185,8 @@ mod tests {
         // left=v4, right=v5, dst=v6 — all in registers
         let locs = make_locs(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
 
         assert!(plan.reloads.is_empty());
         assert_eq!(
@@ -2837,14 +3210,15 @@ mod tests {
         // left spilled at offset 0, right in v5
         let locs = make_locs(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
 
         assert_eq!(plan.reloads.len(), 1);
         assert_eq!(
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(6),
-                offset: 0
+                slot: Slot::new(0, 16),
             }
         );
         assert_eq!(
@@ -2863,7 +3237,8 @@ mod tests {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let locs = make_locs(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
 
         assert_eq!(plan.reloads.len(), 2);
         // left → dst (v6), right → tmp_op (v27)
@@ -2871,14 +3246,14 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(6),
-                offset: 0
+                slot: Slot::new(0, 16),
             }
         );
         assert_eq!(
             plan.reloads[1],
             Reload::FromStack {
                 target: RELOAD[0],
-                offset: 16
+                slot: Slot::new(16, 16),
             }
         );
         assert_eq!(
@@ -2907,7 +3282,7 @@ mod tests {
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
         drop(resolve_operands(
             &op,
-            Loc::Spill(32),
+            Loc::Slot(Slot::new(32, 16)).into(),
             locs.as_slice(),
             TEST_SCRATCH,
         ));
@@ -2924,7 +3299,7 @@ mod tests {
         let op = ScheduledOp::Const(1.5);
         let plan = resolve_operands(
             &op,
-            Loc::Remat(1.5f32.to_bits()),
+            Binding::Remat(1.5f32.to_bits()),
             locs.as_slice(),
             TEST_SCRATCH,
         )
@@ -2943,7 +3318,8 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
 
         assert!(plan.reloads.is_empty());
         // c=v7 ≠ dst=v8, so setup_mov should copy c → dst
@@ -2969,7 +3345,8 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
 
         // a → dst, b → tmp_op loaded upfront
         assert_eq!(plan.reloads.len(), 2);
@@ -2977,14 +3354,14 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(8),
-                offset: 0
+                slot: Slot::new(0, 16),
             }
         );
         assert_eq!(
             plan.reloads[1],
             Reload::FromStack {
                 target: RELOAD[0],
-                offset: 16
+                slot: Slot::new(16, 16),
             }
         );
         // c is in a register, no deferred reload needed
@@ -3016,14 +3393,18 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan = resolve_operands(&op, Loc::Reg(Reg(8)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
 
         // Only a and b reloads upfront — c is deferred
         assert_eq!(plan.reloads.len(), 2);
         match &plan.op {
             ResolvedOp::DecomposedMulAdd { c, c_deferred, .. } => {
                 assert_eq!(*c, RELOAD[1]); // its own reservation, deferred past the FMUL
-                assert_eq!(*c_deferred, Some(DeferredReload::FromStack(32)));
+                assert_eq!(
+                    *c_deferred,
+                    Some(DeferredReload::FromStack(Slot::new(32, 16)))
+                );
             }
             other => panic!("expected DecomposedMulAdd, got {:?}", other),
         }
@@ -3033,7 +3414,8 @@ mod tests {
     fn resolve_var_is_nop() {
         let locs = make_locs(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
-        let plan = resolve_operands(&op, Loc::Reg(Reg(0)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(0)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
         assert_eq!(plan.op, ResolvedOp::Nop);
         assert!(plan.reloads.is_empty());
     }
@@ -3042,7 +3424,8 @@ mod tests {
     fn resolve_const() {
         let locs = make_locs(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
-        let plan = resolve_operands(&op, Loc::Reg(Reg(6)), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
         assert_eq!(
             plan.op,
             ResolvedOp::LoadConst {
@@ -3283,9 +3666,7 @@ mod tests {
         fn assert_guard_forms(a: &ExprArena, root: ExprId) {
             let schedule = arena_to_schedule(a, root);
             let guards = analyze_select_guards(&schedule);
-            let guarded = guards
-                .iter()
-                .any(|g| g.true_range.0 != g.true_range.1 || g.false_range.0 != g.false_range.1);
+            let guarded = guards.iter().any(|g| g.has_guarded_arm());
             assert!(
                 guarded,
                 "no Select in this schedule has an arm-exclusive range, so the \
@@ -3381,7 +3762,7 @@ mod tests {
             };
             analyze_select_guards(&schedule)
                 .iter()
-                .map(|g| (g.true_range.1 - g.true_range.0) + (g.false_range.1 - g.false_range.0))
+                .map(|g| g.total_guarded_entries())
                 .collect()
         }
 
@@ -3629,7 +4010,7 @@ mod tests {
             let allocation = regalloc::LinearScan.allocate(schedule, &file);
             let guard = analyze_select_guards(allocation.body().schedule())
                 .into_iter()
-                .find(|g| g.true_range.0 != g.true_range.1)
+                .find(|g| g.is_guarded(SelectArm::True))
                 .expect("the true arm is exclusive and contiguous, so it is guarded");
 
             // Which `ValueId` the arena's `split` became. `X·Y` is the only
@@ -3646,7 +4027,7 @@ mod tests {
                 })
                 .map(|d| d.value)
                 .expect("X·Y is in the schedule");
-            (a, root, split_vid, guard.true_range, allocation)
+            (a, root, split_vid, guard.true_range(), allocation)
         }
 
         /// The value is right after the arm, on the path that skips it.
@@ -4405,570 +4786,6 @@ mod tests {
     }
 
     // =========================================================================
-    // 128-bit end-to-end: bound-memory gather through the shared driver, run on
-    // the host across 4 lanes. Covers BOTH 128-bit backends — NEON's native
-    // `ld1` lanes and x86's scalar-load assembly (no AVX2 `vgatherdps` at 128
-    // bits) — against the same interpreter oracle, so the two cannot drift.
-    // Mirrors the avx512_driver gather tests at 128-bit width.
-    // =========================================================================
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(
-            target_arch = "x86_64",
-            not(target_feature = "avx512f"),
-            not(target_feature = "avx2")
-        )
-    ))]
-    mod gather_driver_128 {
-        use super::*;
-        use pixelflow_ir::arena::ExprId;
-
-        /// Run a compiled gather kernel over one batch: `ctx` is the array of
-        /// buffer base pointers. Arch-independent now that the coordinates are
-        /// plain arrays rather than intrinsics.
-        fn run4_ctx(
-            res: &CompileResult,
-            ctx: &[*const f32],
-            xs: [f32; LANES],
-            ys: [f32; LANES],
-        ) -> [f32; LANES] {
-            eval_batch(
-                &res.code,
-                ctx,
-                executable::Point4::new(xs, ys, [0.0; LANES], [0.0; LANES]),
-            )
-        }
-
-        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
-        /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
-        /// the reference interpreter, over the same coords and binding. The 16
-        /// coordinate pairs run as four 4-lane batches.
-        fn check_against_interp(
-            arena: &ExprArena,
-            root: ExprId,
-            buffers: &[&[f32]],
-            xs: [f32; 16],
-            ys: [f32; 16],
-            tag: &str,
-        ) {
-            let res = compile(arena, root).expect("compile gather kernel");
-            let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
-            let bindings = pixelflow_ir::binding::BindingTable::bind(arena, buffers).unwrap();
-
-            for batch in 0..4 {
-                let mut cx = [0.0f32; 4];
-                let mut cy = [0.0f32; 4];
-                cx.copy_from_slice(&xs[batch * 4..batch * 4 + 4]);
-                cy.copy_from_slice(&ys[batch * 4..batch * 4 + 4]);
-                let got = run4_ctx(&res, &ctx, cx, cy);
-                for i in 0..4 {
-                    let want =
-                        pixelflow_ir::eval::eval_scalar(arena, root, &[cx[i], cy[i]], &bindings);
-                    assert_eq!(
-                        got[i], want,
-                        "{tag} batch {batch} lane {i} (x={}, y={})",
-                        cx[i], cy[i]
-                    );
-                }
-            }
-        }
-
-        fn idx_lanes() -> ([f32; 16], [f32; 16]) {
-            // A spread of in-range, fractional, and out-of-range coordinates so
-            // the clamp and floor paths are all exercised.
-            let xs = [
-                0.0, 1.0, 2.9, 7.0, -3.0, 100.0, 4.0, 5.5, 6.0, 0.1, 3.0, 2.0, 1.9, 7.9, -0.5, 4.4,
-            ];
-            let ys = [
-                0.0, 0.0, 1.0, 1.9, 2.0, 2.0, -1.0, 3.0, 0.5, 2.9, 1.0, 3.9, 0.0, 2.0, 5.0, 1.0,
-            ];
-            (xs, ys)
-        }
-
-        #[test]
-        fn gather_jit_matches_interpreter() {
-            // 8x4 buffer, gather at (X, Y).
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_gather(b, x, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
-        }
-
-        #[test]
-        fn gather_composed_with_arithmetic() {
-            // out = gather(buf, X, Y) * 2 + Y — proves gather is a schedulable
-            // mid-expression node, not just a whole-kernel root.
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let g = a.push_gather(b, x, y);
-            let two = a.push_const(2.0);
-            let scaled = a.push_binary(OpKind::Mul, g, two);
-            let root = a.push_binary(OpKind::Add, scaled, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
-        }
-
-        #[test]
-        fn gather_two_buffers() {
-            // gA(X,Y) + gB(Y,X) with two distinct bound buffers, exercising
-            // slot 0 and slot 1 of the context.
-            let (w, h) = (6usize, 6usize);
-            let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
-            let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
-            let mut a = ExprArena::new();
-            let ba = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let bb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let ga = a.push_gather(ba, x, y);
-            let gb = a.push_gather(bb, y, x);
-            let root = a.push_binary(OpKind::Add, ga, gb);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(
-                &a,
-                root,
-                &[buf_a.as_slice(), buf_b.as_slice()],
-                xs,
-                ys,
-                "2-buf",
-            );
-        }
-
-        #[test]
-        fn matmul_reduce_jit_matches_interpreter() {
-            // out(j) = Σ_i W(i,j) * input(i), evaluated per output lane j = X.
-            // The reduction over i unrolls to a flat gather/FMA chain (bound
-            // extent), and the whole thing runs as one bound-memory kernel.
-            //   W is IN×OUT row-major (width=IN, height=OUT); input is length IN.
-            let (in_dim, out_dim) = (4usize, 6usize);
-            let w: Vec<f32> = (0..(in_dim * out_dim))
-                .map(|k| (k as f32) * 0.5 - 2.0)
-                .collect();
-            let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
-
-            let mut a = ExprArena::new();
-            let wb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: out_dim as u32,
-            });
-            let ib = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: 1,
-            });
-            // body(i, j=X) = W(i, X) * input(i, 0)
-            let i = a.push_var(4);
-            let j = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let wg = a.push_gather(wb, i, j);
-            let ig = a.push_gather(ib, i, zero);
-            let prod = a.push_binary(OpKind::Mul, wg, ig);
-            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
-
-            let buffers: &[&[f32]] = &[w.as_slice(), input.as_slice()];
-            // Output lanes j = 0..6 (rest clamp to the last row, harmless here).
-            let xs = [
-                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
-            ];
-            let ys = [0.0f32; 16];
-            check_against_interp(&a, root, buffers, xs, ys, "matmul");
-        }
-    }
-
-    // =========================================================================
-    // AVX-512 end-to-end: arena -> shared driver -> EVEX zmm kernel, run on the
-    // host across all 16 lanes. Built only with +avx512f.
-    // =========================================================================
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    mod avx512_driver {
-        use super::*;
-        use pixelflow_ir::arena::{ExprArena, ExprId};
-
-        /// Run a compiled zmm kernel over 16 distinct lanes per coordinate.
-        fn run16(res: &CompileResult, xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
-            let o = executable::Point4::new(xs, ys, zs, [0.0; 16]);
-            eval_batch(&res.code, &[], o)
-        }
-
-        fn lanes() -> ([f32; 16], [f32; 16], [f32; 16]) {
-            let mut xs = [0.0; 16];
-            let mut ys = [0.0; 16];
-            let mut zs = [0.0; 16];
-            for i in 0..16 {
-                xs[i] = i as f32 - 7.0;
-                ys[i] = (i as f32) * 0.5 + 1.0;
-                zs[i] = 3.0 - (i as f32) * 0.25;
-            }
-            (xs, ys, zs)
-        }
-
-        fn check(got: [f32; 16], want: impl Fn(usize) -> f32, tag: &str) {
-            for (i, &g) in got.iter().enumerate() {
-                let w = want(i);
-                assert!(
-                    (g - w).abs() <= 1e-3,
-                    "{tag} lane {i}: got {} want {}",
-                    g,
-                    w
-                );
-            }
-        }
-
-        // ---- Bound-memory gather: JIT vs reference interpreter ----
-
-        /// Run a compiled gather kernel with `ctx` bound as its buffer bases.
-        fn run16_ctx(
-            res: &CompileResult,
-            ctx: &[*const f32],
-            xs: [f32; 16],
-            ys: [f32; 16],
-        ) -> [f32; 16] {
-            let o = executable::Point4::new(xs, ys, [0.0; 16], [0.0; 16]);
-            eval_batch(&res.code, ctx, o)
-        }
-
-        /// Check a compiled gather kernel lane-for-lane against `eval_scalar`,
-        /// the reference interpreter, over the same coords and binding.
-        #[allow(clippy::too_many_arguments)] // test helper: 6 distinct params (arena, root, buffers, xs, ys, tag)
-        fn check_against_interp(
-            arena: &ExprArena,
-            root: ExprId,
-            buffers: &[&[f32]],
-            xs: [f32; 16],
-            ys: [f32; 16],
-            tag: &str,
-        ) {
-            let res = compile(arena, root).expect("compile gather kernel");
-            let ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
-            let got = run16_ctx(&res, &ctx, xs, ys);
-
-            let bindings = pixelflow_ir::binding::BindingTable::bind(arena, buffers).unwrap();
-            for (i, &g) in got.iter().enumerate() {
-                let want = pixelflow_ir::eval::eval_scalar(arena, root, &[xs[i], ys[i]], &bindings);
-                assert_eq!(g, want, "{tag} lane {i} (x={}, y={})", xs[i], ys[i]);
-            }
-        }
-
-        fn idx_lanes() -> ([f32; 16], [f32; 16]) {
-            // A spread of in-range, fractional, and out-of-range coordinates so
-            // the clamp and floor paths are all exercised.
-            let xs = [
-                0.0, 1.0, 2.9, 7.0, -3.0, 100.0, 4.0, 5.5, 6.0, 0.1, 3.0, 2.0, 1.9, 7.9, -0.5, 4.4,
-            ];
-            let ys = [
-                0.0, 0.0, 1.0, 1.9, 2.0, 2.0, -1.0, 3.0, 0.5, 2.9, 1.0, 3.9, 0.0, 2.0, 5.0, 1.0,
-            ];
-            (xs, ys)
-        }
-
-        #[test]
-        fn gather_jit_matches_interpreter() {
-            // 8x4 buffer, gather at (X, Y).
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| i as f32 * 2.0 - 3.0).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let root = a.push_gather(b, x, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather");
-        }
-
-        #[test]
-        fn gather_composed_with_arithmetic() {
-            // out = gather(buf, X, Y) * 2 + Y — proves gather is a schedulable
-            // mid-expression node, not just a whole-kernel root.
-            let (w, h) = (8usize, 4usize);
-            let buf: Vec<f32> = (0..(w * h)).map(|i| (i as f32).sin()).collect();
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let g = a.push_gather(b, x, y);
-            let two = a.push_const(2.0);
-            let scaled = a.push_binary(OpKind::Mul, g, two);
-            let root = a.push_binary(OpKind::Add, scaled, y);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(&a, root, &[buf.as_slice()], xs, ys, "gather*2+Y");
-        }
-
-        #[test]
-        fn gather_two_buffers() {
-            // coverage.select via arithmetic: gA(X,Y) + gB(Y,X) with two distinct
-            // bound buffers, exercising slot 0 and slot 1 of the context.
-            let (w, h) = (6usize, 6usize);
-            let buf_a: Vec<f32> = (0..(w * h)).map(|i| i as f32).collect();
-            let buf_b: Vec<f32> = (0..(w * h)).map(|i| -(i as f32) * 0.5).collect();
-            let mut a = ExprArena::new();
-            let ba = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let bb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: w as u32,
-                height: h as u32,
-            });
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let ga = a.push_gather(ba, x, y);
-            let gb = a.push_gather(bb, y, x);
-            let root = a.push_binary(OpKind::Add, ga, gb);
-            let (xs, ys) = idx_lanes();
-            check_against_interp(
-                &a,
-                root,
-                &[buf_a.as_slice(), buf_b.as_slice()],
-                xs,
-                ys,
-                "2-buf",
-            );
-        }
-
-        #[test]
-        fn matmul_reduce_jit_matches_interpreter() {
-            // out(j) = Σ_i W(i,j) * input(i), evaluated per output lane j = X.
-            // The reduction over i unrolls to a flat gather/FMA chain (bound
-            // extent), and the whole thing runs as one bound-memory kernel.
-            //   W is IN×OUT row-major (width=IN, height=OUT); input is length IN.
-            let (in_dim, out_dim) = (4usize, 6usize);
-            let w: Vec<f32> = (0..(in_dim * out_dim))
-                .map(|k| (k as f32) * 0.5 - 2.0)
-                .collect();
-            let input: Vec<f32> = (0..in_dim).map(|k| k as f32 + 1.0).collect();
-
-            let mut a = ExprArena::new();
-            let wb = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: out_dim as u32,
-            });
-            let ib = a.declare_buffer(pixelflow_ir::arena::BufferDecl {
-                id: pixelflow_ir::arena::BufferIdentity::mint(),
-                width: in_dim as u32,
-                height: 1,
-            });
-            // body(i, j=X) = W(i, X) * input(i, 0)
-            let i = a.push_var(4);
-            let j = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let wg = a.push_gather(wb, i, j);
-            let ig = a.push_gather(ib, i, zero);
-            let prod = a.push_binary(OpKind::Mul, wg, ig);
-            let root = a.push_reduce(OpKind::Add, 4, in_dim as u32, prod);
-
-            let buffers: &[&[f32]] = &[w.as_slice(), input.as_slice()];
-            // Output lanes j = 0..6 (rest clamp to the last row, harmless here).
-            let xs = [
-                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0, 2.0, 3.0,
-            ];
-            let ys = [0.0f32; 16];
-            check_against_interp(&a, root, buffers, xs, ys, "matmul");
-        }
-
-        /// sqrt(X*X + Y*Y) - Z, with a non-commutative shape and FMA-able terms,
-        /// fitting in registers (no spill).
-        #[test]
-        fn avx512_arith_no_spill() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let z = a.push_binary(OpKind::Mul, y, x);
-            let xx = a.push_binary(OpKind::Mul, x, x);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let sum = a.push_binary(OpKind::Add, xx, yy);
-            let dist = a.push_unary(OpKind::Sqrt, sum);
-            let root = a.push_binary(OpKind::Sub, dist, z);
-
-            let res = compile(&a, root).expect("avx512 compile");
-            assert_eq!(res.spill_count, 0, "should fit without spilling");
-
-            let (xs, ys, zs) = lanes();
-            check(
-                run16(&res, xs, ys, zs),
-                |i| (xs[i] * xs[i] + ys[i] * ys[i]).sqrt() - ys[i] * xs[i],
-                "norm-z",
-            );
-        }
-
-        /// Spilling on AVX-512 must use a real stack frame: a zmm is 64 bytes
-        /// and the SSE2 red zone cannot hold one.
-        ///
-        /// The pool is capped rather than out-sized by the expression. This
-        /// test used to lean on a wide DAG "exceeding the 6 allocatable zmm
-        /// regs" and stopped spilling the moment the pool grew to 22 — the
-        /// subject here is what spilling *does*, not when it happens, so say
-        /// so with `with_max_regs` instead of racing the allocator.
-        #[test]
-        fn avx512_spills_to_real_frame() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let mut terms = alloc::vec::Vec::new();
-            for i in 1..=10u32 {
-                let c = a.push_const(i as f32);
-                let ax = a.push_binary(OpKind::Add, x, c);
-                let by = a.push_binary(OpKind::Add, y, c);
-                terms.push(a.push_binary(OpKind::Mul, ax, by));
-            }
-            while terms.len() > 1 {
-                let mut next = alloc::vec::Vec::new();
-                for pair in terms.chunks(2) {
-                    if pair.len() == 2 {
-                        next.push(a.push_binary(OpKind::Add, pair[0], pair[1]));
-                    } else {
-                        next.push(pair[0]);
-                    }
-                }
-                terms = next;
-            }
-            let root = terms[0];
-
-            let res = EmitCtx::with_max_regs(4)
-                .compile(&a, root)
-                .expect("avx512 compile");
-            assert!(res.spill_count > 0, "expected spilling");
-
-            let (xs, ys, zs) = lanes();
-            check(
-                run16(&res, xs, ys, zs),
-                |i| {
-                    let mut acc = 0.0f32;
-                    for k in 1..=10u32 {
-                        acc += (xs[i] + k as f32) * (ys[i] + k as f32);
-                    }
-                    acc
-                },
-                "spill",
-            );
-        }
-
-        /// Compare + select with non-exclusive arms: `(X < Y) ? X : Y` (== min).
-        /// No guard region forms, so this is the plain vcmpps->vpmovm2d mask +
-        /// vpternlogd blend path.
-        #[test]
-        fn avx512_compare_select_blend() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let cond = a.push_binary(OpKind::Lt, x, y);
-            let root = a.push_ternary(OpKind::Select, cond, x, y);
-
-            let res = compile(&a, root).expect("avx512 compile");
-            let (xs, ys, zs) = lanes();
-            check(run16(&res, xs, ys, zs), |i| xs[i].min(ys[i]), "lt-select");
-        }
-
-        /// Select with arm-exclusive subexpressions: `(X > 0) ? Y*Y*Y : Z+Z+Z`.
-        /// Forms guard regions, exercising the vptestmd+kortestw short-circuit
-        /// branches (all-false skips Y^3, all-true skips 3Z) plus the per-lane
-        /// blend on mixed input.
-        #[test]
-        fn avx512_select_guards() {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let zero = a.push_const(0.0);
-            let cond = a.push_binary(OpKind::Gt, x, zero);
-            let yy = a.push_binary(OpKind::Mul, y, y);
-            let yyy = a.push_binary(OpKind::Mul, yy, y);
-            let zz = a.push_binary(OpKind::Add, x, x);
-            let zzz = a.push_binary(OpKind::Add, zz, x);
-            let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
-
-            let res = compile(&a, root).expect("avx512 compile");
-
-            let allpos = [2.0f32; 16];
-            let allneg = [-2.0f32; 16];
-            let ys = core::array::from_fn::<f32, 16, _>(|i| i as f32 * 0.5 + 1.0);
-            let zs = core::array::from_fn::<f32, 16, _>(|i| 3.0 - i as f32 * 0.25);
-            check(
-                run16(&res, allpos, ys, zs),
-                |i| ys[i] * ys[i] * ys[i],
-                "guard-true",
-            );
-            let _unused_third_input = zs;
-            check(
-                run16(&res, allneg, ys, zs),
-                |_| 3.0 * allneg[0],
-                "guard-false",
-            );
-
-            let mixed = core::array::from_fn::<f32, 16, _>(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
-            check(
-                run16(&res, mixed, ys, zs),
-                |i| {
-                    if mixed[i] > 0.0 {
-                        ys[i] * ys[i] * ys[i]
-                    } else {
-                        3.0 * mixed[i]
-                    }
-                },
-                "guard-mixed",
-            );
-        }
-
-        /// Rounding via vrndscaleps (floor/ceil/round), each a single EVEX op.
-        #[test]
-        fn avx512_rounding() {
-            // Mixed fractional/sign inputs so each rounding mode is distinct.
-            let xs = core::array::from_fn::<f32, 16, _>(|i| (i as f32 - 8.0) * 0.7);
-            let ones = [1.0f32; 16];
-            for (op, f, tag) in [
-                (OpKind::Floor, f32::floor as fn(f32) -> f32, "floor"),
-                (OpKind::Ceil, f32::ceil as fn(f32) -> f32, "ceil"),
-                (
-                    OpKind::Round,
-                    f32::round_ties_even as fn(f32) -> f32,
-                    "round",
-                ),
-            ] {
-                let mut a = ExprArena::new();
-                let x = a.push_var(0);
-                let root = a.push_unary(op, x);
-                let res = compile(&a, root).expect("avx512 compile");
-                check(run16(&res, xs, ones, ones), |i| f(xs[i]), tag);
-            }
-        }
-    }
-
-    // =========================================================================
     // Backend op-coverage completeness (docs/designs/2026-07-25-two-level-ir-
     // and-backend-completeness.md)
     // =========================================================================
@@ -5135,17 +4952,23 @@ mod tests {
             const MOV_RAX_CTX2: [u8; 7] = [0x48, 0x8B, 0x87, 0x10, 0, 0, 0];
 
             let mut sse = Vec::new();
-            x86_64::emit_uniform_load(&mut sse, Reg(5), load);
+            x86_64::emit_uniform_load(&mut sse, Reg(5), load, x86_64::ptr::RAX, x86_64::ptr::RDI);
             assert_eq!(&sse[..7], &MOV_RAX_CTX2);
             assert_eq!(&sse[7..], &[0xC4, 0xE2, 0x79, 0x18, 0xA8, 0x0C, 0, 0, 0]);
 
             let mut avx2 = Vec::new();
-            avx2::emit_uniform_load(&mut avx2, Reg(5), load);
+            avx2::emit_uniform_load(&mut avx2, Reg(5), load, x86_64::ptr::RAX, x86_64::ptr::RDI);
             assert_eq!(&avx2[..7], &MOV_RAX_CTX2);
             assert_eq!(&avx2[7..], &[0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0, 0, 0]);
 
             let mut avx512 = Vec::new();
-            avx512::emit_uniform_load(&mut avx512, Reg(5), load);
+            avx512::emit_uniform_load(
+                &mut avx512,
+                Reg(5),
+                load,
+                x86_64::ptr::RAX,
+                x86_64::ptr::RDI,
+            );
             assert_eq!(&avx512[..7], &MOV_RAX_CTX2);
             assert_eq!(
                 &avx512[7..],
@@ -5153,7 +4976,7 @@ mod tests {
             );
 
             let mut neon = Vec::new();
-            aarch64::emit_uniform_load(&mut neon, Reg(5), load);
+            aarch64::emit_uniform_load(&mut neon, Reg(5), load, aarch64::ptr::X9, aarch64::ptr::X0);
             let words: Vec<u32> = neon
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
@@ -5184,9 +5007,14 @@ mod tests {
                 // whatever scratch the allocator would hand an encoding that
                 // asks for some. A backend that wants scratch and finds none
                 // panics, which `try_emit` would report as a missing op.
-                scratch: regalloc::Scratch::for_test(
+                // `Gpr(9..=11)`/`KReg(1)` stand in the same way for the
+                // GPR/mask-class reservations `Gather`/`Uniform`/compare ask
+                // for.
+                scratch: regalloc::Scratch::for_test_with_classes(
                     Some([Reg(15), Reg(14), Reg(13), Reg(12)]),
                     [Some(Reg(11)), Some(Reg(10))],
+                    Some([Gpr(9), Gpr(10), Gpr(11)]),
+                    Some(KReg(1)),
                 ),
             };
             let mut code = alloc::vec::Vec::new();
@@ -5266,7 +5094,7 @@ mod tests {
                 ("c in a register", None),
                 (
                     "c reloaded from the stack",
-                    Some(DeferredReload::FromStack(32)),
+                    Some(DeferredReload::FromStack(Slot::new(32, 16))),
                 ),
                 (
                     "c rematerialized",
@@ -5551,7 +5379,7 @@ mod tests {
                 // the tail rather than by a per-backend length.
                 let (mul, add) = undeferred.split_at(undeferred.len() - tail_len(name));
                 for deferred in [
-                    DeferredReload::FromStack(32),
+                    DeferredReload::FromStack(Slot::new(32, 16)),
                     DeferredReload::Const(1.0f32.to_bits()),
                 ] {
                     let got = encode(backend, decomposed(Some(deferred.clone())));

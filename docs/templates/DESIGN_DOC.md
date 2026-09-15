@@ -2,15 +2,55 @@
 
 ## Metadata
 - **Author**:
-- **Status**: Draft | Review | Approved | Implemented (required; choose exactly one)
+- **Status**: (required; choose exactly one — see the vocabulary below)
 - **Created**: YYYY-MM-DD
+- **Verified against**: `<commit sha>` (required for any document that makes claims
+  about the tree — see below)
 - **Reviewers**:
 
 ---
 
-Every new plan or design must retain this metadata block and use one of the four
-status values above. Describe archival relationships separately with `Supersedes:` or
-`Superseded by:`; do not invent another workflow status for them.
+### Status vocabulary
+
+Choose exactly one:
+
+| Status | Means |
+|---|---|
+| `Draft` | Written, not agreed. Nothing is built. |
+| `Proposed` | Offered for a decision. |
+| `Registered` | A pre-registration: constants and decision rules committed **before** the data exists, and not revisable after the first run. Results are appended, never edited in. |
+| `Plan of record` | The agreed direction for work not yet fully implemented. |
+| `Landed` | Implemented and merged. Say which PRs in the body. |
+| `Closed` | Ran to completion; the result is recorded and no further work follows. A negative result is a completed document, not an abandoned one. |
+| `Superseded` | Replaced. **Must name the replacement**, and the replacement should say what it keeps. |
+| `Historical` | Kept for rationale or archaeology. Not authoritative about the tree. |
+
+This list replaced `Draft | Review | Approved | Implemented` on 2026-09-09. The old
+four were followed by 3 of 59 plans and designs; the other 56 had invented roughly
+twenty words of their own, and several of those — `Registered`, `Plan of record`,
+`Landed` — carried more information than any of the sanctioned four. **The
+vocabulary was wrong, not the authors.** Describe archival relationships with
+`Supersedes:` / `Superseded by:` in addition to the status, not instead of it.
+
+### Why `Verified against` is required
+
+A status document pinned to a moving base is stale by default, and the fix is not
+more diligence — it is recording *which tree* a claim was checked on, so a later
+reader can tell without re-deriving. Every audit, ledger row and triage table this
+repository has produced records *when* it was written and none recorded this; the
+2026-09-08 open-PR sweep hit that failure four times in one run, twice because of
+merges it made itself.
+
+Resolve the sha, do not name a ref. `main` is a moving target and a local `main`
+can be days behind — `git rev-parse HEAD` at the moment you read the code.
+
+### If the document names source paths
+
+`scripts/check-doc-paths.sh` (CI job `doc-paths`) fails when a plan, design or note
+cites a `.rs` file the tree does not have. A document is fine if the path exists, if
+the surrounding prose says the file is gone, or if it carries one of the archival
+statuses above — so the status is load-bearing, not decoration. A path you intend to
+*create* goes in `scripts/doc-paths-baseline.txt` with a one-line reason.
 
 ## 1. Overview
 

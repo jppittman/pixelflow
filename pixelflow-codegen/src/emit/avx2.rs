@@ -29,8 +29,8 @@
 //! with `vinsertf128`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm8, Imm32, Mem, NoDisp, gpr};
-use super::{Reg, unimplemented_op};
+use super::x86_64::{Disp, Imm8, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
+use super::{AsmProgram, EncodedInst, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -130,29 +130,64 @@ impl Vex {
     }
 
     /// Register-register-register form: `op dst, vvvv, rm`.
-    fn rrr(self, code: &mut Vec<u8>, dst: u8, vvvv: u8, rm: u8) {
+    fn rrr(self, dst: u8, vvvv: u8, rm: u8) -> EncodedInst {
+        let mut inst = EncodedInst::new();
         let rbit = if dst >= 8 { 0x00 } else { 0x80 };
         let xbit = 0x40;
         let bbit = if rm >= 8 { 0x00 } else { 0x20 };
-        code.push(0xC4);
-        code.push(rbit | xbit | bbit | self.map as u8);
-        code.push(((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | (1 << 2) | self.pp as u8); // L=1
-        code.push(self.opcode);
-        code.push(0xC0 | ((dst & 7) << 3) | (rm & 7));
+        inst.push(0xC4);
+        inst.push(rbit | xbit | bbit | self.map as u8);
+        inst.push(((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | (1 << 2) | self.pp as u8); // L=1
+        inst.push(self.opcode);
+        inst.push(0xC0 | ((dst & 7) << 3) | (rm & 7));
+        inst
     }
 
     /// `op reg, [addr]` — the memory-operand form, for any base and any
     /// displacement mode. The prefix is VEX's; the ModRM/SIB/displacement tail
     /// is the architecture's, so it comes from `x86_64::mem_operand`.
-    fn rm<D: Disp>(self, code: &mut Vec<u8>, reg: u8, addr: Mem<D>) {
+    fn rm<D: Disp>(self, reg: u8, addr: Mem<D>) -> EncodedInst {
+        let mut inst = EncodedInst::new();
         // R and B are stored inverted; X is unused (no index register).
         let rbit = if reg >= 8 { 0x00 } else { 0x80 };
         let bbit = if addr.base.0 >= 8 { 0x00 } else { 0x20 };
-        code.push(0xC4);
-        code.push(rbit | 0x40 | bbit | self.map as u8);
-        code.push(((self.w as u8) << 7) | (0xF << 3) | (1 << 2) | self.pp as u8); // vvvv unused, L=1
-        code.push(self.opcode);
-        x86_64::mem_operand(code, reg, addr);
+        inst.push(0xC4);
+        inst.push(rbit | 0x40 | bbit | self.map as u8);
+        inst.push(((self.w as u8) << 7) | (0xF << 3) | (1 << 2) | self.pp as u8); // vvvv unused, L=1
+        inst.push(self.opcode);
+        x86_64::mem_operand_into(&mut inst, reg, addr);
+        inst
+    }
+
+    /// `op dst, vvvv, [addr]` — 3-operand VEX.256 with memory operand.
+    #[allow(dead_code)]
+    fn rrm<D: Disp>(self, dst: u8, vvvv: u8, addr: Mem<D>) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let rbit = if dst >= 8 { 0x00 } else { 0x80 };
+        let bbit = if addr.base.0 >= 8 { 0x00 } else { 0x20 };
+        inst.push(0xC4);
+        inst.push(rbit | 0x40 | bbit | self.map as u8);
+        inst.push(((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | (1 << 2) | self.pp as u8); // L=1
+        inst.push(self.opcode);
+        x86_64::mem_operand_into(&mut inst, dst, addr);
+        inst
+    }
+
+    /// Generic 3-operand form: `op dst, vvvv, rm` where `rm` can be a register or stack slot.
+    #[allow(dead_code)]
+    fn rro<S: SourceOperand>(self, dst: u8, vvvv: u8, rm: S) -> Option<EncodedInst> {
+        if let Some(r) = rm.source_reg() {
+            return Some(self.rrr(dst, vvvv, r.0));
+        }
+        let slot = rm.source_slot()?;
+        Some(self.rrm(
+            dst,
+            vvvv,
+            Mem {
+                base: ptr::RSP,
+                disp: Imm32(slot.offset() as i32),
+            },
+        ))
     }
 }
 
@@ -165,53 +200,54 @@ struct VexImm {
 
 impl VexImm {
     /// Register form with the imm8 appended.
-    fn rrr(self, code: &mut Vec<u8>, dst: u8, vvvv: u8, rm: u8) {
-        self.vex.rrr(code, dst, vvvv, rm);
-        code.push(self.imm);
+    fn rrr(self, dst: u8, vvvv: u8, rm: u8) -> EncodedInst {
+        let mut inst = self.vex.rrr(dst, vvvv, rm);
+        inst.push(self.imm);
+        inst
     }
 }
 
 // --- packed-single arithmetic (0F, no prefix, W0) ---
 fn vaddps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x58).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x58).rrr(d, s1, s2)]);
 }
 fn vsubps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x5C).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x5C).rrr(d, s1, s2)]);
 }
 fn vmulps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x59).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x59).rrr(d, s1, s2)]);
 }
 fn vdivps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x5E).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x5E).rrr(d, s1, s2)]);
 }
 fn vminps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x5D).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x5D).rrr(d, s1, s2)]);
 }
 fn vmaxps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x5F).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x5F).rrr(d, s1, s2)]);
 }
 fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) {
-    Vex::m0f(0x51).rrr(c, d, UNUSED_VVVV, s);
+    assemble(c, [Vex::m0f(0x51).rrr(d, UNUSED_VVVV, s)]);
 }
 fn vrsqrtps(c: &mut Vec<u8>, d: u8, s: u8) {
-    Vex::m0f(0x52).rrr(c, d, UNUSED_VVVV, s);
+    assemble(c, [Vex::m0f(0x52).rrr(d, UNUSED_VVVV, s)]);
 }
 fn vrcpps(c: &mut Vec<u8>, d: u8, s: u8) {
-    Vex::m0f(0x53).rrr(c, d, UNUSED_VVVV, s);
+    assemble(c, [Vex::m0f(0x53).rrr(d, UNUSED_VVVV, s)]);
 }
 
 // --- bitwise (0F, no prefix, W0) ---
 fn vandps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x54).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x54).rrr(d, s1, s2)]);
 }
 fn vandnps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x55).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x55).rrr(d, s1, s2)]);
 }
 fn vorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x56).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x56).rrr(d, s1, s2)]);
 }
 fn vxorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f(0x57).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0x57).rrr(d, s1, s2)]);
 }
 
 // --- comparisons (0F, no prefix, W0; imm8 predicate) ---
@@ -223,7 +259,7 @@ const CMP_GE: u8 = 5;
 const CMP_NLE: u8 = 6; // > (unordered-safe "not less-or-equal")
 
 fn vcmpps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8, pred: u8) {
-    Vex::m0f(0xC2).imm(pred).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f(0xC2).imm(pred).rrr(d, s1, s2)]);
 }
 
 fn cmp_pred(op: OpKind) -> Option<u8> {
@@ -246,40 +282,40 @@ pub fn is_compare(op: OpKind) -> bool {
 
 // --- rounding (0F3A, 66 prefix, W0; imm8) ---
 fn vroundps(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
-    Vex::m0f3a_66(0x08).imm(imm).rrr(c, d, UNUSED_VVVV, s);
+    assemble(c, [Vex::m0f3a_66(0x08).imm(imm).rrr(d, UNUSED_VVVV, s)]);
 }
 
 // --- int/float convert (0F, W0) ---
 fn vcvttps2dq(c: &mut Vec<u8>, d: u8, s: u8) {
-    Vex::m0f_f3(0x5B).rrr(c, d, UNUSED_VVVV, s); // F3 prefix
+    assemble(c, [Vex::m0f_f3(0x5B).rrr(d, UNUSED_VVVV, s)]); // F3 prefix
 }
 fn vcvtdq2ps(c: &mut Vec<u8>, d: u8, s: u8) {
-    Vex::m0f(0x5B).rrr(c, d, UNUSED_VVVV, s); // no prefix
+    assemble(c, [Vex::m0f(0x5B).rrr(d, UNUSED_VVVV, s)]); // no prefix
 }
 
 // --- integer-domain (66 prefix, 0F, W0) ---
 fn vpaddd(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f_66(0xFE).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f_66(0xFE).rrr(d, s1, s2)]);
 }
 fn vpslld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
-    Vex::m0f_66(0x72).imm(imm).rrr(c, 6, d, s); // /6, dst=vvvv, src=rm
+    assemble(c, [Vex::m0f_66(0x72).imm(imm).rrr(6, d, s)]); // /6, dst=vvvv, src=rm
 }
 fn vpsrld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
-    Vex::m0f_66(0x72).imm(imm).rrr(c, 2, d, s); // /2
+    assemble(c, [Vex::m0f_66(0x72).imm(imm).rrr(2, d, s)]); // /2
 }
 
 // --- lane insert/extract between 256-bit and 128-bit (0F3A, 66 prefix, W0) ---
 /// `vinsertf128 ymmDST, ymmSRC1, xmmSRC2, imm8[0]` — copy `src1`, then place
 /// `src2` into the low (`imm=0`) or high (`imm=1`) 128 bits.
 fn vinsertf128(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8, imm: u8) {
-    Vex::m0f3a_66(0x18).imm(imm).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f3a_66(0x18).imm(imm).rrr(d, s1, s2)]);
 }
 /// `vextractf128 xmmDST, ymmSRC, imm8[0]` — extract the low (`imm=0`) or high
 /// (`imm=1`) 128 bits of `src` into `dst`.
 fn vextractf128(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
     // VEX.256.66.0F3A.W0 19 /r ib — note dst is the ModRM.rm operand here
     // (the reverse of the usual direction: register source, register/mem dest).
-    Vex::m0f3a_66(0x19).imm(imm).rrr(c, s, UNUSED_VVVV, d);
+    assemble(c, [Vex::m0f3a_66(0x19).imm(imm).rrr(s, UNUSED_VVVV, d)]);
 }
 
 /// `vmovaps ymmDST, ymmSRC` — register copy.
@@ -287,33 +323,23 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 == src.0 {
         return;
     }
-    Vex::m0f(0x28).rrr(code, dst.0, UNUSED_VVVV, src.0);
+    assemble(code, [Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]);
 }
 
 /// A slot in the allocated spill frame. AVX2 kernels are leaves with no base
 /// pointer, so a slot *is* `rsp + offset`.
 const fn frame_slot(offset: u32) -> Mem<Imm32> {
     Mem {
-        base: gpr::RSP,
+        base: ptr::RSP,
         disp: Imm32(offset as i32),
     }
-}
-
-/// `vmovups ymmDST, [addr]` — 256-bit load.
-pub fn emit_load<D: Disp>(code: &mut Vec<u8>, dst: Reg, addr: Mem<D>) {
-    Vex::m0f(0x10).rm(code, dst.0, addr);
-}
-
-/// `vmovups [addr], ymmSRC` — 256-bit store.
-pub fn emit_store<D: Disp>(code: &mut Vec<u8>, addr: Mem<D>, src: Reg) {
-    Vex::m0f(0x11).rm(code, src.0, addr);
 }
 
 /// Where [`emit_const`] stages an f32 before broadcasting it: four bytes of
 /// red zone below `rsp`, never touched by a spill frame (which lives at
 /// `[rsp .. rsp+N)`).
 const RED_ZONE_CONST: Mem<Imm8> = Mem {
-    base: gpr::RSP,
+    base: ptr::RSP,
     disp: Imm8(-4),
 };
 
@@ -329,22 +355,35 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
     code.extend_from_slice(&[0xC7, 0x44, 0x24, 0xFC]);
     code.extend_from_slice(&bits.to_le_bytes());
     // vbroadcastss ymm, [rsp-4]  (VEX.256.66.0F38.W0 18 /r)
-    Vex::m0f38_66(0x18).rm(code, dst.0, RED_ZONE_CONST);
+    assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, RED_ZONE_CONST)]);
 }
 
-/// `dst = splat(block[offset])` at 256 bits: `mov rax, [rdi + ctx_slot*8]`
-/// then `vbroadcastss ymm<dst>, [rax + 4*offset]` (VEX.256.66.0F38.W0 18 /r).
-/// See `x86_64::emit_uniform_load` for the register contract.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, load: super::UniformLoad) {
-    x86_64::emit_load_ptr_from_ctx(code, gpr::RAX.0, gpr::RDI.0, i32::from(load.ctx_slot) * 8);
-    Vex::m0f38_66(0x18).rm(
-        code,
-        dst.0,
-        Mem {
-            base: gpr::RAX,
-            disp: Imm32(i32::from(load.offset) * 4),
-        },
-    );
+/// `dst = splat(block[offset])` at 256 bits: `mov base, [ctx + ctx_slot*8]`
+/// then `vbroadcastss ymm<dst>, [base + 4*offset]` (VEX.256.66.0F38.W0 18
+/// /r). See `x86_64::emit_uniform_load` for the register contract.
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    load: super::UniformLoad,
+    base: PtrReg,
+    ctx: PtrReg,
+) {
+    AsmProgram::from([
+        MovLoadPtr {
+            dst: base,
+            base: ctx,
+            disp: i32::from(load.ctx_slot) * 8,
+        }
+        .encode(),
+        Vex::m0f38_66(0x18).rm(
+            dst.0,
+            Mem {
+                base,
+                disp: Imm32(i32::from(load.offset) * 4),
+            },
+        ),
+    ])
+    .assemble(code);
 }
 
 // =============================================================================
@@ -449,7 +488,7 @@ pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tm
 
 /// `vmovmskps eax, ymmSRC` — gather the 8 lane sign bits into eax[7:0].
 pub fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
-    Vex::m0f(0x50).rrr(code, 0, UNUSED_VVVV, src.0);
+    assemble(code, [Vex::m0f(0x50).rrr(0, UNUSED_VVVV, src.0)]);
 }
 
 /// `cmp al, imm8` — unlike `cmp eax, imm8` (sign-extending `0x83`), this
@@ -468,7 +507,7 @@ pub fn emit_cmp_al_imm8(code: &mut Vec<u8>, imm: u8) {
 /// feature model, which is why this file's own `compile_error!` pins the two
 /// together for this backend — see the module-top comment.
 fn vfmadd231ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    Vex::m0f38_66(0xB8).rrr(c, d, s1, s2);
+    assemble(c, [Vex::m0f38_66(0xB8).rrr(d, s1, s2)]);
 }
 
 /// Fused multiply-add: `dst` already holds `c`; computes `dst = a*b + dst`.
@@ -539,6 +578,35 @@ pub fn emit_gather_scalar(code: &mut Vec<u8>, dst: Reg, idx: Reg, slot: u16, s: 
 mod tests {
     //! Hardware validation, mirroring `avx512.rs`'s runtime test tier: JIT real
     //! `ymm` kernels and execute them on the host.
+    use super::*;
+
+    #[test]
+    fn is_compare_is_true_only_for_the_six_ordered_comparison_ops() {
+        for op in [
+            OpKind::Eq,
+            OpKind::Ne,
+            OpKind::Lt,
+            OpKind::Le,
+            OpKind::Gt,
+            OpKind::Ge,
+        ] {
+            assert!(is_compare(op), "{op:?} should be a compare");
+        }
+        for op in [
+            OpKind::Add,
+            OpKind::Sub,
+            OpKind::Mul,
+            OpKind::Div,
+            OpKind::Min,
+            OpKind::Max,
+            OpKind::BitAnd,
+            OpKind::BitOr,
+            OpKind::IAdd,
+        ] {
+            assert!(!is_compare(op), "{op:?} should not be a compare");
+        }
+    }
+
     #[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
     mod runtime {
         use super::super::*;
@@ -612,7 +680,7 @@ mod tests {
         const TEMP: Reg = Reg(15);
 
         #[test]
-        fn binary_ops() {
+        fn emit_binary_matches_the_scalar_reference_for_every_arithmetic_op() {
             let (xs, ys, zs) = lanes();
             let cases: &[BinaryCase] = &[
                 (OpKind::Add, |a, b| a + b),
@@ -630,7 +698,7 @@ mod tests {
         }
 
         #[test]
-        fn compare_lt() {
+        fn emit_binary_produces_an_all_ones_mask_when_lt_holds() {
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, X, X, Y);
@@ -642,7 +710,39 @@ mod tests {
         }
 
         #[test]
-        fn sqrt_and_neg_abs() {
+        fn emit_movmskps_eax_gathers_the_lanewise_compare_mask_sign_bits() {
+            #[allow(improper_ctypes_definitions)]
+            type MaskCheck = unsafe extern "C" fn(__m256, __m256) -> i32;
+
+            fn run_mask(body: &[u8], xs: [f32; 8], ys: [f32; 8]) -> i32 {
+                let mut code = body.to_vec();
+                crate::emit::x86_64::ret(&mut code);
+                let exec = unsafe { ExecutableCode::from_code(&code).expect("mmap") };
+                unsafe {
+                    let f: MaskCheck = exec.as_fn();
+                    f(_mm256_loadu_ps(xs.as_ptr()), _mm256_loadu_ps(ys.as_ptr()))
+                }
+            }
+
+            // Half true, half false, so the result exercises every mask bit
+            // rather than only the all-true/all-false extremes.
+            let xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+            let ys = [9.0, 9.0, 9.0, 9.0, -9.0, -9.0, -9.0, -9.0];
+            let mut c = Vec::new();
+            emit_binary(&mut c, OpKind::Lt, X, X, Y);
+            emit_movmskps_eax(&mut c, X);
+            assert_eq!(run_mask(&c, xs, ys), 0b0000_1111, "lt mask, lanes 0-3 true");
+
+            // The complementary comparison, to pin the other half of eax
+            // independently of the first assertion.
+            let mut c = Vec::new();
+            emit_binary(&mut c, OpKind::Gt, X, X, Y);
+            emit_movmskps_eax(&mut c, X);
+            assert_eq!(run_mask(&c, xs, ys), 0b1111_0000, "gt mask, lanes 4-7 true");
+        }
+
+        #[test]
+        fn emit_unary_computes_sqrt_neg_and_abs_per_lane() {
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_unary(&mut c, OpKind::Sqrt, X, Y, None);
@@ -658,7 +758,7 @@ mod tests {
         }
 
         #[test]
-        fn select_blend() {
+        fn emit_select_blends_if_true_and_if_false_by_the_mask() {
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, Reg(5), X, Y); // mask
@@ -673,18 +773,22 @@ mod tests {
         }
 
         #[test]
-        fn const_broadcast_and_fma() {
+        fn emit_const_broadcasts_and_adds_to_every_lane() {
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_const(&mut c, Reg(5), 2.5);
             emit_binary(&mut c, OpKind::Add, X, X, Reg(5));
             check(run(&c, xs, ys, zs), |i| xs[i] + 2.5, "const+add");
+        }
 
+        #[test]
+        fn emit_fmadd_c_in_dst_computes_the_fused_multiply_add() {
+            let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_mov(&mut c, Reg(5), Z);
             emit_fmadd_c_in_dst(&mut c, Reg(5), X, Y);
             emit_mov(&mut c, X, Reg(5));
-            check(run(&c, xs, ys, zs), |i| xs[i] * ys[i] + zs[i], "fma sw");
+            check(run(&c, xs, ys, zs), |i| xs[i] * ys[i] + zs[i], "fma231");
         }
 
         /// The FMA bytes really are an FMA: **one** rounding, not a multiply
@@ -696,7 +800,7 @@ mod tests {
         /// of the inputs CLAUDE.md's `MulAdd` row is about, where the two
         /// forms genuinely disagree, and this asserts the bits.
         #[test]
-        fn fma_rounds_once() {
+        fn emit_fmadd_c_in_dst_rounds_once_not_twice() {
             let xs = [1.000_000_1f32; 8];
             let ys = [4097.0f32; 8];
             let zs = [4097.0f32; 8];
@@ -724,20 +828,28 @@ mod tests {
         }
 
         #[test]
-        fn spill_frame_roundtrip() {
+        fn emit_load_after_emit_store_recovers_the_spilled_value() {
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
-            crate::emit::x86_64::emit_sub_rsp(&mut c, 32);
+            AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
+                dst: crate::emit::x86_64::gpr::RSP,
+                imm: crate::emit::x86_64::Imm32(32),
+            }])
+            .assemble(&mut c);
             emit_binary(&mut c, OpKind::Mul, Reg(6), X, Y);
-            emit_store(&mut c, frame_slot(0), Reg(6));
+            AsmProgram::from([Vex::m0f(0x11).rm(6, frame_slot(0))]).assemble(&mut c);
             emit_binary(&mut c, OpKind::Add, Reg(6), X, X); // clobber
-            emit_load(&mut c, X, frame_slot(0));
-            crate::emit::x86_64::emit_add_rsp(&mut c, 32);
+            AsmProgram::from([Vex::m0f(0x10).rm(X.0, frame_slot(0))]).assemble(&mut c);
+            AsmProgram::from([crate::emit::x86_64::Inst::AddImm32 {
+                dst: crate::emit::x86_64::gpr::RSP,
+                imm: crate::emit::x86_64::Imm32(32),
+            }])
+            .assemble(&mut c);
             check(run(&c, xs, ys, zs), |i| xs[i] * ys[i], "spill roundtrip");
         }
 
         #[test]
-        fn gather_from_buffer() {
+        fn emit_gather_scalar_reads_the_value_at_each_lanes_index() {
             // Matches the production ABI (mod.rs's ResolvedOp::Gather): the
             // first arg is a context pointer to an ARRAY of buffer base
             // pointers (one per slot), not a buffer pointer directly —
@@ -821,7 +933,7 @@ mod tests {
 )]
 pub(crate) mod driver {
     use super::super::*;
-    use super::{Mem, NoDisp, frame_slot};
+    use super::{AsmProgram, Mem, NoDisp, UNUSED_VVVV, Vex, frame_slot};
     use crate::emit::x86_64 as x86;
     use crate::emit::x86_64::driver::SSE2_FILE;
     use crate::error::CompileError;
@@ -875,8 +987,9 @@ pub(crate) mod driver {
 
         fn reload(code: &mut Vec<u8>, reload: &Reload) {
             match reload {
-                Reload::FromStack { target, offset } => {
-                    super::emit_load(code, *target, frame_slot(*offset));
+                Reload::FromStack { target, slot } => {
+                    AsmProgram::from([Vex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
+                        .assemble(code);
                 }
                 Reload::Const { target, val_bits } => {
                     super::emit_const(code, *target, f32::from_bits(*val_bits));
@@ -904,8 +1017,10 @@ pub(crate) mod driver {
             for r in &plan.reloads {
                 Self::reload(code, r);
             }
-            if let Some((dst, src)) = plan.setup_mov {
-                super::emit_mov(code, dst, src);
+            if let Some((dst, src)) = plan.setup_mov
+                && dst != src
+            {
+                AsmProgram::from([Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
             }
             match &plan.op {
                 ResolvedOp::Nop => {}
@@ -924,14 +1039,21 @@ pub(crate) mod driver {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
                 ResolvedOp::Gather { dst, idx, slot } => {
-                    // Context pointer (array of buffer base pointers) arrives in
-                    // rdi; arithmetic/const emit never touches rdi, so it
-                    // survives to here. ymm13/14 mirror X86Backend's gather
-                    // scratch; ymm8/9 are the AVX2-only high-half scratch this
-                    // two-half gather needs (see `super::emit_gather_scalar`).
-                    // ymm8/9 are non-allocatable by construction — see
-                    // `AVX2_SCHED_NUM_REGS`, which caps the pool at ymm4-7 so the
-                    // allocator can never place `dst`/`idx` where this clobbers.
+                    // Context pointer (array of buffer base pointers) arrives
+                    // in `AVX2_FILE.gpr_ctx` (rdi); arithmetic/const emit
+                    // never touches it, so it survives to here. The base
+                    // pointer and index GPRs are `AVX2_FILE.gpr_scratch`'s
+                    // allocated reservations. ymm13/14 mirror X86Backend's
+                    // gather scratch; ymm8/9 are the AVX2-only high-half
+                    // scratch this two-half gather needs (see
+                    // `super::emit_gather_scalar`). ymm8/9 are non-allocatable
+                    // by construction — see `AVX2_SCHED_NUM_REGS`, which caps
+                    // the pool at ymm4-7 so the allocator can never place
+                    // `dst`/`idx` where this clobbers.
+                    let ctx_gpr = self
+                        .file
+                        .gpr_ctx
+                        .expect("AVX2's gather needs a GPR context input");
                     super::emit_gather_scalar(
                         code,
                         *dst,
@@ -939,9 +1061,11 @@ pub(crate) mod driver {
                         *slot,
                         super::GatherScratch {
                             half: x86_64::GatherScratch {
-                                base_gpr: 0,  // rax
-                                index_gpr: 1, // rcx
-                                ctx_gpr: 7,   // rdi
+                                base_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0))
+                                    .0,
+                                index_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1))
+                                    .0,
+                                ctx_gpr: ctx_gpr.0,
                                 idx_lanes: crate::emit::declared_temp(plan.scratch.temp(0)),
                                 value: crate::emit::declared_temp(plan.scratch.temp(1)),
                             },
@@ -951,7 +1075,14 @@ pub(crate) mod driver {
                     );
                 }
                 ResolvedOp::Uniform { dst, load } => {
-                    super::emit_uniform_load(code, *dst, *load);
+                    let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
+                    let ctx = PtrReg(
+                        self.file
+                            .gpr_ctx
+                            .expect("AVX2's uniform load needs a GPR context input")
+                            .0,
+                    );
+                    super::emit_uniform_load(code, *dst, *load, base, ctx);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -974,8 +1105,9 @@ pub(crate) mod driver {
                 } => {
                     super::emit_binary(code, OpKind::Mul, *dst, *a, *b);
                     match c_deferred {
-                        Some(DeferredReload::FromStack(off)) => {
-                            super::emit_load(code, *c, frame_slot(*off));
+                        Some(DeferredReload::FromStack(slot)) => {
+                            AsmProgram::from([Vex::m0f(0x10).rm(c.0, frame_slot(slot.offset()))])
+                                .assemble(code);
                         }
                         Some(DeferredReload::Const(bits)) => {
                             super::emit_const(code, *c, f32::from_bits(*bits));
@@ -997,7 +1129,9 @@ pub(crate) mod driver {
         }
 
         fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
-            super::emit_mov(code, dst, src);
+            if dst != src {
+                AsmProgram::from([Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
+            }
         }
 
         fn emit_store(
@@ -1006,7 +1140,7 @@ pub(crate) mod driver {
             src: Reg,
             offset: u32,
         ) -> Result<(), CompileError> {
-            super::emit_store(code, frame_slot(offset), src);
+            AsmProgram::from([Vex::m0f(0x11).rm(src.0, frame_slot(offset))]).assemble(code);
             Ok(())
         }
 
@@ -1015,16 +1149,17 @@ pub(crate) mod driver {
             code: &mut Vec<u8>,
             vid: regalloc::ValueId,
             target: Reg,
-            locs: &[Option<Loc>],
+            locs: &[Option<Binding>],
         ) -> Reg {
             match location_of(locs, vid) {
-                Loc::Reg(reg) => reg,
-                Loc::Remat(bits) => {
+                Binding::Loc(Loc::Reg(reg)) => reg,
+                Binding::Remat(bits) => {
                     super::emit_const(code, target, f32::from_bits(bits));
                     target
                 }
-                Loc::Spill(offset) => {
-                    super::emit_load(code, target, frame_slot(offset));
+                Binding::Loc(Loc::Slot(slot)) => {
+                    AsmProgram::from([Vex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
+                        .assemble(code);
                     target
                 }
             }
@@ -1034,26 +1169,30 @@ pub(crate) mod driver {
         // X86Backend's MOVMSKPS guards but 8 lanes wide (al == 0xFF for
         // all-true, not 0x0F — see `super::emit_cmp_al_imm8`'s doc for why the
         // sign-extending `cmp eax, imm8` X86Backend uses doesn't work here).
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
+        /// `_scratch`/`_mask_scratch` are unused: this tier's guard reduces
+        /// the mask with `movmskps`/`kortest` into the flags, needing no
+        /// vector or mask register.
         fn emit_skip_if_all_false(
             &mut self,
             code: &mut Vec<u8>,
             mask_reg: Reg,
             _scratch: Option<Reg>,
+            _mask_scratch: Option<KReg>,
         ) -> usize {
             super::emit_movmskps_eax(code, mask_reg);
             x86_64::emit_test_eax(code);
             x86_64::je(code).field() // ZF set when eax == 0 (all lanes false)
         }
 
-        /// `_scratch` is unused: this tier's guard reduces the mask with
-        /// `movmskps`/`kortest` into the flags, needing no vector register.
+        /// `_scratch`/`_mask_scratch` are unused: this tier's guard reduces
+        /// the mask with `movmskps`/`kortest` into the flags, needing no
+        /// vector or mask register.
         fn emit_skip_if_all_true(
             &mut self,
             code: &mut Vec<u8>,
             mask_reg: Reg,
             _scratch: Option<Reg>,
+            _mask_scratch: Option<KReg>,
         ) -> usize {
             super::emit_movmskps_eax(code, mask_reg);
             super::emit_cmp_al_imm8(code, 0xFF);
@@ -1073,19 +1212,27 @@ pub(crate) mod driver {
         // slots sit above it.
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            x86::emit_sub_rsp(code, bytes);
+            AsmProgram::from([x86::Inst::SubImm32 {
+                dst: x86::gpr::RSP,
+                imm: x86::Imm32(bytes as i32),
+            }])
+            .assemble(code);
         }
 
         fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            x86::emit_add_rsp(code, bytes);
+            AsmProgram::from([x86::Inst::AddImm32 {
+                dst: x86::gpr::RSP,
+                imm: x86::Imm32(bytes as i32),
+            }])
+            .assemble(code);
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-            super::emit_store(code, frame_slot(offset), src);
+            AsmProgram::from([Vex::m0f(0x11).rm(src.0, frame_slot(offset))]).assemble(code);
         }
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-            super::emit_load(code, dst, frame_slot(offset));
+            AsmProgram::from([Vex::m0f(0x10).rm(dst.0, frame_slot(offset))]).assemble(code);
         }
 
         fn latch_bounds(&mut self, code: &mut Vec<u8>) {
@@ -1105,14 +1252,14 @@ pub(crate) mod driver {
         }
 
         fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            super::emit_store(
-                code,
+            AsmProgram::from([Vex::m0f(0x11).rm(
+                src.0,
                 Mem {
                     base: x86::scaffold::OUT_PTR,
                     disp: NoDisp,
                 },
-                src,
-            );
+            )])
+            .assemble(code);
         }
 
         fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
@@ -1125,7 +1272,7 @@ pub(crate) mod driver {
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            x86::ret(code);
+            AsmProgram::from([x86::Inst::Ret]).assemble(code);
         }
     }
 }

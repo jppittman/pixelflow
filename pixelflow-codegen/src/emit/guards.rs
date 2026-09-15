@@ -35,7 +35,97 @@ use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 
 use super::ScheduledOp;
+use super::demand::{self, Demand, Literal};
 use super::regalloc::{Def, ValueId};
+
+/// Which arm of a `Select` node a guard branch skips or targets.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SelectArm {
+    /// The `if_true` arm: skipped when all lanes of the mask are false.
+    True,
+    /// The `if_false` arm: skipped when all lanes of the mask are true.
+    False,
+}
+
+impl SelectArm {
+    /// Both arms of a conditional select.
+    pub const ALL: [Self; 2] = [Self::True, Self::False];
+}
+
+/// A value associated with each arm of a `Select` node (`True` and `False`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ArmPair<T> {
+    pub true_arm: T,
+    pub false_arm: T,
+}
+
+impl<T> ArmPair<T> {
+    /// Construct a pair from true-arm and false-arm values.
+    #[inline]
+    pub const fn new(true_arm: T, false_arm: T) -> Self {
+        Self {
+            true_arm,
+            false_arm,
+        }
+    }
+
+    /// Access the value for `arm`.
+    #[inline]
+    pub const fn get(&self, arm: SelectArm) -> &T {
+        match arm {
+            SelectArm::True => &self.true_arm,
+            SelectArm::False => &self.false_arm,
+        }
+    }
+
+    /// Mutably access the value for `arm`.
+    #[inline]
+    pub fn get_mut(&mut self, arm: SelectArm) -> &mut T {
+        match arm {
+            SelectArm::True => &mut self.true_arm,
+            SelectArm::False => &mut self.false_arm,
+        }
+    }
+
+    /// Map a function over both arms.
+    #[inline]
+    pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> ArmPair<U> {
+        ArmPair {
+            true_arm: f(self.true_arm),
+            false_arm: f(self.false_arm),
+        }
+    }
+
+    /// Borrow both arms.
+    #[inline]
+    pub fn as_ref(&self) -> ArmPair<&T> {
+        ArmPair {
+            true_arm: &self.true_arm,
+            false_arm: &self.false_arm,
+        }
+    }
+
+    /// Iterate over references to both arm values.
+    #[inline]
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        [&self.true_arm, &self.false_arm].into_iter()
+    }
+}
+
+impl<T> core::ops::Index<SelectArm> for ArmPair<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, arm: SelectArm) -> &Self::Output {
+        self.get(arm)
+    }
+}
+
+impl<T> core::ops::IndexMut<SelectArm> for ArmPair<T> {
+    #[inline]
+    fn index_mut(&mut self, arm: SelectArm) -> &mut Self::Output {
+        self.get_mut(arm)
+    }
+}
 
 /// Describes a Select node's short-circuit structure in the schedule.
 ///
@@ -48,11 +138,61 @@ pub(crate) struct SelectGuard {
     pub(crate) select_idx: usize,
     /// ValueId of the mask operand (already computed before arms).
     pub(crate) mask_vid: ValueId,
-    /// Range of schedule indices exclusive to the true arm: [true_start, true_end).
-    /// Empty if true_start == true_end.
-    pub(crate) true_range: (usize, usize),
-    /// Range of schedule indices exclusive to the false arm: [false_start, false_end).
-    pub(crate) false_range: (usize, usize),
+    /// Range of schedule indices exclusive to each arm: `[start, end)`.
+    /// Empty if `start == end`.
+    pub(crate) ranges: ArmPair<(usize, usize)>,
+}
+
+impl SelectGuard {
+    /// Schedule index range exclusive to the given arm: `[start, end)`.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn range(&self, arm: SelectArm) -> (usize, usize) {
+        match arm {
+            SelectArm::True => self.ranges.true_arm,
+            SelectArm::False => self.ranges.false_arm,
+        }
+    }
+
+    /// Schedule index range exclusive to the true arm: `[start, end)`.
+    #[must_use]
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) const fn true_range(&self) -> (usize, usize) {
+        self.ranges.true_arm
+    }
+
+    /// Schedule index range exclusive to the false arm: `[start, end)`.
+    #[must_use]
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) const fn false_range(&self) -> (usize, usize) {
+        self.ranges.false_arm
+    }
+
+    /// Whether this arm is guarded (has a non-empty range).
+    #[must_use]
+    #[inline]
+    pub(crate) fn is_guarded(&self, arm: SelectArm) -> bool {
+        let (s, e) = self.range(arm);
+        s != e
+    }
+
+    /// Whether either arm is guarded.
+    #[must_use]
+    #[inline]
+    pub(crate) fn has_guarded_arm(&self) -> bool {
+        SelectArm::ALL.iter().any(|&arm| self.is_guarded(arm))
+    }
+
+    /// Total entries skipped across both arms.
+    #[must_use]
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn total_guarded_entries(&self) -> usize {
+        (self.ranges.true_arm.1 - self.ranges.true_arm.0)
+            + (self.ranges.false_arm.1 - self.ranges.false_arm.0)
+    }
 }
 
 /// Compute the transitive dependencies of a ValueId in the schedule.
@@ -106,8 +246,7 @@ struct SelectArms {
     /// Where the mask lands, or `usize::MAX` when it is not in this scope's
     /// schedule (a live-in from an enclosing one).
     mask_idx: usize,
-    true_indices: alloc::collections::BTreeSet<usize>,
-    false_indices: alloc::collections::BTreeSet<usize>,
+    indices: ArmPair<alloc::collections::BTreeSet<usize>>,
     /// Everything the select reads, transitively, as schedule positions —
     /// which is also, by complement, everything between the mask and the
     /// select that the select does NOT need.
@@ -115,12 +254,11 @@ struct SelectArms {
     /// What each arm's own entries cost, in latency-prior cycles — what a
     /// guard on that arm could save, against what the branch costs when it
     /// does not.
-    true_cycles: usize,
-    false_cycles: usize,
+    cycles: ArmPair<usize>,
 }
 
 impl SelectArms {
-    /// The half-open range a branch may skip for `indices`, or an empty range
+    /// The half-open range a branch may skip for `arm`, or an empty range
     /// at the select when it may not.
     ///
     /// The branch skips the WHOLE range when the mask is uniform, so every
@@ -130,11 +268,9 @@ impl SelectArms {
     /// arms, but arena-composed kernels may schedule an arm BEFORE it —
     /// guarding that would branch on an uninitialized register. The select
     /// still evaluates correctly through the unconditional blend.)
-    fn range(
-        &self,
-        indices: &alloc::collections::BTreeSet<usize>,
-        cycles: usize,
-    ) -> (usize, usize) {
+    fn range(&self, arm: SelectArm) -> (usize, usize) {
+        let indices = &self.indices[arm];
+        let cycles = self.cycles[arm];
         if cycles <= MISPREDICT_PENALTY_CYCLES {
             return (self.select_idx, self.select_idx);
         }
@@ -152,11 +288,15 @@ impl SelectArms {
     }
 
     fn true_range(&self) -> (usize, usize) {
-        self.range(&self.true_indices, self.true_cycles)
+        self.range(SelectArm::True)
     }
 
     fn false_range(&self) -> (usize, usize) {
-        self.range(&self.false_indices, self.false_cycles)
+        self.range(SelectArm::False)
+    }
+
+    fn ranges(&self) -> ArmPair<(usize, usize)> {
+        ArmPair::new(self.true_range(), self.false_range())
     }
 
     /// An arm the ORDER refuses: it is worth guarding and no branch can span
@@ -166,8 +306,9 @@ impl SelectArms {
         let refused = |cycles: usize, range: (usize, usize)| {
             cycles > MISPREDICT_PENALTY_CYCLES && range.0 == range.1
         };
-        refused(self.true_cycles, self.true_range())
-            || refused(self.false_cycles, self.false_range())
+        SelectArm::ALL
+            .iter()
+            .any(|&arm| refused(self.cycles[arm], self.range(arm)))
     }
 }
 
@@ -184,26 +325,55 @@ pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
     let mut telemetry = Telemetry::new();
     let mut guards = Vec::new();
 
+    // One backward pass over the whole DAG, and only when someone is
+    // reading: demand is what an arm *may skip*, which is a weaker
+    // condition than what the partition may *move*, so it is recorded
+    // beside `exclusive` rather than replacing it. See `SelectStat`.
+    let demand = telemetry
+        .is_on()
+        .then(|| {
+            let root = schedule.last()?.value;
+            Some(demand::demand_of(schedule, root))
+        })
+        .flatten();
+
     for select in &arms {
-        let (true_range, false_range) = (select.true_range(), select.false_range());
+        let ranges = select.ranges();
+        let demand_exclusive = demand.as_ref().map_or(ArmPair::new(0, 0), |d| {
+            let observed = |v: ValueId| d.get(&v).cloned().unwrap_or_default();
+            let arm = |lit: Literal| observed(select.select_vid).and_literal(lit);
+            let count = |pred: &Demand| {
+                schedule
+                    .iter()
+                    .filter(|def| {
+                        let seen = observed(def.value);
+                        !seen.is_never() && seen.implies(pred)
+                    })
+                    .count()
+            };
+            ArmPair::new(
+                count(&arm(Literal::set(select.mask_vid))),
+                count(&arm(Literal::clear(select.mask_vid))),
+            )
+        });
         telemetry.select(|| SelectStat {
+            demand_exclusive,
             select_idx: select.select_idx,
             mask_idx: select.mask_idx,
-            exclusive: (select.true_indices.len(), select.false_indices.len()),
-            guarded: (true_range.1 - true_range.0, false_range.1 - false_range.0),
-            intruders: (
-                intruders(&select.true_indices, schedule),
-                intruders(&select.false_indices, schedule),
-            ),
+            exclusive: select.indices.as_ref().map(|s| s.len()),
+            guarded: ranges.map(|(s, e)| e - s),
+            intruders: select
+                .indices
+                .as_ref()
+                .map(|indices| intruders(indices, schedule)),
         });
 
         // Only create a guard if at least one arm has exclusive nodes
-        if true_range.0 != true_range.1 || false_range.0 != false_range.1 {
+        if ranges.true_arm.0 != ranges.true_arm.1 || ranges.false_arm.0 != ranges.false_arm.1 {
             guards.push(SelectGuard {
                 select_idx: select.select_idx,
                 mask_vid: select.mask_vid,
-                true_range,
-                false_range,
+                ranges,
             });
         }
     }
@@ -380,11 +550,9 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
                 select_vid: *sel_vid,
                 mask_vid: *mask_vid,
                 mask_idx,
-                true_indices,
-                false_indices,
+                indices: ArmPair::new(true_indices, false_indices),
                 cone,
-                true_cycles,
-                false_cycles,
+                cycles: ArmPair::new(true_cycles, false_cycles),
             });
         }
     }
@@ -473,12 +641,18 @@ pub(crate) fn cluster_select_arms(schedule: Vec<Def>) -> Vec<Def> {
 
 /// The entries each select has under a guard, keyed by the select's value —
 /// the one identity that survives a reordering, unlike a schedule position.
-fn guarded_spans(schedule: &[Def]) -> alloc::collections::BTreeMap<ValueId, (usize, usize)> {
+fn guarded_spans(schedule: &[Def]) -> alloc::collections::BTreeMap<ValueId, ArmPair<usize>> {
     select_arms(schedule)
         .into_iter()
         .map(|select| {
-            let (t, f) = (select.true_range(), select.false_range());
-            (select.select_vid, (t.1 - t.0, f.1 - f.0))
+            let ranges = select.ranges();
+            (
+                select.select_vid,
+                ArmPair::new(
+                    ranges.true_arm.1 - ranges.true_arm.0,
+                    ranges.false_arm.1 - ranges.false_arm.0,
+                ),
+            )
         })
         .collect()
 }
@@ -487,26 +661,25 @@ fn guarded_spans(schedule: &[Def]) -> alloc::collections::BTreeMap<ValueId, (usi
 /// already had — including the nested ones, whose arms lie inside the arm that
 /// moved.
 fn is_improvement(
-    before: &alloc::collections::BTreeMap<ValueId, (usize, usize)>,
-    after: &alloc::collections::BTreeMap<ValueId, (usize, usize)>,
+    before: &alloc::collections::BTreeMap<ValueId, ArmPair<usize>>,
+    after: &alloc::collections::BTreeMap<ValueId, ArmPair<usize>>,
 ) -> bool {
-    let total = |spans: &alloc::collections::BTreeMap<ValueId, (usize, usize)>| -> usize {
-        spans.values().map(|(t, f)| t + f).sum()
+    let total = |spans: &alloc::collections::BTreeMap<ValueId, ArmPair<usize>>| -> usize {
+        spans.values().map(|p| p.true_arm + p.false_arm).sum()
     };
     total(after) > total(before)
-        && before.iter().all(|(vid, (t, f))| {
-            let (at, af) = after.get(vid).copied().unwrap_or((0, 0));
-            at >= *t && af >= *f
+        && before.iter().all(|(vid, b)| {
+            let a = after.get(vid).copied().unwrap_or_default();
+            a.true_arm >= b.true_arm && a.false_arm >= b.false_arm
         })
 }
 
 /// The schedule with `select`'s region stable-partitioned into shared, then
 /// true-exclusive, then false-exclusive entries.
 fn partition_around(schedule: &[Def], select: &SelectArms) -> Vec<Def> {
-    let first_arm = select
-        .true_indices
+    let first_arm = select.indices[SelectArm::True]
         .iter()
-        .chain(select.false_indices.iter())
+        .chain(select.indices[SelectArm::False].iter())
         .copied()
         .min();
     let Some(first_arm) = first_arm else {
@@ -520,11 +693,10 @@ fn partition_around(schedule: &[Def], select: &SelectArms) -> Vec<Def> {
     // A scope's result is its last entry, so nothing may be placed after it:
     // when the select IS the root, the strangers stay ahead of the arms.
     let sink_past_select = select.select_idx + 1 < schedule.len();
-    let stays_before = |i: &usize| {
-        (select.cone.contains(i) || !sink_past_select)
-            && !select.true_indices.contains(i)
-            && !select.false_indices.contains(i)
+    let in_any_arm = |i: &usize| {
+        select.indices[SelectArm::True].contains(i) || select.indices[SelectArm::False].contains(i)
     };
+    let stays_before = |i: &usize| (select.cone.contains(i) || !sink_past_select) && !in_any_arm(i);
 
     let mut out = Vec::with_capacity(schedule.len());
     out.extend_from_slice(&schedule[..start]);
@@ -536,9 +708,10 @@ fn partition_around(schedule: &[Def], select: &SelectArms) -> Vec<Def> {
             .filter(stays_before)
             .map(|i| schedule[i].clone()),
     );
-    for arm in [&select.true_indices, &select.false_indices] {
+    for arm in SelectArm::ALL {
         out.extend(
-            arm.iter()
+            select.indices[arm]
+                .iter()
                 .filter(|i| region.contains(i))
                 .map(|i| schedule[*i].clone()),
         );
@@ -552,11 +725,7 @@ fn partition_around(schedule: &[Def], select: &SelectArms) -> Vec<Def> {
     out.extend(
         region
             .clone()
-            .filter(|i| {
-                !stays_before(i)
-                    && !select.true_indices.contains(i)
-                    && !select.false_indices.contains(i)
-            })
+            .filter(|i| !stays_before(i) && !in_any_arm(i))
             .map(|i| schedule[i].clone()),
     );
     out.extend_from_slice(&schedule[select.select_idx + 1..]);
@@ -603,27 +772,52 @@ fn is_topological(schedule: &[Def]) -> bool {
     true
 }
 
+/// Entries inside `[min(arm), max(arm)]` that the arm does not own.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct IntruderStats {
+    /// Total entries not belonging to the arm.
+    pub total: usize,
+    /// Of which are leaves (`Const` or coordinate `Var`).
+    pub leaves: usize,
+}
+
 /// What one `Select` in the schedule offered a guard, and what survived.
 struct SelectStat {
     select_idx: usize,
     /// Where the mask lands in the schedule; a guard needs it before the arm.
     mask_idx: usize,
-    /// Values exclusive to (true, false) — what a guard could skip if the
+    /// Values exclusive to each arm — what a guard could skip if the
     /// exclusive set happened to be contiguous.
-    exclusive: (usize, usize),
-    /// Schedule entries a guard actually skips, (true, false).
-    guarded: (usize, usize),
+    exclusive: ArmPair<usize>,
+    /// What [`demand`](super::demand) calls exclusive to each arm — the
+    /// values observed only where this arm's polarity holds.
+    ///
+    /// Always at least `exclusive`, and the gap is the point: demand
+    /// answers *may this be skipped*, while `exclusive` answers the
+    /// stronger *may this be skipped and also moved*, which is what
+    /// [`cluster_select_arms`]'s three-way partition needs. Two selects
+    /// sharing a mask separate them — the inner select's arms are
+    /// demand-exclusive to the outer one, but the inner select itself is
+    /// shared and reads them, so moving them past it is illegal. The gap
+    /// is the headroom a partition that ordered within its groups would
+    /// unlock.
+    demand_exclusive: ArmPair<usize>,
+    /// Schedule entries a guard actually skips on each arm.
+    guarded: ArmPair<usize>,
     /// Entries that are NOT this arm's but lie between its first and its last,
     /// as (total, of which leaves) — the values a single branch would have to
     /// jump over, which is why the arm is not guardable.
-    intruders: ((usize, usize), (usize, usize)),
+    intruders: ArmPair<IntruderStats>,
 }
 
 /// Entries inside `[min(arm), max(arm)]` that the arm does not own, and how
 /// many of those are leaves (a `Const` or a coordinate). Diagnosis only.
-fn intruders(arm: &alloc::collections::BTreeSet<usize>, schedule: &[Def]) -> (usize, usize) {
+fn intruders(arm: &alloc::collections::BTreeSet<usize>, schedule: &[Def]) -> IntruderStats {
     let (Some(&start), Some(&end)) = (arm.iter().next(), arm.iter().next_back()) else {
-        return (0, 0);
+        return IntruderStats {
+            total: 0,
+            leaves: 0,
+        };
     };
     let mut total = 0;
     let mut leaves = 0;
@@ -636,7 +830,7 @@ fn intruders(arm: &alloc::collections::BTreeSet<usize>, schedule: &[Def]) -> (us
             leaves += 1;
         }
     }
-    (total, leaves)
+    IntruderStats { total, leaves }
 }
 
 /// The guard analysis, counted, on stderr when `PIXELFLOW_GUARD_TELEMETRY` is
@@ -661,6 +855,12 @@ impl Telemetry {
         }
     }
 
+    /// Whether anything will read what is recorded. Callers ask before
+    /// computing a statistic that costs more than reading a field.
+    fn is_on(&self) -> bool {
+        self.stats.is_some()
+    }
+
     /// The stat is built lazily: computing it walks the schedule, and nothing
     /// should pay for that when the telemetry is off.
     fn select(&mut self, stat: impl FnOnce() -> SelectStat) {
@@ -673,11 +873,21 @@ impl Telemetry {
         let Some(stats) = self.stats.as_ref() else {
             return;
         };
-        let covered: usize = stats.iter().map(|s| s.guarded.0 + s.guarded.1).sum();
-        let offered: usize = stats.iter().map(|s| s.exclusive.0 + s.exclusive.1).sum();
+        let covered: usize = stats
+            .iter()
+            .map(|s| s.guarded.true_arm + s.guarded.false_arm)
+            .sum();
+        let offered: usize = stats
+            .iter()
+            .map(|s| s.exclusive.true_arm + s.exclusive.false_arm)
+            .sum();
+        let demanded: usize = stats
+            .iter()
+            .map(|s| s.demand_exclusive.true_arm + s.demand_exclusive.false_arm)
+            .sum();
         std::eprintln!(
             "guard-telemetry: schedule={sched_len} selects={} guarded={covered} \
-             exclusive={offered} per_select={:?}",
+             exclusive={offered} demand_exclusive={demanded} per_select={:?}",
             stats.len(),
             stats
                 .iter()
@@ -685,12 +895,135 @@ impl Telemetry {
                     (
                         s.select_idx,
                         s.mask_idx,
-                        s.exclusive,
-                        s.guarded,
-                        s.intruders,
+                        (s.exclusive.true_arm, s.exclusive.false_arm),
+                        (s.demand_exclusive.true_arm, s.demand_exclusive.false_arm),
+                        (s.guarded.true_arm, s.guarded.false_arm),
+                        (
+                            (s.intruders.true_arm.total, s.intruders.true_arm.leaves),
+                            (s.intruders.false_arm.total, s.intruders.false_arm.leaves),
+                        ),
                     )
                 })
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pixelflow_ir::kind::OpKind;
+
+    fn def(value: u32, op: ScheduledOp) -> Def {
+        Def {
+            value: ValueId(value),
+            op,
+        }
+    }
+
+    // The arm op in each fixture is load-bearing, not decoration.
+    // `SelectArms::range` refuses any arm costing `<= MISPREDICT_PENALTY_CYCLES`
+    // — guarding one cannot pay for a mispredict — so the op has to clear that
+    // bar for a guard to exist at all to pin the range of. `Rsqrt` is 21 cycles
+    // in `latency_prior`; a `Neg` is 3, and every assertion here would read
+    // zero guards.
+
+    /// A `Select` whose true arm alone does work exclusive to it — the false
+    /// arm is just the mask again, so it contributes nothing beyond
+    /// `mask_deps`. Pins the exact range rather than only "a guard formed
+    /// somewhere," which the whole-kernel `assert_guard_forms`-style tests
+    /// in `emit/mod.rs` already cover.
+    #[test]
+    fn range_the_true_arm_when_only_it_is_exclusive() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
+            def(
+                3,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+            ),
+        ];
+
+        let guards = analyze_select_guards(&schedule);
+
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].mask_vid, ValueId(0));
+        assert_eq!(guards[0].true_range(), (1, 3));
+        assert_eq!(guards[0].false_range(), (3, 3));
+    }
+
+    /// Symmetric to the above: the false arm alone is exclusive.
+    #[test]
+    fn range_the_false_arm_when_only_it_is_exclusive() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
+            def(
+                3,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(0), ValueId(2)),
+            ),
+        ];
+
+        let guards = analyze_select_guards(&schedule);
+
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].true_range(), (3, 3));
+        assert_eq!(guards[0].false_range(), (1, 3));
+    }
+
+    /// An operand reachable only through a value the schedule never defines
+    /// (a "hole" — legitimate for a schedule spliced from arbitrary
+    /// fragments, per this module's doc comment) must not be mistaken for a
+    /// real schedule position. Regression test for treating the sentinel
+    /// `usize::MAX` (marking "not in this schedule") as a valid index, which
+    /// would corrupt the range or overflow computing its end.
+    #[test]
+    fn ignore_a_false_operand_missing_from_the_schedule() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(3))), // ValueId(3) has no Def
+            def(
+                4,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(0), ValueId(1)),
+            ),
+        ];
+
+        let guards = analyze_select_guards(&schedule);
+
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].select_idx, 2);
+        assert_eq!(guards[0].false_range(), (1, 2));
+    }
+
+    /// The cost gate is `<=`, and this pins that boundary rather than a value
+    /// safely past it. `Recip` is exactly `MISPREDICT_PENALTY_CYCLES` in
+    /// `latency_prior`, and an arm that costs exactly the mispredict penalty
+    /// is refused: the branch can save at most what it costs when it is
+    /// wrong, so guarding it is never a win. Turning the gate into `<` admits
+    /// this arm and this test says so; the `Rsqrt` fixtures above cannot,
+    /// since 21 is on the same side of the bar either way.
+    #[test]
+    fn refuse_an_arm_that_costs_exactly_the_mispredict_penalty() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Unary(OpKind::Recip, ValueId(1))),
+            def(
+                3,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+            ),
+        ];
+
+        assert_eq!(
+            pixelflow_search::egraph::CostModel::latency_prior().cost(OpKind::Recip),
+            MISPREDICT_PENALTY_CYCLES,
+            "fixture assumes Recip sits exactly on the gate",
+        );
+
+        assert!(analyze_select_guards(&schedule).is_empty());
     }
 }

@@ -34,8 +34,6 @@ pub mod mint;
 pub mod structural;
 
 #[cfg(feature = "training")]
-pub mod quarantine;
-
 #[cfg(feature = "training")]
 pub mod guide_linear;
 

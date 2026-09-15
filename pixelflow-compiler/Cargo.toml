@@ -10,10 +10,9 @@ license = "Apache-2.0"
 proc-macro = true
 
 [features]
-# Forwards to `pixelflow-search/saturation-telemetry`: the macro-tier
-# `optimize()` entry (`src/optimize.rs`) emits one JSONL saturation record
-# per e-graph pass when this is on. See `pixelflow-search/src/telemetry.rs`
-# for the record shape and sink.
+# Forwards to `pixelflow-search/saturation-telemetry`: the macro tier's
+# `Saturate` pass emits one JSONL saturation record per e-graph run when this
+# is on. See `pixelflow-search/src/telemetry.rs` for the record shape and sink.
 saturation-telemetry = ["pixelflow-search/saturation-telemetry"]
 
 [dependencies]
@@ -26,4 +25,4 @@ pixelflow-codegen = { path = "../pixelflow-codegen" }
 
 [dev-dependencies]
 pixelflow-core = { path = "../pixelflow-core" }
-pixelflow-ir = { path = "../pixelflow-ir", features = ["oracle"] }
+pixelflow-ir = { path = "../pixelflow-ir" }

@@ -577,6 +577,22 @@ fn plasma() -> (ExprArena, ExprId) {
 ///   2-component field each time — this port keeps only the first level,
 ///   to stay inside the corpus's ~30-400 node band (see the module doc's
 ///   "what was tried and abandoned").
+/// - Numerically ill-conditioned by construction, documented rather than
+///   "fixed": `hash()`'s `fract(sin(d)*43758.547)` multiplies `sin(d)` by a
+///   huge constant *before* subtracting `floor`, so any conforming
+///   evaluator's rounding latitude that CLAUDE.md's "Floating point at the
+///   edges" explicitly licenses (`MulAdd` fusing one rounding instead of
+///   two; an e-graph-extracted form associating `Add(Mul,Mul)` differently)
+///   is amplified past `floor`/`fract`'s cancellation into an output that
+///   two independently-correct evaluators are not guaranteed to agree on —
+///   occasionally not even to the same integer. This is the *only* kernel
+///   in this corpus using that idiom, which is why `egraph_off_on`'s raw
+///   `oracle()` diff reports it an order of magnitude above every other
+///   kernel; it is not a compiler defect (see
+///   `pixelflow-pipeline/tests/domain_warp_fbm_hash_conditioning.rs`, whose
+///   module doc has the full bisection against an independent `f64`
+///   reference, and which is the check to consult — or extend — before
+///   treating a large `same_form`/`cross_form` number here as a miscompile).
 fn domain_warp_fbm() -> (ExprArena, ExprId) {
     fn hash(a: &mut ExprArena, x: ExprId, y: ExprId) -> ExprId {
         let kx = a.k(127.1);

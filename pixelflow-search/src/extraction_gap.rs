@@ -56,7 +56,7 @@
 //!
 //! Read-only. Nothing here changes production behavior.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -67,9 +67,7 @@ use crate::arena_corpus::{category_of, load_arena_dump, median, percentile};
 use crate::egraph::extract::{
     ExtractedDAG, extract_dag_objectives, extract_dag_scoped, extract_dag_tree_arm,
 };
-use crate::egraph::{
-    Budget, CostModel, EClassId, EGraph, ENode, Extraction, Optimizer, SaturationStop,
-};
+use crate::egraph::{Budget, CostModel, EClassId, EGraph, ENode, Extraction, Optimizer};
 use crate::egraph::{Vocabulary, insert, reachable_count};
 
 // ---------------------------------------------------------------------------
@@ -133,7 +131,8 @@ impl Instance {
         while let Some(c) = stack.pop() {
             reachable.push(c);
             for node in egraph.nodes(EClassId(c)) {
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &ch in children {
                         let ch = egraph.find(ch).0;
                         if !seen[ch as usize] {
@@ -860,7 +859,6 @@ fn exact_dag_choices(
 /// algorithm, so drift fails loudly rather than being averaged in.
 struct GreedyTrace {
     choices: Vec<Option<usize>>,
-    total_cost: usize,
     /// Classes whose winning node was priced at the cycle sentinel.
     cycle_priced: HashSet<u32>,
 }
@@ -888,7 +886,8 @@ fn greedy_trace(egraph: &EGraph, root: EClassId, costs: &CostModel) -> GreedyTra
             }
             stack.push((canonical, true));
             for node in egraph.nodes(canonical) {
-                if let ENode::Op { children, .. } = node {
+                {
+                    let children = (node).children_slice();
                     for &child in children {
                         let child_canonical = egraph.find(child);
                         if best_cost[child_canonical.0 as usize].is_none() {
@@ -906,10 +905,13 @@ fn greedy_trace(egraph: &EGraph, root: EClassId, costs: &CostModel) -> GreedyTra
             for (idx, node) in nodes.iter().enumerate() {
                 let mut saw_cycle = false;
                 let this_node_cost = match node {
-                    ENode::Var(_) | ENode::Const(_) | ENode::Buffer(_) | ENode::Uniform(_) => {
-                        costs.node_op_cost(node)
-                    }
-                    ENode::Op { children, .. } => {
+                    ENode::Var(_)
+                    | ENode::Const(_)
+                    | ENode::Buffer(_)
+                    | ENode::Uniform(_)
+                    | ENode::Param(_) => costs.node_op_cost(node),
+                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                        let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
                             saw_cycle = true;
                             CYCLE_COST
@@ -946,10 +948,8 @@ fn greedy_trace(egraph: &EGraph, root: EClassId, costs: &CostModel) -> GreedyTra
         }
     }
 
-    let total_cost = best_cost[egraph.find(root).0 as usize].unwrap_or(usize::MAX);
     GreedyTrace {
         choices: best_node,
-        total_cost,
         cycle_priced,
     }
 }
@@ -1043,16 +1043,16 @@ fn measure(
     time_limit: Duration,
     max_expansions: u64,
 ) -> Measured {
-    // The same two lowering passes `optimize_runtime_arena_uncached` runs
-    // before the e-graph sees the arena.
-    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(arena, root)
-        .unwrap_or_else(|e| panic!("{name}: lower_dwrt failed: {e:?}"));
-    let (arena, root) = pixelflow_ir::passes::expand_reduce_owned(&arena, root);
+    // What `optimize_runtime_arena_uncached` hands the e-graph: `ExpandRefs`
+    // and nothing else. Legalization (`LowerDwrt`, `ExpandReduce`) runs
+    // *after* saturation now — it is the fallback for shapes the graph
+    // declined — so lowering here would measure a pipeline that no longer
+    // exists, on an arena an order of magnitude larger than production's.
+    let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
     let node_count = reachable_count(&arena, root);
 
     let mut optimizer = Optimizer::production().budget(budget);
     let mut egraph = optimizer.egraph();
-    let mut memo: HashMap<ExprId, EClassId> = HashMap::new();
     let root_class = insert(&arena, root, &mut egraph, Vocabulary::Runtime)
         .ok()
         .unwrap_or_else(|| panic!("{name}: arena_to_egraph returned None (unsupported node)"));
@@ -1428,7 +1428,7 @@ fn write_report(
         .filter(|r| r.exact_status == "UNSOLVED")
         .collect();
 
-    let mut ratios: Vec<f64> = solved.iter().map(|r| r.ratio).collect();
+    let ratios: Vec<f64> = solved.iter().map(|r| r.ratio).collect();
     assert!(
         ratios.iter().all(|x| x.is_finite()),
         "a solved kernel produced a non-finite greedy/exact ratio — that means the exact \
@@ -1462,7 +1462,7 @@ fn write_report(
     // ones give a valid upper bound on the optimum (the best term the search
     // actually built), so `greedy / best_found` is a lower bound on the true
     // ratio.
-    let mut certified: Vec<f64> = rows
+    let certified: Vec<f64> = rows
         .iter()
         .filter(|r| r.exact_dag > 0)
         .map(|r| r.greedy_dag as f64 / r.exact_dag as f64)
@@ -1477,7 +1477,7 @@ fn write_report(
     // The always-computable half of the gap. Knuth's algorithm has no time
     // limit, so these quantiles run over EVERY kernel — nothing is excluded,
     // and no kernel is silently dropped for being hard.
-    let mut dp_loss: Vec<f64> = rows.iter().map(|r| r.dp_loss_frac).collect();
+    let dp_loss: Vec<f64> = rows.iter().map(|r| r.dp_loss_frac).collect();
     let dp_med = median(&mut dp_loss.clone());
     let dp_q1 = percentile(&mut dp_loss.clone(), 25.0);
     let dp_q3 = percentile(&mut dp_loss.clone(), 75.0);
@@ -1489,7 +1489,7 @@ fn write_report(
         .fold(f64::NAN, f64::max);
     let dp_agree = rows.iter().filter(|r| r.loss_dp == 0).count();
     let dp_greedy_wins = rows.iter().filter(|r| r.loss_dp < 0).count();
-    let mut obj_miss: Vec<f64> = rows.iter().map(|r| r.objective_miss_frac).collect();
+    let obj_miss: Vec<f64> = rows.iter().map(|r| r.objective_miss_frac).collect();
     let obj_med = median(&mut obj_miss.clone());
     let obj_p90 = percentile(&mut obj_miss.clone(), 90.0);
     let obj_worst = obj_miss
@@ -2739,7 +2739,7 @@ mod self_check {
         let model = CostModel::latency_prior();
         let mut egraph = Optimizer::production().egraph();
         let x = egraph.add(ENode::Var(0));
-        let y = egraph.add(ENode::Var(1));
+        let _y = egraph.add(ENode::Var(1));
         let sq = egraph.add(ENode::Op {
             op: op_from_kind(OpKind::Mul).expect("Mul is a known op"),
             children: vec![x, x],
@@ -2844,7 +2844,6 @@ mod self_check {
             let mut generator = BwdGenerator::new(seed, config, templates.clone());
             let pair = generator.generate_arena();
             let mut egraph = Optimizer::production().egraph();
-            let mut memo: HashMap<ExprId, EClassId> = HashMap::new();
             let Some(root) = insert(
                 &pair.arena,
                 pair.unoptimized,

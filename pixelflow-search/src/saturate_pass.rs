@@ -10,7 +10,8 @@ use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::optimize::{Optimize, Rewritten};
 
-use crate::egraph::{Optimizer, Vocabulary, insert, reachable_count};
+use crate::egraph::{Optimizer, RuleSet, Vocabulary, insert, reachable_count};
+use crate::tier::Tier;
 
 /// Rewrite a term by equality saturation under `optimizer`.
 ///
@@ -20,6 +21,7 @@ use crate::egraph::{Optimizer, Vocabulary, insert, reachable_count};
 pub struct Saturate {
     optimizer: Optimizer,
     vocab: Vocabulary,
+    tier: Tier,
 }
 
 impl Saturate {
@@ -30,16 +32,43 @@ impl Saturate {
     #[must_use]
     pub fn runtime(shape: LatticeShape) -> Self {
         Self {
-            optimizer: Optimizer::production().for_lattice(shape),
+            optimizer: Optimizer::production()
+                .rules(RuleSet::runtime())
+                .for_lattice(shape),
             vocab: Vocabulary::Runtime,
+            tier: Tier::Runtime,
+        }
+    }
+
+    /// The macro tier's configuration: the same production policy, over the
+    /// template vocabulary, priced without a lattice — `kernel!` expands
+    /// before any consumer has said what shape it wants.
+    ///
+    /// Sits here beside [`Self::runtime`] rather than in the compiler crate
+    /// because the two are one decision: what differs between the tiers is
+    /// this, and it should be readable in one place. It also carries
+    /// [`Tier::Macro`], which is not bookkeeping — a macro-tier saturation
+    /// writes to rustc's stderr, and telemetry has to prefix its record so
+    /// cargo's `--message-format=json` parser does not read it as a compiler
+    /// message.
+    #[must_use]
+    pub fn macro_tier() -> Self {
+        Self {
+            optimizer: Optimizer::production(),
+            vocab: Vocabulary::Templates,
+            tier: Tier::Macro,
         }
     }
 
     /// Saturation under an explicitly chosen policy and vocabulary, for
     /// harnesses that vary one and hold the rest.
     #[must_use]
-    pub fn with(optimizer: Optimizer, vocab: Vocabulary) -> Self {
-        Self { optimizer, vocab }
+    pub fn with(optimizer: Optimizer, vocab: Vocabulary, tier: Tier) -> Self {
+        Self {
+            optimizer,
+            vocab,
+            tier,
+        }
     }
 }
 
@@ -52,14 +81,18 @@ impl Optimize for Saturate {
 
         let node_count = reachable_count(arena, root);
         #[cfg(feature = "saturation-telemetry")]
+        let inserted_classes = egraph.num_classes();
+        #[cfg(feature = "saturation-telemetry")]
         let telemetry_start = std::time::Instant::now();
         let optimized = self.optimizer.run(&mut egraph, root_class, node_count);
         let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
 
         #[cfg(feature = "saturation-telemetry")]
         crate::telemetry::record(crate::telemetry::SaturationInvocation {
-            tier: crate::telemetry::Tier::Runtime,
+            tier: self.tier,
             node_count,
+            inserted_classes,
+            extraction: optimized.extraction,
             stats: &optimized.stats,
             union_count: optimized.stats.unions,
             extracted_arena: &extracted,

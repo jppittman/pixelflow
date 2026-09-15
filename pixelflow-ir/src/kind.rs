@@ -65,6 +65,25 @@ macro_rules! op_table {
             pub(crate) const fn from_index(idx: usize) -> Option<Self> {
                 match idx { $( $code => Some(Self::$name), )+ _ => None }
             }
+
+            /// This op's Rust variant identifier — [`OpKind::MulAdd`]'s is
+            /// `"MulAdd"`.
+            ///
+            /// Distinct from [`OpKind::name`], which is the DSL spelling
+            /// (`"mul_add"`). A code generator wants the identifier: emitting
+            /// the path `OpKind::#variant` is checked by the compiler at the
+            /// expansion's use site, where emitting a `from_name` call would
+            /// defer a typo to a runtime `expect` inside generated code.
+            ///
+            /// Generated from the table like everything else here, so an op
+            /// cannot be added without one — which is the point. The
+            /// hand-written match this replaced lived in
+            /// `pixelflow-compiler`, covered 40 of the 50 ops, and closed
+            /// with `_ => panic!("Unsupported OpKind for JIT")`.
+            #[must_use]
+            pub const fn variant_name(self) -> &'static str {
+                match self { $( Self::$name => stringify!($name), )+ }
+            }
         }
     };
 }
@@ -182,6 +201,20 @@ op_table! {
     /// uniform table. A scalar invariant across the lattice, supplied per
     /// call from a block; never folded, loaded once per call.
     Uniform = 50,
+
+    /// An unbound scalar slot in a `kernel!` builder, before the builder is
+    /// called. A leaf with no value yet — never folded, matched by no rewrite
+    /// rule, derivative zero — which is exactly [`OpKind::Uniform`]'s
+    /// contract, one tier earlier.
+    ///
+    /// Only the macro tier may hold one (`Vocabulary::Templates`); a `Param`
+    /// reaching bake time means a builder was never called, and
+    /// `Vocabulary::Runtime` declines it. Before this existed, the e-graph
+    /// refused `Param` outright and every macro-side caller smuggled one past
+    /// as something else — as `Var(16 + i)`, or as an opaque identifier —
+    /// which is how `Var` reacquired the third meaning CLAUDE.md records as
+    /// retired.
+    Param = 51,
 }
 
 impl OpKind {
@@ -348,7 +381,7 @@ impl OpKind {
     #[must_use]
     pub const fn arity(self) -> usize {
         match self {
-            Self::Var | Self::Const | Self::Tuple | Self::Buffer | Self::Uniform => 0,
+            Self::Var | Self::Const | Self::Tuple | Self::Buffer | Self::Uniform | Self::Param => 0,
 
             Self::Neg
             | Self::Sqrt
@@ -396,8 +429,10 @@ impl OpKind {
 
             Self::MulAdd | Self::Select | Self::Gather => 3,
 
-            // N-ary: [combiner, reduce_var, extent, body].
-            Self::Reduce => 4,
+            // The body. The algebra, the binder and the range are the node's
+            // own metadata ([`Fold`](crate::Fold)) rather than three `Const`
+            // children, so nothing that walks operands can reach them.
+            Self::Reduce => 1,
         }
     }
 
@@ -456,6 +491,7 @@ impl OpKind {
             Self::RawGather => "raw_gather",
             Self::Reduce => "reduce",
             Self::Uniform => "uniform",
+            Self::Param => "param",
         }
     }
 
@@ -514,15 +550,85 @@ impl OpKind {
             "raw_gather" => Some(Self::RawGather),
             "reduce" => Some(Self::Reduce),
             "uniform" => Some(Self::Uniform),
+            "param" => Some(Self::Param),
             _ => None,
         }
+    }
+
+    /// True for ops a kernel body may call as `.method(args)` — the surface
+    /// set [`OpKind::from_method_call`] resolves into.
+    ///
+    /// Stricter than "not [`EmitStyle::Special`]": [`Self::Add`]/[`Self::Sub`]/
+    /// [`Self::Mul`]/[`Self::Div`] are real, non-special ops but are spelled
+    /// `+ - * /`, never `.add(y)`, and [`Self::TruncToInt`]/[`Self::IAdd`]/
+    /// [`Self::Shl`]/[`Self::Shr`]/[`Self::BitAnd`]/[`Self::BitOr`]/
+    /// [`Self::IntToFloat`] are primitives that only ever arise from lowering
+    /// passes (`Gather`/`Reduce` expansion), never from surface syntax a
+    /// kernel body writes directly.
+    #[must_use]
+    const fn is_dsl_method(self) -> bool {
+        matches!(
+            self,
+            Self::Neg
+                | Self::Sqrt
+                | Self::Rsqrt
+                | Self::Abs
+                | Self::Recip
+                | Self::Floor
+                | Self::Ceil
+                | Self::Round
+                | Self::Sin
+                | Self::Cos
+                | Self::Tan
+                | Self::Asin
+                | Self::Acos
+                | Self::Atan
+                | Self::Exp
+                | Self::Exp2
+                | Self::Ln
+                | Self::Log2
+                | Self::Log10
+                | Self::Min
+                | Self::Max
+                | Self::Atan2
+                | Self::Pow
+                | Self::Lt
+                | Self::Le
+                | Self::Gt
+                | Self::Ge
+                | Self::Eq
+                | Self::Ne
+                | Self::MulAdd
+                | Self::Select
+        )
+    }
+
+    /// Resolve a DSL method call — as written in a `kernel!` body, e.g.
+    /// `.sqrt()` or `.min(y)` — to the primitive op it denotes.
+    ///
+    /// `arg_count` is the call's argument list length, not counting the
+    /// receiver; this checks it against the op's arity, so `"sqrt"` at
+    /// `arg_count` 1 is rejected exactly as an unrecognized name would be.
+    /// `None` for anything [`OpKind::is_dsl_method`] excludes, or a name
+    /// [`OpKind::from_name`] doesn't recognize at all.
+    ///
+    /// This is the one place `(name, arity) -> op` is decided; a compiler
+    /// front end that re-lists method names itself is a second place for that
+    /// mapping to drift from this one.
+    #[must_use]
+    pub fn from_method_call(name: &str, arg_count: usize) -> Option<Self> {
+        let op = Self::from_name(name)?;
+        if !op.is_dsl_method() {
+            return None;
+        }
+        (op.arity() == arg_count + 1).then_some(op)
     }
 
     /// Get the default cost estimate for this operation (in cycles).
     #[must_use]
     pub const fn default_cost(self) -> usize {
         match self {
-            Self::Var | Self::Const | Self::Tuple | Self::Buffer | Self::Uniform => 0,
+            Self::Var | Self::Const | Self::Tuple | Self::Buffer | Self::Uniform | Self::Param => 0,
             // Memory read: native gather on AVX2/AVX-512, scalar loads on
             // NEON/SSE2. Priced between an arithmetic op and a transcendental.
             Self::Gather | Self::RawGather => 10,
@@ -622,6 +728,8 @@ impl OpKind {
     /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
     /// - Select (needs mask input — only valid composed with a comparison)
     /// - Buffer/Gather (memory ops — require a bound buffer, not synthesizable)
+    /// - Uniform/Param (unbound scalar slots — a value arrives per call or
+    ///   from a builder, so a generator cannot synthesize one that evaluates)
     #[must_use]
     pub const fn is_seed_op(self) -> bool {
         !matches!(
@@ -642,6 +750,7 @@ impl OpKind {
                 | Self::RawGather
                 | Self::Reduce
                 | Self::Uniform
+                | Self::Param
         )
     }
 
@@ -650,7 +759,7 @@ impl OpKind {
     pub const fn emit_style(self) -> EmitStyle {
         match self {
             // Special cases handled separately
-            Self::Var | Self::Const | Self::Tuple => EmitStyle::Special,
+            Self::Var | Self::Const | Self::Tuple | Self::Param => EmitStyle::Special,
 
             // Unary prefix: (-a)
             Self::Neg => EmitStyle::UnaryPrefix,
@@ -1088,10 +1197,9 @@ impl<T> IndexMut<OpKind> for OpMap<T> {
 
 // EmitStyle is imported from crate::traits - single source of truth
 
-/// Every op name the surface language accepts as a method.
-///
-/// `Special` ops are excluded: they are structural (`Var`, `Const`, `Buffer`,
-/// `Reduce`, ...) and have no method spelling.
+/// Every op name the surface language accepts as a method — see
+/// [`OpKind::is_dsl_method`] for exactly which ops that is and why it is
+/// narrower than "not `Special`".
 ///
 /// This used to walk a parallel array of one zero-sized type per op, each
 /// implementing an `OpMeta`/`Op`/arity-marker trait family, purely to answer
@@ -1099,9 +1207,23 @@ impl<T> IndexMut<OpKind> for OpMap<T> {
 /// the family and its 230-line module are gone.
 pub fn known_method_names() -> impl Iterator<Item = &'static str> {
     OpKind::all()
-        .filter(|op| !matches!(op.emit_style(), EmitStyle::Special))
+        .filter(|op| op.is_dsl_method())
         .map(OpKind::name)
+        .chain(METHOD_ALIASES.iter().map(|(spelling, _)| *spelling))
 }
+
+/// Accepted spellings that are not their op's canonical [`OpKind::name`].
+///
+/// `from_name` takes `"powf"` because `f32::powf` is what a Rust programmer
+/// types; the canonical name is `"pow"`. Both resolve, so both must be
+/// advertised — a spelling the front end accepts but never lists is one no
+/// sweep exercises and no consumer can discover, which is exactly how a later
+/// stage could drop `powf` with every test still green.
+///
+/// The aliases live here, beside [`known_method_names`], rather than only
+/// inside `from_name`'s match: accepting a name and advertising it are the
+/// same fact, and this is the one place that says so.
+const METHOD_ALIASES: &[(&str, OpKind)] = &[("powf", OpKind::Pow)];
 
 #[cfg(test)]
 mod index_space {
@@ -1211,13 +1333,32 @@ mod op_map {
 mod method_names {
     use super::{EmitStyle, OpKind, known_method_names};
 
+    /// Every advertised name must resolve. Not every advertised name is its
+    /// own canonical spelling — `from_name` is deliberately non-injective, and
+    /// `"powf"` resolves to `Pow`, whose `name()` is `"pow"`. This asserted
+    /// the stronger property while aliases were unadvertised, which is a fine
+    /// thing to have asserted and the wrong thing to keep asserting: it would
+    /// now forbid advertising exactly the spellings that most need it.
     #[test]
-    fn every_returned_name_round_trips_through_from_name() {
+    fn every_returned_name_resolves() {
         for name in known_method_names() {
-            assert_eq!(
-                OpKind::from_name(name).map(OpKind::name),
-                Some(name),
-                "known_method_names() produced {name:?}, which from_name() cannot parse back"
+            assert!(
+                OpKind::from_name(name).is_some(),
+                "known_method_names() produced {name:?}, which from_name() cannot parse"
+            );
+        }
+    }
+
+    /// Each alias resolves to the op it claims, and is genuinely an alias
+    /// rather than a name that has quietly become canonical.
+    #[test]
+    fn every_alias_resolves_to_its_op_under_a_different_canonical_name() {
+        for (spelling, op) in super::METHOD_ALIASES {
+            assert_eq!(OpKind::from_name(spelling), Some(*op));
+            assert_ne!(
+                *spelling,
+                op.name(),
+                "{spelling:?} is the canonical name, so it does not belong in METHOD_ALIASES"
             );
         }
     }
@@ -1243,6 +1384,90 @@ mod method_names {
             names.contains(&"min"),
             "Min is not EmitStyle::Special and should surface as a known method"
         );
+    }
+
+    #[test]
+    fn excludes_infix_arithmetic_spelled_as_operators_not_methods() {
+        let names: Vec<&str> = known_method_names().collect();
+        for op in ["add", "sub", "mul", "div"] {
+            assert!(
+                !names.contains(&op),
+                "{op:?} is spelled with an operator, not a method call"
+            );
+        }
+    }
+
+    #[test]
+    fn excludes_lowering_only_bit_manipulation_primitives() {
+        let names: Vec<&str> = known_method_names().collect();
+        for op in [
+            "trunc_to_int",
+            "int_to_float",
+            "iadd",
+            "shl",
+            "shr",
+            "bitand",
+            "bitor",
+        ] {
+            assert!(
+                !names.contains(&op),
+                "{op:?} only arises from lowering passes, never surface syntax"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod from_method_call {
+    use super::OpKind;
+
+    #[test]
+    fn resolves_a_unary_method_at_zero_args() {
+        assert_eq!(OpKind::from_method_call("sqrt", 0), Some(OpKind::Sqrt));
+    }
+
+    #[test]
+    fn resolves_a_binary_method_at_one_arg() {
+        assert_eq!(OpKind::from_method_call("min", 1), Some(OpKind::Min));
+    }
+
+    #[test]
+    fn resolves_a_ternary_method_at_two_args() {
+        assert_eq!(OpKind::from_method_call("mul_add", 2), Some(OpKind::MulAdd));
+        assert_eq!(OpKind::from_method_call("select", 2), Some(OpKind::Select));
+    }
+
+    #[test]
+    fn resolves_neg_as_a_method_despite_its_operator_emit_style() {
+        assert_eq!(OpKind::from_method_call("neg", 0), Some(OpKind::Neg));
+    }
+
+    #[test]
+    fn accepts_the_powf_alias_for_pow() {
+        assert_eq!(OpKind::from_method_call("powf", 1), Some(OpKind::Pow));
+    }
+
+    #[test]
+    fn rejects_a_wrong_arg_count() {
+        assert_eq!(OpKind::from_method_call("sqrt", 1), None);
+        assert_eq!(OpKind::from_method_call("min", 0), None);
+        assert_eq!(OpKind::from_method_call("min", 2), None);
+    }
+
+    #[test]
+    fn rejects_infix_arithmetic() {
+        assert_eq!(OpKind::from_method_call("add", 1), None);
+    }
+
+    #[test]
+    fn rejects_lowering_only_primitives() {
+        assert_eq!(OpKind::from_method_call("trunc_to_int", 0), None);
+        assert_eq!(OpKind::from_method_call("shl", 1), None);
+    }
+
+    #[test]
+    fn rejects_an_unrecognized_name() {
+        assert_eq!(OpKind::from_method_call("not_a_real_op", 0), None);
     }
 }
 
@@ -1372,6 +1597,7 @@ mod algebraic_properties {
         OpKind::RawGather,
         OpKind::Reduce,
         OpKind::Uniform,
+        OpKind::Param,
     ];
 
     #[test]
@@ -1417,7 +1643,12 @@ mod algebraic_properties {
     fn match_each_ops_actual_operand_count() {
         for op in OpKind::all() {
             let want = match op {
-                OpKind::Var | OpKind::Const | OpKind::Tuple | OpKind::Buffer | OpKind::Uniform => 0,
+                OpKind::Var
+                | OpKind::Const
+                | OpKind::Tuple
+                | OpKind::Buffer
+                | OpKind::Uniform
+                | OpKind::Param => 0,
 
                 OpKind::Neg
                 | OpKind::Sqrt
@@ -1465,7 +1696,7 @@ mod algebraic_properties {
 
                 OpKind::MulAdd | OpKind::Select | OpKind::Gather => 3,
 
-                OpKind::Reduce => 4,
+                OpKind::Reduce => 1,
             };
             assert_eq!(op.arity(), want, "{op:?} arity mismatch");
         }

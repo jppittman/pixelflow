@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L065.** The absolute cost-table numbers quoted from #1134 (Sin 70->95, Cos 75->103, Tan 87->117) are 4x optimistic (INPUT_TUPLES / INPUT_VECTORS lane confusion since #1071) and `Gather` was never priced (null context); the table shift is re-measured as re-validation item 4, and the sharing result and the 0-of-206 insensitivity (L066, L067) stand. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Making extraction price sharing (#1116)
 
 `extract_dag` summed each child's `best_cost` — a TREE cost — so a subterm used ten times was charged ten times in the objective and emitted once in the kernel. This is the measurement of replacing that objective with the DAG cost the kernel actually pays, scored against the same two exact references #1115 built (`2026-09-02-extraction-gap.md`): Knuth's exact tree optimum, and the branch-and-bound DAG optimum where it closes.

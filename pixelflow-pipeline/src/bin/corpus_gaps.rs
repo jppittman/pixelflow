@@ -39,8 +39,8 @@ use pixelflow_pipeline::collapse_bench::{self, LANES, corpus::Trips};
 use pixelflow_pipeline::shader_bench::{NAMED_KERNEL_NAMES, SHADERTOY_KERNEL_NAMES, named_kernel};
 use pixelflow_pipeline::training::{bezier_family, sh_family};
 use pixelflow_search::egraph::{
-    Budget, CostModel, KeepJournal, Optimizer, RuleSet, Vocabulary, collect_rule_templates, insert,
-    reachable_count,
+    Budget, CostModel, InputSize, KeepJournal, Optimizer, RuleSet, Vocabulary,
+    collect_rule_templates, insert, reachable_count,
 };
 use pixelflow_search::nnue::{BwdGenConfig, BwdGenerator};
 
@@ -466,6 +466,9 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
         Buffer(u16),
         Uniform(u16),
         Op(OpKind, Vec<u32>),
+        /// A fold's identity is its metadata plus its body — the bits are
+        /// the metadata, and two folds sharing them fold the same way.
+        Reduce(u64, u32),
     }
     type Build = Box<dyn Fn(&mut ExprArena) -> ExprId>;
     let mut interned: HashMap<Key, ExprId> = HashMap::new();
@@ -486,6 +489,17 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
             ExprNode::Buffer(b) => (Key::Buffer(b.0), Box::new(move |a| a.push_buffer(b))),
             ExprNode::Uniform(u) => (Key::Uniform(u.0), Box::new(move |a| a.push_uniform(u))),
+            ExprNode::Ref(k) => panic!(
+                "hash_cons: Ref({k:?}) names a kernel interned in this process; \
+                 corpus arenas are self-contained, so expand_refs first"
+            ),
+            ExprNode::Reduce { fold, body } => {
+                let body = ExprId(m(body, &map));
+                (
+                    Key::Reduce(fold.to_bits(), body.0),
+                    Box::new(move |a: &mut ExprArena| a.push_reduce(fold, body)),
+                )
+            }
             ExprNode::Unary(k, c) => {
                 let c = ExprId(m(c, &map));
                 (Key::Op(k, vec![c.0]), Box::new(move |a| a.push_unary(k, c)))
@@ -757,10 +771,13 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     let mut optimizer = Optimizer::production()
         .for_lattice(LatticeShape::new(k.extent))
         .observe(Some(Box::new(KeepJournal)));
-    let limits = Budget::Production.limits(node_count);
     let mut egraph = optimizer.egraph();
     let root_class = insert(&lowered, lowered_root, &mut egraph, Vocabulary::Runtime)
         .unwrap_or_else(|_| panic!("{}: not e-graph representable", k.name));
+    let limits = Budget::Production.limits(InputSize {
+        nodes: node_count,
+        classes: egraph.num_classes(),
+    });
     let started = Instant::now();
     let optimized = optimizer.run(&mut egraph, root_class, node_count);
     let opt_ms = started.elapsed().as_secs_f64() * 1e3;

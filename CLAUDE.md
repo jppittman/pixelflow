@@ -122,8 +122,11 @@ The trade above buys speed with *accuracy* — an answer close to the true one,
 off in the last bits. It never licenses an answer **outside the function's
 range**. `sin` returning 8.64e8 is not an imprecise sine, it is not a sine; no
 budget was saved by computing it, and nothing downstream can recover from it.
-So range is a hard property, asserted with no tolerance
-(`pixelflow-ir/tests/trig_range.rs`), while accuracy is a tunable.
+So range is a hard property, asserted with no tolerance, while accuracy is a
+tunable. **It is currently unasserted**: `pixelflow-ir/tests/trig_range.rs`
+made the claim through the scalar interpreter and went with it when the
+interpreter was deleted. The property is unchanged and the assertion needs
+rebuilding on the JIT — an out-of-range `sin` would now ship green.
 
 Where a function cannot be computed over the whole input type, it gets a
 **documented domain** and returns **NaN** outside it. `sin`/`cos`/`tan` are
@@ -134,8 +137,9 @@ anyway — `ulp(x)` exceeds 1 radian, so an f32 no longer names a phase.
 
 NaN specifically, and not a clamp into `[-1, 1]`: a clamped value is a wrong
 answer wearing a right answer's clothes. That is precisely how the reduction bug
-survived — the JIT and the `eval_scalar` oracle run the *same* expansion, so
-they agreed bit-for-bit on the garbage and every same-form equivalence test
+survived — the JIT and the `eval_scalar` oracle (since deleted, along with
+every same-form suite built on it) ran the *same* expansion, so they agreed
+bit-for-bit on the garbage and every same-form equivalence test
 passed, while outputs in the 1e2–1e6 range slipped under the `>1e30`
 "ill-conditioned" filter and were admitted as valid training labels. A
 same-form check cannot see a shared-definition bug; only an external bound can.
@@ -173,7 +177,7 @@ Cargo workspace with 13 member crates:
 | Crate | Purpose |
 |-------|---------|
 | `pixelflow-core` | Lattices, the compiled `Manifold`, `collapse`, and the cell grid. Backends: x86-64 (SSE2 baseline, AVX2/AVX-512 opt-in via `target-feature`) and aarch64 (NEON) only — no portable/scalar fallback for other architectures. Edition 2024. |
-| `pixelflow-compiler` | Proc-macro front end: `kernel!` and `kernel_raw!`, parser, sema, e-graph optimization, arena lowering. Edition 2024. |
+| `pixelflow-compiler` | Proc-macro front end: `kernel!` and `kernel_raw!`, parser, sema, arena lowering, then optimization as an `Optimize` value over the arena. Edition 2024. |
 | `pixelflow-ir` | Shared IR. `ExprArena` (sole IR), OpKind enum, the `Kernel` value/AST. |
 | `pixelflow-codegen` | Expression graphs to machine code: per-ISA emitters (x86-64, aarch64), register allocation, executable memory, the JIT compile cache (`jit_cache`, `CompiledKernel`). Runs the optimizer itself, so a compiled kernel is never obtained unoptimized. |
 | `pixelflow-graphics` | Font loading (TTF, SDF), colors (`Rgba8`, `Color`), the packed frame program, analytic 3-D scenes. |
@@ -217,17 +221,35 @@ Control creates backpressure by timing out senders who are too aggressive. If th
 ### Compiler Pipeline
 
 ```
-Source → Parser → Sema → Optimize → Arena lowering → Rust TokenStream
-            ↓         ↓
-       Symbol Table  E-graph + latency prior
+Source → Parser → Sema → Arena lowering → Optimize → Rust TokenStream
+            ↓                                 ↓
+       Symbol Table                E-graph + latency prior
 ```
 
-`kernel!` runs all of it; `kernel_raw!` skips `Optimize` and is otherwise identical. Both
-emit code that rebuilds an `ExprArena` at load time as a `Kernel` — zero params gives a
-`Kernel`, N params a builder closure that folds them in as constants.
+Two representations, the AST and `ExprArena`, and **optimization runs on the arena**.
+It used to run on the AST — `kernel!` went AST → e-graph → extracted DAG → back to a
+synthesized AST → and only then to the arena the e-graph had already built and discarded.
+Each boundary was a place two stages could disagree about what the language is, and three
+defects were found there in one week, every one a stage accepting what a later stage
+refused. See docs/plans/2026-09-08-macro-tier-is-arena-native.md.
+
+Both macros are `expand(input, optimizer)`; the optimizer is the only difference, and
+"do not optimize" is a value rather than a skipped branch — `kernel_raw!` passes
+`Identity`. Both emit code that rebuilds an `ExprArena` at load time as a `Kernel` — zero
+params gives a `Kernel`, N params a builder closure that folds them in as constants.
+
+**The macro tier does not resolve `Dwrt`.** A surviving `Dwrt` is what makes the chain
+rule work under composition: `Kernel::at` warps by substituting into `Var` leaves, so the
+warp reaches the `Dwrt`'s operand and differentiates the warped function. Saturation
+*would* resolve it (the chain rule is in the rule set, and a `Dwrt` is priced so the
+extractor never keeps one), so the macro tier declines any term carrying one and the
+runtime tier lowers it at bake time, after composition. Resolving derivatives at expansion
+time was a miscompilation for four months, visible only under a warp, and the production
+glyph kernels escaped it by coincidence — a `&` mask made the e-graph decline their arena.
+`pixelflow-compiler/tests/derivative_under_warp.rs` is the guard.
 
 The compiler uses e-graphs (equality graphs) to find optimal instruction sequences:
-1. **Build e-graph** from expression AST
+1. **Build e-graph** from the arena
 2. **Saturate** by applying rewrite rules (associativity, FMA fusion, etc.)
 3. **Extract** minimum-cost implementation using the **static latency-prior cost model**
    (`CostModel::latency_prior()` — handwritten per-op cycle estimates, the only policy;
@@ -277,6 +299,17 @@ A CL that touches only `docs/` and Markdown skips the build-and-test jobs
 (`scripts/ci-change-scope.sh` classifies the diff; the four metadata jobs still
 run). The skip is a job-level `if`, so the required checks report "skipped" and
 merge; a workflow-level `paths-ignore` would leave them pending.
+
+**That last sentence is true of a scalar job and false of a matrix one**, which
+cost three docs-only CLs (#1233, #1207, #1215) weeks of being unmergeable. A job
+skipped by its own `if` never expands its `strategy`, so it reports one check
+run under the *unexpanded* template name — literally `Test on ${{ matrix.os }}`.
+The names branch protection requires, `Test on ubuntu-latest` and
+`Test on macos-latest`, are never reported, and "never reported" blocks exactly
+as hard as "pending". So the `test:` matrix job carries no job-level `if`: it
+always runs and always expands, and the docs-only guard sits on each of its
+steps. A new step there needs the guard, or it runs on a docs-only CL whose
+checkout step was skipped.
 
 Shift left where it is cheap, and *measure* the cheapness rather than assuming
 it. A check that costs an hour presubmit belongs in postsubmit — but a fast
@@ -399,6 +432,22 @@ Priority: AVX-512 > SSE2 (x86-64), NEON (aarch64) — no scalar fallback for oth
   than reconstructed, and `Union`'s explicit ranges and a select's implicit
   mask are the same thing at different levels of static knowledge. See
   docs/plans/2026-09-07-demand-is-a-dag-property.md.
+- **Platform `cfg` is encapsulation, not sprinkle** - a platform-predicate
+  `#[cfg(...)]` (`target_os`, `target_arch`, `target_family`,
+  `target_feature`, `target_pointer_width`, `target_endian`, `windows`,
+  `unix`, or a bare arch/os name like `aarch64`/`x86_64`/`wasm32`) is only
+  allowed to (1) gate a whole file or module — `#![cfg(...)]` at the top of a
+  file, or `#[cfg(...)]` directly on a `mod foo;`/`mod foo { ... }` item — or
+  (2) select a platform implementation as a single-line dispatch item in
+  `mod.rs` (e.g. `#[cfg(aarch64)] pub use native::Foo as PlatformFoo;`).
+  Scattering it on an individual `fn`/`struct`/`impl`/field inside an
+  otherwise platform-agnostic file means the platform split is `grep -r cfg`
+  instead of a file boundary, and the two halves silently drift back into
+  each other's file. Put the platform-specific code in its own file and
+  select it once, at the seam. Enforced by `scripts/check-cfg-encapsulation.sh`
+  (CI job `cfg-encapsulation`), baselined against pre-existing violations in
+  `scripts/cfg_encapsulation_baseline.txt` — new violations fail, old ones
+  are tracked, not silently regenerated as debt.
 - **New implementation of an existing category → trait first** - Before
   adding a second way of doing something the codebase already does one way,
   check whether that category is already a trait. If it is, implement the new
@@ -490,7 +539,8 @@ handle.send(Message::Data(MyDataMsg))?;           // Lowest (backpressure)
 
 - **Hot paths:** the loop nest is inside the emitted code — one collapse call per stripe, not one per row or per SIMD batch
 - **Glyph caching:** a glyph bakes once and reads back as a gather over its bound buffer (`fonts/cache.rs`)
-- **Antialiasing:** symbolic derivatives — `Kernel::dx()`/`dy()`, resolved before emission
+- **Glyph coverage:** a winding number about a reference point, per-pixel and discriminant-free (`fonts/loop_blinn.rs`, docs/plans/2026-09-08-loop-blinn-glyph.md). Its bound is a domain-side extent because `u² − v` outside its control triangle is *wrong*, not merely slow — so the glyph is where a `Union` of index ranges earns its keep
+- **Antialiasing:** symbolic derivatives — `Kernel::dx()`/`dy()`, resolved before emission. A glyph's *winding* is exact (hard masks selecting signed constants); only the distance feeding the ramp is soft, so a comparison landing on the wrong side costs a rounding rather than half a unit of coverage
 - **One kernel per scene:** four channel kernels compile together, so shared geometry is emitted once
 
 ## Cost Model and the Guide (offline, supervised)
@@ -510,7 +560,9 @@ What remains:
 - The static latency prior (`CostModel::latency_prior()`) is the extraction cost model.
   `pixelflow-pipeline`'s `measure_latency_prior` example and `jit_bench` (`BenchSession`,
   median-of-samples, sentinel drift normalization) are how the table is re-derived.
-- `gen_bench_corpus` (pixelflow-pipeline, `--features training`) mints quarantined,
-  tier-split expression corpora for the Guide program's research bins.
+- `gen_bench_corpus` minted quarantined, tier-split expression corpora for the
+  Guide program's research bins. **Deleted**: its quarantine gate decided
+  acceptance by comparing against the scalar interpreter, so it went with it.
+  A corpus needs a new acceptance criterion before that tooling comes back.
 - The saturation Guide trains on hindsight provenance labels from `pixelflow-search`'s
   `egraph::labeler` — no critic, no RL (docs/plans/2026-08-31-guide-design-revision.md).

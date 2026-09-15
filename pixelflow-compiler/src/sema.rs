@@ -21,8 +21,9 @@
 //! The semantic phase produces an `AnalyzedKernel`: the AST, validated.
 
 use crate::ast::{BlockExpr, Expr, KernelDef, LetStmt, MethodCallExpr, Param, Stmt};
+use crate::lower::LIBRARY_METHODS;
 use crate::symbol::{SymbolKind, SymbolTable};
-use pixelflow_ir::known_method_names;
+use pixelflow_ir::{OpKind, known_method_names};
 use syn::Ident;
 
 /// DSL-specific methods that aren't IR operations.
@@ -203,14 +204,37 @@ impl SemanticAnalyzer {
             self.analyze_expr(arg)?;
         }
 
-        // Validate method name against known methods (IR ops + DSL methods)
+        // Validate method name AND arity against known methods (IR ops +
+        // library compositions + DSL methods) — `OpKind::from_method_call`
+        // checks arity, so `.sqrt(1)` is rejected here rather than slipping
+        // through as "known" and failing later with a less specific error.
         let method_name = call.method.to_string();
-        let is_ir_method = known_method_names().any(|m| m == method_name);
+        let arg_count = call.args.len();
+        let is_ir_method = OpKind::from_method_call(&method_name, arg_count).is_some();
+        let is_library_method = LIBRARY_METHODS.contains(&(method_name.as_str(), arg_count));
         let is_dsl_method = DSL_METHODS.contains(&method_name.as_str());
 
-        if !is_ir_method && !is_dsl_method {
+        if !is_ir_method && !is_library_method && !is_dsl_method {
+            // A recognized name at the wrong arity is not an unknown name, and
+            // sending it into the typo search below produced the useless
+            // `unknown method 'sqrt'; did you mean 'sqrt'?` — the search found
+            // the very name it had just declared unknown. Answer the question
+            // the caller actually got wrong.
+            if let Some(want) = Self::expected_arg_count(&method_name) {
+                return Err(syn::Error::new(
+                    call.method.span(),
+                    format!(
+                        "`{method_name}` takes {want} argument{}, but {arg_count} \
+                         {} supplied",
+                        if want == 1 { "" } else { "s" },
+                        if arg_count == 1 { "was" } else { "were" },
+                    ),
+                ));
+            }
+
             // Find similar method for suggestion - collect all known methods
             let all_methods: Vec<&str> = known_method_names()
+                .chain(LIBRARY_METHODS.iter().map(|(name, _)| *name))
                 .chain(DSL_METHODS.iter().copied())
                 .collect();
 
@@ -246,6 +270,32 @@ impl SemanticAnalyzer {
             return Err(syn::Error::new(call.method.span(), msg));
         }
         Ok(())
+    }
+
+    /// The argument count a known method takes, or `None` if no method has
+    /// that name at any arity.
+    ///
+    /// Name and arity are separate questions. `OpKind::from_method_call`
+    /// deliberately answers them together — that is what makes `.sqrt(1.0)` a
+    /// hard error rather than something that slips through and fails later —
+    /// but a *diagnostic* has to take them apart again to say which one is
+    /// wrong.
+    ///
+    /// Asking `from_method_call` again at the op's own arity is what
+    /// distinguishes a DSL method from an op that merely shares a name
+    /// (`add`, `shl`), without this module needing to see the private
+    /// predicate that decides it.
+    fn expected_arg_count(name: &str) -> Option<usize> {
+        if let Some(op) = OpKind::from_name(name) {
+            let args = op.arity().checked_sub(1)?;
+            if OpKind::from_method_call(name, args).is_some() {
+                return Some(args);
+            }
+        }
+        LIBRARY_METHODS
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, count)| *count)
     }
 
     /// Analyze a block expression.
@@ -333,11 +383,28 @@ mod tests {
         assert!(analyze(kernel).is_ok());
     }
 
-    /// An unknown name is a capture from the caller's scope, not an error:
-    /// the expansion is a closure written where the caller wrote it, so
-    /// Rust's own resolver is the one that can say whether the name exists.
+    /// Semantic analysis does not reject an unknown name: the expansion is a
+    /// closure written where the caller wrote it, so Rust's own resolver is
+    /// the one that can say whether the name exists.
+    ///
+    /// **This proves only that `analyze` accepts it — not that the kernel
+    /// compiles.** It does not: arena lowering has no node for a captured
+    /// Rust binding and refuses with `Unknown identifier`, so
+    /// `let scale = 2.0; kernel!(|| X * scale)` is a compile error today
+    /// (verified). The name this test used to carry —
+    /// `an_unknown_name_is_captured_from_the_callers_scope` — claimed the
+    /// end-to-end behavior and so read as coverage of something nothing
+    /// checks.
+    ///
+    /// It is the same shape as the `round`/`log10`/`pow` and
+    /// `fract`/`hypot`/`clamp` defects: one stage accepts what a later stage
+    /// refuses, because the surface is spelled separately at each stage. A
+    /// capture is expressible — the emitted tokens sit in the caller's scope,
+    /// so it could fold as a `Const` exactly as a parameter does — so this is
+    /// an unimplemented capability, not an impossible one. Pass it as a
+    /// parameter meanwhile.
     #[test]
-    fn an_unknown_name_is_captured_from_the_callers_scope() {
+    fn analysis_accepts_an_unknown_name_and_leaves_it_to_rusts_resolver() {
         let input = quote! { |r: f32| X * X + captured_from_env };
         let kernel = parse(input).unwrap();
         assert!(analyze(kernel).is_ok());

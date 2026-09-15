@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L046.** The multi-mask deltas are tree-cost differences (pre-#1192) on a generated corpus. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Counterfactual credit: hindsight bounds vs measured Δ (leave-one-out and confluence-aware)
 
 > **Instrument change (2026-09-02 forward-port).** Two things about how a

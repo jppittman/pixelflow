@@ -101,13 +101,49 @@ until the parity suite + font goldens prove arena coverage, then it is deleted.
 |---|---|
 | Jet2/Jet3 domain evaluation (font AA, 3D normals) | `Dwrt` symbolic differentiation lowered in pixelflow-ir; derivatives are ordinary expressions compiled by the same backend. NOT the deleted emit-time jet mode (bd47aa7c) — that was an architectural trap. |
 | Portable / reference semantics (SSE2, WASM, scalar — no JIT emitters) | The IR interpreter (`pixelflow-ir/src/eval.rs`). Same arena, same semantics, slow. WASM may later get its own arena emitter. |
-| Composition (`.at()`, `Sum`, named structs, manifold params) | IR-carrying kernels: every kernel exposes its arena fragment; composition is arena splicing (contramap = Var substitution, Sum = chained Add). |
+| Composition (`.at()`, `Sum`, named structs, manifold params) | IR-carrying kernels: every kernel exposes its arena fragment; composition **inlines** that fragment into the host (contramap = Var substitution, Sum = chained Add). This plan and the code call the mechanism "splicing" (`ExprArena::splice`) — see the 2026-09-08 amendment: the name hid a policy decision. |
 | Opaque Rust manifolds (DiscreteManifold, dynamic BSP, CachedGlyph) | Enter the IR as bound buffers / ctx-pointer calls (the existing Gather pattern), not as expressions. The `Manifold` trait survives as the composition substrate. |
 
 Numerics are defined once: the JIT's near-libm behavior is canonical. The
 combinator backend's inaccurate `sin` (0.5116 vs 0.8415 at x=1; see
 pixelflow-compiler/tests/jit_parity.rs header) is a parity bug in the
 to-be-retired backend, tracked until that backend dies.
+
+### Amendment (2026-09-08): composition inlines, and inlining is the e-graph's call
+
+This plan called composition "arena splicing." Splicing is the *mechanism*
+(`ExprArena::splice`, a copy); the *operation* is *inlining* — composition copies
+the callee's body into the caller. Naming it after the memcpy hid the fact that a
+policy decision was being taken at all, and taken eagerly, at construction time,
+by code that has no cost model to take it with.
+
+That decision is now measured. See
+[2026-09-06-egraph-at-production-scale.md](2026-09-06-egraph-at-production-scale.md)
+§2: `at`, `select`, and the per-channel `Rgba` operations each re-inline the hit
+point, so the tree the e-graph receives is **~40× its own DAG**. Hash-consing at
+build folds it back, and that fold alone "lands within 90 classes of the cap" —
+"almost the whole budget is spent representing the input", which is why the class
+cap binds on iteration 2.
+
+Inlining is a cost-driven choice — inline when the win beats the duplication,
+outline when it does not — and an e-graph is precisely the machinery for holding
+such a choice open until something can price it. So composition should build a
+**reference** to a fragment, and inlining should be a rewrite the extractor
+prices like any other. Today the choice is made before anything can price it,
+and then the optimizer spends its budget undoing it.
+
+What follows from that:
+
+- Nothing downstream may assume a composed arena is already inlined.
+- The ~40× blowup is an artifact of *construction*, not a property of the
+  kernels. It is not evidence that these kernels are large.
+- An un-inlined reference needs an IR node, and `ExprArena` has none today: the
+  `op_table!` roster runs `Var … Uniform` with no call/reference form. Adding
+  one is the first piece of that work, not the last.
+
+This amendment is a correction to the vocabulary and to the design it concealed.
+It does not block the arena-native macro-tier work, which is about *where* the
+e-graph runs, not *what* composition builds.
 
 ## Phases
 

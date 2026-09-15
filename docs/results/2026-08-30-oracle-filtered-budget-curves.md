@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L031.** The curves are inconclusive by the doc's own reading, sampled after 97.8% of runs had ended, with the class cap unscaled per checkpoint and costs in tree units, and are not evidence for or against a Guide. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Oracle-filtered anytime budget curves: inconclusive as calibrated (2026-08-30)
 
 > **SUPERSEDED (2026-09-02).** This report's `cost` and `regret_pct` columns are the

@@ -1,0 +1,8 @@
+kernel,family,b_lo,b_hi,live_lo,live_hi,objective_witness,objective_greedy,delta_objective,dag_witness,dag_greedy,delta_dag,occupied,merges,divergences,frontier,best_single_swap,greedy_swaps,swaps_accepted,witness_kind,realizable,first_class,first_label,first_stage,first_rule
+chrome_packed,chrome,5000,10000,398,404,3294983903,3326094392,-31110489,1668,1673,-5,393,5,29,3,3317799992,3317799992,1,objective,PARTIAL,164,COORDINATED,dp,associative(Mul)
+chrome_packed,chrome,5000,20000,398,403,3253511903,3301227397,-47715494,1668,1681,-13,389,9,33,8,3301226308,3301226303,2,objective,PARTIAL,436,COORDINATED,dp,seed
+chrome_packed,chrome,5000,50000,398,518,3234839778,4564003324,-1329163546,1668,2214,-546,386,12,98,5,4564003324,4564003324,0,objective,COORDINATED,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,20000,50000,403,518,3272191587,4564003324,-1291811737,1681,2214,-533,399,4,120,6,4564003324,4564003324,0,objective,COORDINATED,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,5000,100000,398,568,3234839778,4700952733,-1466112955,1668,2374,-706,386,12,96,5,4682290333,4682286013,2,objective,PARTIAL,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,20000,100000,403,568,3272191587,4700952733,-1428761146,1681,2374,-693,399,4,104,7,4682290333,4682286013,2,objective,PARTIAL,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,50000,100000,518,568,4526678524,4700952733,-174274209,2214,2374,-160,514,4,155,1,4700952733,4700952733,0,objective,COORDINATED,36890,CYCLE-PRICED,min-of-two,fma-fusion

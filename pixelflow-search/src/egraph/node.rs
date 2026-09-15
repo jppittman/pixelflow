@@ -3,6 +3,7 @@
 use super::ops::Op;
 use alloc::vec::Vec;
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
+use pixelflow_ir::fold::Fold;
 
 /// Identifier for an equivalence class in the e-graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,11 +42,38 @@ pub enum ENode {
     /// `Const`, so it is never folded; its gain in the e-graph is CSE of the
     /// arithmetic that depends on it alone.
     Uniform(UniformDecl),
+    /// Unbound scalar slot of a `kernel!` builder, hash-consed by index.
+    ///
+    /// The same opaque leaf as [`ENode::Uniform`], one tier earlier: no rule
+    /// matches it, nothing folds it, its derivative is zero, and its gain in
+    /// the e-graph is CSE of the arithmetic depending on it alone. A builder
+    /// substitutes it away before anything is compiled, so only the macro
+    /// tier's [`Vocabulary::Templates`](super::ops::Vocabulary) may hold one.
+    ///
+    /// Before this leaf existed the e-graph refused `Param` outright, and
+    /// each macro-side caller smuggled one past as something else — as
+    /// `Var(16 + i)` in the compiler's arena bridge, as an opaque synthetic
+    /// identifier in its AST optimizer. Two encodings of one idea, next to
+    /// two worked examples of it.
+    Param(u8),
     /// Operation with children
     Op {
         op: &'static dyn Op,
         children: Vec<EClassId>,
     },
+    /// A bounded fold: `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
+    ///
+    /// The one node in the graph that *binds*, and the reason it can be in
+    /// the graph at all: its algebra, binder and range live in the node's
+    /// identity rather than in three `Const` children. As children they were
+    /// e-classes like any other — the `Const(4.0)` naming the `Add` combiner
+    /// was the same class as any literal `4.0` in the kernel, and every
+    /// arithmetic rule in the set could reach a trip count — so `Reduce` was
+    /// simply lowered before insertion and the e-graph never saw a fold.
+    ///
+    /// Hash-consing therefore does what it should: two folds are one node iff
+    /// they fold the same body, under the same algebra, over the same range.
+    Reduce { fold: Fold, body: EClassId },
 }
 
 impl ENode {
@@ -75,11 +103,49 @@ impl ENode {
         }
     }
 
-    /// Get children of this node.
-    pub fn children(&self) -> Vec<EClassId> {
+    /// The fold this node performs, if it is one.
+    pub fn fold(&self) -> Option<Fold> {
         match self {
-            ENode::Var(_) | ENode::Const(_) | ENode::Buffer(_) | ENode::Uniform(_) => vec![],
-            ENode::Op { children, .. } => children.clone(),
+            ENode::Reduce { fold, .. } => Some(*fold),
+            _ => None,
+        }
+    }
+
+    /// Get children of this node.
+    ///
+    /// Allocates and clones — see [`Self::children_slice`] for the
+    /// zero-allocation borrow, which every call site on a saturation/
+    /// extraction hot path should prefer. This owned form stays for callers
+    /// (training/eval tooling outside this crate) that want a `Vec` to hold
+    /// past the node's borrow.
+    pub fn children(&self) -> Vec<EClassId> {
+        self.children_slice().to_vec()
+    }
+
+    /// Borrow this node's children with no allocation.
+    pub fn children_slice(&self) -> &[EClassId] {
+        match self {
+            ENode::Var(_)
+            | ENode::Const(_)
+            | ENode::Buffer(_)
+            | ENode::Uniform(_)
+            | ENode::Param(_) => &[],
+            ENode::Op { children, .. } => children,
+            ENode::Reduce { body, .. } => core::slice::from_ref(body),
+        }
+    }
+
+    /// Borrow this node's children mutably — what canonicalization needs, and
+    /// the only reason a caller should want it.
+    pub fn children_slice_mut(&mut self) -> &mut [EClassId] {
+        match self {
+            ENode::Var(_)
+            | ENode::Const(_)
+            | ENode::Buffer(_)
+            | ENode::Uniform(_)
+            | ENode::Param(_) => &mut [],
+            ENode::Op { children, .. } => children,
+            ENode::Reduce { body, .. } => core::slice::from_mut(body),
         }
     }
 
@@ -107,6 +173,7 @@ impl PartialEq for ENode {
             (ENode::Buffer(a), ENode::Buffer(b)) => a == b,
             // Identity and default, bitwise (`UniformDecl`'s own equality).
             (ENode::Uniform(a), ENode::Uniform(b)) => a == b,
+            (ENode::Param(a), ENode::Param(b)) => a == b,
             (
                 ENode::Op {
                     op: op1,
@@ -119,6 +186,9 @@ impl PartialEq for ENode {
             ) => {
                 // Compare by OpKind - ZST pointer addresses are unreliable
                 op1.kind() == op2.kind() && c1 == c2
+            }
+            (ENode::Reduce { fold: f1, body: b1 }, ENode::Reduce { fold: f2, body: b2 }) => {
+                f1 == f2 && b1 == b2
             }
             _ => false,
         }
@@ -147,11 +217,20 @@ impl core::hash::Hash for ENode {
                 4u8.hash(state);
                 decl.hash(state);
             }
+            ENode::Param(i) => {
+                5u8.hash(state);
+                i.hash(state);
+            }
             ENode::Op { op, children } => {
                 2u8.hash(state);
                 // Hash by OpKind - ZST pointer addresses are unreliable
                 op.kind().hash(state);
                 children.hash(state);
+            }
+            ENode::Reduce { fold, body } => {
+                6u8.hash(state);
+                fold.hash(state);
+                body.hash(state);
             }
         }
     }

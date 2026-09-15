@@ -1,3 +1,11 @@
+> **Superseded in large part — see the 2026-09-01 closure note immediately below,**
+> which lists row by row what has no object left. Roughly a dozen files this
+> document's module map names were deleted with the extraction-head program
+> (`nnue/edge.rs`, `nnue/head.rs`, `nnue/embeddings.rs`, `nnue/serialize.rs`,
+> `src/eval/gates.rs`, `src/eval/verdict.rs`, `src/bench/*`, `oracle_compare.rs`,
+> `pixelflow-ml/src/nnue.rs`). The rows marked live in that note (J2, J7/J8, J10,
+> J11, J15) are the part still worth reading.
+
 # Cost-Model Domain Model and Reorganization Plan (2026-08-17)
 
 Synthesis of three independent analyses over the cost-model pipeline

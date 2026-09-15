@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L028.** The per-rule labeler-vs-strict correlation (Spearman 0.35) is withdrawn as a constant - two draws give 0.35 and 0.19 - and the headroom and structural-rule rows (L027, L029) were never taken on a shipped kernel. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Phase 3 oracle headroom at corpus scale (2026-08-30)
 
 Reproduce:

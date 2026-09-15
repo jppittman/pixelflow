@@ -343,7 +343,7 @@ fn chosen_tagged_nodes(
         let tags = egraph.tags(canonical);
         result.push((canonical, tags[node_idx]));
 
-        for child in nodes[node_idx].children() {
+        for &child in nodes[node_idx].children_slice() {
             stack.push(child);
         }
     }

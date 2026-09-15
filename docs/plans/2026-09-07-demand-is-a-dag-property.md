@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L082.** Section 9's reading that a tight Y-extent gate fixes the '8' waist is withdrawn - an always-true gate fixed it equally; the bug is open on main and belongs to the font thread, out of this program's scope. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Demand is a property of the DAG
 
 **Date:** 2026-09-07

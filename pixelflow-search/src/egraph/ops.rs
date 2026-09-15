@@ -226,12 +226,15 @@ pub fn op_from_kind(kind: OpKind) -> Option<&'static dyn Op> {
         // runtime tier resolve `Gather` directly via the crate-private
         // `Gather` op above. `RawGather` and `Reduce` are lowered
         // before/after the e-graph and never appear in one.
-        // `Uniform` likewise: a leaf the e-graph holds as `ENode::Uniform`,
-        // never as an op a rule could match — which is exactly what keeps
-        // `ConstantFold` from ever seeing one.
-        OpKind::Buffer | OpKind::Gather | OpKind::RawGather | OpKind::Reduce | OpKind::Uniform => {
-            None
-        }
+        // `Uniform` and `Param` likewise: leaves the e-graph holds as
+        // `ENode::Uniform`/`ENode::Param`, never as an op a rule could match —
+        // which is exactly what keeps `ConstantFold` from ever seeing one.
+        OpKind::Buffer
+        | OpKind::Gather
+        | OpKind::RawGather
+        | OpKind::Reduce
+        | OpKind::Uniform
+        | OpKind::Param => None,
     }
 }
 
@@ -263,6 +266,22 @@ impl Op for MaskOr {
     fn kind(&self) -> OpKind {
         OpKind::BitOr
     }
+}
+
+/// Mask `∧` as an `Op`, for a caller that already named the *algebra*.
+///
+/// Crate-visible where [`op_from_kind`] is not: resolving an `OpKind` to
+/// these would hand them to the macro tier, which is the miscompile the
+/// comment above describes. Resolving a [`Monoid`](pixelflow_ir::Monoid) to
+/// them leaks no opcode — the caller said "the universal quantifier", and
+/// this is what that is.
+pub(crate) fn mask_and() -> &'static dyn Op {
+    &MaskAnd
+}
+
+/// Mask `∨` as an `Op`. See [`mask_and`].
+pub(crate) fn mask_or() -> &'static dyn Op {
+    &MaskOr
 }
 
 // ─────────────────────── Runtime-only integer-domain ops ─────────────────────

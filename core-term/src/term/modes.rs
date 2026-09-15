@@ -240,3 +240,83 @@ pub enum Mode {
     /// A standard ANSI mode.
     Standard(u16),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_should_map_known_values_to_their_erase_mode_on_from_u16() {
+        let expected: &[(u16, EraseMode)] = &[
+            (0, EraseMode::ToEnd),
+            (1, EraseMode::ToStart),
+            (2, EraseMode::All),
+            (3, EraseMode::Scrollback),
+        ];
+        for &(value, mode) in expected {
+            assert_eq!(EraseMode::from(value), mode, "value {} mapped wrong", value);
+        }
+    }
+
+    #[test]
+    fn it_should_map_an_unrecognized_value_to_unknown_on_erase_mode_from_u16() {
+        assert_eq!(EraseMode::from(42), EraseMode::Unknown);
+    }
+
+    #[test]
+    fn it_should_map_every_known_value_to_its_dec_mode_constant_on_from_u16() {
+        let expected: &[(u16, DecModeConstant)] = &[
+            (1, DecModeConstant::CursorKeys),
+            (6, DecModeConstant::Origin),
+            (7, DecModeConstant::AutoWrapMode),
+            (9, DecModeConstant::MouseX10),
+            (12, DecModeConstant::Att610CursorBlink),
+            (25, DecModeConstant::TextCursorEnable),
+            (1000, DecModeConstant::MouseVt200),
+            (1001, DecModeConstant::MouseVt200Highlight),
+            (1002, DecModeConstant::MouseButtonEvent),
+            (1003, DecModeConstant::MouseAnyEvent),
+            (1004, DecModeConstant::FocusEvent),
+            (1005, DecModeConstant::MouseUtf8),
+            (1006, DecModeConstant::MouseSgr),
+            (1015, DecModeConstant::MouseUrxvt),
+            (1016, DecModeConstant::MousePixelPosition),
+            (1047, DecModeConstant::AltScreenBufferClear),
+            (1048, DecModeConstant::SaveRestoreCursor),
+            (1049, DecModeConstant::AltScreenBufferSaveRestore),
+            (2004, DecModeConstant::BracketedPaste),
+            (2026, DecModeConstant::SynchronizedOutput),
+            (7727, DecModeConstant::Unknown7727),
+        ];
+        for &(value, constant) in expected {
+            assert_eq!(
+                DecModeConstant::from_u16(value),
+                Some(constant),
+                "value {} mapped wrong",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn it_should_return_none_for_an_unrecognized_value_on_dec_mode_constant_from_u16() {
+        assert_eq!(DecModeConstant::from_u16(9999), None);
+    }
+
+    #[test]
+    fn it_should_map_every_known_value_to_its_standard_mode_constant_on_from_u16() {
+        assert_eq!(
+            StandardModeConstant::from_u16(4),
+            Some(StandardModeConstant::InsertMode)
+        );
+        assert_eq!(
+            StandardModeConstant::from_u16(20),
+            Some(StandardModeConstant::LinefeedNewlineMode)
+        );
+    }
+
+    #[test]
+    fn it_should_return_none_for_an_unrecognized_value_on_standard_mode_constant_from_u16() {
+        assert_eq!(StandardModeConstant::from_u16(9999), None);
+    }
+}

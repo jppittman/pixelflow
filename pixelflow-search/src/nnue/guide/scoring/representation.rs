@@ -73,7 +73,7 @@
 //! represent the hypothesis Round 1b tested, not that the bilinear one
 //! learns it.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 
 use super::*;
 use crate::egraph::rules::{RuleId, RuleSet};

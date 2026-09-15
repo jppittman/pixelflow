@@ -1,0 +1,6 @@
+kernel,family,class_cap,inserted_classes,classes_at_stop,live_classes,applications,stop,objective,dag_cost,tree_cost,extraction_objective,canonical_objective,canonical_dag_cost,tied_classes,seconds
+chrome_packed,chrome,5000,465,4944,410,5502,ClassCap,3485751868,1737,4137984610451,Shared,3427694308,1712,164,0.109
+chrome_packed,chrome,10000,465,9495,419,11528,ClassCap,3494055992,1754,4404920278912,Shared,3390375992,1704,170,0.121
+chrome_packed,chrome,20000,465,17886,423,22744,ClassCap,3483709601,1778,4777249033684,Shared,3365508997,1712,177,0.141
+chrome_packed,chrome,50000,465,46074,419,78903,ClassCap,3533454368,1749,4900698113946,Shared,3309510968,1646,185,2.511
+chrome_packed,chrome,100000,465,85977,442,142134,ClassCap,3728383573,1858,4607424946602,Shared,3535544173,1770,185,6.826

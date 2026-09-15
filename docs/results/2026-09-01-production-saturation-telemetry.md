@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L054.** The "what the class cap costs" figures (median 8.66%, p90 13.22%, max 15.07% vs a 4x-lifted reference) are tree-DP costs whose sign the chrome clock contradicted (12x more classes = +15% ns/px, L072); the stop-reason counts, the 8,446-application regime and the "more saturation extracts worse code" rows (L053, L055, L056) stand. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Production saturation telemetry: does the budget bind on real kernels? (2026-09-01)
 
 Two rounds. **Round 1** (commit `b2d1e48e`, base `origin/main` 453d2a6e) measured 173/193 kernels

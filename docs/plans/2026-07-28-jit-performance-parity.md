@@ -1,3 +1,11 @@
+> **Superseded in scope (2026-09-06).** Its "Surface" lane is explicitly superseded
+> by [`2026-09-06-kernel-with-a-lattice.md`](2026-09-06-kernel-with-a-lattice.md),
+> which states the end state; `pixelflow-core/src/jit.rs` and
+> `pixelflow-runtime/examples/bench_psychedelic.rs` are deleted. The per-ISA
+> scoping notes below (constant materialization, `vzeroupper`, select-vs-blend)
+> were never a plan of record and several are overtaken by the S3/S3b schedule
+> work — check `docs/results/` before acting on one.
+
 # JIT Performance Parity: Scoping
 
 **Date:** 2026-07-28

@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L046.** The regime-restricted Spearman rests on tree-cost deltas on a generated corpus and is not re-taken. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Guide return-to-go, round 4: training inside the selected regime, and confluence-aware credit
 
 > **Instrument change (2026-09-02 forward-port).** Two things about how a

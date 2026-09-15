@@ -141,6 +141,8 @@ pub struct BinaryExpr {
     pub op: BinaryOp,
     pub lhs: Box<Expr>,
     pub rhs: Box<Expr>,
+    // Kept for AST-node uniformity; not all node types' spans are read today.
+    #[allow(dead_code)]
     pub span: Span,
 }
 
@@ -156,6 +158,8 @@ pub enum UnaryOp {
 pub struct UnaryExpr {
     pub op: UnaryOp,
     pub operand: Box<Expr>,
+    // Kept for AST-node uniformity; not all node types' spans are read today.
+    #[allow(dead_code)]
     pub span: Span,
 }
 

@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L033, L034.** The registered constants B = 100 / 200 and Y = 16.3% / 9.0% were derived from tree-cost truncation losses on a synthetic corpus, in a regime 85x below where production stops (median 8,446 applications on real kernels); they port as-is and are not re-derivable, so this registration is closed rather than re-run. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Phase 3 pre-registration: budget tiers, improvement threshold, and gates
 
 **Date:** 2026-09-01

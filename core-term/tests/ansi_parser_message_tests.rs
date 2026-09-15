@@ -6,6 +6,7 @@
 use actor_scheduler::{
     Actor, ActorScheduler, ActorStatus, HandlerError, HandlerResult, Message, SystemStatus,
 };
+use core_term::ansi::commands::CsiCommand;
 use core_term::ansi::{AnsiCommand, AnsiParser, AnsiProcessor};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -434,7 +435,7 @@ impl TerminalMessageChain {
 }
 
 #[test]
-fn cuj_e2e_complete_message_chain() {
+fn cuj_e2e_complete_message_chain_delivers_erase_move_and_print_commands_in_order() {
     // Given: A complete terminal message chain
     let chain = TerminalMessageChain::new();
 
@@ -442,13 +443,23 @@ fn cuj_e2e_complete_message_chain() {
     // Simulate: clear screen, move cursor, print text
     chain.send_bytes(b"\x1b[2J".to_vec()); // Clear screen
     chain.send_bytes(b"\x1b[1;1H".to_vec()); // Move to 1,1
-    chain.send_bytes(b"Hello, Terminal!".to_vec()); // Print text
+    chain.send_bytes(b"Hi".to_vec()); // Print text
 
     thread::sleep(Duration::from_millis(100));
+    let commands = chain.get_commands();
     chain.shutdown();
 
-    // Then: All commands should be received by app
-    // This validates the complete: PTY → ReadThread → Parser → App chain
+    // Then: the erase, cursor move, and both printed characters arrive in order,
+    // proving the PTY -> ReadThread -> Parser -> App chain preserves sequencing.
+    assert_eq!(
+        commands,
+        vec![
+            AnsiCommand::Csi(CsiCommand::EraseInDisplay(2)),
+            AnsiCommand::Csi(CsiCommand::CursorPosition(1, 1)),
+            AnsiCommand::Print('H'),
+            AnsiCommand::Print('i'),
+        ]
+    );
 }
 
 #[test]

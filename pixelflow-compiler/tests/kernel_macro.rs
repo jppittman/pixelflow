@@ -4,7 +4,7 @@
 //! e-graph, arena, and then the one evaluation entry there is — compiled at a
 //! lattice's shape and collapsed.
 
-use pixelflow_compiler::kernel;
+use pixelflow_compiler::{kernel, kernel_raw};
 use pixelflow_core::{Kernel, Lattice};
 
 // ============================================================================
@@ -119,6 +119,114 @@ fn macro_min_returns_smaller_and_max_returns_larger() {
     let m_max = kernel!(|| X.max(Y));
     assert_eq!(eval2(&m_min, 10.0, 42.0), 10.0);
     assert_eq!(eval2(&m_max, 10.0, 42.0), 42.0);
+}
+
+// ============================================================================
+// Primitive methods the arena lowering used to have no arm for
+// (`round`/`log10`/`pow` are real `OpKind`s, but the hand-written method-call
+// match was missing all three, so a kernel body calling them failed to
+// compile with "Unsupported method" even though sema and the e-graph both
+// accepted them). Fixed by resolving every primitive method through
+// `OpKind::from_method_call` instead of re-listing names by hand.
+// ============================================================================
+
+#[test]
+fn macro_round() {
+    // round(41.6) = 42, ties to even (round_ties_to_even_matching_x86s_vroundps
+    // in pixelflow-ir pins the exact tie behavior; this just needs an ordinary
+    // non-tie value).
+    let m = kernel!(|| X.round());
+    assert_eq!(eval1(&m, 41.6), 42.0);
+}
+
+#[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
+fn macro_log10() {
+    let m = kernel!(|| X.log10());
+    let val = eval1(&m, 1000.0);
+    let expected = 1000.0_f32.log10();
+    assert!(
+        (val - expected).abs() < 0.02,
+        "log10(1000) = {val}, expected ~{expected}"
+    );
+}
+
+#[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
+fn macro_pow() {
+    let m = kernel!(|| X.pow(Y));
+    let val = eval2(&m, 2.0, 10.0);
+    let expected = 2.0_f32.powf(10.0);
+    assert!(
+        (val - expected).abs() / expected < 0.02,
+        "pow(2, 10) = {val}, expected ~{expected}"
+    );
+}
+
+// ============================================================================
+// Library methods: fixed compositions of primitive ops, not an `OpKind`
+// themselves. Previously accepted by the AST-tier e-graph pass but
+// rejected by `sema.rs` as "unknown method" before ever reaching it — the
+// e-graph's `fract`/`hypot`/`clamp` decomposition was unreachable dead code.
+// Fixed by validating against the same `LIBRARY_METHODS` list the two
+// backends' dispatch reads.
+// ============================================================================
+
+#[test]
+fn macro_fract_is_x_minus_its_floor() {
+    let m = kernel!(|| X.fract());
+    let val = eval1(&m, 42.75);
+    assert!(
+        (val - 0.75).abs() < 1e-5,
+        "fract(42.75) = {val}, expected ~0.75"
+    );
+}
+
+#[test]
+fn macro_hypot_is_the_euclidean_norm() {
+    let m = kernel!(|| X.hypot(Y));
+    // 3-4-5 triangle.
+    assert!((eval2(&m, 3.0, 4.0) - 5.0).abs() < 1e-5);
+}
+
+#[test]
+fn macro_clamp_bounds_the_value_on_both_sides() {
+    let m = kernel!(|lo: f32, hi: f32| X.clamp(lo, hi));
+    let clamped = m(0.0, 1.0);
+    assert_eq!(eval1(&clamped, -5.0), 0.0);
+    assert_eq!(eval1(&clamped, 0.5), 0.5);
+    assert_eq!(eval1(&clamped, 5.0), 1.0);
+}
+
+// `kernel_raw!` skips the e-graph entirely and goes straight from sema to
+// the arena lowering — the one path that used to have no arm for
+// `round`/`log10`/`pow` at all, and no decomposition for `hypot`/`fract`
+// (only the AST-tier e-graph pass had those, so `kernel!` could express
+// them once sema stopped rejecting the names, but `kernel_raw!` had no
+// second implementation to fall back on). Proven here directly, without the
+// optimizer in the way.
+#[test]
+fn kernel_raw_supports_the_same_primitive_and_library_methods_as_kernel() {
+    assert_eq!(eval1(&kernel_raw!(|| X.round()), 41.6), 42.0);
+    assert!((eval1(&kernel_raw!(|| X.fract()), 42.75) - 0.75).abs() < 1e-5);
+    assert!((eval2(&kernel_raw!(|| X.hypot(Y)), 3.0, 4.0) - 5.0).abs() < 1e-5);
+    assert_eq!(
+        eval1(
+            &kernel_raw!(|lo: f32, hi: f32| X.clamp(lo, hi))(0.0, 1.0),
+            5.0
+        ),
+        1.0
+    );
+}
+
+#[test]
+#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
+fn kernel_raw_supports_pow_and_log10() {
+    let pow = eval2(&kernel_raw!(|| X.pow(Y)), 2.0, 10.0);
+    assert!((pow - 2.0_f32.powf(10.0)).abs() / pow < 0.02);
+
+    let log10 = eval1(&kernel_raw!(|| X.log10()), 1000.0);
+    assert!((log10 - 1000.0_f32.log10()).abs() < 0.02);
 }
 
 // ============================================================================

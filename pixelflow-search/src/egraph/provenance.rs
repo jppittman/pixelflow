@@ -57,9 +57,9 @@
 //! function's doc comment).
 
 #[cfg(feature = "provenance-journal")]
-use std::collections::BTreeSet;
+use rustc_hash::FxHashMap as HashMap;
 #[cfg(feature = "provenance-journal")]
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 
 use super::node::EClassId;
 
@@ -550,7 +550,7 @@ pub fn derivation_ancestors_tight(
     seeds: &[(EClassId, ENodeId)],
     chosen_nodes: &[(EClassId, ENodeId)],
 ) -> BTreeSet<ApplicationId> {
-    let mut chosen_map: HashMap<EClassId, ENodeId> = HashMap::new();
+    let mut chosen_map: HashMap<EClassId, ENodeId> = HashMap::default();
     for &(class, node) in chosen_nodes {
         let class = canonical_of(class);
         match chosen_map.entry(class) {

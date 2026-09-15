@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-08), ledger L054.** The "median 8.66%, p90 13.2%" truncation-cost premise this measurement is framed against (`docs/results/2026-09-01-production-saturation-telemetry.md:41-46`) is computed specifically over the 132 `ClassCap` rows against a 4×-lifted, no-clock reference — it is a tree-DP cost whose *sign* the chrome clock contradicted (12× more classes made the kernel 15% slower, L072), the same reason that source document's own banner withdraws it. It is not derived from, and is not made obsolete by, the ClassCap/Timeout stop-reason prevalence shifting from 68.4% to 93% under the current budget (that shift is L053/L056, now marked historical: the 200 ms-timeout regime, pre-#1118). The under-merging *mechanism* this document measures is unaffected and stands; only the 8.66% cost premise is withdrawn, and for the sign problem, not the regime. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Missing congruence measurement (issue #1106)
 
 Read-only measurement, no fix. THE FINDING under test: `EGraph::union(x, y)`

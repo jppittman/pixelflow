@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L042.** V3 showed the |R| effect reported here is an order confound, and the regret is a tree cost besides. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Round 2 v2 Register run: unguided regret vs rule count, interleaved order
 
 > **Instrument change (2026-09-02 forward-port).** Two things about how a

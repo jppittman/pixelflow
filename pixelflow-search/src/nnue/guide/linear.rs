@@ -56,7 +56,7 @@
 //! candidate-local features earned their place.
 
 use alloc::collections::BTreeMap;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use pixelflow_ir::OpKind;

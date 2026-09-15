@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L036.** Predates the 2026-09-02 review fixes (dedup rows excluded, AP ties grouped) that its companion comparison says change every number, and was never re-run. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Guide cold-start training report (strict-v1 labels)
 
 > **Predates the 2026-09-02 review fixes; a re-run is required.** The trainer now excludes

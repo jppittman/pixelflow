@@ -571,39 +571,6 @@ fn is_templated(r: &dyn Rewrite) -> bool {
     r.lhs_template(&mut scratch).is_some() && r.rhs_template(&mut scratch).is_some()
 }
 
-/// Ops whose `eval_scalar` implementation is only well-behaved for a
-/// positive argument (`Pow`'s base; `Log2`/`Ln`/`Log10`/`Sqrt`/`Rsqrt`/
-/// `Recip`'s argument) — it produces large finite garbage rather than a
-/// clean domain-edge `NaN` outside that domain (verified empirically while
-/// building this harness's oracle gate, `math::oracle`). For a rule used
-/// standalone this is harmless: its metavariable IS the argument, and a
-/// harness or a Guide samples/matches it directly. For a COMPOSITION,
-/// unifying another rule's RHS into that argument position can make the
-/// *effective* argument a compound sub-expression (e.g. `sin(neg(y))`) that
-/// legitimately goes negative for ordinary `y` — narrowing the composed
-/// rule's valid domain in its surface metavariables in a way this harness
-/// has no general way to detect. Rather than accept an oracle gate that
-/// cannot tell that domain-narrowing apart from a real unifier bug (both
-/// present as "disagreement at some sampled points"), `compose_rules`
-/// excludes any composition touching this op family — conservative, but
-/// checkable structurally with no oracle/eval_scalar dependency, so it
-/// applies in every build, not just `cargo test`.
-fn touches_domain_restricted_op(arena: &ExprArena, id: pixelflow_ir::ExprId) -> bool {
-    use pixelflow_ir::OpKind;
-    matches!(
-        arena.kind(id),
-        OpKind::Pow
-            | OpKind::Log2
-            | OpKind::Ln
-            | OpKind::Log10
-            | OpKind::Sqrt
-            | OpKind::Rsqrt
-            | OpKind::Recip
-    ) || arena
-        .children(id)
-        .any(|c| touches_domain_restricted_op(arena, c))
-}
-
 /// Enumerate every valid composition of `base`'s templated rules, in
 /// deterministic (a_idx, b_idx, position) order, applying §2.2's filters
 /// (identity, no-op, exact-structural-duplicate) via
@@ -650,11 +617,6 @@ pub fn compose_rules(base: &[Box<dyn Rewrite>]) -> Vec<Composition> {
                 let rhs = rule
                     .rhs_template(&mut disp)
                     .expect("TemplateRewrite always has both templates");
-                if touches_domain_restricted_op(&disp, lhs)
-                    || touches_domain_restricted_op(&disp, rhs)
-                {
-                    continue;
-                }
                 let key = (disp.display(lhs).to_string(), disp.display(rhs).to_string());
                 if seen.insert(key) {
                     out.push(Composition {
@@ -1107,14 +1069,14 @@ mod tests {
         assert_eq!(fp(dup, 248, interleave).0, 0x43c4_3d76_4ef7_f76b);
         assert_eq!(fp(dup, 248, RuleOrder::Append).0, 0x809a_0f52_b61f_e6c0);
 
-        assert_eq!(fp(comp, 93, interleave).0, 0x904c_eec9_b110_e89e);
-        assert_eq!(fp(comp, 93, RuleOrder::Append).0, 0x0c3f_d6f3_5f44_4a59);
-        assert_eq!(fp(comp, 124, interleave).0, 0xa760_0e59_42f0_baa5);
-        assert_eq!(fp(comp, 124, RuleOrder::Append).0, 0x5217_98ae_521a_0572);
-        assert_eq!(fp(comp, 186, interleave).0, 0x9e9b_f3a4_458a_3045);
-        assert_eq!(fp(comp, 186, RuleOrder::Append).0, 0xff65_cfba_bc95_a6cf);
-        assert_eq!(fp(comp, 248, interleave).0, 0xb89d_841e_ada6_3c13);
-        assert_eq!(fp(comp, 248, RuleOrder::Append).0, 0xdfc1_76cd_60c7_124f);
+        assert_eq!(fp(comp, 93, interleave).0, 0xa175_ce9c_a554_cc64);
+        assert_eq!(fp(comp, 93, RuleOrder::Append).0, 0x90fc_9d0a_8a42_5880);
+        assert_eq!(fp(comp, 124, interleave).0, 0x4f97_9d02_3b7e_8b7c);
+        assert_eq!(fp(comp, 124, RuleOrder::Append).0, 0x178b_0fb7_263c_8921);
+        assert_eq!(fp(comp, 186, interleave).0, 0x56c4_bed1_e6d4_31ca);
+        assert_eq!(fp(comp, 186, RuleOrder::Append).0, 0xa3b1_a097_f689_0d3e);
+        assert_eq!(fp(comp, 248, interleave).0, 0x2b32_41f0_11e1_2ac8);
+        assert_eq!(fp(comp, 248, RuleOrder::Append).0, 0xa237_6877_fef0_fce1);
 
         let new_rules = InflationMode::NewRules;
         assert_eq!(fp(new_rules, 95, interleave).0, 0x113c_ca49_c99c_c850);

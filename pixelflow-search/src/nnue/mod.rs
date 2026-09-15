@@ -22,10 +22,10 @@ pub mod factored;
 pub mod guide;
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use libm::fabsf;
 use pixelflow_ir::kind::OpMap;
+use pixelflow_ir::term::{Children, Ir, Shape};
 
 /// Re-export canonical IR types as the source of truth.
 pub use pixelflow_ir::{ExprArena, ExprId, ExprNode, OpKind};
@@ -39,133 +39,8 @@ pub use factored::{CostEdge, EdgeTrace, OpEmbeddings, PeSlot};
 /// junkification below — unrelated to `nnue::guide`'s rule encoding.
 pub use factored::{ArenaRuleTemplates, EMBED_DIM, MLP_HIDDEN, RuleTemplates};
 
-// Note: ExprGenConfig, ExprGenerator, BwdGenConfig, and BwdGenerator are already
-// public structs defined in this module - no re-export needed.
-
-/// Configuration for random expression generation.
-#[derive(Clone, Debug)]
-pub struct ExprGenConfig {
-    /// Maximum depth of generated expressions.
-    pub max_depth: usize,
-    /// Probability of generating a leaf (var or const) vs operation.
-    pub leaf_prob: f32,
-    /// Number of variables available (0-3 for X,Y,Z,W).
-    pub num_vars: usize,
-    /// Whether to include fused operations.
-    pub include_fused: bool,
-}
-
-impl Default for ExprGenConfig {
-    fn default() -> Self {
-        Self {
-            max_depth: 8,
-            leaf_prob: 0.2,
-            num_vars: 4,
-            include_fused: true,
-        }
-    }
-}
-
-/// Random expression generator for training data.
-///
-/// This is like Stockfish's position generator for self-play training data.
-/// Op selection is driven by `OpKind::is_seed_op()` + `OpKind::arity()` so
-/// adding a new variant to `OpKind` automatically includes it here.
-pub struct ExprGenerator {
-    /// Configuration.
-    pub config: ExprGenConfig,
-    /// Random state (simple LCG for no_std compatibility).
-    state: u64,
-    /// Cached seed ops, built once from OpKind.
-    seed_ops: Vec<OpKind>,
-}
-
-impl ExprGenerator {
-    /// Op weights derived from ShaderToy corpus analysis.
-    /// Real shaders are dominated by arithmetic (+, -, *, /), with moderate
-    /// use of abs/sin/cos/clamp and rare use of exotic ops like atan2/rsqrt.
-    /// Uniform weighting produces unrealistic expressions that the NNUE can't
-    /// transfer to real workloads.
-    fn shader_weight(op: OpKind) -> u32 {
-        match op {
-            // Arithmetic: ~70% of real shader ops
-            OpKind::Mul => 50,
-            OpKind::Add => 30,
-            OpKind::Sub => 20,
-            OpKind::Div => 10,
-            OpKind::Neg => 10,
-            // Common shader ops: ~20%
-            OpKind::Abs => 12,
-            OpKind::Sin => 8,
-            OpKind::Cos => 8,
-            OpKind::Max => 6,
-            OpKind::Min => 4,
-            OpKind::Pow => 4,
-            OpKind::Floor => 3,
-            OpKind::Sqrt => 4,
-            OpKind::Exp => 3,
-            // Rare but valid: ~10%
-            OpKind::Rsqrt => 2,
-            OpKind::Recip => 2,
-            OpKind::Ln => 2,
-            OpKind::Log2 => 1,
-            OpKind::Log10 => 1,
-            OpKind::Exp2 => 1,
-            OpKind::Tan => 1,
-            OpKind::Atan => 1,
-            OpKind::Atan2 => 1,
-            OpKind::Asin => 1,
-            OpKind::Acos => 1,
-            OpKind::Ceil => 1,
-            OpKind::Round => 1,
-            _ => 0,
-        }
-    }
-
-    /// Create a new generator with the given seed.
-    #[must_use]
-    pub fn new(seed: u64, config: ExprGenConfig) -> Self {
-        // Build weighted op table: each op appears proportional to its shader weight
-        let mut seed_ops = Vec::new();
-        for op in OpKind::all() {
-            if op.is_seed_op() {
-                let w = Self::shader_weight(op).max(1);
-                for _ in 0..w {
-                    seed_ops.push(op);
-                }
-            }
-        }
-        assert!(
-            !seed_ops.is_empty(),
-            "No seed ops found in OpKind — is_seed_op() is broken"
-        );
-        assert!(
-            config.num_vars <= 4,
-            "num_vars={} exceeds INPUT_REGS limit of 4",
-            config.num_vars
-        );
-        Self {
-            config,
-            state: seed,
-            seed_ops,
-        }
-    }
-
-    /// Generate a random f32 in [0, 1).
-    fn rand_f32(&mut self) -> f32 {
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (self.state >> 33) as f32 / (1u64 << 31) as f32
-    }
-
-    /// Generate a random usize in [0, max).
-    fn rand_usize(&mut self, max: usize) -> usize {
-        if max == 0 {
-            return 0;
-        }
-        let val = (self.rand_f32() * max as f32) as usize;
-        if val >= max { max - 1 } else { val }
-    }
-}
+// Note: BwdGenConfig and BwdGenerator are already public structs defined in
+// this module - no re-export needed.
 
 // ============================================================================
 // Rewrite Rules (as "Moves")
@@ -243,6 +118,13 @@ pub fn pattern_match_arena(
                 ExprNode::Uniform(w) if u == w => {}
                 _ => return None,
             },
+            // A reference matches the reference to the same kernel: a key IS
+            // the content, so equal keys are equal terms without resolving
+            // either.
+            ExprNode::Ref(k) => match arena.node(e_id) {
+                ExprNode::Ref(e_k) if k == e_k => {}
+                _ => return None,
+            },
             // Structural match: op must match, push children onto the stack.
             ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
                 ExprNode::Unary(e_op, e_a) if e_op == t_op => {
@@ -265,16 +147,25 @@ pub fn pattern_match_arena(
                 }
                 _ => return None,
             },
-            ExprNode::Nary(t_op, t_start, t_len) => match arena.node(e_id) {
-                ExprNode::Nary(e_op, e_start, e_len) if e_op == t_op && e_len == t_len => {
-                    let e_children = arena.nary_children_slice(*e_start, *e_len).to_vec();
-                    let t_children = template.nary_children_slice(*t_start, *t_len).to_vec();
-                    for (ec, tc) in e_children.into_iter().zip(t_children.into_iter()) {
-                        stack.push((ec, tc));
+            ExprNode::Nary(t_op, _, _) => match arena.node(e_id) {
+                ExprNode::Nary(e_op, _, _) if e_op == t_op => {
+                    let e_children = arena.children(e_id);
+                    let t_children = template.children(t_id);
+                    if e_children.len() == t_children.len() {
+                        for (ec, tc) in e_children.zip(t_children) {
+                            stack.push((ec, tc));
+                        }
+                    } else {
+                        return None;
                     }
                 }
                 _ => return None,
             },
+            // No template contains a fold: templates are arithmetic, and the
+            // decompositions of a fold are rules with their own constructors
+            // rather than a pattern to match. A fold in the *target* still
+            // matches nothing, which is what this arm says.
+            ExprNode::Reduce { .. } => return None,
         }
     }
 
@@ -342,6 +233,13 @@ pub fn substitute_template_arena(
                 "ExprNode::Uniform({}) in a rewrite template — uniforms are not rewritable",
                 u.0
             ),
+            ExprNode::Ref(k) => panic!(
+                "ExprNode::Ref({k:?}) in a rewrite template — a reference names a                  kernel this rewrite cannot see; expand_refs first"
+            ),
+            ExprNode::Reduce { .. } => panic!(
+                "a fold in a rewrite template — templates are arithmetic, and a \
+                 fold binds; its decompositions are rules of their own"
+            ),
             ExprNode::Unary(op, t_a) => {
                 let a = ExprId(remap[t_a.0 as usize]);
                 target_arena.push_unary(op, a)
@@ -357,10 +255,9 @@ pub fn substitute_template_arena(
                 let c = ExprId(remap[t_c.0 as usize]);
                 target_arena.push_ternary(op, a, b, c)
             }
-            ExprNode::Nary(op, t_start, t_len) => {
+            ExprNode::Nary(op, _, _) => {
                 let t_children: Vec<ExprId> = template
-                    .nary_children_slice(t_start, t_len)
-                    .iter()
+                    .children(*id)
                     .map(|tc| ExprId(remap[tc.0 as usize]))
                     .collect();
                 target_arena.push_nary(op, &t_children)
@@ -971,15 +868,43 @@ impl BwdGenerator {
         for idx in 0..n {
             let id = ExprId(idx as u32);
 
-            // Clone the node so we can inspect it without borrowing self.arena.
-            let node = self.arena.node(id).clone();
-
             // Remap children to point to their (possibly junkified) versions.
-            let remapped_node = Self::remap_node(&node, &remap, &self.arena);
-
             // Push the remapped copy into the arena. This is the "base" version;
             // if junkification succeeds below we'll overwrite the remap entry.
-            let base_id = Self::push_arena_node(&mut self.arena, &remapped_node);
+            let base_id = match self.arena.project(id) {
+                Shape::Var(v) => self.arena.push_var(v),
+                Shape::Const(c) => self.arena.push_const(c),
+                Shape::Param(p) => self.arena.push_param(p),
+                Shape::Buffer(decl) => self.arena.embed(Shape::Buffer(decl)),
+                Shape::Uniform(decl) => self.arena.embed(Shape::Uniform(decl)),
+                // A key names a kernel interned in *this* process, and a
+                // corpus outlives the process — same refusal `corpus.rs`
+                // makes when it serializes one.
+                Shape::Ref(k) => panic!("junkify: Ref({k:?}) in a corpus expression"),
+                Shape::Reduce { fold, body } => self.arena.embed(Shape::Reduce {
+                    fold,
+                    body: remap[body.0 as usize],
+                }),
+                Shape::Op(op, children) => match children {
+                    Children::Zero => panic!("junkify: op with 0 children"),
+                    Children::One(a) => self.arena.push_unary(op, remap[a.0 as usize]),
+                    Children::Two(a, b) => {
+                        self.arena
+                            .push_binary(op, remap[a.0 as usize], remap[b.0 as usize])
+                    }
+                    Children::Three(a, b, c) => self.arena.push_ternary(
+                        op,
+                        remap[a.0 as usize],
+                        remap[b.0 as usize],
+                        remap[c.0 as usize],
+                    ),
+                    Children::Many(s) => {
+                        let remapped_children: Vec<ExprId> =
+                            s.iter().map(|c| remap[c.0 as usize]).collect();
+                        self.arena.push_nary(op, &remapped_children)
+                    }
+                },
+            };
             remap[idx] = base_id;
 
             // Budget exhausted — just copy remaining nodes.
@@ -1075,73 +1000,6 @@ impl BwdGenerator {
 
         (remap[root.0 as usize], applied)
     }
-
-    /// Remap the children of an `ExprNode` through the remap table.
-    ///
-    /// For `Nary` nodes, the children are read from the arena's nary_children
-    /// buffer and pushed as a new nary group. For all other node types,
-    /// children are remapped inline.
-    fn remap_node(node: &ExprNode, remap: &[ExprId], arena: &ExprArena) -> ExprNode {
-        match node {
-            ExprNode::Var(v) => ExprNode::Var(*v),
-            ExprNode::Const(c) => ExprNode::Const(*c),
-            ExprNode::Param(p) => ExprNode::Param(*p),
-            ExprNode::Buffer(b) => ExprNode::Buffer(*b),
-            ExprNode::Uniform(u) => ExprNode::Uniform(*u),
-            ExprNode::Unary(op, a) => ExprNode::Unary(*op, remap[a.0 as usize]),
-            ExprNode::Binary(op, a, b) => {
-                ExprNode::Binary(*op, remap[a.0 as usize], remap[b.0 as usize])
-            }
-            ExprNode::Ternary(op, a, b, c) => ExprNode::Ternary(
-                *op,
-                remap[a.0 as usize],
-                remap[b.0 as usize],
-                remap[c.0 as usize],
-            ),
-            ExprNode::Nary(op, start, len) => {
-                // Read the original children and remap them.
-                let children: Vec<ExprId> = arena
-                    .nary_children_slice(*start, *len)
-                    .iter()
-                    .map(|child| remap[child.0 as usize])
-                    .collect();
-                // Return a sentinel; actual push happens in push_arena_node.
-                // We encode the remapped children in a temporary Nary with placeholder
-                // start/len — push_arena_node will handle it properly.
-                // Actually, we can't do this cleanly because Nary stores (start, len)
-                // referring to the arena's internal buffer. We need to handle Nary
-                // specially in push_arena_node.
-                //
-                // For now, store the REMAPPED children inline by abusing the fact
-                // that push_arena_node will detect this case. Instead, let's just
-                // mark it and handle Nary in the caller.
-                //
-                // Simplest approach: for Nary, return the original node unchanged.
-                // Nary is extremely rare in generated expressions (the generator
-                // never produces them). If one somehow appears, it gets copied as-is.
-                ExprNode::Nary(*op, *start, *len)
-            }
-        }
-    }
-
-    /// Push an `ExprNode` into the arena, returning its `ExprId`.
-    fn push_arena_node(arena: &mut ExprArena, node: &ExprNode) -> ExprId {
-        match node {
-            ExprNode::Var(v) => arena.push_var(*v),
-            ExprNode::Const(c) => arena.push_const(*c),
-            ExprNode::Param(p) => arena.push_param(*p),
-            ExprNode::Buffer(b) => arena.push_buffer(*b),
-            ExprNode::Uniform(u) => arena.push_uniform(*u),
-            ExprNode::Unary(op, a) => arena.push_unary(*op, *a),
-            ExprNode::Binary(op, a, b) => arena.push_binary(*op, *a, *b),
-            ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, *a, *b, *c),
-            ExprNode::Nary(op, start, len) => {
-                // Copy the children from the existing nary_children buffer.
-                let children: Vec<ExprId> = arena.nary_children_slice(*start, *len).to_vec();
-                arena.push_nary(*op, &children)
-            }
-        }
-    }
 }
 
 // ============================================================================
@@ -1151,7 +1009,6 @@ impl BwdGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libm::fabsf;
 
     // ========================================================================
     // Pattern Match + Substitute Tests

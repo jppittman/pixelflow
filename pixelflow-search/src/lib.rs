@@ -13,6 +13,8 @@ pub mod nnue;
 pub mod runtime;
 /// Equality saturation as an `Optimize` endomorphism on the IR.
 pub mod saturate_pass;
+pub mod tier;
 pub use saturate_pass::Saturate;
+pub use tier::Tier;
 #[cfg(feature = "saturation-telemetry")]
 pub mod telemetry;

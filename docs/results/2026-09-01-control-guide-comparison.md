@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L036.** This doc's own banner says the 2026-09-02 review fixes change every weight and metric below, and it was never re-run; the AUC / PR-AUC comparison is withdrawn. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Control-arm comparison: linear Guide vs per-rule rate lookup
 
 > **Predates the 2026-09-02 review fixes; a re-run is required.** Both guides are now
