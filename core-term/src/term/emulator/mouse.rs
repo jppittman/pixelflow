@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn no_mode_returns_none() {
+    fn it_should_return_none_when_no_mouse_tracking_mode_is_active() {
         let modes = DecPrivateModes::default();
         let result = encode_mouse_event(
             &modes,
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_left_press() {
+    fn it_should_encode_sgr_left_button_press_with_1_based_coordinates() {
         let modes = modes_with_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_left_release() {
+    fn it_should_encode_sgr_left_button_release_with_a_lowercase_m_suffix() {
         let modes = modes_with_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_right_press() {
+    fn it_should_encode_sgr_right_button_press_at_the_origin() {
         let modes = modes_with_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_right_release() {
+    fn it_should_preserve_button_identity_on_sgr_release() {
         let modes = modes_with_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -282,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_middle_press() {
+    fn it_should_encode_sgr_middle_button_press() {
         let modes = modes_with_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_motion_left() {
+    fn it_should_add_32_to_the_button_code_for_sgr_motion_in_any_event_mode() {
         let modes = modes_with_any_event_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_motion_right() {
+    fn it_should_encode_sgr_motion_when_only_button_event_mode_is_enabled() {
         let modes = modes_with_button_event_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_scroll_up() {
+    fn it_should_encode_sgr_scroll_up_as_button_code_64() {
         let modes = modes_with_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_scroll_down() {
+    fn it_should_encode_sgr_scroll_down_as_button_code_65() {
         let modes = modes_with_sgr();
         let result = encode_mouse_event(
             &modes,
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_left_press() {
+    fn it_should_encode_legacy_left_button_press() {
         let modes = modes_with_vt200();
         let result = encode_mouse_event(
             &modes,
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_left_release_uses_code_3() {
+    fn it_should_encode_legacy_release_using_button_code_3() {
         let modes = modes_with_vt200();
         let result = encode_mouse_event(
             &modes,
@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_right_release_uses_code_3() {
+    fn it_should_use_button_code_3_for_legacy_release_regardless_of_which_button_was_released() {
         let modes = modes_with_vt200();
         let result = encode_mouse_event(
             &modes,
@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_coords_overflow_returns_none() {
+    fn it_should_return_none_when_legacy_coordinates_exceed_222() {
         let modes = modes_with_vt200();
         let result = encode_mouse_event(
             &modes,
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn sgr_large_coordinates() {
+    fn it_should_encode_sgr_coordinates_beyond_the_legacy_222_limit() {
         let modes = modes_with_sgr();
         // SGR has no coordinate limit
         let result = encode_mouse_event(

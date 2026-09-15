@@ -18,11 +18,13 @@ const THRESHOLD: f32 = 32.0 / 255.0;
 fn bake_text(s: &str) -> Vec<f32> {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
     // `text` is convention-agnostic; land on pixel centers as a contramap.
-    let kernel = text(&font, s, 48.0).at(
+    let glyph = text(&font, s, 48.0);
+    let kernel = glyph.kernel().at(
         &Kernel::x().add(&Kernel::constant(0.5)),
         &Kernel::y().add(&Kernel::constant(0.5)),
     );
-    Lattice::frame(WIDTH, HEIGHT).bake(&kernel).into_buffer()
+    let lattice = Lattice::frame(WIDTH, HEIGHT);
+    glyph.bake(&kernel, lattice).into_buffer()
 }
 
 /// Width of rendered content at a given Y row (0 if the row is empty).

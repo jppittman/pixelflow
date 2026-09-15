@@ -175,17 +175,25 @@ impl GlyphAtlas {
         }
         let baked = font
             .glyph_kernel_scaled(ch, self.tile_px as f32)
-            .map(|kernel| {
+            .map(|glyph| {
                 let n = self.tile_px as u32;
                 // This crate's shared pixel-center convention (`fonts/mod.rs`):
                 // texel (i, j) holds coverage at (i + PIXEL_CENTER, j +
                 // PIXEL_CENTER). Used to be the lattice's own origin; a
                 // contramap on the kernel now that a lattice is a pure index.
-                let centered = kernel.at(
+                let centered = glyph.kernel().at(
                     &Kernel::x().add(&Kernel::constant(PIXEL_CENTER)),
                     &Kernel::y().add(&Kernel::constant(PIXEL_CENTER)),
                 );
-                Lattice { extent: [n, n] }.bake(&centered)
+                let lattice = Lattice { extent: [n, n] };
+                // `glyph.kernel()` declares the winding table `glyph` built as
+                // a slot (S1a), so a bare `Lattice::bake` (which binds
+                // nothing itself) would panic on it — `Glyph::bake` goes
+                // through `Manifold::compile`/`bind` instead, and the table
+                // travels with `centered` itself (`Kernel::with_buffer_data`),
+                // so there is nothing to bind explicitly; a glyph with no
+                // outline declares no buffer and bakes the same way.
+                glyph.bake(&centered, lattice)
             });
         let Some(baked) = baked else {
             self.slots.insert(ch, None);

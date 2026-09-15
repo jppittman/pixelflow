@@ -549,7 +549,7 @@ impl<'a, G: SaturationGuide> GuidedSaturation<'a, G> {
 }
 ```
 
-**pixelflow-search — `src/math/oracle.rs` (`#[cfg(test)]` helper + tests).**
+**pixelflow-search — `src/math/oracle.rs` (deleted) (`#[cfg(test)]` helper + tests).**
 
 ```rust
 pub(crate) struct OracleVerdict { pub agree: usize, pub disagree_well_conditioned: Vec<[f32; 4]>, pub ill_conditioned: usize }

@@ -1,3 +1,12 @@
+> **Historical — a coverage plan whose test files were never created under these names
+> (annotated 2026-09-09).** `core-term/tests/e2e_message_tests.rs`,
+> `engine_app_message_tests.rs` and `pixelflow-runtime/tests/vsync_cuj_tests.rs`
+> are not in the tree, and the actor layer has been rewritten twice since
+> (supervisor → Mealy transducer, mediator → mesh). The CUJ enumeration is still a
+> reasonable statement of *what* the message flows are; the file plan is not a
+> description of current tests. Live actor design:
+> [`designs/actor-scheduler-mealy-transducer.md`](designs/actor-scheduler-mealy-transducer.md).
+
 # Message CUJ Coverage Plan
 
 ## Overview

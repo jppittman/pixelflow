@@ -60,7 +60,7 @@ fn it_should_print_a_sequence_of_characters_left_to_right() {
 }
 
 #[test]
-fn newline_advances_row() {
+fn it_should_advance_to_the_next_grid_row_on_line_feed() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print, newline, print again
@@ -143,7 +143,7 @@ fn it_should_wrap_to_a_new_grid_line_on_each_lf_cr_pair() {
 // =============================================================================
 
 #[test]
-fn grid_checksum_changes_on_input() {
+fn it_should_change_the_grid_checksum_after_each_of_several_prints() {
     let mut harness = MinimalTestHarness::new();
 
     // Get initial checksum (empty grid)
@@ -174,7 +174,7 @@ fn grid_checksum_changes_on_input() {
 }
 
 #[test]
-fn grid_checksum_stable_without_changes() {
+fn it_should_report_the_same_checksum_when_the_grid_is_unchanged() {
     let mut harness = MinimalTestHarness::new();
 
     // Print a character
@@ -213,22 +213,4 @@ fn it_should_change_the_grid_checksum_after_each_character_printed() {
             );
         }
     }
-}
-
-#[test]
-fn it_should_change_the_grid_checksum_when_ansi_print_commands_are_processed() {
-    // Note: despite its history as a "bug reproduction" test, this only
-    // exercises MinimalTestHarness's grid/checksum path (identical in
-    // substance to `it_should_change_the_grid_checksum_after_each_character_printed`
-    // above) — it never touches `TerminalApp`/`send_frame`, so it does not
-    // cover the render-trigger behavior its old name implied.
-    let mut harness = MinimalTestHarness::new();
-
-    harness.inject_ansi(AnsiCommand::Print('a'));
-    let checksum_after_a = harness.compute_grid_checksum();
-
-    harness.inject_ansi(AnsiCommand::Print('b'));
-    let checksum_after_b = harness.compute_grid_checksum();
-
-    assert_ne!(checksum_after_a, checksum_after_b);
 }

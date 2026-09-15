@@ -1,4 +1,4 @@
-use crate::ansi::commands::{AnsiCommand, Attribute, C0Control, CsiCommand};
+use crate::ansi::commands::{AnsiCommand, Attribute, C0Control, CsiCommand, EscCommand};
 use crate::color::{Color, NamedColor};
 use crate::glyph::{AttrFlags, Attributes, Glyph};
 use crate::term::{
@@ -2900,4 +2900,434 @@ fn it_should_handle_csi_cup_with_origin_mode_decom() {
         ],
         Some((0, 0)),
     );
+}
+
+// --- Insert/Delete Lines, Insert/Delete/Erase Characters, Reverse Index,
+// --- Character Set Designation, and Combining Character Tests ---
+//
+// A cargo-mutants sweep found these `TerminalEmulator` operations were
+// entirely uncovered: mutating their bodies to a no-op left every existing
+// test passing. Each below drives the operation through its real CSI/ESC/C0
+// escape sequence and checks the resulting grid, per this module's pattern.
+
+fn print_str(term: &mut TerminalEmulator, s: &str) {
+    for ch in s.chars() {
+        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(ch)));
+    }
+}
+
+#[test]
+fn it_should_insert_blank_lines_at_cursor_and_scroll_lines_below_off_the_bottom_on_csi_l() {
+    let mut term = create_test_emulator(5, 5);
+    let rows = ["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    // Cursor to row 2 (0-indexed), column 0.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(3, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::InsertLine(2),
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &snapshot,
+        &["AAAAA", "BBBBB", "     ", "     ", "CCCCC"],
+        Some((2, 0)),
+    );
+}
+
+#[test]
+fn it_should_delete_lines_at_cursor_and_pull_lines_below_up_to_fill_the_gap_on_csi_m() {
+    let mut term = create_test_emulator(5, 5);
+    let rows = ["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    // Cursor to row 1 (0-indexed), column 0.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(2, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::DeleteLine(2),
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &snapshot,
+        &["AAAAA", "DDDDD", "EEEEE", "     ", "     "],
+        Some((1, 0)),
+    );
+}
+
+#[test]
+fn it_should_insert_blank_characters_at_cursor_and_shift_the_rest_of_the_line_right_on_csi_at() {
+    let mut term = create_test_emulator(6, 1);
+    print_str(&mut term, "ABCDEF");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 2),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::InsertCharacter(2),
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["A  BCD"], Some((0, 1)));
+}
+
+#[test]
+fn it_should_delete_characters_at_cursor_and_shift_the_rest_of_the_line_left_on_csi_p() {
+    let mut term = create_test_emulator(6, 1);
+    print_str(&mut term, "ABCDEF");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 2),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::DeleteCharacter(2),
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["ADEF  "], Some((0, 1)));
+}
+
+#[test]
+fn it_should_erase_characters_at_cursor_in_place_without_shifting_the_line_on_csi_x() {
+    let mut term = create_test_emulator(6, 1);
+    print_str(&mut term, "ABCDEF");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 2),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::EraseCharacter(2),
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["A  DEF"], Some((0, 1)));
+}
+
+#[test]
+fn it_should_scroll_the_screen_down_on_esc_reverse_index_when_cursor_is_at_the_scroll_top() {
+    let mut term = create_test_emulator(3, 3);
+    let rows = ["AAA", "BBB", "CCC"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::ReverseIndex,
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["   ", "AAA", "BBB"], Some((0, 0)));
+}
+
+#[test]
+fn it_should_move_the_cursor_up_on_esc_reverse_index_when_cursor_is_below_the_scroll_top() {
+    let mut term = create_test_emulator(3, 3);
+    let rows = ["AAA", "BBB", "CCC"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(2, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::ReverseIndex,
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["AAA", "BBB", "CCC"], Some((0, 0)));
+}
+
+#[test]
+fn it_should_map_characters_through_g1_when_shifted_out_and_back_to_g0_ascii_when_shifted_in() {
+    let mut term = create_test_emulator(5, 1);
+
+    // Designate G1 as DEC Special Graphics (line drawing): ESC ) 0
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::SelectCharacterSet(')', '0'),
+    )));
+    // Shift Out: make G1 (line drawing) the active set. 'q' maps to '─'.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::SO)));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('q')));
+    // Shift In: make G0 (still default ASCII) active again. 'q' prints literally.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::SI)));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('q')));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["─q   "], Some((0, 2)));
+}
+
+#[test]
+fn it_should_attach_a_zero_width_combining_character_to_the_previously_printed_cell() {
+    let mut term = create_test_emulator(5, 1);
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('e')));
+    // U+0301 COMBINING ACUTE ACCENT: zero-width, must not advance the cursor.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    let glyph = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    match glyph {
+        Glyph::Single(cell) => {
+            assert_eq!(cell.c, 'e');
+            assert_eq!(cell.combining, Some('\u{0301}'));
+        }
+        other => panic!("Expected Single glyph for combined cell, got {:?}", other),
+    }
+    assert_screen_state(&snapshot, &["e    "], Some((0, 1)));
+}
+
+// --- Save/Restore Cursor, Reset, Next Line, Tab Stop, Bell, and Device
+// --- Status Report Tests ---
+//
+// Another gap the cargo-mutants sweep found: whole match arms in
+// `handle_esc_command`/`handle_c0_control`/`handle_csi_command` (ESC 7/8,
+// ESC c, ESC E, ESC H, BEL, and both DSR branches) could be deleted without
+// any test failing.
+
+#[test]
+fn it_should_save_and_restore_the_cursor_position_on_esc_7_and_esc_8() {
+    let mut term = create_test_emulator(10, 5);
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(3, 4),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::SaveCursor,
+    )));
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::RestoreCursor,
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &snapshot,
+        &[
+            "          ",
+            "          ",
+            "          ",
+            "          ",
+            "          ",
+        ],
+        Some((2, 3)),
+    );
+}
+
+#[test]
+fn it_should_clear_the_screen_and_reset_cursor_and_attributes_on_esc_c() {
+    let mut term = create_test_emulator(5, 2);
+    print_str(&mut term, "AB");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetGraphicsRendition(vec![Attribute::Bold]),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::ResetToInitialState,
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["     ", "     "], Some((0, 0)));
+
+    // Attributes should also be back to default: a freshly printed char is not bold.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    let snapshot2 = term.get_render_snapshot().expect("Snapshot was None");
+    match get_glyph_from_snapshot(&snapshot2, 0, 0).unwrap() {
+        Glyph::Single(cell) => assert!(
+            !cell.attr.flags.contains(AttrFlags::BOLD),
+            "attributes should be reset to default after ESC c"
+        ),
+        other => panic!("Expected Single glyph, got {:?}", other),
+    }
+}
+
+#[test]
+fn it_should_move_cursor_to_start_of_next_line_on_esc_e() {
+    let mut term = create_test_emulator(5, 3);
+    print_str(&mut term, "AB");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(EscCommand::NextLine)));
+    print_str(&mut term, "C");
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["AB   ", "C    ", "     "], Some((1, 1)));
+}
+
+#[test]
+fn it_should_set_a_custom_tab_stop_at_the_cursor_column_on_esc_h() {
+    let mut term = create_test_emulator(20, 1);
+    // Column 5 is not one of the default (every-8) tab stops.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 6),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::SetTabStop,
+    )));
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::HT)));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["                    "], Some((0, 5)));
+}
+
+#[test]
+fn it_should_request_a_bell_ring_on_bel_control_code() {
+    let mut term = create_test_emulator(5, 1);
+    let action = term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::BEL)));
+    assert_eq!(action, Some(EmulatorAction::RingBell));
+}
+
+#[test]
+fn it_should_report_cursor_position_on_csi_6n_device_status_report() {
+    let mut term = create_test_emulator(10, 5);
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(3, 4),
+    )));
+    let action = term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::DeviceStatusReport(6),
+    )));
+    assert_eq!(
+        action,
+        Some(EmulatorAction::WritePty(b"\x1b[3;4R".to_vec()))
+    );
+}
+
+#[test]
+fn it_should_report_ok_status_on_csi_5n_device_status_report() {
+    let mut term = create_test_emulator(10, 5);
+    let action = term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::DeviceStatusReport(5),
+    )));
+    assert_eq!(action, Some(EmulatorAction::WritePty(b"\x1b[0n".to_vec())));
+}
+
+#[test]
+fn it_should_scroll_the_screen_up_on_esc_index_when_cursor_is_at_the_scroll_bottom() {
+    let mut term = create_test_emulator(3, 3);
+    let rows = ["AAA", "BBB", "CCC"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(3, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(EscCommand::Index)));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["BBB", "CCC", "   "], Some((2, 0)));
+}
+
+#[test]
+fn it_should_move_the_cursor_down_on_esc_index_when_cursor_is_above_the_scroll_bottom() {
+    let mut term = create_test_emulator(3, 3);
+    let rows = ["AAA", "BBB", "CCC"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(EscCommand::Index)));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["AAA", "BBB", "CCC"], Some((1, 0)));
+}
+
+#[test]
+fn it_should_attach_a_combining_character_to_the_last_cell_of_the_previous_row_after_wrap() {
+    let mut term = create_test_emulator(3, 2);
+    print_str(&mut term, "ABC"); // Fills row 0 exactly.
+                                 // Move to the start of row 1 (as printing a full line with autowrap would).
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(2, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    match get_glyph_from_snapshot(&snapshot, 0, 2).unwrap() {
+        Glyph::Single(cell) => {
+            assert_eq!(cell.c, 'C');
+            assert_eq!(cell.combining, Some('\u{0301}'));
+        }
+        other => panic!("Expected Single glyph for 'C', got {:?}", other),
+    }
+}
+
+#[test]
+fn it_should_attach_a_combining_character_to_the_wide_primary_cell_when_following_a_wide_char() {
+    let mut term = create_test_emulator(5, 1);
+    print_str(&mut term, "世");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
+        Glyph::WidePrimary(cell) => {
+            assert_eq!(cell.c, '世');
+            assert_eq!(cell.combining, Some('\u{0301}'));
+        }
+        other => panic!("Expected WidePrimary glyph for '世', got {:?}", other),
+    }
+    assert!(matches!(
+        get_glyph_from_snapshot(&snapshot, 0, 1).unwrap(),
+        Glyph::WideSpacer
+    ));
+}
+
+#[test]
+fn it_should_discard_a_combining_character_printed_at_the_origin_with_no_previous_cell() {
+    let mut term = create_test_emulator(3, 2);
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["   ", "   "], Some((0, 0)));
+}
+
+#[test]
+fn it_should_map_the_pound_sign_when_the_uk_national_charset_is_active_on_g0() {
+    let mut term = create_test_emulator(5, 1);
+    // Designate G0 as UK National: ESC ( A
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        EscCommand::SelectCharacterSet('(', 'A'),
+    )));
+    print_str(&mut term, "#A");
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["£A   "], Some((0, 2)));
 }
