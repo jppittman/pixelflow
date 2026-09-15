@@ -4,13 +4,13 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pixelflow_core::{Kernel, Lattice, Manifold};
-use pixelflow_graphics::fonts::{text, text_union, CachedText, Font, GlyphCache};
+use pixelflow_graphics::fonts::{text, CachedText, Font, GlyphCache};
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
-/// `text`/`text_union` return convention-agnostic kernels (raw glyph space);
-/// the pixel-center convention is a contramap the caller applies, same as a
-/// raw glyph kernel would.
+/// `text` returns a convention-agnostic kernel (raw glyph space); the
+/// pixel-center convention is a contramap the caller applies, same as a raw
+/// glyph kernel would.
 fn pixel_centered(k: &Kernel) -> Kernel {
     k.at(
         &Kernel::x().add(&Kernel::constant(0.5)),
@@ -31,10 +31,11 @@ fn bench_pixelflow_single_char(c: &mut Criterion) {
     // measure the tabulation (the per-frame cost).
     for (label, ch) in [("A_linear", 'A'), ("O_quadratic", 'O'), ("S_complex", 'S')] {
         group.bench_function(label, |b| {
-            let kernel = pixel_centered(&text(&font, &ch.to_string(), 32.0));
+            let glyph = text(&font, &ch.to_string(), 32.0);
+            let kernel = pixel_centered(&glyph.kernel());
             let lattice = Lattice::frame(40, 45);
 
-            b.iter(|| black_box(lattice.bake(black_box(&kernel))));
+            b.iter(|| black_box(glyph.bake(black_box(&kernel), lattice)));
         });
     }
 
@@ -63,17 +64,9 @@ fn bench_pixelflow_text_sizes(c: &mut Criterion) {
 
         // The range encoding: one kernel, every pixel evaluating every glyph.
         group.bench_with_input(BenchmarkId::new("sum", length), &length, |b, _| {
-            let kernel = pixel_centered(&text(&font, &text_str, 16.0));
-            b.iter(|| black_box(lattice.bake(black_box(&kernel))));
-        });
-
-        // The domain encoding: one program per cell, each collapsed only over
-        // the columns its glyphs can reach. `compile` is hoisted for the same
-        // reason `cached_HELLO` hoists its own — the measurement is the
-        // collapse, and the sum row leaves its compile to the global cache.
-        group.bench_with_input(BenchmarkId::new("union", length), &length, |b, _| {
-            let program = text_union(&font, lattice, &text_str, 16.0).compile();
-            b.iter(|| black_box(program.collapse()));
+            let glyph = text(&font, &text_str, 16.0);
+            let kernel = pixel_centered(&glyph.kernel());
+            b.iter(|| black_box(glyph.bake(black_box(&kernel), lattice)));
         });
     }
 
@@ -89,8 +82,9 @@ fn bench_pixelflow_with_caching(c: &mut Criterion) {
     group.bench_function("uncached_HELLO", |b| {
         let lattice = Lattice::frame(100, 30);
         b.iter(|| {
-            let kernel = pixel_centered(&text(&font, "HELLO", 20.0));
-            black_box(lattice.bake(&kernel));
+            let glyph = text(&font, "HELLO", 20.0);
+            let kernel = pixel_centered(&glyph.kernel());
+            black_box(glyph.bake(&kernel, lattice));
         });
     });
 
@@ -105,7 +99,10 @@ fn bench_pixelflow_with_caching(c: &mut Criterion) {
         let cached = CachedText::new(&font, &mut cache, "HELLO", 20.0, 1.0);
         let lattice = Lattice::frame(100, 30);
         let centered = pixel_centered(&cached.kernel());
-        let bound = Manifold::compile(&centered, lattice.extent).bind(&cached.bindings());
+        // Every glyph's coverage buffer travels with `centered` itself
+        // (`Kernel::with_buffer_data`, seeded by `BilinearSampler::kernel`),
+        // so there is nothing left to gather into a binding list here.
+        let bound = Manifold::compile(&centered, lattice.extent).bind(&[]);
 
         b.iter(|| black_box(lattice.collapse(black_box(&bound))));
     });

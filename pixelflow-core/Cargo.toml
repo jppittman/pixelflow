@@ -20,7 +20,4 @@ pixelflow-ir = { path = "../pixelflow-ir" }
 pixelflow-codegen = { path = "../pixelflow-codegen" }
 
 [dev-dependencies]
-# The scalar oracle, for JIT-versus-interpreter checks under a bound block —
-# a test-only walker, gated off every shipped build (see pixelflow-ir's
-# `eval` module), so it is a dev-dependency exactly as in codegen and search.
-pixelflow-ir = { path = "../pixelflow-ir", features = ["oracle"] }
+pixelflow-ir = { path = "../pixelflow-ir" }

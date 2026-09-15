@@ -1,3 +1,12 @@
+> **Superseded (2026-07-20); its subject and every file it names are gone.**
+> `kernel_jit!` was retired with the dual-backend framing by
+> [`2026-07-20-kernel-unification.md`](2026-07-20-kernel-unification.md) — the
+> param-baking scope specified here *did* land, and the `Param` semantics below are
+> still the ones in force. Deleted since: `pixelflow-ir/src/expr.rs` (the Arc-tree
+> `Expr`, replaced by `ExprArena`), `pixelflow-ir/src/jit_manifold.rs`
+> (`JitManifold`), and `pixelflow-compiler/src/ir_bridge.rs` (split into `lower.rs`
+> and `emit.rs` by #1206).
+
 # kernel_jit! Feature Parity Design
 
 **Date:** 2025-02-21

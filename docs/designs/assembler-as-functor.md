@@ -1,3 +1,12 @@
+> **Partly superseded — the file layout it argues over no longer exists.**
+> `pixelflow-compiler/src/codegen/emitter.rs` and
+> `pixelflow-ir/src/backend/emit/lowering.rs` were both deleted when codegen moved
+> to `pixelflow-codegen`; §5b's feasibility verdict was reached against that tree.
+> The functor framing and the `Instruction`/`Assembler` split are live — the split
+> landed, see
+> [`2026-07-25-two-level-ir-and-backend-completeness.md`](2026-07-25-two-level-ir-and-backend-completeness.md)
+> — and §7's open `Abi`/`IsaBackend` boundary question is still open.
+
 # The Assembler as a Functor: Formalizing the Codegen Pipeline
 
 ## 1. Why this doc exists

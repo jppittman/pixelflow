@@ -825,6 +825,7 @@ impl ChoicesCostDag<'_> {
             ENode::Uniform(_) => OpKind::Uniform,
             ENode::Param(_) => OpKind::Param,
             ENode::Op { op, .. } => op.kind(),
+            ENode::Reduce { .. } => OpKind::Reduce,
         }
     }
 
@@ -857,7 +858,8 @@ impl CostDag for ChoicesCostDag<'_> {
                 nodes.len()
             )
         });
-        if let ENode::Op { children, .. } = node {
+        {
+            let children = (node).children_slice();
             for &child in children {
                 out.push(egraph.find(child).0);
             }

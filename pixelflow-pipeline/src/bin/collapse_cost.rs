@@ -24,8 +24,11 @@
 //! the measured contradiction that asked for it.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use pixelflow_graphics::fonts::Glyph;
+use pixelflow_ir::arena::ExprArena;
 use pixelflow_pipeline::collapse_bench::{
     self,
     corpus::{self, CollapseKernel},
@@ -133,6 +136,27 @@ fn main() {
     }
 }
 
+/// Captured contents for each buffer `arena` declares, matched to the data
+/// `glyph.kernel` itself carries
+/// ([`Kernel::buffer_data`](pixelflow_ir::Kernel::buffer_data)) by
+/// [`BufferIdentity`](pixelflow_ir::arena::BufferIdentity) — the winding
+/// sum's real piece table, not a restatement of its shape. `None` at a slot
+/// means this glyph declared a buffer its kernel carries no data for, which
+/// `dummy_context` reports loudly at replay rather than silently zeroing.
+fn buffer_data_for(arena: &ExprArena, glyph: &Glyph) -> Vec<Option<Arc<Vec<f32>>>> {
+    arena
+        .buffers()
+        .iter()
+        .map(|decl| {
+            glyph
+                .kernel()
+                .buffer_data()
+                .find(|(id, _)| *id == decl.id)
+                .map(|(_, data)| Arc::new(data.to_vec()))
+        })
+        .collect()
+}
+
 fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
     // core-term itself loads `NotoSansMono-Regular.ttf`; that asset is stored
     // in large-file storage and is a pointer file in checkouts without it, so
@@ -156,33 +180,44 @@ fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
             pixelflow_graphics::fonts::GlyphAtlas::new(CELL_HEIGHT_PT, density, ATLAS_CAPACITY);
         let tile = atlas.tile_px() as u32;
         for ch in WARM_RANGE {
-            let Some(kernel) = parsed.glyph_kernel_scaled(ch, tile as f32) else {
+            let Some(glyph) = parsed.glyph_kernel_scaled(ch, tile as f32) else {
                 // Production bakes nothing for these either (atlas.rs leaves
                 // the slot blank), so they are not kernels.
                 missing += 1;
                 continue;
             };
-            let (arena, root) = kernel.parts();
+            // Linked: the winding sum is composed by reference, and the
+            // corpus holds the arena the optimizer sees — the referent
+            // spliced in, declaring the table it reads.
+            let coverage = glyph.kernel();
+            let (arena, root) = coverage.parts();
+            let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
+            let buffer_data = buffer_data_for(&arena, &glyph);
             kernels.push(CollapseKernel {
                 name: format!("glyph{tile}_U{:04X}", ch as u32),
                 family: format!("glyph{tile}"),
-                arena: arena.clone(),
+                arena,
                 root,
                 extent: [tile, tile],
+                buffer_data,
             });
         }
     }
     for (label, ch) in BENCH_CHARS {
-        let kernel = parsed
+        let glyph = parsed
             .glyph_kernel_scaled(ch, BENCH_PT)
             .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
-        let (arena, root) = kernel.parts();
+        let coverage = glyph.kernel();
+        let (arena, root) = coverage.parts();
+        let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
+        let buffer_data = buffer_data_for(&arena, &glyph);
         kernels.push(CollapseKernel {
             name: format!("bench_{label}"),
             family: "bench".to_string(),
-            arena: arena.clone(),
+            arena,
             root,
             extent: BENCH_EXTENT,
+            buffer_data,
         });
     }
     corpus::write_dir(out, &kernels);

@@ -1,3 +1,11 @@
+> **Historical — a January-2026 snapshot of a pipeline since rebuilt (annotated
+> 2026-09-09).** Read it as history. Since it was written the AST→e-graph→AST
+> round trip it analyses was removed (optimization now runs on the arena — #1206),
+> `pixelflow-ir/src/expr.rs`'s Arc-tree `Expr` was deleted in favour of
+> `ExprArena`, codegen moved to its own `pixelflow-codegen` crate, and the
+> benchmark and `calibrate_costs` binaries it cites are gone. CLAUDE.md's
+> "Compiler Pipeline" section is the current description.
+
 # PixelFlow Compiler Pipeline Analysis
 
 **Date:** 2026-01-30

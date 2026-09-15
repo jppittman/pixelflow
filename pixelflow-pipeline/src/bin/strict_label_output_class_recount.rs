@@ -161,6 +161,12 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
                 .collect();
             format!("{:?}({})", op.kind(), kids.join(", "))
         }
+        ENode::Reduce { fold, body } => format!(
+            "Reduce[{}..{}]({})",
+            fold.range().start,
+            fold.range().end,
+            render_chosen(eg, choices, *body)
+        ),
     }
 }
 

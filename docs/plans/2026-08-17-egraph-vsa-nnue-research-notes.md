@@ -1,3 +1,10 @@
+> **Partly superseded (annotated 2026-09-09) — the reading list is the live half.**
+> §5's literature map, §3's VSA analysis and §6's adoption order are what this
+> document is for and they stand. §1's defect list describes a tree that no longer
+> exists (see the 2026-08-17 reconciliation note below), and the files it names —
+> `pixelflow-ml/src/nnue.rs`, `unified_backward.rs`, `extraction.rs` — were deleted
+> with the extraction-head program in Sep 2026.
+
 # E-graph × VSA × NNUE: Review Findings and Literature Survey
 
 **Date:** 2026-08-17

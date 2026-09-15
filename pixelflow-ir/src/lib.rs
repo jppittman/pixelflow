@@ -13,14 +13,16 @@
 //! reaches its two remaining constructors as inherent methods on
 //! `pixelflow-core`'s own `pub(crate)` lane types, with no trait at all.
 
-// NOTE: `no_std` support (disabling the `std` feature) is currently
-// incomplete: `cargo check -p pixelflow-ir --no-default-features` fails with
-// over 200 errors (missing f32 methods, `ExprId` deref mismatches in
-// `arena.rs`). No CI job builds this crate with `std` off -- the default
-// feature set and `--all-features` both enable it -- so this has never been
-// exercised. Tracked as a known, non-blocking gap by the
-// `pixelflow-ir-nostd-status` job in `.github/workflows/rust.yaml`; treat
-// `no_std` as aspirational until that job is green.
+// `no_std` is built and blocking: `cargo check -p pixelflow-ir
+// --no-default-features` with `-D warnings` runs presubmit (the "pixelflow-ir
+// no_std + pixelflow-search std-feature-off builds" job). It is no longer the
+// aspirational, unexercised gap an earlier revision of this note described —
+// and a comment that said so is precisely what let `store.rs` land three
+// unconditional `use std::` lines.
+//
+// What the `std` feature buys is exactly one module: [`store`], the
+// process-global map a `Ref` names into. See its docs for why that is the
+// whole of it.
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -28,13 +30,68 @@ extern crate alloc;
 /// Exact dyadic rationals — the constant domain the e-graph folds in, so
 /// that folding cannot contradict the algebraic rewrites. See the module docs.
 pub mod dyadic;
+
+/// What a bounded reduction *is*: the algebra it folds under, the index it
+/// binds, and the range that index runs over. See the module docs for why
+/// those are a type rather than three `Const` children.
+pub mod fold;
+pub use fold::{Binder, Fold, Monoid};
+
 pub mod kind;
 pub mod traits;
 pub mod variance;
 
-pub use variance::{LatticeShape, Variance};
+pub use variance::{LatticeShape, Variance, compute_dag_variance};
 
 pub mod arena;
+
+/// What it means for two kernels to be the same kernel: the canonical form of
+/// a reachable subgraph, and the fixed-size [`KernelKey`] that digests it.
+pub mod key;
+// Only the key is re-exported at the root: it is a *name* other crates hold
+// (a `Ref` leaf, an e-graph refusal), where `Canonical`/`canonical` are the
+// machinery behind it and one consumer — the compile cache — spells the
+// module out.
+pub use key::KernelKey;
+
+/// The process-global, content-addressed store a `Ref` names into.
+///
+/// `std` only: a global map needs a lock. Without it nothing can mint a
+/// `Ref`, so nothing can need to resolve one — see the module's own docs.
+#[cfg(feature = "std")]
+pub mod store;
+#[cfg(feature = "std")]
+pub use store::KernelStore;
+
+/// A generic arena-backed DAG whose consumers never see the arena: nodes
+/// are named by a borrowed [`dag::Node`] handle, never a raw index.
+///
+/// `ExprArena` predates this and still keeps its own index-based storage.
+/// What holds it back is representation coupling, not lifecycle — its
+/// mutating methods take `&mut self` but are already pure at every call
+/// site, so `Builder` would serve them. See
+/// `docs/plans/2026-09-09-exprarena-on-dag.md` for the actual blockers and
+/// the staging around them.
+///
+/// A *new* graph should reach for this rather than hand-roll another `Vec`
+/// plus index-newtype.
+///
+/// Only the consumption vocabulary — `Dag`, `Node`, `Rooted`, `Scratch`,
+/// `SideTable` — is public at all. `Id`, `Key`, and `Builder` (which builds
+/// a `Dag`) are `pub(crate)`: invisible outside this crate, not merely
+/// unexported at the root. Memory management is a `Dag`'s own business —
+/// `kernel.rs` and `expr.rs` build DAGs because they *are* this crate's
+/// construction machinery, the same standing `arena.rs`'s own callers have;
+/// nothing further out ever needs to. A caller that only ever reads a `Dag`
+/// someone handed it never notices the difference.
+pub mod dag;
+pub use dag::{Dag, Node, Rooted, Scratch, SideTable};
+
+pub mod expr;
+pub use expr::{
+    Environment, ExprData, compute_dag_depth, depth, from_arena, has_degenerate, has_var,
+    node_count_subtree, retired_axis, subtree_eq, to_arena,
+};
 
 /// IR-to-IR transforms: each takes an expression graph and returns another.
 /// Target-blind by construction — nothing here knows which ISA it is feeding.
@@ -56,21 +113,19 @@ pub use optimize::{Identity, Optimize, Rewritten, Then};
 pub mod binding;
 pub use binding::{BindError, BindingTable};
 
-// The differential-testing oracle, not an execution tier: PixelFlow is
-// JIT-only, so nothing in a shipped build may reach a tree-walking evaluator.
-// Gating it here is what enforces that — `cargo build` cannot name it.
-#[cfg(any(test, feature = "oracle"))]
-pub mod eval;
-#[cfg(any(test, feature = "oracle"))]
-pub use eval::{
-    DifferentialCheck, MaskComparison, MaskVerdict, PointCheck, PointVerdict, Tolerance,
-    compare_mask_root, equivalence_tolerance, eval_scalar, is_mask_valued, is_valid_mask,
-    op_is_divergent_at, trunc_input_is_divergent,
-};
-
 pub mod kernel;
-pub use kernel::{Bits, Kernel, Monoid, Scalar, Uniform};
+pub use kernel::{Bits, Kernel, Scalar, Uniform};
 
 pub use kind::OpKind;
 pub use kind::known_method_names;
 pub use traits::EmitStyle;
+
+/// Fixture builders for this crate's own `benches/`/`tests/` binaries and
+/// one `pixelflow-search` unit test — the only callers still allowed to
+/// know a `Dag` is built at all. `pub` only because Cargo compiles a
+/// `benches/`/`tests/` target as if it were an external crate, so there is
+/// no visibility short of `pub` that reaches it; `#[doc(hidden)]` keeps it
+/// out of rendered docs and out of the API this crate actually advertises.
+/// Not for anything else. See the module doc for why.
+#[doc(hidden)]
+pub mod internal_test_support;

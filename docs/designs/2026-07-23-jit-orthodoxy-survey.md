@@ -1,3 +1,11 @@
+> **Its one open gap is now closed (annotated 2026-09-09).** The survey's verdict
+> names the missing compile cache as "the one place we are genuinely unorthodox
+> relative to *every* mature JIT". That cache exists — `pixelflow-codegen`'s
+> `jit_cache` / `CompiledKernel`, keyed by shape — so the verdict should be read as
+> "orthodox, gap closed". Everything else stands, and the Halide comparison
+> (especially the missing schedule language) is still the sharpest statement of
+> where this compiler sits.
+
 # Is the PixelFlow JIT orthodox? A survey against V8, LuaJIT, HotSpot, and Halide-class compilers
 
 **Date:** 2026-07-23

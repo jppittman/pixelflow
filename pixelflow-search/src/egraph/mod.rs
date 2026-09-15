@@ -16,6 +16,8 @@
 //! - [`saturate`]: Budget-limited saturation, plus the size-based
 //!   [`saturate::SaturationConfig`] presets both tiers drive it with
 //! - [`graph`]: The EGraph itself
+//! - `growth` (feature `saturation-telemetry`): per-application growth
+//!   telemetry — how many e-nodes/e-classes a rewrite actually added
 //! - [`deps`]: Dependency analysis for uniform hoisting
 //!
 //! Mathematical rewrite rules are now in the [`crate::math`] module.
@@ -31,7 +33,14 @@ pub(crate) mod cost;
 pub mod deps;
 pub mod derivative;
 pub(crate) mod extract;
+pub mod fold_rules;
 mod graph;
+// Per-application growth telemetry (docs/plans/2026-08-31-guide-design-revision.md
+// §4.1) has no production consumer yet, exactly like `crate::telemetry` —
+// gated behind the same `saturation-telemetry` feature so a build that
+// doesn't ask for it doesn't carry the module at all.
+#[cfg(feature = "saturation-telemetry")]
+mod growth;
 mod guided;
 pub mod insert;
 // The hindsight labeler reads the provenance journal directly
@@ -48,6 +57,12 @@ pub mod rule_order;
 pub mod rules;
 pub mod saturate;
 pub mod template;
+// Research only: the read-only half of the extraction-witness instrument
+// (docs/plans/2026-09-08-extraction-witnesses.md). Gated behind the feature
+// every `pixelflow-pipeline` harness already builds with, so nothing here
+// reaches a downstream build.
+#[cfg(feature = "provenance-journal")]
+pub mod witness;
 
 // Re-export public API
 pub use anytime::{
@@ -61,14 +76,18 @@ pub use cost::{CostFunction, CostModel};
 pub use deps::{Deps, DepsAnalysis};
 pub use derivative::{ChainRule, derivative_rules};
 pub use extract::{
-    ChoiceCost, ExtractedDAG, Extraction, ExtractionObjective, ExtractionReport,
-    SHARED_DAG_PASS_BYTE_BUDGET, SharedPassStats, build_extracted_dag_from_choices,
-    choices_to_arena, compute_ref_counts, cost_of_choices, extract, extract_dag,
+    ChoiceCost, ClaimAudit, CostScale, ExtractedDAG, Extraction, ExtractionObjective,
+    ExtractionReport, SHARED_DAG_PASS_BYTE_BUDGET, SharedPassStats,
+    build_extracted_dag_from_choices, choices_to_arena, compute_ref_counts, cost_of_choices,
+    extract, extract_dag,
 };
+pub use fold_rules::{EmptyFold, PeelFold, fold_rules};
 pub use graph::{
     ApplicationMask, ApplyResult, EGraph, EGraphBatch, HARD_CLASS_LIMIT, MaskScope, RewriteTarget,
     SaturationStats, SaturationStop, ScanStop,
 };
+#[cfg(feature = "saturation-telemetry")]
+pub use growth::{GrowthTelemetry, RuleGrowth};
 pub use insert::{Declined, insert, reachable_count};
 #[cfg(feature = "provenance-journal")]
 pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
@@ -82,7 +101,7 @@ pub use provenance::{ApplicationId, ENodeId, Provenance};
 pub use provenance::{
     ApplicationRecord, Origin, UnionEvent, derivation_ancestors, format_derivation_trace,
 };
-pub use rewrite::{Rewrite, RewriteAction, TemplateArena};
+pub use rewrite::{Rewrite, RewriteAction, TemplateArena, TemplatePattern};
 pub use rules::{Fingerprint, RuleId, RuleSet, rule_label};
 pub use saturate::{
     APPLICATIONS_PER_CLASS, CLASSICAL_CLASS_CEILING, CLASSICAL_CLASS_CEILING_CALIBRATED,

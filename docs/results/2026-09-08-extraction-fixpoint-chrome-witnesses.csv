@@ -1,0 +1,8 @@
+kernel,family,b_lo,b_hi,live_lo,live_hi,objective_witness,objective_greedy,delta_objective,dag_witness,dag_greedy,delta_dag,occupied,merges,divergences,frontier,best_single_swap,greedy_swaps,swaps_accepted,witness_kind,realizable,first_class,first_label,first_stage,first_rule
+chrome_packed,chrome,5000,10000,410,419,3409028668,3494055992,-85027324,1737,1754,-17,405,5,43,8,3481614392,3467099192,3,objective,PARTIAL,19,TIE,dp,seed
+chrome_packed,chrome,5000,20000,410,423,3398660668,3483709601,-85048933,1737,1778,-41,404,6,60,9,3462973601,3438090396,4,objective,PARTIAL,19,TIE,dp,seed
+chrome_packed,chrome,5000,50000,410,419,3398660658,3533454368,-134793710,1737,1749,-12,402,8,70,7,3521012768,3508571168,2,objective,PARTIAL,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,20000,50000,423,419,3431853383,3533454368,-101600985,1778,1749,29,416,7,35,6,3521012768,3521012768,1,objective,PARTIAL,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,5000,100000,410,442,3398660658,3728383573,-329722915,1737,1858,-121,402,8,76,7,3715941973,3703500373,2,objective,PARTIAL,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,20000,100000,423,442,3431853383,3728383573,-296530190,1778,1858,-80,416,7,40,6,3715941973,3715941973,1,objective,PARTIAL,299,COORDINATED,dp,constant-fold
+chrome_packed,chrome,50000,100000,419,442,3533454368,3728383573,-194929205,1749,1858,-109,419,0,24,7,3720089173,3720083768,2,objective,PARTIAL,6720,COORDINATED,dp,associative(Mul)

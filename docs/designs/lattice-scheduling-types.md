@@ -1,3 +1,14 @@
+> **Historical (Apr 2026) — right about factoring, wrong about the mechanism.**
+> "Extraction is factoring" and the variance lattice are current, and variance is
+> computed on the arena today. Two things here did not happen and should not be
+> built from this page: variance is **not** a type parameter (there are no
+> `Varying`/`Uniform`/`Const` wrapper types; it is a computed bitset), and the
+> NNUE/ILP cost model this document hands the scheduling decision to was deleted
+> in Sep 2026 after measuring a tie with the static table — see
+> [`../plans/2026-09-01-schedule-cost-model-denotation.md`](../plans/2026-09-01-schedule-cost-model-denotation.md).
+> The live scheduling direction is
+> [`../plans/2026-09-08-one-conditional-three-lowerings.md`](../plans/2026-09-08-one-conditional-three-lowerings.md).
+
 # Lattice Scheduling via Types: Extraction as Factoring
 
 ## The Insight

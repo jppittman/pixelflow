@@ -1,3 +1,13 @@
+> **Closed 2026-09-01 — the workflow ran and its result was a tie.** Kept as the
+> record of how the extraction-head program was run, not as work to do. The paper
+> it targets closed unmerged (PR #1072, branch `claude/workshop-writeup`, not in
+> this tree) and the architecture was deleted; its denotation survives behind the
+> `Reranker` seam in
+> [`2026-09-01-schedule-cost-model-denotation.md`](2026-09-01-schedule-cost-model-denotation.md).
+> Note that #1236 has since measured that seam's neighbourhood and found the answer
+> mostly outside it. `bench_extraction_3way.rs` and `bootstrap_extraction_head.rs`
+> are deleted.
+
 # E-graph NNUE research workflow: iterate to a publishable extraction-head result
 
 **Status:** Closed, 2026-09-01. The workflow below ran to completion: the workshop paper it
