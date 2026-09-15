@@ -453,6 +453,19 @@ mod extent_tests {
             "unreachable: len panics"
         );
     }
+
+    #[test]
+    fn is_empty_is_true_when_either_dimension_is_zero_and_false_otherwise() {
+        assert!(Extent2D::new(0, 5).is_empty());
+        assert!(Extent2D::new(5, 0).is_empty());
+        assert!(!Extent2D::new(5, 5).is_empty());
+    }
+
+    #[test]
+    fn from_a_tuple_or_an_array_carries_width_then_height_in_order() {
+        assert_eq!(Extent2D::from((3, 4)), Extent2D::new(3, 4));
+        assert_eq!(Extent2D::from([3, 4]), Extent2D::new(3, 4));
+    }
 }
 
 /// Page preparation, independent of ISA level and architecture.
@@ -465,7 +478,10 @@ mod page_tests {
     use super::*;
 
     /// A single `ret` for the host, so the buffer really is valid machine code
-    /// and `from_code`'s safety contract holds. Nothing here executes it.
+    /// and `from_code`'s safety contract holds —
+    /// `host_ret_is_actually_a_valid_return_instruction` below is what proves
+    /// that claim by executing it; every other test here only reads the
+    /// bytes back.
     fn host_ret() -> Vec<u8> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -543,6 +559,65 @@ mod page_tests {
         assert_eq!(exec.len(), code.len());
         assert_eq!(exec.as_bytes(), code.as_slice());
     }
+
+    /// Every other test in this module reads `host_ret`'s bytes back rather
+    /// than running them, so nothing else here actually proves it is a valid
+    /// instruction for the host rather than a placeholder that happens to
+    /// round-trip. Executing it and returning control to the test process is
+    /// the only way to prove that.
+    #[test]
+    fn host_ret_is_actually_a_valid_return_instruction() {
+        type NoOp = unsafe extern "C" fn();
+        let code = host_ret();
+        // SAFETY: about to prove `code` is a valid `ret` by executing it — a
+        // bare `ret` touches no memory and no register but the program
+        // counter, so calling it with no arguments and discarding any return
+        // value is sound as long as it really is one.
+        let exec = unsafe { ExecutableCode::from_code(&code) }.expect("map + flip");
+        let func: NoOp = unsafe { exec.as_fn() };
+        unsafe { func() };
+    }
+
+    /// `from_code` refuses an empty buffer, so `is_empty` can never observe
+    /// the zero-length case through it; go around it the way `from_code`
+    /// itself is built — `map` then `finish` directly — to construct the
+    /// case `is_empty` exists to report.
+    #[test]
+    fn is_empty_reports_a_zero_length_page() {
+        let exec = MockCodePage::map(page_size())
+            .expect("map")
+            .finish(0)
+            .expect("finish");
+        assert!(exec.is_empty());
+        assert_eq!(exec.len(), 0);
+    }
+
+    /// The `- 1` in `(len + page_size - 1) & !(page_size - 1)` is what stops
+    /// an exact multiple of the page size from spilling into an extra page;
+    /// pin the arithmetic at that boundary specifically; a naive round-up
+    /// without it would double the mapping for `exact` below. `capacity` is
+    /// private to this crate but not to this module — [`page_tests`] is a
+    /// descendant of `executable`, same as `MockCodePage`'s own construction
+    /// of it.
+    #[test]
+    fn capacity_rounds_up_to_the_page_size_without_overshooting_an_exact_multiple() {
+        let page = page_size();
+
+        let exact = vec![0u8; page];
+        let exec = NativeCodePage::from_code(&exact).expect("map");
+        assert_eq!(
+            exec.capacity, page,
+            "an exact page multiple must not round up to a second page"
+        );
+
+        let over = vec![0u8; page + 1];
+        let exec = NativeCodePage::from_code(&over).expect("map");
+        assert_eq!(
+            exec.capacity,
+            2 * page,
+            "one byte past a page boundary must round up to the next page"
+        );
+    }
 }
 
 #[cfg(all(test, not(target_feature = "avx512f"), not(target_feature = "avx2")))]
@@ -573,7 +648,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn jit_return_x() {
+    fn a_hand_assembled_kernel_with_only_a_ret_passes_x_through_unchanged() {
         // Simplest kernel: return X (already in v0)
         // Just RET - input X is already in v0, which is the return register!
 
@@ -601,7 +676,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn jit_add_xy() {
+    fn a_hand_assembled_kernel_can_add_the_x_and_y_arguments() {
         // kernel: X + Y
         // v0 = X, v1 = Y, return v0 + v1
 
@@ -632,7 +707,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn jit_complex_expr() {
+    fn a_hand_assembled_kernel_executes_chained_instructions_in_order() {
         // kernel: (X + Y) * Z
         // Uses register allocation:
         //   v0=X, v1=Y, v2=Z, v3=W
@@ -674,7 +749,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
-    fn jit_const_05_raw() {
+    fn a_hand_assembled_kernel_can_load_and_return_an_immediate_constant() {
         // Test raw constant loading for 0.5
         // MOVZ W16, #0
         // MOVK W16, #0x3F00, LSL #16  (0x3F000000 = 0.5f)
@@ -711,7 +786,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn jit_return_x_x86() {
+    fn a_hand_assembled_kernel_with_only_a_ret_passes_x_through_unchanged_on_x86() {
         // Simplest kernel: return X (already in xmm0)
 
         let mut code = Vec::new();
@@ -736,7 +811,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn jit_add_xy_x86() {
+    fn a_hand_assembled_kernel_can_add_the_x_and_y_arguments_on_x86() {
         // kernel: X + Y
 
         let mut code = Vec::new();
