@@ -113,3 +113,79 @@ pub fn map_to_dec_line_drawing(ch: char) -> char {
         _ => ch, // Default: return the character itself if no mapping
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_should_map_the_ascii_designator_to_the_ascii_character_set_on_from_char() {
+        assert_eq!(CharacterSet::from_char('B'), CharacterSet::Ascii);
+    }
+
+    #[test]
+    fn it_should_map_the_uk_national_designator_to_the_uk_national_character_set_on_from_char() {
+        assert_eq!(CharacterSet::from_char('A'), CharacterSet::UkNational);
+    }
+
+    #[test]
+    fn it_should_map_the_dec_special_graphics_designator_to_dec_line_drawing_on_from_char() {
+        assert_eq!(CharacterSet::from_char('0'), CharacterSet::DecLineDrawing);
+    }
+
+    #[test]
+    fn it_should_default_to_ascii_for_an_unrecognized_designator_on_from_char() {
+        assert_eq!(CharacterSet::from_char('Z'), CharacterSet::Ascii);
+    }
+
+    #[test]
+    fn it_should_map_every_dec_special_graphics_designator_to_its_documented_glyph() {
+        let expected_mappings: &[(char, char)] = &[
+            ('`', '◆'),
+            ('a', '▒'),
+            ('b', '\u{2409}'),
+            ('c', '\u{240C}'),
+            ('d', '\u{240D}'),
+            ('e', '\u{240A}'),
+            ('f', '°'),
+            ('g', '±'),
+            ('h', '\u{2424}'),
+            ('i', '\u{240B}'),
+            ('j', '┘'),
+            ('k', '┐'),
+            ('l', '┌'),
+            ('m', '└'),
+            ('n', '┼'),
+            ('o', '─'),
+            ('p', '─'),
+            ('q', '─'),
+            ('r', '─'),
+            ('s', '─'),
+            ('t', '├'),
+            ('u', '┤'),
+            ('v', '┴'),
+            ('w', '┬'),
+            ('x', '│'),
+            ('y', '≤'),
+            ('z', '≥'),
+            ('{', 'π'),
+            ('|', '≠'),
+            ('}', '£'),
+            ('~', '·'),
+        ];
+        for &(input, expected) in expected_mappings {
+            assert_eq!(
+                map_to_dec_line_drawing(input),
+                expected,
+                "mapping for '{}' was wrong",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn it_should_pass_through_characters_with_no_dec_special_graphics_mapping() {
+        assert_eq!(map_to_dec_line_drawing('Z'), 'Z');
+        assert_eq!(map_to_dec_line_drawing(' '), ' ');
+    }
+}

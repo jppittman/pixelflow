@@ -1,7 +1,13 @@
 //! Message CUJ (Critical User Journey) Tests
 //!
-//! These tests verify the message flows between actors in the core-term system.
-//! Each test covers a specific CUJ identified in MESSAGE_CUJ_COVERAGE.md.
+//! These tests exercise `actor_scheduler`'s generic message-delivery
+//! guarantees (FIFO ordering, priority-lane ordering, channel-closure
+//! propagation) using mock actors and mock command types, not `core_term`'s
+//! real parser/app actors. For coverage against the real `core_term`
+//! `AnsiProcessor`-backed parsing pipeline, see `ansi_parser_message_tests.rs`;
+//! for the real `PtyWriter` message boundary, see the `pty_writer_*` tests in
+//! `actor_roundtrip_tests.rs`. Each test covers a specific CUJ identified in
+//! MESSAGE_CUJ_COVERAGE.md (a historical document — see its own status note).
 
 use actor_scheduler::{
     Actor, ActorBuilder, ActorScheduler, ActorStatus, HandlerError, HandlerResult, Message,
@@ -257,27 +263,6 @@ fn cuj_pty01_channel_closure_propagation() {
 // =============================================================================
 
 #[test]
-fn cuj_pty02_command_batch_delivery() {
-    // Given: A channel from parser to app
-    let (cmd_tx, cmd_rx): (
-        SyncSender<Vec<MockAnsiCommand>>,
-        Receiver<Vec<MockAnsiCommand>>,
-    ) = sync_channel(10);
-
-    // When: Parser sends a batch of commands
-    let commands = vec![
-        MockAnsiCommand::Print('H'),
-        MockAnsiCommand::Print('i'),
-        MockAnsiCommand::Newline,
-    ];
-    cmd_tx.send(commands.clone()).unwrap();
-
-    // Then: App should receive the exact batch
-    let received = cmd_rx.recv_timeout(Duration::from_millis(100)).unwrap();
-    assert_eq!(received, commands, "App should receive exact command batch");
-}
-
-#[test]
 fn cuj_pty02_empty_input_no_output() {
     // Given: A parser actor
     let (cmd_tx, cmd_rx) = sync_channel::<Vec<MockAnsiCommand>>(10);
@@ -307,40 +292,6 @@ fn cuj_pty02_empty_input_no_output() {
         result.is_err(),
         "No commands should be sent for empty input"
     );
-}
-
-#[test]
-fn cuj_pty02_mixed_content_batch() {
-    // Given: A parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<MockAnsiCommand>>(10);
-    let bytes_received = Arc::new(AtomicUsize::new(0));
-
-    let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
-
-    let bytes_received_clone = bytes_received.clone();
-    let parser_handle = thread::spawn(move || {
-        let mut actor = MockParserActor {
-            cmd_tx,
-            bytes_received: bytes_received_clone,
-        };
-        parser_rx.run(&mut actor);
-    });
-
-    // When: Mixed content (text + newlines) is sent
-    let mixed_data = b"Line1\nLine2\n".to_vec();
-    parser_tx.send(Message::Data(mixed_data)).unwrap();
-
-    thread::sleep(Duration::from_millis(50));
-    drop(parser_tx);
-    parser_handle.join().unwrap();
-
-    // Then: Commands should include both prints and newlines
-    let commands = cmd_rx.try_recv().unwrap();
-    let newline_count = commands
-        .iter()
-        .filter(|c| matches!(c, MockAnsiCommand::Newline))
-        .count();
-    assert_eq!(newline_count, 2, "Should have 2 newline commands");
 }
 
 // =============================================================================

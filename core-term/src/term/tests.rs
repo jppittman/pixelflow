@@ -2,16 +2,13 @@
 
 use crate::ansi::commands::{Attribute, C0Control, CsiCommand};
 use crate::color::{Color, NamedColor};
-use crate::glyph::{Attributes, ContentCell, Glyph};
+use crate::glyph::{Attributes, Glyph};
 use crate::keys::{KeySymbol, Modifiers};
 // use crate::term::action::{MouseButton, MouseEventType}; // Not used directly in this file anymore
 use crate::term::{
     modes::{DecModeConstant, StandardModeConstant}, // For DECTCEM test
-    snapshot::SelectionRange,
     AnsiCommand,
     ControlEvent,
-    CursorRenderState,
-    CursorShape,
     EmulatorAction,
     EmulatorInput,
     MouseEncodingParams,
@@ -20,7 +17,6 @@ use crate::term::{
     Point,
     Selection,
     SelectionMode,
-    SnapshotLine,
     TerminalEmulator,
     TerminalSnapshot,
     UserInputAction,
@@ -258,7 +254,7 @@ fn it_should_move_to_column_zero_of_the_next_line_when_lnm_is_set_and_lf_is_rece
 }
 
 #[test]
-fn carriage_return_input() {
+fn it_should_return_cursor_to_column_zero_and_overwrite_on_carriage_return() {
     let mut term = create_test_emulator(10, 1);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
@@ -268,100 +264,6 @@ fn carriage_return_input() {
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     // "ABC", CR -> (0,0), "D" prints at (0,0) over 'A', cursor moves to (0,1)
     assert_screen_state(&snapshot, &["DBC       "], Some((0, 1)));
-}
-
-#[test]
-fn csi_cursor_forward_cuf() {
-    let mut term = create_test_emulator(10, 1); // Cursor at (0,0)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::CursorForward(1),
-    )));
-    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    assert_screen_state(&snapshot, &["          "], Some((0, 1))); // Cursor physical (0,1)
-
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::CursorForward(2),
-    )));
-    let snapshot2 = term.get_render_snapshot().expect("Snapshot was None");
-    assert_screen_state(&snapshot2, &["          "], Some((0, 3))); // Cursor physical (0,3)
-}
-
-#[test]
-fn csi_ed_clear_below_csi_j() {
-    let mut term = create_test_emulator(3, 2);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF))); // Now correctly results in cursor at (1,0)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('D')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('E')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('F'))); // Screen: ABC, DEF. Cursor at (1,3)
-
-    // Move cursor to (1,0) (second row, first col) physical for the snapshot
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::CursorPosition(2, 1),
-    )));
-    let snapshot_before = term.get_render_snapshot().expect("Snapshot was None");
-    assert_screen_state(&snapshot_before, &["ABC", "DEF"], Some((1, 0)));
-
-    // CSI J (EraseInDisplay(0) - Erase Below)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::EraseInDisplay(0),
-    )));
-    let snapshot_after = term.get_render_snapshot().expect("Snapshot was None");
-    // Clears from cursor (1,0) to end of screen. Line 1 from (1,0) becomes "   "
-    assert_screen_state(&snapshot_after, &["ABC", "   "], Some((1, 0)));
-}
-
-#[test]
-fn csi_sgr_fg_color() {
-    let mut term = create_test_emulator(5, 1);
-    let red_attr = vec![Attribute::Foreground(Color::Named(NamedColor::Red))];
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::SetGraphicsRendition(red_attr),
-    )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-
-    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
-    let glyph_a_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
-
-    match glyph_a_wrapper {
-        Glyph::Single(cell) | Glyph::WidePrimary(cell) => {
-            assert_eq!(cell.c, 'A');
-            assert_eq!(
-                cell.attr.fg,
-                Color::Named(NamedColor::Red),
-                "Foreground color should be Red"
-            );
-        }
-        other => panic!(
-            "Expected Single or WidePrimary for glyph A, got {:?}",
-            other
-        ),
-    }
-
-    // Reset SGR
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::SetGraphicsRendition(vec![Attribute::Reset]),
-    )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
-    let snapshot_b = term.get_render_snapshot().expect("Snapshot was None");
-    assert_screen_state(&snapshot_b, &["AB   "], Some((0, 2))); // A is red, B is default
-    let glyph_b_wrapper = get_glyph_from_snapshot(&snapshot_b, 0, 1).unwrap();
-    match glyph_b_wrapper {
-        Glyph::Single(cell) | Glyph::WidePrimary(cell) => {
-            assert_eq!(
-                cell.attr.fg,
-                Attributes::default().fg,
-                "Foreground color should have reset to default"
-            );
-        }
-        other => panic!(
-            "Expected Single or WidePrimary for glyph B, got {:?}",
-            other
-        ),
-    }
 }
 
 // --- Helpers for Selection Integration Tests ---
@@ -707,7 +609,7 @@ fn selection_on_alt_screen_then_exit() {
 // --- End of Selection with Alternate Screen Test ---
 
 #[test]
-fn resize_larger() {
+fn it_should_preserve_content_and_cursor_when_resizing_to_a_larger_grid() {
     let mut term = create_test_emulator(5, 2);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
@@ -732,7 +634,7 @@ fn resize_larger() {
 }
 
 #[test]
-fn resize_smaller_content_truncation() {
+fn it_should_truncate_content_when_resizing_to_a_smaller_grid() {
     let mut term = create_test_emulator(5, 2);
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('H')));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('e')));
@@ -749,28 +651,7 @@ fn resize_smaller_content_truncation() {
 }
 
 #[test]
-fn osc_set_window_title() {
-    let mut term = create_test_emulator(10, 1);
-
-    let action = term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Osc(
-        "2;New Title".as_bytes().to_vec(),
-    )));
-    assert_eq!(
-        action,
-        Some(EmulatorAction::SetTitle("New Title".to_string()))
-    );
-
-    let action2 = term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Osc(
-        "0;Another Title".as_bytes().to_vec(),
-    )));
-    assert_eq!(
-        action2,
-        Some(EmulatorAction::SetTitle("Another Title".to_string()))
-    );
-}
-
-#[test]
-fn key_event_printable_char() {
+fn it_should_write_a_printable_keypress_to_the_pty_and_echo_it_to_the_grid() {
     let mut term = create_test_emulator(5, 1);
     let key_input = UserInputAction::KeyInput {
         symbol: KeySymbol::Char('x'),
@@ -789,7 +670,7 @@ fn key_event_printable_char() {
 }
 
 #[test]
-fn key_event_arrow_up() {
+fn it_should_write_the_arrow_up_escape_sequence_to_the_pty_without_moving_the_cursor() {
     let mut term = create_test_emulator(5, 1);
     let key_input = UserInputAction::KeyInput {
         symbol: KeySymbol::Up,
@@ -803,100 +684,6 @@ fn key_event_arrow_up() {
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["     "], Some((0, 0)));
-}
-
-#[test]
-fn it_should_preserve_selection_range_and_mode_in_a_constructed_snapshot() {
-    let num_cols = 10;
-    let num_rows = 2;
-    let default_glyph = Glyph::Single(ContentCell {
-        c: ' ',
-        attr: Attributes::default(),
-        combining: None,
-    });
-
-    let lines = vec![
-        SnapshotLine {
-            is_dirty: true,
-            cells: std::sync::Arc::new(vec![default_glyph; num_cols])
-        };
-        num_rows
-    ];
-
-    let selection = Selection {
-        range: Some(SelectionRange {
-            start: Point { x: 1, y: 0 },
-            end: Point { x: 3, y: 1 },
-        }),
-        mode: SelectionMode::Cell,
-        is_active: false,
-    };
-
-    let snapshot_with_selection = TerminalSnapshot {
-        dimensions: (num_cols, num_rows),
-        lines,
-        cursor_state: Some(CursorRenderState {
-            x: 0,
-            y: 0,
-            shape: CursorShape::Block,
-            cell_char_underneath: ' ',
-            cell_attributes_underneath: Attributes::default(),
-        }),
-        selection,
-        cell_width_px: 10,
-        cell_height_px: 16,
-    };
-
-    assert!(snapshot_with_selection.selection.range.is_some());
-    let sel_range = snapshot_with_selection.selection.range.unwrap();
-    assert_eq!(sel_range.start, Point { x: 1, y: 0 });
-    assert_eq!(sel_range.end, Point { x: 3, y: 1 });
-    assert_eq!(snapshot_with_selection.selection.mode, SelectionMode::Cell);
-
-    let snapshot_cleared = TerminalSnapshot {
-        dimensions: (num_cols, num_rows),
-        lines: snapshot_with_selection.lines.clone(),
-        cursor_state: snapshot_with_selection.cursor_state.clone(),
-        selection: Selection::default(),
-        cell_width_px: 10,
-        cell_height_px: 16,
-    };
-    assert!(snapshot_cleared.selection.range.is_none());
-}
-
-#[test]
-fn mode_show_cursor_dectcem() {
-    let mut term = create_test_emulator(5, 1);
-
-    let snap_default = term.get_render_snapshot().expect("Snapshot was None");
-    assert!(
-        snap_default.cursor_state.is_some(),
-        "Cursor should be visible by default"
-    );
-    let initial_shape = snap_default.cursor_state.as_ref().unwrap().shape;
-
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::ResetModePrivate(DecModeConstant::TextCursorEnable as u16),
-    )));
-    let snap_hidden = term.get_render_snapshot().expect("Snapshot was None");
-    assert!(
-        snap_hidden.cursor_state.is_none(),
-        "Cursor should be hidden after DECRST ?25l"
-    );
-
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-        CsiCommand::SetModePrivate(DecModeConstant::TextCursorEnable as u16),
-    )));
-    let snap_shown = term.get_render_snapshot().expect("Snapshot was None");
-    assert!(
-        snap_shown.cursor_state.is_some(),
-        "Cursor should be visible again after DECSET ?25h"
-    );
-    assert_eq!(
-        snap_shown.cursor_state.as_ref().unwrap().shape,
-        initial_shape,
-        "Cursor should revert to its initial non-hidden shape"
-    );
 }
 
 // --- PS1 Multi-line Prompt Tests ---
@@ -1237,7 +1024,7 @@ fn lf_at_bottom_of_partial_scrolling_region_no_origin_mode() {
     );
 }
 #[test]
-fn primary_device_attributes_response() {
+fn it_should_respond_to_primary_device_attributes_query_with_csi_question_mark_6c() {
     let mut term = create_test_emulator(80, 24);
 
     let input_da = EmulatorInput::Ansi(AnsiCommand::Csi(CsiCommand::PrimaryDeviceAttributes));

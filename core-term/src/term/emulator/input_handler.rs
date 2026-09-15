@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn paste_text_action_bracketed_on() {
+    fn it_should_wrap_pasted_text_in_bracketed_paste_sequences_when_bracketed_paste_mode_is_on() {
         let mut emu = create_test_emu_for_input();
         // Enable bracketed paste mode via the public message-passing surface (CSI ? 2004 h).
         use crate::ansi::commands::CsiCommand;
@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn paste_text_action_bracketed_off() {
+    fn it_should_print_pasted_text_directly_to_the_grid_when_bracketed_paste_mode_is_off() {
         let mut emu = create_test_emu_for_input();
         assert!(!emu.dec_modes.bracketed_paste_mode);
 
@@ -237,23 +237,6 @@ mod tests {
 
         let snapshot_option = emu.get_render_snapshot();
         let snapshot = snapshot_option.as_ref().expect("Snapshot was None");
-        // Print the actual screen content for debugging
-        for (r, line) in snapshot.lines.iter().enumerate() {
-            let line_str: String =
-                line.cells
-                    .iter()
-                    .map(|glyph_wrapper| match glyph_wrapper {
-                        crate::glyph::Glyph::Single(cell)
-                        | crate::glyph::Glyph::WidePrimary(cell) => cell.c,
-                        crate::glyph::Glyph::WideSpacer => crate::glyph::WIDE_CHAR_PLACEHOLDER,
-                    })
-                    .collect();
-            println!("Actual line {}: '{}'", r, line_str);
-        }
-        println!(
-            "Actual cursor pos: {:?}",
-            snapshot.cursor_state.as_ref().map(|cs| (cs.y, cs.x))
-        );
 
         match snapshot.lines[0].cells[0] {
             crate::glyph::Glyph::Single(cell) | crate::glyph::Glyph::WidePrimary(cell) => {
@@ -326,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn control_event_resize_minimum_dimensions() {
+    fn it_should_clamp_resize_dimensions_to_the_minimum_grid_size() {
         let mut emu = create_test_emu_for_input();
 
         // Very small resize (should clamp to MIN_GRID_DIMENSION)

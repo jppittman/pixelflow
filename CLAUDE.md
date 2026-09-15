@@ -300,6 +300,17 @@ A CL that touches only `docs/` and Markdown skips the build-and-test jobs
 run). The skip is a job-level `if`, so the required checks report "skipped" and
 merge; a workflow-level `paths-ignore` would leave them pending.
 
+**That last sentence is true of a scalar job and false of a matrix one**, which
+cost three docs-only CLs (#1233, #1207, #1215) weeks of being unmergeable. A job
+skipped by its own `if` never expands its `strategy`, so it reports one check
+run under the *unexpanded* template name — literally `Test on ${{ matrix.os }}`.
+The names branch protection requires, `Test on ubuntu-latest` and
+`Test on macos-latest`, are never reported, and "never reported" blocks exactly
+as hard as "pending". So the `test:` matrix job carries no job-level `if`: it
+always runs and always expands, and the docs-only guard sits on each of its
+steps. A new step there needs the guard, or it runs on a docs-only CL whose
+checkout step was skipped.
+
 Shift left where it is cheap, and *measure* the cheapness rather than assuming
 it. A check that costs an hour presubmit belongs in postsubmit — but a fast
 fraction of it usually belongs presubmit, and finding that fraction is the
