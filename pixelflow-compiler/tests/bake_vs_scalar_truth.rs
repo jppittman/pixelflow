@@ -17,8 +17,10 @@
 //! lattice, which is the only way a kernel becomes a number.
 //!
 //! Transcendentals are deliberately absent: their accuracy is pinned against
-//! libm per op in `pixelflow-codegen/tests/transcendental_jit.rs`, and their
-//! *range* in `pixelflow-ir/tests/trig_range.rs`. What these five check is
+//! libm per op in `pixelflow-codegen/tests/transcendental_jit.rs`. Their
+//! *range* was pinned in `pixelflow-ir/tests/trig_range.rs`, which asserted
+//! it through the scalar interpreter and was deleted with it — that check
+//! needs rebuilding on the JIT (CLAUDE.md says so where it states the rule). What these five check is
 //! that the front end, the e-graph and the backend carry an expression's
 //! meaning from source to buffer.
 

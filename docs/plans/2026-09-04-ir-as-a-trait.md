@@ -142,7 +142,7 @@ Not in the trait, each for a reason:
 
 - Every tier stops inserting unreachable nodes. Strictly fewer e-classes for
   the same budget. `anytime.rs`'s assertion that callers pre-compact, and the
-  `compact_subtree` helper in `examples/oracle_filtered_budget_curves.rs`,
+  `compact_subtree` helper in `examples/oracle_filtered_budget_curves.rs` (deleted),
   both existed only to work around this; the assertion goes.
 - A zero-arity `Op` now panics in `embed` where `choices_to_arena` silently
   materialised the constant `0.0` — a wrong answer wearing a right answer's

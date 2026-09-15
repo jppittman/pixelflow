@@ -122,8 +122,11 @@ The trade above buys speed with *accuracy* — an answer close to the true one,
 off in the last bits. It never licenses an answer **outside the function's
 range**. `sin` returning 8.64e8 is not an imprecise sine, it is not a sine; no
 budget was saved by computing it, and nothing downstream can recover from it.
-So range is a hard property, asserted with no tolerance
-(`pixelflow-ir/tests/trig_range.rs`), while accuracy is a tunable.
+So range is a hard property, asserted with no tolerance, while accuracy is a
+tunable. **It is currently unasserted**: `pixelflow-ir/tests/trig_range.rs`
+made the claim through the scalar interpreter and went with it when the
+interpreter was deleted. The property is unchanged and the assertion needs
+rebuilding on the JIT — an out-of-range `sin` would now ship green.
 
 Where a function cannot be computed over the whole input type, it gets a
 **documented domain** and returns **NaN** outside it. `sin`/`cos`/`tan` are
@@ -134,8 +137,9 @@ anyway — `ulp(x)` exceeds 1 radian, so an f32 no longer names a phase.
 
 NaN specifically, and not a clamp into `[-1, 1]`: a clamped value is a wrong
 answer wearing a right answer's clothes. That is precisely how the reduction bug
-survived — the JIT and the `eval_scalar` oracle run the *same* expansion, so
-they agreed bit-for-bit on the garbage and every same-form equivalence test
+survived — the JIT and the `eval_scalar` oracle (since deleted, along with
+every same-form suite built on it) ran the *same* expansion, so they agreed
+bit-for-bit on the garbage and every same-form equivalence test
 passed, while outputs in the 1e2–1e6 range slipped under the `>1e30`
 "ill-conditioned" filter and were admitted as valid training labels. A
 same-form check cannot see a shared-definition bug; only an external bound can.
@@ -417,6 +421,22 @@ Priority: AVX-512 > SSE2 (x86-64), NEON (aarch64) — no scalar fallback for oth
   than reconstructed, and `Union`'s explicit ranges and a select's implicit
   mask are the same thing at different levels of static knowledge. See
   docs/plans/2026-09-07-demand-is-a-dag-property.md.
+- **Platform `cfg` is encapsulation, not sprinkle** - a platform-predicate
+  `#[cfg(...)]` (`target_os`, `target_arch`, `target_family`,
+  `target_feature`, `target_pointer_width`, `target_endian`, `windows`,
+  `unix`, or a bare arch/os name like `aarch64`/`x86_64`/`wasm32`) is only
+  allowed to (1) gate a whole file or module — `#![cfg(...)]` at the top of a
+  file, or `#[cfg(...)]` directly on a `mod foo;`/`mod foo { ... }` item — or
+  (2) select a platform implementation as a single-line dispatch item in
+  `mod.rs` (e.g. `#[cfg(aarch64)] pub use native::Foo as PlatformFoo;`).
+  Scattering it on an individual `fn`/`struct`/`impl`/field inside an
+  otherwise platform-agnostic file means the platform split is `grep -r cfg`
+  instead of a file boundary, and the two halves silently drift back into
+  each other's file. Put the platform-specific code in its own file and
+  select it once, at the seam. Enforced by `scripts/check-cfg-encapsulation.sh`
+  (CI job `cfg-encapsulation`), baselined against pre-existing violations in
+  `scripts/cfg_encapsulation_baseline.txt` — new violations fail, old ones
+  are tracked, not silently regenerated as debt.
 - **New implementation of an existing category → trait first** - Before
   adding a second way of doing something the codebase already does one way,
   check whether that category is already a trait. If it is, implement the new
@@ -508,7 +528,8 @@ handle.send(Message::Data(MyDataMsg))?;           // Lowest (backpressure)
 
 - **Hot paths:** the loop nest is inside the emitted code — one collapse call per stripe, not one per row or per SIMD batch
 - **Glyph caching:** a glyph bakes once and reads back as a gather over its bound buffer (`fonts/cache.rs`)
-- **Antialiasing:** symbolic derivatives — `Kernel::dx()`/`dy()`, resolved before emission
+- **Glyph coverage:** a winding number about a reference point, per-pixel and discriminant-free (`fonts/loop_blinn.rs`, docs/plans/2026-09-08-loop-blinn-glyph.md). Its bound is a domain-side extent because `u² − v` outside its control triangle is *wrong*, not merely slow — so the glyph is where a `Union` of index ranges earns its keep
+- **Antialiasing:** symbolic derivatives — `Kernel::dx()`/`dy()`, resolved before emission. A glyph's *winding* is exact (hard masks selecting signed constants); only the distance feeding the ramp is soft, so a comparison landing on the wrong side costs a rounding rather than half a unit of coverage
 - **One kernel per scene:** four channel kernels compile together, so shared geometry is emitted once
 
 ## Cost Model and the Guide (offline, supervised)
@@ -528,7 +549,9 @@ What remains:
 - The static latency prior (`CostModel::latency_prior()`) is the extraction cost model.
   `pixelflow-pipeline`'s `measure_latency_prior` example and `jit_bench` (`BenchSession`,
   median-of-samples, sentinel drift normalization) are how the table is re-derived.
-- `gen_bench_corpus` (pixelflow-pipeline, `--features training`) mints quarantined,
-  tier-split expression corpora for the Guide program's research bins.
+- `gen_bench_corpus` minted quarantined, tier-split expression corpora for the
+  Guide program's research bins. **Deleted**: its quarantine gate decided
+  acceptance by comparing against the scalar interpreter, so it went with it.
+  A corpus needs a new acceptance criterion before that tooling comes back.
 - The saturation Guide trains on hindsight provenance labels from `pixelflow-search`'s
   `egraph::labeler` — no critic, no RL (docs/plans/2026-08-31-guide-design-revision.md).

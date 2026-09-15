@@ -10,7 +10,7 @@ use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::optimize::{Optimize, Rewritten};
 
-use crate::egraph::{Optimizer, Vocabulary, insert, reachable_count};
+use crate::egraph::{Optimizer, RuleSet, Vocabulary, insert, reachable_count};
 use crate::tier::Tier;
 
 /// Rewrite a term by equality saturation under `optimizer`.
@@ -32,7 +32,9 @@ impl Saturate {
     #[must_use]
     pub fn runtime(shape: LatticeShape) -> Self {
         Self {
-            optimizer: Optimizer::production().for_lattice(shape),
+            optimizer: Optimizer::production()
+                .rules(RuleSet::runtime())
+                .for_lattice(shape),
             vocab: Vocabulary::Runtime,
             tier: Tier::Runtime,
         }

@@ -308,12 +308,10 @@ fn pty_child_termination_on_drop() {
                 child_pid
             );
             // Attempt to clean up; best-effort, the child may already be gone.
+            // Not treated as a test failure: SIGHUP is not a 100%-guaranteed kill for `sleep`.
             if let Err(e) = kill(child_pid, Some(Signal::SIGKILL)) {
                 log::warn!("SIGKILL of child {} failed: {}", child_pid, e);
             }
-            // Depending on strictness, this could be a panic.
-            // For CI stability, we might log and not panic, if SIGHUP is not 100% guaranteed kill for `sleep`.
-            // panic!("Child process {} did not terminate after PTY drop.", child_pid);
         }
         Err(nix::Error::ESRCH) => {
             // ESRCH ("No such process") means the child terminated as expected.

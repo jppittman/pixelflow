@@ -429,8 +429,10 @@ impl OpKind {
 
             Self::MulAdd | Self::Select | Self::Gather => 3,
 
-            // N-ary: [combiner, reduce_var, extent, body].
-            Self::Reduce => 4,
+            // The body. The algebra, the binder and the range are the node's
+            // own metadata ([`Fold`](crate::Fold)) rather than three `Const`
+            // children, so nothing that walks operands can reach them.
+            Self::Reduce => 1,
         }
     }
 
@@ -1694,7 +1696,7 @@ mod algebraic_properties {
 
                 OpKind::MulAdd | OpKind::Select | OpKind::Gather => 3,
 
-                OpKind::Reduce => 4,
+                OpKind::Reduce => 1,
             };
             assert_eq!(op.arity(), want, "{op:?} arity mismatch");
         }

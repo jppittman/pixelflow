@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 
 use super::ScheduledOp;
+use super::demand::{self, Demand, Literal};
 use super::regalloc::{Def, ValueId};
 
 /// Which arm of a `Select` node a guard branch skips or targets.
@@ -324,9 +325,39 @@ pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
     let mut telemetry = Telemetry::new();
     let mut guards = Vec::new();
 
+    // One backward pass over the whole DAG, and only when someone is
+    // reading: demand is what an arm *may skip*, which is a weaker
+    // condition than what the partition may *move*, so it is recorded
+    // beside `exclusive` rather than replacing it. See `SelectStat`.
+    let demand = telemetry
+        .is_on()
+        .then(|| {
+            let root = schedule.last()?.value;
+            Some(demand::demand_of(schedule, root))
+        })
+        .flatten();
+
     for select in &arms {
         let ranges = select.ranges();
+        let demand_exclusive = demand.as_ref().map_or(ArmPair::new(0, 0), |d| {
+            let observed = |v: ValueId| d.get(&v).cloned().unwrap_or_default();
+            let arm = |lit: Literal| observed(select.select_vid).and_literal(lit);
+            let count = |pred: &Demand| {
+                schedule
+                    .iter()
+                    .filter(|def| {
+                        let seen = observed(def.value);
+                        !seen.is_never() && seen.implies(pred)
+                    })
+                    .count()
+            };
+            ArmPair::new(
+                count(&arm(Literal::set(select.mask_vid))),
+                count(&arm(Literal::clear(select.mask_vid))),
+            )
+        });
         telemetry.select(|| SelectStat {
+            demand_exclusive,
             select_idx: select.select_idx,
             mask_idx: select.mask_idx,
             exclusive: select.indices.as_ref().map(|s| s.len()),
@@ -758,6 +789,19 @@ struct SelectStat {
     /// Values exclusive to each arm — what a guard could skip if the
     /// exclusive set happened to be contiguous.
     exclusive: ArmPair<usize>,
+    /// What [`demand`](super::demand) calls exclusive to each arm — the
+    /// values observed only where this arm's polarity holds.
+    ///
+    /// Always at least `exclusive`, and the gap is the point: demand
+    /// answers *may this be skipped*, while `exclusive` answers the
+    /// stronger *may this be skipped and also moved*, which is what
+    /// [`cluster_select_arms`]'s three-way partition needs. Two selects
+    /// sharing a mask separate them — the inner select's arms are
+    /// demand-exclusive to the outer one, but the inner select itself is
+    /// shared and reads them, so moving them past it is illegal. The gap
+    /// is the headroom a partition that ordered within its groups would
+    /// unlock.
+    demand_exclusive: ArmPair<usize>,
     /// Schedule entries a guard actually skips on each arm.
     guarded: ArmPair<usize>,
     /// Entries that are NOT this arm's but lie between its first and its last,
@@ -811,6 +855,12 @@ impl Telemetry {
         }
     }
 
+    /// Whether anything will read what is recorded. Callers ask before
+    /// computing a statistic that costs more than reading a field.
+    fn is_on(&self) -> bool {
+        self.stats.is_some()
+    }
+
     /// The stat is built lazily: computing it walks the schedule, and nothing
     /// should pay for that when the telemetry is off.
     fn select(&mut self, stat: impl FnOnce() -> SelectStat) {
@@ -831,9 +881,13 @@ impl Telemetry {
             .iter()
             .map(|s| s.exclusive.true_arm + s.exclusive.false_arm)
             .sum();
+        let demanded: usize = stats
+            .iter()
+            .map(|s| s.demand_exclusive.true_arm + s.demand_exclusive.false_arm)
+            .sum();
         std::eprintln!(
             "guard-telemetry: schedule={sched_len} selects={} guarded={covered} \
-             exclusive={offered} per_select={:?}",
+             exclusive={offered} demand_exclusive={demanded} per_select={:?}",
             stats.len(),
             stats
                 .iter()
@@ -842,6 +896,7 @@ impl Telemetry {
                         s.select_idx,
                         s.mask_idx,
                         (s.exclusive.true_arm, s.exclusive.false_arm),
+                        (s.demand_exclusive.true_arm, s.demand_exclusive.false_arm),
                         (s.guarded.true_arm, s.guarded.false_arm),
                         (
                             (s.intruders.true_arm.total, s.intruders.true_arm.leaves),

@@ -1,3 +1,17 @@
+> **ARCHIVED (April 2026) — do not execute this plan.** It carries a live
+> "REQUIRED SUB-SKILL … implement this plan task-by-task" directive for an
+> architecture that no longer exists, which is the reason this banner is here
+> rather than in the index alone: an agent that lands on this file and follows
+> it will start building deleted types. `emit_backward` and the per-`OpKind` VJP registry were never adopted; there
+> is no reverse-mode path in this compiler. Forward-mode `Dwrt` is the only
+> differentiation, and `ir_bridge.rs` — where this plan puts the work — was
+> split into `lower.rs` and `emit.rs` by #1206.
+> The programme these four team plans and their spec belong to was superseded;
+> the current direction is
+> [`../../plans/2026-09-06-kernel-with-a-lattice.md`](../../plans/2026-09-06-kernel-with-a-lattice.md),
+> and the learned-model history is
+> [`../../plans/2026-07-07-guided-saturation-redesign.md`](../../plans/2026-07-07-guided-saturation-redesign.md).
+
 # Team 2: IR Pullback Registry Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

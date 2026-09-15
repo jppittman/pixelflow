@@ -24,12 +24,14 @@ impl Ir for ExprArena {
             ExprNode::Param(i) => Shape::Param(i),
             ExprNode::Buffer(b) => Shape::Buffer(*self.buffer_decl(b)),
             ExprNode::Uniform(u) => Shape::Uniform(*self.uniform_decl(u)),
+            ExprNode::Ref(k) => Shape::Ref(k),
             ExprNode::Unary(op, a) => Shape::Op(op, Children::One(a)),
             ExprNode::Binary(op, a, b) => Shape::Op(op, Children::Two(a, b)),
             ExprNode::Ternary(op, a, b, c) => Shape::Op(op, Children::Three(a, b, c)),
             ExprNode::Nary(op, start, len) => {
                 Shape::Op(op, Children::Many(self.nary_children_slice(start, len)))
             }
+            ExprNode::Reduce { fold, body } => Shape::Reduce { fold, body },
         }
     }
 
@@ -46,6 +48,7 @@ impl Ir for ExprArena {
                 let slot = self.uniform_slot_for(decl);
                 self.push_uniform(slot)
             }
+            Shape::Ref(key) => self.push_ref(key),
             Shape::Op(op, children) => match children {
                 Children::Zero => {
                     panic!("ExprArena::embed: {op:?} with no children — no arena node has arity 0")
@@ -60,6 +63,7 @@ impl Ir for ExprArena {
                     _ => self.push_nary(op, s),
                 },
             },
+            Shape::Reduce { fold, body } => self.push_reduce(fold, body),
         }
     }
 }
@@ -116,6 +120,9 @@ impl ExprArena {
                         .iter()
                         .filter(|k| memo[k.0 as usize].is_none())
                         .collect(),
+                    Shape::Reduce { body, .. } if memo[body.0 as usize].is_none() => {
+                        alloc::vec![body]
+                    }
                     _ => Vec::new(),
                 };
                 if !pending.is_empty() {
@@ -130,6 +137,7 @@ impl ExprArena {
                 Shape::Param(i) => out.embed(Shape::Param(i)),
                 Shape::Buffer(d) => out.embed(Shape::Buffer(d)),
                 Shape::Uniform(d) => out.embed(Shape::Uniform(d)),
+                Shape::Ref(k) => out.embed(Shape::Ref(k)),
                 Shape::Op(op, kids) => {
                     let mapped: Vec<O::Ref> = kids
                         .iter()
@@ -138,6 +146,10 @@ impl ExprArena {
                         })
                         .collect();
                     out.embed(Shape::Op(op, Children::Many(&mapped)))
+                }
+                Shape::Reduce { fold, body } => {
+                    let body = memo[body.0 as usize].expect("rebuild_into: body before fold");
+                    out.embed(Shape::Reduce { fold, body })
                 }
             };
             memo[id.0 as usize] = Some(built);

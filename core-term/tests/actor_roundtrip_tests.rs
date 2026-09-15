@@ -3,7 +3,18 @@
 //! These tests verify complete message roundtrips through actors:
 //! - Send message → Actor processes → Verify output
 //!
-//! Following TDD principles: write tests first, uncover bugs, fix them.
+//! The `ParserActor`/`TerminalApp` sections below (`TestParserActor`,
+//! `TestAnsiCommand`, `TestEngineManagement`) exercise `actor_scheduler`'s
+//! generic delivery guarantees through hand-rolled test doubles that
+//! reimplement ANSI parsing and key-to-escape-sequence translation — they do
+//! not exercise `core_term::ansi::AnsiProcessor` or
+//! `core_term::term::emulator::key_translator`, so they cannot catch a
+//! regression there. See `ansi_parser_message_tests.rs` and
+//! `core-term/src/term/emulator/key_translator.rs`'s own unit tests for that
+//! coverage. The `pty_writer_*` section at the bottom of this file is the
+//! pattern to follow for a new test here: it drives the real
+//! `core_term::io::event_monitor_actor::WriterControl`/`core_term::io::Resize`
+//! types through a probe actor standing in for the real `PtyWriter`.
 
 use actor_scheduler::{
     Actor, ActorBuilder, ActorScheduler, ActorStatus, HandlerError, HandlerResult, Message,

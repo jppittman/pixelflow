@@ -268,6 +268,22 @@ impl Op for MaskOr {
     }
 }
 
+/// Mask `∧` as an `Op`, for a caller that already named the *algebra*.
+///
+/// Crate-visible where [`op_from_kind`] is not: resolving an `OpKind` to
+/// these would hand them to the macro tier, which is the miscompile the
+/// comment above describes. Resolving a [`Monoid`](pixelflow_ir::Monoid) to
+/// them leaks no opcode — the caller said "the universal quantifier", and
+/// this is what that is.
+pub(crate) fn mask_and() -> &'static dyn Op {
+    &MaskAnd
+}
+
+/// Mask `∨` as an `Op`. See [`mask_and`].
+pub(crate) fn mask_or() -> &'static dyn Op {
+    &MaskOr
+}
+
 // ─────────────────────── Runtime-only integer-domain ops ─────────────────────
 //
 // The packed cell-grid kernel's spine: clamp → `TruncToInt` → `Shl` →

@@ -97,10 +97,9 @@ fn each_lattice_extent_is_its_own_kernel() {
     // share one cache entry, one more column is a different lattice and a
     // different kernel. Resizing is recompilation, by decision.
     let sdf = circle_sdf();
-    let (arena, root) = sdf.parts();
     let shape_of = |l: Lattice| LatticeShape::new(l.extent);
     let compile = |l: Lattice| {
-        jit_cache::compile(arena, root, shape_of(l))
+        jit_cache::compile(&sdf, shape_of(l))
             .expect("compile")
             .kernel
     };
