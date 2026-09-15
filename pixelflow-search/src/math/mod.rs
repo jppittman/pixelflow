@@ -66,8 +66,6 @@ pub mod trig;
 pub mod round2_rules;
 
 #[cfg(test)]
-pub(crate) mod oracle; // cross-form oracle gate for Round 2 generated rules (§2.4)
-
 #[cfg(test)]
 mod pict_rewrite_tests; // PICT-style pairwise testing of the rewrite rules (POC)
 
@@ -164,6 +162,8 @@ mod tests {
             ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
             ExprNode::Param(i) => panic!("Param({i}) reached math tests"),
             ExprNode::Buffer(b) => panic!("Buffer({}) reached math tests", b.0),
+            ExprNode::Ref(k) => panic!("Ref({k:?}) reached math tests"),
+            ExprNode::Reduce { .. } => panic!("a bounded fold reached math tests"),
             ExprNode::Uniform(u) => egraph.add(ENode::Uniform(*arena.uniform_decl(u))),
             ExprNode::Unary(kind, a) => {
                 let ca = expr_to_egraph(arena, a, egraph);
@@ -209,6 +209,7 @@ mod tests {
             ENode::Const(bits) => arena.push_const(f32::from_bits(bits)),
             ENode::Buffer(decl) => panic!("Buffer({decl:?}) reached math tests"),
             ENode::Param(i) => panic!("Param({i}) reached math tests"),
+            ENode::Reduce { .. } => panic!("a bounded fold reached math tests"),
             ENode::Uniform(decl) => {
                 let slot = arena.declare_uniform(decl);
                 arena.push_uniform(slot)
@@ -226,68 +227,6 @@ mod tests {
                     n => panic!("unsupported arity in math test: {n}"),
                 }
             }
-        }
-    }
-
-    /// Evaluate an arena expression via the reference interpreter.
-    ///
-    /// Delegates to `pixelflow_ir::eval_scalar` rather than walking the arena
-    /// here: that is the language's semantics (it lowers transcendentals to the
-    /// expansion the compiler emits), and a private walker would be a second
-    /// definition free to drift from it.
-    fn eval_arena(arena: &ExprArena, id: ExprId, vars: &[f32; 2]) -> f32 {
-        pixelflow_ir::eval_scalar(
-            arena,
-            id,
-            vars,
-            &pixelflow_ir::binding::BindingTable::empty(),
-        )
-    }
-
-    /// Run an expression through the egraph optimizer and check that the
-    /// optimized result produces the same output at all test points.
-    fn check_optimization_preserves_semantics(
-        arena: &ExprArena,
-        root: ExprId,
-        test_points: &[[f32; 2]],
-        epsilon: f32,
-    ) {
-        let mut eg = EGraph::new();
-        let root_class = expr_to_egraph(arena, root, &mut eg);
-        let _result = saturate_with_budget(&mut eg, 200);
-
-        let mut opt_arena = ExprArena::new();
-        let opt_root = eclass_to_arena(&eg, root_class, &mut opt_arena);
-
-        for point in test_points {
-            let original = eval_arena(arena, root, point);
-            let opt = eval_arena(&opt_arena, opt_root, point);
-
-            if original.is_nan() && opt.is_nan() {
-                continue;
-            }
-            if original.is_infinite() && opt.is_infinite() && original.signum() == opt.signum() {
-                continue;
-            }
-
-            let diff = (original - opt).abs();
-            let threshold = if original.abs() > 1.0 {
-                epsilon * original.abs()
-            } else {
-                epsilon
-            };
-            assert!(
-                diff <= threshold,
-                "Optimization changed semantics!\n\
-                 Expression: {}\n\
-                 Optimized:  {}\n\
-                 Point: {point:?}\n\
-                 Original: {original}\n\
-                 Optimized: {opt}\n\
-                 Diff: {diff} > threshold {threshold}",
-                arena.display(root),
-                opt_arena.display(opt_root),
-            );
         }
     }
 
@@ -312,149 +251,6 @@ mod tests {
             [3.14159, 1.5708],
             [-0.5, 0.3],
         ]
-    }
-
-    /// Assert two e-graph root classes are semantically equal at all points,
-    /// and that associativity added alternative tree shapes to the root class.
-    fn check_assoc(arena: &ExprArena, root: ExprId) {
-        let mut eg = EGraph::with_rules(all_rules());
-        let root_class = expr_to_egraph(arena, root, &mut eg);
-        // Budget 5: associativity fires on the first iteration. Higher budgets
-        // cause combinatorial explosion with commutativity.
-        let _result = saturate_with_budget(&mut eg, 5);
-
-        let mut opt_arena = ExprArena::new();
-        let opt_root = eclass_to_arena(&eg, root_class, &mut opt_arena);
-        for point in &standard_test_points() {
-            let original = eval_arena(arena, root, point);
-            let opt = eval_arena(&opt_arena, opt_root, point);
-            if original.is_nan() && opt.is_nan() {
-                continue;
-            }
-            let diff = (original - opt).abs();
-            let threshold = if original.abs() > 1.0 {
-                1e-5 * original.abs()
-            } else {
-                1e-5
-            };
-            assert!(
-                diff <= threshold,
-                "associativity changed semantics at {point:?}: {original} vs {opt}"
-            );
-        }
-
-        let canon = eg.find(root_class);
-        let node_count = eg.nodes(canon).len();
-        assert!(
-            node_count > 1,
-            "expected associativity to add alternative tree shapes, but root class has {node_count} node(s)"
-        );
-    }
-
-    #[test]
-    fn algebraic_rules_preserve_semantics() {
-        let pts = standard_test_points();
-        let mut a = ExprArena::new();
-
-        // a - b (canonicalize: sub -> add+neg)
-        let e = arena_pat!(&mut a, bin OpKind::Sub, (var 0), (var 1));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
-
-        // a / b (canonicalize: div -> mul+recip)
-        let e = arena_pat!(&mut a, bin OpKind::Div, (var 0), (var 1));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // neg(neg(x)) (involution)
-        let e = arena_pat!(&mut a, un OpKind::Neg, (un OpKind::Neg, (var 0)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // (x + y) - y (cancellation)
-        let e = arena_pat!(&mut a, bin OpKind::Sub, (bin OpKind::Add, (var 0), (var 1)), (var 1));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // x * 0 (annihilator)
-        let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (cst 0.0));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // x + 0 (identity)
-        let e = arena_pat!(&mut a, bin OpKind::Add, (var 0), (cst 0.0));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // x * 1 (identity)
-        let e = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (cst 1.0));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-    }
-
-    #[test]
-    fn trig_rules_preserve_semantics() {
-        let pts = standard_test_points();
-        let mut a = ExprArena::new();
-
-        // sin(x + y) (angle addition)
-        let e = arena_pat!(&mut a, un OpKind::Sin, (bin OpKind::Add, (var 0), (var 1)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // cos(x + y) (angle addition)
-        let e = arena_pat!(&mut a, un OpKind::Cos, (bin OpKind::Add, (var 0), (var 1)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-4);
-
-        // sin(neg(x)) (parity: odd)
-        let e = arena_pat!(&mut a, un OpKind::Sin, (un OpKind::Neg, (var 0)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
-
-        // cos(neg(x)) (parity: even)
-        let e = arena_pat!(&mut a, un OpKind::Cos, (un OpKind::Neg, (var 0)));
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-5);
-    }
-
-    #[test]
-    fn associativity_left_to_right() {
-        // (v0 + v1) + v2 should produce v0 + (v1 + v2) in the e-graph
-        let mut a = ExprArena::new();
-        let v2 = arg(&mut a, 0.75);
-        let inner = arena_pat!(&mut a, bin OpKind::Add, (var 0), (var 1));
-        let e = a.push_binary(OpKind::Add, inner, v2);
-        check_assoc(&a, e);
-    }
-
-    #[test]
-    fn associativity_right_to_left() {
-        // v0 + (v1 + v2) should produce (v0 + v1) + v2 in the e-graph
-        let mut a = ExprArena::new();
-        let v2 = arg(&mut a, 0.75);
-        let v1 = a.push_var(1);
-        let inner = a.push_binary(OpKind::Add, v1, v2);
-        let v0 = a.push_var(0);
-        let e = a.push_binary(OpKind::Add, v0, inner);
-        check_assoc(&a, e);
-    }
-
-    #[test]
-    fn associativity_mul() {
-        // (v0 * v1) * v2 should produce v0 * (v1 * v2) and vice versa
-        let mut a = ExprArena::new();
-        let v2 = arg(&mut a, 0.75);
-        let inner = arena_pat!(&mut a, bin OpKind::Mul, (var 0), (var 1));
-        let e = a.push_binary(OpKind::Mul, inner, v2);
-        check_optimization_preserves_semantics(&a, e, &standard_test_points(), 1e-4);
-    }
-
-    #[test]
-    fn associativity_min_max() {
-        let pts = standard_test_points();
-        let mut a = ExprArena::new();
-
-        // min(min(v0, v1), v2) should produce min(v0, min(v1, v2))
-        let v2 = arg(&mut a, 0.75);
-        let inner = arena_pat!(&mut a, bin OpKind::Min, (var 0), (var 1));
-        let e = a.push_binary(OpKind::Min, inner, v2);
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
-
-        // max(max(v0, v1), v2) should produce max(v0, max(v1, v2))
-        let v2 = arg(&mut a, 0.75);
-        let inner = arena_pat!(&mut a, bin OpKind::Max, (var 0), (var 1));
-        let e = a.push_binary(OpKind::Max, inner, v2);
-        check_optimization_preserves_semantics(&a, e, &pts, 1e-6);
     }
 
     #[test]

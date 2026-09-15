@@ -201,7 +201,6 @@ pub fn run_anytime_curve(
     // construction and the budget is keyed on exactly what was inserted.
     let node_count = reachable_node_count(arena, root);
 
-    let env = optimizer.limits_for(node_count);
     let mut egraph = optimizer.egraph();
     let root_class = crate::egraph::insert(
         arena,
@@ -210,6 +209,13 @@ pub fn run_anytime_curve(
         crate::egraph::Vocabulary::Templates,
     )
     .expect("anytime: arena must be e-graph representable");
+    // Sized after insertion and before any rewrite, as `Optimizer::run`
+    // sizes it: the class count here is the hash-consed input.
+    let input = super::saturate::InputSize {
+        nodes: node_count,
+        classes: egraph.num_classes(),
+    };
+    let env = optimizer.limits_for(input);
 
     let mut checkpoints: Vec<AnytimeCheckpoint> = Vec::with_capacity(grid.len());
     let mut sweeps_total = 0usize;
@@ -244,7 +250,7 @@ pub fn run_anytime_curve(
                 classes: env.classes,
                 applications: Some(delta),
             },
-            node_count,
+            input,
         );
         assert_ne!(
             out.stats.stop,

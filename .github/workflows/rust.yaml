@@ -26,7 +26,7 @@ jobs:
   # `if`, not a workflow-level `paths-ignore`: a job skipped by `if` reports
   # "skipped", which satisfies a required status check, while a workflow that
   # never runs leaves the required checks pending and blocks the merge. The
-  # three metadata jobs below run on every CL regardless; they take seconds.
+  # six metadata jobs below run on every CL regardless; they take seconds.
   change-scope:
     name: Change scope
     runs-on: ubuntu-latest
@@ -48,6 +48,8 @@ jobs:
   cl-metadata:
     name: CL metadata
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     steps:
       - name: Checkout code and CL history
         uses: actions/checkout@v4
@@ -56,14 +58,21 @@ jobs:
 
       - name: Check CL title and commit subjects
         env:
-          CL_TITLE: ${{ github.event.pull_request.title }}
+          # `github.event.pull_request.title` is a snapshot from whatever
+          # event triggered this run (open/sync/reopen) -- this job's own
+          # trigger list has no `edited`, so a title fixed *after* a push
+          # (edit the PR title, no new commit) leaves this run's copy stale
+          # and a rerun of the job replays the same stale event payload
+          # rather than reading the PR live. `gh pr view` asks the API for
+          # the title as of *now*, so a title-only fix needs only a rerun,
+          # not another commit.
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
           HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
-        run: >-
-          bash scripts/check-cl-metadata.sh
-          "$CL_TITLE"
-          "$BASE_COMMIT"
-          "$HEAD_COMMIT"
+        run: |
+          cl_title=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json title -q .title)
+          bash scripts/check-cl-metadata.sh "$cl_title" "$BASE_COMMIT" "$HEAD_COMMIT"
 
   # A build.rs can declare (via rustc-check-cfg) a display-driver cfg that no
   # CI job ever actually builds -- that's exactly how the headless driver
@@ -96,6 +105,40 @@ jobs:
 
       - name: Check every src/bin target is declared in its Cargo.toml
         run: bash scripts/check-bin-declarations.sh
+
+  # Platform `#[cfg(...)]` is encapsulation, not sprinkle (CLAUDE.md, "Code
+  # Style"): it must gate a whole file/mod, or be a single-line dispatch item
+  # in mod.rs. A grep-and-line-scan check, not a build, so it's fast and
+  # blocking like the other metadata jobs above -- and it's baselined against
+  # ~200 pre-existing files so it only gates NEW violations, not a retroactive
+  # audit of the whole tree.
+  cfg-encapsulation:
+    name: Platform cfg encapsulation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check platform cfg only gates a whole file/mod, or a single-line dispatch item in mod.rs
+        run: bash scripts/check-cfg-encapsulation.sh
+
+  # A plan or design must not name a source file the tree does not have.
+  # docs/plans/2026-09-06-kernel-with-a-lattice.md §4 asked for this by name:
+  # every stage of that programme deleted files that prose elsewhere still
+  # described, and every stage found them by grepping rather than by a job
+  # failing. Baselined the same way cfg-encapsulation is, and for the same
+  # reason it needs one: a plan may legitimately name a file it proposes to
+  # create, so only NEW pairs fail.
+  # Runs on docs-only CLs too -- it is a docs check, and it needs no toolchain.
+  doc-paths:
+    name: Doc source paths
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check plans and designs cite source paths that exist
+        run: bash scripts/check-doc-paths.sh
 
   # pixelflow-search's `provenance-journal` feature (the rule-provenance
   # journal: origins, application log, union journal, `derivation_ancestors`,
@@ -153,6 +196,14 @@ jobs:
 
       - name: Install X11 dependencies
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
@@ -221,6 +272,14 @@ jobs:
 
       - name: Install X11 dependencies
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
@@ -291,8 +350,17 @@ jobs:
       # script before it type-checks a single line. These are the crates whose
       # output is architecture-specific; runtime and core-term carry no
       # aarch64-only code. Do not "simplify" this to `--workspace`.
+      # `-D warnings`, matching the macOS clippy step, because a warning is
+      # how this class actually presents. Deleting an aarch64-only test can
+      # leave the helper it called dead on aarch64 and live on x86, which is
+      # `dead_code` — a warning, so a bare `check` stays green and the failure
+      # surfaces on the macOS runner instead, where it fails *clippy* and so
+      # skips the whole test step. That happened to `logged_expr_jit_output`,
+      # and the point of this job is that it should not have to.
       - name: Type-check every aarch64 block
         shell: bash
+        env:
+          RUSTFLAGS: -D warnings
         run: |
           cargo check --target aarch64-unknown-linux-gnu --all-targets \
             -p pixelflow-core -p pixelflow-codegen -p pixelflow-ir \
@@ -336,6 +404,14 @@ jobs:
       - name: Install X11 dependencies (Linux)
         if: needs.change-scope.outputs.docs_only != 'true' && runner.os == 'Linux'
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 
@@ -455,22 +531,19 @@ jobs:
               --no-tests fail
           done
 
-      - name: Check JIT/interpreter glyph parity
+      # Was `kernel_glyph_golden`, four JIT-vs-interpreter goldens. That
+      # oracle shared its definitions with the thing it checked, and went with
+      # the interpreter. Its replacement is the one glyph check that never
+      # did: FreeType, a rasterizer with no code in common with ours, now
+      # compared against the JIT's own pixels through `Glyph::bound`.
+      - name: Check glyph coverage against an external rasterizer
         shell: bash
         run: |
           set -euo pipefail
-          tests=(
-            descender_glyph_bake_matches_interpreter
-            double_counter_glyph_bake_matches_interpreter
-            round_glyph_bake_matches_interpreter
-            simple_glyph_bake_matches_interpreter
-          )
-          for test_name in "${tests[@]}"; do
-            cargo nextest run -p pixelflow-graphics \
-              --test kernel_glyph_golden \
-              -E "test(=$test_name)" \
-              --no-tests fail
-          done
+          cargo nextest run -p pixelflow-graphics --features freetype \
+            --test freetype_oracle \
+            -E "test(=our_ink_is_never_more_than_a_texel_from_freetype_s)" \
+            --no-tests fail
 
       - name: Check scene color, reflection, and antialiasing contracts
         shell: bash
@@ -539,6 +612,14 @@ jobs:
 
       - name: Install X11 dependencies
         run: |
+          # The runner image ships third-party apt sources this project does
+          # not use. A stale index on one of them fails `apt-get update` with
+          # exit 100 and takes the whole job with it before anything builds —
+          # which is what every job on this workflow did on 2026-09-09, on a
+          # Chrome repo hash mismatch. We need Ubuntu's own X11 dev packages
+          # and nothing else, so drop the rest rather than depend on them.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 

@@ -25,7 +25,7 @@ semantics), all pinned to a static-latency-prior cost model, no wall-clock timin
 |---|---|---|---|
 | Oracle headroom | If a perfect Guide replayed only load-bearing applications, how much smaller would saturation be? | `pixelflow-pipeline/src/bin/guide_headroom.rs` | `docs/results/2026-08-30-guide-headroom.md` |
 | Saturation delta economics | Does the Stockfish incrementality argument (refuted for extraction candidates) hold for the Guide's actual scoring object — the growing e-graph? | `pixelflow-pipeline/src/bin/guide_scope_saturation_delta.rs` | `docs/results/2026-08-30-guide-scope-saturation-delta.md` |
-| Oracle-filtered anytime budget curves | Does replaying only oracle-approved rules reach forms unguided saturation never finds, at standardized work fractions? | `pixelflow-search/examples/oracle_filtered_budget_curves.rs` | `docs/results/2026-08-30-oracle-filtered-budget-curves.md` |
+| Oracle-filtered anytime budget curves | Does replaying only oracle-approved rules reach forms unguided saturation never finds, at standardized work fractions? | `pixelflow-search/examples/oracle_filtered_budget_curves.rs` (deleted) | `docs/results/2026-08-30-oracle-filtered-budget-curves.md` |
 
 **Audit note on this round's provenance.** All three artifacts existed on disk from an
 interrupted session (three agents that each hit a session limit mid-write) and were audited,
@@ -285,6 +285,78 @@ No part of this recommendation is a VSA/binding-algebra claim one way or the oth
 locality argument from the measured cost structure. Nothing here requires deleting the existing
 accumulator work — see §6 (out of scope) for why extending it, rather than replacing it, is the
 right sequencing.
+
+### 4.1 Growth is a feature, and it is most of the question
+
+**Direction (JP, 2026-09-09).** State the Guide's question as an economic
+one rather than a ranking one: *is this application going to grow the graph
+and give me nothing, or grow it a little and give me something useful?*
+
+Growth is **computable before firing, cheaply and exactly**, which is what
+makes it a feature rather than a prediction. A rewrite's RHS is a template
+of known size, and the e-graph is hash-consed, so the nodes it would add are
+the RHS nodes that do not already exist. An application whose RHS is
+entirely present adds zero — which is the 90.4% dedup case of §2.2 seen from
+the cost side rather than the identity side, and another reason to build the
+dedup key and the feature as one object.
+
+This costs nothing to add to §4's proposed feature shape (matched
+neighborhood + rule identity + budget state), and it is the term that most
+directly expresses what the budget is for.
+
+**Why it stops being optional.** Every rule in the current set adds one or
+two nodes, so growth barely varies and a policy that ignored it would lose
+little. That changes with
+[2026-09-09-composition-is-linking.md](2026-09-09-composition-is-linking.md),
+which proposes `Ref(k) ⟷ body(k)` — inlining as a rewrite, with the cost
+model choosing between a call and a splice. That rule's growth is *the
+entire referent*, and a rewrite fires eagerly: an ungated inline rule puts
+the inlined form in the e-class whether or not extraction wants it, so the
+graph pays even when the answer is "keep the call."
+
+The magnitude is already measured on the same shape of question. Expanding a
+glyph's reduce before saturation — the same "introduce N copies of a body"
+move — costs 3.8× on `A`, 5.9× on `O`, and **8.7× on `8`** (87,007 →
+758,059 nodes). No rule in the present set has that profile. So
+growth-awareness is not a refinement of the Guide for that rule; it is the
+precondition for the rule being admissible at all, and the linking design
+should be read as blocked on it.
+
+### 4.2 Measured: spending the whole budget is not monotone in extracted cost
+
+Growth is now computed exactly before firing (`EGraph::predicted_growth`,
+asserted equal to the measured delta on every application under growth
+telemetry — 10,819 real applications, zero mismatches). Wiring it into the
+scan-time estimator in place of the flat 0/1/3 guess did what the guess was
+preventing: saturation ran to its cap where it had stopped short
+(`circle_sdf` 1218 → 2000 classes, `redundant` 428 → 500).
+
+And on the shipped-kernel corpus (`egraph_off_on`, 16 kernels that run),
+**that made 4 kernels extract worse** — `mandelbrot_distance` 518 → 556
+(+7.3%), `smooth_min_scene` 134 → 142 (+6.0%), `chrome_packed` and
+`plasma` by a point — against 4 better (`julia_set` 717 → 689, `metaballs`
+155 → 140, `domain_warp_fbm`, `chrome_R`) and 8 unchanged, with 4–16× the
+saturation wall clock on the ones that regressed.
+
+**Decision (JP, 2026-09-09): more saturation is better, and this is the
+extractor's bug.** The first reading of that table — that the guess was
+regularizing by accident and should be kept — is withdrawn. A richer
+equivalence class cannot make the true optimum worse; a superset of forms
+contains everything the subset did. So an extractor that returns a *worse*
+DAG when given *more* choices is not being led astray by the graph, it is
+not monotone in what it is given, and that is a defect in extraction —
+greedy with swap-refinement, not exact — with a concrete reproducer:
+`mandelbrot_distance` 518 → 556 and `smooth_min_scene` 134 → 142 on the
+same kernel with a superset graph.
+
+Therefore the estimator now spends the budget it is given
+(`action_cost = predicted_growth`), the four regressions are filed against
+the extractor rather than absorbed by saturating less, and the exact growth
+term stays available to the Guide as a feature. Two consequences for Phase 3
+below: the per-candidate feature set of §4 gains an exact growth term at no
+cost; and "budget exhausted" must not be read as success in any experiment
+here — extracted cost is the only score, and where it moves the wrong way on
+a richer graph, the extractor is what is being measured.
 
 ## 5. Pre-registered Phase 3 experiment
 

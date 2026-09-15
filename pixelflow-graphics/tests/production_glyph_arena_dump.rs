@@ -65,14 +65,23 @@ fn dump_production_glyph_arenas() {
         );
 
         for ch in ' '..='~' {
-            let Some(kernel) = font.glyph_kernel_scaled(ch, atlas.tile_px() as f32) else {
+            let Some(glyph) = font.glyph_kernel_scaled(ch, atlas.tile_px() as f32) else {
                 missing.push((density, ch));
                 continue;
             };
-            let (arena, root) = kernel.parts();
+            let coverage = glyph.kernel();
+            let (arena, root) = coverage.parts();
+            // `glyph.kernel()`'s winding sum is a `Kernel::sum_over` (S1a): the
+            // raw arena still carries the `Nary(Reduce, ..)` node this
+            // dumper panics on below, same as the JIT would see it before
+            // `Manifold::compile`'s own `legalize` unrolls it. Legalize here
+            // too, so this telemetry dump matches what production actually
+            // compiles rather than an arena shape that never reaches the JIT.
+            let (arena, root) =
+                pixelflow_ir::passes::legalize(arena, root).expect("legalize glyph arena");
             let name = format!("glyph{tile_px}:U+{:04X}", ch as u32);
             let path = dir.join(format!("glyph{tile_px}_U{:04X}.arena", ch as u32));
-            dump_arena(arena, root, &name, &path);
+            dump_arena(&arena, root, &name, &path);
             dumped += 1;
         }
     }
@@ -140,7 +149,10 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
             ExprNode::Ternary(k, a, b, c) => {
                 writeln!(out, "T {k:?} {} {} {}", d(&dense, *a), d(&dense, *b), d(&dense, *c))
             }
-            other @ (ExprNode::Param(_) | ExprNode::Nary(..)) => {
+            ExprNode::Reduce { fold, body } => {
+                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+            }
+            other @ (ExprNode::Param(_) | ExprNode::Nary(..) | ExprNode::Ref(_)) => {
                 panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
             }
         }

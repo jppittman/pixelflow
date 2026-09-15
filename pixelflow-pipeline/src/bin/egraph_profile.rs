@@ -16,39 +16,10 @@
 
 use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::{LatticeShape, OpKind};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-struct CountingAlloc;
-
-static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static DEALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            let now = ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            let live = now.saturating_sub(DEALLOCATED.load(Ordering::Relaxed));
-            PEAK.fetch_max(live, Ordering::Relaxed);
-        }
-        ptr
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
-    }
-}
+use pixelflow_pipeline::alloc_probe::{self, CountingAlloc};
 
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
-
-fn reset_counters() {
-    ALLOCATED.store(0, Ordering::Relaxed);
-    DEALLOCATED.store(0, Ordering::Relaxed);
-    PEAK.store(0, Ordering::Relaxed);
-}
 
 /// Same shape as `bench_jit_compile_cost::build_kernel_arena`: an SDF-style
 /// core plus a repeating 8-op mix (select, sqrt, mul, add, mul_add, max,
@@ -107,7 +78,7 @@ fn main() {
             let salt = 0.25 + (salt_counter as f32) * (1.0 / 65536.0);
             let (arena, root) = build_kernel_arena(size, salt);
 
-            reset_counters();
+            alloc_probe::reset();
             let start = std::time::Instant::now();
             let out = pixelflow_search::runtime::optimize_runtime_arena(
                 &arena,
@@ -118,8 +89,8 @@ fn main() {
             std::hint::black_box(&out);
 
             times.push(elapsed.as_nanos() as f64);
-            bytes_per_call = ALLOCATED.load(Ordering::Relaxed);
-            peak_bytes = PEAK.load(Ordering::Relaxed);
+            bytes_per_call = alloc_probe::allocated_bytes();
+            peak_bytes = alloc_probe::peak_bytes();
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = times[REPS / 2];

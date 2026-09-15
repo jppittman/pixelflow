@@ -170,7 +170,7 @@ pub fn saturate_with_full_budget(
 /// knob; [`saturate_with_full_budget`] is the mechanism both the AOT macro
 /// tier (`pixelflow-compiler`) and the runtime tier
 /// ([`crate::runtime::optimize_runtime_arena`]) drive with it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaturationConfig {
     /// Rewrite-round budget (each round applies every rule once).
     pub max_iterations: usize,
@@ -194,35 +194,122 @@ pub struct SaturationConfig {
     pub safety_ceiling: std::time::Duration,
 }
 
+/// The application budget per e-class of a tier's class cap — 1.9× the
+/// highest applications-per-class ratio ever observed at a tier's own cap
+/// (docs/plans/2026-09-01-production-budget-determinism.md, "Decision: the
+/// application budgets").
+pub const APPLICATIONS_PER_CLASS: u64 = 40;
+
+/// The safety ceiling per application of a tier's budget: a floor
+/// throughput of 1 application/ms, rounded up by half — 14× below the
+/// slowest rate ever measured — so the ceiling is "this budget could not
+/// take this long on any machine we would build on" (the same plan,
+/// "Decision: the wall-clock safety ceiling"; 20,000 / 80,000 / 200,000
+/// applications give the 30 s / 120 s / 300 s it tabulates).
+const SAFETY_CEILING_PER_APPLICATION: std::time::Duration = std::time::Duration::from_micros(1_500);
+
+/// How many e-classes the classical cap grants per e-class the input
+/// **inserts** to — the hash-consed size the e-graph actually holds, which
+/// is what the first round of rewrites multiplies. Calibrated on the
+/// 2026-09-08 class-cap sweep (`docs/results/2026-09-08-class-cap-sweep.md`):
+/// the production rule set's first sweep grows every DejaVu glyph to
+/// between 6 and 7 times its inserted size — at 6 per inserted class the
+/// same 44 of 95 glyphs stop on the cap inside round 1 as at the flat
+/// 5,000, at 7 none do, and 7 and 8 extract identical terms (Σ `dag_cost`
+/// −16.7% against the flat cap on both). 8 rather than the measured
+/// threshold's 7 buys a held-out font one seventh of headroom over the cliff
+/// for a third more compile time on the raised glyphs.
+pub const CLASSICAL_CLASSES_PER_INSERTED_CLASS: usize = 8;
+
+/// The classical cap's floor — the flat cap every classical kernel had
+/// before 2026-09-08, kept for every kernel whose input does not ask for
+/// more (the shaders, the cell grid, the scene kernels).
+pub const CLASSICAL_CLASS_FLOOR: usize = 5_000;
+
+/// The classical cap's ceiling — **pinned at the floor, which switches the
+/// input-sized cap off.**
+///
+/// The rule is calibrated and measured (8 per inserted class, ceiling 50,000:
+/// `docs/results/2026-09-08-class-cap-sweep.md`, −16.7% Σ `dag_cost` on the
+/// 44 DEJaVu glyphs it raises, none dearer) and it is blocked by a rendering
+/// defect it exposes: raising `'8'` off the floor changes which fusion the
+/// extractor picks for its quadratic solver, `disc >= 0` at the waist's
+/// tangency lands on the other side of exact zero, and a half-covered smear
+/// appears along the waist at 13–21 px where FreeType has no ink
+/// (`pixelflow-graphics/tests/freetype_oracle.rs`, the optimized arm — the
+/// `'8'` defect the raw arm's oracle found in 2026-09, back by the route its
+/// own comment predicted). The knife edge is the glyph kernel's
+/// (`quad_tangency_winding.rs`), not the optimizer's, and it has to be fixed
+/// there first. When it is, this constant becomes 50,000 — a 50,000-class
+/// e-graph peaks near 25 MB of live heap on the sweep's glyphs and the
+/// extraction pass's reach sets stay under 2 MB there — and nothing else
+/// changes.
+pub const CLASSICAL_CLASS_CEILING: usize = CLASSICAL_CLASS_FLOOR;
+
+/// What [`CLASSICAL_CLASS_CEILING`] becomes when the `'8'` tangency is fixed:
+/// the ceiling the sweep calibrated the rule under.
+pub const CLASSICAL_CLASS_CEILING_CALIBRATED: usize = 50_000;
+
+// The saturation loop clamps every cap to `HARD_CLASS_LIMIT`; a ceiling above
+// it would be a cap that silently never applies.
+const _: () = assert!(CLASSICAL_CLASS_CEILING_CALIBRATED <= super::graph::HARD_CLASS_LIMIT);
+const _: () = assert!(CLASSICAL_CLASS_FLOOR <= CLASSICAL_CLASS_CEILING);
+const _: () = assert!(CLASSICAL_CLASS_CEILING <= CLASSICAL_CLASS_CEILING_CALIBRATED);
+
 impl SaturationConfig {
+    /// A tier from its two free dimensions: the application budget and the
+    /// safety ceiling are derived, so the plan's ratios hold at every cap
+    /// rather than at three hand-copied points.
+    const fn tier(max_iterations: usize, max_classes: usize) -> Self {
+        let max_applications = max_classes as u64 * APPLICATIONS_PER_CLASS;
+        Self {
+            max_iterations,
+            max_classes,
+            max_applications,
+            safety_ceiling: SAFETY_CEILING_PER_APPLICATION
+                .checked_mul(max_applications as u32)
+                .expect("a safety ceiling fits a Duration"),
+        }
+    }
+
     /// Trivial expressions (≤10 nodes): minimal budget.
     pub fn blitz() -> Self {
-        Self {
-            max_iterations: 20,
-            max_classes: 500,
-            max_applications: 20_000,
-            safety_ceiling: std::time::Duration::from_secs(30),
-        }
+        Self::tier(20, 500)
     }
 
     /// Normal complexity (11-50 nodes): balanced.
     pub fn rapid() -> Self {
-        Self {
-            max_iterations: 50,
-            max_classes: 2_000,
-            max_applications: 80_000,
-            safety_ceiling: std::time::Duration::from_secs(120),
-        }
+        Self::tier(50, 2_000)
     }
 
-    /// Complex expressions (51+ nodes): thorough search.
+    /// Complex expressions (51+ nodes) at the classical **floor**: the flat
+    /// 5,000-class cap. Production sizes classical from the input through
+    /// [`Self::classical_for`]; this is what that resolves to for any input
+    /// of at most 500 inserted classes, and what every offline caller that
+    /// names "the classical budget" without an input gets.
     pub fn classical() -> Self {
-        Self {
-            max_iterations: 100,
-            max_classes: 5_000,
-            max_applications: 200_000,
-            safety_ceiling: std::time::Duration::from_secs(300),
-        }
+        Self::tier(100, CLASSICAL_CLASS_FLOOR)
+    }
+
+    /// Complex expressions, with the class cap sized by what the input
+    /// inserts to: [`CLASSICAL_CLASSES_PER_INSERTED_CLASS`] per inserted
+    /// class, never below [`Self::classical`]'s floor nor above
+    /// [`CLASSICAL_CLASS_CEILING`]. The application budget and the safety
+    /// ceiling scale with it. **Inert while the ceiling is pinned at the
+    /// floor** — see [`CLASSICAL_CLASS_CEILING`] for what blocks it.
+    ///
+    /// Why the inserted class count and not the node count the tier is
+    /// keyed on: a `Kernel` built by composition re-expands its shared
+    /// subtrees, so the arena is 2.3 nodes per class on a glyph and 840 on
+    /// the chrome scene (a 390,815-node tree that hash-conses to 465).
+    /// Sizing by nodes would hand the chrome scene the ceiling, and at the
+    /// ceiling its extraction is 42% dearer (the sweep's chrome rows); by
+    /// inserted classes it keeps the floor it had.
+    pub fn classical_for(inserted_classes: usize) -> Self {
+        let classes = inserted_classes
+            .saturating_mul(CLASSICAL_CLASSES_PER_INSERTED_CLASS)
+            .clamp(CLASSICAL_CLASS_FLOOR, CLASSICAL_CLASS_CEILING);
+        Self::tier(100, classes)
     }
 
     /// The pre-2026-09 fixed budget — 10,000 e-classes and 500 ms, no
@@ -277,35 +364,56 @@ impl SaturationConfig {
     }
 }
 
-/// Pick a [`SaturationConfig`] preset from a rough expression-size measure.
+/// The two sizes production's budget is keyed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputSize {
+    /// A rough node count — the tier key. AST node count for the macro
+    /// tier, reachable-arena-node count for the runtime tier: a proxy, and
+    /// both serve equally well as "how big is this expression".
+    pub nodes: usize,
+    /// E-classes the input inserted to before any rewrite — the hash-consed
+    /// size, which sizes the classical class cap
+    /// ([`SaturationConfig::classical_for`]).
+    pub classes: usize,
+}
+
+/// Pick a [`SaturationConfig`] from the input's sizes.
 ///
 /// | Nodes | Config | Rationale |
 /// |-------|--------|-----------|
 /// | 0-10 | blitz | Trivial expressions need minimal optimization |
 /// | 11-50 | rapid | Normal complexity, balanced approach |
-/// | 51+ | classical | Complex expressions need thorough search |
-///
-/// `node_count` is a proxy, not a precise measure — AST node count for the
-/// macro tier, reachable-arena-node count for the runtime tier both serve
-/// equally well as "how big is this expression".
+/// | 51+ | classical, sized by `input.classes` | Complex expressions need thorough search, and a cap the input itself does not fill |
+pub fn config_for_input(input: InputSize) -> SaturationConfig {
+    tier_for_input(input).1
+}
+
+/// The tier's **floor** preset for a rough node count — classical at its
+/// flat 5,000-class floor. Production goes through [`config_for_input`],
+/// which sizes classical from the inserted class count; this is what an
+/// offline caller that has only a node count gets, and what every tier
+/// resolves to for an input of at most 500 inserted classes.
 pub fn config_for_node_count(node_count: usize) -> SaturationConfig {
-    tier_for_node_count(node_count).1
+    config_for_input(InputSize {
+        nodes: node_count,
+        classes: 0,
+    })
 }
 
 /// The one place the tier thresholds live: a tier's **name** and its
 /// **budget** come out of the same match, so a diagnostic that names a tier
 /// can never disagree with the budget it is describing.
 ///
-/// [`config_for_node_count`] is the budget half. The name half exists for
+/// [`config_for_input`] is the budget half. The name half exists for
 /// [`Optimizer::run`](super::optimizer::Optimizer::run)'s safety-ceiling
 /// panic, which has to say *which* tier's ceiling was exceeded — and which,
-/// spelled as its own `match` on `node_count`, would be a second copy of
+/// spelled as its own `match` on the node count, would be a second copy of
 /// this table, free to drift out of step with it.
-pub(crate) fn tier_for_node_count(node_count: usize) -> (&'static str, SaturationConfig) {
-    match node_count {
+pub(crate) fn tier_for_input(input: InputSize) -> (&'static str, SaturationConfig) {
+    match input.nodes {
         0..=10 => ("blitz", SaturationConfig::blitz()),
         11..=50 => ("rapid", SaturationConfig::rapid()),
-        _ => ("classical", SaturationConfig::classical()),
+        _ => ("classical", SaturationConfig::classical_for(input.classes)),
     }
 }
 

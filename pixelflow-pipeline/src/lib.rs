@@ -11,10 +11,10 @@
 //! extraction-head program whose shape was deleted on 2026-09-01 and whose
 //! denotation (a schedule-cost residual over the table) is kept.
 
+pub mod alloc_probe;
 pub mod collapse_bench;
 pub mod jit_bench;
 pub mod journal;
-pub mod oracle_lowering;
 pub mod poly;
 pub mod schema;
 pub mod shader_bench;

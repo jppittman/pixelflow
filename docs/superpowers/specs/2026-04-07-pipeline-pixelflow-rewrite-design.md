@@ -1,3 +1,16 @@
+> **ARCHIVED (April 2026) — do not execute this plan.** It carries a live
+> "REQUIRED SUB-SKILL … implement this plan task-by-task" directive for an
+> architecture that no longer exists, which is the reason this banner is here
+> rather than in the index alone: an agent that lands on this file and follows
+> it will start building deleted types. Its four-team decomposition (lattice extensions, IR pullbacks, NNUE forward
+> pass, backward + training loop) describes a pipeline that was rewritten and
+> then largely deleted.
+> The programme these four team plans and their spec belong to was superseded;
+> the current direction is
+> [`../../plans/2026-09-06-kernel-with-a-lattice.md`](../../plans/2026-09-06-kernel-with-a-lattice.md),
+> and the learned-model history is
+> [`../../plans/2026-07-07-guided-saturation-redesign.md`](../../plans/2026-07-07-guided-saturation-redesign.md).
+
 # Pipeline → PixelFlow Rewrite: Design Spec
 
 **Date:** 2026-04-07  

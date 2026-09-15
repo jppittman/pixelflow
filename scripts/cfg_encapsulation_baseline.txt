@@ -1,0 +1,219 @@
+# Grandfathered platform-cfg-encapsulation violations -- see
+# check_cfg_encapsulation.py's module docstring. Regenerate with
+# `python3 scripts/check_cfg_encapsulation.py --update-baseline`.
+# Format: <path>\t<cfg line>\t<item line>
+core-term/build.rs	#[cfg(not(target_os = "macos"))]	fn create_macos_app_bundle() {
+core-term/build.rs	#[cfg(target_os = "macos")]	fn create_macos_app_bundle() {
+core-term/build.rs	#[cfg(target_os = "macos")]	fn find_workspace_root(manifest_dir: &std::path::Path) -> std::path::PathBuf {
+core-term/src/io/pty.rs	#[cfg(not(target_os = "macos"))]	use libc::POSIX_SPAWN_SETSID;
+core-term/src/io/pty.rs	#[cfg(target_os = "macos")]	const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
+core-term/src/io/traits.rs	#[cfg(unix)]	impl<T> EventSource for T where T: std::io::Read + std::os::unix::io::AsRawFd + Send {}
+core-term/src/io/traits.rs	#[cfg(unix)]	pub trait EventSource: std::io::Read + std::os::unix::io::AsRawFd + Send {}
+core-term/src/io/waker.rs	#[cfg(target_os = "linux")]	use crate::io::event::EpollFlags as EventFlags;
+core-term/src/io/waker.rs	#[cfg(target_os = "macos")]	use crate::io::event::KqueueFlags as EventFlags;
+core-term/src/main.rs	#[cfg(not(unix))]	let log_file = OpenOptions::new()
+core-term/src/main.rs	#[cfg(not(unix))]	{
+core-term/src/main.rs	#[cfg(unix)]	let log_file = {
+core-term/src/main.rs	#[cfg(unix)]	{
+pixelflow-codegen/examples/jit_timing.rs	#[cfg(not(target_arch = "aarch64"))]	fn main() {
+pixelflow-codegen/examples/jit_timing.rs	#[cfg(target_arch = "aarch64")]	fn build_expr(target_nodes: usize) -> (ExprArena, pixelflow_ir::arena::ExprId) {
+pixelflow-codegen/examples/jit_timing.rs	#[cfg(target_arch = "aarch64")]	fn main() {
+pixelflow-codegen/examples/jit_timing.rs	#[cfg(target_arch = "aarch64")]	use pixelflow_ir::arena::ExprArena;
+pixelflow-codegen/examples/jit_timing.rs	#[cfg(target_arch = "aarch64")]	use pixelflow_ir::kind::OpKind;
+pixelflow-codegen/src/emit/aarch64.rs	#[cfg(target_arch = "aarch64")]	pub fn dump_jit_asm(
+pixelflow-codegen/src/emit/avx2.rs	#[cfg(all(target_feature = "avx2", not(target_feature = "fma")))]	compile_error!(
+pixelflow-codegen/src/emit/executable.rs	#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]	pub type KernelFn =
+pixelflow-codegen/src/emit/executable.rs	#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]	use core::arch::x86_64::__m512;
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	fn jit_add_xy() {
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	fn jit_complex_expr() {
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	fn jit_const_05_raw() {
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	fn jit_return_x() {
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	pub type KernelFn = extern "C" fn(
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	type KernelFn = extern "C" fn(
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	use core::arch::aarch64::float32x4_t;
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	{
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "x86_64")]	fn jit_add_xy_x86() {
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "x86_64")]	fn jit_return_x_x86() {
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "x86_64")]	type KernelFn = extern "C" fn(
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "x86_64")]	{
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "linux")]	linux::test_sync_empty();
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "linux")]	pub type NativeCodePage = linux::LinuxCodePage;
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "linux")]	pub use linux::LinuxCodePage;
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "macos")]	macos::test_sync_empty();
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "macos")]	pub type NativeCodePage = macos::MacOsCodePage;
+pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "macos")]	pub use macos::MacOsCodePage;
+pixelflow-codegen/src/emit/executable.rs	#[cfg(unix)]	pub unsafe fn from_code(code: &[u8]) -> Result<Self, CompileError> {
+pixelflow-codegen/src/emit/executable.rs	#[cfg(unix)]	unsafe {
+pixelflow-codegen/src/emit/executable/linux.rs	#[cfg(not(target_arch = "aarch64"))]	fn sync_instruction_cache(_ptr: *mut u8, _len: usize) {}
+pixelflow-codegen/src/emit/executable/linux.rs	#[cfg(target_arch = "aarch64")]	fn sync_instruction_cache(ptr: *mut u8, len: usize) {
+pixelflow-codegen/src/emit/executable/macos.rs	#[cfg(not(target_arch = "aarch64"))]	fn sync_instruction_cache(_ptr: *mut u8, _len: usize) {}
+pixelflow-codegen/src/emit/executable/macos.rs	#[cfg(target_arch = "aarch64")]	fn sync_instruction_cache(ptr: *mut u8, len: usize) {
+pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "aarch64")]	fn arena_compile_simple() {
+pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "aarch64")]	fn arena_compile_with_constant() {
+pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "aarch64")]	fn arena_compile_with_spills() {
+pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "x86_64")]	fn dwrt_of_gather_refuses_to_compile() {
+pixelflow-codegen/src/lib.rs	#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]	pub const JIT_VECTOR_BYTES: usize = 64;
+pixelflow-codegen/tests/avx512_evex_proof.rs	#[cfg(target_feature = "avx512f")]	fn evex_runtime_16_lanes() {
+pixelflow-codegen/tests/avx512_evex_proof.rs	#[cfg(target_feature = "avx512f")]	use pixelflow_codegen::emit::executable::ExecutableCode;
+pixelflow-codegen/tests/muladd_rounding.rs	#[cfg(not(target_feature = "fma"))]	assert_bits(
+pixelflow-codegen/tests/muladd_rounding.rs	#[cfg(target_feature = "fma")]	assert_bits("fused MulAdd on an FMA target", got, fused(A, B, C));
+pixelflow-codegen/tests/reduction_binder.rs	#[cfg(not(target_feature = "avx2"))]	fn jit_eval(k: &Kernel, x: f32, y: f32) -> f32 {
+pixelflow-codegen/tests/reduction_binder.rs	#[cfg(target_feature = "avx2")]	fn jit_eval(k: &Kernel, x: f32, y: f32) -> f32 {
+pixelflow-compiler/tests/jit_parity.rs	#[cfg(not(target_feature = "avx512f"))]	fn jit_exp() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn kernel_raw_supports_pow_and_log10() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_acos() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_asin() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_atan() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_atan2_matches_reference_at_boundary_and_interior_points() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_atan2_quadrants() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_cos() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_log10() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_pow() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_sin() {
+pixelflow-compiler/tests/kernel_macro.rs	#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set	fn macro_sin_pi_half() {
+pixelflow-core/src/backend/fastmath.rs	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]	_phantom: (),
+pixelflow-core/src/backend/fastmath.rs	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]	{
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "aarch64")]	const FPCR_FZ: u64 = 1 << 24;
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "aarch64")]	old_fpcr: u64,
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "aarch64")]	unsafe fn restore_fpcr(old_fpcr: u64) {
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "aarch64")]	unsafe fn set_fp_fast_mode_arm() -> u64 {
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "aarch64")]	unsafe {
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "aarch64")]	{
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "x86_64")]	const MXCSR_FTZ_DAZ: u32 = (1 << 15) | (1 << 6);
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "x86_64")]	old_mxcsr: u32,
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "x86_64")]	unsafe fn restore_mxcsr(old_mxcsr: u32) {
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "x86_64")]	unsafe fn set_fp_fast_mode_x86() -> u32 {
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "x86_64")]	unsafe {
+pixelflow-core/src/backend/fastmath.rs	#[cfg(target_arch = "x86_64")]	{
+pixelflow-core/src/backend/x86.rs	#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]	impl Debug for F32x8 {
+pixelflow-core/src/backend/x86.rs	#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]	impl F32x8 {
+pixelflow-core/src/backend/x86.rs	#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]	pub(crate) struct F32x8(__m256);
+pixelflow-core/src/backend/x86.rs	#[cfg(not(any(target_feature = "avx2", target_feature = "avx512f")))]	impl Debug for F32x4 {
+pixelflow-core/src/backend/x86.rs	#[cfg(not(any(target_feature = "avx2", target_feature = "avx512f")))]	impl F32x4 {
+pixelflow-core/src/backend/x86.rs	#[cfg(not(any(target_feature = "avx2", target_feature = "avx512f")))]	pub(crate) struct F32x4(__m128);
+pixelflow-core/src/backend/x86.rs	#[cfg(target_arch = "x86_64")]	use core::arch::x86_64::*;
+pixelflow-core/src/backend/x86.rs	#[cfg(target_feature = "avx512f")]	impl Debug for F32x16 {
+pixelflow-core/src/backend/x86.rs	#[cfg(target_feature = "avx512f")]	impl F32x16 {
+pixelflow-core/src/backend/x86.rs	#[cfg(target_feature = "avx512f")]	pub(crate) struct F32x16(__m512);
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	fn bilinear_arena(
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	impl BilinearSampler {
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	impl DiscreteManifold {
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn bake(&self, kernel: &pixelflow_ir::Kernel) -> DiscreteManifold {
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn collapse(&self, manifold: &manifold::BoundManifold) -> DiscreteManifold {
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn eval_at(kernel: &pixelflow_ir::Kernel, x: f32, y: f32) -> f32 {
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn scanline(kernel: &pixelflow_ir::Kernel, width: usize, y0: usize) -> DiscreteManifold {
+pixelflow-core/src/lattice/mod.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub struct BilinearSampler {
+pixelflow-core/src/lib.rs	#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]	type NativeSimd = backend::x86::F32x16;
+pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::BilinearSampler;
+pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::cell_grid::{
+pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::manifold::{
+pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::union::IndexRange;
+pixelflow-core/src/lib.rs	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]	compile_error!(
+pixelflow-core/src/lib.rs	#[cfg(target_arch = "aarch64")]	type NativeSimd = backend::arm::F32x4;
+pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	fn get_jit_mul_kernel() -> usize {
+pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	unsafe fn invoke_naked_kernel(
+pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	use std::arch::aarch64::float32x4_t;
+pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	use std::sync::atomic::{AtomicUsize, Ordering};
+pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	{
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	fn mmap_source() {
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	impl Drop for MmapInner {
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	impl MmapInner {
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	mmap: MmapInner,
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	struct MmapInner {
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	unsafe impl Send for MmapInner {}
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	unsafe impl Sync for MmapInner {}
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	use std::os::unix::io::AsRawFd;
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(windows)]	impl Drop for MmapInner {
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(windows)]	impl MmapInner {
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(windows)]	mmap: MmapInner,
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(windows)]	struct MmapInner {
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(windows)]	unsafe impl Send for MmapInner {}
+pixelflow-graphics/src/fonts/loader.rs	#[cfg(windows)]	unsafe impl Sync for MmapInner {}
+pixelflow-graphics/src/render/color.rs	#[cfg(not(any(target_os = "macos", target_os = "linux")))]	pub type PlatformPixel = Rgba8;
+pixelflow-graphics/src/render/color.rs	#[cfg(target_os = "linux")]	pub type PlatformPixel = Bgra8;
+pixelflow-graphics/src/render/color.rs	#[cfg(target_os = "macos")]	pub type PlatformPixel = Rgba8;
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	CellGrid(CellGridPackedFrame),
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	Packed(PackedFrame),
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	Self::CellGrid(_) => f.debug_tuple("Scene::CellGrid").finish(),
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	Self::CellGrid(grid) => {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	Self::Packed(_) => f.debug_tuple("Scene::Packed").finish(),
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	Self::Packed(packed) => {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	const STRIPE_ROWS: usize = 8;
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	fn claim<'a>(
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	fn packed_shifts_of<P: Pixel>(what: &str) -> [u32; 4] {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	fn render_bands<P: Pixel + Send>(
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	fn worker_count(num_threads: usize, stripes: usize) -> usize {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	impl From<CellGridPackedFrame> for Scene {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	impl From<PackedFrame> for Scene {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn compile_cell_grid_for<P: Pixel>(
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn compile_packed_for<P: Pixel>(color: &Rgba, frame: [u32; 2]) -> PackedManifold {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn compile_platform_cell_grid(
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn compile_platform_packed(color: &Rgba, frame: [u32; 2]) -> PackedManifold {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn constant_platform_scene(rgba: [f32; 4], frame: [u32; 2]) -> Scene {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub fn constant_scene_for<P: Pixel>(rgba: [f32; 4], frame: [u32; 2]) -> Scene {
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	use crate::render::cell_grid::{CellGridPackedFrame, CellGridPackedManifold};
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	use crate::render::color::PlatformPixel;
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	use crate::render::packed::{PackedFrame, PackedManifold};
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	use crate::scene3d::Rgba;
+pixelflow-graphics/src/render/scene.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	use pixelflow_core::{CellGridShape, FastMathGuard, IndexRange, PlaneRegion};
+pixelflow-pipeline/src/bin/gen_bench_corpus.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn named_kernels_pass_the_numeric_quarantine() {
+pixelflow-pipeline/src/collapse_bench/mod.rs	#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]	{
+pixelflow-pipeline/src/collapse_bench/mod.rs	#[cfg(target_arch = "aarch64")]	{
+pixelflow-pipeline/src/collapse_bench/mod.rs	#[cfg(target_os = "linux")]	{
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn a_large_expression_is_measurable_rather_than_rejected() {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn benchmark_compiled_times_the_given_code_object() {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn latency_chain_step(exec_code: &ExecutableCode, prev: &mut [f32; LANES]) {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn latency_mode_feeds_every_lane_for_x_independent_expressions() {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn measure_exec_code(
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn session_benchmarks_both_modes() {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn var_free_arenas_still_execute_their_ops() {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]	fn measure_exec_code(
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(not(any(target_os = "macos", target_os = "linux")))]	pub(crate) fn nanos_now() -> u64 {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(not(target_os = "macos"))]	eprintln!(
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(target_os = "linux")]	pub(crate) fn nanos_now() -> u64 {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(target_os = "macos")]	const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(target_os = "macos")]	pub(crate) fn nanos_now() -> u64 {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(target_os = "macos")]	struct MachTimebaseInfo {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(target_os = "macos")]	unsafe extern "C" {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(target_os = "macos")]	unsafe extern "C" {
+pixelflow-pipeline/src/jit_bench.rs	#[cfg(target_os = "macos")]	{
+pixelflow-pipeline/src/training/factored.rs	#[cfg(target_arch = "aarch64")]	fn assert_scalar_and_jit_close(src: &str, epsilon: f32) {
+pixelflow-pipeline/src/training/factored.rs	#[cfg(target_arch = "aarch64")]	fn logged_expr_jit_output(src: &str) -> f32 {
+pixelflow-pipeline/src/training/factored.rs	#[cfg(target_arch = "aarch64")]	fn seed_24042_t52_final_jit_matches_scalar() {
+pixelflow-pipeline/src/training/factored.rs	#[cfg(target_arch = "aarch64")]	fn seed_24042_t52_initial_jit_matches_scalar() {
+pixelflow-pipeline/src/training/factored.rs	#[cfg(target_arch = "aarch64")]	fn seed_42_t1_final_jit_matches_scalar() {
+pixelflow-pipeline/src/training/factored.rs	#[cfg(target_arch = "aarch64")]	fn seed_42_t1_initial_jit_matches_scalar() {
+pixelflow-pipeline/src/training/factored.rs	#[cfg(target_arch = "aarch64")]	use crate::jit_bench::benchmark_jit_arena;
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn a_grid_that_bounds_nothing_is_excluded_not_admitted() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn a_passing_expression_verified_something() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn amplification_shows_up_as_conditioning_not_exclusion() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn amplified_estimate_error_is_not_a_miscompile() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn benign_low_gain_multiply_stays_well_conditioned() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn divergent_points_are_metadata_never_exclusions() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn mask_root_passes_without_false_ill_conditioning() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn quarantine_sidecar_records_are_written_per_expression() {
+pixelflow-pipeline/src/training/quarantine.rs	#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]	fn select_with_a_divergent_unchosen_branch_stays_checkable() {
+pixelflow-runtime/src/engine_troupe.rs	#[cfg(not(any(target_os = "macos", target_os = "linux")))]	let mut troupe = Self::new();
+pixelflow-runtime/src/engine_troupe.rs	#[cfg(not(any(target_os = "macos", target_os = "linux")))]	{
+pixelflow-runtime/src/engine_troupe.rs	#[cfg(target_os = "linux")]	let mut troupe = {
+pixelflow-runtime/src/engine_troupe.rs	#[cfg(target_os = "linux")]	{
+pixelflow-runtime/src/engine_troupe.rs	#[cfg(target_os = "macos")]	let mut troupe = {
+pixelflow-runtime/src/engine_troupe.rs	#[cfg(target_os = "macos")]	{
+pixelflow-runtime/src/lib.rs	#[cfg(all(use_web_display, target_arch = "wasm32"))]	pub fn pixelflow_dispatch_event(
+pixelflow-runtime/src/lib.rs	#[cfg(all(use_web_display, target_arch = "wasm32"))]	pub fn pixelflow_init_worker(
+pixelflow-runtime/src/lib.rs	#[cfg(all(use_web_display, target_arch = "wasm32"))]	use wasm_bindgen::prelude::*;
+pixelflow-runtime/src/pixel.rs	#[cfg(not(any(target_os = "macos", target_os = "linux")))]	pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
+pixelflow-runtime/src/pixel.rs	#[cfg(target_os = "linux")]	pub type PlatformPixel = pixelflow_graphics::render::color::Bgra8;
+pixelflow-runtime/src/pixel.rs	#[cfg(target_os = "macos")]	pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
+pixelflow-runtime/src/platform/waker.rs	#[cfg(all(target_os = "macos", not(use_cocoa_display)))]	pub(crate) fn consume_wake_token() {}
+xtask/src/main.rs	#[cfg(not(target_arch = "x86_64"))]	{
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	const ISA_LEVELS: &[IsaLevel] = &[
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	enum LevelResult {
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn host_has_feature(feature: &str) -> bool {
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn host_triple() -> String {
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn run_with_rustflags(
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn scope(&self) -> &'static str {
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn test_args(&self) -> Option<&'static [&'static str]> {
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	struct IsaLevel {
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	{
+xtask/src/main.rs	#[cfg(unix)]	{

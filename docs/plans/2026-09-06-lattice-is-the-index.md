@@ -6,7 +6,9 @@ per-stage PRs, commits, and what the execution found that this plan's draft
 did not anticipate. C1 (§5) did not land as written — it was superseded by
 [2026-09-07-demand-is-a-dag-property.md](2026-09-07-demand-is-a-dag-property.md)
 before merging; see that plan's amendment for what happened to the gate PR
-(#1187) along the way. G1 (§4) remains unscheduled.
+(#1187) along the way. G1 (§4) was executed on 2026-09-08 as its own plan,
+[2026-09-08-loop-blinn-glyph.md](2026-09-08-loop-blinn-glyph.md) (PR #1213);
+§4's own §9.6 below records what that execution found.
 **Author:** JP (direction), Claude (draft)
 **Refines:** [2026-09-06-kernel-with-a-lattice.md](2026-09-06-kernel-with-a-lattice.md),
 which defines a lattice as "extents and origin". This plan removes the
@@ -323,7 +325,10 @@ its 640-px number already shows, with the font's tight `y_min/y_max` mask
 supplied alongside.
 
 **G1 — Loop–Blinn glyph kernel** (§4). Depends on L3 for the domain-side
-triangle extent. Not scheduled.
+triangle extent.
+**Executed as its own plan on 2026-09-08**,
+[2026-09-08-loop-blinn-glyph.md](2026-09-08-loop-blinn-glyph.md) (PR #1213).
+Two of §4's proposals did not survive contact — see §9.6.
 
 ## 7. Constraints
 
@@ -374,8 +379,17 @@ plan is in turn superseded by
 [2026-09-08-one-conditional-three-lowerings.md](2026-09-08-one-conditional-three-lowerings.md),
 which also refines §5 above: guards and index ranges are one thing because
 they are two lowerings of one `Select`, and `Union`/`IndexRange` are what
-the compiler should derive rather than what a caller writes. G1 (§4) was
-not scheduled and nothing here changes that.
+the compiler should derive rather than what a caller writes.
+
+G1 (§4) was not scheduled when this section was written; it was executed on
+2026-09-08 (§9.6). On 2026-09-09 `Union` was **deleted** — which is that
+refinement's conclusion arrived at from the other end. G1 was said to depend
+on L3 because `u² − v` outside its control triangle is wrong rather than
+slow, so the crescent needed a domain-side fence. It does not:
+`{v ≥ u²} ∩ {v ≤ u}` is empty outside `u ∈ [0, 1]`, so two comparisons fence
+it with no domain at all. With correctness no longer resting on it, `Union`
+was a sum whose terms a caller declared disjoint — `place` panics on overlap,
+so it could never say anything `+` could not — and it reached no screen.
 
 The stage-by-stage findings below are corrections and additions to what the
 draft above predicted — read them alongside the sections they amend, not as
@@ -513,6 +527,40 @@ the exact and the ±1 cases.
   aarch64-only file broke that no x86 job or the pre-existing (single-crate)
   aarch64 job could see (§10.4). Type-checks only — it does not execute — and
   every later stage (L2, L4) re-ran it and reported it as such.
+
+### 9.6 G1: the extent was the denotation, but the triangulation was not
+
+§4 got its central claim right and two of its proposals wrong, which is
+worth separating because the claim is what made the stage worth doing.
+
+**Right, and load-bearing.** "Outside its control triangle, `u² − v` is not
+slow, it is wrong" — so the bound is the denotation, and L3's union is what
+supplies it. Also right: nothing in the formulation is a function of `Y`
+alone, so §5's row-prologue finding is moot for glyphs, and there is no
+discriminant, so the `'8'` waist defect (§9 of the demand plan, open on
+`main` through five refuted fixes) is not expressible. Both its pins are now
+asserted empty rather than pinned.
+
+**Wrong.** §4 says "the triangulation is the BSP over which each pixel finds
+its one triangle" and "the glyph interior is an ordinary triangulation of
+the control polygon". Neither was built, and §2 of this same plan is the
+reason: the retired `spatial_bsp` put which-glyph-where in tree structure,
+and that is what killed fusion. The interior is a winding constant per cell
+and routing is `index / cell_size` — `CellGrid`'s own shape. A plan that
+argues against structure in §2 should not have reached for a BSP in §4.
+
+**Also wrong, and only found by measuring.** §4 says the antialiasing "is
+`f / ‖∇f‖`, which is the gradient-normalized ramp the font code already
+computes". It is what a GPU shader uses and it is **not sound as a distance
+on the CPU**: it underestimates at high curvature, and an underestimate past
+the ramp is a saturation failure rather than a rounding difference — which
+is also what the cell pruning relies on. It survives only as one half of a
+maximum against a chord-derived lower bound. See §7.2 of the G1 plan.
+
+§4's cost estimate — "a few guarded selects plus eight ops against a
+gather's latency" — is not yet tested: the execution recorded arena node
+counts (33 per straight segment, 86 per curved one) and did not run the
+benchmark comparison. That is open.
 
 ## 10. CI findings from executing this plan
 

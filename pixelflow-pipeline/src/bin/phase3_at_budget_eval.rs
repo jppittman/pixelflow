@@ -426,18 +426,21 @@ const POLY_OPS: &[OpKind] = &[
 ];
 
 /// The op of a non-leaf `ExprNode`, or `None` for a leaf
-/// (`Var`/`Const`/`Param`/`Buffer` — excluded from the stratification rule).
+/// (`Var`/`Const`/`Param`/`Buffer`/`Uniform`/`Ref` — excluded from the
+/// stratification rule).
 fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
     match node {
         ExprNode::Var(_)
         | ExprNode::Const(_)
         | ExprNode::Param(_)
         | ExprNode::Buffer(_)
-        | ExprNode::Uniform(_) => None,
+        | ExprNode::Uniform(_)
+        | ExprNode::Ref(_) => None,
         ExprNode::Unary(op, _)
         | ExprNode::Binary(op, _, _)
         | ExprNode::Ternary(op, _, _, _)
         | ExprNode::Nary(op, _, _) => Some(*op),
+        ExprNode::Reduce { .. } => Some(OpKind::Reduce),
     }
 }
 
@@ -1218,7 +1221,6 @@ fn run_guided(
 fn production_probe(arena: &ExprArena, root: ExprId, costs: &CostModel) -> ProductionRow {
     let node_count = arena.nodes_raw().len();
     let mut optimizer = Optimizer::production().cost(costs.clone());
-    let limits = optimizer.limits_for(node_count);
     let mut egraph = optimizer.egraph();
     let root_class = pixelflow_search::egraph::insert(
         arena,
@@ -1227,6 +1229,10 @@ fn production_probe(arena: &ExprArena, root: ExprId, costs: &CostModel) -> Produ
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
+    let limits = optimizer.limits_for(pixelflow_search::egraph::InputSize {
+        nodes: node_count,
+        classes: egraph.num_classes(),
+    });
     let out = optimizer.run(&mut egraph, root_class, node_count);
     ProductionRow {
         node_count_reachable: node_count,

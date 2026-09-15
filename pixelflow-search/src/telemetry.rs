@@ -45,7 +45,7 @@
 use std::io::Write as _;
 use std::time::Duration;
 
-use crate::egraph::{CostModel, OptimizerStats, SaturationStop};
+use crate::egraph::{CostModel, ExtractionReport, OptimizerStats, SaturationStop};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
 pub use crate::tier::Tier;
@@ -65,9 +65,16 @@ impl Tier {
 pub struct SaturationInvocation<'a> {
     /// Which tier invoked saturation.
     pub tier: Tier,
-    /// Size of the input, as passed to `config_for_node_count` to select the
-    /// budget triple.
+    /// Size of the input, as passed to `config_for_input` to select the
+    /// tier.
     pub node_count: usize,
+    /// E-classes the input inserted to before any rewrite — what sized the
+    /// classical class cap.
+    pub inserted_classes: usize,
+    /// Which objective chose the extracted term, and what the sharing-aware
+    /// pass cost — so a record above any budget can never be read as if it
+    /// were on the production objective.
+    pub extraction: ExtractionReport,
     /// What [`crate::egraph::Optimizer::run`] reported: the deterministic
     /// limits the run was held to, the rounds and applications it used, the
     /// e-class count it stopped at, and — the field this feature exists to
@@ -111,14 +118,18 @@ pub struct SaturationInvocation<'a> {
 pub fn record(inv: SaturationInvocation<'_>) {
     let cost = latency_prior_cost(inv.extracted_arena, inv.extracted_root);
     let line = format!(
-        "{{\"tier\":\"{tier}\",\"node_count\":{node_count},\"max_iterations\":{max_iterations},\
+        "{{\"tier\":\"{tier}\",\"node_count\":{node_count},\"inserted_classes\":{inserted_classes},\
+         \"max_iterations\":{max_iterations},\
          \"max_classes\":{max_classes},\"max_applications\":{max_applications},\
          \"stop_reason\":\"{stop_reason}\",\"iterations\":{iterations},\
          \"classes_at_stop\":{classes_at_stop},\"application_count\":{application_count},\
          \"union_count\":{union_count},\"extracted_latency_prior_cost\":{cost},\
+         \"extraction_objective\":\"{objective}\",\"live_classes\":{live_classes},\
+         \"shared_pass_bytes\":{shared_pass_bytes},\
          \"wall_clock_us\":{wall_clock_us},\"kernel_label\":{kernel_label}}}",
         tier = inv.tier.as_json_str(),
         node_count = inv.node_count,
+        inserted_classes = inv.inserted_classes,
         max_iterations = inv.stats.limits.iterations,
         max_classes = inv.stats.limits.classes,
         max_applications = json_opt_u64(inv.stats.limits.applications),
@@ -128,6 +139,9 @@ pub fn record(inv: SaturationInvocation<'_>) {
         application_count = inv.stats.applications,
         union_count = inv.union_count,
         cost = cost,
+        objective = inv.extraction.objective.as_str(),
+        live_classes = json_opt_usize(inv.extraction.shared_pass.map(|p| p.live_classes)),
+        shared_pass_bytes = json_opt_usize(inv.extraction.shared_pass.map(|p| p.reach_bytes)),
         wall_clock_us = inv.wall_clock.as_micros(),
         kernel_label = json_opt_str(inv.kernel_label),
     );
@@ -141,6 +155,15 @@ fn stop_str(stop: SaturationStop) -> &'static str {
         SaturationStop::IterationCeiling => "iteration_ceiling",
         SaturationStop::Timeout => "timeout",
         SaturationStop::ApplicationBudget => "application_budget",
+    }
+}
+
+/// `null` when no sharing-aware pass ran (an external extractor), rather
+/// than a zero that would read as a measurement.
+fn json_opt_usize(v: Option<usize>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "null".to_string(),
     }
 }
 
@@ -214,6 +237,17 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             | ExprNode::Param(_)
             | ExprNode::Buffer(_)
             | ExprNode::Uniform(_) => None,
+            // Not `None`: a reference's cost is its referent's, and pricing
+            // it at zero would put a silently wrong number in a measurement.
+            // Saturation never sees one — `egraph::insert` declines a `Ref`
+            // — so this arena cannot hold one either.
+            ExprNode::Ref(k) => panic!(
+                "latency_prior_cost: {k:?} — a reference has no cost of its own,                  and expand_refs runs before saturation, so one here means this                  arena never went through the pipeline"
+            ),
+            // A fold survives extraction; the legalizer unrolls it after.
+            // Priced as the node it is, which is what `CostModel` says about
+            // it — see `node_op_cost`'s note on why that is a sentinel.
+            ExprNode::Reduce { .. } => Some(pixelflow_ir::OpKind::Reduce),
         };
         if let Some(op) = op {
             total += costs.cost(op);

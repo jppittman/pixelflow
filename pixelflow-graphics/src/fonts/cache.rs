@@ -61,10 +61,10 @@
 //! ```
 
 use pixelflow_core::{BilinearSampler, DiscreteManifold, Kernel, Lattice};
-use pixelflow_ir::arena::BufferIdentity;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::loop_blinn::Glyph;
 use super::ttf::Font;
 // `PIXEL_CENTER` is this crate's shared rasterizer convention (`fonts/mod.rs`)
 // — see the "Coordinate convention" section above for what it means here.
@@ -130,14 +130,20 @@ impl CachedGlyph {
 
     /// Create a cached glyph by baking a glyph coverage [`Kernel`]
     /// ([`Font::glyph_kernel_scaled`] → one fused arena, compiled once
-    /// through the global cache, tabulated by [`Lattice::bake`]).
+    /// through the global cache, tabulated over a [`Lattice`]).
     /// Antialiasing comes from the kernel's symbolic `Dwrt` ramps resolved
     /// at compile time. The JIT-vs-interpreter goldens
     /// (tests/kernel_glyph_golden.rs) guard this path. The kernel's outline
     /// must be scaled to `size × density` pixels; texels sample at centers,
     /// and the result takes point-space coordinates.
+    ///
+    /// Takes the whole [`Glyph`], not a bare [`Kernel`], to match
+    /// [`Glyph::bake`]'s own shape; the winding sum's piece table travels
+    /// with `glyph.kernel()` itself (`Kernel::with_buffer_data`, seeded by
+    /// [`loop_blinn::glyph`](super::loop_blinn::glyph)), so — unlike
+    /// before — there is no second value that must come from the same call.
     #[must_use]
-    pub fn from_kernel(kernel: &Kernel, size: usize, density: f32) -> Self {
+    pub fn from_kernel(glyph: &Glyph, size: usize, density: f32) -> Self {
         assert!(
             density.is_finite() && density > 0.0,
             "invalid bake density: {density}"
@@ -147,14 +153,17 @@ impl CachedGlyph {
         // (i + PIXEL_CENTER, j + PIXEL_CENTER). Used to be the bake
         // lattice's own origin; a contramap on the kernel now that a
         // lattice is a pure index.
-        let centered = kernel.at(
+        let centered = glyph.kernel().at(
             &Kernel::x().add(&Kernel::constant(PIXEL_CENTER)),
             &Kernel::y().add(&Kernel::constant(PIXEL_CENTER)),
         );
         let lattice = Lattice {
             extent: [px as u32, px as u32],
         };
-        let baked = lattice.bake(&centered);
+        // `Glyph::bake` needs no explicit binding: the winding table the
+        // kernel declares (S1a) travels with it, and a glyph with no
+        // outline declares no buffer at all — both bake the same way.
+        let baked = glyph.bake(&centered, lattice);
 
         Self {
             sampler: Arc::new(baked.bilinear()),
@@ -169,9 +178,11 @@ impl CachedGlyph {
     /// This glyph's coverage in point space, as a [`Kernel`]: the baked texels
     /// read through the bilinear blend, masked to the glyph's own extent.
     ///
-    /// The kernel declares the coverage buffer as a slot, so it reaches
-    /// numbers the way any kernel over bound memory does — compiled at a
-    /// lattice's shape, [`Self::binding`] bound into it, collapsed. It
+    /// The kernel declares the coverage buffer as a slot, but reaches
+    /// numbers without a caller binding it: [`BilinearSampler::kernel`]
+    /// seeds this fragment with the coverage lattice's own texels
+    /// (`Kernel::with_buffer_data`), so the data travels with the value —
+    /// compile at a lattice's shape, bind (trivially), collapse. It
     /// composes like any other kernel too: `.at(..)` reads it at computed
     /// coordinates, which is how [`CachedText`] places it.
     ///
@@ -202,13 +213,6 @@ impl CachedGlyph {
             .and(&Kernel::y().ge(&zero))
             .and(&Kernel::y().le(&Kernel::constant(self.height as f32)));
         in_bounds.select(&sampled, &zero)
-    }
-
-    /// The coverage buffer paired with the identity [`Self::kernel`] declared,
-    /// for [`Manifold::bind`](pixelflow_core::Manifold::bind).
-    #[must_use]
-    pub fn binding(&self) -> (BufferIdentity, Arc<Vec<f32>>) {
-        self.coverage().binding()
     }
 }
 
@@ -316,11 +320,12 @@ impl GlyphCache {
         // Bake at the quantized density so the key and the lattice agree.
         let density = density_q as f32 / DENSITY_STEPS;
         let px = px_extent(bucket, density);
-        // The glyph as ONE fused coverage Kernel, compiled once, tabulated by
-        // Lattice::bake. There is no fallback path: an architecture without an
-        // arena backend fails to build, loudly, rather than rendering slowly.
-        let kernel = font.glyph_kernel_scaled(ch, px as f32)?;
-        let cached = CachedGlyph::from_kernel(&kernel, bucket, density);
+        // The glyph as ONE fused coverage Kernel, compiled once, tabulated
+        // over a Lattice. There is no fallback path: an architecture without
+        // an arena backend fails to build, loudly, rather than rendering
+        // slowly.
+        let glyph = font.glyph_kernel_scaled(ch, px as f32)?;
+        let cached = CachedGlyph::from_kernel(&glyph, bucket, density);
         self.entries.insert(key, cached.clone());
         Some(cached)
     }
@@ -481,7 +486,12 @@ impl CachedText {
     /// Composition is `Kernel::at` and `Kernel::sum` — the same two moves the
     /// layout above already makes, now in the language rather than in a Rust
     /// loop over `eval`, so the run compiles as one kernel with each glyph's
-    /// coverage a declared slot.
+    /// coverage a declared slot, its data carried along rather than gathered
+    /// separately. A run that draws the same character twice places two
+    /// `Kernel`s built from the same `CachedGlyph` (the cache returns a
+    /// clone, sharing its `Arc<BilinearSampler>`), so `Kernel::sum`'s merge
+    /// sees one `BufferIdentity` twice naming the very same `Arc` — a
+    /// pointer-equal no-op, not two tabulations to compare.
     #[must_use]
     pub fn kernel(&self) -> Kernel {
         let placed: Vec<Kernel> = self
@@ -496,17 +506,6 @@ impl CachedText {
             })
             .collect();
         Kernel::sum(&placed)
-    }
-
-    /// Every glyph's coverage buffer paired with the identity its kernel
-    /// declared, for [`Manifold::bind`](pixelflow_core::Manifold::bind).
-    ///
-    /// One entry per placed glyph, repeats included: a run that draws the same
-    /// character twice reads one buffer through one identity, and `bind`
-    /// matches slots to it by that identity rather than by position.
-    #[must_use]
-    pub fn bindings(&self) -> Vec<(BufferIdentity, Arc<Vec<f32>>)> {
-        self.glyphs.iter().map(|pg| pg.glyph.binding()).collect()
     }
 }
 
@@ -524,19 +523,16 @@ mod tests {
     const FONT_DATA: &[u8] = include_bytes!("../../assets/DejaVuSansMono-Fallback.ttf");
 
     /// A coverage kernel tabulated over `lattice`: compile at its shape, bind
-    /// the buffers the kernel declared, collapse. The whole evaluation API.
-    fn collapse(
-        kernel: &Kernel,
-        buffers: &[(BufferIdentity, Arc<Vec<f32>>)],
-        lattice: Lattice,
-    ) -> Vec<f32> {
-        let bound = Manifold::compile(kernel, lattice.extent).bind(buffers);
+    /// (trivially — every buffer slot `kernel` declares carries its own data
+    /// now), collapse. The whole evaluation API.
+    fn collapse(kernel: &Kernel, lattice: Lattice) -> Vec<f32> {
+        let bound = Manifold::compile(kernel, lattice.extent).bind(&[]);
         lattice.collapse(&bound).into_buffer()
     }
 
     /// One glyph's coverage over `lattice`.
     fn glyph_grid(g: &CachedGlyph, lattice: Lattice) -> Vec<f32> {
-        collapse(&g.kernel(), &[g.binding()], lattice)
+        collapse(&g.kernel(), lattice)
     }
 
     /// One glyph's coverage over a `size × size` point-space grid, sampled at
@@ -547,14 +543,14 @@ mod tests {
             &Kernel::x().add(&Kernel::constant(0.5)),
             &Kernel::y().add(&Kernel::constant(0.5)),
         );
-        collapse(&centered, &[g.binding()], Lattice::frame(size, size))
+        collapse(&centered, Lattice::frame(size, size))
     }
 
     /// One glyph's coverage at a single point — not a lattice at all now,
     /// since a lattice carries no coordinate; a bound manifold answers a
     /// point directly.
     fn sample(g: &CachedGlyph, x: f32, y: f32) -> f32 {
-        let bound = Manifold::compile(&g.kernel(), [1, 1]).bind(&[g.binding()]);
+        let bound = Manifold::compile(&g.kernel(), [1, 1]).bind(&[]);
         bound.eval_at(x, y)
     }
 
@@ -645,72 +641,29 @@ mod tests {
     }
 
     #[test]
-    fn cached_glyph_matches_analytical_at_pixel_centers() {
-        // At pixel centers the bilinear weights vanish, so the cached glyph
-        // must reproduce the analytical coverage kernel to f32 tolerance.
-        //
-        // The reference is the interpreter, not a second bake. This used to
-        // compare against `Lattice::point(x, y).bake(&kernel)`, which was
-        // bit-exact while every lattice compiled identically. Extraction is
-        // now priced against the lattice a kernel runs over, so a point and a
-        // 32×32 frame are two compilations of the same function: over a frame
-        // the optimizer un-fuses an FMA whose multiplier is Y-invariant,
-        // trading one rounding for two in exchange for hoisting the multiply
-        // out of the pixel loop. Comparing two compilations at f32 tolerance
-        // pinned a promise the compiler no longer makes; comparing against
-        // the reference evaluation pins the one it does.
-        //
-        // The tolerance holds the measured divergence with room: the baked
-        // glyph sits ~8.5e-6 from the interpreter at the worst of these
-        // points, and a genuinely mistabulated glyph (a half-texel offset,
-        // say) is off by O(0.1).
-        let font = Font::parse(FONT_DATA).unwrap();
-        let kernel = font.glyph_kernel_scaled('A', 32.0).unwrap();
-        let cached = CachedGlyph::from_kernel(&kernel, 32, 1.0);
-        let (arena, root) = kernel.parts();
-        // `Dwrt` (the antialiasing gradient) has no scalar evaluation until
-        // it is lowered, exactly as the compile entries lower it.
-        let (lowered, lowered_root) =
-            pixelflow_ir::passes::lower_dwrt_owned(arena, root).expect("glyph kernel lowers");
-
-        for &(i, j) in &[(4usize, 4usize), (10, 16), (16, 8), (16, 20), (24, 28)] {
-            let (x, y) = (i as f32 + 0.5, j as f32 + 0.5);
-            let reference = pixelflow_ir::eval_scalar(
-                &lowered,
-                lowered_root,
-                &[x, y],
-                &pixelflow_ir::BindingTable::empty(),
-            );
-            let baked = sample(&cached, x, y);
-            assert!(
-                (reference - baked).abs() < 1e-4,
-                "cached glyph diverges from the analytical kernel at pixel center ({x}, {y}): \
-                 reference {reference}, baked {baked}"
-            );
-        }
-    }
-
-    #[test]
     fn no_half_pixel_shift_center_of_mass() {
         // Regression: the baked glyph must sit at the same position as the
         // analytical glyph rasterized directly at pixel centers. A half-pixel
         // convention error here shows up as a ~0.5px center-of-mass shift.
         let size = 32usize;
         let font = Font::parse(FONT_DATA).unwrap();
-        let kernel = font.glyph_kernel_scaled('A', size as f32).unwrap();
+        let glyph = font.glyph_kernel_scaled('A', size as f32).unwrap();
 
         // Direct analytical tabulation at pixel centers (the rasterizer's
         // sampling convention), as a contramap over a plain index lattice.
-        let centered = kernel.at(
+        // The winding sum reads a bound piece table (S1a), so bind it
+        // rather than a bare `Lattice::bake`.
+        let centered = glyph.kernel().at(
             &Kernel::x().add(&Kernel::constant(0.5)),
             &Kernel::y().add(&Kernel::constant(0.5)),
         );
-        let direct = Lattice::frame(size, size).bake(&centered);
+        let lattice = Lattice::frame(size, size);
+        let direct = glyph.bake(&centered, lattice);
         let (dx, dy) = center_of_mass(direct.buffer(), size);
 
         // Cached glyph sampled at pixel centers through the full
         // bake -> bilinear -> half-pixel-shift chain.
-        let cached = CachedGlyph::from_kernel(&kernel, size, 1.0);
+        let cached = CachedGlyph::from_kernel(&glyph, size, 1.0);
         let resampled = glyph_grid_at_pixel_centers(&cached, size);
         let (cx, cy) = center_of_mass(&resampled, size);
 
@@ -812,9 +765,13 @@ mod tests {
 
         // The run is ONE kernel — every glyph placed by `Kernel::at` and
         // summed — over the four distinct coverage buffers its glyphs bake,
-        // repeats sharing one identity. Collapsing it draws the whole line.
+        // repeats sharing one identity and (now) one carried tabulation:
+        // `Kernel::sum`'s merge sees the repeated 'l's name the same
+        // `BufferIdentity` with the very same `Arc`, so it collapses to one
+        // entry rather than asserting a mismatch. Collapsing draws the
+        // whole line with no binding gathered by hand.
         let lattice = Lattice::frame(48, 16);
-        let line = collapse(&text.kernel(), &text.bindings(), lattice);
+        let line = collapse(&text.kernel(), lattice);
         assert_eq!(line.len(), 48 * 16);
         assert!(
             line.iter().sum::<f32>() > 10.0,

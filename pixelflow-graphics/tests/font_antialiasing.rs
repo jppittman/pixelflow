@@ -1,53 +1,72 @@
-//! Tests for gradient-normalized crossing-ramp antialiasing in the font path.
+//! Tests for gradient-normalized edge-ramp antialiasing in the font path.
 //!
-//! Antialiasing is intrinsic to the glyph coverage `Kernel`: each crossing's
-//! `DX`/`DY` become symbolic `Dwrt` resolved at bake, so the coverage ramp is
-//! ~1 *screen* pixel wide at any glyph scale (the chain rule runs through
-//! every coordinate warp). There is no separate hard/AA mode — the old
-//! Field-domain "hard step" was a degenerate mode of the retired combinator
-//! pipeline.
+//! Antialiasing is intrinsic to the glyph coverage `Kernel`: each edge
+//! function's `DX`/`DY` become symbolic `Dwrt` resolved at bake, so the
+//! coverage ramp is ~1 *screen* pixel wide at any glyph scale (the chain
+//! rule runs through every coordinate warp). There is no separate hard/AA
+//! mode — the old Field-domain "hard step" was a degenerate mode of the
+//! retired combinator pipeline.
 
 use pixelflow_core::{Kernel, Lattice};
-use pixelflow_graphics::fonts::ttf_curve_analytical::{AnalyticalLine, AnalyticalQuad};
-use pixelflow_graphics::fonts::Font;
+use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, Glyph, Outline, Segment};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
-/// Evaluate a coverage kernel at a single point (the compile cache makes
-/// repeated samples of the same kernel cheap).
-fn sample(k: &Kernel, x: f32, y: f32) -> f32 {
-    Lattice::eval_at(k, x, y)
+/// Evaluate a coverage kernel at a single point, binding `glyph`'s winding
+/// table if it has one (`glyph`'s `Kernel::sum_over` winding sum reads a
+/// bound piece table — S1a of
+/// docs/plans/2026-09-09-glyph-as-a-fold-execution.md). The compile cache
+/// makes repeated samples of the same kernel cheap.
+fn sample(glyph: &Glyph, x: f32, y: f32) -> f32 {
+    glyph.bound(&glyph.kernel(), [1, 1]).eval_at(x, y)
 }
 
-/// Winding coverage for segment kernels: `min(|Σ|, 1)`.
-fn coverage(segments: &[Kernel]) -> Kernel {
-    Kernel::sum(segments).abs().min(&Kernel::constant(1.0))
+/// Bake `kernel` (derived from `glyph` by a coordinate contramap, so it
+/// declares the same winding table) over `lattice`.
+fn bake(lattice: Lattice, kernel: &Kernel, glyph: &Glyph) -> Vec<f32> {
+    glyph.bake(kernel, lattice).into_buffer()
+}
+
+/// Coverage of one closed contour.
+fn coverage(segments: Vec<Segment>) -> Glyph {
+    loop_blinn::glyph(&Outline {
+        contours: vec![Contour::new(segments).expect("test contour must close")],
+    })
 }
 
 /// A square from (100,100) to (500,500) built from line segments.
-///
-/// Horizontal edges contribute nothing to the winding number, so
-/// `from_points` rejects them; the inside test is determined by the two
-/// vertical edges.
-fn square_coverage() -> Kernel {
-    let segs: Vec<Kernel> = [
-        AnalyticalLine::from_points([100.0, 100.0], [500.0, 100.0]),
-        AnalyticalLine::from_points([500.0, 100.0], [500.0, 500.0]),
-        AnalyticalLine::from_points([500.0, 500.0], [100.0, 500.0]),
-        AnalyticalLine::from_points([100.0, 500.0], [100.0, 100.0]),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|l| l.kernel())
-    .collect();
-    coverage(&segs)
+fn square_coverage() -> Glyph {
+    let corners = [
+        [100.0, 100.0],
+        [500.0, 100.0],
+        [500.0, 500.0],
+        [100.0, 500.0],
+    ];
+    coverage(
+        (0..4)
+            .map(|i| Segment::Line {
+                from: corners[i],
+                to: corners[(i + 1) % 4],
+            })
+            .collect(),
+    )
 }
 
 /// A dome: quadratic from (0,0) up to the control point (50,100) and back to
-/// (100,0), closed by the (rejected, horizontal) chord. The curve's
-/// Y-extremum — the tangent point of the horizontal scanline — is at (50, 50).
-fn dome_coverage() -> Kernel {
-    coverage(&[AnalyticalQuad::new([0.0, 0.0], [50.0, 100.0], [100.0, 0.0]).kernel()])
+/// (100,0), closed by the horizontal chord. The curve's Y-extremum is at
+/// (50, 50).
+fn dome_coverage() -> Glyph {
+    coverage(vec![
+        Segment::Quad {
+            from: [0.0, 0.0],
+            control: [50.0, 100.0],
+            to: [100.0, 0.0],
+        },
+        Segment::Line {
+            from: [100.0, 0.0],
+            to: [0.0, 0.0],
+        },
+    ])
 }
 
 // =============================================================================
@@ -100,10 +119,10 @@ fn aa_ramp_across_straight_edge() {
 /// Measure the width (in screen pixels) of the first left-to-right coverage
 /// ramp on the given scanline, by scanning at 1/16px resolution and measuring
 /// the contiguous run of intermediate values around the 0.5 crossing.
-fn first_ramp_width(k: &Kernel, y: f32, x_max: f32) -> f32 {
+fn first_ramp_width(glyph: &Glyph, y: f32, x_max: f32) -> f32 {
     const STEP: f32 = 1.0 / 16.0;
     let n = (x_max / STEP) as usize;
-    let cov: Vec<f32> = (0..n).map(|i| sample(k, i as f32 * STEP, y)).collect();
+    let cov: Vec<f32> = (0..n).map(|i| sample(glyph, i as f32 * STEP, y)).collect();
 
     // First 0.5 crossing.
     let crossing = cov
@@ -160,12 +179,11 @@ fn coverage_saturates_far_from_edges() {
     let glyph = font.glyph_kernel_scaled('H', size).unwrap();
 
     let n = size as usize;
-    let centered = glyph.at(
+    let centered = glyph.kernel().at(
         &Kernel::x().add(&Kernel::constant(0.5)),
         &Kernel::y().add(&Kernel::constant(0.5)),
     );
-    let baked = Lattice::frame(n, n).bake(&centered);
-    let buf = baked.buffer();
+    let buf = bake(Lattice::frame(n, n), &centered, &glyph);
     let cov = |i: usize, j: usize| buf[j * n + i];
 
     let mut saturated_in = 0;
@@ -206,7 +224,8 @@ fn quad_tangent_point_is_finite() {
     let smooth = dome_coverage();
 
     // Dense grid over the dome, including the exact Y-extremum row (y = 50,
-    // where the quadratic discriminant is 0) and the tangent point (50, 50).
+    // where a scanline solver's discriminant would be 0) and the tangent
+    // point (50, 50).
     for j in 0..=120 {
         let y = j as f32 * 0.5;
         for i in 0..=100 {
@@ -233,14 +252,14 @@ fn quad_heavy_glyph_is_finite_everywhere() {
     // Sample at half-pixel steps: warp coordinates by 1/2 and bake on the
     // integer grid — texel (i, j) holds coverage at (i/2, j/2).
     let n = size as usize * 2 + 1;
-    let half = glyph.at(
+    let half = glyph.kernel().at(
         &Kernel::x().mul(&Kernel::constant(0.5)),
         &Kernel::y().mul(&Kernel::constant(0.5)),
     );
-    let baked = Lattice::frame(n, n).bake(&half);
+    let buf = bake(Lattice::frame(n, n), &half, &glyph);
 
     let mut covered = 0;
-    for &c in baked.buffer() {
+    for &c in &buf {
         assert!(c.is_finite(), "'O' coverage not finite: {c}");
         assert!(
             (-1e-3..=1.0 + 1e-3).contains(&c),

@@ -1,5 +1,18 @@
 # Production saturation budgets denominated in rule applications (2026-09-01)
 
+> **Revised 2026-09-08 — the classical class cap is sized by the input, and the raise
+> is pinned off.** The numbers below were calibrated at a flat classical cap of 5,000
+> classes. The class-cap sweep (`docs/results/2026-09-08-class-cap-sweep.md`) showed that
+> cap is smaller than what 44 of the 95 DejaVu glyphs *insert*: their first rewrite
+> round hits it before it completes, so the rules never run on them. The classical cap
+> is now `clamp(8 × inserted_classes, CLASSICAL_CLASS_FLOOR, CLASSICAL_CLASS_CEILING)`
+> with the application budget and safety ceiling scaling with it at this document's own
+> ratios — **and the ceiling is pinned at the floor**, because raising `'8'` off the
+> floor re-fuses its quadratic solver and puts the waist smear the FreeType oracle found
+> back on screen at 13–21 px. See "Revision: the classical cap grows with the inserted
+> input" at the end; everything else here stands, with the flat 5,000 read as the
+> classical **floor**.
+
 **Calibration only. No code in this commit.** This document fixes the constants and
 names; the implementation is a separate change.
 
@@ -315,3 +328,121 @@ J11 was two loops disagreeing about when to stop; the fix holds only as long as
    (b) `PIXELFLOW_SATURATION_CEILING_MS` changes no extracted arena; (c) a run that
    exceeds its ceiling panics rather than truncating; (d) `application_count()` is
    identical with the journal feature on and off.
+
+## Revision: the classical cap grows with the inserted input (2026-09-08)
+
+**Measured:** `docs/results/2026-09-08-class-cap-sweep.{md,csv,json}`, with the
+harness `egraph_off_on run --class-cap / --classes-per-inserted` and `cap-sweep`.
+
+### What was wrong with a flat 5,000
+
+The flat cap was calibrated as memory protection and as "the bound that actually
+binds on real kernels" (above). On the glyph family it binds *before the first round
+completes*: a `Kernel` built by composition inserts to 600–4,000 hash-consed classes
+(`glyph16:U+0038` 3,405; `U+0025` 3,994), and the production rule set's first sweep
+grows every glyph to between **6× and 7×** its inserted size — at 6 classes per
+inserted class the same 44 of 95 glyphs stop on `ClassCap` inside round 1 as at the flat
+5,000, at 7 none do. Below that the cap is not a budget, it is a truncation of the
+input's own rewrite frontier, and the numbers this document calibrated on those 44
+kernels (`ref_apps` at `ClassCap`, 1 round) describe the cap, not the kernels.
+
+### The rule
+
+| dimension | classical, before | **classical, now** | how |
+|---|---:|---:|---|
+| class cap | 5,000 | **`clamp(8 × inserted_classes, 5,000, CLASSICAL_CLASS_CEILING)`**, the ceiling **pinned at 5,000** (calibrated: 50,000) | `SaturationConfig::classical_for(inserted)` via `config_for_input(InputSize { nodes, classes })`; `Optimizer::run` reads `egraph.num_classes()` on entry, which is the inserted count |
+| application budget | 200,000 | **40 × the resolved cap** (200,000 at the floor, 2,000,000 at the ceiling) | `APPLICATIONS_PER_CLASS`, this document's ratio, now derived at every cap rather than copied at three |
+| safety ceiling | 300 s | **1.5 ms × the application budget** (300 s at the floor, 50 min at the ceiling) | `SAFETY_CEILING_PER_APPLICATION`: the 1 application/ms floor throughput above, rounded up by half, which reproduces 30 s / 120 s / 300 s at the three presets |
+| iteration cap | 100 | 100 | unchanged |
+| blitz, rapid | 500 / 2,000 | unchanged | their inputs never approach their caps |
+| tier key | node count | node count (tier), **inserted classes (classical cap)** | see below |
+
+`SaturationConfig::classical()` keeps its name and its constants as the **floor** — what
+every classical kernel of at most 625 inserted classes still gets, and what an offline
+caller with only a node count (`config_for_node_count`) resolves to.
+
+**Why the inserted class count and not the node count.** The tier is keyed on a rough
+node count; the cap cannot be, because composition re-expands shared subtrees: a glyph is
+2.3 legalized nodes per inserted class, the chrome scene is 840 (a 390,815-node tree that
+hash-conses to 465 classes). Sized by nodes at the same ratio, chrome would get the
+ceiling — and at the ceiling its extraction is 42% dearer in `dag_cost` and 39% larger
+(the sweep's chrome rows, `cap100000-*`). Sized by inserted classes it keeps the floor it
+had, byte-identical.
+
+### Calibration
+
+Per-inserted-class ratios 6, 7, 8, 10, 12 (floor 5,000, ceiling 50,000), 95 DejaVu glyphs
+at tile 16, against the flat 5,000:
+
+| ratio | glyphs on `ClassCap` in round 1 | Σ `dag_cost` | Σ bytes | Σ guarded | spills | Σ compile (95 glyphs) | max per glyph | peak heap |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| flat 5,000 | **44** | 392,757 | 852,052 | 74,213 | 1,074 | 6.6 s | 0.27 s | 3.7 MB |
+| 6 | **44** (the same 44) | −10.7% | −1.2% | 51,395 | 69 | 9.7 s | 0.46 s | 11.6 MB |
+| **7** | **0** | **−16.7%** | −0.3% | 51,347 | 21 | 19.7 s | 1.3 s | 14.8 MB |
+| **8 (shipped)** | **0** | **−16.7%** | −0.3% | 51,395 | 20 | 25.5 s | 2.5 s | 16.1 MB |
+| 10 | 0 | −16.7% | −0.8% | 51,395 | 19 | 43.4 s | 4.8 s | 19.7 MB |
+| 12 | 0 | −16.4% | −1.0% | 51,503 | 26 | 47.2 s | 5.7 s | 22.7 MB |
+| flat 50,000 | 0 | −10.8% (14 glyphs worse) | −7.3% | 38,260 | 86 | 1,662 s | 86 s | 23.1 MB |
+
+Compile times are under the harness's counting allocator on a shared host (1-minute load
+5–18); ratios between rows of the same table are the claim, the seconds are a sign.
+
+The threshold is 7 (the smallest ratio at which no DEV glyph stops on the cap in its
+first round, which is the pick rule the sweep was run under); 7 and 8 extract identical
+terms. **8 is shipped**: the transition at 6 → 7 is a cliff — the same 44 glyphs, none
+of them marginal — so a ratio sitting on it leaves a held-out font's outlines one
+seventh from clipping, and the seventh costs 30% more compile time on the raised
+glyphs only.
+
+The application budget never bound on any arm of the sweep, including the flat 100,000
+(chrome reaches 142,134 applications at 85,977 classes; cellgrid 165,997 at 90,816): the
+ratio of applications to classes at stop stays under 2 at every cap, and the 40-per-class
+budget remains the tail's deterministic terminator, not an operating point. The
+safety ceiling never fired.
+
+### Why the ceiling is pinned at the floor
+
+With the ceiling at 50,000 the rule raises `'8'` (3,405 inserted classes) to 27,240, the
+extractor prefers a different fusion of its quadratic solver, and `disc >= 0` at the
+waist's tangency — exact zero at a shared extremum, decided by one rounding of
+`Y·slope + c` against two — lands on the other side: a half-covered smear along the waist
+at 13, 15, 17, 19 and 21 px, 15 texels where FreeType has no ink within a texel
+(`freetype_oracle.rs`, the optimized arm added by this change), 37 texels where the
+optimized arena differs from the raw one by ~0.5 (`kernel_glyph_optimize`). The
+production tiles (16 and 32 px) are clean (cross-form |Δ| ≤ 6.4e-6). This is the `'8'`
+defect that the raw-arm oracle found and that deleting the second optimizer removed
+(docs/plans/2026-09-08-macro-tier-is-arena-native.md), back by the route the oracle's own
+comment predicted. The knife edge belongs to the glyph kernel (`quad_tangency_winding.rs`)
+and the fix does too; until it lands, `CLASSICAL_CLASS_CEILING = CLASSICAL_CLASS_FLOOR`
+and the rule is inert. The enable is one constant (`CLASSICAL_CLASS_CEILING_CALIBRATED`),
+and the optimized-arm oracle is the gate that says whether it may be flipped.
+
+### What it costs, and what it buys (measured with the ceiling at 50,000)
+
+Against the flat 5,000 on the DEV corpus (deterministic columns; `2026-09-08-class-cap-sweep.md`):
+
+- **glyphs (both tiles — the tile scales a constant, the 190 rows are pairwise
+  identical in every deterministic column):** 44 of 95 raised (to 5,448–31,952), Σ
+  `dag_cost` −16.7%, Σ guarded entries −31%, spill slots 1,074 → 20, Σ bytes −0.3%, no
+  glyph dearer in `dag_cost`, 18 larger in bytes; Σ compile per 95-glyph warm **6.6 s →
+  25.5 s (+290%)** under the counting allocator, all of it saturation on the 44 raised
+  glyphs (the 51 at the floor are byte-identical and cost what they did).
+- **cell grid, psychedelic, the twelve `shader_bench` ports, chrome:** at most 465
+  inserted classes → the floor → byte-identical to before.
+
+The +5% bound this document's successor put on the glyph warm is exceeded by a factor of
+~60. The raise was directed anyway ("the cap is smaller than the input; the rules never
+run"); it is stated at the top of the PR rather than hidden in a ratio — and it is not
+what blocked the raise; the `'8'` waist is.
+
+### The reading the sweep gives the research question
+
+Quality does not improve with budget; it improves with *enough* budget and then gets
+worse. On the 44 raised glyphs, the flat 50,000 (5× to 50× what they need) extracts
+11% cheaper than the floor where 8 per inserted class extracts 18% cheaper — 14 mid-size
+glyphs (`(`, `)`, `D`, `P`, `J`, `f`, `h`, `j`, `l`, `n`, `r`, `t`, `u`, `y`) are 15–20%
+dearer at 50,000 than at 5,000. On chrome every raise past the floor is a loss (+42%
+`dag_cost` at 100,000, and at 100,000 the tree objective wins the two-objective race).
+On the shaders +8%. Extraction cannot rank the larger space; that is the net's job, and
+the budget is not the lever past the input's own frontier — which is exactly where the
+new rule stops.
