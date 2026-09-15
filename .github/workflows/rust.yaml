@@ -27,6 +27,20 @@ jobs:
   # "skipped", which satisfies a required status check, while a workflow that
   # never runs leaves the required checks pending and blocks the merge. The
   # six metadata jobs below run on every CL regardless; they take seconds.
+  #
+  # THE EXCEPTION, and it is not a detail: the sentence above is true of a
+  # scalar job and FALSE of a matrix one. A job skipped by its own `if` never
+  # expands its `strategy`, so it reports ONE check run under the unexpanded
+  # template name -- literally `Test on ${{ matrix.os }}`. The names branch
+  # protection requires, `Test on ubuntu-latest` and `Test on macos-latest`,
+  # are never reported at all, and the CL is blocked forever rather than
+  # merged. Every docs-only CL on this repo hit that and sat: #1233, #1207,
+  # #1215.
+  #
+  # So `test:` below carries NO job-level `if`. It always runs and always
+  # expands, and each of its steps carries the docs_only guard instead. If you
+  # add a step there, it needs the guard -- without it the step runs on a
+  # docs-only CL where the checkout step was skipped.
   change-scope:
     name: Change scope
     runs-on: ubuntu-latest
