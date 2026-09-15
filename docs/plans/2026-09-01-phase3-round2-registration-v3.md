@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L043 / L053 / L056.** The "Production quick-win" appended below — unguided regret 96.58% → 1.12% at B=100, 40.49% → 0.44% at B=200 from the numeric-first reorder — is a **registered budget the production regime does not run at**. Production stops at a median 5,422 rule applications (`docs/results/2026-09-07-corpus-structural-gaps.md`), which is 54× the B=100 the regret was measured at, and 93% of real kernels stop on `ClassCap` rather than the budget. The measurement stands at the budget it was taken at; the *production* reading of it does not, and no reorder has shipped. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order (item 2 re-takes rule order on real kernels in DAG units): `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Phase 3 Round 2 registration v3: the |R| effect and the order effect, separated
 
 **SUPERSEDES** `docs/plans/2026-09-01-phase3-round2-registration-v2.md`'s **H1 READING — not its

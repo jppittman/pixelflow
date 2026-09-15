@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L035.** The registered claim is judged here in tree cost (pre-#1192) at a budget production never runs in; the DAG reading is a smaller DEV win and a loss on every structured family. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Phase 3 at-budget evaluation on DEV: the registered claim holds, and per-rule base rates carry most of it (2026-09-01)
 
 > **This page's numbers predate the 2026-09-02 review fixes and a re-run is required.**

@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L043.** The 86x order headline (96.58 / 1.12) is a synthetic tree-cost number: on real kernels it is ~3% (numeric-first 0.9702 median) and it reverses on the psychedelic shader; re-taken in DAG units as re-validation item 2. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 > **Instrument change (2026-09-02 forward-port).** Two things about how a
 > Phase 3 anytime curve is measured changed with the port, so a re-run does
 > not reproduce the numbers below even if nothing else changed: the

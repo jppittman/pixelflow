@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L041.** This doc's own banner says the name-pooled vectors, quiescence filter and canonicalized ids all move the numbers below, and it was never re-run. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Tightened-labeler re-measurement: does narrowing the over-approximation reorder the rule ranking? (2026-09-01)
 
 > **Predates the 2026-09-02 review fixes; a re-run is required.** The per-rule Spearman

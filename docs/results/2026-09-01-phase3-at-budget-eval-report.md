@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L035.** The "Guide saves 16%+" headline is a tree-cost number; read in DAG units it is a smaller DEV win and a loss on every structured family, and it was never taken on a shipped shader. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Phase 3 at-budget evaluation on DEV (ablation ladder against the registered claim)
 
 > **Instrument change (2026-09-02 forward-port).** Two things about how a

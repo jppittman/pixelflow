@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L088.** The premise that "the cost model does 95% of the work" and the reranker over swap neighbourhoods as the next step are withdrawn - the number is a cross-population Spearman on a synthetic corpus, and B is not a step toward C (`2026-09-06-egraph-at-production-scale.md` section 7); the denotation of schedule cost as table plus residual stands. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # The schedule cost model: denotation first, code when there is something to learn
 
 **Date:** 2026-09-01

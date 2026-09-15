@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L045.** The Claim B delta is a tree-cost difference on a generated corpus; the negative result ("the target was not the bottleneck") is not re-taken. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Guide return-to-go (linear first): the learned credit is not real — R2G ties the strict bit on every set and tier, and its advantage has zero rank correlation with the leave-one-out counterfactual (2026-09-01)
 
 > **Instrument change (2026-09-02 forward-port).** Two things about how a

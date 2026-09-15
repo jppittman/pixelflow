@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L004.** The Apr-2 "kernel! is 4.9% over LLVM" number cited below was taken with the 41.67x-underscaled bench timebase on an unrecorded corpus and is withdrawn; the audit findings L001-L003 stand. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Guided Saturation Redesign
 
 **Date:** 2026-07-07

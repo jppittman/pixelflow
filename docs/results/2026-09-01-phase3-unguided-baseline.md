@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L033.** Every loss percentage below is a tree cost (`ExtractedDAG::total_cost` before #1192) where the kernel pays DAG cost, on a generated corpus whose median kernel has no select, no sharing and 32 nodes; the budget tiers and Y it fixed are withdrawn with it. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Phase 3 unguided anytime baseline: truncation loss lives in the classical band (2026-09-01)
 
 > **Instrument change (2026-09-02 forward-port).** Two things about how a

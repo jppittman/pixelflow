@@ -1,3 +1,21 @@
+> **Superseded (2026-09-08), ledger L092.** §2's framing that hash-consing alone lands the
+> ~4,900 classes "within 90 of the cap" and that "almost the whole budget is spent
+> representing the input" was pre-#1146 telemetry on chrome alone. `docs/results/2026-09-07-corpus-structural-gaps.csv`
+> and the completed off-vs-on measurement (`docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md`)
+> now show scenes and shaders enter the e-graph small (chrome 465, psychedelic 112, mandelbrot
+> 128, julia 110 hash-consed nodes) and the RULES do most of the expanding — 10–40× to the
+> class cap in 2–5 iterations — and most glyphs reach the cap the same way: the 95-glyph
+> population (`glyph16`) hash-conses at a median 1,049 nodes (p10 96, p90 3,014) and needs a
+> median 2 saturation iterations and 4.6× rule expansion (4,707 of 5,000 classes at stop) to
+> get there — 43 glyphs stop after one iteration, 21 after two, 30 after three or more; 89 of
+> 95 stop on the class cap, 6 quiesce first. Only the largest few enter near or above the cap
+> on hash-consing alone — `U+0040` at 5,226 hash-consed nodes and two others (`U+0026`,
+> `U+0038`) above 4,000 — and that is not the population. The rest of §2's chrome measurements
+> (arena nodes, compile time, stop reason, extracted schedule, emitted bytes, runtime) stand;
+> only the input-vs-rules attribution is withdrawn. Verdict and rationale:
+> `docs/results/2026-09-07-claims-ledger.md` (PR #1207, row L092); the corrected benchmark:
+> `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # The e-graph at production scale: the chrome scene as the case to optimize around
 
 **Audience:** the research arm. **Status:** a use case and a set of measured facts,

@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L044.** The return labels minted here are differences of tree costs (pre-#1192); the mint is kept as an instrument, its gate is not a result. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # R2G trajectory mint
 
 > **Instrument change (2026-09-02 forward-port).** Two things about how a

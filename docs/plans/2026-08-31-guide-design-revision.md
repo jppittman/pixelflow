@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L087.** Section 5's framing "Y = half the truncation loss" at B = 100 / 200 is withdrawn: the regime is 85x below where production stops on real kernels and the unit is tree cost; re-validation item 5 is the only Guide claim that may be re-taken. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 # Guide design revision: measured economics and a pre-registered Phase 3 experiment
 
 **Date:** 2026-08-31

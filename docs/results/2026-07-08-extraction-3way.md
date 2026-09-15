@@ -1,3 +1,5 @@
+> **Retracted/Superseded (2026-09-07), ledger L007.** Every ns number and ratio in this doc was produced by the 41.67x-underscaled timebase the 2026-08-05 harness audit found (H1-H3 all apply), and is provenance only. Verdict and rationale: `docs/results/2026-09-07-claims-ledger.md` (PR #1207); the corrected benchmark and re-validation order: `docs/plans/2026-09-07-benchmark-correction.md`.
+
 > **Provenance note (2026-08-05):** restored after deletion by commit `dc726864`
 > ("docs: remove stale performance claims"). The absolute nanosecond figures below
 > predate the 41.67x timebase fix (`nanos_now` returned raw `mach_absolute_time()`
