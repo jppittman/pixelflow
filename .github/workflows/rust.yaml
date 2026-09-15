@@ -160,6 +160,32 @@ jobs:
       - name: Check provenance-journal does not reach pixelflow-compiler or core-term
         run: bash scripts/check-provenance-journal-scope.sh
 
+  # docs/results/journal.jsonl is append-only and LFS-tracked, which is a
+  # combination that truncates itself silently: a checkout without git-lfs sees
+  # the pointer text, an edit "appends" to that, and the real journal is
+  # replaced by a 217-byte object. Two PRs in one week did this and were caught
+  # only by a reviewer reading the pointer's `size` field by eye. Deliberately
+  # NOT gated on docs_only -- a docs-only CL is precisely the kind that touches
+  # the journal, so a skip here would skip the only case that matters.
+  lfs-append-only:
+    name: Append-only LFS paths
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # The pointer text IS what this reads; smudging the file would
+          # download an object that only grows, to check a number the pointer
+          # already states.
+          lfs: false
+
+      - name: Check append-only LFS paths did not shrink
+        env:
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/check-lfs-append-only.sh "$BASE_COMMIT" "$HEAD_COMMIT"
+
   dependency-advisories:
     name: Dependency advisories
     needs: change-scope
