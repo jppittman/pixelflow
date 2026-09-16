@@ -48,11 +48,23 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf"
 /// unrolled program (141,530 nodes for `8`, now 2,881) and pays for it in
 /// emitted size, which is the cheap side.
 ///
+/// Raised again 2026-09-16 (`A` 1446 → 2076, `O` 3588 → 4092, `8` unchanged
+/// at 8124) for the same reason under a new name: bucketed trip counts
+/// (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3). Each fold's
+/// trip count — the JIT cache's key, and the unroll count `ExpandReduce`
+/// reads — is now `pieces.next_power_of_two()`, not `pieces`, so `A`'s 11
+/// pieces unroll as 16 and `O`'s 28 as 32; `8`'s piece count in this font
+/// is already a power of two, so it pays nothing and its ceiling is
+/// untouched. The padding rows are exact identities of both folds (pinned
+/// by `loop_blinn::tests::a_padding_row_is_an_exact_identity_of_both_folds`
+/// and every coverage golden), so this is evaluated cost, not a coverage
+/// change — measured, ~10% headroom, same ratchet as above.
+///
 /// One line-segment glyph, one all-quadratic, and the one whose waist
 /// tangency is the knife edge the class-cap sweep is blocked on
 /// (`egraph::saturate::CLASSICAL_CLASS_CEILING`) — so if that unblocks and
 /// the cap rises, this notices.
-const CEILINGS: [(char, usize, usize); 3] = [('A', 16, 1600), ('O', 16, 4000), ('8', 32, 9100)];
+const CEILINGS: [(char, usize, usize); 3] = [('A', 16, 2300), ('O', 16, 4500), ('8', 32, 9100)];
 
 /// `(character, piece count)` — 11, 28 and 34 pieces, a 3× spread.
 const SPREAD: [char; 3] = ['A', 'O', '8'];
