@@ -935,11 +935,18 @@ pub enum OperandSource {
     Resident,
     /// Not in a register, and reloaded into the **destination**.
     ///
-    /// Sound because every backend here reads all of an instruction's sources
-    /// before writing its destination, and free because these are the operands
-    /// an encoding needs in the destination anyway: a `Select`'s mask, an
-    /// FMA's addend, and a two-operand binary's left, which `dst op= right`
-    /// consumes from the destination by definition.
+    /// Free because these are the operands an encoding needs in the
+    /// destination anyway: a `Select`'s mask, an FMA's addend, and a
+    /// two-operand binary's left, which `dst op= right` consumes from the
+    /// destination by definition. Sound because the reload lands before the
+    /// op and nothing else the instruction reads is resident in `dst` — the
+    /// allocator's destination contest never leaves another *resident*
+    /// operand in the register it hands out (a displaced one is non-resident
+    /// at this index and reloaded elsewhere). That is the whole guarantee:
+    /// the encoders do **not** read every source before writing `dst`
+    /// (SSE2's `movaps dst, src1` prelude, `setup_mov` ahead of a `Select`
+    /// or FMA on every ISA), so this is the one register-level alias any of
+    /// them tolerates.
     Destination,
     /// Not in a register, and reloaded into the `k`'th register the allocator
     /// reserved for this instruction ([`regalloc::Scratch::reload`]).
@@ -3080,11 +3087,14 @@ pub fn resolve_operands(
             // `dst == right` and `dst != left`.
             //
             // That assignment cannot arise. `dst` is a pool register the
-            // allocator gave this definition, disjoint by construction from
-            // every register this instruction reads: `right` is either a pool
-            // register a live operand holds — which a destination never takes
-            // — an input register, or one of this instruction's own reload
-            // reservations, which the destination is excluded from.
+            // allocator gave this definition, and at this index no *resident*
+            // operand lives in it: the destination may take an operand's
+            // register, but it does so by evicting that operand here, so the
+            // operand is reloaded — into `dst` if it is `left` (the operand the
+            // two-operand form consumes from the destination anyway), into one
+            // of this instruction's own reload reservations if it is `right`,
+            // and those reservations are claimed after the destination and
+            // exclude it.
             //
             // So `left` may alias `dst` and the backends may write the
             // destructive form directly — but if the allocator ever stops
@@ -5274,15 +5284,26 @@ mod tests {
                 spans[kept].from.index < arm.1,
                 "the range begins outside the arm it was confined to"
             );
-            let ends_at = spans
+            let reverted = spans
                 .get(kept + 1)
-                .map(|s| s.from.index)
                 .expect("a confined range is followed by the range it reverts to");
             assert_eq!(
-                ends_at, arm.1,
+                reverted.from.index, arm.1,
                 "a register range that begins inside a guarded arm must end \
                  where the arm does: a read after it would name a register the \
                  skipped path never loaded"
+            );
+            // And it reverts to *memory*, not to another register. A revert
+            // places `(end, Spilled)`; if the kept-reload step then re-keeps
+            // the value at that same index, `Pass::place` overwrites the
+            // same-index range with `(end, Reg)` and the index check above
+            // still passes — while the skipped path reads a register it never
+            // loaded. This is the assertion that would have caught it.
+            assert!(
+                !matches!(reverted.at, regalloc::Where::Reg(_)),
+                "the range after a confined one must be in memory, not a \
+                 register the skipped path never wrote: {:?}",
+                reverted.at
             );
         }
     }
