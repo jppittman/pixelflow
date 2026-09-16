@@ -4131,6 +4131,34 @@ mod tests {
         }
     }
 
+    /// A root the body never reads is never a carry candidate, no matter how
+    /// much budget is free: carrying it would spend a register for the whole
+    /// loop to save reloads that do not exist.
+    #[test]
+    fn a_root_the_body_never_reads_is_never_carried() {
+        let unused = ValueId(1);
+        let alloc = LinearScan.allocate_nest(
+            ScopedSchedule {
+                regions: vec![ScopeRegion {
+                    roots: vec![unused],
+                    schedule: vec![
+                        def(0, ScheduledOp::Var(0)),
+                        def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                    ],
+                }],
+                // The body never names `unused` at all.
+                body: vec![def(100, ScheduledOp::Var(0))],
+                folds: Vec::new(),
+            },
+            &NEST_FILE,
+        );
+        assert_eq!(
+            alloc.carried(unused),
+            None,
+            "budget is available (NEST_FILE), so only the zero-use filter can be refusing this"
+        );
+    }
+
     /// `within` is a subtree, not a suffix of a chain.
     ///
     /// This is the whole of 2b in one assertion. A fold opens in the *middle*
