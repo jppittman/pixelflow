@@ -4372,6 +4372,69 @@ mod tests {
         }
     }
 
+    /// The schedule's last instruction needs no separate result register when
+    /// its own destination already gave it one: the three-way `&&` in the
+    /// reservation's guard all have to hold, and here none of them do.
+    #[test]
+    fn the_last_instructions_own_destination_needs_no_extra_result_register() {
+        let a = alloc(add_xy());
+        let last = a.body().schedule().len() - 1;
+        assert!(
+            matches!(a.body().where_at(ValueId(2), last), Where::Reg(_)),
+            "fixture assumes the root already has a register from its own destination"
+        );
+        assert_eq!(
+            a.body().scratch(last).result,
+            None,
+            "a root that already computed into a register needs no separate result slot"
+        );
+    }
+
+    /// A root already resident *because it was carried* also needs no extra
+    /// result register, even though it is `live_in` — the other half of the
+    /// same three-way `&&`: `live_in` alone is not enough, residency is what
+    /// decides it.
+    #[test]
+    fn a_carried_roots_result_register_is_not_reserved_when_it_is_already_resident() {
+        let root = ValueId(1);
+        let alloc = LinearScan.allocate_nest(
+            ScopedSchedule {
+                regions: vec![ScopeRegion {
+                    roots: vec![root],
+                    schedule: vec![
+                        def(0, ScheduledOp::Var(0)),
+                        def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                    ],
+                }],
+                body: vec![
+                    // A real use, so `root` is ranked for carrying at all.
+                    def(200, ScheduledOp::Unary(OpKind::Neg, root)),
+                    // The enclosing park's own placeholder, last in the
+                    // schedule — the live_in value this final check answers
+                    // for.
+                    def(1, ScheduledOp::Const(0.0)),
+                ],
+                folds: Vec::new(),
+            },
+            &NEST_FILE,
+        );
+        assert!(
+            alloc.carried(root).is_some(),
+            "fixture assumes NEST_FILE's budget carries the only root"
+        );
+        let body = alloc.body();
+        let last = body.schedule().len() - 1;
+        assert!(
+            matches!(body.where_at(root, last), Where::Reg(_)),
+            "a carried root is resident from a register, not a slot"
+        );
+        assert_eq!(
+            body.scratch(last).result,
+            None,
+            "already resident through the carry, so no result register is reserved for it"
+        );
+    }
+
     /// A root's placement is the whole of what used to need a `carries` map
     /// beside it: its register inside the region that computes it, and then —
     /// from the first point of the loops within — either the carry or a slot.
