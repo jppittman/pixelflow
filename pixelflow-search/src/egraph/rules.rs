@@ -178,7 +178,7 @@ impl RuleSet {
     /// [`RuleSet::production`] plus the bounded-fold decompositions.
     ///
     /// The runtime tier's set, and only its: `kernel!` has no syntax that
-    /// builds a fold, so at the macro tier these two rules can never fire.
+    /// builds a fold, so at the macro tier these rules can never fire.
     /// Adding them to [`super::all_rules`] instead would leave them inert
     /// there while perturbing the pinned rule-set grids that
     /// `crate::math::inflate`'s inflation study measures against — a changed

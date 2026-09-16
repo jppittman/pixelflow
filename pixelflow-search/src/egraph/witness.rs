@@ -428,6 +428,15 @@ pub fn induce<I: Ir>(
                     mapped: memo.len(),
                 });
             }
+            // Not a term the graph ever held either: `insert` declines a
+            // `Guard` (G1 — extraction has no price for one yet), so no
+            // e-class was ever built for it.
+            Shape::Guard { on, off, .. } => {
+                return Err(TermMiss {
+                    node: format!("Guard(on={on:?}, off={off:?}) (insert declines a Guard)"),
+                    mapped: memo.len(),
+                });
+            }
         };
         let Some(&(class, idx)) = table.get(&node) else {
             return Err(TermMiss {
@@ -489,6 +498,12 @@ fn post_order_term<I: Ir>(term: &I, root: I::Ref) -> Vec<I::Ref> {
                     // A fold's one child is its body. Missing it would leave
                     // the body unmapped and the fold unmatchable.
                     Shape::Reduce { body, .. } => stack.push(Task::Visit(body)),
+                    // Likewise a `Guard`'s one child is its mask. `induce`
+                    // bails out with a `TermMiss` the moment it projects a
+                    // `Guard` regardless (`insert` never builds one), but
+                    // this walk should still visit what structure there is
+                    // rather than silently skip it.
+                    Shape::Guard { mask, .. } => stack.push(Task::Visit(mask)),
                     _ => {}
                 }
             }

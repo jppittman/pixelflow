@@ -282,7 +282,10 @@ pub(crate) fn demand_of(schedule: &[Def], root: ValueId) -> BTreeMap<ValueId, De
 /// whose index is as demanded as the load.
 fn edges(op: &ScheduledOp, observed: &Demand) -> Vec<(ValueId, Demand)> {
     match op {
-        ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => Vec::new(),
+        ScheduledOp::Var(_)
+        | ScheduledOp::Const(_)
+        | ScheduledOp::Uniform(_)
+        | ScheduledOp::Reduce(..) => Vec::new(),
         ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) | ScheduledOp::Gather(a, _) => {
             alloc::vec![(*a, observed.clone())]
         }

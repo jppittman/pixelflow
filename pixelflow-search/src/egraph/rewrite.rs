@@ -184,6 +184,28 @@ pub enum RewriteAction {
         body: EClassId,
     },
 
+    /// Double a fold's body and halve its trip count:
+    /// `⊕_{[lo,hi) step s} f  ->  ⊕_{[lo,hi) step 2s} (f ⊕ f[binder:=binder+s])`.
+    ///
+    /// `shift` is `f[binder := binder+s]` — `f` with every leaf occurrence of
+    /// the binder rebuilt as `binder+s`, an *expression*, not a literal:
+    /// unlike `PeelFold`'s `head`, the binder must stay live in the result,
+    /// because the doubled body this builds is the new body of a `Reduce`,
+    /// not a value that has left one. It travels as a plan for the same
+    /// reason `PeelFold`'s `head` does: a copy of a term the graph already
+    /// holds, which may contain any op the graph holds.
+    HalveFold {
+        /// `f[binder := binder + s]`, in build order.
+        shift: alloc::vec::Vec<super::fold_rules::HeadNode>,
+        /// Which entry of `shift` — or which existing class — is the shifted
+        /// body's root.
+        shift_root: super::fold_rules::HeadRef,
+        /// The new fold: same bounds, doubled stride.
+        halved: pixelflow_ir::Fold,
+        /// The body being doubled, unshifted.
+        body: EClassId,
+    },
+
     /// Differentiate: expand `Dwrt(inner, var)` one chain-rule step.
     ///
     /// `inner` is a representative node of the expression being differentiated;

@@ -22,7 +22,7 @@
 //! than a silently dropped term.
 
 use super::regalloc::ValueId;
-use super::{Binding, InstructionPlan, IsaBackend, KReg, Loc, Reg, Reload};
+use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload};
 use crate::error::CompileError;
 
 /// Emitted traffic within one scope of the collapse nest.
@@ -135,7 +135,9 @@ impl<'a, B: IsaBackend> Counting<'a, B> {
 }
 
 impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
-    type Branch = B::Branch;
+    fn jump(&mut self, asm: &mut super::Assembly, label: super::Label) {
+        self.inner.jump(asm, label);
+    }
 
     fn register_file(&self) -> super::regalloc::RegisterFile {
         self.inner.register_file()
@@ -197,34 +199,13 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.emit_resolve(code, vid, target, locs)
     }
 
-    fn emit_skip_if_all_false(
+    fn branch_if_arm_is_dead(
         &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-        mask_scratch: Option<KReg>,
-    ) -> Self::Branch {
-        self.inner
-            .emit_skip_if_all_false(code, mask_reg, scratch, mask_scratch)
-    }
-
-    fn emit_skip_if_all_true(
-        &mut self,
-        code: &mut Vec<u8>,
-        mask_reg: Reg,
-        scratch: Option<Reg>,
-        mask_scratch: Option<KReg>,
-    ) -> Self::Branch {
-        self.inner
-            .emit_skip_if_all_true(code, mask_reg, scratch, mask_scratch)
-    }
-
-    fn emit_jump(&mut self, code: &mut Vec<u8>) -> Self::Branch {
-        self.inner.emit_jump(code)
-    }
-
-    fn patch_branch(&mut self, code: &mut Vec<u8>, branch: Self::Branch, target: usize) {
-        self.inner.patch_branch(code, branch, target);
+        asm: &mut super::Assembly,
+        test: super::MaskTest,
+        label: super::Label,
+    ) {
+        self.inner.branch_if_arm_is_dead(asm, test, label);
     }
 
     fn body_frame_bytes(&self, frame_size: u32) -> u32 {
@@ -239,12 +220,12 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.frame_free(code, bytes);
     }
 
-    fn scaffold_anchor(&mut self, code: &mut Vec<u8>) {
-        self.inner.scaffold_anchor(code);
+    fn scaffold_anchor(&mut self, asm: &mut super::Assembly) {
+        self.inner.scaffold_anchor(asm);
     }
 
-    fn scaffold_finish(&mut self, code: &mut Vec<u8>) {
-        self.inner.scaffold_finish(code);
+    fn scaffold_finish(&mut self, asm: &mut super::Assembly) {
+        self.inner.scaffold_finish(asm);
     }
 
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
@@ -273,10 +254,11 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
 
     fn branch_if_counter_done(
         &mut self,
-        code: &mut Vec<u8>,
+        asm: &mut super::Assembly,
         counter: super::Counter,
-    ) -> Self::Branch {
-        self.inner.branch_if_counter_done(code, counter)
+        label: super::Label,
+    ) {
+        self.inner.branch_if_counter_done(asm, counter, label);
     }
 
     fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
@@ -289,6 +271,35 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
 
     fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
         self.inner.add_scalar(code, dst, scratch, scalar);
+    }
+
+    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+        self.inner.load_const(code, dst, val);
+    }
+
+    fn alu(
+        &mut self,
+        code: &mut Vec<u8>,
+        op: pixelflow_ir::kind::OpKind,
+        dst: Reg,
+        srcs: [Reg; 2],
+    ) {
+        self.inner.alu(code, op, dst, srcs);
+    }
+
+    // Explicit rather than inherited: the trait's default for `test_ge`
+    // calls `self.alu`, which through this wrapper would call `Counting`'s
+    // own `alu` — never reaching a backend's own `test_ge` override (only
+    // AVX-512 has one). Forwarding the call itself, not its default body, is
+    // what keeps that override reachable through the decorator.
+    fn test_ge(
+        &mut self,
+        code: &mut Vec<u8>,
+        dst: Reg,
+        srcs: [Reg; 2],
+        mask_scratch: Option<super::KReg>,
+    ) {
+        self.inner.test_ge(code, dst, srcs, mask_scratch);
     }
 
     fn emit_ret(&mut self, code: &mut Vec<u8>) {
@@ -305,7 +316,8 @@ mod tests {
     use super::super::regalloc;
     use super::super::storage::Slot;
     use super::super::{
-        Binding, Counter, InstructionPlan, IsaBackend, KReg, Loc, OutStep, Reg, Reload, ResolvedOp,
+        Assembly, Binding, Counter, InstructionPlan, IsaBackend, Label, Loc, MaskTest, OutStep,
+        Reg, Reload, ResolvedOp,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
     use crate::error::CompileError;
@@ -330,7 +342,7 @@ mod tests {
     }
 
     impl IsaBackend for RecordingBackend {
-        type Branch = ();
+        fn jump(&mut self, _asm: &mut Assembly, _label: Label) {}
 
         fn register_file(&self) -> regalloc::RegisterFile {
             unimplemented!("not exercised by the traffic-counting tests")
@@ -369,37 +381,17 @@ mod tests {
             target
         }
 
-        fn emit_skip_if_all_false(
-            &mut self,
-            _code: &mut Vec<u8>,
-            _mask_reg: Reg,
-            _scratch: Option<Reg>,
-            _mask_scratch: Option<KReg>,
-        ) -> Self::Branch {
-        }
-
-        fn emit_skip_if_all_true(
-            &mut self,
-            _code: &mut Vec<u8>,
-            _mask_reg: Reg,
-            _scratch: Option<Reg>,
-            _mask_scratch: Option<KReg>,
-        ) -> Self::Branch {
-        }
-
-        fn emit_jump(&mut self, _code: &mut Vec<u8>) -> Self::Branch {}
-
-        fn patch_branch(&mut self, _code: &mut Vec<u8>, _branch: Self::Branch, _target: usize) {}
+        fn branch_if_arm_is_dead(&mut self, _asm: &mut Assembly, _test: MaskTest, _label: Label) {}
 
         fn frame_alloc(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
 
         fn frame_free(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
 
-        fn scaffold_anchor(&mut self, _code: &mut Vec<u8>) {
+        fn scaffold_anchor(&mut self, _asm: &mut Assembly) {
             self.scaffold_anchor_calls += 1;
         }
 
-        fn scaffold_finish(&mut self, _code: &mut Vec<u8>) {
+        fn scaffold_finish(&mut self, _asm: &mut Assembly) {
             self.scaffold_finish_calls += 1;
         }
 
@@ -413,9 +405,10 @@ mod tests {
 
         fn branch_if_counter_done(
             &mut self,
-            _code: &mut Vec<u8>,
+            _asm: &mut Assembly,
             _counter: Counter,
-        ) -> Self::Branch {
+            _label: Label,
+        ) {
         }
 
         fn store_result(&mut self, _code: &mut Vec<u8>, _src: Reg) {}
@@ -423,6 +416,10 @@ mod tests {
         fn advance_out(&mut self, _code: &mut Vec<u8>, _step: OutStep) {}
 
         fn add_scalar(&mut self, _code: &mut Vec<u8>, _dst: Reg, _scratch: Reg, _scalar: f32) {}
+
+        fn load_const(&mut self, _code: &mut Vec<u8>, _dst: Reg, _val: f32) {}
+
+        fn alu(&mut self, _code: &mut Vec<u8>, _op: OpKind, _dst: Reg, _srcs: [Reg; 2]) {}
 
         fn emit_ret(&mut self, _code: &mut Vec<u8>) {}
     }
@@ -571,11 +568,11 @@ mod tests {
     #[test]
     fn scaffold_anchor_and_finish_forward_to_the_inner_backend() {
         let mut backend = RecordingBackend::new();
-        let mut code = Vec::new();
+        let mut asm = Assembly::default();
         {
             let mut counting = Counting::new(&mut backend);
-            counting.scaffold_anchor(&mut code);
-            counting.scaffold_finish(&mut code);
+            counting.scaffold_anchor(&mut asm);
+            counting.scaffold_finish(&mut asm);
         }
 
         assert_eq!(backend.scaffold_anchor_calls, 1);

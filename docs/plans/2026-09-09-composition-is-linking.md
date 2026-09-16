@@ -274,3 +274,77 @@ fragment, and five measurement consumers that took it straight into
 (a name has no derivative and declares no buffer). That is the right
 division today — `parts()` is the fragment, and the pipeline's first step is
 the link — but it is five copies of one line.
+
+## 8. `Kernel::at` expands, and this plan never said so (JP, 2026-09-12)
+
+§3 says inlining is an e-graph rule. §5.2 says a surviving reference needs a
+calling convention. Both assume a `Ref` *reaches* the IR.
+
+**It usually does not.** `Kernel::at` — the eDSL's composition operator, and
+the only way to read a tabulated kernel — calls `linked()`, which runs
+`expand_refs_owned` whenever the fragment holds a `Ref` at all. That happens
+at **construction**, in the eDSL, before an arena exists for anyone to
+rewrite. Its own doc gives the reason:
+
+> a `Ref` is opaque to substitution — it has no `Var` to rewrite here, only a
+> name — so leaving one in place would sample the referent at the outer
+> coordinates and produce plausible, wrong pixels. Expand first.
+
+The reason is correct; the remedy is one of two available. Expanding makes
+the coordinates agree by rewriting the body. **Naming the composite makes
+them agree by construction**, and keeps the name.
+
+So there are two unconditional expansions in this system, not one:
+
+| | when | denoted |
+|---|---|---|
+| `passes::expand_refs` | every compile entry point | yes — L4 |
+| **`Kernel::at` → `linked()`** | **at construction, in the eDSL** | **no — until now** |
+
+The second is the worse of the two, because it happens before the IR exists.
+No later stage can revisit a choice made by the front end.
+
+### The requirement
+
+> *"`at` needs the same machinery as the rest of the linking stuff. We need
+> references that have the option, but not the requirement, to expand."* — JP
+
+### The shape
+
+`Ref(k).at(cx, cy)` denotes the composite `k ∘ (cx, cy)`. Name it rather than
+build it:
+
+```rust
+Apply { inner: KernelKey, cx: ExprId, cy: ExprId }
+```
+
+One node, two children, one name — the shape `Guard { mask, on, off }` already
+takes. Its key derives structurally from `key(k)` and the canonical forms of
+`cx`/`cy`, so **naming the composite requires no expansion**: content
+addressing composes, which is the same property that makes the graph acyclic.
+
+Then one node has three lowerings, decided at extraction rather than at
+construction:
+
+- **expand** — substitute into the referent. What `at` does today, now a choice.
+- **call** — §5.2's convention, with the coordinates as arguments (L5).
+- **tabulate** — a read of a materialized composite (L6).
+
+The same pattern as `Select`/`Guard` and `Reduce`/loop: equivalent forms in
+the graph, priced by extraction.
+
+### What this reorders
+
+**L6 is not independent, and its row in the backlog reads as though it is.**
+A table is a `Ref`; reading it is `at`; `at` expands. So a tabulated `Ref`
+cannot survive being read, and "a tabulated kernel is a `Ref` with a cached
+tabulation" is not expressible until `at` stops expanding.
+
+Ordering: **L4 → `Apply` → L5 / L6.**
+
+This also narrows the blast radius of "memory leaks into the algebra". The
+eDSL surface is already clean — a table is an opaque `Kernel`, and reading it
+is coordinate substitution; there is no load, no index operator, no table
+type. What leaks is one constructor: `DiscreteManifold::kernel_for` builds a
+fragment holding `ExprNode::Buffer` and `OpKind::Gather`, committing to the
+tabulated lowering at construction, where nothing downstream can revisit it.
