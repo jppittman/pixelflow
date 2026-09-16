@@ -3597,6 +3597,158 @@ mod tests {
         }
     }
 
+    /// A constant that loses its own keep contest never touches a register at
+    /// all: it is rebuilt at each use, so eviction never has to run for it.
+    ///
+    /// Seven fillers fill `TEST_FILE`'s pool exactly, each with a read late
+    /// enough to survive to the constant's own definition (an unread value
+    /// would simply expire, never reaching a contest at all); the eighth
+    /// definition, a constant, forces an eviction, and its own contest is
+    /// decided by `traffic` alone (0 for a constant against 2 for the
+    /// filler), regardless of how the reads are staggered.
+    #[test]
+    fn a_constant_that_loses_its_keep_contest_is_never_given_a_register() {
+        let mut schedule = vec![def(0, ScheduledOp::Var(0))];
+        let fillers: Vec<u32> = (10..17).collect(); // f1..f7, exactly TEST_FILE's pool size.
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        schedule.push(def(17, ScheduledOp::Const(99.0)));
+        let const_def_index = schedule.len() - 1; // index 8: pool is full, so this evicts someone.
+        // Every filler reads once, after the constant's own definition, so
+        // none of them expire before the constant's contest runs.
+        for (i, &f) in fillers.iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            ));
+        }
+        let a = alloc(schedule);
+        assert_eq!(
+            a.body().where_at(ValueId(17), const_def_index),
+            Where::Remat(99.0f32.to_bits()),
+            "the constant should never occupy a register even at its own \
+             definition, let alone evict the filler it forced open"
+        );
+    }
+
+    /// A destination that forces an eviction to be written keeps the register
+    /// past its own instruction only when its own next read beats what the
+    /// occupant it evicted offered — not merely because it forced room open.
+    ///
+    /// Seven fillers fill `TEST_FILE`'s pool exactly; an eighth definition
+    /// forces an eviction, and the evicted occupant (`f7`, read soonest among
+    /// the fillers... — no: farthest, see below) sets the bar the new
+    /// definition has to beat.
+    #[test]
+    fn a_destination_that_forces_an_eviction_but_reads_later_than_the_occupant_is_spilled_next() {
+        let mut schedule = vec![def(0, ScheduledOp::Var(0))];
+        let fillers: Vec<u32> = (10..17).collect(); // f1..f7, exactly TEST_FILE's pool size.
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let new_val = 17;
+        schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        let def_index = schedule.len() - 1; // index 8: pool is full, so this evicts someone.
+        // f1..f7 read once each, staggered — f1 soonest, f7 last of the
+        // fillers (distance 7) — and `new_val`'s own read even later still
+        // (distance 8), so it is used farther out than the occupant (`f7`,
+        // distance 7) that `loser` picks to evict for it.
+        for (i, &f) in fillers.iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            ));
+        }
+        schedule.push(def(200, ScheduledOp::Unary(OpKind::Neg, ValueId(new_val))));
+
+        let a = alloc(schedule);
+        assert_eq!(
+            a.body().where_at(ValueId(new_val), def_index + 1),
+            Where::Spilled,
+            "new_val forced f7's eviction to be written, but its own next \
+             read is even farther out than f7's was, so it does not keep \
+             the register past its own instruction"
+        );
+    }
+
+    /// The mirror image of the above: a destination whose own next read beats
+    /// the occupant's keeps the register, so it is not queued for a demotion
+    /// at all.
+    #[test]
+    fn a_destination_that_reads_sooner_than_the_occupant_keeps_its_register() {
+        let mut schedule = vec![def(0, ScheduledOp::Var(0))];
+        let fillers: Vec<u32> = (10..17).collect(); // f1..f7.
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let new_val = 17;
+        schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        let def_index = schedule.len() - 1; // index 8.
+        // f1..f6 read soon (distance 1..6); f7 read at distance 10, the
+        // farthest among the fillers, so `loser` picks it. `new_val` is read
+        // at distance 2 — nearer than f7's 10 — so it should win the contest
+        // and keep the register `f7` gave up.
+        schedule.push(def(
+            300,
+            ScheduledOp::Unary(OpKind::Neg, ValueId(fillers[0])),
+        ));
+        schedule.push(def(301, ScheduledOp::Unary(OpKind::Neg, ValueId(new_val))));
+        for &f in &fillers[1..6] {
+            schedule.push(def(300 + f, ScheduledOp::Unary(OpKind::Neg, ValueId(f))));
+        }
+        schedule.push(def(
+            999,
+            ScheduledOp::Unary(OpKind::Neg, ValueId(fillers[6])),
+        ));
+
+        let a = alloc(schedule);
+        assert!(
+            matches!(
+                a.body().where_at(ValueId(new_val), def_index + 1),
+                Where::Reg(_)
+            ),
+            "new_val reads sooner than the occupant it evicted, so it should \
+             still be resident one instruction later"
+        );
+    }
+
+    /// A tie between the new definition and the occupant it evicted goes to
+    /// the occupant: `keeps` is a strict `>`, not `>=`.
+    #[test]
+    fn a_tie_with_the_evicted_occupant_does_not_keep_the_new_definition() {
+        let mut schedule = vec![def(0, ScheduledOp::Var(0))];
+        let fillers: Vec<u32> = (10..17).collect(); // f1..f7.
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let new_val = 17;
+        schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        let def_index = schedule.len() - 1; // index 8.
+        // f1..f6 read soon, so f7 (unread so far) is the farthest among the
+        // fillers and is the one `loser` evicts.
+        for (i, &f) in fillers[..6].iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            ));
+        }
+        // One instruction reads both f7 and new_val, so both have the exact
+        // same next-read distance from `def_index` — a genuine tie.
+        schedule.push(def(
+            999,
+            ScheduledOp::Binary(OpKind::Add, ValueId(fillers[6]), ValueId(new_val)),
+        ));
+
+        let a = alloc(schedule);
+        assert_eq!(
+            a.body().where_at(ValueId(new_val), def_index + 1),
+            Where::Spilled,
+            "tied against the occupant it evicted, new_val must not keep the \
+             register — `keeps` requires strictly beating it"
+        );
+    }
+
     /// Belady: with no constants in play, the value used farthest in the
     /// future is the one that goes to memory.
     ///
