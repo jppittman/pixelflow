@@ -185,6 +185,7 @@ roughly 800 lines to 150 — and makes H1's padding free.
 | **C3** | `CachedText::kernel` sums glyph coverages, so overlapping glyphs can exceed 1. Not on any production path — `core-term` renders through `GlyphAtlas`, and `CachedText` has no non-test caller. | — |
 | **C4** | A corpus needs a new acceptance criterion before `gen_bench_corpus` can come back; its quarantine gate compared against the interpreter. | CLAUDE.md, "Cost Model and the Guide" |
 | **C5** | A local CI runner, so a full presubmit does not cost a push. | — |
+| **C6** | ~~Every CI job set `RUSTC_WRAPPER: sccache` against the GHA cache backend, making sccache a hard dependency of `rustc` rather than an accelerator — a transient DNS failure reaching the cache service killed `ISA matrix` at `rustc -vV` with `compile_requests: 0` on a docs-only commit.~~ **Done** — set `SCCACHE_SKIP_CACHE_CHECK: "1"` (skips the server's eager startup probe of the GHA backend — the incident's path) and `SCCACHE_IGNORE_SERVER_IO_ERROR: "1"` (falls back to local compilation when a running server later loses the cache) alongside every job-level `RUSTC_WRAPPER: sccache` in `rust.yaml`, `benchmark_regression.yaml`, and `postsubmit-flake-detection.yaml`. | .github/workflows/rust.yaml |
 
 ## Housekeeping
 
