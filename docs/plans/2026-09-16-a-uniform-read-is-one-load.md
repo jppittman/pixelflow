@@ -120,6 +120,42 @@ should be reading:
 Both are facts the emitter can read off the DAG it is handed. Neither asks
 the front end to say anything new.
 
+### 2a. The analysis is not the gap (JP, 2026-09-16)
+
+> *"Can our normal variance tracking not detect this? It's a normal
+> ref/kernel call. The same machinery should house collapse and folds."*
+
+It does detect it. A table read is `table.at(col, i)`, ordinary composition
+with the coordinates substituted into the tabulated kernel's `Gather`;
+`compute_arena_variance` gives the read the variance of its index, so it
+comes out invariant in X and Y and varying only in the fold binder — the
+same lattice `unroll_reduce` reads to share index-invariant subtrees across
+terms, and the same one `plan_collapse_hoist` is handed. The bit is dropped
+twice, both times in the emitter, after the analysis has already answered:
+
+- `plan_collapse_hoist` holds the variance for every value, then computes
+  `contains_gather` and refuses anything under one — a carve-out from when
+  the comment "winding kernels are gather-free" was true. The analysis says
+  X-invariant; one line says "but not you".
+- `arena_to_schedule` turns the node into `ScheduledOp::Gather(idx, slot)`
+  and every backend emits the per-lane sequence unconditionally. The
+  variance vector is the same one the hoist planner reads; the gather
+  lowering never looks at it.
+
+So §3.2 and §3.3 are not new analysis. They are the emitter consulting a
+fact it is already holding, at the two places it currently discards it.
+
+The scope machinery is likewise already one thing: since 2b a fold is a
+`Scope` in the same nest as the collapse loops, placement is per scope, and
+the partition is by binder set. What that leaves open is not classification
+but *order* — see §6's third question. With the fold innermost, a read that
+varies only with the binder hoists no higher than the fold's own scope head,
+which is inside the batch loop, so the hoist alone buys nothing there and
+the broadcast lowering is what pays. With the fold outermost, the read
+hoists above the whole pixel loop and the per-lane-versus-broadcast question
+stops mattering. That decision is expressible in the scope nest as it
+stands; it is not a gather problem.
+
 ---
 
 ## 3. The three lowerings, and where each lives
@@ -241,7 +277,11 @@ it printed.
 - **Which loop is outer?** With both folds loops, a glyph is `for piece {
   for batch { … } }` or `for batch { for piece { … } }`. The reads are
   invariant across batches and vary across pieces, so the first order makes
-  every read a scope-head load and the second makes it a per-trip broadcast
-  from L1. [glyph-as-a-fold-execution](2026-09-09-glyph-as-a-fold-execution.md)
-  §S2 is the same question from the domain side. Not decided here; 3.2 is
-  correct under either.
+  every read a scope-head load above the whole pixel loop and the second
+  makes it a per-trip broadcast from L1. Today the fold binder is innermost
+  (`partition_by_scope(.., &[4, 0, 1])`), which is the second order.
+  [glyph-as-a-fold-execution](2026-09-09-glyph-as-a-fold-execution.md)
+  §S2 is the same question from the domain side, and per §2a it is a
+  scope-order decision the existing nest can express, not an analysis gap.
+  Not decided here; 3.2 is correct under either, and 3.3's payoff depends
+  on it.
