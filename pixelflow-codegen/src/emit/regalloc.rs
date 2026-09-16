@@ -4213,6 +4213,25 @@ mod tests {
         assert_eq!(alloc.body().opens_at(), None);
     }
 
+    /// `fold_opening_at` asks [`Allocation::opens_at`]'s question from the
+    /// other end, and both halves of its match must hold: the right parent
+    /// at the wrong position finds nothing, just as the wrong parent would.
+    #[test]
+    fn fold_opening_at_matches_the_position_as_well_as_the_parent() {
+        let alloc = nest_with_a_fold();
+        let region0 = alloc.scope(Scope::Region(0));
+        assert_eq!(
+            region0.fold_opening_at(1),
+            Some(Scope::Fold(0)),
+            "the fold does open here"
+        );
+        assert_eq!(
+            region0.fold_opening_at(0),
+            None,
+            "Region(0) is the fold's parent, but the fold opens at 1, not 0"
+        );
+    }
+
     /// A scope encloses itself, so "is this in scope here" needs no special
     /// case for the asker — but `within` still excludes it, because the
     /// question there is what the code *inside* does.
