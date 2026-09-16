@@ -6,14 +6,18 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # sccache env vars (RUSTC_WRAPPER, CARGO_INCREMENTAL, SCCACHE_GHA_ENABLED)
-  # are set per-job below, not here: `dependency-advisories` runs
-  # cargo-deny-action inside its own Docker container, which doesn't have
-  # sccache installed, and `RUSTC_WRAPPER=sccache` set workflow-wide broke
-  # its internal `cargo metadata` (rustc version probe tries to exec a
-  # wrapper that doesn't exist in that container). Job-level scoping keeps
-  # it opt-in to exactly the jobs that install sccache via
-  # mozilla-actions/sccache-action.
+  # sccache env vars (RUSTC_WRAPPER, CARGO_INCREMENTAL, SCCACHE_GHA_ENABLED,
+  # SCCACHE_IGNORE_SERVER_IO_ERROR) are set per-job below, not here:
+  # `dependency-advisories` runs cargo-deny-action inside its own Docker
+  # container, which doesn't have sccache installed, and
+  # `RUSTC_WRAPPER=sccache` set workflow-wide broke its internal `cargo
+  # metadata` (rustc version probe tries to exec a wrapper that doesn't
+  # exist in that container). Job-level scoping keeps it opt-in to exactly
+  # the jobs that install sccache via mozilla-actions/sccache-action.
+  # SCCACHE_IGNORE_SERVER_IO_ERROR=1 makes sccache degrade to no cache
+  # instead of failing the build when it can't reach its cache service —
+  # a transient DNS failure to the GHA cache backend once killed `ISA
+  # matrix` at `rustc -vV`. See docs/BACKLOG.md, "Correctness and CI", C6.
 
 # Cancel superseded runs on the same ref so a hung job doesn't linger.
 concurrency:
@@ -227,6 +231,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -301,6 +308,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -349,6 +359,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -425,6 +438,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
 
     steps:
       - name: Report success for docs-only change
@@ -521,6 +537,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -641,6 +660,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -714,6 +736,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -788,6 +813,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -868,6 +896,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
+      # Degrade to no cache instead of failing the job on a cache-service
+      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
