@@ -2708,6 +2708,135 @@ mod tests {
     use super::*;
     use pixelflow_ir::kind::OpKind;
 
+    // --- bit sets ---
+
+    #[test]
+    fn reg_set_of_contains_exactly_the_given_registers() {
+        let s = RegSet::of(&[Reg(2), Reg(5)]);
+        assert!(s.contains(Reg(2)));
+        assert!(s.contains(Reg(5)));
+        assert!(!s.contains(Reg(3)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn reg_set_range_is_the_contiguous_run_it_names() {
+        let s = RegSet::range(4, 3);
+        assert!(!s.contains(Reg(3)));
+        assert!(s.contains(Reg(4)));
+        assert!(s.contains(Reg(5)));
+        assert!(s.contains(Reg(6)));
+        assert!(!s.contains(Reg(7)));
+        assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn reg_set_union_holds_every_member_of_both_sets_and_nothing_else() {
+        let u = RegSet::of(&[Reg(1)]).union(RegSet::of(&[Reg(2)]));
+        assert!(u.contains(Reg(1)));
+        assert!(u.contains(Reg(2)));
+        assert!(!u.contains(Reg(3)));
+        assert_eq!(u.len(), 2);
+    }
+
+    #[test]
+    fn reg_set_without_removes_only_the_named_members() {
+        let d = RegSet::of(&[Reg(1), Reg(2), Reg(3)]).without(RegSet::of(&[Reg(2)]));
+        assert!(d.contains(Reg(1)));
+        assert!(!d.contains(Reg(2)));
+        assert!(d.contains(Reg(3)));
+    }
+
+    #[test]
+    fn reg_set_contains_is_false_one_past_its_highest_member() {
+        let s = RegSet::of(&[Reg(31)]);
+        assert!(s.contains(Reg(31)));
+        assert!(!s.contains(Reg(30)));
+    }
+
+    #[test]
+    fn reg_set_is_empty_is_true_only_for_the_empty_set() {
+        assert!(RegSet::EMPTY.is_empty());
+        assert!(!RegSet::of(&[Reg(0)]).is_empty());
+    }
+
+    #[test]
+    fn reg_set_take_keeps_only_the_lowest_n_members() {
+        let t = RegSet::of(&[Reg(1), Reg(3), Reg(5)]).take(2);
+        assert!(t.contains(Reg(1)));
+        assert!(t.contains(Reg(3)));
+        assert!(!t.contains(Reg(5)));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn reg_set_take_beyond_its_size_returns_the_whole_set() {
+        let s = RegSet::of(&[Reg(1), Reg(3)]);
+        assert_eq!(s.take(10), s);
+    }
+
+    #[test]
+    fn reg_set_iter_yields_every_member_low_to_high() {
+        let s = RegSet::of(&[Reg(5), Reg(1), Reg(3)]);
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![Reg(1), Reg(3), Reg(5)]);
+    }
+
+    #[test]
+    fn gpr_set_of_contains_exactly_the_given_registers() {
+        let s = GprSet::of(&[Gpr(2), Gpr(5)]);
+        assert!(s.contains(Gpr(2)));
+        assert!(s.contains(Gpr(5)));
+        assert!(!s.contains(Gpr(3)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn gpr_set_contains_is_false_one_past_its_highest_member() {
+        let s = GprSet::of(&[Gpr(31)]);
+        assert!(s.contains(Gpr(31)));
+        assert!(!s.contains(Gpr(30)));
+    }
+
+    #[test]
+    fn gpr_set_is_empty_is_true_only_for_the_empty_set() {
+        assert!(GprSet::EMPTY.is_empty());
+        assert!(!GprSet::of(&[Gpr(0)]).is_empty());
+    }
+
+    #[test]
+    fn gpr_set_iter_yields_every_member_low_to_high() {
+        let s = GprSet::of(&[Gpr(5), Gpr(1)]);
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![Gpr(1), Gpr(5)]);
+    }
+
+    #[test]
+    fn mask_set_of_contains_exactly_the_given_registers() {
+        let s = MaskSet::of(&[KReg(1), KReg(4)]);
+        assert!(s.contains(KReg(1)));
+        assert!(s.contains(KReg(4)));
+        assert!(!s.contains(KReg(2)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn mask_set_contains_is_false_one_past_its_highest_member() {
+        let s = MaskSet::of(&[KReg(7)]);
+        assert!(s.contains(KReg(7)));
+        assert!(!s.contains(KReg(6)));
+    }
+
+    #[test]
+    fn mask_set_is_empty_is_true_only_for_the_empty_set() {
+        assert!(MaskSet::EMPTY.is_empty());
+        assert!(!MaskSet::of(&[KReg(0)]).is_empty());
+    }
+
+    #[test]
+    fn mask_set_iter_yields_every_member_low_to_high() {
+        let s = MaskSet::of(&[KReg(3), KReg(0)]);
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![KReg(0), KReg(3)]);
+    }
+
     /// The smallest pool a register file may declare, so pressure tests need
     /// only a handful of values to reach spilling.
     const TEST_FILE: RegisterFile = RegisterFile {
