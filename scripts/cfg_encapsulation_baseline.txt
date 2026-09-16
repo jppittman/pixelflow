@@ -194,7 +194,7 @@ xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn host_has_feature(feature: &s
 xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn host_triple() -> String {
 xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn run_with_rustflags(
 xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn scope(&self) -> &'static str {
-xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn test_args(&self) -> Option<&'static [&'static str]> {
+xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	fn test_commands(&self) -> Option<&'static [&'static [&'static str]]> {
 xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	struct IsaLevel {
 xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	{
 xtask/src/main.rs	#[cfg(unix)]	{
