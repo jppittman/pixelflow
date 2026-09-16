@@ -166,6 +166,10 @@ pub fn pattern_match_arena(
             // rather than a pattern to match. A fold in the *target* still
             // matches nothing, which is what this arm says.
             ExprNode::Reduce { .. } => return None,
+            // Same reasoning as `Reduce`: no template this harness writes
+            // contains a `Guard` (extraction cannot choose one yet, G3), so
+            // a `Guard` in the target simply matches nothing.
+            ExprNode::Guard { .. } => return None,
         }
     }
 
@@ -239,6 +243,10 @@ pub fn substitute_template_arena(
             ExprNode::Reduce { .. } => panic!(
                 "a fold in a rewrite template — templates are arithmetic, and a \
                  fold binds; its decompositions are rules of their own"
+            ),
+            ExprNode::Guard { mask: _, on, off } => panic!(
+                "Guard(on={on:?}, off={off:?}) in a rewrite template — no rule \
+                 this harness writes rewrites into a Guard yet (G3)"
             ),
             ExprNode::Unary(op, t_a) => {
                 let a = ExprId(remap[t_a.0 as usize]);
@@ -885,6 +893,12 @@ impl BwdGenerator {
                     fold,
                     body: remap[body.0 as usize],
                 }),
+                // Same refusal as `Ref`, and for the same reason: `on`/`off`
+                // name kernels interned in *this* process, which a corpus
+                // does not outlive.
+                Shape::Guard { on, off, .. } => {
+                    panic!("junkify: Guard(on={on:?}, off={off:?}) in a corpus expression")
+                }
                 Shape::Op(op, children) => match children {
                     Children::Zero => panic!("junkify: op with 0 children"),
                     Children::One(a) => self.arena.push_unary(op, remap[a.0 as usize]),

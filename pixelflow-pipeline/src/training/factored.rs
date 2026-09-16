@@ -620,6 +620,10 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "a bounded fold reached arena_to_kernel_code — kernel code has no \
                          syntax for a binder; expand_reduce first"
                     ),
+                    ExprNode::Guard { mask: _, on, off } => panic!(
+                        "Guard(on={on:?}, off={off:?}) reached arena_to_kernel_code — kernel \
+                         code has no syntax for a hard branch yet (G1: never chosen)"
+                    ),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _) => emit_op_kc(*op, &args),

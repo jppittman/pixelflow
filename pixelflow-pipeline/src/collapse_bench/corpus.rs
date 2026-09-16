@@ -283,6 +283,15 @@ pub fn encode(kernel: &CollapseKernel) -> String {
                  a name for a kernel interned in this process only",
                 kernel.name
             ),
+            // Same reasoning as `Ref`: `on`/`off` name kernels in this
+            // process's `KernelStore` too, and nothing produces a `Guard`
+            // for a corpus kernel to hold yet (G1: never chosen).
+            ExprNode::Guard { mask: _, on, off } => panic!(
+                "{}: corpus kernels must be self-contained, but this one holds \
+                 Guard(on={on:?}, off={off:?}) — names for kernels interned in this \
+                 process only",
+                kernel.name
+            ),
         }
         .expect("fmt");
         dense[idx] = next;

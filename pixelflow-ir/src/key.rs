@@ -268,6 +268,17 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
                 key.extend_from_slice(&fold.to_bits().to_le_bytes());
                 push_id(&mut key, &dense, *body);
             }
+            // The mask is a real child, densified like any other; `on` and
+            // `off` are content-addressed names, keyed the same way `Ref`
+            // keys its one — so a `Guard` over the same mask and the same
+            // two arms canonicalizes identically, and a different arm on
+            // either side is a different key.
+            ExprNode::Guard { mask, on, off } => {
+                key.push(11);
+                push_id(&mut key, &dense, *mask);
+                key.extend_from_slice(&on.bits().to_le_bytes());
+                key.extend_from_slice(&off.bits().to_le_bytes());
+            }
         }
         dense[idx] = next;
         next += 1;
@@ -413,5 +424,69 @@ mod tests {
             canonical(&host, ref_a).key,
             canonical(&twin, ref_a_again).key
         );
+    }
+
+    /// A `Guard` over the same mask and the same two arm keys canonicalizes
+    /// identically in two different arenas — the property that lets one
+    /// `Guard` be recognized as the same kernel as another, exactly as two
+    /// `Ref`s to the same key already are.
+    #[test]
+    fn a_guard_over_the_same_mask_and_arms_is_the_same_key() {
+        let on = KernelKey::from_bits(0xAAAA);
+        let off = KernelKey::from_bits(0xBBBB);
+
+        let mut a = ExprArena::new();
+        let (xa, za) = (a.push_var(0), a.push_const(0.0));
+        let mask_a = a.push_binary(OpKind::Lt, xa, za);
+        let guard_a = a.push_guard(mask_a, on, off);
+
+        let mut b = ExprArena::new();
+        let (xb, zb) = (b.push_var(0), b.push_const(0.0));
+        let mask_b = b.push_binary(OpKind::Lt, xb, zb);
+        let guard_b = b.push_guard(mask_b, on, off);
+
+        assert_eq!(canonical(&a, guard_a).key, canonical(&b, guard_b).key);
+        assert_eq!(KernelKey::of(&a, guard_a), KernelKey::of(&b, guard_b));
+    }
+
+    /// A different `on` arm, a different `off` arm, or a different mask each
+    /// change the key on their own — none of the three is redundant with the
+    /// other two.
+    #[test]
+    fn a_guard_key_depends_on_the_mask_and_on_both_arms_independently() {
+        let mask = |a: &mut ExprArena| a.push_var(0);
+        let on = KernelKey::from_bits(1);
+        let off = KernelKey::from_bits(2);
+
+        let mut base_arena = ExprArena::new();
+        let base_mask = mask(&mut base_arena);
+        let base_guard = base_arena.push_guard(base_mask, on, off);
+        let base = KernelKey::of(&base_arena, base_guard);
+
+        let mut diff_on_arena = ExprArena::new();
+        let diff_on_mask = mask(&mut diff_on_arena);
+        let diff_on_guard = diff_on_arena.push_guard(diff_on_mask, KernelKey::from_bits(99), off);
+        let diff_on = KernelKey::of(&diff_on_arena, diff_on_guard);
+        assert_ne!(base, diff_on, "a different `on` arm must change the key");
+
+        let mut diff_off_arena = ExprArena::new();
+        let diff_off_mask = mask(&mut diff_off_arena);
+        let diff_off_guard = diff_off_arena.push_guard(diff_off_mask, on, KernelKey::from_bits(99));
+        let diff_off = KernelKey::of(&diff_off_arena, diff_off_guard);
+        assert_ne!(base, diff_off, "a different `off` arm must change the key");
+
+        let mut diff_mask_arena = ExprArena::new();
+        let diff_mask = diff_mask_arena.push_var(1); // Y instead of X
+        let diff_mask_guard = diff_mask_arena.push_guard(diff_mask, on, off);
+        let diff_mask_key = KernelKey::of(&diff_mask_arena, diff_mask_guard);
+        assert_ne!(base, diff_mask_key, "a different mask must change the key");
+
+        // And swapping the two arms is not the same kernel either — `on` and
+        // `off` name different branches of the same test.
+        let mut swapped_arena = ExprArena::new();
+        let swapped_mask = mask(&mut swapped_arena);
+        let swapped_guard = swapped_arena.push_guard(swapped_mask, off, on);
+        let swapped = KernelKey::of(&swapped_arena, swapped_guard);
+        assert_ne!(base, swapped, "on and off are not interchangeable");
     }
 }
