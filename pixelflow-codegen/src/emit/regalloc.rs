@@ -2737,6 +2737,11 @@ mod tests {
         assert!(u.contains(Reg(2)));
         assert!(!u.contains(Reg(3)));
         assert_eq!(u.len(), 2);
+
+        // A member shared by both operands must survive the union: `^`
+        // would cancel it out where `|` keeps it.
+        let shared = RegSet::of(&[Reg(1), Reg(2)]).union(RegSet::of(&[Reg(2), Reg(3)]));
+        assert_eq!(shared, RegSet::of(&[Reg(1), Reg(2), Reg(3)]));
     }
 
     #[test]
@@ -2752,6 +2757,10 @@ mod tests {
         let s = RegSet::of(&[Reg(31)]);
         assert!(s.contains(Reg(31)));
         assert!(!s.contains(Reg(30)));
+        // Reg(31) is the highest bit a 32-register file can hold; a set
+        // holding it must not treat Reg(32) as a member too (an `<=` bound
+        // check would shift by 32, which is out of range for a `u32`).
+        assert!(!s.contains(Reg(32)));
     }
 
     #[test]
@@ -2795,6 +2804,7 @@ mod tests {
         let s = GprSet::of(&[Gpr(31)]);
         assert!(s.contains(Gpr(31)));
         assert!(!s.contains(Gpr(30)));
+        assert!(!s.contains(Gpr(32)));
     }
 
     #[test]
@@ -2823,6 +2833,7 @@ mod tests {
         let s = MaskSet::of(&[KReg(7)]);
         assert!(s.contains(KReg(7)));
         assert!(!s.contains(KReg(6)));
+        assert!(!s.contains(KReg(8)));
     }
 
     #[test]
