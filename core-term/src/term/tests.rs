@@ -395,14 +395,14 @@ fn mouse_release_ends_selection_activity() {
 
 // --- Copy Action Tests ---
 #[test]
-fn initiate_copy_no_selection() {
+fn initiate_copy_returns_none_when_no_selection_is_active() {
     let mut emu = create_test_emulator(10, 5);
     let action = emu.interpret_input(EmulatorInput::User(UserInputAction::InitiateCopy));
     assert_eq!(action, None, "Should return None if no selection exists.");
 }
 
 #[test]
-fn initiate_copy_with_selection() {
+fn initiate_copy_returns_the_selected_text_as_a_copy_to_clipboard_action() {
     let mut emu = create_test_emulator(10, 2);
     fill_emulator_screen(&mut emu, vec!["Hello".to_string(), "World".to_string()]);
 
@@ -423,7 +423,7 @@ fn initiate_copy_with_selection() {
 }
 
 #[test]
-fn initiate_copy_block_selection() {
+fn initiate_copy_joins_block_selected_rows_with_newlines() {
     let mut emu = create_test_emulator(3, 3);
     fill_emulator_screen(
         &mut emu,
@@ -556,7 +556,7 @@ fn selection_coordinates_adjust_on_scroll() {
 
 // --- Selection with Alternate Screen Test ---
 #[test]
-fn selection_on_alt_screen_then_exit() {
+fn selection_is_cleared_when_returning_from_the_alt_screen_to_the_primary_screen() {
     let mut emu = create_test_emulator(10, 3);
     fill_emulator_screen(
         &mut emu,
@@ -940,7 +940,7 @@ fn ps1_multiline_with_sgr_at_bottom_scrolls() {
 }
 
 #[test]
-fn lf_at_bottom_of_partial_scrolling_region_no_origin_mode() {
+fn lf_scrolls_the_partial_scrolling_region_when_the_cursor_is_at_its_bottom_with_origin_mode_off() {
     let cols = 10;
     let rows = 5;
     let mut emu = create_test_emulator(cols, rows);
