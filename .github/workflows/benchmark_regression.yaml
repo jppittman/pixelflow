@@ -40,8 +40,9 @@ jobs:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
       SCCACHE_GHA_ENABLED: "true"
-      # Degrade to no cache instead of failing the job on a cache-service
-      # error (docs/BACKLOG.md, "Correctness and CI", C6).
+      # A cache-service error must degrade to no cache, not fail the job (docs/BACKLOG.md, "Correctness and CI", C6):
+      # SCCACHE_SKIP_CACHE_CHECK covers the server's eager startup probe of the GHA backend (the `rustc -vV` incident's path); SCCACHE_IGNORE_SERVER_IO_ERROR covers a running server losing the cache mid-job.
+      SCCACHE_SKIP_CACHE_CHECK: "1"
       SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
     steps:
       - uses: actions/checkout@v4
