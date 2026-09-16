@@ -33,11 +33,31 @@ the stage.**
 | [emit should just emit](plans/2026-09-12-emit-should-just-emit.md) | G1 (`Guard` node, unchosen) | **G2** — emitter emits it, allocator reads regions off structure, the analysis deletes | G1 is additive by design: nothing constructs a `Guard`, and `arena_to_schedule` panics on one. |
 | [composition is linking](plans/2026-09-09-composition-is-linking.md) | L1, L2, L3 | **L4** — `Ref(k) ⟷ body(k)` as a growth-gated rule | `expand_refs` still inlines every `Ref` unconditionally, so inline-vs-by-reference is not yet a choice. L5 (a survivor is a call) follows. |
 | [one conditional, three lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) | D1 (`mask_support`) | D2 — emit the split | D1 derives the range and checks it; nothing is lowered. |
-| [glyph as a fold execution](plans/2026-09-09-glyph-as-a-fold-execution.md) | S0, S1, S1b | S3 — one program per font, **reframed**: bucket trip counts, 95 → 6 programs | S2's `cells` is on no production path. S3-as-written (one global program) is a worse trade than bucketing. |
+| [glyph as a fold execution](plans/2026-09-09-glyph-as-a-fold-execution.md) | S0, S1, S1b, **S3a** — the box is an argument: 95 glyphs → 36 programs, cold warm −48% | **S3b** — bucket trip counts to powers of two, 36 → 6 | S2's `cells` is on no production path. S3-as-written (one global program) is a worse trade than bucketing. S3a needed the allocator's destination contest reordered first (below). |
 
 Measured, at `9643f3b`, tile 16, 95 glyphs: optimize ~1,896 ms, emit ~3,704 ms
 (down 76% from the guard fixes), and **21.1 MB of emitted code, mean 227
 KB/glyph**. The code-size number is what 2c exists to collapse.
+
+**After S3a** (the glyph's box as four uniforms instead of four constants),
+measured where a user waits — one cold `GlyphAtlas::warm` per density through
+the JIT cache (`glyph_compile_report`, warm mode): tile 16 **3,903 → 1,852
+ms**, tile 32 **4,597 → 2,582 ms**, both **8.5 → 4.4 s** (−48%). 95 glyphs
+now compile to **36 distinct programs** (39 at tile 32) — exactly the count of
+distinct trip-count multisets, so the box was the last differentiator; the
+next one is the trip count, and bucketing it is 36 → 6. Per-glyph cost is
+unchanged; the whole win is the cache serving 59 of 95 compiles.
+
+Landing it needed the register allocator to allocate with **zero special
+cases for operands**: the destination contest excluded every register the
+instruction reads, its exhaustion path was `unreachable!`, and two more
+carried values reached it. The contest now runs *before* the reload and guard
+reservations that read residency, draws from every open register, and prices
+an operand's register (`ReadHere { No, FromDst, NeedsRegister }`) instead of
+fencing it. That exposed the fold-pool floor bug (a fold scope's pool is the
+body's minus `REDUCE_TEMPS`, and the carry budget did not know), and turned up
+a latent miscompile shipping green (a same-index overwrite in `Pass::place`
+under a guard's revert). All three are one PR.
 
 **After 2c**, same harness and tile, re-baselined on one host (before: emit
 4,640 ms, 21.1 MB): emit **1,431 ms** (−69%), atlas **15.8 MB**, mean **174
