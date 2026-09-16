@@ -19,19 +19,10 @@
 
 use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, Outline, Segment};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
-use pixelflow_ir::passes::{expand_refs_owned, lower_dwrt_owned};
-use pixelflow_ir::{Kernel, OpKind};
+use pixelflow_ir::passes::lower_dwrt_owned;
+use pixelflow_ir::OpKind;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
-
-/// A glyph kernel's arena with its references linked. The winding sum is
-/// composed by reference, and a name has no derivative, declares no buffer,
-/// and counts as one node — so every count and every lowering below starts
-/// from the linked arena, as the pipeline's own first step does.
-fn linked(kernel: &Kernel) -> (ExprArena, ExprId) {
-    let (arena, root) = kernel.parts();
-    expand_refs_owned(arena, root)
-}
 
 /// Count reachable nodes matching `pred` from `root`.
 fn count_reachable(arena: &ExprArena, root: ExprId, pred: impl Fn(&ExprNode) -> bool) -> usize {
@@ -154,7 +145,11 @@ const SQRT_PER_PIECE: usize = 4;
 #[test]
 fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
     let (small, large) = (5usize, 11usize);
-    let build = |n: usize| linked(&loop_blinn::glyph(&regular_polygon(n)).kernel());
+    let build = |n: usize| {
+        loop_blinn::glyph(&regular_polygon(n))
+            .kernel()
+            .linked_parts()
+    };
     let (few, few_root) = build(small);
     let (many, many_root) = build(large);
 
@@ -206,7 +201,7 @@ fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
 fn lowered_glyph_ops_are_all_egraph_representable() {
     let font = Font::parse(FONT_DATA).unwrap();
     let glyph = font.glyph_kernel_scaled('g', 16.0).expect("glyph");
-    let (arena, root) = linked(&glyph.kernel());
+    let (arena, root) = glyph.kernel().linked_parts();
     let (lowered, lroot) = lower_dwrt_owned(&arena, root).expect("lower");
     let mut missing = std::collections::BTreeSet::new();
     let len = lowered.nodes_raw().len();

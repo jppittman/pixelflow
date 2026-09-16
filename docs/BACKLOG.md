@@ -83,9 +83,11 @@ roughly 800 lines to 150 — and makes H1's padding free.
 
 ## Housekeeping
 
-- `Kernel::parts()` hands out the **unlinked** fragment, and five measurement
+- ~~`Kernel::parts()` hands out the **unlinked** fragment, and five measurement
   consumers each learned to link first. Right division, five copies of one
-  line. ([composition-is-linking](plans/2026-09-09-composition-is-linking.md) §7)
+  line.~~ **Done**: `Kernel::linked_parts()` is the one accessor; the five
+  call sites call it instead of repeating `expand_refs_owned` by hand.
+  ([composition-is-linking](plans/2026-09-09-composition-is-linking.md) §7)
 - `cells` / `text_union` reach only one Criterion bench; nothing on screen has
   ever gone through them. Delete with S2, not before — they are the worked
   example of a domain-side extent.

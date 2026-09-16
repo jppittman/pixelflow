@@ -140,11 +140,10 @@ fn the_egraph_is_fed_a_program_it_can_reason_about() {
             .glyph_kernel_scaled(ch, 16.0)
             .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
         let kernel = glyph.kernel();
-        let (arena, root) = kernel.parts();
-        // `ExpandRefs` is the pipeline's one step before `Saturate`: a `Ref`
-        // has no structure for the e-graph to read, so it is resolved first.
-        // Everything after it is saturation's input.
-        let (linked, lroot) = pixelflow_ir::passes::expand_refs_owned(arena, root);
+        // `Kernel::linked_parts` is the pipeline's one step before
+        // `Saturate`: a `Ref` has no structure for the e-graph to read, so
+        // it is resolved first. Everything after it is saturation's input.
+        let (linked, lroot) = kernel.linked_parts();
         sizes.push((ch, reachable(&linked, lroot)));
     }
 

@@ -25,7 +25,7 @@ use std::time::Instant;
 use pixelflow_core::Kernel;
 use pixelflow_graphics::fonts::{text, Font};
 use pixelflow_ir::arena::{ExprArena, ExprId};
-use pixelflow_ir::passes::{expand_refs_owned, legalize};
+use pixelflow_ir::passes::legalize;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -70,7 +70,7 @@ fn main() {
             .map(|(_, data)| data.len())
             .sum::<usize>()
             / PIECE_ROW_COLS;
-        let (linked, linked_root) = expand_refs_owned(arena, root);
+        let (linked, linked_root) = kernel.linked_parts();
         let t1 = Instant::now();
         let (legal, legal_root) = legalize(arena, root).expect("legalize");
         let legalize_t = t1.elapsed();
