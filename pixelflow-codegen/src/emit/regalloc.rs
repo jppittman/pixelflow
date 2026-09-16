@@ -2953,6 +2953,111 @@ mod tests {
         ]
     }
 
+    // --- scan internals: record, guarded_arms, Reservations, Pass ---
+
+    /// A second placement recorded at the same schedule index replaces the
+    /// first rather than appending a range: an eviction that puts a value
+    /// back where it already was is not a move, and a repeated `from` would
+    /// break `Placement`'s strictly-increasing invariant.
+    #[test]
+    fn record_collapses_consecutive_ranges_at_the_same_index_into_one() {
+        let scan = Scan {
+            schedule: Vec::new(),
+            ranges: vec![vec![(0, Where::Reg(Reg(4))), (2, Where::Reg(Reg(4)))]],
+            scratch: Vec::new(),
+            guards: Vec::new(),
+        };
+        let placements = record(&scan, &BTreeMap::new());
+        let placement = placements[0].as_ref().expect("value 0 was placed");
+        assert_eq!(
+            placement.spans().collect::<Vec<_>>(),
+            vec![Span {
+                from: Point { index: 0 },
+                at: Where::Reg(Reg(4)),
+            }],
+            "an eviction that put the value back in the same register it \
+             already held is not a move, so the second entry must not add \
+             a second span"
+        );
+    }
+
+    /// The narrowest arm containing an index wins, not the first or the
+    /// widest: ending a kept reload at the inner arm's end is safe under an
+    /// outer one too, so the narrower answer is always the safe one to keep.
+    #[test]
+    fn guarded_arms_prefers_the_narrowest_covering_arm() {
+        use super::super::guards::ArmPair;
+        let wide = SelectGuard {
+            select_idx: 20,
+            mask_vid: ValueId(0),
+            ranges: ArmPair::new((0, 10), (0, 0)),
+        };
+        let narrow = SelectGuard {
+            select_idx: 21,
+            mask_vid: ValueId(1),
+            ranges: ArmPair::new((3, 5), (0, 0)),
+        };
+        let arms = guarded_arms(&[wide, narrow], 10);
+        for (i, arm) in arms.iter().enumerate() {
+            let expected = if (3..5).contains(&i) {
+                Some((3, 5))
+            } else {
+                Some((0, 10))
+            };
+            assert_eq!(
+                *arm, expected,
+                "index {i} should hold the narrowest covering arm"
+            );
+        }
+    }
+
+    /// `ROLES` is guard mask, guard temp, result and the destination on top
+    /// of the widest encoding's temps and reloads — not any other mix of the
+    /// same numbers.
+    #[test]
+    fn reservations_roles_covers_temps_reloads_and_the_four_named_slots() {
+        assert_eq!(
+            Reservations::ROLES,
+            10,
+            "Scratch::MAX_TEMPS (4) + Scratch::MAX_RELOADS (2) + 4 named roles"
+        );
+    }
+
+    /// `rank`'s distance is measured forward from the point asked about, not
+    /// from the value's own definition.
+    #[test]
+    fn rank_measures_distance_from_the_point_asked_about() {
+        let dag = vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Var(2)),
+            def(3, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+        ];
+        let sites = vec![Vec::new(); dag.len()];
+        let mut pass = Pass::new(&dag, &TEST_FILE, dag.len(), &BTreeMap::new(), &sites);
+        let rank = pass.rank(ValueId(0), 1, &[]);
+        assert_eq!(
+            rank.nearest.0, 2,
+            "value 0's only read is at index 3, two steps ahead of index 1"
+        );
+    }
+
+    /// A second `place` at the same index overwrites the first, matching
+    /// `record`'s own rule for the ranges it consumes.
+    #[test]
+    fn place_overwrites_a_range_recorded_at_the_same_index() {
+        let dag = vec![def(0, ScheduledOp::Var(0))];
+        let sites = vec![Vec::new(); 1];
+        let mut pass = Pass::new(&dag, &TEST_FILE, 1, &BTreeMap::new(), &sites);
+        pass.place(ValueId(0), 3, Where::Reg(Reg(4)));
+        pass.place(ValueId(0), 3, Where::Spilled);
+        assert_eq!(
+            pass.ranges[0],
+            vec![(3, Where::Spilled)],
+            "the second placement at index 3 must replace the first, not add a range"
+        );
+    }
+
     #[test]
     fn an_empty_schedule_allocates_nothing() {
         let a = alloc(vec![]);
