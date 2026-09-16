@@ -275,6 +275,11 @@ fragment, and five measurement consumers that took it straight into
 division today — `parts()` is the fragment, and the pipeline's first step is
 the link — but it is five copies of one line.
 
+*Status.* Closed: `Kernel::linked_parts()` is `parts()` after `expand_refs`,
+in one call, and the five call sites use it; `parts()` itself is unchanged
+and still the right thing for a caller (`legalize`, `optimize_runtime_arena`,
+`jit_cache::compile`) that links as its own first step.
+
 ## 8. `Kernel::at` expands, and this plan never said so (JP, 2026-09-12)
 
 §3 says inlining is an e-graph rule. §5.2 says a surviving reference needs a

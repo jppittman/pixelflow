@@ -866,6 +866,22 @@ impl Kernel {
         (&self.inner.legacy.0, self.inner.legacy.1)
     }
 
+    /// [`Kernel::parts`] with every [`Ref`](ExprData::Ref) resolved to its
+    /// referent — the linker's one direction (`expand_refs`), at the arena
+    /// level `parts` already returns. A consumer that walks or lowers the
+    /// fragment directly instead of composing more `Kernel` (a node-count
+    /// measurement, `lower_dwrt_owned`, `arena.buffers()`) wants this one: a
+    /// name has no derivative and declares no buffer, so the raw fragment
+    /// `parts()` hands out is not enough for either. `Kernel::at` and
+    /// `Kernel::by_ref` link at the `Kernel` level instead
+    /// ([`linked`](Self::linked)), because they compose further; this is
+    /// the same expansion for the caller that does not.
+    #[must_use]
+    pub fn linked_parts(&self) -> (ExprArena, ExprId) {
+        let (arena, root) = self.parts();
+        crate::passes::expand_refs_owned(arena, root)
+    }
+
     // ────────────────────────── linking ───────────────────────────
 
     /// This kernel as a one-node *reference* to itself: intern it in the

@@ -95,7 +95,7 @@ instead of one per glyph — makes the terminal usable.** Full measurements
 
 | | what | where |
 |---|---|---|
-| **H1** | **S3 — one program for the font.** Font-wide extent, table padded with monoid identities, so every glyph compiles to the same program and a glyph becomes a table write. 95 compiles → 1. With H2 measured, this is the whole hump. S3's own doc calls itself "a trade, not a win" for general use, but for the **atlas** path a glyph bakes once into texels and is a gather forever after, so the padding is a one-time bake cost, not per frame — worth re-deciding when H1 is picked up. | [glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S3 |
+| **H1** | ~~S3 — one program for the font.~~ **Done.** A piece table's trip count is rounded up to `u32::next_power_of_two()` before it becomes the fold's extent, so glyphs whose piece counts round to the same bucket share a program; the padding rows are exact identities of both folds (`loop_blinn::tests::a_padding_row_is_an_exact_identity_of_both_folds`, plus every coverage golden, bit-identical). Measured on this host: 95 → 6 programs at tile 16 (was 36), 7 at tile 32 (was 39); cold `GlyphAtlas::warm` 20.3 s → 3.7 s at tile 16, 25.9 s → 12.0 s at tile 32 — a net win despite the unrolled fold evaluating every padding row, because collapsing 30-odd compiles into one outweighs the per-compile growth. | [glyph-as-a-fold-execution](plans/2026-09-09-glyph-as-a-fold-execution.md) §S3 |
 | **H2** | ~~Split the 331 ms between compile and collapse.~~ **Done** — see [results](results/2026-09-10-glyph-bake-hump.md). | — |
 | **H3** | **Hash-consing in `ExprArena`.** Prototyped and measured: arena 2,721 → 154 nodes, 2.1–2.2× on the glyph suites, extracted kernel unchanged. In flight (JP). Lands on the compile half, so it compounds with H1 rather than competing. | [exprarena-on-dag](plans/2026-09-09-exprarena-on-dag.md) §5.2 |
 | **H5** | ~~Bound the guard search by what a guard can pay.~~ **Search killed** (`3a4c4e3`): `cluster_select_arms` is one unconditional pass — partition every select worth guarding and not already contiguous, outermost first, each once. `MAX_CLUSTER_ROUNDS`, `is_improvement` and `guarded_spans` went with the hill-climbing. **31.5 s → 20.0 s** on the 95-glyph atlas *with guards kept* (the 9.8 s figure in [results](results/2026-09-10-glyph-bake-hump.md) is what the optimization is worth, not a target — it comes from discarding them). `MISPREDICT_PENALTY_CYCLES` stays: one comparison, and measured, not tuned — a glyph's coverage mask is 3.6× *slower* guarded. **What remains:** `select_arms` is recomputed once per partitioned select, O(selects²·n). A single stable sort keyed by arm ownership would be one pass. But see **D6/D7** — the decision belongs in the e-graph, and optimizing this further is polishing a reconstruction. | [one-conditional-three-lowerings](plans/2026-09-08-one-conditional-three-lowerings.md) §8 |
@@ -155,9 +155,11 @@ roughly 800 lines to 150 — and makes H1's padding free.
 
 ## Housekeeping
 
-- `Kernel::parts()` hands out the **unlinked** fragment, and five measurement
+- ~~`Kernel::parts()` hands out the **unlinked** fragment, and five measurement
   consumers each learned to link first. Right division, five copies of one
-  line. ([composition-is-linking](plans/2026-09-09-composition-is-linking.md) §7)
+  line.~~ **Done**: `Kernel::linked_parts()` is the one accessor; the five
+  call sites call it instead of repeating `expand_refs_owned` by hand.
+  ([composition-is-linking](plans/2026-09-09-composition-is-linking.md) §7)
 - `cells` / `text_union` reach only one Criterion bench; nothing on screen has
   ever gone through them. Delete with S2, not before — they are the worked
   example of a domain-side extent.

@@ -190,8 +190,7 @@ fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
             // corpus holds the arena the optimizer sees — the referent
             // spliced in, declaring the table it reads.
             let coverage = glyph.kernel();
-            let (arena, root) = coverage.parts();
-            let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
+            let (arena, root) = coverage.linked_parts();
             let buffer_data = buffer_data_for(&arena, &glyph);
             kernels.push(CollapseKernel {
                 name: format!("glyph{tile}_U{:04X}", ch as u32),
@@ -208,8 +207,7 @@ fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
             .glyph_kernel_scaled(ch, BENCH_PT)
             .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
         let coverage = glyph.kernel();
-        let (arena, root) = coverage.parts();
-        let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
+        let (arena, root) = coverage.linked_parts();
         let buffer_data = buffer_data_for(&arena, &glyph);
         kernels.push(CollapseKernel {
             name: format!("bench_{label}"),
