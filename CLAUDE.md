@@ -123,10 +123,9 @@ off in the last bits. It never licenses an answer **outside the function's
 range**. `sin` returning 8.64e8 is not an imprecise sine, it is not a sine; no
 budget was saved by computing it, and nothing downstream can recover from it.
 So range is a hard property, asserted with no tolerance, while accuracy is a
-tunable. **It is currently unasserted**: `pixelflow-ir/tests/trig_range.rs`
-made the claim through the scalar interpreter and went with it when the
-interpreter was deleted. The property is unchanged and the assertion needs
-rebuilding on the JIT — an out-of-range `sin` would now ship green.
+tunable. It is pinned on the JIT by `pixelflow-codegen/tests/trig_range_jit.rs`,
+which replaces the claim `pixelflow-ir/tests/trig_range.rs` made through the
+since-deleted scalar interpreter.
 
 Where a function cannot be computed over the whole input type, it gets a
 **documented domain** and returns **NaN** outside it. `sin`/`cos`/`tan` are

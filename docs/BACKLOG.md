@@ -74,7 +74,7 @@ roughly 800 lines to 150 — and makes H1's padding free.
 
 | | what | where |
 |---|---|---|
-| **C1** | **Trig range is unasserted.** `pixelflow-ir/tests/trig_range.rs` made its claims through the deleted interpreter and went with it. The property is unchanged; an out-of-range `sin` would now ship green. Needs rebuilding on the JIT. | CLAUDE.md, "Precision is on the table; range is not" |
+| **C1** | ~~Trig range is unasserted.~~ **Done** — `pixelflow-codegen/tests/trig_range_jit.rs` asserts `\|sin\|`/`\|cos\| ≤ 1` with no tolerance and NaN outside `TRIG_DOMAIN` against ~100,000 JIT-evaluated points. | CLAUDE.md, "Precision is on the table; range is not" |
 | **C2** | **The `'8'` waist bug is open on `main`.** Five fixes tried and refuted; `freetype_oracle.rs` pins it rather than fixing it. The general demand predicate (D5), not a sixth per-select patch, is the intended next attempt. | [demand-is-a-dag-property](plans/2026-09-07-demand-is-a-dag-property.md) §9 |
 | **C3** | `CachedText::kernel` sums glyph coverages, so overlapping glyphs can exceed 1. Not on any production path — `core-term` renders through `GlyphAtlas`, and `CachedText` has no non-test caller. | — |
 | **C4** | A corpus needs a new acceptance criterion before `gen_bench_corpus` can come back; its quarantine gate compared against the interpreter. | CLAUDE.md, "Cost Model and the Guide" |
