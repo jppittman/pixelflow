@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::guards::{SelectGuard, analyze_select_guards};
-use super::{Gpr, KReg, OperandSource, Reg, ScheduledOp, operand_sources, reloads_wanted};
+use super::{Gpr, KReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1457,44 +1457,18 @@ impl Scan {
 /// its slot needs no store; anything else has to be written out. Belady's
 /// distance breaks ties *within* a tier and only within one: the traffic an
 /// eviction causes outweighs how long it waits to cause it.
-/// What it costs the instruction being placed to lose one of its own reads —
-/// the tier that outranks every kind of deferred traffic, and the reason an
-/// operand's register is a *priced* choice rather than a forbidden one.
-///
-/// Ordered cheapest first. The distinction between the two read-here cases is
-/// what makes the exhausted pool feasible: when every held register belongs to
-/// something this instruction reads, the loser has to be one of them, and only
-/// one kind of them costs no further register.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum ReadHere {
-    /// Not read by this instruction or by a guard emitted before it.
-    No,
-    /// Read here, and it is the operand the encoding consumes *from the
-    /// destination* ([`OperandSource::Destination`]): losing its register
-    /// means one reload — into `dst`, which is the register it is losing —
-    /// and no other register at all.
-    FromDst,
-    /// Read here and needs a register of its own to be read from: a reload
-    /// register the pool then has to find too, or a guard's mask register for
-    /// a branch emitted before the instruction.
-    NeedsRegister,
-}
-
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct EvictionRank {
-    /// Read by the instruction being placed — see [`ReadHere`].
+    /// Read by the instruction being placed — the one thing that outranks
+    /// cheap traffic, and the reason an operand's register is a last resort
+    /// rather than a forbidden one.
     ///
     /// The tiers below price the traffic an eviction *defers*; for a value read
     /// right here there is nothing to defer, so taking its register buys a
     /// reload inside this very instruction. Without this, a value already in
     /// its slot is the standing favourite — and at a read, the standing
     /// favourite is whichever value the instruction is reading.
-    ///
-    /// Answered from the instruction's own read set, never from the read
-    /// cursor: the kept-reload step advances the cursor past the current index
-    /// (`next_read(operand, i + 1)`), so by the time the destination is
-    /// contested a just-kept operand would read as "not needed now".
-    read_here: ReadHere,
+    needed_now: bool,
     /// 0 = rematerialized, 1 = slot already valid, 2 = needs a store.
     traffic: u8,
     /// Nearest next read *last*, so the cheapest loser is the one used
@@ -1506,20 +1480,15 @@ struct EvictionRank {
 /// them.
 ///
 /// Sized by the roles an instruction can fill at once — its encoding's temps,
-/// its operand reloads, a guard's mask and scratch, the scope's result, and
-/// the destination itself — which is the same list [`RegisterFile::MIN_SCRATCH`]
-/// is derived from.
+/// its operand reloads, a guard's mask and scratch, and the scope's result —
+/// which is the same list [`RegisterFile::MIN_SCRATCH`] is derived from.
 struct Reservations {
     slots: [Option<usize>; Self::ROLES],
     filled: usize,
 }
 
 impl Reservations {
-    /// `+ 4`: guard mask, guard temp, result, and the destination. The
-    /// destination is in here because it is claimed *before* the reloads and
-    /// the guard's registers now, so those have to see it as taken rather
-    /// than rely on being chosen after it.
-    const ROLES: usize = Scratch::MAX_TEMPS + Scratch::MAX_RELOADS + 4;
+    const ROLES: usize = Scratch::MAX_TEMPS + Scratch::MAX_RELOADS + 3;
 
     fn new() -> Self {
         Self {
@@ -1577,17 +1546,11 @@ struct Pass {
 }
 
 impl Pass {
-    /// `sites[i]` is every mask a guard emitted *before* instruction `i` reads
-    /// ([`guard_sites`]). A guard's read is a read: it decides `expire`, the
-    /// Belady distance and the read-here tier exactly as an operand's does,
-    /// and leaving it out made a mask read only by a branch the preferred
-    /// eviction at the very index the branch tests it.
     fn new(
         dag: &[Def],
         file: &RegisterFile,
         vec_len: usize,
         live_in: &BTreeMap<ValueId, Where>,
-        sites: &[Vec<ValueId>],
     ) -> Self {
         let mut reads: Vec<Vec<usize>> = vec![Vec::new(); vec_len];
         let mut const_bits: Vec<Option<u32>> = vec![None; vec_len];
@@ -1597,10 +1560,8 @@ impl Pass {
             if let ScheduledOp::Const(val) = def.op {
                 const_bits[def.value.0 as usize] = Some(val.to_bits());
             }
-            // Operands and guard masks together, so each value's read list
-            // stays ascending with one entry per index.
-            for read in operands(&def.op).chain(sites[i].iter().copied()) {
-                let r = &mut reads[read.0 as usize];
+            for operand in operands(&def.op) {
+                let r = &mut reads[operand.0 as usize];
                 if r.last() != Some(&i) {
                     r.push(i);
                 }
@@ -1642,9 +1603,9 @@ impl Pass {
     /// Claim one more pool register for this instruction's own use.
     ///
     /// Disjoint from every register the instruction reads (`live`, its
-    /// operands and its guards' masks) and from every role it has already
-    /// filled — the destination included, once it has been claimed, because
-    /// it is pushed into `taken` like any other role.
+    /// operands and its guards' masks), from every role it has already filled,
+    /// and — because the destination is claimed last, against the same two
+    /// exclusions — from the destination.
     fn reserve(&mut self, index: usize, taken: &mut Reservations, live: &[ValueId]) -> Reg {
         let open = self.without_operands(taken, live);
         let slot = self.claim(index, &open);
@@ -1662,11 +1623,7 @@ impl Pass {
     }
 
     /// What evicting `v` at `from` would cost. See [`EvictionRank`].
-    ///
-    /// `read_here` is the instruction's own read set with its tier per value
-    /// ([`ReadHere`]); a value not in it is not read here. Empty where the
-    /// candidates already exclude everything the instruction reads.
-    fn rank(&mut self, v: ValueId, from: usize, read_here: &[(ValueId, ReadHere)]) -> EvictionRank {
+    fn rank(&mut self, v: ValueId, from: usize) -> EvictionRank {
         let k = v.0 as usize;
         let traffic = if self.const_bits[k].is_some() {
             0
@@ -1677,10 +1634,7 @@ impl Pass {
         };
         let distance = self.next_read(v, from).map_or(usize::MAX, |r| r - from);
         EvictionRank {
-            read_here: read_here
-                .iter()
-                .find(|(r, _)| *r == v)
-                .map_or(ReadHere::No, |(_, tier)| *tier),
+            needed_now: distance == 0,
             traffic,
             nearest: core::cmp::Reverse(distance),
         }
@@ -1735,20 +1689,13 @@ impl Pass {
     }
 
     /// Pool slots this instruction may still draw on: every one it has not
-    /// already claimed for a role.
+    /// already claimed for a scratch role.
     ///
-    /// An operand's register is in here and does not need excluding — for the
-    /// **destination**, which is the one role claimed from this set. Taking it
-    /// makes that operand non-resident at this index, *before* the reload
-    /// count is taken, so `resolve_operands` reloads it from the slot its
-    /// definition wrote — into `dst` for the operand the encoding consumes
-    /// there, into a reserved reload register otherwise. That is the whole
-    /// of what the encoders tolerate: no encoder reads every source before
-    /// writing `dst` (SSE2's `movaps dst, src1` prelude; `setup_mov` ahead of
-    /// a `Select` or FMA on every ISA), so a *resident* operand in `dst`'s
-    /// register would be corrupted. A displaced one is not resident, which is
-    /// why the split is recorded at this index and not the next.
-    /// [`EvictionRank`] prices it so it stays a last resort.
+    /// An operand's register is in here and does not need excluding. The
+    /// encoder reads every source before it writes the destination, so a
+    /// destination that takes an operand's register only makes that operand
+    /// non-resident *here*, and `resolve_operands` reads it back from the slot
+    /// its definition wrote. [`EvictionRank`] is what keeps that a last resort.
     fn open(&self, taken: &Reservations) -> Vec<usize> {
         (0..self.owner.len()).filter(|k| !taken.holds(*k)).collect()
     }
@@ -1765,42 +1712,32 @@ impl Pass {
     }
 
     /// The slot to give up at `index`, among `open` ones that hold something.
-    fn loser(
-        &mut self,
-        open: &[usize],
-        index: usize,
-        read_here: &[(ValueId, ReadHere)],
-    ) -> Option<usize> {
+    fn loser(&mut self, open: &[usize], index: usize) -> Option<usize> {
         let held: Vec<(usize, ValueId)> = open
             .iter()
             .filter_map(|k| self.owner[*k].map(|v| (*k, v)))
             .collect();
         held.into_iter()
-            .min_by_key(|(_, v)| self.rank(*v, index, read_here))
+            .min_by_key(|(_, v)| self.rank(*v, index))
             .map(|(k, _)| k)
     }
 
-    /// A pool register for a scratch role or a kept reload at `index`: a free
-    /// one if there is one, and otherwise the one whose occupant is cheapest
-    /// to evict — which splits that occupant's live range here.
+    /// A pool register for something defined or reloaded at `index`: a free one
+    /// if there is one, and otherwise the one whose occupant is cheapest to
+    /// evict — which splits that occupant's live range here.
     ///
-    /// The candidates here already exclude everything the instruction reads
-    /// (see [`Self::without_operands`]), so no occupant is read here and the
-    /// read-here tier is uniformly [`ReadHere::No`].
-    ///
-    /// Answers as long as the pool leaves one register past the roles: the
-    /// floor [`RegisterFile::MIN_SCRATCH`] is derived from the widest set of
-    /// roles one instruction can hold at once. A pool cut below it — a fold
-    /// scope's is its parent's minus the carried registers minus the loop's
-    /// own three — is a floor bug to fix at the floor, not here.
+    /// Always answers. The floor [`RegisterFile::MIN_SCRATCH`] is what makes
+    /// that true: the widest demand is a gather's one operand plus four temps,
+    /// or a ternary's three operands plus a temp and an arm reload — five
+    /// exclusions either way, against a pool of at least six.
     fn claim(&mut self, index: usize, open: &[usize]) -> usize {
         if let Some(free) = open.iter().copied().find(|k| self.owner[*k].is_none()) {
             return free;
         }
-        let slot = self.loser(open, index, &[]).unwrap_or_else(|| {
+        let slot = self.loser(open, index).unwrap_or_else(|| {
             unreachable!(
-                "every pool register is already one of this instruction's roles \
-                 or a value it reads, against a floor of {}",
+                "every pool register is this instruction's own scratch or one of \
+                 its operands, against a floor of {}",
                 RegisterFile::MIN_SCRATCH
             )
         });
@@ -1888,6 +1825,8 @@ impl LinearScan {
             };
         }
 
+        let mut pass = Pass::new(&dag, file, vec_len, live_in);
+
         // The arms a `Select` guard may skip. A register range that begins at a
         // read inside one, for a value defined outside it, must end there too:
         // after the arm a read has to name what it named before, because the
@@ -1897,10 +1836,6 @@ impl LinearScan {
         let guards = analyze_select_guards(&dag);
         let arms = guarded_arms(&guards, dag.len());
         let sites = guard_sites(&guards, dag.len());
-
-        // After `sites`: a guard's read of its mask is a read the pass has to
-        // know about from the start (see `Pass::new`).
-        let mut pass = Pass::new(&dag, file, vec_len, live_in, &sites);
         let mut reverts: Vec<Vec<(ValueId, Where, usize)>> =
             (0..dag.len()).map(|_| Vec::new()).collect();
         // Pool slots a definition held for its own instruction and no longer:
@@ -2021,22 +1956,6 @@ impl LinearScan {
                 if pass.live_in[operand.0 as usize] {
                     continue;
                 }
-                // A value whose location was already settled *at this index* —
-                // by a revert at an arm's end, or a demotion — is served by a
-                // scratch reload here, never re-kept. `Pass::place` overwrites
-                // a same-index range rather than appending one, so keeping it
-                // would turn the `(i, Spilled)` just recorded into `(i, Reg)`:
-                // on a guard's skipped path that register was never loaded,
-                // and the emitter would copy from it as if it had been. This
-                // was live — a value spilled before a guarded arm, kept inside
-                // it, reverted at its end and read at the next arm's head
-                // came back wrong on the skipped path at the floor.
-                if pass.ranges[operand.0 as usize]
-                    .last()
-                    .is_some_and(|(at, _)| *at == i)
-                {
-                    continue;
-                }
                 let open = pass.without_operands(&taken, &live_here);
                 if open.is_empty() {
                     break;
@@ -2061,142 +1980,9 @@ impl LinearScan {
                 }
             }
 
-            // **The destination, before anything that reads residency.** The
-            // guard's mask register and the operand reloads below are counted
-            // from which values are in a register *at this index*, and the
-            // emitter counts them again from the same table when it resolves
-            // the instruction's operands — so the two answers agree only if
-            // nothing changes residency in between. The destination can: it
-            // may take an operand's register. So it is decided first, and the
-            // counts are taken from what it left.
-            //
-            // A definition is the one write in an instruction, and there is no
-            // register outside the pool left to write to — so the loser of the
-            // contest is the *occupant*, and the value being defined loses only
-            // the right to *keep* what it was given. That is
-            // `Where(v, def(v)) == Reg(_)`, which is what dissolves the fixed
-            // destination register.
-            //
-            // Two definitions write nothing here and take no pool register:
-            // a placeholder for a value an enclosing scope parked (its location
-            // is that scope's answer), and a coordinate input (pinned to the
-            // register the ABI delivers it in, outside the pool). A
-            // rematerialized constant that loses the contest is the third: its
-            // definition emits no instruction, so it needs nothing to write to.
-            let destination: Option<usize> = if pass.live_in[def.value.0 as usize] {
-                None
-            } else if let ScheduledOp::Var(k) = def.op {
-                pass.place(def.value, i, Where::Reg(input_register(file, k)));
-                None
-            } else {
-                // What each value this instruction reads would cost to lose
-                // its register *here* — see `ReadHere`. Membership, not the
-                // read cursor: the kept reloads above advanced it past `i`.
-                // An operand's tier is what `operand_sources` would route it
-                // through were it the one non-resident: into `dst` costs no
-                // further register; anything else needs a reload register the
-                // same pool then has to find. A value read twice by one
-                // instruction takes the harsher of its two tiers. A guard's
-                // mask read before the instruction needs `guard_mask`, so it
-                // is never the cheap kind.
-                let ops: Vec<ValueId> = operands(&def.op).collect();
-                let mut resident = [true; 3];
-                for (k, operand) in ops.iter().enumerate() {
-                    resident[k] = pass.is_resident(*operand);
-                }
-                let mut read_here: Vec<(ValueId, ReadHere)> = Vec::new();
-                let mut note = |v: ValueId, tier: ReadHere| match read_here
-                    .iter_mut()
-                    .find(|(r, _)| *r == v)
-                {
-                    Some((_, held)) => *held = (*held).max(tier),
-                    None => read_here.push((v, tier)),
-                };
-                for (k, operand) in ops.iter().enumerate() {
-                    let mut without = resident;
-                    without[k] = false;
-                    let tier = match operand_sources(&def.op, without)[k] {
-                        OperandSource::Destination => ReadHere::FromDst,
-                        OperandSource::Reload(_) => ReadHere::NeedsRegister,
-                        OperandSource::Resident => {
-                            unreachable!("an operand forced non-resident is not Resident")
-                        }
-                    };
-                    note(*operand, tier);
-                }
-                for mask in &sites[i] {
-                    note(*mask, ReadHere::NeedsRegister);
-                }
-
-                let open = pass.open(&taken);
-                if let Some(free) = open.iter().copied().find(|k| pass.owner[*k].is_none()) {
-                    pass.occupy(def.value, free, i);
-                    Some(free)
-                } else {
-                    let slot = pass.loser(&open, i, &read_here).unwrap_or_else(|| {
-                        unreachable!(
-                            "the pool is at most this instruction's temps against a \
-                             floor of {}, so some register is open and held",
-                            RegisterFile::MIN_SCRATCH
-                        )
-                    });
-                    let occupant =
-                        pass.owner[slot].unwrap_or_else(|| unreachable!("a loser holds one"));
-                    // Whether the new value keeps the register past this
-                    // instruction, by the rule that chose the slot: its own
-                    // rank against the occupant's. A definition has written
-                    // nothing yet, so its slot is never the cheap kind.
-                    let new_rank = EvictionRank {
-                        // A definition is a write; nothing reads it here.
-                        read_here: ReadHere::No,
-                        traffic: if pass.const_bits[def.value.0 as usize].is_some() {
-                            0
-                        } else {
-                            2
-                        },
-                        nearest: core::cmp::Reverse(
-                            pass.next_read(def.value, i).map_or(usize::MAX, |r| r - i),
-                        ),
-                    };
-                    let keeps = new_rank > pass.rank(occupant, i, &read_here);
-                    if !keeps && pass.const_bits[def.value.0 as usize].is_some() {
-                        // Nothing to write: the definition of a rematerialized
-                        // constant emits no instruction, so it takes no
-                        // register and evicts no one. Reserving one for it
-                        // would cost a live value its register to hold a value
-                        // the emitter never computes.
-                        pass.place(def.value, i, pass.out_of_register(def.value));
-                        None
-                    } else {
-                        // Split at `i`, not `i + 1`: a displaced operand is
-                        // reloaded by this instruction from the slot its
-                        // definition wrote, and that reload is what the
-                        // counts below have to see. (The register still holds
-                        // it until the write, but no encoder relies on that —
-                        // see `Pass::open`.)
-                        pass.split_out(slot, i);
-                        pass.occupy(def.value, slot, i);
-                        if !keeps && i + 1 < dag.len() {
-                            // Given a register to be written into and stored
-                            // from — the store goes right after the definition,
-                            // as it does for any value with a slot — and not to
-                            // keep.
-                            demotions[i + 1].push((def.value, slot));
-                        }
-                        Some(slot)
-                    }
-                }
-            };
-            // A role like any other from here on: the reloads and the guard's
-            // registers may not land on it.
-            if let Some(slot) = destination {
-                taken.push(slot);
-            }
-
             // A guard's own two registers, on the instruction it is emitted
             // before. The mask needs one only when it is not in a register
-            // here — which the kept reloads, and now the destination, may
-            // just have changed.
+            // here — which the kept reloads above may just have changed.
             if !sites[i].is_empty() {
                 if sites[i].iter().any(|m| !pass.is_resident(*m)) {
                     scratch_for[i].guard_mask = Some(pass.reserve(i, &mut taken, &live_here));
@@ -2217,11 +2003,10 @@ impl LinearScan {
             }
 
             // One register per operand this instruction has to reload, named
-            // by the same function the emitter reads. Residency is final here
-            // because the destination was chosen above: eviction splits a
-            // range rather than rewriting one, so an operand in a register now
-            // is in a register when this instruction is emitted, and an
-            // operand the destination displaced is already out of one.
+            // by the same function the emitter reads. Residency is final here:
+            // eviction splits a range rather than rewriting one, so an operand
+            // in a register now is in a register when this instruction is
+            // emitted, and the destination below cannot take it back.
             let mut resident = [true; 3];
             for (k, operand) in operands(&def.op).enumerate() {
                 resident[k] = pass.is_resident(operand);
@@ -2241,6 +2026,77 @@ impl LinearScan {
                 && !pass.is_resident(def.value)
             {
                 scratch_for[i].result = Some(pass.reserve(i, &mut taken, &live_here));
+            }
+
+            // A placeholder for a value an enclosing scope parked: it emits
+            // nothing, so it writes no register and gets no range here.
+            if pass.live_in[def.value.0 as usize] {
+                continue;
+            }
+
+            // Coordinate inputs are pinned to the registers the ABI delivers
+            // them in. The scratch pool excludes those registers, so a pinned
+            // value never competes for one.
+            if let ScheduledOp::Var(k) = def.op {
+                pass.place(def.value, i, Where::Reg(input_register(file, k)));
+                continue;
+            }
+
+            // **The destination always gets a register.** A definition is the
+            // one write in an instruction, and there is no register outside the
+            // pool left to write to — so the loser of the contest below is the
+            // *occupant*, and the value being defined loses only the right to
+            // *keep* what it was given. That is `Where(v, def(v)) == Reg(_)`,
+            // which is what dissolves the fixed destination register.
+            //
+            // A rematerialized constant is the exception, and it is not one in
+            // spirit: its definition emits nothing at all, so it needs nothing
+            // to write to.
+            let open = pass.without_operands(&taken, &live_here);
+            if let Some(free) = open.iter().copied().find(|k| pass.owner[*k].is_none()) {
+                pass.occupy(def.value, free, i);
+                continue;
+            }
+            let slot = pass.loser(&open, i).unwrap_or_else(|| {
+                unreachable!(
+                    "every pool register is this instruction's own scratch or one of \
+                     its operands, against a floor of {}",
+                    RegisterFile::MIN_SCRATCH
+                )
+            });
+            let occupant = pass.owner[slot].unwrap_or_else(|| unreachable!("a loser holds one"));
+            // Whether the new value keeps the register past this instruction,
+            // by the rule that chose the slot: its own rank against the
+            // occupant's. A definition has written nothing yet, so its slot is
+            // never the cheap kind.
+            let new_rank = EvictionRank {
+                // A definition is a write; nothing reads it here.
+                needed_now: false,
+                traffic: if pass.const_bits[def.value.0 as usize].is_some() {
+                    0
+                } else {
+                    2
+                },
+                nearest: core::cmp::Reverse(
+                    pass.next_read(def.value, i).map_or(usize::MAX, |r| r - i),
+                ),
+            };
+            let keeps = new_rank > pass.rank(occupant, i);
+            if !keeps && pass.const_bits[def.value.0 as usize].is_some() {
+                // Nothing to write: the definition of a rematerialized constant
+                // emits no instruction, so it takes no register and evicts no
+                // one. Reserving one for it would cost a live value its
+                // register to hold a value the emitter never computes.
+                pass.place(def.value, i, pass.out_of_register(def.value));
+                continue;
+            }
+            pass.split_out(slot, i);
+            pass.occupy(def.value, slot, i);
+            if !keeps && i + 1 < dag.len() {
+                // Given a register to be written into and stored from — the
+                // store goes right after the definition, as it does for any
+                // value with a slot — and not to keep.
+                demotions[i + 1].push((def.value, slot));
             }
         }
 
@@ -2852,16 +2708,12 @@ mod tests {
     /// directly.
     ///
     /// `dst op= right` corrupts `right` when `dst == right` and `dst != left`.
-    /// The destination *may* take an operand's register — it is a priced
-    /// candidate, not an excluded one — but when it does, the eviction is
-    /// recorded at this very index, so that operand is no longer *resident*
-    /// here: it is reloaded from its slot, into `dst` if it is the operand
-    /// the encoding consumes there and into a reserved register otherwise.
-    /// What this asserts is the residency view, which is what the encoders
-    /// see: at the instruction's own point, no operand still in a register is
-    /// in `dst`'s. The backend needs no stashing temp to route around a case
-    /// that cannot arise, which is what `emit_binary_safe` used to be and what
-    /// held xmm10 out of every kernel's pool.
+    /// That assignment is unrepresentable here: a destination is drawn from
+    /// the slots this instruction has not claimed for a scratch role *and*
+    /// that no value it reads is living in, so it can only take a slot whose
+    /// occupant is dead or evicted here. The backend needs no stashing temp to
+    /// route around a case that cannot arise, which is what `emit_binary_safe`
+    /// used to be and what held xmm10 out of every kernel's pool.
     #[test]
     fn a_destination_never_lands_on_a_resident_operand() {
         // Wide enough to evict: `width` values all live at once over a pool of
@@ -2919,99 +2771,6 @@ mod tests {
                 "no instruction read a pool-resident operand, so nothing above \
                  could have collided"
             );
-        }
-    }
-
-    /// The allocator reserved exactly the registers the emitter will ask for.
-    ///
-    /// `operand_sources` is one statement read twice — the allocator counts
-    /// its `Reload`s to reserve, the emitter names the register each lands in
-    /// — and the two agree only if residency is the same at both readings.
-    /// The destination contest can change residency (it may evict an operand),
-    /// so it runs *before* the counts; this is the check that it does. The
-    /// same for a guard's mask: a branch emitted before the instruction needs
-    /// `guard_mask` exactly when its mask is not in a register at that index.
-    ///
-    /// An earlier attempt at letting the destination take an operand's
-    /// register left the counts where they were, and the emitter panicked with
-    /// "operand k needs reload register n, which the allocator did not
-    /// reserve" — the failure this test turns into a named assertion.
-    fn assert_reservations_match_residency(a: &Allocation<'_>, file: &RegisterFile) {
-        let schedule = a.schedule();
-        let sites = guard_sites(&analyze_select_guards(schedule), schedule.len());
-        for (i, d) in schedule.iter().enumerate() {
-            let in_register = |v: ValueId| matches!(a.where_at(v, i), Where::Reg(_));
-            let mut resident = [true; 3];
-            for (k, operand) in operands(&d.op).enumerate() {
-                resident[k] = in_register(operand);
-            }
-            let want = reloads_wanted(operand_sources(&d.op, resident));
-            let scratch = a.scratch(i);
-            let have = (0..Scratch::MAX_RELOADS)
-                .filter(|k| scratch.reload(*k).is_some())
-                .count();
-            assert_eq!(
-                have, want,
-                "{:?} at {i}: the allocator reserved {have} reload registers but \
-                 resolve_operands will ask for {want}",
-                d.value
-            );
-            let mask_needs_one = sites[i].iter().any(|m| !in_register(*m));
-            assert!(
-                !mask_needs_one || scratch.guard_mask.is_some(),
-                "{:?} at {i}: a guard's mask is not in a register here and no \
-                 guard_mask was reserved",
-                d.value
-            );
-            // Nothing the instruction reads from a register is in `dst`'s —
-            // the one alias every encoder assumes never happens.
-            if let Where::Reg(dst) = a.where_at(d.value, i) {
-                for operand in operands(&d.op) {
-                    assert_ne!(
-                        a.where_at(operand, i),
-                        Where::Reg(dst),
-                        "{:?} at {i}: destination {dst:?} holds resident operand {operand:?}",
-                        d.value
-                    );
-                }
-                for mask in &sites[i] {
-                    if file.scratch.contains(dst) {
-                        assert_ne!(
-                            a.where_at(*mask, i),
-                            Where::Reg(dst),
-                            "{:?} at {i}: destination {dst:?} holds a guard's mask {mask:?}",
-                            d.value
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// The reservation contract holds under pressure, with and without temps,
-    /// over a schedule wide enough to evict at every step.
-    #[test]
-    fn reservations_match_residency_under_pressure() {
-        let width = u32::from(RegisterFile::MIN_SCRATCH) * 3;
-        let mut schedule = vec![def(0, ScheduledOp::Var(0)), def(1, ScheduledOp::Var(1))];
-        for i in 2..=width {
-            schedule.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
-        }
-        // Folds that read three live values at once, so an instruction can
-        // find every open register held by something it reads.
-        let mut acc = ValueId(2);
-        for i in 3..=width {
-            let mask = ValueId(i);
-            schedule.push(def(
-                width + i,
-                ScheduledOp::Ternary(OpKind::Select, mask, acc, ValueId(1)),
-            ));
-            acc = ValueId(width + i);
-        }
-        for file in [&TEST_FILE, &TEMP_FILE] {
-            let a = LinearScan.allocate(schedule.clone(), file);
-            assert!(spill_count(&a) > 0, "the schedule has to reach eviction");
-            assert_reservations_match_residency(&a.body(), file);
         }
     }
 

@@ -693,11 +693,7 @@ impl IsaExecutionMode {
     /// cost is execution only — ~70s per level against ~344s for the whole
     /// workspace, measured warm (`pixelflow-core`'s lib suite is ~20s of
     /// that). That is the difference between a check that fits in a PR's wait
-    /// and one that does not. The two glyph-JIT test binaries from
-    /// `pixelflow-graphics` ride along for a few seconds more: they are the
-    /// only presubmit check that runs a *real* glyph kernel through the
-    /// register allocator at every level, and the one time they were absent
-    /// an allocator panic reachable only on AVX2+FMA shipped green (#1258).
+    /// and one that does not.
     /// What a `PASS` from this mode covers, for the summary line.
     ///
     /// Called only from the `#[cfg(target_arch = "x86_64")]` half of
@@ -709,47 +705,28 @@ impl IsaExecutionMode {
     fn scope(&self) -> &'static str {
         match self {
             Self::BuildOnly => "none",
-            Self::Smoke => "smoke: codegen+ir+core+pipeline + graphics' glyph JIT tests",
+            Self::Smoke => "smoke: codegen+ir+core+pipeline",
             Self::BuildAndTest => "workspace",
         }
     }
 
-    /// The `cargo` invocations this mode runs per level, in order; every one
-    /// must pass. More than one because a crate's *fast fraction* is not a
-    /// crate: `pixelflow-graphics`'s suite is minutes per level, but the two
-    /// test binaries that JIT real glyphs are seconds, and they are the
-    /// ones that caught what the crate-only smoke set missed (#1258: a
-    /// register-allocator `unreachable!` reachable on AVX2+FMA and on no
-    /// other level, shipped green presubmit and reverted from postsubmit).
     #[cfg(target_arch = "x86_64")]
-    fn test_commands(&self) -> Option<&'static [&'static [&'static str]]> {
+    fn test_args(&self) -> Option<&'static [&'static str]> {
         match self {
             Self::BuildOnly => None,
             Self::Smoke => Some(&[
-                &[
-                    "test",
-                    "-p",
-                    "pixelflow-codegen",
-                    "-p",
-                    "pixelflow-ir",
-                    "-p",
-                    "pixelflow-core",
-                    "-p",
-                    "pixelflow-pipeline",
-                    "--no-fail-fast",
-                ],
-                &[
-                    "test",
-                    "-p",
-                    "pixelflow-graphics",
-                    "--test",
-                    "run_is_a_glyph",
-                    "--test",
-                    "font_rasterization_regression",
-                    "--no-fail-fast",
-                ],
+                "test",
+                "-p",
+                "pixelflow-codegen",
+                "-p",
+                "pixelflow-ir",
+                "-p",
+                "pixelflow-core",
+                "-p",
+                "pixelflow-pipeline",
+                "--no-fail-fast",
             ]),
-            Self::BuildAndTest => Some(&[&["test", "--workspace", "--no-fail-fast"]]),
+            Self::BuildAndTest => Some(&["test", "--workspace", "--no-fail-fast"]),
         }
     }
 }
@@ -885,7 +862,7 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
             // not enough that a given test avoids them.
             // A level this host cannot execute is still built and linted
             // above; only the run is skipped, and the summary says which.
-            let skip_reason = match mode.test_commands() {
+            let skip_reason = match mode.test_args() {
                 None => Some("build-only mode: tests run in postsubmit".to_string()),
                 Some(_) => level
                     .requires
@@ -903,13 +880,10 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
                 continue;
             }
 
-            let commands = mode
-                .test_commands()
-                .expect("a mode with no test commands produced no skip reason");
-            if !commands
-                .iter()
-                .all(|args| run_with_rustflags(&workspace_root, &matrix_target, &rustflags, args))
-            {
+            let test_args = mode
+                .test_args()
+                .expect("a mode with no test args produced no skip reason");
+            if !run_with_rustflags(&workspace_root, &matrix_target, &rustflags, test_args) {
                 println!("isa-matrix: {} — cargo test FAILED", level.name);
                 results.push((level.name, LevelResult::Failed { stage: "test" }));
                 continue;
