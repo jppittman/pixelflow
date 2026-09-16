@@ -3988,6 +3988,29 @@ mod tests {
     }
 
     #[test]
+    fn fixed_registers_disjoint_from_scratch_and_inputs_pass_checked() {
+        let file = RegisterFile {
+            fixed: &[Reg(20)],
+            ..TEST_FILE
+        }
+        .checked();
+        assert_eq!(file.fixed, &[Reg(20)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "aliases a coordinate input")]
+    fn a_fixed_register_aliasing_an_input_is_refused() {
+        // Reg(1) is one of TEST_FILE's inputs but outside its scratch pool,
+        // so only the input-aliasing check (not the scratch-overlap check)
+        // can be what refuses it.
+        let _refused = RegisterFile {
+            fixed: &[Reg(1)],
+            ..TEST_FILE
+        }
+        .checked();
+    }
+
+    #[test]
     #[should_panic(expected = "vector_bytes")]
     fn a_non_power_of_two_vector_width_is_refused() {
         let _refused = RegisterFile {
