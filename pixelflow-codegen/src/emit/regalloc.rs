@@ -2987,28 +2987,106 @@ mod tests {
     #[test]
     fn guarded_arms_prefers_the_narrowest_covering_arm() {
         use super::super::guards::ArmPair;
-        let wide = SelectGuard {
-            select_idx: 20,
-            mask_vid: ValueId(0),
-            ranges: ArmPair::new((0, 10), (0, 0)),
+        let guard = |select_idx: usize, mask: u32, true_arm: (usize, usize)| SelectGuard {
+            select_idx,
+            mask_vid: ValueId(mask),
+            ranges: ArmPair::new(true_arm, (0, 0)),
         };
-        let narrow = SelectGuard {
-            select_idx: 21,
-            mask_vid: ValueId(1),
-            ranges: ArmPair::new((3, 5), (0, 0)),
-        };
-        let arms = guarded_arms(&[wide, narrow], 10);
-        for (i, arm) in arms.iter().enumerate() {
+        // A clear case (width 10 vs. width 2): the narrower arm wins.
+        let wide = guard(100, 0, (0, 10));
+        let narrow = guard(101, 1, (3, 5));
+        // A genuine tie (width 2 each, processed first): the earlier one is
+        // kept rather than overwritten — distinguishes `<` from `<=`/`==`.
+        let tie_a = guard(102, 2, (15, 17));
+        let tie_b = guard(103, 3, (16, 18));
+        // A clear case the other way (width 3 vs. width 1): distinguishes
+        // `<` from `>`, which the tie case above cannot (both agree there).
+        let wider = guard(104, 4, (25, 28));
+        let narrower = guard(105, 5, (26, 27));
+        // The new arm's own width (`end - start`): distinguishes `-` from
+        // `+`/`/` on that computation specifically.
+        let own_width_prior = guard(106, 6, (35, 37));
+        let own_width_narrower = guard(107, 7, (36, 37));
+        // The stored arm's width (`e - s`): a tie (width 4 each) that must
+        // stay with the first-recorded arm — distinguishes `-` from `+`/`/`
+        // on *that* computation, which the tie case above cannot (it never
+        // exercises a stored span with a nonzero `s`).
+        let stored_width_prior = guard(108, 8, (41, 45));
+        let stored_width_current = guard(109, 9, (40, 44));
+
+        let arms = guarded_arms(
+            &[
+                wide,
+                narrow,
+                tie_a,
+                tie_b,
+                wider,
+                narrower,
+                own_width_prior,
+                own_width_narrower,
+                stored_width_prior,
+                stored_width_current,
+            ],
+            46,
+        );
+
+        for (i, arm) in arms.iter().enumerate().take(10) {
             let expected = if (3..5).contains(&i) {
                 Some((3, 5))
             } else {
                 Some((0, 10))
             };
+            assert_eq!(*arm, expected, "index {i}: narrowest of a clear pair");
+        }
+        assert_eq!(arms[15], Some((15, 17)), "only tie_a covers index 15");
+        assert_eq!(
+            arms[16],
+            Some((15, 17)),
+            "tie_a and tie_b tie in width at index 16; the first recorded must stand"
+        );
+        assert_eq!(arms[17], Some((16, 18)), "only tie_b covers index 17");
+        assert_eq!(
+            arms[25],
+            Some((25, 28)),
+            "only the wider arm covers index 25"
+        );
+        assert_eq!(
+            arms[26],
+            Some((26, 27)),
+            "the strictly narrower arm must win at index 26"
+        );
+        assert_eq!(
+            arms[27],
+            Some((25, 28)),
+            "only the wider arm covers index 27"
+        );
+        assert_eq!(
+            arms[35],
+            Some((35, 37)),
+            "only the first arm covers index 35"
+        );
+        assert_eq!(
+            arms[36],
+            Some((36, 37)),
+            "the new arm's own width (1) must beat the stored one (2) at index 36"
+        );
+        for (i, arm) in arms.iter().enumerate().take(44).skip(41) {
             assert_eq!(
-                *arm, expected,
-                "index {i} should hold the narrowest covering arm"
+                *arm,
+                Some((41, 45)),
+                "index {i}: tied stored width (4 each) keeps the first-recorded arm"
             );
         }
+        assert_eq!(
+            arms[40],
+            Some((40, 44)),
+            "only the second arm covers index 40"
+        );
+        assert_eq!(
+            arms[44],
+            Some((41, 45)),
+            "only the first arm covers index 44"
+        );
     }
 
     /// `ROLES` is guard mask, guard temp, result and the destination on top
@@ -3055,6 +3133,26 @@ mod tests {
             pass.ranges[0],
             vec![(3, Where::Spilled)],
             "the second placement at index 3 must replace the first, not add a range"
+        );
+    }
+
+    /// `place` marks a value's slot as already valid in memory exactly when
+    /// it places it `Spilled` — never for a register or a remat, and it
+    /// never un-marks a value memory has already seen once.
+    #[test]
+    fn place_marks_in_slot_only_when_placing_spilled() {
+        let dag = vec![def(0, ScheduledOp::Var(0)), def(1, ScheduledOp::Var(1))];
+        let sites = vec![Vec::new(); 2];
+        let mut pass = Pass::new(&dag, &TEST_FILE, 2, &BTreeMap::new(), &sites);
+        pass.place(ValueId(0), 0, Where::Reg(Reg(4)));
+        assert!(
+            !pass.in_slot[0],
+            "landing in a register is not a reason to believe memory is valid"
+        );
+        pass.place(ValueId(1), 0, Where::Spilled);
+        assert!(
+            pass.in_slot[1],
+            "placing a value Spilled is exactly what makes its slot valid"
         );
     }
 
