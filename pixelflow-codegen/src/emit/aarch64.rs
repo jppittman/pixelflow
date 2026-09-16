@@ -702,7 +702,7 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // A surviving fold's own loop scaffold: the persistent binder
         // register plus two transient registers for the trip test and the
         // accumulate — see `emit_dag_body_hoisted`'s `Reduce` arm.
-        ScheduledOp::Reduce(..) => 3,
+        ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
         _ => 0,
     }
 }

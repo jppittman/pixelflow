@@ -737,7 +737,7 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // transient registers for the trip test's bound and the
         // accumulate's slot round-trip — see `emit_dag_body_hoisted`'s
         // `Reduce` arm.
-        ScheduledOp::Reduce(..) => 3,
+        ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
         _ => 0,
     }
 }

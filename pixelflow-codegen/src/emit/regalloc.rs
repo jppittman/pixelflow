@@ -825,6 +825,14 @@ impl Scratch {
     /// each to carry the high half while the low one is built.
     pub const MAX_TEMPS: usize = 4;
 
+    /// The temps a surviving `Reduce` def reserves: one persistent (the
+    /// binder, which is the loop counter) and two transient (the trip test
+    /// and the accumulate). Every backend's `temps_for` answers this for a
+    /// `Reduce`, `allocate_nest` reads that many back to build the fold's
+    /// pool, and the carry budget leaves this much headroom below the floor
+    /// when a nest has a fold — one number, so the three cannot drift.
+    pub const REDUCE_TEMPS: usize = 3;
+
     /// The most reload targets any one instruction asks for.
     ///
     /// Two. Three operands is the widest op, and the one that must reach the
@@ -1513,20 +1521,36 @@ impl RegisterAllocator for LinearScan {
             }
         }
 
+        // A fold scope allocates over the body's pool *minus* the loop's own
+        // temps (`Scratch::REDUCE_TEMPS`, reserved at its `Reduce` def and
+        // read back below), so the floor the carries must leave is that much
+        // higher whenever the nest has one. Without this a body exactly at
+        // `MIN_SCRATCH` handed its folds a pool three registers under it, and
+        // the first instruction there that needed a reload register or a
+        // guard's mask found every register already spoken for — a glyph
+        // with two more carried values reached that from an `unreachable!`.
+        let fold_headroom: u8 = if nest.folds.is_empty() {
+            0
+        } else {
+            Scratch::REDUCE_TEMPS as u8
+        };
+
         for (index, region) in nest.regions.into_iter().enumerate() {
             let scope = Scope::Region(index);
             let scoped = file.inside(carried);
             let scan = self.scan(region.schedule, &scoped, &parked);
 
-            // Carry the roots the body reads most, while the body keeps a
-            // pool it can still allocate in. Every carry costs one register
-            // for the whole loop and saves one reload per use per iteration,
-            // so the ordering is by use count and the cap is the floor.
+            // Carry the roots the body reads most, while the body — and every
+            // fold inside it — keeps a pool it can still allocate in. Every
+            // carry costs one register for the whole loop and saves one
+            // reload per use per iteration, so the ordering is by use count
+            // and the cap is the floor.
             let budget = file
                 .scratch
                 .len()
                 .saturating_sub(carried.len())
-                .saturating_sub(RegisterFile::MIN_SCRATCH);
+                .saturating_sub(RegisterFile::MIN_SCRATCH)
+                .saturating_sub(fold_headroom);
             let mut ranked: Vec<(usize, ValueId)> = region
                 .roots
                 .iter()
@@ -1638,7 +1662,9 @@ impl RegisterAllocator for LinearScan {
                 Scope::Body => &body.scratch[fold.at],
                 Scope::Fold(j) => &folds[j].code.scratch[fold.at],
             };
-            let reserved: Vec<Reg> = (0..3).filter_map(|k| parent_scratch.temp(k)).collect();
+            let reserved: Vec<Reg> = (0..Scratch::REDUCE_TEMPS)
+                .filter_map(|k| parent_scratch.temp(k))
+                .collect();
 
             // The binder's own `Var` leaf, if the body reads it (an unusual
             // but valid fold never does) — parked to the persistent temp the
@@ -3439,6 +3465,87 @@ mod tests {
             },
             &NEST_FILE,
         )
+    }
+
+    /// A nest with a fold never carries into the fold's own headroom.
+    ///
+    /// A fold scope allocates over the body's pool minus
+    /// [`Scratch::REDUCE_TEMPS`], so with a fold in the nest the carry budget
+    /// is `scratch − MIN_SCRATCH − REDUCE_TEMPS`, and zero when that is not
+    /// positive. Two files one register apart, on either side of that line:
+    /// at the line nothing may be carried, one above it exactly one root is —
+    /// so the test cannot pass by carrying nothing everywhere.
+    ///
+    /// Before this budget a body exactly at the floor handed its fold a pool
+    /// three under it, and the first instruction there needing a reload or a
+    /// guard's mask register found nothing left to take.
+    #[test]
+    fn carries_leave_a_folds_headroom_below_the_floor() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        let line = RegisterFile::MIN_SCRATCH + Scratch::REDUCE_TEMPS as u8;
+        for (scratch, allowed) in [(line, 0usize), (line + 1, 1)] {
+            let file = RegisterFile {
+                scratch: RegSet::range(4, scratch),
+                ..TEMP_FILE
+            }
+            .checked();
+            let fold_meta = Fold::new(
+                Monoid::SUM,
+                Binder::from_slot(0).expect("slot 0 exists"),
+                0..4,
+            );
+            // Two roots the body reads once each, so there is something to
+            // carry and the budget is what decides how much of it.
+            let (a, b, inner) = (ValueId(2), ValueId(3), ValueId(11));
+            let alloc = LinearScan.allocate_nest(
+                ScopedSchedule {
+                    regions: vec![
+                        ScopeRegion {
+                            roots: vec![a, b],
+                            schedule: vec![
+                                def(0, ScheduledOp::Var(1)),
+                                def(2, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                                def(3, ScheduledOp::Unary(OpKind::Neg, ValueId(2))),
+                                def(1, ScheduledOp::Reduce(fold_meta, ValueId(0))),
+                            ],
+                        },
+                        ScopeRegion {
+                            roots: vec![inner],
+                            schedule: vec![def(11, ScheduledOp::Unary(OpKind::Neg, a))],
+                        },
+                    ],
+                    body: vec![
+                        def(100, ScheduledOp::Binary(OpKind::Add, a, b)),
+                        def(101, ScheduledOp::Binary(OpKind::Add, ValueId(100), inner)),
+                    ],
+                    folds: vec![ScopeFold {
+                        parent: Scope::Region(0),
+                        at: 3,
+                        roots: Vec::new(),
+                        schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))],
+                    }],
+                },
+                &file,
+            );
+            let carried: usize = (0..alloc.regions())
+                .map(|i| {
+                    let region = alloc.scope(Scope::Region(i));
+                    region
+                        .roots()
+                        .iter()
+                        .filter(|r| region.carried(**r).is_some())
+                        .count()
+                })
+                .sum();
+            assert_eq!(
+                carried,
+                allowed,
+                "a pool of {scratch} with a fold in the nest must carry exactly \
+                 {allowed} root(s): MIN_SCRATCH {} + REDUCE_TEMPS {} is the line",
+                RegisterFile::MIN_SCRATCH,
+                Scratch::REDUCE_TEMPS
+            );
+        }
     }
 
     /// `within` is a subtree, not a suffix of a chain.
