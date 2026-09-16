@@ -3263,6 +3263,192 @@ mod tests {
         assert_eq!(s.reload(wanted), None, "nothing reserved past the demand");
     }
 
+    /// `select_guards` is the guard analysis on file, not an empty stand-in:
+    /// a schedule with a genuine exclusive arm reports it back unchanged.
+    #[test]
+    fn select_guards_reports_the_arm_the_schedule_actually_has() {
+        let schedule = vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
+            def(
+                3,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+            ),
+        ];
+        let a = alloc(schedule);
+        let guards = a.body().select_guards();
+        assert_eq!(guards.len(), 1, "the schedule has exactly one Select");
+        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].mask_vid, ValueId(0));
+        assert_eq!(guards[0].true_range(), (1, 3));
+        assert_eq!(guards[0].false_range(), (3, 3));
+    }
+
+    /// A spilled operand read inside a guarded arm is *not* worth promoting
+    /// back into a register when its very next read is at or after the arm's
+    /// end: the promotion would not even reach the read it was for, so an
+    /// ordinary reload serves it just as well.
+    ///
+    /// `X` is forced to spill under pressure (seven fillers exactly fill
+    /// `TEST_FILE`'s pool, and `X`'s own next read — deep inside the arm — is
+    /// the farthest among the candidates, so `X` is the one evicted). The
+    /// arm then reads `X` twice: once inside it, and again as the `Select`'s
+    /// own false-arm operand — a read at exactly the arm's end.
+    #[test]
+    fn a_spilled_operand_read_again_only_at_the_arms_end_is_not_kept() {
+        let x = ValueId(1);
+        let mut schedule = vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+        ];
+        let fillers: Vec<u32> = (10..16).collect(); // f1..f6.
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        schedule.push(def(16, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))); // f7: 8th value, forces eviction.
+        let eviction_index = schedule.len() - 1; // index 8.
+        for (i, &f) in fillers.iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            )); // dist 1..6.
+        }
+        schedule.push(def(50, ScheduledOp::Var(1))); // mask, index 15.
+        let rsqrt_index = schedule.len();
+        schedule.push(def(60, ScheduledOp::Unary(OpKind::Rsqrt, x))); // index 16: reads X.
+        let select_index = schedule.len();
+        schedule.push(def(
+            70,
+            ScheduledOp::Ternary(OpKind::Select, ValueId(50), ValueId(60), x), // X again, as the false arm.
+        ));
+
+        let a = alloc(schedule);
+        let guards = a.body().select_guards();
+        assert_eq!(
+            guards
+                .iter()
+                .find(|g| g.select_idx == select_index)
+                .map(SelectGuard::true_range),
+            Some((rsqrt_index, select_index)),
+            "fixture assumes the Rsqrt alone forms the true arm's exclusive range"
+        );
+        assert_eq!(
+            a.body().where_at(x, eviction_index),
+            Where::Spilled,
+            "fixture assumes X, not a filler, is the one evicted"
+        );
+        assert_eq!(
+            a.body().where_at(x, rsqrt_index),
+            Where::Spilled,
+            "X's next read (the Select's own false arm) lands exactly at the \
+             arm's end, so keeping X in a register here would not even reach \
+             it — an ordinary reload serves the Rsqrt instead"
+        );
+    }
+
+    /// A value defined *at* a guarded arm's own first instruction is arm-
+    /// internal, not something the arm merely reads from outside — so even
+    /// once pressure evicts and then re-promotes it within the same arm, it
+    /// gets no revert scheduled at the arm's end: nothing outside the arm
+    /// ever reads it, by the same exclusivity that put it in the arm at all.
+    ///
+    /// The pressure has to come from *inside* the arm: an external filler's
+    /// own read is necessarily scheduled after the whole arm (anything it
+    /// reads earlier would break the arm's contiguous range), which always
+    /// makes it farther out than a within-arm read and so never a genuine
+    /// rival for `loser`. Eight independent leaves feeding one reduction give
+    /// the arm its own pressure — `Y` is the first leaf (so `defined_at`
+    /// equals the arm's `start` exactly) but the last one consumed, so it is
+    /// the one `loser` evicts when the eighth leaf needs a register. `Y` is
+    /// then read twice more, and directly again right before the `Select` —
+    /// that last read is what keeps it resident (protected as an operand)
+    /// all the way to the arm's end without any other reason to hold it,
+    /// which is what makes a spurious revert there observable.
+    #[test]
+    fn a_value_defined_at_the_arms_own_start_needs_no_revert_at_its_end() {
+        let y = ValueId(1);
+        let mut schedule = vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+        ];
+        let leaves: Vec<u32> = (10..17).collect(); // 7 more leaves alongside Y: 8 live at once.
+        for &l in &leaves {
+            schedule.push(def(l, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let eviction_index = schedule.len() - 1; // the 8th leaf: pool is full, so this evicts Y.
+        // Pair the other seven leaves off soonest-first, so Y — read only by
+        // the last pair — is the farthest-out candidate when the 8th leaf
+        // needs a register.
+        let p1 = 200;
+        schedule.push(def(
+            p1,
+            ScheduledOp::Binary(OpKind::Add, ValueId(leaves[0]), ValueId(leaves[1])),
+        ));
+        let p2 = 201;
+        schedule.push(def(
+            p2,
+            ScheduledOp::Binary(OpKind::Add, ValueId(leaves[2]), ValueId(leaves[3])),
+        ));
+        let p3 = 202;
+        schedule.push(def(
+            p3,
+            ScheduledOp::Binary(OpKind::Add, ValueId(leaves[4]), ValueId(leaves[5])),
+        ));
+        let p4 = 203; // Y's first re-read, and the farthest among the pairs' operands at eviction time.
+        schedule.push(def(
+            p4,
+            ScheduledOp::Binary(OpKind::Add, y, ValueId(leaves[6])),
+        ));
+        let extra = 204; // Y's second re-read.
+        schedule.push(def(extra, ScheduledOp::Binary(OpKind::Add, ValueId(p4), y)));
+        let q1 = 210;
+        schedule.push(def(
+            q1,
+            ScheduledOp::Binary(OpKind::Add, ValueId(p1), ValueId(p2)),
+        ));
+        let q2 = 211;
+        schedule.push(def(
+            q2,
+            ScheduledOp::Binary(OpKind::Add, ValueId(p3), ValueId(extra)),
+        ));
+        let q3 = 212;
+        schedule.push(def(
+            q3,
+            ScheduledOp::Binary(OpKind::Add, ValueId(q1), ValueId(q2)),
+        ));
+        let root = 220; // Y's third re-read, right before the Select.
+        schedule.push(def(root, ScheduledOp::Binary(OpKind::Add, ValueId(q3), y)));
+        let select_index = schedule.len();
+        schedule.push(def(
+            70,
+            ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(root), ValueId(0)),
+        ));
+
+        let a = alloc(schedule);
+        let guards = a.body().select_guards();
+        assert_eq!(
+            guards
+                .iter()
+                .find(|g| g.select_idx == select_index)
+                .map(SelectGuard::true_range),
+            Some((1, select_index)),
+            "fixture assumes the whole reduction, starting at Y's own \
+             definition, is the true arm's exclusive range"
+        );
+        assert_eq!(
+            a.body().where_at(y, eviction_index),
+            Where::Spilled,
+            "fixture assumes Y, not one of the other leaves, is the one evicted"
+        );
+        assert!(
+            matches!(a.body().where_at(y, select_index), Where::Reg(_)),
+            "Y is arm-internal from its own definition on, so re-promoting it \
+             inside the arm needs no revert at the arm's end — it should \
+             still be resident at the Select"
+        );
+    }
+
     /// Nothing is reserved for an operand that is already in a register.
     #[test]
     fn a_resident_operand_reserves_no_reload_target() {
