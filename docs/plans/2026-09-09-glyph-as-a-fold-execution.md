@@ -217,6 +217,17 @@ the body depends on.
 
 ## S3 — one program for the font
 
+*Status.* Landed, reframed as **bucketed** trip counts rather than one
+font-wide extent: a piece table's row count becomes
+`pieces.next_power_of_two()`, not every glyph's own count padded up to the
+font's largest, so a small glyph does not pay for the font's biggest one.
+`bucketed_trip_count`/`padding_row` in `pixelflow-graphics/src/fonts/loop_blinn.rs`.
+The padding rows are the identity of both folds by construction — a bare
+`y_min == y_max` row for the sum, a bare-constant `across` column divided
+through `MIN_GRADIENT`'s floor for the min — pinned by
+`loop_blinn::tests::a_padding_row_is_an_exact_identity_of_both_folds` and
+left unmoved by every coverage golden (bit-identical).
+
 **Deliverable:** font-wide extent, table padded with monoid identities (`0`
 for the sum, `+∞` for the min), so the compiled program is the same for every
 glyph and a glyph is a `UniformBlock`-style table write.
@@ -227,6 +238,24 @@ exactly what ask A removes, so S3 is worth much more after §A than before it.
 
 Measure: distinct `jit_cache::entry_count()` deltas over a font bake, compile
 wall clock, and collapse wall clock, both ways.
+
+**Measured** (NotoSansMono, 95 printable ASCII, this host, `glyph_compile_report`):
+
+| | tile 16 | tile 32 |
+|---|---|---|
+| distinct programs | 36 → **6** | 39 → **7** |
+| cold `GlyphAtlas::warm` | 20.3 s → **3.7 s** | 25.9 s → **12.0 s** |
+
+Per-kernel emitted size grew as expected (a non-power-of-two piece count now
+unrolls its fold to the next power of two — e.g. 11 pieces as 16, 28 as 32 —
+so `a_glyph_costs_no_more_than_it_did`'s ceilings and
+`a_glyph_is_one_body_and_a_fixed_budget_per_piece`'s sqrt budget both moved
+from "per piece" to "per bucketed row"), and the `kernels` report mode's
+summed isolated-compile time rose with it (42.3 s → 73.7 s at tile 16,
+ignoring cache sharing by construction). The cache-sharing win dominates
+anyway: collapsing 30-odd compiles into one outweighs a ~40% larger body on
+the few that no longer share. **Not a loss**, so the coarser/finer bucketing
+this doc asked S3 to compare against was not needed.
 
 ## Order and parallelism
 

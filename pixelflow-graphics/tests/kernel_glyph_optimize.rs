@@ -135,9 +135,15 @@ const SQRT_PER_PIECE: usize = 4;
 /// - the arena a glyph **builds** is the same size whatever the outline is
 ///   — one body per fold, not one fragment per edge, so construction stops
 ///   being a function of the piece count;
-/// - the optimizer's output stays **linear** in the piece count with a
-///   fixed budget of [`SQRT_PER_PIECE`] per piece, so a rewrite that
-///   multiplied work per pixel still shows up as a hard number;
+/// - the optimizer's output stays **linear** in the fold's trip count with a
+///   fixed budget of [`SQRT_PER_PIECE`] per row, so a rewrite that
+///   multiplied work per pixel still shows up as a hard number. The trip
+///   count is the piece count rounded up to a bucket, not the piece count
+///   itself (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3), so a
+///   `5`-gon budgets against `8` rows and an `11`-gon against `16` — the
+///   padding rows are exact identities of both folds (their own gate is
+///   `loop_blinn::tests::a_padding_row_is_an_exact_identity_of_both_folds`)
+///   but they are still rows the fold runs and this budget still counts;
 /// - and `Dwrt` is still fully resolved, which now also covers
 ///   `passes::lower_dwrt`'s rule that a table read whose index does not move
 ///   with the differentiation variable is a constant. Without that rule this
@@ -183,12 +189,17 @@ fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
             total_reachable(&opt, opt_root),
         );
         assert_eq!(opt_dwrt, 0, "Dwrt must be fully resolved by bake time");
+        // The fold's trip count is `n` rounded up to a bucket
+        // (`loop_blinn::bucketed_trip_count`, mirrored here rather than
+        // exposed: it is `u32::next_power_of_two`, not a bespoke rule), not
+        // `n` itself — see the budget's own doc above.
+        let bucketed_rows = (n as u32).next_power_of_two() as usize;
         assert!(
-            opt_sqrt <= SQRT_PER_PIECE * n,
-            "a {n}-gon's unrolled kernel may keep {SQRT_PER_PIECE} sqrt per piece \
-             (the capsule distance and three gradient normalisations); {opt_sqrt} \
-             survived, so something is computing a root per pixel that the one \
-             body does not ask for"
+            opt_sqrt <= SQRT_PER_PIECE * bucketed_rows,
+            "a {n}-gon's unrolled kernel (bucketed to {bucketed_rows} rows) may \
+             keep {SQRT_PER_PIECE} sqrt per row (the capsule distance and three \
+             gradient normalisations); {opt_sqrt} survived, so something is \
+             computing a root per pixel that the one body does not ask for"
         );
     }
 }

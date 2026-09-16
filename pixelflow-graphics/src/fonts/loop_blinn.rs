@@ -90,6 +90,12 @@
 //! (`passes::expand_reduce`), and the min's body names the sum rather than
 //! copying it, so the sum is unrolled once.
 //!
+//! Each fold's own trip count is rounded up to a shared bucket
+//! (`bucketed_trip_count`) before it becomes that unroll count, so glyphs
+//! with different piece counts can still compile to the same JIT program —
+//! the rows past an outline's own pieces are `padding_row`s, one further
+//! number each rather than a new kind.
+//!
 //! ## The winding is exact; only the distance is soft
 //!
 //! Every winding term is a hard mask selecting a signed constant, so the sum
@@ -416,8 +422,18 @@ pub fn run(outlines: &[Outline]) -> Glyph {
             .expect("a run has far fewer pieces than u32::MAX");
         let count = u32::try_from(pieces.pieces.len())
             .expect("an outline has far fewer pieces than u32::MAX");
+        // The fold's trip count is part of the JIT cache's key
+        // (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3), so a
+        // glyph's own piece count is rounded up to a shared bucket *before*
+        // it becomes that trip count — otherwise every distinct piece count
+        // in the font mints its own program. The gap between `count` and
+        // the bucket is filled with `padding_row`s, each an exact identity
+        // of both folds (see its own docs), so this changes which program a
+        // glyph shares, never the glyph.
+        let padded = bucketed_trip_count(count);
         rows.extend(pieces.pieces.iter().flat_map(|p| piece_row(*p)));
-        spans.push((start, count, bounds));
+        rows.extend((count..padded).flat_map(|_| padding_row()));
+        spans.push((start, padded, bounds));
     }
     if spans.is_empty() {
         return Glyph::empty();
@@ -899,8 +915,10 @@ impl Distance {
 // at a reduce binder, so a glyph is two folds with fixed bodies rather than
 // one arena fragment per piece: [`glyph`]'s `Kernel::sum_over` is the
 // winding and its `Kernel::min_over` the ramp distance, and row `i` of the
-// one table is piece `i` for both. The [`Coeff`] indirection is what keeps
-// the read one definition regardless of which fold is asking.
+// one table is piece `i` for both — or, past the outline's own piece count
+// and up to its bucketed trip count ([`bucketed_trip_count`]), a
+// [`padding_row`]. The [`Coeff`] indirection is what keeps the read one
+// definition regardless of which fold is asking, or which kind of row.
 //
 // **A row always evaluates.** There is no per-kind branch on the host,
 // because every distinction a piece could carry is a number that makes the
@@ -919,7 +937,12 @@ impl Distance {
 //   jump for an edge no horizontal ray crosses;
 // - a piece nothing else covers carries a set mask in column 21, the
 //   absorbing element of the `∨` [`boundary_distance`] ORs it into, so that
-//   test is true without being asked.
+//   test is true without being asked;
+// - a padding row is a line with an empty Y span (columns 0–1 both `0`, so
+//   [`crossing_term`]'s row test holds nowhere) and one further-than-any-ramp
+//   entry (column 13, see [`padding_row`]) — the monoid identity of both
+//   folds, by the same mechanism the line and horizontal-chord cases above
+//   already use, not a third one.
 
 /// `y_min` of the chord.
 const COL_Y_MIN: usize = 0;
@@ -1076,6 +1099,77 @@ fn piece_row(piece: Piece) -> [f32; PIECE_ROW_COLS] {
     row[COL_HALF_LENGTH] = (length / 2.0) as f32;
     row[COL_DEVIATION] = piece.deviation() as f32;
     row[COL_ALWAYS_BOUNDARY] = OpKind::mask(!piece.may_be_interior);
+    row
+}
+
+/// A distance, in the units [`piece_distance`] produces before dividing by
+/// any gradient, that [`padding_row`] plants in a padding row's `across`
+/// column. What survives to the fold is this divided by [`MIN_GRADIENT`]
+/// (`1.0 / 1e-3`, a thousand): past [`RAMP_REACH`] and past any capsule
+/// distance a real piece reports, so a padding row never wins [`Distance`]'s
+/// `min`. `1.0` is not load-bearing — any positive, finite value is — it is
+/// picked only to make that thousandfold amplification legible at the call
+/// site.
+const PADDING_DISTANCE_SEED: f64 = 1.0;
+
+/// The number of rows [`run`] folds over for a piece count of `pieces`: the
+/// count itself, rounded up to a shared bucket.
+///
+/// The JIT cache keys a compiled program by canonical arena *and shape*
+/// (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3), and a fold's
+/// shape is its trip count, so two glyphs otherwise alike but for their
+/// piece count compile to two programs. Bucketing collapses the font-wide
+/// *set* of trip counts a piece count can land on, so unrelated glyphs whose
+/// counts round to the same bucket share one program; [`padding_row`] is
+/// what fills the gap between a glyph's own count and its bucket without
+/// changing what the glyph draws.
+///
+/// Powers of two, per
+/// `docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3's own framing
+/// — see that section, and this crate's measurements in
+/// `docs/BACKLOG.md`, for the trade against a coarser bucket.
+fn bucketed_trip_count(pieces: u32) -> u32 {
+    pieces.next_power_of_two()
+}
+
+/// A row that folds to the identity of **both** of [`glyph`]'s reductions,
+/// at every sample: [`Kernel::sum_over`] reads `0` from it and
+/// [`Kernel::min_over`] reads a distance nothing real can beat.
+///
+/// It is the all-zero row (every column [`piece_row`] would zero for a
+/// straight, always-boundary-eligible piece already is), plus one nonzero
+/// entry:
+///
+/// - **winding is `0`.** [`COL_Y_MIN`] `== `[`COL_Y_MAX`] `== 0.0` makes
+///   [`crossing_term`]'s row span empty for every `Y` — `Y ≥ 0 ∧ Y < 0`
+///   holds nowhere — so it selects its `0.0` arm unconditionally, the same
+///   way a horizontal chord's does. [`sliver_term`]'s `u`, `v` are both
+///   `0.0`, which is exactly a line's identity case (see the module note
+///   above [`COL_Y_MIN`]): `0 ≥ 0` and `0·0 − 0 ≤ 0` both hold, so it
+///   selects [`COL_SLIVER_SIGN`] `== 0.0`. Both are literal IEEE `0.0`
+///   selected outright, not a mask folded against a coefficient, so summing
+///   this row into [`Winding::sum`] changes no bit of a real glyph's
+///   winding.
+/// - **distance is never the `min`'s winner.** [`COL_ACROSS_C`] is
+///   [`PADDING_DISTANCE_SEED`] with [`COL_ACROSS_A`]/[`COL_ACROSS_B`] left
+///   `0.0`, so [`piece_distance`]'s `across` is a bare constant — no `X`,
+///   `Y` term — and its symbolic gradient is exactly `(0, 0)`.
+///   [`Distance::in_pixels`]'s [`MIN_GRADIENT`] floor is then the whole
+///   denominator, so the perpendicular term alone is
+///   `PADDING_DISTANCE_SEED / MIN_GRADIENT` at every sample: finite, never
+///   NaN (no division by an unfloored zero), and comfortably past
+///   [`RAMP_REACH`]. [`COL_HALF_LENGTH`], [`COL_ALONG_*`] and
+///   [`COL_DEVIATION`] all `0.0` only adds nonnegative terms on top.
+///
+/// The one producer of a padding row, and the only one — [`piece_row`]
+/// takes a [`Piece`], and [`Piece::line`]/[`Piece::quad`] never construct
+/// one with a zero-length or otherwise degenerate chord, so there is no way
+/// to reach this row's shape by constructing a "fake" piece. [`run`] calls
+/// this function directly wherever [`bucketed_trip_count`] asks for more
+/// rows than the outline has pieces.
+fn padding_row() -> [f32; PIECE_ROW_COLS] {
+    let mut row = [0.0f32; PIECE_ROW_COLS];
+    row[COL_ACROSS_C] = PADDING_DISTANCE_SEED as f32;
     row
 }
 
@@ -1410,6 +1504,69 @@ mod tests {
                 p.deviation() <= MAX_DEVIATION,
                 "a piece still strays {} from its chord",
                 p.deviation()
+            );
+        }
+    }
+
+    #[test]
+    fn bucketed_trip_count_rounds_up_to_a_power_of_two() {
+        assert_eq!(bucketed_trip_count(1), 1);
+        assert_eq!(bucketed_trip_count(2), 2);
+        assert_eq!(bucketed_trip_count(3), 4);
+        assert_eq!(bucketed_trip_count(4), 4);
+        assert_eq!(bucketed_trip_count(5), 8);
+        assert_eq!(bucketed_trip_count(34), 64);
+    }
+
+    /// A [`padding_row`] changes no bit of either fold. Baking the winding
+    /// sum and the distance min with extra padding rows appended — over a
+    /// lattice wide enough to sample both sides of a real piece's own
+    /// crossing and its boundary test — must reproduce exactly the same
+    /// buffer as baking with the real row alone, at every padding count this
+    /// glyph's own pieces ever land between (`bucketed_trip_count` never
+    /// pads past the next power of two, so 1–7 extra rows covers every case
+    /// up to an 8-piece bucket).
+    #[test]
+    fn a_padding_row_is_an_exact_identity_of_both_folds() {
+        let piece = Piece::line([0.0, 0.0], [4.0, 4.0]).expect("a 4-unit chord is not degenerate");
+        let real = piece_row(piece);
+
+        let bake = |rows: &[[f32; PIECE_ROW_COLS]]| -> (Vec<f32>, Vec<f32>) {
+            let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+            let height = rows.len();
+            let table = DiscreteManifold::new(flat, PIECE_ROW_COLS, height).kernel();
+            let count = u32::try_from(rows.len()).expect("test row counts fit u32");
+            let winding = Winding(Kernel::sum_over(count, |i| {
+                let c = row_at(&table, i);
+                crossing_term(&c).add(&sliver_term(&c)).0
+            }));
+            let winding = Winding(winding.0.by_ref());
+            let distance = Distance(Kernel::min_over(count, |i| {
+                let c = row_at(&table, i);
+                boundary_distance(&c, &winding).0
+            }))
+            .min(&Distance::unreachable());
+
+            let extent = [4u32, 4u32];
+            let bake_one = |k: &Kernel| {
+                let bound = Manifold::compile(k, extent).bind(&[]);
+                Lattice::frame(4, 4).collapse(&bound).into_buffer()
+            };
+            (bake_one(&winding.0), bake_one(&distance.0))
+        };
+
+        let (w0, d0) = bake(&[real]);
+        for padding in 1..=7 {
+            let mut rows = vec![real];
+            rows.extend(core::iter::repeat_with(padding_row).take(padding));
+            let (w1, d1) = bake(&rows);
+            assert_eq!(
+                w0, w1,
+                "winding changed with {padding} padding row(s) appended"
+            );
+            assert_eq!(
+                d0, d1,
+                "distance changed with {padding} padding row(s) appended"
             );
         }
     }
