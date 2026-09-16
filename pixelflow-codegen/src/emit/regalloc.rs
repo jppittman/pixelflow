@@ -3735,9 +3735,12 @@ mod tests {
     /// occupant it evicted offered — not merely because it forced room open.
     ///
     /// Seven fillers fill `TEST_FILE`'s pool exactly; an eighth definition
-    /// forces an eviction, and the evicted occupant (`f7`, read soonest among
-    /// the fillers... — no: farthest, see below) sets the bar the new
-    /// definition has to beat.
+    /// forces an eviction, and the evicted occupant (`f7`, farthest among the
+    /// fillers) sets the bar the new definition has to beat. The check runs
+    /// at a `Var` spacer right after `new_val`'s own definition — not the
+    /// literal next instruction, which would otherwise need a destination of
+    /// its own and could evict `new_val` on that unrelated contest, masking
+    /// whether *this* one demoted it.
     #[test]
     fn a_destination_that_forces_an_eviction_but_reads_later_than_the_occupant_is_spilled_next() {
         let mut schedule = vec![def(0, ScheduledOp::Var(0))];
@@ -3747,11 +3750,17 @@ mod tests {
         }
         let new_val = 17;
         schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
-        let def_index = schedule.len() - 1; // index 8: pool is full, so this evicts someone.
+        schedule.push(def(18, ScheduledOp::Var(1))); // spacer: no pool interaction.
+        let check_index = schedule.len() - 1;
         // f1..f7 read once each, staggered — f1 soonest, f7 last of the
-        // fillers (distance 7) — and `new_val`'s own read even later still
-        // (distance 8), so it is used farther out than the occupant (`f7`,
-        // distance 7) that `loser` picks to evict for it.
+        // fillers (distance 7 from `new_val`'s own definition) — and
+        // `new_val`'s own read even later still (distance 9), so it is used
+        // farther out than the occupant (`f7`, distance 8) that `loser`
+        // picks to evict for it. The check runs at the spacer right after
+        // `new_val`'s own definition, not the literal next instruction,
+        // which would otherwise need a destination of its own and could
+        // evict `new_val` on that unrelated contest, masking whether *this*
+        // one demoted it.
         for (i, &f) in fillers.iter().enumerate() {
             schedule.push(def(
                 100 + i as u32,
@@ -3762,7 +3771,7 @@ mod tests {
 
         let a = alloc(schedule);
         assert_eq!(
-            a.body().where_at(ValueId(new_val), def_index + 1),
+            a.body().where_at(ValueId(new_val), check_index),
             Where::Spilled,
             "new_val forced f7's eviction to be written, but its own next \
              read is even farther out than f7's was, so it does not keep \
@@ -3813,6 +3822,11 @@ mod tests {
 
     /// A tie between the new definition and the occupant it evicted goes to
     /// the occupant: `keeps` is a strict `>`, not `>=`.
+    ///
+    /// As above, the check runs at a `Var` spacer right after `new_val`'s
+    /// own definition, so an unrelated instruction's own destination contest
+    /// (which would also be entitled to evict `new_val`, tie or no tie)
+    /// cannot stand in for the answer this test is actually asking.
     #[test]
     fn a_tie_with_the_evicted_occupant_does_not_keep_the_new_definition() {
         let mut schedule = vec![def(0, ScheduledOp::Var(0))];
@@ -3822,7 +3836,8 @@ mod tests {
         }
         let new_val = 17;
         schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
-        let def_index = schedule.len() - 1; // index 8.
+        schedule.push(def(18, ScheduledOp::Var(1))); // spacer: no pool interaction.
+        let check_index = schedule.len() - 1;
         // f1..f6 read soon, so f7 (unread so far) is the farthest among the
         // fillers and is the one `loser` evicts.
         for (i, &f) in fillers[..6].iter().enumerate() {
@@ -3832,7 +3847,8 @@ mod tests {
             ));
         }
         // One instruction reads both f7 and new_val, so both have the exact
-        // same next-read distance from `def_index` — a genuine tie.
+        // same next-read distance from `new_val`'s own definition — a
+        // genuine tie.
         schedule.push(def(
             999,
             ScheduledOp::Binary(OpKind::Add, ValueId(fillers[6]), ValueId(new_val)),
@@ -3840,10 +3856,37 @@ mod tests {
 
         let a = alloc(schedule);
         assert_eq!(
-            a.body().where_at(ValueId(new_val), def_index + 1),
+            a.body().where_at(ValueId(new_val), check_index),
             Where::Spilled,
             "tied against the occupant it evicted, new_val must not keep the \
              register — `keeps` requires strictly beating it"
+        );
+    }
+
+    /// A demotion is never queued past the schedule's own end: the loser of
+    /// the schedule's very last instruction has no `i + 1` to be reset at,
+    /// and `demotions` is sized to `dag.len()`, so queuing one there would be
+    /// an out-of-bounds write, not merely a wasted one.
+    ///
+    /// Eight unread values tied at "never read again": the eighth (also the
+    /// schedule's last instruction) forces an eviction among the other
+    /// seven, and every candidate — including the new definition itself —
+    /// has the identical worst-case rank, so it loses its own contest
+    /// exactly as any of the others would have.
+    #[test]
+    fn a_demoted_last_instruction_queues_no_demotion_past_the_schedule() {
+        let mut schedule = vec![def(0, ScheduledOp::Var(0))];
+        for f in 10..17u32 {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        schedule.push(def(20, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))); // 8th value: the last instruction.
+        let last = schedule.len() - 1;
+
+        let a = alloc(schedule);
+        assert!(
+            matches!(a.body().where_at(ValueId(20), last), Where::Reg(_)),
+            "nothing later reverses its own destination write; only a queued \
+             demotion could, and there is nowhere to queue one to"
         );
     }
 
