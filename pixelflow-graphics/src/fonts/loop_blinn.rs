@@ -128,7 +128,7 @@
 //! exact, whatever the glyph's shape.
 
 use super::outline::{Outline, Point, Segment};
-use pixelflow_core::{BoundManifold, DiscreteManifold, Kernel, Lattice, Manifold, Monoid};
+use pixelflow_core::{BoundManifold, DiscreteManifold, Kernel, Lattice, Manifold, Monoid, Uniform};
 use pixelflow_ir::OpKind;
 
 /// How far coverage can reach past the outline, in the frame the kernel is
@@ -326,13 +326,35 @@ impl Support {
 
     /// The mask that is set exactly inside this box — the binning test, and
     /// the cut [`Glyph::kernel`] applies so the box's claim survives a warp.
+    ///
+    /// **The four edges are arguments, not constants**, and that is the whole
+    /// reason a font needs so few programs. A box spelled as four `Const`
+    /// leaves is *data living in the program*: the key `canonical` builds
+    /// digests a `Const`'s bits, so two glyphs alike in every other way
+    /// compiled to two different regions, and 95 ASCII glyphs minted 90
+    /// distinct programs. A `Uniform` keys by its **dense slot** — "the
+    /// default is the block's business, not the code's" — so the same glyphs
+    /// now share one region per shape and differ only in the block bound
+    /// beside it.
+    ///
+    /// Minting here rather than storing handles on `Self` keeps [`Support`] a
+    /// plain geometric value (`Copy`, comparable, `const`-constructible), and
+    /// puts the mint at the one point where the box stops being host data and
+    /// becomes program. Two calls on one box are therefore two argument sets,
+    /// exactly as [`Uniform`]'s own contract says; each call site below makes
+    /// one call per box, which is the arity that means.
+    ///
+    /// The defaults carry the box, so nothing downstream binds a block: a
+    /// `Manifold` reads its own `defaults` off the link it was compiled
+    /// against, and `bind` binds every argument at its default.
     fn contains(self) -> Kernel {
         let [x0, y0, x1, y1] = self.0;
+        let edge = |v: f32| Uniform::new(v).kernel();
         Kernel::x()
-            .ge(&constant(x0))
-            .and(&Kernel::x().le(&constant(x1)))
-            .and(&Kernel::y().ge(&constant(y0)))
-            .and(&Kernel::y().le(&constant(y1)))
+            .ge(&edge(x0))
+            .and(&Kernel::x().le(&edge(x1)))
+            .and(&Kernel::y().ge(&edge(y0)))
+            .and(&Kernel::y().le(&edge(y1)))
     }
 
     /// The smallest box containing both — the support of two glyphs laid
