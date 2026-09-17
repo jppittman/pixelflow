@@ -4273,7 +4273,7 @@ mod tests {
     }
 
     /// The three-deep contraction of the test above, as an arena.
-    fn three_deep_contraction() -> (ExprArena, ExprId) {
+    fn three_deep_contraction() -> (ExprArena, pixelflow_ir::arena::ExprId) {
         use pixelflow_ir::fold::{Binder, Fold, Monoid};
 
         let mut a = ExprArena::new();
