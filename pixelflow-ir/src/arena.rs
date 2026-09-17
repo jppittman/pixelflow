@@ -1393,6 +1393,45 @@ impl ExprArena {
 
     // ───────────────────── linking ───────────────────────────
 
+    /// This arena with its buffer and uniform tables replaced slot for slot:
+    /// slot `i` names `buffers[i]` / `uniforms[i]`, and no node moves.
+    ///
+    /// The second half of sharing one optimization between two compositions
+    /// of one shape (`pixelflow-search`'s runtime cache): the saturated graph
+    /// carries the first composition's names in its leaves, and this gives
+    /// the extracted term the second's. Positional, so the tables must
+    /// already agree on everything but the names — the slot count, and a
+    /// buffer's extents, which the code folds its addressing against. A
+    /// uniform's default is the block's business, not the code's, and may
+    /// differ.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a table's length differs from this arena's, or a buffer's
+    /// extents differ from the one whose slot it takes.
+    #[must_use]
+    pub fn with_tables(mut self, buffers: Vec<BufferDecl>, uniforms: Vec<UniformDecl>) -> Self {
+        assert_eq!(
+            self.buffers.len(),
+            buffers.len(),
+            "with_tables: the buffer tables differ in length"
+        );
+        for (slot, (mine, theirs)) in self.buffers.iter().zip(&buffers).enumerate() {
+            assert!(
+                mine.width == theirs.width && mine.height == theirs.height,
+                "with_tables: buffer slot {slot} changes extents: {mine:?} -> {theirs:?}"
+            );
+        }
+        assert_eq!(
+            self.uniforms.len(),
+            uniforms.len(),
+            "with_tables: the uniform tables differ in length"
+        );
+        self.buffers = buffers;
+        self.uniforms = uniforms;
+        self
+    }
+
     /// The subgraph reachable from `root`, with its buffer and uniform tables
     /// replaced by the given orders — the link step: slot `i` of the result
     /// names `buffers[i]` / `uniforms[i]` and every reachable leaf is

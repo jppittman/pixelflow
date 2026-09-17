@@ -298,3 +298,29 @@ fn a_nested_sum_over_reads_every_column_exactly() {
         );
     }
 }
+
+/// A second composition of a table kernel, at a second lattice, reads its
+/// *own* table. The optimizer saturates a structure once and shares that
+/// across compositions and shapes; what each gets back is the term in its
+/// own names, or it would gather from the first composition's memory. Every
+/// sample of the lattice, since the kernel varies with neither axis.
+#[test]
+fn a_second_composition_at_a_second_shape_reads_its_own_table() {
+    for col in 0..TABLE_COLS {
+        let (binding, table) = bind_table();
+        let kernel = Kernel::sum_over(TABLE_ROWS as u32, |i| {
+            table.at(&Kernel::constant(col as f32), i).mul(i)
+        });
+        let program = Manifold::compile(&kernel, [3, 2]);
+        let bound = program.bind(&[binding]);
+        let out = Lattice::frame(3, 2).collapse(&bound);
+        let want = host_column_weighted_sum(col);
+        for (k, got) in out.buffer().iter().enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "column {col}, sample {k}: got {got}, want {want}"
+            );
+        }
+    }
+}
