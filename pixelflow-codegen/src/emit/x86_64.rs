@@ -732,11 +732,11 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // The gather truncates the float indices into one vector register and
         // loads each element through another.
         ScheduledOp::Gather(..) => 2,
-        // A surviving fold's own loop scaffold: the persistent binder
-        // register (broadcast, stepped once per iteration) plus two
-        // transient registers for the trip test's bound and the
-        // accumulate's slot round-trip — see `emit_dag_body_hoisted`'s
-        // `Reduce` arm.
+        // A surviving fold's own loop scaffold: two transient registers for
+        // the trip test's bound and mask, reused by the accumulate's slot
+        // round-trip and the step — see `emit_dag_body_hoisted`'s `Reduce`
+        // arm. The binder and the accumulator are the fold's roots, placed
+        // by the allocator, not scratch.
         ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
         _ => 0,
     }
