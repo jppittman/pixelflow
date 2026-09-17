@@ -110,6 +110,7 @@ fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::
         ExprNode::Guard { .. } => {
             panic!("a Guard reached the pict rewrite tests (G1: never chosen)")
         }
+        ExprNode::Write { .. } => panic!("a Write reached the pict rewrite tests"),
         ExprNode::Unary(kind, a) => {
             let ca = expr_to_egraph(arena, a, egraph);
             let op = crate::egraph::ops::op_from_kind(kind).expect("op");

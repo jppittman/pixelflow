@@ -448,6 +448,7 @@ fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
         // corpus arena holds one (G1, and the corpus writer refuses to
         // serialize one at all).
         ExprNode::Guard { .. } => None,
+        ExprNode::Write { .. } => None,
     }
 }
 

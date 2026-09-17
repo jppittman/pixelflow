@@ -145,6 +145,9 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         // A leaf like Buffer: its one broadcast load lands in the per-call
         // prologue, which the per-sample cost model does not see.
         OpKind::Uniform => 0,
+        // Sequencing computes nothing, and never reaches an e-graph anyway:
+        // it is post-legalize vocabulary.
+        OpKind::Seq => 0,
     })
 }
 

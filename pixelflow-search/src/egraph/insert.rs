@@ -51,6 +51,12 @@ pub enum Declined {
     /// here can rewrite inside a name. G3 is what gives extraction a price
     /// and this decline something to change.
     Guard,
+    /// A `Write` — the store the lattice's folds wrap a kernel in
+    /// (docs/plans/2026-09-16-collapse-is-a-fold.md §2.4). Declined for a
+    /// standing reason: an effect is not a value, so no rule may rewrite
+    /// it, and it is built by the legalize passes *after* extraction, so a
+    /// term carrying one into saturation skipped the pipeline.
+    Write,
 }
 
 /// Insert the subgraph reachable from `root` into `egraph`, returning the
@@ -109,6 +115,7 @@ pub fn insert<I: Ir>(
                     },
                     Shape::Ref(key) => return Err(Declined::Ref(key)),
                     Shape::Guard { .. } => return Err(Declined::Guard),
+                    Shape::Write { .. } => return Err(Declined::Write),
                     Shape::Buffer(decl) => egraph.add(ENode::Buffer(decl)),
                     Shape::Uniform(decl) => egraph.add(ENode::Uniform(decl)),
                     Shape::Op(kind, children) => {
@@ -192,6 +199,7 @@ pub fn reachable_count<I: Ir>(term: &I, root: I::Ref) -> usize {
             },
             Shape::Reduce { body, .. } => stack.push(body),
             Shape::Guard { mask, .. } => stack.push(mask),
+            Shape::Write { value, .. } => stack.push(value),
             _ => {}
         }
     }

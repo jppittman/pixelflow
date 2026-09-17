@@ -3,7 +3,8 @@
 ## Metadata
 - **Author**: JP (design), Claude (draft)
 - **Status**: `In progress` — denotation settled 2026-09-17; implementation in
-  the order of §5, one PR per row. Step 1 landed (#1277); step 2 in review.
+  the order of §5, one PR per row. Steps 1, 2 and 2½ landed (#1277, #1278,
+  #1279); step 3 in review.
 - **Created**: 2026-09-16 (as "a uniform read is one load"; rewritten
   2026-09-17 around the decision below)
 - **Verified against**: `93d48c86` (main with #1268, the re-land of the
@@ -213,7 +214,7 @@ by `kernel!`:
 
 | word | what | denotation |
 |---|---|---|
-| `Write { out, row, col, lane, value }` | `ExprNode`, `pub(crate)` | store `value`'s first `len(lane)` lanes at `out + 4·(row·pitch + col + lane)` |
+| `Write { row, col, lane, value }` | `ExprNode`; `push_write` is `pub(crate)` | store `value`'s first `len(lane)` lanes at `out + 4·(row·pitch + col + lane)` |
 | `OpKind::Seq` | binary, unit-typed | evaluate the left, then the right |
 | `Monoid::SEQ` | `Monoid(OpKind::Seq)` | the unit monoid |
 
@@ -225,7 +226,18 @@ would allocate is one dead vector of stack until a measurement says
 otherwise; that is what "no special case" costs, and it is cheap.
 
 `out` and `pitch` are call arguments: the collapse ABI becomes
-`fn(ctx, out, pitch)`. `Point4` and `TileSlice` go.
+`fn(ctx, out, pitch)`. `Point4` and `TileSlice` go. The node names neither
+(the first draft of the table wrote `Write { out, … }`): with one output
+plane per call there is nothing for a field to choose, and a field that can
+hold one value is a comment. A second output plane is the day it becomes a
+field.
+
+Refusal is the e-graph's and `kernel!`'s, not the type's, for `Seq`: an
+`OpKind` is an open enum and `push_binary(Seq, …)` is sayable. `insert`
+declines it as an op no vocabulary resolves, and the surface set has no
+method for it. `Write` is refused by construction — `push_write` is
+crate-private — and declined by `insert` besides, so a term carrying one
+into saturation is a pipeline-order bug reported at the node.
 
 ### 2.5 Static extents, and what that costs
 
@@ -308,7 +320,7 @@ One PR per row. Each lands green on its own; none needs the next.
 | 1 | ~~**Nested fold scopes.** `extract_folds` carves a fold inside a fold's body; `expand_nested_reduce` deleted. 2c's stated remainder.~~ **Done** (#1277). A nested fold that does not depend on the enclosing binder is hoisted: it stays the enclosing scope's fold, run once, and the fold reading it keeps its def as a placeholder parked in the accumulator slot — the glyph's winding sum runs once per batch, not once per piece. | goldens; `run_is_a_glyph`; `font_rasterization_regression` at every ISA level; `traffic` | `8`@32, this host's tier: 536,960 B → **12,390 B**; body 24,738 → **612** instructions; table reads (`vcvttps2dq`) 1,610 → **35**; spills 19 → 5. `A`@32 is the identical program: the body no longer scales with the piece count. |
 | 2 | **One saturation per structure, one extraction per shape.** `optimize_runtime_arena` holds the saturated e-graph, keyed on structure (never identity), and extracts per shape; the extracted term comes back in the caller's own names and slot order (`ExprArena::with_tables` + `relink`). `Optimizer::run` split into `saturate_term` and `extract`. | `one_compile_per_shape` counts saturations across shapes and compositions; a second composition keeps its own names; a second composition at a second shape reads its own table end to end | saturations per structure: 1, whatever the shape or the composition. Measured: the 95-glyph atlas at tile 32 after tile 16 saturates 1 structure (its one new bucket), not 7; warm 0.41 s → 0.31 s |
 | 2½ | **A fold's binder and accumulator are roots the allocator places.** Step 1 reserved the binder as a `Reduce` def's temp for the loop's whole life and kept it out of every pool inside, which put a depth on nesting: each level took a register from the pool below until, three levels down on SSE2, an instruction had nowhere to put its scratch — and step 5 nests the lattice's three folds *outside* a kernel's own. Now `allocate_nest` decides every carry in one plan (`plan_carries`): a region's roots and each fold's binder and accumulator are one ranking by reads saved per batch — a fold root's loop traffic and binder reads times its trip count, a region root's reads in the body — taken greedily under one constraint, that no scope has more carried across it than the pool has above the floor. Each is carried in a register or parked in a driver slot, and the loop seeds, tests, combines and steps whichever it got. Nothing is reserved across a body; the pool inside any fold is at or above the floor at every depth. Two bugs surfaced and are pinned: a binder slot keyed by its `Var`'s identity was one slot for a glyph's two sibling folds (they bind the same slot and the e-graph hash-conses the leaf), and a fold hoisted into a prologue whose result the body reads from a carried register was never handed over. | `a_folds_roots_are_placed_by_the_budget`: the three-deep contraction runs at the floor with every root in a slot, and five above it with the coldest root — the outermost accumulator — the one in a slot; `a_folds_roots_and_a_regions_are_one_ranking` walks the budget one register at a time for a per-call fold and a per-batch one; `sibling_folds_sharing_a_binder_node_read_their_own_counters`; `a_hoisted_fold_the_body_reads_is_carried_after_its_loop` | depth limit: gone. `8`@32 on this host's tier: 12,390 B → **12,328 B**, body 612 → 610 instructions, body loads 62 → **23** (18 transient + 5 kept), stores 20 → 14 — both glyph folds' roots are carried and three region roots with them, where the old headroom carried two region roots and pinned the binders. Ranking outer-first without trip counts measured **12,706 B** on the way (five region roots carried, every fold root in a slot): the number that made the weighting part of this step |
-| 3 | **Vocabulary.** `Write`, `OpKind::Seq`, `Monoid::SEQ`; `Variance` widened past `u8` and `REDUCE_BINDERS` past 4 (three lattice binders plus a kernel's own — the control plane is 64-bit). | unit tests; no production path changes | — |
+| 3 | ~~**Vocabulary.** `Write`, `OpKind::Seq`, `Monoid::SEQ`; `Variance` widened past `u8` and `REDUCE_BINDERS` past 4 (three lattice binders plus a kernel's own — the control plane is 64-bit).~~ **Done.** `Variance` is a `u64`; `REDUCE_BINDERS` is every bit past the axes (60), derived rather than chosen; `Fold`'s ends are `u32` (§6's open question, closed — `to_bits` is a `u128`, and the two corpus formats read it as one); `Write { row, col, lane, value }` with `push_write` crate-private; `Seq`/`SEQ` as in §2.4. Every exhaustive match in the workspace has its arm: structural copies carry a `Write` through, everything that prices, rewrites, emits or serialises one refuses it by name. One thing sat on the old width unsaid: `Kernel::over`'s binder placeholders were `Var(8..)`, past the four binders, and with sixty would have let an outer fold's rename capture an inner fold's index; they sit past `Variance::VARIABLES` now, and a test that fails on the old base pins it. | unit tests: a store's children, variance, key, display and equality; six nested sums bind six slots; a fold past sixteen bits; `SEQ` round-trips; `insert` declines a `Write` and a `Seq` under both vocabularies; `kernel!`'s surface set has no `seq`. No production path changes. | — |
 | 4 | **The two passes.** `collapse(extent)` and `pack(L)` in `legalize`, on an arena the emitter does not yet accept. | arena-level tests: structure, remainder for `w = qL + r`, every binder's bit, a read's uniformity | — |
 | 5 | **The emitter executes the lane fold and the `Write`; the scaffold is deleted; the ABI is `fn(ctx, out, pitch)`; `pixelflow-core` collapses in one call.** | goldens at every ISA level (`isa-matrix --smoke`); `bind_allocates_nothing`; `traffic`; distinct shapes per terminal frame counted before landing | collapse time; body instruction count; `loads_kept` by scope |
 | 6 | **Broadcast load** for a `Gather` whose address lacks the lane bit, split at `arena_to_schedule`. | goldens; `avx512_evex_proof` | `vgatherdps`/`vpextrd`/`vinsertps` → 0 on glyph programs |
@@ -329,5 +341,5 @@ write `code.as_bytes()`, count mnemonics.
 - **Where the write's address is computed.** From the row and batch counters
   (`lea`-shaped, two GPR ops per store) or as an induction pointer stepped at
   each scope's close. The emitter's choice; whichever is fewer lines.
-- **`Fold`'s `u16` ends.** A frame width fits; the control-plane rule says
-  widen anyway, and step 3 is where.
+- ~~**`Fold`'s `u16` ends.** A frame width fits; the control-plane rule says
+  widen anyway, and step 3 is where.~~ Widened to `u32` in step 3.

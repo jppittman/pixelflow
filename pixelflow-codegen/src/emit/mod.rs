@@ -2598,6 +2598,14 @@ fn arena_to_schedule(
                  reached the JIT emitter -- the emitter cannot emit one yet \
                  (G2, docs/plans/2026-09-12-emit-should-just-emit.md)"
             ),
+            // The store the lattice's folds wrap a kernel in. The emitter
+            // executes it in step 5 of docs/plans/2026-09-16-collapse-is-a-fold.md;
+            // until then nothing builds one, and one here is a bypassed
+            // pipeline rather than a kernel this backend lacks.
+            ExprNode::Write { .. } => panic!(
+                "arena_to_schedule: a Write reached the JIT emitter -- the emitter \
+                 does not execute one yet (collapse-is-a-fold, step 5)"
+            ),
         };
         schedule.push(regalloc::Def {
             value: vid,
@@ -2623,7 +2631,7 @@ fn schedule_variance(schedule: &[regalloc::Def]) -> Vec<pixelflow_ir::variance::
         let (vid, op) = (&def.value, &def.op);
         let i = vid.0 as usize;
         v[i] = match op {
-            ScheduledOp::Var(idx) if *idx < 8 => Variance::from_var(*idx),
+            ScheduledOp::Var(idx) if *idx < Variance::VARIABLES => Variance::from_var(*idx),
             ScheduledOp::Var(_) => Variance::ALL,
             // Invariant across the lattice; unknown until the call. The
             // `CONST` here is what carries it into the per-call prologue.
@@ -2683,7 +2691,7 @@ struct HoistPlan {
 fn plan_collapse_hoist(
     schedule: &[regalloc::Def],
     variance: &[pixelflow_ir::variance::Variance],
-    scope_mask: u8,
+    scope_mask: u64,
 ) -> Option<HoistPlan> {
     use regalloc::ValueId;
     let n = schedule.len();
@@ -2839,7 +2847,7 @@ fn partition_by_scope(
     // Outermost first: the scope outside binder `j` cannot depend on `j` or
     // on anything bound inside it.
     for j in (0..binders.len()).rev() {
-        let mask = binders[..=j].iter().fold(0u8, |m, b| m | (1 << b));
+        let mask = binders[..=j].iter().fold(0u64, |m, b| m | (1u64 << b));
         match plan_collapse_hoist(&remaining, variance, mask) {
             Some(plan) => {
                 remaining = plan.body;

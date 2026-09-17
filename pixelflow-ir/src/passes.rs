@@ -215,6 +215,14 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
         // this pass while the mask — a real child, rebuilt through `m` like
         // any other child — is legalized like the rest of the graph.
         ExprNode::Guard { mask, on, off } => arena.push_guard(m(*mask), *on, *off),
+        // The binders are metadata, copied as a fold's are; the value is
+        // the one child.
+        ExprNode::Write {
+            row,
+            col,
+            lane,
+            value,
+        } => arena.push_write(*row, *col, *lane, m(*value)),
     }
 }
 
@@ -626,6 +634,18 @@ impl<'a> Substitution<'a> {
                 let mask = self.apply(arena, mask);
                 arena.push_guard(mask, on, off)
             }
+            // The value may read the index; the binders name folds that
+            // are never unrolled — a lattice fold survives to codegen as a
+            // loop — so they pass through untouched.
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => {
+                let value = self.apply(arena, value);
+                arena.push_write(row, col, lane, value)
+            }
         };
         if let Some(slot) = self.memo.get_mut(idx) {
             *slot = Some(new);
@@ -851,6 +871,8 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
         // calculus, not G1). `diff_node` raises the error for the node
         // itself, so nothing here needs its mask's derivative.
         ExprNode::Guard { .. } => {}
+        // An effect has no derivative; `diff_node` refuses it.
+        ExprNode::Write { .. } => {}
     }
 }
 
@@ -1095,6 +1117,9 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
         // calculus. G1 only makes the node constructible, so this declines
         // rather than guess.
         ExprNode::Guard { .. } => Err("lower_dwrt: no derivative rule for a Guard"),
+        // A store is an effect, not a function of the coordinates; and
+        // `lower_dwrt` runs before the passes that build one.
+        ExprNode::Write { .. } => Err("lower_dwrt: no derivative of a store"),
     }
 }
 
