@@ -2005,6 +2005,16 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
         // never a register, so nothing about it needs `resolve_operands` —
         // this is the whole of what a `Reduce` def does.
         if let ScheduledOp::Reduce(fold, _) = sched_op {
+            // The body is a scope of its own, opening exactly here — the
+            // query `Allocation::opens_at` was built to answer, from the
+            // other side, for exactly this walk. A `Reduce` def that opens
+            // no scope here is an enclosing scope's fold, read from its slot
+            // (`extract_folds`'s placeholder): that loop ran before this
+            // scope began, `locs` already names the slot, and there is
+            // nothing to emit.
+            let Some(fold_scope) = allocation.fold_opening_at(sched_idx) else {
+                continue;
+            };
             let acc_offset = *fold_slots.get(vid).unwrap_or_else(|| {
                 panic!(
                     "{vid:?}'s Reduce def has no accumulator slot — the driver did not assign one"
@@ -2049,12 +2059,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 exit,
             );
 
-            // The body: a scope of its own, opening exactly here — the query
-            // `Allocation::opens_at` was built to answer, from the other
-            // side, for exactly this walk.
-            let fold_scope = allocation
-                .fold_opening_at(sched_idx)
-                .unwrap_or_else(|| panic!("{vid:?}'s Reduce def opens no fold scope in this nest"));
+            // The body, in its own scope.
             let fold_alloc = allocation.sibling(fold_scope);
             let (fold_code, body_result, _, _) = emit_dag_body_hoisted(
                 fold_alloc,
@@ -2742,6 +2747,9 @@ struct PendingFold {
     /// The fold's own per-iteration computation, in topological order,
     /// ending at the body's root.
     schedule: Vec<regalloc::Def>,
+    /// The folds whose `Reduce` def sits in `schedule`: a fold inside this
+    /// one's body. The nest is a tree, and this is the recursion.
+    children: Vec<PendingFold>,
 }
 
 /// Carve every surviving `Reduce`'s body out of `schedule`, before anything
@@ -2752,76 +2760,166 @@ struct PendingFold {
 /// but *not* call-invariant) would otherwise read as hoistable and be lifted
 /// into a region that runs once instead of `len()` times.
 ///
-/// A schedule's `ValueId`s are dense and positional —
-/// `arena_to_schedule` assigns them in the same order it pushes `Def`s, so
-/// `schedule[v.0 as usize]` is always the def of `v` — which is what makes a
-/// bitset over positions double as a reachability set here.
+/// A fold inside a fold's body is carved the same way, one level down: the
+/// outer fold's closure is a schedule like any other, and the inner fold is
+/// a `Reduce` def in it. `variance` is indexed by `ValueId` (dense and
+/// positional in the arena's own schedule — `arena_to_schedule` assigns
+/// them in the order it pushes `Def`s), which is what lets one array answer
+/// for every level.
 fn extract_folds(
     schedule: Vec<regalloc::Def>,
     variance: &[pixelflow_ir::variance::Variance],
 ) -> (Vec<regalloc::Def>, Vec<PendingFold>) {
-    let n = schedule.len();
-    let mut pending: Vec<PendingFold> = Vec::new();
+    let top = alloc::vec![false; variance.len()];
+    extract_folds_bound_by(
+        schedule,
+        variance,
+        pixelflow_ir::variance::Variance::CONST,
+        &top,
+    )
+}
 
-    for def in &schedule {
-        let ScheduledOp::Reduce(_, body_vid) = def.op else {
+/// [`extract_folds`] for one scope, `bound` being the binders that scope is
+/// *inside*: none at the top, a fold's own binder and its ancestors' for
+/// that fold's body.
+///
+/// `bound` is what decides which values leave. Nothing outside a fold can
+/// read its own binder — that is what makes it a binder — so a value whose
+/// variance names a binder this scope is *not* inside can only belong to a
+/// fold nested deeper, and dropping it here is safe by construction. A value
+/// a fold's closure also reached but whose variance names no deeper binder
+/// (a shared invariant leaf, or one that varies only with an enclosing
+/// binder) is not dropped: it stays here too, genuinely computed on both
+/// sides, and is recomputed once per iteration inside the fold — a missed
+/// hoist (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "ask B"),
+/// not a wrong split. Getting this backwards — removing the whole closure —
+/// would orphan exactly that shared leaf's other consumer.
+///
+/// The one thing that is *not* recomputed inside a fold is another fold
+/// that does not depend on its binder: a whole loop per iteration is the
+/// glyph's winding sum run once per piece of its distance fold, and once
+/// more at the top for the coverage that reads it. Such a `Reduce` stays
+/// the enclosing scope's fold, and the fold that reads its result keeps its
+/// def as a **placeholder** — in the schedule, so the reads resolve, but
+/// opening no scope here; `allocate_nest` parks it in its accumulator slot,
+/// where the enclosing scope's loop left it before this one began.
+/// `placeholder` is that verdict from the level above, by `ValueId`, so a
+/// level never mistakes one for a fold of its own.
+fn extract_folds_bound_by(
+    schedule: Vec<regalloc::Def>,
+    variance: &[pixelflow_ir::variance::Variance],
+    bound: pixelflow_ir::variance::Variance,
+    placeholder: &[bool],
+) -> (Vec<regalloc::Def>, Vec<PendingFold>) {
+    use pixelflow_ir::variance::Variance;
+
+    // `ValueId` space, not this schedule's length: a fold's schedule is a
+    // subset of its parent's, keeping the parent's ids.
+    let n = variance.len();
+    let mut position: Vec<Option<usize>> = alloc::vec![None; n];
+    for (i, def) in schedule.iter().enumerate() {
+        position[def.value.0 as usize] = Some(i);
+    }
+    // A binder this scope is not inside: what a value carrying one is
+    // nested under, and what a fold read from outside does not carry.
+    let deeper = Variance::BINDERS.bits() & !bound.bits();
+    let hoisted = |v: regalloc::ValueId| {
+        placeholder[v.0 as usize] || variance[v.0 as usize].bits() & deeper == 0
+    };
+
+    let mut pending: Vec<PendingFold> = Vec::new();
+    // A `Reduce` inside another's closure is that one's child, not this
+    // scope's own fold. The schedule is topological, so an outer fold's def
+    // comes after everything its body reaches; walking it backwards meets
+    // the outer fold first, and what its closure claims is skipped here and
+    // carved out by the recursion instead.
+    let mut claimed = alloc::vec![false; n];
+
+    for def in schedule.iter().rev() {
+        let ScheduledOp::Reduce(fold, body_vid) = def.op else {
             continue;
         };
+        if claimed[def.value.0 as usize] || placeholder[def.value.0 as usize] {
+            continue;
+        }
         // The fold's own closure: everything its body needs, reachable by
         // operand from its root. This *includes* any invariant leaf it
         // shares with code outside it (a `Uniform`, a shared sub-expression)
         // — reachability says nothing about whether such a value depends on
         // *this* binder, which is why it is not what decides removal below.
+        //
+        // A nested `Reduce` that depends on a binder bound here is followed
+        // *into*: its body is not an operand (`regalloc::operands` says so —
+        // the def's own emission never reads it), but it is this closure's
+        // to carry, so the recursion below can carve it out again one level
+        // down. One that does not is a placeholder (see the fn doc): its def
+        // is kept, nothing behind it is.
         let mut mark = alloc::vec![false; n];
-        let mut stack = alloc::vec![body_vid];
+        let mut placeholder_here = alloc::vec![false; n];
+        let is_fold = |v: regalloc::ValueId| {
+            position[v.0 as usize]
+                .is_some_and(|p| matches!(schedule[p].op, ScheduledOp::Reduce(..)))
+        };
+        let mut stack = Vec::new();
         mark[body_vid.0 as usize] = true;
+        // The root too: a body that *is* another fold's result reads that
+        // result from its slot, and the whole schedule is the placeholder.
+        if is_fold(body_vid) && hoisted(body_vid) {
+            placeholder_here[body_vid.0 as usize] = true;
+        } else {
+            stack.push(body_vid);
+        }
         while let Some(v) = stack.pop() {
-            for operand in regalloc::operands(&schedule[v.0 as usize].op) {
-                if !mark[operand.0 as usize] {
-                    mark[operand.0 as usize] = true;
-                    stack.push(operand);
+            let at = position[v.0 as usize].unwrap_or_else(|| {
+                panic!(
+                    "{v:?} is read by {:?}'s body but is not in its scope",
+                    def.value
+                )
+            });
+            let op = &schedule[at].op;
+            let nested_body = match op {
+                ScheduledOp::Reduce(_, body) => {
+                    claimed[v.0 as usize] = true;
+                    Some(*body)
                 }
+                _ => None,
+            };
+            for operand in regalloc::operands(op).chain(nested_body) {
+                if mark[operand.0 as usize] {
+                    continue;
+                }
+                mark[operand.0 as usize] = true;
+                if is_fold(operand) && hoisted(operand) {
+                    placeholder_here[operand.0 as usize] = true;
+                    continue;
+                }
+                stack.push(operand);
             }
         }
-        assert!(
-            (0..n).all(|i| !mark[i] || !matches!(schedule[i].op, ScheduledOp::Reduce(..))),
-            "{:?}'s body reads another fold's result -- nested reduce loops \
-             are not carved out by this stage (2c handles one level; see \
-             docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md section 5)",
-            def.value
-        );
-        let fold_schedule: Vec<regalloc::Def> = (0..n)
-            .filter(|&i| mark[i])
-            .map(|i| schedule[i].clone())
+        let fold_schedule: Vec<regalloc::Def> = schedule
+            .iter()
+            .filter(|d| mark[d.value.0 as usize])
+            .cloned()
             .collect();
+        let inside = bound.union(Variance::from_var(fold.binder().var()));
+        let (fold_schedule, children) =
+            extract_folds_bound_by(fold_schedule, variance, inside, &placeholder_here);
         pending.push(PendingFold {
             reduce_vid: def.value,
             schedule: fold_schedule,
+            children,
         });
     }
+    // Schedule order, so fold indices are stable whichever way this walked.
+    pending.reverse();
 
     if pending.is_empty() {
         return (schedule, pending);
     }
 
-    // Variance, not reachability, decides what leaves the outer schedule.
-    // Nothing outside a fold can read its own binder — that is what makes it
-    // a binder — so a value whose variance carries *any* binder bit can only
-    // ever be part of that fold's own closure, and dropping it here is safe
-    // by construction. A value the closure above *also* reached but whose
-    // variance carries no binder bit (a shared invariant leaf) is not
-    // dropped: it stays here too, genuinely computed on both sides, and is
-    // recomputed once per iteration inside the fold — a missed hoist
-    // (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "ask B"), not
-    // a wrong split. Getting this backwards — removing the whole closure —
-    // would orphan exactly that shared leaf's other consumer.
     let remaining: Vec<regalloc::Def> = schedule
         .into_iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            variance[*i].bits() & pixelflow_ir::variance::Variance::BINDERS.bits() == 0
-        })
-        .map(|(_, def)| def)
+        .filter(|def| variance[def.value.0 as usize].bits() & deeper == 0)
         .collect();
     (remaining, pending)
 }
@@ -2863,12 +2961,50 @@ fn attach_folds(scoped: &mut regalloc::ScopedSchedule, pending: Vec<PendingFold>
                 fold.reduce_vid
             )
         });
-        scoped.folds.push(regalloc::ScopeFold {
-            parent,
-            at,
-            roots: Vec::new(),
-            schedule: fold.schedule,
-        });
+        attach_fold(scoped, fold, parent, at);
+    }
+}
+
+/// Record `fold` as a [`regalloc::ScopeFold`] opening at `at` in `parent`,
+/// then each of its children inside it — depth first, so a parent's index is
+/// always below its children's, which is the order `allocate_nest` and the
+/// frame layout both walk the tree in.
+///
+/// A child's position is a search of its parent's schedule, for the same
+/// reason [`attach_folds`] searches rather than carries: the allocator keeps
+/// a fold's evaluation order, but a position is a fact about a schedule and
+/// this is the schedule it will be asked of.
+fn attach_fold(
+    scoped: &mut regalloc::ScopedSchedule,
+    fold: PendingFold,
+    parent: regalloc::Scope,
+    at: usize,
+) {
+    let PendingFold {
+        reduce_vid,
+        schedule,
+        children,
+    } = fold;
+    let index = scoped.folds.len();
+    scoped.folds.push(regalloc::ScopeFold {
+        parent,
+        at,
+        roots: Vec::new(),
+        schedule,
+    });
+    for child in children {
+        let at = scoped.folds[index]
+            .schedule
+            .iter()
+            .position(|def| def.value == child.reduce_vid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}'s Reduce def is not in {reduce_vid:?}'s body, which \
+                     extract_folds said it was nested in",
+                    child.reduce_vid
+                )
+            });
+        attach_fold(scoped, child, regalloc::Scope::Fold(index), at);
     }
 }
 
@@ -3921,6 +4057,259 @@ mod tests {
             // Summation order differs from the emitted tree's, so this is a
             // tolerance on rounding — the bug it guards was off by the whole
             // value, not the last bits.
+            let tol = want.abs() * 1e-4 + 1e-3;
+            assert!(
+                (got - want).abs() <= tol,
+                "at x={xv}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// A fold inside a fold's body is a loop inside a loop.
+    ///
+    /// `extract_folds` used to refuse this shape (one level, with
+    /// `expand_nested_reduce` unrolling the inner fold ahead of it); it
+    /// carves the inner fold out of the outer fold's closure now, the same
+    /// way it carves the outer one out of the body. The inner body reads
+    /// *both* binders — a contraction — which is what exercises the outer
+    /// binder staying in its register across the inner loop, and the inner
+    /// scope being handed the outer binder's park.
+    ///
+    /// `inner(j) = Σ_{i<3} (X + i·j) = 3X + 3j`;
+    /// `root = Σ_{j<2} inner(j) = 6X + 3`.
+    #[test]
+    fn a_reduce_inside_a_reduce_compiles_and_runs() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
+        let outer_binder = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(inner_binder.var());
+        let j = a.push_var(outer_binder.var());
+        let ij = a.push_binary(OpKind::Mul, i, j);
+        let inner_body = a.push_binary(OpKind::Add, x, ij);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), inner);
+
+        let schedule = arena_to_schedule(&a, root);
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("a fold inside a fold compiles");
+
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+            let want = 6.0 * x + 3.0;
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// Three deep, every level's binder read at the bottom, and the inner
+    /// fold's result feeding further arithmetic in its parent's body rather
+    /// than being the parent's whole body.
+    ///
+    /// `Σ_{k<2} (k + Σ_{j<2} (j + Σ_{i<2} (X + i + j + k)))`: the innermost
+    /// sums to `2X + 1 + 2j + 2k`, the middle to `Σ_j (2X + 1 + 2k + 3j)` =
+    /// `4X + 5 + 4k`, the outer to `Σ_k (4X + 5 + 5k)` = `8X + 15`.
+    #[test]
+    fn a_reduce_three_deep_compiles_and_runs() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let bk = Binder::from_slot(2).expect("slot 2 exists");
+        let i = a.push_var(bi.var());
+        let j = a.push_var(bj.var());
+        let k = a.push_var(bk.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let xij = a.push_binary(OpKind::Add, xi, j);
+        let xijk = a.push_binary(OpKind::Add, xij, k);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..2), xijk);
+        let j_inner = a.push_binary(OpKind::Add, j, inner);
+        let middle = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), j_inner);
+        let k_middle = a.push_binary(OpKind::Add, k, middle);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, bk, 0..2), k_middle);
+
+        let schedule = arena_to_schedule(&a, root);
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("a fold three deep compiles");
+
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+            let want = 8.0 * x + 15.0;
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// A fold inside a fold's body that does not depend on the outer binder
+    /// is the outer scope's fold, run once, and read inside from its slot —
+    /// not a loop per iteration. Both readings of it here: the outer body
+    /// reads it under its own binder, and the root reads it again outside.
+    ///
+    /// `inner = Σ_{i<3} (X + i) = 3X + 3`; `outer = Σ_{j<2} (inner + j) =
+    /// 2·inner + 1`; `root = outer + inner = 3·inner + 1 = 9X + 10`.
+    #[test]
+    fn an_invariant_reduce_inside_a_reduce_is_hoisted_and_shared() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(bi.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let j = a.push_var(bj.var());
+        let inner_j = a.push_binary(OpKind::Add, inner, j);
+        let outer = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), inner_j);
+        let root = a.push_binary(OpKind::Add, outer, inner);
+
+        // The structure: two folds, both the body's own, neither inside the
+        // other — the inner's def sits in the outer's schedule as a
+        // placeholder, opening nothing.
+        let schedule = arena_to_schedule(&a, root);
+        let variance = schedule_variance(&schedule);
+        let (remaining, pending) = extract_folds(schedule.clone(), &variance);
+        assert_eq!(pending.len(), 2, "both folds are the body's");
+        assert!(
+            pending.iter().all(|p| p.children.is_empty()),
+            "neither fold is inside the other"
+        );
+        let outer_fold = pending
+            .iter()
+            .find(|p| p.reduce_vid == regalloc::ValueId(outer.0))
+            .expect("the outer fold");
+        assert!(
+            outer_fold
+                .schedule
+                .iter()
+                .any(|d| d.value == regalloc::ValueId(inner.0)),
+            "the inner fold's def stays in the outer body as a placeholder"
+        );
+        assert!(
+            !outer_fold
+                .schedule
+                .iter()
+                .any(|d| d.value == regalloc::ValueId(xi.0)),
+            "nothing behind the placeholder is copied in"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|d| d.value == regalloc::ValueId(inner.0)),
+            "the inner fold is emitted once, at the top"
+        );
+
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("a hoisted fold compiles");
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+            let want = 9.0 * x + 10.0;
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// The same hoist when the invariant fold *is* the outer body: the
+    /// outer's schedule is one placeholder, and its result comes from the
+    /// slot. `Σ_{j<2} Σ_{i<3} (X + i) = 2·(3X + 3) = 6X + 6`.
+    #[test]
+    fn an_invariant_reduce_as_a_folds_whole_body_is_hoisted() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(bi.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), inner);
+
+        let schedule = arena_to_schedule(&a, root);
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("a fold whose body is a hoisted fold compiles");
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+            let want = 6.0 * x + 6.0;
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// `a_folds_spill_slots_do_not_alias_its_parents`, one level deeper: the
+    /// outer fold's body holds `K` values live across the inner loop, and the
+    /// inner loop holds `K` more, so both scopes go to slots and the inner
+    /// fold's frame is based at the outer fold's top rather than at its
+    /// parent's. The outer binder is read on both sides of the inner loop.
+    ///
+    /// `p_k = X + j + k` (in the outer body); `inner(j) = Σ_{i<R} Σ_k (i +
+    /// p_k)`; `outer body = Σ_k (p_k + inner(j))`; `root = Σ_{j<J} outer`.
+    #[test]
+    fn a_nested_folds_spill_slots_do_not_alias_its_parents() {
+        use pixelflow_ir::arena::ExprId;
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        const K: usize = 20;
+        const R: u32 = 3;
+        const J: u32 = 2;
+
+        fn tree_sum(a: &mut ExprArena, mut ids: alloc::vec::Vec<ExprId>) -> ExprId {
+            while ids.len() > 1 {
+                let mut next = alloc::vec::Vec::new();
+                for pair in ids.chunks(2) {
+                    next.push(match pair {
+                        [l, r] => a.push_binary(OpKind::Add, *l, *r),
+                        [only] => *only,
+                        _ => unreachable!("chunks(2) yields 1 or 2"),
+                    });
+                }
+                ids = next;
+            }
+            ids[0]
+        }
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(bi.var());
+        let j = a.push_var(bj.var());
+        let xj = a.push_binary(OpKind::Add, x, j);
+        // Live across the inner loop: defined in the outer body, consumed
+        // only past the inner `Reduce`.
+        let p: alloc::vec::Vec<ExprId> = (0..K)
+            .map(|k| {
+                let c = a.push_const(k as f32);
+                a.push_binary(OpKind::Add, xj, c)
+            })
+            .collect();
+        let q: alloc::vec::Vec<ExprId> = (0..K)
+            .map(|k| a.push_binary(OpKind::Add, i, p[k]))
+            .collect();
+        let inner_body = tree_sum(&mut a, q);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..R), inner_body);
+        let joined: alloc::vec::Vec<ExprId> = p
+            .iter()
+            .map(|&pk| a.push_binary(OpKind::Add, pk, inner))
+            .collect();
+        let outer_body = tree_sum(&mut a, joined);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..J), outer_body);
+
+        let schedule = arena_to_schedule(&a, root);
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("nested folds under register pressure compile");
+
+        for xv in [0.0f32, 1.0, -2.5, 7.0] {
+            let got = eval_point(&code.code, xv, 0.0, 0.0, 0.0);
+            let want: f32 = (0..J)
+                .map(|jv| {
+                    let pv = |k: usize| xv + jv as f32 + k as f32;
+                    let inner_v: f32 = (0..R)
+                        .map(|iv| (0..K).map(|k| iv as f32 + pv(k)).sum::<f32>())
+                        .sum();
+                    (0..K).map(|k| pv(k) + inner_v).sum::<f32>()
+                })
+                .sum();
             let tol = want.abs() * 1e-4 + 1e-3;
             assert!(
                 (got - want).abs() <= tol,

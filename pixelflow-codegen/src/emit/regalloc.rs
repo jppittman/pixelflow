@@ -830,7 +830,8 @@ impl Scratch {
     /// and the accumulate). Every backend's `temps_for` answers this for a
     /// `Reduce`, `allocate_nest` reads that many back to build the fold's
     /// pool, and the carry budget leaves this much headroom below the floor
-    /// when a nest has a fold — one number, so the three cannot drift.
+    /// when a nest has a fold — plus one per level of nesting, for each
+    /// enclosing fold's binder — one number, so the three cannot drift.
     pub const REDUCE_TEMPS: usize = 3;
 
     /// The most reload targets any one instruction asks for.
@@ -1529,10 +1530,24 @@ impl RegisterAllocator for LinearScan {
         // the first instruction there that needed a reload register or a
         // guard's mask found every register already spoken for — a glyph
         // with two more carried values reached that from an `unreachable!`.
-        let fold_headroom: u8 = if nest.folds.is_empty() {
-            0
-        } else {
-            Scratch::REDUCE_TEMPS as u8
+        //
+        // A fold inside a fold is one register deeper again: its pool also
+        // leaves out every enclosing fold's binder (see `pinned` below), so
+        // the headroom is the innermost fold's own temps plus one per level
+        // above it. Parents come before children in `nest.folds` — asserted
+        // where each is allocated below — so one forward pass finds the
+        // depth.
+        let mut depth: Vec<u8> = Vec::with_capacity(nest.folds.len());
+        for (index, fold) in nest.folds.iter().enumerate() {
+            let above = match fold.parent {
+                Scope::Fold(j) if j < index => depth[j],
+                Scope::Fold(_) | Scope::Region(_) | Scope::Body => 0,
+            };
+            depth.push(above + 1);
+        }
+        let fold_headroom: u8 = match depth.iter().max() {
+            None => 0,
+            Some(&deepest) => Scratch::REDUCE_TEMPS as u8 + deepest - 1,
         };
 
         for (index, region) in nest.regions.into_iter().enumerate() {
@@ -1624,6 +1639,19 @@ impl RegisterAllocator for LinearScan {
         // Reading a sibling's park would be a real error rather than a waste,
         // so it is checked below instead of being left to the conservatism.
         let mut folds: Vec<FoldScope> = Vec::with_capacity(nest.folds.len());
+        // Per fold, what a fold nested inside it needs to know: the `Var`
+        // its binder is and the register that binder lives in. The binder is
+        // the one value a fold's body holds in a register for the whole of
+        // the loop — its temps for the trip test and the accumulate are dead
+        // across the body — so it is the one register a loop inside must
+        // never be handed.
+        let mut binders: Vec<(u8, Option<Reg>)> = Vec::with_capacity(nest.folds.len());
+        let as_set = |reg: Option<Reg>| reg.map_or(RegSet::EMPTY, |r| RegSet::of(&[r]));
+        // Where every fold of the nest opens, so a `Reduce` def in a fold's
+        // schedule that opens none of them can be told from one that does:
+        // it is a placeholder for an enclosing scope's fold, read from the
+        // accumulator slot that loop left its result in.
+        let opens: Vec<(Scope, usize)> = nest.folds.iter().map(|f| (f.parent, f.at)).collect();
         for (index, fold) in nest.folds.into_iter().enumerate() {
             assert!(
                 match fold.parent {
@@ -1672,27 +1700,55 @@ impl RegisterAllocator for LinearScan {
             // inside it, which is the general mechanism this reuses rather
             // than a bespoke one: the binder is a value defined *outside*
             // this scope, at a fixed register for the scope's whole life.
+            //
+            // Every enclosing fold's binder the same way: a fold inside a
+            // fold may read the outer index too (a contraction does), and
+            // that index is in the register the outer loop keeps it in.
             let binder_var = fold_meta.binder().var();
-            let binder_vid = fold
-                .schedule
-                .iter()
-                .find(|d| matches!(d.op, ScheduledOp::Var(v) if v == binder_var))
-                .map(|d| d.value);
+            let binder_reg = reserved.first().copied();
             let mut fold_parked = parked.clone();
-            if let Some(bv) = binder_vid {
-                let t0 = *reserved.first().unwrap_or_else(|| {
+            for (at, def) in fold.schedule.iter().enumerate() {
+                if matches!(def.op, ScheduledOp::Reduce(..))
+                    && !opens.contains(&(Scope::Fold(index), at))
+                {
+                    fold_parked.insert(def.value, Where::Spilled);
+                }
+            }
+            let mut ancestors = RegSet::EMPTY;
+            let mut park_binder = |var: u8, reg: Option<Reg>, of: &str| {
+                let Some(bv) = fold
+                    .schedule
+                    .iter()
+                    .find(|d| matches!(d.op, ScheduledOp::Var(v) if v == var))
+                    .map(|d| d.value)
+                else {
+                    return;
+                };
+                let reg = reg.unwrap_or_else(|| {
                     panic!(
-                        "Fold({index}) reads its own binder but its Reduce \
-                         def reserved no temps -- temps_for must return at \
-                         least one for ScheduledOp::Reduce"
+                        "Fold({index}) reads {of} binder but that Reduce def \
+                         reserved no temps -- temps_for must return at least \
+                         one for ScheduledOp::Reduce"
                     )
                 });
-                fold_parked.insert(bv, Where::Reg(t0));
+                fold_parked.insert(bv, Where::Reg(reg));
+            };
+            park_binder(binder_var, binder_reg, "its own");
+            let mut up = fold.parent;
+            while let Scope::Fold(j) = up {
+                let (var, reg) = binders[j];
+                park_binder(var, reg, &alloc::format!("Fold({j})'s"));
+                ancestors = ancestors.union(as_set(reg));
+                up = folds[j].parent;
             }
+            binders.push((binder_var, binder_reg));
 
             let scan = self.scan(
                 fold.schedule,
-                &file.inside(carried).inside(RegSet::of(&reserved)),
+                &file
+                    .inside(carried)
+                    .inside(RegSet::of(&reserved))
+                    .inside(ancestors),
                 &fold_parked,
             );
             folds.push(FoldScope {
@@ -2290,7 +2346,10 @@ impl LinearScan {
             // of the identical value, and whichever one the loop's last
             // iteration leaves behind is read back instead of the outer
             // scope's own answer.
-            if matches!(def.op, ScheduledOp::Reduce(..)) {
+            //
+            // Not for a live-in `Reduce`: that is a placeholder for a loop an
+            // enclosing scope already ran, and nothing runs here.
+            if matches!(def.op, ScheduledOp::Reduce(..)) && !pass.live_in[def.value.0 as usize] {
                 for slot in 0..pass.owner.len() {
                     if pass.owner[slot].is_some() {
                         pass.split_out(slot, i);
@@ -2321,7 +2380,14 @@ impl LinearScan {
             // with neither.
             let mut taken = Reservations::new();
 
-            let wanted = (file.temps_for)(&def.op) as usize;
+            // A live-in def emits nothing, so its encoding wants nothing —
+            // a placeholder for an enclosing scope's fold would otherwise
+            // reserve a loop's three temps for a loop that does not run here.
+            let wanted = if pass.live_in[def.value.0 as usize] {
+                0
+            } else {
+                (file.temps_for)(&def.op) as usize
+            };
             assert!(
                 wanted <= Scratch::MAX_TEMPS,
                 "a backend asked for {wanted} scratch registers for one \

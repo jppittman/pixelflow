@@ -1,13 +1,12 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! Five passes, each `(arena, root) -> (arena, root)`, each turning nodes no
+//! Four passes, each `(arena, root) -> (arena, root)`, each turning nodes no
 //! backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
 //! |---|---|---|
 //! | [`expand_refs`] | `Ref` | the referent, spliced in |
 //! | [`lower_dwrt`] | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
-//! | [`expand_reduce`] | `Reduce` | the unrolled body, `extent` copies |
 //! | [`expand_gather`] | `Gather` | index arithmetic + `RawGather` |
 //! | [`expand_transcendentals`] | `Sin`..`Pow` | arithmetic + bit-manip atoms |
 //!
@@ -17,8 +16,11 @@
 //! everything. Every pass is idempotent and has an identity fast-path, so
 //! running one that has nothing to do is free.
 //!
-//! **`Reduce` is legal in the arena, but [`legalize`] still unrolls every one
-//! unconditionally — see [`legalize`]'s own doc comment for why.**
+//! **`Reduce` is legal in the arena and [`legalize`] leaves every one
+//! standing**, nested or not: codegen emits a surviving fold as a loop, and a
+//! fold inside a fold's body as a loop inside a loop. [`expand_reduce`] is
+//! still here for a caller that wants a fold unrolled — a test comparing the
+//! two shapes — and is on no production path.
 //!
 //! **Nothing here knows what it is lowering *for*.** There is no `cfg` in this
 //! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, kind,
@@ -74,22 +76,20 @@ pub fn legalize(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), 
     // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
     // has to precede the pass that expands them.
     let (arena, root) = lower_dwrt_owned(&arena, root)?;
-    // `expand_nested_reduce`, not `expand_reduce`: a `Reduce` is legal for
-    // codegen now (stage 2c — `pixelflow-codegen` emits a surviving fold as a
-    // loop), so the legalizer's job here shrank to the one shape codegen's
-    // `extract_folds` genuinely cannot carve out — a `Reduce` inside another
-    // `Reduce`'s own body, which `Kernel::by_ref` produces whenever two folds
-    // are composed by name and `expand_refs` splices one into the other. That
-    // one is unrolled; every other fold is left standing.
+    // No reduce pass. A `Reduce` is legal for codegen (stage 2c —
+    // `pixelflow-codegen` emits a surviving fold as a loop), and since
+    // `extract_folds` carves a fold inside a fold's body as a loop inside a
+    // loop, so is the shape `Kernel::by_ref` produces whenever two folds are
+    // composed by name and `expand_refs` splices one into the other. That
+    // shape was the last thing unrolled here (`expand_nested_reduce`, now
+    // deleted), and for a glyph it was the winding fold: N copies of a body
+    // the language had written once, N being the piece count.
     //
-    // This is the whole of the trade stage 2c was for. Unrolling every fold
-    // here meant the assembler saw N copies of a body the language had
-    // written once, and for a glyph N is the piece count. Over a 95-glyph
-    // tile-16 atlas, same host, before and after: emit 4,640 ms -> 1,431 ms,
-    // the emitted atlas 21.1 MB -> 15.8 MB, and `'@'` alone 655,866 B ->
-    // 478,404 B, on nothing but declining to unroll. Saturation is unmoved
-    // (2,534 ms -> 2,569 ms), which is the point of legalizing last.
-    let (arena, root) = expand_nested_reduce_owned(&arena, root);
+    // Declining to unroll is the whole of the trade stage 2c was for. Over a
+    // 95-glyph tile-16 atlas, same host, before and after 2c's one level:
+    // emit 4,640 ms -> 1,431 ms, the emitted atlas 21.1 MB -> 15.8 MB, and
+    // `'@'` alone 655,866 B -> 478,404 B. Saturation is unmoved (2,534 ms ->
+    // 2,569 ms), which is the point of legalizing last.
     let (arena, root) = expand_gather_owned(&arena, root);
     Ok(expand_transcendentals_owned(&arena, root))
 }
@@ -2113,189 +2113,67 @@ impl Optimize for ExpandReduce {
     }
 }
 
-/// The `body` of every `Reduce` reachable from `root` that has *another*
-/// `Reduce` somewhere inside its own body — the one shape
-/// `pixelflow-codegen`'s loop emission does not carve out (one level at a
-/// time; see docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md §5, "No
-/// nested reduce loops"). Keyed by `body` rather than the `Reduce` node's own
-/// id because that is the field [`expand_nested_reduce`]'s rewrite hook can
-/// actually match against — [`rebuild_arena`]'s hook sees a node's content,
-/// not its id, and a `body` is exactly as unique to its `Reduce` as the node
-/// itself is.
-///
-/// This is not a hypothetical. `Kernel::by_ref` composes two folds by name —
-/// a glyph's distance fold reads its winding fold's result this way, so the
-/// boundary test only evaluates the winding once per piece rather than
-/// splicing a copy of it into every piece — and `expand_refs`, which runs
-/// unconditionally ahead of everything else in [`legalize`], resolves that
-/// reference by splicing the referenced arena in. The winding's `Reduce`
-/// then sits inside the distance fold's own body: two folds, composed by a
-/// caller who never wrote either one inside the other.
-fn nested_reduce_bodies(arena: &ExprArena, root: ExprId) -> BTreeSet<ExprId> {
-    // Every `Reduce` reachable from `root` at all, as (its own id, its body).
-    let mut reduces: Vec<(ExprId, ExprId)> = Vec::new();
-    let mut seen = alloc::vec![false; arena.len()];
-    let mut stack = alloc::vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if core::mem::replace(&mut seen[idx], true) {
-            continue;
-        }
-        if let ExprNode::Reduce { body, .. } = arena.node(id) {
-            reduces.push((id, *body));
-        }
-        stack.extend(arena.children(id));
-    }
-    // For each one, walk its own body's closure for another.
-    let mut nested = BTreeSet::new();
-    for &(r, body) in &reduces {
-        let mut seen = alloc::vec![false; arena.len()];
-        let mut stack = alloc::vec![body];
-        while let Some(id) = stack.pop() {
-            let idx = id.0 as usize;
-            if core::mem::replace(&mut seen[idx], true) {
-                continue;
-            }
-            if id != r
-                && let ExprNode::Reduce {
-                    body: inner_body, ..
-                } = arena.node(id)
-            {
-                nested.insert(*inner_body);
-            }
-            stack.extend(arena.children(id));
-        }
-    }
-    nested
-}
-
-/// [`expand_nested_reduce`] as an owned rewrite, for [`legalize`]'s chain.
-///
-/// The fast path is the common one: an arena with no `Reduce` nested inside
-/// another's body is handed straight back, which after `expand_refs` is every
-/// kernel that does not compose two folds by name.
-#[must_use]
-pub fn expand_nested_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if nested_reduce_bodies(arena, root).is_empty() {
-        return (arena.clone(), root);
-    }
-    let mut owned = arena.clone();
-    let new_root = expand_nested_reduce(&mut owned, root);
-    (owned, new_root)
-}
-
-/// Unroll only the `Reduce`s [`nested_reduce_bodies`] finds, leaving every
-/// other one standing — `expand_reduce`'s rewrite rule (`unroll_reduce`),
-/// applied selectively rather than to every `Reduce` in the arena. Because
-/// [`rebuild_arena`] rebuilds bottom-up, an inner fold this selects is
-/// already unrolled by the time its outer fold's own `body` is visited
-/// (through `m`), so the outer `Reduce` is copied — not matched — with its
-/// now-unrolled body.
-fn expand_nested_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    let nested = nested_reduce_bodies(arena, root);
-    rebuild_arena(arena, root, |arena, node, m| match node {
-        ExprNode::Reduce { fold, body } if nested.contains(body) => {
-            Some(unroll_reduce(arena, *fold, m(*body)))
-        }
-        _ => None,
-    })
-}
-
-/// The fallback stage 2c's own plan named and did not yet need: "it unrolls
-/// what survived only when codegen cannot take it" — which turned out not to
-/// be "nothing" the moment a real glyph's `by_ref` composition was tried.
-/// Unrolls exactly the `Reduce`s [`nested_reduce_bodies`] finds; a
-/// non-nested `Reduce` is left standing, and `pixelflow-codegen` emits it as
-/// a loop.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ExpandNestedReduce;
-
-impl Optimize for ExpandNestedReduce {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if nested_reduce_bodies(arena, root).is_empty() {
-            return Rewritten::Unchanged;
-        }
-        let mut owned = arena.clone();
-        let new_root = expand_nested_reduce(&mut owned, root);
-        Rewritten::Changed(owned, new_root)
-    }
-}
-
 #[cfg(test)]
 mod nested_reduce_tests {
     use super::*;
     use crate::fold::{Binder, Fold, Monoid};
 
-    /// A non-nested `Reduce` is left standing exactly as-is: `Unchanged`,
-    /// not merely equal after a rebuild.
-    #[test]
-    fn a_non_nested_reduce_is_unchanged() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let binder = Binder::from_slot(0).expect("slot 0 exists");
-        let i = a.push_var(binder.var());
-        let body = a.push_binary(OpKind::Add, x, i);
-        let fold = Fold::new(Monoid::SUM, binder, 0..4);
-        let root = a.push_reduce(fold, body);
-
-        assert!(nested_reduce_bodies(&a, root).is_empty());
-        assert!(matches!(
-            ExpandNestedReduce.optimize(&a, root),
-            Rewritten::Unchanged
-        ));
+    /// Every `Reduce` reachable from `root`.
+    fn reachable_reduces(arena: &ExprArena, root: ExprId) -> usize {
+        let mut seen = alloc::vec![false; arena.len()];
+        let mut stack = alloc::vec![root];
+        let mut count = 0;
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            if matches!(arena.node(id), ExprNode::Reduce { .. }) {
+                count += 1;
+            }
+            stack.extend(arena.children(id));
+        }
+        count
     }
 
-    /// A `Reduce` whose body reads another `Reduce`'s result is unrolled;
-    /// the outer `Reduce` survives, now reading the unrolled body directly
-    /// rather than a nested node.
+    /// A `Reduce` whose body reads another `Reduce`'s result reaches the
+    /// backend as written: two folds, one inside the other. This used to be
+    /// the one shape `legalize` still unrolled (`expand_nested_reduce`,
+    /// deleted), because codegen carved fold bodies out one level at a time;
+    /// it carves a fold inside a fold now, and the pass went with the
+    /// restriction it existed for.
     ///
-    /// `inner = sum_{i<3}(X+i) = 3X+3`; `outer = sum_{j<2}(inner+j) =
-    /// 2*inner+1`.
+    /// `inner = sum_{i<3}(X+i)`; `outer = sum_{j<2}(inner+j)`.
     #[test]
-    fn a_nested_reduce_is_unrolled_and_the_outer_one_survives() {
+    fn legalize_leaves_a_nested_reduce_standing() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
         let i = a.push_var(inner_binder.var());
         let inner_body = a.push_binary(OpKind::Add, x, i);
-        let inner_fold = Fold::new(Monoid::SUM, inner_binder, 0..3);
-        let inner = a.push_reduce(inner_fold, inner_body);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
 
         let outer_binder = Binder::from_slot(1).expect("slot 1 exists");
         let j = a.push_var(outer_binder.var());
         let outer_body = a.push_binary(OpKind::Add, inner, j);
-        let outer_fold = Fold::new(Monoid::SUM, outer_binder, 0..2);
-        let root = a.push_reduce(outer_fold, outer_body);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), outer_body);
 
-        let nested = nested_reduce_bodies(&a, root);
-        assert_eq!(nested.len(), 1, "only inner's body is nested");
-        assert!(nested.contains(&inner_body));
-
-        let Rewritten::Changed(owned, new_root) = ExpandNestedReduce.optimize(&a, root) else {
-            panic!("a nested Reduce must rewrite");
-        };
-        // The outer Reduce survives; its body no longer contains any Reduce.
-        let ExprNode::Reduce {
-            fold: surviving_fold,
-            body: surviving_body,
-        } = owned.node(new_root)
-        else {
+        let (legalized, new_root) = legalize(&a, root).expect("legalize");
+        assert_eq!(
+            reachable_reduces(&legalized, new_root),
+            2,
+            "both folds must survive legalization"
+        );
+        let ExprNode::Reduce { fold, body } = legalized.node(new_root) else {
             panic!("root must still be the outer Reduce");
         };
-        assert_eq!(surviving_fold.range(), 0..2);
-        let mut stack = alloc::vec![*surviving_body];
-        let mut seen = alloc::vec![false; owned.len()];
-        while let Some(id) = stack.pop() {
-            let idx = id.0 as usize;
-            if core::mem::replace(&mut seen[idx], true) {
-                continue;
-            }
-            assert!(
-                !matches!(owned.node(id), ExprNode::Reduce { .. }),
-                "the outer body must no longer nest a Reduce"
-            );
-            stack.extend(owned.children(id));
-        }
+        assert_eq!(fold.range(), 0..2);
+        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(*body) else {
+            panic!("the outer body must still be `inner + j`");
+        };
+        assert!(
+            matches!(legalized.node(*lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
+            "the inner Reduce must be the outer body's own operand, not unrolled into it"
+        );
     }
 }
 
