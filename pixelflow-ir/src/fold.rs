@@ -152,10 +152,13 @@ impl Binder {
 ///
 /// `⟦Reduce { fold, body }⟧ = ⊕_{k ∈ lo, lo+s, lo+2s, …, hi-s} ⟦body⟧[fold.binder() := k]`
 ///
-/// `s` is [`Fold::stride`]: 1 until something calls [`Fold::halve`], the only
-/// thing that ever changes it. [`Fold::range`] still names the bounding
-/// `[lo, hi)`, which is why it is a poor stand-in for "every index visited"
-/// once the stride is not 1 — [`Fold::len`] is the count that stays exact.
+/// `s` is [`Fold::stride`]: 1 from [`Fold::new`], or whatever [`Fold::strided`]
+/// was given directly — `pack` strip-mining a lattice's column fold is the
+/// reason a second constructor exists at all. After construction, only
+/// [`Fold::halve`] ever changes it, by doubling. [`Fold::range`] still names
+/// the bounding `[lo, hi)`, which is why it is a poor stand-in for "every
+/// index visited" once the stride is not 1 — [`Fold::len`] is the count that
+/// stays exact.
 ///
 /// [`Reduce`]: crate::arena::ExprNode::Reduce
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -174,34 +177,58 @@ pub struct Fold {
     /// describing a program is not narrowed without a measurement asking.
     lo: u32,
     hi: u32,
-    /// The step between visited indices. `1` for every [`Fold::new`]; only
+    /// The step between visited indices. `1` for every [`Fold::new`], or
+    /// whatever [`Fold::strided`] was constructed with. After that, only
     /// [`Fold::halve`] ever doubles it, and only when `hi - lo` stays an
-    /// exact multiple of it — an invariant [`Fold::new`] establishes
-    /// (`stride` starts at 1, which divides anything) and [`Fold::halve`]
-    /// preserves (it only fires on an even trip count, so the new stride
-    /// still divides `hi - lo` exactly). That invariant is what makes
-    /// [`Fold::len`] integer division rather than an approximation.
+    /// exact multiple of it — an invariant [`Fold::strided`] checks directly
+    /// (it refuses a stride that does not divide the span), [`Fold::new`]
+    /// gets for free by going through it with a stride of 1 (which divides
+    /// anything), and [`Fold::halve`] preserves (it only fires on an even
+    /// trip count, so the new stride still divides `hi - lo` exactly). That
+    /// invariant is what makes [`Fold::len`] integer division rather than an
+    /// approximation.
     stride: u32,
 }
 
 impl Fold {
-    /// The fold of `monoid` over `range`, binding `binder`.
+    /// The fold of `monoid` over `range`, binding `binder`, visiting every
+    /// index in it — [`Fold::strided`] with a stride of `1`.
     ///
     /// # Panics
     ///
     /// Panics if `range` is reversed.
     #[must_use]
     pub fn new(monoid: Monoid, binder: Binder, range: Range<u32>) -> Self {
+        Self::strided(monoid, binder, range, 1)
+    }
+
+    /// The fold of `monoid` over `range`, binding `binder`, visiting every
+    /// `stride`-th index from `range.start` — the strip-mining `pack` uses to
+    /// carve a lattice's column fold into a lane-width main fold and a
+    /// narrower remainder (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is reversed, `stride` is `0`, or `stride` does not
+    /// divide `range.end - range.start` exactly — the invariant [`Fold::len`]
+    /// and [`Fold::from_bits`] both rely on.
+    #[must_use]
+    pub fn strided(monoid: Monoid, binder: Binder, range: Range<u32>, stride: u32) -> Self {
         assert!(
             range.start <= range.end,
             "a fold's range runs forwards: {range:?}"
+        );
+        assert!(stride != 0, "a fold's stride must be nonzero");
+        assert!(
+            (range.end - range.start).is_multiple_of(stride),
+            "a fold's stride must divide its span exactly: {range:?} step {stride}"
         );
         Self {
             monoid,
             binder,
             lo: range.start,
             hi: range.end,
-            stride: 1,
+            stride,
         }
     }
 
@@ -245,8 +272,9 @@ impl Fold {
         self.lo..self.hi
     }
 
-    /// The step between one visited index and the next. `1` until
-    /// [`Fold::halve`] doubles it.
+    /// The step between one visited index and the next. `1` from
+    /// [`Fold::new`], or [`Fold::strided`]'s own argument; [`Fold::halve`] is
+    /// the only thing that doubles it afterward.
     #[must_use]
     pub fn stride(self) -> u32 {
         self.stride
@@ -465,6 +493,44 @@ mod tests {
         assert_eq!(Monoid::of(OpKind::Seq), Some(Monoid::SEQ));
         let back = Fold::from_bits(fold.to_bits()).expect("a SEQ fold round-trips");
         assert_eq!(back, fold);
+    }
+
+    #[test]
+    fn strided_builds_with_the_given_step() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let fold = Fold::strided(Monoid::SUM, b, 0..12, 3);
+        assert_eq!(fold.stride(), 3);
+        assert_eq!(
+            fold.range(),
+            0..12,
+            "range() names the bound, not stride's steps"
+        );
+        assert_eq!(fold.len(), 4);
+        let back = Fold::from_bits(fold.to_bits()).expect("a strided fold's own bits name it");
+        assert_eq!(back, fold);
+    }
+
+    #[test]
+    #[should_panic(expected = "must divide")]
+    fn strided_refuses_a_stride_that_does_not_divide_the_span() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert!(!Fold::strided(Monoid::SUM, b, 0..10, 3).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero")]
+    fn strided_refuses_a_zero_stride() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert!(!Fold::strided(Monoid::SUM, b, 0..10, 0).is_empty());
+    }
+
+    #[test]
+    fn new_is_strided_with_a_stride_of_one() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert_eq!(
+            Fold::new(Monoid::SUM, b, 2..9),
+            Fold::strided(Monoid::SUM, b, 2..9, 1)
+        );
     }
 
     #[test]
