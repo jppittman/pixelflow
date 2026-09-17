@@ -13,9 +13,28 @@
 //! `Id` or a `Builder`. Calling one of these teaches a caller nothing about
 //! how a `Dag` is built.
 
+use crate::arena::{ExprArena, ExprId};
 use crate::dag::{Builder, Rooted};
 use crate::expr::{ExprBuilderExt, ExprData};
+use crate::fold::Binder;
 use crate::kind::OpKind;
+
+/// An arena whose root is a [`Write`](crate::arena::ExprNode::Write) of
+/// `X + lane` under three binders — the store a lattice's folds wrap a
+/// kernel in, built here because `ExprArena::push_write` is crate-private
+/// on purpose (only the legalize passes may build one) and
+/// `pixelflow-search`'s `insert` tests need one to decline.
+#[must_use]
+pub fn write_fixture() -> (ExprArena, ExprId) {
+    let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
+    let (row, col, lane) = (slot(0), slot(1), slot(2));
+    let mut arena = ExprArena::new();
+    let x = arena.push_var(0);
+    let l = arena.push_var(lane.var());
+    let value = arena.push_binary(OpKind::Add, x, l);
+    let write = arena.push_write(row, col, lane, value);
+    (arena, write)
+}
 
 /// The shared node payload for the two generic-`Dag` fixtures below. Its
 /// shape is arbitrary — nothing reads it as anything but an opaque `T`.

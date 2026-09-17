@@ -279,6 +279,19 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
                 key.extend_from_slice(&on.bits().to_le_bytes());
                 key.extend_from_slice(&off.bits().to_le_bytes());
             }
+            // The value is a real child; the three binders are metadata in
+            // the tag bytes, as a fold's is: a store of the same value
+            // under different binders is a different program.
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => {
+                key.push(12);
+                push_id(&mut key, &dense, *value);
+                key.extend_from_slice(&[row.slot(), col.slot(), lane.slot()]);
+            }
         }
         dense[idx] = next;
         next += 1;
@@ -295,6 +308,22 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
 mod tests {
     use super::*;
     use crate::kind::OpKind;
+
+    /// A store of one value under different binders is a different program,
+    /// and the key says so from the tag bytes alone.
+    #[test]
+    fn a_write_under_different_binders_is_a_different_key() {
+        use crate::fold::Binder;
+        let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
+        let (row, col, lane) = (slot(0), slot(1), slot(2));
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let one = a.push_write(row, col, lane, x);
+        let other = a.push_write(col, row, lane, x);
+        let same = a.push_write(row, col, lane, x);
+        assert_ne!(canonical(&a, one).key, canonical(&a, other).key);
+        assert_eq!(canonical(&a, one).key, canonical(&a, same).key);
+    }
 
     /// `√(x² + y²)`, optionally preceded by unreachable construction garbage.
     fn circle(garbage: bool) -> (ExprArena, ExprId) {

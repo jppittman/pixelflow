@@ -29,12 +29,12 @@ pub type Deps = Variance;
 
 /// Convert a variable index to its variance (single-bit set).
 ///
-/// 0→X, 1→Y, 2→Z, 3→W, 4..8→the reduction index slots. Unknown indices are
-/// conservatively ALL.
+/// 0→X, 1→Y, 2 and 3 the retired axes, then the reduction index slots up
+/// to [`Variance::VARIABLES`]. Unknown indices are conservatively ALL.
 #[inline]
 #[must_use]
 pub fn var_variance(v: u8) -> Variance {
-    if v < 8 {
+    if v < Variance::VARIABLES {
         Variance::from_var(v)
     } else {
         Variance::ALL // Unknown vars are conservatively all-varying
@@ -317,10 +317,16 @@ mod tests {
     fn verify_var_variance() {
         assert_eq!(var_variance(0), Variance::X);
         assert_eq!(var_variance(1), Variance::Y);
-        // Above the axes the index is a name slot, one bit each, and past the
-        // eight the analysis gives up and says everything.
+        // Above the axes the index is a name slot, one bit each — the word
+        // holds every binder the index space has — and past the word the
+        // analysis gives up and says everything.
         assert_eq!(var_variance(NAME), Variance::from_var(NAME));
-        assert_eq!(var_variance(8), Variance::ALL);
+        assert_eq!(var_variance(8), Variance::from_var(8));
+        assert_eq!(
+            var_variance(Variance::VARIABLES - 1),
+            Variance::from_var(Variance::VARIABLES - 1)
+        );
+        assert_eq!(var_variance(Variance::VARIABLES), Variance::ALL);
     }
 
     #[test]

@@ -189,7 +189,7 @@ op_table! {
     /// Fold a body over a bounded domain. Encoded
     /// `Nary(Reduce, [Const(combiner), Const(reduce_var), Const(extent), body])`:
     /// `combiner` is the monoid op index (`Add`/`Mul`/`Min`/`Max`), `body`
-    /// references `Var(reduce_var)` (indices 4..8), and the fold runs over
+    /// references `Var(reduce_var)` (a binder-space index), and the fold runs over
     /// `0..extent`. The combiner is a *child* (a parameter), not baked into the
     /// opcode, so one `Reduce` covers every monoid and can later take an
     /// arbitrary combiner function. Lowered to an unrolled accumulation by
@@ -215,6 +215,16 @@ op_table! {
     /// which is how `Var` reacquired the third meaning CLAUDE.md records as
     /// retired.
     Param = 51,
+
+    // --- Effects (post-legalize) ---
+    /// Sequencing: evaluate the left, then the right. Unit-typed — it has
+    /// no value, and nothing may read one — so it is a monoid whose identity
+    /// is nothing: [`Monoid::SEQ`](crate::fold::Monoid::SEQ), the algebra
+    /// of the folds a lattice is (docs/plans/2026-09-16-collapse-is-a-fold.md
+    /// §2.4). Constructible only by those legalize passes: `kernel!` cannot
+    /// name it and the e-graph's vocabularies decline it, as they do a
+    /// `Write`. A backend that meets one as an instruction emits no bytes.
+    Seq = 52,
 }
 
 impl OpKind {
@@ -235,6 +245,9 @@ impl OpKind {
             // number, only ANDed).
             Self::BitOr => Some(0.0),
             Self::BitAnd => Some(f32::from_bits(u32::MAX)),
+            // The unit monoid's identity is nothing. As the `f32` a fold's
+            // accumulator is seeded with, that is a zero no combine reads.
+            Self::Seq => Some(0.0),
             _ => None,
         }
     }
@@ -425,7 +438,8 @@ impl OpKind {
             | Self::BitAnd
             | Self::BitOr
             | Self::Dwrt
-            | Self::RawGather => 2,
+            | Self::RawGather
+            | Self::Seq => 2,
 
             Self::MulAdd | Self::Select | Self::Gather => 3,
 
@@ -492,6 +506,7 @@ impl OpKind {
             Self::Reduce => "reduce",
             Self::Uniform => "uniform",
             Self::Param => "param",
+            Self::Seq => "seq",
         }
     }
 
@@ -551,6 +566,7 @@ impl OpKind {
             "reduce" => Some(Self::Reduce),
             "uniform" => Some(Self::Uniform),
             "param" => Some(Self::Param),
+            "seq" => Some(Self::Seq),
             _ => None,
         }
     }
@@ -635,6 +651,8 @@ impl OpKind {
             // Reduction is lowered (unrolled) away before costing; price the
             // node itself at zero so a stray one never dominates extraction.
             Self::Reduce => 0,
+            // Sequencing computes nothing.
+            Self::Seq => 0,
             Self::Neg | Self::Abs | Self::Floor | Self::Ceil | Self::Round => 1,
             Self::Add
             | Self::Sub
@@ -751,6 +769,7 @@ impl OpKind {
                 | Self::Reduce
                 | Self::Uniform
                 | Self::Param
+                | Self::Seq
         )
     }
 
@@ -818,6 +837,9 @@ impl OpKind {
 
             // Reduction: lowered to unrolled arithmetic before codegen.
             Self::Reduce => EmitStyle::Special,
+
+            // Sequencing: an effect no kernel body spells.
+            Self::Seq => EmitStyle::Special,
 
             // Ternary method: (a).mul_add(b, c)
             Self::MulAdd | Self::Select => EmitStyle::TernaryMethod,
@@ -1598,6 +1620,7 @@ mod algebraic_properties {
         OpKind::Reduce,
         OpKind::Uniform,
         OpKind::Param,
+        OpKind::Seq,
     ];
 
     #[test]
@@ -1637,6 +1660,18 @@ mod algebraic_properties {
                 "{op:?} bitwise-domain mismatch"
             );
         }
+    }
+
+    /// `Seq` has a name and an arity like any op, and no way in from a
+    /// `kernel!` body: the surface set refuses it, so a store's sequencing
+    /// is spelled only by the passes that build one.
+    #[test]
+    fn seq_is_a_binary_op_no_kernel_body_can_call() {
+        assert_eq!(OpKind::Seq.arity(), 2);
+        assert_eq!(OpKind::from_name("seq"), Some(OpKind::Seq));
+        assert_eq!(OpKind::from_method_call("seq", 1), None);
+        assert!(OpKind::Seq.is_monoid(), "the unit monoid's combine");
+        assert!(!OpKind::Seq.is_seed_op());
     }
 
     #[test]
@@ -1692,7 +1727,8 @@ mod algebraic_properties {
                 | OpKind::BitAnd
                 | OpKind::BitOr
                 | OpKind::Dwrt
-                | OpKind::RawGather => 2,
+                | OpKind::RawGather
+                | OpKind::Seq => 2,
 
                 OpKind::MulAdd | OpKind::Select | OpKind::Gather => 3,
 

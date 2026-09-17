@@ -1111,7 +1111,8 @@ mod tests {
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
-                | ExprNode::Guard { .. }) => {
+                | ExprNode::Guard { .. }
+                | ExprNode::Write { .. }) => {
                     panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
                 }
             }

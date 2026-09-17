@@ -170,6 +170,8 @@ pub fn pattern_match_arena(
             // contains a `Guard` (extraction cannot choose one yet, G3), so
             // a `Guard` in the target simply matches nothing.
             ExprNode::Guard { .. } => return None,
+            // Nor a store: post-legalize vocabulary no template names.
+            ExprNode::Write { .. } => return None,
         }
     }
 
@@ -247,6 +249,10 @@ pub fn substitute_template_arena(
             ExprNode::Guard { mask: _, on, off } => panic!(
                 "Guard(on={on:?}, off={off:?}) in a rewrite template — no rule \
                  this harness writes rewrites into a Guard yet (G3)"
+            ),
+            ExprNode::Write { .. } => panic!(
+                "a Write in a rewrite template — a store is an effect the legalize \
+                 passes build after extraction, and no rule rewrites into one"
             ),
             ExprNode::Unary(op, t_a) => {
                 let a = ExprId(remap[t_a.0 as usize]);
@@ -899,6 +905,8 @@ impl BwdGenerator {
                 Shape::Guard { on, off, .. } => {
                     panic!("junkify: Guard(on={on:?}, off={off:?}) in a corpus expression")
                 }
+                // A corpus expression is pre-legalize by construction.
+                Shape::Write { .. } => panic!("junkify: a Write in a corpus expression"),
                 Shape::Op(op, children) => match children {
                     Children::Zero => panic!("junkify: op with 0 children"),
                     Children::One(a) => self.arena.push_unary(op, remap[a.0 as usize]),

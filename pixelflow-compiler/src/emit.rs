@@ -223,6 +223,15 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
                      against an ExprArena, not lowered from a kernel! body"
                 )
             }
+            // A store is post-legalize vocabulary: the passes that wrap a
+            // kernel in the lattice's folds build one, after extraction,
+            // and no kernel! body can spell it.
+            pixelflow_ir::arena::ExprNode::Write { .. } => {
+                panic!(
+                    "kernel! produced ExprNode::Write — a store has no surface syntax; \
+                     the legalize passes build one after extraction"
+                )
+            }
         };
         stmts.push(quote! {
             let #ident = #expr;

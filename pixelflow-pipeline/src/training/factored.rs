@@ -624,6 +624,10 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "Guard(on={on:?}, off={off:?}) reached arena_to_kernel_code — kernel \
                          code has no syntax for a hard branch yet (G1: never chosen)"
                     ),
+                    ExprNode::Write { .. } => panic!(
+                        "a Write reached arena_to_kernel_code — kernel code has no syntax \
+                         for a store; it is post-legalize vocabulary"
+                    ),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _) => emit_op_kc(*op, &args),

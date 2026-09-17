@@ -468,7 +468,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
         Op(OpKind, Vec<u32>),
         /// A fold's identity is its metadata plus its body — the bits are
         /// the metadata, and two folds sharing them fold the same way.
-        Reduce(u64, u32),
+        Reduce(u128, u32),
     }
     type Build = Box<dyn Fn(&mut ExprArena) -> ExprId>;
     let mut interned: HashMap<Key, ExprId> = HashMap::new();
@@ -500,6 +500,9 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
                 "hash_cons: Guard(on={on:?}, off={off:?}) names kernels interned in this \
                  process; corpus arenas are self-contained"
             ),
+            ExprNode::Write { .. } => {
+                panic!("hash_cons: a Write in a corpus arena — corpus arenas are pre-legalize")
+            }
             ExprNode::Reduce { fold, body } => {
                 let body = ExprId(m(body, &map));
                 (

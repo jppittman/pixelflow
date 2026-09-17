@@ -11,7 +11,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::fold::Fold;
+use crate::fold::{Binder, Fold};
 use crate::kernel::Scalar;
 use crate::key::KernelKey;
 use crate::kind::OpKind;
@@ -39,8 +39,15 @@ pub(crate) const RETIRED_COORD_AXES: [u8; 2] = [2, 3];
 pub(crate) const REDUCE_BINDER_BASE: u8 = COORD_AXES as u8 + RETIRED_COORD_AXES.len() as u8;
 
 /// How many reduction binders the index space holds, starting at
-/// [`REDUCE_BINDER_BASE`] — the depth of nested folds a kernel may carry.
-pub(crate) const REDUCE_BINDERS: u8 = 4;
+/// [`REDUCE_BINDER_BASE`] — the depth of nested folds a program may carry.
+///
+/// Every bit of a [`Variance`](crate::variance::Variance) past the
+/// coordinates and the retired axes, and not a number chosen on its own:
+/// the control plane is 64-bit, so the bitset is a `u64` and the binders
+/// are what it has room for. It was four, sized to the deepest kernel then
+/// written; the lattice's own three folds (docs/plans/2026-09-16-collapse-is-a-fold.md
+/// §2.1) nest *outside* a kernel's, and would have left one for the kernel.
+pub(crate) const REDUCE_BINDERS: u8 = u64::BITS as u8 - REDUCE_BINDER_BASE;
 
 // ───────────────────────────────────────── ExprId ─────────────────────────────
 
@@ -189,7 +196,8 @@ impl core::hash::Hash for UniformDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprNode {
     /// A bound variable: a lattice coordinate ([`COORD_AXES`] of them, X and
-    /// Y), a reduction binder's index (`4..8`), or — in the macro front end
+    /// Y), a reduction binder's index (from [`REDUCE_BINDER_BASE`],
+    /// [`REDUCE_BINDERS`] of them), or — in the macro front end
     /// only, before substitution — a parameter placeholder. Which one an
     /// index means is [`ExprArena::push_var`]'s documentation; the indices
     /// between the coordinates and the binders are not a hole to grow into,
@@ -258,6 +266,30 @@ pub enum ExprNode {
         mask: ExprId,
         on: KernelKey,
         off: KernelKey,
+    },
+    /// A store: the one effect in the language, and the body of the folds a
+    /// lattice is (docs/plans/2026-09-16-collapse-is-a-fold.md §2.4).
+    ///
+    /// `⟦Write { row, col, lane, value }⟧` stores `value`'s first `len(lane)`
+    /// lanes at `out + 4·(row·pitch + col + lane)`, where `out` and `pitch`
+    /// are the call's arguments — the collapse ABI is `fn(ctx, out, pitch)`,
+    /// with one output plane, so the node names nothing about *where* the
+    /// plane is. It names **binders**, not an address expression: `row`,
+    /// `col` and `lane` are the three lattice folds' indices, so contiguity
+    /// along `lane` holds by construction and needs no analysis, and the
+    /// store's width is the lane fold's trip count rather than a field here.
+    ///
+    /// Unit-typed: its value is nothing, which is why the folds it sits in
+    /// are over [`Monoid::SEQ`](crate::fold::Monoid::SEQ). Constructible only
+    /// by the legalize passes that wrap a kernel in the lattice
+    /// ([`ExprArena::push_write`] is `pub(crate)`); the e-graph declines one
+    /// and `kernel!` cannot name one, exactly as for [`Guard`](Self::Guard).
+    /// One child, the value, as `Reduce` has its body.
+    Write {
+        row: Binder,
+        col: Binder,
+        lane: Binder,
+        value: ExprId,
     },
 }
 
@@ -651,6 +683,27 @@ impl ExprArena {
         self.push_node(ExprNode::Reduce { fold, body })
     }
 
+    /// A store of `value` at the lattice position the three binders name —
+    /// see [`ExprNode::Write`].
+    ///
+    /// Crate-private: only the legalize passes that wrap a kernel in the
+    /// lattice's folds may build one. Nothing a `Kernel` can say, and
+    /// nothing the e-graph will hold.
+    pub(crate) fn push_write(
+        &mut self,
+        row: Binder,
+        col: Binder,
+        lane: Binder,
+        value: ExprId,
+    ) -> ExprId {
+        self.push_node(ExprNode::Write {
+            row,
+            col,
+            lane,
+            value,
+        })
+    }
+
     /// Get the declaration for a buffer slot.
     ///
     /// # Panics
@@ -802,6 +855,14 @@ impl ExprArena {
                  OpKind describes it (G3 gives extraction a price for the \
                  choice); ask about its mask directly"
             ),
+            // A store is an effect, not an operation: it computes nothing a
+            // cost table could price or an arithmetic rule could rewrite,
+            // and the one consumer that executes it (the emitter, on the
+            // folds a lattice is) reads the node, not a kind.
+            ExprNode::Write { .. } => panic!(
+                "ExprArena::kind: a Write is a store, not an operation — no \
+                 OpKind describes it; read the node's value and binders directly"
+            ),
         }
     }
 
@@ -832,6 +893,9 @@ impl ExprArena {
             // `Ref` yields nothing: `on`/`off` are names, not edges, so no
             // walk over children can reach into either arm.
             ExprNode::Guard { mask, .. } => ExprChildren::One(*mask),
+            // One child, the value stored. The binders are the node's own
+            // metadata, as a `Reduce`'s fold is: an index, not an operand.
+            ExprNode::Write { value, .. } => ExprChildren::One(*value),
         }
     }
 
@@ -879,6 +943,7 @@ impl ExprArena {
                 }
                 ExprNode::Reduce { body, .. } => stack.push((*body, d + 1)),
                 ExprNode::Guard { mask, .. } => stack.push((*mask, d + 1)),
+                ExprNode::Write { value, .. } => stack.push((*value, d + 1)),
             }
         }
         max_depth
@@ -917,6 +982,7 @@ impl ExprArena {
                 }
                 ExprNode::Reduce { body, .. } => stack.push(*body),
                 ExprNode::Guard { mask, .. } => stack.push(*mask),
+                ExprNode::Write { value, .. } => stack.push(*value),
             }
         }
         false
@@ -969,6 +1035,7 @@ impl ExprArena {
                 }
                 ExprNode::Reduce { body, .. } => stack.push(*body),
                 ExprNode::Guard { mask, .. } => stack.push(*mask),
+                ExprNode::Write { value, .. } => stack.push(*value),
             }
         }
         false
@@ -1013,6 +1080,7 @@ impl ExprArena {
                 }
                 ExprNode::Reduce { body, .. } => stack.push(*body),
                 ExprNode::Guard { mask, .. } => stack.push(*mask),
+                ExprNode::Write { value, .. } => stack.push(*value),
             }
         }
         count
@@ -1081,6 +1149,7 @@ impl ExprArena {
                         }
                         ExprNode::Reduce { body, .. } => work.push(Task::Descend(*body)),
                         ExprNode::Guard { mask, .. } => work.push(Task::Descend(*mask)),
+                        ExprNode::Write { value, .. } => work.push(Task::Descend(*value)),
                     }
                 }
                 Task::Emit(id) => {
@@ -1160,6 +1229,16 @@ impl ExprArena {
                             let mask = id_map[mask.0 as usize]
                                 .expect("substitute_params: guard mask not yet mapped");
                             self.push_guard(mask, on, off)
+                        }
+                        ExprNode::Write {
+                            row,
+                            col,
+                            lane,
+                            value,
+                        } => {
+                            let value = id_map[value.0 as usize]
+                                .expect("substitute_params: write value not yet mapped");
+                            self.push_write(row, col, lane, value)
                         }
                     };
                     id_map[id.0 as usize] = Some(new_id);
@@ -1288,6 +1367,15 @@ impl ExprArena {
                             let mask = m(mask);
                             self.push_guard(mask, on, off)
                         }
+                        ExprNode::Write {
+                            row,
+                            col,
+                            lane,
+                            value,
+                        } => {
+                            let value = m(value);
+                            self.push_write(row, col, lane, value)
+                        }
                     };
                     id_map[id.0 as usize] = Some(new_id);
                 }
@@ -1381,6 +1469,15 @@ impl ExprArena {
                         ExprNode::Guard { mask, on, off } => {
                             let mask = m(mask);
                             self.push_guard(mask, on, off)
+                        }
+                        ExprNode::Write {
+                            row,
+                            col,
+                            lane,
+                            value,
+                        } => {
+                            let value = m(value);
+                            self.push_write(row, col, lane, value)
                         }
                     };
                     id_map[id.0 as usize] = Some(new_id);
@@ -1528,6 +1625,15 @@ impl ExprArena {
                     let mask = m(*mask);
                     out.push_guard(mask, *on, *off)
                 }
+                ExprNode::Write {
+                    row,
+                    col,
+                    lane,
+                    value,
+                } => {
+                    let value = m(*value);
+                    out.push_write(*row, *col, *lane, value)
+                }
             };
             dense[idx] = Some(new_id);
         }
@@ -1629,6 +1735,22 @@ impl ExprArena {
                             "Guard[on={:#018x}, off={:#018x}](",
                             on.bits(),
                             off.bits()
+                        )?;
+                    }
+                    ExprNode::Write {
+                        row,
+                        col,
+                        lane,
+                        value,
+                    } => {
+                        stack.push(Task::WriteStr(")"));
+                        stack.push(Task::Visit(*value));
+                        write!(
+                            f,
+                            "Write[row=i{}, col=i{}, lane=i{}](",
+                            row.var(),
+                            col.var(),
+                            lane.var()
                         )?;
                     }
                 },
@@ -1766,6 +1888,25 @@ impl ExprArena {
                         return false;
                     }
                     stack.push((*s_mask, *o_mask));
+                }
+                (
+                    ExprNode::Write {
+                        row: s_row,
+                        col: s_col,
+                        lane: s_lane,
+                        value: s_value,
+                    },
+                    ExprNode::Write {
+                        row: o_row,
+                        col: o_col,
+                        lane: o_lane,
+                        value: o_value,
+                    },
+                ) => {
+                    if s_row != o_row || s_col != o_col || s_lane != o_lane {
+                        return false;
+                    }
+                    stack.push((*s_value, *o_value));
                 }
                 // Different node variants — structurally unequal.
                 _ => return false,
@@ -2000,6 +2141,51 @@ mod tests {
         let children: Vec<ExprId> = arena.children(red).collect();
         assert_eq!(children, alloc::vec![body]);
         assert!(matches!(arena.node(red), ExprNode::Reduce { fold: f, .. } if *f == fold));
+    }
+
+    /// A store names its binders and holds its value: one child, three
+    /// indices that are metadata, and an identity that tells two stores of
+    /// one value at different lattice positions apart.
+    #[test]
+    fn a_write_stores_one_value_under_three_binders() {
+        let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
+        let (row, col, lane) = (slot(0), slot(1), slot(2));
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let l = arena.push_var(lane.var());
+        let value = arena.push_binary(OpKind::Add, x, l);
+        let write = arena.push_write(row, col, lane, value);
+
+        let children: Vec<ExprId> = arena.children(write).collect();
+        assert_eq!(children, vec![value], "the value is the one child");
+        assert!(matches!(
+            arena.node(write),
+            ExprNode::Write { row: r, col: c, lane: n, value: v }
+                if *r == row && *c == col && *n == lane && *v == value
+        ));
+        assert_eq!(
+            format!("{}", arena.display(write)),
+            "Write[row=i4, col=i5, lane=i6](add(Var(0), Var(6)))"
+        );
+
+        // The same value stored under other binders is a different store.
+        let elsewhere = arena.push_write(col, row, lane, value);
+        assert!(arena.subtree_eq(write, &arena, write));
+        assert!(!arena.subtree_eq(write, &arena, elsewhere));
+    }
+
+    /// A store is an effect, not an operation: it has no `OpKind` to price
+    /// or rewrite, and asking for one is a pipeline that reached a `Write`
+    /// where only values belong.
+    #[test]
+    #[should_panic(expected = "a Write is a store, not an operation")]
+    fn a_write_has_no_kind() {
+        let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
+        let mut arena = ExprArena::new();
+        let value = arena.push_var(0);
+        let write = arena.push_write(slot(0), slot(1), slot(2), value);
+        let kind = arena.kind(write);
+        unreachable!("a Write answered with {kind:?}");
     }
 
     // 8. test_nary

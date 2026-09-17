@@ -292,6 +292,12 @@ pub fn encode(kernel: &CollapseKernel) -> String {
                  process only",
                 kernel.name
             ),
+            // A corpus kernel is pre-legalize by construction; a store is
+            // built after extraction and has no line here.
+            ExprNode::Write { .. } => panic!(
+                "{}: corpus kernels are pre-legalize, but this one holds a Write",
+                kernel.name
+            ),
         }
         .expect("fmt");
         dense[idx] = next;
@@ -478,7 +484,7 @@ fn decode(path: &Path) -> CollapseKernel {
                 arena.push_nary(op(k), &children)
             }
             ["R", bits, body] => {
-                let bits: u64 = bits
+                let bits: u128 = bits
                     .parse()
                     .unwrap_or_else(|e| panic!("{}: bad fold bits {bits:?}: {e}", path.display()));
                 let fold = Fold::from_bits(bits)

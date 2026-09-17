@@ -257,6 +257,12 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
                 "latency_prior_cost: Guard(on={on:?}, off={off:?}) — insert declines a \
                  Guard, so one here means this arena never went through the pipeline"
             ),
+            // Same again: `insert` declines a `Write`, which is built after
+            // extraction in any case.
+            ExprNode::Write { .. } => panic!(
+                "latency_prior_cost: a Write — insert declines a Write, so one here \
+                 means this arena never went through the pipeline"
+            ),
         };
         if let Some(op) = op {
             total += costs.cost(op);

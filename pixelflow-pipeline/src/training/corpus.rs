@@ -270,6 +270,10 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                          off={off:?}) — a corpus outlives the process these keys are \
                          interned in"
                     ),
+                    ExprNode::Write { .. } => panic!(
+                        "reachable_subtree: expression holds a Write — a corpus entry is \
+                         pre-legalize, and a store is built after extraction"
+                    ),
                     ExprNode::Unary(op, a) => out_arena.push_unary(*op, map(*a)),
                     ExprNode::Binary(op, a, b) => out_arena.push_binary(*op, map(*a), map(*b)),
                     ExprNode::Ternary(op, a, b, c) => {
@@ -430,6 +434,12 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
                 ),
             ));
         }
+        ExprNode::Write { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a Write has no corpus encoding: a corpus entry is pre-legalize",
+            ));
+        }
     }
     Ok(())
 }
@@ -567,7 +577,7 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
             Ok(arena.push_buffer(b))
         }
         TAG_REDUCE => {
-            let bits = r.read_u64()?;
+            let bits = r.read_u128()?;
             let fold = Fold::from_bits(bits).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -672,6 +682,12 @@ impl<'a> Cursor<'a> {
         let mut buf = [0u8; 8];
         self.read_exact(&mut buf)?;
         Ok(u64::from_le_bytes(buf))
+    }
+
+    fn read_u128(&mut self) -> io::Result<u128> {
+        let mut buf = [0u8; 16];
+        self.read_exact(&mut buf)?;
+        Ok(u128::from_le_bytes(buf))
     }
 }
 

@@ -165,6 +165,7 @@ mod tests {
             ExprNode::Ref(k) => panic!("Ref({k:?}) reached math tests"),
             ExprNode::Reduce { .. } => panic!("a bounded fold reached math tests"),
             ExprNode::Guard { .. } => panic!("a Guard reached math tests (G1: never chosen)"),
+            ExprNode::Write { .. } => panic!("a Write reached math tests"),
             ExprNode::Uniform(u) => egraph.add(ENode::Uniform(*arena.uniform_decl(u))),
             ExprNode::Unary(kind, a) => {
                 let ca = expr_to_egraph(arena, a, egraph);

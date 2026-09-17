@@ -33,6 +33,17 @@ impl Ir for ExprArena {
             }
             ExprNode::Reduce { fold, body } => Shape::Reduce { fold, body },
             ExprNode::Guard { mask, on, off } => Shape::Guard { mask, on, off },
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => Shape::Write {
+                row,
+                col,
+                lane,
+                value,
+            },
         }
     }
 
@@ -66,6 +77,12 @@ impl Ir for ExprArena {
             },
             Shape::Reduce { fold, body } => self.push_reduce(fold, body),
             Shape::Guard { mask, on, off } => self.push_guard(mask, on, off),
+            Shape::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => self.push_write(row, col, lane, value),
         }
     }
 }
@@ -128,6 +145,9 @@ impl ExprArena {
                     Shape::Guard { mask, .. } if memo[mask.0 as usize].is_none() => {
                         alloc::vec![mask]
                     }
+                    Shape::Write { value, .. } if memo[value.0 as usize].is_none() => {
+                        alloc::vec![value]
+                    }
                     _ => Vec::new(),
                 };
                 if !pending.is_empty() {
@@ -159,6 +179,20 @@ impl ExprArena {
                 Shape::Guard { mask, on, off } => {
                     let mask = memo[mask.0 as usize].expect("rebuild_into: mask before guard");
                     out.embed(Shape::Guard { mask, on, off })
+                }
+                Shape::Write {
+                    row,
+                    col,
+                    lane,
+                    value,
+                } => {
+                    let value = memo[value.0 as usize].expect("rebuild_into: value before write");
+                    out.embed(Shape::Write {
+                        row,
+                        col,
+                        lane,
+                        value,
+                    })
                 }
             };
             memo[id.0 as usize] = Some(built);
