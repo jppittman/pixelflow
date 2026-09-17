@@ -236,9 +236,10 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
         // The gather's truncated-index lanes and its destination.
         ScheduledOp::Gather(..) => 2,
-        // A surviving fold's own loop scaffold: the persistent binder
-        // register plus two transient registers for the trip test and the
-        // accumulate — see `emit_dag_body_hoisted`'s `Reduce` arm.
+        // A surviving fold's own loop scaffold: two transient registers for
+        // the trip test and the accumulate — see `emit_dag_body_hoisted`'s
+        // `Reduce` arm. The binder and the accumulator are the fold's roots,
+        // placed by the allocator, not scratch.
         ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
         _ => 0,
     }

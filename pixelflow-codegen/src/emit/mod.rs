@@ -1273,11 +1273,12 @@ trait IsaBackend {
     // A surviving `Reduce`'s own scaffold: the accumulate and the trip test.
     //
     // Neither goes through the schedule/`InstructionPlan` machinery — a
-    // fold's accumulator lives in a slot outside any `Placement` (see
+    // fold's roots live where `allocate_nest` put them, a carried register or
+    // a slot outside any scope's frame (see
     // docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md), and the trip
-    // test compares the binder register against a compile-time bound, not
-    // another scheduled value. Both are ordinary two- and three-register ALU
-    // ops, so they are spelled as one verb each rather than a new opcode.
+    // test compares the binder against a compile-time bound, not another
+    // scheduled value. Both are ordinary two- and three-register ALU ops, so
+    // they are spelled as one verb each rather than a new opcode.
     // -------------------------------------------------------------------------
 
     /// Load an `f32` constant, broadcast across every lane.
@@ -1679,12 +1680,13 @@ fn emit_dag_body<B: IsaBackend>(
         FramePlan {
             override_size: None,
             fold_slots: &alloc::collections::BTreeMap::new(),
+            binder_slots: &alloc::collections::BTreeMap::new(),
             slot_base: 0,
         },
     )
 }
 
-/// Where one scope's memory is, as its driver decided it — the three answers
+/// Where one scope's memory is, as its driver decided it — the answers
 /// [`emit_dag_body_hoisted`] cannot work out for itself because they are all
 /// facts about the *nest*, not about the scope.
 #[derive(Clone, Copy)]
@@ -1699,6 +1701,14 @@ struct FramePlan<'a> {
     /// that opens the loop and the loop itself both address it. Empty
     /// wherever nothing here can open a fold.
     fold_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
+    /// Each surviving fold's binder slot, by the same `Reduce` `ValueId`: the
+    /// loop seeds and steps the binder there when the allocator did not carry
+    /// it, and a scope inside reads it there through the binder's `Var`. Keyed
+    /// by the fold rather than by that `Var` because sibling folds binding
+    /// the same slot share one `Var` node — which loop's counter it names is
+    /// a fact about the scope reading it, found by walking that scope's
+    /// enclosing folds.
+    binder_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
     /// Where this scope's own spill slots start. Zero for a scope that has
     /// the frame to itself for as long as its values live — the two collapse
     /// prologues and the body, which run one after another. A fold's body is
@@ -1739,6 +1749,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     let FramePlan {
         override_size: frame_override,
         fold_slots,
+        binder_slots,
         slot_base,
     } = frame;
     let file = backend.register_file();
@@ -1761,16 +1772,56 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             layout.pin_slot(*vid, Slot::new(offset, file.vector_bytes));
         }
     }
-    // A surviving fold's accumulator, the same idea in the other direction:
-    // its `Reduce` def is a genuine computation *in* this scope (scanned,
-    // never a placeholder), but its slot is the driver's dedicated fold
-    // slot, not whatever offset this scope's own `FrameLayout::resolve` gave
-    // it (`ScheduledOp::Reduce`'s scan-time `Where::Spilled` earns it one
+    // A surviving fold's roots, the same idea in the other direction. Its
+    // `Reduce` def is a genuine computation *in* this scope (scanned, never a
+    // placeholder), but its slot is the driver's dedicated fold slot, not
+    // whatever offset this scope's own `FrameLayout::resolve` gave it
+    // (`ScheduledOp::Reduce`'s scan-time `Where::Spilled` earns it one
     // regardless, thrown away here). Harmless to pin one this scope never
-    // reaches — `pin_slot` on a `ValueId` nothing here reads is simply
-    // never read back.
-    for (vid, &offset) in fold_slots {
-        layout.pin_slot(*vid, Slot::new(offset, file.vector_bytes));
+    // reaches — `pin_slot` on a `ValueId` nothing here reads is simply never
+    // read back.
+    let mut fold_pins: alloc::vec::Vec<(regalloc::ValueId, u32)> = fold_slots
+        .iter()
+        .map(|(vid, &offset)| (*vid, offset))
+        .collect();
+    // And its binder, read here through the binder's `Var`: this scope's own
+    // fold's, and every enclosing fold's, each where that loop keeps it. The
+    // `Var` is found here by the binder's number — sibling folds binding the
+    // same slot share one `Var` node, so which counter it names is this
+    // scope's question — innermost first, so a binder shadowing an enclosing
+    // one is the nearer loop's. Its def emits nothing (the loop seeded it),
+    // and only one the allocator did not carry has a slot to pin: pinning a
+    // carried one would earn the register a store nothing reads.
+    let mut binder_placeholders: alloc::vec::Vec<regalloc::ValueId> = alloc::vec::Vec::new();
+    let mut opened = allocation;
+    while let Some((parent, at)) = opened.opens_at() {
+        let parent = opened.sibling(parent);
+        let def = &parent.schedule()[at];
+        let ScheduledOp::Reduce(fold, _) = &def.op else {
+            unreachable!("a fold scope opens at its parent's Reduce def")
+        };
+        let var = fold.binder().var();
+        if let Some(bv) = schedule
+            .iter()
+            .find(|d| matches!(d.op, ScheduledOp::Var(v) if v == var))
+            .map(|d| d.value)
+            && !binder_placeholders.contains(&bv)
+        {
+            binder_placeholders.push(bv);
+            if !matches!(opened.fold_roots().binder, regalloc::Where::Reg(_)) {
+                let offset = *binder_slots.get(&def.value).unwrap_or_else(|| {
+                    panic!(
+                        "{:?}'s fold has no binder slot — the driver did not assign one",
+                        def.value
+                    )
+                });
+                fold_pins.push((bv, offset));
+            }
+        }
+        opened = parent;
+    }
+    for &(vid, offset) in &fold_pins {
+        layout.pin_slot(vid, Slot::new(offset, file.vector_bytes));
     }
 
     let frame_size = frame_override.unwrap_or(layout.frame_size);
@@ -1835,18 +1886,21 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     // becomes one write here at the point it starts — O(total ranges), not a
     // lookup per operand per instruction.
     let mut locs: alloc::vec::Vec<Option<Binding>> = layout.bindings().to_vec();
-    // A surviving fold's accumulator, read back from its dedicated slot
-    // rather than wherever this scope's own `FrameLayout::resolve` happened
-    // to put it. `resolve` gave it a real address (its scan-time
-    // `Where::Spilled` earns one like any other spilled value), but a
-    // throwaway one — `ScheduledOp::Reduce`'s own emission never goes
-    // through the ordinary operand/destination machinery this table serves
-    // everyone else, so nothing but this override ever reads or writes it.
-    for def in schedule {
-        if let ScheduledOp::Reduce(..) = def.op
-            && let Some(&offset) = fold_slots.get(&def.value)
+    // A surviving fold's root in its slot — an accumulator, or a binder the
+    // allocator did not carry — is read back from its dedicated slot rather
+    // than wherever this scope's own `FrameLayout::resolve` happened to put
+    // it. `resolve` gave it a real address (its scan-time `Where::Spilled`
+    // earns one like any other spilled value), but a throwaway one — a
+    // `Reduce` def's own emission never goes through the ordinary
+    // operand/destination machinery this table serves everyone else, and a
+    // binder's placeholder emits nothing, so nothing but this override ever
+    // reads or writes it. Only for a value this scope has: a pin this scope
+    // never reaches has no entry here to override.
+    for &(vid, offset) in &fold_pins {
+        if let Some(entry) = locs.get_mut(vid.0 as usize)
+            && entry.is_some()
         {
-            locs[def.value.0 as usize] = Some(Binding::from(Slot::new(offset, file.vector_bytes)));
+            *entry = Some(Binding::from(Slot::new(offset, file.vector_bytes)));
         }
     }
     let mut moves: alloc::vec::Vec<alloc::vec::Vec<(regalloc::ValueId, Binding)>> =
@@ -1999,11 +2053,19 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             continue;
         }
 
-        // A surviving fold: seed the accumulator and the binder, run the
-        // loop, combine, step, branch back. `vid`'s own placement was forced
-        // to its dedicated slot at scan time (see `regalloc::LinearScan`),
-        // never a register, so nothing about it needs `resolve_operands` —
-        // this is the whole of what a `Reduce` def does.
+        // A fold's binder, read here through its `Var`: the loop that binds
+        // it seeded it and steps it, wherever the allocator keeps it, so its
+        // def here is a placeholder too. `locs` already names the register
+        // or the slot.
+        if binder_placeholders.contains(vid) {
+            continue;
+        }
+
+        // A surviving fold: seed its roots, run the loop, combine, step,
+        // branch back. `vid`'s own placement was forced to its dedicated slot
+        // at scan time (see `regalloc::LinearScan`), never a register, so
+        // nothing about it needs `resolve_operands` — this is the whole of
+        // what a `Reduce` def does.
         if let ScheduledOp::Reduce(fold, _) = sched_op {
             // The body is a scope of its own, opening exactly here — the
             // query `Allocation::opens_at` was built to answer, from the
@@ -2015,28 +2077,50 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             let Some(fold_scope) = allocation.fold_opening_at(sched_idx) else {
                 continue;
             };
-            let acc_offset = *fold_slots.get(vid).unwrap_or_else(|| {
+            let fold_alloc = allocation.sibling(fold_scope);
+            let acc_slot = *fold_slots.get(vid).unwrap_or_else(|| {
                 panic!(
                     "{vid:?}'s Reduce def has no accumulator slot — the driver did not assign one"
                 )
             });
-            let binder = scratch.temp(0).unwrap_or_else(|| {
-                panic!("{vid:?}'s Reduce def reserved no binder register (temps_for must return >= 3 for ScheduledOp::Reduce)")
+            let binder_slot = *binder_slots.get(vid).unwrap_or_else(|| {
+                panic!("{vid:?}'s Reduce def has no binder slot — the driver did not assign one")
             });
-            let t1 = scratch
-                .temp(1)
-                .unwrap_or_else(|| panic!("{vid:?}'s Reduce def reserved fewer than 2 temps"));
-            let t2 = scratch
-                .temp(2)
-                .unwrap_or_else(|| panic!("{vid:?}'s Reduce def reserved fewer than 3 temps"));
+            // Two transient temps (`Scratch::REDUCE_TEMPS`): the trip test's
+            // bound and its mask, reused by the combine's reload and the
+            // step's scratch. Neither outlives the instruction it serves,
+            // so the body's pool is free to hold them too.
+            let temp = |i: usize| {
+                scratch.temp(i).unwrap_or_else(|| {
+                    panic!("{vid:?}'s Reduce def reserved fewer than {} temps", i + 1)
+                })
+            };
+            let (t0, t1) = (temp(0), temp(1));
 
-            // Seed: the accumulator starts at the monoid's identity, parked
-            // in its slot before the loop opens; the binder starts at `lo`,
-            // broadcast into the one register it lives in for the loop's
-            // whole life (never a slot — "the binder is the counter").
-            backend.load_const(&mut asm.code, t1, fold.monoid().identity());
-            backend.slot_store(&mut asm.code, t1, acc_offset);
-            backend.load_const(&mut asm.code, binder, fold.range().start as f32);
+            // The loop's own roots, where the allocator put them: a register
+            // it carries across the body, or a slot. Nothing is reserved for
+            // either — at the floor the answer is "slot", which always fits,
+            // and a body inside gets the whole pool minus what is carried.
+            let carried_in = |at: regalloc::Where| match at {
+                regalloc::Where::Reg(r) => Some(r),
+                regalloc::Where::Spilled | regalloc::Where::Remat(_) => None,
+            };
+            let roots = fold_alloc.fold_roots();
+            let binder_reg = carried_in(roots.binder);
+            let acc_reg = carried_in(roots.accumulator);
+
+            // Seed: the accumulator starts at the monoid's identity and the
+            // binder at `lo`, each where it lives — written through a temp
+            // when that is a slot.
+            let mut seed = |backend: &mut B, at: Option<Reg>, value: f32, slot: u32| match at {
+                Some(r) => backend.load_const(&mut asm.code, r, value),
+                None => {
+                    backend.load_const(&mut asm.code, t0, value);
+                    backend.slot_store(&mut asm.code, t0, slot);
+                }
+            };
+            seed(backend, acc_reg, fold.monoid().identity(), acc_slot);
+            seed(backend, binder_reg, fold.range().start as f32, binder_slot);
 
             let top = Label::new(&alloc::format!("reduce{}_top", vid.0));
             let exit = Label::new(&alloc::format!("reduce{}_exit", vid.0));
@@ -2045,13 +2129,23 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             // Trip test: exit once every lane agrees the binder has reached
             // `hi` — `SelectArm::False`'s test is exactly "every lane true",
             // which is what an all-lanes-equal broadcast compare produces
-            // the instant it stops being false.
-            backend.load_const(&mut asm.code, t2, fold.range().end as f32);
-            backend.test_ge(&mut asm.code, t1, [binder, t2], scratch.mask_guard_temp);
+            // the instant it stops being false. The compare lands in `t0`,
+            // which is either the binder's own reload or distinct from its
+            // register: the two-operand form the backends share (`dst <-
+            // srcs[0]; dst op= srcs[1]`) is sound for both.
+            let binder_now = match binder_reg {
+                Some(b) => b,
+                None => {
+                    backend.slot_load(&mut asm.code, t0, binder_slot);
+                    t0
+                }
+            };
+            backend.load_const(&mut asm.code, t1, fold.range().end as f32);
+            backend.test_ge(&mut asm.code, t0, [binder_now, t1], scratch.mask_guard_temp);
             backend.branch_if_arm_is_dead(
                 &mut asm,
                 MaskTest {
-                    reg: t1,
+                    reg: t0,
                     scratch: scratch.guard_temp,
                     mask_scratch: scratch.mask_guard_temp,
                     arm: SelectArm::False,
@@ -2060,7 +2154,6 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             );
 
             // The body, in its own scope.
-            let fold_alloc = allocation.sibling(fold_scope);
             let (fold_code, body_result, _, _) = emit_dag_body_hoisted(
                 fold_alloc,
                 backend,
@@ -2068,24 +2161,62 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 FramePlan {
                     override_size: Some(frame_size),
                     fold_slots,
+                    binder_slots,
                     slot_base: nested_slot_base,
                 },
             )?;
             asm.code.extend_from_slice(&fold_code);
 
-            // Combine: fold the body's result into the accumulator and park
-            // it straight back — an ordinary two-register ALU op, outside
-            // the schedule (see `IsaBackend::alu`'s doc).
-            backend.slot_load(&mut asm.code, t1, acc_offset);
-            backend.alu(&mut asm.code, fold.combine_op(), t1, [t1, body_result]);
-            backend.slot_store(&mut asm.code, t1, acc_offset);
+            // Combine: fold the body's result into the accumulator — an
+            // ordinary two-register ALU op, outside the schedule (see
+            // `IsaBackend::alu`'s doc) — where the accumulator lives. The
+            // body's result may be in either temp, since its pool had both;
+            // a slot-held accumulator round-trips through the other one.
+            match acc_reg {
+                Some(a) => backend.alu(&mut asm.code, fold.combine_op(), a, [a, body_result]),
+                None => {
+                    let acc = if body_result == t0 { t1 } else { t0 };
+                    backend.slot_load(&mut asm.code, acc, acc_slot);
+                    backend.alu(&mut asm.code, fold.combine_op(), acc, [acc, body_result]);
+                    backend.slot_store(&mut asm.code, acc, acc_slot);
+                }
+            }
 
             // Step and loop: the binder is the counter, so stepping it is
             // the whole of "advance the loop" (`add_scalar` reuses the
             // scaffold's own broadcast-add verb).
-            backend.add_scalar(&mut asm.code, binder, t2, fold.stride() as f32);
+            let stride = fold.stride() as f32;
+            match binder_reg {
+                Some(b) => backend.add_scalar(&mut asm.code, b, t0, stride),
+                None => {
+                    backend.slot_load(&mut asm.code, t0, binder_slot);
+                    backend.add_scalar(&mut asm.code, t0, t1, stride);
+                    backend.slot_store(&mut asm.code, t0, binder_slot);
+                }
+            }
             backend.jump(&mut asm, top);
             asm.bind(exit);
+
+            // The result is read from the accumulator's slot — where this
+            // scope's placement of the def says it is — so a carried
+            // accumulator lands there once, on the way out.
+            if let Some(a) = acc_reg {
+                backend.slot_store(&mut asm.code, a, acc_slot);
+            }
+
+            // A fold hoisted into a prologue is a hoist root like any other,
+            // handed to the scopes inside right here (see the prologue-mode
+            // hand-off below, which this arm's `continue` skips). They read
+            // it from the accumulator's slot, pinned for them over the hoist
+            // slot — unless the allocator carries it, and then the carry is
+            // loaded once, here, from the slot the loop just left it in.
+            if let Some(hoisted) = hoist.parked()
+                && hoisted.contains_key(vid)
+                && let Some(inner) = allocation.within().next()
+                && let regalloc::Where::Reg(carry) = inner.at_head(*vid)
+            {
+                backend.slot_load(&mut asm.code, carry, acc_slot);
+            }
             continue;
         }
 
@@ -3437,16 +3568,16 @@ pub fn compile(
     EmitCtx::default().compile(arena, root)
 }
 
-/// Drive a schedule to a complete collapse kernel via an
-/// [`IsaBackend`]: the body from [`emit_dag_body_hoisted`], framed by the backend's
-/// [`IsaBackend::emit_collapse_loop`] scaffold.
-fn compile_via_backend<B: IsaBackend>(
+/// The collapse ABI's nest, scoped and allocated: what every scope's frame
+/// and code are read off. One allocation pass over the whole nest, so each
+/// region's frame is a function of its own allocation and the shared frame
+/// is read off these rather than computed by allocating everything twice.
+fn allocate_collapse_nest(
     schedule: Vec<regalloc::Def>,
-    backend: &mut B,
-) -> Result<CompileResult, CompileError> {
+    file: &regalloc::RegisterFile,
+) -> regalloc::NestAllocation {
     use regalloc::RegisterAllocator;
 
-    let file = backend.register_file();
     // Variance first, over the arena's *full* schedule — a surviving
     // `Reduce`'s own result depends on its body's, and the body's def is
     // about to move (`extract_folds`, next) out of this array entirely.
@@ -3471,15 +3602,24 @@ fn compile_via_backend<B: IsaBackend>(
     // nothing and running it earlier would risk `at` naming a stale index.
     attach_folds(&mut scoped, pending_folds);
 
-    // One allocation pass over the whole nest. Each region's frame is a
-    // function of its own allocation, so the shared frame below is read off
-    // these rather than computed by allocating everything a second time.
-    let nest = regalloc::LinearScan.allocate_nest(scoped, &file);
+    let nest = regalloc::LinearScan.allocate_nest(scoped, file);
     assert_eq!(
         nest.regions(),
         COLLAPSE_BINDERS.len(),
         "one region per collapse binder"
     );
+    nest
+}
+
+/// Drive a schedule to a complete collapse kernel via an
+/// [`IsaBackend`]: the body from [`emit_dag_body_hoisted`], framed by the backend's
+/// [`IsaBackend::emit_collapse_loop`] scaffold.
+fn compile_via_backend<B: IsaBackend>(
+    schedule: Vec<regalloc::Def>,
+    backend: &mut B,
+) -> Result<CompileResult, CompileError> {
+    let file = backend.register_file();
+    let nest = allocate_collapse_nest(schedule, &file);
     let frame_alloc = nest.scope(regalloc::Scope::Region(0));
     let row_alloc = nest.scope(regalloc::Scope::Region(1));
     let body_alloc = nest.body();
@@ -3500,6 +3640,7 @@ fn compile_via_backend<B: IsaBackend>(
             FramePlan {
                 override_size: None,
                 fold_slots: &alloc::collections::BTreeMap::new(),
+                binder_slots: &alloc::collections::BTreeMap::new(),
                 slot_base: 0,
             },
         )?;
@@ -3603,17 +3744,19 @@ fn compile_via_backend<B: IsaBackend>(
         .chain(&row_map)
         .map(|(vid, offset)| (*vid, *offset))
         .collect();
-    // Each surviving fold's accumulator gets a slot the same way a hoist
-    // root does — one that outlives both the scope reading it (wherever the
+    // Each surviving fold's two roots get a slot the same way a hoist root
+    // does — one that outlives both the scope reading it (wherever the
     // `Reduce` def is) and the fold's own frame — sitting right above the
-    // LICM roots' slots.
+    // LICM roots' slots: the accumulator's, then the binder's, both by the
+    // fold's `Reduce`. Whether either is used is the allocator's answer,
+    // read where the loop is emitted.
+    let fold_slot =
+        |j: usize, root: usize| hoist_slot(frame_roots.len() + row_roots.len() + 2 * j + root);
     let fold_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.fold_count())
-        .map(|j| {
-            (
-                nest.fold_reduce_vid(j),
-                hoist_slot(frame_roots.len() + row_roots.len() + j),
-            )
-        })
+        .map(|j| (nest.fold_reduce_vid(j), fold_slot(j, 0)))
+        .collect();
+    let binder_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.fold_count())
+        .map(|j| (nest.fold_reduce_vid(j), fold_slot(j, 1)))
         .collect();
 
     let (frame_code, frame_spills) = if frame_alloc.schedule().is_empty() {
@@ -3629,6 +3772,7 @@ fn compile_via_backend<B: IsaBackend>(
             FramePlan {
                 override_size: Some(m),
                 fold_slots: &fold_map,
+                binder_slots: &binder_map,
                 slot_base: 0,
             },
         )?;
@@ -3652,6 +3796,7 @@ fn compile_via_backend<B: IsaBackend>(
             FramePlan {
                 override_size: Some(m),
                 fold_slots: &fold_map,
+                binder_slots: &binder_map,
                 slot_base: 0,
             },
         )?;
@@ -3665,12 +3810,13 @@ fn compile_via_backend<B: IsaBackend>(
         FramePlan {
             override_size: Some(m),
             fold_slots: &fold_map,
+            binder_slots: &binder_map,
             slot_base: 0,
         },
     )?;
     let body_traffic = counting.take(body.len() as u32);
 
-    let hoisted_values = (frame_roots.len() + row_roots.len() + nest.fold_count()) as u32;
+    let hoisted_values = (frame_roots.len() + row_roots.len() + 2 * nest.fold_count()) as u32;
     let code = counting.emit_collapse_loop(&CollapseBody {
         frame_hoist: &frame_code,
         row_hoist: &row_code,
@@ -4092,14 +4238,21 @@ mod tests {
         let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
         let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), inner);
 
-        let schedule = arena_to_schedule(&a, root);
-        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
-            .expect("a fold inside a fold compiles");
-
-        for x in [0.0f32, 2.0, -1.5, 10.0] {
-            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
-            let want = 6.0 * x + 3.0;
-            assert_eq!(got, want, "at x={x}");
+        // With the whole pool and at the floor: the outer body never reads
+        // its own binder, only the inner one does, so at the floor the inner
+        // scope reads an enclosing loop's counter from that loop's slot.
+        for ctx in [
+            EmitCtx::default(),
+            EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH),
+        ] {
+            let schedule = arena_to_schedule(&a, root);
+            let code = compile_via_backend(schedule, &mut Native::new(ctx))
+                .expect("a fold inside a fold compiles");
+            for x in [0.0f32, 2.0, -1.5, 10.0] {
+                let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+                let want = 6.0 * x + 3.0;
+                assert_eq!(got, want, "at x={x}");
+            }
         }
     }
 
@@ -4112,6 +4265,15 @@ mod tests {
     /// `4X + 5 + 4k`, the outer to `Σ_k (4X + 5 + 5k)` = `8X + 15`.
     #[test]
     fn a_reduce_three_deep_compiles_and_runs() {
+        let (a, root) = three_deep_contraction();
+        let schedule = arena_to_schedule(&a, root);
+        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            .expect("a fold three deep compiles");
+        assert_three_deep(&code);
+    }
+
+    /// The three-deep contraction of the test above, as an arena.
+    fn three_deep_contraction() -> (ExprArena, pixelflow_ir::arena::ExprId) {
         use pixelflow_ir::fold::{Binder, Fold, Monoid};
 
         let mut a = ExprArena::new();
@@ -4130,15 +4292,147 @@ mod tests {
         let middle = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), j_inner);
         let k_middle = a.push_binary(OpKind::Add, k, middle);
         let root = a.push_reduce(Fold::new(Monoid::SUM, bk, 0..2), k_middle);
+        (a, root)
+    }
 
-        let schedule = arena_to_schedule(&a, root);
-        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
-            .expect("a fold three deep compiles");
-
+    /// `8X + 15`, at four points.
+    fn assert_three_deep(code: &CompileResult) {
         for x in [0.0f32, 2.0, -1.5, 10.0] {
             let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
             let want = 8.0 * x + 15.0;
             assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// Two sibling folds binding the same slot read one `Var` node, and
+    /// each reads its own counter through it.
+    ///
+    /// A glyph's distance and winding folds are this shape, and the e-graph
+    /// hash-conses their binder leaf into one node. A binder slot keyed by
+    /// that node would be one slot for two loops: the fold allocated last
+    /// would own it, and the other would step its own counter but test and
+    /// read the sibling's. At the floor neither binder is carried, so both
+    /// are read from their slots.
+    ///
+    /// `Σ_{i<3} (X + i) + Σ_{i<2} 2i = (3X + 3) + 2 = 3X + 5`.
+    #[test]
+    fn sibling_folds_sharing_a_binder_node_read_their_own_counters() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(bi.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let left = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let two = a.push_const(2.0);
+        let two_i = a.push_binary(OpKind::Mul, two, i);
+        let right = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..2), two_i);
+        let root = a.push_binary(OpKind::Add, left, right);
+
+        for ctx in [
+            EmitCtx::default(),
+            EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH),
+        ] {
+            let schedule = arena_to_schedule(&a, root);
+            let code = compile_via_backend(schedule, &mut Native::new(ctx))
+                .expect("sibling folds compile");
+            for x in [0.0f32, 2.0, -1.5, 10.0] {
+                let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+                let want = 3.0 * x + 5.0;
+                assert_eq!(got, want, "at x={x}");
+            }
+        }
+    }
+
+    /// A fold invariant across the lattice is hoisted into the per-call
+    /// prologue like any other root, and when the body reads it from a
+    /// carried register the loop hands its result over.
+    ///
+    /// The `Reduce` arm ends its def early, past the prologue's hand-off,
+    /// so a carried fold result used to reach the body in a register nothing
+    /// had loaded. `X + Σ_{i<3} 2i = X + 6`.
+    #[test]
+    fn a_hoisted_fold_the_body_reads_is_carried_after_its_loop() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(bi.var());
+        let two = a.push_const(2.0);
+        let two_i = a.push_binary(OpKind::Mul, two, i);
+        let sum = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), two_i);
+        let root = a.push_binary(OpKind::Add, x, sum);
+
+        let file = Native::new(EmitCtx::default()).register_file();
+        let nest = allocate_collapse_nest(arena_to_schedule(&a, root), &file);
+        let frame = nest.scope(regalloc::Scope::Region(0));
+        let sum = regalloc::ValueId(sum.0);
+        assert!(
+            frame.roots().contains(&sum),
+            "the fold is not a per-call root, so nothing here is hoisted"
+        );
+        assert!(
+            frame.carried(sum).is_some(),
+            "the fold's result is not carried, so the hand-off under test is not reached"
+        );
+
+        let code = compile_via_backend(
+            arena_to_schedule(&a, root),
+            &mut Native::new(EmitCtx::default()),
+        )
+        .expect("a hoisted fold compiles");
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+            assert_eq!(got, x + 6.0, "at x={x}");
+        }
+    }
+
+    /// A fold's binder and accumulator are roots the allocator places under
+    /// its budget, not registers reserved across the body.
+    ///
+    /// Two pools, the same three-deep contraction. At the floor
+    /// (`MIN_SCRATCH`) the budget is zero at every depth, so every fold's
+    /// roots go to slots and the loops step and test them from memory —
+    /// the case a reserved binder could not serve past one level, since each
+    /// level took a register from the pool below until an instruction there
+    /// had nowhere to put its scratch. Five registers above the floor (the
+    /// SSE2 pool, the smallest any backend has), six roots ranked by reads
+    /// per batch: the innermost binder is read thrice per trip over eight
+    /// trips, the outermost accumulator twice over two, so the outermost
+    /// accumulator is the one root in a slot, its loop mixes a carried
+    /// binder with a slot-held accumulator, and the pool inside the
+    /// innermost fold is exactly the floor. Both compile and run.
+    #[test]
+    fn a_folds_roots_are_placed_by_the_budget() {
+        let (a, root) = three_deep_contraction();
+        let carried = |file: &regalloc::RegisterFile| -> Vec<(bool, bool)> {
+            let nest = allocate_collapse_nest(arena_to_schedule(&a, root), file);
+            (0..nest.fold_count())
+                .map(|j| {
+                    let roots = nest.fold_roots(j);
+                    let in_register = |at: regalloc::Where| matches!(at, regalloc::Where::Reg(_));
+                    (in_register(roots.binder), in_register(roots.accumulator))
+                })
+                .collect()
+        };
+        let floor = regalloc::RegisterFile::MIN_SCRATCH;
+        for (above, want) in [
+            (0, vec![(false, false); 3]),
+            (5, vec![(true, false), (true, true), (true, true)]),
+        ] {
+            let ctx = EmitCtx::with_max_regs(floor + above);
+            let file = Native::new(ctx.clone()).register_file();
+            assert_eq!(
+                file.scratch.len(),
+                floor + above,
+                "the pool did not cap where the test expects"
+            );
+            assert_eq!(carried(&file), want, "{above} registers above the floor");
+            let code = compile_via_backend(arena_to_schedule(&a, root), &mut Native::new(ctx))
+                .expect("a fold three deep compiles");
+            assert_three_deep(&code);
         }
     }
 
