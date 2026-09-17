@@ -618,6 +618,73 @@ impl Optimizer {
         limits: Limits,
         input: InputSize,
     ) -> Optimized {
+        let stats = self.saturate_bounded(egraph, limits, input);
+        self.extract(egraph, root, stats)
+    }
+
+    /// Saturate `egraph` under this configuration and stop there: the half of
+    /// [`Self::run`] that does not depend on the lattice. The rules, the
+    /// budget (a function of the input's size) and the graph they produce are
+    /// the same at every extent, so what this leaves in `egraph` is a graph
+    /// every extent can be extracted from ([`Self::extract`]) — which is what
+    /// a cache holding one saturation per structure keeps.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::run`]: if a [`hard_ceiling`](Optimizer::hard_ceiling) was
+    /// set and the saturation exceeded it.
+    pub fn saturate_term(&mut self, egraph: &mut EGraph, node_count: usize) -> OptimizerStats {
+        let input = InputSize {
+            nodes: node_count,
+            classes: egraph.num_classes(),
+        };
+        self.saturate_bounded(egraph, self.budget.limits(input), input)
+    }
+
+    /// Extract from a saturated `egraph` under this configuration's cost model
+    /// and lattice: the half of [`Self::run`] that depends on the shape.
+    /// [`Self::for_lattice`] prices a node by how many times the loop nest
+    /// evaluates it, so the term that is cheapest at one extent need not be
+    /// at another — which is why this runs once per shape over a graph that
+    /// was saturated once. `stats` is what that saturation reported, carried
+    /// through so an [`Optimized`] reads the same whichever way it was made.
+    #[must_use]
+    pub fn extract(&self, egraph: &EGraph, root: EClassId, stats: OptimizerStats) -> Optimized {
+        // Both arms report the cost of the choices they RETURN — the DP's
+        // own table is read before `repair_choices_well_founded` rewrites
+        // picks and so can name a different term (#1111), and the reranker's
+        // search score is on its own scale entirely.
+        let (choices, cost, extraction) = match self.rerank.as_ref() {
+            Some(reranker) => {
+                let choices = IncrementalExtractor::new(reranker.as_ref(), RERANK_TOP_K)
+                    .extract_choices_only(egraph, root)
+                    .1
+                    .into_choices();
+                let cost =
+                    super::extract::cost_of_choices(egraph, root, &choices, &self.cost, self.shape);
+                (choices, cost, ExtractionReport::external())
+            }
+            None => {
+                let dag = super::extract::extract_dag_scoped(egraph, root, &self.cost, self.shape);
+                let cost = dag.cost();
+                (dag.choices, cost, dag.report)
+            }
+        };
+
+        Optimized {
+            choices,
+            cost,
+            extraction,
+            stats,
+        }
+    }
+
+    fn saturate_bounded(
+        &mut self,
+        egraph: &mut EGraph,
+        limits: Limits,
+        input: InputSize,
+    ) -> OptimizerStats {
         let started = std::time::Instant::now();
 
         #[cfg(feature = "provenance-journal")]
@@ -667,39 +734,13 @@ impl Optimizer {
             }
         }
 
-        // Both arms report the cost of the choices they RETURN — the DP's
-        // own table is read before `repair_choices_well_founded` rewrites
-        // picks and so can name a different term (#1111), and the reranker's
-        // search score is on its own scale entirely.
-        let (choices, cost, extraction) = match self.rerank.as_ref() {
-            Some(reranker) => {
-                let choices = IncrementalExtractor::new(reranker.as_ref(), RERANK_TOP_K)
-                    .extract_choices_only(egraph, root)
-                    .1
-                    .into_choices();
-                let cost =
-                    super::extract::cost_of_choices(egraph, root, &choices, &self.cost, self.shape);
-                (choices, cost, ExtractionReport::external())
-            }
-            None => {
-                let dag = super::extract::extract_dag_scoped(egraph, root, &self.cost, self.shape);
-                let cost = dag.cost();
-                (dag.choices, cost, dag.report)
-            }
-        };
-
-        Optimized {
-            choices,
-            cost,
-            extraction,
-            stats: OptimizerStats {
-                stop: saturation.stop,
-                iterations: saturation.iterations,
-                applications: egraph.application_count(),
-                unions: saturation.total_unions,
-                classes: egraph.num_classes(),
-                limits,
-            },
+        OptimizerStats {
+            stop: saturation.stop,
+            iterations: saturation.iterations,
+            applications: egraph.application_count(),
+            unions: saturation.total_unions,
+            classes: egraph.num_classes(),
+            limits,
         }
     }
 }

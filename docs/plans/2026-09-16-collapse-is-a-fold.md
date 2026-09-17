@@ -3,7 +3,7 @@
 ## Metadata
 - **Author**: JP (design), Claude (draft)
 - **Status**: `In progress` — denotation settled 2026-09-17; implementation in
-  the order of §5, one PR per row. Step 1 in #1277.
+  the order of §5, one PR per row. Step 1 landed (#1277); step 2 in review.
 - **Created**: 2026-09-16 (as "a uniform read is one load"; rewritten
   2026-09-17 around the decision below)
 - **Verified against**: `93d48c86` (main with #1268, the re-land of the
@@ -237,13 +237,21 @@ count that must change is a recompile through the shape-keyed cache") and
 `manifold.rs`'s own `plan` anticipates ("becomes load-bearing when the
 emitted code specializes on the extents").
 
-The cost is bounded by one fix that is itself a subtraction: `pixelflow-search`'s
-`optimize_runtime_arena` keys its cache on the shape while documenting that
-"saturation does not depend on it". Drop the shape from that key and a second
-band height costs an emit (milliseconds), not a saturation (seconds). The
-JIT cache stays keyed on `(arena, shape)`. A frame stripes into at most two
-heights; a glyph is one tile; a `Union`'s pieces are already per-piece
-collapses.
+The cost is bounded by one fix in `pixelflow-search`'s `optimize_runtime_arena`.
+Saturation does not depend on the shape; extraction does
+(`Optimizer::for_lattice` prices a node by how many times the loop nest
+evaluates it), so the cache holds the **saturated e-graph per structure** and
+extracts per shape — which is what that function's own doc prescribed. It
+also keys on structure rather than identity, so buffer- and uniform-bearing
+arenas — every glyph, the cell grid — stop bypassing the cache entirely, as
+they did. A second band height then costs an extraction and an emit
+(milliseconds), not a saturation (seconds). The JIT cache stays keyed on
+`(arena, shape)`. A frame stripes into at most two heights; a glyph is one
+tile; a `Union`'s pieces are already per-piece collapses.
+
+*(The first draft of this section said "drop the shape from the key", on a
+stale comment claiming the cache's output was shape-independent. It is not:
+the extraction is priced by the lattice, and the split above is the fix.)*
 
 The alternative — a dynamic bound on `Fold` — is a type extension and an
 emitter case for one caller's convenience. Refused.
@@ -298,7 +306,7 @@ One PR per row. Each lands green on its own; none needs the next.
 | step | what | gate | number that should move |
 |---|---|---|---|
 | 1 | ~~**Nested fold scopes.** `extract_folds` carves a fold inside a fold's body; `expand_nested_reduce` deleted. 2c's stated remainder.~~ **Done** (#1277). A nested fold that does not depend on the enclosing binder is hoisted: it stays the enclosing scope's fold, run once, and the fold reading it keeps its def as a placeholder parked in the accumulator slot — the glyph's winding sum runs once per batch, not once per piece. | goldens; `run_is_a_glyph`; `font_rasterization_regression` at every ISA level; `traffic` | `8`@32, this host's tier: 536,960 B → **12,390 B**; body 24,738 → **612** instructions; table reads (`vcvttps2dq`) 1,610 → **35**; spills 19 → 5. `A`@32 is the identical program: the body no longer scales with the piece count. |
-| 2 | **Optimizer cache keyed on structure**, not shape (`optimize_runtime_arena`). | its own tests; `one_compile_per_shape` counts saturations, not emits | saturations per frame shape: 1 |
+| 2 | **One saturation per structure, one extraction per shape.** `optimize_runtime_arena` holds the saturated e-graph, keyed on structure (never identity), and extracts per shape; the extracted term comes back in the caller's own names and slot order (`ExprArena::with_tables` + `relink`). `Optimizer::run` split into `saturate_term` and `extract`. | `one_compile_per_shape` counts saturations across shapes and compositions; a second composition keeps its own names; a second composition at a second shape reads its own table end to end | saturations per structure: 1, whatever the shape or the composition. Measured: the 95-glyph atlas at tile 32 after tile 16 saturates 1 structure (its one new bucket), not 7; warm 0.41 s → 0.31 s |
 | 3 | **Vocabulary.** `Write`, `OpKind::Seq`, `Monoid::SEQ`; `Variance` widened past `u8` and `REDUCE_BINDERS` past 4 (three lattice binders plus a kernel's own — the control plane is 64-bit). | unit tests; no production path changes | — |
 | 4 | **The two passes.** `collapse(extent)` and `pack(L)` in `legalize`, on an arena the emitter does not yet accept. | arena-level tests: structure, remainder for `w = qL + r`, every binder's bit, a read's uniformity | — |
 | 5 | **The emitter executes the lane fold and the `Write`; the scaffold is deleted; the ABI is `fn(ctx, out, pitch)`; `pixelflow-core` collapses in one call.** | goldens at every ISA level (`isa-matrix --smoke`); `bind_allocates_nothing`; `traffic`; distinct shapes per terminal frame counted before landing | collapse time; body instruction count; `loads_kept` by scope |
