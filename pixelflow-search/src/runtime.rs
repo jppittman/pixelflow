@@ -36,7 +36,7 @@ use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandNestedReduce, ExpandRefs, LowerDwrt};
+use pixelflow_ir::passes::{ExpandRefs, LowerDwrt};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -169,31 +169,25 @@ fn optimize_runtime_arena_uncached(
     // `egraph::fold_rules`), so the graph resolves what it judges worth
     // resolving and keeps the rest folded.
     //
-    // **`LowerDwrt` and the reduce legalizer come last, and that is the whole
-    // point.** Legalization is the *fallback*: it takes whatever illegal
-    // shape survived saturation — a `Dwrt` the chain rule did not reach, a
-    // `Reduce` the graph declined to peel — and makes it emittable. It owns
-    // nothing the graph does not also know, so running it first only takes
-    // choices away.
+    // **`LowerDwrt` comes last, and that is the whole point.** Legalization
+    // is the *fallback*: it takes whatever illegal shape survived saturation
+    // — a `Dwrt` the chain rule did not reach — and makes it emittable. It
+    // owns nothing the graph does not also know, so running it first only
+    // takes choices away.
     //
-    // Size is not symmetric across that boundary, which is why the order is
-    // not arbitrary. Unrolling a 34-piece fold *before* saturation hands the
-    // e-graph 141,530 nodes for one glyph, and an e-graph is quadratic-ish in
-    // what it is fed: that is where the budget goes. Unrolling it *after*
-    // hands the same expansion to the assembler, which is linear and does not
-    // care — a million-node IR is a routine afternoon for a register
-    // allocator and a catastrophe for saturation. So the emitted node count
-    // rises when the legalizer moves back, and that is the trade being made,
-    // not a regression: the e-graph gets to see the small, high-level program
-    // it can actually reason about.
-    //
-    // `ExpandNestedReduce`, not `ExpandReduce`: stage 2c's codegen compiles a
-    // surviving `Reduce` as a loop, so legalization only has to unroll the one
-    // shape `extract_folds` cannot carve out — a `Reduce` nested inside
-    // another's own body, which is what `Kernel::by_ref` composition plus
-    // `ExpandRefs` produces. Everything else stays folded all the way to the
-    // assembler. Mirrors `pixelflow-ir::passes::legalize`, which says the same
-    // thing at the other compile entry.
+    // A `Reduce` is not illegal, nested or not: stage 2c's codegen compiles
+    // a surviving fold as a loop, and a fold inside a fold's body as a loop
+    // inside a loop, so every fold stays folded all the way to the
+    // assembler. The reduce legalizer that used to sit after `LowerDwrt`
+    // (`ExpandNestedReduce`, unrolling the one shape codegen could not carve
+    // out) is deleted; nothing unrolls on this path. That matters because
+    // size is not symmetric across the saturation boundary: unrolling a
+    // 34-piece fold *before* saturation hands the e-graph 141,530 nodes for
+    // one glyph, and an e-graph is quadratic-ish in what it is fed, while a
+    // register allocator is linear and does not care. The e-graph gets to
+    // see the small, high-level program it can actually reason about.
+    // Mirrors `pixelflow-ir::passes::legalize`, which says the same thing at
+    // the other compile entry.
     //
     // A declining step short-circuits the rest and yields `None` here, which
     // means exactly what it always meant: the caller compiles its own arena
@@ -201,19 +195,14 @@ fn optimize_runtime_arena_uncached(
     // `Manifold::compile` runs `passes::legalize` regardless of whether this
     // function returned anything.
     match saturation_switch() {
-        SaturationSwitch::On => pipeline![
-            ExpandRefs,
-            Saturate::runtime(shape),
-            LowerDwrt,
-            ExpandNestedReduce
-        ]
-        .optimize(arena, root)
-        .into_changed(),
+        SaturationSwitch::On => pipeline![ExpandRefs, Saturate::runtime(shape), LowerDwrt]
+            .optimize(arena, root)
+            .into_changed(),
         // The `Identity` path: the same legalizing tail, no saturation.
         // What `Lattice::bake` would emit if the e-graph did not exist —
         // the "F" column of docs/plans/2026-09-06-egraph-at-production-scale.md
         // §7, measured by docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
-        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandNestedReduce]
+        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt]
             .optimize(arena, root)
             .into_changed(),
     }
