@@ -485,6 +485,12 @@ pub fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 /// they agree because they spell the same thing.
 pub const CONST_POOL: &str = "const_pool";
 
+/// The constant pool's alignment: one [`PoolEntry`], so every `LDR Qt` from
+/// it is an aligned vector load. The padding that reaches it from the last
+/// instruction follows the code's length, which is why a kernel's trailing
+/// bytes can differ between two allocations of it by less than this.
+pub const CONST_POOL_ALIGN: usize = 16;
+
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
 pub fn needs_const_pool(val: f32) -> bool {
@@ -2145,7 +2151,7 @@ pub(crate) mod driver {
                 asm.bind(CONST_POOL);
                 return;
             }
-            while !asm.code.len().is_multiple_of(16) {
+            while !asm.code.len().is_multiple_of(super::CONST_POOL_ALIGN) {
                 asm.code.push(0);
             }
             asm.bind(CONST_POOL);

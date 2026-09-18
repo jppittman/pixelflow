@@ -86,11 +86,18 @@ pub struct EmitTraffic {
     /// How many times one call runs each scope, indexed like `scopes`: the
     /// body once, a fold its trip count times its parent's.
     pub trips: Vec<u64>,
-    /// The function around the nest: its frame and what trails the return.
-    /// Constant for a given target, so it cannot explain a difference between
-    /// two allocations of one kernel — recorded separately rather than folded
-    /// into a scope so that stays visible.
+    /// The function around the nest: its frame, the body's place in it and
+    /// the return. The same code under every allocation of a kernel on a
+    /// given target, so it cannot explain a difference between two
+    /// allocations — recorded separately rather than folded into a scope so
+    /// that stays visible.
     pub scaffold: ScopeTraffic,
+    /// Bytes after the return: aarch64's constant pool and the padding that
+    /// aligns it, nothing on x86. The pool is the kernel's; the padding
+    /// follows the code's length, so this is the one count that can differ
+    /// between two allocations of a kernel with no instruction differing, by
+    /// less than [`CONST_POOL_ALIGN`](super::aarch64::CONST_POOL_ALIGN).
+    pub trailing: u32,
     /// Bytes one spilled register occupies: the backend's vector width.
     pub vector_bytes: u32,
     /// Registers the allocator had to hand out.
@@ -119,11 +126,11 @@ impl EmitTraffic {
         self.scopes.first().copied().unwrap_or_default()
     }
 
-    /// Every scope's bytes plus the function's own — the whole of what was
-    /// emitted, by construction.
+    /// Every scope's bytes plus the function's own and what trails its return
+    /// — the whole of what was emitted, by construction.
     #[must_use]
     pub fn bytes(&self) -> u32 {
-        self.scopes.iter().map(|s| s.bytes).sum::<u32>() + self.scaffold.bytes
+        self.scopes.iter().map(|s| s.bytes).sum::<u32>() + self.scaffold.bytes + self.trailing
     }
 
     /// Memory operations one call executes: each scope's, weighted by how
@@ -803,16 +810,63 @@ mod tests {
     /// The scaffold is the same code under every allocation of a kernel, so it
     /// is counted apart from the scopes rather than folded into one — a
     /// difference between two allocations must not be able to hide there.
+    ///
+    /// Every backend, from this host, since each emits its own frame. What
+    /// trails the return is counted apart again: aarch64's constant pool is
+    /// the kernel's, but the padding that aligns it follows the code's
+    /// length, so that count may move with the budget by less than one
+    /// alignment — and it is the only count that may.
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
+        use crate::emit::tests::schedule_for;
+        use crate::emit::{
+            BYTES_PER_LANE, IsaBackend, aarch64, avx2, avx512, compile_via_backend, x86_64,
+        };
+
+        fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
+            let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
+            let schedule = schedule_for(arena, root, SHAPE, lanes);
+            compile_via_backend(schedule, &mut backend)
+                .expect("compile")
+                .traffic
+        }
         let (arena, root) = wide_live_range_kernel(24);
-        let tight = EmitCtx::with_max_regs(TIGHT_POOL)
-            .compile(&arena, root, SHAPE)
-            .expect("compile");
-        let loose = crate::emit::compile(&arena, root, SHAPE).expect("compile");
-        assert_eq!(
-            tight.traffic.scaffold, loose.traffic.scaffold,
-            "the scaffold changed with the register budget"
-        );
+        let tight = || EmitCtx::with_max_regs(TIGHT_POOL);
+        let loose = EmitCtx::default;
+        let budgets = [
+            (
+                "NEON",
+                traffic(aarch64::driver::Aarch64Backend::new(tight()), &arena, root),
+                traffic(aarch64::driver::Aarch64Backend::new(loose()), &arena, root),
+            ),
+            (
+                "SSE2",
+                traffic(x86_64::driver::X86Backend::new(tight()), &arena, root),
+                traffic(x86_64::driver::X86Backend::new(loose()), &arena, root),
+            ),
+            (
+                "AVX2",
+                traffic(avx2::driver::Avx2Backend::new(tight()), &arena, root),
+                traffic(avx2::driver::Avx2Backend::new(loose()), &arena, root),
+            ),
+            (
+                "AVX-512",
+                traffic(avx512::driver::Avx512Backend::new(tight()), &arena, root),
+                traffic(avx512::driver::Avx512Backend::new(loose()), &arena, root),
+            ),
+        ];
+        for (name, t, l) in budgets {
+            assert_eq!(
+                t.scaffold, l.scaffold,
+                "{name}: the scaffold changed with the register budget"
+            );
+            assert!(
+                t.trailing.abs_diff(l.trailing) < aarch64::CONST_POOL_ALIGN as u32,
+                "{name}: what trails the return changed with the register budget by more \
+                 than the pool's alignment: {} vs {} bytes",
+                t.trailing,
+                l.trailing
+            );
+        }
     }
 }
