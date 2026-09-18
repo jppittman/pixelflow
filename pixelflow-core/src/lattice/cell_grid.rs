@@ -720,7 +720,7 @@ impl CellGridFrame {
         );
         let claim = self.grid_range().intersect(&band);
         if !claim.is_empty() {
-            self.channels[channel].collapse_subrect(
+            self.channels[channel].collapse_rows(
                 PlaneRegion::rows(claim.width(), claim.y0(), claim.rows()),
                 out,
                 stride,
@@ -1424,7 +1424,7 @@ mod tests {
     /// | case | grid extent | what it pins |
     /// |---|---|---|
     /// | integral | 12 x 8 | the ordinary case; a border on both axes |
-    /// | fractional | 17 x 12 | **the `− ½`**: the grid spans `[0, 17.5)`, so pixel 17 (centre 17.5) is outside, and a range computed as `ceil(g)` would claim it. Also a claim width that is no multiple of any SIMD batch, so `RowTail::Exact`'s scratch path is live. |
+    /// | fractional | 17 x 12 | **the `− ½`**: the grid spans `[0, 17.5)`, so pixel 17 (centre 17.5) is outside, and a range computed as `ceil(g)` would claim it. Also a claim width that is no multiple of any SIMD batch, so a row's final partial batch is stored lane-wise. |
     /// | fractional through the scale | 22 x 11 | the same, with the display contramap carrying it: `3 · 5 · 1.5 = 22.5` is fractional though every cell extent on X is integral, and `3 · 2.5 · 1.5 = 11.25` is fractional in both. **Both axes discriminate** — `ceil(g)` gives 23 x 12. At `scale = 2.0`, which this case had first, both products came out integral and it pinned nothing about the half-pixel however fractional its cell extents looked. |
     /// | grid past the frame | 15 x 11 | the clip to the frame, with no border at all |
     ///

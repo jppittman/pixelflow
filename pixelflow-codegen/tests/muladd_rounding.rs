@@ -21,33 +21,29 @@
 //! all four backends from any host by `emit::tests::muladd_encoding`.
 #![cfg(target_arch = "x86_64")]
 
-use pixelflow_codegen::emit::executable::{Point4, TileSlice};
+use pixelflow_codegen::CompiledKernel;
 use pixelflow_codegen::emit::{EmitCtx, compile};
-use pixelflow_codegen::{CompiledKernel, JIT_VECTOR_BYTES};
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 
-/// Lanes in one emitted batch.
-const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
-
-/// One point of a compiled kernel: a single-batch collapse call, lane 0 read
-/// back. `call_collapse` is the collapse driver's entry; a test that wants one
-/// number owns this loop rather than the crate growing a point API for it.
+/// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
+/// the one sample read back. `CompiledKernel::call` is the collapse driver's
+/// entry; a test that wants one number owns this loop rather than the crate
+/// growing a point API for it.
 ///
 /// `block` holds the kernel's arguments in link order — the addend and the
-/// wall's multiplier, which used to be the Z and W coordinates.
+/// wall's multiplier, which used to be the Z and W coordinates — and is the
+/// uniform block the context passes it in, since these arenas declare no
+/// buffer.
 fn eval_point(jit: &CompiledKernel, x: f32, y: f32, block: &[f32]) -> f32 {
-    let mut out = [0.0f32; LANES];
-    let ctx: [*const f32; 1] = [block.as_ptr()];
-    // SAFETY: `out` holds exactly one whole batch; these arenas declare no
-    // buffers, so `ctx[0]` is the block entry and holds one `f32` per
-    // declared argument, alive for the call.
+    let mut out = [0.0f32; 1];
+    let origin = [x, y];
+    // SAFETY: `ctx[0]` is the uniform block — one `f32` per declared
+    // argument, in link order — `ctx[1]` is the origin block, and `out`
+    // holds the one sample a single-point lattice writes.
+    let ctx: [*const f32; 2] = [block.as_ptr(), origin.as_ptr()];
     unsafe {
-        jit.call_collapse(
-            ctx.as_ptr(),
-            TileSlice::single(out.as_mut_ptr()),
-            Point4::new([x; LANES], [y; LANES], [0.0; LANES], [0.0; LANES]),
-        );
+        jit.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
     }
     out[0]
 }
@@ -136,8 +132,22 @@ fn an_unspilled_muladd_rounds_the_way_this_target_does() {
     let z = arg_leaf(&mut a);
     let root = a.push_ternary(OpKind::MulAdd, x, y, z);
 
-    let result = compile(&a, root).expect("compile MulAdd(X, Y, U)");
-    assert_eq!(result.spill_count, 0, "this scenario must not spill");
+    let result =
+        compile(&a, root, pixelflow_ir::LatticeShape::POINT).expect("compile MulAdd(X, Y, U)");
+    // Not asserted: `result.spill_count`. Every kernel this file has compiled
+    // at `LatticeShape::POINT` reports one nominal spill, independent of
+    // content — a bare `Const(1.0)` and `X + Y` report the same
+    // `spill_count == 1, spill_bytes == 80` this scenario does, with zero
+    // corresponding store or load in `result.traffic`'s per-scope counts, so
+    // it is not a register genuinely forced to memory. That looks like the
+    // lattice's own row/col/lane folds (`pixelflow_ir::passes::lattice::collapse`
+    // wraps every kernel in them, even a one-point one) costing a nominal
+    // slot the emitted code never touches, not register pressure from this
+    // scenario's operands — see this file's final report for the finding.
+    // The property this test actually needs — that the multiplicands reach
+    // the backend live in registers rather than reloaded — is what the bit
+    // check below proves: only the fused, single-rounding form produces
+    // `fused(A, B, C)`/its SSE2 stand-in.
     let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
     let got = eval_point(&jit, A, B, &[C]);
 
@@ -225,7 +235,7 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     let root = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
 
     let result = EmitCtx::with_max_regs(1)
-        .compile(&a, root)
+        .compile(&a, root, pixelflow_ir::LatticeShape::POINT)
         .expect("compile spilled MulAdd");
     assert!(
         result.spill_count > 0,

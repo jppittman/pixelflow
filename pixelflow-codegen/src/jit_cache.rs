@@ -146,10 +146,10 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
             .map(|(a, r)| (a, *r))
             .unwrap_or((arena, root));
         if buffers.is_empty() && uniforms.is_empty() {
-            return emit::compile(arena, root);
+            return emit::compile(arena, root, shape);
         }
         let (linked, root) = arena.relink(root, &buffers, &uniforms);
-        emit::compile(&linked, root)
+        emit::compile(&linked, root, shape)
     };
 
     // Keyed on the arena *as handed in*, before optimization, plus the shape.

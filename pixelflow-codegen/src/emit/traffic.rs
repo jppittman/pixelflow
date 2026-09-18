@@ -21,16 +21,17 @@
 //! is written, and a trait method that disappears is a compile error rather
 //! than a silently dropped term.
 
-use super::regalloc::ValueId;
-use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload};
+use super::regalloc::{Scope, ValueId};
+use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload, WritePlan};
 use crate::error::CompileError;
+use alloc::vec::Vec;
 
-/// Emitted traffic within one scope of the collapse nest.
+/// Emitted traffic within one scope of the nest.
 ///
 /// A scope's counts are *static*: what the scope's code contains, not what a
 /// call executes. Multiply by the scope's trip count for the dynamic figure —
-/// which is the whole reason the split by scope exists, since a body
-/// instruction runs `rows × groups` times and a prologue instruction once.
+/// which is the whole reason the split by scope exists, since an instruction
+/// in the column fold runs `rows × batches` times and one in the body once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScopeTraffic {
     /// Scheduled operations emitted (one per `InstructionPlan`).
@@ -41,8 +42,7 @@ pub struct ScopeTraffic {
     pub loads_transient: u32,
     /// Stack loads the driver emits *between* instructions — a range the
     /// allocator chose to bring back into a register the value then keeps, a
-    /// scope head's reconciliation, a guard's mask, the scaffold's coordinate
-    /// reloads.
+    /// scope head's reconciliation, a guard's mask, a fold's slot-held root.
     ///
     /// The split is by *which emission path*, not by which register the load
     /// targets. It used to be the latter, and that stopped being derivable
@@ -56,9 +56,13 @@ pub struct ScopeTraffic {
     /// where the immediate is inline; on aarch64 it may reach the constant
     /// pool, which is why it is counted apart from both.
     pub remats: u32,
-    /// Stack stores emitted, including the scaffold's coordinate saves.
+    /// Stack stores emitted: spills, parks, a fold's slot-held roots.
     pub stores: u32,
-    /// Bytes of machine code the scope occupies.
+    /// The lattice's own stores — one per `Write`, whatever its width. Not a
+    /// spill: the output plane is the kernel's result, not its scratch.
+    pub writes: u32,
+    /// Bytes of machine code the scope's own instructions occupy, excluding
+    /// the scopes nested inside it, so every byte lands in exactly one scope.
     pub bytes: u32,
 }
 
@@ -73,64 +77,144 @@ impl ScopeTraffic {
 
 /// The whole nest's traffic, plus the target facts a cost model needs to
 /// price it (a 64-byte spill is not a 16-byte one).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmitTraffic {
-    /// The once-per-call prologue (X- and Y-invariant values).
-    pub frame: ScopeTraffic,
-    /// The once-per-row prologue (X-invariant values).
-    pub row: ScopeTraffic,
-    /// The innermost batch body.
-    pub body: ScopeTraffic,
-    /// The collapse scaffold itself: coordinate slot traffic, induction
-    /// stepping, the output store. Constant for a given target, so it cannot
-    /// explain a difference between two allocations of one kernel — recorded
-    /// separately rather than folded into a scope so that stays visible.
+    /// One entry per scope, the body first and then the folds in nest order
+    /// (`Scope::Fold(j)` at `j + 1`) — the lattice's row and column folds
+    /// among them, since they are folds like any other.
+    pub scopes: Vec<ScopeTraffic>,
+    /// How many times one call runs each scope, indexed like `scopes`: the
+    /// body once, a fold its trip count times its parent's.
+    pub trips: Vec<u64>,
+    /// The function around the nest: its frame and what trails the return.
+    /// Constant for a given target, so it cannot explain a difference between
+    /// two allocations of one kernel — recorded separately rather than folded
+    /// into a scope so that stays visible.
     pub scaffold: ScopeTraffic,
     /// Bytes one spilled register occupies: the backend's vector width.
     pub vector_bytes: u32,
     /// Registers the allocator had to hand out.
     pub pool: u8,
-    /// Hoist roots that hold a register across the loops inside them rather
-    /// than a slot.
+    /// Parked roots that hold a register across the scopes inside them
+    /// rather than a slot.
     pub carried: u32,
 }
 
 impl EmitTraffic {
-    /// Memory operations one call executes, given each scope's trip count.
+    /// Assemble the nest's traffic from what [`Counting`] recorded per scope,
+    /// in whatever order the scopes finished, and the trip count of each.
+    #[must_use]
+    pub fn new(
+        recorded: Vec<(Scope, ScopeTraffic)>,
+        trips: Vec<u64>,
+        scaffold: ScopeTraffic,
+        vector_bytes: u32,
+        pool: u8,
+        carried: u32,
+    ) -> Self {
+        let mut scopes = alloc::vec![ScopeTraffic::default(); trips.len()];
+        for (scope, traffic) in recorded {
+            scopes[scope_ix(scope)] = traffic;
+        }
+        Self {
+            scopes,
+            trips,
+            scaffold,
+            vector_bytes,
+            pool,
+            carried,
+        }
+    }
+
+    /// The body's traffic: what runs once per call.
+    #[must_use]
+    pub fn body(&self) -> ScopeTraffic {
+        self.scopes.first().copied().unwrap_or_default()
+    }
+
+    /// Every scope's bytes plus the function's own — the whole of what was
+    /// emitted, by construction.
+    #[must_use]
+    pub fn bytes(&self) -> u32 {
+        self.scopes.iter().map(|s| s.bytes).sum::<u32>() + self.scaffold.bytes
+    }
+
+    /// Memory operations one call executes: each scope's, weighted by how
+    /// many times the call runs it.
     ///
     /// The scaffold is excluded: it is the same code under every allocation of
     /// a kernel, so including it only adds a constant to both sides of every
     /// comparison this number exists to make.
     #[must_use]
-    pub const fn dynamic_memory_ops(&self, rows: u64, groups: u64) -> u64 {
-        self.frame.memory_ops() as u64
-            + self.row.memory_ops() as u64 * rows
-            + self.body.memory_ops() as u64 * rows * groups
+    pub fn dynamic_memory_ops(&self) -> u64 {
+        self.scopes
+            .iter()
+            .zip(&self.trips)
+            .map(|(s, trips)| u64::from(s.memory_ops()) * trips)
+            .sum()
     }
+}
+
+/// The index a scope's count is kept under: the body first, then the folds.
+fn scope_ix(scope: Scope) -> usize {
+    match scope {
+        Scope::Body => 0,
+        Scope::Fold(j) => j + 1,
+    }
+}
+
+/// One open scope's running count, and the bytes of the scopes that finished
+/// inside it, so its own `bytes` can exclude them.
+#[derive(Default)]
+struct Open {
+    traffic: ScopeTraffic,
+    nested_bytes: u32,
 }
 
 /// An `IsaBackend` that counts what it forwards.
 ///
-/// `take` reads and clears, so the driver brackets each scope's emission with
-/// one call and the counts partition by construction.
+/// Scopes nest, so the counts do: `scope_begin` opens a fresh count that
+/// everything emitted until the matching `scope_end` lands in, and closing it
+/// records the count under the scope's name. What is emitted outside every
+/// scope — the function's frame and trailer — accumulates at the base, read
+/// off by `take`.
 pub(super) struct Counting<'a, B: IsaBackend> {
     inner: &'a mut B,
-    traffic: ScopeTraffic,
+    base: ScopeTraffic,
+    open: Vec<Open>,
+    closed: Vec<(Scope, ScopeTraffic)>,
 }
 
 impl<'a, B: IsaBackend> Counting<'a, B> {
     pub(super) fn new(inner: &'a mut B) -> Self {
         Self {
             inner,
-            traffic: ScopeTraffic::default(),
+            base: ScopeTraffic::default(),
+            open: Vec::new(),
+            closed: Vec::new(),
         }
     }
 
-    /// The traffic since the last `take`, with the counters reset.
+    /// The count everything emitted right now lands in.
+    fn current(&mut self) -> &mut ScopeTraffic {
+        match self.open.last_mut() {
+            Some(open) => &mut open.traffic,
+            None => &mut self.base,
+        }
+    }
+
+    /// The traffic emitted outside every scope since the last `take`, with
+    /// those counters reset; `bytes` is the caller's measure of it.
     pub(super) fn take(&mut self, bytes: u32) -> ScopeTraffic {
-        let mut taken = core::mem::take(&mut self.traffic);
+        debug_assert!(self.open.is_empty(), "take while a scope is open");
+        let mut taken = core::mem::take(&mut self.base);
         taken.bytes = bytes;
         taken
+    }
+
+    /// Every scope closed so far, in the order they closed.
+    pub(super) fn scopes(&mut self) -> Vec<(Scope, ScopeTraffic)> {
+        core::mem::take(&mut self.closed)
     }
 }
 
@@ -156,11 +240,12 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         code: &mut Vec<u8>,
         plan: &InstructionPlan,
     ) -> Result<(), CompileError> {
-        self.traffic.instructions += 1;
+        let current = self.current();
+        current.instructions += 1;
         for reload in &plan.reloads {
             match reload {
-                Reload::FromStack { .. } => self.traffic.loads_transient += 1,
-                Reload::Const { .. } => self.traffic.remats += 1,
+                Reload::FromStack { .. } => current.loads_transient += 1,
+                Reload::Const { .. } => current.remats += 1,
             }
         }
         // No store here: a plan's destination is always a register since
@@ -179,7 +264,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         src: Reg,
         offset: u32,
     ) -> Result<(), CompileError> {
-        self.traffic.stores += 1;
+        self.current().stores += 1;
         self.inner.emit_store(code, src, offset)
     }
 
@@ -191,8 +276,8 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         locs: &[Option<Binding>],
     ) -> Reg {
         match locs.get(vid.0 as usize).copied().flatten() {
-            Some(Binding::Loc(Loc::Slot(_))) => self.traffic.loads_kept += 1,
-            Some(Binding::Remat(_)) => self.traffic.remats += 1,
+            Some(Binding::Loc(Loc::Slot(_))) => self.current().loads_kept += 1,
+            Some(Binding::Remat(_)) => self.current().remats += 1,
             // Already in a register, or not placed at all: nothing is emitted.
             Some(Binding::Loc(Loc::Reg(_))) | None => {}
         }
@@ -208,10 +293,6 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.branch_if_arm_is_dead(asm, test, label);
     }
 
-    fn body_frame_bytes(&self, frame_size: u32) -> u32 {
-        self.inner.body_frame_bytes(frame_size)
-    }
-
     fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
         self.inner.frame_alloc(code, bytes);
     }
@@ -220,53 +301,42 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.frame_free(code, bytes);
     }
 
-    fn scaffold_anchor(&mut self, asm: &mut super::Assembly) {
-        self.inner.scaffold_anchor(asm);
+    fn anchor(&mut self, asm: &mut super::Assembly) {
+        self.inner.anchor(asm);
     }
 
-    fn scaffold_finish(&mut self, asm: &mut super::Assembly) {
-        self.inner.scaffold_finish(asm);
+    fn finish(&mut self, asm: &mut super::Assembly) {
+        self.inner.finish(asm);
     }
 
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-        self.traffic.stores += 1;
+        self.current().stores += 1;
         self.inner.slot_store(code, src, offset);
     }
 
     fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-        // A coordinate the scaffold reloads is read for the whole iteration
+        // A root a fold reloads from its slot is read for the whole iteration
         // that follows it, not for one instruction.
-        self.traffic.loads_kept += 1;
+        self.current().loads_kept += 1;
         self.inner.slot_load(code, dst, offset);
     }
 
-    fn latch_bounds(&mut self, code: &mut Vec<u8>) {
-        self.inner.latch_bounds(code);
+    fn scope_begin(&mut self) {
+        self.open.push(Open::default());
+        self.inner.scope_begin();
     }
 
-    fn counter_clear(&mut self, code: &mut Vec<u8>, counter: super::Counter) {
-        self.inner.counter_clear(code, counter);
-    }
-
-    fn counter_step(&mut self, code: &mut Vec<u8>, counter: super::Counter) {
-        self.inner.counter_step(code, counter);
-    }
-
-    fn branch_if_counter_done(
-        &mut self,
-        asm: &mut super::Assembly,
-        counter: super::Counter,
-        label: super::Label,
-    ) {
-        self.inner.branch_if_counter_done(asm, counter, label);
-    }
-
-    fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-        self.inner.store_result(code, src);
-    }
-
-    fn advance_out(&mut self, code: &mut Vec<u8>, step: super::OutStep) {
-        self.inner.advance_out(code, step);
+    fn scope_end(&mut self, scope: Scope, bytes: u32) {
+        let Open {
+            mut traffic,
+            nested_bytes,
+        } = self.open.pop().expect("scope_end without a scope_begin");
+        traffic.bytes = bytes - nested_bytes;
+        if let Some(parent) = self.open.last_mut() {
+            parent.nested_bytes += bytes;
+        }
+        self.closed.push((scope, traffic));
+        self.inner.scope_end(scope, bytes);
     }
 
     fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
@@ -302,6 +372,11 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.test_ge(code, dst, srcs, mask_scratch);
     }
 
+    fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
+        self.current().writes += 1;
+        self.inner.emit_write(code, write);
+    }
+
     fn emit_ret(&mut self, code: &mut Vec<u8>) {
         self.inner.emit_ret(code);
     }
@@ -313,30 +388,31 @@ mod tests {
     use pixelflow_ir::OpKind;
     use pixelflow_ir::arena::{ExprArena, ExprId};
 
-    use super::super::regalloc;
+    use super::super::regalloc::{self, Scope};
     use super::super::storage::Slot;
     use super::super::{
-        Assembly, Binding, Counter, InstructionPlan, IsaBackend, Label, Loc, MaskTest, OutStep,
-        Reg, Reload, ResolvedOp,
+        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, Reg, Reload,
+        ResolvedOp, WritePlan,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
     use crate::error::CompileError;
+    use pixelflow_ir::LatticeShape;
 
     /// An [`IsaBackend`] that does nothing but hand back what a test told it
     /// to, so [`Counting`]'s own counting and forwarding can be pinned
     /// without a real encoder or a compiled kernel.
     struct RecordingBackend {
         begin_result: Result<(), CompileError>,
-        scaffold_anchor_calls: u32,
-        scaffold_finish_calls: u32,
+        anchor_calls: u32,
+        finish_calls: u32,
     }
 
     impl RecordingBackend {
         fn new() -> Self {
             Self {
                 begin_result: Ok(()),
-                scaffold_anchor_calls: 0,
-                scaffold_finish_calls: 0,
+                anchor_calls: 0,
+                finish_calls: 0,
             }
         }
     }
@@ -387,39 +463,25 @@ mod tests {
 
         fn frame_free(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
 
-        fn scaffold_anchor(&mut self, _asm: &mut Assembly) {
-            self.scaffold_anchor_calls += 1;
+        fn anchor(&mut self, _asm: &mut Assembly) {
+            self.anchor_calls += 1;
         }
 
-        fn scaffold_finish(&mut self, _asm: &mut Assembly) {
-            self.scaffold_finish_calls += 1;
+        fn finish(&mut self, _asm: &mut Assembly) {
+            self.finish_calls += 1;
         }
 
         fn slot_store(&mut self, _code: &mut Vec<u8>, _src: Reg, _offset: u32) {}
 
         fn slot_load(&mut self, _code: &mut Vec<u8>, _dst: Reg, _offset: u32) {}
 
-        fn counter_clear(&mut self, _code: &mut Vec<u8>, _counter: Counter) {}
-
-        fn counter_step(&mut self, _code: &mut Vec<u8>, _counter: Counter) {}
-
-        fn branch_if_counter_done(
-            &mut self,
-            _asm: &mut Assembly,
-            _counter: Counter,
-            _label: Label,
-        ) {
-        }
-
-        fn store_result(&mut self, _code: &mut Vec<u8>, _src: Reg) {}
-
-        fn advance_out(&mut self, _code: &mut Vec<u8>, _step: OutStep) {}
-
         fn add_scalar(&mut self, _code: &mut Vec<u8>, _dst: Reg, _scratch: Reg, _scalar: f32) {}
 
         fn load_const(&mut self, _code: &mut Vec<u8>, _dst: Reg, _val: f32) {}
 
         fn alu(&mut self, _code: &mut Vec<u8>, _op: OpKind, _dst: Reg, _srcs: [Reg; 2]) {}
+
+        fn emit_write(&mut self, _code: &mut Vec<u8>, _write: &WritePlan) {}
 
         fn emit_ret(&mut self, _code: &mut Vec<u8>) {}
     }
@@ -439,20 +501,40 @@ mod tests {
         assert_eq!(traffic.memory_ops(), 15);
     }
 
-    /// Same reasoning as `memory_ops` above, one level up: the three scopes'
-    /// weights (1, `rows`, `rows * groups`) are exactly what makes this
-    /// number differ from a plain sum, so the test's inputs are chosen so
+    /// Same reasoning as `memory_ops` above, one level up: each scope is
+    /// weighted by its own trip count, so the test's inputs are chosen so
     /// every wrong weighting or wrong operator lands on a different total.
     #[test]
-    fn dynamic_memory_ops_weights_row_and_body_scopes_by_their_trip_counts() {
-        let mut traffic = EmitTraffic::default();
-        traffic.frame.loads_transient = 1;
-        traffic.row.loads_transient = 2;
-        traffic.row.stores = 1;
-        traffic.body.loads_transient = 4;
-        traffic.body.stores = 1;
+    fn dynamic_memory_ops_weights_each_scope_by_its_trip_count() {
+        let body = ScopeTraffic {
+            loads_transient: 1,
+            ..ScopeTraffic::default()
+        };
+        let rows = ScopeTraffic {
+            loads_transient: 2,
+            stores: 1,
+            ..ScopeTraffic::default()
+        };
+        let cols = ScopeTraffic {
+            loads_transient: 4,
+            stores: 1,
+            ..ScopeTraffic::default()
+        };
+        let traffic = EmitTraffic::new(
+            alloc::vec![
+                (Scope::Fold(1), cols),
+                (Scope::Body, body),
+                (Scope::Fold(0), rows)
+            ],
+            alloc::vec![1, 6, 42],
+            ScopeTraffic::default(),
+            16,
+            12,
+            0,
+        );
 
-        assert_eq!(traffic.dynamic_memory_ops(6, 7), 229);
+        assert_eq!(traffic.scopes, alloc::vec![body, rows, cols]);
+        assert_eq!(traffic.dynamic_memory_ops(), 1 + 3 * 6 + 5 * 42);
     }
 
     /// `begin` is the one place a backend can refuse to compile at all
@@ -561,27 +643,27 @@ mod tests {
         assert_eq!(counting.take(0), ScopeTraffic::default());
     }
 
-    /// The scaffold hooks carry no counter of their own, but aarch64's
+    /// The function's hooks carry no counter of their own, but aarch64's
     /// backend overrides both to seed and flush its literal pool — if the
     /// decorator ever stopped forwarding them, that pool would silently go
     /// missing on that target.
     #[test]
-    fn scaffold_anchor_and_finish_forward_to_the_inner_backend() {
+    fn anchor_and_finish_forward_to_the_inner_backend() {
         let mut backend = RecordingBackend::new();
         let mut asm = Assembly::default();
         {
             let mut counting = Counting::new(&mut backend);
-            counting.scaffold_anchor(&mut asm);
-            counting.scaffold_finish(&mut asm);
+            counting.anchor(&mut asm);
+            counting.finish(&mut asm);
         }
 
-        assert_eq!(backend.scaffold_anchor_calls, 1);
-        assert_eq!(backend.scaffold_finish_calls, 1);
+        assert_eq!(backend.anchor_calls, 1);
+        assert_eq!(backend.finish_calls, 1);
     }
 
-    /// The scaffold's own store/reload path (`slot_store`/`slot_load`) is
-    /// separate from an instruction's operand resolution and must count
-    /// independently of it.
+    /// A fold's own store/reload path (`slot_store`/`slot_load`) is separate
+    /// from an instruction's operand resolution and must count independently
+    /// of it.
     #[test]
     fn slot_store_and_slot_load_each_count_once_per_call() {
         let mut backend = RecordingBackend::new();
@@ -602,9 +684,37 @@ mod tests {
         );
     }
 
+    /// Scopes nest, and a nested scope's bytes are its own: a parent's count
+    /// is what the parent emitted, not what it contains.
+    #[test]
+    fn a_nested_scopes_bytes_are_excluded_from_its_parents() {
+        let mut backend = RecordingBackend::new();
+        let mut counting = Counting::new(&mut backend);
+        let mut code = Vec::new();
+
+        counting.scope_begin();
+        counting.slot_store(&mut code, Reg(0), 0);
+        counting.scope_begin();
+        counting.slot_load(&mut code, Reg(0), 0);
+        counting.scope_end(Scope::Fold(0), 4);
+        counting.scope_end(Scope::Body, 10);
+
+        let scopes = counting.scopes();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(
+            (scopes[0].0, scopes[0].1.bytes, scopes[0].1.loads_kept),
+            (Scope::Fold(0), 4, 1)
+        );
+        assert_eq!(
+            (scopes[1].0, scopes[1].1.bytes, scopes[1].1.stores),
+            (Scope::Body, 6, 1)
+        );
+        assert_eq!(counting.take(0), ScopeTraffic::default());
+    }
+
     /// Registers to allocate in the pressure test: small enough that a
     /// deliberately wide expression cannot fit, on every tier.
-    const TIGHT_POOL: u8 = 4;
+    const TIGHT_POOL: u8 = 7;
 
     /// A wide sum whose terms are all pushed before any is consumed, so more
     /// values are live at once than `TIGHT_POOL` can hold.
@@ -626,6 +736,8 @@ mod tests {
         (a, root)
     }
 
+    const SHAPE: LatticeShape = LatticeShape::new([16, 2]);
+
     /// The completeness property the decorator exists to have: every byte the
     /// driver emitted landed in exactly one scope's count.
     ///
@@ -637,14 +749,14 @@ mod tests {
         for terms in [2usize, 8, 24] {
             let (arena, root) = wide_live_range_kernel(terms);
             let result = EmitCtx::with_max_regs(TIGHT_POOL)
-                .compile(&arena, root)
+                .compile(&arena, root, SHAPE)
                 .expect("compile");
             let t = &result.traffic;
-            let attributed = t.frame.bytes + t.row.bytes + t.body.bytes + t.scaffold.bytes;
             assert_eq!(
-                attributed as usize,
+                t.bytes() as usize,
                 result.code.len(),
-                "{terms} terms: {attributed} bytes attributed, {} emitted",
+                "{terms} terms: {} bytes attributed, {} emitted",
+                t.bytes(),
                 result.code.len()
             );
         }
@@ -659,26 +771,48 @@ mod tests {
     fn a_kernel_that_must_spill_reports_stores_and_loads() {
         let (arena, root) = wide_live_range_kernel(24);
         let result = EmitCtx::with_max_regs(TIGHT_POOL)
-            .compile(&arena, root)
+            .compile(&arena, root, SHAPE)
             .expect("compile");
         assert!(
             result.spill_count > 0,
             "24 values live against a {TIGHT_POOL}-register pool did not spill; \
              the scenario has stopped testing its subject"
         );
-        let body = result.traffic.body;
+        let t = &result.traffic;
+        let stores: u32 = t.scopes.iter().map(|s| s.stores).sum();
+        let loads: u32 = t
+            .scopes
+            .iter()
+            .map(|s| s.loads_transient + s.loads_kept)
+            .sum();
+        let instructions: u32 = t.scopes.iter().map(|s| s.instructions).sum();
         assert!(
-            body.stores > 0,
-            "values reached a frame slot with no store counted: {body:?}"
+            stores > 0,
+            "values reached a frame slot with no store counted: {t:?}"
         );
+        assert!(loads > 0, "values were spilled and never reloaded: {t:?}");
         assert!(
-            body.loads_transient + body.loads_kept > 0,
-            "values were spilled and never reloaded: {body:?}"
+            instructions > 0,
+            "a kernel with a body emitted no scheduled operation: {t:?}"
         );
-        assert!(
-            body.instructions > 0,
-            "a kernel with a body emitted no scheduled operation: {body:?}"
-        );
+    }
+
+    /// The lattice's stores are counted apart from spills: a kernel that
+    /// spills nothing still writes every batch of every row.
+    #[test]
+    fn every_batch_of_every_row_is_one_write() {
+        let (arena, root) = wide_live_range_kernel(2);
+        let result = crate::emit::compile(&arena, root, SHAPE).expect("compile");
+        let t = &result.traffic;
+        let dynamic_writes: u64 = t
+            .scopes
+            .iter()
+            .zip(&t.trips)
+            .map(|(s, trips)| u64::from(s.writes) * trips)
+            .sum();
+        let lanes = u64::from(crate::JIT_VECTOR_BYTES as u32 / 4);
+        let [width, rows] = SHAPE.extent().map(u64::from);
+        assert_eq!(dynamic_writes, rows * width.div_ceil(lanes));
     }
 
     /// The scaffold is the same code under every allocation of a kernel, so it
@@ -688,9 +822,9 @@ mod tests {
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
         let (arena, root) = wide_live_range_kernel(24);
         let tight = EmitCtx::with_max_regs(TIGHT_POOL)
-            .compile(&arena, root)
+            .compile(&arena, root, SHAPE)
             .expect("compile");
-        let loose = crate::emit::compile(&arena, root).expect("compile");
+        let loose = crate::emit::compile(&arena, root, SHAPE).expect("compile");
         assert_eq!(
             tight.traffic.scaffold, loose.traffic.scaffold,
             "the scaffold changed with the register budget"

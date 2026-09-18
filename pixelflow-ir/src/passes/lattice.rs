@@ -30,6 +30,20 @@ use crate::fold::{Binder, Fold, Monoid};
 use crate::kind::OpKind;
 use crate::variance::LatticeShape;
 
+/// What [`legalize`](super::legalize) wraps a kernel for: the domain it
+/// tabulates, and the lane width the target executes the innermost fold by.
+///
+/// The lanes are the one thing codegen tells the IR about a target, and they
+/// are a parameter rather than a constant because `pixelflow-ir` never names
+/// a width (CLAUDE.md, "SIMD is an implementation detail").
+#[derive(Clone, Copy, Debug)]
+pub struct Collapse {
+    /// The extent and the origin.
+    pub domain: Domain,
+    /// Lanes per batch: [`pack`]'s `L`.
+    pub lanes: u32,
+}
+
 /// The domain a collapse tabulates a kernel over: its extent, and the origin
 /// the call supplies. `LatticeShape` is "the compile-time half of
 /// `pixelflow_core::Lattice`, origin erased"; this puts the origin back as

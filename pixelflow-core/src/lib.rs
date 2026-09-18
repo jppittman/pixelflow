@@ -173,10 +173,11 @@ compile_error!(
 
 /// One SIMD batch of `f32`, at this build's width.
 ///
-/// This is the type the **collapse ABI is denominated in**, and that is all
-/// it is: the emitted code takes a batch of X coordinates and a broadcast of
-/// each of Y, Z and W, and `size_of::<Field>()` is the width a compiled
-/// kernel must agree with (`JIT_VECTOR_BYTES`). It is deliberately
+/// This is the width the **collapse is executed at**, and that is all it
+/// is: the emitted code stores a batch of samples at a time, and
+/// `size_of::<Field>()` is the width a compiled kernel must agree with
+/// (`JIT_VECTOR_BYTES`) — the width this crate's own buffers are laid out
+/// for. Nothing crosses the ABI as a vector any more. It is deliberately
 /// crate-private — SIMD is an implementation detail, and nothing outside this
 /// crate should be able to name a lane, let alone construct one. A consumer
 /// composes `Kernel` values and collapses them.
@@ -188,15 +189,6 @@ compile_error!(
 #[derive(Copy, Clone, Debug)]
 #[repr(transparent)]
 pub(crate) struct Field(NativeSimd);
-
-impl Field {
-    /// Sequential lane values `[start, start+1, ...]` — a batch of X
-    /// coordinates.
-    #[inline(always)]
-    pub(crate) fn sequential(start: f32) -> Self {
-        Self(NativeSimd::sequential(start))
-    }
-}
 
 impl From<f32> for Field {
     /// Every lane the same value — a fixed axis, broadcast.

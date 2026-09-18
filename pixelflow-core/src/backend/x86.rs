@@ -37,13 +37,6 @@ impl F32x4 {
         unsafe { Self(_mm_set1_ps(val)) }
     }
 
-    #[inline(always)]
-    pub(crate) fn sequential(start: f32) -> Self {
-        unsafe {
-            // _mm_set_ps args are in reverse order: e3, e2, e1, e0
-            Self(_mm_set_ps(start + 3.0, start + 2.0, start + 1.0, start))
-        }
-    }
 }
 
 // ============================================================================
@@ -79,22 +72,6 @@ impl F32x8 {
         unsafe { Self(_mm256_set1_ps(val)) }
     }
 
-    #[inline(always)]
-    pub(crate) fn sequential(start: f32) -> Self {
-        unsafe {
-            // _mm256_set_ps args are in reverse order
-            Self(_mm256_set_ps(
-                start + 7.0,
-                start + 6.0,
-                start + 5.0,
-                start + 4.0,
-                start + 3.0,
-                start + 2.0,
-                start + 1.0,
-                start,
-            ))
-        }
-    }
 }
 
 // ============================================================================
@@ -130,16 +107,4 @@ impl F32x16 {
         unsafe { Self(_mm512_set1_ps(val)) }
     }
 
-    #[inline(always)]
-    pub(crate) fn sequential(start: f32) -> Self {
-        unsafe {
-            // _mm512_set_ps args are in reverse order: e15, e14, ..., e1, e0
-            let base = _mm512_set1_ps(start);
-            let increments = _mm512_set_ps(
-                15.0, 14.0, 13.0, 12.0, 11.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0,
-                0.0,
-            );
-            Self(_mm512_add_ps(base, increments))
-        }
-    }
 }
