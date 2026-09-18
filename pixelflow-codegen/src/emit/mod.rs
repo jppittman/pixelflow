@@ -5136,7 +5136,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "aarch64")]
     fn arena_compile_simple() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -5144,13 +5143,16 @@ mod tests {
         let sum = arena.push_binary(OpKind::Add, x, y);
 
         let result = compile(&arena, sum, POINT).expect("arena DAG compile failed");
-        assert_eq!(result.spill_count, 0);
+        // Two leaves and one add force nothing to memory: no scope of the
+        // nest stores or reloads a value. Not `spill_count`, which counts the
+        // frame's slots — the lattice's own folds reserve one the emitted
+        // code never touches, on every backend.
+        assert_eq!(result.traffic.dynamic_memory_ops(), 0);
 
         assert_eq!(eval_point(&result.code, 3.0, 4.0), 7.0);
     }
 
     #[test]
-    #[cfg(target_arch = "aarch64")]
     fn arena_compile_with_constant() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
@@ -5179,7 +5181,6 @@ mod tests {
     /// subject here — what spilling *does* — no longer depends on how small
     /// the pool can be made.
     #[test]
-    #[cfg(target_arch = "aarch64")]
     fn arena_compile_with_spills() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
