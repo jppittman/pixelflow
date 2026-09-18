@@ -159,14 +159,6 @@ impl IndexRange {
     /// their own rather than folded into something larger.
     /// [`Lattice::scanline`](crate::Lattice::scanline) is this at one row.
     ///
-    /// This goes through `BoundManifold::collapse_subrect` rather than
-    /// `collapse_rows` because the two differ once a row's final batch
-    /// overhangs its declared width, and here that width is this call's own,
-    /// not a padded frame's: an overhanging store would run past this
-    /// buffer's last column into undefined memory (`width` not a whole SIMD
-    /// batch) or the next row (any `width`), neither of which
-    /// `collapse_rows`'s "the caller owns the padding" excuse covers.
-    ///
     /// # Panics
     ///
     /// Panics if the range is empty, or whatever [`Manifold::compile`] and
@@ -180,7 +172,7 @@ impl IndexRange {
         assert!(!self.is_empty(), "IndexRange::bake: {self:?} is empty");
         let bound = Manifold::compile(kernel, [self.width as u32, self.rows as u32]).bind(&[]);
         let mut buffer = vec![0.0f32; self.width * self.rows];
-        bound.collapse_subrect(
+        bound.collapse_rows(
             PlaneRegion::at_index(self.width, self.rows, self.x0, self.y0),
             &mut buffer,
             self.width,

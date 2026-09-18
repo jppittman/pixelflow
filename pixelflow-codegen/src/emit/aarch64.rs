@@ -485,6 +485,12 @@ pub fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 /// they agree because they spell the same thing.
 pub const CONST_POOL: &str = "const_pool";
 
+/// The constant pool's alignment: one [`PoolEntry`], so every `LDR Qt` from
+/// it is an aligned vector load. The padding that reaches it from the last
+/// instruction follows the code's length, which is why a kernel's trailing
+/// bytes can differ between two allocations of it by less than this.
+pub const CONST_POOL_ALIGN: usize = 16;
+
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
 pub fn needs_const_pool(val: f32) -> bool {
@@ -584,13 +590,24 @@ impl AsmInsn for AdrpAdd {
     }
 }
 
-/// Emit a constant pool entry: 16 bytes = f32 value splatted 4x (fills a 128-bit NEON register).
-pub fn emit_pool_entry(code: &mut Vec<u8>, val_bits: u32) {
-    let bytes = val_bits.to_le_bytes();
-    for _ in 0..4 {
-        code.extend_from_slice(&bytes);
+/// One constant pool entry: the four words of a 128-bit NEON register, lane
+/// 0 first. A splat is the common one; the lattice's iota is the other.
+pub type PoolEntry = [u32; 4];
+
+/// Emit a constant pool entry — 16 bytes, lane 0 first.
+pub fn emit_pool_entry(code: &mut Vec<u8>, entry: PoolEntry) {
+    for word in entry {
+        code.extend_from_slice(&word.to_le_bytes());
     }
 }
+
+/// The iota `[0, 1, 2, 3]`, as a pool entry.
+pub const IOTA: PoolEntry = [
+    0.0f32.to_bits(),
+    1.0f32.to_bits(),
+    2.0f32.to_bits(),
+    3.0f32.to_bits(),
+];
 
 // =============================================================================
 // Bound-Memory Gather (scalar-load lowering — NEON has no native gather)
@@ -699,11 +716,16 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         ScheduledOp::Unary(OpKind::Rsqrt | OpKind::Recip, _) => 1,
         // The gather's truncated-index lanes.
         ScheduledOp::Gather(..) => 1,
-        // A surviving fold's own loop scaffold: two transient registers for
-        // the trip test and the accumulate — see `emit_dag_body_hoisted`'s
-        // `Reduce` arm. The binder and the accumulator are the fold's roots,
-        // placed by the allocator, not scratch.
+        // A surviving fold's own loop: two transient registers for the trip
+        // test and the accumulate — see `emit_scope`'s `Reduce` arm. The
+        // binder and the accumulator are the fold's roots, placed by the
+        // allocator, not scratch.
         ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
+        // A binder the allocator left in a slot has to pass through a vector
+        // register on its way to `FCVTZS`: there is no memory-operand
+        // convert on this ISA. Whether either binder is in a slot is the
+        // allocation's answer, so the register is reserved regardless.
+        ScheduledOp::Write { .. } => 1,
         _ => 0,
     }
 }
@@ -712,13 +734,15 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// [`regalloc::RegisterFile::gpr_ctx`].
 ///
 /// `Gather`'s scalar-load sequence needs a base pointer, a per-lane index and
-/// a loaded value, each a GPR; `Uniform` needs only the base pointer. All
-/// were `x9`/`x10`/`x11` chosen by hand before this work and are
-/// `RegisterFile::gpr_scratch` reservations now.
+/// a loaded value, each a GPR; `Uniform` needs only the base pointer; a
+/// `Write` converts its row and column into one each before combining them
+/// into the address. All were `x9`/`x10`/`x11` chosen by hand before this
+/// work and are `RegisterFile::gpr_scratch` reservations now.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Gather(..) => 3,
+        ScheduledOp::Write { .. } => 2,
         ScheduledOp::Uniform(..) => 1,
         _ => 0,
     }
@@ -1213,7 +1237,8 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
 // dump_jit_asm — compile expression and return disassembly
 // =============================================================================
 
-/// Compile an expression from an [`ExprArena`] and return its disassembly.
+/// Compile an expression from an [`ExprArena`] for a lattice of `shape` and
+/// return its disassembly.
 ///
 /// This is a diagnostic entry point: it compiles the expression through the
 /// normal JIT pipeline, then disassembles the resulting machine code instead
@@ -1227,8 +1252,9 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
 pub fn dump_jit_asm(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
+    shape: pixelflow_ir::LatticeShape,
 ) -> Result<String, crate::error::CompileError> {
-    let result = super::compile(arena, root)?;
+    let result = super::compile(arena, root, shape)?;
     Ok(disassemble_code(result.code.as_bytes()))
 }
 
@@ -1775,10 +1801,10 @@ mod tests {
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) mod driver {
     use super::super::*;
+    use super::Mem;
     use super::ptr;
     use super::xr::*;
     use super::*;
-    use super::{Mem, Xr};
     use crate::error::CompileError;
     use alloc::vec::Vec;
 
@@ -1790,10 +1816,10 @@ pub(crate) mod driver {
     /// with a single `LDR Qt, [X17, #offset]` instead of the 3-instruction
     /// MOVZ+MOVK+DUP sequence.
     pub(crate) struct ConstPool {
-        /// Deduplicated entries: f32 bit patterns in pool order.
-        entries: Vec<u32>,
-        /// Map from f32 bits → pool index.
-        index: alloc::collections::BTreeMap<u32, u16>,
+        /// Deduplicated entries, in pool order.
+        entries: Vec<PoolEntry>,
+        /// Map from entry → pool index.
+        index: alloc::collections::BTreeMap<PoolEntry, u16>,
     }
     impl ConstPool {
         /// Create an empty constant pool.
@@ -1804,8 +1830,9 @@ pub(crate) mod driver {
             }
         }
 
-        /// Insert an f32 into the pool (deduplicating by bit pattern) and return
-        /// the byte offset for an `LDR Qt, [X17, #offset]` load.
+        /// Insert an f32 into the pool as a splat (deduplicating by bit
+        /// pattern) and return the byte offset for an `LDR Qt, [X17,
+        /// #offset]` load.
         ///
         /// Zero and FMOV-encodable constants are NOT filtered here — callers
         /// that want the fast path should check `needs_const_pool` first.
@@ -1813,8 +1840,13 @@ pub(crate) mod driver {
         /// they use benefits from the pool (they are transcendental coefficients,
         /// never zero or FMOV-encodable).
         pub(crate) fn push_f32(&mut self, val: f32) -> Result<u16, CompileError> {
-            let bits = val.to_bits();
-            if let Some(&idx) = self.index.get(&bits) {
+            self.push(PoolEntry::from([val.to_bits(); 4]))
+        }
+
+        /// Insert one register's worth of words, deduplicated, and return
+        /// the byte offset for an `LDR Qt, [X17, #offset]` load.
+        pub(crate) fn push(&mut self, entry: PoolEntry) -> Result<u16, CompileError> {
+            if let Some(&idx) = self.index.get(&entry) {
                 return Ok(idx * 16);
             }
             let idx = self.entries.len();
@@ -1823,14 +1855,14 @@ pub(crate) mod driver {
                     "constant pool overflow: exceeded 12-bit LDR offset limit (max 4095 entries)",
                 ));
             }
-            self.entries.push(bits);
-            self.index.insert(bits, idx as u16);
+            self.entries.push(entry);
+            self.index.insert(entry, idx as u16);
             Ok((idx * 16) as u16)
         }
 
-        /// Get the byte offset for a constant, or None if it's not in the pool.
-        fn offset_for(&self, val_bits: u32) -> Option<u16> {
-            self.index.get(&val_bits).map(|&idx| idx * 16)
+        /// Get the byte offset for an entry, or None if it's not in the pool.
+        fn offset_for(&self, entry: PoolEntry) -> Option<u16> {
+            self.index.get(&entry).map(|&idx| idx * 16)
         }
 
         /// Returns true if the pool has any entries.
@@ -1842,7 +1874,7 @@ pub(crate) mod driver {
     ///
     /// Falls back to `emit_fmov_imm` for zero and FMOV-encodable values.
     fn emit_const_load(code: &mut Vec<u8>, dst: Reg, val_bits: u32, pool: &ConstPool) {
-        if let Some(offset) = pool.offset_for(val_bits) {
+        if let Some(offset) = pool.offset_for([val_bits; 4]) {
             AsmProgram::from([Inst::ldr_q(
                 dst,
                 Mem {
@@ -1866,10 +1898,6 @@ pub(crate) mod driver {
         }
     }
 
-    /// aarch64 implementation of the shared driver's leaf operations.
-    ///
-    /// Mechanically wraps the existing aarch64 encoders + constant pool, so the
-    /// emitted code is the same as the previous bespoke `compile_from_schedule`.
     /// The aarch64 (NEON) register file.
     ///
     /// AAPCS64 callee-saves the low 64 bits of v8-v15. These kernels are leaf
@@ -1878,23 +1906,15 @@ pub(crate) mod driver {
     /// v8-v15 would silently corrupt whatever the *caller* had live there across
     /// the JIT call.
     ///
-    ///   v0-v3:   inputs (X, Y, Z, W)
     ///   v8-v15:  callee-saved, never allocatable
-    ///   v4-v7, v16-v31: allocatable scratch — everything else
+    ///   v0-v7, v16-v31: allocatable scratch — everything else
     const AARCH64_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
-        inputs: INPUT_REGS,
-        // v4-v7 and v16-v31: twenty of thirty-two. AAPCS64 callee-saves the
-        // low 64 bits of v8-v15 and these are leaf kernels with no prologue
-        // that preserves them, so v8-v15 stay out; v4-v7 are unused argument
-        // registers.
-        //
-        // v26/v27 are the last two to join: they were `reload`, held out of
-        // every kernel's pool for a spilled operand and a spilled destination.
-        // v28 came before them, holding the `UMAXV`/`UMINV` the Select
-        // short-circuit guards reduce a mask into. Both needs arise at points
-        // the schedule contains, so both are reservations the allocator makes
-        // on an instruction (`Scratch::reload`, `guard_temps`).
-        scratch: regalloc::RegSet::range(16, 16).union(regalloc::RegSet::range(4, 4)),
+        // v0-v7 and v16-v31: twenty-four of thirty-two. AAPCS64 callee-saves
+        // the low 64 bits of v8-v15 and these are leaf kernels with no
+        // prologue that preserves them, so v8-v15 stay out. v0-v3 are the
+        // last to join: they carried the coordinate vectors of the per-batch
+        // ABI, which a call no longer passes.
+        scratch: regalloc::RegSet::range(16, 16).union(regalloc::RegSet::range(0, 8)),
         // Nothing. v30 is the gather's truncated-index register, a `temps_for`
         // answer since the gathers landed; v29 used to be `UNARY_SCRATCH`,
         // reserved whole-kernel so a reciprocal estimate could borrow it. The
@@ -1908,15 +1928,18 @@ pub(crate) mod driver {
         // guard is emitted before.
         guard_temps: 1,
         vector_bytes: 16,
-        // The context pointer (array of buffer base pointers) arrives in x0
-        // per AAPCS64, disjoint from the coordinate vectors in v0-v3.
-        // Declaring it here is what lets `checked` prove `gpr_scratch` misses
-        // it, rather than a comment asserting the two constants never
-        // collide.
+        // AAPCS64's first three integer arguments, in the ABI's order: the
+        // context (the array of buffer base pointers, then the uniform and
+        // origin blocks), the output plane, its pitch. Declaring them here is
+        // what lets `checked` prove `gpr_scratch` misses all three, rather
+        // than a comment asserting the constants never collide.
         gpr_ctx: Some(ptr::X0.as_gpr()),
+        gpr_out: Some(ptr::X1.as_gpr()),
+        gpr_pitch: Some(gpr::X2),
         // x9-x11: the gather's base pointer and per-lane index/value GPRs,
-        // chosen by hand before this work and now `Scratch` reservations —
-        // clear of the branch guard (w16) and the const-pool anchor (x17).
+        // the store's row and column — chosen by hand before this work and
+        // now `Scratch` reservations — clear of the branch guard (w16) and
+        // the const-pool anchor (x17).
         gpr_scratch: regalloc::GprSet::of(&[ptr::X9.as_gpr(), gpr::X10, gpr::X11]),
         gpr_temps_for: super::gpr_temps_for,
         // No mask-register file on this tier: masks are ordinary vectors.
@@ -1953,7 +1976,7 @@ pub(crate) mod driver {
         /// compile pushes through one backend. A reset there is the glyph-ink
         /// regression.
         #[cfg(test)]
-        pub(crate) fn pool_entries(&self) -> &[u32] {
+        pub(crate) fn pool_entries(&self) -> &[PoolEntry] {
             &self.consts.entries
         }
 
@@ -1976,18 +1999,21 @@ pub(crate) mod driver {
 
         fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
             // Seed by APPENDING into the existing pool, never replacing it: a
-            // collapse compile emits two bodies through one backend (the LICM
-            // prologue, then the loop body), and the prologue's bytes have the
-            // first pool's X17-relative offsets baked in — resetting here left
-            // them pointing into the body's rebuilt pool (wrong constants; the
-            // macOS glyph-ink regression). `push_f32` dedups, and each compile
-            // constructs a fresh backend, so appending is reset-equivalent for
-            // single-body compiles.
+            // compile emits every scope of the nest through one backend, and
+            // an outer scope's bytes have the pool's X17-relative offsets
+            // baked in — resetting here left them pointing into an inner
+            // scope's rebuilt pool (wrong constants; the macOS glyph-ink
+            // regression). `push` dedups, and each compile constructs a fresh
+            // backend, so appending is reset-equivalent for a single scope.
             for def in schedule {
-                if let ScheduledOp::Const(val) = def.op
-                    && super::needs_const_pool(val)
-                {
-                    self.consts.push_f32(val)?;
+                match def.op {
+                    ScheduledOp::Const(val) if super::needs_const_pool(val) => {
+                        self.consts.push_f32(val)?;
+                    }
+                    ScheduledOp::Lanes(_) => {
+                        self.consts.push(IOTA)?;
+                    }
+                    _ => {}
                 }
             }
             // Builtins add up to ~60 polynomial coefficients during emission; bail
@@ -2070,12 +2096,10 @@ pub(crate) mod driver {
             asm.push(CbzW16 { target: label });
         }
 
-        // AAPCS64: x0 = ctx (read-only in the body's gathers), x1 = out,
-        // x2 = groups, x3 = rows, x4 = row-skip bytes, v0..3 = x0/y0/z/w.
-        // Loop registers: x5 = batch counter, x6 = row counter; the body's
-        // scratch GPRs are x9-x11 (gather), w16 (branch tests), x17 (pool
-        // anchor) — all disjoint. The bounds arrive in registers the body never
-        // touches, so `latch_bounds` has nothing to do.
+        // AAPCS64: x0 = ctx (read-only in the body's gathers and uniform
+        // loads), x1 = out, x2 = pitch; the body's scratch GPRs are x9-x11
+        // (gather, store address), w16 (branch tests), x17 (pool anchor) —
+        // all disjoint, and `checked` says so for the ones it can see.
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
             let mut remaining = bytes;
@@ -2105,9 +2129,9 @@ pub(crate) mod driver {
             }
         }
 
-        /// The prologue's and body's constant loads are X17-relative, so the
-        /// anchor has to be inside the emitted function, after the frame.
-        fn scaffold_anchor(&mut self, asm: &mut Assembly) {
+        /// Every scope's constant loads are X17-relative, so the anchor has
+        /// to be inside the emitted function, after the frame.
+        fn anchor(&mut self, asm: &mut Assembly) {
             asm.push(AdrpAdd {
                 dst: X17.into(),
                 target: Label::new(CONST_POOL),
@@ -2116,23 +2140,23 @@ pub(crate) mod driver {
 
         /// Append the constant pool after the final `RET`.
         ///
-        /// `scaffold_anchor` branches to [`CONST_POOL`] unconditionally —
-        /// whether this compile needed the pool is not known until every
-        /// constant has been emitted — so the name must be written here even
-        /// when there is nothing to append: `Assembly::finish` panics on a
-        /// name nobody wrote, and an unpatched `AdrpAdd` would leave X17
-        /// pointing at itself, same as the unpatched `ADR` this replaced.
-        fn scaffold_finish(&mut self, asm: &mut Assembly) {
+        /// `anchor` branches to [`CONST_POOL`] unconditionally — whether
+        /// this compile needed the pool is not known until every constant
+        /// has been emitted — so the name must be written here even when
+        /// there is nothing to append: `Assembly::finish` panics on a name
+        /// nobody wrote, and an unpatched `AdrpAdd` would leave X17 pointing
+        /// at itself, same as the unpatched `ADR` this replaced.
+        fn finish(&mut self, asm: &mut Assembly) {
             if self.consts.is_empty() {
                 asm.bind(CONST_POOL);
                 return;
             }
-            while !asm.code.len().is_multiple_of(16) {
+            while !asm.code.len().is_multiple_of(super::CONST_POOL_ALIGN) {
                 asm.code.push(0);
             }
             asm.bind(CONST_POOL);
-            for &bits in &self.consts.entries {
-                super::emit_pool_entry(&mut asm.code, bits);
+            for &entry in &self.consts.entries {
+                super::emit_pool_entry(&mut asm.code, entry);
             }
         }
 
@@ -2142,49 +2166,6 @@ pub(crate) mod driver {
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
             AsmProgram::from([Inst::ldr_q(dst, frame_slot(offset))]).assemble(code);
-        }
-
-        fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            AsmProgram::from([table::Movz::new(counter_reg(counter), 0)]).assemble(code);
-        }
-
-        fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            let r = counter_reg(counter);
-            AsmProgram::from([table::AddI64::new(r, r, table::Imm12(1))]).assemble(code);
-        }
-
-        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
-            AsmProgram::from([table::CmpI64::new(counter_reg(counter), bound_reg(counter))])
-                .assemble(&mut asm.code);
-            // The counter runs up to an unsigned bound, so "done" is `>=`.
-            asm.push(BCond::hs(label));
-        }
-
-        fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            AsmProgram::from([Inst::str_q(
-                src,
-                Mem {
-                    base: X1,
-                    offset: 0,
-                },
-            )])
-            .assemble(code);
-        }
-
-        fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
-            match step {
-                OutStep::Batch => {
-                    AsmProgram::from([table::AddI64::new(
-                        X1,
-                        X1,
-                        table::Imm12(self.file.vector_bytes as u16),
-                    )])
-                    .assemble(code);
-                }
-                OutStep::RowSkip => {
-                    AsmProgram::from([table::AddI64::new(X1, X1, X4)]).assemble(code);
-                }
-            }
         }
 
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
@@ -2200,26 +2181,97 @@ pub(crate) mod driver {
             super::emit_binary(code, op, dst, srcs[0], srcs[1]);
         }
 
+        /// A full batch is one `STR Q`. A remainder is `ST1 {V.S}[k]` per
+        /// lane, post-indexed by the lane's four bytes.
+        fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
+            let row = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(0));
+            let col = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(1));
+            let via = crate::emit::declared_temp(write.scratch.temp(0));
+            let out = self
+                .file
+                .gpr_out
+                .expect("NEON's store needs the output pointer");
+            let pitch = self.file.gpr_pitch.expect("NEON's store needs the pitch");
+            index_into(code, row, write.row, via);
+            index_into(code, col, write.col, via);
+            AsmProgram::from([
+                // madd row, row, pitch, col
+                Inst::Raw(
+                    0x9B00_0000
+                        | (u32::from(pitch.0) << 16)
+                        | (u32::from(col.0) << 10)
+                        | (u32::from(row.0) << 5)
+                        | u32::from(row.0),
+                ),
+                // add row, out, row, lsl #2
+                Inst::Raw(
+                    0x8B00_0000
+                        | (u32::from(row.0) << 16)
+                        | (2 << 10)
+                        | (u32::from(out.0) << 5)
+                        | u32::from(row.0),
+                ),
+            ])
+            .assemble(code);
+            if write.lanes == 4 {
+                AsmProgram::from([Inst::str_q(
+                    write.value,
+                    Mem {
+                        base: PtrReg(row.0),
+                        offset: 0,
+                    },
+                )])
+                .assemble(code);
+                return;
+            }
+            for lane in 0..write.lanes {
+                // st1 {value.s}[lane], [row], #4 — the lane index is Q:S.
+                let q = (lane >> 1) & 1;
+                let s_bit = lane & 1;
+                AsmProgram::from([Inst::Raw(
+                    0x0D9F_8000
+                        | (q << 30)
+                        | (s_bit << 12)
+                        | (u32::from(row.0) << 5)
+                        | u32::from(write.value.0),
+                )])
+                .assemble(code);
+            }
+        }
+
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
             AsmProgram::from([Inst::Ret]).assemble(code);
         }
     }
 
-    /// The register each loop counter lives in.
-    const fn counter_reg(counter: Counter) -> Xr {
-        match counter {
-            Counter::Batch => X5,
-            Counter::Row => X6,
-        }
-    }
-
-    /// The register each counter is compared against — both arrive as
-    /// arguments and stay put, since nothing in the body writes them.
-    const fn bound_reg(counter: Counter) -> Xr {
-        match counter {
-            Counter::Batch => X2,
-            Counter::Row => X3,
-        }
+    /// `dst = trunc(index)` as a 64-bit integer, wherever a fold keeps its
+    /// binder: `FCVTZS` from lane 0 of its register, or of `via` after a
+    /// scalar load when the allocator left it in a slot.
+    fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, via: Reg) {
+        let from = match at {
+            Binding::Loc(Loc::Reg(r)) => r,
+            Binding::Loc(Loc::Slot(slot)) => {
+                AsmProgram::from([Inst::ldr_s(via, frame_slot(slot.offset()))]).assemble(code);
+                via
+            }
+            // A fold whose binder folded to a constant: the trip count was
+            // one and the allocator rematerialized it. Truncate on the host,
+            // which is what the instruction would have done.
+            Binding::Remat(bits) => {
+                let index = f32::from_bits(bits) as i64 as u64;
+                AsmProgram::from([table::Movz::new(dst, index as u16)]).assemble(code);
+                debug_assert!(
+                    index <= u64::from(u16::MAX),
+                    "a rematerialized index fits movz"
+                );
+                return;
+            }
+        };
+        // fcvtzs dst, s(from) — scalar, 64-bit destination.
+        AsmProgram::from([Inst::Raw(
+            0x9E38_0000 | (u32::from(from.0) << 5) | u32::from(dst.0),
+        )])
+        .assemble(code);
     }
     /// Emit machine code for a resolved instruction plan.
     ///
@@ -2256,6 +2308,20 @@ pub(crate) mod driver {
             ResolvedOp::Nop => {}
             ResolvedOp::LoadConst { dst, val_bits } => {
                 emit_const_load(code, *dst, *val_bits, pool);
+            }
+            // The iota is one pool entry, seeded by `begin`.
+            ResolvedOp::Lanes { dst } => {
+                let offset = pool
+                    .offset_for(IOTA)
+                    .expect("begin seeds the iota for every Lanes def");
+                AsmProgram::from([Inst::ldr_q(
+                    *dst,
+                    Mem {
+                        base: ptr::X17,
+                        offset: offset.into(),
+                    },
+                )])
+                .assemble(code);
             }
             ResolvedOp::Unary { op, dst, src } => {
                 emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
@@ -2455,11 +2521,12 @@ pub const fn Xr(r: u8) -> Gpr {
 pub mod ptr {
     use super::PtrReg;
 
-    /// 1st argument: context pointer — array of bound buffer bases.
+    /// 1st argument: context pointer — array of bound buffer bases, then
+    /// the uniform and origin blocks.
     pub const X0: PtrReg = PtrReg(0);
-    /// 2nd argument: output pointer, advanced per batch and per row.
+    /// 2nd argument: the output plane.
     pub const X1: PtrReg = PtrReg(1);
-    /// Scratch base register for gather.
+    /// Scratch: a gather's base pointer, a store's address.
     pub const X9: PtrReg = PtrReg(9);
     /// IP0, intra-procedure scratch (displacement fallback).
     pub const X16: PtrReg = PtrReg(16);
@@ -2469,25 +2536,22 @@ pub mod ptr {
     pub const SP: PtrReg = PtrReg(31);
 }
 
-/// AAPCS64 general-purpose registers (integers, counters, indices, bounds).
+/// AAPCS64 general-purpose registers (integers, indices, the pitch).
 pub mod gpr {
     use super::Gpr;
 
     /// The zero register in positions where `xzr` is meant.
     pub const XZR: Gpr = Gpr(31);
-    /// 3rd argument: group count (the inner bound).
+    /// 3rd argument: the pitch.
     pub const X2: Gpr = Gpr(2);
-    /// 4th argument: row count (the outer bound).
+    /// Named for the encoders' tests.
     pub const X3: Gpr = Gpr(3);
-    /// 5th argument: row-skip in bytes.
     pub const X4: Gpr = Gpr(4);
-    /// Inner (batch) loop counter.
     pub const X5: Gpr = Gpr(5);
-    /// Outer (row) loop counter.
     pub const X6: Gpr = Gpr(6);
-    /// Scratch: gather index.
+    /// Scratch: a gather's index, a store's column.
     pub const X10: Gpr = Gpr(10);
-    /// Scratch: gather value.
+    /// Scratch: a gather's value.
     pub const X11: Gpr = Gpr(11);
 }
 

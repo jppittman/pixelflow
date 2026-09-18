@@ -61,26 +61,24 @@ use pixelflow_codegen::jit_cache;
 use pixelflow_ir::Kernel;
 use pixelflow_ir::passes::TRIG_DOMAIN;
 
-const LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / 4;
+/// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
+/// read back through the origin block.
+fn eval_point(jit: &pixelflow_codegen::CompiledKernel, x: f32) -> f32 {
+    let mut out = [0.0f32; 1];
+    let origin = [x, 0.0f32];
+    // SAFETY: every kernel this file compiles declares no buffer and no
+    // uniform, so `ctx[0]` — the uniform-block slot — is unread; `ctx[1]` is
+    // the origin block, and `out` holds the one sample a single-point
+    // lattice writes.
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
+    unsafe {
+        jit.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
+    }
+    out[0]
+}
 
 fn eval_points_1d(jit: &pixelflow_codegen::CompiledKernel, inputs: &[f32]) -> Vec<f32> {
-    let mut outputs = Vec::with_capacity(inputs.len());
-    for chunk in inputs.chunks(LANES) {
-        let mut xs = [0.0f32; LANES];
-        for (i, &x) in chunk.iter().enumerate() {
-            xs[i] = x;
-        }
-        let res = unsafe {
-            jit.call(pixelflow_codegen::Point4::new(
-                xs,
-                [0.0; LANES],
-                [0.0; LANES],
-                [0.0; LANES],
-            ))
-        };
-        outputs.extend_from_slice(&res[..chunk.len()]);
-    }
-    outputs
+    inputs.iter().map(|&x| eval_point(jit, x)).collect()
 }
 
 /// Reproducible LCG — a fixed seed keeps a failure reproducible from the

@@ -2,6 +2,7 @@
 //! cargo run --release -p pixelflow-pipeline --features "training profiling" --bin bench_jit_profile
 
 use pixelflow_codegen::emit::compile;
+use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::ExprArena;
 use pixelflow_ir::kind::OpKind;
 
@@ -9,9 +10,14 @@ fn main() {
     let (arena, root) = build_expr(200);
     eprintln!("Arena: {} nodes", arena.len());
 
+    // Compile-cost profiling only, so the shape is not the point:
+    // `LatticeShape::POINT`, the smallest lattice, keeps the loop-nest
+    // codegen work (and this profile) minimal.
+    let shape = LatticeShape::POINT;
+
     // Warmup
     for _ in 0..100 {
-        compile(&arena, root).unwrap();
+        compile(&arena, root, shape).unwrap();
     }
 
     #[cfg(feature = "profiling")]
@@ -35,7 +41,7 @@ fn main() {
     let n = 10_000;
     let start = std::time::Instant::now();
     for _ in 0..n {
-        std::hint::black_box(compile(&arena, root).unwrap());
+        std::hint::black_box(compile(&arena, root, shape).unwrap());
     }
     let elapsed = start.elapsed();
     eprintln!(

@@ -12,48 +12,28 @@
 use pixelflow_codegen::jit_cache;
 use pixelflow_ir::Kernel;
 
-const LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / 4;
+/// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
+/// read back through the origin block.
+fn eval_point(jit: &pixelflow_codegen::CompiledKernel, x: f32, y: f32) -> f32 {
+    let mut out = [0.0f32; 1];
+    let origin = [x, y];
+    // SAFETY: every kernel this file compiles declares no buffer and no
+    // uniform, so `ctx[0]` — the uniform-block slot — is unread; `ctx[1]` is
+    // the origin block, and `out` holds the one sample a single-point
+    // lattice writes.
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
+    unsafe {
+        jit.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
+    }
+    out[0]
+}
 
 fn eval_points_1d(jit: &pixelflow_codegen::CompiledKernel, inputs: &[f32]) -> Vec<f32> {
-    let mut outputs = Vec::with_capacity(inputs.len());
-    for chunk in inputs.chunks(LANES) {
-        let mut xs = [0.0f32; LANES];
-        for (i, &x) in chunk.iter().enumerate() {
-            xs[i] = x;
-        }
-        let res = unsafe {
-            jit.call(pixelflow_codegen::Point4::new(
-                xs,
-                [0.0; LANES],
-                [0.0; LANES],
-                [0.0; LANES],
-            ))
-        };
-        outputs.extend_from_slice(&res[..chunk.len()]);
-    }
-    outputs
+    inputs.iter().map(|&x| eval_point(jit, x, 0.0)).collect()
 }
 
 fn eval_points_2d(jit: &pixelflow_codegen::CompiledKernel, inputs: &[(f32, f32)]) -> Vec<f32> {
-    let mut outputs = Vec::with_capacity(inputs.len());
-    for chunk in inputs.chunks(LANES) {
-        let mut xs = [0.0f32; LANES];
-        let mut ys = [0.0f32; LANES];
-        for (i, &(x, y)) in chunk.iter().enumerate() {
-            xs[i] = x;
-            ys[i] = y;
-        }
-        let res = unsafe {
-            jit.call(pixelflow_codegen::Point4::new(
-                xs,
-                ys,
-                [0.0; LANES],
-                [0.0; LANES],
-            ))
-        };
-        outputs.extend_from_slice(&res[..chunk.len()]);
-    }
-    outputs
+    inputs.iter().map(|&(x, y)| eval_point(jit, x, y)).collect()
 }
 
 fn check(name: &str, k: &Kernel, inputs: &[f32], reference: impl Fn(f32) -> f32) {
@@ -419,7 +399,7 @@ fn compile_shift(op: pixelflow_ir::OpKind, count: f32) -> bool {
     let x = a.push_var(0);
     let c = a.push_const(count);
     let root = a.push_binary(op, x, c);
-    pixelflow_codegen::emit::compile(&a, root).is_ok()
+    pixelflow_codegen::emit::compile(&a, root, pixelflow_ir::LatticeShape::POINT).is_ok()
 }
 
 /// A shift count is refused where the `Const` narrows to the encoder's `u8`,

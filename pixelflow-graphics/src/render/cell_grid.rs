@@ -234,7 +234,7 @@ impl CellGridPackedFrame {
         );
         let claim = self.grid_range().intersect(&band);
         if !claim.is_empty() {
-            self.frame.collapse_subrect(
+            self.frame.collapse_rows(
                 PlaneRegion::rows(claim.width(), claim.y0(), claim.rows()),
                 out,
                 stride,
@@ -554,27 +554,20 @@ mod tests {
     }
 
     /// **The restricted collapse writes exactly its own columns.** A grid
-    /// that covers its frame is the case `RowTail::Exact` exists for:
-    /// `collapse_rows`' overhang policy — "the caller owns the padding" —
-    /// would put the final batch's spare lanes in whatever lies past the
-    /// band, and here that is a sentinel this test owns rather than padding
-    /// nobody reads.
+    /// that covers its frame is the case that shows it: a store that let a
+    /// row's final partial batch overhang would put its spare lanes in
+    /// whatever lies past the band, and here that is a sentinel this test
+    /// owns rather than padding nobody reads.
     ///
-    /// **The discriminating quantity is the STRIDE, not the width.**
-    /// `BandPlan` only overhangs when `stride >= batches · BATCH_LANES`, so a
-    /// stride chosen against one vector width silently stops discriminating
-    /// at another: at width 21, a stride of 24 admits the overhang at 4 lanes
-    /// (`6·4 = 24`) and at 8 (`3·8 = 24`) but not at 16 (`2·16 = 32 > 24`),
-    /// where `Absorbs` falls through to the same row count as `Exact` and the
-    /// mutation is invisible. A stride of 40 clears `batches · BATCH_LANES`
-    /// at 4, 8 and 16 lanes alike. An odd width is still needed — the batch
-    /// must be partial for there to be spare lanes at all — but it is not
-    /// sufficient, and reasoning about it alone is what left this test
-    /// certifying nothing at AVX-512.
+    /// The stride leaves room for such an overhang at 4, 8 and 16 lanes
+    /// alike (width 21 rounds up to 24, 24 and 32; the stride is 40), so a
+    /// store that overhung at any vector width would be seen. An odd width
+    /// is still needed — the batch must be partial for there to be spare
+    /// lanes at all.
     ///
     /// Every other fixture in this module has a grid narrower than its frame,
-    /// where an overhang lands in border columns that are painted over
-    /// immediately afterwards and so cannot be seen at all.
+    /// where an overhang would land in border columns that are painted over
+    /// immediately afterwards and so could not be seen at all.
     #[test]
     fn a_grid_that_covers_its_frame_writes_no_further_than_the_frame() {
         const SENTINEL: u32 = 0xdead_beef;
