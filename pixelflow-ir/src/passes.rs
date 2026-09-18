@@ -1,7 +1,7 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! Four passes, each `(arena, root) -> (arena, root)`, each turning nodes no
-//! backend can emit into nodes every backend can:
+//! [`legalize`] runs four passes today, each `(arena, root) -> (arena, root)`,
+//! each turning nodes no backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
 //! |---|---|---|
@@ -15,6 +15,23 @@
 //! them, and you cannot differentiate a *name*, so `expand_refs` goes before
 //! everything. Every pass is idempotent and has an identity fast-path, so
 //! running one that has nothing to do is free.
+//!
+//! Two more exist, in [`lattice`], and are **not** in that list or in
+//! [`legalize`]'s pipeline:
+//!
+//! | pass | consumes | produces |
+//! |---|---|---|
+//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
+//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
+//!
+//! Their place in the full order is `expand_refs -> lower_dwrt -> collapse ->
+//! pack -> expand_gather -> expand_transcendentals`
+//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3), but
+//! **[`legalize`] does not call either one yet.** The emitter refuses a
+//! `Write` until step 5 of that plan lands, so wiring them into every
+//! production compile now would hand the emitter a node it cannot execute,
+//! breaking every collapse in the tree. Until then they are arena-level
+//! transforms a caller runs directly.
 //!
 //! **`Reduce` is legal in the arena and [`legalize`] leaves every one
 //! standing**, nested or not: codegen emits a surviving fold as a loop, and a
@@ -51,6 +68,11 @@ use crate::kind::OpKind;
 use crate::variance::Variance;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+
+/// The lattice's own two folds — `collapse(extent)`, `pack(lanes)` — as
+/// legalize passes. See the module doc above for their place in the order
+/// and why [`legalize`] does not call them yet.
+pub mod lattice;
 
 /// Run every legalization pass, in the one order they compose in.
 ///
