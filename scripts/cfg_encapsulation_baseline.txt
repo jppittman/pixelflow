@@ -31,9 +31,6 @@ pixelflow-codegen/src/emit/executable/linux.rs	#[cfg(not(target_arch = "aarch64"
 pixelflow-codegen/src/emit/executable/linux.rs	#[cfg(target_arch = "aarch64")]	fn sync_instruction_cache(ptr: *mut u8, len: usize) {
 pixelflow-codegen/src/emit/executable/macos.rs	#[cfg(not(target_arch = "aarch64"))]	fn sync_instruction_cache(_ptr: *mut u8, _len: usize) {}
 pixelflow-codegen/src/emit/executable/macos.rs	#[cfg(target_arch = "aarch64")]	fn sync_instruction_cache(ptr: *mut u8, len: usize) {
-pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "aarch64")]	fn arena_compile_simple() {
-pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "aarch64")]	fn arena_compile_with_constant() {
-pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "aarch64")]	fn arena_compile_with_spills() {
 pixelflow-codegen/src/emit/mod.rs	#[cfg(target_arch = "x86_64")]	fn dwrt_of_gather_refuses_to_compile() {
 pixelflow-codegen/src/lib.rs	#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]	pub const JIT_VECTOR_BYTES: usize = 64;
 pixelflow-codegen/tests/avx512_evex_proof.rs	#[cfg(target_feature = "avx512f")]	fn evex_runtime_16_lanes() {
@@ -91,11 +88,6 @@ pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch
 pixelflow-core/src/lib.rs	#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]	pub use lattice::union::IndexRange;
 pixelflow-core/src/lib.rs	#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]	compile_error!(
 pixelflow-core/src/lib.rs	#[cfg(target_arch = "aarch64")]	type NativeSimd = backend::arm::F32x4;
-pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	fn get_jit_mul_kernel() -> usize {
-pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	unsafe fn invoke_naked_kernel(
-pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	use std::arch::aarch64::float32x4_t;
-pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	use std::sync::atomic::{AtomicUsize, Ordering};
-pixelflow-core/tests/naked_scale.rs	#[cfg(target_arch = "aarch64")]	{
 pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	fn mmap_source() {
 pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	impl Drop for MmapInner {
 pixelflow-graphics/src/fonts/loader.rs	#[cfg(unix)]	impl MmapInner {
