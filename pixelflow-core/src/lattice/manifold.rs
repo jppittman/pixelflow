@@ -4,22 +4,24 @@
 //! ──bind(buffers)──▶ bound ──collapse(region)──▶ buffer`. A [`Kernel`] is the
 //! description; compiling it at a lattice's extents gives a **manifold**
 //! ([`Manifold`]); binding the memory it declared gives a [`BoundManifold`];
-//! collapsing that over a band of rows gives numbers. The loop over batches
-//! and rows lives inside the emitted code, with the two-level LICM prologues
-//! (per call, per row) active, so one collapse call covers a whole band, and
-//! whatever memory the kernel declared is bound by identity once and stays
-//! bound for every band collapsed from it.
+//! collapsing that over a band of rows gives numbers. The lattice's folds —
+//! rows, columns, lanes — are wrapped around the kernel before it is
+//! scheduled and emitted as the loops of the code, with everything invariant
+//! in a loop computed outside it, so a band is one call, and whatever memory
+//! the kernel declared is bound by identity once and stays bound for every
+//! band collapsed from it.
 //!
 //! ## Rank
 //!
-//! A manifold is compiled at a [`Lattice`](crate::Lattice)'s whole `[x, y]`
-//! extent, which is exactly what a
-//! [`LatticeShape`](pixelflow_ir::LatticeShape) is: the extents decide which
-//! axes are binders, and therefore what the emitter may hoist out of what. The
-//! *collapse ABI* is two-dimensional — one call fills batches across X and
-//! rows down Y — and so is the domain, so a lattice is one call. A scalar the
-//! kernel needs but the lattice does not vary is an argument
-//! ([`UniformBlock`]), not a third axis of extent 1.
+//! A manifold is compiled at a [`Lattice`](crate::Lattice)'s `[x, y]` extent,
+//! which is exactly what a [`LatticeShape`](pixelflow_ir::LatticeShape) is:
+//! the extents are the folds' trip counts, and the code is specialized to
+//! them. A band of some other shape — a stripe of a frame, a cell grid's
+//! claim on a wider band — is another shape and so other code: the manifold
+//! keeps a table of the shapes it has been collapsed at and compiles a new
+//! one on first use, through the same shape-keyed cache. A scalar the kernel
+//! needs but the lattice does not vary is an argument ([`UniformBlock`]),
+//! not a third axis of extent 1.
 //!
 //! This is the shape every frame path in the tree already had — the cell
 //! grid's four channel programs and its packed sibling were two copies of it
@@ -30,24 +32,28 @@
 //! ## Output planes
 //!
 //! A band is written straight into the caller's plane, whose rows are however
-//! many elements apart the caller says: the collapse ABI stores whole SIMD
-//! batches and steps the output pointer by the leftover bytes between rows,
-//! so a destination at any stride is filled in place — no staging plane, no
-//! per-row copy. The one thing a batch store cannot do is a row's final
-//! *partial* batch when the stride has no room for its overhang; that batch
-//! alone goes through a one-batch scratch, and it is the only place in this
-//! module where the SIMD width is visible at all.
+//! many elements apart the caller says: the code's stores address
+//! `row · pitch + col`, so a destination at any stride is filled in place —
+//! no staging plane, no per-row copy — and exactly `width` samples per row
+//! are written, a row's final partial batch through a masked or lane-wise
+//! store. The SIMD width is nowhere in this module.
 //!
 //! The store is a raw vector store, type-blind bit movement, so a kernel
 //! whose root is int-domain (a packed pixel, a mask) collapses through
 //! [`BoundManifold::collapse_int_rows`] into a `u32` plane exactly: no float
 //! operation touches the value between the root and memory.
 
+// The compiled code is executable memory, which is `std`'s business already;
+// the table of shapes it is kept in needs a lock, which is `std`'s too.
+extern crate std;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use std::sync::RwLock;
 
 use crate::Field;
 use pixelflow_codegen::CompiledKernel;
+use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformDecl, UniformIdentity};
 use pixelflow_ir::{Kernel, Uniform};
 
@@ -58,9 +64,10 @@ use pixelflow_ir::{Kernel, Uniform};
 pub const MAX_BOUND_BUFFERS: usize = 4;
 
 /// Entries in the context a collapse call hands the kernel: one base pointer
-/// per buffer slot, then the uniform block's, which sits in the entry after
-/// the kernel's last buffer and exists only when the kernel has an argument.
-const CONTEXT_ENTRIES: usize = MAX_BOUND_BUFFERS + 1;
+/// per buffer slot, then the uniform block's in the entry after the kernel's
+/// last buffer (read only when the kernel has an argument), then the origin
+/// block's — where the band's first sample lies.
+const CONTEXT_ENTRIES: usize = MAX_BOUND_BUFFERS + 2;
 
 /// The values of a compiled kernel's arguments, laid out as its code reads
 /// them: one `f32` per [`Uniform`] the kernel declares, at the offset the
@@ -256,9 +263,12 @@ const SAMPLE_CENTER: f32 = 0.5;
 /// packed manifold is four channel kernels compiled through here with an
 /// integer pack at the root. Not three paths — one, sampled three ways.
 pub struct Manifold {
+    /// The code at this manifold's own extent, compiled up front.
     jit: Arc<CompiledKernel>,
-    /// The lattice shape the kernel was specialized to, `[x, y]`. Every band
-    /// collapsed through it lies within these extents.
+    /// That code and every other shape's, as they are asked for.
+    codes: Arc<Codes>,
+    /// The lattice shape this manifold was compiled for, `[x, y]`: the shape
+    /// [`Lattice::collapse`](crate::Lattice::collapse) fills.
     extent: [u32; crate::lattice::AXES],
     /// The memory the kernel declared, in the slot order its ABI binds.
     /// Shared so a [`BoundManifold`] stays cheap to clone.
@@ -324,9 +334,9 @@ impl Manifold {
         // identity each slot binds, in the order the code was compiled
         // against. That order, not the arena's declaration order, is the
         // one `bind` fills the context in.
-        let linked =
-            pixelflow_codegen::jit_cache::compile(kernel, pixelflow_ir::LatticeShape::new(extent))
-                .expect("Manifold: kernel failed to compile");
+        let shape = LatticeShape::new(extent);
+        let linked = pixelflow_codegen::jit_cache::compile(kernel, shape)
+            .expect("Manifold: kernel failed to compile");
         assert!(
             linked.buffers.len() <= MAX_BOUND_BUFFERS,
             "Manifold::compile: kernel needs {} buffer slots, over the \
@@ -338,11 +348,19 @@ impl Manifold {
             .buffer_data()
             .map(|(id, data)| (id, Arc::clone(data)))
             .collect();
+        let slots: Arc<[BufferDecl]> = linked.buffers.into();
+        let link: Arc<[UniformDecl]> = linked.uniforms.into();
         Self {
-            jit: linked.kernel,
+            jit: Arc::clone(&linked.kernel),
+            codes: Arc::new(Codes {
+                kernel: kernel.clone(),
+                slots: Arc::clone(&slots),
+                link: Arc::clone(&link),
+                compiled: RwLock::new(alloc::vec![(shape, linked.kernel)]),
+            }),
             extent,
-            slots: linked.buffers.into(),
-            link: linked.uniforms.into(),
+            slots,
+            link,
             defaults: Arc::new(defaults),
             carried: carried.into(),
         }
@@ -379,7 +397,8 @@ impl Manifold {
         }
     }
 
-    /// The compiled kernel's emitted bytes (research/profiling harness).
+    /// The emitted bytes of the code compiled at this manifold's own extent
+    /// (research/profiling harness).
     #[must_use]
     pub fn code_bytes(&self) -> &[u8] {
         self.jit.code_bytes()
@@ -428,7 +447,7 @@ impl Manifold {
             *slot = Some(data);
         }
         BoundManifold {
-            jit: Arc::clone(&self.jit),
+            codes: Arc::clone(&self.codes),
             extent: self.extent,
             bound,
             buffer_slots: self.slots.len(),
@@ -458,6 +477,48 @@ fn buffer_len(decl: &BufferDecl) -> usize {
         .expect("Manifold: declared buffer length overflows usize")
 }
 
+/// The code a manifold's kernel compiles to, per shape it has been collapsed
+/// at. The shape is what the code *is* — its loop bounds are the extent —
+/// so a band of a new shape is a compile, through the global shape-keyed
+/// cache, and a band of a shape seen before is a lookup that allocates
+/// nothing. Shared between a [`Manifold`] and every [`BoundManifold`] made
+/// from it, so a shape one frame compiled is the next frame's hit.
+struct Codes {
+    kernel: Kernel,
+    /// The link every shape's code binds against — the same for all of
+    /// them, since the link is a function of the kernel's structure alone,
+    /// and checked to be when a new shape is compiled.
+    slots: Arc<[BufferDecl]>,
+    link: Arc<[UniformDecl]>,
+    compiled: RwLock<Vec<(LatticeShape, Arc<CompiledKernel>)>>,
+}
+
+impl Codes {
+    /// Run `f` on the code for `shape`, compiling it first on the first
+    /// request for that shape.
+    fn with<R>(&self, shape: LatticeShape, f: impl FnOnce(&CompiledKernel) -> R) -> R {
+        {
+            let table = self.compiled.read().expect("Manifold: code table poisoned");
+            if let Some((_, code)) = table.iter().find(|(s, _)| *s == shape) {
+                return f(code);
+            }
+        }
+        let linked = pixelflow_codegen::jit_cache::compile(&self.kernel, shape)
+            .expect("Manifold: kernel failed to compile at a band's shape");
+        debug_assert!(
+            linked.buffers[..] == self.slots[..] && linked.uniforms[..] == self.link[..],
+            "Manifold: a kernel's link changed with the shape it was compiled at"
+        );
+        let mut table = self.compiled.write().expect("Manifold: code table poisoned");
+        // Another thread may have compiled the same shape meanwhile; the
+        // global cache handed both the same code, so keeping either is right.
+        if !table.iter().any(|(s, _)| *s == shape) {
+            table.push((shape, Arc::clone(&linked.kernel)));
+        }
+        f(&linked.kernel)
+    }
+}
+
 /// A [`Manifold`] with its memory bound: the compiled code plus the buffers it
 /// reads. Cheap to clone (one `Arc` for the code, one per bound buffer).
 ///
@@ -465,7 +526,7 @@ fn buffer_len(decl: &BufferDecl) -> usize {
 /// slice and is a bound manifold too — there is no second, buffer-free form.
 #[derive(Clone)]
 pub struct BoundManifold {
-    jit: Arc<CompiledKernel>,
+    codes: Arc<Codes>,
     extent: [u32; crate::lattice::AXES],
     /// Bound memory in slot order; entries past the declared slots stay
     /// `None` and are never addressed, because the kernel only reads slots it
@@ -529,168 +590,85 @@ impl BoundManifold {
     /// the samples are taken is the region's — pixel centers for
     /// [`PlaneRegion::rows`].
     ///
-    /// The destination is written in place — the collapse loop's own stores
-    /// land in it — so `stride` is whatever the caller's plane already is: a
-    /// frame's packed row width, a padded scratch, a sub-rectangle of
-    /// something larger.
+    /// The destination is written in place — the code's own stores land in
+    /// it — so `stride` is whatever the caller's plane already is: a frame's
+    /// packed row width, a padded scratch, a sub-rectangle of something
+    /// larger. Exactly `width` samples per row are written and every other
+    /// element of `out` is left as it was, so a caller writing one piece of
+    /// a plane other pieces share writes only its own columns.
+    ///
+    /// The region's `width × rows` is a lattice shape, and the code that
+    /// fills it is compiled the first time this manifold is collapsed at that
+    /// shape (see [`Manifold`]); after that a band of the same shape is a
+    /// call that allocates nothing.
     ///
     /// # Panics
     ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the band.
+    /// Panics if the region's width or row count is zero, `stride` is less
+    /// than the width, or `out` cannot hold the band.
     pub fn collapse_rows(&self, region: PlaneRegion, out: &mut [f32], stride: usize) {
-        let band = self.plan(
-            "collapse_rows",
-            region,
-            Destination::absorbing(stride, out.len()),
-        );
+        self.check("collapse_rows", region, stride, out.len());
         // SAFETY: see `collapse`. `out` is an `f32` plane, which is what the
-        // collapse ABI writes, and `plan` proved it holds the band.
-        unsafe { self.collapse(region, out.as_mut_ptr(), band) }
+        // code writes, and `check` proved it holds the band.
+        unsafe { self.collapse(region, out.as_mut_ptr(), stride) }
     }
 
     /// [`BoundManifold::collapse_rows`] for a kernel whose root is int-domain:
     /// each lane already holds a bit pattern (a packed pixel, a mask), and the
-    /// collapse store is a raw vector store — type-blind bit movement — so
-    /// writing through the ABI's `*mut f32` into a `u32` plane is exact.
+    /// store is a raw vector store — type-blind bit movement — so writing
+    /// through the ABI's `*mut f32` into a `u32` plane is exact.
     ///
     /// # Panics
     ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the band.
+    /// Panics if the region's width or row count is zero, `stride` is less
+    /// than the width, or `out` cannot hold the band.
     pub fn collapse_int_rows(&self, region: PlaneRegion, out: &mut [u32], stride: usize) {
-        let band = self.plan(
-            "collapse_int_rows",
-            region,
-            Destination::absorbing(stride, out.len()),
-        );
+        self.check("collapse_int_rows", region, stride, out.len());
         // SAFETY: see `collapse`. `u32` and `f32` share size and alignment,
         // and the store moves the root's bit pattern without interpreting it.
-        unsafe { self.collapse(region, out.as_mut_ptr().cast::<f32>(), band) }
+        unsafe { self.collapse(region, out.as_mut_ptr().cast::<f32>(), stride) }
     }
 
-    /// Collapse the region into the `width × rows` sub-rectangle of `out`
-    /// whose first sample is `out[0]` and whose rows are `stride` elements
-    /// apart, writing **exactly** `region.width` samples per row and leaving
-    /// every other element of `out` as it was.
-    ///
-    /// [`BoundManifold::collapse_rows`] deliberately lets a row's final
-    /// partial batch overhang into the stride's spare columns, because for a
-    /// frame those columns are padding nobody reads. For a caller writing one
-    /// piece of a larger shared destination, those spare columns are a
-    /// *neighbour's*, filled by different content, so an overhang there is
-    /// not scratch — it is wrong samples. That is the whole of the
-    /// difference: same plan, same loop, same one-batch scratch for a row's
-    /// tail, with [`RowTail::Exact`] where a frame passes
-    /// [`RowTail::Absorbs`]. No staging plane, and so nothing to allocate.
+    /// The guard that a destination of `out_len` elements at `stride` can
+    /// hold the band.
     ///
     /// # Panics
     ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the sub-rectangle.
-    pub(crate) fn collapse_subrect(&self, region: PlaneRegion, out: &mut [f32], stride: usize) {
-        let band = self.plan(
-            "collapse_subrect",
-            region,
-            Destination::exact(stride, out.len()),
-        );
-        // SAFETY: see `collapse`. `out` is an `f32` plane, which is what the
-        // collapse ABI writes, and `plan` proved it holds the sub-rectangle —
-        // which under `RowTail::Exact` reaches no further than `width` in any
-        // row.
-        unsafe { self.collapse(region, out.as_mut_ptr(), band) }
-    }
-
-    /// [`Self::collapse_subrect`] for a kernel whose root is int-domain — a
-    /// packed pixel or a mask — the way [`Self::collapse_int_rows`] is for
-    /// [`Self::collapse_rows`].
-    ///
-    /// Public because the caller that needs it writes one piece of a larger
-    /// shared destination from another crate: a program that answers for
-    /// part of a frame writes exactly its own columns, and the columns past
-    /// them belong to whatever fills the rest. `collapse_int_rows`'s
-    /// overhang policy — "the caller owns the padding" — is false there.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the sub-rectangle.
-    pub fn collapse_int_subrect(&self, region: PlaneRegion, out: &mut [u32], stride: usize) {
-        let band = self.plan(
-            "collapse_int_subrect",
-            region,
-            Destination::exact(stride, out.len()),
-        );
-        // SAFETY: see `collapse`. `u32` and `f32` share size and alignment,
-        // the store moves the root's bit pattern without interpreting it, and
-        // `plan` proved `out` holds the sub-rectangle — which under
-        // `RowTail::Exact` reaches no further than `width` in any row.
-        unsafe { self.collapse(region, out.as_mut_ptr().cast::<f32>(), band) }
-    }
-
-    /// How a band lands in a destination of a given stride, and the guard that
-    /// the destination can hold it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the region's width is zero, `stride` is less than it, the
-    /// region leaves the compiled extents, or `out_len` cannot hold the band.
-    fn plan(&self, what: &str, region: PlaneRegion, dest: Destination) -> BandPlan {
-        let Destination {
-            stride,
-            len: out_len,
-            tail,
-        } = dest;
+    /// Panics if the region's width or row count is zero, `stride` is less
+    /// than the width, or `out_len` cannot hold the band.
+    fn check(&self, what: &str, region: PlaneRegion, stride: usize, out_len: usize) {
         let (width, rows) = (region.width, region.rows);
-        assert!(width > 0, "{what}: zero width");
+        assert!(width > 0 && rows > 0, "{what}: empty region {width}×{rows}");
         assert!(
             stride >= width,
             "{what}: stride {stride} is narrower than the {width} samples a row holds"
         );
-        // The kernel was compiled for `extent`; a region outside it would run
-        // the collapse loop past the lattice it was specialized to.
-        //
-        // `debug_assert`, matching `CompiledKernel::call_collapse`'s own check of
-        // the same promise: today's emitted code takes its loop bounds from
-        // the tile at run time, so a wider region is merely a stale cache key,
-        // not wrong samples. It becomes load-bearing when the emitted code
-        // specializes on the extents, and is promoted with that change rather
-        // than ahead of it — a release panic for a promise nothing yet relies
-        // on is a new way for a terminal to die.
-        let (fw, fh) = (self.extent[0] as usize, self.extent[1] as usize);
-        debug_assert!(
-            width <= fw && rows <= fh,
-            "{what}: a band of {width}×{rows} lies outside the {fw}×{fh} \
-             lattice this manifold was compiled for"
-        );
-        let plan = BandPlan::new(width, rows, stride, tail);
         // Checked: the span wraps in release for a caller-supplied region
         // large enough, and a wrapped product would let an undersized `out`
-        // pass this guard while the collapse call below still received the
-        // real (enormous) row count and wrote past the slice. The documented
-        // panic must fire before any unsafe call, not after.
-        let needed = plan.span().expect("collapse: band span overflows usize");
+        // pass this guard while the code still wrote the real (enormous)
+        // band. The documented panic must fire before any unsafe call.
+        let needed = (rows - 1)
+            .checked_mul(stride)
+            .and_then(|before_last| before_last.checked_add(width))
+            .expect("collapse: band span overflows usize");
         assert!(
             out_len >= needed,
             "{what}: plane of {out_len} elements cannot hold {rows} rows at stride {stride}"
         );
-        plan
     }
 
     /// # Safety
     ///
-    /// `out` must be writable for `band.span()` 4-byte elements — which
-    /// [`BoundManifold::plan`] asserted for the slice it came from.
-    unsafe fn collapse(&self, region: PlaneRegion, out: *mut f32, band: BandPlan) {
-        if band.rows == 0 {
-            return;
-        }
+    /// `out` must be writable for `(rows - 1) * stride + width` 4-byte
+    /// elements — which [`BoundManifold::check`] asserted for the slice it
+    /// came from.
+    unsafe fn collapse(&self, region: PlaneRegion, out: *mut f32, stride: usize) {
         // One base pointer per declared slot, in slot order, then the block's
-        // in the entry after them when the kernel has arguments.
-        // Stack-allocated against the MAX_BOUND_BUFFERS bound `compile`
-        // checked, so baking a band allocates nothing; trailing entries stay
-        // null and are never read because the kernel only addresses slots it
-        // declared.
+        // in the entry after them when the kernel has arguments, then the
+        // origin's. Stack-allocated against the MAX_BOUND_BUFFERS bound
+        // `compile` checked, so a band allocates nothing; entries between
+        // stay null and are never read because the kernel only addresses
+        // slots it declared.
         let mut ctx = [core::ptr::null::<f32>(); CONTEXT_ENTRIES];
         for (dst, src) in ctx.iter_mut().zip(self.bound.iter()) {
             if let Some(data) = src {
@@ -700,201 +678,23 @@ impl BoundManifold {
         if !self.uniforms.is_empty() {
             ctx[self.buffer_slots] = self.uniforms.as_ptr();
         }
-        // Where the band's first sample lies; X advances by one per lane, Y by
-        // one per row, which is what the collapse loop does.
-        //
-        // The ABI still carries four base coordinates. The last two are dead:
-        // the emitter refuses an arena naming `Var(2)` or `Var(3)`, so no
-        // emitted body reads them, and passing zero keeps every kernel's
-        // bytes exactly what they were. Narrowing the ABI to two is not this
-        // stage's either — L2 removed `Lattice::origin`, a type-level change
-        // with no effect on the ABI's own shape — because it changes the
-        // scaffold's own stores and loads and so every kernel's bytes, which
-        // is exactly what an identity gate needs held still.
-        let [x0, y0] = region.origin;
-        let dead = Field::from(0.0);
-        if band.groups > 0 {
+        // Where the band's first sample lies; the code steps X by one per
+        // column and Y by one per row from here.
+        let origin = region.origin;
+        ctx[self.buffer_slots + 1] = origin.as_ptr();
+        let shape = LatticeShape::new([region.width as u32, region.rows as u32]);
+        self.codes.with(shape, |code| {
             // SAFETY: `compile` checked size_of::<Field>() == JIT_VECTOR_BYTES
-            // and that every declared slot fits `ctx`; `bind` bound a buffer of
-            // the declared length to each of them and this frame holds those
-            // `Arc`s alive for the duration of the call, as it does the block
-            // the entry after them points into (one `f32` per argument, in
-            // the link's order, which is the order the code was compiled
-            // against); the caller's guard
-            // proved `out` holds `rows` rows of `groups` whole batches at
-            // `stride`, which is what `row_skip_bytes` steps between.
-            unsafe {
-                self.jit.call_collapse(
-                    ctx.as_ptr(),
-                    pixelflow_codegen::TileSlice::new(
-                        out,
-                        band.groups,
-                        band.rows,
-                        band.row_skip_bytes(),
-                    ),
-                    pixelflow_codegen::Point4::new(
-                        Field::sequential(x0),
-                        Field::from(y0),
-                        dead,
-                        dead,
-                    ),
-                );
-            }
-        }
-        let Some(tail) = band.tail() else { return };
-        // The row's last, partial batch. A whole-batch store there would run
-        // past the row into the next one, so it lands in a scratch batch and
-        // only the samples that belong to the row are copied back — one extra
-        // call per row, and only when the stride left no room for the overhang.
-        let mut scratch = [0.0f32; BATCH_LANES];
-        for row in 0..band.rows {
-            // SAFETY: as above; `scratch` is exactly the one batch
-            // `TileSlice::single` writes.
-            unsafe {
-                self.jit.call_collapse(
-                    ctx.as_ptr(),
-                    pixelflow_codegen::TileSlice::single(scratch.as_mut_ptr()),
-                    pixelflow_codegen::Point4::new(
-                        Field::sequential(x0 + band.whole_lanes() as f32),
-                        Field::from(y0 + row as f32),
-                        dead,
-                        dead,
-                    ),
-                );
-            }
-            // SAFETY: `plan` proved `out` holds `row * stride + width`
-            // elements, and this writes the last `tail` of them.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    scratch.as_ptr(),
-                    out.add(row * band.stride + band.whole_lanes()),
-                    tail,
-                );
-            }
-        }
-    }
-}
-
-/// Lanes in one SIMD batch of the emitted code. The only place in this module
-/// the width is visible, and it is here for one reason: a row's final partial
-/// batch needs somewhere to land that is not the next row.
-const BATCH_LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
-
-/// The plane a band lands in: how far apart its rows are, how much of it
-/// there is, and whether the columns past the band are the caller's.
-///
-/// One value because the three are one question — *where does this go* — and
-/// answering it in three parameters is how a signature stops refusing the
-/// wrong combination.
-#[derive(Clone, Copy, Debug)]
-struct Destination {
-    /// Elements between the starts of two rows.
-    stride: usize,
-    /// Elements the destination holds.
-    len: usize,
-    /// Whose the columns past the band's width are.
-    tail: RowTail,
-}
-
-impl Destination {
-    /// A plane the caller owns: a final partial batch may overhang.
-    fn absorbing(stride: usize, len: usize) -> Self {
-        Self {
-            stride,
-            len,
-            tail: RowTail::Absorbs,
-        }
-    }
-
-    /// A sub-rectangle of somebody else's plane: exactly `width` per row.
-    fn exact(stride: usize, len: usize) -> Self {
-        Self {
-            stride,
-            len,
-            tail: RowTail::Exact,
-        }
-    }
-}
-
-/// Who owns a destination row's columns past `width`.
-///
-/// The only thing separating a frame's collapse from a summand's, and so the
-/// only reason there are two entry points at all.
-#[derive(Clone, Copy, Debug)]
-enum RowTail {
-    /// A plane the caller owns outright: the columns past `width` are padding
-    /// nobody reads back, so a final partial batch may overhang into them and
-    /// a whole band is one call.
-    Absorbs,
-    /// A sub-rectangle of somebody else's plane: exactly `width` samples per
-    /// row are written, and a final partial batch goes through the one-batch
-    /// scratch rather than into a neighbour's columns.
-    Exact,
-}
-
-/// How one band of rows is written into a destination plane: whole SIMD
-/// batches stored straight through the collapse loop, and whatever partial
-/// batch the stride left no room for.
-#[derive(Clone, Copy, Debug)]
-struct BandPlan {
-    /// Samples per row the caller asked for.
-    width: usize,
-    rows: usize,
-    /// Elements between the starts of two destination rows.
-    stride: usize,
-    /// Whole batches the collapse loop stores per row.
-    groups: usize,
-}
-
-impl BandPlan {
-    /// A final partial batch overhangs `width`, which is harmless exactly when
-    /// the destination row both is wide enough to absorb it and is the
-    /// caller's to clobber — the padding lanes then hold whatever the kernel
-    /// computed past the right edge and are not read back. Otherwise it is
-    /// left to the scratch batch, and the loop stores only the batches that
-    /// fit.
-    fn new(width: usize, rows: usize, stride: usize, tail: RowTail) -> Self {
-        let batches = width.div_ceil(BATCH_LANES);
-        let groups = match tail {
-            RowTail::Absorbs if stride >= batches * BATCH_LANES => batches,
-            _ => width / BATCH_LANES,
-        };
-        Self {
-            width,
-            rows,
-            stride,
-            groups,
-        }
-    }
-
-    /// Samples of each row the collapse loop's whole batches cover.
-    fn whole_lanes(self) -> usize {
-        self.groups * BATCH_LANES
-    }
-
-    /// Bytes the collapse loop steps the output pointer by between rows.
-    fn row_skip_bytes(self) -> usize {
-        (self.stride - self.whole_lanes()) * core::mem::size_of::<f32>()
-    }
-
-    /// Samples per row left for the scratch batch, or `None` when the whole
-    /// batches already covered the row.
-    fn tail(self) -> Option<usize> {
-        self.width
-            .checked_sub(self.whole_lanes())
-            .filter(|t| *t > 0)
-    }
-
-    /// Elements the destination must hold: every row but the last at full
-    /// stride, then whichever of the batch overhang and the sampled width
-    /// reaches further.
-    fn span(self) -> Option<usize> {
-        let Some(before_last) = self.rows.checked_sub(1) else {
-            return Some(0);
-        };
-        before_last
-            .checked_mul(self.stride)?
-            .checked_add(self.whole_lanes().max(self.width))
+            // and that every declared slot fits `ctx`; `bind` bound a buffer
+            // of the declared length to each of them and this frame holds
+            // those `Arc`s alive for the duration of the call, as it does the
+            // block the entry after them points into (one `f32` per argument,
+            // in the link's order, which is the order the code was compiled
+            // against) and the origin on this stack frame; the caller's
+            // guard proved `out` holds `rows` rows of `width` at `stride`,
+            // which is exactly what code compiled at `shape` writes.
+            unsafe { code.call(ctx.as_ptr(), out, stride) }
+        });
     }
 }
 
@@ -939,29 +739,28 @@ mod tests {
     /// The destination's rows are `stride` apart because the caller said so,
     /// not because the batch width worked out that way: every row's samples
     /// name their own coordinates, so a band placed at the wrong pitch reads
-    /// back the wrong values. This is the case the collapse ABI's
-    /// `row_skip_bytes` exists for, and the packed frame path is built on it.
+    /// back the wrong values. The packed frame path is built on this.
     ///
-    /// A spare row past the band stays pristine: the collapse fills the rows
-    /// it was given and no more. (Within a row, everything past `width` is
-    /// scratch — a final partial batch's lanes land there — which is why only
-    /// the samples themselves are read back.)
+    /// Everything but the samples stays pristine: the columns past `width`
+    /// in every row, and the spare row past the band. The collapse writes
+    /// exactly what it was given and no more.
     #[test]
     fn a_band_lands_at_the_stride_the_caller_asked_for() {
         let program = Manifold::compile(&coordinate_kernel(), [16, 8]);
         let frame = program.bind(&[]);
-        let (width, stride, rows) = (9, BATCH_LANES * 4 + 1, 4);
+        let (width, stride, rows) = (9, 61, 4);
         const UNTOUCHED: f32 = -1.0;
         let mut out = vec![UNTOUCHED; (rows + 1) * stride];
         frame.collapse_rows(PlaneRegion::rows(width, 0, rows), &mut out, stride);
         for row in 0..rows {
-            for col in 0..width {
-                let want = expected(col, row);
-                assert!(
-                    (out[row * stride + col] - want).abs() < 1e-3,
-                    "row {row} col {col}: {} != {want}",
-                    out[row * stride + col]
-                );
+            for col in 0..stride {
+                let got = out[row * stride + col];
+                if col < width {
+                    let want = expected(col, row);
+                    assert!((got - want).abs() < 1e-3, "row {row} col {col}: {got} != {want}");
+                } else {
+                    assert_eq!(got, UNTOUCHED, "row {row} col {col}: past the width was written");
+                }
             }
         }
         assert!(
@@ -971,14 +770,14 @@ mod tests {
     }
 
     /// Whatever the stride, the samples are the same: a row's final partial
-    /// batch reaches memory through the scratch batch with the values it would
-    /// have had from a whole-batch store into a padded row.
+    /// batch is stored lane by lane with the values it would have had from a
+    /// whole-batch store into a padded row.
     #[test]
     fn a_partial_last_batch_collapses_the_same_samples_at_any_stride() {
         let program = Manifold::compile(&coordinate_kernel(), [32, 8]);
         let frame = program.bind(&[]);
-        let (width, rows) = (BATCH_LANES * 2 - 1, 3);
-        let padded = BATCH_LANES * 2;
+        let (width, rows) = (31, 3);
+        let padded = 32;
         let mut packed = vec![0.0f32; rows * width];
         let mut spread = vec![0.0f32; rows * padded];
         let region = PlaneRegion::rows(width, 1, rows);
@@ -991,9 +790,30 @@ mod tests {
         }
     }
 
+    /// A band of a shape the manifold was not compiled at is compiled on
+    /// first use and reused after: the frame path collapses eight-row
+    /// stripes of a frame compiled at its whole height.
+    #[test]
+    fn a_band_of_a_new_shape_compiles_once_and_is_reused() {
+        let program = Manifold::compile(&coordinate_kernel(), [16, 24]);
+        let frame = program.bind(&[]);
+        let mut out = vec![0.0f32; 16 * 24];
+        for stripe in 0..3 {
+            frame.collapse_rows(PlaneRegion::rows(16, stripe * 8, 8), &mut out[stripe * 8 * 16..], 16);
+        }
+        for row in 0..24 {
+            for col in 0..16 {
+                let want = expected(col, row);
+                assert!((out[row * 16 + col] - want).abs() < 1e-3, "row {row} col {col}");
+            }
+        }
+        let shapes = program.codes.compiled.read().unwrap().len();
+        assert_eq!(shapes, 2, "the frame's shape and the stripe's, and nothing else");
+    }
+
     /// An int-domain root reaches memory as the bit pattern the kernel built,
-    /// with no float operation in between — including through the scratch
-    /// batch, which is why the width here is not a whole batch.
+    /// with no float operation in between — including through a row's final
+    /// partial batch, which is why the width here is not a whole batch.
     #[test]
     fn an_int_domain_root_collapses_into_a_u32_plane_bit_exactly() {
         let kernel = Kernel::x()
@@ -1001,7 +821,7 @@ mod tests {
             .shl(8)
             .or(&Kernel::y().trunc_to_int())
             .into_kernel();
-        let width = BATCH_LANES + 1;
+        let width = 17;
         let program = Manifold::compile(&kernel, [width as u32, 4]);
         let frame = program.bind(&[]);
         let mut out = vec![0u32; 2 * width];

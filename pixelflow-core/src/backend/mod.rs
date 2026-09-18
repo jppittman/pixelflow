@@ -1,9 +1,9 @@
 //! The SIMD backend: what a `Field` *is*.
 //!
-//! `Field`'s ABI is one native SIMD vector at the build's width. This module
-//! is nothing more than the four concrete lane types — one per ISA level —
-//! and the two constructors `Field` needs from whichever one the build
-//! selects: `splat` (broadcast) and `sequential` (`[start, start+1, ...]`).
+//! `Field` is one native SIMD vector at the build's width. This module is
+//! nothing more than the four concrete lane types — one per ISA level — and
+//! the one constructor `Field` keeps from whichever one the build selects:
+//! `splat` (broadcast).
 //!
 //! There is deliberately no trait here. A trait buys polymorphism for code
 //! that is generic over the lane type; nothing is — `pixelflow-core/src/lib.rs`

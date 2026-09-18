@@ -31,15 +31,11 @@
 //! the glyph scale that motivated it — see
 //! [`halving_a_glyph_scale_fold_costs_far_fewer_than_n_applications`].
 
-use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
-use pixelflow_codegen::emit::executable::{Point4, TileSlice};
-use pixelflow_ir::{ExprArena, ExprId, ExprNode, Kernel, OpKind};
+use pixelflow_ir::{ExprArena, ExprId, ExprNode, Kernel, LatticeShape, OpKind};
 use pixelflow_search::egraph::{
     CostModel, EGraph, SaturationConfig, Vocabulary, extract, fold_rules, insert,
 };
-
-const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 
 /// Whether a `Reduce` survives *reachable from `root`* — not whether one
 /// merely sits somewhere in `arena.nodes_raw()`. `passes::expand_reduce`
@@ -63,23 +59,19 @@ fn has_fold(arena: &ExprArena, root: ExprId) -> bool {
     false
 }
 
-/// Compile a lattice-invariant kernel (no X/Y dependence) and read the value
-/// it computes.
+/// Compile a lattice-invariant kernel (no X/Y dependence) at a single-point
+/// lattice and read the value it computes.
 fn eval_point(arena: &ExprArena, root: ExprId) -> f32 {
-    let jit = compile(arena, root).expect("JIT compile");
-    let p = Point4::new(
-        [0.0f32; LANES],
-        [0.0f32; LANES],
-        [0.0f32; LANES],
-        [0.0f32; LANES],
-    );
-    let mut out = [0.0f32; LANES];
-    // SAFETY: no buffers/uniforms (ctx unused by a pure arithmetic kernel),
-    // `out` holds one full vector batch, and `[f32; LANES]` is exactly
-    // `JIT_VECTOR_BYTES` wide.
+    let jit = compile(arena, root, LatticeShape::POINT).expect("JIT compile");
+    let mut out = [0.0f32; 1];
+    let origin = [0.0f32, 0.0f32];
+    // SAFETY: this arena declares no buffers and no uniform (a pure
+    // arithmetic kernel), so `ctx[0]` — the uniform-block slot — is unread;
+    // `ctx[1]` is the origin block, and `out` holds the one sample a
+    // single-point lattice writes.
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
     unsafe {
-        jit.code
-            .call_collapse(core::ptr::null(), TileSlice::single(out.as_mut_ptr()), p);
+        jit.code.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
     }
     out[0]
 }

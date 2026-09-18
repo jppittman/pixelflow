@@ -1,8 +1,8 @@
-//! Execute the raw collapse ABI once, the way the benchmarks do.
+//! Execute the collapse ABI once, the way `pixelflow-core` does.
 //!
-//! `collapse_overhead` drives `call_collapse` directly — its own context
-//! pointer, its own `Point4`, its own tile — and **no CI job runs it**:
-//! `cargo nextest` does not execute benchmark targets, and the bench declares
+//! `collapse_overhead` drives `CompiledKernel::call` directly — its own
+//! context pointer, its own plane — and **no CI job runs it**: `cargo
+//! nextest` does not execute benchmark targets, and the bench declares
 //! `harness = false`, so a `#[test]` inside it would not run either. Clippy
 //! compiles it and nothing more.
 //!
@@ -11,26 +11,30 @@
 //! uniform through the null context the bench passes, which segfaults. Both
 //! are execution failures in code that type-checks perfectly.
 //!
-//! So this is the same ABI usage as a test, at one call of each granularity.
-//! It is not a measurement and takes no timings — it exists so that "the
+//! So this is the same ABI usage as a test: one call filling one plane. It
+//! is not a measurement and takes no timings — it exists so that "the
 //! benchmark still runs" is something a normal `cargo test` can answer.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
-use pixelflow_codegen::emit::executable::{Point4, TileSlice};
-use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::{LatticeShape, OpKind};
 
 const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
-const GROUPS: usize = 3;
+/// Three full batches and a remainder of every width below a batch.
+const WIDTH: usize = 3 * LANES + LANES - 1;
 const ROWS: usize = 2;
+/// Wider than the extent: the rows are not contiguous, so a store that
+/// stepped by the width rather than the pitch would land in the wrong row.
+const PITCH: usize = WIDTH + 5;
 const BIAS: f32 = 1.75;
+const ORIGIN: [f32; 2] = [0.5, 0.5];
 
 /// `X * Y + BIAS` — reads both axes, so every lane and row must differ, and
-/// a scaffold that failed to step X or Y would land on the wrong answer
-/// rather than merely a slow one.
+/// a loop that failed to step X or Y would land on the wrong answer rather
+/// than merely a slow one.
 fn kernel() -> (ExprArena, pixelflow_ir::arena::ExprId) {
     let mut a = ExprArena::new();
     let x = a.push_var(0);
@@ -41,76 +45,35 @@ fn kernel() -> (ExprArena, pixelflow_ir::arena::ExprId) {
     (a, root)
 }
 
-fn lane_x0() -> [f32; LANES] {
-    let mut x0 = [0.0f32; LANES];
-    for (i, lane) in x0.iter_mut().enumerate() {
-        *lane = 0.5 + i as f32;
-    }
-    x0
-}
-
 #[test]
-fn one_call_per_group_computes_the_kernel() {
+fn one_call_fills_the_plane() {
     let (arena, root) = kernel();
-    let code = compile(&arena, root).expect("the smoke kernel must compile");
-    let x0 = lane_x0();
+    let shape = LatticeShape::new([WIDTH as u32, ROWS as u32]);
+    let code = compile(&arena, root, shape).expect("the smoke kernel must compile");
 
-    for row in 0..ROWS {
-        let y = row as f32 + 0.5;
-        for g in 0..GROUPS {
-            let mut out = [0.0f32; LANES];
-            let mut xs = [0.0f32; LANES];
-            for (i, lane) in xs.iter_mut().enumerate() {
-                *lane = x0[i] + (g * LANES) as f32;
-            }
-            // The context is null on purpose: this kernel declares neither a
-            // buffer nor an argument, which is the precondition that makes a
-            // null context sound. A kernel that declared one would fault
-            // here, which is the point.
-            unsafe {
-                code.code.call_collapse(
-                    core::ptr::null(),
-                    TileSlice::single(out.as_mut_ptr()),
-                    Point4::new(xs, [y; LANES], [0.0; LANES], [0.0; LANES]),
-                );
-            }
-            for lane in 0..LANES {
-                let want = xs[lane] * y + BIAS;
-                assert!(
-                    (out[lane] - want).abs() <= 1e-4,
-                    "row {row}, group {g}, lane {lane}: want {want}, got {}",
-                    out[lane]
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn one_call_for_the_whole_frame_computes_the_kernel() {
-    let (arena, root) = kernel();
-    let code = compile(&arena, root).expect("the smoke kernel must compile");
-    let mut out = vec![0.0f32; GROUPS * LANES * ROWS];
-
+    const UNWRITTEN: f32 = -1000.0;
+    let mut out = vec![UNWRITTEN; ROWS * PITCH];
+    // This kernel declares neither a buffer nor a uniform, so the context is
+    // the origin block alone at the slot after the (empty) buffer table and
+    // the (absent) uniform block.
+    let origin = ORIGIN;
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
     unsafe {
-        code.code.call_collapse(
-            core::ptr::null(),
-            TileSlice::contiguous(out.as_mut_ptr(), GROUPS, ROWS),
-            Point4::new(lane_x0(), [0.5; LANES], [0.0; LANES], [0.0; LANES]),
-        );
+        code.code.call(ctx.as_ptr(), out.as_mut_ptr(), PITCH);
     }
 
     for row in 0..ROWS {
-        let y = row as f32 + 0.5;
-        for g in 0..GROUPS {
-            for lane in 0..LANES {
-                let x = 0.5 + (g * LANES + lane) as f32;
-                let want = x * y + BIAS;
-                let got = out[row * GROUPS * LANES + g * LANES + lane];
+        let y = ORIGIN[1] + row as f32;
+        for col in 0..PITCH {
+            let got = out[row * PITCH + col];
+            if col < WIDTH {
+                let want = (ORIGIN[0] + col as f32) * y + BIAS;
                 assert!(
                     (got - want).abs() <= 1e-4,
-                    "row {row}, group {g}, lane {lane}: want {want}, got {got}"
+                    "row {row} col {col}: got {got}, want {want}"
                 );
+            } else {
+                assert_eq!(got, UNWRITTEN, "row {row} col {col}: past the width was written");
             }
         }
     }

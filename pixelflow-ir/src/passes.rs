@@ -1,37 +1,29 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! [`legalize`] runs four passes today, each `(arena, root) -> (arena, root)`,
-//! each turning nodes no backend can emit into nodes every backend can:
+//! [`legalize`] runs six passes, each `(arena, root) -> (arena, root)`, each
+//! turning nodes no backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
 //! |---|---|---|
 //! | [`expand_refs`] | `Ref` | the referent, spliced in |
 //! | [`lower_dwrt`] | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
+//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
+//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
 //! | [`expand_gather`] | `Gather` | index arithmetic + `RawGather` |
 //! | [`expand_transcendentals`] | `Sin`..`Pow` | arithmetic + bit-manip atoms |
 //!
 //! The order in that table is the order they must run: differentiating a `sin`
 //! produces a `cos`, so `lower_dwrt` has to go before the pass that expands
-//! them, and you cannot differentiate a *name*, so `expand_refs` goes before
-//! everything. Every pass is idempotent and has an identity fast-path, so
-//! running one that has nothing to do is free.
-//!
-//! Two more exist, in [`lattice`], and are **not** in that list or in
-//! [`legalize`]'s pipeline:
-//!
-//! | pass | consumes | produces |
-//! |---|---|---|
-//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
-//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
-//!
-//! Their place in the full order is `expand_refs -> lower_dwrt -> collapse ->
-//! pack -> expand_gather -> expand_transcendentals`
-//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3), but
-//! **[`legalize`] does not call either one yet.** The emitter refuses a
-//! `Write` until step 5 of that plan lands, so wiring them into every
-//! production compile now would hand the emitter a node it cannot execute,
-//! breaking every collapse in the tree. Until then they are arena-level
-//! transforms a caller runs directly.
+//! them; you cannot differentiate a *name*, so `expand_refs` goes before
+//! everything; a derivative is taken with respect to `X` before `collapse`
+//! substitutes `X` away, and a read's address arithmetic is built over the
+//! lattice's binders after it, so the two lattice passes sit between
+//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3). Every pass is
+//! idempotent and has an identity fast-path, so running one that has nothing
+//! to do is free — except the two lattice passes, which always wrap: after
+//! them no coordinate `Var` exists and the root is a `Reduce` over the unit
+//! monoid whose body is a `Write`. That is the shape every backend emits, and
+//! the only shape.
 //!
 //! **`Reduce` is legal in the arena and [`legalize`] leaves every one
 //! standing**, nested or not: codegen emits a surviving fold as a loop, and a
@@ -70,11 +62,12 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 /// The lattice's own two folds — `collapse(extent)`, `pack(lanes)` — as
-/// legalize passes. See the module doc above for their place in the order
-/// and why [`legalize`] does not call them yet.
+/// legalize passes. See the module doc above for their place in the order.
 pub mod lattice;
 
-/// Run every legalization pass, in the one order they compose in.
+/// Run every legalization pass, in the one order they compose in, for the
+/// collapse `collapse` describes: the kernel comes back wrapped in the
+/// lattice's folds, strip-mined to the target's lane width.
 ///
 /// This is the whole pipeline. It was previously four calls copied into each
 /// compile entry, which is how two since-deleted entries came to run none of
@@ -83,21 +76,27 @@ pub mod lattice;
 /// refuses a surviving `Dwrt`. An order that has to be retyped is an order
 /// that can be forgotten.
 ///
-/// Every pass has an identity fast-path, so calling this on an arena that
-/// needs nothing lowered costs four comparisons and no allocation. There is
-/// no reason for a caller to want a subset.
-///
 /// # Errors
 ///
 /// Propagates [`lower_dwrt_owned`]'s error for expressions with no derivative
 /// rule — bound-memory reads, integer/bit ops, reductions.
-pub fn legalize(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), &'static str> {
+pub fn legalize(
+    arena: &ExprArena,
+    root: ExprId,
+    collapse: &lattice::Collapse,
+) -> Result<(ExprArena, ExprId), &'static str> {
     // `expand_refs` before anything else: every pass below reads structure,
     // and a reference has none to read — you cannot differentiate a name.
     let (arena, root) = expand_refs_owned(arena, root);
     // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
     // has to precede the pass that expands them.
-    let (arena, root) = lower_dwrt_owned(&arena, root)?;
+    let (mut arena, root) = lower_dwrt_owned(&arena, root)?;
+    // The lattice, as folds: after `collapse` no coordinate `Var` exists,
+    // and `pack` strip-mines its column fold to the width the caller's
+    // target executes by lanes. Before `expand_gather`, so a read's address
+    // arithmetic is built over the binders and its variance read off them.
+    let root = lattice::collapse(&mut arena, root, collapse.domain);
+    let root = lattice::pack(&mut arena, root, collapse.lanes);
     // No reduce pass. A `Reduce` is legal for codegen (stage 2c —
     // `pixelflow-codegen` emits a surviving fold as a loop), and since
     // `extract_folds` carves a fold inside a fold's body as a loop inside a
@@ -2183,15 +2182,18 @@ mod nested_reduce_tests {
     }
 
     /// A `Reduce` whose body reads another `Reduce`'s result reaches the
-    /// backend as written: two folds, one inside the other. This used to be
-    /// the one shape `legalize` still unrolled (`expand_nested_reduce`,
-    /// deleted), because codegen carved fold bodies out one level at a time;
-    /// it carves a fold inside a fold now, and the pass went with the
-    /// restriction it existed for.
+    /// backend as written: two folds, one inside the other, both inside the
+    /// lattice's three. This used to be the one shape `legalize` still
+    /// unrolled (`expand_nested_reduce`, deleted), because codegen carved
+    /// fold bodies out one level at a time; it carves a fold inside a fold
+    /// now, and the pass went with the restriction it existed for.
     ///
     /// `inner = sum_{i<3}(X+i)`; `outer = sum_{j<2}(inner+j)`.
     #[test]
-    fn legalize_leaves_a_nested_reduce_standing() {
+    fn legalize_leaves_a_nested_reduce_standing_inside_the_lattices_folds() {
+        use crate::arena::{UniformDecl, UniformIdentity};
+        use crate::variance::LatticeShape;
+
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
@@ -2204,16 +2206,36 @@ mod nested_reduce_tests {
         let outer_body = a.push_binary(OpKind::Add, inner, j);
         let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), outer_body);
 
-        let (legalized, new_root) = legalize(&a, root).expect("legalize");
+        let origin = |default| UniformDecl {
+            id: UniformIdentity::mint(),
+            default,
+        };
+        let collapse = lattice::Collapse {
+            domain: lattice::Domain {
+                shape: LatticeShape::new([4, 1]),
+                origin: [origin(0.0), origin(0.0)],
+            },
+            lanes: 4,
+        };
+        let (legalized, new_root) = legalize(&a, root, &collapse).expect("legalize");
+        // The lattice's row, column and lane folds around the kernel's two.
         assert_eq!(
             reachable_reduces(&legalized, new_root),
-            2,
-            "both folds must survive legalization"
+            5,
+            "both folds must survive legalization, inside the lattice's three"
         );
-        let ExprNode::Reduce { fold, body } = legalized.node(new_root) else {
-            panic!("root must still be the outer Reduce");
+        let ExprNode::Reduce { fold, .. } = legalized.node(new_root) else {
+            panic!("root must be the lattice's row fold");
         };
-        assert_eq!(fold.range(), 0..2);
+        assert_eq!(fold.monoid(), Monoid::SEQ);
+        assert_eq!(fold.range(), 0..1);
+        let outer = (0..legalized.len())
+            .map(|k| ExprId(k as u32))
+            .find(|id| matches!(legalized.node(*id), ExprNode::Reduce { fold, .. } if fold.range() == (0..2)))
+            .expect("the outer kernel fold survives");
+        let ExprNode::Reduce { body, .. } = legalized.node(outer) else {
+            unreachable!()
+        };
         let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(*body) else {
             panic!("the outer body must still be `inner + j`");
         };

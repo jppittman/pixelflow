@@ -11,7 +11,7 @@ use std::fmt;
 use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::emit::executable::ExecutableCode;
 use pixelflow_codegen::error::CompileError;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 
 /// Number of timed samples per expression. Take the median.
 const TIMED_RUNS: usize = 20;
@@ -404,49 +404,76 @@ fn input_tuples() -> &'static [[f32; 2]; INPUT_TUPLES] {
 }
 
 /// Which dependency structure the timed loop imposes (audit H3).
+///
+/// Every mode now measures a **whole collapse**: a compiled kernel is a
+/// [`LatticeShape`] baked in at compile time (`compile(arena, root, shape)`),
+/// and one `code.call(ctx, out, pitch)` fills that entire plane — there is no
+/// per-batch entry any more, and a coordinate is `x = x0 + col`, `y = y0 +
+/// row` for whatever `(x0, y0)` origin the call supplies, not a free
+/// per-lane variable ([`shape_for`] picks the shape per mode). See
+/// docs/plans/2026-09-16-collapse-is-a-fold.md.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchMode {
-    /// Independent back-to-back calls: the CPU overlaps them, measuring
+    /// Independent back-to-back calls, each filling one [`LANES`]-wide batch
+    /// ([`shape_for`]'s `[LANES, 1]`): the CPU overlaps them, measuring
     /// throughput under perfect ILP. This is the historical behavior and the
     /// default for un-migrated callers.
     Throughput,
-    /// Each eval's output is fed back into EVERY input lane of the next eval
-    /// through `black_box`, serializing the dependency chain through
-    /// whichever variables the expression actually reads: measures
-    /// single-evaluation latency. Feeding all four lanes rather than only x
-    /// keeps the chain intact for expressions that never read Var(0) — with
-    /// a single fed lane their chain silently breaks and the "latency" label
-    /// is an ILP-overlapped throughput number (the exact audit-H3
-    /// under-billing this mode exists to close). The varied-input buffer
-    /// drives only [`BenchMode::Throughput`] and the recorded outputs; in
-    /// this mode the operand values are the orbit of the kernel's own
-    /// iteration. An expression that reads NO variable has no data path from
-    /// inputs to output, so no chaining scheme can serialize it: its chained
-    /// latency legitimately equals its throughput.
+    /// Each call's first output lane is fed back into BOTH origin coordinates
+    /// (`x0` and `y0`) of the next call through `black_box`, serializing the
+    /// dependency chain through whichever variable the expression actually
+    /// reads: measures single-evaluation latency. Feeding both coordinates
+    /// rather than only `x0` keeps the chain intact for expressions that
+    /// never read `Var(0)` — with a single fed coordinate their chain
+    /// silently breaks and the "latency" label is an ILP-overlapped
+    /// throughput number (the exact audit-H3 under-billing this mode exists
+    /// to close). Compiled at the same `[LANES, 1]` shape as
+    /// [`BenchMode::Throughput`] — every lane of a call is still evaluated
+    /// (the cost of a real batch), only lane 0's result is carried forward,
+    /// so the serialized chain is the SIMD instruction sequence's own
+    /// dependency latency, independent of how many lanes ride along. The
+    /// varied-origin sweep (`input_tuples`) drives only
+    /// [`BenchMode::Throughput`] and the recorded outputs; in this mode the
+    /// origin is the orbit of the kernel's own iteration. An expression that
+    /// reads NO variable has no data path from inputs to output, so no
+    /// chaining scheme can serialize it: its chained latency legitimately
+    /// equals its throughput.
     Latency,
-    /// One call per [`SCANLINE_GROUPS`]-group row: the kernel's own emitted
-    /// loop supplies the independent evaluations, and call/ret is amortized
-    /// over all of them.
+    /// One call fills a whole [`SCANLINE_GROUPS`]-group row
+    /// ([`shape_for`]'s `[SCANLINE_GROUPS * LANES, 1]`): the kernel's own
+    /// emitted loop nest supplies the independent evaluations, and call/ret
+    /// is amortized over all of them.
     ///
-    /// A **row**, not a 2D block. `TileSlice`'s `rows`/`row_skip_bytes` exist
-    /// so a caller can land scanlines inside a strided destination —
-    /// `Lattice::collapse_into` passes `full_groups` per row and the scalar
-    /// tail as the skip — and this mode passes `rows = 1`, so what it measures
-    /// is a single contiguous run: X advancing lane-sequentially into one
-    /// ascending address stream, which is what a CPU rasterizer does and what
-    /// the prefetcher wants. Nothing here is GPU-style tiling, and the extra
-    /// row does not belong in an arithmetic comparison anyway: a row advance
-    /// costs the same in every kernel being compared and only dilutes the
-    /// ratio.
+    /// A **row**, not a 2D block — the shape's height is 1, so what it
+    /// measures is a single contiguous run: X advancing lane-sequentially
+    /// into one ascending address stream, which is what a CPU rasterizer
+    /// does and what the prefetcher wants. Nothing here is GPU-style tiling,
+    /// and an extra row does not belong in an arithmetic comparison anyway: a
+    /// row advance costs the same in every kernel being compared and only
+    /// dilutes the ratio.
     ///
     /// The other two modes bracket reality from opposite sides — `Latency`
     /// serializes evaluations that production never serializes, `Throughput`
     /// overlaps them across a call boundary production does not pay. This one
     /// is neither bracket but the thing itself: the loop `compile` emits, run
-    /// the way `Lattice`'s collapse runs it. Use it whenever the question is
+    /// the way `Lattice::collapse` runs it. Use it whenever the question is
     /// "which kernel should ship", and the other two when the question is
     /// "why".
     Scanline,
+}
+
+/// The [`LatticeShape`] a mode's compiled kernel is baked at.
+///
+/// [`BenchMode::Throughput`] and [`BenchMode::Latency`] share one shape (one
+/// [`LANES`]-wide batch), so [`BenchSession::benchmark_arena_both`] compiles
+/// once and measures both; [`BenchMode::Scanline`] compiles separately at the
+/// wider row shape.
+#[must_use]
+fn shape_for(mode: BenchMode) -> LatticeShape {
+    match mode {
+        BenchMode::Throughput | BenchMode::Latency => LatticeShape::new([LANES as u32, 1]),
+        BenchMode::Scanline => LatticeShape::new([(SCANLINE_GROUPS * LANES) as u32, 1]),
+    }
 }
 
 /// Result of benchmarking: timing, dispersion, and outputs for correctness checks.
@@ -808,159 +835,144 @@ struct RawMeasurement {
 
 const LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / 4;
 
-/// One [`BenchMode::Latency`] chain step (audit H3): feed the previous
-/// iteration's output into EVERY input lane — x, y, z, AND w, not just x —
-/// and return the freshly computed lanes. Factored out of the timed loop so
-/// the exact production step (not a re-implementation of it) is directly
-/// observable from a test: `latency_mode_feeds_every_lane_for_x_independent_expressions`
-/// calls this same function on an expression that never reads `Var(0)` and
-/// checks a structural, clock-free property instead of a timing.
+/// Run `exec_code` once, filling `out` (one row, whose width is `out.len()`)
+/// starting from `origin`: `x = origin[0] + col`, `y = origin[1] + row` for
+/// `row` fixed at 0 — the whole-plane [`ExecutableCode::call`] ABI, one call.
 ///
-/// Feeding all four lanes rather than only x is what keeps the chain intact
-/// for expressions that never read x — see [`BenchMode::Latency`]'s doc for
-/// why a single fed lane silently breaks the chain for such expressions.
+/// # Safety
+///
+/// `exec_code` must have been compiled at a `[out.len() as u32, 1]` shape
+/// declaring no buffer and no uniform beyond the lattice's own origin — every
+/// kernel this module benchmarks (`identity_arena`, `sentinel_arena`, and
+/// whatever arena a caller hands [`benchmark_jit_arena`]/[`BenchSession`]) is
+/// built from `Var(0)`/`Var(1)` and constants alone, so the uniform-block
+/// slot is never dereferenced and its value here is unobserved.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn call_at(exec_code: &ExecutableCode, origin: &[f32; 2], out: &mut [f32]) {
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
+    let pitch = out.len();
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        exec_code.call(ctx.as_ptr(), out.as_mut_ptr(), pitch);
+    }
+}
+
+/// One [`BenchMode::Latency`] chain step (audit H3): feed the previous call's
+/// first output (column 0, `x = origin[0]` exactly) into BOTH of the next
+/// call's origin coordinates — `x0` AND `y0`, not just `x0` — and update
+/// `prev` to the freshly computed value. Factored out of the timed loop so
+/// the exact production step (not a re-implementation of it) is directly
+/// observable from a test:
+/// `latency_mode_feeds_both_coordinates_for_x_independent_expressions` calls
+/// this same function on an expression that never reads `Var(0)` and checks a
+/// structural, clock-free property instead of a timing.
+///
+/// Feeding both coordinates rather than only `x0` is what keeps the chain
+/// intact for expressions that never read `Var(0)` — see
+/// [`BenchMode::Latency`]'s doc for why a single fed coordinate silently
+/// breaks the chain for such expressions. Every lane of `scratch` is still
+/// computed each step — the full batch's worth of work, matching what a real
+/// call pays — only `scratch[0]` is read back.
 ///
 /// `#[inline(always)]` and `&mut` are load-bearing, not style: this runs
 /// inside the timed loop, so the extracted function must compile to what the
-/// inlined body compiled to. Taking and returning `[f32; LANES]` by value
-/// would copy 64 bytes each way per iteration (AVX-512), and an un-inlined
-/// call would add call overhead — either one perturbs the 2-8ns measurement
-/// this loop exists to make. Mutating in place is what the loop did before
-/// the step had a name.
+/// inlined body compiled to, and an un-inlined call would add call overhead
+/// that perturbs the 2-8ns measurement this loop exists to make.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline(always)]
-fn latency_chain_step(exec_code: &ExecutableCode, prev: &mut [f32; LANES]) {
-    use pixelflow_codegen::emit::executable::{Point4, TileSlice};
-
-    // Every coordinate the language has, so an expression that never reads
-    // X still has a data path from the chain. The last two lanes are the
-    // retired axes: nothing can name them, so feeding them would say a
-    // dependency exists where none can.
-    let p = Point4::new(*prev, *prev, [0.0f32; LANES], [0.0f32; LANES]);
-    std::hint::black_box(&p);
+fn latency_chain_step(exec_code: &ExecutableCode, prev: &mut [f32; 2], scratch: &mut [f32]) {
+    std::hint::black_box(&*prev);
+    // SAFETY: forwarded from `measure_exec_code`'s own call to `call_at`.
     unsafe {
-        exec_code.call_collapse(core::ptr::null(), TileSlice::single(prev.as_mut_ptr()), p);
+        call_at(exec_code, prev, scratch);
     }
+    let next = scratch[0];
+    *prev = [next, next];
 }
 
 /// Core timed loop: warmup, output capture over the full input buffer,
 /// tick-floor autoscaling of `repeat_batches` (audit H5), and TIMED_RUNS
 /// samples reduced to median + IQR (audit M5).
+///
+/// `exec_code` must have been compiled at `shape_for(mode)` — see
+/// [`call_at`]'s safety contract, which this function relies on throughout.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn measure_exec_code(
     exec_code: &ExecutableCode,
     start_batches: usize,
     mode: BenchMode,
 ) -> Result<RawMeasurement, BenchError> {
-    use pixelflow_codegen::emit::executable::{Point4, TileSlice};
-
     const INPUT_VECTORS: usize = INPUT_TUPLES / LANES;
-    let mut input_points = [Point4::new(
-        [0.0f32; LANES],
-        [0.0f32; LANES],
-        [0.0f32; LANES],
-        [0.0f32; LANES],
-    ); INPUT_VECTORS];
     let tuples = input_tuples();
-    for (v_idx, pt) in input_points.iter_mut().enumerate() {
-        let mut xs = [0.0f32; LANES];
-        let mut ys = [0.0f32; LANES];
-        for lane in 0..LANES {
-            let t = &tuples[v_idx * LANES + lane];
-            xs[lane] = t[0];
-            ys[lane] = t[1];
-        }
-        // Zero in the two retired lanes, and `emit::compile` refuses an
-        // arena that names them — so this is the whole coordinate input,
-        // not a convention a fixture can quietly disagree with. It did:
-        // the frozen corpus fixtures name `Var(2)`/`Var(3)`, and while the
-        // scalar oracle substituted real values here the JIT read these
-        // zeros, which is a silent scalar/JIT divergence rather than a
-        // failure. See `training::factored`'s `bind_retired_axes`.
-        *pt = Point4::new(xs, ys, [0.0f32; LANES], [0.0f32; LANES]);
+
+    // `INPUT_VECTORS` distinct starting points (audit H3): one call's columns
+    // are no longer independently settable per lane — a coordinate is a
+    // lattice position now, `x = x0 + col`, not a free variable (CLAUDE.md
+    // "collapse is a fold") — so diversity comes from cycling the ORIGIN a
+    // call starts at, one per group of `LANES` consecutive tuples, rather
+    // than from setting every lane independently within one call.
+    let mut origins = [[0.0f32; 2]; INPUT_VECTORS];
+    for (v, origin) in origins.iter_mut().enumerate() {
+        *origin = tuples[v * LANES];
     }
 
-    let mut out_buf = [0.0f32; LANES];
+    // The width `exec_code` was compiled for (`shape_for(mode)`'s extent):
+    // one batch for Throughput/Latency, the whole scanline for Scanline.
+    let width = match mode {
+        BenchMode::Throughput | BenchMode::Latency => LANES,
+        BenchMode::Scanline => SCANLINE_GROUPS * LANES,
+    };
+    let mut out_buf = vec![0.0f32; width];
+
     for _ in 0..WARMUP_PASSES {
-        for &p in &input_points {
+        for &origin in &origins {
             unsafe {
-                exec_code.call_collapse(
-                    core::ptr::null(),
-                    TileSlice::single(out_buf.as_mut_ptr()),
-                    p,
-                );
+                call_at(exec_code, &origin, &mut out_buf);
             }
         }
     }
 
-    // Independent (non-chained) evals over the whole buffer, so the
-    // recorded outputs are mode-independent pure function values.
+    // Independent (non-chained) evals at every one of the 64 input tuples
+    // exactly — not just the `INPUT_VECTORS` starting points — so the
+    // recorded outputs are mode-independent pure function values at every
+    // point audit H1 wants covered. Column 0 of a call starting at tuple `t`
+    // is `x = t[0] + 0 = t[0]` exactly, so this reads the kernel's value AT
+    // that tuple regardless of `width`.
     let mut outputs = Vec::with_capacity(INPUT_TUPLES);
-    for &p in &input_points {
-        let mut out = [0.0f32; LANES];
+    for &t in tuples.iter() {
         unsafe {
-            exec_code.call_collapse(core::ptr::null(), TileSlice::single(out.as_mut_ptr()), p);
+            call_at(exec_code, &t, &mut out_buf);
         }
-        for &val in &out {
-            outputs.push([val; 4]);
-        }
+        outputs.push([out_buf[0]; 4]);
     }
     let output = outputs[0];
-
-    // One row-sized destination, allocated outside the timed loop.
-    // `BenchMode::Scanline` is the only mode that writes past the first group,
-    // but the allocation is 4KiB and once per measurement, so it is not worth
-    // a branch to skip.
-    let mut row_buf = vec![0.0f32; SCANLINE_GROUPS * LANES];
 
     let mut repeat_batches = start_batches.max(1);
     loop {
         let mut totals = [0u64; TIMED_RUNS];
         for t in &mut totals {
             match mode {
-                BenchMode::Throughput => {
+                BenchMode::Throughput | BenchMode::Scanline => {
                     let start = nanos_now();
                     for _ in 0..repeat_batches {
-                        for &p in &input_points {
+                        for &origin in &origins {
                             unsafe {
-                                exec_code.call_collapse(
-                                    core::ptr::null(),
-                                    TileSlice::single(out_buf.as_mut_ptr()),
-                                    p,
-                                );
-                            }
-                        }
-                    }
-                    *t = nanos_now() - start;
-                }
-                BenchMode::Scanline => {
-                    let start = nanos_now();
-                    for _ in 0..repeat_batches {
-                        for &p in &input_points {
-                            unsafe {
-                                exec_code.call_collapse(
-                                    core::ptr::null(),
-                                    TileSlice::contiguous(row_buf.as_mut_ptr(), SCANLINE_GROUPS, 1),
-                                    p,
-                                );
+                                call_at(exec_code, &origin, &mut out_buf);
                             }
                         }
                     }
                     *t = nanos_now() - start;
                 }
                 BenchMode::Latency => {
-                    let mut prev = [0.0f32; LANES];
                     unsafe {
-                        exec_code.call_collapse(
-                            core::ptr::null(),
-                            TileSlice::single(prev.as_mut_ptr()),
-                            input_points[0],
-                        );
+                        call_at(exec_code, &origins[0], &mut out_buf);
                     }
+                    let mut prev = [out_buf[0], out_buf[0]];
                     let start = nanos_now();
                     for _ in 0..repeat_batches {
                         for _ in 0..INPUT_VECTORS {
-                            latency_chain_step(exec_code, &mut prev);
+                            latency_chain_step(exec_code, &mut prev, &mut out_buf);
                         }
                     }
                     std::hint::black_box(prev);
@@ -986,8 +998,11 @@ fn measure_exec_code(
             continue;
         }
 
-        // Every mode performs `INPUT_VECTORS` calls per batch; `Scanline` is
-        // the one where a call is more than one vector of work.
+        // Every mode performs `INPUT_VECTORS` calls per batch, each `width`
+        // evals wide; `INPUT_VECTORS * LANES == INPUT_TUPLES` by
+        // construction (`LANES` divides `INPUT_TUPLES`), so this is the same
+        // arithmetic as before the collapse-ABI port, just derived from
+        // `width` instead of restated per mode.
         let evals_per_batch = match mode {
             BenchMode::Throughput | BenchMode::Latency => INPUT_TUPLES,
             BenchMode::Scanline => INPUT_TUPLES * SCANLINE_GROUPS,
@@ -1066,7 +1081,8 @@ pub fn benchmark_jit_arena_repeated(
     root: ExprId,
     repeat_batches: usize,
 ) -> Result<BenchResult, BenchError> {
-    let result = compile(arena, root).map_err(BenchError::CompileFailed)?;
+    let result =
+        compile(arena, root, shape_for(BenchMode::Throughput)).map_err(BenchError::CompileFailed)?;
     let raw = measure_exec_code(&result.code, repeat_batches, BenchMode::Throughput)?;
     Ok(finalize(raw, op_count(arena, root), 0.0, None))
 }
@@ -1111,11 +1127,11 @@ fn sentinel_arena() -> (ExprArena, ExprId) {
     (arena, acc)
 }
 
-/// The identity kernel (`|x, _, _, _| x`): its measured per-eval time is pure
-/// call overhead — fn-pointer call/ret plus register setup (audit M1). Under
+/// The identity kernel (`|x, y| x`): its measured per-eval time is pure call
+/// overhead — fn-pointer call/ret plus register setup (audit M1). Under
 /// [`BenchMode::Latency`] its chained measurement serializes the same
-/// all-lanes-fed call/ret + register-move path every candidate's chained
-/// measurement pays, so the per-mode subtraction stays coherent.
+/// both-coordinates-fed call/ret + register-move path every candidate's
+/// chained measurement pays, so the per-mode subtraction stays coherent.
 fn identity_arena() -> (ExprArena, ExprId) {
     let mut arena = ExprArena::new();
     let root = arena.push_var(0);
@@ -1159,9 +1175,10 @@ impl BenchSession {
         pin_qos();
 
         let (sentinel_arena, sentinel_root) = sentinel_arena();
-        let sentinel_code = compile(&sentinel_arena, sentinel_root)
-            .unwrap_or_else(|e| panic!("BenchSession: sentinel kernel failed to compile: {e}"))
-            .code;
+        let sentinel_code =
+            compile(&sentinel_arena, sentinel_root, shape_for(BenchMode::Throughput))
+                .unwrap_or_else(|e| panic!("BenchSession: sentinel kernel failed to compile: {e}"))
+                .code;
 
         // Burn-in (audit L5): run real work for BURN_IN_NS so DVFS reaches
         // steady state before anything is calibrated.
@@ -1173,27 +1190,38 @@ impl BenchSession {
         }
 
         // Identity-kernel call overhead per mode (audit M1). Throughput and
-        // latency overheads differ (overlapped vs serialized call/ret), so
-        // each mode subtracts its own.
+        // Latency share one compiled shape ([`shape_for`]), so one compile
+        // serves both; Scanline's wider row is a separate compile. Throughput
+        // and latency overheads differ (overlapped vs serialized call/ret),
+        // so each mode subtracts its own.
         let (identity_arena, identity_root) = identity_arena();
-        let identity_code = compile(&identity_arena, identity_root)
-            .unwrap_or_else(|e| panic!("BenchSession: identity kernel failed to compile: {e}"))
-            .code;
-        let overhead_throughput_ns = measure_exec_code(&identity_code, 1, BenchMode::Throughput)
-            .unwrap_or_else(|e| {
-                panic!("BenchSession: identity overhead (throughput) measurement failed: {e}")
-            })
-            .ns;
-        let overhead_latency_ns = measure_exec_code(&identity_code, 1, BenchMode::Latency)
+        let identity_batch_code =
+            compile(&identity_arena, identity_root, shape_for(BenchMode::Throughput))
+                .unwrap_or_else(|e| panic!("BenchSession: identity kernel failed to compile: {e}"))
+                .code;
+        let overhead_throughput_ns =
+            measure_exec_code(&identity_batch_code, 1, BenchMode::Throughput)
+                .unwrap_or_else(|e| {
+                    panic!("BenchSession: identity overhead (throughput) measurement failed: {e}")
+                })
+                .ns;
+        let overhead_latency_ns = measure_exec_code(&identity_batch_code, 1, BenchMode::Latency)
             .unwrap_or_else(|e| {
                 panic!("BenchSession: identity overhead (latency) measurement failed: {e}")
             })
             .ns;
-        let overhead_scanline_ns = measure_exec_code(&identity_code, 1, BenchMode::Scanline)
-            .unwrap_or_else(|e| {
-                panic!("BenchSession: identity overhead (scanline) measurement failed: {e}")
-            })
-            .ns;
+        let identity_scanline_code =
+            compile(&identity_arena, identity_root, shape_for(BenchMode::Scanline))
+                .unwrap_or_else(|e| {
+                    panic!("BenchSession: identity kernel failed to compile (scanline shape): {e}")
+                })
+                .code;
+        let overhead_scanline_ns =
+            measure_exec_code(&identity_scanline_code, 1, BenchMode::Scanline)
+                .unwrap_or_else(|e| {
+                    panic!("BenchSession: identity overhead (scanline) measurement failed: {e}")
+                })
+                .ns;
 
         // Opening sentinel calibration (audit H4).
         let calibration_ns = measure_exec_code(&sentinel_code, 1, BenchMode::Throughput)

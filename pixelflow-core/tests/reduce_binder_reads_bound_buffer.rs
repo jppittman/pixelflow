@@ -213,7 +213,19 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
         let kernel = Kernel::sum_over(extent, |i| table.at(&Kernel::constant(0.0), i));
         let (arena, root) = kernel.parts();
         let before = arena.nodes_raw().len();
-        let (legalized, new_root) = pixelflow_ir::passes::legalize(arena, root).expect("legalize");
+        // Legalized for a lattice, as a compile does: the lattice's own folds
+        // are wrapped around the kernel here, and every one of them is a
+        // `Monoid::SEQ` fold, which is how the count below tells them apart
+        // from the kernel's.
+        let collapse = pixelflow_ir::passes::lattice::Collapse {
+            domain: pixelflow_ir::passes::lattice::Domain {
+                shape: pixelflow_ir::LatticeShape::new([1, 1]),
+                origin: pixelflow_codegen::emit::origin(),
+            },
+            lanes: 4,
+        };
+        let (legalized, new_root) =
+            pixelflow_ir::passes::legalize(arena, root, &collapse).expect("legalize");
         let after = legalized.nodes_raw().len();
         // From the root, not over `nodes_raw`: each rewrite appends and leaves
         // what it replaced behind, so the raw array still holds the pre-pass
@@ -225,10 +237,9 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
             if std::mem::replace(&mut seen[id.0 as usize], true) {
                 continue;
             }
-            if matches!(
-                legalized.node(id),
-                pixelflow_ir::arena::ExprNode::Reduce { .. }
-            ) {
+            if let pixelflow_ir::arena::ExprNode::Reduce { fold, .. } = legalized.node(id)
+                && fold.monoid() != pixelflow_ir::fold::Monoid::SEQ
+            {
                 reduces += 1;
             }
             stack.extend(legalized.children(id));

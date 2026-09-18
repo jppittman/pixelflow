@@ -24,7 +24,7 @@
 
 use super::x86_64;
 use super::x86_64::{Disp, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
-use super::{AsmProgram, EncodedInst, KReg, PtrReg, Reg, assemble, unimplemented_op};
+use super::{AsmProgram, EncodedInst, Gpr, KReg, PtrReg, Reg, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -54,10 +54,11 @@ enum Pp {
     F3 = 2,
 }
 
-/// The identity of one EVEX-512 instruction: opcode map, mandatory prefix, W
-/// bit, opcode byte. This quadruple is *which instruction* — it is constant
-/// per mnemonic, so each mnemonic below states it exactly once and the
-/// operand form (`rrr`/`rm`) supplies the per-call parts.
+/// The identity of one EVEX instruction: opcode map, mandatory prefix, W
+/// bit, opcode byte, vector length, and the writemask. This is *which
+/// instruction* — it is constant per mnemonic, so each mnemonic below states
+/// it exactly once and the operand form (`rrr`/`rm`) supplies the per-call
+/// parts.
 ///
 /// The 128- and 256-bit twins are `x86_64::Vex` and `avx2::Vex`.
 #[derive(Clone, Copy)]
@@ -65,8 +66,18 @@ struct Evex {
     map: Map,
     pp: Pp,
     w: bool,
+    /// `EVEX.L'L`: `10` for the `zmm` form, `00` for the few `xmm`-only
+    /// instructions this tier needs (`vmovq`, `vpinsrq`).
+    ll: u8,
+    /// `EVEX.aaa`: the writemask register, or 0 for none. Merge-masking
+    /// (`z = 0`), which for a store means the masked-off lanes are left in
+    /// memory untouched.
+    aaa: u8,
     opcode: u8,
 }
+
+/// `EVEX.L'L` for a 512-bit operation.
+const LL_512: u8 = 0b10;
 
 impl Evex {
     const fn new(map: Map, pp: Pp, opcode: u8) -> Self {
@@ -74,8 +85,22 @@ impl Evex {
             map,
             pp,
             w: false,
+            ll: LL_512,
+            aaa: 0,
             opcode,
         }
+    }
+    /// The 128-bit (`L'L = 00`) form of this instruction.
+    const fn xmm(self) -> Self {
+        Self { ll: 0, ..self }
+    }
+    /// The 64-bit-operand (`EVEX.W = 1`) form of this instruction.
+    const fn w1(self) -> Self {
+        Self { w: true, ..self }
+    }
+    /// This instruction under writemask `k`.
+    const fn masked(self, k: KReg) -> Self {
+        Self { aaa: k.0, ..self }
     }
     /// Map `0F`, no prefix — the packed-single family.
     const fn m0f(opcode: u8) -> Self {
@@ -166,8 +191,8 @@ impl Evex {
         inst.push(0x62);
         inst.push(reg_ext | (self.map as u8));
         inst.push(((self.w as u8) << 7) | (vvvv << 3) | (1 << 2) | (self.pp as u8));
-        // z=0, L'L=10 (512-bit), b(roadcast)=0, V', aaa=0 (no mask).
-        inst.push((0b10 << 5) | (vp << 3));
+        // z=0 (merge), L'L, b(roadcast)=0, V', aaa.
+        inst.push((self.ll << 5) | (vp << 3) | self.aaa);
         inst.push(self.opcode);
     }
 }
@@ -236,10 +261,10 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
         // The gather's truncated-index lanes and its destination.
         ScheduledOp::Gather(..) => 2,
-        // A surviving fold's own loop scaffold: two transient registers for
-        // the trip test and the accumulate — see `emit_dag_body_hoisted`'s
-        // `Reduce` arm. The binder and the accumulator are the fold's roots,
-        // placed by the allocator, not scratch.
+        // A surviving fold's own loop: two transient registers for the trip
+        // test and the accumulate — see `emit_scope`'s `Reduce` arm. The
+        // binder and the accumulator are the fold's roots, placed by the
+        // allocator, not scratch.
         ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
         _ => 0,
     }
@@ -250,11 +275,15 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 ///
 /// `Gather`/`Uniform` each need one GPR to hold the buffer/block base pointer
 /// loaded from the context — `rax`, chosen by hand before this work and now a
-/// `RegisterFile::gpr_scratch` reservation.
+/// `RegisterFile::gpr_scratch` reservation. A `Write` converts its row and
+/// column into one each before combining them into the address, and the
+/// remainder's writemask rides in through the second once the address is
+/// done with it; the iota carries each eight bytes in through one.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
-        ScheduledOp::Gather(..) | ScheduledOp::Uniform(..) => 1,
+        ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Gather(..) | ScheduledOp::Uniform(..) | ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
 }
@@ -262,15 +291,83 @@ pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 /// How many mask registers this backend's encoding of `op` needs.
 ///
 /// A comparison's `vcmpps` destination — `k1`, chosen by hand before this
-/// work and now a `RegisterFile::mask_scratch` reservation. Every other op
-/// either has no mask (arithmetic) or reads the mask as an ordinary vector
-/// (`Select`).
+/// work and now a `RegisterFile::mask_scratch` reservation — and a remainder
+/// store's writemask. Every other op either has no mask (arithmetic) or
+/// reads the mask as an ordinary vector (`Select`).
 pub(crate) fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
+    use super::ScheduledOp;
     match op {
-        super::ScheduledOp::Binary(op_kind, ..) if is_compare(*op_kind) => 1,
+        ScheduledOp::Binary(op_kind, ..) if is_compare(*op_kind) => 1,
+        ScheduledOp::Write { lanes, .. } if *lanes < 16 => 1,
         _ => 0,
     }
 }
+
+// =============================================================================
+// The store, and the iota
+// =============================================================================
+
+/// `vcvttss2si r64, xmm` — `EVEX.LIG.F3.0F.W1 2C /r`: lane 0, truncated to
+/// a 64-bit integer. EVEX rather than VEX so the source may be `zmm16..31`.
+#[must_use]
+fn vcvttss2si_xmm(dst: Gpr, src: Reg) -> EncodedInst {
+    Evex::m0f_f3(0x2C).w1().rrr(dst.0, UNUSED_VVVV, src.0)
+}
+
+/// `vcvttss2si r64, m32` — the same, reading the first word of a slot.
+#[must_use]
+fn vcvttss2si_mem<D: Disp>(dst: Gpr, addr: Mem<D>) -> EncodedInst {
+    Evex::m0f_f3(0x2C).w1().rm(dst.0, addr)
+}
+
+/// `vmovq xmm, r64` — `EVEX.128.66.0F.W1 6E /r`: eight bytes into the low
+/// lanes, the rest zeroed.
+#[must_use]
+fn vmovq_xmm_r64(dst: Reg, src: Gpr) -> EncodedInst {
+    Evex::m0f_66(0x6E).w1().xmm().rrr(dst.0, UNUSED_VVVV, src.0)
+}
+
+/// `vpinsrq xmm, xmm, r64, 1` — `EVEX.128.66.0F3A.W1 22 /r ib`: eight bytes
+/// into the high half of the low 128 bits.
+#[must_use]
+fn vpinsrq_hi(dst: Reg, src: Gpr) -> EncodedInst {
+    Evex::m0f3a_66(0x22)
+        .w1()
+        .xmm()
+        .imm(1)
+        .rrr(dst.0, dst.0, src.0)
+}
+
+/// `vpmovzxbd zmm, xmm` — `EVEX.512.66.0F38.WIG 31 /r`: sixteen bytes
+/// widened to sixteen dword lanes.
+#[must_use]
+fn vpmovzxbd(dst: Reg, src: Reg) -> EncodedInst {
+    Evex::m0f38_66(0x31).rrr(dst.0, UNUSED_VVVV, src.0)
+}
+
+/// `kmovw k, r32` — `VEX.L0.0F.W0 92 /r`.
+#[must_use]
+fn kmovw_from_gpr(k: KReg, src: Gpr) -> EncodedInst {
+    let bbit = if src.0 >= 8 { 0x00 } else { 0x20 };
+    let mut inst = EncodedInst::new();
+    inst.push(0xC4);
+    inst.push(0x80 | 0x40 | bbit | 0x01); // R̄ X̄ B̄ map=0F
+    inst.push(0x78); // W=0, vvvv=1111, L=0, pp=00
+    inst.push(0x92);
+    inst.push(0xC0 | ((k.0 & 7) << 3) | (src.0 & 7));
+    inst
+}
+
+/// `vmovups [addr]{k}, zmm` — the full-width store under a writemask, which
+/// leaves the masked-off lanes of memory untouched.
+#[must_use]
+fn vmovups_store_masked<D: Disp>(addr: Mem<D>, src: Reg, k: KReg) -> EncodedInst {
+    Evex::m0f(0x11).masked(k).rm(src.0, addr)
+}
+
+/// The bytes `0..8` and `8..16`, little end first: what two `movabs` carry
+/// in for `vpmovzxbd` to widen into the iota.
+const IOTA_BYTES: [u64; 2] = [0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908];
 
 // --- unary (one source; no second source -> UNUSED_VVVV) ---
 /// vsqrtps zmmD, zmmS — EVEX.512.0F.W0 51 /r ; vvvv unused.
@@ -1080,9 +1177,12 @@ mod tests {
 )]
 pub(crate) mod driver {
     use super::super::*;
-    use super::{AsmProgram, Evex, Mem, NoDisp, UNUSED_VVVV, frame_slot};
+    use super::{
+        AsmProgram, Evex, IOTA_BYTES, Mem, NoDisp, UNUSED_VVVV, frame_slot, kmovw_from_gpr,
+        vcvttss2si_mem, vcvttss2si_xmm, vmovq_xmm_r64, vmovups_store_masked, vpinsrq_hi, vpmovzxbd,
+    };
     use crate::emit::x86_64 as x86;
-    use crate::emit::x86_64::driver::SSE2_FILE;
+    use crate::emit::x86_64::driver::{Convert, SSE2_FILE, write_address};
     use crate::error::CompileError;
     use alloc::vec::Vec;
     use pixelflow_ir::kind::OpKind;
@@ -1090,31 +1190,29 @@ pub(crate) mod driver {
     /// The AVX-512 register file (zmm, 512-bit).
     ///
     /// Identical register *roles* to SSE2 — the shared driver depends on that —
-    /// at four times the width, so only `vector_bytes` differs.
+    /// at four times the width, over the whole extended file.
     const AVX512_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
-        // zmm4-31: twenty-eight of thirty-two, which is every register the ABI
-        // does not use for an argument. The pool was *six* when this work
+        // zmm0-31, all thirty-two. The pool was *six* when this work
         // started, because a contiguous range could not reach past the reload
         // pair and the gather's scratch — sixteen registers were untouched by
         // anything at all.
-        scratch: regalloc::RegSet::range(4, 28),
-        // Nothing. Every register this backend's encodings destroy is now a
-        // per-instruction reservation: zmm15 for a sign-flip's mask, zmm14 and
-        // zmm16 for the gather's destination and truncated indices. All three
-        // are in the pool above, borrowed only across the one instruction that
-        // needs them. The select needs none — `vpternlogd` consumes its three
-        // operands.
+        scratch: regalloc::RegSet::range(0, 32),
+        // Nothing. Every register this backend's encodings destroy is a
+        // per-instruction reservation, borrowed only across the one
+        // instruction that needs it. The select needs none — `vpternlogd`
+        // consumes its three operands.
         fixed: &[],
         temps_for: super::temps_for,
         vector_bytes: 64,
         // The gather/uniform base pointer is one GPR (`vgatherdps`'s native
         // addressing needs no per-lane index GPR, unlike the scalar-load
-        // tiers), not SSE2's two.
-        gpr_scratch: regalloc::GprSet::of(&[x86::gpr::RAX]),
+        // tiers); the store's row and column are two.
+        gpr_scratch: regalloc::GprSet::of(&[x86::gpr::RAX, x86::gpr::RCX]),
         gpr_temps_for: super::gpr_temps_for,
         // AVX-512's mask-register file: k1, transient scratch for a
-        // compare's `vcmpps` destination and a guard's `vptestmd`
-        // destination, never the same instruction's use of both at once.
+        // compare's `vcmpps` destination, a guard's `vptestmd` destination
+        // and a remainder store's writemask, never the same instruction's
+        // use of two at once.
         mask_scratch: regalloc::MaskSet::of(&[KReg(1)]),
         mask_temps_for: super::mask_temps_for,
         // `vptestmd`'s k-register destination, reduced to flags by
@@ -1181,6 +1279,21 @@ pub(crate) mod driver {
                 ResolvedOp::Nop => {}
                 ResolvedOp::LoadConst { dst, val_bits } => {
                     super::emit_const(code, *dst, f32::from_bits(*val_bits));
+                }
+                // The iota: the bytes `0..16` in through a GPR eight at a
+                // time, widened to dwords, converted. No vector temp — `dst`
+                // is every stage's.
+                ResolvedOp::Lanes { dst } => {
+                    let gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0));
+                    x86::movabs(code, gpr, IOTA_BYTES[0]);
+                    AsmProgram::from([vmovq_xmm_r64(*dst, gpr)]).assemble(code);
+                    x86::movabs(code, gpr, IOTA_BYTES[1]);
+                    AsmProgram::from([
+                        vpinsrq_hi(*dst, gpr),
+                        vpmovzxbd(*dst, *dst),
+                        Evex::m0f(0x5B).rrr(dst.0, UNUSED_VVVV, dst.0),
+                    ])
+                    .assemble(code);
                 }
                 ResolvedOp::Unary { op, dst, src } => {
                     super::emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
@@ -1348,11 +1461,6 @@ pub(crate) mod driver {
             });
         }
 
-        // Same scaffold register roles as SSE2 — see `x86_64::scaffold` — at
-        // this vector width. Unlike SSE2 there is no red-zone mode: the body
-        // always spills into an allocated frame, and the scaffold's coordinate
-        // slots sit above it.
-
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
             AsmProgram::from([x86::Inst::SubImm32 {
                 dst: x86::gpr::RSP,
@@ -1375,37 +1483,6 @@ pub(crate) mod driver {
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
             AsmProgram::from([Evex::m0f(0x10).rm(dst.0, frame_slot(offset))]).assemble(code);
-        }
-
-        fn latch_bounds(&mut self, code: &mut Vec<u8>) {
-            x86::scaffold::latch_bounds(code);
-        }
-
-        fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            x86::scaffold::counter_clear(code, counter);
-        }
-
-        fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            x86::scaffold::counter_step(code, counter);
-        }
-
-        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
-            x86::scaffold::branch_if_counter_done(asm, counter, label);
-        }
-
-        fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            AsmProgram::from([Evex::m0f(0x11).rm(
-                src.0,
-                Mem {
-                    base: x86::scaffold::OUT_PTR,
-                    disp: NoDisp,
-                },
-            )])
-            .assemble(code);
-        }
-
-        fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
-            x86::scaffold::advance_out(code, step, self.file.vector_bytes);
         }
 
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
@@ -1436,6 +1513,42 @@ pub(crate) mod driver {
             super::emit_compare(code, OpKind::Ge, dst, srcs, k);
         }
 
+        /// A full batch is one `vmovups`; a remainder is the same store
+        /// under a writemask of its lanes, built in the GPR the address
+        /// arithmetic has finished with.
+        fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
+            let addr = write_address(
+                code,
+                &self.file,
+                write,
+                Convert {
+                    from_xmm: |code, dst, src| {
+                        AsmProgram::from([vcvttss2si_xmm(dst, src)]).assemble(code)
+                    },
+                    from_mem: |code, dst, addr| {
+                        AsmProgram::from([vcvttss2si_mem(dst, addr)]).assemble(code)
+                    },
+                },
+            );
+            let at = Mem {
+                base: PtrReg(addr.0),
+                disp: NoDisp,
+            };
+            let lanes = self.file.vector_bytes / 4;
+            if write.lanes == lanes {
+                AsmProgram::from([Evex::m0f(0x11).rm(write.value.0, at)]).assemble(code);
+                return;
+            }
+            let mask = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(1));
+            let k = crate::emit::declared_mask_temp(write.scratch.mask_temp(0));
+            x86::mov_imm32(code, mask, (1u32 << write.lanes) - 1);
+            AsmProgram::from([
+                kmovw_from_gpr(k, mask),
+                vmovups_store_masked(at, write.value, k),
+            ])
+            .assemble(code);
+        }
+
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
             AsmProgram::from([x86::Inst::Ret]).assemble(code);
         }
@@ -1446,18 +1559,43 @@ pub(crate) mod driver {
         use super::*;
 
         /// `AVX512_FILE`'s field values are restated (not delegated to
-        /// `..SSE2_FILE`) because they genuinely differ — twenty-eight
+        /// `..SSE2_FILE`) because they genuinely differ — thirty-two
         /// registers and this backend's own `temps_for` rather than SSE2's
-        /// twelve and its select-reload-aware one — so nothing catches a
+        /// sixteen and its select-reload-aware one — so nothing catches a
         /// regression back to the SSE2 shape except a direct assertion.
         #[test]
-        fn avx512_file_reserves_zmm4_through_27_with_no_fixed_registers() {
-            assert_eq!(AVX512_FILE.scratch, regalloc::RegSet::range(4, 28));
+        fn avx512_file_reserves_the_whole_zmm_file_with_no_fixed_registers() {
+            assert_eq!(AVX512_FILE.scratch, regalloc::RegSet::range(0, 32));
             assert!(AVX512_FILE.fixed.is_empty());
             assert_eq!(
                 AVX512_FILE.temps_for as *const () as usize,
                 super::super::temps_for as *const () as usize
             );
+        }
+
+        /// The remainder's writemask path, byte for byte against the SDM.
+        #[test]
+        fn a_masked_store_and_its_mask_encode_as_the_manual_says() {
+            let mut c = Vec::new();
+            // kmovw k1, ecx — VEX.L0.0F.W0 92 /r
+            AsmProgram::from([kmovw_from_gpr(KReg(1), x86::gpr::RCX)]).assemble(&mut c);
+            assert_eq!(c, [0xC4, 0xE1, 0x78, 0x92, 0xC9]);
+            // vmovups [rax]{k1}, zmm4 — EVEX.512.0F.W0 11 /r, aaa = 001
+            let mut c = Vec::new();
+            AsmProgram::from([vmovups_store_masked(
+                Mem {
+                    base: PtrReg(0),
+                    disp: NoDisp,
+                },
+                Reg(4),
+                KReg(1),
+            )])
+            .assemble(&mut c);
+            assert_eq!(c, [0x62, 0xF1, 0x7C, 0x49, 0x11, 0x20]);
+            // vmovq xmm20, rax — EVEX.128.66.0F.W1 6E /r, an extended register
+            let mut c = Vec::new();
+            AsmProgram::from([vmovq_xmm_r64(Reg(20), x86::gpr::RAX)]).assemble(&mut c);
+            assert_eq!(c, [0x62, 0xE1, 0xFD, 0x08, 0x6E, 0xE0]);
         }
     }
 }

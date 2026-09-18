@@ -282,16 +282,6 @@ pub(crate) fn demand_of(schedule: &[Def], root: ValueId) -> BTreeMap<ValueId, De
 /// whose index is as demanded as the load.
 fn edges(op: &ScheduledOp, observed: &Demand) -> Vec<(ValueId, Demand)> {
     match op {
-        ScheduledOp::Var(_)
-        | ScheduledOp::Const(_)
-        | ScheduledOp::Uniform(_)
-        | ScheduledOp::Reduce(..) => Vec::new(),
-        ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) | ScheduledOp::Gather(a, _) => {
-            alloc::vec![(*a, observed.clone())]
-        }
-        ScheduledOp::Binary(_, a, b) => {
-            alloc::vec![(*a, observed.clone()), (*b, observed.clone())]
-        }
         ScheduledOp::Ternary(pixelflow_ir::OpKind::Select, mask, if_true, if_false) => {
             alloc::vec![
                 (*mask, observed.clone()),
@@ -299,11 +289,9 @@ fn edges(op: &ScheduledOp, observed: &Demand) -> Vec<(ValueId, Demand)> {
                 (*if_false, observed.and_literal(Literal::clear(*mask))),
             ]
         }
-        ScheduledOp::Ternary(_, a, b, c) => alloc::vec![
-            (*a, observed.clone()),
-            (*b, observed.clone()),
-            (*c, observed.clone()),
-        ],
+        _ => super::regalloc::operands(op)
+            .map(|operand| (operand, observed.clone()))
+            .collect(),
     }
 }
 
