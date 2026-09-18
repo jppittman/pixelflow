@@ -36,7 +36,6 @@ impl F32x4 {
     pub(crate) fn splat(val: f32) -> Self {
         unsafe { Self(_mm_set1_ps(val)) }
     }
-
 }
 
 // ============================================================================
@@ -71,7 +70,6 @@ impl F32x8 {
     pub(crate) fn splat(val: f32) -> Self {
         unsafe { Self(_mm256_set1_ps(val)) }
     }
-
 }
 
 // ============================================================================
@@ -106,5 +104,4 @@ impl F32x16 {
     pub(crate) fn splat(val: f32) -> Self {
         unsafe { Self(_mm512_set1_ps(val)) }
     }
-
 }

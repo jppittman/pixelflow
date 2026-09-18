@@ -2370,10 +2370,7 @@ fn arena_to_schedule(
     // One slot, by construction (`passes::lattice::pack` builds both lane
     // folds on `collapse`'s), asserted rather than assumed.
     let mut lane: Option<Binder> = None;
-    for idx in 0..len {
-        if !reachable[idx] {
-            continue;
-        }
+    for (idx, _) in reachable.iter().enumerate().filter(|(_, r)| **r) {
         if let ExprNode::Write { lane: l, .. } = arena.node(ExprId(idx as u32)) {
             match lane {
                 None => lane = Some(*l),
@@ -3595,14 +3592,14 @@ fn compile_via_backend<B: IsaBackend>(
         spill_bytes: m,
         max_regs: file.scratch.len(),
         hoisted_values: parks.len() as u32,
-        traffic: EmitTraffic::new(
-            scopes,
+        traffic: EmitTraffic {
+            scopes: EmitTraffic::by_index(scopes, trips.len()),
             trips,
             scaffold,
-            file.vector_bytes,
-            file.scratch.len(),
+            vector_bytes: file.vector_bytes,
+            pool: file.scratch.len(),
             carried,
-        ),
+        },
     })
 }
 
@@ -4475,9 +4472,9 @@ mod tests {
             "the schedule must carry the uniform load for the backends to dispatch on"
         );
 
-        let neon_len = emit_dag_body(for_backend(neon.register_file()), &mut neon)
+        let neon_len = compile_via_backend(for_backend(neon.register_file()), &mut neon)
             .expect("NEON emit")
-            .0
+            .code
             .len();
         assert!(
             neon_len > 0 && neon_len.is_multiple_of(4),
@@ -4486,23 +4483,23 @@ mod tests {
         for (name, len) in [
             (
                 "SSE2",
-                emit_dag_body(for_backend(sse2.register_file()), &mut sse2)
+                compile_via_backend(for_backend(sse2.register_file()), &mut sse2)
                     .expect("SSE2")
-                    .0
+                    .code
                     .len(),
             ),
             (
                 "AVX2",
-                emit_dag_body(for_backend(avx2b.register_file()), &mut avx2b)
+                compile_via_backend(for_backend(avx2b.register_file()), &mut avx2b)
                     .expect("AVX2")
-                    .0
+                    .code
                     .len(),
             ),
             (
                 "AVX-512",
-                emit_dag_body(for_backend(avx512b.register_file()), &mut avx512b)
+                compile_via_backend(for_backend(avx512b.register_file()), &mut avx512b)
                     .expect("AVX-512")
-                    .0
+                    .code
                     .len(),
             ),
         ] {
@@ -4522,12 +4519,29 @@ mod tests {
     /// unit test on every host.
     #[test]
     fn aarch64_const_pool_appends_across_scopes() {
-        fn scope_for(k: f32, lanes: u32) -> Vec<regalloc::Def> {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let c = a.push_const(k);
-            let root = a.push_binary(OpKind::Mul, x, c);
-            schedule_for(&a, root, POINT, lanes)
+        /// One scope: a uniform times a constant only the pool can hold.
+        fn scope_for(k: f32) -> Vec<regalloc::Def> {
+            alloc::vec![
+                regalloc::Def {
+                    value: regalloc::ValueId(0),
+                    op: ScheduledOp::Uniform(UniformLoad {
+                        ctx_slot: 0,
+                        offset: 0,
+                    }),
+                },
+                regalloc::Def {
+                    value: regalloc::ValueId(1),
+                    op: ScheduledOp::Const(k),
+                },
+                regalloc::Def {
+                    value: regalloc::ValueId(2),
+                    op: ScheduledOp::Binary(
+                        OpKind::Mul,
+                        regalloc::ValueId(0),
+                        regalloc::ValueId(1),
+                    ),
+                },
+            ]
         }
 
         // Two constants that genuinely need the pool (not FMOV-immediate).
@@ -4536,11 +4550,10 @@ mod tests {
         assert!(aarch64::needs_const_pool(second));
 
         let mut backend = aarch64::driver::Aarch64Backend::new(EmitCtx::default());
-        let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
-        emit_dag_body(scope_for(first, lanes), &mut backend).expect("first scope");
+        emit_dag_body(scope_for(first), &mut backend).expect("first scope");
         let after_first = backend.pool_entries().to_vec();
         assert!(!after_first.is_empty(), "the first scope pooled nothing");
-        emit_dag_body(scope_for(second, lanes), &mut backend).expect("second scope");
+        emit_dag_body(scope_for(second), &mut backend).expect("second scope");
 
         assert!(
             backend.pool_entries().starts_with(&after_first),
@@ -4766,6 +4779,8 @@ mod tests {
         guard_temps: 0,
         vector_bytes: 16,
         gpr_ctx: None,
+        gpr_out: None,
+        gpr_pitch: None,
         gpr_scratch: regalloc::GprSet::EMPTY,
         gpr_temps_for: regalloc::no_temps,
         mask_scratch: regalloc::MaskSet::EMPTY,
@@ -5060,14 +5075,6 @@ mod tests {
     }
 
     // =========================================================================
-    // DAG integration tests — expressions that previously crashed (SIGSEGV)
-    // =========================================================================
-
-    /// Test that Select short-circuits: when mask is all-true, the false arm
-    /// (which contains a division by zero) must NOT produce NaN in the output.
-    /// Test Select with all-false mask: should return false arm.
-    /// Test Select with mixed mask: BSL path, both arms evaluated.
-    // =========================================================================
     // Arena compilation tests
     // =========================================================================
 
@@ -5276,6 +5283,44 @@ mod tests {
             // the mistake it exists to catch.
             let carried = a.push_binary(OpKind::Sub, x, y);
             a.push_binary(OpKind::Add, sel, carried)
+        }
+
+        /// How many terms the filler below has.
+        const FILLER: usize = 8;
+
+        /// Coprime with [`FILLER`], so the pairing has no short cycle.
+        fn pair(i: usize) -> usize {
+            (i * 7 + 3) % FILLER
+        }
+
+        /// Filler that is live all at once whatever the evaluation order.
+        ///
+        /// [`FILLER`] terms off `seed`, multiplied in pairs by a permutation,
+        /// so each is read twice with the others in between: no order keeps
+        /// them all in registers, which is what makes the tests below about a
+        /// *spilled* value rather than about an arithmetic identity. Defining
+        /// them all before consuming any is not enough on its own —
+        /// `passes::lattice::collapse` rebuilds the arena from the root, and
+        /// the order it hands the scheduler is its own.
+        fn filler(a: &mut ExprArena, seed: ExprId) -> ExprId {
+            let terms: alloc::vec::Vec<ExprId> = (0..FILLER)
+                .map(|i| {
+                    let c = a.push_const(i as f32 + 1.0);
+                    a.push_binary(OpKind::Add, seed, c)
+                })
+                .collect();
+            let mut sum = a.push_const(0.0);
+            for i in 0..FILLER {
+                let product = a.push_binary(OpKind::Mul, terms[i], terms[pair(i)]);
+                sum = a.push_binary(OpKind::Add, sum, product);
+            }
+            sum
+        }
+
+        /// [`filler`], in scalar `f32`.
+        fn filler_value(seed: f32) -> f32 {
+            let term = |i: usize| seed + i as f32 + 1.0;
+            (0..FILLER).map(|i| term(i) * term(pair(i))).sum()
         }
 
         /// Assert a guard region actually formed for `root`.
@@ -5503,12 +5548,11 @@ mod tests {
         ///
         /// Getting the mask to be the value that spills takes care, and the
         /// test asserts it rather than assuming: eviction is Belady, so the
-        /// victim is whatever is used farthest out. The mask is computed first
-        /// and read last, and everything between it and the `Select` is
-        /// consumed before the `Select` — so the mask is the farthest-out live
-        /// value when the filler fills the pool, and it is the one to go. A
-        /// plain `spill_count > 0` would pass with the mask still resident and
-        /// this path never taken.
+        /// victim is whatever is used farthest out. The mask is read only at
+        /// the `Select`, and the [`filler`] between fills the pool — so the
+        /// mask is the farthest-out live value there, and it is the one to
+        /// go. A plain `spill_count > 0` would pass with the mask still
+        /// resident and this path never taken.
         #[test]
         fn a_guarded_select_survives_a_spilled_mask() {
             let mut a = ExprArena::new();
@@ -5518,18 +5562,7 @@ mod tests {
 
             // Read only at the very end: the farthest-out live value.
             let cond = a.push_binary(OpKind::Gt, x, zero);
-
-            // Filler that is all live at once and all consumed *before* the
-            // select, so the mask outlives every one of them.
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
-                .map(|i| {
-                    let c = a.push_const(i as f32);
-                    a.push_binary(OpKind::Add, x, c)
-                })
-                .collect();
-            let mid = terms[1..]
-                .iter()
-                .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
+            let mid = filler(&mut a, x);
 
             // Shared-base arms, as in `guarded_select`.
             let base = a.push_binary(OpKind::Mul, mid, y);
@@ -5560,8 +5593,7 @@ mod tests {
                 .expect("spilled guarded select compile");
 
             for &(px, py) in &[(3.0f32, 2.0f32), (-2.0, 0.5), (0.5, -1.0)] {
-                let m: f32 = (1..=8).map(|i| px + i as f32).sum();
-                let b = m * py;
+                let b = filler_value(px) * py;
                 let want = if px > 0.0 { b * b * b } else { 3.0 * b } + PADDING + (px - py);
                 let got = eval_point(&result.code, px, py);
                 assert!(
@@ -5603,24 +5635,16 @@ mod tests {
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
 
-            // Computed first, read last: the farthest-out live values, so
-            // these are what eviction takes when the filler fills the pool.
-            // `split` wears an `Abs` so the schedule can be searched for it
-            // by op: the coordinates are folds' binders now, and `X·Y` is no
-            // longer a product of two `Var`s to look for.
+            // `split` seeds the filler, so it is live across all of it and is
+            // the farthest-out live value where the pool fills; its next read
+            // after that is inside the arm. It wears an `Abs` so the schedule
+            // can be searched for it by op: the coordinates are folds'
+            // binders now, and `X·Y` is no longer a product of two `Var`s to
+            // look for.
             let cond = a.push_binary(OpKind::Gt, x, zero);
             let xy = a.push_binary(OpKind::Mul, x, y);
             let split = a.push_unary(OpKind::Abs, xy);
-
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
-                .map(|i| {
-                    let c = a.push_const(i as f32);
-                    a.push_binary(OpKind::Add, x, c)
-                })
-                .collect();
-            let mid = terms[1..]
-                .iter()
-                .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
+            let mid = filler(&mut a, split);
 
             // Shared-base arms, so neither arm's leaves land outside it and
             // the arms' own nodes stay adjacent (see `guarded_select`).
@@ -5646,7 +5670,7 @@ mod tests {
             let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
                 .register_file();
             let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
-            let scopes = core::iter::once(regalloc::Scope::Body)
+            let mut scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
             let (scope, guard) = scopes
                 .find_map(|s| {
@@ -5703,9 +5727,8 @@ mod tests {
             // inside it — never runs, and the read after it must still be the
             // value.
             for &(px, py) in &[(-2.0f32, 3.0f32), (-0.5, -4.0), (3.0, 2.0), (0.25, 1.5)] {
-                let m: f32 = (1..=8).map(|i| px + i as f32).sum();
-                let b = m * py;
                 let v = (px * py).abs();
+                let b = filler_value(v) * py;
                 let arm_value = if px > 0.0 {
                     (b * v + v) * b
                 } else {
@@ -5839,8 +5862,14 @@ mod tests {
 
     /// A deep spill frame must compile and produce correct results — the
     /// glyph-scale-kernel case that used to refuse with "exceeds 128-byte red
-    /// zone". 40 products are all pushed before any is consumed, so dozens are
-    /// simultaneously live against 6 allocatable registers.
+    /// zone". There is no red zone any more, so what is under test is only
+    /// that a frame dozens of slots deep is emitted and addressed correctly.
+    ///
+    /// Forty terms, **paired by a permutation** so that each is read twice,
+    /// far apart: no evaluation order keeps them all in registers. Pushing
+    /// them all before consuming any is no longer enough on its own, because
+    /// `passes::lattice::collapse` rebuilds the arena from the root and the
+    /// order it hands the scheduler is its own.
     #[test]
     #[cfg(all(
         target_arch = "x86_64",
@@ -5848,19 +5877,27 @@ mod tests {
         not(target_feature = "avx2")
     ))]
     fn a_deep_spill_frame_compiles_correctly() {
+        const TERMS: usize = 40;
+        /// Coprime with `TERMS`, so `i -> PAIR(i)` is a permutation with no
+        /// short cycle: a term's two readers are far apart in every order.
+        fn pair(i: usize) -> usize {
+            (i * 7 + 3) % TERMS
+        }
+
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
-        let mut products = alloc::vec::Vec::new();
-        for i in 0..40u32 {
-            let c = a.push_const(i as f32 + 1.0);
-            let xa = a.push_binary(OpKind::Add, x, c);
-            let yb = a.push_binary(OpKind::Add, y, c);
-            products.push(a.push_binary(OpKind::Mul, xa, yb));
-        }
-        let mut root = products[0];
-        for p in &products[1..] {
-            root = a.push_binary(OpKind::Add, root, *p);
+        let terms: alloc::vec::Vec<ExprId> = (0..TERMS)
+            .map(|i| {
+                let c = a.push_const(i as f32 + 1.0);
+                let xc = a.push_binary(OpKind::Add, x, c);
+                a.push_binary(OpKind::Mul, xc, y)
+            })
+            .collect();
+        let mut root = a.push_const(0.0);
+        for i in 0..TERMS {
+            let product = a.push_binary(OpKind::Mul, terms[i], terms[pair(i)]);
+            root = a.push_binary(OpKind::Add, root, product);
         }
 
         let result = compile(&a, root, POINT).expect("large spill frame must compile");
@@ -5872,9 +5909,8 @@ mod tests {
 
         for (px, py) in [(1.5f32, -2.0f32), (0.0, 0.0), (3.0, 4.0)] {
             let got = run_xy(&a, root, px, py);
-            let want: f32 = (0..40)
-                .map(|i| (px + i as f32 + 1.0) * (py + i as f32 + 1.0))
-                .sum();
+            let term = |i: usize| (px + i as f32 + 1.0) * py;
+            let want: f32 = (0..TERMS).map(|i| term(i) * term(pair(i))).sum();
             let tol = 1e-3 * want.abs().max(1.0);
             assert!(
                 (got - want).abs() <= tol,
@@ -6314,6 +6350,42 @@ mod tests {
             eval_point(&res.code, x, y)
         }
 
+        /// How many of its own values the scope that stores spills.
+        ///
+        /// Not [`CompileResult::spill_count`], which is the body's alone and
+        /// which counts a scope's parked roots and its store along with them
+        /// — both are in a slot by construction rather than by pressure, so
+        /// no kernel ever reaches zero by that measure.
+        fn sample_spills(a: &ExprArena, root: ExprId, ctx: EmitCtx) -> usize {
+            let file = Native::new(ctx).register_file();
+            let nest = allocate_nest(native_schedule(a, root, POINT), &file);
+            let scopes = core::iter::once(regalloc::Scope::Body)
+                .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+            scopes
+                .map(|s| nest.scope(s))
+                .filter(|view| {
+                    view.schedule()
+                        .iter()
+                        .any(|d| matches!(d.op, ScheduledOp::Write { .. }))
+                })
+                .map(|view| {
+                    view.schedule()
+                        .iter()
+                        .filter(|d| {
+                            !matches!(
+                                d.op,
+                                ScheduledOp::Write { .. }
+                                    | ScheduledOp::Seq(..)
+                                    | ScheduledOp::Reduce(..)
+                            ) && !view.parked_by_an_enclosing_scope(d.value)
+                                && view.placement(d.value).spills()
+                        })
+                        .count()
+                })
+                .max()
+                .expect("a collapse stores somewhere")
+        }
+
         const PTS: &[(f32, f32, f32)] = &[
             (3.0, 4.0, 0.0),
             (1.0, 2.0, 3.0),
@@ -6345,7 +6417,11 @@ mod tests {
             let root = sub;
 
             let sched = compile(&a, root, POINT).expect("compile");
-            assert_eq!(sched.spill_count, 0, "should fit without spilling");
+            assert_eq!(
+                sample_spills(&a, root, EmitCtx::default()),
+                0,
+                "should fit without spilling"
+            );
 
             for &(px, py, pz) in PTS {
                 let want = (px * px + py * py).sqrt() - py * pz;
@@ -6358,8 +6434,8 @@ mod tests {
         /// and still compute the right answer.
         #[test]
         fn sched_spills_and_is_correct() {
-            // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree so the 10
-            // products are live together — forcing spills with only 7 regs.
+            // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree, against a
+            // pool at the floor: more live at once than seven registers hold.
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
@@ -6384,9 +6460,13 @@ mod tests {
             }
             let root = terms[0];
 
-            let sched = compile(&a, root, POINT).expect("scheduled compile");
+            let ctx = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH);
+            let sched = ctx
+                .clone()
+                .compile(&a, root, POINT)
+                .expect("scheduled compile");
             assert!(
-                sched.spill_count > 0,
+                sample_spills(&a, root, ctx) > 0,
                 "expected spilling; widen the expression if this regresses"
             );
 
@@ -6490,11 +6570,12 @@ mod tests {
             let variance = schedule_variance(&schedule);
             let scoped = scope_schedule(schedule, &variance);
 
-            // The kernel's own uniform, told from the origin's two by its
-            // offset within the block.
-            let kernel_uniform = |op: &ScheduledOp| {
-                matches!(op, ScheduledOp::Uniform(load) if load.offset == 0 && load.ctx_slot == 0)
-            };
+            // The kernel's own uniform, told from the origin's two by the
+            // block it is read from: the link's, at the context slot after
+            // the (empty) buffer table, rather than the origin block after
+            // that.
+            let kernel_uniform =
+                |op: &ScheduledOp| matches!(op, ScheduledOp::Uniform(load) if load.ctx_slot == 0);
             assert!(
                 scoped.body.schedule.iter().any(|d| kernel_uniform(&d.op)),
                 "the broadcast load is once per call"
@@ -7074,22 +7155,19 @@ mod tests {
         /// arena builder that never emitted it) would silently take away.
         #[test]
         fn a_muladd_dag_emits_the_fused_encoding() {
-            use pixelflow_ir::arena::ExprArena;
-
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_binary(OpKind::Add, y, x);
             let root = a.push_ternary(OpKind::MulAdd, x, y, z);
-            let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
 
-            let (code, _, _, _) = emit_dag_body(
-                arena_to_schedule(&a, root),
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            )
-            .expect("AVX2 emit");
+            let mut backend = avx2::driver::Avx2Backend::new(EmitCtx::default());
+            let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
+            let result = compile_via_backend(schedule_for(&a, root, POINT, lanes), &mut backend)
+                .expect("AVX2 emit");
+            let code = result.code.as_bytes();
             // vfmadd231ps: VEX.256.66.0F38 B8 — the opcode byte after the
-            // 3-byte prefix. Nothing else this body emits uses it.
+            // 3-byte prefix. Nothing else this kernel emits uses it.
             assert!(
                 code.windows(4)
                     .any(|w| w[0] == 0xc4 && w[1] == 0xe2 && w[3] == 0xb8),

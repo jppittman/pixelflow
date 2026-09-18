@@ -509,7 +509,10 @@ impl Codes {
             linked.buffers[..] == self.slots[..] && linked.uniforms[..] == self.link[..],
             "Manifold: a kernel's link changed with the shape it was compiled at"
         );
-        let mut table = self.compiled.write().expect("Manifold: code table poisoned");
+        let mut table = self
+            .compiled
+            .write()
+            .expect("Manifold: code table poisoned");
         // Another thread may have compiled the same shape meanwhile; the
         // global cache handed both the same code, so keeping either is right.
         if !table.iter().any(|(s, _)| *s == shape) {
@@ -757,9 +760,15 @@ mod tests {
                 let got = out[row * stride + col];
                 if col < width {
                     let want = expected(col, row);
-                    assert!((got - want).abs() < 1e-3, "row {row} col {col}: {got} != {want}");
+                    assert!(
+                        (got - want).abs() < 1e-3,
+                        "row {row} col {col}: {got} != {want}"
+                    );
                 } else {
-                    assert_eq!(got, UNTOUCHED, "row {row} col {col}: past the width was written");
+                    assert_eq!(
+                        got, UNTOUCHED,
+                        "row {row} col {col}: past the width was written"
+                    );
                 }
             }
         }
@@ -799,16 +808,26 @@ mod tests {
         let frame = program.bind(&[]);
         let mut out = vec![0.0f32; 16 * 24];
         for stripe in 0..3 {
-            frame.collapse_rows(PlaneRegion::rows(16, stripe * 8, 8), &mut out[stripe * 8 * 16..], 16);
+            frame.collapse_rows(
+                PlaneRegion::rows(16, stripe * 8, 8),
+                &mut out[stripe * 8 * 16..],
+                16,
+            );
         }
         for row in 0..24 {
             for col in 0..16 {
                 let want = expected(col, row);
-                assert!((out[row * 16 + col] - want).abs() < 1e-3, "row {row} col {col}");
+                assert!(
+                    (out[row * 16 + col] - want).abs() < 1e-3,
+                    "row {row} col {col}"
+                );
             }
         }
         let shapes = program.codes.compiled.read().unwrap().len();
-        assert_eq!(shapes, 2, "the frame's shape and the stripe's, and nothing else");
+        assert_eq!(
+            shapes, 2,
+            "the frame's shape and the stripe's, and nothing else"
+        );
     }
 
     /// An int-domain root reaches memory as the bit pattern the kernel built,

@@ -8,7 +8,9 @@
 
 use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
-use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity};
+use pixelflow_ir::arena::{
+    BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity,
+};
 use pixelflow_ir::fold::{Binder, Fold, Monoid};
 use pixelflow_ir::{LatticeShape, OpKind};
 
@@ -21,12 +23,7 @@ const ORIGIN: [f32; 2] = [2.0, 5.0];
 /// Run `root` over the plane and hand back `(x, y) -> sample`, with the
 /// buffers and uniforms the arena declares supplied from `buffers` and
 /// `uniforms`.
-fn collapse(
-    arena: &ExprArena,
-    root: ExprId,
-    buffers: &[&[f32]],
-    uniforms: &[f32],
-) -> Vec<f32> {
+fn collapse(arena: &ExprArena, root: ExprId, buffers: &[&[f32]], uniforms: &[f32]) -> Vec<f32> {
     let shape = LatticeShape::new([WIDTH as u32, ROWS as u32]);
     let code = compile(arena, root, shape).expect("compile");
     let mut out = vec![f32::NAN; ROWS * PITCH];
@@ -52,7 +49,10 @@ fn check(out: &[f32], want: impl Fn(f32, f32) -> f32) {
             );
         }
         for col in WIDTH..PITCH {
-            assert!(out[row * PITCH + col].is_nan(), "row {row} col {col} past the width was written");
+            assert!(
+                out[row * PITCH + col].is_nan(),
+                "row {row} col {col} past the width was written"
+            );
         }
     }
 }
@@ -158,6 +158,9 @@ fn a_shape_narrower_than_a_batch_is_all_remainder() {
             let want = (1.0 + col as f32) - (10.0 + row as f32);
             assert_eq!(out[row * 4 + col], want, "row {row} col {col}");
         }
-        assert!(out[row * 4 + 3].is_nan(), "row {row}: the pitch gap was written");
+        assert!(
+            out[row * 4 + 3].is_nan(),
+            "row {row}: the pitch gap was written"
+        );
     }
 }

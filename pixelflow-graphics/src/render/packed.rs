@@ -268,7 +268,6 @@ impl PackedFrame {
     pub fn collapse_rows(&self, region: PlaneRegion, out: &mut [u32], stride: usize) {
         self.frame.collapse_int_rows(region, out, stride);
     }
-
 }
 
 #[cfg(test)]
