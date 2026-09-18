@@ -362,3 +362,10 @@ write `code.as_bytes()`, count mnemonics.
   `emit_f32_const` already embeds a splat (one instruction, no temp), or
   letting a lane-only leaf park in the body as the constant vector it is.
   Step 6's territory, since it is about what a lane-invariant load costs.
+- **A constant is placed in every scope that can see it, read or not.** A
+  scope that never reads a constant still emits its definition: the AVX2
+  disassembly of `muladd_rounding`'s spilled scenario carries ten dead
+  `vbroadcastss` in each outer scope, one per wall constant, before the body
+  rebuilds them where they are read. Prologue cost, once per fold entry and
+  never per pixel, so it rides with the iota above: same measurement, same
+  fix (a constant is a `Remat` binding and no scope's root).
