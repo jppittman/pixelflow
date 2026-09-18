@@ -3550,9 +3550,11 @@ fn compile_via_backend<B: IsaBackend>(
     asm.code.extend_from_slice(&body);
     counting.frame_free(&mut asm.code, total);
     counting.emit_ret(&mut asm.code);
+    let ret_end = asm.code.len();
     counting.finish(&mut asm);
+    let trailing = (asm.code.len() - ret_end) as u32;
     let code = asm.finish();
-    let scaffold = counting.take(code.len() as u32 - body.len() as u32);
+    let scaffold = counting.take(code.len() as u32 - body.len() as u32 - trailing);
     let scopes = counting.scopes();
 
     // How many times one call runs each scope: the body once, a fold its
@@ -3596,6 +3598,7 @@ fn compile_via_backend<B: IsaBackend>(
             scopes: EmitTraffic::by_index(scopes, trips.len()),
             trips,
             scaffold,
+            trailing,
             vector_bytes: file.vector_bytes,
             pool: file.scratch.len(),
             carried,
@@ -3675,7 +3678,7 @@ mod tests {
     /// `passes::legalize` at `shape` for a target of `lanes` lanes, then
     /// `arena_to_schedule`: everything a compile entry point runs before the
     /// emitter is handed a schedule.
-    fn schedule_for(
+    pub(super) fn schedule_for(
         a: &ExprArena,
         root: ExprId,
         shape: LatticeShape,
