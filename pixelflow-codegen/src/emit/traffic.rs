@@ -101,29 +101,16 @@ pub struct EmitTraffic {
 }
 
 impl EmitTraffic {
-    /// Assemble the nest's traffic from what [`Counting`] recorded per scope,
-    /// in whatever order the scopes finished, and the trip count of each.
+    /// Order what [`Counting`] recorded per scope, in whatever order the
+    /// scopes finished, into `scopes`' index: the body first, then the folds.
+    /// `count` is the number of scopes; one nothing was recorded for is empty.
     #[must_use]
-    pub fn new(
-        recorded: Vec<(Scope, ScopeTraffic)>,
-        trips: Vec<u64>,
-        scaffold: ScopeTraffic,
-        vector_bytes: u32,
-        pool: u8,
-        carried: u32,
-    ) -> Self {
-        let mut scopes = alloc::vec![ScopeTraffic::default(); trips.len()];
+    pub fn by_index(recorded: Vec<(Scope, ScopeTraffic)>, count: usize) -> Vec<ScopeTraffic> {
+        let mut scopes = alloc::vec![ScopeTraffic::default(); count];
         for (scope, traffic) in recorded {
             scopes[scope_ix(scope)] = traffic;
         }
-        Self {
-            scopes,
-            trips,
-            scaffold,
-            vector_bytes,
-            pool,
-            carried,
-        }
+        scopes
     }
 
     /// The body's traffic: what runs once per call.
@@ -520,18 +507,16 @@ mod tests {
             stores: 1,
             ..ScopeTraffic::default()
         };
-        let traffic = EmitTraffic::new(
-            alloc::vec![
-                (Scope::Fold(1), cols),
-                (Scope::Body, body),
-                (Scope::Fold(0), rows)
-            ],
-            alloc::vec![1, 6, 42],
-            ScopeTraffic::default(),
-            16,
-            12,
-            0,
-        );
+        let recorded = alloc::vec![
+            (Scope::Fold(1), cols),
+            (Scope::Body, body),
+            (Scope::Fold(0), rows)
+        ];
+        let traffic = EmitTraffic {
+            scopes: EmitTraffic::by_index(recorded, 3),
+            trips: alloc::vec![1, 6, 42],
+            ..EmitTraffic::default()
+        };
 
         assert_eq!(traffic.scopes, alloc::vec![body, rows, cols]);
         assert_eq!(traffic.dynamic_memory_ops(), 1 + 3 * 6 + 5 * 42);

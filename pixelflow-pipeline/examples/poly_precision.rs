@@ -15,10 +15,10 @@
 //!
 //! Run: `cargo run --release -p pixelflow-pipeline --example poly_precision`
 
+use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
-use pixelflow_codegen::{JIT_VECTOR_BYTES, Point4, TileSlice};
 use pixelflow_ir::passes::EXP2_POLY;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::poly::{PolyForm, build, chebyshev_fit};
 
@@ -47,21 +47,21 @@ fn kernel(form: PolyForm, coeffs: &[f32], scale: f32) -> (ExprArena, ExprId) {
 /// Max `|JIT(x) − f(x)|` over the sampled range, using the JIT's own
 /// arithmetic — FMA rounding included, which is the whole point: the floor
 /// being looked for IS a rounding floor, so no scalar oracle can stand in.
+///
+/// One collapse call over a `[SAMPLES, 1]` plane: `x = 0 + col` for
+/// `col in 0..SAMPLES`, whether or not `SAMPLES` is a multiple of a batch —
+/// the compiled kernel handles its own remainder, so there is no separate
+/// group count to compute here any more.
 fn error(form: PolyForm, coeffs: &[f32], f: impl Fn(f64) -> f64) -> f64 {
     let (arena, root) = kernel(form, coeffs, 1.0 / SAMPLES as f32);
-    let code = compile(&arena, root).expect("compile").code;
-    let groups = SAMPLES / LANES;
-    let mut out = vec![0.0f32; groups * LANES];
-    let mut x0 = [0.0f32; LANES];
-    for (i, lane) in x0.iter_mut().enumerate() {
-        *lane = i as f32;
-    }
+    let code = compile(&arena, root, LatticeShape::new([SAMPLES as u32, 1]))
+        .expect("compile")
+        .code;
+    let mut out = vec![0.0f32; SAMPLES];
+    let origin = [0.0f32, 0.0f32];
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
     unsafe {
-        code.call_collapse(
-            core::ptr::null(),
-            TileSlice::contiguous(out.as_mut_ptr(), groups, 1),
-            Point4::new(x0, [0.0; LANES], [0.0; LANES], [0.0; LANES]),
-        );
+        code.call(ctx.as_ptr(), out.as_mut_ptr(), SAMPLES);
     }
     out.iter()
         .enumerate()

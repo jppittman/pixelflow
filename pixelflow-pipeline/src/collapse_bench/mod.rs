@@ -23,13 +23,16 @@
 //!
 //! # What is timed, and what is not
 //!
-//! One `call_collapse` into a buffer allocated once, per sample. Compilation
-//! (including e-graph saturation) happens before the timer starts, and the
-//! scalar tail `Lattice::bake` walks after the vector groups is not part of
-//! the kernel. So the number is the emitted code's own cost at that shape —
-//! which is the thing an allocator's cost model is supposed to predict, with
-//! the per-bake allocation and tail arithmetic that would otherwise dilute it
-//! held out.
+//! One collapse call (`code.call`) into a buffer allocated once, per sample,
+//! at the kernel's own declared shape. A compiled kernel now fills its whole
+//! extent in that one call — remainder columns masked in, not walked
+//! separately afterwards — so there is no scalar tail outside the kernel any
+//! more; the row/column/lane folds `Lattice::bake` used to hand off the
+//! remainder to are baked into the same emitted function
+//! (docs/plans/2026-09-16-collapse-is-a-fold.md). So the number is the
+//! emitted code's own cost at that shape — which is the thing an allocator's
+//! cost model is supposed to predict, with the per-bake allocation that would
+//! otherwise dilute it held out.
 //!
 //! # Measurement discipline
 //!
@@ -50,7 +53,7 @@ pub mod row;
 use std::path::Path;
 use std::sync::Arc;
 
-use pixelflow_codegen::emit::executable::{ExecutableCode, Point4, TileSlice};
+use pixelflow_codegen::emit::executable::ExecutableCode;
 use pixelflow_codegen::emit::{CompileResult, compile};
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId};
@@ -144,7 +147,7 @@ pub fn compile_as_baked(arena: &ExprArena, root: ExprId, extent: [u32; 2]) -> Co
         .as_deref()
         .map(|(a, r)| (a, *r))
         .unwrap_or((arena, root));
-    compile(arena, root).expect("corpus kernel failed to compile")
+    compile(arena, root, shape).expect("corpus kernel failed to compile")
 }
 
 /// A measurement run: owns the sentinel calibration and the output buffer.
@@ -158,7 +161,7 @@ pub struct CollapseSession {
 struct Sentinel {
     code: ExecutableCode,
     buffer: Vec<f32>,
-    trips: Trips,
+    extent: [u32; 2],
     bytes: u32,
     /// Kept so [`Sentinel::measure`] can bind its context the same way
     /// [`CollapseSession::measure`] binds any other kernel's — empty for
@@ -184,12 +187,11 @@ impl CollapseSession {
         let sum = arena.push_binary(pixelflow_ir::OpKind::Add, xx, yy);
         let root = arena.push_unary(pixelflow_ir::OpKind::Sqrt, sum);
         let result = compile_as_baked(&arena, root, SENTINEL_EXTENT);
-        let trips = Trips::of(SENTINEL_EXTENT, LANES as u32);
         let mut sentinel = Sentinel {
             bytes: result.code.len() as u32,
             code: result.code,
-            buffer: output_buffer(trips),
-            trips,
+            buffer: output_buffer(SENTINEL_EXTENT),
+            extent: SENTINEL_EXTENT,
             arena,
         };
         // Burn in before calibrating: the first milliseconds of a process run
@@ -243,12 +245,21 @@ impl CollapseSession {
     /// batch at this tier.
     pub fn measure(&mut self, kernel: &CollapseKernel, pass: u32) -> Row {
         self.maybe_resample_sentinel();
+        // `Trips` is recorded on the row for its own sake (how many full
+        // batches this extent holds at this tier's lane width) — it no
+        // longer drives the call: the compiled kernel fills `kernel.extent`
+        // in full, remainder included, in the one call below.
         let trips = Trips::of(kernel.extent, LANES as u32);
         let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
-        let mut buffer = output_buffer(trips);
+        let mut buffer = output_buffer(kernel.extent);
         let (buffers, uniforms) = dummy_context(&kernel.name, &kernel.arena, &kernel.buffer_data);
-        let slots = context_slots(&buffers, &uniforms);
-        let timing = time_kernel(&result.code, &mut buffer, trips, slots.as_ptr());
+        let slots = context_slots(&buffers, &uniforms, &ORIGIN);
+        let timing = time_kernel(
+            &result.code,
+            &mut buffer,
+            kernel.extent[0] as usize,
+            slots.as_ptr(),
+        );
         let drift = self.context().normalization();
         Row {
             schema: row::SCHEMA.to_string(),
@@ -274,14 +285,36 @@ impl CollapseSession {
                 samples: SAMPLES as u32,
                 calls_per_sample: timing.calls as u64,
             },
-            statics: features_of(&result, trips),
+            statics: features_of(&result),
         }
     }
 }
 
+/// The origin every collapse call in this module starts from. Arbitrary but
+/// fixed and shared by every kernel measured, so a comparison across kernels
+/// samples the same lattice position rather than being confounded by where
+/// each one happened to start.
+const ORIGIN: [f32; 2] = [0.5, 0.5];
+
 /// The static half of a row: the emitter's counts, plus what they derive.
+///
+/// `regalloc::Scope` no longer names a `frame`/`row`/`body` scope directly —
+/// it is only `Body` (`Scope::Body`, `scopes[0]`, what runs once per call) or
+/// `Fold(j)` (`scopes[j + 1]`), one per surviving fold, the lattice's row,
+/// column and lane folds among them (`pixelflow-codegen`'s `traffic`
+/// module). `attach_folds` (`pixelflow-codegen/src/emit/mod.rs`) attaches a
+/// parent before its children, so `scopes[1]` is always the OUTERMOST
+/// surviving fold — the lattice's own row (Y) loop — and `scopes[2..]` are
+/// everything nested inside it: the column and lane folds `pack`
+/// strip-mines out of it (split further when the extent has a remainder),
+/// plus any surviving user `Reduce`. [`StaticFeatures`]'s `frame`/`row`/
+/// `body` fields keep their old names and their old three-tier shape —
+/// once-per-call, once-per-row, once-per-(whatever's left) — mapped onto
+/// this: `frame` is `scopes[0]`, `row` is `scopes[1]`, and `body` is every
+/// deeper scope summed together, the way the old innermost bucket covered
+/// every per-SIMD-group op.
 #[must_use]
-pub fn features_of(result: &CompileResult, trips: Trips) -> StaticFeatures {
+pub fn features_of(result: &CompileResult) -> StaticFeatures {
     let t = &result.traffic;
     let scope = |s: &pixelflow_codegen::emit::traffic::ScopeTraffic| ScopeRow {
         bytes: s.bytes,
@@ -291,13 +324,20 @@ pub fn features_of(result: &CompileResult, trips: Trips) -> StaticFeatures {
         remats: s.remats,
         stores: s.stores,
     };
-    let (rows, groups) = (trips.rows, trips.groups);
-    let body_trips = rows * groups;
+    let outer_loop = t.scopes.get(1).copied().unwrap_or_default();
+    let inner_loop = sum_scope_traffic(t.scopes.get(2..).unwrap_or(&[]));
+    let dyn_weighted = |pick: fn(&pixelflow_codegen::emit::traffic::ScopeTraffic) -> u32| -> u64 {
+        t.scopes
+            .iter()
+            .zip(&t.trips)
+            .map(|(s, trips)| u64::from(pick(s)) * trips)
+            .sum()
+    };
     StaticFeatures {
         bytes_total: result.code.len() as u32,
-        frame: scope(&t.frame),
-        row: scope(&t.row),
-        body: scope(&t.body),
+        frame: scope(&t.body()),
+        row: scope(&outer_loop),
+        body: scope(&inner_loop),
         scaffold: scope(&t.scaffold),
         spill_slots: result.spill_count,
         frame_bytes: result.spill_bytes,
@@ -305,18 +345,33 @@ pub fn features_of(result: &CompileResult, trips: Trips) -> StaticFeatures {
         carried: t.carried,
         pool: u32::from(t.pool),
         vector_bytes: t.vector_bytes,
-        dyn_memory_ops: t.dynamic_memory_ops(rows, groups),
-        dyn_instructions: u64::from(t.frame.instructions)
-            + u64::from(t.row.instructions) * rows
-            + u64::from(t.body.instructions) * body_trips,
-        dyn_bytes: u64::from(t.frame.bytes)
-            + u64::from(t.row.bytes) * rows
-            + u64::from(t.body.bytes) * body_trips,
+        dyn_memory_ops: t.dynamic_memory_ops(),
+        dyn_instructions: dyn_weighted(|s| s.instructions),
+        dyn_bytes: dyn_weighted(|s| s.bytes),
     }
 }
 
-fn output_buffer(trips: Trips) -> Vec<f32> {
-    vec![0.0f32; (trips.rows * trips.groups) as usize * LANES]
+/// Field-wise sum of several scopes' traffic, for [`features_of`]'s `body`
+/// bucket — every fold nested inside the lattice's own row loop, combined.
+fn sum_scope_traffic(
+    scopes: &[pixelflow_codegen::emit::traffic::ScopeTraffic],
+) -> pixelflow_codegen::emit::traffic::ScopeTraffic {
+    use pixelflow_codegen::emit::traffic::ScopeTraffic;
+    scopes
+        .iter()
+        .fold(ScopeTraffic::default(), |acc, s| ScopeTraffic {
+            instructions: acc.instructions + s.instructions,
+            loads_transient: acc.loads_transient + s.loads_transient,
+            loads_kept: acc.loads_kept + s.loads_kept,
+            remats: acc.remats + s.remats,
+            stores: acc.stores + s.stores,
+            writes: acc.writes + s.writes,
+            bytes: acc.bytes + s.bytes,
+        })
+}
+
+fn output_buffer(extent: [u32; 2]) -> Vec<f32> {
+    vec![0.0f32; extent[0] as usize * extent[1] as usize]
 }
 
 /// Memory for every buffer slot `arena` declares, sized to the slot's own
@@ -380,14 +435,16 @@ fn dummy_context(
 }
 
 /// The context pointer table `dummy_context`'s memory is bound through: one
-/// base pointer per buffer slot, then the uniform block's — exactly the
-/// layout `compile_as_baked`'s emitted code reads (an `ExprNode::Uniform`'s
-/// context slot is `arena.buffers().len()`, the entry right after the last
-/// buffer). Borrows `buffers`/`uniforms`, so the returned pointers are valid
+/// base pointer per buffer slot, then the uniform block's, then the origin
+/// block's — exactly the layout `compile_as_baked`'s emitted code reads
+/// (`ctx[buffers.len()]` is the uniform block, read when the arena declares
+/// one; `ctx[buffers.len() + 1]` is the origin: two `f32`s, `x0` then `y0`).
+/// Borrows `buffers`/`uniforms`/`origin`, so the returned pointers are valid
 /// exactly as long as they are.
-fn context_slots(buffers: &[Vec<f32>], uniforms: &[f32]) -> Vec<*const f32> {
+fn context_slots(buffers: &[Vec<f32>], uniforms: &[f32], origin: &[f32; 2]) -> Vec<*const f32> {
     let mut slots: Vec<*const f32> = buffers.iter().map(Vec::as_ptr).collect();
     slots.push(uniforms.as_ptr());
+    slots.push(origin.as_ptr());
     slots
 }
 
@@ -402,12 +459,12 @@ struct Timing {
 fn time_kernel(
     code: &ExecutableCode,
     buffer: &mut [f32],
-    trips: Trips,
+    pitch: usize,
     ctx: *const *const f32,
 ) -> Timing {
     let mut calls = 1usize;
     loop {
-        let elapsed = run_calls(code, buffer, trips, WARMUP_CALLS.max(calls), ctx);
+        let elapsed = run_calls(code, buffer, pitch, WARMUP_CALLS.max(calls), ctx);
         if elapsed >= MIN_SAMPLE_NS || calls >= MAX_CALLS_PER_SAMPLE {
             break;
         }
@@ -418,7 +475,7 @@ fn time_kernel(
     }
 
     let mut per_call: Vec<f64> = (0..SAMPLES)
-        .map(|_| run_calls(code, buffer, trips, calls, ctx) as f64 / calls as f64)
+        .map(|_| run_calls(code, buffer, pitch, calls, ctx) as f64 / calls as f64)
         .collect();
     per_call.sort_by(f64::total_cmp);
     Timing {
@@ -432,29 +489,20 @@ fn time_kernel(
 fn run_calls(
     code: &ExecutableCode,
     buffer: &mut [f32],
-    trips: Trips,
+    pitch: usize,
     calls: usize,
     ctx: *const *const f32,
 ) -> u64 {
-    let mut x0 = [0.0f32; LANES];
-    for (i, lane) in x0.iter_mut().enumerate() {
-        *lane = 0.5 + i as f32;
-    }
-    let origin = Point4::new(x0, [0.5f32; LANES], [0.0f32; LANES], [0.0f32; LANES]);
-    let tile = TileSlice::contiguous(
-        buffer.as_mut_ptr(),
-        trips.groups as usize,
-        trips.rows as usize,
-    );
     let start = crate::jit_bench::nanos_now();
     for _ in 0..calls {
-        // SAFETY: the kernel was compiled for this shape, the tile is exactly
-        // `rows × groups × LANES` floats of the buffer allocated for it, and
-        // `ctx` points at a live table (built by `context_slots`) with one
-        // base pointer per buffer slot the kernel declared plus the uniform
+        // SAFETY: the kernel was compiled for the `[pitch, buffer.len() /
+        // pitch]` shape, `buffer` is exactly that many floats (packed, no
+        // gap — `pitch` doubles as the stride), and `ctx` points at a live
+        // table (built by `context_slots`) with one base pointer per buffer
+        // slot the kernel declared, then the uniform block, then the origin
         // block, in the order the kernel was compiled expecting.
         unsafe {
-            code.call_collapse(ctx, tile, origin);
+            code.call(ctx, buffer.as_mut_ptr(), pitch);
         }
         std::hint::black_box(&buffer);
     }
@@ -466,8 +514,14 @@ impl Sentinel {
         // The sentinel arena declares no buffers, so there is nothing for
         // `buffer_data` to carry.
         let (buffers, uniforms) = dummy_context("sentinel", &self.arena, &[]);
-        let slots = context_slots(&buffers, &uniforms);
-        time_kernel(&self.code, &mut self.buffer, self.trips, slots.as_ptr()).median
+        let slots = context_slots(&buffers, &uniforms, &ORIGIN);
+        time_kernel(
+            &self.code,
+            &mut self.buffer,
+            self.extent[0] as usize,
+            slots.as_ptr(),
+        )
+        .median
     }
 }
 
@@ -592,8 +646,7 @@ mod tests {
             .find(|k| k.name.starts_with("invariant16_hot"))
             .expect("the corpus holds invariant16_hot");
         let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
-        let trips = Trips::of(kernel.extent, LANES as u32);
-        let statics = features_of(&result, trips);
+        let statics = features_of(&result);
         assert!(statics.bytes_total > 0);
         assert!(
             statics.body.instructions > 0,
@@ -617,7 +670,7 @@ mod tests {
             result.hoisted_values > 0,
             "48 X-invariant terms and nothing hoisted: the corpus is not exercising LICM"
         );
-        let statics = features_of(&result, Trips::of(kernel.extent, LANES as u32));
+        let statics = features_of(&result);
         assert!(
             statics.frame.instructions + statics.row.instructions > 0,
             "hoisted values but empty prologues"

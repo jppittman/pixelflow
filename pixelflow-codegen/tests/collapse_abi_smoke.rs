@@ -73,7 +73,10 @@ fn one_call_fills_the_plane() {
                     "row {row} col {col}: got {got}, want {want}"
                 );
             } else {
-                assert_eq!(got, UNWRITTEN, "row {row} col {col}: past the width was written");
+                assert_eq!(
+                    got, UNWRITTEN,
+                    "row {row} col {col}: past the width was written"
+                );
             }
         }
     }
