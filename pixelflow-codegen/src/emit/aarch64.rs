@@ -1238,7 +1238,7 @@ mod tests {
     use crate::emit::Assembly;
 
     #[test]
-    fn fmov_imm8_common_values() {
+    fn try_encode_fmov_imm8_matches_the_arm_arm_for_common_encodable_and_non_encodable_values() {
         // Encodable values — imm8 derived from ARM ARM bit layout:
         //   f32 = [a][NOT(b)][bbbbb][cdefgh][19 zeros]
         //   imm8 = a:b:c:d:e:f:g:h
@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn fmov_imm8_roundtrip() {
+    fn try_encode_fmov_imm8_roundtrips_every_encodable_imm8() {
         // Every valid imm8 should encode a value that round-trips
         for imm8 in 0..=255u8 {
             let a = (imm8 >> 7) & 1;
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_fmov_imm_fallback_for_non_encodable() {
+    fn emit_fmov_imm_falls_back_to_movz_movk_dup_for_non_encodable_values() {
         let mut code = Vec::new();
         emit_fmov_imm(&mut code, Reg(0), core::f32::consts::PI);
         assert_eq!(
@@ -1427,7 +1427,7 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn disassemble_ret() {
+    fn disassembly_of_a_ret_names_it_ret() {
         let mut code = Vec::new();
         ret(&mut code);
         let dis = disassemble_code(&code);
@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_fadd() {
+    fn disassembly_of_fadd_names_the_operands_and_element_size() {
         let mut code = Vec::new();
         AsmProgram::from([Inst::Fadd(Reg(0), Reg(1), Reg(2))]).assemble(&mut code);
         let dis = disassemble_code(&code);
@@ -1454,7 +1454,7 @@ mod tests {
     // that ignores those bits either never matches (the USHR bug fixed here) or
     // mis-decodes the 64-bit `.2D` form as `.4s` (the SHL case).
     #[test]
-    fn disassemble_ushr() {
+    fn disassembly_of_ushr_decodes_the_shift_amount_and_element_size() {
         let mut code = Vec::new();
         emit_ushr(&mut code, Reg(0), Reg(0), 23); // used by the log2 lowering
         let dis = disassemble_code(&code);
@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_shl() {
+    fn disassembly_of_shl_decodes_the_shift_amount_and_element_size() {
         let mut code = Vec::new();
         emit_shl(&mut code, Reg(1), Reg(2), 8);
         let dis = disassemble_code(&code);
@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_mov_vec() {
+    fn disassembly_of_mov_names_the_16b_vector_form() {
         let mut code = Vec::new();
         AsmProgram::from([Inst::mov(Reg(5), Reg(3))]).assemble(&mut code);
         let dis = disassemble_code(&code);
@@ -1487,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_sequence() {
+    fn disassembly_names_every_instruction_in_a_multi_instruction_sequence() {
         let mut code = Vec::new();
         AsmProgram::from([
             Inst::Fmul(Reg(4), Reg(0), Reg(0)),
@@ -1502,7 +1502,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_zero_const() {
+    fn disassembly_of_a_zero_constant_names_it_movi() {
         let mut code = Vec::new();
         emit_fmov_imm(&mut code, Reg(0), 0.0);
         let dis = disassemble_code(&code);
@@ -1513,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_ldr_str() {
+    fn disassembly_names_both_ldr_and_str() {
         let mut code = Vec::new();
         AsmProgram::from([
             Inst::ldr_q(
@@ -1538,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_code_empty() {
+    fn disassembly_of_empty_code_is_empty() {
         let dis = disassemble_code(&[]);
         assert!(
             dis.is_empty(),
@@ -1547,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn disassemble_code_short_chunk() {
+    fn disassembly_of_a_chunk_shorter_than_one_instruction_is_empty() {
         // Less than 4 bytes should produce nothing
         let dis = disassemble_code(&[0x00, 0x01]);
         assert!(
@@ -1586,7 +1586,7 @@ mod tests {
     /// Encodings cross-checked against clang: `fcvtzs v28.4s, v5.4s` etc.,
     /// assembled with `clang -c -arch arm64` and dumped with objdump.
     #[test]
-    fn gather_primitive_encodings() {
+    fn gather_primitive_encodings_match_the_manual() {
         fn one(f: impl FnOnce(&mut Vec<u8>)) -> u32 {
             let mut code = Vec::new();
             f(&mut code);
@@ -1746,6 +1746,201 @@ mod tests {
         assert_eq!(words[0], 0x9100_0000 | (4080 << 10) | (31 << 5) | 16);
         assert_eq!(words[1], 0x9100_0000 | (4080 << 10) | (16 << 5) | 16);
         assert_eq!(*words.last().unwrap(), 0x3DC0_0000 | (16 << 5) | 3);
+    }
+
+    /// `Inst::encode` is a total function over every variant, including the
+    /// three branches — `emit_into` reaches each through its *own*
+    /// `AsmInsn::emit_into` instead (see `label_tests`), so this is the only
+    /// path that ever calls `Inst::encode` on one of them.
+    #[test]
+    fn inst_encode_gives_a_branch_its_fixed_word_or_its_condition() {
+        let exit = Label::new("exit");
+        assert_eq!(Inst::from(B { target: exit }).encode(), 0x1400_0000);
+        assert_eq!(Inst::from(CbzW16 { target: exit }).encode(), 0x3400_0010);
+        assert_eq!(
+            Inst::from(BCond::ge(exit)).encode(),
+            0x5400_0000 | Cond::Ge as u32,
+            "the base word before displacement patching still carries the condition"
+        );
+    }
+
+    /// `AsmInsn::emit_into`'s `Mov` arm elides a move to the same register;
+    /// the wildcard fallback (`self.encode()`) does not know to, so losing
+    /// this arm would turn every no-op move into a real, wasted `ORR`.
+    #[test]
+    fn emit_into_elides_a_mov_to_the_same_register() {
+        let mut code = Vec::new();
+        AsmProgram::from([Inst::mov(Reg(4), Reg(4))]).assemble(&mut code);
+        assert!(
+            code.is_empty(),
+            "mov v4, v4 is a no-op and should emit nothing"
+        );
+
+        let mut code = Vec::new();
+        AsmProgram::from([Inst::mov(Reg(4), Reg(2))]).assemble(&mut code);
+        assert_eq!(code.len(), 4, "a real move still emits its ORR");
+    }
+
+    #[test]
+    fn needs_const_pool_is_false_for_zero_and_fmov_encodable_values_and_true_otherwise() {
+        // -0.0 is deliberately not covered here: its bit pattern is nonzero
+        // (0x8000_0000), so — matching `emit_fmov_imm`'s own `bits == 0`
+        // fast-path check — it takes the general/pool-eligible path, not the
+        // single-instruction MOVI one. Only +0.0 is exact-zero.
+        assert!(
+            !needs_const_pool(0.0),
+            "zero gets its own MOVI, not a pool slot"
+        );
+        assert!(
+            !needs_const_pool(1.0),
+            "FMOV-encodable values skip the pool too"
+        );
+        assert!(
+            needs_const_pool(core::f32::consts::PI),
+            "PI is neither zero nor FMOV-encodable"
+        );
+    }
+
+    #[test]
+    fn emit_pool_entry_splats_the_f32_bit_pattern_into_four_lanes() {
+        let mut code = Vec::new();
+        emit_pool_entry(&mut code, 0x3F80_0000); // 1.0f32
+        assert_eq!(code.len(), 16, "one 128-bit NEON register's worth");
+        for lane in code.chunks(4) {
+            assert_eq!(lane, 0x3F80_0000u32.to_le_bytes());
+        }
+    }
+
+    /// The one-instruction paths (zero, FMOV-imm8) are pinned above; this is
+    /// the three-instruction MOVZ+MOVK+DUP fallback, checked byte-for-byte —
+    /// the existing coverage only checked its *length*, so a corrupted
+    /// `lo16`/`hi16` extraction or a misplaced destination register was free
+    /// to survive.
+    #[test]
+    fn emit_fmov_imm_general_case_encodes_the_exact_movz_movk_dup_sequence() {
+        let val = 12_345.679_f32;
+        assert!(
+            try_encode_fmov_imm8(val).is_none(),
+            "the test needs a value that hits the 3-instruction fallback"
+        );
+        let bits = val.to_bits();
+
+        let mut code = Vec::new();
+        emit_fmov_imm(&mut code, Reg(5), val);
+        assert_eq!(code.len(), 12);
+
+        let word = |i: usize| u32::from_le_bytes(code[i..i + 4].try_into().unwrap());
+        assert_eq!(
+            word(0),
+            0x5280_0010 | ((bits & 0xFFFF) << 5),
+            "MOVZ W16, #lo16"
+        );
+        assert_eq!(
+            word(4),
+            0x72A0_0010 | ((bits >> 16) << 5),
+            "MOVK W16, #hi16, LSL #16"
+        );
+        assert_eq!(word(8), 0x4E04_0C00 | 5 | (16 << 5), "DUP V5.4S, W16");
+    }
+
+    /// Every existing `emit_ushr` test uses `dst = src = v0`, which happens to
+    /// make several of its bit-packing operators indistinguishable from a
+    /// wrong one (an operand that is always zero masks the difference). A
+    /// distinct, nonzero register pair does not.
+    #[test]
+    fn emit_ushr_places_the_registers_and_shift_amount_in_their_own_fields() {
+        let mut code = Vec::new();
+        emit_ushr(&mut code, Reg(3), Reg(7), 12);
+        let word = u32::from_le_bytes(code[..4].try_into().unwrap());
+        assert_eq!(word >> 24, 0x6F, "USHR .4S opcode byte");
+        assert_eq!(word & 0x1F, 3, "Rd");
+        assert_eq!((word >> 5) & 0x1F, 7, "Rn");
+        assert_eq!(
+            (word >> 16) & 0x3F,
+            (64u32 - 12) & 0x3F,
+            "immh:immb = 64 - shift"
+        );
+    }
+
+    #[test]
+    fn emit_dup_lane0_broadcasts_lane_zero_to_every_lane() {
+        let mut code = Vec::new();
+        emit_dup_lane0(&mut code, Reg(3), Reg(5));
+        assert_eq!(code.len(), 4, "one DUP instruction, not nothing");
+    }
+
+    #[test]
+    fn temps_for_asks_for_a_temp_only_for_rsqrt_recip_gather_and_reduce() {
+        use crate::emit::{ScheduledOp, regalloc};
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        assert_eq!(
+            temps_for(&ScheduledOp::Unary(OpKind::Rsqrt, regalloc::ValueId(0))),
+            1
+        );
+        assert_eq!(
+            temps_for(&ScheduledOp::Unary(OpKind::Recip, regalloc::ValueId(0))),
+            1
+        );
+        assert_eq!(
+            temps_for(&ScheduledOp::Unary(OpKind::Sqrt, regalloc::ValueId(0))),
+            0,
+            "a single instruction, no correction to hold"
+        );
+        assert_eq!(temps_for(&ScheduledOp::Gather(regalloc::ValueId(0), 0)), 1);
+        let binder = Binder::from_slot(0).expect("slot 0 exists");
+        let fold = Fold::new(Monoid::SUM, binder, 0..4);
+        assert_eq!(
+            temps_for(&ScheduledOp::Reduce(fold, regalloc::ValueId(0))),
+            regalloc::Scratch::REDUCE_TEMPS as u8
+        );
+        assert_eq!(temps_for(&ScheduledOp::Const(1.0)), 0);
+    }
+
+    #[test]
+    fn gpr_temps_for_asks_for_three_for_gather_one_for_uniform_and_none_otherwise() {
+        use crate::emit::{ScheduledOp, UniformLoad, regalloc};
+
+        assert_eq!(
+            gpr_temps_for(&ScheduledOp::Gather(regalloc::ValueId(0), 0)),
+            3
+        );
+        assert_eq!(
+            gpr_temps_for(&ScheduledOp::Uniform(UniformLoad {
+                ctx_slot: 0,
+                offset: 0,
+            })),
+            1
+        );
+        assert_eq!(gpr_temps_for(&ScheduledOp::Const(1.0)), 0);
+    }
+
+    #[test]
+    fn emit_unary_emits_the_operations_own_instruction() {
+        let mut code = Vec::new();
+        emit_unary(&mut code, OpKind::Sqrt, Reg(2), Reg(3), None);
+        assert_eq!(code.len(), 4);
+    }
+
+    #[test]
+    fn emit_shift_imm_dispatches_shl_and_shr_to_different_instructions() {
+        let mut shl_code = Vec::new();
+        emit_shift_imm(&mut shl_code, OpKind::Shl, Reg(1), Reg(2), 4);
+        let mut shr_code = Vec::new();
+        emit_shift_imm(&mut shr_code, OpKind::Shr, Reg(1), Reg(2), 4);
+        assert_eq!(shl_code.len(), 4);
+        assert_eq!(shr_code.len(), 4);
+        assert_ne!(
+            shl_code, shr_code,
+            "Shl and Shr must not collapse to the same instruction"
+        );
+    }
+
+    #[test]
+    fn emit_binary_emits_the_operations_own_instruction() {
+        let mut code = Vec::new();
+        emit_binary(&mut code, OpKind::Add, Reg(1), Reg(2), Reg(3));
+        assert_eq!(code.len(), 4);
     }
 }
 
@@ -2429,6 +2624,346 @@ pub(crate) mod driver {
             None => {}
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn backend() -> Aarch64Backend {
+            Aarch64Backend::new(EmitCtx::default())
+        }
+
+        #[test]
+        fn const_pool_dedups_by_bit_pattern_and_offsets_by_16_bytes() {
+            let mut pool = ConstPool::new();
+            assert!(pool.is_empty());
+
+            let a = pool.push_f32(1.5).unwrap();
+            assert_eq!(a, 0);
+            assert!(!pool.is_empty());
+
+            let b = pool.push_f32(2.5).unwrap();
+            assert_eq!(b, 16, "each entry is 16 bytes — the f32 splatted 4x");
+
+            // Re-inserting an already-pooled bit pattern must hand back its
+            // existing offset rather than growing the pool.
+            assert_eq!(pool.push_f32(1.5).unwrap(), 0);
+            assert_eq!(pool.push_f32(2.5).unwrap(), 16);
+
+            assert_eq!(pool.offset_for(1.5f32.to_bits()), Some(0));
+            assert_eq!(pool.offset_for(2.5f32.to_bits()), Some(16));
+            assert_eq!(pool.offset_for(3.5f32.to_bits()), None);
+        }
+
+        /// The 12-bit `LDR` offset this pool feeds caps it at 4096 entries;
+        /// past that, a compile must fail loudly instead of emitting an
+        /// offset the instruction cannot hold.
+        #[test]
+        fn const_pool_refuses_a_4096th_distinct_entry() {
+            let mut pool = ConstPool::new();
+            for i in 0..4096u32 {
+                pool.push_f32(f32::from_bits(i + 1))
+                    .expect("within the 4096-entry budget");
+            }
+            let err = pool.push_f32(f32::from_bits(5000)).unwrap_err();
+            assert!(matches!(err, CompileError::BudgetExceeded(_)));
+        }
+
+        #[test]
+        fn jump_emits_an_unconditional_branch() {
+            let mut backend = backend();
+            let mut asm = Assembly::default();
+            let label = Label::new("target");
+            backend.jump(&mut asm, label);
+            asm.bind(label);
+            let code = asm.finish();
+            assert_eq!(code.len(), 4, "jump must emit exactly one B, not nothing");
+        }
+
+        /// One test per leaf `IsaBackend` method that just forwards to a
+        /// single encoder — each had no coverage at all, so replacing its
+        /// body with `()` (emit nothing) was undetectable.
+        #[test]
+        fn every_plain_leaf_isa_backend_method_emits_its_instruction() {
+            let mut backend = backend();
+
+            let mut code = Vec::new();
+            backend.emit_mov(&mut code, Reg(1), Reg(2));
+            assert_eq!(code.len(), 4, "emit_mov");
+
+            let mut code = Vec::new();
+            backend.emit_store(&mut code, Reg(3), 16).unwrap();
+            assert_eq!(code.len(), 4, "emit_store");
+
+            let mut code = Vec::new();
+            backend.slot_store(&mut code, Reg(4), 32);
+            assert_eq!(code.len(), 4, "slot_store");
+
+            let mut code = Vec::new();
+            backend.slot_load(&mut code, Reg(5), 32);
+            assert_eq!(code.len(), 4, "slot_load");
+
+            let mut code = Vec::new();
+            backend.counter_clear(&mut code, Counter::Batch);
+            assert_eq!(code.len(), 4, "counter_clear");
+
+            let mut code = Vec::new();
+            backend.counter_step(&mut code, Counter::Row);
+            assert_eq!(code.len(), 4, "counter_step");
+
+            let mut code = Vec::new();
+            backend.store_result(&mut code, Reg(6));
+            assert_eq!(code.len(), 4, "store_result");
+
+            let mut code = Vec::new();
+            backend.advance_out(&mut code, OutStep::Batch);
+            assert_eq!(code.len(), 4, "advance_out batch step");
+            let mut code = Vec::new();
+            backend.advance_out(&mut code, OutStep::RowSkip);
+            assert_eq!(code.len(), 4, "advance_out row-skip step");
+
+            let mut code = Vec::new();
+            backend.add_scalar(&mut code, Reg(7), Reg(8), 3.0);
+            assert_eq!(code.len(), 8, "add_scalar: load the constant, then add it");
+
+            let mut code = Vec::new();
+            backend.load_const(&mut code, Reg(9), 3.0);
+            assert_eq!(code.len(), 4, "load_const");
+
+            let mut code = Vec::new();
+            backend.alu(&mut code, OpKind::Add, Reg(10), [Reg(11), Reg(12)]);
+            assert_eq!(code.len(), 4, "alu");
+
+            let mut code = Vec::new();
+            backend.emit_ret(&mut code);
+            assert_eq!(code.len(), 4, "emit_ret");
+        }
+
+        #[test]
+        fn branch_if_counter_done_compares_then_branches() {
+            let mut backend = backend();
+            let mut asm = Assembly::default();
+            let label = Label::new("done");
+            backend.branch_if_counter_done(&mut asm, Counter::Batch, label);
+            asm.bind(label);
+            let code = asm.finish();
+            assert_eq!(code.len(), 8, "a CMP, then a conditional branch");
+        }
+
+        /// The false arm reduces with `UMINV` + an extra `MVN` (one more
+        /// instruction than the true arm's `UMAXV`) — see `branch_if_arm_is_dead`'s
+        /// own doc comment for why both polarities end in `cbz`.
+        #[test]
+        fn branch_if_arm_is_dead_reduces_with_the_arms_own_instruction_count() {
+            let true_arm_len = {
+                let mut backend = backend();
+                let mut asm = Assembly::default();
+                let label = Label::new("skip_true");
+                backend.branch_if_arm_is_dead(
+                    &mut asm,
+                    MaskTest {
+                        reg: Reg(2),
+                        scratch: Some(Reg(3)),
+                        mask_scratch: None,
+                        arm: SelectArm::True,
+                    },
+                    label,
+                );
+                asm.bind(label);
+                asm.finish().len()
+            };
+            assert_eq!(true_arm_len, 12, "UMAXV + FMOV + CBZ");
+
+            let false_arm_len = {
+                let mut backend = backend();
+                let mut asm = Assembly::default();
+                let label = Label::new("skip_false");
+                backend.branch_if_arm_is_dead(
+                    &mut asm,
+                    MaskTest {
+                        reg: Reg(2),
+                        scratch: Some(Reg(3)),
+                        mask_scratch: None,
+                        arm: SelectArm::False,
+                    },
+                    label,
+                );
+                asm.bind(label);
+                asm.finish().len()
+            };
+            assert_eq!(false_arm_len, 16, "UMINV + FMOV + MVN + CBZ");
+        }
+
+        #[test]
+        fn frame_alloc_and_frame_free_move_the_stack_pointer_in_chunks_of_at_most_max_add_imm() {
+            let mut backend = backend();
+
+            let mut code = Vec::new();
+            backend.frame_alloc(&mut code, 100);
+            assert_eq!(
+                code.len(),
+                4,
+                "one chunk for a frame under the immediate limit"
+            );
+
+            let mut code = Vec::new();
+            backend.frame_alloc(&mut code, table::MAX_ADD_IMM + 16);
+            assert_eq!(
+                code.len(),
+                8,
+                "two chunks once the frame exceeds one immediate"
+            );
+
+            let mut code = Vec::new();
+            backend.frame_free(&mut code, table::MAX_ADD_IMM + 16);
+            assert_eq!(
+                code.len(),
+                8,
+                "frame_free chunks the same way frame_alloc does"
+            );
+        }
+
+        #[test]
+        fn scaffold_anchor_emits_an_adrp_add_and_scaffold_finish_binds_an_empty_pool() {
+            let mut backend = backend();
+            let mut asm = Assembly::default();
+            backend.scaffold_anchor(&mut asm);
+            backend.scaffold_finish(&mut asm);
+            let code = asm.finish();
+            assert_eq!(
+                code.len(),
+                8,
+                "ADRP+ADD, and an empty pool needs no entries or padding"
+            );
+        }
+
+        /// Deleting `scaffold_finish`'s `!` (padding while *not yet* aligned)
+        /// flips it to padding while *already* aligned, which — for a pool
+        /// that starts unaligned, as this one is made to — never executes,
+        /// leaving the pool unaligned and every one of its entries offset by
+        /// the pre-padding remainder.
+        #[test]
+        fn scaffold_finish_pads_the_pool_to_a_16_byte_boundary() {
+            let mut backend = backend();
+            backend.consts.push_f32(1.5).unwrap();
+            let mut asm = Assembly::default();
+            backend.scaffold_anchor(&mut asm); // 8 bytes
+            asm.code.push(0); // 9 bytes — not yet 16-aligned
+            backend.scaffold_finish(&mut asm);
+            let code = asm.finish();
+            assert_eq!(code.len() % 16, 0, "the pool starts on a 16-byte boundary");
+            assert_eq!(
+                &code[code.len() - 16..],
+                &[1.5f32.to_bits().to_le_bytes(); 4].concat()[..],
+                "1.5f32 splatted 4 times"
+            );
+        }
+
+        #[test]
+        fn begin_seeds_the_pool_from_constants_that_need_it_and_skips_ones_that_dont() {
+            use crate::emit::ScheduledOp;
+            use regalloc::{Def, ValueId};
+
+            let mut backend = backend();
+            let schedule = alloc::vec![
+                Def {
+                    value: ValueId(0),
+                    op: ScheduledOp::Const(1.0), // FMOV-encodable: must be skipped
+                },
+                Def {
+                    value: ValueId(1),
+                    op: ScheduledOp::Const(0.123_456_79), // needs the pool
+                },
+                Def {
+                    value: ValueId(2),
+                    op: ScheduledOp::Var(0), // not a constant at all
+                },
+            ];
+            backend.begin(&schedule).expect("well within budget");
+            assert_eq!(backend.pool_entries(), [0.123_456_79_f32.to_bits()]);
+        }
+
+        /// `BUILTIN_HEADROOM` (128) is reserved so a kernel's own constants
+        /// never leave the builtins that follow with nowhere to go; these pin
+        /// the exact boundary rather than "some large schedule eventually
+        /// errors".
+        #[test]
+        fn begin_accepts_a_schedule_that_leaves_exactly_the_builtin_headroom() {
+            use crate::emit::ScheduledOp;
+            use regalloc::{Def, ValueId};
+
+            let mut backend = backend();
+            let schedule: alloc::vec::Vec<Def> = (0..3967u32)
+                .map(|i| Def {
+                    value: ValueId(i),
+                    op: ScheduledOp::Const(f32::from_bits(i + 1)),
+                })
+                .collect();
+            backend
+                .begin(&schedule)
+                .expect("3967 + 128 headroom == 4095, not past the limit");
+        }
+
+        #[test]
+        fn begin_rejects_a_schedule_that_would_leave_no_builtin_headroom() {
+            use crate::emit::ScheduledOp;
+            use regalloc::{Def, ValueId};
+
+            let mut backend = backend();
+            let schedule: alloc::vec::Vec<Def> = (0..3968u32)
+                .map(|i| Def {
+                    value: ValueId(i),
+                    op: ScheduledOp::Const(f32::from_bits(i + 1)),
+                })
+                .collect();
+            let err = backend.begin(&schedule).unwrap_err();
+            assert!(matches!(err, CompileError::BudgetExceeded(_)));
+        }
+
+        /// The gather's base-pointer load offsets into the context array by
+        /// `slot * 8` (one pointer per buffer); every production gather this
+        /// crate has ever scheduled uses slot 0 or 1, where `*`, `+` and even
+        /// a stray `/` by 8 all agree at small values, so only a slot with a
+        /// distinguishing offset (2, here — 16 bytes, not 10 or 0) tells them
+        /// apart.
+        #[test]
+        fn emit_instruction_plan_scales_the_gather_slot_by_pointer_size_not_adds_or_divides() {
+            let plan = InstructionPlan {
+                reloads: Vec::new(),
+                op: ResolvedOp::Gather {
+                    dst: Reg(4),
+                    idx: Reg(5),
+                    slot: 2,
+                },
+                setup_mov: None,
+                scratch: regalloc::Scratch::for_test_with_classes(
+                    Some([Reg(6), Reg(0), Reg(0), Reg(0)]),
+                    [None, None],
+                    Some([Gpr(9), Gpr(10), Gpr(11)]),
+                    None,
+                ),
+            };
+            let mut code = Vec::new();
+            let mut pool = ConstPool::new();
+            emit_instruction_plan(&mut code, &plan, &mut pool)
+                .expect("gather lowers to scalar loads");
+
+            let mut expected_ldr_x = Vec::new();
+            AsmProgram::from([Inst::ldr_x(
+                ptr::X9,
+                Mem {
+                    base: ptr::X0,
+                    offset: 16,
+                },
+            )])
+            .assemble(&mut expected_ldr_x);
+            assert_eq!(
+                &code[4..8],
+                &expected_ldr_x[..],
+                "slot 2 must offset the context load by 2*8=16 bytes"
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -2958,6 +3493,37 @@ mod label_tests {
         let mut code = alloc::vec![0u8; 4];
         DispField::IMM26.write(&mut code, 0, 2);
     }
+
+    /// `AdrpAdd`'s own `label_ref`/`emit_into` are pinned directly above; this
+    /// wraps it as an `Inst` — the path every other multi-word or branch item
+    /// takes when pushed through `Item::Inst` — and must not fall back to
+    /// `Inst::encode`'s panic (real, for `AdrpAdd`) or to `label_ref`'s
+    /// default `None` (which would leave the `ADD`'s immediate at its
+    /// unpatched `#0`).
+    #[test]
+    fn an_adrp_add_wrapped_as_an_inst_still_reaches_its_target() {
+        let pool = Label::new("end");
+        let code = assemble([
+            Item::Inst(
+                AdrpAdd {
+                    dst: Gpr(17),
+                    target: pool,
+                }
+                .into(),
+            ),
+            Item::Inst(NOP),
+            Item::Inst(NOP),
+            Item::Label(pool),
+        ]);
+        assert_eq!(code.len(), 16, "ADRP+ADD, then two NOPs");
+        let add = word_at(&code, 4);
+        assert_eq!(add & 0xFFC0_0000, 0x9100_0000, "still an ADD");
+        assert_eq!(
+            (add >> 10) & 0xFFF,
+            16,
+            "the pair reaches the label 16 bytes ahead, not left at its unpatched #0"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3048,5 +3614,48 @@ mod xr_tests {
             .assemble(c)),
             0xF940_0023
         );
+    }
+
+    /// Every existing `movz` case uses `#0`, which makes the immediate's
+    /// shift-direction indistinguishable from a wrong one (`0 << 5 == 0 >>
+    /// 5`). A nonzero immediate does not have that blind spot.
+    #[test]
+    fn movz_places_a_nonzero_immediate_at_bits_5_through_20() {
+        let word = word(|c| movz(c, X1, 0x1234));
+        assert_eq!(word & 0x1F, 1, "Rd");
+        assert_eq!((word >> 5) & 0xFFFF, 0x1234, "the 16-bit immediate");
+        assert_eq!(word & 0xFFE0_0000, 0xD280_0000, "MOVZ opcode/hw bits");
+    }
+
+    /// `add`'s operand type selects the encoding (`Imm12` vs. `Gpr` are
+    /// already pinned above); `PtrReg` is the third `AddOperand` impl and had
+    /// no caller anywhere, so nothing had ever exercised it.
+    #[test]
+    fn add_accepts_a_ptr_reg_operand_the_same_way_it_accepts_the_equivalent_gpr() {
+        let via_ptr = {
+            let mut c = Vec::new();
+            add(&mut c, X1, X1, ptr::X17);
+            c
+        };
+        let via_gpr = {
+            let mut c = Vec::new();
+            add(&mut c, X1, X1, ptr::X17.as_gpr());
+            c
+        };
+        assert_eq!(
+            via_ptr, via_gpr,
+            "a PtrReg operand must add the same value as its underlying Gpr"
+        );
+    }
+
+    /// `mvn_w` ("bitwise NOT of a 32-bit general register") has no caller
+    /// anywhere in the crate; nothing had ever run it.
+    #[test]
+    fn mvn_w_computes_bitwise_not_via_orn_with_wzr() {
+        let word = word(|c| mvn_w(c, Gpr(3), Gpr(7)));
+        assert_eq!(word & 0x1F, 3, "Rd");
+        assert_eq!((word >> 16) & 0x1F, 7, "Rm — the source register");
+        assert_eq!((word >> 5) & 0x1F, 31, "Rn is hardcoded to WZR");
+        assert_eq!((word >> 21) & 1, 1, "N=1 selects ORN, the negated form");
     }
 }
