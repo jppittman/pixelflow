@@ -690,6 +690,17 @@ fn select_arms(schedule: &[Def], external: &[ValueId]) -> Vec<SelectArms> {
                         ScheduledOp::Reduce(fold, _) => {
                             cycles.cost(OpKind::Reduce) * fold.len() as usize
                         }
+                        // A hard branch, not a select arm of this cost
+                        // estimate's own concern (G2,
+                        // docs/plans/2026-09-12-emit-should-just-emit.md) —
+                        // its own arms are separately scheduled scopes this
+                        // walk never reaches. Priced the same coarse way as
+                        // a surviving `Reduce` above: this is a cluster-
+                        // ordering heuristic (docs/BACKLOG.md X1), not a
+                        // correctness question, so a `Guard` landing in a
+                        // `Select`'s cone (its result feeding an unrelated
+                        // select) costs nothing to be conservative about.
+                        ScheduledOp::Guard(..) => cycles.cost(OpKind::Reduce),
                     })
                     .sum()
             };
