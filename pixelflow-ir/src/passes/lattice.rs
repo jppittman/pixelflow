@@ -167,7 +167,7 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
                  variable away; run lower_dwrt first ({PASS_ORDER})"
             ),
             ExprNode::Var(i) => {
-                if let Some(b) = Binder::from_var(*i) {
+                if let Some(b) = Binder::from_var(i) {
                     taken[b.slot() as usize] = true;
                 }
             }
@@ -245,7 +245,6 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
     else {
         panic!("{SHAPE} (root is not a Reduce)");
     };
-    let (row_fold, col_id) = (*row_fold, *col_id);
 
     let ExprNode::Reduce {
         fold: col_fold,
@@ -254,7 +253,6 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
     else {
         panic!("{SHAPE} (the row fold's body is not a Reduce)");
     };
-    let (col_fold, lane_id) = (*col_fold, *lane_id);
 
     let ExprNode::Reduce {
         fold: lane_fold,
@@ -263,7 +261,6 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
     else {
         panic!("{SHAPE} (the col fold's body is not a Reduce)");
     };
-    let (lane_fold, write) = (*lane_fold, *write);
 
     let ExprNode::Write {
         row: w_row,
@@ -274,7 +271,7 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
     else {
         panic!("{SHAPE} (the lane fold's body is not a Write)");
     };
-    let write_binders = (*w_row, *w_col, *w_lane);
+    let write_binders = (w_row, w_col, w_lane);
 
     for fold in [row_fold, col_fold, lane_fold] {
         assert_eq!(
@@ -340,7 +337,7 @@ mod tests {
             if core::mem::replace(&mut seen[idx], true) {
                 continue;
             }
-            if matches!(arena.node(id), ExprNode::Var(v) if *v == target) {
+            if matches!(arena.node(id), ExprNode::Var(v) if v == target) {
                 return true;
             }
             stack.extend(arena.children(id));
@@ -388,7 +385,6 @@ mod tests {
         };
         assert_eq!(row_fold.monoid(), Monoid::SEQ);
         assert_eq!(row_fold.range(), 0..3);
-        let col_id = *col_id;
 
         let ExprNode::Reduce {
             fold: col_fold,
@@ -399,7 +395,6 @@ mod tests {
         };
         assert_eq!(col_fold.monoid(), Monoid::SEQ);
         assert_eq!(col_fold.range(), 0..5);
-        let lane_id = *lane_id;
 
         let ExprNode::Reduce {
             fold: lane_fold,
@@ -410,7 +405,6 @@ mod tests {
         };
         assert_eq!(lane_fold.monoid(), Monoid::SEQ);
         assert_eq!(lane_fold.range(), 0..1);
-        let write = *write;
 
         let ExprNode::Write {
             row,
@@ -422,11 +416,10 @@ mod tests {
             panic!("the lane fold's body must be a Write");
         };
         assert_eq!(
-            (*row, *col, *lane),
+            (row, col, lane),
             (row_fold.binder(), col_fold.binder(), lane_fold.binder()),
             "the Write's binders must be the three folds' own, in order"
         );
-        let value = *value;
 
         assert_eq!(arena.uniforms().len(), 2, "x0 and y0, and nothing else");
         assert!(
@@ -500,7 +493,7 @@ mod tests {
             panic!("collapse must build a Write");
         };
         assert!(
-            reachable_var(&arena, *value, Binder::from_slot(0).expect("slot 0").var()),
+            reachable_var(&arena, value, Binder::from_slot(0).expect("slot 0").var()),
             "the kernel's own fold must still read its own binder after collapse"
         );
     }
@@ -524,7 +517,6 @@ mod tests {
         let ExprNode::Write { value, .. } = arena.node(write) else {
             panic!("collapse must build a Write");
         };
-        let value = *value;
 
         let v = compute_arena_variance(&arena);
         assert_eq!(
@@ -585,10 +577,9 @@ mod tests {
         let ExprNode::Write { value, .. } = arena.node(write) else {
             panic!("collapse must build a Write");
         };
-        let ExprNode::Binary(OpKind::Add, new_row_only, new_all_three) = arena.node(*value) else {
+        let ExprNode::Binary(OpKind::Add, new_row_only, new_all_three) = arena.node(value) else {
             panic!("the value must still be Add(row_only, all_three_read)");
         };
-        let (new_row_only, new_all_three) = (*new_row_only, *new_all_three);
 
         let v = compute_arena_variance(&arena);
         let (row, col, lane) = (
@@ -632,7 +623,6 @@ mod tests {
         };
         assert_eq!(row_fold.monoid(), Monoid::SEQ);
         assert_eq!(row_fold.range(), 0..3);
-        let row_body = *row_body;
 
         let ExprNode::Reduce {
             fold: col_fold,
@@ -644,7 +634,6 @@ mod tests {
         assert_eq!(col_fold.range(), 0..8);
         assert_eq!(col_fold.stride(), 4);
         assert_eq!(col_fold.len(), 2);
-        let lane_id = *lane_id;
 
         let ExprNode::Reduce {
             fold: lane_fold,
@@ -656,7 +645,7 @@ mod tests {
         assert_eq!(lane_fold.range(), 0..4);
         assert_eq!(lane_fold.stride(), 1);
 
-        assert_eq!(*write, write_before, "pack shares collapse's Write");
+        assert_eq!(write, write_before, "pack shares collapse's Write");
         assert!(!reachable_seq(&arena, packed), "no remainder means no Seq");
     }
 
@@ -685,12 +674,10 @@ mod tests {
             panic!("packed root must be the row fold");
         };
         assert_eq!(row_fold.range(), 0..2);
-        let row_body = *row_body;
 
         let ExprNode::Binary(OpKind::Seq, main, rem) = arena.node(row_body) else {
             panic!("a nonzero remainder must sequence main then remainder");
         };
-        let (main, rem) = (*main, *rem);
 
         let ExprNode::Reduce {
             fold: main_col,
@@ -701,7 +688,6 @@ mod tests {
         };
         assert_eq!(main_col.range(), 0..8);
         assert_eq!(main_col.stride(), 4);
-        let main_lane_id = *main_lane_id;
         let ExprNode::Reduce {
             fold: main_lane,
             body: main_write,
@@ -710,7 +696,6 @@ mod tests {
             panic!("main's body must be the lane fold");
         };
         assert_eq!(main_lane.range(), 0..4);
-        let main_write = *main_write;
 
         let ExprNode::Reduce {
             fold: rem_col,
@@ -721,7 +706,6 @@ mod tests {
         };
         assert_eq!(rem_col.range(), 8..9);
         assert_eq!(rem_col.stride(), 1);
-        let rem_lane_id = *rem_lane_id;
         let ExprNode::Reduce {
             fold: rem_lane,
             body: rem_write,
@@ -730,7 +714,6 @@ mod tests {
             panic!("rem's body must be the lane fold");
         };
         assert_eq!(rem_lane.range(), 0..2);
-        let rem_write = *rem_write;
 
         assert_eq!(main_write, write_before);
         assert_eq!(
@@ -761,12 +744,10 @@ mod tests {
         let ExprNode::Reduce { body: row_body, .. } = arena.node(packed) else {
             panic!("packed root must be the row fold");
         };
-        let row_body = *row_body;
 
         let ExprNode::Binary(OpKind::Seq, main, rem) = arena.node(row_body) else {
             panic!("even an all-remainder row sequences main then remainder");
         };
-        let (main, rem) = (*main, *rem);
 
         let ExprNode::Reduce { fold: main_col, .. } = arena.node(main) else {
             panic!("main must be a Reduce");
@@ -783,7 +764,6 @@ mod tests {
             panic!("rem must be a Reduce");
         };
         assert_eq!(rem_col.range(), 0..1);
-        let rem_lane_id = *rem_lane_id;
         let ExprNode::Reduce { fold: rem_lane, .. } = arena.node(rem_lane_id) else {
             panic!("rem's body must be the lane fold");
         };

@@ -597,7 +597,7 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "arena_to_kernel_code: variable index {} exceeds X/Y/Z/W range",
                         i
                     ),
-                    ExprNode::Const(v) => format_const_kc(*v),
+                    ExprNode::Const(v) => format_const_kc(v),
                     ExprNode::Param(i) => panic!(
                         "ExprNode::Param({}) reached arena_to_kernel_code — substitute params first",
                         i
@@ -630,7 +630,7 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                     ),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
-                    | ExprNode::Ternary(op, _, _, _) => emit_op_kc(*op, &args),
+                    | ExprNode::Ternary(op, _, _, _) => emit_op_kc(op, &args),
                     ExprNode::Nary(op, _) => panic!(
                         "arena_to_kernel_code: Nary({}) not representable in kernel code syntax",
                         op.name()

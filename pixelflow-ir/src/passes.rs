@@ -198,7 +198,7 @@ where
                 if id_map[id.0 as usize].is_some() {
                     continue;
                 }
-                let node = arena.node(id).clone();
+                let node = arena.node(id);
                 let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
                 let new_id = match lower(arena, &node, &m)? {
                     Some(new) => new,
@@ -378,8 +378,8 @@ pub(crate) fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (
     // transcendental-free kernels; skipping it keeps lowering a true no-op for
     // them.
     if !arena.nodes().any(|(_, n)| match n {
-        ExprNode::Unary(op, _) => is_transcendental_unary(*op),
-        ExprNode::Binary(op, _, _) => is_transcendental_binary(*op),
+        ExprNode::Unary(op, _) => is_transcendental_unary(op),
+        ExprNode::Binary(op, _, _) => is_transcendental_binary(op),
         _ => false,
     }) {
         return (arena.clone(), root);
@@ -431,7 +431,7 @@ pub(crate) fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena
 /// matching `DiscreteManifold::eval`.
 fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> ExprId {
     let decl = match arena.node(buf) {
-        ExprNode::Buffer(id) => *arena.buffer_decl(*id),
+        ExprNode::Buffer(id) => *arena.buffer_decl(id),
         other => panic!("lower_gather: first child must be a Buffer leaf, got {other:?}"),
     };
 
@@ -707,7 +707,7 @@ pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, &'stati
     try_rebuild_arena(arena, root, |arena, node, m| match node {
         ExprNode::Binary(OpKind::Dwrt, expr, var) => {
             let var_idx = match arena.node(m(*var)) {
-                ExprNode::Const(v) => *v as u8,
+                ExprNode::Const(v) => v as u8,
                 _ => return Err("lower_dwrt: Dwrt's variable operand must be a Const"),
             };
             differentiate(arena, m(*expr), var_idx).map(Some)
@@ -768,7 +768,7 @@ fn differentiate(arena: &mut ExprArena, expr: ExprId, var: u8) -> Result<ExprId,
         if !marked.insert(id) {
             continue;
         }
-        push_deriv_children(arena.node(id), &mut stack);
+        push_deriv_children(&arena.node(id), &mut stack);
     }
 
     // A tabulation is the one rule that asks about *dependence* rather than
@@ -1169,11 +1169,11 @@ fn sqrt_one_minus_sq(arena: &mut ExprArena, u: ExprId) -> ExprId {
 }
 
 fn is_const_zero(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if *v == 0.0)
+    matches!(arena.node(id), ExprNode::Const(v) if v == 0.0)
 }
 
 fn is_const_one(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if *v == 1.0)
+    matches!(arena.node(id), ExprNode::Const(v) if v == 1.0)
 }
 
 // Peephole constructors for derivative arithmetic. Most leaf derivatives are
@@ -1797,7 +1797,7 @@ mod dwrt_tests {
         let mut a = ExprArena::new();
         let body = a.push_var(4);
         let red = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..4), body);
-        let ExprNode::Reduce { fold, .. } = *a.node(red) else {
+        let ExprNode::Reduce { fold, .. } = a.node(red) else {
             panic!("expected a fold");
         };
         assert_eq!(fold.len(), 4);
@@ -1956,7 +1956,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1970,7 +1970,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1992,7 +1992,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("an X-indexed read is constant in Y");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -2025,7 +2025,7 @@ mod dwrt_tests {
         assert_eq!(children.len(), 3, "wrong slice length");
         for (child, expected_var) in children.iter().zip([0u8, 1, 4]) {
             assert!(
-                matches!(a.node(*child), ExprNode::Var(v) if *v == expected_var),
+                matches!(a.node(*child), ExprNode::Var(v) if v == expected_var),
                 "child {child:?} should be Var({expected_var})"
             );
         }
@@ -2240,11 +2240,11 @@ mod nested_reduce_tests {
         let ExprNode::Reduce { body, .. } = legalized.node(outer) else {
             unreachable!()
         };
-        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(*body) else {
+        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(body) else {
             panic!("the outer body must still be `inner + j`");
         };
         assert!(
-            matches!(legalized.node(*lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
+            matches!(legalized.node(lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
             "the inner Reduce must be the outer body's own operand, not unrolled into it"
         );
     }
@@ -2340,11 +2340,11 @@ mod ref_expansion_tests {
         let on_key = Kernel::x().sqrt().by_ref();
         let off_key = Kernel::y().neg().by_ref();
         let on_key = match on_key.parts().0.node(on_key.parts().1) {
-            ExprNode::Ref(k) => *k,
+            ExprNode::Ref(k) => k,
             other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
         };
         let off_key = match off_key.parts().0.node(off_key.parts().1) {
-            ExprNode::Ref(k) => *k,
+            ExprNode::Ref(k) => k,
             other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
         };
 
@@ -2364,15 +2364,15 @@ mod ref_expansion_tests {
 
         match expanded.node(expanded_root) {
             ExprNode::Guard { mask, on, off } => {
-                assert_eq!(*on, on_key, "on must survive expand_refs untouched");
-                assert_eq!(*off, off_key, "off must survive expand_refs untouched");
+                assert_eq!(on, on_key, "on must survive expand_refs untouched");
+                assert_eq!(off, off_key, "off must survive expand_refs untouched");
                 assert!(
-                    !matches!(expanded.node(*mask), ExprNode::Ref(_)),
+                    !matches!(expanded.node(mask), ExprNode::Ref(_)),
                     "the mask, a real child, must still be expanded — got {:?}",
-                    expanded.node(*mask)
+                    expanded.node(mask)
                 );
                 assert!(
-                    matches!(expanded.node(*mask), ExprNode::Var(0)),
+                    matches!(expanded.node(mask), ExprNode::Var(0)),
                     "the mask named X, so its expansion must read X directly"
                 );
             }

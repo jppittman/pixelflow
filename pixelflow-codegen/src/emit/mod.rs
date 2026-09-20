@@ -2372,9 +2372,9 @@ fn arena_to_schedule(
     for (idx, _) in reachable.iter().enumerate().filter(|(_, r)| **r) {
         if let ExprNode::Write { lane: l, .. } = arena.node(ExprId(idx as u32)) {
             match lane {
-                None => lane = Some(*l),
+                None => lane = Some(l),
                 Some(seen) => assert_eq!(
-                    seen, *l,
+                    seen, l,
                     "two Writes name different lane binders; a lattice has one lane fold"
                 ),
             }
@@ -2403,7 +2403,7 @@ fn arena_to_schedule(
         next_id += 1;
         id_map[idx] = vid;
 
-        let map_child = |child: &ExprId| -> ValueId {
+        let map_child = |child: ExprId| -> ValueId {
             let mapped = id_map[child.0 as usize];
             assert!(
                 mapped.0 != u32::MAX,
@@ -2415,16 +2415,16 @@ fn arena_to_schedule(
         };
 
         let sched_op = match node {
-            ExprNode::Var(i) => match Binder::from_var(*i) {
+            ExprNode::Var(i) => match Binder::from_var(i) {
                 None => panic!(
                     "arena_to_schedule: Var({i}) is a coordinate, which \
                      passes::lattice::collapse substitutes away -- this schedule was \
                      built without the lowering pipeline"
                 ),
                 Some(b) if lane == Some(b) => ScheduledOp::Lanes(b),
-                Some(_) => ScheduledOp::Var(*i),
+                Some(_) => ScheduledOp::Var(i),
             },
-            ExprNode::Const(v) => ScheduledOp::Const(*v),
+            ExprNode::Const(v) => ScheduledOp::Const(v),
             ExprNode::Param(i) => panic!(
                 "ExprNode::Param({}) reached the JIT emitter -- \
                  call substitute_params before compile()",
@@ -2443,7 +2443,7 @@ fn arena_to_schedule(
             // order before anything reaches here, and the two origin slots
             // are the last two, declared by `collapse` after the relink.
             ExprNode::Uniform(u) => {
-                ScheduledOp::Uniform(match origin.iter().position(|o| o == u) {
+                ScheduledOp::Uniform(match origin.iter().position(|&o| o == u) {
                     Some(axis) => UniformLoad {
                         ctx_slot: buffers + 1,
                         offset: axis as u16,
@@ -2454,25 +2454,25 @@ fn arena_to_schedule(
                     },
                 })
             }
-            ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
+            ExprNode::Unary(op, child) => ScheduledOp::Unary(op, map_child(child)),
             // Shl/Shr fold their Const shift-count operand into an immediate, so
             // the count never becomes a scheduled value (matching the imm-only
             // hardware shift encoders). The count const may still appear as its
             // own schedule entry (harmless/unused) if shared.
             ExprNode::Binary(op @ (OpKind::Shl | OpKind::Shr), a, b) => {
-                let amount = match arena.node(*b) {
-                    ExprNode::Const(v) => shift_immediate(*op, *v),
+                let amount = match arena.node(b) {
+                    ExprNode::Const(v) => shift_immediate(op, v),
                     _ => panic!(
                         "{:?} shift count must be a Const (lowering guarantees this)",
                         op
                     ),
                 };
-                ScheduledOp::ShiftImm(*op, map_child(a), amount)
+                ScheduledOp::ShiftImm(op, map_child(a), amount)
             }
             // RawGather folds its Buffer leaf into the `slot` immediate (like a
             // shift count); only the index operand becomes a scheduled value.
             ExprNode::Binary(OpKind::RawGather, buf, idx) => {
-                let slot = match arena.node(*buf) {
+                let slot = match arena.node(buf) {
                     ExprNode::Buffer(id) => id.0,
                     other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
                 };
@@ -2491,9 +2491,9 @@ fn arena_to_schedule(
                  means this schedule was built without the lowering pipeline."
             ),
             ExprNode::Binary(OpKind::Seq, a, b) => ScheduledOp::Seq(map_child(a), map_child(b)),
-            ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
+            ExprNode::Binary(op, a, b) => ScheduledOp::Binary(op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {
-                ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
+                ScheduledOp::Ternary(op, map_child(a), map_child(b), map_child(c))
             }
             // Same unreachable precondition as `Dwrt` above: `passes::legalize`
             // runs `expand_refs` first in every compile entry point, so a
@@ -2511,17 +2511,17 @@ fn arena_to_schedule(
             ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
             // The lane fold, executed by lanes: its body is the store, and
             // the store is this def, with the fold's trip count as its width.
-            ExprNode::Reduce { fold, body } if matches!(arena.node(*body), ExprNode::Write { lane, .. } if *lane == fold.binder()) =>
+            ExprNode::Reduce { fold, body } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
             {
                 let ExprNode::Write {
                     row, col, value, ..
-                } = arena.node(*body)
+                } = arena.node(body)
                 else {
                     unreachable!("matched a Write above")
                 };
                 ScheduledOp::Write {
-                    row: *row,
-                    col: *col,
+                    row,
+                    col,
                     lane: fold.binder(),
                     lanes: fold.len(),
                     value: map_child(value),
@@ -2533,7 +2533,7 @@ fn arena_to_schedule(
             // value's `ValueId` in *this* numbering. `extract_folds` reads
             // it back out into the fold's own `ScopeFold`; nothing after
             // that resolves it as an operand (see `ScheduledOp::Reduce`).
-            ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(*fold, map_child(body)),
+            ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),
             // G1 only makes `Guard` constructible; nothing chooses one
             // (extraction has no price for it yet, G3) and nothing lowers
             // one away (there is no legalization pass for it, unlike

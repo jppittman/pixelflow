@@ -463,7 +463,7 @@ fn ops_stratum(arena: &ExprArena) -> &'static str {
     let mut root = 0usize;
     let mut poly_only = true;
     for (_, node) in arena.nodes() {
-        let Some(op) = non_leaf_op(node) else {
+        let Some(op) = non_leaf_op(&node) else {
             continue;
         };
         if TRIG_OPS.contains(&op) {

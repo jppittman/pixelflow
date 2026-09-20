@@ -220,7 +220,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // The Z axis used to serve that role; it was the same thing
             // wearing a coordinate's name.
             ExprNode::Uniform(u) => {
-                writeln!(out, "A {}", arena.uniform_decl(*u).default.to_bits())
+                writeln!(out, "A {}", arena.uniform_decl(u).default.to_bits())
             }
             ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
             // A declared buffer slot. `id.0` is the *arena's* slot index, not
@@ -232,25 +232,25 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // shape (`ExprArena::buffers().len()`, and with it every
             // `Uniform`'s context slot).
             ExprNode::Buffer(id) => {
-                let decl = arena.buffer_decl(*id);
+                let decl = arena.buffer_decl(id);
                 writeln!(out, "B {} {} {}", id.0, decl.width, decl.height).expect("fmt");
                 // Only the first occurrence of this slot writes its data —
                 // see `buffer_data_emitted` above.
                 if buffer_data_emitted.insert(id.0) {
-                    write_buffer_data(&mut out, kernel, *id);
+                    write_buffer_data(&mut out, kernel, id);
                 }
                 Ok(())
             }
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
+            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
             ExprNode::Binary(k, a, b) => {
-                writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+                writeln!(out, "Bi {k:?} {} {}", d(&dense, a), d(&dense, b))
             }
             ExprNode::Ternary(k, a, b, c) => writeln!(
                 out,
                 "T {k:?} {} {} {}",
-                d(&dense, *a),
-                d(&dense, *b),
-                d(&dense, *c)
+                d(&dense, a),
+                d(&dense, b),
+                d(&dense, c)
             ),
             // An n-ary node — in practice `Reduce`, the winding fold's
             // binder: `[Const(combiner), Const(reduce_var), Const(extent),
@@ -268,7 +268,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // The fold as opaque bits — it is metadata, not children, so it
             // travels as one field rather than as three serialized nodes.
             ExprNode::Reduce { fold, body } => {
-                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
             }
             ExprNode::Param(i) => panic!(
                 "{}: corpus kernels must be bakeable, but this one holds Param({i}) — a \

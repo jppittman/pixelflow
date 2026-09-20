@@ -765,11 +765,17 @@ mod tests {
     }
 
     /// Pins the packed program's size, in the spirit of
-    /// `reads_of_one_buffer_share_a_slot_but_not_nodes`: 667 = 4 × 157 (each
-    /// `or` re-splices a whole channel fragment) + 4 × 9 (each channel's pack
+    /// `reads_of_one_buffer_share_a_slot_but_not_nodes`. Before `ExprArena`
+    /// hash-consed (Stage C of docs/plans/2026-09-09-exprarena-on-dag.md)
+    /// this was 667 = 4 x 157 (each `or` re-splices a whole channel
+    /// fragment, and node sharing across the four re-splices was the
+    /// e-graph's call, not this arena's) + 4 x 9 (each channel's pack
     /// chain: const 255, mul, const 0, max, const 255, min, trunc, const
-    /// shift, shl) + 3 ors. Node sharing is the e-graph's call once it can
-    /// see `Gather`; this number falling is the sign that landed.
+    /// shift, shl) + 3 ors. Consing now collapses the repetition *within*
+    /// one composed arena for free — the four channels' identical constants
+    /// (0, 255, the shift amounts) and identical pack-chain shapes intern to
+    /// shared nodes — so the pinned count fell to 123 without touching the
+    /// e-graph or `Gather`'s visibility to it.
     #[test]
     fn packed_kernel_node_count_is_the_channel_kernels_plus_the_pack() {
         let shape = CellGridShape {
@@ -781,8 +787,8 @@ mod tests {
         let (arena, root) = kernel.parts();
         assert_eq!(
             reachable_nodes(arena, root),
-            667,
-            "composed packed node count (4 channels of 157, plus the pack)"
+            123,
+            "composed packed node count (4 channels, hash-consed, plus the pack)"
         );
     }
 
@@ -1084,22 +1090,22 @@ mod tests {
                 ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
                 ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
                 ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-                ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
+                ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
                 ExprNode::Binary(k, a, b) => {
-                    writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+                    writeln!(out, "Bi {k:?} {} {}", d(&dense, a), d(&dense, b))
                 }
                 ExprNode::Ternary(k, a, b, c) => writeln!(
                     out,
                     "T {k:?} {} {} {}",
-                    d(&dense, *a),
-                    d(&dense, *b),
-                    d(&dense, *c)
+                    d(&dense, a),
+                    d(&dense, b),
+                    d(&dense, c)
                 ),
                 // A fold survives the runtime tier now — it is representable
                 // in the e-graph and legalized after extraction — so the dump
                 // has a line for it rather than a panic.
                 ExprNode::Reduce { fold, body } => {
-                    writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+                    writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
                 }
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)

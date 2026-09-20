@@ -494,7 +494,7 @@ mod tests {
         reachable_ids(arena, root)
             .iter()
             .filter_map(|&id| match arena.node(id) {
-                &ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
+                ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
                 _ => None,
             })
             .collect()
@@ -778,7 +778,7 @@ mod congruence_gap_probe {
             let kind = match arena.node(id) {
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 _ => None,
             };
             if let Some(k) = kind {
@@ -1788,7 +1788,7 @@ pub(crate) mod production_telemetry {
                 | ExprNode::Uniform(_) => None,
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 // A fold survives extraction now; the legalizer unrolls it
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),

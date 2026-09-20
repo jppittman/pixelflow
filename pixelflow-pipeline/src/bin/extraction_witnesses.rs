@@ -261,7 +261,7 @@ fn dag_cost(arena: &ExprArena, root: ExprId) -> usize {
         .into_iter()
         .filter_map(|id| match arena.node(id) {
             ExprNode::Unary(k, _) | ExprNode::Binary(k, _, _) | ExprNode::Ternary(k, _, _, _) => {
-                Some(model.cost(*k))
+                Some(model.cost(k))
             }
             _ => None,
         })
