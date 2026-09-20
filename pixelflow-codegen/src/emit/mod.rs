@@ -2509,7 +2509,7 @@ fn arena_to_schedule(
                  point, so a survivor means this schedule was built without \
                  the lowering pipeline."
             ),
-            ExprNode::Nary(_, _, _) => panic!("Nary not supported in JIT arena compilation"),
+            ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
             // The lane fold, executed by lanes: its body is the store, and
             // the store is this def, with the fold's trip count as its width.
             ExprNode::Reduce { fold, body } if matches!(arena.node(*body), ExprNode::Write { lane, .. } if *lane == fold.binder()) =>

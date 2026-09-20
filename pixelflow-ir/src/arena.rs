@@ -190,6 +190,21 @@ impl core::hash::Hash for UniformDecl {
 
 // ───────────────────────────────────────── ExprNode ───────────────────────────
 
+/// Where an [`ExprNode::Nary`] node's children live in
+/// [`ExprArena`]'s n-ary slab.
+///
+/// Fields are private: this is storage, not expression semantics, and
+/// docs/plans/2026-09-09-exprarena-on-dag.md's Stage B gate is exactly that
+/// nothing outside this file can name an offset. A value can still be held
+/// and passed around freely — it is `Copy` — but the only thing anything
+/// outside `arena.rs` can do with one is match it as an opaque token; the
+/// children it describes come back through [`ExprArena::children`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NaryChildren {
+    start: u32,
+    len: u16,
+}
+
 /// A single expression node stored in the arena.
 ///
 /// Layout is kept tight: the static assertion below guarantees <= 16 bytes.
@@ -226,8 +241,9 @@ pub enum ExprNode {
     Unary(OpKind, ExprId),
     Binary(OpKind, ExprId, ExprId),
     Ternary(OpKind, ExprId, ExprId, ExprId),
-    /// N-ary node. Children live in `ExprArena::nary_children[start..start+len]`.
-    Nary(OpKind, u32, u16),
+    /// N-ary node. Its children's location is private storage detail — see
+    /// [`NaryChildren`] — and comes back through [`ExprArena::children`].
+    Nary(OpKind, NaryChildren),
     /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
     /// `fold`'s own visited indices (see [`Fold`]'s doc — `lo`, `lo+stride`,
     /// …, [`Fold::len`] of them).
@@ -751,7 +767,7 @@ impl ExprArena {
         let start = self.nary_children.len() as u32;
         let len = children.len() as u16;
         self.nary_children.extend_from_slice(children);
-        self.push_node(ExprNode::Nary(op, start, len))
+        self.push_node(ExprNode::Nary(op, NaryChildren { start, len }))
     }
 
     // ───────────────────── node observation ──────────────────
@@ -761,11 +777,12 @@ impl ExprArena {
     /// reference an id less than its own.
     ///
     /// This is the topological order every "scan every node" pass already
-    /// relies on. It is the narrow replacement for the old `nodes_raw`: a
-    /// caller that wants a node's edges still goes through
-    /// [`ExprArena::children`], never through the n-ary slab directly —
-    /// that slab, and its offsets, are `arena.rs`'s own business
-    /// (docs/plans/2026-09-09-exprarena-on-dag.md, Stage A).
+    /// relies on. A caller that wants a node's edges goes through
+    /// [`ExprArena::children`] instead, never through the n-ary slab
+    /// directly — that slab, and its offsets, are `arena.rs`'s own business
+    /// (docs/plans/2026-09-09-exprarena-on-dag.md, Stage B: nothing outside
+    /// this file names an offset, which is why there is no `nodes_raw`/
+    /// `nary_children_raw` pair here any more).
     #[inline]
     #[must_use]
     pub fn nodes(&self) -> impl DoubleEndedIterator<Item = (ExprId, &ExprNode)> + '_ {
@@ -773,51 +790,6 @@ impl ExprArena {
             .iter()
             .enumerate()
             .map(|(i, n)| (ExprId(i as u32), n))
-    }
-
-    /// Raw slice of all nodes in the arena.
-    ///
-    /// Superseded by [`ExprArena::nodes`], which pairs each node with its
-    /// id instead of asking the caller to reconstruct one from a position.
-    /// Kept, unused outside this crate as of
-    /// docs/plans/2026-09-09-exprarena-on-dag.md's Stage A, until Stage B
-    /// removes it.
-    #[inline]
-    #[must_use]
-    pub fn nodes_raw(&self) -> &[ExprNode] {
-        &self.nodes
-    }
-
-    /// Raw slice of the nary-children slab.
-    ///
-    /// Superseded by [`ExprArena::children`], which resolves a node's
-    /// children without exposing where they live in this arena. Kept,
-    /// unused outside this crate as of the same Stage A, until Stage B
-    /// removes it.
-    #[inline]
-    #[must_use]
-    pub fn nary_children_raw(&self) -> &[ExprId] {
-        &self.nary_children
-    }
-
-    /// Reconstruct an arena from raw parts.
-    ///
-    /// # Safety contract (logical, not `unsafe`)
-    ///
-    /// The caller must ensure that every `ExprId` referenced by nodes in
-    /// `nodes` is in-bounds, and that `Nary` start/len pairs index validly
-    /// into `nary_children`. Violating this will cause panics on access,
-    /// not UB.
-    /// The reconstructed arena has empty buffer and uniform tables, so it
-    /// cannot hold `Buffer` or `Uniform` nodes.
-    #[must_use]
-    pub fn from_raw(nodes: Vec<ExprNode>, nary_children: Vec<ExprId>) -> Self {
-        Self {
-            nodes,
-            nary_children,
-            buffers: Vec::new(),
-            uniforms: Vec::new(),
-        }
     }
 
     // ───────────────────── access ────────────────────────────
@@ -831,19 +803,6 @@ impl ExprArena {
     #[must_use]
     pub fn node(&self, id: ExprId) -> &ExprNode {
         &self.nodes[id.0 as usize]
-    }
-
-    /// Get the N-ary children slice for a `Nary(_, start, len)` node.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `start + len` exceeds the internal nary_children buffer.
-    #[inline]
-    #[must_use]
-    pub fn nary_children_slice(&self, start: u32, len: u16) -> &[ExprId] {
-        let s = start as usize;
-        let l = len as usize;
-        &self.nary_children[s..s + l]
     }
 
     /// Get the [`OpKind`] of the node at `id`.
@@ -872,7 +831,7 @@ impl ExprArena {
             ExprNode::Unary(op, _) => *op,
             ExprNode::Binary(op, _, _) => *op,
             ExprNode::Ternary(op, _, _, _) => *op,
-            ExprNode::Nary(op, _, _) => *op,
+            ExprNode::Nary(op, _) => *op,
             ExprNode::Reduce { .. } => OpKind::Reduce,
             // A branch is not an operation any vocabulary names yet: no
             // extraction can choose one (G1), so no cost table or emitter
@@ -910,9 +869,9 @@ impl ExprArena {
             ExprNode::Unary(_, a) => ExprChildren::One(*a),
             ExprNode::Binary(_, a, b) => ExprChildren::Two(*a, *b),
             ExprNode::Ternary(_, a, b, c) => ExprChildren::Three(*a, *b, *c),
-            ExprNode::Nary(_, start, len) => {
-                let s = *start as usize;
-                let l = *len as usize;
+            ExprNode::Nary(_, range) => {
+                let s = range.start as usize;
+                let l = range.len as usize;
                 ExprChildren::Nary(&self.nary_children[s..s + l])
             }
             // One child, not four: the combiner, the binder and the extent
@@ -960,9 +919,9 @@ impl ExprArena {
                     stack.push((*b, d + 1));
                     stack.push((*c, d + 1));
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     if l == 0 {
                         max_depth = max_depth.max(d);
                     } else {
@@ -1003,9 +962,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -1056,9 +1015,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -1101,9 +1060,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -1170,9 +1129,9 @@ impl ExprArena {
                             work.push(Task::Descend(*b));
                             work.push(Task::Descend(*a));
                         }
-                        ExprNode::Nary(_, start, len) => {
-                            let s = *start as usize;
-                            let l = *len as usize;
+                        ExprNode::Nary(_, range) => {
+                            let s = range.start as usize;
+                            let l = range.len as usize;
                             for child in self.nary_children[s..s + l].iter().rev() {
                                 work.push(Task::Descend(*child));
                             }
@@ -1234,9 +1193,9 @@ impl ExprArena {
                                 .expect("substitute_params: child c not yet mapped for Ternary");
                             self.push_ternary(op, na, nb, nc)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let s = start as usize;
-                            let l = len as usize;
+                        ExprNode::Nary(op, range) => {
+                            let s = range.start as usize;
+                            let l = range.len as usize;
                             let child_ids: Vec<ExprId> = self.nary_children[s..s + l]
                                 .iter()
                                 .map(|old_child| {
@@ -1378,8 +1337,8 @@ impl ExprArena {
                             let (a, b, c) = (m(a), m(b), m(c));
                             self.push_ternary(op, a, b, c)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let (s, l) = (start as usize, len as usize);
+                        ExprNode::Nary(op, range) => {
+                            let (s, l) = (range.start as usize, range.len as usize);
                             let mapped: Vec<ExprId> = other.nary_children[s..s + l]
                                 .iter()
                                 .map(|c| m(*c))
@@ -1478,8 +1437,8 @@ impl ExprArena {
                             let (a, b, c) = (m(a), m(b), m(c));
                             self.push_ternary(op, a, b, c)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let (s, l) = (start as usize, len as usize);
+                        ExprNode::Nary(op, range) => {
+                            let (s, l) = (range.start as usize, range.len as usize);
                             let child_ids: Vec<ExprId> = self.nary_children[s..s + l].to_vec();
                             let mapped: Vec<ExprId> = child_ids.into_iter().map(m).collect();
                             self.push_nary(op, &mapped)
@@ -1638,8 +1597,8 @@ impl ExprArena {
                 ExprNode::Unary(op, a) => out.push_unary(*op, m(*a)),
                 ExprNode::Binary(op, a, b) => out.push_binary(*op, m(*a), m(*b)),
                 ExprNode::Ternary(op, a, b, c) => out.push_ternary(*op, m(*a), m(*b), m(*c)),
-                ExprNode::Nary(op, start, len) => {
-                    let (s, l) = (*start as usize, *len as usize);
+                ExprNode::Nary(op, range) => {
+                    let (s, l) = (range.start as usize, range.len as usize);
                     let mapped: Vec<ExprId> =
                         self.nary_children[s..s + l].iter().map(|c| m(*c)).collect();
                     out.push_nary(*op, &mapped)
@@ -1717,9 +1676,9 @@ impl ExprArena {
                         f.write_str(op.name())?;
                         f.write_str("(")?;
                     }
-                    ExprNode::Nary(op, start, len) => {
-                        let s = *start as usize;
-                        let l = *len as usize;
+                    ExprNode::Nary(op, range) => {
+                        let s = range.start as usize;
+                        let l = range.len as usize;
                         stack.push(Task::WriteStr(")"));
                         for (i, child) in self.nary_children[s..s + l].iter().enumerate().rev() {
                             stack.push(Task::Visit(*child));
@@ -1889,13 +1848,13 @@ impl ExprArena {
                     }
                     stack.push((*s_body, *o_body));
                 }
-                (ExprNode::Nary(s_op, s_start, s_len), ExprNode::Nary(o_op, o_start, o_len)) => {
-                    if s_op != o_op || s_len != o_len {
+                (ExprNode::Nary(s_op, s_range), ExprNode::Nary(o_op, o_range)) => {
+                    if s_op != o_op || s_range.len != o_range.len {
                         return false;
                     }
-                    let ss = *s_start as usize;
-                    let os = *o_start as usize;
-                    let len = *s_len as usize;
+                    let ss = s_range.start as usize;
+                    let os = o_range.start as usize;
+                    let len = s_range.len as usize;
                     for i in 0..len {
                         stack.push((self.nary_children[ss + i], other.nary_children[os + i]));
                     }
@@ -2449,7 +2408,10 @@ mod composition_tests {
         let c = by_hand.push_const(2.5);
         let hand_root = by_hand.push_binary(OpKind::Mul, x, c);
         let _ = root;
-        assert_eq!(folded.nodes_raw(), by_hand.nodes_raw());
+        assert_eq!(
+            folded.nodes().map(|(_, n)| n).collect::<Vec<_>>(),
+            by_hand.nodes().map(|(_, n)| n).collect::<Vec<_>>()
+        );
         assert_eq!(folded_root, hand_root);
         assert!(folded.uniforms().is_empty());
     }

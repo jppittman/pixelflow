@@ -282,7 +282,7 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                         out_arena.push_ternary(*op, map(*a), map(*b), map(*c))
                     }
                     ExprNode::Reduce { fold, body } => out_arena.push_reduce(*fold, map(*body)),
-                    ExprNode::Nary(op, _, _) => {
+                    ExprNode::Nary(op, _) => {
                         let mapped_children: Vec<ExprId> = arena.children(id).map(map).collect();
                         out_arena.push_nary(*op, &mapped_children)
                     }
@@ -381,7 +381,7 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
             w.write_all(&b.0.to_le_bytes())?;
             w.write_all(&c.0.to_le_bytes())?;
         }
-        ExprNode::Nary(op, _, _) => {
+        ExprNode::Nary(op, _) => {
             w.write_all(&[TAG_NARY])?;
             w.write_all(&op.marshal().to_bytes())?;
             let children = arena.children(id);
@@ -810,7 +810,7 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         match loaded[0].1.node(loaded[0].2) {
-            ExprNode::Nary(OpKind::Tuple, _, _) => {
+            ExprNode::Nary(OpKind::Tuple, _) => {
                 let children: Vec<_> = loaded[0].1.children(loaded[0].2).collect();
                 assert_eq!(children.len(), 3);
             }
