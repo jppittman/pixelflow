@@ -3688,7 +3688,11 @@ fn extract_guards(scoped: &mut regalloc::ScopedSchedule) {
     // is harmless (neither ever parks anything the other reads), but keeping
     // one counter is simpler than arguing that case is fine.
     let max_vid = |schedule: &[regalloc::Def]| {
-        schedule.iter().map(|d| d.value.0).max().map_or(0, |m| m + 1)
+        schedule
+            .iter()
+            .map(|d| d.value.0)
+            .max()
+            .map_or(0, |m| m + 1)
     };
     let mut next_id = max_vid(&scoped.body.schedule);
     for fold in &scoped.folds {
@@ -3788,7 +3792,12 @@ fn schedule_guard_arm(
             def.op
         );
     }
-    regalloc::ScopeGuardArm { parent, at, arm, schedule }
+    regalloc::ScopeGuardArm {
+        parent,
+        at,
+        arm,
+        schedule,
+    }
 }
 
 /// Drive a schedule to a complete collapse kernel via an [`IsaBackend`]: the
@@ -3875,8 +3884,7 @@ fn compile_via_backend<B: IsaBackend>(
     // sibling scopes both compute (a row's main batches and its remainder
     // share their closures) is one root with one slot: the two never run at
     // once, and each writes it before its own scopes read it.
-    let park_base =
-        guard_slot_base + nest.guard_count() as u32 * vector_bytes;
+    let park_base = guard_slot_base + nest.guard_count() as u32 * vector_bytes;
     let mut parks: alloc::collections::BTreeMap<regalloc::ValueId, u32> =
         alloc::collections::BTreeMap::new();
     let scopes = core::iter::once(regalloc::Scope::Body)

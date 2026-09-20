@@ -1082,7 +1082,10 @@ impl NestAllocation {
             .and_then(|c| c.schedule.get(arm.at))
             .map(|def| def.value)
             .unwrap_or_else(|| {
-                panic!("Guard({k})'s parent {:?} has no def at {}", arm.parent, arm.at)
+                panic!(
+                    "Guard({k})'s parent {:?} has no def at {}",
+                    arm.parent, arm.at
+                )
             })
     }
 
@@ -1434,7 +1437,10 @@ impl<'a> Allocation<'a> {
         match self.scope {
             Scope::Fold(j) => self.nest.fold_roots(j),
             Scope::Body | Scope::GuardArm(_) => {
-                panic!("{:?} is not a fold, so it has no binder or accumulator", self.scope)
+                panic!(
+                    "{:?} is not a fold, so it has no binder or accumulator",
+                    self.scope
+                )
             }
         }
     }
@@ -3125,7 +3131,8 @@ impl LinearScan {
             // for exactly the same reason, at exactly the same point — its
             // mask test and branch are emitted in place of this instruction
             // too.
-            let is_reduce_or_guard = matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..));
+            let is_reduce_or_guard =
+                matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..));
             if !sites[i].is_empty() || is_reduce_or_guard {
                 // A `Reduce`'s own trip test builds its mask fresh into a
                 // temp every time (`t0` in `emit_scope`'s loop, never a
