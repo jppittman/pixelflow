@@ -300,6 +300,21 @@ into a loop over that range, and the per-row call overhead L3 measured
 on narrow summands (1.46× at 15-px cells) closes. Depends on L3's union
 being the loop-nest primitive.
 
+**2026-09-20 update.** The pass this section describes — the DNF algebra
+(§1) and the one backward pass computing it — now lives in
+`pixelflow-ir` (`pixelflow-ir/src/passes/demand.rs`), generic over its key
+type, per `docs/plans/2026-09-09-exprarena-on-dag.md`'s "Demand moves to
+the IR". `pixelflow-codegen`'s `emit::guards` instantiates the same
+generic function for its own `ValueId`-keyed schedule rather than holding
+a second copy; that telemetry-only use is unchanged in shape and behavior
+— it still answers `demand_exclusive` beside `exclusive`, exactly as §
+"Why now" describes. What C2a still needs, unbuilt: a version of
+`demand_of_arena` (or the schedule-keyed instantiation) that a
+runtime-tier extraction pass can call *during* costing, not only after —
+today's callers run it as a diagnostic over an already-built schedule,
+while C2a wants demand available to the cost model while it is still
+choosing a term, which is a different call site and not yet wired to one.
+
 ## 7. Constraints
 
 - **Widening is always sound.** Any predicate may be replaced by a weaker

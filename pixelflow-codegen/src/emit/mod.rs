@@ -67,7 +67,6 @@ pub mod avx2;
 pub mod avx512;
 #[cfg(test)]
 pub(crate) mod coverage;
-pub(crate) mod demand;
 pub mod encoded;
 pub mod executable;
 mod guards;

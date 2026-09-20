@@ -65,6 +65,12 @@ use alloc::vec::Vec;
 /// legalize passes. See the module doc above for their place in the order.
 pub mod lattice;
 
+/// Control dependence as a DAG property: the condition under which a value
+/// is observed. Not a legalize pass (it does not rewrite the arena), but a
+/// query over it — see the module's own doc for what reads it and why it
+/// lives here rather than in `pixelflow-codegen`.
+pub mod demand;
+
 /// Run every legalization pass, in the one order they compose in, for the
 /// collapse `collapse` describes: the kernel comes back wrapped in the
 /// lattice's folds, strip-mined to the target's lane width.
