@@ -56,7 +56,16 @@ fn round_chain(start: f32) -> Kernel {
 /// then re-rounded `ROUND_CHAIN_DEPTH - 1` more times, which is a no-op on
 /// an already-integral value on both targets.
 fn expected_tie(x: f32) -> f32 {
-    #[cfg(target_arch = "x86_64")]
+    // cfg-encapsulation: a 3-arm test oracle for one platform-observable
+    // rounding rule (CLAUDE.md's own ISA-divergence table), not production
+    // behavior that can drift out of sync with an implementation elsewhere —
+    // there is nothing else to encapsulate this against. Splitting it into
+    // three files plus a mod.rs dispatch shim for one 15-line helper used by
+    // a single test would be the machinery CLAUDE.md's "subtract before you
+    // add" argues against, not an application of the encapsulation rule's
+    // actual concern (a platform split silently drifting because it isn't a
+    // file boundary).
+    #[cfg(target_arch = "x86_64")] // cfg-encapsulation: see fn doc above
     {
         // Nearest-even.
         let floor = x.floor();
@@ -71,12 +80,12 @@ fn expected_tie(x: f32) -> f32 {
             x.round()
         }
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(target_arch = "aarch64")] // cfg-encapsulation: see fn doc above
     {
         // Ties away from zero — Rust's `f32::round` already does this.
         x.round()
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))] // cfg-encapsulation: see doc
     {
         x.round()
     }
