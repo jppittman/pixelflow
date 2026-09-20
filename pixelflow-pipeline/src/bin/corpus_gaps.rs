@@ -442,7 +442,7 @@ fn existing_names(path: &Path) -> HashSet<String> {
 /// multiset the e-graph's own interning sees. Buffers and uniforms keep
 /// their declarations (identity-equal slots stay one node).
 fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -528,12 +528,8 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
                     Box::new(move |a| a.push_ternary(k, x, y, z)),
                 )
             }
-            ExprNode::Nary(k, start, n) => {
-                let kids: Vec<ExprId> = arena
-                    .nary_children_slice(start, n)
-                    .iter()
-                    .map(|&c| ExprId(m(c, &map)))
-                    .collect();
+            ExprNode::Nary(k, ..) => {
+                let kids: Vec<ExprId> = arena.children(id).map(|c| ExprId(m(c, &map))).collect();
                 let raw: Vec<u32> = kids.iter().map(|c| c.0).collect();
                 (Key::Op(k, raw), Box::new(move |a| a.push_nary(k, &kids)))
             }
@@ -572,7 +568,7 @@ fn median_usize(v: &mut [usize]) -> f64 {
 /// Tree count with multiplicity (a spliced subterm counted once per use)
 /// and the latency-prior tree cost, both saturating.
 fn tree_figures(arena: &ExprArena, root: ExprId, costs: &CostModel) -> (u128, u128) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut memo: Vec<Option<(u128, u128)>> = vec![None; len];
     let mut order = Vec::new();
     let mut stack = vec![root];

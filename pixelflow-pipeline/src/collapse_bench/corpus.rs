@@ -176,7 +176,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
     use std::fmt::Write as _;
 
     let (arena, root) = (&kernel.arena, kernel.root);
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -257,9 +257,8 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // body]`. The three `Const` children round trip through the `C`
             // arm above like any other constant; this arm only has to spell
             // the child list itself, whatever its length.
-            ExprNode::Nary(k, start, count) => {
-                let children = arena.nary_children_slice(*start, *count);
-                let ids: Vec<u32> = children.iter().map(|c| d(&dense, *c)).collect();
+            ExprNode::Nary(k, ..) => {
+                let ids: Vec<u32> = arena.children(id).map(|c| d(&dense, c)).collect();
                 write!(out, "N {k:?}").expect("fmt");
                 for id in ids {
                     write!(out, " {id}").expect("fmt");

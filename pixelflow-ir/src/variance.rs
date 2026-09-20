@@ -408,10 +408,9 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
                 .union(Variance::from_var(row.var()))
                 .union(Variance::from_var(col.var()))
                 .union(Variance::from_var(lane.var())),
-            ExprNode::Nary(_, start, len) => {
-                let children = arena.nary_children_slice(*start, *len);
+            ExprNode::Nary(..) => {
                 let mut v = Variance::CONST;
-                for &child in children {
+                for child in arena.children(id) {
                     v = v.union(result[child.0 as usize]);
                 }
                 v
