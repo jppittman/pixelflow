@@ -81,7 +81,7 @@ pub use extract::{
     build_extracted_dag_from_choices, choices_to_arena, compute_ref_counts, cost_of_choices,
     extract, extract_dag,
 };
-pub use fold_rules::{EmptyFold, PeelFold, fold_rules};
+pub use fold_rules::{EmptyFold, HalveFold, PeelFold, fold_rules};
 pub use graph::{
     ApplicationMask, ApplyResult, EGraph, EGraphBatch, HARD_CLASS_LIMIT, MaskScope, RewriteTarget,
     SaturationStats, SaturationStop, ScanStop,

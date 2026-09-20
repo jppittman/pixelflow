@@ -261,6 +261,19 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                          kernel interned in this process — a corpus outlives the process, so \
                          the key would read back naming nothing"
                     ),
+                    // Same reasoning as `Ref`: `on`/`off` name kernels in
+                    // this process's `KernelStore` too, and nothing produces
+                    // a `Guard` for a corpus entry to hold yet (G1: never
+                    // chosen).
+                    ExprNode::Guard { mask: _, on, off } => panic!(
+                        "reachable_subtree: expression references Guard(on={on:?}, \
+                         off={off:?}) — a corpus outlives the process these keys are \
+                         interned in"
+                    ),
+                    ExprNode::Write { .. } => panic!(
+                        "reachable_subtree: expression holds a Write — a corpus entry is \
+                         pre-legalize, and a store is built after extraction"
+                    ),
                     ExprNode::Unary(op, a) => out_arena.push_unary(*op, map(*a)),
                     ExprNode::Binary(op, a, b) => out_arena.push_binary(*op, map(*a), map(*b)),
                     ExprNode::Ternary(op, a, b, c) => {
@@ -408,6 +421,25 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
                 format!("Ref({k:?}) has no corpus encoding: it names a process-local kernel"),
             ));
         }
+        // Same reasoning as `Ref`, and unreachable for the same practical
+        // one: `write_entry` compacts through `reachable_subtree` first,
+        // which already refuses a `Guard`. Kept exhaustive rather than
+        // relying on that ordering.
+        ExprNode::Guard { mask: _, on, off } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Guard(on={on:?}, off={off:?}) has no corpus encoding: its arms name \
+                     process-local kernels"
+                ),
+            ));
+        }
+        ExprNode::Write { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a Write has no corpus encoding: a corpus entry is pre-legalize",
+            ));
+        }
     }
     Ok(())
 }
@@ -545,7 +577,7 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
             Ok(arena.push_buffer(b))
         }
         TAG_REDUCE => {
-            let bits = r.read_u64()?;
+            let bits = r.read_u128()?;
             let fold = Fold::from_bits(bits).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -650,6 +682,12 @@ impl<'a> Cursor<'a> {
         let mut buf = [0u8; 8];
         self.read_exact(&mut buf)?;
         Ok(u64::from_le_bytes(buf))
+    }
+
+    fn read_u128(&mut self) -> io::Result<u128> {
+        let mut buf = [0u8; 16];
+        self.read_exact(&mut buf)?;
+        Ok(u128::from_le_bytes(buf))
     }
 }
 

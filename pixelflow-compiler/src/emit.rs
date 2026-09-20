@@ -209,6 +209,29 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
                     )
                 }
             }
+            // Unreachable for the same reason `Ref` is: there is no
+            // `kernel!` surface syntax for a hard branch. `Guard` is built
+            // directly against an `ExprArena` (`ExprArena::push_guard`), not
+            // lowered from a macro body — and even if it were, its `on`/
+            // `off` keys would name kernels interned in the *build host's*
+            // process, which the emitted program does not share, exactly as
+            // `Ref`'s panic says.
+            pixelflow_ir::arena::ExprNode::Guard { mask, on, off } => {
+                panic!(
+                    "kernel! produced ExprNode::Guard(mask={mask:?}, on={on:?}, off={off:?}) \
+                     — there is no surface syntax for a hard branch yet; it is built directly \
+                     against an ExprArena, not lowered from a kernel! body"
+                )
+            }
+            // A store is post-legalize vocabulary: the passes that wrap a
+            // kernel in the lattice's folds build one, after extraction,
+            // and no kernel! body can spell it.
+            pixelflow_ir::arena::ExprNode::Write { .. } => {
+                panic!(
+                    "kernel! produced ExprNode::Write — a store has no surface syntax; \
+                     the legalize passes build one after extraction"
+                )
+            }
         };
         stmts.push(quote! {
             let #ident = #expr;

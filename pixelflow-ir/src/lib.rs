@@ -45,6 +45,11 @@ pub use variance::{LatticeShape, Variance, compute_dag_variance};
 
 pub mod arena;
 
+/// Where a mask can be nonzero, as a rectangle of lattice indices — the
+/// derivation a domain split needs, without the split.
+pub mod mask_support;
+pub use mask_support::{MaskSupport, mask_support};
+
 /// What it means for two kernels to be the same kernel: the canonical form of
 /// a reachable subgraph, and the fixed-size [`KernelKey`] that digests it.
 pub mod key;

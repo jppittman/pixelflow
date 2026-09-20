@@ -235,6 +235,9 @@ pub fn op_from_kind(kind: OpKind) -> Option<&'static dyn Op> {
         | OpKind::Reduce
         | OpKind::Uniform
         | OpKind::Param => None,
+        // Post-legalize vocabulary: sequencing is an effect built after
+        // extraction, so no rule may name it and no e-graph holds it.
+        OpKind::Seq => None,
     }
 }
 

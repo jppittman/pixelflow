@@ -225,9 +225,24 @@ impl StackFrame {
     #[inline]
     #[must_use]
     pub const fn new(vector_bytes: u32) -> Self {
+        Self::with_base(vector_bytes, 0)
+    }
+
+    /// The same, but handing out slots from `base` upward instead of from 0.
+    ///
+    /// A scope that runs to completion before the next one needs its slots can
+    /// reuse the same offsets — that is why the two collapse prologues and the
+    /// body all start at 0. A scope that runs *nested inside* another cannot:
+    /// its parent's values are still live in their slots across it, so a fold's
+    /// frame is based at its parent's [`Self::frame_size`] and the two never
+    /// alias. [`frame_size`](Self::frame_size) stays the total extent — base
+    /// included — so a parent's top is exactly its child's base.
+    #[inline]
+    #[must_use]
+    pub const fn with_base(vector_bytes: u32, base: u32) -> Self {
         Self {
             vector_bytes,
-            allocated_bytes: 0,
+            allocated_bytes: base,
             free_pool: Vec::new(),
         }
     }

@@ -13,7 +13,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::guards::{SelectGuard, analyze_select_guards};
-use super::{Gpr, KReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
+use super::{Gpr, KReg, OperandSource, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -524,45 +524,61 @@ impl RegisterFile {
     }
 }
 
-/// One scope of a loop nest: the enclosing regions, outermost first, and then
-/// the innermost body.
+/// Which scope of a loop nest: the enclosing regions, outermost first, and
+/// then the innermost body.
 ///
-/// The derived order is execution order on the first pass through the nest —
-/// `Region(0)` runs once per call, the last region once per iteration of the
-/// next-to-innermost binder, `Body` at every sample. That order is all a
-/// [`Point`] needs to compare, and it is deliberately no more than that: it is
-/// **not** a trip-count model and must not be read as one.
+/// A **name**, not a coordinate. It used to be half of one — [`Point`] was
+/// `(scope, index)` ordered lexicographically — and that only worked because
+/// this nest is a *chain*: scopes totally ordered by nesting, and all of an
+/// outer scope's code preceding all of an inner scope's. The second stops
+/// being true the moment a scope opens in the *middle* of another, which is
+/// what a surviving `Reduce` is: `body`'s own defs sit on both sides of the
+/// fold's. So the ordering moved to where it is always meaningful — within
+/// one scope — and this is now only the key that says which one.
+///
+/// With [`Scope::Fold`] the nest stops being a chain at all and becomes a
+/// **tree**: the regions are still a spine, because they are the collapse
+/// nest and a `Reduce` does not reorder them, but a fold hangs off whichever
+/// scope holds its def, and off other folds. The derived `Ord` is therefore
+/// **not** nesting order — it is a total order over names, for deterministic
+/// keying, and reading it as "inside" would put a fold in `Region(0)` outside
+/// `Region(1)` when neither contains the other.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// An enclosing region; `Region(0)` is the outermost.
     Region(usize),
     /// The innermost body, inside every back edge.
     Body,
+    /// A surviving `Reduce`'s loop body, indexing
+    /// [`NestAllocation::folds`]. Unlike a region it opens in the *middle* of
+    /// its parent's schedule, which is what makes the nest a tree.
+    Fold(usize),
 }
 
-/// A program point in a loop nest: a scope, and a position in that scope's
-/// schedule. Ordered lexicographically.
+/// A program point: a position in one scope's schedule.
 ///
-/// Program point *is* (scope, index into that scope's schedule), which is why
-/// this is the coordinate a placement's ranges are stated in.
+/// Which scope is not part of it. A [`Placement`] is one scope's answer, and
+/// every query against one is asked from inside that scope, so carrying the
+/// scope here would be carrying it twice — and a comparison between two
+/// scopes' points is exactly the question a loop nest makes meaningless.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Point {
-    /// Which scope of the nest.
-    pub scope: Scope,
-    /// Position in that scope's schedule.
+    /// Position in the scope's schedule.
     pub index: usize,
 }
 
 impl Point {
-    /// The last point of the nest.
+    /// The first point of a scope: where an iteration begins, and where a
+    /// value an enclosing scope parked is picked up.
+    pub const HEAD: Self = Self { index: 0 };
+
+    /// The last point of a scope — after everything it schedules.
     ///
-    /// Every scope's subtree ends inside the body, so there is exactly one of
-    /// these — which is what makes "live to the tail" a single, comparable
-    /// answer for a value read across any back edge.
-    pub const TAIL: Self = Self {
-        scope: Scope::Body,
-        index: usize::MAX,
-    };
+    /// "Where does this value end an iteration", which is the question a back
+    /// edge asks. It used to name the end of the whole *nest*, which is the
+    /// same point only for the innermost scope; every scope has a back edge of
+    /// its own to reconcile.
+    pub const TAIL: Self = Self { index: usize::MAX };
 }
 
 /// Where the allocator decided a value lives, over one range of its life.
@@ -593,13 +609,20 @@ pub struct Span {
     pub at: Where,
 }
 
-/// Where a value lives, at every point in the nest.
+/// Where a value lives, at every point of **one scope**.
 ///
 /// A **non-empty, strictly increasing sequence** of [`Span`]s. Non-empty by
 /// construction — a value lives somewhere from its definition on — which is
 /// why the first range is a field rather than the head of a `Vec` something
 /// could empty; the rest is usually empty, and an empty `Vec` does not
 /// allocate.
+///
+/// One scope, not the nest, because a sequence is what a *straight line* has.
+/// A scope is a loop body and is scanned straight through; the nest is a tree,
+/// and a value's life across it is not an interval sequence in any coordinate
+/// a tree admits. What crosses a scope boundary is carried by the park —
+/// a slot, or a register held across the loops — and the scope inside reads
+/// that as its own first span.
 ///
 /// One location for a whole life was the old shape, and it is the shape that
 /// makes two things unsayable. A value hot in part of a region and cold in the
@@ -698,6 +721,10 @@ impl Placement {
 /// position — hands back the order it chose.
 #[derive(Debug)]
 struct ScopeCode {
+    /// Dense by `ValueId.0`: where each value this scope touches lives, at
+    /// every point of it. `None` for a value this scope never sees — which is
+    /// most of them, in most scopes.
+    placements: Vec<Option<Placement>>,
     /// Evaluation order: the schedule the emitter walks.
     schedule: Vec<Def>,
     /// The scratch each position in `schedule` may destroy.
@@ -709,6 +736,9 @@ struct ScopeCode {
     /// Values this scope computes for the scopes inside it, in slot order.
     /// Empty for the body, which parks nothing.
     roots: Vec<ValueId>,
+    /// This scope's `Select` guards, straight from the [`Scan`] that produced
+    /// `schedule` — see [`Allocation::select_guards`].
+    guards: Vec<SelectGuard>,
 }
 
 /// The registers one instruction may destroy for its own duration.
@@ -794,6 +824,17 @@ impl Scratch {
     /// costs the half-sequence's own index and value registers plus one of
     /// each to carry the high half while the low one is built.
     pub const MAX_TEMPS: usize = 4;
+
+    /// The temps a surviving `Reduce` def reserves: two, both transient —
+    /// the trip test's bound and its mask, reused by the combine's reload
+    /// and the step's scratch. Nothing here lives across the loop's body:
+    /// the binder and the accumulator are the fold's *roots*, placed by
+    /// `allocate_nest` like any other root — carried in a register the
+    /// budget allows, or parked in a slot — so the body's pool is the whole
+    /// pool minus what is carried, and a reservation across a body is not a
+    /// thing this type can express. Every backend's `temps_for` answers this
+    /// for a `Reduce`.
+    pub const REDUCE_TEMPS: usize = 2;
 
     /// The most reload targets any one instruction asks for.
     ///
@@ -912,15 +953,64 @@ impl Scratch {
 /// `ValueId`s are *not* partitioned by the nest — a `Var` or `Const` leaf
 /// feeding both an invariant expression and a varying one appears in both
 /// scopes' schedules, with an independently chosen location in each. That is
-/// another thing a sequence says and a single answer per value cannot.
+/// why a placement belongs to a [`ScopeCode`] rather than to the nest: the two
+/// answers are both true, of different scopes, and a nest-wide map has room
+/// for only one of them.
 #[derive(Debug)]
 pub struct NestAllocation {
-    /// Dense by `ValueId.0`, over the whole nest.
-    placements: Vec<Option<Placement>>,
     /// One per input region, in the same order — outermost first.
     regions: Vec<ScopeCode>,
     /// The innermost body.
     body: ScopeCode,
+    /// The surviving folds, indexed by [`Scope::Fold`]. Flat storage; the tree
+    /// is each entry's [`FoldScope::parent`].
+    folds: Vec<FoldScope>,
+}
+
+/// A surviving `Reduce`'s loop body: a scope, plus where it opens.
+///
+/// The parent is a pointer rather than recursion, so storage stays flat —
+/// which is what the dense placement vectors want — and depth is never a case
+/// anything special-cases. A fold inside a fold is simply `parent:
+/// Scope::Fold(j)`.
+#[derive(Debug)]
+struct FoldScope {
+    /// The scope whose schedule holds this loop's def.
+    parent: Scope,
+    /// Which def — the position in `parent`'s schedule of the `Reduce` this is
+    /// the body of. A fold opens in the *middle* of its parent, and this is
+    /// where.
+    at: usize,
+    /// The loop's own two values and where it keeps them.
+    roots: FoldRoots,
+    /// Everything else a scope has.
+    ///
+    /// A whole [`ScopeCode`], not a bare schedule: the value a fold carries
+    /// lives across its back edge, and where a value lives is a *placement*.
+    /// A fold scope given only an evaluation order would be the one scope that
+    /// exists for a carried value with nowhere to record where that value is.
+    code: ScopeCode,
+}
+
+/// A surviving fold's own roots — the two values its loop carries across
+/// its back edge — and where the allocator put each.
+///
+/// Placed by [`RegisterAllocator::allocate_nest`] the way a region's roots
+/// are: in a register while the budget allows, in a slot otherwise. Nothing
+/// is reserved for either by fiat, so a body's pool is the whole pool minus
+/// what is carried, at any depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldRoots {
+    /// Where the binder lives for the whole of the loop. The loop's trip
+    /// test and step read it there, and so does every scope inside that
+    /// reads the binder's `Var` — each scope finds that `Var` in its own
+    /// schedule by the binder's number, since two sibling folds binding the
+    /// same slot share one `Var` node and the answer differs per fold.
+    pub binder: Where,
+    /// Where the accumulator lives across the loop's iterations. Its result
+    /// is in the accumulator's slot either way once the loop exits, which is
+    /// where the parent's placement of the `Reduce` def says it is.
+    pub accumulator: Where,
 }
 
 impl NestAllocation {
@@ -928,6 +1018,66 @@ impl NestAllocation {
     #[must_use]
     pub fn regions(&self) -> usize {
         self.regions.len()
+    }
+
+    /// How many surviving folds this nest has.
+    #[must_use]
+    pub fn fold_count(&self) -> usize {
+        self.folds.len()
+    }
+
+    /// The scope fold `j`'s loop opens inside.
+    ///
+    /// A region is a *prologue*: it runs to completion and hands its results
+    /// on through hoist slots, so its own frame is dead by the time the next
+    /// scope needs one, and every region and the body can share one base. A
+    /// fold is the case that is not that — its loop runs in the middle of its
+    /// parent's schedule, with the parent's spilled values live across it —
+    /// which is why the frame is laid out as a tree and only a fold needs its
+    /// parent named. See [`StackFrame::with_base`](crate::emit::StackFrame::with_base).
+    ///
+    /// # Panics
+    /// If `j` names no fold in this nest.
+    #[must_use]
+    pub(crate) fn fold_parent(&self, j: usize) -> Scope {
+        self.folds
+            .get(j)
+            .unwrap_or_else(|| panic!("Fold({j}) is not a fold of this nest"))
+            .parent
+    }
+
+    /// The `ValueId` fold `j`'s `Reduce` def names — its accumulator's own
+    /// identity, for a driver assigning it a slot address before any scope
+    /// is emitted.
+    ///
+    /// # Panics
+    /// If `j` names no fold in this nest, or its parent's schedule does not
+    /// reach the position it opens at (an inconsistency between this nest's
+    /// own folds and the schedule that produced them).
+    #[must_use]
+    pub fn fold_reduce_vid(&self, j: usize) -> ValueId {
+        let fold = &self.folds[j];
+        self.code(fold.parent)
+            .and_then(|c| c.schedule.get(fold.at))
+            .map(|def| def.value)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Fold({j})'s parent {:?} has no def at {}",
+                    fold.parent, fold.at
+                )
+            })
+    }
+
+    /// Fold `j`'s own roots and where its loop keeps them.
+    ///
+    /// # Panics
+    /// If `j` names no fold in this nest.
+    #[must_use]
+    pub fn fold_roots(&self, j: usize) -> FoldRoots {
+        self.folds
+            .get(j)
+            .unwrap_or_else(|| panic!("Fold({j}) is not a fold of this nest"))
+            .roots
     }
 
     /// The allocation as `scope` reads it.
@@ -953,70 +1103,88 @@ impl NestAllocation {
         match scope {
             Scope::Region(i) => self.regions.get(i),
             Scope::Body => Some(&self.body),
+            Scope::Fold(i) => self.folds.get(i).map(|f| &f.code),
         }
     }
 
-    /// Where `v` lives, at every point in the nest.
+    /// The scope `scope` opens inside, or `None` for one that opens inside
+    /// nothing.
     ///
-    /// # Panics
-    /// If `v` is in no scope of this nest.
-    #[must_use]
-    pub fn placement(&self, v: ValueId) -> &Placement {
-        self.placements
-            .get(v.0 as usize)
-            .and_then(Option::as_ref)
-            .unwrap_or_else(|| panic!("{v:?} is not in this allocation"))
+    /// The regions are a chain and the body is inside all of them, so their
+    /// answers are positional; only a fold stores a parent, because only a
+    /// fold can hang anywhere.
+    fn parent_of(&self, scope: Scope) -> Option<Scope> {
+        match scope {
+            Scope::Region(0) => None,
+            Scope::Region(i) => Some(Scope::Region(i - 1)),
+            Scope::Body => self.regions.len().checked_sub(1).map(Scope::Region),
+            Scope::Fold(i) => self.folds.get(i).map(|f| f.parent),
+        }
     }
 
-    /// Where `v` lives at program point `at`.
+    /// Every scope of this nest, in no particular order.
+    fn scopes(&self) -> impl Iterator<Item = Scope> + use<'_> {
+        (0..self.regions.len())
+            .map(Scope::Region)
+            .chain(core::iter::once(Scope::Body))
+            .chain((0..self.folds.len()).map(Scope::Fold))
+    }
+
+    /// Whether `outer` contains `inner` — i.e. `outer`'s code runs `inner`.
     ///
-    /// # Panics
-    /// If `v` is in no scope of this nest.
-    #[must_use]
-    pub fn where_at(&self, v: ValueId, at: Point) -> Where {
-        self.placement(v).at(at)
+    /// Reflexive: a scope encloses itself, so "is this value in scope here"
+    /// needs no special case for the scope asking.
+    fn encloses(&self, outer: Scope, inner: Scope) -> bool {
+        let mut at = Some(inner);
+        while let Some(scope) = at {
+            if scope == outer {
+                return true;
+            }
+            at = self.parent_of(scope);
+        }
+        false
     }
 
     /// The register a root is **carried** in across the loops inside the
     /// region that computes it, if it is carried at all.
     ///
-    /// A root is carried exactly when its placement inside the loops is a
+    /// A root is carried exactly when the innermost scope picks it up in a
     /// register: the body reads it from there on every iteration instead of
     /// reloading it from a slot at every use. There is no separate map saying
-    /// so — that map was `carries`, and the placement already answers.
+    /// so — that map was `carries`, and the park the body starts from already
+    /// answers.
     ///
     /// # Panics
     /// If `root` is in no scope of this nest.
     #[must_use]
     pub fn carried(&self, root: ValueId) -> Option<Reg> {
-        match self.where_at(
-            root,
-            Point {
-                scope: Scope::Body,
-                index: 0,
-            },
-        ) {
+        match self.body().at_head(root) {
             Where::Reg(r) => Some(r),
             Where::Spilled | Where::Remat(_) => None,
         }
     }
 
-    /// Override where a value lives, for the whole of its life.
+    /// Override where a value lives, for the whole of its life in `scope`.
     ///
     /// The emitter's own tests pin a value somewhere the allocator did not
     /// choose. One write, so the placement cannot desync from itself.
     ///
     /// # Panics
-    /// If `v` is in no scope of this nest — a placement has to start
-    /// somewhere, and only the allocation knows where `v` is defined.
-    pub fn place(&mut self, v: ValueId, at: Where) {
-        let from = self.placement(v).defined_at();
-        self.placements[v.0 as usize] = Some(Placement::new(Span { from, at }));
+    /// If `v` is not in `scope` — a placement has to start somewhere, and only
+    /// the allocation knows where `v` is defined.
+    pub fn place(&mut self, scope: Scope, v: ValueId, at: Where) {
+        let from = self.scope(scope).placement(v).defined_at();
+        let code = match scope {
+            Scope::Region(i) => &mut self.regions[i],
+            Scope::Body => &mut self.body,
+            Scope::Fold(i) => &mut self.folds[i].code,
+        };
+        code.placements[v.0 as usize] = Some(Placement::new(Span { from, at }));
     }
 }
 
-/// The allocation as one scope reads it: that scope's schedule and scratch,
-/// and the nest-wide placements resolved at points inside it.
+/// The allocation as one scope reads it: that scope's schedule, scratch and
+/// placements.
 ///
 /// The scope is baked in, so callers hand over a *local* schedule index and
 /// cannot name a point in some other scope by accident.
@@ -1039,6 +1207,18 @@ impl<'a> Allocation<'a> {
         &self.code().roots
     }
 
+    /// This scope's `Select` short-circuit guards, as analyzed once during
+    /// allocation.
+    ///
+    /// The schedule an emitter reads here is the one the allocator scanned —
+    /// [`schedule`](Self::schedule) never reorders it — so the guard analysis
+    /// is the same question asked and answered twice. This is the answer on
+    /// file; nothing downstream needs to ask again.
+    #[must_use]
+    pub(crate) fn select_guards(&self) -> &'a [SelectGuard] {
+        &self.code().guards
+    }
+
     /// The scratch the instruction at schedule position `i` may destroy.
     #[must_use]
     pub fn scratch(&self, i: usize) -> Scratch {
@@ -1052,10 +1232,23 @@ impl<'a> Allocation<'a> {
     /// question with no answer once a live range can be split.
     ///
     /// # Panics
-    /// If `v` is in no scope of this nest.
+    /// If this scope never sees `v`.
     #[must_use]
     pub fn where_at(&self, v: ValueId, index: usize) -> Where {
-        self.nest.where_at(v, self.point(index))
+        self.placement(v).at(Point { index })
+    }
+
+    /// Where `v` lives when this scope is entered.
+    ///
+    /// For a value an enclosing scope computed, this is its park — the one
+    /// place it is on both of the head's predecessors, the fall-through and
+    /// the back edge — and it is where every iteration expects to find it.
+    ///
+    /// # Panics
+    /// If this scope never sees `v`.
+    #[must_use]
+    pub fn at_head(&self, v: ValueId) -> Where {
+        self.where_at(v, Point::HEAD.index)
     }
 
     /// The register a root is carried in across the loops inside its region.
@@ -1064,51 +1257,131 @@ impl<'a> Allocation<'a> {
         self.nest.carried(root)
     }
 
-    /// Where `v` lives at every point in the nest.
+    /// Where `v` lives at every point of this scope.
     ///
     /// # Panics
-    /// If `v` is in no scope of this nest.
+    /// If this scope never sees `v`.
     #[must_use]
     pub fn placement(&self, v: ValueId) -> &'a Placement {
-        self.nest.placement(v)
+        self.placement_of(v)
+            .unwrap_or_else(|| panic!("{v:?} is not in {:?}", self.scope))
     }
 
-    /// The points inside *this* scope at which `v` changes place, in order.
+    /// Where `v` lives at every point of this scope, or `None` if it never
+    /// reaches here.
     ///
-    /// A placement is nest-wide; emitting one scope needs the part of it that
-    /// happens here. This is what lets the emitter maintain its location table
-    /// incrementally — one pass, O(total spans) — rather than asking where
-    /// every value is at every instruction.
+    /// The fallible form, for the questions asked *about* a scope rather than
+    /// from inside it — "does the loop within hold this in one register the
+    /// whole way", where a value the loop never reads is vacuously fine.
+    #[must_use]
+    pub fn placement_of(&self, v: ValueId) -> Option<&'a Placement> {
+        self.code().placements.get(v.0 as usize)?.as_ref()
+    }
+
+    /// The points of this scope at which `v` changes place, in order.
+    ///
+    /// This is what lets the emitter maintain its location table incrementally
+    /// — one pass, O(total spans) — rather than asking where every value is at
+    /// every instruction.
     ///
     /// # Panics
-    /// If `v` is in no scope of this nest.
+    /// If this scope never sees `v`.
     pub fn transitions(self, v: ValueId) -> impl Iterator<Item = (usize, Where)> + use<'a> {
-        let scope = self.scope;
-        self.nest
-            .placement(v)
-            .spans()
-            .filter(move |s| s.from.scope == scope)
-            .map(|s| (s.from.index, s.at))
+        self.placement(v).spans().map(|s| (s.from.index, s.at))
     }
 
-    /// The first program point *inside* this scope: where the loops it
-    /// encloses begin, and where a root it parks is picked up.
+    /// Where this scope opens in its parent: the parent, and the position in
+    /// its schedule. `None` for a scope that wraps all of its parent rather
+    /// than opening partway through it.
     ///
-    /// The body encloses nothing, so its own end is the answer there — a point
-    /// no span starts at, which is exactly "there is nothing inside".
+    /// Only a fold answers. A region surrounds everything inside it and the
+    /// body is inside every back edge, so for those "where does it open" is
+    /// the head — there is no position to name. It is a fold that starts at a
+    /// def, which is exactly what makes the nest a tree, so this is the query
+    /// that distinguishes the two.
     #[must_use]
-    pub fn inner_head(&self) -> Point {
+    pub fn opens_at(&self) -> Option<(Scope, usize)> {
         match self.scope {
-            Scope::Region(i) if i + 1 < self.nest.regions.len() => Point {
-                scope: Scope::Region(i + 1),
-                index: 0,
-            },
-            Scope::Region(_) => Point {
-                scope: Scope::Body,
-                index: 0,
-            },
-            Scope::Body => Point::TAIL,
+            Scope::Fold(i) => {
+                let fold = &self.nest.folds[i];
+                Some((fold.parent, fold.at))
+            }
+            Scope::Region(_) | Scope::Body => None,
         }
+    }
+
+    /// Which scope this allocation answers for.
+    ///
+    /// Not a coordinate — see [`Scope`]'s own doc — but the key an emitter
+    /// needs to ask [`Allocation::fold_opening_at`] from the right place.
+    #[must_use]
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// The scope of this same nest that opens *at* `at` in this schedule —
+    /// [`Allocation::opens_at`]'s query from the other end, asked by the
+    /// emitter walking a schedule position by position rather than by a
+    /// fold looking for its own parent.
+    ///
+    /// A linear scan of the nest's folds: there are a handful per kernel at
+    /// most, and this is asked once per schedule position during emission.
+    #[must_use]
+    pub fn fold_opening_at(&self, at: usize) -> Option<Scope> {
+        self.nest
+            .folds
+            .iter()
+            .position(|f| f.parent == self.scope && f.at == at)
+            .map(Scope::Fold)
+    }
+
+    /// This fold scope's own roots and where its loop keeps them — what the
+    /// emitter opening the loop seeds, tests, combines into and steps.
+    ///
+    /// # Panics
+    /// If this scope is a region or the body: neither has a binder or an
+    /// accumulator, so the question has no answer there.
+    #[must_use]
+    pub fn fold_roots(&self) -> FoldRoots {
+        match self.scope {
+            Scope::Fold(j) => self.nest.fold_roots(j),
+            Scope::Region(_) | Scope::Body => {
+                panic!(
+                    "{:?} is not a fold, so it has no binder or accumulator",
+                    self.scope
+                )
+            }
+        }
+    }
+
+    /// This nest's own view of `scope` — a sibling, an ancestor, or a
+    /// descendant of the scope this [`Allocation`] answers for.
+    ///
+    /// # Panics
+    /// If `scope` names a scope this nest does not have (see
+    /// [`NestAllocation::scope`]).
+    #[must_use]
+    pub fn sibling(&self, scope: Scope) -> Self {
+        self.nest.scope(scope)
+    }
+
+    /// The scopes inside this one, in no particular order.
+    ///
+    /// A root this scope parks is picked up by each of them, so "where does
+    /// the code within keep it" is a question about all of them together.
+    ///
+    /// A **subtree** walk, not a suffix of a chain. Those coincide while the
+    /// nest is a spine of regions — every later region is inside every earlier
+    /// one — and stop the moment a fold hangs off one: a fold in `Region(0)`
+    /// and `Region(1)` are siblings, each inside region 0 and neither inside
+    /// the other. Answering "inside" positionally would put a fold's carried
+    /// value under a region that never runs it.
+    pub fn within(self) -> impl Iterator<Item = Allocation<'a>> + use<'a> {
+        let nest = self.nest;
+        let me = self.scope;
+        nest.scopes()
+            .filter(move |s| *s != me && nest.encloses(me, *s))
+            .map(move |scope| Allocation { nest, scope })
     }
 
     /// Whether this scope *reads* `v` from an enclosing region's park rather
@@ -1119,22 +1392,21 @@ impl<'a> Allocation<'a> {
     /// this frame's to place. Narrower than "defined elsewhere": a `Const`
     /// leaf shared with an enclosing region is genuinely computed here too,
     /// and does need a location of its own.
+    ///
+    /// Walks up [`NestAllocation::parent_of`] rather than slicing a prefix of
+    /// the regions, for the reason [`Allocation::within`] walks a subtree: a
+    /// scope's ancestors are the scopes that actually run it, and with a fold
+    /// in the nest those are no longer the ones that precede it.
     #[must_use]
     pub fn parked_by_an_enclosing_scope(&self, v: ValueId) -> bool {
-        let outside = match self.scope {
-            Scope::Region(i) => i,
-            Scope::Body => self.nest.regions.len(),
-        };
-        self.nest.regions[..outside]
-            .iter()
-            .any(|r| r.roots.contains(&v))
-    }
-
-    fn point(&self, index: usize) -> Point {
-        Point {
-            scope: self.scope,
-            index,
+        let mut at = self.nest.parent_of(self.scope);
+        while let Some(scope) = at {
+            if self.nest.code(scope).is_some_and(|c| c.roots.contains(&v)) {
+                return true;
+            }
+            at = self.nest.parent_of(scope);
         }
+        false
     }
 
     fn code(&self) -> &'a ScopeCode {
@@ -1191,6 +1463,7 @@ pub trait RegisterAllocator {
             ScopedSchedule {
                 regions: Vec::new(),
                 body: dag,
+                folds: Vec::new(),
             },
             file,
         )
@@ -1216,6 +1489,13 @@ pub struct ScopedSchedule {
     pub regions: Vec<ScopeRegion>,
     /// The innermost region: evaluated at every sample.
     pub body: Vec<Def>,
+    /// The surviving folds, in [`Scope::Fold`] order. Empty for a nest whose
+    /// every `Reduce` was unrolled, which today is all of them.
+    ///
+    /// Its own field for the same reason `body` is: a fold is not a region.
+    /// It opens partway through its parent's schedule rather than around all
+    /// of it, so a list that could hold both would let the two be confused.
+    pub folds: Vec<ScopeFold>,
 }
 
 /// One scope of a [`ScopedSchedule`].
@@ -1223,6 +1503,19 @@ pub struct ScopeRegion {
     /// Values this region computes for the ones inside it.
     pub roots: Vec<ValueId>,
     /// What it computes, in topological order.
+    pub schedule: Vec<Def>,
+}
+
+/// One surviving fold of a [`ScopedSchedule`]: a region that opens in the
+/// middle of another scope.
+pub struct ScopeFold {
+    /// The scope whose schedule holds this loop's def.
+    pub parent: Scope,
+    /// Which def of `parent` — the `Reduce` this is the body of.
+    pub at: usize,
+    /// Values this fold computes for the scopes inside it.
+    pub roots: Vec<ValueId>,
+    /// The loop body, in topological order.
     pub schedule: Vec<Def>,
 }
 
@@ -1259,61 +1552,279 @@ pub struct ScopeRegion {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct LinearScan;
 
+/// Which roots of a nest are carried in registers — the decision every
+/// scope's allocation then follows.
+///
+/// One ranking over every candidate, a region's roots and each fold's
+/// binder and accumulator alike, by what a carry saves per batch. A region
+/// root saves one reload per read in the body. A fold root saves its loop's
+/// own traffic — the trip test and the step for a binder, the combine's
+/// reload and store for an accumulator — plus one reload per read of the
+/// binder inside, all multiplied by how many times the loop runs, so a
+/// counter stepped thirty times a batch outranks a root read once. A fold
+/// in a prologue runs per call or per row rather than per batch, so
+/// candidates rank first by the loop level their reads run at and only
+/// then by count.
+///
+/// Greedy, under one constraint: a carry is live across every scope its
+/// value is read in, and no scope may have more registers carried across it
+/// than the pool has above the floor. That is what keeps every scope's own
+/// allocation possible at any depth, and it is the whole of what used to be
+/// a per-scope budget.
+struct CarryPlan {
+    /// Per region, the roots to carry, hottest first.
+    region_roots: Vec<Vec<ValueId>>,
+    /// Per fold, whether its binder is carried.
+    fold_binder: Vec<bool>,
+    /// Per fold, whether its accumulator is carried.
+    fold_accumulator: Vec<bool>,
+}
+
+/// The `Var` `var` is read through in `schedule`, if it is read there.
+///
+/// By number, not identity: a `Var` node is shared by every fold binding the
+/// same slot, so which loop's counter it names is a fact about the schedule
+/// reading it.
+fn var_in(schedule: &[Def], var: u8) -> Option<ValueId> {
+    schedule
+        .iter()
+        .find(|d| matches!(d.op, ScheduledOp::Var(v) if v == var))
+        .map(|d| d.value)
+}
+
+fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
+    let regions = nest.regions.len();
+    let folds = nest.folds.len();
+    for (index, fold) in nest.folds.iter().enumerate() {
+        assert!(
+            match fold.parent {
+                // A fold nested in a fold needs its parent's answer, so
+                // parents come first. Also makes a parent cycle unsayable.
+                Scope::Fold(j) => j < index,
+                Scope::Region(i) => i < regions,
+                Scope::Body => true,
+            },
+            "Fold({index})'s parent {:?} is not an earlier scope",
+            fold.parent
+        );
+    }
+
+    // The loop level a scope's code runs at: a region's index, the body
+    // one past the last region, a fold its parent's.
+    let level_of = |mut scope: Scope| loop {
+        match scope {
+            Scope::Region(i) => break i,
+            Scope::Body => break regions,
+            Scope::Fold(j) => scope = nest.folds[j].parent,
+        }
+    };
+    let meta_of = |j: usize| -> &pixelflow_ir::fold::Fold {
+        let fold = &nest.folds[j];
+        let def = match fold.parent {
+            Scope::Region(i) => &nest.regions[i].schedule[fold.at],
+            Scope::Body => &nest.body[fold.at],
+            Scope::Fold(p) => &nest.folds[p].schedule[fold.at],
+        };
+        let ScheduledOp::Reduce(meta, _) = &def.op else {
+            panic!(
+                "Fold({j})'s parent def at {:?}[{}] is not a Reduce",
+                fold.parent, fold.at
+            )
+        };
+        meta
+    };
+    // How many times fold `j`'s body runs per run of the scope its
+    // outermost enclosing fold hangs off: its own trip count times every
+    // enclosing fold's.
+    let mut trips: Vec<usize> = Vec::with_capacity(folds);
+    for j in 0..folds {
+        let own = meta_of(j).len() as usize;
+        trips.push(match nest.folds[j].parent {
+            Scope::Fold(p) => own * trips[p],
+            Scope::Region(_) | Scope::Body => own,
+        });
+    }
+    // The folds from `k` up to `j`, `k` first, if `j` encloses `k` (or is
+    // it); empty otherwise.
+    let chain_up_to = |k: usize, j: usize| -> Vec<usize> {
+        let mut chain = vec![k];
+        let mut at = k;
+        while at != j {
+            match nest.folds[at].parent {
+                Scope::Fold(p) => {
+                    chain.push(p);
+                    at = p;
+                }
+                Scope::Region(_) | Scope::Body => return Vec::new(),
+            }
+        }
+        chain
+    };
+    // Every read of fold `j`'s binder inside it, weighted by how often the
+    // reading fold runs — across `j`'s own body and every fold within,
+    // except where a fold in between rebinds the same slot.
+    let binder_reads = |j: usize| -> usize {
+        let var = meta_of(j).binder().var();
+        (0..folds)
+            .map(|k| {
+                let chain = chain_up_to(k, j);
+                if chain.is_empty()
+                    || chain[..chain.len() - 1]
+                        .iter()
+                        .any(|f| meta_of(*f).binder().var() == var)
+                {
+                    return 0;
+                }
+                let Some(bv) = var_in(&nest.folds[k].schedule, var) else {
+                    return 0;
+                };
+                let reads = nest.folds[k]
+                    .schedule
+                    .iter()
+                    .flat_map(|d| operands(&d.op))
+                    .filter(|o| *o == bv)
+                    .count();
+                reads * trips[k]
+            })
+            .sum()
+    };
+
+    // Scopes, indexed for the count: regions, then the body, then folds.
+    let body_ix = regions;
+    let fold_ix = |j: usize| regions + 1 + j;
+    enum Root {
+        Region(usize, ValueId),
+        Binder(usize),
+        Accumulator(usize),
+    }
+    struct Candidate {
+        level: usize,
+        weight: usize,
+        live_across: Vec<usize>,
+        root: Root,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    // Uses in the innermost body are what carrying a region root saves: one
+    // reload per use, per batch.
+    let mut body_uses: BTreeMap<ValueId, usize> = BTreeMap::new();
+    for def in &nest.body {
+        for operand in operands(&def.op) {
+            *body_uses.entry(operand).or_insert(0) += 1;
+        }
+    }
+    for (i, region) in nest.regions.iter().enumerate() {
+        // Live across every scope after this region — every fold that
+        // runs inside it or inside a later scope included.
+        let live_across: Vec<usize> = ((i + 1)..regions)
+            .chain(core::iter::once(body_ix))
+            .chain(
+                (0..folds)
+                    .filter(|&j| level_of(Scope::Fold(j)) >= i)
+                    .map(fold_ix),
+            )
+            .collect();
+        // By id within the region, so two roots read the same number of
+        // times are ordered by something other than map order.
+        let mut roots: Vec<ValueId> = region.roots.clone();
+        roots.sort_by_key(|v| v.0);
+        for v in roots {
+            let weight = body_uses.get(&v).copied().unwrap_or(0);
+            if weight == 0 {
+                continue;
+            }
+            candidates.push(Candidate {
+                level: body_ix,
+                weight,
+                live_across: live_across.clone(),
+                root: Root::Region(i, v),
+            });
+        }
+    }
+    for (j, &trips_j) in trips.iter().enumerate() {
+        let level = level_of(Scope::Fold(j));
+        let live_across: Vec<usize> = (0..folds)
+            .filter(|&k| !chain_up_to(k, j).is_empty())
+            .map(fold_ix)
+            .collect();
+        // The trip test and the step read the binder once each per trip;
+        // the combine reloads and stores the accumulator once each.
+        candidates.push(Candidate {
+            level,
+            weight: 2 * trips_j + binder_reads(j),
+            live_across: live_across.clone(),
+            root: Root::Binder(j),
+        });
+        candidates.push(Candidate {
+            level,
+            weight: 2 * trips_j,
+            live_across,
+            root: Root::Accumulator(j),
+        });
+    }
+    // Stable, so the order above breaks ties: regions before folds, a
+    // binder before its accumulator, lower ids first.
+    candidates.sort_by_key(|c| core::cmp::Reverse((c.level, c.weight)));
+
+    let mut count = vec![0usize; regions + 1 + folds];
+    let mut plan = CarryPlan {
+        region_roots: vec![Vec::new(); regions],
+        fold_binder: vec![false; folds],
+        fold_accumulator: vec![false; folds],
+    };
+    for candidate in candidates {
+        if candidate
+            .live_across
+            .iter()
+            .any(|&s| count[s] >= above_floor)
+        {
+            continue;
+        }
+        for &s in &candidate.live_across {
+            count[s] += 1;
+        }
+        match candidate.root {
+            Root::Region(i, v) => plan.region_roots[i].push(v),
+            Root::Binder(j) => plan.fold_binder[j] = true,
+            Root::Accumulator(j) => plan.fold_accumulator[j] = true,
+        }
+    }
+    plan
+}
+
 impl RegisterAllocator for LinearScan {
     fn allocate_nest(&self, nest: ScopedSchedule, file: &RegisterFile) -> NestAllocation {
+        // Which roots are carried, decided once over the whole nest; each
+        // scope below picks the registers.
+        let above_floor = file.scratch.len().saturating_sub(RegisterFile::MIN_SCRATCH) as usize;
+        let plan = plan_carries(&nest, above_floor);
         // Outermost first, because that is the direction liveness flows: a
         // value a region computes for the scopes inside it is live across
         // every iteration of every loop between here and its last use. A
         // register holding it is therefore unavailable to all of them, which
         // is what allocating each region against the full pool used to miss.
         let mut carried = RegSet::EMPTY;
-        let mut placements: Vec<Option<Placement>> = Vec::new();
-        // Roots of the regions already handled: values an inner scope reads
-        // from a park rather than computing, so its scan's answer for them is
-        // a placeholder's and must not overwrite the park.
-        // Where each of them lives for the whole of every scope inside: the
-        // register carrying it, or its park slot. A scan inside reads this
-        // rather than choosing, which is what lets it tell a resident operand
-        // from one it has to reload — the question every reservation now turns
-        // on.
+        // Roots of the regions already handled, and where each of them lives
+        // for the whole of every scope inside: the register carrying it, or
+        // its park slot. A scan inside reads this rather than choosing, which
+        // is what lets it tell a resident operand from one it has to reload —
+        // the question every reservation now turns on. It is also that scope's
+        // whole answer for the value, since nothing inside may move it.
         let mut parked: BTreeMap<ValueId, Where> = BTreeMap::new();
         let mut regions: Vec<ScopeCode> = Vec::with_capacity(nest.regions.len());
-        let region_count = nest.regions.len();
-
-        // Uses in the innermost body are what a carry actually saves: one
-        // reload per use, per iteration. Counted once, up front.
-        let mut body_uses: BTreeMap<ValueId, usize> = BTreeMap::new();
-        for def in &nest.body {
-            for operand in operands(&def.op) {
-                *body_uses.entry(operand).or_insert(0) += 1;
-            }
-        }
+        // What the scopes *inside* region `i` may not allocate: the carries
+        // of regions `0..=i`. A fold hanging off region `i` runs inside it
+        // and not inside the regions after it, whose carries it may use.
+        let mut carried_after_region: Vec<RegSet> = Vec::with_capacity(nest.regions.len());
 
         for (index, region) in nest.regions.into_iter().enumerate() {
             let scope = Scope::Region(index);
             let scoped = file.inside(carried);
             let scan = self.scan(region.schedule, &scoped, &parked);
 
-            // Carry the roots the body reads most, while the body keeps a
-            // pool it can still allocate in. Every carry costs one register
-            // for the whole loop and saves one reload per use per iteration,
-            // so the ordering is by use count and the cap is the floor.
-            let budget = file
-                .scratch
-                .len()
-                .saturating_sub(carried.len())
-                .saturating_sub(RegisterFile::MIN_SCRATCH);
-            let mut ranked: Vec<(usize, ValueId)> = region
-                .roots
-                .iter()
-                .map(|v| (body_uses.get(v).copied().unwrap_or(0), *v))
-                .filter(|(uses, _)| *uses > 0)
-                .collect();
-            // Descending by use count, then by id so the choice is
-            // deterministic — two roots read the same number of times must
-            // not depend on map iteration order.
-            ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.0.cmp(&b.1.0)));
-
+            // Carry the roots the plan chose, hottest first, from the
+            // registers this region's own code leaves free.
+            //
             // Everything the region's own code touches: placed values AND
             // per-instruction scratch. A temp is a pool register that no
             // placement records, so taking the complement of the locations
@@ -1329,99 +1840,215 @@ impl RegisterAllocator for LinearScan {
             let free = scoped.scratch.without(RegSet::of(&used));
             let mut available = free.iter();
             let mut carries: BTreeMap<ValueId, Reg> = BTreeMap::new();
-            for (_, vid) in ranked.into_iter().take(budget as usize) {
+            for &vid in &plan.region_roots[index] {
                 let Some(reg) = available.next() else { break };
                 carried = carried.union(RegSet::of(&[reg]));
                 carries.insert(vid, reg);
             }
 
-            record(&mut placements, scope, &scan, &parked);
+            let placements = record(&scan, &parked);
 
-            // A root outlives the region computing it, so its placement has a
-            // second range: from the first point of the scope inside, it is
-            // either the register carrying it across the loops or the slot it
-            // was parked in. Two ranges over one life — the thing a single
-            // location per value could not say, and the reason the emitter
-            // needed a `carries` map beside it.
-            let inside = if index + 1 < region_count {
-                Scope::Region(index + 1)
-            } else {
-                Scope::Body
-            };
+            // A root outlives the region computing it, and where the scopes
+            // inside find it is *their* answer, not another range on this
+            // one's: either the register carrying it across the loops, or the
+            // slot it was parked in. `parked` is how they are told, and
+            // `record` turns it into their first span.
             for root in &region.roots {
                 let at = match carries.get(root) {
                     Some(reg) => Where::Reg(*reg),
                     None => Where::Spilled,
                 };
-                let park = Span {
-                    from: Point {
-                        scope: inside,
-                        index: 0,
-                    },
-                    at,
-                };
-                let in_region = placements[root.0 as usize]
-                    .take()
-                    .unwrap_or_else(|| unreachable!("a region computes its own roots"));
-                placements[root.0 as usize] = Some(in_region.then(park));
+                assert!(
+                    placements.get(root.0 as usize).is_some_and(Option::is_some),
+                    "a region computes its own roots, but {root:?} is not in {scope:?}"
+                );
                 parked.insert(*root, at);
             }
 
             regions.push(ScopeCode {
+                placements,
                 schedule: scan.schedule,
                 scratch: scan.scratch,
                 roots: region.roots,
+                guards: scan.guards,
             });
+            carried_after_region.push(carried);
         }
 
         let body = self.scan(nest.body, &file.inside(carried), &parked);
-        record(&mut placements, Scope::Body, &body, &parked);
+        let body_code = ScopeCode {
+            placements: record(&body, &parked),
+            schedule: body.schedule,
+            scratch: body.scratch,
+            roots: Vec::new(),
+            guards: body.guards,
+        };
+
+        // Each surviving fold, against the pool minus what its *ancestors*
+        // carry and the parks they left it. A fold's own roots — its binder
+        // and its accumulator — are placed here the way a region's roots are
+        // placed above: carried in a register while the budget allows, parked
+        // in a slot otherwise. Nothing is reserved across a body by fiat; the
+        // binder used to be, pinned to a temp for the loop's whole life and
+        // kept out of every pool inside, which put a depth on how many folds
+        // could nest before a pool fell under the floor. The allocator decides
+        // now, and at the floor it decides "slot", which always fits.
+        let mut folds: Vec<FoldScope> = Vec::with_capacity(nest.folds.len());
+        // What the scopes inside fold `j` may not allocate: what its parent's
+        // scopes may not, plus fold `j`'s own carries.
+        let mut carried_into_fold: Vec<RegSet> = Vec::with_capacity(nest.folds.len());
+        // Per fold, the `Var` its binder is and where it lives, for a fold
+        // nested inside it that reads the outer index (a contraction does).
+        let mut binders: Vec<(u8, Where)> = Vec::with_capacity(nest.folds.len());
+        // Where every fold of the nest opens, so a `Reduce` def in a fold's
+        // schedule that opens none of them can be told from one that does:
+        // it is a placeholder for an enclosing scope's fold, read from the
+        // accumulator slot that loop left its result in.
+        let opens: Vec<(Scope, usize)> = nest.folds.iter().map(|f| (f.parent, f.at)).collect();
+        for (index, fold) in nest.folds.into_iter().enumerate() {
+            // The `Reduce` def this fold is the body of — read back out of
+            // whichever scope's schedule holds it, the same schedule
+            // `Allocation::opens_at` names, so the fold's own metadata (its
+            // monoid, its binder, its range) never needs restating on
+            // `ScopeFold` itself.
+            let (parent_code, carried_into_parent): (&ScopeCode, RegSet) = match fold.parent {
+                Scope::Region(i) => (&regions[i], carried_after_region[i]),
+                Scope::Body => (&body_code, carried),
+                Scope::Fold(j) => (&folds[j].code, carried_into_fold[j]),
+            };
+            let ScheduledOp::Reduce(fold_meta, _) = &parent_code.schedule[fold.at].op else {
+                panic!(
+                    "Fold({index})'s parent def at {:?}[{}] is not a Reduce",
+                    fold.parent, fold.at
+                );
+            };
+            let binder_var = fold_meta.binder().var();
+            // The binder's `Var` as this body reads it, if it does (an
+            // unusual but valid fold never does).
+            let binder_vid = var_in(&fold.schedule, binder_var);
+
+            // The fold's roots, carried as the plan decided, from the
+            // registers free at the def — everything the parent holds
+            // resident was evicted there (see `scan`), so that is the pool
+            // minus the ancestors' carries and the def's own scratch.
+            let parent_scratch = &parent_code.scratch[fold.at];
+            let mut taken_at_def: Vec<Reg> = Vec::new();
+            taken_at_def.extend(parent_scratch.temps.iter().flatten().copied());
+            taken_at_def.extend(parent_scratch.reloads.iter().flatten().copied());
+            taken_at_def.extend(parent_scratch.guard_mask);
+            taken_at_def.extend(parent_scratch.guard_temp);
+            taken_at_def.extend(parent_scratch.result);
+            let free = file
+                .scratch
+                .without(carried_into_parent)
+                .without(RegSet::of(&taken_at_def));
+            let mut available = free.iter();
+            let mut own = RegSet::EMPTY;
+            let (mut binder_at, mut accumulator_at) = (Where::Spilled, Where::Spilled);
+            for (wanted, at) in [
+                (plan.fold_binder[index], &mut binder_at),
+                (plan.fold_accumulator[index], &mut accumulator_at),
+            ] {
+                if !wanted {
+                    continue;
+                }
+                let Some(reg) = available.next() else { break };
+                own = own.union(RegSet::of(&[reg]));
+                *at = Where::Reg(reg);
+            }
+            let carried_into = carried_into_parent.union(own);
+
+            // What the body finds parked: the ancestors' roots, a `Reduce`
+            // it reads but does not open (an enclosing scope's fold, in its
+            // slot), every enclosing fold's binder where *that* loop keeps
+            // it, and its own binder where this loop keeps it — last, so a
+            // binder that shadows an enclosing one is this fold's.
+            let mut fold_parked = parked.clone();
+            for (at, def) in fold.schedule.iter().enumerate() {
+                if matches!(def.op, ScheduledOp::Reduce(..))
+                    && !opens.contains(&(Scope::Fold(index), at))
+                {
+                    fold_parked.insert(def.value, Where::Spilled);
+                }
+            }
+            let mut up = fold.parent;
+            while let Scope::Fold(j) = up {
+                let (var, at) = binders[j];
+                if let Some(bv) = var_in(&fold.schedule, var) {
+                    fold_parked.insert(bv, at);
+                }
+                up = folds[j].parent;
+            }
+            if let Some(bv) = binder_vid {
+                fold_parked.insert(bv, binder_at);
+            }
+            binders.push((binder_var, binder_at));
+            carried_into_fold.push(carried_into);
+
+            let scan = self.scan(fold.schedule, &file.inside(carried_into), &fold_parked);
+            folds.push(FoldScope {
+                parent: fold.parent,
+                at: fold.at,
+                roots: FoldRoots {
+                    binder: binder_at,
+                    accumulator: accumulator_at,
+                },
+                code: ScopeCode {
+                    placements: record(&scan, &fold_parked),
+                    schedule: scan.schedule,
+                    scratch: scan.scratch,
+                    roots: fold.roots,
+                    guards: scan.guards,
+                },
+            });
+        }
 
         NestAllocation {
-            placements,
             regions,
-            body: ScopeCode {
-                schedule: body.schedule,
-                scratch: body.scratch,
-                roots: Vec::new(),
-            },
+            body: body_code,
+            folds,
         }
     }
 }
 
-/// Fold one scope's scan into the nest-wide map.
+/// One scope's scan as placements.
 ///
-/// A `parked` value is skipped: its entry in this schedule is a placeholder
-/// the emitter never emits, and the region that computes it has already said
-/// where it lives from here on. Everything else this scope schedules gets a
-/// range at its own definition — including a `Var`/`Const` leaf an enclosing
-/// scope also computes, which is genuinely rebuilt here and genuinely may land
-/// somewhere else.
-fn record(
-    placements: &mut Vec<Option<Placement>>,
-    scope: Scope,
-    scan: &Scan,
-    parked: &BTreeMap<ValueId, Where>,
-) {
-    if placements.len() < scan.ranges.len() {
-        placements.resize(scan.ranges.len(), None);
-    }
+/// A `parked` value's ranges are *replaced* rather than merged: its entry in
+/// this schedule is a placeholder the emitter never emits, and the region that
+/// computes it already said where this scope finds it — at the head, and for
+/// the whole of it, since nothing here may move a value the loops outside are
+/// holding. Everything else gets its own ranges, including a `Var`/`Const`
+/// leaf an enclosing scope also computes, which is genuinely rebuilt here and
+/// genuinely may land somewhere else.
+fn record(scan: &Scan, parked: &BTreeMap<ValueId, Where>) -> Vec<Option<Placement>> {
+    let mut placements: Vec<Option<Placement>> = alloc::vec![None; scan.ranges.len()];
     for (key, ranges) in scan.ranges.iter().enumerate() {
         if parked.contains_key(&ValueId(key as u32)) {
             continue;
         }
         for &(index, at) in ranges {
-            let from = Point { scope, index };
+            let from = Point { index };
             let slot = &mut placements[key];
             *slot = Some(match slot.take() {
-                // A leaf an enclosing scope also computes: another range, since
-                // the two scans chose independently.
+                // Consecutive ranges at the same place are one range: an
+                // eviction that put a value back where it already was is not a
+                // move, and a repeated span would break the strict increase.
                 Some(prior) if prior.at(from) != at => prior.then(Span { from, at }),
                 Some(prior) => prior,
                 None => Placement::new(Span { from, at }),
             });
         }
     }
+    for (&v, &at) in parked {
+        if placements.len() <= v.0 as usize {
+            placements.resize(v.0 as usize + 1, None);
+        }
+        placements[v.0 as usize] = Some(Placement::new(Span {
+            from: Point::HEAD,
+            at,
+        }));
+    }
+    placements
 }
 
 /// One scope, scanned straight through: the ranges each value's life is cut
@@ -1429,15 +2056,21 @@ fn record(
 ///
 /// Ranges rather than one location, because eviction **splits**: a value keeps
 /// the register it held up to the point it lost, and may come back into one at
-/// a later read. Turning these into nest-wide [`Placement`]s is
-/// [`LinearScan::allocate_nest`]'s job, because only the nest knows what
-/// happens to a value after this scope ends.
+/// a later read. [`record`] turns these into this scope's [`Placement`]s,
+/// which is nearly a rename — the work it does is folding in what an enclosing
+/// scope parked, since that is the one thing a scan of this scope alone cannot
+/// know.
 struct Scan {
     schedule: Vec<Def>,
     /// Dense by `ValueId.0`: this scope's ranges for that value, in strictly
     /// increasing schedule order. Empty for a value this scope does not place.
     ranges: Vec<Vec<(usize, Where)>>,
     scratch: Vec<Scratch>,
+    /// This scope's `Select` guards, analyzed once against `schedule` here and
+    /// carried into its [`ScopeCode`] rather than recomputed at emission: the
+    /// schedule a scope emits is the one it was scanned with, unchanged, so a
+    /// second analysis of it would answer a question already on file.
+    guards: Vec<SelectGuard>,
 }
 
 impl Scan {
@@ -1457,18 +2090,44 @@ impl Scan {
 /// its slot needs no store; anything else has to be written out. Belady's
 /// distance breaks ties *within* a tier and only within one: the traffic an
 /// eviction causes outweighs how long it waits to cause it.
+/// What it costs the instruction being placed to lose one of its own reads —
+/// the tier that outranks every kind of deferred traffic, and the reason an
+/// operand's register is a *priced* choice rather than a forbidden one.
+///
+/// Ordered cheapest first. The distinction between the two read-here cases is
+/// what makes the exhausted pool feasible: when every held register belongs to
+/// something this instruction reads, the loser has to be one of them, and only
+/// one kind of them costs no further register.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum ReadHere {
+    /// Not read by this instruction or by a guard emitted before it.
+    No,
+    /// Read here, and it is the operand the encoding consumes *from the
+    /// destination* ([`OperandSource::Destination`]): losing its register
+    /// means one reload — into `dst`, which is the register it is losing —
+    /// and no other register at all.
+    FromDst,
+    /// Read here and needs a register of its own to be read from: a reload
+    /// register the pool then has to find too, or a guard's mask register for
+    /// a branch emitted before the instruction.
+    NeedsRegister,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct EvictionRank {
-    /// Read by the instruction being placed — the one thing that outranks
-    /// cheap traffic, and the reason an operand's register is a last resort
-    /// rather than a forbidden one.
+    /// Read by the instruction being placed — see [`ReadHere`].
     ///
     /// The tiers below price the traffic an eviction *defers*; for a value read
     /// right here there is nothing to defer, so taking its register buys a
     /// reload inside this very instruction. Without this, a value already in
     /// its slot is the standing favourite — and at a read, the standing
     /// favourite is whichever value the instruction is reading.
-    needed_now: bool,
+    ///
+    /// Answered from the instruction's own read set, never from the read
+    /// cursor: the kept-reload step advances the cursor past the current index
+    /// (`next_read(operand, i + 1)`), so by the time the destination is
+    /// contested a just-kept operand would read as "not needed now".
+    read_here: ReadHere,
     /// 0 = rematerialized, 1 = slot already valid, 2 = needs a store.
     traffic: u8,
     /// Nearest next read *last*, so the cheapest loser is the one used
@@ -1480,15 +2139,20 @@ struct EvictionRank {
 /// them.
 ///
 /// Sized by the roles an instruction can fill at once — its encoding's temps,
-/// its operand reloads, a guard's mask and scratch, and the scope's result —
-/// which is the same list [`RegisterFile::MIN_SCRATCH`] is derived from.
+/// its operand reloads, a guard's mask and scratch, the scope's result, and
+/// the destination itself — which is the same list [`RegisterFile::MIN_SCRATCH`]
+/// is derived from.
 struct Reservations {
     slots: [Option<usize>; Self::ROLES],
     filled: usize,
 }
 
 impl Reservations {
-    const ROLES: usize = Scratch::MAX_TEMPS + Scratch::MAX_RELOADS + 3;
+    /// `+ 4`: guard mask, guard temp, result, and the destination. The
+    /// destination is in here because it is claimed *before* the reloads and
+    /// the guard's registers now, so those have to see it as taken rather
+    /// than rely on being chosen after it.
+    const ROLES: usize = Scratch::MAX_TEMPS + Scratch::MAX_RELOADS + 4;
 
     fn new() -> Self {
         Self {
@@ -1546,11 +2210,17 @@ struct Pass {
 }
 
 impl Pass {
+    /// `sites[i]` is every mask a guard emitted *before* instruction `i` reads
+    /// ([`guard_sites`]). A guard's read is a read: it decides `expire`, the
+    /// Belady distance and the read-here tier exactly as an operand's does,
+    /// and leaving it out made a mask read only by a branch the preferred
+    /// eviction at the very index the branch tests it.
     fn new(
         dag: &[Def],
         file: &RegisterFile,
         vec_len: usize,
         live_in: &BTreeMap<ValueId, Where>,
+        sites: &[Vec<ValueId>],
     ) -> Self {
         let mut reads: Vec<Vec<usize>> = vec![Vec::new(); vec_len];
         let mut const_bits: Vec<Option<u32>> = vec![None; vec_len];
@@ -1560,8 +2230,10 @@ impl Pass {
             if let ScheduledOp::Const(val) = def.op {
                 const_bits[def.value.0 as usize] = Some(val.to_bits());
             }
-            for operand in operands(&def.op) {
-                let r = &mut reads[operand.0 as usize];
+            // Operands and guard masks together, so each value's read list
+            // stays ascending with one entry per index.
+            for read in operands(&def.op).chain(sites[i].iter().copied()) {
+                let r = &mut reads[read.0 as usize];
                 if r.last() != Some(&i) {
                     r.push(i);
                 }
@@ -1603,9 +2275,9 @@ impl Pass {
     /// Claim one more pool register for this instruction's own use.
     ///
     /// Disjoint from every register the instruction reads (`live`, its
-    /// operands and its guards' masks), from every role it has already filled,
-    /// and — because the destination is claimed last, against the same two
-    /// exclusions — from the destination.
+    /// operands and its guards' masks) and from every role it has already
+    /// filled — the destination included, once it has been claimed, because
+    /// it is pushed into `taken` like any other role.
     fn reserve(&mut self, index: usize, taken: &mut Reservations, live: &[ValueId]) -> Reg {
         let open = self.without_operands(taken, live);
         let slot = self.claim(index, &open);
@@ -1623,7 +2295,11 @@ impl Pass {
     }
 
     /// What evicting `v` at `from` would cost. See [`EvictionRank`].
-    fn rank(&mut self, v: ValueId, from: usize) -> EvictionRank {
+    ///
+    /// `read_here` is the instruction's own read set with its tier per value
+    /// ([`ReadHere`]); a value not in it is not read here. Empty where the
+    /// candidates already exclude everything the instruction reads.
+    fn rank(&mut self, v: ValueId, from: usize, read_here: &[(ValueId, ReadHere)]) -> EvictionRank {
         let k = v.0 as usize;
         let traffic = if self.const_bits[k].is_some() {
             0
@@ -1634,7 +2310,10 @@ impl Pass {
         };
         let distance = self.next_read(v, from).map_or(usize::MAX, |r| r - from);
         EvictionRank {
-            needed_now: distance == 0,
+            read_here: read_here
+                .iter()
+                .find(|(r, _)| *r == v)
+                .map_or(ReadHere::No, |(_, tier)| *tier),
             traffic,
             nearest: core::cmp::Reverse(distance),
         }
@@ -1689,13 +2368,20 @@ impl Pass {
     }
 
     /// Pool slots this instruction may still draw on: every one it has not
-    /// already claimed for a scratch role.
+    /// already claimed for a role.
     ///
-    /// An operand's register is in here and does not need excluding. The
-    /// encoder reads every source before it writes the destination, so a
-    /// destination that takes an operand's register only makes that operand
-    /// non-resident *here*, and `resolve_operands` reads it back from the slot
-    /// its definition wrote. [`EvictionRank`] is what keeps that a last resort.
+    /// An operand's register is in here and does not need excluding — for the
+    /// **destination**, which is the one role claimed from this set. Taking it
+    /// makes that operand non-resident at this index, *before* the reload
+    /// count is taken, so `resolve_operands` reloads it from the slot its
+    /// definition wrote — into `dst` for the operand the encoding consumes
+    /// there, into a reserved reload register otherwise. That is the whole
+    /// of what the encoders tolerate: no encoder reads every source before
+    /// writing `dst` (SSE2's `movaps dst, src1` prelude; `setup_mov` ahead of
+    /// a `Select` or FMA on every ISA), so a *resident* operand in `dst`'s
+    /// register would be corrupted. A displaced one is not resident, which is
+    /// why the split is recorded at this index and not the next.
+    /// [`EvictionRank`] prices it so it stays a last resort.
     fn open(&self, taken: &Reservations) -> Vec<usize> {
         (0..self.owner.len()).filter(|k| !taken.holds(*k)).collect()
     }
@@ -1712,32 +2398,42 @@ impl Pass {
     }
 
     /// The slot to give up at `index`, among `open` ones that hold something.
-    fn loser(&mut self, open: &[usize], index: usize) -> Option<usize> {
+    fn loser(
+        &mut self,
+        open: &[usize],
+        index: usize,
+        read_here: &[(ValueId, ReadHere)],
+    ) -> Option<usize> {
         let held: Vec<(usize, ValueId)> = open
             .iter()
             .filter_map(|k| self.owner[*k].map(|v| (*k, v)))
             .collect();
         held.into_iter()
-            .min_by_key(|(_, v)| self.rank(*v, index))
+            .min_by_key(|(_, v)| self.rank(*v, index, read_here))
             .map(|(k, _)| k)
     }
 
-    /// A pool register for something defined or reloaded at `index`: a free one
-    /// if there is one, and otherwise the one whose occupant is cheapest to
-    /// evict — which splits that occupant's live range here.
+    /// A pool register for a scratch role or a kept reload at `index`: a free
+    /// one if there is one, and otherwise the one whose occupant is cheapest
+    /// to evict — which splits that occupant's live range here.
     ///
-    /// Always answers. The floor [`RegisterFile::MIN_SCRATCH`] is what makes
-    /// that true: the widest demand is a gather's one operand plus four temps,
-    /// or a ternary's three operands plus a temp and an arm reload — five
-    /// exclusions either way, against a pool of at least six.
+    /// The candidates here already exclude everything the instruction reads
+    /// (see [`Self::without_operands`]), so no occupant is read here and the
+    /// read-here tier is uniformly [`ReadHere::No`].
+    ///
+    /// Answers as long as the pool leaves one register past the roles: the
+    /// floor [`RegisterFile::MIN_SCRATCH`] is derived from the widest set of
+    /// roles one instruction can hold at once. A pool cut below it — a fold
+    /// scope's is its parent's minus the carried registers minus the loop's
+    /// own three — is a floor bug to fix at the floor, not here.
     fn claim(&mut self, index: usize, open: &[usize]) -> usize {
         if let Some(free) = open.iter().copied().find(|k| self.owner[*k].is_none()) {
             return free;
         }
-        let slot = self.loser(open, index).unwrap_or_else(|| {
+        let slot = self.loser(open, index, &[]).unwrap_or_else(|| {
             unreachable!(
-                "every pool register is this instruction's own scratch or one of \
-                 its operands, against a floor of {}",
+                "every pool register is already one of this instruction's roles \
+                 or a value it reads, against a floor of {}",
                 RegisterFile::MIN_SCRATCH
             )
         });
@@ -1822,10 +2518,9 @@ impl LinearScan {
                 schedule: dag,
                 ranges: Vec::new(),
                 scratch: scratch_for,
+                guards: Vec::new(),
             };
         }
-
-        let mut pass = Pass::new(&dag, file, vec_len, live_in);
 
         // The arms a `Select` guard may skip. A register range that begins at a
         // read inside one, for a value defined outside it, must end there too:
@@ -1836,6 +2531,10 @@ impl LinearScan {
         let guards = analyze_select_guards(&dag);
         let arms = guarded_arms(&guards, dag.len());
         let sites = guard_sites(&guards, dag.len());
+
+        // After `sites`: a guard's read of its mask is a read the pass has to
+        // know about from the start (see `Pass::new`).
+        let mut pass = Pass::new(&dag, file, vec_len, live_in, &sites);
         let mut reverts: Vec<Vec<(ValueId, Where, usize)>> =
             (0..dag.len()).map(|_| Vec::new()).collect();
         // Pool slots a definition held for its own instruction and no longer:
@@ -1858,6 +2557,39 @@ impl LinearScan {
                 }
             }
             pass.expire(i);
+
+            // A surviving `Reduce`'s own body is emitted through a wholly
+            // separate, nested register allocation (`allocate_nest`'s fold
+            // scope, recursed into via `Allocation::sibling`) that starts
+            // fresh over the pool minus only what is carried into it -- it
+            // has no visibility into what *this* scope currently holds
+            // resident, and no reason not to reuse any of it. A value this
+            // scope still needs after the
+            // loop must therefore not be sitting in a register *across*
+            // it: evict everything resident into its slot here, exactly as
+            // a call to something that clobbers the whole register file
+            // would force a caller to. `split_out` is the same eviction
+            // every ordinary loser of the destination contest below goes
+            // through (constants remat instead of spilling); the only
+            // difference is that here it runs for every occupant at once,
+            // pre-emptively, rather than one at a time as something else
+            // claims the slot. Without this, `extract_folds`'s "a shared
+            // invariant leaf stays in both places, recomputed" is only
+            // true of the arena -- the register that held the outer
+            // copy's result can be clobbered by the fold's own recompute
+            // of the identical value, and whichever one the loop's last
+            // iteration leaves behind is read back instead of the outer
+            // scope's own answer.
+            //
+            // Not for a live-in `Reduce`: that is a placeholder for a loop an
+            // enclosing scope already ran, and nothing runs here.
+            if matches!(def.op, ScheduledOp::Reduce(..)) && !pass.live_in[def.value.0 as usize] {
+                for slot in 0..pass.owner.len() {
+                    if pass.owner[slot].is_some() {
+                        pass.split_out(slot, i);
+                    }
+                }
+            }
 
             let mut reads: Vec<ValueId> = Vec::new();
             for operand in operands(&def.op) {
@@ -1882,7 +2614,14 @@ impl LinearScan {
             // with neither.
             let mut taken = Reservations::new();
 
-            let wanted = (file.temps_for)(&def.op) as usize;
+            // A live-in def emits nothing, so its encoding wants nothing —
+            // a placeholder for an enclosing scope's fold would otherwise
+            // reserve a loop's three temps for a loop that does not run here.
+            let wanted = if pass.live_in[def.value.0 as usize] {
+                0
+            } else {
+                (file.temps_for)(&def.op) as usize
+            };
             assert!(
                 wanted <= Scratch::MAX_TEMPS,
                 "a backend asked for {wanted} scratch registers for one \
@@ -1956,6 +2695,22 @@ impl LinearScan {
                 if pass.live_in[operand.0 as usize] {
                     continue;
                 }
+                // A value whose location was already settled *at this index* —
+                // by a revert at an arm's end, or a demotion — is served by a
+                // scratch reload here, never re-kept. `Pass::place` overwrites
+                // a same-index range rather than appending one, so keeping it
+                // would turn the `(i, Spilled)` just recorded into `(i, Reg)`:
+                // on a guard's skipped path that register was never loaded,
+                // and the emitter would copy from it as if it had been. This
+                // was live — a value spilled before a guarded arm, kept inside
+                // it, reverted at its end and read at the next arm's head
+                // came back wrong on the skipped path at the floor.
+                if pass.ranges[operand.0 as usize]
+                    .last()
+                    .is_some_and(|(at, _)| *at == i)
+                {
+                    continue;
+                }
                 let open = pass.without_operands(&taken, &live_here);
                 if open.is_empty() {
                     break;
@@ -1980,10 +2735,159 @@ impl LinearScan {
                 }
             }
 
+            // **The destination, before anything that reads residency.** The
+            // guard's mask register and the operand reloads below are counted
+            // from which values are in a register *at this index*, and the
+            // emitter counts them again from the same table when it resolves
+            // the instruction's operands — so the two answers agree only if
+            // nothing changes residency in between. The destination can: it
+            // may take an operand's register. So it is decided first, and the
+            // counts are taken from what it left.
+            //
+            // A definition is the one write in an instruction, and there is no
+            // register outside the pool left to write to — so the loser of the
+            // contest is the *occupant*, and the value being defined loses only
+            // the right to *keep* what it was given. That is
+            // `Where(v, def(v)) == Reg(_)`, which is what dissolves the fixed
+            // destination register.
+            //
+            // Three definitions write nothing here and take no pool register:
+            // a placeholder for a value an enclosing scope parked (its location
+            // is that scope's answer), a coordinate input (pinned to the
+            // register the ABI delivers it in, outside the pool), and a
+            // surviving `Reduce`'s result (its accumulator's slot, where the
+            // loop leaves it whether or not `allocate_nest` carried the
+            // accumulator across the iterations — docs/plans/
+            // 2026-09-10-a-surviving-reduce-is-a-loop.md, "the design decision
+            // that makes this tractable"; the driver pins the real address
+            // afterward through `FrameLayout::pin_slot`). A rematerialized
+            // constant that loses the contest is the fourth: its definition
+            // emits no instruction, so it needs nothing to write to.
+            let destination: Option<usize> = if pass.live_in[def.value.0 as usize] {
+                None
+            } else if let ScheduledOp::Var(k) = def.op {
+                pass.place(def.value, i, Where::Reg(input_register(file, k)));
+                None
+            } else if let ScheduledOp::Reduce(..) = def.op {
+                pass.place(def.value, i, Where::Spilled);
+                None
+            } else {
+                // What each value this instruction reads would cost to lose
+                // its register *here* — see `ReadHere`. Membership, not the
+                // read cursor: the kept reloads above advanced it past `i`.
+                // An operand's tier is what `operand_sources` would route it
+                // through were it the one non-resident: into `dst` costs no
+                // further register; anything else needs a reload register the
+                // same pool then has to find. A value read twice by one
+                // instruction takes the harsher of its two tiers. A guard's
+                // mask read before the instruction needs `guard_mask`, so it
+                // is never the cheap kind.
+                let ops: Vec<ValueId> = operands(&def.op).collect();
+                let mut resident = [true; 3];
+                for (k, operand) in ops.iter().enumerate() {
+                    resident[k] = pass.is_resident(*operand);
+                }
+                let mut read_here: Vec<(ValueId, ReadHere)> = Vec::new();
+                let mut note = |v: ValueId, tier: ReadHere| match read_here
+                    .iter_mut()
+                    .find(|(r, _)| *r == v)
+                {
+                    Some((_, held)) => *held = (*held).max(tier),
+                    None => read_here.push((v, tier)),
+                };
+                for (k, operand) in ops.iter().enumerate() {
+                    let mut without = resident;
+                    without[k] = false;
+                    let tier = match operand_sources(&def.op, without)[k] {
+                        OperandSource::Destination => ReadHere::FromDst,
+                        OperandSource::Reload(_) => ReadHere::NeedsRegister,
+                        OperandSource::Resident => {
+                            unreachable!("an operand forced non-resident is not Resident")
+                        }
+                    };
+                    note(*operand, tier);
+                }
+                for mask in &sites[i] {
+                    note(*mask, ReadHere::NeedsRegister);
+                }
+
+                let open = pass.open(&taken);
+                if let Some(free) = open.iter().copied().find(|k| pass.owner[*k].is_none()) {
+                    pass.occupy(def.value, free, i);
+                    Some(free)
+                } else {
+                    let slot = pass.loser(&open, i, &read_here).unwrap_or_else(|| {
+                        unreachable!(
+                            "the pool is at most this instruction's temps against a \
+                             floor of {}, so some register is open and held",
+                            RegisterFile::MIN_SCRATCH
+                        )
+                    });
+                    let occupant =
+                        pass.owner[slot].unwrap_or_else(|| unreachable!("a loser holds one"));
+                    // Whether the new value keeps the register past this
+                    // instruction, by the rule that chose the slot: its own
+                    // rank against the occupant's. A definition has written
+                    // nothing yet, so its slot is never the cheap kind.
+                    let new_rank = EvictionRank {
+                        // A definition is a write; nothing reads it here.
+                        read_here: ReadHere::No,
+                        traffic: if pass.const_bits[def.value.0 as usize].is_some() {
+                            0
+                        } else {
+                            2
+                        },
+                        nearest: core::cmp::Reverse(
+                            pass.next_read(def.value, i).map_or(usize::MAX, |r| r - i),
+                        ),
+                    };
+                    let keeps = new_rank > pass.rank(occupant, i, &read_here);
+                    if !keeps && pass.const_bits[def.value.0 as usize].is_some() {
+                        // Nothing to write: the definition of a rematerialized
+                        // constant emits no instruction, so it takes no
+                        // register and evicts no one. Reserving one for it
+                        // would cost a live value its register to hold a value
+                        // the emitter never computes.
+                        pass.place(def.value, i, pass.out_of_register(def.value));
+                        None
+                    } else {
+                        // Split at `i`, not `i + 1`: a displaced operand is
+                        // reloaded by this instruction from the slot its
+                        // definition wrote, and that reload is what the
+                        // counts below have to see. (The register still holds
+                        // it until the write, but no encoder relies on that —
+                        // see `Pass::open`.)
+                        pass.split_out(slot, i);
+                        pass.occupy(def.value, slot, i);
+                        if !keeps && i + 1 < dag.len() {
+                            // Given a register to be written into and stored
+                            // from — the store goes right after the definition,
+                            // as it does for any value with a slot — and not to
+                            // keep.
+                            demotions[i + 1].push((def.value, slot));
+                        }
+                        Some(slot)
+                    }
+                }
+            };
+            // A role like any other from here on: the reloads and the guard's
+            // registers may not land on it.
+            if let Some(slot) = destination {
+                taken.push(slot);
+            }
+
             // A guard's own two registers, on the instruction it is emitted
             // before. The mask needs one only when it is not in a register
-            // here — which the kept reloads above may just have changed.
-            if !sites[i].is_empty() {
+            // here — which the kept reloads, and now the destination, may
+            // just have changed.
+            //
+            // A surviving `Reduce`'s own trip test needs exactly the same
+            // thing (a mask reduced to a branch condition) and is emitted
+            // the same way, in place of this instruction — so it reserves
+            // through the same gate rather than a second one, even though
+            // `sites[i]` (built from `Select`s alone) never names it.
+            let is_reduce = matches!(def.op, ScheduledOp::Reduce(..));
+            if !sites[i].is_empty() || is_reduce {
                 if sites[i].iter().any(|m| !pass.is_resident(*m)) {
                     scratch_for[i].guard_mask = Some(pass.reserve(i, &mut taken, &live_here));
                 }
@@ -2003,10 +2907,11 @@ impl LinearScan {
             }
 
             // One register per operand this instruction has to reload, named
-            // by the same function the emitter reads. Residency is final here:
-            // eviction splits a range rather than rewriting one, so an operand
-            // in a register now is in a register when this instruction is
-            // emitted, and the destination below cannot take it back.
+            // by the same function the emitter reads. Residency is final here
+            // because the destination was chosen above: eviction splits a
+            // range rather than rewriting one, so an operand in a register now
+            // is in a register when this instruction is emitted, and an
+            // operand the destination displaced is already out of one.
             let mut resident = [true; 3];
             for (k, operand) in operands(&def.op).enumerate() {
                 resident[k] = pass.is_resident(operand);
@@ -2017,86 +2922,19 @@ impl LinearScan {
             }
 
             // The scope's result is materialized after its last instruction,
-            // and it needs a register of its own in exactly one case: the
-            // whole body was hoisted out, so its root is read from a park
-            // rather than computed. Every other root is the last
-            // instruction's own destination, which is a register.
+            // and it needs a register of its own in two cases: the whole
+            // body was hoisted out, so its root is read from a park rather
+            // than computed, or a surviving fold's own `Reduce` is the
+            // schedule's root, whose accumulator is a slot by construction
+            // (see the destination above) — both never resident for the same
+            // reason, a value with no register to be the "last instruction's
+            // own destination" in. Every other root is exactly that
+            // destination.
             if i + 1 == dag.len()
-                && pass.live_in[def.value.0 as usize]
                 && !pass.is_resident(def.value)
+                && (pass.live_in[def.value.0 as usize] || matches!(def.op, ScheduledOp::Reduce(..)))
             {
                 scratch_for[i].result = Some(pass.reserve(i, &mut taken, &live_here));
-            }
-
-            // A placeholder for a value an enclosing scope parked: it emits
-            // nothing, so it writes no register and gets no range here.
-            if pass.live_in[def.value.0 as usize] {
-                continue;
-            }
-
-            // Coordinate inputs are pinned to the registers the ABI delivers
-            // them in. The scratch pool excludes those registers, so a pinned
-            // value never competes for one.
-            if let ScheduledOp::Var(k) = def.op {
-                pass.place(def.value, i, Where::Reg(input_register(file, k)));
-                continue;
-            }
-
-            // **The destination always gets a register.** A definition is the
-            // one write in an instruction, and there is no register outside the
-            // pool left to write to — so the loser of the contest below is the
-            // *occupant*, and the value being defined loses only the right to
-            // *keep* what it was given. That is `Where(v, def(v)) == Reg(_)`,
-            // which is what dissolves the fixed destination register.
-            //
-            // A rematerialized constant is the exception, and it is not one in
-            // spirit: its definition emits nothing at all, so it needs nothing
-            // to write to.
-            let open = pass.without_operands(&taken, &live_here);
-            if let Some(free) = open.iter().copied().find(|k| pass.owner[*k].is_none()) {
-                pass.occupy(def.value, free, i);
-                continue;
-            }
-            let slot = pass.loser(&open, i).unwrap_or_else(|| {
-                unreachable!(
-                    "every pool register is this instruction's own scratch or one of \
-                     its operands, against a floor of {}",
-                    RegisterFile::MIN_SCRATCH
-                )
-            });
-            let occupant = pass.owner[slot].unwrap_or_else(|| unreachable!("a loser holds one"));
-            // Whether the new value keeps the register past this instruction,
-            // by the rule that chose the slot: its own rank against the
-            // occupant's. A definition has written nothing yet, so its slot is
-            // never the cheap kind.
-            let new_rank = EvictionRank {
-                // A definition is a write; nothing reads it here.
-                needed_now: false,
-                traffic: if pass.const_bits[def.value.0 as usize].is_some() {
-                    0
-                } else {
-                    2
-                },
-                nearest: core::cmp::Reverse(
-                    pass.next_read(def.value, i).map_or(usize::MAX, |r| r - i),
-                ),
-            };
-            let keeps = new_rank > pass.rank(occupant, i);
-            if !keeps && pass.const_bits[def.value.0 as usize].is_some() {
-                // Nothing to write: the definition of a rematerialized constant
-                // emits no instruction, so it takes no register and evicts no
-                // one. Reserving one for it would cost a live value its
-                // register to hold a value the emitter never computes.
-                pass.place(def.value, i, pass.out_of_register(def.value));
-                continue;
-            }
-            pass.split_out(slot, i);
-            pass.occupy(def.value, slot, i);
-            if !keeps && i + 1 < dag.len() {
-                // Given a register to be written into and stored from — the
-                // store goes right after the definition, as it does for any
-                // value with a slot — and not to keep.
-                demotions[i + 1].push((def.value, slot));
             }
         }
 
@@ -2104,6 +2942,7 @@ impl LinearScan {
             schedule: dag,
             ranges: pass.ranges,
             scratch: scratch_for,
+            guards,
         }
     }
 }
@@ -2143,9 +2982,19 @@ pub fn no_temps(_op: &ScheduledOp) -> u8 {
 }
 
 /// The values an operation reads, in operand order.
+///
+/// A `Reduce` is a leaf here, the same as `Uniform` — by the time one reaches
+/// a schedule this function walks, `extract_folds` has already carved its
+/// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
+/// still carries is `schedule_variance`'s and `extract_folds`'s own concern
+/// (they run before extraction, and after respectively, over different
+/// schedules), never an operand this scope's allocation resolves.
 pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
     let (a, b, c) = match sop {
-        ScheduledOp::Var(_) | ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => (None, None, None),
+        ScheduledOp::Var(_)
+        | ScheduledOp::Const(_)
+        | ScheduledOp::Uniform(_)
+        | ScheduledOp::Reduce(..) => (None, None, None),
         ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) | ScheduledOp::Gather(a, _) => {
             (Some(*a), None, None)
         }
@@ -2204,10 +3053,7 @@ mod tests {
     /// A point in the innermost body — the only scope a loop-free
     /// allocation has.
     fn body(index: usize) -> Point {
-        Point {
-            scope: Scope::Body,
-            index,
-        }
+        Point { index }
     }
 
     fn def(value: u32, op: ScheduledOp) -> Def {
@@ -2226,7 +3072,7 @@ mod tests {
         a.body()
             .schedule()
             .iter()
-            .filter(|d| a.placement(d.value).spills())
+            .filter(|d| a.body().placement(d.value).spills())
             .count()
     }
 
@@ -2256,7 +3102,7 @@ mod tests {
     /// a life: `at` answers where a value *starts*, which stopped being the
     /// same as where it spends its time.
     fn ever(a: &NestAllocation, v: ValueId) -> Vec<Where> {
-        a.placement(v).locations().collect()
+        a.body().placement(v).locations().collect()
     }
 
     /// `v2 = X + Y`.
@@ -2679,7 +3525,7 @@ mod tests {
     fn a_placement_can_be_overridden() {
         let mut a = alloc(add_xy());
         assert!(matches!(at(&a, ValueId(2)), Where::Reg(_)));
-        a.place(ValueId(2), Where::Spilled);
+        a.place(Scope::Body, ValueId(2), Where::Spilled);
         assert_eq!(at(&a, ValueId(2)), Where::Spilled);
         assert_eq!(spill_count(&a), 1);
     }
@@ -2708,12 +3554,16 @@ mod tests {
     /// directly.
     ///
     /// `dst op= right` corrupts `right` when `dst == right` and `dst != left`.
-    /// That assignment is unrepresentable here: a destination is drawn from
-    /// the slots this instruction has not claimed for a scratch role *and*
-    /// that no value it reads is living in, so it can only take a slot whose
-    /// occupant is dead or evicted here. The backend needs no stashing temp to
-    /// route around a case that cannot arise, which is what `emit_binary_safe`
-    /// used to be and what held xmm10 out of every kernel's pool.
+    /// The destination *may* take an operand's register — it is a priced
+    /// candidate, not an excluded one — but when it does, the eviction is
+    /// recorded at this very index, so that operand is no longer *resident*
+    /// here: it is reloaded from its slot, into `dst` if it is the operand
+    /// the encoding consumes there and into a reserved register otherwise.
+    /// What this asserts is the residency view, which is what the encoders
+    /// see: at the instruction's own point, no operand still in a register is
+    /// in `dst`'s. The backend needs no stashing temp to route around a case
+    /// that cannot arise, which is what `emit_binary_safe` used to be and what
+    /// held xmm10 out of every kernel's pool.
     #[test]
     fn a_destination_never_lands_on_a_resident_operand() {
         // Wide enough to evict: `width` values all live at once over a pool of
@@ -2774,6 +3624,421 @@ mod tests {
         }
     }
 
+    /// The allocator reserved exactly the registers the emitter will ask for.
+    ///
+    /// `operand_sources` is one statement read twice — the allocator counts
+    /// its `Reload`s to reserve, the emitter names the register each lands in
+    /// — and the two agree only if residency is the same at both readings.
+    /// The destination contest can change residency (it may evict an operand),
+    /// so it runs *before* the counts; this is the check that it does. The
+    /// same for a guard's mask: a branch emitted before the instruction needs
+    /// `guard_mask` exactly when its mask is not in a register at that index.
+    ///
+    /// An earlier attempt at letting the destination take an operand's
+    /// register left the counts where they were, and the emitter panicked with
+    /// "operand k needs reload register n, which the allocator did not
+    /// reserve" — the failure this test turns into a named assertion.
+    fn assert_reservations_match_residency(a: &Allocation<'_>, file: &RegisterFile) {
+        let schedule = a.schedule();
+        let sites = guard_sites(&analyze_select_guards(schedule), schedule.len());
+        for (i, d) in schedule.iter().enumerate() {
+            if matches!(d.op, ScheduledOp::Reduce(..)) {
+                continue; // Its own trip test reserves through the guard gate.
+            }
+            let in_register = |v: ValueId| matches!(a.where_at(v, i), Where::Reg(_));
+            let mut resident = [true; 3];
+            for (k, operand) in operands(&d.op).enumerate() {
+                resident[k] = in_register(operand);
+            }
+            let want = reloads_wanted(operand_sources(&d.op, resident));
+            let scratch = a.scratch(i);
+            let have = (0..Scratch::MAX_RELOADS)
+                .filter(|k| scratch.reload(*k).is_some())
+                .count();
+            assert_eq!(
+                have, want,
+                "{:?} at {i}: the allocator reserved {have} reload registers but \
+                 resolve_operands will ask for {want}",
+                d.value
+            );
+            let mask_needs_one = sites[i].iter().any(|m| !in_register(*m));
+            assert!(
+                !mask_needs_one || scratch.guard_mask.is_some(),
+                "{:?} at {i}: a guard's mask is not in a register here and no \
+                 guard_mask was reserved",
+                d.value
+            );
+            // Nothing the instruction reads from a register is in `dst`'s —
+            // the one alias every encoder assumes never happens.
+            if let Where::Reg(dst) = a.where_at(d.value, i) {
+                for operand in operands(&d.op) {
+                    assert_ne!(
+                        a.where_at(operand, i),
+                        Where::Reg(dst),
+                        "{:?} at {i}: destination {dst:?} holds resident operand {operand:?}",
+                        d.value
+                    );
+                }
+                for mask in &sites[i] {
+                    if file.scratch.contains(dst) {
+                        assert_ne!(
+                            a.where_at(*mask, i),
+                            Where::Reg(dst),
+                            "{:?} at {i}: destination {dst:?} holds a guard's mask {mask:?}",
+                            d.value
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reservation contract holds under pressure, with and without temps,
+    /// over a schedule wide enough to evict at every step.
+    #[test]
+    fn reservations_match_residency_under_pressure() {
+        let width = u32::from(RegisterFile::MIN_SCRATCH) * 3;
+        let mut schedule = vec![def(0, ScheduledOp::Var(0)), def(1, ScheduledOp::Var(1))];
+        for i in 2..=width {
+            schedule.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        // Folds that read three live values at once, so an instruction can
+        // find every open register held by something it reads.
+        let mut acc = ValueId(2);
+        for i in 3..=width {
+            let mask = ValueId(i);
+            schedule.push(def(
+                width + i,
+                ScheduledOp::Ternary(OpKind::Select, mask, acc, ValueId(1)),
+            ));
+            acc = ValueId(width + i);
+        }
+        for file in [&TEST_FILE, &TEMP_FILE] {
+            let a = LinearScan.allocate(schedule.clone(), file);
+            assert!(spill_count(&a) > 0, "the schedule has to reach eviction");
+            assert_reservations_match_residency(&a.body(), file);
+        }
+    }
+
+    /// A nest with two regions and a fold hanging off the outer one.
+    ///
+    /// The shape every test below needs, and the smallest one where a chain
+    /// and a tree give different answers: `Region(0)` contains both
+    /// `Region(1)` and `Fold(0)`, and those two contain each other not at all.
+    fn nest_with_a_fold() -> NestAllocation {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        let outer_root = ValueId(1);
+        let inner_root = ValueId(11);
+        let fold_meta = Fold::new(
+            Monoid::SUM,
+            Binder::from_slot(0).expect("slot 0 exists"),
+            0..4,
+        );
+        LinearScan.allocate_nest(
+            ScopedSchedule {
+                regions: vec![
+                    ScopeRegion {
+                        roots: vec![outer_root],
+                        schedule: vec![
+                            def(0, ScheduledOp::Var(1)),
+                            // A fold's parent def is always a `Reduce` — this
+                            // is the query 2c's `allocate_nest` reads back
+                            // out to find the binder and the fold's own
+                            // metadata, so the fixture has to be one.
+                            def(1, ScheduledOp::Reduce(fold_meta, ValueId(0))),
+                        ],
+                    },
+                    ScopeRegion {
+                        roots: vec![inner_root],
+                        schedule: vec![def(11, ScheduledOp::Unary(OpKind::Neg, outer_root))],
+                    },
+                ],
+                body: vec![def(
+                    100,
+                    ScheduledOp::Binary(OpKind::Add, inner_root, outer_root),
+                )],
+                folds: vec![ScopeFold {
+                    parent: Scope::Region(0),
+                    at: 1,
+                    roots: Vec::new(),
+                    schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, outer_root))],
+                }],
+            },
+            &NEST_FILE,
+        )
+    }
+
+    /// A fold's roots and a region's are one ranking, by what a carry saves
+    /// per batch, and nothing is reserved for either.
+    ///
+    /// One register at a time from the floor up, over a nest with two
+    /// region roots the body reads once each, one deeper region root, and a
+    /// fold of four trips whose body never reads its binder — hung off the
+    /// per-call prologue in one run and off the body in the other. The
+    /// constraint is the same in both: no scope has more carried across it
+    /// than the pool has above the floor, so the pool a scope allocates in
+    /// never falls under it, which is what the binder's old reservation
+    /// could not promise past a depth. The order differs, and that is the
+    /// point:
+    ///
+    /// - A **per-call** fold runs once per call. Its roots are read eight
+    ///   times a call; a root the body reads is read once a batch, of which
+    ///   a call has many. So the region roots go first and the fold's roots
+    ///   take what is left, the binder before its accumulator.
+    /// - A **per-batch** fold runs four trips every batch: its binder is
+    ///   read eight times a batch to the region roots' once, so it goes
+    ///   first, then its accumulator, and the region roots take what is
+    ///   left — a region root is live across the fold, so each costs the
+    ///   fold's pool a register too.
+    #[test]
+    fn a_folds_roots_and_a_regions_are_one_ranking() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        let floor = RegisterFile::MIN_SCRATCH;
+        // (region roots carried, binder carried, accumulator carried), one
+        // entry per register above the floor, from zero.
+        let per_call = [
+            (0usize, false, false),
+            (1, false, false),
+            (2, false, false),
+            (3, true, false),
+            (3, true, true),
+        ];
+        let per_batch = [
+            (0usize, false, false),
+            (0, true, false),
+            (0, true, true),
+            (1, true, true),
+            (2, true, true),
+        ];
+        for (parent, ladder) in [(Scope::Region(0), per_call), (Scope::Body, per_batch)] {
+            for (above, (regions_carried, binder_carried, acc_carried)) in
+                ladder.into_iter().enumerate()
+            {
+                let scratch = floor + above as u8;
+                let file = RegisterFile {
+                    scratch: RegSet::range(4, scratch),
+                    ..TEMP_FILE
+                }
+                .checked();
+                let fold_meta = Fold::new(
+                    Monoid::SUM,
+                    Binder::from_slot(0).expect("slot 0 exists"),
+                    0..4,
+                );
+                let (a, b, inner) = (ValueId(2), ValueId(3), ValueId(11));
+                let reduce = def(1, ScheduledOp::Reduce(fold_meta, ValueId(0)));
+                let mut frame = vec![
+                    def(0, ScheduledOp::Var(1)),
+                    def(2, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                    def(3, ScheduledOp::Unary(OpKind::Neg, ValueId(2))),
+                ];
+                let mut body = vec![
+                    def(100, ScheduledOp::Binary(OpKind::Add, a, b)),
+                    def(101, ScheduledOp::Binary(OpKind::Add, ValueId(100), inner)),
+                ];
+                let at = match parent {
+                    Scope::Region(_) => {
+                        frame.push(reduce);
+                        frame.len() - 1
+                    }
+                    Scope::Body => {
+                        body.insert(0, reduce);
+                        0
+                    }
+                    Scope::Fold(_) => {
+                        unreachable!("the fixture hangs the fold off a region or the body")
+                    }
+                };
+                let alloc = LinearScan.allocate_nest(
+                    ScopedSchedule {
+                        regions: vec![
+                            ScopeRegion {
+                                roots: vec![a, b],
+                                schedule: frame,
+                            },
+                            ScopeRegion {
+                                roots: vec![inner],
+                                schedule: vec![def(11, ScheduledOp::Unary(OpKind::Neg, a))],
+                            },
+                        ],
+                        body,
+                        folds: vec![ScopeFold {
+                            parent,
+                            at,
+                            roots: Vec::new(),
+                            schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))],
+                        }],
+                    },
+                    &file,
+                );
+                let region_carries = |i: usize| -> Vec<Reg> {
+                    let region = alloc.scope(Scope::Region(i));
+                    region
+                        .roots()
+                        .iter()
+                        .filter_map(|r| region.carried(*r))
+                        .collect()
+                };
+                let carried: usize = (0..alloc.regions()).map(|i| region_carries(i).len()).sum();
+                assert_eq!(
+                    carried, regions_carried,
+                    "{parent:?} fold, {above} above the floor: region roots carried"
+                );
+                let roots = alloc.fold_roots(0);
+                let in_register = |at: Where| matches!(at, Where::Reg(_));
+                assert_eq!(
+                    in_register(roots.binder),
+                    binder_carried,
+                    "{parent:?} fold, {above} above the floor: binder at {:?}",
+                    roots.binder
+                );
+                assert_eq!(
+                    in_register(roots.accumulator),
+                    acc_carried,
+                    "{parent:?} fold, {above} above the floor: accumulator at {:?}",
+                    roots.accumulator
+                );
+                // The fold's body allocates in the pool minus everything
+                // carried into it — the carries of every region it runs
+                // inside, and its own — and that never falls under the floor.
+                let regions_around = match parent {
+                    Scope::Region(i) => i + 1,
+                    Scope::Body | Scope::Fold(_) => alloc.regions(),
+                };
+                let carried_into = (0..regions_around)
+                    .map(|i| region_carries(i).len())
+                    .sum::<usize>()
+                    + [roots.binder, roots.accumulator]
+                        .into_iter()
+                        .filter(|at| in_register(*at))
+                        .count();
+                assert!(
+                    file.scratch.len() as usize - carried_into >= floor as usize,
+                    "{parent:?} fold, {above} above the floor: the fold's body was handed {} registers",
+                    file.scratch.len() as usize - carried_into
+                );
+            }
+        }
+    }
+
+    /// `within` is a subtree, not a suffix of a chain.
+    ///
+    /// This is the whole of 2b in one assertion. A fold opens in the *middle*
+    /// of its parent, so it is a sibling of the regions nested further in —
+    /// `Region(0)` runs both, and neither runs the other. Answering positionally
+    /// (everything after me) would report `Fold(0)` as inside `Region(1)`, and
+    /// the register the fold carries across its back edge would be handed out
+    /// inside a loop that never runs it.
+    #[test]
+    fn a_fold_and_a_deeper_region_are_siblings_not_nested() {
+        let alloc = nest_with_a_fold();
+        let within = |s: Scope| {
+            let mut v: Vec<Scope> = alloc.scope(s).within().map(|a| a.scope).collect();
+            v.sort_unstable();
+            v
+        };
+
+        let mut all_inside = vec![Scope::Region(1), Scope::Body, Scope::Fold(0)];
+        all_inside.sort_unstable();
+        assert_eq!(
+            within(Scope::Region(0)),
+            all_inside,
+            "region 0 runs everything"
+        );
+        assert_eq!(
+            within(Scope::Region(1)),
+            vec![Scope::Body],
+            "the fold is beside region 1, not inside it"
+        );
+        assert_eq!(
+            within(Scope::Fold(0)),
+            Vec::new(),
+            "and region 1 is not inside the fold either"
+        );
+    }
+
+    /// A fold opens at a def of its parent; a region and the body do not open
+    /// anywhere, because they wrap the whole of what is inside them.
+    ///
+    /// This is the query 2c emits from — it is where the back edge goes — and
+    /// the one question whose answer differs between a scope that surrounds
+    /// its parent's code and one that interrupts it.
+    #[test]
+    fn only_a_fold_opens_partway_through_its_parent() {
+        let alloc = nest_with_a_fold();
+        assert_eq!(
+            alloc.scope(Scope::Fold(0)).opens_at(),
+            Some((Scope::Region(0), 1)),
+            "the fold opens at the def it is the body of"
+        );
+        assert_eq!(alloc.scope(Scope::Region(1)).opens_at(), None);
+        assert_eq!(alloc.body().opens_at(), None);
+    }
+
+    /// A scope encloses itself, so "is this in scope here" needs no special
+    /// case for the asker — but `within` still excludes it, because the
+    /// question there is what the code *inside* does.
+    #[test]
+    fn enclosing_is_reflexive_and_within_is_not() {
+        let alloc = nest_with_a_fold();
+        for scope in alloc.scopes() {
+            assert!(alloc.encloses(scope, scope), "{scope:?} encloses itself");
+            assert!(
+                !alloc.scope(scope).within().any(|a| a.scope == scope),
+                "{scope:?} is not within itself"
+            );
+        }
+    }
+
+    /// A fold reads its *ancestors'* parks, and a value parked by a scope
+    /// beside it is not one of them.
+    ///
+    /// The prefix-of-the-chain form answered this by position, which for a
+    /// fold at `Region(0)` would have counted `Region(1)`'s roots — values
+    /// computed by a loop the fold never enters.
+    #[test]
+    fn a_fold_is_parked_by_its_ancestors_only() {
+        let alloc = nest_with_a_fold();
+        let fold = alloc.scope(Scope::Fold(0));
+
+        assert!(
+            fold.parked_by_an_enclosing_scope(ValueId(1)),
+            "region 0 is the fold's parent, so its root is parked for the fold"
+        );
+        assert!(
+            !fold.parked_by_an_enclosing_scope(ValueId(11)),
+            "region 1 is beside the fold, so its root is not"
+        );
+        assert!(
+            alloc.body().parked_by_an_enclosing_scope(ValueId(11)),
+            "the body *is* inside region 1, so the same value is parked for it"
+        );
+    }
+
+    /// A fold whose parent is a later fold is refused rather than allocated.
+    ///
+    /// Parents are allocated first, so a forward reference is both unanswerable
+    /// and the only way to write a cycle. Refusing it here makes the cycle
+    /// unrepresentable in an allocation rather than an infinite walk in
+    /// `encloses`.
+    #[test]
+    #[should_panic(expected = "is not an earlier scope")]
+    fn a_folds_parent_must_already_exist() {
+        let _ = LinearScan.allocate_nest(
+            ScopedSchedule {
+                regions: Vec::new(),
+                body: vec![def(0, ScheduledOp::Var(0))],
+                folds: vec![ScopeFold {
+                    parent: Scope::Fold(1),
+                    at: 0,
+                    roots: Vec::new(),
+                    schedule: vec![def(50, ScheduledOp::Var(0))],
+                }],
+            },
+            &NEST_FILE,
+        );
+    }
+
     /// A carried register is untouched by every scope inside the loop.
     ///
     /// This is the whole safety property of showing the allocator the nest. A
@@ -2809,6 +4074,7 @@ mod tests {
                 schedule: outer,
             }],
             body,
+            folds: Vec::new(),
         };
         let alloc = LinearScan.allocate_nest(nest, &NEST_FILE);
 
@@ -2830,7 +4096,7 @@ mod tests {
             .schedule()
             .iter()
             .filter(|d| !roots.contains(&d.value))
-            .flat_map(|d| alloc.placement(d.value).registers())
+            .flat_map(|d| body.placement(d.value).registers())
             .collect();
         for i in 0..body.schedule().len() {
             let s = body.scratch(i);
@@ -2878,33 +4144,26 @@ mod tests {
                     schedule: outer,
                 }],
                 body,
+                folds: Vec::new(),
             },
             &NEST_FILE,
         );
 
+        let (region, inner) = (alloc.scope(Scope::Region(0)), alloc.body());
         let (mut carried, mut parked) = (0, 0);
         for root in &roots {
-            let p = alloc.placement(*root);
-            assert_eq!(
-                p.defined_at().scope,
-                Scope::Region(0),
-                "{root:?} is computed by the outer region"
-            );
+            let p = region
+                .placement_of(*root)
+                .unwrap_or_else(|| panic!("{root:?} is computed by the outer region"));
             // Inside the region: whatever the scan chose, and a pool register
             // there — never the carry, which is picked from what the region
             // leaves free.
-            let inside_region = p.at(Point {
-                scope: Scope::Region(0),
-                index: usize::MAX,
-            });
-            let in_the_loop = p.at(Point {
-                scope: Scope::Body,
-                index: 0,
-            });
+            let inside_region = p.at(Point::TAIL);
+            let in_the_loop = inner.at_head(*root);
             assert_ne!(
                 inside_region, in_the_loop,
-                "{root:?} would need only one range, but a root always changes \
-                 place at the loop it is read inside"
+                "{root:?} would be in the same place in both scopes, but a root \
+                 always changes place at the loop it is read inside"
             );
             match alloc.carried(*root) {
                 Some(reg) => {
@@ -2912,8 +4171,7 @@ mod tests {
                     carried += 1;
                 }
                 None => {
-                    assert_eq!(in_the_loop, Where::Spilled);
-                    assert!(p.spills(), "a parked root is in a slot");
+                    assert_eq!(in_the_loop, Where::Spilled, "a parked root is in a slot");
                     parked += 1;
                 }
             }

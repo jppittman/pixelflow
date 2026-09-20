@@ -57,6 +57,14 @@ impl Monoid {
     /// Mask `∧`, identity all-set — the universal quantifier over a bounded
     /// domain.
     pub const ALL: Self = Self(OpKind::BitAnd);
+    /// Sequencing, the **unit monoid**: combine is "then", identity is
+    /// nothing. The algebra a lattice's folds are over — rows, batches and
+    /// lanes wrapped around a [`Write`](crate::arena::ExprNode::Write)
+    /// (docs/plans/2026-09-16-collapse-is-a-fold.md §2.4). A fold over it
+    /// goes through the fold machinery unchanged; what its combine emits is
+    /// no bytes, and the accumulator it would seed with
+    /// [`identity`](Self::identity) is one nothing ever reads.
+    pub const SEQ: Self = Self(OpKind::Seq);
 
     /// The combining operation. Crate-private: the op set is an IR concept,
     /// and consumers name algebras, not opcodes.
@@ -140,9 +148,17 @@ impl Binder {
 }
 
 /// The fold a [`Reduce`] performs: a monoid, the index it binds, and the
-/// half-open range that index runs over.
+/// arithmetic progression that index runs over.
 ///
-/// `⟦Reduce { fold, body }⟧ = ⊕_{k ∈ fold.range()} ⟦body⟧[fold.binder() := k]`
+/// `⟦Reduce { fold, body }⟧ = ⊕_{k ∈ lo, lo+s, lo+2s, …, hi-s} ⟦body⟧[fold.binder() := k]`
+///
+/// `s` is [`Fold::stride`]: 1 from [`Fold::new`], or whatever [`Fold::strided`]
+/// was given directly — `pack` strip-mining a lattice's column fold is the
+/// reason a second constructor exists at all. After construction, only
+/// [`Fold::halve`] ever changes it, by doubling. [`Fold::range`] still names
+/// the bounding `[lo, hi)`, which is why it is a poor stand-in for "every
+/// index visited" once the stride is not 1 — [`Fold::len`] is the count that
+/// stays exact.
 ///
 /// [`Reduce`]: crate::arena::ExprNode::Reduce
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -150,44 +166,69 @@ pub struct Fold {
     monoid: Monoid,
     binder: Binder,
     /// Half-open `[lo, hi)`, `lo <= hi` by construction.
-    lo: u16,
-    hi: u16,
+    ///
+    /// `u32`, the width [`Fold::range`] speaks. These were `u16`, first "so
+    /// the two fit the node in the 16 bytes `ExprNode` is capped at" — a
+    /// width nothing depended on, made into a cap on how many terms a
+    /// reduction may have — and then because an unrolled fold could not
+    /// afford more copies of its body. A surviving `Reduce` is a loop now
+    /// (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md), so a trip
+    /// count costs a counter, and the control plane is 64-bit: an extent
+    /// describing a program is not narrowed without a measurement asking.
+    lo: u32,
+    hi: u32,
+    /// The step between visited indices. `1` for every [`Fold::new`], or
+    /// whatever [`Fold::strided`] was constructed with. After that, only
+    /// [`Fold::halve`] ever doubles it, and only when `hi - lo` stays an
+    /// exact multiple of it — an invariant [`Fold::strided`] checks directly
+    /// (it refuses a stride that does not divide the span), [`Fold::new`]
+    /// gets for free by going through it with a stride of 1 (which divides
+    /// anything), and [`Fold::halve`] preserves (it only fires on an even
+    /// trip count, so the new stride still divides `hi - lo` exactly). That
+    /// invariant is what makes [`Fold::len`] integer division rather than an
+    /// approximation.
+    stride: u32,
 }
 
 impl Fold {
-    /// The largest index a fold may run to.
-    ///
-    /// This is not an arbitrary truncation of a `u32`. **A `Reduce` is not a
-    /// loop**: the language is a DAG with no iteration binder, so a fold that
-    /// survives to codegen is emitted as `len()` copies of its body. A trip
-    /// count is therefore bounded by what one can afford to *emit* — the
-    /// e-graph's `max_classes` budget dies orders of magnitude below this
-    /// ceiling — and a range that does not fit is a program that was never
-    /// going to compile. [`Fold::new`] rejects it rather than wrapping, and
-    /// the two ends fit the node in the 16 bytes `ExprNode` is capped at.
-    pub const MAX_INDEX: u32 = u16::MAX as u32;
-
-    /// The fold of `monoid` over `range`, binding `binder`.
+    /// The fold of `monoid` over `range`, binding `binder`, visiting every
+    /// index in it — [`Fold::strided`] with a stride of `1`.
     ///
     /// # Panics
     ///
-    /// Panics if `range` is reversed or runs past [`Fold::MAX_INDEX`].
+    /// Panics if `range` is reversed.
     #[must_use]
     pub fn new(monoid: Monoid, binder: Binder, range: Range<u32>) -> Self {
+        Self::strided(monoid, binder, range, 1)
+    }
+
+    /// The fold of `monoid` over `range`, binding `binder`, visiting every
+    /// `stride`-th index from `range.start` — the strip-mining `pack` uses to
+    /// carve a lattice's column fold into a lane-width main fold and a
+    /// narrower remainder (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is reversed, `stride` is `0`, or `stride` does not
+    /// divide `range.end - range.start` exactly — the invariant [`Fold::len`]
+    /// and [`Fold::from_bits`] both rely on.
+    #[must_use]
+    pub fn strided(monoid: Monoid, binder: Binder, range: Range<u32>, stride: u32) -> Self {
         assert!(
             range.start <= range.end,
             "a fold's range runs forwards: {range:?}"
         );
+        assert!(stride != 0, "a fold's stride must be nonzero");
         assert!(
-            range.end <= Self::MAX_INDEX,
-            "a fold over {range:?} would emit more than {} copies of its body",
-            Self::MAX_INDEX
+            (range.end - range.start).is_multiple_of(stride),
+            "a fold's stride must divide its span exactly: {range:?} step {stride}"
         );
         Self {
             monoid,
             binder,
-            lo: range.start as u16,
-            hi: range.end as u16,
+            lo: range.start,
+            hi: range.end,
+            stride,
         }
     }
 
@@ -197,22 +238,56 @@ impl Fold {
         self.monoid
     }
 
+    /// The combining opcode, for a backend that has decided to *emit* this
+    /// fold as a loop rather than have the e-graph reason about it further.
+    ///
+    /// `Monoid::op` stays crate-private — "consumers name algebras, not
+    /// opcodes" is right for anything still inside the algebra (rewrite
+    /// rules, extraction, the cost model). Codegen is not that: once a
+    /// `Reduce` has survived extraction, the surviving loop's own combine
+    /// instruction has to be *some* opcode, and this is the one narrow door
+    /// for the one consumer past the e-graph that needs it (see
+    /// `pixelflow-codegen`'s `IsaBackend::alu`, and
+    /// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "2a″" for why
+    /// the combine could not live in the arena instead).
+    #[must_use]
+    pub fn combine_op(self) -> OpKind {
+        self.monoid.op()
+    }
+
     /// The index this fold binds.
     #[must_use]
     pub fn binder(self) -> Binder {
         self.binder
     }
 
-    /// The half-open range the index runs over.
+    /// The half-open range every visited index lies within.
+    ///
+    /// The *bound*, not the visited set: once [`Fold::halve`] has run, the
+    /// indices in `[lo, hi)` that are actually visited are `lo`,
+    /// `lo + stride`, `lo + 2·stride`, … — [`Fold::stride`] apart, not
+    /// consecutive. [`Fold::len`] is the count that stays exact either way.
     #[must_use]
     pub fn range(self) -> Range<u32> {
-        u32::from(self.lo)..u32::from(self.hi)
+        self.lo..self.hi
     }
 
-    /// How many terms the fold combines.
+    /// The step between one visited index and the next. `1` from
+    /// [`Fold::new`], or [`Fold::strided`]'s own argument; [`Fold::halve`] is
+    /// the only thing that doubles it afterward.
+    #[must_use]
+    pub fn stride(self) -> u32 {
+        self.stride
+    }
+
+    /// How many terms the fold combines — the *trip count*, which
+    /// [`Fold::halve`] halves without touching [`Fold::range`]. Distinct from
+    /// the index span `hi - lo`: they coincide only at `stride == 1`, and
+    /// every caller here wants the trip count (how many times the body is
+    /// evaluated), never the span.
     #[must_use]
     pub fn len(self) -> u32 {
-        u32::from(self.hi - self.lo)
+        (self.hi - self.lo) / self.stride
     }
 
     /// Whether the domain is empty — in which case the fold *is* its monoid's
@@ -226,22 +301,52 @@ impl Fold {
     /// the domain is empty.
     ///
     /// ```text
-    /// ⊕_{[lo,hi)} f  =  f(lo) ⊕ ⊕_{[lo+1,hi)} f
+    /// ⊕_{[lo,hi) step s} f  =  f(lo) ⊕ ⊕_{[lo+s,hi) step s} f
     /// ```
     ///
     /// The decomposition, as one method. Only the range moves, so the tail
     /// folds *the same body* — which is what lets an e-graph state this as a
     /// rule (the tail shares the body's e-class) and what makes unrolling and
-    /// peeling one operation rather than two: **the legalizer is `peel` run to
-    /// exhaustion.**
+    /// peeling one operation rather than two.
     #[must_use]
     pub fn peel(self) -> Option<(u32, Self)> {
         (!self.is_empty()).then(|| {
             let rest = Self {
-                lo: self.lo + 1,
+                lo: self.lo + self.stride,
                 ..self
             };
-            (u32::from(self.lo), rest)
+            (self.lo, rest)
+        })
+    }
+
+    /// Halve the trip count by doubling the stride: `[lo,hi) step s` becomes
+    /// `[lo,hi) step 2s`. `None` when there are fewer than two terms, or an
+    /// odd number of them — [`Fold::peel_back`] is the epilogue for the
+    /// latter (peel one off the back, then halve the even remainder), not a
+    /// second one.
+    ///
+    /// **Doubles the stride, does not split the range.** `[lo,hi) step s`
+    /// visits `lo, lo+s, lo+2s, …` in order; doubling the stride re-groups
+    /// that same sequence into adjacent pairs —
+    /// `(f(lo)⊕f(lo+s)) ⊕ (f(lo+2s)⊕f(lo+3s)) ⊕ …` — the original order,
+    /// only re-bracketed, so it needs associativity alone and holds for every
+    /// [`Monoid`] here. Halving the *range* into `[lo,mid)` and `[mid,hi)`
+    /// instead pairs `f(lo)⊕f(mid)`, `f(lo+1)⊕f(mid+1)`, … — it interleaves
+    /// the sequence rather than re-bracketing it, and needs commutativity on
+    /// top of associativity to still equal the original fold.
+    ///
+    /// Run to exhaustion (peeling the odd remainder as it arises) this
+    /// reaches the same fully-unrolled term [`Fold::peel_back`] does, in
+    /// `⌈log₂ n⌉` steps rather than `n`.
+    #[must_use]
+    pub fn halve(self) -> Option<Self> {
+        let n = self.len();
+        (n >= 2 && n.is_multiple_of(2)).then(|| Self {
+            // `n` even means `hi - lo` is an exact multiple of `2 * stride`
+            // (it was one of `stride`), so `len()` stays exact integer
+            // division on the result.
+            stride: self.stride * 2,
+            ..self
         })
     }
 
@@ -255,30 +360,35 @@ impl Fold {
     /// the combining opcode, which stays crate-private because the op set is
     /// an IR concept and a consumer names algebras.
     #[must_use]
-    pub fn to_bits(self) -> u64 {
-        u64::from(self.monoid.op().index() as u8) << 40
-            | u64::from(self.binder.slot()) << 32
-            | u64::from(self.lo) << 16
-            | u64::from(self.hi)
+    pub fn to_bits(self) -> u128 {
+        u128::from(self.stride) << 80
+            | u128::from(self.monoid.op().index() as u8) << 72
+            | u128::from(self.binder.slot()) << 64
+            | u128::from(self.lo) << 32
+            | u128::from(self.hi)
     }
 
     /// The fold [`Fold::to_bits`] wrote, or `None` if the bits do not name
     /// one — an op that generates no algebra, an index outside the binder
-    /// space, a reversed range.
+    /// space, a reversed range, a zero stride, or a stride that does not
+    /// divide `hi - lo` exactly (the invariant every constructor here
+    /// maintains, and which [`Fold::len`] relies on).
     ///
     /// Total, so a corrupt cache key or a hand-written token stream is a
     /// `None` at the boundary rather than a fold that means something else.
     #[must_use]
-    pub fn from_bits(bits: u64) -> Option<Self> {
-        let monoid = Monoid::of(OpKind::from_index(((bits >> 40) & 0xff) as usize)?)?;
-        let binder = Binder::from_slot(((bits >> 32) & 0xff) as u8)?;
-        let lo = ((bits >> 16) & 0xffff) as u16;
-        let hi = (bits & 0xffff) as u16;
-        (lo <= hi).then_some(Self {
+    pub fn from_bits(bits: u128) -> Option<Self> {
+        let stride = ((bits >> 80) & 0xffff_ffff) as u32;
+        let monoid = Monoid::of(OpKind::from_index(((bits >> 72) & 0xff) as usize)?)?;
+        let binder = Binder::from_slot(((bits >> 64) & 0xff) as u8)?;
+        let lo = ((bits >> 32) & 0xffff_ffff) as u32;
+        let hi = (bits & 0xffff_ffff) as u32;
+        (lo <= hi && stride != 0 && (hi - lo).is_multiple_of(stride)).then_some(Self {
             monoid,
             binder,
             lo,
             hi,
+            stride,
         })
     }
 
@@ -286,24 +396,23 @@ impl Fold {
     /// `None` when the domain is empty.
     ///
     /// ```text
-    /// ⊕_{[lo,hi)} f  =  ⊕_{[lo,hi-1)} f ⊕ f(hi-1)
+    /// ⊕_{[lo,hi) step s} f  =  ⊕_{[lo,hi-s) step s} f ⊕ f(hi-s)
     /// ```
     ///
     /// [`Fold::peel`]'s mirror, and the one a rewrite should use: run to
-    /// exhaustion it builds the **left**-leaning chain
-    /// `((f(lo) ⊕ f(lo+1)) ⊕ …)`, which is the association
-    /// `passes::expand_reduce` produces. Peeling from the front instead
-    /// yields the same value in the opposite association, and an e-graph then
-    /// has to spend reassociation rules — and the classes they mint — to
-    /// reach the shape everything downstream was tuned on.
+    /// exhaustion over a `stride`-1 fold it builds the **left**-leaning chain
+    /// `((f(lo) ⊕ f(lo+1)) ⊕ …)`. Peeling from the front instead yields the
+    /// same value in the opposite association, and an e-graph then has to
+    /// spend reassociation rules — and the classes they mint — to reach the
+    /// shape everything downstream was tuned on.
     #[must_use]
     pub fn peel_back(self) -> Option<(Self, u32)> {
         (!self.is_empty()).then(|| {
             let rest = Self {
-                hi: self.hi - 1,
+                hi: self.hi - self.stride,
                 ..self
             };
-            (rest, u32::from(self.hi) - 1)
+            (rest, rest.hi)
         })
     }
 }
@@ -358,10 +467,237 @@ mod tests {
         assert!(Fold::new(Monoid::SUM, b, lo..hi).is_empty());
     }
 
+    /// A trip count past what a `u16` held. A surviving fold is a loop, so
+    /// this costs a counter, not sixty-six thousand copies of a body.
     #[test]
-    #[should_panic(expected = "copies of its body")]
-    fn a_range_past_the_emit_ceiling_is_refused() {
+    fn a_range_past_sixteen_bits_is_a_fold_like_any_other() {
         let b = Binder::from_slot(0).expect("slot 0 exists");
-        assert!(Fold::new(Monoid::SUM, b, 0..Fold::MAX_INDEX + 1).is_empty());
+        let wide = Fold::new(Monoid::SUM, b, 1_000..1_000_000);
+        assert_eq!(wide.len(), 999_000);
+        assert_eq!(wide.range(), 1_000..1_000_000);
+        let halved = wide.halve().expect("an even trip count halves");
+        assert_eq!(halved.len(), 499_500);
+        let back = Fold::from_bits(wide.to_bits()).expect("a fold's own bits name a fold");
+        assert_eq!(back, wide);
+    }
+
+    /// The unit monoid: a fold over it is a loop whose combine says nothing.
+    #[test]
+    fn seq_is_a_monoid_whose_combine_is_sequencing() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let fold = Fold::new(Monoid::SEQ, b, 0..4);
+        assert_eq!(fold.combine_op(), OpKind::Seq);
+        assert_eq!(fold.monoid(), Monoid::SEQ);
+        // The seed of an accumulator no combine ever reads.
+        assert_eq!(Monoid::SEQ.identity(), 0.0);
+        assert_eq!(Monoid::of(OpKind::Seq), Some(Monoid::SEQ));
+        let back = Fold::from_bits(fold.to_bits()).expect("a SEQ fold round-trips");
+        assert_eq!(back, fold);
+    }
+
+    #[test]
+    fn strided_builds_with_the_given_step() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let fold = Fold::strided(Monoid::SUM, b, 0..12, 3);
+        assert_eq!(fold.stride(), 3);
+        assert_eq!(
+            fold.range(),
+            0..12,
+            "range() names the bound, not stride's steps"
+        );
+        assert_eq!(fold.len(), 4);
+        let back = Fold::from_bits(fold.to_bits()).expect("a strided fold's own bits name it");
+        assert_eq!(back, fold);
+    }
+
+    #[test]
+    #[should_panic(expected = "must divide")]
+    fn strided_refuses_a_stride_that_does_not_divide_the_span() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert!(!Fold::strided(Monoid::SUM, b, 0..10, 3).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero")]
+    fn strided_refuses_a_zero_stride() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert!(!Fold::strided(Monoid::SUM, b, 0..10, 0).is_empty());
+    }
+
+    #[test]
+    fn new_is_strided_with_a_stride_of_one() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert_eq!(
+            Fold::new(Monoid::SUM, b, 2..9),
+            Fold::strided(Monoid::SUM, b, 2..9, 1)
+        );
+    }
+
+    #[test]
+    fn halve_doubles_the_stride_and_halves_the_trip_count() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let fold = Fold::new(Monoid::SUM, b, 0..8);
+        assert_eq!(fold.stride(), 1);
+        let once = fold.halve().expect("8 is even and has more than one term");
+        assert_eq!(once.stride(), 2);
+        assert_eq!(once.len(), 4);
+        assert_eq!(once.range(), 0..8, "halve moves the stride, not the bound");
+        let twice = once.halve().expect("4 is still even");
+        assert_eq!(twice.stride(), 4);
+        assert_eq!(twice.len(), 2);
+        let thrice = twice.halve().expect("2 is still even");
+        assert_eq!(thrice.stride(), 8);
+        assert_eq!(thrice.len(), 1);
+        // One term left: nothing to pair it with.
+        assert_eq!(thrice.halve(), None);
+    }
+
+    #[test]
+    fn halve_declines_on_an_odd_or_too_short_fold() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert_eq!(
+            Fold::new(Monoid::SUM, b, 0..0).halve(),
+            None,
+            "zero terms: nothing to pair"
+        );
+        assert_eq!(
+            Fold::new(Monoid::SUM, b, 0..1).halve(),
+            None,
+            "one term: nothing to pair it with"
+        );
+        assert_eq!(
+            Fold::new(Monoid::SUM, b, 0..7).halve(),
+            None,
+            "an odd trip count has no even pairing"
+        );
+        assert!(Fold::new(Monoid::SUM, b, 0..2).halve().is_some());
+    }
+
+    /// **The load-bearing property.** Halving to exhaustion (falling back to
+    /// [`Fold::peel_back`] for the odd remainder, the preference
+    /// `passes::expand_reduce` and `egraph::fold_rules::HalveFold` both give
+    /// it) must visit the same terms, in the same left-to-right order, as
+    /// [`Fold::peel`] does one at a time — for an even trip count (pure
+    /// halving, no remainder ever arises) and an odd one (forces the
+    /// peel-back epilogue at more than one level of the recursion).
+    ///
+    /// "Same order" here means the same *sequence* of leaves read
+    /// left-to-right, not the same bracketing: halving `[lo,hi)` re-groups
+    /// `(f₀⊕f₁) ⊕ (f₂⊕f₃) ⊕ …` rather than peeling's `((f₀⊕f₁)⊕f₂)⊕…`, and
+    /// those are genuinely different trees, sound only because the monoid is
+    /// associative. Every [`Monoid`] this crate has — `SUM`, `PRODUCT`,
+    /// `MIN`, `MAX`, and the two mask quantifiers `ANY`/`ALL` — is also
+    /// *commutative*, so a numeric total cannot even see this order property:
+    /// a genuinely reordering decomposition (the rejected "halve-and-offset",
+    /// module doc of `egraph::fold_rules`) would sum to the identical value.
+    /// So this checks the sequence directly — with "term" specialized to its
+    /// own raw index and "combine" to list concatenation, `combine` below is
+    /// the shape `passes::expand_reduce::combine_halved` uses for real, just
+    /// instantiated to make the order legible without an arena or a JIT.
+    #[test]
+    fn halving_to_exhaustion_visits_the_same_terms_in_the_same_order_as_peeling() {
+        fn combine(fold: Fold, terms: &[alloc::vec::Vec<u32>]) -> alloc::vec::Vec<u32> {
+            assert_eq!(fold.len() as usize, terms.len());
+            if let Some(halved) = fold.halve() {
+                let paired: alloc::vec::Vec<alloc::vec::Vec<u32>> = terms
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[a, b]| [a.as_slice(), b.as_slice()].concat())
+                    .collect();
+                return combine(halved, &paired);
+            }
+            let (rest, _) = fold.peel_back().expect("a non-empty fold has a last term");
+            let last = terms.last().expect("len matches terms.len()").clone();
+            if rest.is_empty() {
+                return last;
+            }
+            let mut acc = combine(rest, &terms[..terms.len() - 1]);
+            acc.extend(last);
+            acc
+        }
+
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        for &(lo, hi) in &[(0u32, 8u32), (3, 11), (0, 7), (2, 9), (0, 1), (5, 6)] {
+            let fold = Fold::new(Monoid::SUM, b, lo..hi);
+            let want: alloc::vec::Vec<u32> = (lo..hi).collect();
+
+            let terms: alloc::vec::Vec<alloc::vec::Vec<u32>> =
+                (lo..hi).map(|k| alloc::vec![k]).collect();
+            let halved_order = combine(fold, &terms);
+            assert_eq!(
+                halved_order, want,
+                "halving {lo}..{hi} must visit every index once, in ascending order"
+            );
+
+            let mut peeled_order = alloc::vec::Vec::new();
+            let mut rest = fold;
+            while let Some((k, shorter)) = rest.peel() {
+                peeled_order.push(k);
+                rest = shorter;
+            }
+            assert_eq!(
+                halved_order, peeled_order,
+                "halving and peeling {lo}..{hi} to exhaustion must visit identical sequences"
+            );
+        }
+    }
+
+    #[test]
+    fn to_bits_round_trips_a_halved_fold() {
+        let b = Binder::from_slot(2).expect("slot 2 exists");
+        let fold = Fold::new(Monoid::MAX, b, 10..26)
+            .halve()
+            .expect("16 is even")
+            .halve()
+            .expect("8 is still even");
+        assert_eq!(fold.stride(), 4);
+        assert_eq!(fold.len(), 4);
+
+        let back = Fold::from_bits(fold.to_bits()).expect("a fold's own bits name a fold");
+        assert_eq!(back, fold);
+        assert_eq!(back.stride(), 4);
+        assert_eq!(back.monoid(), Monoid::MAX);
+        assert_eq!(back.binder(), b);
+        assert_eq!(back.range(), 10..26);
+    }
+
+    #[test]
+    fn from_bits_refuses_a_stride_that_does_not_divide_the_range() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let mut bits = Fold::new(Monoid::SUM, b, 0..5).to_bits();
+        // Corrupt the stride field (bits 48..64) to 2, which does not divide
+        // `5 - 0`: a fold that claims this would silently drop or duplicate
+        // an index, so `from_bits` must refuse it rather than build one.
+        bits = (bits & !(0xffff_ffffu128 << 80)) | (2u128 << 80);
+        assert_eq!(Fold::from_bits(bits), None);
+    }
+
+    /// `ExprNode`'s crate-wide budget (see the static assertion in
+    /// `arena.rs`) is a ceiling every variant shares, not a per-variant
+    /// promise — it grew from 16 to 24 when `Guard` arrived with two
+    /// `KernelKey`s, and a `Fold` with `u32` ends fits a `Reduce` node in
+    /// that same 24. Pinned here as a byte count rather than left to the
+    /// crate-wide assertion alone, so a future field that also fits the
+    /// crate-wide check but pushes `Fold` itself past what a `Reduce` node
+    /// ought to need fails here with a number, not just "too big".
+    #[test]
+    fn fold_and_expr_node_stay_within_the_node_budget() {
+        assert_eq!(
+            core::mem::size_of::<Fold>(),
+            16,
+            "Fold: monoid(1) + binder(1) + pad(2) + lo(4) + hi(4) + stride(4)"
+        );
+        assert!(
+            core::mem::size_of::<Fold>() + core::mem::size_of::<crate::arena::ExprId>() <= 24,
+            "a Reduce node is a Fold plus one ExprId, and fits the width a \
+             Guard already needs — a fact about Reduce, not a budget Fold's \
+             fields were chosen to meet"
+        );
+        assert!(
+            core::mem::size_of::<crate::arena::ExprNode>() <= 32,
+            "see arena.rs's assertion: a tripwire against an accident, not a \
+             width anything depends on"
+        );
     }
 }

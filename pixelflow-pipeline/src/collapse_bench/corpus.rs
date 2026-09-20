@@ -283,6 +283,21 @@ pub fn encode(kernel: &CollapseKernel) -> String {
                  a name for a kernel interned in this process only",
                 kernel.name
             ),
+            // Same reasoning as `Ref`: `on`/`off` name kernels in this
+            // process's `KernelStore` too, and nothing produces a `Guard`
+            // for a corpus kernel to hold yet (G1: never chosen).
+            ExprNode::Guard { mask: _, on, off } => panic!(
+                "{}: corpus kernels must be self-contained, but this one holds \
+                 Guard(on={on:?}, off={off:?}) — names for kernels interned in this \
+                 process only",
+                kernel.name
+            ),
+            // A corpus kernel is pre-legalize by construction; a store is
+            // built after extraction and has no line here.
+            ExprNode::Write { .. } => panic!(
+                "{}: corpus kernels are pre-legalize, but this one holds a Write",
+                kernel.name
+            ),
         }
         .expect("fmt");
         dense[idx] = next;
@@ -469,7 +484,7 @@ fn decode(path: &Path) -> CollapseKernel {
                 arena.push_nary(op(k), &children)
             }
             ["R", bits, body] => {
-                let bits: u64 = bits
+                let bits: u128 = bits
                     .parse()
                     .unwrap_or_else(|e| panic!("{}: bad fold bits {bits:?}: {e}", path.display()));
                 let fold = Fold::from_bits(bits)

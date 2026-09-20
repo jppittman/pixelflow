@@ -197,33 +197,48 @@ mod tests {
     /// already there — the two outcomes `Drop` running or not would produce.
     #[test]
     fn dropping_the_executable_code_unmaps_the_page() {
-        // Content is irrelevant: this page is only ever mapped, never executed.
-        let code = [0x90u8];
-        let exec = LinuxCodePage::from_code(&code).expect("map + flip");
-        let addr = exec.as_bytes().as_ptr();
+        // The probe is `MAP_FIXED_NOREPLACE` at the dropped page's address:
+        // it succeeds only if nothing is mapped there. That distinguishes a
+        // leak from a race by *persistence*, not by one attempt. A page the
+        // drop failed to unmap occupies its own address every time; an
+        // address another test thread happened to reuse between the drop and
+        // the probe (the harness runs tests in parallel, and every JIT and
+        // every large allocation is an `mmap`) is taken once and the next
+        // fresh page lands somewhere else. So a leak fails every attempt and
+        // a race fails at most a few, which is what the bound is for.
+        const ATTEMPTS: usize = 8;
         let len = <LinuxCodePage as CodePage>::page_size();
-        drop(exec);
+        let mut taken: Vec<*const u8> = Vec::new();
+        for _ in 0..ATTEMPTS {
+            // Content is irrelevant: this page is only ever mapped, never
+            // executed.
+            let code = [0x90u8];
+            let exec = LinuxCodePage::from_code(&code).expect("map + flip");
+            let addr = exec.as_bytes().as_ptr();
+            drop(exec);
 
-        let remap = unsafe {
-            libc::mmap(
-                addr.cast::<libc::c_void>().cast_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED_NOREPLACE,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(
-            remap,
-            libc::MAP_FAILED,
-            "{addr:p} is still mapped after drop"
-        );
-        assert_eq!(
-            remap.cast::<u8>(),
-            addr.cast_mut(),
-            "kernel placed the remap elsewhere despite MAP_FIXED_NOREPLACE"
-        );
-        unsafe { libc::munmap(remap, len) };
+            let remap = unsafe {
+                libc::mmap(
+                    addr.cast::<libc::c_void>().cast_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if remap == libc::MAP_FAILED {
+                taken.push(addr);
+                continue;
+            }
+            assert_eq!(
+                remap.cast::<u8>(),
+                addr.cast_mut(),
+                "kernel placed the remap elsewhere despite MAP_FIXED_NOREPLACE"
+            );
+            unsafe { libc::munmap(remap, len) };
+            return;
+        }
+        panic!("every one of {ATTEMPTS} dropped pages is still mapped: {taken:?}");
     }
 }

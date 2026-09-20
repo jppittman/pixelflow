@@ -1,28 +1,36 @@
 //! The decompositions of a bounded fold, as e-graph rewrites.
 //!
 //! ```text
-//! ⊕_{[lo,hi)} f  =  f(lo) ⊕ ⊕_{[lo+1,hi)} f      (peel)
-//! ⊕_{[lo,lo)} f  =  identity(⊕)                   (empty)
+//! ⊕_{[lo,hi) step s} f  =  f(lo) ⊕ ⊕_{[lo+s,hi) step s} f              (peel)
+//! ⊕_{[lo,hi) step s} f  =  ⊕_{[lo,hi) step 2s} (f ⊕ f[binder:=binder+s]) (halve)
+//! ⊕_{[lo,lo) step s} f  =  identity(⊕)                                  (empty)
 //! ```
 //!
-//! These are the rules the encoding used to make unstatable. While a fold's
-//! algebra, binder and range were `Const` children, a rewrite that changed the
-//! range would have had to rewrite an *e-class* holding a number — the same
-//! class as any literal of that value elsewhere in the kernel. With the
-//! metadata in the node's identity ([`pixelflow_ir::Fold`]) a peel changes
+//! Peel and empty are the rules the encoding used to make unstatable. While a
+//! fold's algebra, binder and range were `Const` children, a rewrite that
+//! changed the range would have had to rewrite an *e-class* holding a number —
+//! the same class as any literal of that value elsewhere in the kernel. With
+//! the metadata in the node's identity ([`pixelflow_ir::Fold`]) a peel changes
 //! only the node, and the tail shares the original body's class.
 //!
-//! **Peel to exhaustion is the unroll.** `passes::expand_reduce` — the
-//! legalizer that runs when a fold survives extraction, because codegen has no
-//! iteration binder — is the same operation at a different budget, and both go
-//! through [`Fold::peel`]. That is why the pipeline can put the legalizer
-//! *after* saturation: what the graph unrolled, it unrolled and then folded and
-//! CSE'd across; what it declined, the legalizer finishes.
+//! **Peeling is O(n) applications to unroll a length-n fold; halving is
+//! O(log n).** Each `HalveFold` firing doubles the body and halves the trip
+//! count, and [`Fold::halve`] declines on an odd count — `PeelFold` is that
+//! remainder's epilogue, run once per odd level the recursion hits (`log n`
+//! of them at most), not a fallback that reverts to unrolling one term at a
+//! time. `passes::expand_reduce` — the legalizer that runs when a fold
+//! survives extraction, because codegen has no iteration binder — prefers the
+//! same decomposition, through the same two [`Fold`] methods, so a fold that
+//! survives saturation unrolls into the identical shape one that didn't have
+//! to would have reached inside the graph.
 //!
 //! ## Substituting under a binder, in an e-graph
 //!
-//! Peeling needs `body[binder := lo]`, and substitution is where e-graphs and
-//! binders meet. Two things make it affordable and sound here:
+//! Both rules need to rebuild `body` with its binder's leaves replaced —
+//! `peel` by a literal, `halve` by an expression (`binder + stride`, since the
+//! doubled body still lives inside a `Reduce` and the binder must stay live)
+//! — and substitution is where e-graphs and binders meet. Two things make it
+//! affordable and sound here:
 //!
 //! - **A representative suffices.** Every node in a class denotes the same
 //!   value, and `f ≡ g ⟹ f[x:=c] ≡ g[x:=c]`, so substituting through one
@@ -84,16 +92,45 @@ pub enum HeadNode {
     },
 }
 
-/// `⊕_{[lo,hi)} f = ⊕_{[lo,hi-1)} f ⊕ f(hi-1)`.
+/// `⊕_{[lo,hi) step s} f = ⊕_{[lo,hi-s) step s} f ⊕ f(hi-s)`.
 ///
-/// From the *back*, so running it to exhaustion builds the same left-leaning
-/// chain `passes::expand_reduce` does. Peeling from the front is the same
-/// value in the opposite association, and the difference is not cosmetic: it
-/// measured 23–42% more emitted nodes on production glyphs, because the graph
-/// then has to reassociate an n-deep chain to reach the shape the cost model
-/// and the fusion rules were tuned on, and spends its class budget doing it.
-/// See docs/plans/2026-09-09-a-fold-is-a-node.md §9.
+/// From the *back*, so running it to exhaustion over a `stride`-1 fold builds
+/// the same left-leaning chain `passes::expand_reduce` falls back to for an
+/// odd remainder. Peeling from the front is the same value in the opposite
+/// association, and the difference is not cosmetic: it measured 23–42% more
+/// emitted nodes on production glyphs, because the graph then has to
+/// reassociate an n-deep chain to reach the shape the cost model and the
+/// fusion rules were tuned on, and spends its class budget doing it. See
+/// docs/plans/2026-09-09-a-fold-is-a-node.md §9.
+///
+/// [`HalveFold`]'s epilogue for an odd trip count, at whatever level of the
+/// halving recursion it arises — declines outright on a fold
+/// [`Fold::halve`] can still shrink (see its `apply`). Saturation has no
+/// notion of "the cheaper rule tries first": every matching rule fires every
+/// round, so without that guard this rule would peel a fold one term per
+/// application in parallel with `HalveFold` halving the same fold — an `n`
+/// applications-worth of independent unrolling that the extractor's cost
+/// model would then have to notice and discard, right back to the O(n)
+/// application count `HalveFold` exists to avoid.
 pub struct PeelFold;
+
+/// `⊕_{[lo,hi) step s} f = ⊕_{[lo,hi) step 2s} (f ⊕ f[binder := binder+s])`.
+///
+/// The stride-2 unroll (module doc): the trip count halves and the stride
+/// doubles, re-bracketing the same left-to-right order of terms —
+/// `(f₀⊕f₁) ⊕ (f₂⊕f₃) ⊕ …` — rather than reordering them, so it needs only
+/// associativity and holds for every [`Monoid`] here. The alternative, halving
+/// the *range* into `[lo,mid)` and `[mid,hi)`, would instead pair `f₀⊕f_{n/2}`,
+/// `f₁⊕f_{1+n/2}`, … — interleaving the sequence, which additionally needs
+/// commutativity to still equal the original fold, and is not what this does.
+///
+/// Run to exhaustion (peeling the odd remainder as it arises, via
+/// [`PeelFold`]) this reaches the same fully-unrolled term peeling alone
+/// does, in `⌈log₂ n⌉` applications rather than `n` — the entire reason this
+/// rule exists: a 34,993-term glyph fold unrolled one term per application
+/// was burning that many rule applications against a budget denominated in
+/// them (CLAUDE.md, "A kernel built differently on two machines?").
+pub struct HalveFold;
 
 /// `⊕_{[lo,lo)} f = identity(⊕)` — whatever the body says.
 pub struct EmptyFold;
@@ -107,6 +144,12 @@ impl Rewrite for PeelFold {
         let ENode::Reduce { fold, body } = node else {
             return None;
         };
+        // `HalveFold`'s epilogue only (see this rule's doc): while the fold
+        // can still be halved, this rule declines so the two do not
+        // independently unroll the same fold in parallel.
+        if fold.halve().is_some() {
+            return None;
+        }
         let (rest, last) = fold.peel_back()?;
         // The combiner must be nameable as an `Op` before any work is done:
         // declining early costs one lookup, declining late costs a walk of
@@ -117,6 +160,30 @@ impl Rewrite for PeelFold {
             head,
             head_root,
             rest,
+            body: *body,
+        })
+    }
+}
+
+impl Rewrite for HalveFold {
+    fn name(&self) -> &str {
+        "halve-fold"
+    }
+
+    fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
+        let ENode::Reduce { fold, body } = node else {
+            return None;
+        };
+        let halved = fold.halve()?;
+        // Same ordering `PeelFold` uses, for the same reason: the combiner
+        // must be nameable before any work is done, and building the shifted
+        // half is a walk of the whole body — the expensive part.
+        combiner_op(fold.monoid())?;
+        let (shift, shift_root) = shifted_body(egraph, *body, fold.binder(), fold.stride())?;
+        Some(RewriteAction::HalveFold {
+            shift,
+            shift_root,
+            halved,
             body: *body,
         })
     }
@@ -136,10 +203,17 @@ impl Rewrite for EmptyFold {
     }
 }
 
-/// The two fold decompositions. Inert for a kernel with no folds in it.
+/// The fold decompositions: [`HalveFold`] for the bulk of a trip count,
+/// [`PeelFold`] as its odd-remainder epilogue (and a fold [`Fold::halve`]
+/// declines on outright), [`EmptyFold`] to close out. Inert for a kernel
+/// with no folds in it.
 #[must_use]
 pub fn fold_rules() -> Vec<Box<dyn Rewrite>> {
-    alloc::vec![Box::new(PeelFold) as Box<dyn Rewrite>, Box::new(EmptyFold)]
+    alloc::vec![
+        Box::new(HalveFold) as Box<dyn Rewrite>,
+        Box::new(PeelFold) as Box<dyn Rewrite>,
+        Box::new(EmptyFold),
+    ]
 }
 
 /// The `Op` that combines a fold's terms.
@@ -169,17 +243,25 @@ struct Done {
     varies: bool,
 }
 
-/// Build `body[binder := value]` as a plan, walking one representative per
-/// e-class.
+/// Build `body` with every leaf occurrence of `binder` rebuilt by `leaf`,
+/// walking one representative per e-class.
+///
+/// Shared by [`substituted_body`] (`binder := value`, a literal — `PeelFold`)
+/// and [`shifted_body`] (`binder := binder + stride`, an expression —
+/// `HalveFold`): both are "rebuild `body` with the binder's leaves replaced,"
+/// differing only in what a leaf becomes. `leaf` receives the plan being
+/// built (to push onto) and the binder leaf's own class (which
+/// [`shifted_body`] needs, to reference the unshifted binder in what it
+/// builds; [`substituted_body`] ignores it).
 ///
 /// Returns `None` when the walk re-enters a class it is already inside: a
 /// merged class can reach itself, and a substitution through a cycle does not
 /// terminate. Declining costs completeness and never soundness.
-fn substituted_body(
+fn rebuild_body(
     egraph: &EGraph,
     body: EClassId,
     binder: Binder,
-    value: f32,
+    mut leaf: impl FnMut(&mut Vec<HeadNode>, EClassId) -> HeadRef,
 ) -> Option<(Vec<HeadNode>, HeadRef)> {
     enum Task {
         Visit(EClassId),
@@ -206,11 +288,8 @@ fn substituted_body(
                 let node = egraph.nodes(class).first()?;
                 // The binder itself: the one place the substitution bites.
                 if matches!(node, ENode::Var(v) if *v == binder.var()) {
-                    plan.push(HeadNode::Const(value.to_bits()));
-                    let done = Done {
-                        at: HeadRef::Plan(plan.len() as u32 - 1),
-                        varies: true,
-                    };
+                    let at = leaf(&mut plan, class);
+                    let done = Done { at, varies: true };
                     on_stack.remove(&class);
                     memo.insert(class, done);
                     built.push(done);
@@ -258,6 +337,44 @@ fn substituted_body(
     // class — `⊕_{[lo,hi)} c` peeling to `c ⊕ ⊕_{[lo+1,hi)} c`, with no copy
     // made anywhere.
     Some((plan, built.pop()?.at))
+}
+
+/// Build `body[binder := value]` as a plan — `PeelFold`'s substitution. The
+/// binder is resolved to a literal and does not survive into the result,
+/// which is why the peeled term is safe to place outside its `Reduce`.
+fn substituted_body(
+    egraph: &EGraph,
+    body: EClassId,
+    binder: Binder,
+    value: f32,
+) -> Option<(Vec<HeadNode>, HeadRef)> {
+    rebuild_body(egraph, body, binder, |plan, _class| {
+        plan.push(HeadNode::Const(value.to_bits()));
+        HeadRef::Plan(plan.len() as u32 - 1)
+    })
+}
+
+/// Build `body[binder := binder + stride]` as a plan — `HalveFold`'s
+/// substitution. Every leaf occurrence of the binder is rebuilt as
+/// `binder + stride`, an *expression*, not a literal: unlike
+/// [`substituted_body`], the binder must stay live in the result, because
+/// the doubled body [`HalveFold`] builds from this is the new body of a
+/// `Reduce`, not a value that has left one.
+fn shifted_body(
+    egraph: &EGraph,
+    body: EClassId,
+    binder: Binder,
+    stride: u32,
+) -> Option<(Vec<HeadNode>, HeadRef)> {
+    rebuild_body(egraph, body, binder, |plan, class| {
+        plan.push(HeadNode::Const((stride as f32).to_bits()));
+        let amount = HeadRef::Plan(plan.len() as u32 - 1);
+        plan.push(HeadNode::Op {
+            op: &ops::Add,
+            children: alloc::vec![HeadRef::Class(class), amount],
+        });
+        HeadRef::Plan(plan.len() as u32 - 1)
+    })
 }
 
 /// A class reused as-is.
@@ -371,6 +488,140 @@ mod tests {
                 );
             }
             None => panic!("the rest must be a fold"),
+        }
+    }
+
+    /// **`PeelFold` is the epilogue, not a competitor.** An e-graph applies
+    /// every matching rule every round; without this decline, `PeelFold`
+    /// would independently unroll an even fold one term per application in
+    /// parallel with `HalveFold`'s halving, right back to the `n`
+    /// applications `HalveFold` exists to avoid (see `PeelFold`'s doc). A
+    /// fold `Fold::halve` still shrinks must get *no* `PeelFold` action; one
+    /// it declines outright on (odd, or the one-term base case) must still
+    /// get its usual peel.
+    #[test]
+    fn peel_fold_declines_exactly_when_halve_fold_would_apply() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+
+        let even = a.push_reduce(Fold::new(Monoid::SUM, binder(0), 0..8), x);
+        let mut eg = EGraph::with_rules(fold_rules());
+        let class = insert(&a, even, &mut eg, Vocabulary::Runtime).expect("a fold inserts");
+        let ENode::Reduce { fold, body } = eg.nodes(class).first().cloned().expect("a fold") else {
+            panic!("expected a fold");
+        };
+        assert!(
+            PeelFold
+                .apply(&eg, class, &ENode::Reduce { fold, body })
+                .is_none(),
+            "8 is even — HalveFold's job, not PeelFold's"
+        );
+
+        let odd = a.push_reduce(Fold::new(Monoid::SUM, binder(0), 0..7), x);
+        let mut eg2 = EGraph::with_rules(fold_rules());
+        let class2 = insert(&a, odd, &mut eg2, Vocabulary::Runtime).expect("a fold inserts");
+        let ENode::Reduce {
+            fold: fold2,
+            body: body2,
+        } = eg2.nodes(class2).first().cloned().expect("a fold")
+        else {
+            panic!("expected a fold");
+        };
+        assert!(
+            PeelFold
+                .apply(
+                    &eg2,
+                    class2,
+                    &ENode::Reduce {
+                        fold: fold2,
+                        body: body2
+                    }
+                )
+                .is_some(),
+            "7 is odd — Fold::halve declines, so PeelFold is the epilogue"
+        );
+    }
+
+    /// **Doubling the body, one round.** `Σ_{[0,8)} X` has a body that
+    /// ignores the binder, so — mirroring `a_peel_shares_the_body_it_folds`
+    /// — the shifted half must be *X's own e-class*, no copy, and the
+    /// doubled body must combine the original body with it, original first.
+    #[test]
+    fn halve_doubles_the_body_sharing_it_when_the_binder_is_unused() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, binder(0), 0..8), x);
+
+        let mut eg = EGraph::with_rules(fold_rules());
+        let class = insert(&a, root, &mut eg, Vocabulary::Runtime).expect("a fold inserts");
+        let body_class = match eg.nodes(class).first() {
+            Some(ENode::Reduce { body, .. }) => eg.find(*body),
+            other => panic!("expected a fold, got {other:?}"),
+        };
+
+        // One round: 8 is even, so only `HalveFold` fires on the root (`x`
+        // never reaches the binder, so `PeelFold`'s own gate is moot here —
+        // `HalveFold` is simply the only rule that matches a Reduce at all).
+        SaturationConfig::compatibility(1).run(&mut eg);
+
+        // `class` now holds *two* `Reduce` nodes — the original (stride 1)
+        // and the one `HalveFold` just built — so the doubled one has to be
+        // picked out by its stride rather than by `find_map(ENode::fold)`,
+        // which would just return whichever comes first.
+        let (doubled_fold, new_body_class) = eg
+            .nodes(class)
+            .iter()
+            .find_map(|n| match n {
+                ENode::Reduce { fold, body } if fold.stride() > 1 => Some((*fold, eg.find(*body))),
+                _ => None,
+            })
+            .expect("the class must now also hold the halved fold");
+        assert_eq!(doubled_fold.stride(), 2, "one halving doubles the stride");
+        assert_eq!(
+            doubled_fold.range(),
+            0..8,
+            "halve moves the stride, not the bound"
+        );
+        let sum = eg
+            .nodes(new_body_class)
+            .iter()
+            .find_map(|n| match n {
+                ENode::Op { op, children } if op.kind() == OpKind::Add => Some(children.clone()),
+                _ => None,
+            })
+            .expect("the doubled body's class must hold the Add combining it with its shift");
+        assert_eq!(
+            eg.find(sum[0]),
+            body_class,
+            "the unshifted half is the body itself: a binder the body never reads shifts to \
+             the identity, and hash-consing says so — `body` first, matching `b ⊕ b[binder:=binder+s]`"
+        );
+    }
+
+    /// `combiner_op` is total over every [`Monoid`] constructible outside
+    /// `pixelflow-ir`: `Monoid::of` (the only way to wrap an `OpKind` as a
+    /// `Monoid`) is `pub(crate)` there and accepts only the six ops
+    /// `OpKind::monoid_identity` names, which is exactly this match's arm
+    /// list. Its `_ => None` arm — what `PeelFold`/`HalveFold` decline on —
+    /// is therefore unreachable through any `Fold` this crate, or any
+    /// caller of it, can build today; it exists for a `Monoid` variant that
+    /// does not exist yet, the same defensive shape `PeelFold`'s equivalent
+    /// check already had with no test of its own. This is the test that
+    /// *is* reachable: every constructible algebra must still resolve to a
+    /// combiner, so a future `Monoid` added without a matching arm here
+    /// fails loudly the moment this test tries it, rather than silently
+    /// falling into `_ => None` and making every fold over it inextricable.
+    #[test]
+    fn combiner_op_covers_every_constructible_monoid() {
+        for m in [
+            Monoid::SUM,
+            Monoid::PRODUCT,
+            Monoid::MIN,
+            Monoid::MAX,
+            Monoid::ANY,
+            Monoid::ALL,
+        ] {
+            assert!(combiner_op(m).is_some(), "{m:?} has no combiner");
         }
     }
 }

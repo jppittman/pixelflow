@@ -32,6 +32,18 @@ impl Ir for ExprArena {
                 Shape::Op(op, Children::Many(self.nary_children_slice(start, len)))
             }
             ExprNode::Reduce { fold, body } => Shape::Reduce { fold, body },
+            ExprNode::Guard { mask, on, off } => Shape::Guard { mask, on, off },
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => Shape::Write {
+                row,
+                col,
+                lane,
+                value,
+            },
         }
     }
 
@@ -64,6 +76,13 @@ impl Ir for ExprArena {
                 },
             },
             Shape::Reduce { fold, body } => self.push_reduce(fold, body),
+            Shape::Guard { mask, on, off } => self.push_guard(mask, on, off),
+            Shape::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => self.push_write(row, col, lane, value),
         }
     }
 }
@@ -123,6 +142,12 @@ impl ExprArena {
                     Shape::Reduce { body, .. } if memo[body.0 as usize].is_none() => {
                         alloc::vec![body]
                     }
+                    Shape::Guard { mask, .. } if memo[mask.0 as usize].is_none() => {
+                        alloc::vec![mask]
+                    }
+                    Shape::Write { value, .. } if memo[value.0 as usize].is_none() => {
+                        alloc::vec![value]
+                    }
                     _ => Vec::new(),
                 };
                 if !pending.is_empty() {
@@ -150,6 +175,24 @@ impl ExprArena {
                 Shape::Reduce { fold, body } => {
                     let body = memo[body.0 as usize].expect("rebuild_into: body before fold");
                     out.embed(Shape::Reduce { fold, body })
+                }
+                Shape::Guard { mask, on, off } => {
+                    let mask = memo[mask.0 as usize].expect("rebuild_into: mask before guard");
+                    out.embed(Shape::Guard { mask, on, off })
+                }
+                Shape::Write {
+                    row,
+                    col,
+                    lane,
+                    value,
+                } => {
+                    let value = memo[value.0 as usize].expect("rebuild_into: value before write");
+                    out.embed(Shape::Write {
+                        row,
+                        col,
+                        lane,
+                        value,
+                    })
                 }
             };
             memo[id.0 as usize] = Some(built);

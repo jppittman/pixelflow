@@ -5,9 +5,16 @@
 //! binder (`table.at(&constant(col), &binder)`), so a glyph's per-piece
 //! coefficients can live in one bound buffer instead of `extent`-many
 //! separately-compiled constants. That combination — a buffer gather whose
-//! index is a reduce binder, carried through `.at()`, unrolled by
-//! `legalize`, and executed by the JIT — exists nowhere else in the
-//! workspace, so this file proves it before anything is built on it.
+//! index is a reduce binder, carried through `.at()`, legalized, and executed
+//! by the JIT — exists nowhere else in the workspace, so this file proves it
+//! before anything is built on it.
+//!
+//! Since stage 2c the fold is no longer unrolled on the way: codegen emits it
+//! as a loop, so the gather's index is the binder's own `Var` at run time
+//! rather than a `Const` per unrolled copy. Both facts are pinned below —
+//! `binder_weighted_sum_over_reads_every_column_exactly` for the numbers,
+//! `legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent` for
+//! the shape.
 //!
 //! This lives in `pixelflow-core` and not `pixelflow-codegen` or
 //! `pixelflow-ir`: the test needs both `Kernel::over` (defined in
@@ -173,19 +180,27 @@ fn binder_weighted_sum_over_reads_every_column_exactly() {
     }
 }
 
-/// Reports the arena's node count before and after `legalize`, at two
-/// extents, so the unroll factor `legalize` performs on a
-/// buffer-under-binder reduce is visible rather than assumed.
+/// A bare `Reduce` **survives** `legalize`, gather and all, and its size does
+/// not depend on its extent.
 ///
-/// `legalize` runs `expand_reduce` before `expand_gather` (established fact,
-/// confirmed by reading `pixelflow_ir::passes`): the `Reduce` node unrolls
-/// into `extent` inlined copies of its body *first*, each with the binder
-/// substituted as a distinct `Const`, and only then does each copy's now-
-/// constant-indexed `Gather` lower to index arithmetic. So node count should
-/// scale with `extent`, not stay flat — that scaling, not just "it doesn't
-/// panic", is what this test checks and reports.
+/// This test used to assert the opposite, and the inversion is the whole of
+/// stage 2c (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md).
+/// `legalize` ran `expand_reduce` unconditionally, so a `Reduce` became
+/// `extent` inlined copies of its body — each with the binder substituted as
+/// a distinct `Const`, which is what let the following `expand_gather` see a
+/// constant index — and the node count scaled with the extent. Codegen emits
+/// a surviving fold as a loop now, nested or not, so legalization unrolls
+/// nothing and a `Reduce` reaches the assembler folded.
+///
+/// Two extents, because a count that is merely *small* proves nothing: the
+/// claim is that the arena is the **same size** at extent 3 and extent 16,
+/// which is only true if the body is stored once and the range is metadata on
+/// the fold. The gather still has to lower — its index is now the binder's
+/// own `Var` rather than a `Const` — and
+/// `binder_weighted_sum_over_reads_every_column_exactly` above is what checks
+/// the numbers that come out of it.
 #[test]
-fn legalize_unrolls_the_binder_and_the_gather_together() {
+fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
     /// A second extent, larger than [`TABLE_ROWS`], purely to see the unroll
     /// factor scale — this kernel is never collapsed, so it does not matter
     /// that most of its binder range falls outside the table's declared
@@ -193,52 +208,119 @@ fn legalize_unrolls_the_binder_and_the_gather_together() {
     /// structural rewrite and never executes the gather).
     const WIDE_EXTENT: u32 = 16;
 
-    let node_counts = |extent: u32| {
+    let legalized = |extent: u32| {
         let (_binding, table) = bind_table();
         let kernel = Kernel::sum_over(extent, |i| table.at(&Kernel::constant(0.0), i));
         let (arena, root) = kernel.parts();
         let before = arena.nodes_raw().len();
-        let (legalized, _root) = pixelflow_ir::passes::legalize(arena, root).expect("legalize");
+        let (legalized, new_root) = pixelflow_ir::passes::legalize(arena, root).expect("legalize");
         let after = legalized.nodes_raw().len();
-        (before, after)
+        // From the root, not over `nodes_raw`: each rewrite appends and leaves
+        // what it replaced behind, so the raw array still holds the pre-pass
+        // `Reduce` as garbage. Reachability is the question being asked.
+        let mut seen = vec![false; legalized.nodes_raw().len()];
+        let mut stack = vec![new_root];
+        let mut reduces = 0usize;
+        while let Some(id) = stack.pop() {
+            if std::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            if matches!(
+                legalized.node(id),
+                pixelflow_ir::arena::ExprNode::Reduce { .. }
+            ) {
+                reduces += 1;
+            }
+            stack.extend(legalized.children(id));
+        }
+        (before, after, reduces)
     };
 
-    let (before_3, after_3) = node_counts(TABLE_ROWS as u32);
-    let (before_16, after_16) = node_counts(WIDE_EXTENT);
+    let (before_3, after_3, reduces_3) = legalized(TABLE_ROWS as u32);
+    let (before_16, after_16, reduces_16) = legalized(WIDE_EXTENT);
 
-    eprintln!(
-        "extent {}: {before_3} nodes before legalize, {after_3} after \
-         (x{:.2})",
-        TABLE_ROWS,
-        after_3 as f64 / before_3 as f64
-    );
-    eprintln!(
-        "extent {WIDE_EXTENT}: {before_16} nodes before legalize, {after_16} \
-         after (x{:.2})",
-        after_16 as f64 / before_16 as f64
-    );
+    eprintln!("extent {TABLE_ROWS}: {before_3} nodes before legalize, {after_3} after");
+    eprintln!("extent {WIDE_EXTENT}: {before_16} nodes before legalize, {after_16} after");
 
-    // The unrolled reduce plus its now-constant-indexed gathers must contain
-    // strictly more nodes than the pre-legalize arena (one `Reduce` node and
-    // one `Gather` node, versus `extent` inlined, index-lowered copies of
-    // each).
-    assert!(
-        after_3 > before_3,
-        "extent {TABLE_ROWS}: legalize did not grow the arena \
-         ({before_3} -> {after_3})"
+    // The fold is still a fold. Unrolling it would leave none.
+    assert_eq!(
+        reduces_3, 1,
+        "extent {TABLE_ROWS}: legalize did not leave the Reduce standing"
     );
-    assert!(
-        after_16 > before_16,
-        "extent {WIDE_EXTENT}: legalize did not grow the arena \
-         ({before_16} -> {after_16})"
+    assert_eq!(
+        reduces_16, 1,
+        "extent {WIDE_EXTENT}: legalize did not leave the Reduce standing"
     );
-    // A wider extent must unroll to more nodes than a narrower one, over the
-    // same body — the concrete evidence that the unroll factor tracks
-    // `extent` rather than being some fixed overhead.
-    assert!(
-        after_16 > after_3,
-        "wider extent did not unroll to more nodes: extent {} -> {after_3}, \
-         extent {WIDE_EXTENT} -> {after_16}",
-        TABLE_ROWS
+    // And its size is the body's, not the body's times the extent.
+    assert_eq!(
+        after_3, after_16,
+        "legalized size tracks the extent ({TABLE_ROWS} -> {after_3}, \
+         {WIDE_EXTENT} -> {after_16}) -- the body is being copied per trip"
     );
+}
+
+/// `Σ_{row} table[row][col] · (row + 1) · Σ_{w<3} w`, by plain host iteration,
+/// which is what the nested kernel below denotes: the outer fold weights each
+/// row's read by the inner fold, and the inner fold reads the outer binder.
+fn host_column_nested_sum(col: usize) -> f32 {
+    TABLE
+        .iter()
+        .enumerate()
+        .map(|(row, cols)| {
+            let inner: f32 = (0..3).map(|w| (row as f32 + 1.0) * w as f32).sum();
+            cols[col] * inner
+        })
+        .sum()
+}
+
+/// A fold inside a fold, reading a bound table at the outer binder and the
+/// outer binder again inside the inner body, reaches the numbers through the
+/// whole compiled path — `Kernel::over` twice, `legalize` leaving both
+/// standing, codegen emitting a loop inside a loop.
+///
+/// `Σ_{row} table[row][col] · Σ_{w<3} (row + 1)·w`, at every column.
+#[test]
+fn a_nested_sum_over_reads_every_column_exactly() {
+    for col in 0..TABLE_COLS {
+        let (binding, table) = bind_table();
+        let kernel = Kernel::sum_over(TABLE_ROWS as u32, |row| {
+            let read = table.at(&Kernel::constant(col as f32), row);
+            let row_plus_one = row.add(&Kernel::constant(1.0));
+            let inner = Kernel::sum_over(3, |w| row_plus_one.mul(w));
+            read.mul(&inner)
+        });
+        let got = collapse_scalar(&kernel, binding);
+        let want = host_column_nested_sum(col);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "nested sum_over column {col}: got {got}, want {want}"
+        );
+    }
+}
+
+/// A second composition of a table kernel, at a second lattice, reads its
+/// *own* table. The optimizer saturates a structure once and shares that
+/// across compositions and shapes; what each gets back is the term in its
+/// own names, or it would gather from the first composition's memory. Every
+/// sample of the lattice, since the kernel varies with neither axis.
+#[test]
+fn a_second_composition_at_a_second_shape_reads_its_own_table() {
+    for col in 0..TABLE_COLS {
+        let (binding, table) = bind_table();
+        let kernel = Kernel::sum_over(TABLE_ROWS as u32, |i| {
+            table.at(&Kernel::constant(col as f32), i).mul(i)
+        });
+        let program = Manifold::compile(&kernel, [3, 2]);
+        let bound = program.bind(&[binding]);
+        let out = Lattice::frame(3, 2).collapse(&bound);
+        let want = host_column_weighted_sum(col);
+        for (k, got) in out.buffer().iter().enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "column {col}, sample {k}: got {got}, want {want}"
+            );
+        }
+    }
 }

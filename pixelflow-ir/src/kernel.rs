@@ -36,13 +36,16 @@ use crate::kind::OpKind;
 static PLACEHOLDERS_IN_USE: AtomicU64 = AtomicU64::new(0);
 
 /// Placeholder indices sit above the retired coordinate space (`0..4`, of
-/// which only X and Y are live) and the reduction index space (`4..8`). A `Kernel` never contains the compiler's manifold-param
-/// slots (the value-producing macro path rejects manifold params outright), so
-/// everything from 8 up is free.
-const PLACEHOLDER_BASE: u32 = 8;
+/// which only X and Y are live) and the whole reduction index space
+/// (`4..Variance::VARIABLES`) — past every index a real binder can take,
+/// which is what keeps a placeholder's rename from ever reaching a binder
+/// an inner fold has already chosen. A `Kernel` never contains the
+/// compiler's manifold-param slots (the value-producing macro path rejects
+/// manifold params outright), so everything from here up is free.
+const PLACEHOLDER_BASE: u32 = crate::variance::Variance::VARIABLES as u32;
 
 /// A reduction's bound index while its body is under construction, before a
-/// real slot (`4..8`) is chosen.
+/// real slot is chosen.
 ///
 /// The placeholder must be unique among binders that are *simultaneously* being
 /// built: a nested fold renames every occurrence of its own placeholder to a
@@ -51,9 +54,10 @@ const PLACEHOLDER_BASE: u32 = 8;
 /// The claim is released on drop, so the space is bounded by how many binders
 /// are open at this instant, not by how many kernels have ever been built.
 ///
-/// [`lowest_free_binder`] caps nesting at [`Binder::COUNT`], so the 64 placeholders here
-/// admit 16 fully-nested concurrent constructions; exhaustion panics rather
-/// than aliasing an index.
+/// [`lowest_free_binder`] caps nesting at [`Binder::COUNT`]; the 64
+/// placeholders here admit that many binders under construction at once,
+/// however they nest across threads, and exhaustion panics rather than
+/// aliasing an index.
 struct BinderScope(u32);
 
 impl BinderScope {
@@ -715,8 +719,9 @@ impl Kernel {
     /// backend unrolls, so the domain is bounded in practice as well as in
     /// principle.
     ///
-    /// Nesting is supported (up to 4 live binders — the reserved index space):
-    /// each fold takes the lowest index slot its body does not already bind.
+    /// Nesting is supported (up to [`Binder::COUNT`] live binders — the
+    /// reserved index space): each fold takes the lowest index slot its body
+    /// does not already bind.
     ///
     /// ```ignore
     /// // Σ_d q(d)·k(d) — a contraction over the shared index.
@@ -864,6 +869,22 @@ impl Kernel {
     #[must_use]
     pub fn parts(&self) -> (&ExprArena, ExprId) {
         (&self.inner.legacy.0, self.inner.legacy.1)
+    }
+
+    /// [`Kernel::parts`] with every [`Ref`](ExprData::Ref) resolved to its
+    /// referent — the linker's one direction (`expand_refs`), at the arena
+    /// level `parts` already returns. A consumer that walks or lowers the
+    /// fragment directly instead of composing more `Kernel` (a node-count
+    /// measurement, `lower_dwrt_owned`, `arena.buffers()`) wants this one: a
+    /// name has no derivative and declares no buffer, so the raw fragment
+    /// `parts()` hands out is not enough for either. `Kernel::at` and
+    /// `Kernel::by_ref` link at the `Kernel` level instead
+    /// ([`linked`](Self::linked)), because they compose further; this is
+    /// the same expansion for the caller that does not.
+    #[must_use]
+    pub fn linked_parts(&self) -> (ExprArena, ExprId) {
+        let (arena, root) = self.parts();
+        crate::passes::expand_refs_owned(arena, root)
     }
 
     // ────────────────────────── linking ───────────────────────────

@@ -1,13 +1,12 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! Five passes, each `(arena, root) -> (arena, root)`, each turning nodes no
-//! backend can emit into nodes every backend can:
+//! [`legalize`] runs four passes today, each `(arena, root) -> (arena, root)`,
+//! each turning nodes no backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
 //! |---|---|---|
 //! | [`expand_refs`] | `Ref` | the referent, spliced in |
 //! | [`lower_dwrt`] | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
-//! | [`expand_reduce`] | `Reduce` | the combiner applied over unrolled copies |
 //! | [`expand_gather`] | `Gather` | index arithmetic + `RawGather` |
 //! | [`expand_transcendentals`] | `Sin`..`Pow` | arithmetic + bit-manip atoms |
 //!
@@ -16,6 +15,29 @@
 //! them, and you cannot differentiate a *name*, so `expand_refs` goes before
 //! everything. Every pass is idempotent and has an identity fast-path, so
 //! running one that has nothing to do is free.
+//!
+//! Two more exist, in [`lattice`], and are **not** in that list or in
+//! [`legalize`]'s pipeline:
+//!
+//! | pass | consumes | produces |
+//! |---|---|---|
+//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
+//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
+//!
+//! Their place in the full order is `expand_refs -> lower_dwrt -> collapse ->
+//! pack -> expand_gather -> expand_transcendentals`
+//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3), but
+//! **[`legalize`] does not call either one yet.** The emitter refuses a
+//! `Write` until step 5 of that plan lands, so wiring them into every
+//! production compile now would hand the emitter a node it cannot execute,
+//! breaking every collapse in the tree. Until then they are arena-level
+//! transforms a caller runs directly.
+//!
+//! **`Reduce` is legal in the arena and [`legalize`] leaves every one
+//! standing**, nested or not: codegen emits a surviving fold as a loop, and a
+//! fold inside a fold's body as a loop inside a loop. [`expand_reduce`] is
+//! still here for a caller that wants a fold unrolled — a test comparing the
+//! two shapes — and is on no production path.
 //!
 //! **Nothing here knows what it is lowering *for*.** There is no `cfg` in this
 //! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, kind,
@@ -47,6 +69,11 @@ use crate::variance::Variance;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+/// The lattice's own two folds — `collapse(extent)`, `pack(lanes)` — as
+/// legalize passes. See the module doc above for their place in the order
+/// and why [`legalize`] does not call them yet.
+pub mod lattice;
+
 /// Run every legalization pass, in the one order they compose in.
 ///
 /// This is the whole pipeline. It was previously four calls copied into each
@@ -71,7 +98,20 @@ pub fn legalize(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), 
     // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
     // has to precede the pass that expands them.
     let (arena, root) = lower_dwrt_owned(&arena, root)?;
-    let (arena, root) = expand_reduce_owned(&arena, root);
+    // No reduce pass. A `Reduce` is legal for codegen (stage 2c —
+    // `pixelflow-codegen` emits a surviving fold as a loop), and since
+    // `extract_folds` carves a fold inside a fold's body as a loop inside a
+    // loop, so is the shape `Kernel::by_ref` produces whenever two folds are
+    // composed by name and `expand_refs` splices one into the other. That
+    // shape was the last thing unrolled here (`expand_nested_reduce`, now
+    // deleted), and for a glyph it was the winding fold: N copies of a body
+    // the language had written once, N being the piece count.
+    //
+    // Declining to unroll is the whole of the trade stage 2c was for. Over a
+    // 95-glyph tile-16 atlas, same host, before and after 2c's one level:
+    // emit 4,640 ms -> 1,431 ms, the emitted atlas 21.1 MB -> 15.8 MB, and
+    // `'@'` alone 655,866 B -> 478,404 B. Saturation is unmoved (2,534 ms ->
+    // 2,569 ms), which is the point of legalizing last.
     let (arena, root) = expand_gather_owned(&arena, root);
     Ok(expand_transcendentals_owned(&arena, root))
 }
@@ -188,6 +228,23 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
             arena.push_nary(*op, &mapped)
         }
         ExprNode::Reduce { fold, body } => arena.push_reduce(*fold, m(*body)),
+        // `on`/`off` are names, copied unchanged exactly as `Ref`'s key is
+        // just above — this is the fallback every pass in this module falls
+        // through to when it has no rule for a node, and for a `Guard` that
+        // must mean "leave the arms alone": `expand_refs` in particular
+        // relies on reaching here for `Guard` (it has no rule for one
+        // either), which is what keeps a `Ref` inside an arm unexpanded by
+        // this pass while the mask — a real child, rebuilt through `m` like
+        // any other child — is legalized like the rest of the graph.
+        ExprNode::Guard { mask, on, off } => arena.push_guard(m(*mask), *on, *off),
+        // The binders are metadata, copied as a fold's are; the value is
+        // the one child.
+        ExprNode::Write {
+            row,
+            col,
+            lane,
+            value,
+        } => arena.push_write(*row, *col, *lane, m(*value)),
     }
 }
 
@@ -397,13 +454,12 @@ fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> Exp
 /// Unroll every `Reduce` reachable from `root` into an explicit accumulation
 /// tree, returning the (possibly new) root in the same arena.
 ///
-/// `Reduce([combiner, var, extent, body])` becomes
-/// `combiner(body[var:=0], combiner(body[var:=1], … body[var:=N-1]))` — N
-/// inlined copies of `body` with the reduction index substituted as a `Const`.
-/// Because the extent is static (bound memory), each copy's gather indices
-/// become constant, so the emitter folds their addresses to immediates: the
-/// fold compiles to a flat, call-free, unrolled kernel. This is the reduction
-/// analogue of [`expand_gather`].
+/// N inlined copies of `body`, one per index the fold's range visits, the
+/// reduction index substituted as a `Const` in each — [`unroll_reduce`] has
+/// the exact combining shape. Because the range is static (bound memory),
+/// each copy's gather indices become constant, so the emitter folds their
+/// addresses to immediates: the fold compiles to a flat, call-free, unrolled
+/// kernel. This is the reduction analogue of [`expand_gather`].
 pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
     rebuild_arena(arena, root, |arena, node, m| match node {
         // The body is already lowered; unroll the fold over it.
@@ -430,10 +486,13 @@ pub fn expand_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprI
 
 /// Build the unrolled accumulation for one fold whose body is already lowered.
 ///
-/// This is [`Fold::peel`] run to exhaustion. Peeling and unrolling are the
-/// same operation at different budgets — the e-graph states the first as a
-/// rewrite rule, and this is what remains for a fold that survived extraction,
-/// because codegen has no iteration binder to hand it to.
+/// This is [`Fold::halve`] run to exhaustion, falling back to
+/// [`Fold::peel_back`] for the odd remainder at whatever level it arises —
+/// the same preference `egraph::fold_rules::HalveFold` gives the saturator.
+/// Sharing the two methods (rather than each restating "even → pair up, odd
+/// → strip one from the back") is what keeps a fold that survives extraction
+/// unrolling into the *identical* shape one saturation resolved itself: one
+/// definition of "fully unrolled," not two that happen to agree today.
 fn unroll_reduce(arena: &mut ExprArena, fold: Fold, body: ExprId) -> ExprId {
     // Empty domain folds to the monoid identity.
     if fold.is_empty() {
@@ -450,34 +509,54 @@ fn unroll_reduce(arena: &mut ExprArena, fold: Fold, body: ExprId) -> ExprId {
     // table covers each id the substitution asks about.
     let variance = crate::variance::compute_arena_variance(arena);
 
-    let term = |arena: &mut ExprArena, k: u32| {
-        Substitution::new(body, var_idx, k as f32, &variance).apply(arena, body)
-    };
-
-    // Through `Fold::peel_back`, not through `fold.range()`: this loop and
-    // `egraph::fold_rules::PeelFold` are the same decomposition at different
-    // budgets, and sharing the method is what keeps them the same. It is not
-    // ceremony — the two produced *opposite* associations while each did its
-    // own range arithmetic, and an e-graph then had to spend reassociation
-    // rules reaching the shape this loop produces directly.
-    //
-    // `peel_back` yields the indices from the top down, so they are collected
-    // and consumed in reverse: the accumulator ends up on the left and the
-    // chain leans `((f(lo) ⊕ f(lo+1)) ⊕ …)`. Iterative rather than recursive
-    // for the reason everything here is — the trip count is a `u16` and the
-    // Rust stack is not.
-    let mut indices = Vec::with_capacity(fold.len() as usize);
+    // Ascending order (`peel`, not `peel_back`): `combine_halved` pairs
+    // front-to-back, so the terms must already run left to right.
+    let mut terms = Vec::with_capacity(fold.len() as usize);
     let mut rest = fold;
-    while let Some((shorter, k)) = rest.peel_back() {
-        indices.push(k);
+    while let Some((k, shorter)) = rest.peel() {
+        terms.push(Substitution::new(body, var_idx, k as f32, &variance).apply(arena, body));
         rest = shorter;
     }
-    let mut acc = term(arena, *indices.last().expect("a non-empty fold has terms"));
-    for &k in indices.iter().rev().skip(1) {
-        let next = term(arena, k);
-        acc = arena.push_binary(combiner_op, acc, next);
+
+    combine_halved(arena, fold, &terms, combiner_op)
+}
+
+/// Combine `terms` — `fold`'s own terms, already substituted, left to
+/// right — the way repeated [`Fold::halve`] does: pair adjacent terms,
+/// recursing on the doubled-stride fold, until [`Fold::halve`] declines
+/// (an odd count, or the single-term base case), at which point
+/// [`Fold::peel_back`] strips the last term and this recurses on the even
+/// remainder. Threading `fold` through rather than re-deriving "even vs
+/// odd" from `terms.len()` keeps this one definition: the decomposition
+/// [`Fold::halve`]/[`Fold::peel_back`] already are, not a second copy of
+/// their logic that could drift from it.
+fn combine_halved(arena: &mut ExprArena, fold: Fold, terms: &[ExprId], op: OpKind) -> ExprId {
+    debug_assert_eq!(
+        fold.len() as usize,
+        terms.len(),
+        "a fold and its substituted terms stay in lockstep"
+    );
+    if let Some(halved) = fold.halve() {
+        let paired: Vec<ExprId> = terms
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[a, b]| arena.push_binary(op, a, b))
+            .collect();
+        return combine_halved(arena, halved, &paired, op);
     }
-    acc
+    let (rest, _last_index) = fold
+        .peel_back()
+        .expect("combine_halved is never called on an empty fold");
+    let last = *terms
+        .last()
+        .expect("fold.len() == terms.len(), both non-empty");
+    if rest.is_empty() {
+        // `fold.len() == 1`: nothing left to combine `last` with.
+        return last;
+    }
+    let rest_val = combine_halved(arena, rest, &terms[..terms.len() - 1], op);
+    arena.push_binary(op, rest_val, last)
 }
 
 /// One unrolled term of a fold: the body with the bound index replaced by a
@@ -568,6 +647,26 @@ impl<'a> Substitution<'a> {
             ExprNode::Reduce { fold, body } => {
                 let body = self.apply(arena, body);
                 arena.push_reduce(fold, body)
+            }
+            // Same reasoning as `Ref` just above: an arm names a closed
+            // kernel binding its own indices, so this fold's substitution
+            // cannot reach inside it. Only the mask, a real child of this
+            // arena, can hold the index and is recursed into.
+            ExprNode::Guard { mask, on, off } => {
+                let mask = self.apply(arena, mask);
+                arena.push_guard(mask, on, off)
+            }
+            // The value may read the index; the binders name folds that
+            // are never unrolled — a lattice fold survives to codegen as a
+            // loop — so they pass through untouched.
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => {
+                let value = self.apply(arena, value);
+                arena.push_write(row, col, lane, value)
             }
         };
         if let Some(slot) = self.memo.get_mut(idx) {
@@ -786,6 +885,16 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
         ExprNode::Nary(_, _, _) => {}
         // No rule: `diff_node` raises the error for the fold itself.
         ExprNode::Reduce { .. } => {}
+        // No rule: differentiating a branch is not a question this design
+        // answers (a `Guard`'s two arms are two different functions, and
+        // `Select`'s own rule below blends their derivatives on the primal
+        // mask — whether a `Guard` should do the same, or refuse, is a
+        // decision for whichever stage first composes `Guard` with the
+        // calculus, not G1). `diff_node` raises the error for the node
+        // itself, so nothing here needs its mask's derivative.
+        ExprNode::Guard { .. } => {}
+        // An effect has no derivative; `diff_node` refuses it.
+        ExprNode::Write { .. } => {}
     }
 }
 
@@ -1024,6 +1133,15 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
         // this lowering is a *fallback*; the place for it is the rule set,
         // where the e-graph can also decline it.
         ExprNode::Reduce { .. } => Err("lower_dwrt: no derivative rule for a bounded fold"),
+        // `Select`'s rule blends the branch derivatives on the primal mask;
+        // whether a `Guard` should do the same or refuse outright is a
+        // question for whichever stage first composes `Guard` with the
+        // calculus. G1 only makes the node constructible, so this declines
+        // rather than guess.
+        ExprNode::Guard { .. } => Err("lower_dwrt: no derivative rule for a Guard"),
+        // A store is an effect, not a function of the coordinates; and
+        // `lower_dwrt` runs before the passes that build one.
+        ExprNode::Write { .. } => Err("lower_dwrt: no derivative of a store"),
     }
 }
 
@@ -1638,6 +1756,29 @@ mod dwrt_tests {
         assert!(lower_dwrt_owned(&a, root).is_err());
     }
 
+    /// Same refusal, for the same reason, on a `Guard`: differentiating a
+    /// branch is a decision for whichever stage first composes `Guard` with
+    /// the calculus, not G1 (which only makes the node constructible).
+    #[test]
+    fn differentiating_a_guard_errors_loudly() {
+        let mut a = ExprArena::new();
+        let mask = a.push_var(0);
+        let guard = a.push_guard(
+            mask,
+            crate::key::KernelKey::from_bits(1),
+            crate::key::KernelKey::from_bits(2),
+        );
+        let v0 = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, guard, v0);
+        match lower_dwrt_owned(&a, root) {
+            Err(msg) => assert!(
+                msg.contains("no derivative rule for a Guard"),
+                "unexpected message: {msg}"
+            ),
+            Ok(_) => panic!("lower_dwrt must refuse a Guard"),
+        }
+    }
+
     /// A uniform is a value, never an extent — and that used to need a test,
     /// because the extent was a `Const` child and an arena could be
     /// hand-built (or *rewritten*) into holding a `Uniform` there, at which
@@ -2020,6 +2161,70 @@ impl Optimize for ExpandReduce {
 }
 
 #[cfg(test)]
+mod nested_reduce_tests {
+    use super::*;
+    use crate::fold::{Binder, Fold, Monoid};
+
+    /// Every `Reduce` reachable from `root`.
+    fn reachable_reduces(arena: &ExprArena, root: ExprId) -> usize {
+        let mut seen = alloc::vec![false; arena.len()];
+        let mut stack = alloc::vec![root];
+        let mut count = 0;
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            if matches!(arena.node(id), ExprNode::Reduce { .. }) {
+                count += 1;
+            }
+            stack.extend(arena.children(id));
+        }
+        count
+    }
+
+    /// A `Reduce` whose body reads another `Reduce`'s result reaches the
+    /// backend as written: two folds, one inside the other. This used to be
+    /// the one shape `legalize` still unrolled (`expand_nested_reduce`,
+    /// deleted), because codegen carved fold bodies out one level at a time;
+    /// it carves a fold inside a fold now, and the pass went with the
+    /// restriction it existed for.
+    ///
+    /// `inner = sum_{i<3}(X+i)`; `outer = sum_{j<2}(inner+j)`.
+    #[test]
+    fn legalize_leaves_a_nested_reduce_standing() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(inner_binder.var());
+        let inner_body = a.push_binary(OpKind::Add, x, i);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
+
+        let outer_binder = Binder::from_slot(1).expect("slot 1 exists");
+        let j = a.push_var(outer_binder.var());
+        let outer_body = a.push_binary(OpKind::Add, inner, j);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), outer_body);
+
+        let (legalized, new_root) = legalize(&a, root).expect("legalize");
+        assert_eq!(
+            reachable_reduces(&legalized, new_root),
+            2,
+            "both folds must survive legalization"
+        );
+        let ExprNode::Reduce { fold, body } = legalized.node(new_root) else {
+            panic!("root must still be the outer Reduce");
+        };
+        assert_eq!(fold.range(), 0..2);
+        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(*body) else {
+            panic!("the outer body must still be `inner + j`");
+        };
+        assert!(
+            matches!(legalized.node(*lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
+            "the inner Reduce must be the outer body's own operand, not unrolled into it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod ref_expansion_tests {
     use super::*;
     use crate::kernel::Kernel;
@@ -2099,5 +2304,57 @@ mod ref_expansion_tests {
     #[should_panic(expected = "an open term has no identity")]
     fn naming_an_open_term_is_refused() {
         let _refused = Kernel::sum_over(3, |i| i.by_ref());
+    }
+
+    /// **The load-bearing property of G1.** `expand_refs` rewrites
+    /// `ExprNode::Ref` and nothing else, so a `Guard`'s two names — fields,
+    /// not children — are simply not a shape this pass can reach: they
+    /// survive expansion exactly as written. The mask, a real child in this
+    /// arena, has no such protection and is expanded like any other node —
+    /// this is what tells the test apart from a pass that does nothing at
+    /// all.
+    #[test]
+    fn expand_refs_leaves_a_guards_arms_intact() {
+        let on_key = Kernel::x().sqrt().by_ref();
+        let off_key = Kernel::y().neg().by_ref();
+        let on_key = match on_key.parts().0.node(on_key.parts().1) {
+            ExprNode::Ref(k) => *k,
+            other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
+        };
+        let off_key = match off_key.parts().0.node(off_key.parts().1) {
+            ExprNode::Ref(k) => *k,
+            other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
+        };
+
+        // The mask itself is a `Ref` — real expansion work to do, so a
+        // no-op pass could not accidentally pass this test.
+        let named_x = Kernel::x().by_ref();
+        let (mask_arena, mask_root) = named_x.parts();
+        assert!(
+            matches!(mask_arena.node(mask_root), ExprNode::Ref(_)),
+            "test setup: the mask must actually be a Ref"
+        );
+
+        let mut arena = mask_arena.clone();
+        let guard = arena.push_guard(mask_root, on_key, off_key);
+
+        let (expanded, expanded_root) = expand_refs_owned(&arena, guard);
+
+        match expanded.node(expanded_root) {
+            ExprNode::Guard { mask, on, off } => {
+                assert_eq!(*on, on_key, "on must survive expand_refs untouched");
+                assert_eq!(*off, off_key, "off must survive expand_refs untouched");
+                assert!(
+                    !matches!(expanded.node(*mask), ExprNode::Ref(_)),
+                    "the mask, a real child, must still be expanded — got {:?}",
+                    expanded.node(*mask)
+                );
+                assert!(
+                    matches!(expanded.node(*mask), ExprNode::Var(0)),
+                    "the mask named X, so its expansion must read X directly"
+                );
+            }
+            other => panic!("expand_refs must not splice a Guard's arms away, got {other:?}"),
+        }
     }
 }

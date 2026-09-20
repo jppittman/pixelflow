@@ -40,6 +40,27 @@ pub enum CompileError {
     /// Always a bug in `pixelflow-codegen`, never a fact about the kernel.
     Internal(&'static str),
 
+    /// A branch named a [`Label`](crate::emit::Label) that no
+    /// [`Item::Bind`](crate::emit::Item::Bind) ever bound.
+    ///
+    /// An error rather than a panic because it is the one thing a *program*
+    /// can get wrong that the type system does not already refuse: minting is
+    /// separate from binding precisely so a forward branch can name a position
+    /// that does not exist yet, which means "never bound" is representable.
+    UnboundLabel,
+
+    /// One label was bound at two positions. A name that means two places is
+    /// not a name.
+    DuplicateLabel,
+
+    /// A branch's displacement does not fit its encoding's field — an aarch64
+    /// `B` reaches ±128 MiB and a `B.cond` only ±1 MiB.
+    ///
+    /// A real limit of the instruction, not an invariant to assume away: a
+    /// fully unrolled fold is exactly the kind of body that grows until a
+    /// conditional branch can no longer span it.
+    BranchOutOfRange,
+
     /// [`ExecutableCode::from_code`](crate::emit::executable::ExecutableCode::from_code)
     /// was given an empty code buffer — nothing to map or execute.
     EmptyCodeBuffer,
@@ -66,6 +87,11 @@ impl fmt::Display for CompileError {
             Self::EmptyCodeBuffer => write!(f, "empty code buffer"),
             Self::Mmap => write!(f, "mmap failed"),
             Self::Mprotect => write!(f, "mprotect failed"),
+            Self::UnboundLabel => write!(f, "a branch names a label nothing bound"),
+            Self::DuplicateLabel => write!(f, "a label was bound at two positions"),
+            Self::BranchOutOfRange => {
+                write!(f, "branch displacement does not fit its encoding")
+            }
         }
     }
 }
