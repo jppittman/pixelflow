@@ -227,11 +227,14 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
                 push_id(&mut key, &dense, *b);
                 push_id(&mut key, &dense, *c);
             }
-            ExprNode::Nary(op, _, n) => {
+            ExprNode::Nary(op, _) => {
+                let children = arena.children(ExprId(idx as u32));
+                let n = u16::try_from(children.len())
+                    .expect("push_nary already asserted children.len() <= u16::MAX");
                 key.push(6);
                 key.extend_from_slice(&op.marshal().to_bytes());
                 key.extend_from_slice(&n.to_le_bytes());
-                for child in arena.children(ExprId(idx as u32)) {
+                for child in children {
                     push_id(&mut key, &dense, child);
                 }
             }
@@ -308,76 +311,40 @@ mod tests {
     use super::*;
     use crate::kind::OpKind;
 
-    /// `canonical`'s `Nary` arm used to read `arena.nary_children_raw()[s..s +
-    /// l]` directly; docs/plans/2026-09-09-exprarena-on-dag.md Stage A routes
-    /// it through [`ExprArena::children`] instead. This is the fixture the
-    /// plan asks for: a byte-for-byte oracle built the *old* way, kept only
-    /// here, checked against `canonical`'s actual output on a root that
-    /// reaches an `Nary` node — the one shape the two implementations could
-    /// disagree on.
-    fn canonical_via_raw_offsets(arena: &ExprArena, root: ExprId) -> Vec<u8> {
-        let len = arena.nodes_raw().len();
-        let mut reachable = vec![false; len];
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut reachable[id.0 as usize], true) {
-                continue;
-            }
-            stack.extend(arena.children(id));
-        }
-        let mut dense: Vec<u32> = vec![u32::MAX; len];
-        let mut next = 0u32;
-        let mut key: Vec<u8> = Vec::new();
-        let push_id = |key: &mut Vec<u8>, dense: &[u32], id: ExprId| {
-            key.extend_from_slice(&dense[id.0 as usize].to_le_bytes());
-        };
-        for idx in 0..len {
-            if !reachable[idx] {
-                continue;
-            }
-            match &arena.nodes_raw()[idx] {
-                ExprNode::Var(i) => {
-                    key.push(0);
-                    key.push(*i);
-                }
-                ExprNode::Const(v) => {
-                    key.push(1);
-                    key.extend_from_slice(&v.to_bits().to_le_bytes());
-                }
-                ExprNode::Nary(op, start, n) => {
-                    key.push(6);
-                    key.extend_from_slice(&op.marshal().to_bytes());
-                    key.extend_from_slice(&n.to_le_bytes());
-                    let (s, l) = (*start as usize, *n as usize);
-                    for child in &arena.nary_children_raw()[s..s + l] {
-                        push_id(&mut key, &dense, *child);
-                    }
-                }
-                other => panic!("fixture covers only what the Nary test needs, not {other:?}"),
-            }
-            dense[idx] = next;
-            next += 1;
-        }
-        key
-    }
-
+    /// Pins `canonical`'s bytes for a root that reaches an `Nary` node — the
+    /// one shape whose encoding could drift when its children stop coming
+    /// from a raw slab offset (Stage A,
+    /// docs/plans/2026-09-09-exprarena-on-dag.md) and its node stops naming
+    /// one at all (Stage B). The expected bytes were captured from
+    /// `canonical`'s Stage-A output, itself checked byte-for-byte against an
+    /// oracle built the pre-Stage-A raw-offset way (see that commit); Stage B
+    /// changes only where `Nary`'s children live in the type, never what
+    /// `canonical` computes, so this must keep reading back unchanged.
     #[test]
-    fn nary_canonical_bytes_match_the_pre_stage_a_raw_offset_encoding() {
+    fn nary_canonical_bytes_are_pinned() {
         let mut arena = ExprArena::new();
         let v0 = arena.push_var(0);
         let v1 = arena.push_var(1);
         let c = arena.push_const(2.0);
-        // A second Nary node makes the first's `start` nonzero in the raw
-        // encoding, which is what would expose an off-by-one between the two
-        // implementations.
+        // A second Nary node makes the first's slab position nonzero, which
+        // is what would expose an off-by-one in the child slice.
         let inner = arena.push_nary(OpKind::Tuple, &[v0, c]);
         let root = arena.push_nary(OpKind::Tuple, &[v1, inner, v0]);
 
-        assert_eq!(
-            canonical(&arena, root).key,
-            canonical_via_raw_offsets(&arena, root),
-            "routing Nary through ExprArena::children must not change a byte"
-        );
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            // v0 = Var(0)
+            0, 0,
+            // v1 = Var(1)
+            0, 1,
+            // c = Const(2.0)
+            1, 0, 0, 0, 0x40,
+            // inner = Nary(Tuple, [v0, c]) -> dense [0, 2]
+            6, 37, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0,
+            // root = Nary(Tuple, [v1, inner, v0]) -> dense [1, 3, 0]
+            6, 37, 3, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(canonical(&arena, root).key, expected);
     }
 
     /// A store of one value under different binders is a different program,

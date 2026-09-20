@@ -161,7 +161,7 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
             ExprNode::Unary(OpKind::Dwrt, _)
             | ExprNode::Binary(OpKind::Dwrt, _, _)
             | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-            | ExprNode::Nary(OpKind::Dwrt, _, _) => panic!(
+            | ExprNode::Nary(OpKind::Dwrt, _) => panic!(
                 "collapse: a Dwrt is reachable from root — it must be taken \
                  with respect to Var(0) before this pass substitutes that \
                  variable away; run lower_dwrt first ({PASS_ORDER})"

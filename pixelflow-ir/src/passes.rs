@@ -708,7 +708,7 @@ pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, &'stati
         }
         ExprNode::Unary(OpKind::Dwrt, _)
         | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-        | ExprNode::Nary(OpKind::Dwrt, _, _) => {
+        | ExprNode::Nary(OpKind::Dwrt, _) => {
             Err("lower_dwrt: malformed Dwrt node (must be Binary(expr, var))")
         }
         _ => Ok(None),
@@ -727,7 +727,7 @@ pub fn lower_dwrt_owned(
             ExprNode::Unary(OpKind::Dwrt, _)
                 | ExprNode::Binary(OpKind::Dwrt, _, _)
                 | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                | ExprNode::Nary(OpKind::Dwrt, _, _)
+                | ExprNode::Nary(OpKind::Dwrt, _)
         )
     }) {
         return Ok((arena.clone(), root));
@@ -882,7 +882,7 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
             }
             _ => {}
         },
-        ExprNode::Nary(_, _, _) => {}
+        ExprNode::Nary(_, _) => {}
         // No rule: `diff_node` raises the error for the fold itself.
         ExprNode::Reduce { .. } => {}
         // No rule: differentiating a branch is not a question this design
@@ -1126,7 +1126,7 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
             _ => Err("lower_dwrt: no derivative rule for this ternary op"),
         },
 
-        ExprNode::Nary(_, _, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
+        ExprNode::Nary(_, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
         // Linearity — `d(⊕_k f) = ⊕_k d(f)` — holds for `Σ` and for nothing
         // else in the monoid set: `Π` needs the product rule, and `min`/`max`
         // are selections, not sums. The rule is not written here because
@@ -2121,7 +2121,7 @@ impl Optimize for LowerDwrt {
                 ExprNode::Unary(OpKind::Dwrt, _)
                     | ExprNode::Binary(OpKind::Dwrt, _, _)
                     | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                    | ExprNode::Nary(OpKind::Dwrt, _, _)
+                    | ExprNode::Nary(OpKind::Dwrt, _)
             )
         }) {
             return Rewritten::Unchanged;
