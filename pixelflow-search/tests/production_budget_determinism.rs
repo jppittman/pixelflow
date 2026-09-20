@@ -38,8 +38,8 @@ fn fixture() -> (ExprArena, ExprId) {
 /// A structural rendering of the extracted DAG, for equality comparisons —
 /// the arena is append-only and extraction emits children before parents,
 /// so this is already canonical for a given configuration.
-fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+fn arena_shape(arena: &ExprArena, root: ExprId) -> Vec<u8> {
+    pixelflow_ir::key::canonical(arena, root).key
 }
 
 // ---------------------------------------------------------------------------

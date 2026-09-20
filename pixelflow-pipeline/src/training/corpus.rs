@@ -16,15 +16,17 @@
 //!   name_len: u16 (little-endian)
 //!   name: [u8; name_len]       (UTF-8)
 //!   node_count: u32 (le)
-//!   nary_count: u32 (le)
 //!   root_index: u32 (le)       (ExprId.0)
 //!   nodes: node_count encoded ExprNodes (variable per-node)
-//!   nary_children: [u32; nary_count] (le) (ExprId.0 values)
 //! ```
 //!
 //! Each ExprNode is encoded as:
 //!   tag: u8  (0=Var, 1=Const, 2=Param, 3=Unary, 4=Binary, 5=Ternary, 6=Nary)
-//!   payload varies by tag.
+//!   payload varies by tag — a `Nary`'s children are inline (`len: u16` then
+//!   `len` `ExprId`s), not a separate trailing section, so this format never
+//!   names an arena-internal offset: `write_node` reads a `Nary`'s children
+//!   through `ExprArena::children`, the same accessor everything outside
+//!   `arena.rs` uses (docs/plans/2026-09-09-exprarena-on-dag.md, Stage A).
 //!
 //! ## Only the reachable subtree is stored
 //!
@@ -191,8 +193,8 @@ const TAG_BUFFER: u8 = 7;
 /// DAG sharing is preserved: a node referenced from several parents is
 /// emitted once and referenced by the same new id, so compaction never
 /// expands a shared subgraph into a tree. Children are emitted before their
-/// parents, so the result satisfies [`ExprArena::from_raw`]'s ordering
-/// contract.
+/// parents — the ordering every arena keeps by construction, and the one
+/// `read_node_into` relies on to rebuild an entry node by node.
 ///
 /// This is what makes stored size mean expression size. Callers that
 /// generate expressions into a long-lived scratch arena (`BwdGenerator`, the
@@ -731,14 +733,14 @@ mod tests {
         assert_eq!(loaded[0].1.len(), 3);
         assert_eq!(loaded[0].2.0, root.0);
 
-        // Verify node equality
-        for (i, node) in entries[0].1.nodes_raw().iter().enumerate() {
-            assert_eq!(
-                node,
-                loaded[0].1.node(ExprId(i as u32)),
-                "node {i} mismatch"
-            );
-        }
+        // Structural equality through the same comparison `key.rs` and
+        // `subtree_eq` use elsewhere — not a raw node-by-node walk, which
+        // would compare `Nary`'s internal offsets across two different
+        // arenas rather than the expression they encode.
+        assert!(
+            entries[0].1.subtree_eq(root, &loaded[0].1, loaded[0].2),
+            "round-tripped arena is not structurally equal to the original"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }

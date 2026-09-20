@@ -38,14 +38,14 @@ use pixelflow_search::egraph::{
 };
 
 /// Whether a `Reduce` survives *reachable from `root`* — not whether one
-/// merely sits somewhere in `arena.nodes_raw()`. `passes::expand_reduce`
+/// merely sits somewhere in the arena. `passes::expand_reduce`
 /// clones and lowers rather than pruning, so its output still *holds* the
 /// pre-lowering `Reduce` the arena arrived with; nothing reaches it any
 /// longer, and scanning every node instead of walking from `root` would
 /// refuse a perfectly legal arena (see `ExprArena::retired_axis`'s own doc
 /// for the same pitfall, already paid for once).
 fn has_fold(arena: &ExprArena, root: ExprId) -> bool {
-    let mut seen = vec![false; arena.nodes_raw().len()];
+    let mut seen = vec![false; arena.len()];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
         if core::mem::replace(&mut seen[id.0 as usize], true) {

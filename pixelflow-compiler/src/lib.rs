@@ -186,9 +186,8 @@ struct DwrtFree<P>(P);
 impl<P: Optimize> Optimize for DwrtFree<P> {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
         let carries_dwrt = arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)));
+            .nodes()
+            .any(|(_, n)| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)));
         if carries_dwrt {
             return Rewritten::Declined;
         }

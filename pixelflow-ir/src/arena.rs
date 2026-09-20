@@ -754,9 +754,34 @@ impl ExprArena {
         self.push_node(ExprNode::Nary(op, start, len))
     }
 
-    // ───────────────────── raw access (serialization) ───────
+    // ───────────────────── node observation ──────────────────
+
+    /// Every node with its id, in construction order — children strictly
+    /// before parents, since the arena is append-only and a node may only
+    /// reference an id less than its own.
+    ///
+    /// This is the topological order every "scan every node" pass already
+    /// relies on. It is the narrow replacement for the old `nodes_raw`: a
+    /// caller that wants a node's edges still goes through
+    /// [`ExprArena::children`], never through the n-ary slab directly —
+    /// that slab, and its offsets, are `arena.rs`'s own business
+    /// (docs/plans/2026-09-09-exprarena-on-dag.md, Stage A).
+    #[inline]
+    #[must_use]
+    pub fn nodes(&self) -> impl DoubleEndedIterator<Item = (ExprId, &ExprNode)> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (ExprId(i as u32), n))
+    }
 
     /// Raw slice of all nodes in the arena.
+    ///
+    /// Superseded by [`ExprArena::nodes`], which pairs each node with its
+    /// id instead of asking the caller to reconstruct one from a position.
+    /// Kept, unused outside this crate as of
+    /// docs/plans/2026-09-09-exprarena-on-dag.md's Stage A, until Stage B
+    /// removes it.
     #[inline]
     #[must_use]
     pub fn nodes_raw(&self) -> &[ExprNode] {
@@ -764,6 +789,11 @@ impl ExprArena {
     }
 
     /// Raw slice of the nary-children slab.
+    ///
+    /// Superseded by [`ExprArena::children`], which resolves a node's
+    /// children without exposing where they live in this arena. Kept,
+    /// unused outside this crate as of the same Stage A, until Stage B
+    /// removes it.
     #[inline]
     #[must_use]
     pub fn nary_children_raw(&self) -> &[ExprId] {

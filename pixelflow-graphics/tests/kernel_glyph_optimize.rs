@@ -26,7 +26,7 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf")
 
 /// Count reachable nodes matching `pred` from `root`.
 fn count_reachable(arena: &ExprArena, root: ExprId, pred: impl Fn(&ExprNode) -> bool) -> usize {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut seen = vec![false; len];
     let mut stack = vec![root];
     let mut count = 0;
@@ -215,7 +215,7 @@ fn lowered_glyph_ops_are_all_egraph_representable() {
     let (arena, root) = glyph.kernel().linked_parts();
     let (lowered, lroot) = lower_dwrt_owned(&arena, root).expect("lower");
     let mut missing = std::collections::BTreeSet::new();
-    let len = lowered.nodes_raw().len();
+    let len = lowered.len();
     let mut seen = vec![false; len];
     let mut stack = vec![lroot];
     while let Some(id) = stack.pop() {
