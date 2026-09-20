@@ -175,20 +175,28 @@ impl RuleSet {
         Self::new(super::all_rules())
     }
 
-    /// [`RuleSet::production`] plus the bounded-fold decompositions.
+    /// [`RuleSet::production`] plus the bounded-fold decompositions and the
+    /// `Select ≡ Guard` rule (G3, docs/plans/2026-09-12-emit-should-just-emit.md).
     ///
-    /// The runtime tier's set, and only its: `kernel!` has no syntax that
-    /// builds a fold, so at the macro tier these rules can never fire.
-    /// Adding them to [`super::all_rules`] instead would leave them inert
-    /// there while perturbing the pinned rule-set grids that
-    /// `crate::math::inflate`'s inflation study measures against — a changed
-    /// baseline for no measurement's sake. Which rules a tier holds is
-    /// already a place the tiers differ (so is the vocabulary, and so is
+    /// The runtime tier's set, and only its — same reasoning for both
+    /// additions. `kernel!` has no syntax that builds a fold, so at the
+    /// macro tier the fold rules can never fire; a `Guard`'s named arms are
+    /// minted through `KernelStore` and priced against a lattice
+    /// (`P·cost[on] + (1−P)·cost[off]`, `extract.rs`'s `Guard` pricing), and
+    /// the macro tier saturates "without a lattice" (this module's own doc
+    /// on [`Saturate::macro_tier`](super::super::Saturate::macro_tier)) —
+    /// before any consumer has said what shape it wants, so there is no
+    /// glyph-bake-sized win to weigh a branch against yet. Adding either to
+    /// [`super::all_rules`] instead would perturb the pinned rule-set grids
+    /// that `crate::math::inflate`'s inflation study measures against — a
+    /// changed baseline for no measurement's sake. Which rules a tier holds
+    /// is already a place the tiers differ (so is the vocabulary, and so is
     /// whether extraction is priced against a lattice).
     #[must_use]
     pub fn runtime() -> Self {
         let mut rules = super::all_rules();
         rules.extend(super::fold_rules::fold_rules());
+        rules.push(crate::math::algebra::SelectToGuard::new());
         Self::new(rules)
     }
 

@@ -75,6 +75,22 @@ pub enum ENode {
     /// Hash-consing therefore does what it should: two folds are one node iff
     /// they fold the same body, under the same algebra, over the same range.
     Reduce { fold: Fold, body: EClassId },
+    /// A hard branch: `if mask then on else off`, denoting the same value as
+    /// `Op{op: Select, children: [mask, on, off]}` — never inserted directly
+    /// (the e-graph's front door declines a source-level `Guard`, since no
+    /// surface syntax produces one), only ever created by the `Select →
+    /// Guard` rewrite ([`crate::math::algebra`]) and unioned into the
+    /// `Select` e-class it came from, so the two compete as equals in one
+    /// class and extraction's cost model picks between them.
+    ///
+    /// Stored as `[mask, on, off]` rather than three named fields so
+    /// [`Self::children_slice`]/[`Self::children_slice_mut`] can borrow them
+    /// contiguously with no allocation, the same reason `Op`'s children are a
+    /// `Vec` rather than separate fields — Rust does not guarantee named
+    /// same-type fields of one variant are laid out contiguously, so a slice
+    /// over them would not be sound. [`Self::guard`]/[`ENode::make_guard`]
+    /// are the named-field view everywhere else in this crate.
+    Guard { children: [EClassId; 3] },
 }
 
 impl ENode {
@@ -112,6 +128,23 @@ impl ENode {
         }
     }
 
+    /// Build a `Guard { mask, on, off }` node.
+    pub fn make_guard(mask: EClassId, on: EClassId, off: EClassId) -> Self {
+        ENode::Guard {
+            children: [mask, on, off],
+        }
+    }
+
+    /// The `(mask, on, off)` triple if this is a `Guard` node.
+    pub fn guard(&self) -> Option<(EClassId, EClassId, EClassId)> {
+        match self {
+            ENode::Guard {
+                children: [m, on, off],
+            } => Some((*m, *on, *off)),
+            _ => None,
+        }
+    }
+
     /// Get children of this node.
     ///
     /// Allocates and clones — see [`Self::children_slice`] for the
@@ -133,6 +166,7 @@ impl ENode {
             | ENode::Param(_) => &[],
             ENode::Op { children, .. } => children,
             ENode::Reduce { body, .. } => core::slice::from_ref(body),
+            ENode::Guard { children } => children,
         }
     }
 
@@ -147,6 +181,7 @@ impl ENode {
             | ENode::Param(_) => &mut [],
             ENode::Op { children, .. } => children,
             ENode::Reduce { body, .. } => core::slice::from_mut(body),
+            ENode::Guard { children } => children,
         }
     }
 
@@ -191,6 +226,7 @@ impl PartialEq for ENode {
             (ENode::Reduce { fold: f1, body: b1 }, ENode::Reduce { fold: f2, body: b2 }) => {
                 f1 == f2 && b1 == b2
             }
+            (ENode::Guard { children: c1 }, ENode::Guard { children: c2 }) => c1 == c2,
             _ => false,
         }
     }
@@ -232,6 +268,10 @@ impl core::hash::Hash for ENode {
                 6u8.hash(state);
                 fold.hash(state);
                 body.hash(state);
+            }
+            ENode::Guard { children } => {
+                7u8.hash(state);
+                children.hash(state);
             }
         }
     }

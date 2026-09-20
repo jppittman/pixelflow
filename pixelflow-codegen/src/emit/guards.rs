@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::passes::demand::{Demand, Literal, demand_of};
+use pixelflow_search::egraph::MISPREDICT_PENALTY_CYCLES;
 
 use super::ScheduledOp;
 use super::regalloc::{Def, ValueId};
@@ -721,28 +722,6 @@ fn select_arms(schedule: &[Def], external: &[ValueId]) -> Vec<SelectArms> {
 
     arms
 }
-
-/// What a guard costs when it never fires: the uniformity test, plus a
-/// branch the hardware cannot predict because the mask is incoherent.
-///
-/// Taken as ~16 cycles, which is the mispredict penalty on the cores this
-/// compiler targets — 15–20 on Intel since Skylake and on AMD since Zen
-/// (Agner Fog, *The microarchitecture of Intel, AMD and VIA CPUs*, §"Branch
-/// prediction"), 13–16 on ARM's recent out-of-order cores (Cortex-A76 and
-/// Neoverse software optimization guides). It is an architectural figure, not
-/// a knob: **do not sweep it**, and do not move it to make a kernel faster.
-///
-/// It is used as a *bound*, which is why one number for two architectures is
-/// honest. A guard's upside depends on how often the mask is uniform, which
-/// is data and unknowable here; its downside does not. An arm whose work
-/// costs less than the penalty cannot pay for its own branch even if the
-/// branch always fires, so guarding it is a loss in every world — while an
-/// arm that costs far more is capped at this much loss and may save all of
-/// it. Measured, that is the whole difference between a glyph's coverage
-/// mask (a handful of ops per arm, varying per lane, 3.6x slower with a
-/// guard) and a sphere's silhouette (214 entries, uniformly false in 97% of
-/// batches, 3.2x faster with one).
-const MISPREDICT_PENALTY_CYCLES: usize = 16;
 
 /// Reorder a scope's schedule so that a select's arm-exclusive entries form
 /// one run — where that, and only that, is what stands between the arm and a

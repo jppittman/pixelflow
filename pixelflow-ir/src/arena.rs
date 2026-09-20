@@ -617,6 +617,37 @@ impl ExprArena {
         None
     }
 
+    /// The coordinate axis (`0` = X, `1` = Y) reachable from `root`, if any.
+    ///
+    /// [`Self::retired_axis`]'s sibling for the range that is still live:
+    /// same walk, `i < COORD_AXES` in place of `RETIRED_COORD_AXES.contains`.
+    /// Extraction's `Guard`-vs-`Select` finalization
+    /// (`pixelflow-search::egraph::extract::choices_to_arena`) uses this to
+    /// decide whether a `Select` arm may become a `Guard`'s named arm at
+    /// all: `passes::lattice::collapse`'s coordinate warp does not reach
+    /// into a named kernel (same reason it refuses a reachable `Ref`), so an
+    /// arm that still reads a coordinate cannot be split off as one — see
+    /// `emit::schedule_guard_arm`'s own doc
+    /// (docs/plans/2026-09-12-emit-should-just-emit.md §8).
+    #[must_use]
+    pub fn coordinate_axis(&self, root: ExprId) -> Option<u8> {
+        let mut seen = alloc::vec![false; self.len()];
+        let mut stack = alloc::vec![root];
+        while let Some(id) = stack.pop() {
+            let idx = id.0 as usize;
+            if core::mem::replace(&mut seen[idx], true) {
+                continue;
+            }
+            if let ExprNode::Var(i) = &self.node(id)
+                && (*i as usize) < COORD_AXES
+            {
+                return Some(*i);
+            }
+            stack.extend(self.children(id));
+        }
+        None
+    }
+
     /// The first `Var(i)` with `i >= floor` reachable from `root`, if any.
     ///
     /// `Var`'s index space is three namespaces stacked in one integer —

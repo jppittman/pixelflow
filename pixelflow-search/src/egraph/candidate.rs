@@ -104,6 +104,8 @@ enum NodeShape {
     /// A fold's shape is its metadata plus its body's class — the metadata
     /// is part of the node's identity, so it is part of its shape.
     Reduce(Fold, u32),
+    /// `[mask, on, off]`, each canonicalized to its class index.
+    Guard([u32; 3]),
 }
 
 impl NodeShape {
@@ -123,6 +125,9 @@ impl NodeShape {
             ),
             ENode::Reduce { fold, body } => {
                 NodeShape::Reduce(*fold, egraph.find(*body).index() as u32)
+            }
+            ENode::Guard { children } => {
+                NodeShape::Guard(children.map(|c| egraph.find(c).index() as u32))
             }
         }
     }

@@ -4,7 +4,7 @@
 //! the "best" one according to a cost model and materialises it as an
 //! [`pixelflow_ir::ExprArena`].
 
-use super::cost::{CostFunction, CostModel};
+use super::cost::{CostFunction, CostModel, GUARD_PROBABILITY_PLACEHOLDER};
 use super::deps::var_variance;
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
@@ -929,7 +929,15 @@ pub fn extract<C: CostFunction>(
                     // A fold is, for costing, a node with one child: its
                     // metadata is not an operand, so `children_slice` is the
                     // whole of what this arm needs to know about either.
-                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                    //
+                    // `Guard` gets the same full-weight treatment here rather
+                    // than the DP's `P`-weighted arm cost: this is the legacy
+                    // single-pass `extract` (superseded by `extract_dag_scoped`'s
+                    // `TreePricer`/`SharedPricer` for production), and summing
+                    // both arms at full weight only ever makes `Guard` look
+                    // *more* expensive than the production formula would, so it
+                    // stays conservative rather than silently mispricing it.
+                    ENode::Op { .. } | ENode::Reduce { .. } | ENode::Guard { .. } => {
                         let children = node.children_slice();
                         // Check for self-referential children
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
@@ -1249,15 +1257,33 @@ fn pin_shift_counts(
 pub fn choices_to_arena(
     extraction: &Extraction<'_>,
 ) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
-    use pixelflow_ir::{Children, ExprArena, ExprId, Ir, Shape};
-
     let egraph = extraction.egraph();
-    let root = extraction.root();
-
     // Shifts must reach codegen with a constant count — see
     // `Extraction::pinned_choices` / `pin_shift_counts`.
     let pinned = extraction.pinned_choices();
-    let choices: &[Option<usize>] = &pinned;
+    choices_to_arena_scoped(egraph, extraction.root(), &pinned)
+}
+
+/// [`choices_to_arena`], starting the walk from `start` instead of
+/// `extraction`'s own root.
+///
+/// The one caller that needs this: a winning [`ENode::Guard`] candidate
+/// (G3, docs/plans/2026-09-12-emit-should-just-emit.md) materializes its
+/// `on`/`off` arms as their own small, self-contained arenas — each is
+/// `Kernel::from_parts`-wrapped and `KernelStore::intern`ed to become the
+/// named arm a real [`pixelflow_ir::ExprNode::Guard`] carries — and that is
+/// exactly this same walk, rooted at the arm's e-class instead of the whole
+/// kernel's. `choices` is shared across every scope: it is one well-founded
+/// choice map over the whole e-graph, and an e-class's choice does not
+/// depend on where the walk entered it.
+fn choices_to_arena_scoped(
+    egraph: &EGraph,
+    start: EClassId,
+    choices: &[Option<usize>],
+) -> (pixelflow_ir::ExprArena, pixelflow_ir::ExprId) {
+    use pixelflow_ir::{Children, ExprArena, ExprId, Ir, Kernel, KernelStore, OpKind, Shape};
+
+    let root = start;
 
     enum Task {
         /// Visit an e-class: push it to the result stack if cached, otherwise
@@ -1266,6 +1292,13 @@ pub fn choices_to_arena(
         /// All children of this e-class have been processed; pop their ExprIds,
         /// push a new arena node, and cache the result.
         Complete { canonical_id: u32, node_idx: usize },
+        /// A `Guard` node's mask has been visited (it is a real child of
+        /// this arena, unlike `on`/`off`); pop it and decide the arm shape.
+        CompleteGuard {
+            canonical_id: u32,
+            on: EClassId,
+            off: EClassId,
+        },
     }
 
     let num_classes = egraph.num_classes();
@@ -1392,6 +1425,34 @@ pub fn choices_to_arena(
                             task_stack.push(Task::Visit(child));
                         }
                     }
+                    // The mask is a real child of this arena (evaluated
+                    // unconditionally, same as `Select`'s would be); `on`
+                    // and `off` are not — they become their own arenas,
+                    // handled entirely in `CompleteGuard` once the mask is
+                    // ready, the same split `pixelflow_ir::ExprNode::Guard`
+                    // itself draws (one `ExprId` child, two `KernelKey`
+                    // names).
+                    ENode::Guard {
+                        children: [mask, on, off],
+                    } => {
+                        assert!(
+                            color[idx] != 1,
+                            "choices_to_arena: extraction choices are CYCLIC — e-class {} is \
+                             reached again through its own chosen descendants (root {}). The \
+                             extractor that produced these choices must guarantee a \
+                             well-founded choice DAG; materializing this one would loop until \
+                             the process is OOM-killed",
+                            idx,
+                            root.0
+                        );
+                        color[idx] = 1;
+                        task_stack.push(Task::CompleteGuard {
+                            canonical_id: canonical.0,
+                            on: *on,
+                            off: *off,
+                        });
+                        task_stack.push(Task::Visit(*mask));
+                    }
                 }
             }
 
@@ -1448,6 +1509,96 @@ pub fn choices_to_arena(
                 // materialise it as the constant 0, which is a wrong answer
                 // wearing a right answer's clothes.
                 let expr_id = arena.embed(Shape::Op(op.kind(), Children::Many(&child_ids)));
+
+                if idx < id_map.len() {
+                    id_map[idx] = Some(expr_id);
+                }
+                result_stack.push(expr_id);
+            }
+
+            Task::CompleteGuard {
+                canonical_id,
+                on,
+                off,
+            } => {
+                let idx = canonical_id as usize;
+
+                if let Some(cached_id) = id_map.get(idx).and_then(|o| *o) {
+                    result_stack.push(cached_id);
+                    continue;
+                }
+
+                let mask_id = result_stack
+                    .pop()
+                    .expect("choices_to_arena: a guard's mask is built before it");
+
+                // `on`/`off` are settled e-classes like any other — the
+                // DP's choice map does not depend on which scope reached
+                // them — so each gets its own self-contained sub-extraction
+                // via this same walk, exactly the way the top-level answer
+                // is built (`choices_to_arena`'s doc).
+                let on_canon = egraph.find(on);
+                let off_canon = egraph.find(off);
+                let (on_arena, on_root) = choices_to_arena_scoped(egraph, on_canon, choices);
+                let (off_arena, off_root) = choices_to_arena_scoped(egraph, off_canon, choices);
+
+                // `passes::lattice::collapse`'s coordinate warp cannot reach
+                // into a named kernel (same reason it refuses a reachable
+                // `Ref`) and `emit::schedule_guard_arm` schedules an arm
+                // "short of the lattice" — never wrapped in collapse's own
+                // row/column/lane folds — so an arm that still reads a
+                // coordinate cannot become a `Guard`'s named arm today
+                // (docs/plans/2026-09-12-emit-should-just-emit.md §8, G2's
+                // own stated non-goal).
+                //
+                // Likewise for a `Buffer` or `Uniform`: `schedule_guard_arm`
+                // schedules an arm from its OWN freshly-materialized arena,
+                // whose uniform/buffer table is renumbered from scratch by
+                // this very walk (`choices_to_arena_scoped`'s embed calls,
+                // in that arm's own first-encountered order) — nothing
+                // reconciles that local numbering against the outer
+                // kernel's calling convention (the table
+                // `pixelflow_codegen::jit_cache::compile` builds from the
+                // arena as originally handed in). A `UniformId`/`BufferId`
+                // is a slot index, not a name, so a mismatched renumbering
+                // reads the wrong per-call value rather than failing loudly
+                // — silently wrong, not merely unsupported, which is worse
+                // than the coordinate case above and forbidden by the same
+                // margin `CLAUDE.md` draws around a domain confusion. G2's
+                // own tests never exercised an arm with either (every
+                // hand-built arm there was a closed constant expression), so
+                // this is not a documented non-goal to defer to — it is a
+                // gap this stage's finalization has to close itself, by
+                // never selecting a name for an arm that is not closed.
+                //
+                // Falling back to the soft form here keeps this always
+                // correct rather than only correct for closed arms — the
+                // DP's `Guard` candidate is priced as if every arm
+                // qualifies (extraction cannot see either restriction, only
+                // finalization can), so this is the one place that has to
+                // check before committing to a name.
+                let is_closed = |a: &ExprArena, root: ExprId| {
+                    a.coordinate_axis(root).is_none()
+                        && a.uniforms().is_empty()
+                        && a.buffers().is_empty()
+                };
+                let on_closed = is_closed(&on_arena, on_root);
+                let off_closed = is_closed(&off_arena, off_root);
+
+                let expr_id = if !(on_closed && off_closed) {
+                    let on_id = arena.splice(&on_arena, on_root);
+                    let off_id = arena.splice(&off_arena, off_root);
+                    arena.embed(Shape::Op(
+                        OpKind::Select,
+                        Children::Many(&[mask_id, on_id, off_id]),
+                    ))
+                } else {
+                    let on_kernel = Kernel::from_parts(on_arena, on_root);
+                    let off_kernel = Kernel::from_parts(off_arena, off_root);
+                    let on_key = KernelStore::intern(&on_kernel);
+                    let off_key = KernelStore::intern(&off_kernel);
+                    arena.push_guard(mask_id, on_key, off_key)
+                };
 
                 if idx < id_map.len() {
                     id_map[idx] = Some(expr_id);
@@ -1755,6 +1906,15 @@ fn node_variance(
             }
             best_var[c.0 as usize].without(Variance::from_var(fold.binder().var()))
         }
+        // Same denotation as `Select`: varies with whatever the mask, `on`,
+        // or `off` varies with.
+        ENode::Guard { children } => children.iter().fold(Variance::CONST, |acc, &child| {
+            let c = egraph.find(child);
+            if c == canonical {
+                return Variance::ALL;
+            }
+            acc.union(best_var[c.0 as usize])
+        }),
     }
 }
 
@@ -1834,6 +1994,22 @@ pub fn cost_of_choices<C: CostFunction>(
     // 0 = unvisited, 1 = on the current path, 2 = costed.
     let mut color: Vec<u8> = alloc::vec![0u8; num_classes];
     let mut dag = 0usize;
+    // The probability the class the DP's *tree* cost cannot see: `dag` is
+    // "each distinct chosen class priced once" (its own doc), which is
+    // exactly right for an ordinary node — it always runs when its result
+    // is demanded — but wrong for one of a `Guard`'s arms, which runs only
+    // when the mask picks it. `arm_weight[class]` is that class's
+    // probability of executing at all, at the point this walk first reaches
+    // it (dedup means only the first path a class is discovered on sets its
+    // weight — the same "first visit wins" rule `color`/`var` already use).
+    // `GUARD_PROBABILITY_PLACEHOLDER` for whichever arm is on the path, `1.0`
+    // off of one, multiplying down every `Guard` on the path to the root —
+    // matching `guard_arm_cost`'s own weighting so this number agrees with
+    // `tree[]`'s (and so with the DP's) whenever a class is not *also*
+    // shared into some unrelated, unconditionally-executed use — the
+    // coarser case a comment alone cannot make exact, flagged here rather
+    // than silently assumed away.
+    let mut arm_weight: Vec<f64> = alloc::vec![1.0; num_classes];
 
     let root_canonical = egraph.find(root);
     let mut stack: Vec<(EClassId, bool)> = alloc::vec![(root_canonical, false)];
@@ -1857,9 +2033,35 @@ pub fn cost_of_choices<C: CostFunction>(
             color[idx] = 1;
             stack.push((canonical, true));
             {
-                let children = (chosen(canonical)).children_slice();
-                for &child in children {
-                    stack.push((child, false));
+                let node = chosen(canonical);
+                let my_weight = arm_weight[idx];
+                if let ENode::Guard {
+                    children: [mask, on, off],
+                } = node
+                {
+                    let mask_c = egraph.find(*mask).0 as usize;
+                    let on_c = egraph.find(*on).0 as usize;
+                    let off_c = egraph.find(*off).0 as usize;
+                    if color[mask_c] == 0 {
+                        arm_weight[mask_c] = my_weight;
+                    }
+                    if color[on_c] == 0 {
+                        arm_weight[on_c] = my_weight * GUARD_PROBABILITY_PLACEHOLDER;
+                    }
+                    if color[off_c] == 0 {
+                        arm_weight[off_c] = my_weight * (1.0 - GUARD_PROBABILITY_PLACEHOLDER);
+                    }
+                    stack.push((*mask, false));
+                    stack.push((*on, false));
+                    stack.push((*off, false));
+                } else {
+                    for &child in node.children_slice() {
+                        let c = egraph.find(child).0 as usize;
+                        if color[c] == 0 {
+                            arm_weight[c] = my_weight;
+                        }
+                        stack.push((child, false));
+                    }
                 }
             }
             continue;
@@ -1876,18 +2078,38 @@ pub fn cost_of_choices<C: CostFunction>(
             .unwrap_or(usize::MAX);
         // A fold evaluates its body once per index — see `fold_body_multiple`.
         let per_child = fold_body_multiple(node);
-        let children_cost = node
-            .children_slice()
-            .iter()
-            .map(|&child| {
-                let c = egraph.find(child).0 as usize;
-                let sub = tree[c].expect("post-order visits every child before its parent");
-                usize::try_from((sub as u64).saturating_mul(per_child)).unwrap_or(usize::MAX)
-            })
-            .fold(0usize, usize::saturating_add);
+        let children_cost = if let ENode::Guard {
+            children: [mask, on, off],
+        } = node
+        {
+            // Mirrors `TreePricer::price`'s `Guard` arm: the mask summed at
+            // full weight, `on`/`off` combined by `guard_arm_cost`'s
+            // `P`-weighted sum rather than a plain sum — this function's own
+            // re-derivation of `Guard`'s cost must agree with the DP's or
+            // the claim/price `debug_assert_eq!` audit trips on every
+            // kernel where `Guard` wins.
+            let mask_cost = tree[egraph.find(*mask).0 as usize]
+                .expect("post-order visits every child before its parent");
+            let on_cost = tree[egraph.find(*on).0 as usize]
+                .expect("post-order visits every child before its parent");
+            let off_cost = tree[egraph.find(*off).0 as usize]
+                .expect("post-order visits every child before its parent");
+            mask_cost.saturating_add(guard_arm_cost(on_cost, off_cost))
+        } else {
+            node.children_slice()
+                .iter()
+                .map(|&child| {
+                    let c = egraph.find(child).0 as usize;
+                    let sub = tree[c].expect("post-order visits every child before its parent");
+                    usize::try_from((sub as u64).saturating_mul(per_child)).unwrap_or(usize::MAX)
+                })
+                .fold(0usize, usize::saturating_add)
+        };
         tree[idx] = Some(own.saturating_add(children_cost));
         var[idx] = node_var;
-        dag = dag.saturating_add(own);
+        let weighted_own = (own as f64) * arm_weight[idx];
+        dag =
+            dag.saturating_add(usize::try_from(weighted_own.round() as i64).unwrap_or(usize::MAX));
     }
 
     ChoiceCost {
@@ -2189,6 +2411,25 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
         .unwrap_or(usize::MAX)
 }
 
+/// `P·cost[on] + (1−P)·cost[off]`, `P` = [`GUARD_PROBABILITY_PLACEHOLDER`] —
+/// the one combination step every `Guard` pricing site needs (G3,
+/// docs/plans/2026-09-12-emit-should-just-emit.md §4). The mask's own
+/// settled cost is not part of this: unlike `on`/`off`, the mask is always
+/// evaluated (both a `Guard` and a `Select` read it unconditionally), so
+/// every call site adds it in at full weight the same way it already adds
+/// any other always-evaluated child.
+///
+/// `f64` only for this one weighted sum, rounded back to the `usize` cycle
+/// units everything else here is in — consistent with `own` including
+/// `MISPREDICT_PENALTY_CYCLES` unconditionally
+/// ([`CostModel::node_op_cost`]'s `Guard` arm), since G3's placeholder
+/// `coherence = 0.0` makes `(1 − coherence)` exactly `1.0`.
+fn guard_arm_cost(on_cost: usize, off_cost: usize) -> usize {
+    let weighted = (on_cost as f64) * GUARD_PROBABILITY_PLACEHOLDER
+        + (off_cost as f64) * (1.0 - GUARD_PROBABILITY_PLACEHOLDER);
+    usize::try_from(weighted.round() as i64).unwrap_or(usize::MAX)
+}
+
 /// **How many times `node`'s children are evaluated per evaluation of `node`.**
 ///
 /// One, for everything except a fold: `⊕_{[lo,hi)} f` evaluates `f` once per
@@ -2312,6 +2553,7 @@ fn canonical_key(egraph: &EGraph, node: &ENode) -> (u8, u128, usize, Vec<u32>) {
         // The fold *is* the discriminating part: two folds over one body
         // differ only in their metadata, so that is what orders them.
         ENode::Reduce { fold, .. } => (6, fold.to_bits(), children.len(), children),
+        ENode::Guard { .. } => (7, 0, children.len(), children),
     }
 }
 
@@ -2635,6 +2877,25 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
                         .fold(0usize, usize::saturating_add),
                 )
             }
+            // `own` already carries the fixed overhead
+            // (`GUARD_TEST_BRANCH_CYCLES` + `MISPREDICT_PENALTY_CYCLES`,
+            // `CostModel::node_op_cost`'s `Guard` arm); the mask is summed at
+            // full weight, same as any other always-evaluated child, and
+            // `on`/`off` are combined by `guard_arm_cost`'s `P`-weighted sum
+            // rather than a plain sum — the one thing that makes this arm
+            // different from `Op`'s.
+            ENode::Guard {
+                children: [mask, on, off],
+            } => {
+                let mask_cost = self.cost[self.egraph.find(*mask).0 as usize]
+                    .expect("a priced candidate's children are settled");
+                let on_cost = self.cost[self.egraph.find(*on).0 as usize]
+                    .expect("a priced candidate's children are settled");
+                let off_cost = self.cost[self.egraph.find(*off).0 as usize]
+                    .expect("a priced candidate's children are settled");
+                own.saturating_add(mask_cost)
+                    .saturating_add(guard_arm_cost(on_cost, off_cost))
+            }
         };
         self.dp.rec.candidate(class, idx, cost, own);
         cost
@@ -2738,6 +2999,28 @@ struct ReachSets {
 impl ReachSets {
     /// Union the children's reach sets into `scratch`, returning what those
     /// classes cost with each member paid once.
+    ///
+    /// **`ENode::Guard`'s children (mask, `on`, `off`) all enter this union
+    /// at full weight — a checked, deliberately coarser approximation than
+    /// [`TreePricer`]'s `P`-weighted `guard_arm_cost`, not an oversight**
+    /// (G3, docs/plans/2026-09-12-emit-should-just-emit.md §4's own note
+    /// that this needed confirming during implementation). A reach set is a
+    /// set of classes, not a scalar the way `TreePricer`'s settled
+    /// `Vec<Option<usize>>` is — projecting it to "the arm's cost" the same
+    /// way would need a second, size-tracking union just for `on` and `off`
+    /// separately, which this pass does not otherwise need. Pricing both
+    /// arms at full weight can only ever make `Guard` look *more* expensive
+    /// here than `TreePricer` would — the same "coarser bound, never wrong
+    /// in the dangerous direction" shape `pixelflow-codegen::emit::guards`'s
+    /// own `arm_cycles` already takes for a `Reduce`/`Guard` cone it can't
+    /// see into. The DP's actual node choice for a `Guard`-eligible class is
+    /// decided by [`extract_dag_scoped`]'s tree-vs-shared cost comparison
+    /// (via [`cost_of_choices`], which *is* `P`-weighted), so this pass
+    /// overpricing `Guard` relative to `TreePricer` only ever costs a
+    /// missed win on the shared-DAG objective specifically (it picks
+    /// `Select` here where `Guard` would truly be cheaper), never a wrong
+    /// answer — the tree-vs-shared comparison itself runs on real,
+    /// correctly `P`-weighted costs either way.
     fn union_below(&mut self, egraph: &EGraph, node: &ENode) -> usize {
         self.epoch += 1;
         self.scratch.clear();
@@ -3270,7 +3553,17 @@ mod tests {
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
                     | ENode::Param(_) => own,
-                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                    // `Guard` gets the same full-weight (unweighted-arm)
+                    // treatment as `Op`/`Reduce` here, for the same
+                    // conservative reason `extract()`'s legacy single-pass DP
+                    // does: this is the dense reference used to cross-check
+                    // `SharedPricer`, not the DP itself
+                    // (`TreePricer`/`SharedPricer` in `extract.rs` carry the
+                    // real `P`-weighted `Guard` formula), so summing both
+                    // arms at full weight only ever biases this reference
+                    // *against* choosing `Guard`, never silently in its
+                    // favor.
+                    ENode::Op { .. } | ENode::Reduce { .. } | ENode::Guard { .. } => {
                         let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
                             CYCLE_COST
@@ -4619,7 +4912,7 @@ mod tests {
         fn node_cost(&self, node: &ENode, _parent: Option<pixelflow_ir::OpKind>) -> usize {
             match node {
                 ENode::Op { op, .. } if op.kind() == pixelflow_ir::OpKind::Sin => usize::MAX / 2,
-                ENode::Op { .. } | ENode::Reduce { .. } => 1,
+                ENode::Op { .. } | ENode::Reduce { .. } | ENode::Guard { .. } => 1,
                 ENode::Var(_)
                 | ENode::Const(_)
                 | ENode::Buffer(_)
@@ -5022,6 +5315,100 @@ mod tests {
                 cost_of_choices(&egraph, root, &dag.choices, &costs, shape),
                 dag.cost(),
                 "the reported pair must be `cost_of_choices` of the returned map"
+            );
+        }
+    }
+
+    /// G3 (docs/plans/2026-09-12-emit-should-just-emit.md): a `Select`
+    /// e-class that also holds an equivalent `Guard` (as
+    /// `math::algebra::SelectToGuard`'s rewrite would union in) is priced
+    /// both ways, and the DP picks whichever is cheaper.
+    mod guard_vs_select {
+        use super::*;
+        use crate::egraph::ops::op_from_kind;
+        use pixelflow_ir::OpKind;
+
+        /// `n` `Const`s summed left-to-right: `n - 1` `Add` nodes, each
+        /// costing `CostModel::latency_prior()`'s `Add` (4 cycles), nothing
+        /// else — a cheap way to dial an arm's settled cost to a chosen
+        /// multiple of 4.
+        fn add_chain(egraph: &mut EGraph, n: usize) -> EClassId {
+            let add = op_from_kind(OpKind::Add).expect("Add is modelled");
+            let mut acc = egraph.add(ENode::constant(0.0));
+            for i in 1..n {
+                let next = egraph.add(ENode::constant(i as f32));
+                acc = egraph.add(ENode::Op {
+                    op: add,
+                    children: vec![acc, next],
+                });
+            }
+            acc
+        }
+
+        /// Build `Select(mask, on, off)`, union a hand-built `Guard` with
+        /// the exact same operands into its class (standing in for what
+        /// `SelectToGuard`'s rewrite would produce), and return the merged
+        /// class.
+        fn select_and_guard(
+            egraph: &mut EGraph,
+            mask: EClassId,
+            on: EClassId,
+            off: EClassId,
+        ) -> EClassId {
+            let select = egraph.add(ENode::Op {
+                op: &crate::egraph::ops::Select,
+                children: vec![mask, on, off],
+            });
+            let guard = egraph.add(ENode::make_guard(mask, on, off));
+            let root = egraph.union(select, guard);
+            egraph.rebuild();
+            root
+        }
+
+        /// The chosen candidate's `OpKind`-or-`Guard` shape, read off
+        /// `tree_dp_pass`'s settled choice.
+        fn chosen_is_guard(egraph: &EGraph, root: EClassId, costs: &CostModel) -> bool {
+            let shape = LatticeShape::POINT;
+            let outcome = tree_dp_pass(egraph, root, &mut Dp::production(costs, shape));
+            let canonical = egraph.find(root);
+            let idx = outcome.choices[canonical.0 as usize].expect("root is chosen");
+            matches!(egraph.nodes(canonical)[idx], ENode::Guard { .. })
+        }
+
+        /// Small, cheap arms: `hard = GUARD_TEST_BRANCH_CYCLES +
+        /// MISPREDICT_PENALTY_CYCLES + 0.5*(cost[on]+cost[off])` (18, at
+        /// `Const` arms costing 0) is far above `soft = cost[on] + cost[off]
+        /// + Select's own 4 cycles` (4), so `Select` must still win.
+        #[test]
+        fn small_arms_keep_select() {
+            let mut egraph = EGraph::new();
+            let mask = egraph.add(ENode::Var(0));
+            let on = egraph.add(ENode::constant(1.0));
+            let off = egraph.add(ENode::constant(2.0));
+            let root = select_and_guard(&mut egraph, mask, on, off);
+
+            let costs = CostModel::latency_prior();
+            assert!(
+                !chosen_is_guard(&egraph, root, &costs),
+                "cheap arms must not clear the fixed branch overhead"
+            );
+        }
+
+        /// Large arms: two 6-`Add` chains cost 24 cycles each (`S = 48`), so
+        /// `hard = 18 + 0.5*48 = 42` clears under `soft = 48 + 4 = 52` —
+        /// `Guard` must win.
+        #[test]
+        fn large_arms_choose_guard() {
+            let mut egraph = EGraph::new();
+            let mask = egraph.add(ENode::Var(0));
+            let on = add_chain(&mut egraph, 7);
+            let off = add_chain(&mut egraph, 7);
+            let root = select_and_guard(&mut egraph, mask, on, off);
+
+            let costs = CostModel::latency_prior();
+            assert!(
+                chosen_is_guard(&egraph, root, &costs),
+                "arms large enough to clear the fixed branch overhead must choose Guard"
             );
         }
     }

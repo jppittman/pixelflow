@@ -212,6 +212,11 @@ mod tests {
             ENode::Buffer(decl) => panic!("Buffer({decl:?}) reached math tests"),
             ENode::Param(i) => panic!("Param({i}) reached math tests"),
             ENode::Reduce { .. } => panic!("a bounded fold reached math tests"),
+            ENode::Guard { .. } => {
+                panic!(
+                    "a Guard reached math tests — index 0 is always the Select it was unioned from"
+                )
+            }
             ENode::Uniform(decl) => {
                 let slot = arena.declare_uniform(decl);
                 arena.push_uniform(slot)

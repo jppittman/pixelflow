@@ -826,6 +826,12 @@ impl ChoicesCostDag<'_> {
             ENode::Param(_) => OpKind::Param,
             ENode::Op { op, .. } => op.kind(),
             ENode::Reduce { .. } => OpKind::Reduce,
+            // Feature/corpus tooling only (not the production cost model —
+            // `CLAUDE.md`), so a live `Guard` (G3) gets a neutral,
+            // non-panicking fallback rather than real support: the same
+            // `OpKind` its `Select` e-class-mate already reports, since a
+            // `Guard` denotes the same value.
+            ENode::Guard { .. } => OpKind::Select,
         }
     }
 
