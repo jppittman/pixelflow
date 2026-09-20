@@ -1,17 +1,25 @@
-//! Byte-identity fixture for docs/plans/2026-09-09-exprarena-on-dag.md's
-//! "Demand moves to the IR" work: run on the base commit and on this
-//! branch's head, then diff stdout. Any difference means a guard decision
-//! or the emitted code changed, which that section of the plan forbids.
+//! Byte-identity fixture for docs/plans/2026-09-09-exprarena-on-dag.md: run
+//! it at two commits and diff stdout. What a difference means depends on
+//! which commits:
+//!
+//! - Across the demand move alone (Stage B `9fdb6b37` → `a77e526a`), any
+//!   difference is a bug: relocating the demand pass may change no guard
+//!   decision and no emitted byte. Measured identical on both fixtures.
+//! - Across Stage C (`a77e526a` → hash-consing), the glyph fixture is
+//!   *expected* to change and the select fixture is not: consing lets the
+//!   post-extraction passes share subexpressions they used to duplicate,
+//!   so the glyph program shrank from 19,566 to 10,005 bytes with the
+//!   pixel goldens unchanged, while a kernel with no shared work is
+//!   byte-identical (428 bytes). §5.3 of the plan records both.
 //!
 //! Fixtures:
 //! - A guarded `Select` kernel (mirrors
 //!   `pixelflow-codegen/tests/collapse_paths.rs`'s
 //!   `a_select_blends_and_branches`), at a shape wide enough for the guard
 //!   to actually fire.
-//! - The glyph `8` at 32px, composed with `.at(x+0.5, y+0.5)` — the exact
-//!   fixture docs/plans/2026-09-09-exprarena-on-dag.md's "Demand moves to
-//!   the IR" section names — compiled through the same production path
-//!   (`pixelflow_codegen::jit_cache::compile`) a real bake uses.
+//! - The glyph `8` at 32px, composed with `.at(x+0.5, y+0.5)`, compiled
+//!   through the same production path (`pixelflow_codegen::jit_cache::compile`)
+//!   a real bake uses.
 //!
 //! ```bash
 //! cargo run -p pixelflow-graphics --example demand_move_byte_check
