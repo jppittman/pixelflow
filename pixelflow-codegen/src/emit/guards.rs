@@ -30,13 +30,52 @@
 //! though, is known exactly, and bounding the downside by the upside is
 //! enough to keep the analysis honest without a tuned number anywhere.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use pixelflow_ir::kind::OpKind;
+use pixelflow_ir::passes::demand::{Demand, Literal, demand_of};
 
 use super::ScheduledOp;
-use super::demand::{self, Demand, Literal};
 use super::regalloc::{Def, ValueId};
+
+/// This schedule's demand, keyed by [`ValueId`] —
+/// `pixelflow_ir::passes::demand::demand_of` instantiated for
+/// [`ScheduledOp`]: every op passes its own demand through to its operands
+/// unchanged except `Select`, whose mask is observed with the select and
+/// whose arms are observed only under their own polarity. The one
+/// definition of the DNF algebra and the backward pass lives in
+/// `pixelflow-ir`; this closure is the only thing specific to a schedule
+/// (docs/plans/2026-09-09-exprarena-on-dag.md).
+///
+/// `ops`, a dense `ValueId`-indexed lookup, is why this stays O(schedule):
+/// `demand_of`'s closure is called once per live value with only that
+/// value's key, not its `Def`, so the alternative is an O(n) scan per call.
+fn demand_of_schedule(schedule: &[Def], root: ValueId) -> BTreeMap<ValueId, Demand<ValueId>> {
+    let max_vid = schedule.iter().map(|def| def.value.0).max().unwrap_or(0) as usize;
+    let mut ops: Vec<Option<ScheduledOp>> = alloc::vec![None; max_vid + 1];
+    for def in schedule {
+        ops[def.value.0 as usize] = Some(def.op.clone());
+    }
+
+    demand_of(
+        schedule.iter().map(|def| def.value),
+        root,
+        |vid, observed| match ops.get(vid.0 as usize).and_then(Option::as_ref) {
+            Some(ScheduledOp::Ternary(OpKind::Select, mask, if_true, if_false)) => {
+                alloc::vec![
+                    (*mask, observed.clone()),
+                    (*if_true, observed.and_literal(Literal::set(*mask))),
+                    (*if_false, observed.and_literal(Literal::clear(*mask))),
+                ]
+            }
+            Some(op) => super::regalloc::operands(op)
+                .map(|operand| (operand, observed.clone()))
+                .collect(),
+            None => Vec::new(),
+        },
+    )
+}
 
 /// Which arm of a `Select` node a guard branch skips or targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -425,7 +464,7 @@ pub(crate) fn analyze_select_guards(schedule: &[Def], external: &[ValueId]) -> V
         .is_on()
         .then(|| {
             let root = schedule.last()?.value;
-            Some(demand::demand_of(schedule, root))
+            Some(demand_of_schedule(schedule, root))
         })
         .flatten();
 
@@ -433,8 +472,8 @@ pub(crate) fn analyze_select_guards(schedule: &[Def], external: &[ValueId]) -> V
         let ranges = select.ranges();
         let demand_exclusive = demand.as_ref().map_or(ArmPair::new(0, 0), |d| {
             let observed = |v: ValueId| d.get(&v).cloned().unwrap_or_default();
-            let arm = |lit: Literal| observed(select.select_vid).and_literal(lit);
-            let count = |pred: &Demand| {
+            let arm = |lit: Literal<ValueId>| observed(select.select_vid).and_literal(lit);
+            let count = |pred: &Demand<ValueId>| {
                 schedule
                     .iter()
                     .filter(|def| {
@@ -883,8 +922,8 @@ struct SelectStat {
     /// Values exclusive to each arm — what a guard could skip if the
     /// exclusive set happened to be contiguous.
     exclusive: ArmPair<usize>,
-    /// What [`demand`](super::demand) calls exclusive to each arm — the
-    /// values observed only where this arm's polarity holds.
+    /// What [`demand_of_schedule`] calls exclusive to each arm — the values
+    /// observed only where this arm's polarity holds.
     ///
     /// Always at least `exclusive`, and the gap is the point: demand
     /// answers *may this be skipped*, while `exclusive` answers the
