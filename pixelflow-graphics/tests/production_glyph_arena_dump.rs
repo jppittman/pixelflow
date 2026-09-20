@@ -159,13 +159,13 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
             ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
             ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
             ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-            ExprNode::Binary(k, a, b) => writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b)),
+            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
+            ExprNode::Binary(k, a, b) => writeln!(out, "Bi {k:?} {} {}", d(&dense, a), d(&dense, b)),
             ExprNode::Ternary(k, a, b, c) => {
-                writeln!(out, "T {k:?} {} {} {}", d(&dense, *a), d(&dense, *b), d(&dense, *c))
+                writeln!(out, "T {k:?} {} {} {}", d(&dense, a), d(&dense, b), d(&dense, c))
             }
             ExprNode::Reduce { fold, body } => {
-                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
             }
             other @ (ExprNode::Param(_)
             | ExprNode::Nary(..)

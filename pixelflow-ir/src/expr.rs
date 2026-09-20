@@ -378,7 +378,7 @@ pub fn from_arena_roots(
                     .children(id)
                     .map(|c| map[c.0 as usize].expect("child must be emitted before parent"))
                     .collect();
-                let new_id = match *arena.node(id) {
+                let new_id = match arena.node(id) {
                     ExprNode::Var(i) => b.push_var(i),
                     ExprNode::Const(v) => b.push_const(v),
                     ExprNode::Param(i) => b.push_param(i),

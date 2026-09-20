@@ -34,7 +34,7 @@ fn count_reachable(arena: &ExprArena, root: ExprId, pred: impl Fn(&ExprNode) -> 
         if std::mem::replace(&mut seen[id.0 as usize], true) {
             continue;
         }
-        if pred(arena.node(id)) {
+        if pred(&arena.node(id)) {
             count += 1;
         }
         stack.extend(arena.children(id));
@@ -223,9 +223,9 @@ fn lowered_glyph_ops_are_all_egraph_representable() {
             continue;
         }
         let kind = match lowered.node(id) {
-            ExprNode::Unary(k, _) => Some(*k),
-            ExprNode::Binary(k, _, _) => Some(*k),
-            ExprNode::Ternary(k, _, _, _) => Some(*k),
+            ExprNode::Unary(k, _) => Some(k),
+            ExprNode::Binary(k, _, _) => Some(k),
+            ExprNode::Ternary(k, _, _, _) => Some(k),
             ExprNode::Param(i) => {
                 missing.insert(format!("Param({i})"));
                 None

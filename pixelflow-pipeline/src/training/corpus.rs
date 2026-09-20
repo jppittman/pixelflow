@@ -244,9 +244,9 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                         .expect("reachable_subtree: child must be emitted before its parent")
                 };
                 let new_id = match arena.node(id) {
-                    ExprNode::Var(i) => out_arena.push_var(*i),
-                    ExprNode::Const(v) => out_arena.push_const(*v),
-                    ExprNode::Param(i) => out_arena.push_param(*i),
+                    ExprNode::Var(i) => out_arena.push_var(i),
+                    ExprNode::Const(v) => out_arena.push_const(v),
+                    ExprNode::Param(i) => out_arena.push_param(i),
                     ExprNode::Buffer(b) => panic!(
                         "reachable_subtree: expression references Buffer({}), whose declaration \
                          the corpus format does not serialize — writing it would store a node \
@@ -276,15 +276,15 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                         "reachable_subtree: expression holds a Write — a corpus entry is \
                          pre-legalize, and a store is built after extraction"
                     ),
-                    ExprNode::Unary(op, a) => out_arena.push_unary(*op, map(*a)),
-                    ExprNode::Binary(op, a, b) => out_arena.push_binary(*op, map(*a), map(*b)),
+                    ExprNode::Unary(op, a) => out_arena.push_unary(op, map(a)),
+                    ExprNode::Binary(op, a, b) => out_arena.push_binary(op, map(a), map(b)),
                     ExprNode::Ternary(op, a, b, c) => {
-                        out_arena.push_ternary(*op, map(*a), map(*b), map(*c))
+                        out_arena.push_ternary(op, map(a), map(b), map(c))
                     }
-                    ExprNode::Reduce { fold, body } => out_arena.push_reduce(*fold, map(*body)),
+                    ExprNode::Reduce { fold, body } => out_arena.push_reduce(fold, map(body)),
                     ExprNode::Nary(op, _) => {
                         let mapped_children: Vec<ExprId> = arena.children(id).map(map).collect();
-                        out_arena.push_nary(*op, &mapped_children)
+                        out_arena.push_nary(op, &mapped_children)
                     }
                 };
                 id_map[id.0 as usize] = Some(new_id);
@@ -354,14 +354,14 @@ fn write_entry(w: &mut impl Write, name: &str, arena: &ExprArena, root: ExprId) 
 fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<()> {
     match arena.node(id) {
         ExprNode::Var(i) => {
-            w.write_all(&[TAG_VAR, *i])?;
+            w.write_all(&[TAG_VAR, i])?;
         }
         ExprNode::Const(v) => {
             w.write_all(&[TAG_CONST])?;
             w.write_all(&v.to_le_bytes())?;
         }
         ExprNode::Param(i) => {
-            w.write_all(&[TAG_PARAM, *i])?;
+            w.write_all(&[TAG_PARAM, i])?;
         }
         ExprNode::Unary(op, a) => {
             w.write_all(&[TAG_UNARY])?;
@@ -520,19 +520,47 @@ fn read_entry(r: &mut Cursor<'_>) -> io::Result<(String, ExprArena, ExprId)> {
     };
 
     let node_count = r.read_u32()? as usize;
-    let root_index = r.read_u32()?;
+    let root_index = r.read_u32()? as usize;
 
+    // `id_map[write_time_index]` is the live `ExprId` that position's push
+    // actually returned. The writer's arena (`reachable_subtree`'s output)
+    // was dense and unconsed, so on-disk child references are write-time
+    // positions, not live ids — and `arena` here hash-conses, so a later
+    // push can return an id a structurally-equal earlier node already
+    // holds. Without this indirection, two on-disk `Const(1.0)` leaves
+    // (say) would collapse to one live node, every position after the
+    // second would drift out of step with its own child references, and
+    // the entry would silently decode to the wrong graph rather than fail.
+    let mut id_map: Vec<ExprId> = Vec::with_capacity(node_count);
     let mut arena = ExprArena::new();
     for _ in 0..node_count {
-        read_node_into(r, &mut arena)?;
+        let id = read_node_into(r, &mut arena, &id_map)?;
+        id_map.push(id);
     }
 
-    let root = ExprId(root_index);
+    let root = *id_map
+        .get(root_index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "root_index out of range"))?;
 
     Ok((name, arena, root))
 }
 
-fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprId> {
+/// Translate an on-disk write-time child index through `id_map` into the
+/// live `ExprId` that position's push actually returned — see `read_entry`.
+fn resolve_child(id_map: &[ExprId], raw: u32) -> io::Result<ExprId> {
+    id_map.get(raw as usize).copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("child index {raw} not yet written (arena is not in topological order)"),
+        )
+    })
+}
+
+fn read_node_into(
+    r: &mut Cursor<'_>,
+    arena: &mut ExprArena,
+    id_map: &[ExprId],
+) -> io::Result<ExprId> {
     let tag = r.read_u8()?;
     match tag {
         TAG_VAR => {
@@ -549,20 +577,20 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
         }
         TAG_UNARY => {
             let op = read_opkind(r)?;
-            let a = ExprId(r.read_u32()?);
+            let a = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_unary(op, a))
         }
         TAG_BINARY => {
             let op = read_opkind(r)?;
-            let a = ExprId(r.read_u32()?);
-            let b = ExprId(r.read_u32()?);
+            let a = resolve_child(id_map, r.read_u32()?)?;
+            let b = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_binary(op, a, b))
         }
         TAG_TERNARY => {
             let op = read_opkind(r)?;
-            let a = ExprId(r.read_u32()?);
-            let b = ExprId(r.read_u32()?);
-            let c = ExprId(r.read_u32()?);
+            let a = resolve_child(id_map, r.read_u32()?)?;
+            let b = resolve_child(id_map, r.read_u32()?)?;
+            let c = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_ternary(op, a, b, c))
         }
         TAG_NARY => {
@@ -570,7 +598,7 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
             let len = r.read_u16()? as usize;
             let mut children = Vec::with_capacity(len);
             for _ in 0..len {
-                children.push(ExprId(r.read_u32()?));
+                children.push(resolve_child(id_map, r.read_u32()?)?);
             }
             Ok(arena.push_nary(op, &children))
         }
@@ -586,7 +614,7 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
                     format!("corpus fold bits {bits} name no fold"),
                 )
             })?;
-            let body = ExprId(r.read_u32()?);
+            let body = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_reduce(fold, body))
         }
         _ => Err(io::Error::new(

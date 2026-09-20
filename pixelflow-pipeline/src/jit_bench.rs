@@ -1097,7 +1097,11 @@ fn sentinel_arena() -> (ExprArena, ExprId) {
     let y = arena.push_var(1);
     let vars = [x, y];
     let mut acc = x;
-    // 8 rounds × 5 ops = 40 ops (+ 8 consts + 2 vars = 50 nodes).
+    // 8 rounds x 5 ops = 40 ops (+ 8 consts + 2 vars = 50 pushes), but the
+    // arena hash-conses and round 0 pushes `Mul(acc, v)` and `Mul(acc, acc)`
+    // with `acc == v == x` — the same content, so they intern to one node.
+    // Every later round has `acc != v`, so this is the only collapse: 39
+    // distinct ops, 49 distinct nodes (see `sentinel_arena_is_moderate_size`).
     // sqrt argument is acc² + positive constant, so it never goes negative.
     let round_consts = [1.25f32, 0.75, 2.5, 0.5, 3.0, 1.5, 0.25, 2.0];
     for (i, &c) in round_consts.iter().enumerate() {
@@ -2009,7 +2013,10 @@ mod tests {
             "sentinel kernel should be 30-60 nodes, got {}",
             nodes
         );
-        assert_eq!(op_count(&arena, root), 40);
+        // 39, not 40: hash-consing merges round 0's `Mul(acc, v)` and
+        // `Mul(acc, acc)`, which are the same node (`acc == v == x` only on
+        // that round) -- see the comment in `sentinel_arena`.
+        assert_eq!(op_count(&arena, root), 39);
     }
 
     #[test]

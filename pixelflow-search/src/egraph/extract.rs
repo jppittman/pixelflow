@@ -4422,7 +4422,7 @@ mod tests {
                 | ExprNode::Uniform(_) => None,
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 other => panic!("unexpected extracted node {other:?}"),
             };
             if let Some(k) = kind {

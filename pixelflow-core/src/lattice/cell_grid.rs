@@ -792,13 +792,19 @@ mod tests {
     /// a channel program (four cell fields — `bg` twice — plus the atlas)
     /// occupy exactly two slots: one per distinct buffer.
     ///
-    /// Nodes are a different story, and this pins the gap: every *use* of a
-    /// Kernel value re-splices its whole fragment, and the display contramap
-    /// makes each use of a coordinate two nodes rather than one. Identity
-    /// fixed the slots; it cannot fix this. Node sharing is an inlining
-    /// decision, and it belongs to the e-graph — which cannot see this arena
-    /// at all while `Gather` is unrepresentable there. This number falling is
-    /// the sign that landed.
+    /// Nodes used to be a different story, and this pinned the gap: every
+    /// *use* of a Kernel value re-splices its whole fragment, and the display
+    /// contramap made each use of a coordinate two nodes rather than one.
+    /// Identity fixed the slots; it could not fix this — node sharing was an
+    /// inlining decision, and it belonged to the e-graph, which could not see
+    /// this arena at all while `Gather` is unrepresentable there.
+    ///
+    /// `ExprArena` now hash-conses (docs/plans/2026-09-09-exprarena-on-dag.md,
+    /// Stage C): `push_*` interns structurally, so the *within-one-splice*
+    /// repetition this comment used to describe collapses for free, without
+    /// the e-graph. 157 -> 69 (56%) on this fixture the day consing landed —
+    /// still not the e-graph's sharing (a `Gather` is still opaque to it),
+    /// but the gap this test pins is smaller than it was.
     #[test]
     fn reads_of_one_buffer_share_a_slot_but_not_nodes() {
         let shape = CellGridShape {
@@ -831,8 +837,11 @@ mod tests {
     }
 
     /// Reachable nodes in one channel kernel. Pinned rather than derived:
-    /// see `reads_of_one_buffer_share_a_slot_but_not_nodes`.
-    pub(crate) const CHANNEL_NODES: usize = 157;
+    /// see `reads_of_one_buffer_share_a_slot_but_not_nodes`. Was 157 before
+    /// `ExprArena` hash-consed (Stage C of
+    /// docs/plans/2026-09-09-exprarena-on-dag.md); consing collapsed the
+    /// repeated coordinate-contramap fragments the old doc comment described.
+    pub(crate) const CHANNEL_NODES: usize = 69;
 
     fn reachable_nodes(arena: &ExprArena, root: pixelflow_ir::ExprId) -> usize {
         let mut seen = vec![false; arena.len()];

@@ -483,7 +483,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             assert_ne!(d, u32::MAX, "hash_cons: child after parent");
             d
         };
-        let (key, build): (Key, Build) = match *arena.node(id) {
+        let (key, build): (Key, Build) = match arena.node(id) {
             ExprNode::Var(i) => (Key::Var(i), Box::new(move |a| a.push_var(i))),
             ExprNode::Const(v) => (Key::Const(v.to_bits()), Box::new(move |a| a.push_const(v))),
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
@@ -665,7 +665,7 @@ fn census(arena: &ExprArena, root: ExprId) -> Census {
         if k == OpKind::Gather || k == OpKind::RawGather {
             gathers += 1;
         }
-        if let &ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
+        if let ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
             selects.push((m, a, b));
         }
     }

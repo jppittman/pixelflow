@@ -80,7 +80,6 @@ pub fn pattern_match_arena(
         match t_node {
             // Var(n) is a metavariable: bind or check consistency.
             ExprNode::Var(n) => {
-                let n = *n;
                 if let Some(&existing) = bindings.get(&n) {
                     // Already bound — the subtrees must be structurally equal.
                     // Compare arena-native to avoid Arc allocation.
@@ -92,17 +91,14 @@ pub fn pattern_match_arena(
                 }
             }
             // Const must match exactly (within epsilon).
-            ExprNode::Const(c) => {
-                let c = *c;
-                match arena.node(e_id) {
-                    ExprNode::Const(e) => {
-                        if fabsf(e - c) >= 1e-6 {
-                            return None;
-                        }
+            ExprNode::Const(c) => match arena.node(e_id) {
+                ExprNode::Const(e) => {
+                    if fabsf(e - c) >= 1e-6 {
+                        return None;
                     }
-                    _ => return None,
                 }
-            }
+                _ => return None,
+            },
             // Param must match the same index.
             ExprNode::Param(i) => match arena.node(e_id) {
                 ExprNode::Param(j) if i == j => {}
@@ -128,22 +124,22 @@ pub fn pattern_match_arena(
             // Structural match: op must match, push children onto the stack.
             ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
                 ExprNode::Unary(e_op, e_a) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
+                    stack.push((e_a, t_a));
                 }
                 _ => return None,
             },
             ExprNode::Binary(t_op, t_a, t_b) => match arena.node(e_id) {
                 ExprNode::Binary(e_op, e_a, e_b) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
-                    stack.push((*e_b, *t_b));
+                    stack.push((e_a, t_a));
+                    stack.push((e_b, t_b));
                 }
                 _ => return None,
             },
             ExprNode::Ternary(t_op, t_a, t_b, t_c) => match arena.node(e_id) {
                 ExprNode::Ternary(e_op, e_a, e_b, e_c) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
-                    stack.push((*e_b, *t_b));
-                    stack.push((*e_c, *t_c));
+                    stack.push((e_a, t_a));
+                    stack.push((e_b, t_b));
+                    stack.push((e_c, t_c));
                 }
                 _ => return None,
             },

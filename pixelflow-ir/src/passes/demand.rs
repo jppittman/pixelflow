@@ -345,9 +345,9 @@ pub fn demand_of_arena(arena: &ExprArena, root: ExprId) -> BTreeMap<ExprId, Dema
         |id, observed| match arena.node(id) {
             ExprNode::Ternary(OpKind::Select, mask, if_true, if_false) => {
                 alloc::vec![
-                    (*mask, observed.clone()),
-                    (*if_true, observed.and_literal(Literal::set(*mask))),
-                    (*if_false, observed.and_literal(Literal::clear(*mask))),
+                    (mask, observed.clone()),
+                    (if_true, observed.and_literal(Literal::set(mask))),
+                    (if_false, observed.and_literal(Literal::clear(mask))),
                 ]
             }
             _ => arena.children(id).map(|c| (c, observed.clone())).collect(),

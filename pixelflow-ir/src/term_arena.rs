@@ -18,7 +18,7 @@ impl Ir for ExprArena {
     type Ref = ExprId;
 
     fn project(&self, r: ExprId) -> Shape<'_, ExprId> {
-        match *self.node(r) {
+        match self.node(r) {
             ExprNode::Var(i) => Shape::Var(i),
             ExprNode::Const(v) => Shape::Const(v),
             ExprNode::Param(i) => Shape::Param(i),
