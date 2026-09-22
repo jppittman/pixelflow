@@ -973,20 +973,17 @@ mod tests {
 
         #[test]
         fn emit_gather_scalar_reads_the_value_at_each_lanes_index() {
-            // Matches the production ABI (mod.rs's ResolvedOp::Gather): the
-            // first arg is a context pointer to an ARRAY of buffer base
-            // pointers (one per slot), not a buffer pointer directly —
-            // `x86_64::emit_gather_scalar` loads `[ctx_gpr + slot*8]` to get
-            // the real base. `emit_load_ptr_from_ctx`'s doc calls this out.
+            // Matches the production ABI (mod.rs's `ResolvedOp::Gather`): the
+            // base is a pointer register the allocator placed — here the
+            // first argument, `rdi`, holding the buffer's own address — not a
+            // context slot the gather loads it from.
             #[allow(improper_ctypes_definitions)]
-            type G = unsafe extern "C" fn(*const *const f32, __m256) -> __m256;
+            type G = unsafe extern "C" fn(*const f32, __m256) -> __m256;
 
             let mut c = Vec::new();
             // idx (zmm/ymm0) -> int truncate happens inside emit_gather_scalar.
             let s = x86_64::GatherScratch {
-                base_gpr: 0,  // rax
                 index_gpr: 1, // rcx
-                ctx_gpr: 7,   // rdi
                 idx_lanes: Reg(13),
                 value: Reg(14),
             };
@@ -994,7 +991,7 @@ mod tests {
                 &mut c,
                 Reg(0),
                 Reg(0),
-                0,
+                x86_64::ptr::RDI,
                 GatherScratch {
                     half: s,
                     idx_hi: Reg(9),
@@ -1005,12 +1002,11 @@ mod tests {
 
             let buf: Vec<f32> = (0..64).map(|i| (i as f32) * 1.5 + 0.25).collect();
             let idx: [f32; 8] = [0.0, 63.0, 1.0, 2.0, 10.0, 5.0, 32.0, 7.0];
-            let ctx: [*const f32; 1] = [buf.as_ptr()];
 
             let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
             let out = unsafe {
                 let f: G = exec.as_fn();
-                let r = f(ctx.as_ptr(), _mm256_loadu_ps(idx.as_ptr()));
+                let r = f(buf.as_ptr(), _mm256_loadu_ps(idx.as_ptr()));
                 let mut out = [0.0f32; 8];
                 _mm256_storeu_ps(out.as_mut_ptr(), r);
                 out
