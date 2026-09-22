@@ -1059,21 +1059,35 @@ const SIB_BASE_ONLY: u8 = 0x24;
 /// `mod = 00`, a SIB with scale 4 and no displacement — the element of a
 /// plane of `f32`s, addressed in one instruction. The tail is the
 /// architecture's, not the prefix's, so the VEX and EVEX tiers share it the
-/// way they share [`mem_operand_into`]. The index field is three bits of a
-/// register number: a GPR's for a broadcast, a vector's for a VSIB gather.
+/// way they share [`mem_operand_into`].
 pub(in crate::emit) fn scaled4_operand_into(
     inst: &mut EncodedInst,
     reg: u8,
     base: Gpr,
     index: Gpr,
 ) {
+    debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
+    sib4_tail_into(inst, reg, base, index.0);
+}
+
+/// [`scaled4_operand_into`] with a *vector* index — the VSIB a gather
+/// addresses through, `[base + ymm*4]`. Same bytes; the one rule that does
+/// not carry over is the GPR one, because SIB index `100` means "no index"
+/// only when the index is a general register: as a vector number it is
+/// `ymm4`/`ymm12`, which a gather may perfectly well be indexed by. The
+/// prefix's X bit carries the index's high bit either way.
+pub(in crate::emit) fn vsib4_operand_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: Reg) {
+    sib4_tail_into(inst, reg, base, index.0);
+}
+
+/// The ModRM/SIB bytes both scaled-index forms share.
+fn sib4_tail_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: u8) {
     debug_assert!(
         base.0 & 7 != RM_RIP_AT_MOD0,
         "[rbp/r13 + index*4] has no mod=00 form: that base means no base"
     );
-    debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
     inst.push(((reg & 7) << 3) | RM_SIB);
-    inst.push((0b10 << 6) | ((index.0 & 7) << 3) | (base.0 & 7));
+    inst.push((0b10 << 6) | ((index & 7) << 3) | (base.0 & 7));
 }
 
 /// Write the ModRM/SIB/disp tail into an `EncodedInst`.
