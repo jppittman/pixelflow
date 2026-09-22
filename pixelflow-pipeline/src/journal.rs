@@ -244,42 +244,25 @@ impl SourceVersion {
 /// source, different machine or build, different timings, so these belong in
 /// every config hash beside the source revision.
 ///
-/// Compile-time facts only: `target_arch`/`target_feature` are what actually
-/// select the emitter, and the profile decides whether the timings are
-/// meaningful at all. The specific CPU model is deliberately not read here —
-/// it needs a syscall or `/proc`, varies across otherwise-identical cloud
-/// instances, and a run's sentinel calibration already records per-run clock
-/// behavior.
+/// The ISA tier is the one the JIT selected at startup from the CPU (or
+/// `PIXELFLOW_ISA`) — the fact that actually selects the emitter — and the
+/// profile decides whether the timings are meaningful at all. The tier
+/// implies the `MulAdd` rounding: every selectable tier has a hardware FMA
+/// (AVX2 requires FMA3, AVX-512 has it, NEON has `FMLA`), so the separate
+/// `fma=` field two runs of materially different kernels once hid behind
+/// (P2 finding on the fix commit for PR #1019: an `avx2,+fma` and an
+/// `avx2,-fma` build under one fingerprint) has nothing left to distinguish.
+/// The specific CPU model is deliberately not read here — it needs a syscall
+/// or `/proc`, varies across otherwise-identical cloud instances, and a run's
+/// sentinel calibration already records per-run clock behavior.
 #[must_use]
 pub fn environment_fingerprint() -> String {
-    let isa = if cfg!(target_feature = "avx512f") {
-        "avx512f"
-    } else if cfg!(target_feature = "avx2") {
-        "avx2"
-    } else {
-        "baseline"
-    };
-    // Independent of `isa`, not a rung in its fallback chain: an
-    // `avx2,+fma` build and an `avx2,-fma` build previously both read
-    // isa=avx2 (the `else if target_feature = "fma"` arm was unreachable
-    // whenever avx2 was also set), so two runs executing materially
-    // different kernels — `pixelflow-codegen`'s `emit_fmadd_c_in_dst` emitted
-    // a hardware `vfmadd231ps` under `fma` and a separate multiply-then-add
-    // otherwise, with different timing and rounding — received the same
-    // environment fingerprint (P2 finding on the fix commit for PR #1019).
-    // The AVX2 tier now requires `fma` outright (a `compile_error!` refuses
-    // `avx2,-fma` builds), so `pixelflow-codegen` no longer has that fork —
-    // but `isa=baseline`'s SSE2 path still picks between hardware FMA and a
-    // software mul+add depending on this same flag, so `fma` stays its own
-    // field rather than folding into `isa`.
-    let fma = cfg!(target_feature = "fma");
     format!(
-        "arch={};os={};ptr={};isa={};fma={};profile={}",
+        "arch={};os={};ptr={};isa={};profile={}",
         std::env::consts::ARCH,
         std::env::consts::OS,
         usize::BITS,
-        isa,
-        fma,
+        pixelflow_codegen::isa::detect().name(),
         if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -595,21 +578,18 @@ mod tests {
     }
 
     #[test]
-    fn environment_fingerprint_records_fma_independently_of_isa() {
-        // The defect this guards: `fma` used to be the last rung of the
-        // `isa` if/else chain, so it was unreachable whenever `avx2` (or
-        // `avx512f`) was also set — an avx2+fma build and an avx2-only build
-        // read the same `isa=avx2`, hiding a real codegen difference
-        // (`emit_fmadd_c_in_dst`). `fma=` must appear as its own field,
-        // independent of whatever `isa` says.
+    fn environment_fingerprint_records_the_tier_the_jit_selected() {
+        // The defect this guards, in its current form: the tier is what
+        // selects the emitter, and it is decided at runtime — a fingerprint
+        // read off `cfg!(target_feature)` would say `baseline` on every
+        // machine while the JIT ran AVX-512 on some and AVX2 on others, two
+        // materially different kernels under one fingerprint (the shape of
+        // the P2 finding on the fix commit for PR #1019).
         let fp = environment_fingerprint();
+        let isa = pixelflow_codegen::isa::detect().name();
         assert!(
-            fp.contains(";isa=") && fp.contains(";fma="),
-            "isa and fma must both be present as independent fields: {fp}"
-        );
-        assert!(
-            fp.contains(";fma=true") || fp.contains(";fma=false"),
-            "fma must be a plain boolean, not folded into isa's value: {fp}"
+            fp.contains(&format!(";isa={isa};")),
+            "the fingerprint must name the tier the JIT selected ({isa}): {fp}"
         );
     }
 

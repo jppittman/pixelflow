@@ -819,7 +819,9 @@ with the code: **there is no method named `Field::splat`.** `Field<A>`
 (`storage.rs`). `splat` only exists as a *trait* method,
 `SimdOps::splat`/`SimdU32Ops::splat` (`backend/mod.rs:74,270`), implemented
 by the concrete lane types `F32x4`/`F32x8`/`F32x16`/`U32x4`/... in
-`backend/x86.rs` and `backend/arm.rs`.
+`backend/x86.rs` and `backend/arm.rs` (both since deleted, with `Field`
+itself: `pixelflow-core` holds no vector since
+[the-isa-is-decided-at-startup](2026-09-22-the-isa-is-decided-at-startup.md)).
 
 And that trait, those types, and the modules holding them are **already
 fully `pub` today**, independent of any crate split: `pub mod backend;`

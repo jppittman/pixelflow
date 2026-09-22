@@ -74,7 +74,6 @@ fn macro_negation() {
 // ============================================================================
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_sin() {
     // sin(0) = 0
     let m = kernel!(|| X.sin());
@@ -83,7 +82,6 @@ fn macro_sin() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_sin_pi_half() {
     // sin(π/2) ≈ 1
     let m = kernel!(|| X.sin());
@@ -92,7 +90,6 @@ fn macro_sin_pi_half() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_cos() {
     // cos(0) = 1
     let m = kernel!(|| X.cos());
@@ -140,7 +137,6 @@ fn macro_round() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_log10() {
     let m = kernel!(|| X.log10());
     let val = eval1(&m, 1000.0);
@@ -152,7 +148,6 @@ fn macro_log10() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_pow() {
     let m = kernel!(|| X.pow(Y));
     let val = eval2(&m, 2.0, 10.0);
@@ -220,7 +215,6 @@ fn kernel_raw_supports_the_same_primitive_and_library_methods_as_kernel() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn kernel_raw_supports_pow_and_log10() {
     let pow = eval2(&kernel_raw!(|| X.pow(Y)), 2.0, 10.0);
     assert!((pow - 2.0_f32.powf(10.0)).abs() / pow < 0.02);
@@ -261,7 +255,6 @@ fn two_params_is_a_builder() {
 // ============================================================================
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_atan2_matches_reference_at_boundary_and_interior_points() {
     let m = kernel!(|| Y.atan2(X));
     // atan2(1, 1) = π/4 — polynomial has ~0.06 error at t=1 boundary
@@ -282,7 +275,6 @@ fn macro_atan2_matches_reference_at_boundary_and_interior_points() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_atan2_quadrants() {
     let m = kernel!(|| Y.atan2(X));
 
@@ -321,7 +313,6 @@ fn macro_atan2_quadrants() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_atan() {
     let m = kernel!(|| X.atan());
     // atan(0.5) ≈ 0.4636 — well within polynomial range
@@ -337,7 +328,6 @@ fn macro_atan() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_asin() {
     let m = kernel!(|| X.asin());
     // asin(0) = 0
@@ -353,7 +343,6 @@ fn macro_asin() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_acos() {
     let m = kernel!(|| X.acos());
     // acos(0.5) = π/3 ≈ 1.047 — exercises large-ratio path (ratio ≈ 1.73)

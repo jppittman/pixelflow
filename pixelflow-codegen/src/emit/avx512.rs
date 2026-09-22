@@ -813,11 +813,18 @@ mod tests {
         assert_eq!(via_and, via_vandps);
     }
 
-    #[cfg(target_feature = "avx512f")]
+    /// Executes the bytes on this host's CPU, so every test first asks
+    /// whether it can (`skip_unless_host_runs!`); the encodings themselves
+    /// are pinned bytewise on every host by the tests above. The `extern
+    /// "C"` kernels take `zmm` values, which the ABI only lets a caller
+    /// compiled with AVX-512 pass — hence `#[target_feature]` on the
+    /// functions that call them, and nowhere else.
+    #[cfg(target_arch = "x86_64")]
     mod runtime {
         use super::super::*;
         use crate::emit::executable::ExecutableCode;
         use crate::emit::{Gpr, PtrReg};
+        use crate::isa::{Isa, skip_unless_host_runs};
         use core::arch::x86_64::*;
 
         // Passing __m512 by value IS the emitted ABI (SysV: zmm0-7), so
@@ -828,7 +835,8 @@ mod tests {
         fn run(body: &[u8], xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
             let mut code = body.to_vec();
             crate::emit::x86_64::ret(&mut code);
-            run_code(&code, xs, ys, zs)
+            // SAFETY: every caller is a test that checked the host runs AVX-512.
+            unsafe { run_code(&code, xs, ys, zs) }
         }
 
         /// `run`, for a body that read constants from `pool`: the anchor
@@ -846,10 +854,17 @@ mod tests {
             asm.code.extend_from_slice(body);
             crate::emit::x86_64::ret(&mut asm.code);
             pool.finish(&mut asm);
-            run_code(&asm.finish(), xs, ys, zs)
+            // SAFETY: every caller is a test that checked the host runs AVX-512.
+            unsafe { run_code(&asm.finish(), xs, ys, zs) }
         }
 
-        fn run_code(code: &[u8], xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
+        /// # Safety
+        ///
+        /// The host must execute AVX-512: `code` is `zmm` code, and this
+        /// function is compiled with AVX-512F enabled to be allowed to pass
+        /// `zmm` values.
+        #[target_feature(enable = "avx512f")]
+        unsafe fn run_code(code: &[u8], xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
             let exec = unsafe { ExecutableCode::from_code(code).expect("mmap") };
             unsafe {
                 let f: K = exec.as_fn();
@@ -859,6 +874,25 @@ mod tests {
                     _mm512_loadu_ps(zs.as_ptr()),
                     _mm512_setzero_ps(),
                 );
+                let mut out = [0.0f32; 16];
+                _mm512_storeu_ps(out.as_mut_ptr(), r);
+                out
+            }
+        }
+
+        /// Call `exec` as `fn(*const f32 base, zmm float indices) -> zmm`:
+        /// the gather tests' ABI.
+        ///
+        /// # Safety
+        ///
+        /// The host must execute AVX-512 (every caller checked).
+        #[target_feature(enable = "avx512f")]
+        unsafe fn gather(exec: &ExecutableCode, base: *const f32, idx: [f32; 16]) -> [f32; 16] {
+            #[allow(improper_ctypes_definitions)]
+            type G = unsafe extern "C" fn(*const f32, __m512) -> __m512;
+            unsafe {
+                let f: G = exec.as_fn();
+                let r = f(base, _mm512_loadu_ps(idx.as_ptr()));
                 let mut out = [0.0f32; 16];
                 _mm512_storeu_ps(out.as_mut_ptr(), r);
                 out
@@ -901,6 +935,7 @@ mod tests {
 
         #[test]
         fn emit_binary_matches_the_scalar_reference_for_every_arithmetic_op() {
+            skip_unless_host_runs!(Isa::Avx512);
             let (xs, ys, zs) = lanes();
             let cases: &[BinaryCase] = &[
                 (OpKind::Add, |a, b| a + b),
@@ -919,6 +954,7 @@ mod tests {
 
         #[test]
         fn emit_binary_writes_a_high_numbered_register() {
+            skip_unless_host_runs!(Isa::Avx512);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Mul, Reg(20), X, Y);
@@ -928,6 +964,7 @@ mod tests {
 
         #[test]
         fn emit_load_and_emit_store_address_a_high_numbered_base_register_correctly() {
+            skip_unless_host_runs!(Isa::Avx512);
             // Every production caller in this file addresses memory through
             // rsp or rax (both < r8), so `Evex::rm`'s B-bit inversion for a
             // >= r8 base has no other coverage. Move the incoming pointer
@@ -980,6 +1017,7 @@ mod tests {
 
         #[test]
         fn emit_unary_computes_sqrt_of_a_positive_operand() {
+            skip_unless_host_runs!(Isa::Avx512);
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -989,6 +1027,7 @@ mod tests {
 
         #[test]
         fn emit_unary_negates_and_takes_the_absolute_value_of_every_lane() {
+            skip_unless_host_runs!(Isa::Avx512);
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -1004,6 +1043,7 @@ mod tests {
         /// every read is one broadcast from it.
         #[test]
         fn emit_const_broadcasts_and_adds_to_every_lane() {
+            skip_unless_host_runs!(Isa::Avx512);
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -1022,6 +1062,7 @@ mod tests {
 
         #[test]
         fn emit_fmadd_c_in_dst_computes_the_fused_multiply_add() {
+            skip_unless_host_runs!(Isa::Avx512);
             let (xs, ys, zs) = lanes();
             // emit_fmadd_c_in_dst(dst, a, b): dst = a*b + dst.
             let mut c = Vec::new();
@@ -1041,6 +1082,7 @@ mod tests {
         /// forms genuinely disagree, and this asserts the bits.
         #[test]
         fn emit_fmadd_c_in_dst_rounds_once_not_twice() {
+            skip_unless_host_runs!(Isa::Avx512);
             let xs = [1.000_000_1f32; 16];
             let ys = [4097.0f32; 16];
             let zs = [4097.0f32; 16];
@@ -1069,14 +1111,10 @@ mod tests {
 
         #[test]
         fn emit_gather_reads_the_value_at_each_lanes_index() {
+            skip_unless_host_runs!(Isa::Avx512);
             // JIT a function: fn(*const f32 base [rdi], __m512 idx_float [zmm0]) -> __m512
             // that truncates the float indices, sets the mask, and gathers
             // base[idx] per lane. Validates the VSIB vgatherdps bytes on hardware.
-            // Passing __m512 by value IS the emitted ABI (SysV: zmm0-7), so
-            // not-FFI-safe is a false positive here, as for `executable`'s aliases.
-            #[allow(improper_ctypes_definitions)]
-            type G = unsafe extern "C" fn(*const f32, __m512) -> __m512;
-
             let mut c = Vec::new();
             emit_cvttps2dq(&mut c, Reg(13), Reg(0)); // zmm13 = (i32) idx_float
             emit_set_gather_mask(&mut c); // k1 = 0xFFFF
@@ -1092,13 +1130,8 @@ mod tests {
             ];
 
             let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
-            let out = unsafe {
-                let f: G = exec.as_fn();
-                let r = f(buf.as_ptr(), _mm512_loadu_ps(idx.as_ptr()));
-                let mut out = [0.0f32; 16];
-                _mm512_storeu_ps(out.as_mut_ptr(), r);
-                out
-            };
+            // SAFETY: the host runs AVX-512, checked at the top of this test.
+            let out = unsafe { gather(&exec, buf.as_ptr(), idx) };
 
             for i in 0..16 {
                 let want = buf[idx[i] as usize];
@@ -1108,6 +1141,7 @@ mod tests {
 
         #[test]
         fn emit_gather_addresses_high_numbered_vector_registers_and_gpr_base() {
+            skip_unless_host_runs!(Isa::Avx512);
             // The production driver always gathers through rax (base_gpr=0)
             // with dst/idx below zmm16 in every kernel this test suite
             // compiles, so `emit_gather_reads_the_value_at_each_lanes_index`
@@ -1115,9 +1149,6 @@ mod tests {
             // encode. Move the base pointer into r9 (>= r8) and gather
             // into/from zmm registers >= 16 to pin them, mirroring
             // `emit_binary_writes_a_high_numbered_register`'s zmm20 case.
-            #[allow(improper_ctypes_definitions)]
-            type G = unsafe extern "C" fn(*const f32, __m512) -> __m512;
-
             let mut c = Vec::new();
             x86_64::mov(&mut c, Gpr(9), x86_64::gpr::RDI);
             emit_cvttps2dq(&mut c, Reg(21), Reg(0)); // zmm21 = (i32) idx_float
@@ -1133,13 +1164,8 @@ mod tests {
             ];
 
             let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
-            let out = unsafe {
-                let f: G = exec.as_fn();
-                let r = f(buf.as_ptr(), _mm512_loadu_ps(idx.as_ptr()));
-                let mut out = [0.0f32; 16];
-                _mm512_storeu_ps(out.as_mut_ptr(), r);
-                out
-            };
+            // SAFETY: the host runs AVX-512, checked at the top of this test.
+            let out = unsafe { gather(&exec, buf.as_ptr(), idx) };
 
             for i in 0..16 {
                 let want = buf[idx[i] as usize];
@@ -1149,6 +1175,7 @@ mod tests {
 
         #[test]
         fn emit_load_after_emit_store_recovers_the_spilled_value() {
+            skip_unless_host_runs!(Isa::Avx512);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
@@ -1179,23 +1206,14 @@ mod tests {
 /// **This file is where AVX-512-specific bugs live, and the only place they
 /// can.** Emission is a pure function into `Vec<u8>`, so everything here
 /// compiles, typechecks and is swept for op coverage on every host, whatever
-/// CPU it has. Only [`Native`](super::super::Native) decides which backend a
-/// build instantiates, and only [`executable`](super::super::executable) needs
-/// the matching hardware.
+/// CPU it has. Only `compile_native` in `emit` decides which backend a
+/// process instantiates — from the tier `crate::isa` read off the CPU — and
+/// only [`executable`](super::super::executable) needs the matching hardware.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
-///
-/// Dead only in a build that selected a *different* `Native`. The condition
-/// mirrors this backend's `Native` alias, so a genuinely unused item in the
-/// backend this build actually compiles still trips `dead_code`; an
-/// unconditional allow here would hide it from CI's `clippy -D warnings`.
-#[cfg_attr(
-    not(all(target_arch = "x86_64", target_feature = "avx512f")),
-    allow(dead_code)
-)]
 pub(crate) mod driver {
     use super::super::*;
     use super::{

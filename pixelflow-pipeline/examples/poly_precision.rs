@@ -15,14 +15,11 @@
 //!
 //! Run: `cargo run --release -p pixelflow-pipeline --example poly_precision`
 
-use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
 use pixelflow_ir::passes::EXP2_POLY;
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::poly::{PolyForm, build, chebyshev_fit};
-
-const LANES: usize = JIT_VECTOR_BYTES / 4;
 
 /// Points the error is sampled at, spanning `[0, 1)`.
 const SAMPLES: usize = 1024;
@@ -96,8 +93,9 @@ fn main() {
     let mut session = BenchSession::new();
 
     println!(
-        "# accuracy per nanosecond — target exp2 on [0,1], LANES={LANES}, host fma={}",
-        cfg!(target_feature = "fma"),
+        "# accuracy per nanosecond — target exp2 on [0,1], tier={} (LANES={})",
+        pixelflow_codegen::isa::detect().name(),
+        pixelflow_codegen::jit_vector_bytes() / 4,
     );
     println!(
         "# err = max |JIT(x) − exp2(x)| in the JIT's own f32 arithmetic; \

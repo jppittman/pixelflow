@@ -31,21 +31,11 @@ use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, 
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
-// The AVX2 tier requires FMA3. No shipping x86-64 CPU has ever offered AVX2
-// without it (Intel: both since Haswell; AMD: FMA3 predates AVX2 by a
-// generation) — the industry itself codifies the pairing as x86-64-v3. A
-// hypothetical AVX2-without-FMA build is not a smaller tier, it is a paper
-// configuration: it forked `emit_fmadd_c_in_dst` into a value-semantics
-// variant (one rounding vs. two, see CLAUDE.md's `MulAdd` platform-divergence
-// table) that no real machine ever exercised, and that fork was directly
-// responsible for a P2 (two materially different kernels sharing one
-// environment fingerprint — see `pixelflow-pipeline/src/journal.rs`). Fail
-// loudly at compile time rather than silently degrading precision.
-#[cfg(all(target_feature = "avx2", not(target_feature = "fma")))]
-compile_error!(
-    "the AVX2 backend requires FMA3 (no shipping CPU has AVX2 without it); \
-     build with `-C target-feature=+avx2,+fma` or `-C target-cpu=x86-64-v3`"
-);
+// The AVX2 tier requires FMA3, and `crate::isa` refuses a host without it:
+// AVX2-without-FMA is not a narrower tier but a paper configuration, and the
+// probe's doc says why (no shipping CPU has one without the other, and the
+// two-rounding fork it once forced on `emit_fmadd_c_in_dst` put two
+// materially different kernels under one environment fingerprint).
 
 // =============================================================================
 // VEX.256 encoder
@@ -582,31 +572,26 @@ pub fn emit_cmp_al_imm8(code: &mut Vec<u8>, imm: u8) {
 
 /// `vfmadd231ps ymmD, ymmA, ymmB` — `dst = a*b + dst` (231 form: dst is the
 /// addend going in, `a`/`b` the product). VEX.256.66.0F38.W0 B8 /r, same
-/// opcode as `avx512.rs`'s EVEX form, just VEX-encoded at 256 bits.
-/// `target_feature = "fma"` (FMA3) is not implied by `avx2` alone in rustc's
-/// feature model, which is why this file's own `compile_error!` pins the two
-/// together for this backend — see the module-top comment.
+/// opcode as `avx512.rs`'s EVEX form, just VEX-encoded at 256 bits. FMA3 is
+/// not implied by AVX2 in CPUID, which is why `crate::isa`'s x86-64 probe
+/// asks for both before this backend can be selected.
 fn vfmadd231ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
     assemble(c, [Vex::m0f38_66(0xB8).rrr(d, s1, s2)]);
 }
 
 /// Fused multiply-add: `dst` already holds `c`; computes `dst = a*b + dst`.
 ///
-/// Always real hardware FMA: the AVX2 tier requires `+fma` (see the
-/// module-top `compile_error!`), so there is no software mul+add fallback to
-/// choose between here. This rounds once, exactly matching the reference
-/// interpreter under `fp-contract=fast` — `eval_scalar`'s scalar `a*b+c` gets
-/// contracted to an `fma` instruction by LLVM under `+fma` too, so a
-/// software two-step mul-then-add would round twice and disagree in the last
-/// bit.
+/// Always real hardware FMA: the AVX2 tier requires FMA3 (`crate::isa`
+/// refuses a host without it), so there is no software mul+add fallback to
+/// choose between here. This rounds once, as the folder does
+/// (`libm::fmaf`); a software two-step mul-then-add would round twice and
+/// disagree in the last bit.
 ///
-/// The two-roundings case still exists, just not in *this* function. It is
-/// the SSE2 baseline's only option — `x86_64.rs`'s own `FusedMulAdd` arm is a
-/// `movaps`/`mulps`/`addps` stand-in, as is `pixelflow-core`'s x86 backend —
-/// and it is also what `DecomposedMulAdd` does on every tier, this one
-/// included, whenever register pressure pulls `a` and `b` apart from `c`.
-/// Both are pinned as bytes by `emit::tests::muladd_encoding` and as values
-/// by `tests/muladd_rounding.rs`.
+/// The two-roundings case still exists, just not in *this* function: it is
+/// what `DecomposedMulAdd` does on every tier, this one included, whenever
+/// register pressure pulls `a` and `b` apart from `c`. Both are pinned as
+/// bytes by `emit::tests::muladd_encoding` and as values by
+/// `tests/muladd_rounding.rs`.
 pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
     vfmadd231ps(code, dst.0, a.0, b.0);
 }
@@ -688,10 +673,17 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
+    /// Executes the bytes on this host's CPU, so every test first asks
+    /// whether it can (`skip_unless_host_runs!`); the encodings themselves
+    /// are pinned bytewise on every host by the tests above. The `extern
+    /// "C"` kernels take `ymm` values, which the ABI only lets a caller
+    /// compiled with AVX pass — hence `#[target_feature]` on the functions
+    /// that call them, and nowhere else.
+    #[cfg(target_arch = "x86_64")]
     mod runtime {
         use super::super::*;
         use crate::emit::executable::ExecutableCode;
+        use crate::isa::{Isa, skip_unless_host_runs};
         use core::arch::x86_64::*;
 
         #[allow(improper_ctypes_definitions)]
@@ -700,7 +692,8 @@ mod tests {
         fn run(body: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
             let mut code = body.to_vec();
             crate::emit::x86_64::ret(&mut code);
-            run_code(&code, xs, ys, zs)
+            // SAFETY: every caller is a test that checked the host runs AVX2.
+            unsafe { run_code(&code, xs, ys, zs) }
         }
 
         /// `run`, for a body that read constants from `pool`: the anchor
@@ -718,10 +711,16 @@ mod tests {
             asm.code.extend_from_slice(body);
             crate::emit::x86_64::ret(&mut asm.code);
             pool.finish(&mut asm);
-            run_code(&asm.finish(), xs, ys, zs)
+            // SAFETY: every caller is a test that checked the host runs AVX2.
+            unsafe { run_code(&asm.finish(), xs, ys, zs) }
         }
 
-        fn run_code(code: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
+        /// # Safety
+        ///
+        /// The host must execute AVX2: `code` is `ymm` code, and this function
+        /// is compiled with AVX enabled to be allowed to pass `ymm` values.
+        #[target_feature(enable = "avx2")]
+        unsafe fn run_code(code: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
             let exec = unsafe { ExecutableCode::from_code(code).expect("mmap") };
             unsafe {
                 let f: K = exec.as_fn();
@@ -784,6 +783,7 @@ mod tests {
 
         #[test]
         fn emit_binary_matches_the_scalar_reference_for_every_arithmetic_op() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let cases: &[BinaryCase] = &[
                 (OpKind::Add, |a, b| a + b),
@@ -802,6 +802,7 @@ mod tests {
 
         #[test]
         fn emit_binary_produces_an_all_ones_mask_when_lt_holds() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, X, X, Y);
@@ -814,10 +815,15 @@ mod tests {
 
         #[test]
         fn emit_movmskps_eax_gathers_the_lanewise_compare_mask_sign_bits() {
+            skip_unless_host_runs!(Isa::Avx2);
             #[allow(improper_ctypes_definitions)]
             type MaskCheck = unsafe extern "C" fn(__m256, __m256) -> i32;
 
-            fn run_mask(body: &[u8], xs: [f32; 8], ys: [f32; 8]) -> i32 {
+            /// # Safety
+            ///
+            /// The host must execute AVX2 (checked above).
+            #[target_feature(enable = "avx2")]
+            unsafe fn run_mask(body: &[u8], xs: [f32; 8], ys: [f32; 8]) -> i32 {
                 let mut code = body.to_vec();
                 crate::emit::x86_64::ret(&mut code);
                 let exec = unsafe { ExecutableCode::from_code(&code).expect("mmap") };
@@ -834,18 +840,23 @@ mod tests {
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, X, X, Y);
             emit_movmskps_eax(&mut c, X);
-            assert_eq!(run_mask(&c, xs, ys), 0b0000_1111, "lt mask, lanes 0-3 true");
+            // SAFETY: the host runs AVX2, checked at the top of this test.
+            let got = unsafe { run_mask(&c, xs, ys) };
+            assert_eq!(got, 0b0000_1111, "lt mask, lanes 0-3 true");
 
             // The complementary comparison, to pin the other half of eax
             // independently of the first assertion.
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Gt, X, X, Y);
             emit_movmskps_eax(&mut c, X);
-            assert_eq!(run_mask(&c, xs, ys), 0b1111_0000, "gt mask, lanes 4-7 true");
+            // SAFETY: as above.
+            let got = unsafe { run_mask(&c, xs, ys) };
+            assert_eq!(got, 0b1111_0000, "gt mask, lanes 4-7 true");
         }
 
         #[test]
         fn emit_unary_computes_sqrt_neg_and_abs_per_lane() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let unary = |op, src, temp| crate::emit::Unary {
                 op,
@@ -871,6 +882,7 @@ mod tests {
 
         #[test]
         fn emit_select_blends_if_true_and_if_false_by_the_mask() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, Reg(5), X, Y); // mask
@@ -888,6 +900,7 @@ mod tests {
         /// every read is one broadcast from it.
         #[test]
         fn emit_const_broadcasts_and_adds_to_every_lane() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -906,6 +919,7 @@ mod tests {
 
         #[test]
         fn emit_fmadd_c_in_dst_computes_the_fused_multiply_add() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_mov(&mut c, Reg(5), Z);
@@ -924,6 +938,7 @@ mod tests {
         /// forms genuinely disagree, and this asserts the bits.
         #[test]
         fn emit_fmadd_c_in_dst_rounds_once_not_twice() {
+            skip_unless_host_runs!(Isa::Avx2);
             let xs = [1.000_000_1f32; 8];
             let ys = [4097.0f32; 8];
             let zs = [4097.0f32; 8];
@@ -952,6 +967,7 @@ mod tests {
 
         #[test]
         fn emit_load_after_emit_store_recovers_the_spilled_value() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
@@ -973,12 +989,27 @@ mod tests {
 
         #[test]
         fn emit_gather_scalar_reads_the_value_at_each_lanes_index() {
+            skip_unless_host_runs!(Isa::Avx2);
             // Matches the production ABI (mod.rs's `ResolvedOp::Gather`): the
             // base is a pointer register the allocator placed — here the
             // first argument, `rdi`, holding the buffer's own address — not a
             // context slot the gather loads it from.
             #[allow(improper_ctypes_definitions)]
             type G = unsafe extern "C" fn(*const f32, __m256) -> __m256;
+
+            /// # Safety
+            ///
+            /// The host must execute AVX2 (checked above).
+            #[target_feature(enable = "avx2")]
+            unsafe fn gather(exec: &ExecutableCode, base: *const f32, idx: [f32; 8]) -> [f32; 8] {
+                unsafe {
+                    let f: G = exec.as_fn();
+                    let r = f(base, _mm256_loadu_ps(idx.as_ptr()));
+                    let mut out = [0.0f32; 8];
+                    _mm256_storeu_ps(out.as_mut_ptr(), r);
+                    out
+                }
+            }
 
             let mut c = Vec::new();
             // idx (zmm/ymm0) -> int truncate happens inside emit_gather_scalar.
@@ -1004,13 +1035,8 @@ mod tests {
             let idx: [f32; 8] = [0.0, 63.0, 1.0, 2.0, 10.0, 5.0, 32.0, 7.0];
 
             let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
-            let out = unsafe {
-                let f: G = exec.as_fn();
-                let r = f(buf.as_ptr(), _mm256_loadu_ps(idx.as_ptr()));
-                let mut out = [0.0f32; 8];
-                _mm256_storeu_ps(out.as_mut_ptr(), r);
-                out
-            };
+            // SAFETY: the host runs AVX2, checked at the top of this test.
+            let out = unsafe { gather(&exec, buf.as_ptr(), idx) };
 
             for i in 0..8 {
                 let want = buf[idx[i] as usize];
@@ -1029,27 +1055,14 @@ mod tests {
 /// **This file is where AVX2-specific bugs live, and the only place they
 /// can.** Emission is a pure function into `Vec<u8>`, so everything here
 /// compiles, typechecks and is swept for op coverage on every host, whatever
-/// CPU it has. Only [`Native`](super::super::Native) decides which backend a
-/// build instantiates, and only [`executable`](super::super::executable) needs
-/// the matching hardware.
+/// CPU it has. Only `compile_native` in `emit` decides which backend a
+/// process instantiates — from the tier `crate::isa` read off the CPU — and
+/// only [`executable`](super::super::executable) needs the matching hardware.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
-///
-/// Dead only in a build that selected a *different* `Native`. The condition
-/// mirrors this backend's `Native` alias, so a genuinely unused item in the
-/// backend this build actually compiles still trips `dead_code`; an
-/// unconditional allow here would hide it from CI's `clippy -D warnings`.
-#[cfg_attr(
-    not(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )),
-    allow(dead_code)
-)]
 pub(crate) mod driver {
     use super::super::*;
     use super::{

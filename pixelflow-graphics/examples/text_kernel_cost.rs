@@ -85,7 +85,7 @@ fn main() {
                 shape: MEASURE_SHAPE,
                 origin: pixelflow_codegen::emit::origin(),
             },
-            lanes: (pixelflow_codegen::JIT_VECTOR_BYTES / 4) as u32,
+            lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
         };
         let (legal, legal_root) = legalize(arena, root, &collapse).expect("legalize");
         let legalize_t = t1.elapsed();

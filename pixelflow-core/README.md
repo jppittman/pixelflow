@@ -95,9 +95,10 @@ See [`KERNELS_AND_LATTICES.md`](../docs/designs/KERNELS_AND_LATTICES.md) and
 pixel formats. A colour output is four channel kernels in `[0, 1]` packed by integer IR ops
 that `pixelflow-graphics` composes.
 
-**No SIMD in the vocabulary.** `Field` — one SIMD batch of `f32` — is crate-private and is
-only what the collapse ABI is denominated in. Nothing public here names a lane or a vector
-width, and a consumer never constructs one.
+**No SIMD at all.** This crate holds no vector type and no width. The batch a collapse
+executes by is the JIT's, decided at process startup by the CPU
+(`pixelflow_codegen::isa`); nothing here names a lane or a vector width, and a consumer
+never constructs one.
 
 **No expression templates, and no per-batch evaluation.** Manifolds were once zero-sized types
 (`X * X + Y * Y`) monomorphized into a fused kernel and evaluated one SIMD batch at a time,

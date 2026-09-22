@@ -51,7 +51,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::sync::RwLock;
 
-use crate::Field;
 use pixelflow_codegen::CompiledKernel;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformDecl, UniformIdentity};
@@ -304,8 +303,7 @@ impl Manifold {
     ///
     /// # Panics
     ///
-    /// Panics on a degenerate extent, when this build's `Field` width does not
-    /// match the JIT's emitted width, when the kernel declares more buffers
+    /// Panics on a degenerate extent, when the kernel declares more buffers
     /// than [`MAX_BOUND_BUFFERS`] or one too large to index exactly in `f32`,
     /// or if compilation fails.
     #[must_use]
@@ -313,11 +311,6 @@ impl Manifold {
         assert!(
             extent.iter().all(|&e| e > 0),
             "Manifold::compile: degenerate extent {extent:?}"
-        );
-        assert_eq!(
-            core::mem::size_of::<Field>(),
-            pixelflow_codegen::JIT_VECTOR_BYTES,
-            "Manifold::compile: Field width does not match the JIT's emitted width"
         );
         for decl in kernel.buffers() {
             assert!(
@@ -687,8 +680,9 @@ impl BoundManifold {
         ctx[self.buffer_slots + 1] = origin.as_ptr();
         let shape = LatticeShape::new([region.width as u32, region.rows as u32]);
         self.codes.with(shape, |code| {
-            // SAFETY: `compile` checked size_of::<Field>() == JIT_VECTOR_BYTES
-            // and that every declared slot fits `ctx`; `bind` bound a buffer
+            // SAFETY: `compile` checked that every declared slot fits `ctx`;
+            // the code's batch width is its own — it was compiled at the
+            // shape it fills and writes a remainder lane-wise; `bind` bound a buffer
             // of the declared length to each of them and this frame holds
             // those `Arc`s alive for the duration of the call, as it does the
             // block the entry after them points into (one `f32` per argument,

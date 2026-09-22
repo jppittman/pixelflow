@@ -93,6 +93,7 @@ use traffic::{Counting, EmitTraffic};
 use alloc::vec::Vec;
 
 use crate::error::CompileError;
+use crate::isa::Isa;
 use pixelflow_ir::arena::{UniformDecl, UniformId, UniformIdentity};
 use pixelflow_ir::fold::{Binder, Monoid};
 use pixelflow_ir::passes::lattice::{Collapse, Domain};
@@ -1158,8 +1159,7 @@ impl EmitCtx {
         root: pixelflow_ir::arena::ExprId,
         shape: LatticeShape,
     ) -> Result<CompileResult, CompileError> {
-        let mut backend = Native::new(self);
-        let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
+        let lanes = native_register_file(self.clone()).vector_bytes / BYTES_PER_LANE;
         let collapse = Collapse {
             domain: Domain {
                 shape,
@@ -1171,7 +1171,7 @@ impl EmitCtx {
             .map_err(CompileError::Legalize)?;
         let origin_ids = origin_slots(&arena);
         let schedule = arena_to_schedule(&arena, root, origin_ids);
-        compile_via_backend(schedule, &mut backend)
+        compile_native(schedule, self)
     }
 }
 
@@ -3849,41 +3849,49 @@ fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
 // The one place a target decides anything
 // =============================================================================
 
-/// The backend this build emits for.
+/// Drive `schedule` to a kernel on the backend the host's CPU selected.
 ///
 /// Every [`IsaBackend`] compiles on every host — emission is a pure function of
 /// `(schedule, RegisterFile)` into a `Vec<u8>`, and an x86 machine is perfectly
 /// capable of computing NEON instruction words. So the target does not decide
-/// which backends *exist*; it decides which one is *instantiated*, here, once.
+/// which backends *exist*; it decides which one is *instantiated*, here, from
+/// the tier [`crate::isa::detect`] read off CPUID at startup. Each arm
+/// monomorphizes the driver against one concrete backend, exactly as the
+/// `cfg(target_feature)`-selected `Native` alias this replaces did: static
+/// dispatch inside the compile, no `dyn`, no vtable. The one `match` is this,
+/// and it runs once per kernel, not once per instruction.
 ///
-/// `Native` is a concrete type, so the driver monomorphizes against it exactly
-/// as it did when each backend was `#[cfg]`-gated into existence: static
-/// dispatch, no `dyn`, no vtable. What changes is that the other three are
-/// still typechecked, still swept for op coverage, and still unit-testable on
-/// this host — which is what a `#[cfg]` around their definitions was quietly
-/// costing.
+/// `detect` answers `Neon` only on aarch64 and `Avx2`/`Avx512` only on x86-64,
+/// so no arm carries a `cfg`: the other architecture's backend is typechecked,
+/// swept for op coverage and unit-tested on this host, and its arm is never
+/// taken. The SSE2 tier (`x86_64::driver::X86Backend`) has no arm — the floor
+/// is AVX2+FMA (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md), and
+/// the driver stays only until the follow-up that deletes it.
 ///
 /// Genuinely host-bound code lives in [`executable`] (the `KernelFn` ABI types
 /// and the `mmap`/`mprotect` that makes bytes callable) and nowhere else.
-#[cfg(target_arch = "aarch64")]
-type Native = aarch64::driver::Aarch64Backend;
-/// See the aarch64 variant above.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-type Native = avx512::driver::Avx512Backend;
-/// See the aarch64 variant above.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
-type Native = avx2::driver::Avx2Backend;
-/// See the aarch64 variant above.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(target_feature = "avx2"),
-    not(target_feature = "avx512f")
-))]
-type Native = x86_64::driver::X86Backend;
+fn compile_native(
+    schedule: Vec<regalloc::Def>,
+    ctx: EmitCtx,
+) -> Result<CompileResult, CompileError> {
+    match crate::isa::detect() {
+        Isa::Avx2 => compile_via_backend(schedule, &mut avx2::driver::Avx2Backend::new(ctx)),
+        Isa::Avx512 => compile_via_backend(schedule, &mut avx512::driver::Avx512Backend::new(ctx)),
+        Isa::Neon => compile_via_backend(schedule, &mut aarch64::driver::Aarch64Backend::new(ctx)),
+    }
+}
+
+/// The register file of the backend [`compile_native`] instantiates: the
+/// width a kernel is legalized at before it is scheduled, and what the
+/// allocator's tests allocate against without emitting. The same `match`, so
+/// the two cannot name different backends.
+fn native_register_file(ctx: EmitCtx) -> regalloc::RegisterFile {
+    match crate::isa::detect() {
+        Isa::Avx2 => avx2::driver::Avx2Backend::new(ctx).register_file(),
+        Isa::Avx512 => avx512::driver::Avx512Backend::new(ctx).register_file(),
+        Isa::Neon => aarch64::driver::Aarch64Backend::new(ctx).register_file(),
+    }
+}
 
 /// Compile an [`ExprArena`] DAG into a **collapse** kernel for a lattice of
 /// `shape`: the kernel is wrapped in the lattice's folds by
@@ -4295,17 +4303,47 @@ mod tests {
     use super::*;
     use pixelflow_ir::arena::{ExprArena, ExprId};
 
-    /// Lanes in one SIMD batch for this build.
-    const LANES: usize = crate::JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
+    /// Lanes in one SIMD batch at the tier this host selected.
+    fn lanes() -> usize {
+        crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
+    }
 
     /// One sample, so the lattice's origin *is* the point the kernel is
     /// evaluated at: what a test about arithmetic rather than about the loop
     /// nest compiles for.
     const POINT: LatticeShape = LatticeShape::new([1, 1]);
 
-    /// One full batch of one row: `x` runs `x0 .. x0 + LANES`, which is what
-    /// a test about per-lane behaviour needs.
-    const BATCH: LatticeShape = LatticeShape::new([LANES as u32, 1]);
+    /// One full batch of one row: `x` runs `x0 .. x0 + lanes()`, which is
+    /// what a test about per-lane behaviour needs.
+    fn batch() -> LatticeShape {
+        LatticeShape::new([lanes() as u32, 1])
+    }
+
+    /// `Isa::vector_bytes` is the table `jit_vector_bytes` answers from, and
+    /// each backend's register file is the width its kernels are legalized
+    /// and framed at. They state one ISA-defined fact twice; this is what
+    /// keeps them the same fact.
+    #[test]
+    fn every_backends_vector_width_is_its_tiers() {
+        let ctx = EmitCtx::default;
+        let files = [
+            (
+                Isa::Avx2,
+                avx2::driver::Avx2Backend::new(ctx()).register_file(),
+            ),
+            (
+                Isa::Avx512,
+                avx512::driver::Avx512Backend::new(ctx()).register_file(),
+            ),
+            (
+                Isa::Neon,
+                aarch64::driver::Aarch64Backend::new(ctx()).register_file(),
+            ),
+        ];
+        for (isa, file) in files {
+            assert_eq!(file.vector_bytes as usize, isa.vector_bytes(), "{isa:?}");
+        }
+    }
 
     /// Run the collapse `code` is over a plane of exactly `shape`'s extent,
     /// and hand the plane back.
@@ -4340,7 +4378,7 @@ mod tests {
         collapse_into(code, &[], &[], (x, y), POINT)[0]
     }
 
-    /// Evaluate a kernel compiled at [`BATCH`]: one row of `LANES` samples
+    /// Evaluate a kernel compiled at [`batch`]: one row of `lanes()` samples
     /// from `(x, y)`.
     fn eval_batch(
         code: &executable::ExecutableCode,
@@ -4349,7 +4387,7 @@ mod tests {
         x: f32,
         y: f32,
     ) -> Vec<f32> {
-        collapse_into(code, buffers, uniforms, (x, y), BATCH)
+        collapse_into(code, buffers, uniforms, (x, y), batch())
     }
 
     /// `passes::legalize` at `shape` for a target of `lanes` lanes, then
@@ -4375,7 +4413,7 @@ mod tests {
 
     /// [`schedule_for`] at this host's own lane count.
     fn native_schedule(a: &ExprArena, root: ExprId, shape: LatticeShape) -> Vec<regalloc::Def> {
-        schedule_for(a, root, shape, LANES as u32)
+        schedule_for(a, root, shape, lanes() as u32)
     }
 
     /// The uniform slots a schedule built by hand names for the origin.
@@ -4849,7 +4887,7 @@ mod tests {
         let sum = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), two_i);
         let root = a.push_binary(OpKind::Add, x, sum);
 
-        let file = Native::new(EmitCtx::default()).register_file();
+        let file = native_register_file(EmitCtx::default());
         let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
         let j = kernel_fold(&nest, 3).expect("the kernel's fold is three trips");
         assert_eq!(
@@ -4908,7 +4946,7 @@ mod tests {
         let mut previous = None;
         for above in [0, 5] {
             let ctx = EmitCtx::with_max_regs(floor + above);
-            let file = Native::new(ctx.clone()).register_file();
+            let file = native_register_file(ctx.clone());
             assert_eq!(
                 file.scratch.len(),
                 floor + above,
@@ -4961,7 +4999,7 @@ mod tests {
 
         // The structure: two folds, neither inside the other — the inner's
         // def sits in the outer's schedule as a placeholder, opening nothing.
-        let file = Native::new(EmitCtx::default()).register_file();
+        let file = native_register_file(EmitCtx::default());
         let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
         let inner_j = kernel_fold(&nest, 3).expect("the inner fold is three trips");
         let outer_j = kernel_fold(&nest, 2).expect("the outer fold is two trips");
@@ -5261,7 +5299,7 @@ mod tests {
     #[test]
     fn a_leaf_feeding_both_scopes_is_parked_by_the_outer_one() {
         let (a, root) = shared_leaf_kernel();
-        let schedule = native_schedule(&a, root, BATCH);
+        let schedule = native_schedule(&a, root, batch());
         let variance = schedule_variance(&schedule);
         let scoped = scope_schedule(schedule, &variance);
 
@@ -5299,8 +5337,8 @@ mod tests {
     #[test]
     fn a_shared_leaf_is_placed_once_per_scope() {
         let (a, root) = shared_leaf_kernel();
-        let file = Native::new(EmitCtx::default()).register_file();
-        let nest = allocate_nest(native_schedule(&a, root, BATCH), &file);
+        let file = native_register_file(EmitCtx::default());
+        let nest = allocate_nest(native_schedule(&a, root, batch()), &file);
 
         // Every value a scope schedules has an answer at a point in that
         // scope — which is exactly what a single answer per value could not
@@ -6022,7 +6060,7 @@ mod tests {
         /// forming — they would just be testing an ordinary `Select`, which is
         /// the silent-decay shape this file has been bitten by before.
         fn assert_guard_forms(a: &ExprArena, root: ExprId) {
-            let file = Native::new(EmitCtx::default()).register_file();
+            let file = native_register_file(EmitCtx::default());
             let nest = allocate_nest(native_schedule(a, root, POINT), &file);
             assert!(
                 guarded_scope(&nest).is_some(),
@@ -6191,8 +6229,8 @@ mod tests {
             // produce every lane. `y` is the row, so the inner mask is
             // uniform over a batch and takes its branch — both paths, in one
             // call.
-            let batch = compile(&a, root, BATCH).expect("nested guarded select compile");
-            let x0 = -(LANES as f32) / 2.0;
+            let batch = compile(&a, root, batch()).expect("nested guarded select compile");
+            let x0 = -(lanes() as f32) / 2.0;
             for y in [4.0f32, -4.0] {
                 let got = eval_batch(&batch.code, &[], &[], x0, y);
                 for (lane, got) in got.iter().enumerate() {
@@ -6272,7 +6310,7 @@ mod tests {
 
             // The mask must actually be the value that spills.
             let ctx = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH);
-            let file = Native::new(ctx.clone()).register_file();
+            let file = native_register_file(ctx.clone());
             let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
             let (view, guard) = guarded_scope(&nest).expect("a guard formed above");
             assert!(
@@ -6360,8 +6398,8 @@ mod tests {
             let carried = a.push_binary(OpKind::Sub, x, y);
             let root = a.push_binary(OpKind::Add, after, carried);
 
-            let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
-                .register_file();
+            let file =
+                native_register_file(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH));
             let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
             let mut scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
@@ -6479,24 +6517,13 @@ mod tests {
         }
     }
 
-    /// Run an arena kernel at `(x, 0)`. The builtin-parity tests below use
-    /// it. Gated off `+avx512f` (those builtins aren't in the AVX-512 op set
-    /// yet anyway).
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
+    /// Run an arena kernel at `(x, 0)`, on whichever tier this host selected.
+    /// The builtin-parity tests below use it.
     fn run1(arena: &ExprArena, root: ExprId, x: f32) -> f32 {
         run_xy(arena, root, x, 0.0)
     }
 
-    /// Eval at `(x, y)`. Gated off `+avx512f` like `run1`.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
+    /// Eval at `(x, y)`.
     fn run_xy(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
         let r = compile(arena, root, POINT).expect("compile failed");
         eval_point(&r.code, x, y)
@@ -6506,11 +6533,6 @@ mod tests {
     /// runs `lower_dwrt`, so `D(√(x²+y²), x)` compiles to `x / √(x²+y²)`
     /// without the caller ever seeing the derivative machinery.
     #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
     fn dwrt_compiles_to_analytic_derivative() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -6564,11 +6586,6 @@ mod tests {
     /// `passes::lattice::collapse` rebuilds the arena from the root and the
     /// order it hands the scheduler is its own.
     #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
     fn a_deep_spill_frame_compiles_correctly() {
         const TERMS: usize = 40;
         /// Coprime with `TERMS`, so `i -> PAIR(i)` is a permutation with no
@@ -6616,11 +6633,6 @@ mod tests {
     /// reference across a range of inputs — these exercise `emit_arena` →
     /// `emit_unary` directly (not the compiler's lowering).
     #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
     fn x86_unary_builtins_match_scalar() {
         // Tolerances reflect the shared (with aarch64) minimax-polynomial
         // accuracy over a sensible input range; exact ops use tight bounds.
@@ -6734,11 +6746,6 @@ mod tests {
 
     /// Binary transcendentals + comparisons + ternaries, JIT vs scalar.
     #[test]
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
     fn x86_binary_ternary_builtins_match_scalar() {
         // Helper: compile f(X, Y) and eval at (x, y).
         fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
@@ -6852,12 +6859,8 @@ mod tests {
     // are tight.
     /// Transcendental lowering: sin/cos/tan JIT through the shared driver with
     /// no backend ever emitting a transcendental (they expand to arithmetic in
-    /// `lowering`). Validated against `f32` on the default (128-bit) build.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
+    /// `lowering`). Validated against `f32` on whichever tier this host
+    /// selected.
     mod lowering_tests {
         use super::*;
         use pixelflow_ir::arena::ExprArena;
@@ -7016,14 +7019,8 @@ mod tests {
     }
 
     // =========================================================================
-    // x86 shared-pipeline path (schedule → regalloc → spill).
+    // Shared-pipeline path (schedule → regalloc → spill), on the host's tier.
     // =========================================================================
-    // 128-bit build only; gated off `+avx512f` (covered by `avx512_driver`).
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
     mod sched {
         use super::*;
 
@@ -7050,7 +7047,7 @@ mod tests {
         /// — both are in a slot by construction rather than by pressure, so
         /// no kernel ever reaches zero by that measure.
         fn sample_spills(a: &ExprArena, root: ExprId, ctx: EmitCtx) -> usize {
-            let file = Native::new(ctx).register_file();
+            let file = native_register_file(ctx);
             let nest = allocate_nest(native_schedule(a, root, POINT), &file);
             let scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
@@ -7259,7 +7256,7 @@ mod tests {
             let sq = a.push_binary(OpKind::Mul, uu, uu);
             let root = a.push_binary(OpKind::Add, x, sq);
 
-            let schedule = native_schedule(&a, root, BATCH);
+            let schedule = native_schedule(&a, root, batch());
             let variance = schedule_variance(&schedule);
             let scoped = scope_schedule(schedule, &variance);
 
@@ -7319,7 +7316,7 @@ mod tests {
             let scaled = a.push_binary(OpKind::Mul, r1, two);
             let sum = a.push_binary(OpKind::Add, x, r0);
             let root = a.push_binary(OpKind::Add, sum, scaled);
-            let res = compile(&a, root, BATCH).expect("compile");
+            let res = compile(&a, root, batch()).expect("compile");
             assert!(res.hoisted_values >= 1, "2·u₁ is per call");
 
             for block in [[1.0f32, 10.0], [-2.5, 0.25]] {
@@ -7352,7 +7349,7 @@ mod tests {
             let g = a.push_gather(buf, x, zero);
             let r = a.push_uniform(u);
             let root = a.push_binary(OpKind::Add, g, r);
-            let res = compile(&a, root, BATCH).expect("compile");
+            let res = compile(&a, root, batch()).expect("compile");
 
             let out = eval_batch(&res.code, &[data.as_ptr()], &[0.5f32], 0.0, 0.0);
             for (i, got) in out.iter().enumerate() {
@@ -7446,7 +7443,7 @@ mod tests {
                 let idx = a.push_var(axis);
                 let leaf = a.push_buffer(buf);
                 let root = a.push_binary(OpKind::RawGather, leaf, idx);
-                let schedule = native_schedule(&a, root, BATCH);
+                let schedule = native_schedule(&a, root, batch());
                 let got = (
                     count(&schedule, |op| matches!(op, ScheduledOp::Broadcast(..))),
                     count(&schedule, |op| matches!(op, ScheduledOp::Gather(..))),
@@ -7488,7 +7485,7 @@ mod tests {
             let y = a.push_var(1);
             let leaf = a.push_buffer(buf);
             let root = a.push_binary(OpKind::RawGather, leaf, y);
-            let res = compile(&a, root, BATCH).expect("compile");
+            let res = compile(&a, root, batch()).expect("compile");
             for row in [0.0f32, 3.0, 7.0] {
                 let out = eval_batch(&res.code, &[data.as_ptr()], &[], 0.0, row);
                 assert!(
@@ -7594,8 +7591,8 @@ mod tests {
         #[test]
         fn a_base_read_inside_a_fold_is_carried_into_it() {
             let (a, root) = gather_by_row();
-            let file = Native::new(EmitCtx::default()).register_file();
-            let nest = allocate_nest(native_schedule(&a, root, BATCH), &file);
+            let file = native_register_file(EmitCtx::default());
+            let nest = allocate_nest(native_schedule(&a, root, batch()), &file);
             let mut reads = 0;
             for j in 0..nest.fold_count() {
                 let view = nest.scope(regalloc::Scope::Fold(j));
@@ -8188,12 +8185,12 @@ mod tests {
                 origin: origin(),
             };
             let write_root = lattice::collapse(&mut arena, marker, domain);
-            let packed_root = lattice::pack(&mut arena, write_root, LANES as u32);
+            let packed_root = lattice::pack(&mut arena, write_root, lanes() as u32);
             let root = arena.substitute_vars_with(packed_root, &[(MARKER, guard)]);
 
             let ids = origin_slots(&arena);
             let schedule = arena_to_schedule(&arena, root, ids);
-            let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+            let code = compile_native(schedule, EmitCtx::default())
                 .expect("a hand-built Guard should compile")
                 .code;
 

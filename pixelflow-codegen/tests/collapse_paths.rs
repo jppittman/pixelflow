@@ -6,51 +6,56 @@
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
-use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
+use pixelflow_codegen::jit_vector_bytes;
 use pixelflow_ir::arena::{
     BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity,
 };
 use pixelflow_ir::fold::{Binder, Fold, Monoid};
 use pixelflow_ir::{LatticeShape, OpKind};
 
-const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
-const WIDTH: usize = 2 * LANES + 3;
+/// Two full batches and a remainder, at the tier this host selected.
+fn width() -> usize {
+    2 * (jit_vector_bytes() / core::mem::size_of::<f32>()) + 3
+}
 const ROWS: usize = 3;
-const PITCH: usize = WIDTH + 2;
+fn pitch() -> usize {
+    width() + 2
+}
 const ORIGIN: [f32; 2] = [2.0, 5.0];
 
 /// Run `root` over the plane and hand back `(x, y) -> sample`, with the
 /// buffers and uniforms the arena declares supplied from `buffers` and
 /// `uniforms`.
 fn collapse(arena: &ExprArena, root: ExprId, buffers: &[&[f32]], uniforms: &[f32]) -> Vec<f32> {
-    let shape = LatticeShape::new([WIDTH as u32, ROWS as u32]);
+    let shape = LatticeShape::new([width() as u32, ROWS as u32]);
     let code = compile(arena, root, shape).expect("compile");
-    let mut out = vec![f32::NAN; ROWS * PITCH];
+    let mut out = vec![f32::NAN; ROWS * pitch()];
     let origin = ORIGIN;
     let mut ctx: Vec<*const f32> = buffers.iter().map(|b| b.as_ptr()).collect();
     ctx.push(uniforms.as_ptr());
     ctx.push(origin.as_ptr());
     unsafe {
-        code.code.call(ctx.as_ptr(), out.as_mut_ptr(), PITCH);
+        code.code.call(ctx.as_ptr(), out.as_mut_ptr(), pitch());
     }
     out
 }
 
 fn check(out: &[f32], want: impl Fn(f32, f32) -> f32) {
+    let (width, pitch) = (width(), pitch());
     for row in 0..ROWS {
-        for col in 0..WIDTH {
+        for col in 0..width {
             let (x, y) = (ORIGIN[0] + col as f32, ORIGIN[1] + row as f32);
-            let got = out[row * PITCH + col];
+            let got = out[row * pitch + col];
             let want = want(x, y);
             assert!(
                 (got - want).abs() <= 1e-3 * want.abs().max(1.0),
                 "row {row} col {col} (x={x}, y={y}): got {got}, want {want}"
             );
         }
-        for col in WIDTH..PITCH {
+        for col in width..pitch {
             assert!(
-                out[row * PITCH + col].is_nan(),
+                out[row * pitch + col].is_nan(),
                 "row {row} col {col} past the width was written"
             );
         }

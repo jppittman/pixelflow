@@ -1372,27 +1372,21 @@ mod tests {
 /// **This file is where SSE2-specific bugs live, and the only place they
 /// can.** Emission is a pure function into `Vec<u8>`, so everything here
 /// compiles, typechecks and is swept for op coverage on every host, whatever
-/// CPU it has. Only [`Native`](super::super::Native) decides which backend a
-/// build instantiates, and only [`executable`](super::super::executable) needs
-/// the matching hardware.
+/// CPU it has. Only [`executable`](super::super::executable) needs the
+/// matching hardware.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
 ///
-/// Dead only in a build that selected a *different* `Native`. The condition
-/// mirrors this backend's `Native` alias, so a genuinely unused item in the
-/// backend this build actually compiles still trips `dead_code`; an
-/// unconditional allow here would hide it from CI's `clippy -D warnings`.
-#[cfg_attr(
-    not(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx2"),
-        not(target_feature = "avx512f")
-    )),
-    allow(dead_code)
-)]
+/// **Not selectable.** The ISA tier is decided at startup by the CPU, and
+/// the floor is AVX2+FMA (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md),
+/// so `compile_native` in `emit` has no arm for this backend: it is
+/// typechecked, swept and unit-tested, and never instantiated. It stays
+/// only until the follow-up that deletes it, which is why the `dead_code`
+/// allow is unconditional — nothing selects it on any host.
+#[allow(dead_code)]
 pub(crate) mod driver {
     use super::super::*;
     use super::{
