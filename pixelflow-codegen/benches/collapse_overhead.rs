@@ -1,23 +1,30 @@
-//! Isolate Rust-to-JIT call overhead from expression cost.
+//! Time one collapse call over a plane.
 //!
-//! Both cases execute the *same compiled kernel* over the same lattice and
-//! differ only in call granularity: the baseline crosses the Rust↔JIT boundary
-//! once per SIMD group from a Rust loop, the collapse case once for the whole
-//! frame. One kernel timed two ways is what makes the delta attributable to
-//! the boundary; compiling the baseline separately would fold codegen
-//! differences into the same figure.
+//! The old per-batch ABI crossed the Rust↔JIT boundary once per SIMD group,
+//! so this used to isolate that crossing's cost by timing one compiled
+//! kernel two ways — a Rust loop calling it once per group, and one call for
+//! the whole frame — and attributing the delta to the boundary. The collapse
+//! ABI does not have two granularities to compare any more: the lattice's
+//! row, column and lane folds are wrapped around the kernel and compiled
+//! into the loop nest itself (docs/plans/2026-09-16-collapse-is-a-fold.md),
+//! so a compiled kernel's `call` always fills its whole shape in exactly one
+//! crossing — there is no narrower call to time it against.
+//!
+//! What is left, and what this measures, is that one operation: one `call`
+//! filling a plane of a production-representative size.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use pixelflow_codegen::JIT_VECTOR_BYTES;
-use pixelflow_codegen::emit::{CompileResult, compile};
-use pixelflow_ir::OpKind;
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use pixelflow_codegen::emit::compile;
 use pixelflow_ir::arena::ExprArena;
+use pixelflow_ir::{LatticeShape, OpKind};
 
-const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
-const GROUPS: usize = 240;
-const ROWS: usize = 64;
+/// A 256×64 plane — the height a full-frame collapse measured before, and a
+/// width that divides every lane width this build might select (16, 32 or
+/// 64), so this shape's story does not change with `JIT_VECTOR_BYTES`.
+const WIDTH: usize = 256;
+const HEIGHT: usize = 64;
 
 fn arena() -> (ExprArena, pixelflow_ir::arena::ExprId) {
     let mut arena = ExprArena::new();
@@ -31,100 +38,48 @@ fn arena() -> (ExprArena, pixelflow_ir::arena::ExprId) {
     // Was `Z * Z`, on an axis a lattice no longer has — and the ABI passed
     // zero in that lane, so it was a multiply whose result never mattered.
     // Squaring `ys` keeps the node count and the op mix, which is all this
-    // expression owes a call-overhead measurement: the two cases run the
-    // *same* compiled kernel and differ only in call granularity.
+    // expression owes a call-timing measurement.
     let ys2 = arena.push_binary(OpKind::Mul, ys, ys);
     let sum = arena.push_binary(OpKind::Add, xy, ys2);
     let root = arena.push_binary(OpKind::Add, sum, bias);
     (arena, root)
 }
 
-fn bench_collapse_overhead(c: &mut Criterion) {
+fn bench_collapse_call(c: &mut Criterion) {
     let (arena, root) = arena();
-    let collapse = compile(&arena, root).expect("collapse compile must succeed");
-    let mut out = vec![0.0f32; GROUPS * LANES * ROWS];
-    let seq: Vec<f32> = (0..LANES).map(|lane| lane as f32 + 0.5).collect();
+    let shape = LatticeShape::new([WIDTH as u32, HEIGHT as u32]);
+    let collapse = compile(&arena, root, shape).expect("collapse compile must succeed");
+    let mut out = vec![0.0f32; WIDTH * HEIGHT];
+    let origin = [0.5f32, 0.5];
+    // This kernel declares no buffer and no uniform, so the context is the
+    // origin block alone at the slot after the (empty) buffer table and the
+    // (absent) uniform block.
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
 
     // Warm executable pages and branch predictors before Criterion samples.
-    per_group_frame(&collapse, &mut out, &seq, GROUPS, ROWS);
-    collapse_frame(&collapse, &mut out, &seq, GROUPS, ROWS);
+    // SAFETY: `out` holds exactly `WIDTH * HEIGHT` elements laid out at
+    // pitch `WIDTH`, and `ctx` is live for the call.
+    unsafe {
+        collapse.code.call(ctx.as_ptr(), out.as_mut_ptr(), WIDTH);
+    }
 
-    let mut group = c.benchmark_group("jit_collapse_call_overhead");
-    group.throughput(Throughput::Elements((GROUPS * LANES * ROWS) as u64));
-    group.bench_function(BenchmarkId::new("rust_per_group_loop", LANES), |b| {
+    let mut group = c.benchmark_group("jit_collapse_call");
+    group.throughput(Throughput::Elements((WIDTH * HEIGHT) as u64));
+    group.bench_function("one_call_fills_the_plane", |b| {
         b.iter(|| {
-            per_group_frame(
-                black_box(&collapse),
-                black_box(&mut out),
-                &seq,
-                GROUPS,
-                ROWS,
-            )
-        });
-    });
-    group.bench_function(BenchmarkId::new("one_2d_collapse_call", LANES), |b| {
-        b.iter(|| {
-            collapse_frame(
-                black_box(&collapse),
-                black_box(&mut out),
-                &seq,
-                GROUPS,
-                ROWS,
-            )
+            // SAFETY: see the warm-up call above; nothing here changes the
+            // shape or the buffers this context describes.
+            unsafe {
+                black_box(&collapse).code.call(
+                    black_box(ctx.as_ptr()),
+                    black_box(out.as_mut_ptr()),
+                    WIDTH,
+                );
+            }
         });
     });
     group.finish();
 }
 
-/// One boundary crossing per SIMD group, driven from a Rust loop.
-fn per_group_frame(
-    result: &CompileResult,
-    out: &mut [f32],
-    _seq: &[f32],
-    groups: usize,
-    rows: usize,
-) {
-    for row in 0..rows {
-        let y = row as f32 + 0.5;
-        let row_out = &mut out[row * groups * LANES..][..groups * LANES];
-        for g in 0..groups {
-            let x0 = (g * LANES) as f32 + 0.5;
-            let mut x0_vec = [0.0f32; LANES];
-            for (i, lane) in x0_vec.iter_mut().enumerate() {
-                *lane = x0 + i as f32;
-            }
-            let chunk = &mut row_out[g * LANES..][..LANES];
-            unsafe {
-                result.code.call_collapse(
-                    core::ptr::null(),
-                    pixelflow_codegen::TileSlice::single(chunk.as_mut_ptr()),
-                    pixelflow_codegen::Point4::new(x0_vec, [y; LANES], [0.0; LANES], [0.0; LANES]),
-                );
-            }
-        }
-    }
-}
-
-/// One boundary crossing for the whole frame.
-fn collapse_frame(
-    result: &CompileResult,
-    out: &mut [f32],
-    _seq: &[f32],
-    groups: usize,
-    rows: usize,
-) {
-    let mut x0_vec = [0.0f32; LANES];
-    for (i, lane) in x0_vec.iter_mut().enumerate() {
-        *lane = 0.5 + i as f32;
-    }
-    unsafe {
-        result.code.call_collapse(
-            core::ptr::null(),
-            pixelflow_codegen::TileSlice::contiguous(out.as_mut_ptr(), groups, rows),
-            pixelflow_codegen::Point4::new(x0_vec, [0.5; LANES], [0.0; LANES], [0.0; LANES]),
-        );
-    }
-}
-
-criterion_group!(benches, bench_collapse_overhead);
+criterion_group!(benches, bench_collapse_call);
 criterion_main!(benches);

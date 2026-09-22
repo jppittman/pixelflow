@@ -234,7 +234,7 @@ impl CellGridPackedFrame {
         );
         let claim = self.grid_range().intersect(&band);
         if !claim.is_empty() {
-            self.frame.collapse_subrect(
+            self.frame.collapse_rows(
                 PlaneRegion::rows(claim.width(), claim.y0(), claim.rows()),
                 out,
                 stride,
@@ -317,7 +317,7 @@ mod tests {
     }
 
     fn reachable_nodes(arena: &ExprArena, root: ExprId) -> usize {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         let mut count = 0;
         while let Some(id) = stack.pop() {
@@ -554,27 +554,20 @@ mod tests {
     }
 
     /// **The restricted collapse writes exactly its own columns.** A grid
-    /// that covers its frame is the case `RowTail::Exact` exists for:
-    /// `collapse_rows`' overhang policy — "the caller owns the padding" —
-    /// would put the final batch's spare lanes in whatever lies past the
-    /// band, and here that is a sentinel this test owns rather than padding
-    /// nobody reads.
+    /// that covers its frame is the case that shows it: a store that let a
+    /// row's final partial batch overhang would put its spare lanes in
+    /// whatever lies past the band, and here that is a sentinel this test
+    /// owns rather than padding nobody reads.
     ///
-    /// **The discriminating quantity is the STRIDE, not the width.**
-    /// `BandPlan` only overhangs when `stride >= batches · BATCH_LANES`, so a
-    /// stride chosen against one vector width silently stops discriminating
-    /// at another: at width 21, a stride of 24 admits the overhang at 4 lanes
-    /// (`6·4 = 24`) and at 8 (`3·8 = 24`) but not at 16 (`2·16 = 32 > 24`),
-    /// where `Absorbs` falls through to the same row count as `Exact` and the
-    /// mutation is invisible. A stride of 40 clears `batches · BATCH_LANES`
-    /// at 4, 8 and 16 lanes alike. An odd width is still needed — the batch
-    /// must be partial for there to be spare lanes at all — but it is not
-    /// sufficient, and reasoning about it alone is what left this test
-    /// certifying nothing at AVX-512.
+    /// The stride leaves room for such an overhang at 4, 8 and 16 lanes
+    /// alike (width 21 rounds up to 24, 24 and 32; the stride is 40), so a
+    /// store that overhung at any vector width would be seen. An odd width
+    /// is still needed — the batch must be partial for there to be spare
+    /// lanes at all.
     ///
     /// Every other fixture in this module has a grid narrower than its frame,
-    /// where an overhang lands in border columns that are painted over
-    /// immediately afterwards and so cannot be seen at all.
+    /// where an overhang would land in border columns that are painted over
+    /// immediately afterwards and so could not be seen at all.
     #[test]
     fn a_grid_that_covers_its_frame_writes_no_further_than_the_frame() {
         const SENTINEL: u32 = 0xdead_beef;
@@ -772,11 +765,17 @@ mod tests {
     }
 
     /// Pins the packed program's size, in the spirit of
-    /// `reads_of_one_buffer_share_a_slot_but_not_nodes`: 667 = 4 × 157 (each
-    /// `or` re-splices a whole channel fragment) + 4 × 9 (each channel's pack
+    /// `reads_of_one_buffer_share_a_slot_but_not_nodes`. Before `ExprArena`
+    /// hash-consed (Stage C of docs/plans/2026-09-09-exprarena-on-dag.md)
+    /// this was 667 = 4 x 157 (each `or` re-splices a whole channel
+    /// fragment, and node sharing across the four re-splices was the
+    /// e-graph's call, not this arena's) + 4 x 9 (each channel's pack
     /// chain: const 255, mul, const 0, max, const 255, min, trunc, const
-    /// shift, shl) + 3 ors. Node sharing is the e-graph's call once it can
-    /// see `Gather`; this number falling is the sign that landed.
+    /// shift, shl) + 3 ors. Consing now collapses the repetition *within*
+    /// one composed arena for free — the four channels' identical constants
+    /// (0, 255, the shift amounts) and identical pack-chain shapes intern to
+    /// shared nodes — so the pinned count fell to 123 without touching the
+    /// e-graph or `Gather`'s visibility to it.
     #[test]
     fn packed_kernel_node_count_is_the_channel_kernels_plus_the_pack() {
         let shape = CellGridShape {
@@ -788,8 +787,8 @@ mod tests {
         let (arena, root) = kernel.parts();
         assert_eq!(
             reachable_nodes(arena, root),
-            667,
-            "composed packed node count (4 channels of 157, plus the pack)"
+            123,
+            "composed packed node count (4 channels, hash-consed, plus the pack)"
         );
     }
 
@@ -1044,7 +1043,7 @@ mod tests {
     ) {
         use core::fmt::Write as _;
         use pixelflow_ir::arena::ExprNode;
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut reachable = vec![false; len];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
@@ -1091,22 +1090,22 @@ mod tests {
                 ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
                 ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
                 ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-                ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
+                ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
                 ExprNode::Binary(k, a, b) => {
-                    writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+                    writeln!(out, "Bi {k:?} {} {}", d(&dense, a), d(&dense, b))
                 }
                 ExprNode::Ternary(k, a, b, c) => writeln!(
                     out,
                     "T {k:?} {} {} {}",
-                    d(&dense, *a),
-                    d(&dense, *b),
-                    d(&dense, *c)
+                    d(&dense, a),
+                    d(&dense, b),
+                    d(&dense, c)
                 ),
                 // A fold survives the runtime tier now — it is representable
                 // in the e-graph and legalized after extraction — so the dump
                 // has a line for it rather than a panic.
                 ExprNode::Reduce { fold, body } => {
-                    writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+                    writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
                 }
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)

@@ -257,32 +257,16 @@ impl PackedFrame {
     ///
     /// The kernel's root is int-domain: each lane already holds a packed
     /// pixel's bit pattern, and the collapse store is a raw vector store, so
-    /// what reaches memory is exactly what the OR-fold built.
+    /// what reaches memory is exactly what the OR-fold built. Exactly
+    /// `region.width` words per row are written: a program that answers for
+    /// part of a frame leaves the border's columns to whatever paints them.
     ///
     /// # Panics
     ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the band.
+    /// Panics if the region's width or row count is zero, `stride` is less
+    /// than the width, or `out` cannot hold the band.
     pub fn collapse_rows(&self, region: PlaneRegion, out: &mut [u32], stride: usize) {
         self.frame.collapse_int_rows(region, out, stride);
-    }
-
-    /// [`Self::collapse_rows`] for a program that answers for only part of a
-    /// row: **exactly** `region.width` words per row, leaving the rest of the
-    /// stride as it was.
-    ///
-    /// `collapse_rows` lets a row's final partial batch overhang into the
-    /// stride's spare columns, because for a whole-frame scene those columns
-    /// are padding nobody reads. For a scene that covers part of the frame
-    /// they are the *border's* columns, filled by something else, so an
-    /// overhang there is wrong pixels rather than scratch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the sub-rectangle.
-    pub(crate) fn collapse_subrect(&self, region: PlaneRegion, out: &mut [u32], stride: usize) {
-        self.frame.collapse_int_subrect(region, out, stride);
     }
 }
 

@@ -157,7 +157,7 @@ mod tests {
 
     /// Insert an arena subtree into an e-graph, returning its e-class.
     fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> EClassId {
-        match *arena.node(id) {
+        match arena.node(id) {
             ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
             ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
             ExprNode::Param(i) => panic!("Param({i}) reached math tests"),
@@ -197,7 +197,7 @@ mod tests {
                     children: vec![ca, cb, cc],
                 })
             }
-            ExprNode::Nary(kind, _, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
+            ExprNode::Nary(kind, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
         }
     }
 

@@ -30,13 +30,52 @@
 //! though, is known exactly, and bounding the downside by the upside is
 //! enough to keep the analysis honest without a tuned number anywhere.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use pixelflow_ir::kind::OpKind;
+use pixelflow_ir::passes::demand::{Demand, Literal, demand_of};
 
 use super::ScheduledOp;
-use super::demand::{self, Demand, Literal};
 use super::regalloc::{Def, ValueId};
+
+/// This schedule's demand, keyed by [`ValueId`] —
+/// `pixelflow_ir::passes::demand::demand_of` instantiated for
+/// [`ScheduledOp`]: every op passes its own demand through to its operands
+/// unchanged except `Select`, whose mask is observed with the select and
+/// whose arms are observed only under their own polarity. The one
+/// definition of the DNF algebra and the backward pass lives in
+/// `pixelflow-ir`; this closure is the only thing specific to a schedule
+/// (docs/plans/2026-09-09-exprarena-on-dag.md).
+///
+/// `ops`, a dense `ValueId`-indexed lookup, is why this stays O(schedule):
+/// `demand_of`'s closure is called once per live value with only that
+/// value's key, not its `Def`, so the alternative is an O(n) scan per call.
+fn demand_of_schedule(schedule: &[Def], root: ValueId) -> BTreeMap<ValueId, Demand<ValueId>> {
+    let max_vid = schedule.iter().map(|def| def.value.0).max().unwrap_or(0) as usize;
+    let mut ops: Vec<Option<ScheduledOp>> = alloc::vec![None; max_vid + 1];
+    for def in schedule {
+        ops[def.value.0 as usize] = Some(def.op.clone());
+    }
+
+    demand_of(
+        schedule.iter().map(|def| def.value),
+        root,
+        |vid, observed| match ops.get(vid.0 as usize).and_then(Option::as_ref) {
+            Some(ScheduledOp::Ternary(OpKind::Select, mask, if_true, if_false)) => {
+                alloc::vec![
+                    (*mask, observed.clone()),
+                    (*if_true, observed.and_literal(Literal::set(*mask))),
+                    (*if_false, observed.and_literal(Literal::clear(*mask))),
+                ]
+            }
+            Some(op) => super::regalloc::operands(op)
+                .map(|operand| (operand, observed.clone()))
+                .collect(),
+            None => Vec::new(),
+        },
+    )
+}
 
 /// Which arm of a `Select` node a guard branch skips or targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -296,26 +335,7 @@ fn transitive_deps(vid: ValueId, schedule_ops: &[Option<ScheduledOp>]) -> IndexS
         deps.insert(idx);
         // O(1) lookup via dense Vec indexed by ValueId.0
         if let Some(Some(sop)) = schedule_ops.get(idx) {
-            match sop {
-                ScheduledOp::Var(_)
-                | ScheduledOp::Const(_)
-                | ScheduledOp::Uniform(_)
-                | ScheduledOp::Reduce(..) => {}
-                ScheduledOp::Unary(_, c)
-                | ScheduledOp::ShiftImm(_, c, _)
-                | ScheduledOp::Gather(c, _) => {
-                    worklist.push(*c);
-                }
-                ScheduledOp::Binary(_, l, r) => {
-                    worklist.push(*l);
-                    worklist.push(*r);
-                }
-                ScheduledOp::Ternary(_, a, b, c) => {
-                    worklist.push(*a);
-                    worklist.push(*b);
-                    worklist.push(*c);
-                }
-            }
+            worklist.extend(super::regalloc::operands(sop));
         }
     }
     deps
@@ -335,17 +355,11 @@ fn operands_of(vid: ValueId, schedule_ops: &[Option<ScheduledOp>]) -> [Option<Va
     let Some(Some(op)) = schedule_ops.get(vid.0 as usize) else {
         return [None; 3];
     };
-    match op {
-        ScheduledOp::Var(_)
-        | ScheduledOp::Const(_)
-        | ScheduledOp::Uniform(_)
-        | ScheduledOp::Reduce(..) => [None; 3],
-        ScheduledOp::Unary(_, c) | ScheduledOp::ShiftImm(_, c, _) | ScheduledOp::Gather(c, _) => {
-            [Some(*c), None, None]
-        }
-        ScheduledOp::Binary(_, l, r) => [Some(*l), Some(*r), None],
-        ScheduledOp::Ternary(_, a, b, c) => [Some(*a), Some(*b), Some(*c)],
+    let mut out = [None; 3];
+    for (slot, operand) in out.iter_mut().zip(super::regalloc::operands(op)) {
+        *slot = Some(operand);
     }
+    out
 }
 
 /// One `Select`'s arms as schedule positions: the entries each arm computes
@@ -432,9 +446,13 @@ impl SelectArms {
 /// - True-exclusive: only needed by the true arm (skip if mask all-false)
 /// - False-exclusive: only needed by the false arm (skip if mask all-true)
 ///
+/// `external` are values read *outside* this schedule — a scope's roots,
+/// read by the loops inside it — so no arm may own one: a guard skipping the
+/// arm would leave the value unwritten for a loop that runs regardless.
+///
 /// Returns guards sorted by select_idx (ascending).
-pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
-    let arms = select_arms(schedule);
+pub(crate) fn analyze_select_guards(schedule: &[Def], external: &[ValueId]) -> Vec<SelectGuard> {
+    let arms = select_arms(schedule, external);
     let mut telemetry = Telemetry::new();
     let mut guards = Vec::new();
 
@@ -446,7 +464,7 @@ pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
         .is_on()
         .then(|| {
             let root = schedule.last()?.value;
-            Some(demand::demand_of(schedule, root))
+            Some(demand_of_schedule(schedule, root))
         })
         .flatten();
 
@@ -454,8 +472,8 @@ pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
         let ranges = select.ranges();
         let demand_exclusive = demand.as_ref().map_or(ArmPair::new(0, 0), |d| {
             let observed = |v: ValueId| d.get(&v).cloned().unwrap_or_default();
-            let arm = |lit: Literal| observed(select.select_vid).and_literal(lit);
-            let count = |pred: &Demand| {
+            let arm = |lit: Literal<ValueId>| observed(select.select_vid).and_literal(lit);
+            let count = |pred: &Demand<ValueId>| {
                 schedule
                     .iter()
                     .filter(|def| {
@@ -496,7 +514,10 @@ pub(crate) fn analyze_select_guards(schedule: &[Def]) -> Vec<SelectGuard> {
 }
 
 /// Every `Select` in the schedule, with the entries exclusive to each arm.
-fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
+///
+/// `external` values have a consumer outside the schedule (see
+/// [`analyze_select_guards`]), which no arm's closure can contain.
+fn select_arms(schedule: &[Def], external: &[ValueId]) -> Vec<SelectArms> {
     let mut arms = Vec::new();
 
     if schedule.is_empty() {
@@ -532,28 +553,18 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
         alloc::vec![alloc::vec::Vec::new(); max_vid + 1];
     for def in schedule {
         let vid = def.value;
-        let mut add = |child: ValueId| {
+        for child in super::regalloc::operands(&def.op) {
             if (child.0 as usize) <= max_vid {
                 consumers[child.0 as usize].push(vid);
             }
-        };
-        match &def.op {
-            ScheduledOp::Var(_)
-            | ScheduledOp::Const(_)
-            | ScheduledOp::Uniform(_)
-            | ScheduledOp::Reduce(..) => {}
-            ScheduledOp::Unary(_, c)
-            | ScheduledOp::ShiftImm(_, c, _)
-            | ScheduledOp::Gather(c, _) => add(*c),
-            ScheduledOp::Binary(_, a, b) => {
-                add(*a);
-                add(*b);
-            }
-            ScheduledOp::Ternary(_, a, b, c) => {
-                add(*a);
-                add(*b);
-                add(*c);
-            }
+        }
+    }
+    // A reader outside the schedule is a consumer no arm can contain: a name
+    // no def here has, so it is never "in the set" and never the select.
+    const OUTSIDE: ValueId = ValueId(u32::MAX);
+    for root in external {
+        if (root.0 as usize) <= max_vid {
+            consumers[root.0 as usize].push(OUTSIDE);
         }
     }
 
@@ -655,7 +666,12 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
                 indices
                     .iter()
                     .map(|idx| match &schedule[idx].op {
-                        ScheduledOp::Var(_) | ScheduledOp::Const(_) => 0,
+                        ScheduledOp::Var(_)
+                        | ScheduledOp::Lanes(_)
+                        | ScheduledOp::Const(_)
+                        | ScheduledOp::Seq(..) => 0,
+                        // One store, priced as the load a gather is.
+                        ScheduledOp::Write { .. } => cycles.cost(OpKind::RawGather),
                         // One broadcast load; priced as the leaf it is
                         // in the prologue, where it lands.
                         ScheduledOp::Uniform(_) => cycles.cost(OpKind::Uniform),
@@ -674,6 +690,17 @@ fn select_arms(schedule: &[Def]) -> Vec<SelectArms> {
                         ScheduledOp::Reduce(fold, _) => {
                             cycles.cost(OpKind::Reduce) * fold.len() as usize
                         }
+                        // A hard branch, not a select arm of this cost
+                        // estimate's own concern (G2,
+                        // docs/plans/2026-09-12-emit-should-just-emit.md) —
+                        // its own arms are separately scheduled scopes this
+                        // walk never reaches. Priced the same coarse way as
+                        // a surviving `Reduce` above: this is a cluster-
+                        // ordering heuristic (docs/BACKLOG.md X1), not a
+                        // correctness question, so a `Guard` landing in a
+                        // `Select`'s cone (its result feeding an unrelated
+                        // select) costs nothing to be conservative about.
+                        ScheduledOp::Guard(..) => cycles.cost(OpKind::Reduce),
                     })
                     .sum()
             };
@@ -777,7 +804,12 @@ pub(crate) fn cluster_select_arms(schedule: Vec<Def>) -> Vec<Def> {
         // region it rewrites moves, and relative order is preserved within
         // each group, so a select already contiguous inside that region stays
         // contiguous.
-        let arms = select_arms(&current);
+        // Clustering knows nothing of what an enclosing scope reads from
+        // this one: it runs before the roots are placed. That only costs a
+        // guard — the analysis that ranges an arm is told about the roots,
+        // and excludes them — never correctness, since this is a
+        // permutation.
+        let arms = select_arms(&current, &[]);
         let Some(candidate) = arms
             .iter()
             .rev()
@@ -875,17 +907,7 @@ fn is_topological(schedule: &[Def]) -> bool {
     let mut seen = alloc::collections::BTreeSet::new();
     for def in schedule {
         let ready = |c: &ValueId| seen.contains(c) || !defined.contains(c);
-        let ok = match &def.op {
-            ScheduledOp::Var(_)
-            | ScheduledOp::Const(_)
-            | ScheduledOp::Uniform(_)
-            | ScheduledOp::Reduce(..) => true,
-            ScheduledOp::Unary(_, c)
-            | ScheduledOp::ShiftImm(_, c, _)
-            | ScheduledOp::Gather(c, _) => ready(c),
-            ScheduledOp::Binary(_, a, b) => ready(a) && ready(b),
-            ScheduledOp::Ternary(_, a, b, c) => ready(a) && ready(b) && ready(c),
-        };
+        let ok = super::regalloc::operands(&def.op).all(|c| ready(&c));
         if !ok {
             return false;
         }
@@ -911,8 +933,8 @@ struct SelectStat {
     /// Values exclusive to each arm — what a guard could skip if the
     /// exclusive set happened to be contiguous.
     exclusive: ArmPair<usize>,
-    /// What [`demand`](super::demand) calls exclusive to each arm — the
-    /// values observed only where this arm's polarity holds.
+    /// What [`demand_of_schedule`] calls exclusive to each arm — the values
+    /// observed only where this arm's polarity holds.
     ///
     /// Always at least `exclusive`, and the gap is the point: demand
     /// answers *may this be skipped*, while `exclusive` answers the
@@ -948,7 +970,10 @@ fn intruders(arm: &IndexSet, schedule: &[Def]) -> IntruderStats {
             continue;
         }
         total += 1;
-        if matches!(def.op, ScheduledOp::Const(_) | ScheduledOp::Var(_)) {
+        if matches!(
+            def.op,
+            ScheduledOp::Const(_) | ScheduledOp::Var(_) | ScheduledOp::Lanes(_)
+        ) {
             leaves += 1;
         }
     }
@@ -1128,7 +1153,7 @@ mod tests {
             ),
         ];
 
-        let guards = analyze_select_guards(&schedule);
+        let guards = analyze_select_guards(&schedule, &[]);
 
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].select_idx, 3);
@@ -1150,7 +1175,7 @@ mod tests {
             ),
         ];
 
-        let guards = analyze_select_guards(&schedule);
+        let guards = analyze_select_guards(&schedule, &[]);
 
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].select_idx, 3);
@@ -1175,7 +1200,7 @@ mod tests {
             ),
         ];
 
-        let guards = analyze_select_guards(&schedule);
+        let guards = analyze_select_guards(&schedule, &[]);
 
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].select_idx, 2);
@@ -1207,6 +1232,6 @@ mod tests {
             "fixture assumes Recip sits exactly on the gate",
         );
 
-        assert!(analyze_select_guards(&schedule).is_empty());
+        assert!(analyze_select_guards(&schedule, &[]).is_empty());
     }
 }

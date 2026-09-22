@@ -219,7 +219,7 @@ fn escape_json(s: &str) -> String {
 /// `crate::runtime`'s own `reachable_count` traversal shape.
 fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
     let costs = CostModel::latency_prior();
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut seen = vec![false; len];
     let mut stack = vec![root];
     let mut total = 0usize;
@@ -231,7 +231,7 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             ExprNode::Unary(op, _)
             | ExprNode::Binary(op, _, _)
             | ExprNode::Ternary(op, _, _, _)
-            | ExprNode::Nary(op, _, _) => Some(*op),
+            | ExprNode::Nary(op, _) => Some(op),
             ExprNode::Var(_)
             | ExprNode::Const(_)
             | ExprNode::Param(_)

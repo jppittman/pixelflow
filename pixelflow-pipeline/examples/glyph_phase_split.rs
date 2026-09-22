@@ -151,8 +151,12 @@ fn main() {
             // Phase 2: emit. Compiled through the same entry the bake uses,
             // so the two phases sum to what `compile_as_baked` costs.
             let started = Instant::now();
-            let result = pixelflow_codegen::emit::compile(oarena, oroot)
-                .expect("a production glyph compiles");
+            let result = pixelflow_codegen::emit::compile(
+                oarena,
+                oroot,
+                pixelflow_ir::LatticeShape::new([tile, tile]),
+            )
+            .expect("a production glyph compiles");
             let emit = started.elapsed().as_secs_f64() * 1e3;
 
             for &t in &trips {

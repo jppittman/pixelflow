@@ -208,8 +208,8 @@ fn main() {
         args.samples
     );
     entries.sort_by(|a, b| {
-        let na = a.2.nodes_raw().len();
-        let nb = b.2.nodes_raw().len();
+        let na = a.2.len();
+        let nb = b.2.len();
         na.cmp(&nb).then_with(|| a.1.cmp(&b.1))
     });
     let stride = entries.len() as f64 / args.samples as f64;
@@ -270,7 +270,7 @@ fn main() {
 
         let mut curves: Vec<ExprCurve> = Vec::with_capacity(sampled.len());
         for (i, (origin, name, arena, root)) in sampled.iter().enumerate() {
-            let node_count = arena.nodes_raw().len();
+            let node_count = arena.len();
             let class_cap = config_for_node_count(node_count).max_classes;
             // Every rule set needs its own fresh Vec<Box<dyn Rewrite>> — the
             // e-graph consumes it. Rebuilding per expression, per rule-set,

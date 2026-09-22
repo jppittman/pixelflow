@@ -439,7 +439,7 @@ fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
         ExprNode::Unary(op, _)
         | ExprNode::Binary(op, _, _)
         | ExprNode::Ternary(op, _, _, _)
-        | ExprNode::Nary(op, _, _) => Some(*op),
+        | ExprNode::Nary(op, _) => Some(*op),
         ExprNode::Reduce { .. } => Some(OpKind::Reduce),
         // A `Guard` carries no `OpKind` — same as `Ref`, and for the same
         // reason (`ExprArena::kind` panics on either): it names something
@@ -462,8 +462,8 @@ fn ops_stratum(arena: &ExprArena) -> &'static str {
     let mut trans = 0usize;
     let mut root = 0usize;
     let mut poly_only = true;
-    for node in arena.nodes_raw() {
-        let Some(op) = non_leaf_op(node) else {
+    for (_, node) in arena.nodes() {
+        let Some(op) = non_leaf_op(&node) else {
             continue;
         };
         if TRIG_OPS.contains(&op) {
@@ -1227,7 +1227,7 @@ fn run_guided(
 /// no second copy of it to drift (#1108 removed the one there was), so this
 /// adds only the reporting: production discards its stats, this keeps them.
 fn production_probe(arena: &ExprArena, root: ExprId, costs: &CostModel) -> ProductionRow {
-    let node_count = arena.nodes_raw().len();
+    let node_count = arena.len();
     let mut optimizer = Optimizer::production().cost(costs.clone());
     let mut egraph = optimizer.egraph();
     let root_class = pixelflow_search::egraph::insert(
@@ -1282,7 +1282,7 @@ fn evaluate_expression(
         costs,
         ..
     } = *input;
-    let node_count = arena.nodes_raw().len();
+    let node_count = arena.len();
 
     let mut unguided_opt = arm_optimizer(input, None);
     let unguided = run_anytime_curve(&mut unguided_opt, arena, root, APP_CHECKPOINT_GRID);
@@ -2725,8 +2725,7 @@ fn main() {
         let classical: Vec<(String, ExprArena, ExprId)> = entries
             .into_iter()
             .filter(|(name, arena, _)| {
-                name.starts_with(&args.name_prefix)
-                    && tier_name(arena.nodes_raw().len()) == "classical"
+                name.starts_with(&args.name_prefix) && tier_name(arena.len()) == "classical"
             })
             .collect();
         strata_population_out = Some(strata_counts(&classical));
@@ -2777,16 +2776,11 @@ fn main() {
                 entries.len()
             );
         }
-        entries.sort_by(|a, b| {
-            a.1.nodes_raw()
-                .len()
-                .cmp(&b.1.nodes_raw().len())
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        entries.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(&b.0)));
         let mut by_band: BTreeMap<&str, Vec<(String, ExprArena, ExprId)>> = BTreeMap::new();
         for (name, arena, root) in entries {
             by_band
-                .entry(tier_name(arena.nodes_raw().len()))
+                .entry(tier_name(arena.len()))
                 .or_default()
                 .push((name, arena, root));
         }
@@ -2820,7 +2814,7 @@ fn main() {
                 .remove("classical")
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|(_, a, _)| in_node_band(a.nodes_raw().len()))
+                .filter(|(_, a, _)| in_node_band(a.len()))
                 .collect(),
             (args.classical_samples > 0).then_some(args.classical_samples),
         ));
@@ -2830,7 +2824,7 @@ fn main() {
                     .remove(band)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|(_, a, _)| in_node_band(a.nodes_raw().len()))
+                    .filter(|(_, a, _)| in_node_band(a.len()))
                     .collect(),
                 Some(args.other_samples),
             ));
@@ -2959,13 +2953,13 @@ fn main() {
                 i + 1,
                 total,
                 name,
-                arena.nodes_raw().len(),
-                tier_name(arena.nodes_raw().len())
+                arena.len(),
+                tier_name(arena.len())
             );
             let input = CurveInput {
                 arena,
                 root: *root,
-                class_cap: config_for_node_count(arena.nodes_raw().len()).max_classes,
+                class_cap: config_for_node_count(arena.len()).max_classes,
                 costs: &costs,
                 guided_grid: &guided_grid,
             };

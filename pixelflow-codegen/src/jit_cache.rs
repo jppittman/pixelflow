@@ -110,9 +110,8 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // path still clones the arena, and this runs on every compile including
     // the cache hits.
     let expanded = arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ref(_)))
+        .nodes()
+        .any(|(_, n)| matches!(n, ExprNode::Ref(_)))
         .then(|| pixelflow_ir::passes::expand_refs_owned(arena, root));
     let (arena, root) = match &expanded {
         Some((linked, linked_root)) => (linked, *linked_root),
@@ -146,10 +145,10 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
             .map(|(a, r)| (a, *r))
             .unwrap_or((arena, root));
         if buffers.is_empty() && uniforms.is_empty() {
-            return emit::compile(arena, root);
+            return emit::compile(arena, root, shape);
         }
         let (linked, root) = arena.relink(root, &buffers, &uniforms);
-        emit::compile(&linked, root)
+        emit::compile(&linked, root, shape)
     };
 
     // Keyed on the arena *as handed in*, before optimization, plus the shape.
@@ -484,8 +483,8 @@ mod tests {
         let (linked, lroot) = a.relink(root, &[], &uniforms);
         assert_eq!(linked.uniforms(), &[cx, r, cy]);
         assert_eq!(
-            linked.nodes_raw().len(),
-            a.nodes_raw().len(),
+            linked.len(),
+            a.len(),
             "every node here is reachable, so relinking keeps them all"
         );
         let k_linked = Kernel::from_parts(linked, lroot);

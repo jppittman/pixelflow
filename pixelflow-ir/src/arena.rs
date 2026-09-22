@@ -1,20 +1,99 @@
 //! Arena-allocated expression storage.
 //!
-//! [`ExprArena`] stores expression nodes in a flat `Vec<ExprNode>`, indexed by
-//! [`ExprId`] (a 4-byte Copy handle). This eliminates per-node Arc overhead and
-//! gives O(1) `len()` for node counting.
+//! [`ExprArena`] is a [`Dag`](crate::dag::Dag) of expression data, indexed by
+//! [`ExprId`] (a 4-byte Copy handle, translated to and from the DAG's own
+//! opaque `Id` at this file's boundary — `ExprId`'s numeric value tracks the
+//! DAG's own dense position, so the translation is free). This eliminates
+//! per-node Arc overhead and gives O(1) `len()` for node counting.
+//! docs/plans/2026-09-09-exprarena-on-dag.md is the staged migration that got
+//! it here; [`crate::dag`]'s module doc has the design this file follows.
 //!
-//! The arena is append-only. [`ExprArena::clear`] truncates without deallocating,
+//! Construction interns: `push_var`/`push_binary`/… structurally
+//! hash-cons, so two pushes of the same value — same shape, same children —
+//! return the same [`ExprId`]. Kernels are pure, so that is simply the right
+//! answer, not a cache: nothing downstream of an arena can observe *how many*
+//! times equal content was pushed, only what is reachable from a root. What a
+//! caller must not assume any more is that a `push_*` call returns a *fresh*
+//! id — see docs/plans/2026-09-09-exprarena-on-dag.md §5.2 for the callers
+//! that assumption used to reach and how each was made safe under interning.
+//!
+//! The DAG's own storage is append-only and never deallocates before the
+//! whole arena drops. [`ExprArena::clear`] truncates without deallocating,
 //! ready for reuse.
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::dag::{Builder, Id, Node};
 use crate::fold::{Binder, Fold};
 use crate::kernel::Scalar;
 use crate::key::KernelKey;
 use crate::kind::OpKind;
+
+/// This arena's node payload: everything about a node except its edges,
+/// which the underlying [`Dag`](crate::dag::Dag) owns. Distinct from
+/// [`crate::expr::ExprData`], `Kernel`'s own Dag-native payload, which
+/// collapses `Unary`/`Binary`/`Ternary`/`Nary` into one `Op(OpKind)` (arity
+/// read off the edge count) because nothing there ever needs the arity
+/// back: `Kernel` never constructs the same op two ways. `ExprArena` does —
+/// `push_nary` is used for genuinely variable-arity content (`Tuple`) at
+/// every arity including one, two and three — so collapsing here would
+/// silently reclassify a small `Nary` as a `Unary`/`Binary`/`Ternary` the
+/// moment it interned against (or merely came arity-first after) an
+/// unrelated node of that shape, changing `kind`/`children`/`canonical`'s
+/// tag byte for content nothing about the call site suggested would move.
+/// One extra tag per arity is the price of keeping that impossible instead
+/// of merely unlikely.
+///
+/// `Const` keys on the bit pattern, not the `f32`: `f32` is neither `Eq`
+/// nor `Ord`, which the DAG's interning requires, and bits are what
+/// [`ExprArena::subtree_eq`], the JIT cache key and the corpus format
+/// already compare by — `-0.0` and `0.0` are different constants, and a NaN
+/// payload is equal to itself.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+enum NodeData {
+    Var(u8),
+    Const(u32),
+    Param(u8),
+    Buffer(BufferId),
+    Uniform(UniformId),
+    Ref(KernelKey),
+    Unary(OpKind),
+    Binary(OpKind),
+    Ternary(OpKind),
+    Nary(OpKind),
+    Reduce(Fold),
+    /// `Guard`'s two names. The mask is the node's one DAG edge, exactly as
+    /// [`Reduce`](Self::Reduce)'s body and [`Write`](Self::Write)'s value
+    /// are — see [`ExprNode::Guard`]'s doc for why the arms are names and
+    /// not edges.
+    Guard(KernelKey, KernelKey),
+    /// `Write`'s three binders. The value is the node's one DAG edge, as
+    /// for [`Reduce`](Self::Reduce) — see [`ExprNode::Write`]'s doc.
+    Write(Binder, Binder, Binder),
+}
+
+/// [`ExprId`] ⇄ [`Id`]: `ExprId`'s numeric value *is* the DAG's own dense
+/// position, so the translation costs nothing and needs no side table.
+/// Free functions, not methods, because both directions are used before an
+/// `ExprArena` is fully in scope (building the children slice to pass to
+/// `Builder::intern`).
+fn to_dag_id(id: ExprId) -> Id {
+    Id::from_index(id.0)
+}
+
+fn from_dag_id(id: Id) -> ExprId {
+    ExprId(id.index())
+}
+
+/// A node's DAG children, translated to [`ExprId`]s — the one place that
+/// reads [`Node::children`] so [`ExprArena::node`]/[`ExprArena::children`]
+/// do not each restate the translation.
+fn dag_children(n: Node<'_, NodeData>) -> impl Iterator<Item = ExprId> + '_ {
+    n.children()
+        .map(|child| from_dag_id(Id::from_index(child.index())))
+}
 
 /// Coordinate axes a lattice has, and so the coordinate `Var` indices: `X = 0`,
 /// `Y = 1`.
@@ -190,6 +269,21 @@ impl core::hash::Hash for UniformDecl {
 
 // ───────────────────────────────────────── ExprNode ───────────────────────────
 
+/// Where an [`ExprNode::Nary`] node's children live in
+/// [`ExprArena`]'s n-ary slab.
+///
+/// Fields are private: this is storage, not expression semantics, and
+/// docs/plans/2026-09-09-exprarena-on-dag.md's Stage B gate is exactly that
+/// nothing outside this file can name an offset. A value can still be held
+/// and passed around freely — it is `Copy` — but the only thing anything
+/// outside `arena.rs` can do with one is match it as an opaque token; the
+/// children it describes come back through [`ExprArena::children`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NaryChildren {
+    start: u32,
+    len: u16,
+}
+
 /// A single expression node stored in the arena.
 ///
 /// Layout is kept tight: the static assertion below guarantees <= 16 bytes.
@@ -226,8 +320,9 @@ pub enum ExprNode {
     Unary(OpKind, ExprId),
     Binary(OpKind, ExprId, ExprId),
     Ternary(OpKind, ExprId, ExprId, ExprId),
-    /// N-ary node. Children live in `ExprArena::nary_children[start..start+len]`.
-    Nary(OpKind, u32, u16),
+    /// N-ary node. Its children's location is private storage detail — see
+    /// [`NaryChildren`] — and comes back through [`ExprArena::children`].
+    Nary(OpKind, NaryChildren),
     /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
     /// `fold`'s own visited indices (see [`Fold`]'s doc — `lo`, `lo+stride`,
     /// …, [`Fold::len`] of them).
@@ -377,10 +472,30 @@ impl ExactSizeIterator for ExprChildren<'_> {}
 // ───────────────────────────────────── ExprArena ─────────────────────────────
 
 /// Arena-allocated expression storage. Append-only, O(1) drop.
+///
+/// A [`Builder<NodeData>`](crate::dag::Builder) rather than a
+/// [`Dag`](crate::dag::Dag): unlike `Kernel`, which builds once per
+/// combinator call and freezes into a [`Rooted`](crate::dag::Rooted), an
+/// `ExprArena` is grown by an unbounded number of `push_*` calls over its
+/// whole lifetime — every combinator, every rewrite, every corpus read —
+/// so it needs the always-growable builder, never the frozen shape.
 #[derive(Clone)]
 pub struct ExprArena {
-    nodes: Vec<ExprNode>,
+    builder: Builder<NodeData>,
+    /// The append-only cache backing every interned [`ExprNode::Nary`]
+    /// node's children: [`NaryChildren`] is only ever a range into this.
+    /// Not derived from `builder`'s own edges on demand, because
+    /// `ExprChildren::Nary` hands out a borrowed `&[ExprId]` — the same
+    /// contract it had before this file's storage changed — and there is
+    /// nowhere to borrow one from a freshly-computed set of edges. Grown
+    /// exactly once per *distinct* `Nary` node ([`ExprArena::push_nary`]):
+    /// interning a repeat is a no-op here too, via [`Self::nary_ranges`].
     nary_children: Vec<ExprId>,
+    /// Which slice of [`Self::nary_children`] each `Nary` node at this
+    /// dense position owns, filled in the first time that node is
+    /// interned. `None` for every other position — most of them, since
+    /// only `Nary` nodes have an entry at all.
+    nary_ranges: Vec<Option<NaryChildren>>,
     /// Buffer declarations, indexed by [`BufferId`]. The memory analogue of
     /// the symbol table: shapes are static IR, contents are bound at JIT time.
     buffers: Vec<BufferDecl>,
@@ -400,8 +515,9 @@ impl ExprArena {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            nodes: Vec::new(),
+            builder: Builder::new(),
             nary_children: Vec::new(),
+            nary_ranges: Vec::new(),
             buffers: Vec::new(),
             uniforms: Vec::new(),
         }
@@ -411,8 +527,9 @@ impl ExprArena {
     #[must_use]
     pub fn with_capacity(n: usize) -> Self {
         Self {
-            nodes: Vec::with_capacity(n),
+            builder: Builder::with_capacity(n, n),
             nary_children: Vec::new(),
+            nary_ranges: Vec::new(),
             buffers: Vec::new(),
             uniforms: Vec::new(),
         }
@@ -420,8 +537,9 @@ impl ExprArena {
 
     /// Truncate to zero nodes without deallocating backing storage.
     pub fn clear(&mut self) {
-        self.nodes.clear();
+        self.builder.clear();
         self.nary_children.clear();
+        self.nary_ranges.clear();
         self.buffers.clear();
         self.uniforms.clear();
     }
@@ -430,22 +548,25 @@ impl ExprArena {
     #[must_use]
     #[inline]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.builder.dag().len()
     }
 
     /// Returns `true` if the arena contains no nodes.
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.builder.dag().is_empty()
     }
 
     // ───────────────────── push helpers ──────────────────────
 
-    fn push_node(&mut self, node: ExprNode) -> ExprId {
-        let id = ExprId(self.nodes.len() as u32);
-        self.nodes.push(node);
-        id
+    /// Intern `data` with `children`, translating to and from this file's
+    /// [`ExprId`] boundary — the one choke point every `push_*` method
+    /// spends its arguments through. Structural: two pushes of equal `data`
+    /// over equal `children` return the same id (see the module doc).
+    fn intern(&mut self, data: NodeData, children: &[ExprId]) -> ExprId {
+        let dag_children: Vec<Id> = children.iter().copied().map(to_dag_id).collect();
+        from_dag_id(self.builder.intern(data, &dag_children))
     }
 
     /// Push a `Var(i)` node.
@@ -458,7 +579,7 @@ impl ExprArena {
     /// index and a rewrite rule's pattern metavariable, and those namespaces
     /// are dense from zero.
     pub fn push_var(&mut self, i: u8) -> ExprId {
-        self.push_node(ExprNode::Var(i))
+        self.intern(NodeData::Var(i), &[])
     }
 
     /// The retired coordinate axis reachable from `root`, if any — the guard
@@ -479,14 +600,14 @@ impl ExprArena {
     /// trip.
     #[must_use]
     pub fn retired_axis(&self, root: ExprId) -> Option<u8> {
-        let mut seen = alloc::vec![false; self.nodes.len()];
+        let mut seen = alloc::vec![false; self.len()];
         let mut stack = alloc::vec![root];
         while let Some(id) = stack.pop() {
             let idx = id.0 as usize;
             if core::mem::replace(&mut seen[idx], true) {
                 continue;
             }
-            if let ExprNode::Var(i) = &self.nodes[idx]
+            if let ExprNode::Var(i) = &self.node(id)
                 && RETIRED_COORD_AXES.contains(i)
             {
                 return Some(*i);
@@ -510,14 +631,14 @@ impl ExprArena {
     /// nodes a rebuild replaced, and nothing evaluates those.
     #[must_use]
     pub fn free_var_at_or_above(&self, root: ExprId, floor: u8) -> Option<u8> {
-        let mut seen = alloc::vec![false; self.nodes.len()];
+        let mut seen = alloc::vec![false; self.len()];
         let mut stack = alloc::vec![root];
         while let Some(id) = stack.pop() {
             let idx = id.0 as usize;
             if core::mem::replace(&mut seen[idx], true) {
                 continue;
             }
-            if let ExprNode::Var(i) = &self.nodes[idx]
+            if let ExprNode::Var(i) = &self.node(id)
                 && *i >= floor
             {
                 return Some(*i);
@@ -529,12 +650,12 @@ impl ExprArena {
 
     /// Push a `Const(v)` node.
     pub fn push_const(&mut self, v: f32) -> ExprId {
-        self.push_node(ExprNode::Const(v))
+        self.intern(NodeData::Const(v.to_bits()), &[])
     }
 
     /// Push a `Param(i)` node.
     pub fn push_param(&mut self, i: u8) -> ExprId {
-        self.push_node(ExprNode::Param(i))
+        self.intern(NodeData::Param(i), &[])
     }
 
     /// Declare a buffer slot, returning its [`BufferId`].
@@ -565,7 +686,7 @@ impl ExprArena {
             id.0,
             self.buffers.len()
         );
-        self.push_node(ExprNode::Buffer(id))
+        self.intern(NodeData::Buffer(id), &[])
     }
 
     /// Declare a uniform slot, returning its [`UniformId`].
@@ -616,7 +737,7 @@ impl ExprArena {
             id.0,
             self.uniforms.len()
         );
-        self.push_node(ExprNode::Uniform(id))
+        self.intern(NodeData::Uniform(id), &[])
     }
 
     /// Push a `Ref(key)` leaf — a kernel named by content rather than spliced
@@ -629,7 +750,7 @@ impl ExprArena {
     /// where an unknown key is reported. `Kernel::by_ref` is the only
     /// producer.
     pub fn push_ref(&mut self, key: KernelKey) -> ExprId {
-        self.push_node(ExprNode::Ref(key))
+        self.intern(NodeData::Ref(key), &[])
     }
 
     /// Push a `Guard(mask, on, off)` leaf-with-one-child — the hard lowering
@@ -642,7 +763,7 @@ impl ExprArena {
     /// constructible so `Guard` has a way into an arena at all, ahead of the
     /// codegen (G2) and extraction (G3) that give it a meaning beyond one.
     pub fn push_guard(&mut self, mask: ExprId, on: KernelKey, off: KernelKey) -> ExprId {
-        self.push_node(ExprNode::Guard { mask, on, off })
+        self.intern(NodeData::Guard(on, off), &[mask])
     }
 
     /// Get the declaration for a uniform slot.
@@ -680,7 +801,7 @@ impl ExprArena {
     /// count that fits — and each is now a thing the type will not build.
     /// `expand_reduce` lowers a survivor to an unrolled accumulation.
     pub fn push_reduce(&mut self, fold: Fold, body: ExprId) -> ExprId {
-        self.push_node(ExprNode::Reduce { fold, body })
+        self.intern(NodeData::Reduce(fold), &[body])
     }
 
     /// A store of `value` at the lattice position the three binders name —
@@ -696,12 +817,7 @@ impl ExprArena {
         lane: Binder,
         value: ExprId,
     ) -> ExprId {
-        self.push_node(ExprNode::Write {
-            row,
-            col,
-            lane,
-            value,
-        })
+        self.intern(NodeData::Write(row, col, lane), &[value])
     }
 
     /// Get the declaration for a buffer slot.
@@ -724,17 +840,17 @@ impl ExprArena {
 
     /// Push a unary operation node.
     pub fn push_unary(&mut self, op: OpKind, child: ExprId) -> ExprId {
-        self.push_node(ExprNode::Unary(op, child))
+        self.intern(NodeData::Unary(op), &[child])
     }
 
     /// Push a binary operation node.
     pub fn push_binary(&mut self, op: OpKind, a: ExprId, b: ExprId) -> ExprId {
-        self.push_node(ExprNode::Binary(op, a, b))
+        self.intern(NodeData::Binary(op), &[a, b])
     }
 
     /// Push a ternary operation node.
     pub fn push_ternary(&mut self, op: OpKind, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
-        self.push_node(ExprNode::Ternary(op, a, b, c))
+        self.intern(NodeData::Ternary(op), &[a, b, c])
     }
 
     /// Push an N-ary operation node. Children are copied into the internal slab.
@@ -748,72 +864,114 @@ impl ExprArena {
             "push_nary: {} children exceeds u16::MAX",
             children.len()
         );
-        let start = self.nary_children.len() as u32;
-        let len = children.len() as u16;
-        self.nary_children.extend_from_slice(children);
-        self.push_node(ExprNode::Nary(op, start, len))
-    }
-
-    // ───────────────────── raw access (serialization) ───────
-
-    /// Raw slice of all nodes in the arena.
-    #[inline]
-    #[must_use]
-    pub fn nodes_raw(&self) -> &[ExprNode] {
-        &self.nodes
-    }
-
-    /// Raw slice of the nary-children slab.
-    #[inline]
-    #[must_use]
-    pub fn nary_children_raw(&self) -> &[ExprId] {
-        &self.nary_children
-    }
-
-    /// Reconstruct an arena from raw parts.
-    ///
-    /// # Safety contract (logical, not `unsafe`)
-    ///
-    /// The caller must ensure that every `ExprId` referenced by nodes in
-    /// `nodes` is in-bounds, and that `Nary` start/len pairs index validly
-    /// into `nary_children`. Violating this will cause panics on access,
-    /// not UB.
-    /// The reconstructed arena has empty buffer and uniform tables, so it
-    /// cannot hold `Buffer` or `Uniform` nodes.
-    #[must_use]
-    pub fn from_raw(nodes: Vec<ExprNode>, nary_children: Vec<ExprId>) -> Self {
-        Self {
-            nodes,
-            nary_children,
-            buffers: Vec::new(),
-            uniforms: Vec::new(),
+        let id = self.intern(NodeData::Nary(op), children);
+        // Interning a repeat returns an id this table already has an entry
+        // for — the range recorded the first time this exact (op, children)
+        // was pushed. Only a genuinely new node needs one grown.
+        let idx = id.0 as usize;
+        if self.nary_ranges.len() <= idx {
+            self.nary_ranges.resize(idx + 1, None);
         }
+        if self.nary_ranges[idx].is_none() {
+            let start = self.nary_children.len() as u32;
+            let len = children.len() as u16;
+            self.nary_children.extend_from_slice(children);
+            self.nary_ranges[idx] = Some(NaryChildren { start, len });
+        }
+        id
+    }
+
+    // ───────────────────── node observation ──────────────────
+
+    /// Every node with its id, in construction order — children strictly
+    /// before parents, since the arena is append-only and a node may only
+    /// reference an id less than its own.
+    ///
+    /// This is the topological order every "scan every node" pass already
+    /// relies on. A caller that wants a node's edges goes through
+    /// [`ExprArena::children`] instead, never through the n-ary slab
+    /// directly — that slab, and its offsets, are `arena.rs`'s own business
+    /// (docs/plans/2026-09-09-exprarena-on-dag.md, Stage B: nothing outside
+    /// this file names an offset, which is why there is no `nodes_raw`/
+    /// `nary_children_raw` pair here any more).
+    #[inline]
+    #[must_use]
+    pub fn nodes(&self) -> impl DoubleEndedIterator<Item = (ExprId, ExprNode)> + '_ {
+        (0..self.builder.dag().len() as u32).map(move |i| {
+            let id = ExprId(i);
+            (id, self.node(id))
+        })
     }
 
     // ───────────────────── access ────────────────────────────
 
-    /// Get the node at `id`.
+    /// Reconstruct the node at `id`.
+    ///
+    /// Owned, not borrowed: there is no `Vec<ExprNode>` behind this arena
+    /// any more to hold a reference into (docs/plans/2026-09-09-exprarena-
+    /// on-dag.md, Stage C) — every call rebuilds an [`ExprNode`] from this
+    /// node's [`NodeData`] and its DAG edges. Every field `ExprNode` can
+    /// hold is `Copy`, so a caller that used to match `arena.node(id)` by
+    /// reference sees the same bindings matching the owned value directly.
     ///
     /// # Panics
     ///
     /// Panics if `id` is out of bounds.
     #[inline]
     #[must_use]
-    pub fn node(&self, id: ExprId) -> &ExprNode {
-        &self.nodes[id.0 as usize]
-    }
-
-    /// Get the N-ary children slice for a `Nary(_, start, len)` node.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `start + len` exceeds the internal nary_children buffer.
-    #[inline]
-    #[must_use]
-    pub fn nary_children_slice(&self, start: u32, len: u16) -> &[ExprId] {
-        let s = start as usize;
-        let l = len as usize;
-        &self.nary_children[s..s + l]
+    pub fn node(&self, id: ExprId) -> ExprNode {
+        let n = self.builder.dag().get(id.0);
+        match *n {
+            NodeData::Var(i) => ExprNode::Var(i),
+            NodeData::Const(bits) => ExprNode::Const(f32::from_bits(bits)),
+            NodeData::Param(i) => ExprNode::Param(i),
+            NodeData::Buffer(b) => ExprNode::Buffer(b),
+            NodeData::Uniform(u) => ExprNode::Uniform(u),
+            NodeData::Ref(k) => ExprNode::Ref(k),
+            NodeData::Unary(op) => {
+                let mut kids = dag_children(n);
+                let a = kids.next().expect("a Unary node has one DAG child");
+                ExprNode::Unary(op, a)
+            }
+            NodeData::Binary(op) => {
+                let mut kids = dag_children(n);
+                let a = kids.next().expect("a Binary node has two DAG children");
+                let b = kids.next().expect("a Binary node has two DAG children");
+                ExprNode::Binary(op, a, b)
+            }
+            NodeData::Ternary(op) => {
+                let mut kids = dag_children(n);
+                let a = kids.next().expect("a Ternary node has three DAG children");
+                let b = kids.next().expect("a Ternary node has three DAG children");
+                let c = kids.next().expect("a Ternary node has three DAG children");
+                ExprNode::Ternary(op, a, b, c)
+            }
+            NodeData::Nary(op) => {
+                let range = self.nary_ranges[id.0 as usize]
+                    .expect("a Nary node's range is recorded when it is first interned");
+                ExprNode::Nary(op, range)
+            }
+            NodeData::Reduce(fold) => {
+                let mut kids = dag_children(n);
+                let body = kids.next().expect("a Reduce node has one DAG child");
+                ExprNode::Reduce { fold, body }
+            }
+            NodeData::Guard(on, off) => {
+                let mut kids = dag_children(n);
+                let mask = kids.next().expect("a Guard node has one DAG child");
+                ExprNode::Guard { mask, on, off }
+            }
+            NodeData::Write(row, col, lane) => {
+                let mut kids = dag_children(n);
+                let value = kids.next().expect("a Write node has one DAG child");
+                ExprNode::Write {
+                    row,
+                    col,
+                    lane,
+                    value,
+                }
+            }
+        }
     }
 
     /// Get the [`OpKind`] of the node at `id`.
@@ -830,27 +988,27 @@ impl ExprArena {
     #[inline]
     #[must_use]
     pub fn kind(&self, id: ExprId) -> OpKind {
-        match &self.nodes[id.0 as usize] {
-            ExprNode::Var(_) => OpKind::Var,
-            ExprNode::Const(_) | ExprNode::Param(_) => OpKind::Const,
-            ExprNode::Buffer(_) => OpKind::Buffer,
-            ExprNode::Uniform(_) => OpKind::Uniform,
-            ExprNode::Ref(key) => panic!(
+        match *self.builder.dag().get(id.0) {
+            NodeData::Var(_) => OpKind::Var,
+            NodeData::Const(_) | NodeData::Param(_) => OpKind::Const,
+            NodeData::Buffer(_) => OpKind::Buffer,
+            NodeData::Uniform(_) => OpKind::Uniform,
+            NodeData::Ref(key) => panic!(
                 "ExprArena::kind: {key:?} is a reference to a kernel, not an \
                  operation; run passes::expand_refs before asking for a kind"
             ),
-            ExprNode::Unary(op, _) => *op,
-            ExprNode::Binary(op, _, _) => *op,
-            ExprNode::Ternary(op, _, _, _) => *op,
-            ExprNode::Nary(op, _, _) => *op,
-            ExprNode::Reduce { .. } => OpKind::Reduce,
+            NodeData::Unary(op)
+            | NodeData::Binary(op)
+            | NodeData::Ternary(op)
+            | NodeData::Nary(op) => op,
+            NodeData::Reduce(_) => OpKind::Reduce,
             // A branch is not an operation any vocabulary names yet: no
             // extraction can choose one (G1), so no cost table or emitter
             // needs an `OpKind` to dispatch on. Giving it one now would let
             // it into a cost model or emitter switch that has no rule for
             // it; asking for its mask directly is always available and
             // needs no `kind`.
-            ExprNode::Guard { .. } => panic!(
+            NodeData::Guard(..) => panic!(
                 "ExprArena::kind: a Guard is a branch, not an operation — no \
                  OpKind describes it (G3 gives extraction a price for the \
                  choice); ask about its mask directly"
@@ -859,7 +1017,7 @@ impl ExprArena {
             // cost table could price or an arithmetic rule could rewrite,
             // and the one consumer that executes it (the emitter, on the
             // folds a lattice is) reads the node, not a kind.
-            ExprNode::Write { .. } => panic!(
+            NodeData::Write(..) => panic!(
                 "ExprArena::kind: a Write is a store, not an operation — no \
                  OpKind describes it; read the node's value and binders directly"
             ),
@@ -870,32 +1028,58 @@ impl ExprArena {
     #[inline]
     #[must_use]
     pub fn children(&self, id: ExprId) -> ExprChildren<'_> {
-        match &self.nodes[id.0 as usize] {
-            ExprNode::Var(_)
-            | ExprNode::Const(_)
-            | ExprNode::Param(_)
-            | ExprNode::Buffer(_)
-            | ExprNode::Uniform(_)
-            | ExprNode::Ref(_) => ExprChildren::Zero,
-            ExprNode::Unary(_, a) => ExprChildren::One(*a),
-            ExprNode::Binary(_, a, b) => ExprChildren::Two(*a, *b),
-            ExprNode::Ternary(_, a, b, c) => ExprChildren::Three(*a, *b, *c),
-            ExprNode::Nary(_, start, len) => {
-                let s = *start as usize;
-                let l = *len as usize;
+        let n = self.builder.dag().get(id.0);
+        match *n {
+            NodeData::Var(_)
+            | NodeData::Const(_)
+            | NodeData::Param(_)
+            | NodeData::Buffer(_)
+            | NodeData::Uniform(_)
+            | NodeData::Ref(_) => ExprChildren::Zero,
+            NodeData::Unary(_) => {
+                let mut kids = dag_children(n);
+                ExprChildren::One(kids.next().expect("a Unary node has one DAG child"))
+            }
+            NodeData::Binary(_) => {
+                let mut kids = dag_children(n);
+                let a = kids.next().expect("a Binary node has two DAG children");
+                let b = kids.next().expect("a Binary node has two DAG children");
+                ExprChildren::Two(a, b)
+            }
+            NodeData::Ternary(_) => {
+                let mut kids = dag_children(n);
+                let a = kids.next().expect("a Ternary node has three DAG children");
+                let b = kids.next().expect("a Ternary node has three DAG children");
+                let c = kids.next().expect("a Ternary node has three DAG children");
+                ExprChildren::Three(a, b, c)
+            }
+            NodeData::Nary(_) => {
+                let range = self.nary_ranges[id.0 as usize]
+                    .expect("a Nary node's range is recorded when it is first interned");
+                let s = range.start as usize;
+                let l = range.len as usize;
                 ExprChildren::Nary(&self.nary_children[s..s + l])
             }
             // One child, not four: the combiner, the binder and the extent
             // are no longer expressions, so nothing that walks children can
             // reach them, fold them, or cost them.
-            ExprNode::Reduce { body, .. } => ExprChildren::One(*body),
+            NodeData::Reduce(_) => {
+                let mut kids = dag_children(n);
+                ExprChildren::One(kids.next().expect("a Reduce node has one DAG child"))
+            }
             // One child — the mask — exactly as `Reduce` yields its body and
             // `Ref` yields nothing: `on`/`off` are names, not edges, so no
             // walk over children can reach into either arm.
-            ExprNode::Guard { mask, .. } => ExprChildren::One(*mask),
+            NodeData::Guard(..) => {
+                let mut kids = dag_children(n);
+                ExprChildren::One(kids.next().expect("a Guard node has one DAG child"))
+            }
             // One child, the value stored. The binders are the node's own
             // metadata, as a `Reduce`'s fold is: an index, not an operand.
-            ExprNode::Write { value, .. } => ExprChildren::One(*value),
+            NodeData::Write(..) => {
+                let mut kids = dag_children(n);
+                ExprChildren::One(kids.next().expect("a Write node has one DAG child"))
+            }
         }
     }
 
@@ -909,7 +1093,7 @@ impl ExprArena {
         let mut max_depth: usize = 0;
 
         while let Some((id, d)) = stack.pop() {
-            match &self.nodes[id.0 as usize] {
+            match &self.node(id) {
                 ExprNode::Var(_)
                 | ExprNode::Const(_)
                 | ExprNode::Param(_)
@@ -930,9 +1114,9 @@ impl ExprArena {
                     stack.push((*b, d + 1));
                     stack.push((*c, d + 1));
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     if l == 0 {
                         max_depth = max_depth.max(d);
                     } else {
@@ -956,7 +1140,7 @@ impl ExprArena {
         stack.push(root);
 
         while let Some(id) = stack.pop() {
-            match &self.nodes[id.0 as usize] {
+            match &self.node(id) {
                 ExprNode::Var(_) => return true,
                 ExprNode::Const(_)
                 | ExprNode::Param(_)
@@ -973,9 +1157,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -995,16 +1179,16 @@ impl ExprArena {
         let mut stack: Vec<ExprId> = vec![root];
 
         while let Some(id) = stack.pop() {
-            match &self.nodes[id.0 as usize] {
+            match &self.node(id) {
                 ExprNode::Const(v) if !v.is_finite() => return true,
                 ExprNode::Unary(OpKind::Recip, a) => {
-                    if matches!(self.nodes[a.0 as usize], ExprNode::Const(v) if v == 0.0) {
+                    if matches!(self.node(*a), ExprNode::Const(v) if v == 0.0) {
                         return true;
                     }
                     stack.push(*a);
                 }
                 ExprNode::Binary(OpKind::Div, a, b) => {
-                    if matches!(self.nodes[b.0 as usize], ExprNode::Const(v) if v == 0.0) {
+                    if matches!(self.node(*b), ExprNode::Const(v) if v == 0.0) {
                         return true;
                     }
                     stack.push(*a);
@@ -1026,9 +1210,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -1054,7 +1238,7 @@ impl ExprArena {
 
         while let Some(id) = stack.pop() {
             count += 1;
-            match &self.nodes[id.0 as usize] {
+            match &self.node(id) {
                 ExprNode::Var(_)
                 | ExprNode::Const(_)
                 | ExprNode::Param(_)
@@ -1071,9 +1255,9 @@ impl ExprArena {
                     stack.push(*b);
                     stack.push(*c);
                 }
-                ExprNode::Nary(_, start, len) => {
-                    let s = *start as usize;
-                    let l = *len as usize;
+                ExprNode::Nary(_, range) => {
+                    let s = range.start as usize;
+                    let l = range.len as usize;
                     for child in &self.nary_children[s..s + l] {
                         stack.push(*child);
                     }
@@ -1107,7 +1291,7 @@ impl ExprArena {
 
         // We'll build a mapping: old_id -> new_id.
         // Initialize with sentinel values.
-        let old_len = self.nodes.len();
+        let old_len = self.len();
         let mut id_map: Vec<Option<ExprId>> = Vec::new();
         id_map.resize(old_len, None);
 
@@ -1121,7 +1305,7 @@ impl ExprArena {
                         continue;
                     }
                     work.push(Task::Emit(id));
-                    match &self.nodes[id.0 as usize] {
+                    match &self.node(id) {
                         ExprNode::Var(_)
                         | ExprNode::Const(_)
                         | ExprNode::Param(_)
@@ -1140,9 +1324,9 @@ impl ExprArena {
                             work.push(Task::Descend(*b));
                             work.push(Task::Descend(*a));
                         }
-                        ExprNode::Nary(_, start, len) => {
-                            let s = *start as usize;
-                            let l = *len as usize;
+                        ExprNode::Nary(_, range) => {
+                            let s = range.start as usize;
+                            let l = range.len as usize;
                             for child in self.nary_children[s..s + l].iter().rev() {
                                 work.push(Task::Descend(*child));
                             }
@@ -1157,7 +1341,7 @@ impl ExprArena {
                     if id_map[id.0 as usize].is_some() {
                         continue;
                     }
-                    let new_id = match self.nodes[id.0 as usize].clone() {
+                    let new_id = match self.node(id) {
                         ExprNode::Param(i) => {
                             let idx = i as usize;
                             assert!(
@@ -1178,8 +1362,8 @@ impl ExprArena {
                         ExprNode::Const(v) => self.push_const(v),
                         // Buffer and uniform ids stay valid: the tables live
                         // in this arena.
-                        ExprNode::Buffer(b) => self.push_node(ExprNode::Buffer(b)),
-                        ExprNode::Uniform(u) => self.push_node(ExprNode::Uniform(u)),
+                        ExprNode::Buffer(b) => self.push_buffer(b),
+                        ExprNode::Uniform(u) => self.push_uniform(u),
                         // A key is arena-independent, so a reference copies
                         // across as itself.
                         ExprNode::Ref(k) => self.push_ref(k),
@@ -1204,9 +1388,9 @@ impl ExprArena {
                                 .expect("substitute_params: child c not yet mapped for Ternary");
                             self.push_ternary(op, na, nb, nc)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let s = start as usize;
-                            let l = len as usize;
+                        ExprNode::Nary(op, range) => {
+                            let s = range.start as usize;
+                            let l = range.len as usize;
                             let child_ids: Vec<ExprId> = self.nary_children[s..s + l]
                                 .iter()
                                 .map(|old_child| {
@@ -1265,7 +1449,7 @@ impl ExprArena {
     /// [`UniformIdentity`]: one instance read from twenty places is one slot,
     /// and two instances of one builder stay two.
     pub fn splice(&mut self, other: &ExprArena, root: ExprId) -> ExprId {
-        let mut id_map: Vec<Option<ExprId>> = vec![None; other.nodes.len()];
+        let mut id_map: Vec<Option<ExprId>> = vec![None; other.len()];
         // Fragment-local BufferId -> this arena's slot, filled lazily.
         let mut buf_map: Vec<Option<BufferId>> = vec![None; other.buffers.len()];
         let mut uni_map: Vec<Option<UniformId>> = vec![None; other.uniforms.len()];
@@ -1295,7 +1479,7 @@ impl ExprArena {
                     let m = |old: ExprId| {
                         id_map[old.0 as usize].expect("splice: child copied before parent")
                     };
-                    let new_id = match other.nodes[id.0 as usize].clone() {
+                    let new_id = match other.node(id) {
                         ExprNode::Var(i) => self.push_var(i),
                         ExprNode::Const(v) => self.push_const(v),
                         ExprNode::Param(i) => self.push_param(i),
@@ -1348,8 +1532,8 @@ impl ExprArena {
                             let (a, b, c) = (m(a), m(b), m(c));
                             self.push_ternary(op, a, b, c)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let (s, l) = (start as usize, len as usize);
+                        ExprNode::Nary(op, range) => {
+                            let (s, l) = (range.start as usize, range.len as usize);
                             let mapped: Vec<ExprId> = other.nary_children[s..s + l]
                                 .iter()
                                 .map(|c| m(*c))
@@ -1397,7 +1581,7 @@ impl ExprArena {
     pub fn substitute_vars_with(&mut self, root: ExprId, subs: &[(u8, ExprId)]) -> ExprId {
         let lookup = |i: u8| subs.iter().find(|(v, _)| *v == i).map(|(_, id)| *id);
 
-        let old_len = self.nodes.len();
+        let old_len = self.len();
         let mut id_map: Vec<Option<ExprId>> = vec![None; old_len];
 
         enum Task {
@@ -1426,15 +1610,15 @@ impl ExprArena {
                         id_map[old.0 as usize]
                             .expect("substitute_vars_with: child rebuilt before parent")
                     };
-                    let new_id = match self.nodes[id.0 as usize].clone() {
+                    let new_id = match self.node(id) {
                         ExprNode::Var(i) => match lookup(i) {
                             Some(replacement) => replacement,
                             None => self.push_var(i),
                         },
                         ExprNode::Const(v) => self.push_const(v),
                         ExprNode::Param(i) => self.push_param(i),
-                        ExprNode::Buffer(b) => self.push_node(ExprNode::Buffer(b)),
-                        ExprNode::Uniform(u) => self.push_node(ExprNode::Uniform(u)),
+                        ExprNode::Buffer(b) => self.push_buffer(b),
+                        ExprNode::Uniform(u) => self.push_uniform(u),
                         ExprNode::Ref(k) => self.push_ref(k),
                         ExprNode::Unary(op, a) => {
                             let a = m(a);
@@ -1448,8 +1632,8 @@ impl ExprArena {
                             let (a, b, c) = (m(a), m(b), m(c));
                             self.push_ternary(op, a, b, c)
                         }
-                        ExprNode::Nary(op, start, len) => {
-                            let (s, l) = (start as usize, len as usize);
+                        ExprNode::Nary(op, range) => {
+                            let (s, l) = (range.start as usize, range.len as usize);
                             let child_ids: Vec<ExprId> = self.nary_children[s..s + l].to_vec();
                             let mapped: Vec<ExprId> = child_ids.into_iter().map(m).collect();
                             self.push_nary(op, &mapped)
@@ -1557,7 +1741,7 @@ impl ExprArena {
         buffers: &[BufferDecl],
         uniforms: &[UniformDecl],
     ) -> (ExprArena, ExprId) {
-        let mut reachable = vec![false; self.nodes.len()];
+        let mut reachable = vec![false; self.len()];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             if core::mem::replace(&mut reachable[id.0 as usize], true) {
@@ -1585,20 +1769,19 @@ impl ExprArena {
             UniformId(i as u16)
         };
 
-        let mut out = ExprArena {
-            nodes: Vec::with_capacity(self.nodes.len()),
-            nary_children: Vec::new(),
-            buffers: buffers.to_vec(),
-            uniforms: uniforms.to_vec(),
-        };
-        let mut dense: Vec<Option<ExprId>> = vec![None; self.nodes.len()];
-        for (idx, node) in self.nodes.iter().enumerate() {
+        let mut out = ExprArena::with_capacity(self.len());
+        out.buffers = buffers.to_vec();
+        out.uniforms = uniforms.to_vec();
+        let mut dense: Vec<Option<ExprId>> = vec![None; self.len()];
+        for idx in 0..self.len() {
             if !reachable[idx] {
                 continue;
             }
+            let id = ExprId(idx as u32);
+            let node = self.node(id);
             let m =
                 |old: ExprId| dense[old.0 as usize].expect("relink: child densified before parent");
-            let new_id = match node {
+            let new_id = match &node {
                 ExprNode::Var(i) => out.push_var(*i),
                 ExprNode::Const(v) => out.push_const(*v),
                 ExprNode::Param(i) => out.push_param(*i),
@@ -1608,8 +1791,8 @@ impl ExprArena {
                 ExprNode::Unary(op, a) => out.push_unary(*op, m(*a)),
                 ExprNode::Binary(op, a, b) => out.push_binary(*op, m(*a), m(*b)),
                 ExprNode::Ternary(op, a, b, c) => out.push_ternary(*op, m(*a), m(*b), m(*c)),
-                ExprNode::Nary(op, start, len) => {
-                    let (s, l) = (*start as usize, *len as usize);
+                ExprNode::Nary(op, range) => {
+                    let (s, l) = (range.start as usize, range.len as usize);
                     let mapped: Vec<ExprId> =
                         self.nary_children[s..s + l].iter().map(|c| m(*c)).collect();
                     out.push_nary(*op, &mapped)
@@ -1656,7 +1839,7 @@ impl ExprArena {
         while let Some(task) = stack.pop() {
             match task {
                 Task::WriteStr(s) => f.write_str(s)?,
-                Task::Visit(id) => match &self.nodes[id.0 as usize] {
+                Task::Visit(id) => match &self.node(id) {
                     ExprNode::Var(i) => write!(f, "Var({})", i)?,
                     ExprNode::Const(v) => write!(f, "Const({})", v)?,
                     ExprNode::Param(i) => write!(f, "Param({})", i)?,
@@ -1687,9 +1870,9 @@ impl ExprArena {
                         f.write_str(op.name())?;
                         f.write_str("(")?;
                     }
-                    ExprNode::Nary(op, start, len) => {
-                        let s = *start as usize;
-                        let l = *len as usize;
+                    ExprNode::Nary(op, range) => {
+                        let s = range.start as usize;
+                        let l = range.len as usize;
                         stack.push(Task::WriteStr(")"));
                         for (i, child) in self.nary_children[s..s + l].iter().enumerate().rev() {
                             stack.push(Task::Visit(*child));
@@ -1780,10 +1963,10 @@ impl ExprArena {
         stack.push((a, b));
 
         while let Some((s_id, o_id)) = stack.pop() {
-            let s_node = &self.nodes[s_id.0 as usize];
-            let o_node = &other.nodes[o_id.0 as usize];
+            let s_node = self.node(s_id);
+            let o_node = other.node(o_id);
 
-            match (s_node, o_node) {
+            match (&s_node, &o_node) {
                 (ExprNode::Var(si), ExprNode::Var(oi)) => {
                     if si != oi {
                         return false;
@@ -1859,13 +2042,13 @@ impl ExprArena {
                     }
                     stack.push((*s_body, *o_body));
                 }
-                (ExprNode::Nary(s_op, s_start, s_len), ExprNode::Nary(o_op, o_start, o_len)) => {
-                    if s_op != o_op || s_len != o_len {
+                (ExprNode::Nary(s_op, s_range), ExprNode::Nary(o_op, o_range)) => {
+                    if s_op != o_op || s_range.len != o_range.len {
                         return false;
                     }
-                    let ss = *s_start as usize;
-                    let os = *o_start as usize;
-                    let len = *s_len as usize;
+                    let ss = s_range.start as usize;
+                    let os = o_range.start as usize;
+                    let len = s_range.len as usize;
                     for i in 0..len {
                         stack.push((self.nary_children[ss + i], other.nary_children[os + i]));
                     }
@@ -2079,8 +2262,8 @@ mod tests {
 
         match arena.node(new_root) {
             ExprNode::Binary(OpKind::Add, a, b) => {
-                assert!(matches!(arena.node(*a), ExprNode::Const(v) if (*v - 10.0).abs() < 1e-6));
-                assert!(matches!(arena.node(*b), ExprNode::Const(v) if (*v - 20.0).abs() < 1e-6));
+                assert!(matches!(arena.node(a), ExprNode::Const(v) if (v - 10.0).abs() < 1e-6));
+                assert!(matches!(arena.node(b), ExprNode::Const(v) if (v - 20.0).abs() < 1e-6));
             }
             other => panic!("expected Binary(Add, ...), got {:?}", other),
         }
@@ -2105,7 +2288,7 @@ mod tests {
         assert_eq!(arena.kind(gather), OpKind::Gather);
         let children: Vec<ExprId> = arena.children(gather).collect();
         assert_eq!(children.len(), 3);
-        assert!(matches!(arena.node(children[0]), ExprNode::Buffer(b) if *b == buf));
+        assert!(matches!(arena.node(children[0]), ExprNode::Buffer(b) if b == buf));
         assert_eq!(arena.kind(children[0]), OpKind::Buffer);
         assert_eq!(arena.children(children[0]).count(), 0); // Buffer is a leaf
 
@@ -2140,7 +2323,7 @@ mod tests {
         // not expressions, so nothing that walks children can reach them.
         let children: Vec<ExprId> = arena.children(red).collect();
         assert_eq!(children, alloc::vec![body]);
-        assert!(matches!(arena.node(red), ExprNode::Reduce { fold: f, .. } if *f == fold));
+        assert!(matches!(arena.node(red), ExprNode::Reduce { fold: f, .. } if f == fold));
     }
 
     /// A store names its binders and holds its value: one child, three
@@ -2161,7 +2344,7 @@ mod tests {
         assert!(matches!(
             arena.node(write),
             ExprNode::Write { row: r, col: c, lane: n, value: v }
-                if *r == row && *c == col && *n == lane && *v == value
+                if r == row && c == col && n == lane && v == value
         ));
         assert_eq!(
             format!("{}", arena.display(write)),
@@ -2275,7 +2458,7 @@ mod guard_tests {
         assert_eq!(arena.children(guard).len(), 1);
         assert!(matches!(
             arena.node(guard),
-            ExprNode::Guard { mask: m, on: o, off: f } if *m == mask && *o == on && *f == off
+            ExprNode::Guard { mask: m, on: o, off: f } if m == mask && o == on && f == off
         ));
     }
 
@@ -2419,7 +2602,10 @@ mod composition_tests {
         let c = by_hand.push_const(2.5);
         let hand_root = by_hand.push_binary(OpKind::Mul, x, c);
         let _ = root;
-        assert_eq!(folded.nodes_raw(), by_hand.nodes_raw());
+        assert_eq!(
+            folded.nodes().map(|(_, n)| n).collect::<Vec<_>>(),
+            by_hand.nodes().map(|(_, n)| n).collect::<Vec<_>>()
+        );
         assert_eq!(folded_root, hand_root);
         assert!(folded.uniforms().is_empty());
     }

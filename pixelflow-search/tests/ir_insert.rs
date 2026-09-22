@@ -297,7 +297,9 @@ fn project_then_embed_round_trips() {
 }
 
 /// `embed` owns buffer declaration: one slot per distinct identity, however
-/// many leaves name it.
+/// many leaves name it — and, because the arena hash-conses, two leaves
+/// naming the *same* identity are the same value (`Buffer(slot)`, slot equal
+/// both times) and so land on the very same node, not merely the same slot.
 #[test]
 fn embed_declares_one_slot_per_buffer_identity() {
     let decl = BufferDecl {
@@ -313,7 +315,11 @@ fn embed_declares_one_slot_per_buffer_identity() {
         1,
         "one identity must claim exactly one slot"
     );
-    assert_ne!(a, b, "each leaf is its own node, sharing one slot");
+    assert_eq!(
+        a, b,
+        "two Buffer leaves over the same identity are structurally identical \
+         (the same slot both times), so hash-consing interns them to one node"
+    );
 }
 
 /// Projection reports the arity the node actually has, so a caller rebuilding

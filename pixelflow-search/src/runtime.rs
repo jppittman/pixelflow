@@ -167,11 +167,7 @@ fn with_refs_expanded<'a>(
     root: ExprId,
     expanded: &'a mut Option<(ExprArena, ExprId)>,
 ) -> (&'a ExprArena, ExprId) {
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ref(_)))
-    {
+    if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
         return (arena, root);
     }
     let (owned, owned_root) = expanded.insert(pixelflow_ir::passes::expand_refs_owned(arena, root));
@@ -457,8 +453,8 @@ mod tests {
         let warm = warm_start.elapsed();
 
         assert_eq!(
-            opt1.nodes_raw().len(),
-            opt2.nodes_raw().len(),
+            opt1.len(),
+            opt2.len(),
             "cached and fresh optimization must agree on the result shape"
         );
         assert!(
@@ -470,7 +466,7 @@ mod tests {
 
     /// Ids of every node reachable from `root`, discovery order.
     fn reachable_ids(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         let mut out = Vec::new();
         while let Some(id) = stack.pop() {
@@ -498,7 +494,7 @@ mod tests {
         reachable_ids(arena, root)
             .iter()
             .filter_map(|&id| match arena.node(id) {
-                &ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
+                ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
                 _ => None,
             })
             .collect()
@@ -646,7 +642,7 @@ mod tests {
     /// asks rather than for the node shape it used to look for: a fold is
     /// `ExprNode::Reduce` now, not an `Nary`.
     fn reaches_a_binder(arena: &ExprArena, root: ExprId) -> bool {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             if core::mem::replace(&mut seen[id.0 as usize], true) {
@@ -771,7 +767,7 @@ mod congruence_gap_probe {
     /// quantity this computes; the arena walk is kept as the independent
     /// check that they agree.
     fn arena_static_cost(model: &CostModel, arena: &ExprArena, root: ExprId) -> usize {
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut seen = vec![false; len];
         let mut stack = vec![root];
         let mut total = 0usize;
@@ -782,7 +778,7 @@ mod congruence_gap_probe {
             let kind = match arena.node(id) {
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 _ => None,
             };
             if let Some(k) = kind {
@@ -1777,7 +1773,7 @@ pub(crate) mod production_telemetry {
     /// (#1111) is this same number read off the choices instead of the
     /// materialized arena; this walk stays as the independent check.
     fn arena_cost(arena: &ExprArena, root: ExprId, costs: &CostModel) -> usize {
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut seen = vec![false; len];
         let mut stack = vec![root];
         let mut total = 0usize;
@@ -1792,7 +1788,7 @@ pub(crate) mod production_telemetry {
                 | ExprNode::Uniform(_) => None,
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 // A fold survives extraction now; the legalizer unrolls it
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),
@@ -2318,7 +2314,7 @@ mod production_equivalence {
     /// reason: it has to be reproducible by a different build.
     fn digest(arena: &ExprArena, root: ExprId) -> String {
         let mut text = String::new();
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut reachable = vec![false; len];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {

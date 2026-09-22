@@ -34,6 +34,41 @@ scope, and are now fully closed. `aarch64/table.rs` (a separate 1,004-line
 file, `aarch64`'s own submodule) and the excluded disassembler are carried
 forward, along with the rest of the standing backlog.
 
+## Rebased onto the H6 emitter — the driver counts below are history
+
+This pass was measured against `aarch64.rs` at `d36dc79` (3,052 lines).
+#1283 (H6 step 5) then deleted the collapse scaffold, and with it six of the
+`IsaBackend` verbs this pass had just covered. **The 401-mutant sweep and its
+"0 real gaps" result describe the pre-H6 driver and are not a current
+statement about `aarch64.rs`.** A fresh sweep is carried forward.
+
+What the merge with `main` required:
+
+- **`branch_if_counter_done_compares_then_branches` deleted.** `Counter` is
+  gone; the collapse's trip counts are folds the emitter emits as loops, so
+  there is no counter to compare against.
+- **Six stanzas dropped** from the driver forwarding test — `counter_clear`,
+  `counter_step`, `store_result` and both `advance_out` steps — for the same
+  reason, along with `Counter`/`OutStep` themselves.
+- **That test renamed.** It was `every_plain_leaf_isa_backend_method_emits_its_instruction`,
+  true when written and false now: the trait has 23 methods and this test
+  reaches 8. `emit_write`, `test_ge`, `scope_begin`/`scope_end`, `emit_plan`,
+  `emit_resolve` and `frame_ready` are a carried-forward gap, recorded in the
+  test's own doc comment. `emit_write` takes a row, a column, a lane and a
+  width, so it is not a plain leaf and wants its own shape of test.
+- **`scaffold_anchor`/`scaffold_finish` are `anchor`/`finish`** — a rename,
+  and the two tests pinning the ADRP/ADD pair and the 16-byte pool padding
+  port unchanged apart from the name.
+- **`PoolEntry` is `[u32; 4]`, not `u32`.** A pool entry is a whole 128-bit
+  register now (a splat is the common case, the lattice's iota the other), so
+  `emit_pool_entry`, `ConstPool::offset_for` and `pool_entries()` are keyed and
+  asserted on four words. The dedup, offset and overflow tests are otherwise
+  unchanged — what they pin did not move.
+
+No production code changed here either, and the surviving tests still pass:
+252 `pixelflow-codegen` lib tests green.
+
+
 ## STYLE.md compliance: test naming
 
 `aarch64.rs`'s three existing test modules (`tests`, `label_tests`,

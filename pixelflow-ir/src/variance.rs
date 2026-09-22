@@ -348,8 +348,8 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             // Coordinates and reduction index slots each get their own bit.
             // Anything past them is not a variable this analysis knows.
             ExprNode::Var(idx) => {
-                if *idx < Variance::VARIABLES {
-                    Variance::from_var(*idx)
+                if idx < Variance::VARIABLES {
+                    Variance::from_var(idx)
                 } else {
                     Variance::ALL
                 }
@@ -363,7 +363,7 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             // prologue — and unknown on the parameter space, which is why it
             // is not a `Const`.
             ExprNode::Uniform(_) => Variance::CONST,
-            ExprNode::Ref(key) => referent_variance(*key),
+            ExprNode::Ref(key) => referent_variance(key),
             ExprNode::Param(_) => {
                 // Parameters are substituted before JIT compilation.
                 // If we see one here, treat conservatively as all-varying.
@@ -393,8 +393,8 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             // honest answer is the union of every value the branch could
             // read, exactly as `Select`'s soft form already does.
             ExprNode::Guard { mask, on, off } => result[mask.0 as usize]
-                .union(referent_variance(*on))
-                .union(referent_variance(*off)),
+                .union(referent_variance(on))
+                .union(referent_variance(off)),
             // A store varies with what it stores and with where: its three
             // binders are read for the address, so it sits inside all three
             // folds — which is the whole of why the lattice's loops can be
@@ -408,10 +408,9 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
                 .union(Variance::from_var(row.var()))
                 .union(Variance::from_var(col.var()))
                 .union(Variance::from_var(lane.var())),
-            ExprNode::Nary(_, start, len) => {
-                let children = arena.nary_children_slice(*start, *len);
+            ExprNode::Nary(..) => {
                 let mut v = Variance::CONST;
-                for &child in children {
+                for child in arena.children(id) {
                     v = v.union(result[child.0 as usize]);
                 }
                 v
@@ -621,7 +620,7 @@ pub fn find_hoistable_out_of(
                 _,
             ) => 3, // Transcendentals: highest priority
             ExprNode::Unary(_, _) => 1,
-            ExprNode::Binary(op, _, _) => match *op {
+            ExprNode::Binary(op, _, _) => match op {
                 OpKind::Div => 2, // Division is expensive
                 OpKind::Pow | OpKind::Atan2 => 3,
                 _ => 1, // Add, Sub, Mul are cheap
@@ -1144,9 +1143,9 @@ mod tests {
             };
             let own = fold.binder().var();
             let mut reads_own = false;
-            let mut stack = alloc::vec![*body];
+            let mut stack = alloc::vec![body];
             while let Some(n) = stack.pop() {
-                if matches!(arena.node(n), ExprNode::Var(v) if *v == own) {
+                if matches!(arena.node(n), ExprNode::Var(v) if v == own) {
                     reads_own = true;
                     break;
                 }
@@ -1178,8 +1177,6 @@ mod tests {
         let ExprNode::Reduce { body, .. } = arena.node(root) else {
             panic!("expected a Reduce at the root");
         };
-        let body = *body;
-
         let out_of_binder = super::find_hoistable_out_of(4, arena, body, &v, 8);
         let sin = out_of_binder
             .iter()

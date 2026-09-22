@@ -35,7 +35,7 @@ use pixelflow_ir::arena::{
 };
 use pixelflow_ir::variance::LatticeShape;
 use pixelflow_ir::{ExprArena, ExprId, OpKind};
-use pixelflow_pipeline::collapse_bench::{self, LANES, corpus::Trips};
+use pixelflow_pipeline::collapse_bench::{self, LANES};
 use pixelflow_pipeline::shader_bench::{NAMED_KERNEL_NAMES, SHADERTOY_KERNEL_NAMES, named_kernel};
 use pixelflow_pipeline::training::{bezier_family, sh_family};
 use pixelflow_search::egraph::{
@@ -442,7 +442,7 @@ fn existing_names(path: &Path) -> HashSet<String> {
 /// multiset the e-graph's own interning sees. Buffers and uniforms keep
 /// their declarations (identity-equal slots stay one node).
 fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -483,7 +483,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             assert_ne!(d, u32::MAX, "hash_cons: child after parent");
             d
         };
-        let (key, build): (Key, Build) = match *arena.node(id) {
+        let (key, build): (Key, Build) = match arena.node(id) {
             ExprNode::Var(i) => (Key::Var(i), Box::new(move |a| a.push_var(i))),
             ExprNode::Const(v) => (Key::Const(v.to_bits()), Box::new(move |a| a.push_const(v))),
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
@@ -528,12 +528,8 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
                     Box::new(move |a| a.push_ternary(k, x, y, z)),
                 )
             }
-            ExprNode::Nary(k, start, n) => {
-                let kids: Vec<ExprId> = arena
-                    .nary_children_slice(start, n)
-                    .iter()
-                    .map(|&c| ExprId(m(c, &map)))
-                    .collect();
+            ExprNode::Nary(k, ..) => {
+                let kids: Vec<ExprId> = arena.children(id).map(|c| ExprId(m(c, &map))).collect();
                 let raw: Vec<u32> = kids.iter().map(|c| c.0).collect();
                 (Key::Op(k, raw), Box::new(move |a| a.push_nary(k, &kids)))
             }
@@ -572,7 +568,7 @@ fn median_usize(v: &mut [usize]) -> f64 {
 /// Tree count with multiplicity (a spliced subterm counted once per use)
 /// and the latency-prior tree cost, both saturating.
 fn tree_figures(arena: &ExprArena, root: ExprId, costs: &CostModel) -> (u128, u128) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut memo: Vec<Option<(u128, u128)>> = vec![None; len];
     let mut order = Vec::new();
     let mut stack = vec![root];
@@ -669,7 +665,7 @@ fn census(arena: &ExprArena, root: ExprId) -> Census {
         if k == OpKind::Gather || k == OpKind::RawGather {
             gathers += 1;
         }
-        if let &ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
+        if let ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
             selects.push((m, a, b));
         }
     }
@@ -874,32 +870,37 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     let emit_result = if emit_arena.retired_axis(emit_root).is_some() {
         Err(None)
     } else {
-        pixelflow_codegen::emit::compile(&emit_arena, emit_root).map_err(Some)
+        pixelflow_codegen::emit::compile(&emit_arena, emit_root, LatticeShape::new(k.extent))
+            .map_err(Some)
     };
     match emit_result {
         Ok(res) => {
-            let t = &res.traffic;
-            let trips = Trips::of(k.extent, LANES as u32);
-            let feats = collapse_bench::features_of(&res, trips);
-            let total =
-                f64::from(t.frame.instructions + t.row.instructions + t.body.instructions).max(1.0);
+            // `feats.frame`/`.row`/`.body` are `collapse_bench::features_of`'s
+            // three-tier scope split (once-per-call / lattice row loop /
+            // everything nested deeper), not raw fields of `res.traffic`
+            // any more — see that function's doc.
+            let feats = collapse_bench::features_of(&res);
+            let total = f64::from(
+                feats.frame.instructions + feats.row.instructions + feats.body.instructions,
+            )
+            .max(1.0);
             write!(
                 row,
                 ",ok,{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{},{},{},{},{}",
                 feats.bytes_total,
                 res.spill_count,
                 res.hoisted_values,
-                t.carried,
-                t.frame.instructions,
-                t.row.instructions,
-                t.body.instructions,
-                f64::from(t.frame.instructions) / total,
-                f64::from(t.row.instructions) / total,
-                f64::from(t.body.instructions) / total,
+                feats.carried,
+                feats.frame.instructions,
+                feats.row.instructions,
+                feats.body.instructions,
+                f64::from(feats.frame.instructions) / total,
+                f64::from(feats.row.instructions) / total,
+                f64::from(feats.body.instructions) / total,
                 feats.frame.memory_ops(),
                 feats.row.memory_ops(),
                 feats.body.memory_ops(),
-                t.body.remats,
+                feats.body.remats,
                 feats.dyn_memory_ops,
                 feats.dyn_instructions,
             )

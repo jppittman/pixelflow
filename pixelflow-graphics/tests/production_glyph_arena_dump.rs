@@ -23,6 +23,8 @@
 
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::passes::lattice::{Collapse, Domain};
+use pixelflow_ir::LatticeShape;
 
 const FONT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -77,8 +79,21 @@ fn dump_production_glyph_arenas() {
             // `Manifold::compile`'s own `legalize` unrolls it. Legalize here
             // too, so this telemetry dump matches what production actually
             // compiles rather than an arena shape that never reaches the JIT.
-            let (arena, root) =
-                pixelflow_ir::passes::legalize(arena, root).expect("legalize glyph arena");
+            //
+            // `legalize` now always wraps the kernel in the lattice's own
+            // row/column/lane folds around one `Write` — the collapse ABI's
+            // shape (docs/plans/2026-09-16-collapse-is-a-fold.md) — at
+            // whatever shape production bakes this glyph at, `tile_px ×
+            // tile_px`.
+            let collapse = Collapse {
+                domain: Domain {
+                    shape: LatticeShape::new([tile_px as u32, tile_px as u32]),
+                    origin: pixelflow_codegen::emit::origin(),
+                },
+                lanes: (pixelflow_codegen::JIT_VECTOR_BYTES / 4) as u32,
+            };
+            let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
+                .expect("legalize glyph arena");
             let name = format!("glyph{tile_px}:U+{:04X}", ch as u32);
             let path = dir.join(format!("glyph{tile_px}_U{:04X}.arena", ch as u32));
             dump_arena(&arena, root, &name, &path);
@@ -104,7 +119,7 @@ fn dump_production_glyph_arenas() {
 /// which must not grow a test-only serializer.
 fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Path) {
     use std::fmt::Write as _;
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -144,13 +159,13 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
             ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
             ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
             ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
-            ExprNode::Binary(k, a, b) => writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b)),
+            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
+            ExprNode::Binary(k, a, b) => writeln!(out, "Bi {k:?} {} {}", d(&dense, a), d(&dense, b)),
             ExprNode::Ternary(k, a, b, c) => {
-                writeln!(out, "T {k:?} {} {} {}", d(&dense, *a), d(&dense, *b), d(&dense, *c))
+                writeln!(out, "T {k:?} {} {} {}", d(&dense, a), d(&dense, b), d(&dense, c))
             }
             ExprNode::Reduce { fold, body } => {
-                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
             }
             other @ (ExprNode::Param(_)
             | ExprNode::Nary(..)
