@@ -3277,9 +3277,10 @@ pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use
         | ScheduledOp::Uniform(_)
         | ScheduledOp::Reduce(..)
         | ScheduledOp::Seq(..) => (None, None, None),
-        ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) | ScheduledOp::Gather(a, _) => {
-            (Some(*a), None, None)
-        }
+        ScheduledOp::Unary(_, a)
+        | ScheduledOp::ShiftImm(_, a, _)
+        | ScheduledOp::Gather(a, _)
+        | ScheduledOp::Broadcast(a, _) => (Some(*a), None, None),
         ScheduledOp::Write { value, .. } => (Some(*value), None, None),
         // A `Guard`'s mask is the one register operand its own def reads —
         // its two arms are names into a wholly separate arena, not values in

@@ -175,6 +175,22 @@ impl Vex {
         inst
     }
 
+    /// `op reg, [base + index*4]` — the SIB form with a scaled index, which
+    /// a broadcast load reads one element of a plane through. X carries the
+    /// index's high bit, inverted like R and B.
+    fn rm_scaled4(self, reg: u8, base: Gpr, index: Gpr) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let rbit = if reg >= 8 { 0x00 } else { 0x80 };
+        let xbit = if index.0 >= 8 { 0x00 } else { 0x40 };
+        let bbit = if base.0 >= 8 { 0x00 } else { 0x20 };
+        inst.push(0xC4);
+        inst.push(rbit | xbit | bbit | self.map as u8);
+        inst.push(((self.w as u8) << 7) | (0xF << 3) | ((self.l256 as u8) << 2) | self.pp as u8); // vvvv unused
+        inst.push(self.opcode);
+        x86_64::scaled4_operand_into(&mut inst, reg, base, index);
+        inst
+    }
+
     /// `op dst, vvvv, [addr]` — 3-operand VEX.256 with memory operand.
     #[allow(dead_code)]
     fn rrm<D: Disp>(self, dst: u8, vvvv: u8, addr: Mem<D>) -> EncodedInst {
@@ -394,6 +410,30 @@ pub fn emit_uniform_load(
                 disp: Imm32(i32::from(load.offset) * 4),
             },
         ),
+    ])
+    .assemble(code);
+}
+
+/// `dst = splat(buffer[slot][idx])` at 256 bits, the index being the same in
+/// every lane of `idx`: `vcvttss2si index, xmm<idx>`, `mov base, [ctx +
+/// slot*8]`, `vbroadcastss ymm<dst>, [base + index*4]` (VEX.256.66.0F38.W0
+/// 18 /r). See `x86_64::emit_broadcast_load` for the register contract.
+pub fn emit_broadcast_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    idx: Reg,
+    slot: u16,
+    gprs: x86_64::BroadcastGprs,
+) {
+    AsmProgram::from([
+        vcvttss2si_xmm(gprs.index, idx),
+        MovLoadPtr {
+            dst: PtrReg(gprs.base.0),
+            base: gprs.ctx,
+            disp: i32::from(slot) * 8,
+        }
+        .encode(),
+        Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base, gprs.index),
     ])
     .assemble(code);
 }
@@ -1185,6 +1225,23 @@ pub(crate) mod driver {
                             },
                             idx_hi: crate::emit::declared_temp(plan.scratch.temp(2)),
                             res_hi: crate::emit::declared_temp(plan.scratch.temp(3)),
+                        },
+                    );
+                }
+                ResolvedOp::Broadcast { dst, idx, slot } => {
+                    let ctx = self
+                        .file
+                        .gpr_ctx
+                        .expect("AVX2's broadcast load needs a GPR context input");
+                    super::emit_broadcast_load(
+                        code,
+                        *dst,
+                        *idx,
+                        *slot,
+                        x86::BroadcastGprs {
+                            base: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
+                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
+                            ctx: PtrReg(ctx.0),
                         },
                     );
                 }

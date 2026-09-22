@@ -905,6 +905,13 @@ pub enum ResolvedOp {
     /// halves, SSE2 and NEON as four scalar loads. The buffer base pointer is
     /// loaded from the context struct (rdi) at `slot * 8`.
     Gather { dst: Reg, idx: Reg, slot: u16 },
+    /// Lane-uniform gather: `dst = splat(buffer[slot][idx_lane0])`. The one
+    /// index every lane holds is truncated out of lane 0 into a GPR
+    /// (`cvttss2si`, `fcvtzs`), the buffer base is loaded from the context
+    /// at `slot * 8` as a gather's is, and the element is read once and
+    /// broadcast: `vbroadcastss [base + idx*4]` on every x86 tier, `ldr s`
+    /// + `dup` on NEON. No per-lane extract or insert, on any backend.
+    Broadcast { dst: Reg, idx: Reg, slot: u16 },
     /// Uniform broadcast: `dst = splat(block[offset])`. The block's base
     /// pointer is loaded from the context struct at `ctx_slot * 8` — the
     /// entry after the last buffer — and the scalar at `4 * offset` is
@@ -1040,6 +1047,7 @@ pub fn operand_sources(op: &ScheduledOp, resident: [bool; 3]) -> [OperandSource;
         ScheduledOp::Unary(..)
         | ScheduledOp::ShiftImm(..)
         | ScheduledOp::Gather(..)
+        | ScheduledOp::Broadcast(..)
         | ScheduledOp::Write { .. }
         // A `Guard`'s one register operand is its mask — its own arm
         // resolution never reaches `resolve_operands`/`operand_sources`
@@ -2392,6 +2400,16 @@ pub enum ScheduledOp {
     /// leaf is folded out to the `slot` immediate (like `ShiftImm`'s count) so it
     /// never becomes a scheduled value. The index is the one real input.
     Gather(regalloc::ValueId, u16),
+    /// A `Gather` whose index is the same in every lane: one scalar load,
+    /// broadcast. The same `RawGather(Buffer(slot), index)`, split from
+    /// [`ScheduledOp::Gather`] by [`arena_to_schedule`] on the index's
+    /// variance — it lacks the lane binder's bit, so lane 0 *is* the index
+    /// and the other lanes are copies of it. A glyph's per-piece table
+    /// reads are addressed by its fold's own binder and nothing else, which
+    /// makes them this and not a gather; the split is what turns a per-lane
+    /// address sequence (`vpextrd`/`vinsertps` ×4, `vgatherdps`, four
+    /// `umov`/`ldr`/`ins`) into `cvttss2si` + `vbroadcastss [base + idx*4]`.
+    Broadcast(regalloc::ValueId, u16),
     /// Per-call scalar, broadcast from the block: a definition with no
     /// operands — like `Const`, but not a leaf to the placement, since the
     /// load is an instruction worth doing once per call rather than once
@@ -2581,6 +2599,21 @@ fn arena_to_schedule_from(
         }
     }
 
+    // Which reads are the same in every lane. A `RawGather` whose index
+    // lacks the lane binder's bit is one load broadcast, not a gather; the
+    // bit is read here, where the two are split, because the schedule's
+    // own variance (`schedule_variance`) is computed after it is built. No
+    // lane fold — a schedule built from an arena `collapse` never wrapped,
+    // the emit tests' raw arenas — means nothing is known to be
+    // lane-uniform, and every read stays a gather.
+    let variance = lane.map(|_| pixelflow_ir::variance::compute_arena_variance(arena));
+    let lane_uniform = |idx: ExprId| -> bool {
+        match (lane, &variance) {
+            (Some(lane), Some(variance)) => variance[idx.0 as usize].is_invariant_in(lane.var()),
+            _ => false,
+        }
+    };
+
     // ExprId to ValueId mapping. u32::MAX = unmapped (unreachable, or a
     // `Write` node, whose defs are its lane folds').
     let mut id_map = alloc::vec![ValueId(u32::MAX); len];
@@ -2671,12 +2704,19 @@ fn arena_to_schedule_from(
             }
             // RawGather folds its Buffer leaf into the `slot` immediate (like a
             // shift count); only the index operand becomes a scheduled value.
+            // An index the lane binder does not reach is one address for the
+            // whole batch, and the read is a broadcast load rather than a
+            // gather (see `ScheduledOp::Broadcast`).
             ExprNode::Binary(OpKind::RawGather, buf, idx) => {
                 let slot = match arena.node(buf) {
                     ExprNode::Buffer(id) => id.0,
                     other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
                 };
-                ScheduledOp::Gather(map_child(idx), slot)
+                if lane_uniform(idx) {
+                    ScheduledOp::Broadcast(map_child(idx), slot)
+                } else {
+                    ScheduledOp::Gather(map_child(idx), slot)
+                }
             }
             // Unreachable precondition: every compile entry point runs
             // `passes::lower_dwrt` before scheduling, which either rewrites
@@ -2789,7 +2829,10 @@ fn schedule_variance(schedule: &[regalloc::Def]) -> Vec<pixelflow_ir::variance::
             | ScheduledOp::ShiftImm(_, a, _)
             // A gather reads from a bound buffer, whose contents are fixed for
             // the kernel's lifetime — its variance is its index's variance.
-            | ScheduledOp::Gather(a, _) => v[a.0 as usize],
+            // A broadcast is a gather whose index lacks the lane bit, so
+            // the same rule places it in the scope its address varies in.
+            | ScheduledOp::Gather(a, _)
+            | ScheduledOp::Broadcast(a, _) => v[a.0 as usize],
             ScheduledOp::Binary(_, a, b) | ScheduledOp::Seq(a, b) => {
                 v[a.0 as usize].union(v[b.0 as usize])
             }
@@ -3439,6 +3482,14 @@ pub fn resolve_operands(
         ScheduledOp::Gather(child, slot) => {
             let idx = operand(0, *child, &mut reloads);
             ResolvedOp::Gather {
+                dst,
+                idx,
+                slot: *slot,
+            }
+        }
+        ScheduledOp::Broadcast(child, slot) => {
+            let idx = operand(0, *child, &mut reloads);
+            ResolvedOp::Broadcast {
                 dst,
                 idx,
                 slot: *slot,
@@ -7144,6 +7195,142 @@ mod tests {
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
             assert_eq!(words, [0xF940_0809, 0xBD40_0D25, 0x4E04_04A5]);
+        }
+    }
+
+    /// A gather whose address the lane binder does not reach is one scalar
+    /// load broadcast — `ScheduledOp::Broadcast`, split from `Gather` in
+    /// `arena_to_schedule` by the index's variance.
+    mod broadcast {
+        use super::*;
+        use pixelflow_ir::arena::{BufferDecl, BufferId, BufferIdentity};
+
+        fn table(a: &mut ExprArena, width: u32) -> BufferId {
+            a.declare_buffer(BufferDecl {
+                id: BufferIdentity::mint(),
+                width,
+                height: 1,
+            })
+        }
+
+        fn count(schedule: &[regalloc::Def], pred: fn(&ScheduledOp) -> bool) -> usize {
+            schedule.iter().filter(|d| pred(&d.op)).count()
+        }
+
+        /// The split: a read addressed by the row alone is a `Broadcast`,
+        /// one addressed by the column — which the lane binder reaches — a
+        /// `Gather`. The same arena one leaf apart.
+        #[test]
+        fn the_lane_bit_decides_broadcast_or_gather() {
+            for (axis, want) in [(1u8, (1, 0)), (0u8, (0, 1))] {
+                let mut a = ExprArena::new();
+                let buf = table(&mut a, 8);
+                let idx = a.push_var(axis);
+                let leaf = a.push_buffer(buf);
+                let root = a.push_binary(OpKind::RawGather, leaf, idx);
+                let schedule = native_schedule(&a, root, BATCH);
+                let got = (
+                    count(&schedule, |op| matches!(op, ScheduledOp::Broadcast(..))),
+                    count(&schedule, |op| matches!(op, ScheduledOp::Gather(..))),
+                );
+                assert_eq!(got, want, "(broadcasts, gathers) for Var({axis})");
+            }
+        }
+
+        /// A schedule with no lane fold — an arena `collapse` never
+        /// wrapped, which the scheduler still accepts — knows nothing to be
+        /// lane-uniform, so every read stays a gather, a constant address
+        /// included.
+        #[test]
+        fn without_a_lane_fold_every_read_is_a_gather() {
+            let mut a = ExprArena::new();
+            let buf = table(&mut a, 8);
+            let idx = a.push_const(3.0);
+            let leaf = a.push_buffer(buf);
+            let root = a.push_binary(OpKind::RawGather, leaf, idx);
+            let schedule = arena_to_schedule(&a, root, RAW_ORIGIN);
+            assert_eq!(
+                count(&schedule, |op| matches!(op, ScheduledOp::Gather(..))),
+                1
+            );
+            assert_eq!(
+                count(&schedule, |op| matches!(op, ScheduledOp::Broadcast(..))),
+                0
+            );
+        }
+
+        /// Every lane holds the one element the row names, and another row
+        /// another element: the broadcast reads through the same context
+        /// slot a gather does, at the index lane 0 holds.
+        #[test]
+        fn every_lane_holds_the_rows_element() {
+            let data: Vec<f32> = (0..8).map(|i| 10.0 * i as f32 + 1.0).collect();
+            let mut a = ExprArena::new();
+            let buf = table(&mut a, data.len() as u32);
+            let y = a.push_var(1);
+            let leaf = a.push_buffer(buf);
+            let root = a.push_binary(OpKind::RawGather, leaf, y);
+            let res = compile(&a, root, BATCH).expect("compile");
+            for row in [0.0f32, 3.0, 7.0] {
+                let out = eval_batch(&res.code, &[data.as_ptr()], &[], 0.0, row);
+                assert!(
+                    out.iter().all(|&v| v == data[row as usize]),
+                    "row {row}: {out:?}"
+                );
+            }
+        }
+
+        /// The bytes, per backend, for `dst = 5, idx = 6, slot = 2` through
+        /// `rax`/`rcx` with the context in `rdi` — `cvttss2si rcx, xmm6`,
+        /// `mov rax, [rdi + 16]`, `vbroadcastss xmm5/ymm5/zmm5, [rax + rcx*4]`
+        /// — and through `x9`/`x10` with the context in `x0`: `fcvtzs x10,
+        /// s6`, `ldr x9, [x0, #16]`, `ldr s5, [x9, w10, uxtw #2]`, `dup
+        /// v5.4s, v5.s[0]`. The x86 encodings were checked against
+        /// `objdump -M intel`.
+        #[test]
+        fn every_backend_encodes_the_lane_uniform_read() {
+            const MOV_RAX_CTX2: [u8; 7] = [0x48, 0x8B, 0x87, 0x10, 0, 0, 0];
+            let gprs = x86_64::BroadcastGprs {
+                base: x86_64::gpr::RAX,
+                index: x86_64::gpr::RCX,
+                ctx: x86_64::ptr::RDI,
+            };
+
+            let mut sse = Vec::new();
+            x86_64::emit_broadcast_load(&mut sse, Reg(5), Reg(6), 2, gprs);
+            assert_eq!(&sse[..5], &[0xF3, 0x48, 0x0F, 0x2C, 0xCE]);
+            assert_eq!(&sse[5..12], &MOV_RAX_CTX2);
+            assert_eq!(&sse[12..], &[0xC4, 0xE2, 0x79, 0x18, 0x2C, 0x88]);
+
+            let mut avx2 = Vec::new();
+            avx2::emit_broadcast_load(&mut avx2, Reg(5), Reg(6), 2, gprs);
+            assert_eq!(&avx2[..5], &[0xC4, 0xE1, 0xFE, 0x2C, 0xCE]);
+            assert_eq!(&avx2[5..12], &MOV_RAX_CTX2);
+            assert_eq!(&avx2[12..], &[0xC4, 0xE2, 0x7D, 0x18, 0x2C, 0x88]);
+
+            let mut avx512 = Vec::new();
+            avx512::emit_broadcast_load(&mut avx512, Reg(5), Reg(6), 2, gprs);
+            assert_eq!(&avx512[..6], &[0x62, 0xF1, 0xFE, 0x48, 0x2C, 0xCE]);
+            assert_eq!(&avx512[6..13], &MOV_RAX_CTX2);
+            assert_eq!(&avx512[13..], &[0x62, 0xF2, 0x7D, 0x48, 0x18, 0x2C, 0x88]);
+
+            let mut neon = Vec::new();
+            aarch64::emit_broadcast_load(
+                &mut neon,
+                Reg(5),
+                Reg(6),
+                2,
+                aarch64::BroadcastGprs {
+                    base: aarch64::ptr::X9,
+                    index: aarch64::gpr::X10,
+                    ctx: aarch64::ptr::X0,
+                },
+            );
+            let words: Vec<u32> = neon
+                .chunks(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            assert_eq!(words, [0x9E38_00CA, 0xF940_0809, 0xBC6A_5925, 0x4E04_04A5]);
         }
     }
 

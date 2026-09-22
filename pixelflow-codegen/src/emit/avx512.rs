@@ -183,6 +183,26 @@ impl Evex {
         inst
     }
 
+    /// `op zmmREG, [base + index*4]` — the SIB form with a scaled index,
+    /// which a broadcast load reads one element of a plane through. X is
+    /// the index's high bit here, inverted like R and B.
+    fn rm_scaled4(self, reg: u8, base: Gpr, index: Gpr) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let r = ((reg >> 3) & 1) ^ 1;
+        let rp = ((reg >> 4) & 1) ^ 1;
+        let b = ((base.0 >> 3) & 1) ^ 1;
+        let x = ((index.0 >> 3) & 1) ^ 1;
+
+        self.prefix_into(
+            &mut inst,
+            (r << 7) | (x << 6) | (b << 5) | (rp << 4),
+            0x0F,
+            1,
+        );
+        x86_64::scaled4_operand_into(&mut inst, reg, base, index);
+        inst
+    }
+
     /// The 4-byte EVEX prefix plus the opcode byte, shared by both forms.
     /// `reg_ext` is the assembled `R X B R'` nibble of P0; `vvvv`/`vp` are the
     /// extra-source fields. Every one of them is already inverted by the
@@ -275,14 +295,16 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 ///
 /// `Gather`/`Uniform` each need one GPR to hold the buffer/block base pointer
 /// loaded from the context — `rax`, chosen by hand before this work and now a
-/// `RegisterFile::gpr_scratch` reservation. A `Write` converts its row and
-/// column into one each before combining them into the address, and the
-/// remainder's writemask rides in through the second once the address is
-/// done with it; the iota carries each eight bytes in through one.
+/// `RegisterFile::gpr_scratch` reservation — and `Broadcast` that plus one
+/// for its index, since it addresses the element through a SIB rather than
+/// a vector of indices. A `Write` converts its row and column into one each
+/// before combining them into the address, and the remainder's writemask
+/// rides in through the second once the address is done with it; the iota
+/// carries each eight bytes in through one.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
-        ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Write { .. } | ScheduledOp::Broadcast(..) => 2,
         ScheduledOp::Gather(..) | ScheduledOp::Uniform(..) | ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
@@ -485,6 +507,31 @@ pub fn emit_uniform_load(
                 disp: Imm32(i32::from(load.offset) * 4),
             },
         ),
+    ])
+    .assemble(code);
+}
+
+/// `dst = splat(buffer[slot][idx])` at 512 bits, the index being the same in
+/// every lane of `idx`: `vcvttss2si index, xmm<idx>`, `mov base, [ctx +
+/// slot*8]`, `vbroadcastss zmm<dst>, [base + index*4]` (EVEX.512.66.0F38.W0
+/// 18 /r). Three instructions, no writemask, no `vgatherdps`. See
+/// `x86_64::emit_broadcast_load` for the register contract.
+pub fn emit_broadcast_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    idx: Reg,
+    slot: u16,
+    gprs: x86_64::BroadcastGprs,
+) {
+    AsmProgram::from([
+        vcvttss2si_xmm(gprs.index, idx),
+        MovLoadPtr {
+            dst: PtrReg(gprs.base.0),
+            base: gprs.ctx,
+            disp: i32::from(slot) * 8,
+        }
+        .encode(),
+        Evex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base, gprs.index),
     ])
     .assemble(code);
 }
@@ -1382,6 +1429,23 @@ pub(crate) mod driver {
                         AsmProgram::from([Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, gather_dst.0)])
                             .assemble(code);
                     }
+                }
+                ResolvedOp::Broadcast { dst, idx, slot } => {
+                    let ctx = self
+                        .file
+                        .gpr_ctx
+                        .expect("AVX-512's broadcast load needs a GPR context input");
+                    super::emit_broadcast_load(
+                        code,
+                        *dst,
+                        *idx,
+                        *slot,
+                        x86::BroadcastGprs {
+                            base: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
+                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
+                            ctx: PtrReg(ctx.0),
+                        },
+                    );
                 }
                 ResolvedOp::Uniform { dst, load } => {
                     let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
