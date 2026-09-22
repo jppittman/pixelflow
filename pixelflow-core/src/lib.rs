@@ -36,9 +36,10 @@
 //! RGBA, byte lanes or pixel formats. A colour output is four channel kernels
 //! in `[0, 1]` packed by integer IR ops that `pixelflow-graphics` composes.
 //!
-//! **No SIMD in the vocabulary.** The batch width is an implementation detail
-//! of the backends and the collapse ABI; nothing public here names a lane, a
-//! vector, or a `Field`.
+//! **No SIMD at all.** This crate holds no vector type and no width: the
+//! batch a collapse executes by is the JIT's, decided at startup by the CPU
+//! (`pixelflow_codegen::isa`), and a buffer here is `f32`s at a pitch.
+//! Nothing public names a lane or a vector, and nothing private does either.
 //!
 //! **No expression templates.** Manifolds were once zero-sized types that
 //! monomorphized into a fused kernel and evaluated one SIMD batch at a time.
@@ -71,9 +72,9 @@ extern crate std;
 // Modules
 // ============================================================================
 
-/// SIMD backend: the concrete lane types `Field` is built on. Not public —
-/// nothing outside this crate should be able to name a lane or a width.
-pub(crate) mod backend;
+/// Flush-to-zero / denormals-are-zero, as a scoped guard on the FP control
+/// register.
+pub mod fastmath;
 
 /// Lattice: representable functor for kernel evaluation.
 pub mod lattice;
@@ -82,7 +83,7 @@ pub mod lattice;
 // Re-exports (The "Prelude")
 // ============================================================================
 
-pub use backend::fastmath::FastMathGuard;
+pub use fastmath::FastMathGuard;
 pub use pixelflow_ir::{Bits, Kernel, Monoid, Scalar, Uniform};
 
 // Lattice types: the compiled object, what binding it produces, the domain,
@@ -120,83 +121,16 @@ pub mod __macro {
     pub use pixelflow_ir as ir;
 }
 
-// ============================================================================
-// Field: the collapse ABI's vector, and nothing more
-// ============================================================================
-
-// Backend selection is governed by `target_feature` alone — the flag that
-// actually decides what the compiler may emit — and `-C target-cpu=native` sets
-// it, so nothing extra is needed to pick up the build box's own width.
-//
-// Deliberately NOT ANDed against a build-script probe of the build host's CPU.
-// That probe used to exist here, and it made the width depend on the machine
-// doing the compiling: on a host without AVX-512, `+avx512f` silently produced a
-// 256-bit `Field` while `pixelflow-ir` — which has no build script and gates on
-// bare `target_feature` — still emitted 512-bit code, so the two crates
-// disagreed and the build failed on the `transmute` in `lattice`. It also broke
-// cross-compilation, where the host CPU says nothing about the target's.
-//
-// Executing wide code on a narrow host is a *run* concern, and it is already
-// handled where it belongs: `cargo xtask isa-matrix` builds every ISA level
-// unconditionally and gates only running on `host_has_feature`.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-type NativeSimd = backend::x86::F32x16;
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
-type NativeSimd = backend::x86::F32x8;
-
-// Fallback to SSE2 (always available on x86_64)
-#[cfg(all(
-    target_arch = "x86_64",
-    not(target_feature = "avx512f"),
-    not(target_feature = "avx2")
-))]
-type NativeSimd = backend::x86::F32x4;
-
-#[cfg(target_arch = "aarch64")]
-type NativeSimd = backend::arm::F32x4;
-
 // No scalar fallback: the JIT (`Manifold::compile`, and therefore
 // `Lattice::bake`) exists only on x86-64 and aarch64, and there is no
-// interpreter render path. A target without a JIT could compile a `Field` but
+// interpreter render path. A target without a JIT could hold a lattice but
 // could not render anything, so it fails here, loudly, rather than silently
-// building something inert.
+// building something inert. Which x86-64 tier a process runs — AVX2+FMA, or
+// AVX-512 where the host has it — is the JIT's decision, made once at
+// startup from CPUID (`pixelflow_codegen::isa`); this crate carries no
+// vector type to agree or disagree with it.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!(
     "pixelflow-core supports x86-64 and aarch64 only: rendering goes through \
      the JIT, which has no other targets and no interpreter fallback"
 );
-
-/// One SIMD batch of `f32`, at this build's width.
-///
-/// This is the width the **collapse is executed at**, and that is all it
-/// is: the emitted code stores a batch of samples at a time, and
-/// `size_of::<Field>()` is the width a compiled kernel must agree with
-/// (`JIT_VECTOR_BYTES`) — the width this crate's own buffers are laid out
-/// for. Nothing crosses the ABI as a vector any more. It is deliberately
-/// crate-private — SIMD is an implementation detail, and nothing outside this
-/// crate should be able to name a lane, let alone construct one. A consumer
-/// composes `Kernel` values and collapses them.
-///
-/// It carries no arithmetic beyond what the ABI needs. Field arithmetic,
-/// comparison, selection and the transcendental approximations used to live
-/// here, because expressions were evaluated a batch at a time in Rust; they
-/// are the compiler's now.
-#[derive(Copy, Clone, Debug)]
-#[repr(transparent)]
-pub(crate) struct Field(NativeSimd);
-
-impl From<f32> for Field {
-    /// Every lane the same value — a fixed axis, broadcast.
-    #[inline(always)]
-    fn from(val: f32) -> Self {
-        Self(NativeSimd::splat(val))
-    }
-}
-
-/// Lanes in one SIMD batch at this build's width.
-pub const PARALLELISM: usize = NativeSimd::LANES;

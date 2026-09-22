@@ -765,7 +765,6 @@ pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     }
 }
 
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 /// `dst = op(src)`.
 ///
 /// The temp is the allocator's for this instruction; only the reciprocal
@@ -1804,19 +1803,14 @@ mod tests {
 /// can.** Emission is a pure function into `Vec<u8>`, so everything here
 /// compiles, typechecks and is swept for op coverage on every host — an x86
 /// machine computes NEON instruction words perfectly well. Only
-/// [`Native`](super::super::Native) decides which backend a build instantiates,
-/// and only [`executable`](super::super::executable) needs the matching CPU.
+/// `compile_native` in `emit` decides which backend a process instantiates
+/// — from the tier `crate::isa` read off the CPU — and only
+/// [`executable`](super::super::executable) needs the matching CPU.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the same bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
-///
-/// Dead only in a build that selected a *different* `Native`. The condition
-/// mirrors this backend's `Native` alias, so a genuinely unused item in the
-/// backend this build actually compiles still trips `dead_code`; an
-/// unconditional allow here would hide it from CI's `clippy -D warnings`.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) mod driver {
     use super::super::*;
     use super::Mem;

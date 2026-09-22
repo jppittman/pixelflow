@@ -838,7 +838,7 @@ mod tests {
             .zip(&t.trips)
             .map(|(s, trips)| u64::from(s.writes) * trips)
             .sum();
-        let lanes = u64::from(crate::JIT_VECTOR_BYTES as u32 / 4);
+        let lanes = crate::isa::jit_vector_bytes() as u64 / 4;
         let [width, rows] = SHAPE.extent().map(u64::from);
         assert_eq!(dynamic_writes, rows * width.div_ceil(lanes));
     }
