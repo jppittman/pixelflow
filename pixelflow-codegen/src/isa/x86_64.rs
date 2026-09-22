@@ -89,3 +89,23 @@ pub(super) fn runnable() -> Result<&'static [Isa], &'static str> {
     }
     Ok(&[Isa::Avx2])
 }
+
+/// In a test: return early, with a note on stderr, unless this host can
+/// execute `$isa`'s kernels. The harness has no skip, so an early `return`
+/// with a note is what "this host cannot run it" looks like — never a
+/// silent pass, and never a failure for a fact about the machine.
+///
+/// Here rather than beside [`super::host_runs`] because only the two x86
+/// backends' runtime tests ask: an aarch64 build has one tier and nothing to
+/// skip, and a macro it never expands is a warning `-D warnings` refuses.
+#[cfg(test)]
+macro_rules! skip_unless_host_runs {
+    ($isa:expr) => {
+        if !$crate::isa::host_runs($isa) {
+            std::eprintln!("skipped: this host cannot execute {:?} kernels", $isa);
+            return;
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use skip_unless_host_runs;
