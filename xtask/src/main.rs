@@ -21,9 +21,10 @@ fn main() {
         eprintln!("Commands:");
         eprintln!("  bundle-run    Build and run the bundled macOS app");
         eprintln!("  bake-eigen    Parse Stam's eigenstructure binary → Rust consts");
-        eprintln!("  isa-matrix    Build+lint every x86-64 ISA level (SSE2/AVX2/AVX-512);");
-        eprintln!("                run the tests for those this host can execute");
-        eprintln!("                [--clippy to also run clippy per level]");
+        eprintln!("  isa-matrix    Build+lint once, then run the tests once per x86-64 ISA");
+        eprintln!("                tier this host can execute (AVX2, AVX-512), each under");
+        eprintln!("                PIXELFLOW_ISA=<tier>");
+        eprintln!("                [--clippy to also run clippy]");
         eprintln!("                [--smoke to run only the crates whose output IS");
         eprintln!("                 per-level machine code -- presubmit's fast path]");
         eprintln!("                [--build-only to skip test execution entirely]");
@@ -550,65 +551,55 @@ fn find_crash_reports_since(
 // ISA test matrix
 // ============================================================================
 //
-// `.cargo/config.toml` sets no `target-cpu`/`target-feature`, so a plain
-// `cargo build`/`cargo test` always produces SSE2 code on x86-64 — even on a
-// machine with AVX2 or AVX-512 available. Nothing in the default CI pipeline
-// ever exercised the wider JIT backends. This walks every x86-64 ISA level via
-// explicit `-C target-feature` flags — not `-C target-cpu=native`, which bakes
-// in whatever the build machine happens to be and is not reproducible across
-// machines or CI runners.
+// The JIT decides its x86-64 ISA tier at process startup, from CPUID
+// (`pixelflow_codegen::isa`): AVX-512 where the host has it, AVX2+FMA
+// otherwise, and nothing below. A plain `cargo test` therefore exercises
+// exactly one tier — the widest this machine runs — and the narrower backend
+// the host could also execute is never entered. `PIXELFLOW_ISA` overrides
+// the choice downward, and that is all this matrix is: one build of the
+// workspace's test binaries, then the tests run once per tier the host can
+// execute, with the override set. Nothing is rebuilt per level, because
+// nothing about the build changes per level any more — the tier is not a
+// `target-feature`, and every backend compiles on every host.
 //
-// Build and execute are separated deliberately, because they have different
-// requirements. COMPILING for a target feature needs no matching hardware;
-// only RUNNING the result does. So every level is built and linted
-// unconditionally — that is what catches cfg mistakes, missing backend ops and
-// lints, none of which need the CPU — and only the execution step is gated on
-// `is_x86_feature_detected!`. A level the host cannot run therefore reports
-// BUILT+LINT, not SKIP: an AVX-512-less runner still type-checks and lints the
-// AVX-512 build, which is most of the value.
-//
-// Note the gate is per-LEVEL, not per-test: the whole workspace is compiled
-// with the level's target-feature, so rustc may emit those instructions
-// anywhere in the binary. It is not sufficient that an individual test avoids
-// them.
+// Which tiers this host can execute is asked with `is_x86_feature_detected!`,
+// naming the same features `pixelflow_codegen::isa` probes for (each
+// `ISA_LEVELS` entry says which), so a level this runs is a level the JIT
+// would select. A level the host cannot run is reported NOT RUN, never
+// silently skipped: its code was built and linted with everything else.
 
 /// One row of the ISA test matrix: a human-readable name, the
-/// `-C target-feature` value to pass (empty = the SSE2 baseline, no flag),
-/// and the `is_x86_feature_detected!` names that must all be present on this
-/// host to attempt the level at all.
+/// `PIXELFLOW_ISA` value that selects it, and the `is_x86_feature_detected!`
+/// names that must all be present on this host to execute it — the same
+/// features `pixelflow_codegen::isa` requires for the tier.
 #[cfg(target_arch = "x86_64")]
 struct IsaLevel {
     name: &'static str,
-    target_feature: &'static str,
+    isa: &'static str,
     requires: &'static [&'static str],
 }
 
 #[cfg(target_arch = "x86_64")]
 const ISA_LEVELS: &[IsaLevel] = &[
-    IsaLevel {
-        name: "sse2 (baseline)",
-        target_feature: "",
-        requires: &[],
-    },
-    // One AVX2 row, requiring both features: no shipping x86-64 CPU has ever
-    // offered AVX2 without FMA3 (Intel: both since Haswell; AMD: FMA3
-    // predates AVX2), so `avx2,fma` is the tier — x86-64-v3 codifies the same
-    // pairing industry-wide. AVX2-without-FMA is a compile_error in
-    // `pixelflow-codegen`/`pixelflow-core` now, not a level this matrix
-    // should attempt.
+    // The floor, and both features: no shipping x86-64 CPU has ever offered
+    // AVX2 without FMA3 (Intel: both since Haswell; AMD: FMA3 predates AVX2),
+    // so `avx2,fma` is the tier — x86-64-v3 codifies the same pairing
+    // industry-wide — and `pixelflow_codegen::isa` refuses a host lacking
+    // either. There is no level below this one.
     IsaLevel {
         name: "avx2+fma",
-        target_feature: "+avx2,+fma",
+        isa: "avx2",
         requires: &["avx2", "fma"],
     },
     IsaLevel {
         // DQ, not just F: `avx512::emit_compare` materializes a mask with
-        // `vpmovm2d`, which is AVX-512DQ. An AVX-512F-only part (Knights
-        // Landing) would take an illegal-instruction fault on any kernel
-        // containing a comparison, so probing for F alone would "support" a
-        // level that cannot run.
+        // `vpmovm2d`, which is AVX-512DQ, and the EVEX float logicals are DQ
+        // too. An AVX-512F-only part (Knights Landing) would take an
+        // illegal-instruction fault on any kernel containing a comparison,
+        // so probing for F alone would "support" a level that cannot run —
+        // and `pixelflow_codegen::isa` would not select it either.
         name: "avx512f+dq",
-        target_feature: "+avx512f,+avx512dq",
+        isa: "avx512",
         requires: &["avx512f", "avx512dq"],
     },
 ];
@@ -636,13 +627,13 @@ fn host_has_feature(feature: &str) -> bool {
 /// machinery below: `main` constructs one from CLI args unconditionally,
 /// before `isa_matrix` ever branches on host architecture.
 enum IsaExecutionMode {
-    /// Compile and lint every level; never execute tests, even on a host
-    /// that could run them.
+    /// Compile and lint; never execute tests, even on a host that could run
+    /// them.
     BuildOnly,
     /// Compile, lint, and execute the *ISA-sensitive* tests for whichever
     /// levels this host's CPU can run. Presubmit's path: see
-    /// `IsaExecutionMode::test_args` for what that set is and why running it
-    /// is nearly free once the lint has built it. (Plain code span, not an
+    /// `IsaExecutionMode::test_commands` for what that set is and why running
+    /// it is nearly free once the lint has built it. (Plain code span, not an
     /// intra-doc link: that method is `#[cfg(target_arch = "x86_64")]`, so a
     /// link would be broken on every other rustdoc target.)
     Smoke,
@@ -653,51 +644,6 @@ enum IsaExecutionMode {
 }
 
 impl IsaExecutionMode {
-    /// The `cargo` arguments this mode runs after building and linting a
-    /// level, or `None` if it runs nothing.
-    ///
-    /// `Smoke` names three crates rather than the workspace, and the choice is
-    /// not "the fast tests" — it is **the crates whose output is per-level
-    /// machine code**. `pixelflow-codegen` emits it and `pixelflow-ir` defines
-    /// what it must compute; their suites are differential (JIT against the
-    /// `eval_scalar` interpreter, on the same inputs), so a level-specific
-    /// miscompile shows up as a value mismatch rather than a build error.
-    ///
-    /// `pixelflow-core` is here because it *bakes* kernels — `Lattice::bake`
-    /// runs the whole optimizer-to-JIT path on expressions no synthetic test
-    /// writes, and then checks the pixels. That is a different question from
-    /// "does this op round-trip", and it was the only job that could have
-    /// caught a register allocator whose guard reconciliation was skipped on
-    /// one path: the shape needs a spilled value reloaded exactly at a
-    /// `Select` arm's end, which a 600-node baked kernel produces and a
-    /// hand-written one does not. It ran at SSE2 only, and the bug was
-    /// invisible there because SSE2 reserves one more scratch register per
-    /// `MulAdd` and so allocates a different schedule.
-    ///
-    /// `pixelflow-pipeline` is here for a narrower reason: it does not emit
-    /// machine code, but it *reads the vector width as a constant*. `LANES`
-    /// is `JIT_VECTOR_BYTES / 4`, so its measurement harness computes
-    /// different numbers at 4, 8 and 16 lanes, and its plausibility floor is
-    /// an assertion over one of them. That made it per-level in behavior
-    /// while looking per-level in nothing else, and a floor test that
-    /// restated the formula as a literal passed at SSE2 and failed at both
-    /// FMA levels for eight days of postsubmit before anything presubmit
-    /// could see it.
-    ///
-    /// Every other crate in the workspace consumes the same kernels through
-    /// the same interface at every level, and reads no per-level constant, so
-    /// running it three times re-runs identical work.
-    ///
-    /// The economics are why this belongs presubmit at all: building the test
-    /// binaries already happened for `--no-run` and clippy, so the marginal
-    /// cost is execution only — ~70s per level against ~344s for the whole
-    /// workspace, measured warm (`pixelflow-core`'s lib suite is ~20s of
-    /// that). That is the difference between a check that fits in a PR's wait
-    /// and one that does not. The two glyph-JIT test binaries from
-    /// `pixelflow-graphics` ride along for a few seconds more: they are the
-    /// only presubmit check that runs a *real* glyph kernel through the
-    /// register allocator at every level, and the one time they were absent
-    /// an allocator panic reachable only on AVX2+FMA shipped green (#1258).
     /// What a `PASS` from this mode covers, for the summary line.
     ///
     /// Called only from the `#[cfg(target_arch = "x86_64")]` half of
@@ -721,6 +667,43 @@ impl IsaExecutionMode {
     /// ones that caught what the crate-only smoke set missed (#1258: a
     /// register-allocator `unreachable!` reachable on AVX2+FMA and on no
     /// other level, shipped green presubmit and reverted from postsubmit).
+    ///
+    /// `Smoke` names crates rather than the workspace, and the choice is not
+    /// "the fast tests" — it is **the crates whose output is per-level
+    /// machine code**. `pixelflow-codegen` emits it and `pixelflow-ir` defines
+    /// what it must compute; their suites check the JIT's values against
+    /// scalar references on the same inputs, so a level-specific miscompile
+    /// shows up as a value mismatch rather than a build error.
+    ///
+    /// `pixelflow-core` is here because it *bakes* kernels — `Lattice::bake`
+    /// runs the whole optimizer-to-JIT path on expressions no synthetic test
+    /// writes, and then checks the pixels. That is a different question from
+    /// "does this op round-trip", and it was the only job that could have
+    /// caught a register allocator whose guard reconciliation was skipped on
+    /// one path: the shape needs a spilled value reloaded exactly at a
+    /// `Select` arm's end, which a 600-node baked kernel produces and a
+    /// hand-written one does not. It ran at one tier only, and the bug was
+    /// invisible there because that tier reserved one more scratch register
+    /// per `MulAdd` and so allocated a different schedule.
+    ///
+    /// `pixelflow-pipeline` is here for a narrower reason: it does not emit
+    /// machine code, but it *reads the vector width*. Its lane count is
+    /// `jit_vector_bytes() / 4`, so its measurement harness computes
+    /// different numbers at 8 and 16 lanes, and its plausibility floor is an
+    /// assertion over one of them. That made it per-level in behavior while
+    /// looking per-level in nothing else, and a floor test that restated the
+    /// formula as a literal passed at one level and failed at the others for
+    /// eight days of postsubmit before anything presubmit could see it.
+    ///
+    /// Every other crate in the workspace consumes the same kernels through
+    /// the same interface at every level, and reads no per-level width, so
+    /// running it per level re-runs identical work.
+    ///
+    /// The economics are why this belongs presubmit at all: the test binaries
+    /// are built once, for the lint, so the marginal cost is execution only —
+    /// about a minute per level against several for the whole workspace. That
+    /// is the difference between a check that fits in a PR's wait and one
+    /// that does not.
     #[cfg(target_arch = "x86_64")]
     fn test_commands(&self) -> Option<&'static [&'static [&'static str]]> {
         match self {
@@ -754,37 +737,37 @@ impl IsaExecutionMode {
     }
 }
 
-/// Outcome of attempting one [`IsaLevel`].
+/// Outcome of attempting one [`IsaLevel`]. The build and the lint are not
+/// per level — they happen once, before the levels, and a failure there ends
+/// the run before any level is attempted.
 #[cfg(target_arch = "x86_64")]
 enum LevelResult {
-    /// Compiled, linted, and the test binaries ran. `scope` names *which*
-    /// tests, because presubmit's PASS and postsubmit's are not the same
-    /// claim: a summary that spelled both "PASS" would invite reading the
-    /// cheap one as the expensive one.
+    /// The test binaries ran under this level's `PIXELFLOW_ISA`. `scope`
+    /// names *which* tests, because presubmit's PASS and postsubmit's are not
+    /// the same claim: a summary that spelled both "PASS" would invite
+    /// reading the cheap one as the expensive one.
     Passed { scope: &'static str },
-    /// Compiled and linted, but the tests were not executed — either
-    /// [`IsaExecutionMode::BuildOnly`] was requested (presubmit's fast path)
-    /// or the host CPU cannot run this level's instructions. NOT a skip —
-    /// everything that can be checked without running the binary was
-    /// checked.
-    BuiltNotRun { reason: String },
-    /// A command failed; `stage` names which for the summary.
-    Failed { stage: &'static str },
+    /// The tests were not executed — either [`IsaExecutionMode::BuildOnly`]
+    /// was requested or the host CPU cannot run this level's instructions.
+    /// Stated, never silent: the level's code was built and linted with
+    /// everything else, and only its execution is missing.
+    NotRun { reason: String },
+    /// The tests failed under this level's `PIXELFLOW_ISA`.
+    Failed,
 }
 
-/// Build and lint (`cargo test --workspace --no-run`, optionally `cargo
-/// clippy --workspace --all-targets -- -D warnings`) every x86-64 ISA level,
-/// then run whichever tests [`IsaExecutionMode`] asks for on the levels this
-/// host's CPU can execute.
+/// Build and lint once (`cargo test --workspace --no-run`, optionally `cargo
+/// clippy --workspace --all-targets -- -D warnings`), then run whichever
+/// tests [`IsaExecutionMode`] asks for once per x86-64 ISA level this host's
+/// CPU can execute, each under `PIXELFLOW_ISA=<level>`.
 ///
 /// `Smoke` is presubmit's path and `BuildAndTest` postsubmit's. The split
-/// exists because building for a level needs no special hardware but running
-/// the result does, and because running the *whole* workspace once per level
-/// costs an hour — so presubmit executes the two crates whose output is
+/// exists because running the *whole* workspace once per level costs the
+/// better part of an hour — so presubmit executes the crates whose output is
 /// per-level machine code and defers the rest. `BuildOnly` runs nothing and
-/// remains for hosts or situations where even that is unwanted. Non-x86-64 hosts
-/// (aarch64/NEON) have a single ISA level already, so there is nothing to
-/// matrix — this prints a note and exits 0 rather than silently doing
+/// remains for hosts or situations where even that is unwanted. Non-x86-64
+/// hosts (aarch64/NEON) have a single ISA level already, so there is nothing
+/// to matrix — this prints a note and exits 0 rather than silently doing
 /// nothing.
 fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
     let workspace_root = find_workspace_root();
@@ -795,7 +778,7 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
         let _ = with_clippy;
         let _ = mode;
         println!(
-            "isa-matrix: host is not x86-64 (no SSE2/AVX2/AVX-512 split to test here — \
+            "isa-matrix: host is not x86-64 (no AVX2/AVX-512 split to test here — \
              e.g. aarch64/NEON has one ISA level already)."
         );
     }
@@ -803,88 +786,51 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
     #[cfg(target_arch = "x86_64")]
     {
         println!("isa-matrix: workspace root {}", workspace_root.display());
-        // The base flag every build in this repo already gets from
-        // `.cargo/config.toml`'s `[build] rustflags`. Setting RUSTFLAGS in the
-        // environment REPLACES (does not merge with) that config-file value,
-        // so every level below must repeat it explicitly.
-        const FP_CONTRACT: &str = "-C llvm-args=-fp-contract=fast";
+
+        // One build for every level. The tier is a startup decision, not a
+        // build flag, so the test binaries are the same bytes at every level
+        // — and the developer's own target directory (their incremental
+        // cache) is the right place for them, where a per-flag build once
+        // needed a directory of its own, wiped per level, to fit on disk.
+        if !run_cargo(&workspace_root, &[], &["test", "--workspace", "--no-run"]) {
+            println!("isa-matrix: test build FAILED");
+            std::process::exit(1);
+        }
+        println!("isa-matrix: test build ok");
+
+        if with_clippy {
+            let clippy_ok = run_cargo(
+                &workspace_root,
+                &[],
+                &[
+                    "clippy",
+                    "--workspace",
+                    "--all-targets",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+            );
+            if !clippy_ok {
+                println!("isa-matrix: cargo clippy FAILED");
+                std::process::exit(1);
+            }
+            println!("isa-matrix: cargo clippy passed");
+        }
 
         let mut results: Vec<(&str, LevelResult)> = Vec::new();
 
         for level in ISA_LEVELS {
-            println!("\n=== ISA level: {} ===", level.name);
-
-            let rustflags = if level.target_feature.is_empty() {
-                FP_CONTRACT.to_string()
-            } else {
-                format!("{FP_CONTRACT} -C target-feature={}", level.target_feature)
-            };
-            println!("isa-matrix: RUSTFLAGS=\"{rustflags}\"");
-
-            // Each level's RUSTFLAGS produce a disjoint artifact set (the flags
-            // feed -C metadata), so levels sharing a target dir accumulate one
-            // full workspace build EACH — three levels filled this container's
-            // disk the first time it ran for real. One dedicated dir, wiped per
-            // level: peak disk is a single artifact set, and the developer's
-            // own build dir (their incremental cache) is never touched.
-            let matrix_target = cargo_target_dir(&workspace_root).join("isa-matrix");
-            if matrix_target.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&matrix_target) {
-                    panic!(
-                        "isa-matrix: could not clear {}: {e}",
-                        matrix_target.display()
-                    );
-                }
-            }
-
-            // COMPILING a level needs no special hardware — only running the
-            // result does. So build and lint every level unconditionally: that
-            // is what catches cfg mistakes (a backend compiled out of a wide
-            // build, a coverage sweep referring to a struct that no longer
-            // exists there), missing ops, and lints, none of which need an
-            // AVX-512 CPU to detect. Skipping a level outright, as this used to,
-            // threw all of that away because the runner lacked one CPU flag.
-            if !run_with_rustflags(
-                &workspace_root,
-                &matrix_target,
-                &rustflags,
-                &["test", "--workspace", "--no-run"],
-            ) {
-                println!("isa-matrix: {} — test build FAILED", level.name);
-                results.push((level.name, LevelResult::Failed { stage: "build" }));
-                continue;
-            }
-            println!("isa-matrix: {} — test build ok", level.name);
-
-            if with_clippy {
-                let clippy_ok = run_with_rustflags(
-                    &workspace_root,
-                    &matrix_target,
-                    &rustflags,
-                    &[
-                        "clippy",
-                        "--workspace",
-                        "--all-targets",
-                        "--",
-                        "-D",
-                        "warnings",
-                    ],
-                );
-                if !clippy_ok {
-                    println!("isa-matrix: {} — cargo clippy FAILED", level.name);
-                    results.push((level.name, LevelResult::Failed { stage: "clippy" }));
-                    continue;
-                }
-                println!("isa-matrix: {} — cargo clippy passed", level.name);
-            }
+            println!(
+                "\n=== ISA level: {} (PIXELFLOW_ISA={}) ===",
+                level.name, level.isa
+            );
 
             // Executing is the part that genuinely needs the CPU (and, under
-            // `BuildOnly`, the part presubmit explicitly defers). Note the
-            // whole workspace is built with this level's target-feature, so
-            // rustc may emit those instructions anywhere in the binary — it is
-            // not enough that a given test avoids them.
-            // A level this host cannot execute is still built and linted
-            // above; only the run is skipped, and the summary says which.
+            // `BuildOnly`, the part presubmit explicitly defers). The JIT
+            // itself refuses `PIXELFLOW_ISA` naming a tier the host cannot run,
+            // so this check is what turns that refusal into a stated NOT RUN
+            // rather than a failed test binary.
             let skip_reason = match mode.test_commands() {
                 None => Some("build-only mode: tests run in postsubmit".to_string()),
                 Some(_) => level
@@ -895,23 +841,21 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
             };
 
             if let Some(reason) = skip_reason {
-                println!(
-                    "isa-matrix: {} — built and linted; NOT running tests ({reason})",
-                    level.name
-                );
-                results.push((level.name, LevelResult::BuiltNotRun { reason }));
+                println!("isa-matrix: {} — NOT running tests ({reason})", level.name);
+                results.push((level.name, LevelResult::NotRun { reason }));
                 continue;
             }
 
             let commands = mode
                 .test_commands()
                 .expect("a mode with no test commands produced no skip reason");
+            let env = [("PIXELFLOW_ISA", level.isa)];
             if !commands
                 .iter()
-                .all(|args| run_with_rustflags(&workspace_root, &matrix_target, &rustflags, args))
+                .all(|args| run_cargo(&workspace_root, &env, args))
             {
                 println!("isa-matrix: {} — cargo test FAILED", level.name);
-                results.push((level.name, LevelResult::Failed { stage: "test" }));
+                results.push((level.name, LevelResult::Failed));
                 continue;
             }
             println!("isa-matrix: {} — {} tests passed", level.name, mode.scope());
@@ -929,13 +873,11 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
         for (name, result) in &results {
             let line = match result {
                 LevelResult::Passed { scope } => format!("PASS ({scope})"),
-                LevelResult::Failed { stage } => {
+                LevelResult::Failed => {
                     any_failed = true;
-                    format!("FAIL ({stage})")
+                    "FAIL (test)".to_string()
                 }
-                LevelResult::BuiltNotRun { reason } => {
-                    format!("BUILT+LINT (not run: {reason})")
-                }
+                LevelResult::NotRun { reason } => format!("NOT RUN ({reason})"),
             };
             println!("  {name:<20} {line}");
         }
@@ -946,64 +888,22 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
     }
 }
 
-/// The triple this machine builds for, from `rustc -vV`.
+/// Run `cargo <args>` from the workspace root with `env` set, streaming
+/// output straight through. Returns whether it succeeded.
 ///
-/// Needed because `--target` must be passed *explicitly* to keep `RUSTFLAGS` off host
-/// artifacts — see [`run_with_rustflags`]. Naming the host triple is a no-op for what gets
-/// built; it is the act of specifying `--target` at all that cargo keys the behaviour on.
+/// No `RUSTFLAGS` and no `--target`: the ISA tier is read at startup from
+/// `PIXELFLOW_ISA`, so a level differs from a plain `cargo test` by one
+/// environment variable, and `.cargo/config.toml`'s own `rustflags` apply as
+/// they do to every other build.
 #[cfg(target_arch = "x86_64")]
-fn host_triple() -> String {
-    let out = Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .expect("isa-matrix: could not run `rustc -vV` to discover the host triple");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .expect("isa-matrix: `rustc -vV` printed no `host:` line")
-        .trim()
-        .to_string()
-}
-
-/// Run `cargo <args>` from the workspace root with `RUSTFLAGS` set to
-/// `rustflags` and artifacts confined to `target_dir`, streaming output
-/// straight through. Returns whether it succeeded.
-///
-/// # Why `--target` is always passed
-///
-/// Without it, `RUSTFLAGS` applies to **host** artifacts too — build scripts and proc macros —
-/// and those are compiled *and then executed* by cargo on the machine doing the build. A level
-/// that names an ISA the build machine lacks therefore kills the build script with `SIGILL`
-/// before any of this workspace is even compiled. `proc-macro2`'s build script died exactly
-/// that way on a CI runner without AVX-512.
-///
-/// Passing `--target` explicitly is what makes cargo apply `RUSTFLAGS` to target artifacts only.
-/// The triple is the host's own, so nothing about the build changes except that host tooling
-/// stops being compiled for a CPU that is not going to run it. This is what makes the matrix's
-/// "compiling a level needs no special hardware" claim actually true: it is true of *this*
-/// workspace's code, and was quietly false for everything cargo runs on the way there.
-#[cfg(target_arch = "x86_64")]
-fn run_with_rustflags(
-    workspace_root: &std::path::Path,
-    target_dir: &std::path::Path,
-    rustflags: &str,
-    args: &[&str],
-) -> bool {
-    // Before any `--`, or it would be forwarded to the tool behind the separator (clippy's lint
-    // arguments) instead of being read by cargo.
-    let split = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+fn run_cargo(workspace_root: &std::path::Path, env: &[(&str, &str)], args: &[&str]) -> bool {
     Command::new("cargo")
         .current_dir(workspace_root)
-        .args(&args[..split])
-        .arg("--target")
-        .arg(host_triple())
-        .args(&args[split..])
-        .env("RUSTFLAGS", rustflags)
-        .env("CARGO_TARGET_DIR", target_dir)
+        .args(args)
+        .envs(env.iter().copied())
         // Deeply nested kernel construction recurses near the stack limit,
-        // and 8-/16-lane builds have proportionally larger frames. This
-        // raises the floor for libtest's own threads; worker threads that set
+        // and the 16-lane tier has proportionally larger frames. This raises
+        // the floor for libtest's own threads; worker threads that set
         // `stack_size` explicitly are NOT covered by it and must size
         // themselves.
         .env("RUST_MIN_STACK", "16777216")
