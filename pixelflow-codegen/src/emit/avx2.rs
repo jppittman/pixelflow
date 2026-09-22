@@ -184,7 +184,8 @@ impl Vex {
     /// a *vector* register: one address per lane, scale 4, no displacement.
     /// X carries the index's high bit exactly as it does for a GPR index;
     /// the SIB tail is the same bytes with a vector number in the index
-    /// field. `vvvv` is the gather's mask.
+    /// field (`x86_64::vsib4_operand_into`, which knows `ymm4`/`ymm12` are
+    /// not `rsp`/`r12`). `vvvv` is the gather's mask.
     fn vsib_scaled4(self, reg: u8, vvvv: u8, base: Gpr, index: Reg) -> EncodedInst {
         let mut inst = EncodedInst::new();
         let rbit = if reg >= 8 { 0x00 } else { 0x80 };
@@ -196,7 +197,7 @@ impl Vex {
             ((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | ((self.l256 as u8) << 2) | self.pp as u8,
         );
         inst.push(self.opcode);
-        x86_64::scaled4_operand_into(&mut inst, reg, base, Gpr(index.0));
+        x86_64::vsib4_operand_into(&mut inst, reg, base, index);
         inst
     }
 
@@ -1129,6 +1130,29 @@ mod tests {
             [
                 0xC4, 0x02, 0x05, 0x92, 0x2C, 0xB3, // vgatherdps ymm13, [r11+ymm14*4], ymm15
                 0xC4, 0xA2, 0x0D, 0x92, 0x04, 0xAF, // vgatherdps ymm0, [rdi+ymm13*4], ymm14
+            ]
+        );
+    }
+
+    /// A VSIB index of `ymm4` or `ymm12` puts `100` in the SIB's index
+    /// field — which for a GPR index would mean `rsp`, "no index", and is
+    /// refused there. As a vector number it is just a register, and the
+    /// cell grid's gathers are indexed by whichever the allocator picked.
+    /// The bytes are `objdump`'s: `vgatherdps ymm5, [r9 + ymm4*4], ymm7` and
+    /// the same through `ymm12`, which differ only in the prefix's X bit.
+    #[test]
+    fn a_vsib_index_may_be_the_fourth_or_twelfth_register() {
+        let mut c = Vec::new();
+        AsmProgram::from([
+            gather(Reg(5), PtrReg(9), Reg(4), Reg(7)),
+            gather(Reg(5), PtrReg(9), Reg(12), Reg(7)),
+        ])
+        .assemble(&mut c);
+        assert_eq!(
+            c,
+            [
+                0xC4, 0xC2, 0x45, 0x92, 0x2C, 0xA1, // vgatherdps ymm5, [r9+ymm4*4], ymm7
+                0xC4, 0x82, 0x45, 0x92, 0x2C, 0xA1, // vgatherdps ymm5, [r9+ymm12*4], ymm7
             ]
         );
     }
