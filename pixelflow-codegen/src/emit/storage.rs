@@ -37,7 +37,7 @@ impl Slot {
         self.offset
     }
 
-    /// Size of the vector slot in bytes (16 for SSE/NEON, 32 for AVX2, 64 for AVX-512).
+    /// Size of the vector slot in bytes (16 for NEON, 32 for AVX2, 64 for AVX-512).
     #[inline]
     #[must_use]
     pub const fn bytes(self) -> u32 {

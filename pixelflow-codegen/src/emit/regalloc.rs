@@ -309,8 +309,8 @@ pub struct RegisterFile {
     pub guard_temps: u8,
 
     /// Registers the backend's own instruction emission clobbers, outside the
-    /// allocator's knowledge: an ISA-level temp for a two-operand form, a
-    /// gather's index register, and the like.
+    /// allocator's knowledge: a guard's reduction register, a gather's index
+    /// register, and the like.
     ///
     /// The allocator never hands these out; declaring them is what lets
     /// [`RegisterFile::checked`] prove they miss the pool, the inputs and the
@@ -320,8 +320,8 @@ pub struct RegisterFile {
     /// How many registers this backend's encoding of `op` needs beyond the
     /// operands and destination — the instruction temps.
     ///
-    /// A two-operand ISA needs one to break a destructive hazard; a sign-flip
-    /// needs one to hold the mask. Those used to be `const`s outside the pool,
+    /// A sign-flip needs one to hold its mask; a gather needs one for its
+    /// truncated indices. Those used to be `const`s outside the pool,
     /// reserved for the whole kernel because one instruction in it might want
     /// one. Declaring the demand here instead makes the temp an *allocated*
     /// value with a live range of exactly one instruction, so the register is
@@ -335,7 +335,7 @@ pub struct RegisterFile {
 
     /// Bytes one register occupies when spilled — the backend's vector width.
     ///
-    /// 16 for SSE2 and NEON, 32 for AVX2, 64 for AVX-512. This is the stride
+    /// 16 for NEON, 32 for AVX2, 64 for AVX-512. This is the stride
     /// [`FrameLayout`](super::FrameLayout) lays spill slots out at, so every
     /// offset the emitter sees is already a real byte displacement. It was
     /// once a universal 16 that each wide backend divided back out at its
@@ -954,9 +954,12 @@ pub struct Scratch {
 impl Scratch {
     /// The most scratch registers any one encoding asks for.
     ///
-    /// Four: AVX2 assembles a 256-bit gather from two 128-bit halves, which
-    /// costs the half-sequence's own index and value registers plus one of
-    /// each to carry the high half while the low one is built.
+    /// Four, sized for the AVX2 gather when it was two scalar-insert halves
+    /// (each half's index and value registers, plus one of each to carry
+    /// the high half). No encoding asks for more than two now — a gather's
+    /// truncated indices and mask, a fold's trip test — but this is also
+    /// what [`RegisterFile::MIN_SCRATCH`] is stated through, so lowering it
+    /// moves every carry budget and is measured on its own.
     pub const MAX_TEMPS: usize = 4;
 
     /// The temps a surviving `Reduce` def reserves: two, both transient —
@@ -972,10 +975,9 @@ impl Scratch {
 
     /// The most reload targets any one instruction asks for.
     ///
-    /// Two. Three operands is the widest op, and the one that must reach the
-    /// destination anyway — a `Select`'s mask, an FMA's addend, a two-operand
-    /// binary's left — is reloaded straight into it rather than into a
-    /// reservation.
+    /// Two. Three operands is the widest op, and one of them — a `Select`'s
+    /// mask, an FMA's addend, a binary's left — is reloaded straight into
+    /// the destination rather than into a reservation.
     pub const MAX_RELOADS: usize = 2;
 
     /// The most GPR-class temps any one encoding asks for.
@@ -2888,10 +2890,11 @@ impl Pass {
     /// definition wrote — into `dst` for the operand the encoding consumes
     /// there, into a reserved reload register otherwise. That is the whole
     /// of what the encoders tolerate: no encoder reads every source before
-    /// writing `dst` (SSE2's `movaps dst, src1` prelude; `setup_mov` ahead of
-    /// a `Select` or FMA on every ISA), so a *resident* operand in `dst`'s
-    /// register would be corrupted. A displaced one is not resident, which is
-    /// why the split is recorded at this index and not the next.
+    /// writing `dst` (`setup_mov` ahead of a `Select` or FMA on every ISA;
+    /// the decomposed `MulAdd`'s multiply before its add), so a *resident*
+    /// operand in `dst`'s register would be corrupted. A displaced one is
+    /// not resident, which is why the split is recorded at this index and
+    /// not the next.
     /// [`EvictionRank`] prices it so it stays a last resort.
     fn open(&self, taken: &Reservations) -> Vec<usize> {
         (0..self.owner.len()).filter(|k| !taken.holds(*k)).collect()
@@ -3855,8 +3858,8 @@ mod tests {
     ///
     /// The nest tests need a pool that can spare a register to carry, and the
     /// minimum-sized file by construction cannot: the carry budget is
-    /// `pool - MIN_SCRATCH`, which is zero there. Ten registers mirrors the
-    /// SSE2 tier, whose budget is four.
+    /// `pool - MIN_SCRATCH`, which is zero there. Ten registers leaves a
+    /// budget of three.
     const NEST_FILE: RegisterFile = RegisterFile {
         scratch: RegSet::range(4, 7).union(RegSet::of(&[Reg(13), Reg(14), Reg(15)])),
         ..TEMP_FILE
@@ -5239,10 +5242,11 @@ mod tests {
 
     /// A destination never lands in a register one of its own operands is
     /// still living in — the invariant `resolve_operands` reads back off the
-    /// allocation, and the reason SSE2 can write its two-operand form
-    /// directly.
+    /// allocation, and what lets one operand be reloaded into `dst`.
     ///
-    /// `dst op= right` corrupts `right` when `dst == right` and `dst != left`.
+    /// The encoders write `dst` before their last read — `setup_mov` ahead
+    /// of a `Select` or FMA, the decomposed `MulAdd`'s multiply before its
+    /// add — so a *resident* operand in `dst`'s register would be corrupted.
     /// The destination *may* take an operand's register — it is a priced
     /// candidate, not an excluded one — but when it does, the eviction is
     /// recorded at this very index, so that operand is no longer *resident*
@@ -5250,9 +5254,9 @@ mod tests {
     /// the encoding consumes there and into a reserved register otherwise.
     /// What this asserts is the residency view, which is what the encoders
     /// see: at the instruction's own point, no operand still in a register is
-    /// in `dst`'s. The backend needs no stashing temp to route around a case
-    /// that cannot arise, which is what `emit_binary_safe` used to be and what
-    /// held xmm10 out of every kernel's pool.
+    /// in `dst`'s. No backend needs a stashing temp to route around a case
+    /// that cannot arise; the SSE2 tier once held one out of every kernel's
+    /// pool for it.
     #[test]
     fn a_destination_never_lands_on_a_resident_operand() {
         // Wide enough to evict: `width` values all live at once over a pool of
@@ -5280,8 +5284,8 @@ mod tests {
                 spill_count(&a) > 0,
                 "the schedule has to reach eviction for this to test anything"
             );
-            // Pairs where both ends are the pool's — the case the two-operand
-            // form would corrupt.
+            // Pairs where both ends are the pool's — the case a destination
+            // could collide in.
             let mut contested = 0;
             let body = a.body();
             for (i, d) in body.schedule().iter().enumerate() {

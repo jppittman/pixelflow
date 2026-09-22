@@ -9,7 +9,7 @@
 //! machine was, and each wider tier was a separate build of the whole
 //! workspace that only `xtask isa-matrix` ever made. Now the choice is
 //! CPUID's: the widest tier this host can execute, with a floor of AVX2+FMA on
-//! x86-64 (the SSE2 tier is not selectable) and NEON on aarch64. A host below
+//! x86-64 (there is no SSE2 tier any more) and NEON on aarch64. A host below
 //! the floor is refused, loudly, with the feature it lacks named.
 //!
 //! The width follows the tier ([`jit_vector_bytes`]), and nothing else in the
@@ -195,7 +195,7 @@ mod tests {
             assert_eq!(Isa::parse(&isa.name().to_ascii_uppercase()), Some(isa));
             assert_eq!(Isa::parse(&format!(" {} ", isa.name())), Some(isa));
         }
-        assert_eq!(Isa::parse("sse2"), None, "the SSE2 tier is not selectable");
+        assert_eq!(Isa::parse("sse2"), None, "there is no SSE2 tier");
         assert_eq!(Isa::parse(""), None);
     }
 

@@ -1,17 +1,17 @@
 //! x86-64 AVX2 (VEX.256) JIT encoder — 256-bit, 8-lane `ymm` kernels.
 //!
-//! The middle width between the SSE2 leaf encoders (`x86_64.rs`, 128-bit) and
-//! the AVX-512 EVEX encoders (`avx512.rs`, 512-bit). Register numbering is
-//! identical to SSE2 (ymm0-15, no extended file — AVX2 has no REX2/EVEX), so
-//! this backend reuses the register file `X86Backend` declares and only the
-//! instruction *encoding* changes.
+//! The floor of the x86-64 tiers (`crate::isa`), below the AVX-512 EVEX
+//! encoders (`avx512.rs`, 512-bit). Sixteen registers, `ymm0-15` — AVX2 has
+//! no extended file — and the general-register half of every kernel (the
+//! loop nest, the store's address, the pointer class, the constant pool) is
+//! `x86_64.rs`'s, shared with AVX-512; only the vector *encoding* is this
+//! file's.
 //!
-//! Unlike legacy SSE2, VEX is 3-operand and non-destructive — same property
-//! AVX-512's EVEX has — so there is no two-operand hazard to route around
-//! (the SSE2 tier's two-operand form has no such freedom).
+//! VEX is 3-operand and non-destructive — the same property AVX-512's EVEX
+//! has — so an operand may alias the destination in every encoding here.
 //! Comparisons are simpler here than on AVX-512: `vcmpps` writes an ordinary
 //! all-ones/all-zeros `ymm` directly (no k-register, no mask-to-vector
-//! conversion) — the same representation NEON and SSE2 already use.
+//! conversion) — the same representation NEON uses.
 //!
 //! Spills use a real stack frame, not the red zone: mirrors `avx512.rs`'s
 //! reasoning (a `ymm` slot is 32 bytes; keeping the red-zone arithmetic exact
@@ -25,7 +25,7 @@
 //! AVX-512 tier resets `k1`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm32, Mem, NoDisp, ptr};
+use super::x86_64::{Disp, Imm32, Mem, NoDisp, frame_slot, ptr};
 use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -377,15 +377,6 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     assemble(code, [Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]);
 }
 
-/// A slot in the allocated spill frame. AVX2 kernels are leaves with no base
-/// pointer, so a slot *is* `rsp + offset`.
-const fn frame_slot(offset: u32) -> Mem<Imm32> {
-    Mem {
-        base: ptr::RSP,
-        disp: Imm32(offset as i32),
-    }
-}
-
 /// `dst = splat(val)`: `vbroadcastss ymm, [pool]` (VEX.256.66.0F38.W0 18 /r),
 /// one instruction from the kernel's constant pool. Zero is `vxorps`.
 pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::ConstPool) {
@@ -398,7 +389,8 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
 }
 
 /// `dst = splat(base[offset])` at 256 bits: `vbroadcastss ymm<dst>, [base +
-/// 4*offset]` (VEX.256.66.0F38.W0 18 /r). See `x86_64::emit_uniform_load`.
+/// 4*offset]` (VEX.256.66.0F38.W0 18 /r). `base` is the block's address,
+/// wherever the allocator keeps that pointer value.
 pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
     AsmProgram::from([Vex::m0f38_66(0x18).rm(
         dst.0,
@@ -413,7 +405,8 @@ pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16
 /// `dst = splat(base[idx])` at 256 bits, the index being the same in every
 /// lane of `idx`: `vcvttss2si index, xmm<idx>`, `vbroadcastss ymm<dst>,
 /// [base + index*4]` (VEX.256.66.0F38.W0 18 /r). See
-/// `x86_64::emit_broadcast_load` for the register contract.
+/// [`x86_64::BroadcastGprs`] for the register contract; `dst` may alias
+/// `idx`, since the index is in a GPR before `dst` is written.
 pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
@@ -581,7 +574,7 @@ pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount
 }
 
 /// `dst = mask ? if_true : if_false` (bit-select; mask already in `dst`, same
-/// convention as SSE2/AVX-512).
+/// convention as AVX-512 and NEON).
 ///
 /// `tmp` is the allocator's temp for this instruction, which it picks disjoint
 /// from every operand — the `debug_assert` restates that here, where the
@@ -1165,28 +1158,54 @@ pub(crate) mod driver {
         vcvttss2si_xmm, vextractf128, vextractps_store, vmovq_xmm_r64, vpmovzxbd,
     };
     use crate::emit::x86_64 as x86;
-    use crate::emit::x86_64::driver::{Convert, SSE2_FILE, write_address};
+    use crate::emit::x86_64::{Convert, write_address};
     use crate::error::CompileError;
     use alloc::vec::Vec;
     use pixelflow_ir::kind::OpKind;
 
     /// The AVX2 register file (ymm, 256-bit).
     ///
-    /// The same sixteen registers as SSE2's at twice the width. The gather
+    /// SysV has no callee-saved vector registers and the collapse ABI passes
+    /// no vector, so every one of the sixteen is the allocator's. The gather
     /// borrows two of them across its own sequence (the truncated indices
     /// and the mask), the sign mask and the select blend borrow one — all
     /// reservations the allocator makes for one instruction, so all of them
     /// are its the rest of the time.
     const AVX2_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
         scratch: regalloc::RegSet::range(0, 16),
+        // Nothing: every register an encoding destroys is a `temps_for`
+        // reservation for that one instruction.
         fixed: &[],
         temps_for: super::temps_for,
+        // A guard reduces its mask with `vmovmskps` into the flags, which
+        // costs no vector register at all.
+        guard_temps: 0,
         vector_bytes: 32,
+        // SysV's first three integer arguments, in the ABI's order: the
+        // context (the array of buffer base pointers, then the uniform and
+        // origin blocks), the output plane, its pitch. Declared here so
+        // `checked` proves `gpr_scratch` misses all three, rather than a
+        // comment asserting the constants never collide.
+        gpr_ctx: Some(x86::gpr::RDI),
+        gpr_out: Some(x86::gpr::RSI),
+        gpr_pitch: Some(x86::gpr::RDX),
+        // rax/rcx: the broadcast's index, the store's row and column, the
+        // iota's bytes — `Scratch` reservations like every vector temp.
         // `vgatherdps` addresses through a vector index, so the gather needs
-        // no per-lane GPR: only the broadcast's index, the store's row and
-        // column, and the iota's bytes ride through `rax`/`rcx`.
+        // none.
+        gpr_scratch: regalloc::GprSet::of(&[x86::gpr::RAX, x86::gpr::RCX]),
         gpr_temps_for: super::gpr_temps_for,
-        ..SSE2_FILE
+        // r9-r11: the caller-saved GPRs SysV leaves after the three
+        // arguments, the two scratch and `r8` (the constant pool's anchor).
+        // The pointer class's pool — buffer bases and block addresses are
+        // carried here across the loops that read them
+        // (docs/plans/2026-09-22-a-pointer-is-a-value.md). The callee-saved
+        // six would double it at the price of a prologue; not yet measured.
+        pointers: regalloc::GprSet::of(&[x86::gpr::R9, x86::gpr::R10, x86::gpr::R11]),
+        // No mask-register file on this tier: masks are ordinary vectors.
+        mask_scratch: regalloc::MaskSet::EMPTY,
+        mask_temps_for: regalloc::no_temps,
+        mask_guard_temps: 0,
     }
     .checked();
 
@@ -1328,7 +1347,7 @@ pub(crate) mod driver {
                     left,
                     right,
                 } => {
-                    // VEX 3-operand: no two-operand hazard, emit directly.
+                    // VEX 3-operand: either source may alias `dst`.
                     super::emit_binary(code, *op, *dst, *left, *right);
                 }
                 ResolvedOp::FusedMulAdd { dst, a, b } => {
@@ -1438,10 +1457,10 @@ pub(crate) mod driver {
             self.consts.finish(asm);
         }
 
-        // Select short-circuit guards: vmovmskps -> eax[7:0], same shape as
-        // X86Backend's MOVMSKPS guards but 8 lanes wide (al == 0xFF for
-        // all-true, not 0x0F — see `super::emit_cmp_al_imm8`'s doc for why the
-        // sign-extending `cmp eax, imm8` X86Backend uses doesn't work here).
+        // Select short-circuit guards: vmovmskps -> eax[7:0], then a test
+        // of the low byte (al == 0xFF for all-true — see
+        // `super::emit_cmp_al_imm8`'s doc for why the sign-extending
+        // `cmp eax, imm8` would not do).
         /// [`MaskTest::scratch`] and [`MaskTest::mask_scratch`] are both
         /// unused: this tier reduces the mask with `movmskps` into the
         /// flags, needing neither a vector nor a mask register.

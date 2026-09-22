@@ -909,8 +909,8 @@ pub enum ResolvedOp {
         if_false: Reg,
     },
     /// Bound-memory gather: `dst = base[idx_lane]`. Every backend implements
-    /// it: AVX-512 natively (`vgatherdps`), AVX-2 as two scalar halves, SSE2
-    /// and NEON as four scalar loads. `base` is the buffer's base pointer,
+    /// it: AVX2 and AVX-512 natively (`vgatherdps`), NEON as four scalar
+    /// loads. `base` is the buffer's base pointer,
     /// wherever the allocator keeps that value — a [`PtrReg`] by type, so
     /// nothing but an address can be handed to the memory operand.
     Gather { dst: Reg, idx: Reg, base: PtrReg },
@@ -991,18 +991,19 @@ pub enum OperandSource {
     Resident,
     /// Not in a register, and reloaded into the **destination**.
     ///
-    /// Free because these are the operands an encoding needs in the
-    /// destination anyway: a `Select`'s mask, an FMA's addend, and a
-    /// two-operand binary's left, which `dst op= right` consumes from the
-    /// destination by definition. Sound because the reload lands before the
-    /// op and nothing else the instruction reads is resident in `dst` — the
-    /// allocator's destination contest never leaves another *resident*
-    /// operand in the register it hands out (a displaced one is non-resident
-    /// at this index and reloaded elsewhere). That is the whole guarantee:
-    /// the encoders do **not** read every source before writing `dst`
-    /// (SSE2's `movaps dst, src1` prelude, `setup_mov` ahead of a `Select`
-    /// or FMA on every ISA), so this is the one register-level alias any of
-    /// them tolerates.
+    /// Free because the destination is a register no encoding writes before
+    /// its last read, so one operand can always come from it: a `Select`'s
+    /// mask and an FMA's addend, which the blend and the `231` form consume
+    /// from `dst` anyway, and a binary's left, which costs a reservation
+    /// otherwise. Sound because the reload lands before the op and nothing
+    /// else the instruction reads is resident in `dst` — the allocator's
+    /// destination contest never leaves another *resident* operand in the
+    /// register it hands out (a displaced one is non-resident at this index
+    /// and reloaded elsewhere). That is the whole guarantee: the encoders do
+    /// **not** read every source before writing `dst` (`setup_mov` ahead of
+    /// a `Select` or FMA on every ISA, the decomposed `MulAdd`'s multiply
+    /// before its add), so this is the one register-level alias any of them
+    /// tolerates.
     Destination,
     /// Not in a register, and reloaded into the `k`'th register the allocator
     /// reserved for this instruction ([`regalloc::Scratch::reload`]).
@@ -2142,8 +2143,8 @@ fn emit_scope<B: IsaBackend>(
             // which is what an all-lanes-equal broadcast compare produces
             // the instant it stops being false. The compare lands in `t0`,
             // which is either the binder's own reload or distinct from its
-            // register: the two-operand form the backends share (`dst <-
-            // srcs[0]; dst op= srcs[1]`) is sound for both.
+            // register; `alu` lets a source alias its destination on every
+            // backend, so both are sound.
             let binder_now = match binder_reg {
                 Some(b) => b,
                 None => {
@@ -3707,36 +3708,11 @@ pub fn resolve_operands(
              emit_scope must special-case it before calling this"
         ),
         ScheduledOp::Binary(op_kind, left, right) => {
-            // `left` goes to `dst` when it needs reloading — the two-operand
-            // form consumes it from there anyway — and `right` to a
-            // reservation.
+            // `left` goes to `dst` when it needs reloading (`operand_sources`'
+            // one free target) and `right` to a reservation. Every backend's
+            // binary form is three-operand, so either may alias `dst`.
             let l_reg = operand(0, *left, &mut reloads);
             let r_reg = operand(1, *right, &mut reloads);
-            // The two-operand invariant, stated where the registers are
-            // chosen rather than defended in the one backend that has no
-            // three-operand form. SSE2's `mulps dst, src` computes
-            // `dst <- left; dst op= right`, which corrupts `right` when
-            // `dst == right` and `dst != left`.
-            //
-            // That assignment cannot arise. `dst` is a pool register the
-            // allocator gave this definition, and at this index no *resident*
-            // operand lives in it: the destination may take an operand's
-            // register, but it does so by evicting that operand here, so the
-            // operand is reloaded — into `dst` if it is `left` (the operand the
-            // two-operand form consumes from the destination anyway), into one
-            // of this instruction's own reload reservations if it is `right`,
-            // and those reservations are claimed after the destination and
-            // exclude it.
-            //
-            // So `left` may alias `dst` and the backends may write the
-            // destructive form directly — but if the allocator ever stops
-            // guaranteeing this, the failure is a silently corrupted operand,
-            // which is what this restates in every debug build.
-            debug_assert!(
-                dst != r_reg || dst == l_reg,
-                "{op_kind:?}: dst {dst:?} aliases the right operand without \
-                 aliasing the left — the two-operand form would corrupt it"
-            );
             ResolvedOp::Binary {
                 op: *op_kind,
                 dst,
@@ -3864,9 +3840,8 @@ fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
 /// `detect` answers `Neon` only on aarch64 and `Avx2`/`Avx512` only on x86-64,
 /// so no arm carries a `cfg`: the other architecture's backend is typechecked,
 /// swept for op coverage and unit-tested on this host, and its arm is never
-/// taken. The SSE2 tier (`x86_64::driver::X86Backend`) has no arm — the floor
-/// is AVX2+FMA (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md), and
-/// the driver stays only until the follow-up that deletes it.
+/// taken. There is no tier below AVX2+FMA on x86-64
+/// (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md).
 ///
 /// Genuinely host-bound code lives in [`executable`] (the `KernelFn` ABI types
 /// and the `mmap`/`mprotect` that makes bytes callable) and nowhere else.
@@ -5173,7 +5148,6 @@ mod tests {
 
         let ctx = EmitCtx::default();
         let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
-        let mut sse2 = x86_64::driver::X86Backend::new(ctx.clone());
         let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
         let mut avx512b = avx512::driver::Avx512Backend::new(ctx);
 
@@ -5199,13 +5173,6 @@ mod tests {
             "aarch64 is fixed-width"
         );
         for (name, len) in [
-            (
-                "SSE2",
-                compile_via_backend(for_backend(sse2.register_file()), &mut sse2)
-                    .expect("SSE2")
-                    .code
-                    .len(),
-            ),
             (
                 "AVX2",
                 compile_via_backend(for_backend(avx2b.register_file()), &mut avx2b)
@@ -5952,9 +5919,9 @@ mod tests {
     // The shared driver's Select short-circuit guard, on every backend that
     // has a JIT.
     //
-    // `sched_select_guards` below covers this path, but only on SSE2 — its
-    // module is gated `not(avx2), not(avx512f)` — and `avx512_select_guards`
-    // covers AVX-512. aarch64 had no guard test at all, which mattered because
+    // `sched_select_guards` below covers this path on whichever tier the
+    // host runs, and `avx512_select_guards` covers AVX-512 by name. aarch64
+    // had no guard test at all, which mattered because
     // that is the one backend whose guard needs a scratch register: reducing a
     // mask with `UMAXV`/`UMINV` writes a scalar into a vector register, where
     // the x86 tiers use `movmskps`/`kortest` and the flags. So the register
@@ -7219,20 +7186,10 @@ mod tests {
     // accident the first time someone compiled with `-C target-feature=
     // +avx512f`).
     //
-    // Each test below is scoped to a backend this build ACTUALLY compiles —
-    // `x86_backend_covers_required_ops` always runs on x86-64,
-    // `aarch64_backend_covers_required_ops` always runs on aarch64, and
-    // `avx512_backend_covers_required_ops` only compiles (and only needs to
-    // pass) when built with `avx512f` — the same feature gate
-    // `compile` uses to select `Avx512Backend` in production. On a default `cargo test --workspace` (no RUSTFLAGS) on
-    // this x86-64 host, that means: the SSE2 test runs and must be green
-    // (it is: X86Backend already covers every required op), and the AVX-512
-    // test does not even compile — it isn't lying about passing, it simply
-    // isn't part of this build. The moment someone builds with
-    // `+avx512f` (exactly the multi-ISA completion work tracked separately),
-    // this same test starts running and will fail loudly, by name, for every
-    // op `avx512::emit_unary`/`emit_binary`/`emit_plan` doesn't yet cover —
-    // rather than waiting for an unrelated test to trip over the gap.
+    // Every backend compiles on every host — emission is a pure function
+    // into bytes — so the sweeps below run for all three from whichever
+    // machine runs the tests, and a gap in any of them fails every CI job by
+    // name rather than only the leg that happens to select that backend.
     mod uniforms {
         use super::*;
         use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
@@ -7359,16 +7316,12 @@ mod tests {
 
         /// The bytes, per backend, for `offset = 3, dst = 5` through the
         /// block in `rax` / `x9`. Checked against `llvm-mc --disassemble`
-        /// (LLVM 18): `vbroadcastss 12(%rax), %xmm5` / `%ymm5` / `%zmm5`;
+        /// (LLVM 18): `vbroadcastss 12(%rax), %ymm5` / `%zmm5`;
         /// `ldr s5, [x9, #12]`, `dup v5.4s, v5.s[0]`. The block's address is
         /// a pointer-class value the allocator placed, so no load of it
         /// appears here: that is the `Context` def's, once per call.
         #[test]
         fn every_backend_encodes_the_broadcast_load() {
-            let mut sse = Vec::new();
-            x86_64::emit_uniform_load(&mut sse, Reg(5), x86_64::ptr::RAX, 3);
-            assert_eq!(sse, [0xC4, 0xE2, 0x79, 0x18, 0xA8, 0x0C, 0, 0, 0]);
-
             let mut avx2 = Vec::new();
             avx2::emit_uniform_load(&mut avx2, Reg(5), x86_64::ptr::RAX, 3);
             assert_eq!(avx2, [0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0, 0, 0]);
@@ -7496,8 +7449,8 @@ mod tests {
         }
 
         /// The bytes, per backend, for `dst = 5, idx = 6` through the base in
-        /// `rax` and the index in `rcx` — `cvttss2si rcx, xmm6`,
-        /// `vbroadcastss xmm5/ymm5/zmm5, [rax + rcx*4]` — and through `x9`
+        /// `rax` and the index in `rcx` — `vcvttss2si rcx, xmm6`,
+        /// `vbroadcastss ymm5/zmm5, [rax + rcx*4]` — and through `x9`
         /// and `x10`: `fcvtzs x10, s6`, `ldr s5, [x9, w10, uxtw #2]`, `dup
         /// v5.4s, v5.s[0]`. The x86 encodings were checked against
         /// `objdump -M intel`. The base's own load is the `Context` def's,
@@ -7508,11 +7461,6 @@ mod tests {
                 base: x86_64::ptr::RAX,
                 index: x86_64::gpr::RCX,
             };
-
-            let mut sse = Vec::new();
-            x86_64::emit_broadcast_load(&mut sse, Reg(5), Reg(6), gprs);
-            assert_eq!(&sse[..5], &[0xF3, 0x48, 0x0F, 0x2C, 0xCE]);
-            assert_eq!(&sse[5..], &[0xC4, 0xE2, 0x79, 0x18, 0x2C, 0x88]);
 
             let mut avx2 = Vec::new();
             avx2::emit_broadcast_load(&mut avx2, Reg(5), Reg(6), gprs);
@@ -7542,23 +7490,18 @@ mod tests {
         }
 
         /// A base in a pointer register past the low eight, and one past the
-        /// low eight of the index: `vbroadcastss xmm5, [r9 + r11*4]` sets
-        /// `X` and `B` in the prefix, per tier.
+        /// low eight of the index: `vbroadcastss ymm5, [r9 + r11*4]` sets
+        /// `X` and `B` in the prefix (clear, inverted), per tier, after a
+        /// `vcvttss2si r11, xmm6` whose VEX.R carries the GPR's high bit.
         #[test]
         fn the_broadcast_addresses_high_pointer_registers() {
             let gprs = x86_64::BroadcastGprs {
                 base: PtrReg(9),
                 index: Gpr(11),
             };
-            let mut sse = Vec::new();
-            x86_64::emit_broadcast_load(&mut sse, Reg(5), Reg(6), gprs);
-            // `cvttss2si r11, xmm6`: REX.WR; then the VEX with X and B clear
-            // (inverted), a SIB of scale 4, index r11, base r9.
-            assert_eq!(&sse[..5], &[0xF3, 0x4C, 0x0F, 0x2C, 0xDE]);
-            assert_eq!(&sse[5..], &[0xC4, 0x82, 0x79, 0x18, 0x2C, 0x99]);
-
             let mut avx2 = Vec::new();
             avx2::emit_broadcast_load(&mut avx2, Reg(5), Reg(6), gprs);
+            assert_eq!(&avx2[..5], &[0xC4, 0x61, 0xFE, 0x2C, 0xDE]);
             assert_eq!(&avx2[5..], &[0xC4, 0x82, 0x7D, 0x18, 0x2C, 0x99]);
 
             let mut avx512 = Vec::new();
@@ -7616,21 +7559,22 @@ mod tests {
 
         /// The `Context` def's load is the only load of a base per call.
         ///
-        /// Counted in the x86 tier's bytes, emitted on whatever host this
+        /// Counted in the AVX2 tier's bytes, emitted on whatever host this
         /// runs on: `mov r9..r11, [rdi + disp32]` is `REX.WR 8B` then a ModRM
-        /// of mod=10, reg=1..3, rm=rdi (`8F`/`97`/`9F`), and the pool holds
-        /// no other pointer register. One per `Context` def in the schedule,
+        /// of mod=10, reg=1..3, rm=rdi (`8F`/`97`/`9F`) — the same
+        /// instruction on every x86 tier — and the pool holds no other
+        /// pointer register. One per `Context` def in the schedule,
         /// wherever the def sits; a base parked in a slot would reload from
         /// `rsp` instead, which does not match, and the count would still be
         /// right — what would be wrong is the allocation, and the test above
         /// is the one that says so.
         #[test]
         fn a_context_pointer_is_loaded_once_per_call() {
-            // The 128-bit tier's own batch, whatever this host's is: the
+            // The AVX2 tier's own batch, whatever this host's is: the
             // schedule is packed at the lane count the backend stores.
-            const SSE_LANES: u32 = 4;
+            const AVX2_LANES: u32 = 8;
             let (a, root) = gather_by_row();
-            let schedule = schedule_for(&a, root, LatticeShape::new([SSE_LANES, 1]), SSE_LANES);
+            let schedule = schedule_for(&a, root, LatticeShape::new([AVX2_LANES, 1]), AVX2_LANES);
             let pointers = schedule
                 .iter()
                 .filter(|d| matches!(d.op, ScheduledOp::Context(_)))
@@ -7638,7 +7582,7 @@ mod tests {
             assert!(pointers >= 2, "a buffer and the origin block: {pointers}");
             let res = compile_via_backend(
                 schedule,
-                &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
+                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
             )
             .expect("compile");
             let loads = res
@@ -7801,19 +7745,11 @@ mod tests {
 
         // Ungated, like every sweep below it: these only *encode* — bytes
         // into a Vec, never executed — and every backend now compiles on
-        // every host, so a coverage gap in any of the four fails every CI
+        // every host, so a coverage gap in any of the three fails every CI
         // job rather than only the one leg that happens to select it.
         // AVX-512's binary dispatch once shipped 6 of 15 required ops and
         // nothing noticed until someone first built `+avx512f`; that is the
-        // hole this closes for all four at once.
-        #[test]
-        fn x86_backend_covers_required_ops() {
-            assert_covers_required_ops(
-                "X86Backend (SSE2)",
-                &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-            );
-        }
-
+        // hole this closes for all three at once.
         #[test]
         fn avx2_backend_covers_required_ops() {
             assert_covers_required_ops(
@@ -7851,8 +7787,8 @@ mod tests {
     // equivalence test, and change the last bit of the answer.
     //
     // Ungated, like `backend_op_coverage`: encoding is a pure function into a
-    // `Vec<u8>`, so all four backends are checked from whichever host runs the
-    // tests — including the two (aarch64, AVX-512 decomposed) that no
+    // `Vec<u8>`, so all three backends are checked from whichever host runs
+    // the tests — including the two (aarch64, AVX-512 decomposed) that no
     // execution test on any single host reaches.
     // =========================================================================
     mod muladd_encoding {
@@ -7863,47 +7799,22 @@ mod tests {
         const SRC_B: Reg = Reg(6);
         const ADDEND: Reg = Reg(7);
 
-        /// The temp the SSE2 fused stand-in multiplies into. Any pool
-        /// register disjoint from the operands would do — the allocator picks
-        /// it per instruction — so this names one to pin the bytes.
-        const TEMP: Reg = Reg(10);
-
-        /// A bare plan: no reloads, no setup mov, no store — just the op, so
-        /// the bytes below are the op's encoding and nothing else.
-        ///
-        /// `temps` is empty for every spelling but SSE2's `FusedMulAdd`, which
-        /// has no FMA to fuse into and needs somewhere to put the product; the
-        /// empty set elsewhere is the assertion that no other backend starts
-        /// asking for scratch unnoticed.
-        fn plan(
-            op: ResolvedOp,
-            temps: Option<[Reg; regalloc::Scratch::MAX_TEMPS]>,
-        ) -> InstructionPlan {
+        /// A bare plan: no reloads, no setup mov, no store, no temps — just
+        /// the op, so the bytes below are the op's encoding and nothing
+        /// else. The empty scratch is the assertion that no backend starts
+        /// asking for one on a `MulAdd` unnoticed.
+        fn plan(op: ResolvedOp) -> InstructionPlan {
             InstructionPlan {
                 reloads: alloc::vec::Vec::new(),
                 op,
                 setup_mov: None,
-                scratch: regalloc::Scratch::for_test(temps, [None, None]),
+                scratch: regalloc::Scratch::for_test(None, [None, None]),
             }
         }
 
         fn encode<B: IsaBackend>(backend: &mut B, op: ResolvedOp) -> Vec<u8> {
             let mut code = Vec::new();
-            backend
-                .emit_plan(&mut code, &plan(op, None))
-                .expect("emit_plan");
-            code
-        }
-
-        /// `encode` for the one spelling that asks the allocator for a temp.
-        fn encode_with_temp<B: IsaBackend>(backend: &mut B, op: ResolvedOp) -> Vec<u8> {
-            let mut code = Vec::new();
-            backend
-                .emit_plan(
-                    &mut code,
-                    &plan(op, Some([TEMP; regalloc::Scratch::MAX_TEMPS])),
-                )
-                .expect("emit_plan");
+            backend.emit_plan(&mut code, &plan(op)).expect("emit_plan");
             code
         }
 
@@ -7925,10 +7836,8 @@ mod tests {
             }
         }
 
-        /// `dst += a * b` in one instruction, one rounding, on the three
-        /// targets that have an FMA — and the SSE2 baseline's honest
-        /// three-instruction stand-in, which rounds twice because that is all
-        /// the hardware offers.
+        /// `dst += a * b` in one instruction, one rounding, on every target:
+        /// each of the three has an FMA.
         #[test]
         fn fused_encodes_to_the_targets_fma() {
             // VEX.256.66.0F38.W0 B8 /r — vfmadd231ps ymm4, ymm5, ymm6.
@@ -7958,21 +7867,6 @@ mod tests {
                 aarch64::disassemble_code(&neon).trim_end(),
                 "   0: 4e26cca4  fmla v4.4s, v5.4s, v6.4s",
                 "aarch64 fused MulAdd"
-            );
-            // No FMA at the SSE2 baseline: movaps/mulps into this
-            // instruction's temp, then addps into dst. Two roundings, and the
-            // only reason CLAUDE.md's `MulAdd` row still has a second column.
-            assert_eq!(
-                encode_with_temp(
-                    &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-                    fused()
-                ),
-                alloc::vec![
-                    0x44, 0x0f, 0x28, 0xd5, // movaps xmm10, xmm5
-                    0x44, 0x0f, 0x59, 0xd6, // mulps  xmm10, xmm6
-                    0x41, 0x0f, 0x58, 0xe2, // addps  xmm4,  xmm10
-                ],
-                "SSE2 fused MulAdd"
             );
         }
 
@@ -8013,18 +7907,6 @@ mod tests {
                 "   0: 6e26dca4  fmul v4.4s, v5.4s, v6.4s\n   4: 4e27d484  fadd v4.4s, v4.4s, v7.4s",
                 "aarch64 decomposed MulAdd"
             );
-            assert_eq!(
-                encode(
-                    &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-                    decomposed(None)
-                ),
-                alloc::vec![
-                    0x0f, 0x28, 0xe5, // movaps xmm4, xmm5
-                    0x0f, 0x59, 0xe6, // mulps  xmm4, xmm6
-                    0x0f, 0x58, 0xe7, // addps  xmm4, xmm7
-                ],
-                "SSE2 decomposed MulAdd"
-            );
         }
 
         /// A deferred `c` must be reloaded *between* the multiply and the add.
@@ -8040,9 +7922,9 @@ mod tests {
         fn a_deferred_c_is_reloaded_between_the_multiply_and_the_add() {
             fn check<B: IsaBackend>(name: &str, backend: &mut B) {
                 let undeferred = encode(backend, decomposed(None));
-                // `dst = a*b` is everything before the final add; on SSE2 the
-                // add is 3 bytes, on VEX 5, on EVEX 6, on NEON 4 — so split by
-                // the tail rather than by a per-backend length.
+                // `dst = a*b` is everything before the final add; on VEX the
+                // add is 5 bytes, on EVEX 6, on NEON 4 — so split by the
+                // tail rather than by a per-backend length.
                 let (mul, add) = undeferred.split_at(undeferred.len() - tail_len(name));
                 for deferred in [
                     DeferredReload::FromStack(Slot::new(32, 16)),
@@ -8067,7 +7949,6 @@ mod tests {
             /// Byte length of the trailing add in `decomposed(None)`.
             fn tail_len(name: &str) -> usize {
                 match name {
-                    "SSE2" => 3,
                     "AVX2" => 5,
                     "AVX-512" => 6,
                     "aarch64" => 4,
@@ -8075,10 +7956,6 @@ mod tests {
                 }
             }
 
-            check(
-                "SSE2",
-                &mut x86_64::driver::X86Backend::new(EmitCtx::default()),
-            );
             check(
                 "AVX2",
                 &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
